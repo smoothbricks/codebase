@@ -246,8 +246,18 @@ pub(crate) struct CopyFileIdentity {
 }
 
 impl CopyFileIdentity {
-    pub(crate) fn read(file: &fs::File) -> io::Result<Self> {
+    pub(crate) fn from_metadata(metadata: &fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            mode: metadata.mode(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+    pub(crate) fn read(file: &fs::File) -> io::Result<Self> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -255,14 +265,7 @@ impl CopyFileIdentity {
                 "cross-filesystem recovery requires a regular file",
             ));
         }
-        Ok(Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            size: metadata.len(),
-            mode: metadata.mode(),
-            mtime: (metadata.mtime(), metadata.mtime_nsec()),
-            ctime: (metadata.ctime(), metadata.ctime_nsec()),
-        })
+        Ok(Self::from_metadata(&metadata))
     }
 
     pub(crate) fn same_inode(&self, other: &Self) -> bool {

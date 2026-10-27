@@ -794,12 +794,21 @@ job. Protected complete in-volume Arrow batches and sealed artifacts are the aut
 commitments are audit telemetry that no API reads for a decision (11_shell.md). APIs return `Integrity` for a missing or
 altered artifact, an invalid complete batch, a checkpoint-barrier counter behind a durable barrier, or an incarnation
 outside the marker lineage; nothing silently wins. Authorization, grant, and gateway audit authority remain
-controller-owned.
+controller-owned. A ranged read of a sealed file returns bytes only from the generation the store fully verified at seal
+or open: device, inode, length, mode, link count, and nanosecond modification and change times. The digest pass observes
+the same opened descriptor before and after hashing and accepts evidence only when both generations and the commitment
+agree. Each bounded positioned read checks that generation before and after reading; a changed generation is
+`Integrity`, never altered bytes. Generation evidence is process-local and published beside the immutable terminal
+record in the validated snapshot, not persisted or accompanied by a payload cache. Paging B bytes reads O(B) payload
+bytes after the required seal/open digest pass, without reading or hashing preceding prefixes.
 
-The artifact sink's `sealed(jobId)` returns `Result<Option<SealedJob>>`: `Ok(None)` means the current protected-store
-authority proves no terminal record for that id. A supervisor-held unsealed job answers that fact before any store
-refresh; a held sealed terminal still answers its record. A readable current-incarnation admission row likewise proves
-that its job has no terminal row, rather than making that known job an unread-history unknown.
+The artifact sink's `sealed(jobId)` returns `Result<Option<SealedJobReader>>`: one owned projection sharing the
+canonical validated terminal entry and workspace root for both streams. `Ok(None)` means the current protected-store
+authority proves no terminal record for that id. Logs and tails use that projection directly, without a discarded
+terminal DTO, payload copy or inline revalidation. Only an explicit terminal-facts request materializes the unchanged
+wire `SealedJob` DTO. A supervisor-held unsealed job answers that fact before any store refresh; a held sealed terminal
+still answers its record. A readable current-incarnation admission row likewise proves that its job has no terminal row,
+rather than making that known job an unread-history unknown.
 
 A cache miss refreshes under the existing records lock through the same authoritative snapshot that append and
 checkpoint use. Unchanged validated inode/length within the retained budget reads no record payload and re-hashes no

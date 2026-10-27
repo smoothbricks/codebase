@@ -29,8 +29,8 @@ use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::apfs::Labelled;
 use cowshed_core::storage::job_artifact::{
-    AdmissionLookup, ArtifactConfig, ArtifactStore, FIRST_KEYED_LAYOUT, JobAdmission, JobEnding,
-    JobScheduling, StreamKind,
+    AdmissionLookup, ArtifactConfig, ArtifactStore, FIRST_KEYED_LAYOUT, JobAdmission,
+    JobArtifactRecord, JobEnding, JobScheduling, SealedJobReader, StreamKind,
 };
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
@@ -201,6 +201,8 @@ struct FakeArtifactSink {
     next_barrier: u64,
     quota: u64,
     jobs: BTreeMap<JobId, FakeArtifactJob>,
+    terminals: BTreeMap<JobId, SealedJobReader>,
+    authority: WorkspaceAuthoritySnapshot,
     observations: mpsc::UnboundedSender<ArtifactObservation>,
     order: mpsc::UnboundedSender<OrderObservation>,
 }
@@ -213,10 +215,10 @@ impl ArtifactSink for FakeArtifactSink {
     fn admit(
         &mut self,
         expected_job_id: JobId,
-        _grant_revision: u64,
+        grant_revision: u64,
         command: &cowshed_core::api::ExecCommand,
         admission: Option<JobAdmission>,
-        _scheduling: JobScheduling,
+        scheduling: JobScheduling,
     ) -> Result<()> {
         assert!(command.validate().is_ok());
         assert_eq!(admission, None, "this sink keeps no admission keys");
@@ -231,7 +233,28 @@ impl ArtifactSink for FakeArtifactSink {
         let replaced = self.jobs.insert(
             expected_job_id,
             FakeArtifactJob {
-                id: expected_job_id,
+                record: JobArtifactRecord {
+                    repo_id: self.authority.repo_id.clone(),
+                    workspace_incarnation: self.authority.workspace_incarnation.clone(),
+                    job_id: expected_job_id,
+                    sequence: expected_job_id.get(),
+                    state: JobState::Queued,
+                    grant_revision,
+                    command: command.clone(),
+                    output_limit: None,
+                    stdout: stream(Vec::new()),
+                    stderr: stream(Vec::new()),
+                    failure: None,
+                    exit: None,
+                    duration_ms: None,
+                    resources: None,
+                    admission,
+                    scheduling,
+                    nice: None,
+                    containment: None,
+                    outlived: Vec::new(),
+                    outlived_incomplete: false,
+                },
                 sealed_stdout: self.sealed_stdout.clone(),
                 quota: self.quota,
                 accepted: 0,
@@ -270,10 +293,16 @@ impl ArtifactSink for FakeArtifactSink {
         _stdout_copy: Option<OutputPublication>,
         _stderr_copy: Option<OutputPublication>,
     ) -> Result<ArtifactSeal> {
-        self.jobs
+        let (sealed, terminal) = self
+            .jobs
             .remove(&job_id)
             .expect("live fake artifact job")
-            .seal(ending.state)
+            .seal(ending)?;
+        assert!(
+            self.terminals.insert(job_id, terminal).is_none(),
+            "one terminal entry per job"
+        );
+        Ok(sealed)
     }
 
     fn checkpoint(&mut self) -> Result<CheckpointBarrier> {
@@ -292,16 +321,15 @@ impl ArtifactSink for FakeArtifactSink {
         })
     }
 
-    /// This sink keeps no terminal records: it hands each seal back and forgets the job. The
-    /// record a fresh supervisor answers from is the production store's
-    /// ([`a_fresh_supervisor_answers_for_a_job_its_predecessor_sealed`]).
-    fn sealed(&mut self, _job_id: JobId) -> Result<Option<cowshed_core::api::SealedJob>> {
-        Ok(None)
+    /// Facts and reads use this same terminal entry; durable predecessor recovery stays on the
+    /// production store, not a separate stream map in this boundary fixture.
+    fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJobReader>> {
+        Ok(self.terminals.get(&job_id).cloned())
     }
 }
 
 struct FakeArtifactJob {
-    id: JobId,
+    record: JobArtifactRecord,
     sealed_stdout: Option<Vec<u8>>,
     quota: u64,
     accepted: u64,
@@ -324,7 +352,7 @@ impl FakeArtifactJob {
         self.accepted += u64::try_from(accepted).unwrap();
         self.observations
             .send(ArtifactObservation::Write(
-                self.id,
+                self.record.job_id,
                 stream,
                 Bytes::copy_from_slice(admitted),
             ))
@@ -342,20 +370,50 @@ impl FakeArtifactJob {
         })
     }
 
-    fn seal(self, state: JobState) -> Result<ArtifactSeal> {
+    fn seal(self, ending: JobEnding) -> Result<(ArtifactSeal, SealedJobReader)> {
+        let id = self.record.job_id;
         self.observations
-            .send(ArtifactObservation::Seal(self.id, state))
+            .send(ArtifactObservation::Seal(id, ending.state))
             .expect("artifact observer");
         self.order
-            .send(OrderObservation::ArtifactSeal(self.id))
+            .send(OrderObservation::ArtifactSeal(id))
             .expect("order observer");
-        Ok(ArtifactSeal {
+        let JobEnding {
+            state,
+            exit,
+            duration_ms,
+            resources,
+            failure,
+            nice,
+            containment,
+            outlived,
+            outlived_incomplete,
+        } = ending;
+        let record = JobArtifactRecord {
+            state,
+            exit,
+            duration_ms,
+            resources,
+            failure,
+            nice,
+            containment,
+            outlived,
+            outlived_incomplete,
             stdout: stream(self.sealed_stdout.unwrap_or(self.stdout)),
             stderr: stream(self.stderr),
-            terminal_batch_sha256: Sha256Digest::compute(&self.id.get().to_be_bytes()),
             output_limit: self.crossing,
+            ..self.record
+        };
+        let sealed = ArtifactSeal {
+            stdout: record.stdout.clone(),
+            stderr: record.stderr.clone(),
+            terminal_batch_sha256: Sha256Digest::compute(&id.get().to_be_bytes()),
+            output_limit: record.output_limit.clone(),
             publication_failure: None,
-        })
+        };
+        let terminal = SealedJobReader::inline(record)
+            .expect("fixture produced a valid inline terminal record");
+        Ok((sealed, terminal))
     }
 }
 
@@ -553,6 +611,7 @@ fn harness_with_artifacts(
     let (artifact_tx, artifacts) = mpsc::unbounded_channel();
     let (commitment_tx, commitments) = mpsc::unbounded_channel();
     let (order_tx, order) = mpsc::unbounded_channel();
+    let artifact_authority = supervisor_config.authority.clone();
     let handle = WorkspaceSupervisor::start_with_sinks(
         supervisor_config,
         Box::new(FakeSpawner {
@@ -568,6 +627,8 @@ fn harness_with_artifacts(
             next_barrier: 1,
             quota,
             jobs: BTreeMap::new(),
+            terminals: BTreeMap::new(),
+            authority: artifact_authority,
             observations: artifact_tx,
             order: order_tx.clone(),
         }),
@@ -2051,6 +2112,7 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
     let (artifact_tx, _artifacts) = mpsc::unbounded_channel();
     let (commitment_tx, _commitments) = mpsc::unbounded_channel();
     let (order_tx, _order) = mpsc::unbounded_channel();
+    let artifact_authority = supervisor_config.authority.clone();
     let handle = WorkspaceSupervisor::start_with_sinks(
         supervisor_config,
         Box::new(ReapedGroupSpawner {
@@ -2065,6 +2127,8 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
             next_barrier: 1,
             quota: 1024,
             jobs: BTreeMap::new(),
+            terminals: BTreeMap::new(),
+            authority: artifact_authority,
             observations: artifact_tx,
             order: order_tx.clone(),
         }),
@@ -2832,6 +2896,13 @@ async fn a_terminal_log_read_answers_from_the_sealed_artifact_not_a_retained_cop
     complete(&spawned, b"written", b"", ExitStatus::Exited { code: 0 }).await;
     let info = h.handle.wait(job).await.unwrap();
     assert_eq!(info.stdout.bytes, 6);
+    let terminal = h
+        .handle
+        .sealed(job)
+        .await
+        .expect("the canonical fake terminal is present");
+    assert_eq!(terminal.stdout, info.stdout);
+    assert_eq!(terminal.stderr, info.stderr);
 
     let chunk = h
         .handle
@@ -2842,7 +2913,7 @@ async fn a_terminal_log_read_answers_from_the_sealed_artifact_not_a_retained_cop
     assert_eq!(chunk.next_offset, 6);
     assert!(chunk.eof);
 
-    // Paging from an offset walks the sealed stream, and reading at the end is a clean eof.
+    // A page starts at its offset; reading at the committed end is a clean eof.
     let tail = h
         .handle
         .log_read(job, StreamKind::Stdout, 2, false)
@@ -5021,8 +5092,10 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
     let (commitment_tx, _commitments) = mpsc::unbounded_channel();
     let (order_tx, _order) = mpsc::unbounded_channel();
     let feed = CommitmentFeed::default();
+    let supervisor_config = config(&root);
+    let artifact_authority = supervisor_config.authority.clone();
     let handle = WorkspaceSupervisor::start_with_sinks(
-        config(&root),
+        supervisor_config,
         Box::new(FakeSpawner {
             spawned: spawn_tx,
             process_observations: process_tx,
@@ -5036,6 +5109,8 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
             next_barrier: 1,
             quota: 1024,
             jobs: BTreeMap::new(),
+            terminals: BTreeMap::new(),
+            authority: artifact_authority,
             observations: artifact_tx,
             order: order_tx.clone(),
         }),
@@ -8999,6 +9074,7 @@ os._exit(0)
     )
     .unwrap();
     let durable = reopened.sealed(job).unwrap().unwrap();
+    let durable = durable.record();
     assert_eq!(durable.containment, ended.containment);
     assert_eq!(durable.outlived, ended.outlived);
     assert_eq!(durable.outlived_incomplete, ended.outlived_incomplete);

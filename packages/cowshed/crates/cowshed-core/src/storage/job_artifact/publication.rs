@@ -9,12 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    ArtifactError, PROTECTED_DIRECTORY, PublicationStage, hash_reader, reject_hardlink,
-    verify_private_file_mode,
+    ArtifactError, PROTECTED_DIRECTORY, PublicationStage, SealedStorage, SealedStream, hash_reader,
+    reject_hardlink, verify_private_file_mode,
 };
-use crate::api::dto::{
-    OutputPublication, ProtectedOutput, PublicationPolicy, Sha256Digest, StreamInfo,
-};
+use crate::api::dto::{OutputPublication, PublicationPolicy, Sha256Digest};
 use cowshed_os::fsio::rename_noreplace;
 
 #[cfg(target_os = "linux")]
@@ -35,10 +33,9 @@ static NONCE: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn publish(
     workspace_root: &Path,
-    stream: &StreamInfo,
+    stream: &SealedStream,
     publication: &OutputPublication,
 ) -> Result<(), ArtifactError> {
-    stream.validate()?;
     let parent = Parent::open(workspace_root, publication.path.as_path())?;
     materialize_and_publish(parent, workspace_root, stream, publication.policy)
 }
@@ -46,7 +43,7 @@ pub(super) fn publish(
 fn materialize_and_publish(
     mut parent: Parent,
     workspace_root: &Path,
-    stream: &StreamInfo,
+    stream: &SealedStream,
     policy: PublicationPolicy,
 ) -> Result<(), ArtifactError> {
     if let Err(primary) = parent.materialize_and_publish(workspace_root, stream, policy) {
@@ -173,19 +170,19 @@ impl Parent {
     fn materialize_and_publish(
         &mut self,
         workspace_root: &Path,
-        stream: &StreamInfo,
+        stream: &SealedStream,
         policy: PublicationPolicy,
     ) -> Result<(), ArtifactError> {
         let temporary_path = self.temporary_path();
-        let (temporary, verify_after_materialize) = match stream.storage.artifact() {
-            ProtectedOutput::Inline { data } => {
+        let (temporary, verify_after_materialize) = match &stream.storage {
+            SealedStorage::Inline(data) => {
                 let mut file = self.create_temporary()?;
                 file.write_all(data.as_bytes()).map_err(|error| {
                     publication_error(&temporary_path, PublicationStage::Copy, error)
                 })?;
                 (file, true)
             }
-            ProtectedOutput::File { path } => {
+            SealedStorage::File { path, .. } => {
                 let source_path = workspace_root.join(path.as_path());
                 let source = open_authority_source(&source_path)?;
                 match self.try_fast_clone(&source)? {
@@ -522,7 +519,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::api::dto::{BinaryData, OutputStorage, OutputSummary, WorkspacePath};
+    use crate::api::dto::{
+        BinaryData, OutputStorage, OutputSummary, ProtectedOutput, StreamInfo, WorkspacePath,
+    };
 
     static TEST_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -552,21 +551,25 @@ mod tests {
         }
     }
 
-    fn inline_stream(data: &[u8]) -> StreamInfo {
-        StreamInfo {
-            storage: OutputStorage::Captured {
-                artifact: ProtectedOutput::Inline {
-                    data: BinaryData::new(data.to_vec()).expect("bounded test data"),
+    fn inline_stream(data: &[u8]) -> SealedStream {
+        SealedStream::from_info(
+            StreamInfo {
+                storage: OutputStorage::Captured {
+                    artifact: ProtectedOutput::Inline {
+                        data: BinaryData::new(data.to_vec()).expect("bounded test data"),
+                    },
+                },
+                bytes: u64::try_from(data.len()).expect("fixture length fits u64"),
+                sha256: Sha256Digest::compute(data),
+                summary: OutputSummary {
+                    version: 1,
+                    text: String::new(),
+                    truncated: false,
                 },
             },
-            bytes: data.len() as u64,
-            sha256: Sha256Digest::compute(data),
-            summary: OutputSummary {
-                version: 1,
-                text: String::new(),
-                truncated: false,
-            },
-        }
+            |_, _, _| unreachable!("inline fixture contains no file"),
+        )
+        .expect("canonical inline fixture")
     }
 
     fn output(path: &str, policy: PublicationPolicy) -> OutputPublication {

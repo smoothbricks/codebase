@@ -19789,8 +19789,7 @@ mod removal_supervisor_tests {
     use crate::{
         api::dto::{
             BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobId, OutputStorage,
-            OutputSummary, ProtectedOutput, RunSandboxMode, SealedJob, Sha256Digest, StdinSource,
-            StreamInfo,
+            OutputSummary, ProtectedOutput, RunSandboxMode, Sha256Digest, StdinSource, StreamInfo,
         },
         error::{CowshedError, Result},
         runtime::supervisor::{
@@ -19887,7 +19886,10 @@ mod removal_supervisor_tests {
             })
         }
 
-        fn sealed(&mut self, _job_id: JobId) -> Result<Option<SealedJob>> {
+        fn sealed(
+            &mut self,
+            _job_id: JobId,
+        ) -> Result<Option<crate::storage::job_artifact::SealedJobReader>> {
             Ok(None)
         }
     }

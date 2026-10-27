@@ -75,7 +75,7 @@ use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline, V
 use crate::storage::job_artifact::{
     AdmissionLookup, AdmittedSession, AdmittedStdin, ArtifactConfig, ArtifactError, ArtifactStore,
     CompletedJobArtifacts, JobAdmission, JobEnding, JobScheduling, OutputTargets,
-    SealedCheckpointManifest, StreamKind,
+    SealedCheckpointManifest, SealedJobReader, StreamKind,
 };
 
 #[cfg(test)]
@@ -905,9 +905,9 @@ pub trait ArtifactSink: Send {
         stderr_copy: Option<OutputPublication>,
     ) -> Result<ArtifactSeal>;
     fn checkpoint(&mut self) -> Result<CheckpointBarrier>;
-    /// The terminal record under current store authority. `Ok(None)` proves absence; unread or
-    /// set-aside history is the original refusal, never a missing-job answer.
-    fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJob>>;
+    /// One canonical terminal snapshot for facts and both stream reads. None is authoritative
+    /// absence; unread or set-aside history retains its original refusal.
+    fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJobReader>>;
 }
 
 pub use crate::storage::audit::CommitmentDraft;
@@ -954,28 +954,8 @@ impl ArtifactSink for ArtifactStoreSink {
         self.store.next_job_id().map_err(map_artifact_error)
     }
 
-    fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJob>> {
-        Ok(self
-            .store
-            .sealed(job_id)
-            .map_err(map_artifact_error)?
-            .map(|record| SealedJob {
-                job_id: record.job_id,
-                state: record.state,
-                exit: record.exit.clone(),
-                failure: record.failure,
-                duration_ms: record.duration_ms,
-                resources: record.resources.clone(),
-                containment: record.containment.clone(),
-                outlived: record.outlived.clone(),
-                outlived_incomplete: record.outlived_incomplete,
-                output_limit: record.output_limit.clone(),
-                stdout: record.stdout.clone(),
-                stderr: record.stderr.clone(),
-                class: record.scheduling.class(),
-                scope: record.scheduling.scope(),
-                nice: record.nice,
-            }))
+    fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJobReader>> {
+        self.store.sealed(job_id).map_err(map_artifact_error)
     }
 
     fn admit(
@@ -5445,6 +5425,7 @@ impl SupervisorActor {
                         Some(_) | None => self
                             .artifacts
                             .sealed(job_id)?
+                            .map(|record| record.info())
                             .ok_or_else(|| unsealed_job(job_id)),
                     }
                 });
@@ -7258,24 +7239,13 @@ impl SupervisorActor {
         let Ok(job) = self.job_mut(job_id) else {
             // A job an earlier supervisor of this incarnation ran and sealed: its sealed artifact
             // answers exactly as this supervisor's own terminal jobs do.
-            let sealed = match self.artifacts.sealed(job_id) {
-                Ok(Some(sealed)) => sealed,
-                Ok(None) => {
-                    let _ = reply.send(Err(not_found_job(job_id)));
-                    return;
-                }
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-            };
-            let stream = match stream {
-                StreamKind::Stdout => sealed.stdout,
-                StreamKind::Stderr => sealed.stderr,
-            };
-            let workspace_root = self.workspace_root.clone();
+            let reader = self
+                .artifacts
+                .sealed(job_id)
+                .and_then(|reader| reader.ok_or_else(|| not_found_job(job_id)));
             tokio::task::spawn_blocking(move || {
-                let _ = reply.send(read_sealed_chunk(&workspace_root, &stream, offset));
+                let _ = reply
+                    .send(reader.and_then(|reader| read_sealed_chunk(&reader, stream, offset)));
             });
             return;
         };
@@ -7283,13 +7253,13 @@ impl SupervisorActor {
             // The sealed artifact is the authoritative copy of both streams, so the actor keeps
             // none. Off the actor thread: this may open and read a protected file, and every
             // other job's output pump waits behind this loop.
-            let sealed = match stream {
-                StreamKind::Stdout => job.info.stdout.clone(),
-                StreamKind::Stderr => job.info.stderr.clone(),
-            };
-            let workspace_root = self.workspace_root.clone();
+            let reader = self
+                .artifacts
+                .sealed(job_id)
+                .and_then(|reader| reader.ok_or_else(|| not_found_job(job_id)));
             tokio::task::spawn_blocking(move || {
-                let _ = reply.send(read_sealed_chunk(&workspace_root, &sealed, offset));
+                let _ = reply
+                    .send(reader.and_then(|reader| read_sealed_chunk(&reader, stream, offset)));
             });
             return;
         }
@@ -7339,7 +7309,7 @@ impl SupervisorActor {
             let _ = reply.send(Err(error));
             return;
         }
-        let (stdout, stderr) = match self.job_mut(job_id) {
+        match self.job_mut(job_id) {
             Ok(job) if !job.sealed() => {
                 let lengths = (job.stdout_tally.bytes(), job.stderr_tally.bytes());
                 let _ = reply.send(tail_journals(cursor, limits, lengths, |stream, range| {
@@ -7347,31 +7317,15 @@ impl SupervisorActor {
                 }));
                 return;
             }
-            // The sealed artifact is the authoritative copy of both streams.
-            Ok(job) => (job.info.stdout.clone(), job.info.stderr.clone()),
-            // A job an earlier supervisor of this incarnation sealed: its artifact answers.
-            Err(_) => match self.artifacts.sealed(job_id) {
-                Ok(Some(sealed)) => (sealed.stdout, sealed.stderr),
-                Ok(None) => {
-                    let _ = reply.send(Err(not_found_job(job_id)));
-                    return;
-                }
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-            },
-        };
-        // Off the actor thread, as a sealed log read is: it may read a protected file.
-        let workspace_root = self.workspace_root.clone();
+            Ok(_) | Err(_) => {}
+        }
+        let reader = self
+            .artifacts
+            .sealed(job_id)
+            .and_then(|reader| reader.ok_or_else(|| not_found_job(job_id)));
+        // Both streams retain the same canonical record and root off the actor thread.
         tokio::task::spawn_blocking(move || {
-            let _ = reply.send(sealed_tail(
-                &workspace_root,
-                &stdout,
-                &stderr,
-                cursor,
-                limits,
-            ));
+            let _ = reply.send(reader.and_then(|reader| sealed_tail(&reader, cursor, limits)));
         });
     }
 
@@ -8476,22 +8430,21 @@ fn read_live_range(chunks: &VecDeque<Bytes>, range: Range<u64>) -> Result<Vec<u8
 
 /// A tail of a sealed job, read out of the artifact store.
 fn sealed_tail(
-    workspace_root: &Path,
-    stdout: &StreamInfo,
-    stderr: &StreamInfo,
+    reader: &SealedJobReader,
     cursor: Option<JobJournalCursor>,
     limits: JobTailLimits,
 ) -> Result<JobTail> {
     tail_journals(
         cursor,
         limits,
-        (stdout.bytes, stderr.bytes),
+        (
+            reader.bytes(StreamKind::Stdout),
+            reader.bytes(StreamKind::Stderr),
+        ),
         |stream, range| {
-            let info = match stream {
-                crate::api::JobStream::Stdout => stdout,
-                crate::api::JobStream::Stderr => stderr,
-            };
-            read_sealed_range(workspace_root, info, range)
+            reader
+                .read_range(stream.into(), range)
+                .map_err(map_artifact_error)
         },
     )
 }
@@ -8854,8 +8807,12 @@ fn stdin_delivery_unknown(cursor: u64, why: &str) -> CowshedError {
 }
 
 /// One bounded chunk of a sealed stream, read out of the artifact store.
-fn read_sealed_chunk(workspace_root: &Path, stream: &StreamInfo, offset: u64) -> Result<LogChunk> {
-    let len = stream.bytes;
+fn read_sealed_chunk(
+    reader: &SealedJobReader,
+    stream: StreamKind,
+    offset: u64,
+) -> Result<LogChunk> {
+    let len = reader.bytes(stream);
     if offset > len {
         return Err(CowshedError::conflict(
             "log offset is beyond the captured stream",
@@ -8864,70 +8821,14 @@ fn read_sealed_chunk(workspace_root: &Path, stream: &StreamInfo, offset: u64) ->
     }
     let next_offset = len.min(offset.saturating_add(byte_count(MAX_LOG_READ)));
     Ok(LogChunk {
-        bytes: Bytes::from(read_sealed_range(
-            workspace_root,
-            stream,
-            offset..next_offset,
-        )?),
+        bytes: Bytes::from(
+            reader
+                .read_range(stream, offset..next_offset)
+                .map_err(map_artifact_error)?,
+        ),
         next_offset,
         eof: next_offset == len,
     })
-}
-
-/// The bytes `range` names of a sealed stream, which must lie within its recorded length.
-///
-/// The store's reader verifies bytes and digest as it goes and cannot seek, so an offset is
-/// reached by reading and discarding. Paging a whole stream is therefore quadratic in chunk
-/// count -- which is the right trade against keeping every terminal job's full output resident
-/// forever, and is bounded anyway by the same `MAX_LOG_READ` frame the live path uses. An inline
-/// stream, which is every output under the store's inline cap, touches no filesystem at all.
-fn read_sealed_range(
-    workspace_root: &Path,
-    stream: &StreamInfo,
-    range: Range<u64>,
-) -> Result<Vec<u8>> {
-    if range.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut reader = crate::storage::job_artifact::open_stream_reader(workspace_root, stream)
-        .map_err(map_artifact_error)?;
-    if range.start > 0 {
-        // The skipped prefix is verified and dropped through a fixed scratch on the stack.
-        let mut discard = [0_u8; 16 * 1024];
-        let mut skipped = 0_u64;
-        while skipped < range.start {
-            let want = usize::try_from(range.start - skipped)
-                .unwrap_or(discard.len())
-                .min(discard.len());
-            let read = reader
-                .read_chunk(&mut discard[..want])
-                .map_err(map_artifact_error)?;
-            if read == 0 {
-                return Err(CowshedError::integrity(
-                    "sealed stream ended before the requested log offset",
-                    "cowshed doctor --json",
-                ));
-            }
-            skipped += byte_count(read);
-        }
-    }
-    let want = usize::try_from(range.end - range.start)
-        .map_err(|_| CowshedError::internal("log range exceeds platform range"))?;
-    let mut output = vec![0_u8; want];
-    let mut filled = 0;
-    while filled < want {
-        let read = reader
-            .read_chunk(&mut output[filled..])
-            .map_err(map_artifact_error)?;
-        if read == 0 {
-            return Err(CowshedError::integrity(
-                "sealed stream ended before its recorded length",
-                "cowshed doctor --json",
-            ));
-        }
-        filled += read;
-    }
-    Ok(output)
 }
 
 /// How many lives the job's observer holds running now; `None` for a job with no observer.

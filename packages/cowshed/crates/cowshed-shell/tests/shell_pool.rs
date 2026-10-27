@@ -362,6 +362,70 @@ async fn run(handle: &WorkspaceSupervisorHandle, request: ExecRequest) -> Ran {
     run_in(handle, None, request).await
 }
 
+/// Wait for the real command to seal before reading: every byte must cross the proven range path.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_sealed_ranges_page_a_bounded_command_and_latest_tail() {
+    use cowshed_core::api::{JobTailBytes, JobTailLimits, ProtectedOutput};
+    let workspace = Workspace::new("sealed-range-command", 41_504);
+    workspace.envrc("");
+    let handle = workspace.supervisor(false);
+    let job = handle
+        .exec(
+            None,
+            None,
+            sh("printf '%0196609d' 0; printf 'sealed-range-stderr\\n' >&2"),
+            AdmissionSource::Worker,
+        )
+        .await
+        .expect("admit finite output command");
+    let info = handle.wait(job).await.expect("command sealed");
+    assert_eq!(info.exit, Some(ExitStatus::Exited { code: 0 }));
+    assert_eq!(info.stdout.bytes, 196_609);
+    assert!(matches!(
+        info.stdout.storage.artifact(),
+        ProtectedOutput::File { .. }
+    ));
+    let mut offset = 0;
+    for want in [65_536, 65_536, 65_536, 1] {
+        let chunk = handle
+            .log_read(job, StreamKind::Stdout, offset, false)
+            .await
+            .expect("sealed positioned page");
+        assert_eq!(chunk.bytes.len(), want);
+        assert!(chunk.bytes.iter().all(|byte| *byte == b'0'));
+        offset += u64::try_from(want).unwrap();
+        assert_eq!(chunk.next_offset, offset);
+        assert_eq!(chunk.eof, offset == info.stdout.bytes);
+    }
+    let end = handle
+        .log_read(job, StreamKind::Stdout, offset, false)
+        .await
+        .expect("sealed end");
+    assert!(end.bytes.is_empty() && end.eof);
+    let tail = handle
+        .tail(
+            job,
+            None,
+            JobTailLimits {
+                bytes_per_stream: JobTailBytes::new(65_536).unwrap(),
+                lines_per_stream: std::num::NonZeroU32::new(1).unwrap(),
+            },
+        )
+        .await
+        .expect("latest sealed tail");
+    assert_eq!(tail.stdout.as_bytes(), vec![b'0'; 65_536]);
+    assert!(tail.stdout_truncated);
+    assert_eq!(tail.next.stdout, offset);
+    assert_eq!(tail.stderr.as_bytes(), b"sealed-range-stderr\n");
+    assert_eq!(tail.next.stderr, info.stderr.bytes);
+    handle.quiesce().await.expect("quiesce smoke supervisor");
+    handle
+        .retire(cowshed_core::runtime::supervisor::NxDaemonRetirement::Recorded)
+        .await
+        .expect("retire smoke supervisor");
+}
+
 fn process_alive(pid: i32) -> bool {
     // SAFETY: signal 0 performs only the existence and permission check.
     unsafe { libc::kill(pid, 0) == 0 }

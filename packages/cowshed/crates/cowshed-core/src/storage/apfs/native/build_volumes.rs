@@ -2707,12 +2707,12 @@ mod tests {
             .await
             .unwrap();
         drop(handle);
+        let stored = store().sealed(job_id).unwrap();
         assert_eq!(
-            store()
-                .sealed(job_id)
-                .unwrap()
-                .and_then(|sealed| sealed.resources),
-            Some(terminal),
+            stored
+                .as_ref()
+                .and_then(|sealed| sealed.record().resources.as_ref()),
+            Some(&terminal),
             "the stored record decodes to the terminal sample, its volumes and accounting with it"
         );
 

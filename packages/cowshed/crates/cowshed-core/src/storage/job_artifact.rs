@@ -433,8 +433,40 @@ impl Default for OutputTargets {
     }
 }
 
+// The raw record and private validated snapshot share this field declaration. The generated move
+// changes only the two streams, without a second header roster or unstable struct-update syntax.
+macro_rules! job_artifact_record {
+    (
+        $(#[$attribute:meta])*
+        pub struct $name:ident<$stream:ident = $default:ty> {
+            $( $(#[$field_attribute:meta])* pub $field:ident: $ty:ty, )*
+        }
+    ) => {
+        $(#[$attribute])*
+        pub struct $name<$stream = $default> {
+            $( $(#[$field_attribute])* pub $field: $ty, )*
+        }
+
+        impl<$stream> $name<$stream> {
+            fn try_map_streams<T>(
+                self,
+                stdout: impl FnOnce($stream) -> Result<T, ArtifactError>,
+                stderr: impl FnOnce($stream) -> Result<T, ArtifactError>,
+            ) -> Result<$name<T>, ArtifactError> {
+                Ok($name {
+                    $( $field: job_artifact_record!(@field $field, self.$field, stdout, stderr), )*
+                })
+            }
+        }
+    };
+    (@field stdout, $value:expr, $stdout:ident, $stderr:ident) => { $stdout($value)? };
+    (@field stderr, $value:expr, $stdout:ident, $stderr:ident) => { $stderr($value)? };
+    (@field $field:ident, $value:expr, $stdout:ident, $stderr:ident) => { $value };
+}
+
+job_artifact_record! {
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct JobArtifactRecord {
+pub struct JobArtifactRecord<Stream = StreamInfo> {
     pub repo_id: RepoId,
     pub workspace_incarnation: WorkspaceIncarnation,
     pub job_id: JobId,
@@ -443,8 +475,8 @@ pub struct JobArtifactRecord {
     pub grant_revision: u64,
     pub command: ExecCommand,
     pub output_limit: Option<OutputLimitInfo>,
-    pub stdout: StreamInfo,
-    pub stderr: StreamInfo,
+    pub stdout: Stream,
+    pub stderr: Stream,
     /// Why a failed job failed when no status of its own says so.
     pub failure: Option<crate::api::dto::JobFailure>,
     /// A terminal job's status as `wait(2)` reported it; absent while the job runs and for a job
@@ -471,6 +503,7 @@ pub struct JobArtifactRecord {
     pub outlived: Vec<OutlivedProcess>,
     /// Retirement may have ended members absent from `outlived`; false without `containment`.
     pub outlived_incomplete: bool,
+}
 }
 
 /// A keyed exec's admission: its key and every part of its request a repeat under the key must
@@ -992,27 +1025,43 @@ pub struct VisibleStreamCommitment {
 
 impl VisibleStreamCommitment {
     pub fn from_stream(stream: &StreamInfo) -> Self {
-        let (storage_kind, protected_path) = match &stream.storage {
-            OutputStorage::Captured {
-                artifact: ProtectedOutput::Inline { .. },
-            } => (VisibleStorageKind::CapturedInline, None),
-            OutputStorage::Captured {
-                artifact: ProtectedOutput::File { path },
-            } => (VisibleStorageKind::CapturedFile, Some(path.clone())),
-            OutputStorage::Redirect {
-                artifact: ProtectedOutput::Inline { .. },
-                ..
-            } => (VisibleStorageKind::RedirectInline, None),
-            OutputStorage::Redirect {
-                artifact: ProtectedOutput::File { path },
-                ..
-            } => (VisibleStorageKind::RedirectFile, Some(path.clone())),
+        let path = match stream.storage.artifact() {
+            ProtectedOutput::Inline { .. } => None,
+            ProtectedOutput::File { path } => Some(path),
+        };
+        Self::from_parts(
+            matches!(stream.storage, OutputStorage::Redirect { .. }),
+            stream.bytes,
+            stream.sha256,
+            path,
+        )
+    }
+
+    fn from_sealed(stream: &SealedStream) -> Self {
+        let path = match &stream.storage {
+            SealedStorage::Inline(_) => None,
+            SealedStorage::File { path, .. } => Some(path),
+        };
+        Self::from_parts(stream.source.is_some(), stream.bytes, stream.sha256, path)
+    }
+
+    fn from_parts(
+        redirected: bool,
+        bytes: u64,
+        sha256: Sha256Digest,
+        path: Option<&WorkspacePath>,
+    ) -> Self {
+        let storage_kind = match (redirected, path.is_some()) {
+            (false, false) => VisibleStorageKind::CapturedInline,
+            (false, true) => VisibleStorageKind::CapturedFile,
+            (true, false) => VisibleStorageKind::RedirectInline,
+            (true, true) => VisibleStorageKind::RedirectFile,
         };
         Self {
             storage_kind,
-            bytes: stream.bytes,
-            sha256: stream.sha256,
-            protected_path,
+            bytes,
+            sha256,
+            protected_path: path.cloned(),
         }
     }
 
@@ -1038,15 +1087,15 @@ pub struct VisibleJobCommitment {
 }
 
 impl VisibleJobCommitment {
-    fn from_record(record: &JobArtifactRecord) -> (JobId, Self) {
+    fn from_record(record: &ValidatedJob) -> (JobId, Self) {
         (
             record.job_id,
             Self {
                 workspace_incarnation: record.workspace_incarnation.clone(),
                 job_id: record.job_id,
                 state: record.state,
-                stdout: VisibleStreamCommitment::from_stream(&record.stdout),
-                stderr: VisibleStreamCommitment::from_stream(&record.stderr),
+                stdout: VisibleStreamCommitment::from_sealed(&record.stdout),
+                stderr: VisibleStreamCommitment::from_sealed(&record.stderr),
             },
         )
     }
@@ -1155,7 +1204,7 @@ pub struct RecoveryReport {
 }
 
 pub struct ArtifactStore {
-    workspace_root: PathBuf,
+    workspace_root: Arc<PathBuf>,
     token_namespace: Sha256Digest,
     owned_repo_ids: OwnedRepoIds,
     workspace_incarnation: WorkspaceIncarnation,
@@ -1163,7 +1212,7 @@ pub struct ArtifactStore {
     budget: BufferBudget,
     next_job_id: u64,
     live_jobs: BTreeMap<JobId, LiveJobState>,
-    committed_jobs: BTreeMap<JobId, JobArtifactRecord>,
+    committed_jobs: BTreeMap<JobId, Arc<ValidatedJob>>,
     readable_jobs: BTreeSet<JobId>,
     admissions: AdmissionIndex,
     unread_history: Vec<UnreadHistory>,
@@ -1178,6 +1227,329 @@ pub struct ArtifactStore {
     validated_manifest: Option<Sha256Digest>,
 }
 
+type ValidatedJob = JobArtifactRecord<SealedStream>;
+
+impl ValidatedJob {
+    fn from_inline(record: JobArtifactRecord) -> Result<Self, ArtifactError> {
+        record.validate()?;
+        if !record.state.is_terminal() {
+            return Err(integrity(
+                0,
+                "an inline terminal reader requires a terminal record",
+            ));
+        }
+        let inline = |info| {
+            SealedStream::from_info(info, |_, _, _| {
+                Err(integrity(
+                    0,
+                    "inline terminal reader cannot grant file authority",
+                ))
+            })
+        };
+        record.try_map_streams(inline, inline)
+    }
+}
+
+enum AppendJob {
+    Admission(JobArtifactRecord),
+    Terminal(ValidatedJob),
+}
+
+/// The canonical stream storage of a validated terminal record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedStream {
+    bytes: u64,
+    sha256: Sha256Digest,
+    summary: OutputSummary,
+    source: Option<WorkspacePath>,
+    storage: SealedStorage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SealedStorage {
+    Inline(BinaryData),
+    File {
+        path: WorkspacePath,
+        generation: FileGeneration,
+    },
+}
+
+impl SealedStream {
+    /// The caller already validated the record or owns the writer's bytes. A file receives its
+    /// generation only through the required digest pass (or the unchanged snapshot's proof).
+    fn from_info(
+        info: StreamInfo,
+        file: impl FnOnce(&WorkspacePath, u64, Sha256Digest) -> Result<FileGeneration, ArtifactError>,
+    ) -> Result<Self, ArtifactError> {
+        let StreamInfo {
+            storage,
+            bytes,
+            sha256,
+            summary,
+        } = info;
+        let (source, artifact) = match storage {
+            OutputStorage::Captured { artifact } => (None, artifact),
+            OutputStorage::Redirect { source, artifact } => (Some(source), artifact),
+        };
+        let storage = match artifact {
+            ProtectedOutput::Inline { data } => SealedStorage::Inline(data),
+            ProtectedOutput::File { path } => {
+                let generation = file(&path, bytes, sha256)?;
+                SealedStorage::File { path, generation }
+            }
+        };
+        Ok(Self {
+            bytes,
+            sha256,
+            summary,
+            source,
+            storage,
+        })
+    }
+
+    fn recovered(
+        workspace_root: &Path,
+        info: StreamInfo,
+        before: Option<&Self>,
+    ) -> Result<Self, ArtifactError> {
+        Self::from_info(info, |path, bytes, sha256| match before {
+            Some(before) => match &before.storage {
+                SealedStorage::File { generation, .. } => Ok(generation.clone()),
+                SealedStorage::Inline(_) => Err(integrity(
+                    0,
+                    "a validated terminal record changed its immutable facts",
+                )),
+            },
+            None => verify_file_content(workspace_root, path, bytes, sha256),
+        })
+    }
+
+    fn into_info(self) -> StreamInfo {
+        let artifact = match self.storage {
+            SealedStorage::Inline(data) => ProtectedOutput::Inline { data },
+            SealedStorage::File { path, .. } => ProtectedOutput::File { path },
+        };
+        StreamInfo {
+            storage: match self.source {
+                None => OutputStorage::Captured { artifact },
+                Some(source) => OutputStorage::Redirect { source, artifact },
+            },
+            bytes: self.bytes,
+            sha256: self.sha256,
+            summary: self.summary,
+        }
+    }
+
+    fn info(&self) -> StreamInfo {
+        let artifact = match &self.storage {
+            SealedStorage::Inline(data) => ProtectedOutput::Inline { data: data.clone() },
+            SealedStorage::File { path, .. } => ProtectedOutput::File { path: path.clone() },
+        };
+        StreamInfo {
+            storage: match &self.source {
+                None => OutputStorage::Captured { artifact },
+                Some(source) => OutputStorage::Redirect {
+                    source: source.clone(),
+                    artifact,
+                },
+            },
+            bytes: self.bytes,
+            sha256: self.sha256,
+            summary: self.summary.clone(),
+        }
+    }
+}
+
+/// Reuse the regular-file mutation witness; hardlink count is also artifact authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileGeneration {
+    identity: crate::copy::CopyFileIdentity,
+    links: u64,
+}
+
+impl FileGeneration {
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            identity: crate::copy::CopyFileIdentity::from_metadata(metadata),
+            links: metadata.nlink(),
+        }
+    }
+
+    fn check(&self, file: &File, path: &Path, bytes: u64) -> Result<(), ArtifactError> {
+        let metadata = file.metadata().map_err(|error| io_error(path, error))?;
+        verify_sealed_metadata(path, &metadata, bytes)?;
+        if *self != Self::of(&metadata) {
+            return Err(integrity(
+                0,
+                &format!(
+                    "sealed artifact {} changed since its bytes and digest were verified",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One immutable terminal snapshot, projected once for either or both streams.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedJobReader {
+    workspace_root: Arc<PathBuf>,
+    record: Arc<ValidatedJob>,
+}
+
+impl SealedJobReader {
+    /// Admit a custom sink's untrusted inline terminal through the record's owning validator once.
+    pub fn inline(record: JobArtifactRecord) -> Result<Self, ArtifactError> {
+        Ok(Self {
+            workspace_root: Arc::new(PathBuf::new()),
+            record: Arc::new(ValidatedJob::from_inline(record)?),
+        })
+    }
+
+    pub fn record(&self) -> &JobArtifactRecord<SealedStream> {
+        &self.record
+    }
+
+    fn stream(&self, stream: StreamKind) -> &SealedStream {
+        match stream {
+            StreamKind::Stdout => &self.record.stdout,
+            StreamKind::Stderr => &self.record.stderr,
+        }
+    }
+
+    pub fn bytes(&self, stream: StreamKind) -> u64 {
+        self.stream(stream).bytes
+    }
+
+    /// The owned wire DTO is materialized only for an explicit terminal-facts request, not paging.
+    pub fn info(&self) -> crate::api::dto::SealedJob {
+        let record = &self.record;
+        crate::api::dto::SealedJob {
+            job_id: record.job_id,
+            state: record.state,
+            exit: record.exit.clone(),
+            failure: record.failure,
+            duration_ms: record.duration_ms,
+            resources: record.resources.clone(),
+            containment: record.containment.clone(),
+            outlived: record.outlived.clone(),
+            outlived_incomplete: record.outlived_incomplete,
+            output_limit: record.output_limit.clone(),
+            stdout: record.stdout.info(),
+            stderr: record.stderr.info(),
+            class: record.scheduling.class(),
+            scope: record.scheduling.scope(),
+            nice: record.nice,
+        }
+    }
+
+    /// Read exactly the selected bounded range without reading preceding payload.
+    pub fn read_range(
+        &self,
+        kind: StreamKind,
+        range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, ArtifactError> {
+        let stream = self.stream(kind);
+        let bounds = range_bounds(stream.bytes, range.clone())?;
+        match &stream.storage {
+            SealedStorage::Inline(data) => Ok(data.as_bytes()[bounds].to_vec()),
+            SealedStorage::File { path, generation } => {
+                use std::os::unix::fs::FileExt as _;
+                let absolute = self.workspace_root.join(path.as_path());
+                let file = open_artifact_no_follow(&self.workspace_root, path)
+                    .map_err(|error| integrity(0, &error.to_string()))?;
+                generation.check(&file, &absolute, stream.bytes)?;
+                let mut output = Vec::new();
+                output
+                    .try_reserve_exact(bounds.len())
+                    .map_err(|_| ArtifactError::BufferAllocation)?;
+                output.resize(bounds.len(), 0);
+                file.read_exact_at(&mut output, range.start)
+                    .map_err(|error| integrity(0, &io_error(&absolute, error).to_string()))?;
+                #[cfg(test)]
+                observe_artifact_read(ArtifactRead::Range(output.len()));
+                generation.check(&file, &absolute, stream.bytes)?;
+                Ok(output)
+            }
+        }
+    }
+}
+
+fn range_bounds(
+    bytes: u64,
+    range: std::ops::Range<u64>,
+) -> Result<std::ops::Range<usize>, ArtifactError> {
+    if range.start > range.end || range.end > bytes {
+        return Err(integrity(
+            0,
+            &format!(
+                "sealed range {}..{} is outside committed length {bytes}",
+                range.start, range.end
+            ),
+        ));
+    }
+    let count = range.end - range.start;
+    if count > u64::try_from(MAX_INLINE_OUTPUT_BYTES).expect("inline bound fits u64") {
+        return Err(ArtifactError::StreamTooLarge {
+            limit_bytes: u64::try_from(MAX_INLINE_OUTPUT_BYTES).expect("inline bound fits u64"),
+            bytes: count,
+        });
+    }
+    let start = usize::try_from(range.start).map_err(|_| ArtifactError::BufferAllocation)?;
+    let end = usize::try_from(range.end).map_err(|_| ArtifactError::BufferAllocation)?;
+    Ok(start..end)
+}
+
+fn verify_sealed_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    bytes: u64,
+) -> Result<(), ArtifactError> {
+    if !metadata.is_file() || !metadata.permissions().readonly() {
+        return Err(integrity(
+            0,
+            &format!(
+                "protected artifact {} is not a sealed regular file",
+                path.display()
+            ),
+        ));
+    }
+    reject_hardlink(path, metadata)?;
+    verify_private_file_mode(path, metadata, true)?;
+    if metadata.len() != bytes {
+        return Err(integrity(
+            0,
+            &format!(
+                "protected artifact {} length differs from its commitment",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum ArtifactRead {
+    Digest(usize),
+    Range(usize),
+}
+
+#[cfg(test)]
+thread_local! {
+    static ARTIFACT_READ_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(ArtifactRead)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_artifact_read(event: ArtifactRead) {
+    ARTIFACT_READ_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().as_mut() {
+            observer(event);
+        }
+    });
+}
 /// Which records file, at which length.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RecordsIdentity {
@@ -1252,14 +1624,17 @@ impl ArtifactStore {
         config: ArtifactConfig,
     ) -> Result<Self, ArtifactError> {
         config.validate()?;
-        let workspace_root = workspace_root.into();
+        let workspace_root: Arc<PathBuf> = Arc::new(workspace_root.into());
         let records_path = records_path(&workspace_root);
         let lock = RecordsLock::acquire(&records_path, CONTROL)?;
         let mut recovery =
             recover_records_with_budget_under_lock(&lock, config.retained_recovery_budget_bytes)?;
         validate_recovered_authority(&owned_repo_ids, &workspace_incarnation, &config, &recovery)?;
-        let (_, validated_manifest) =
-            validate_recovered_files(&workspace_root, &workspace_incarnation, &recovery)?;
+        let RecoveredFiles {
+            new_jobs: committed_jobs,
+            validated_manifest,
+            ..
+        } = validate_recovered_files(&workspace_root, &workspace_incarnation, &recovery)?;
         let directory_max = scan_job_directories(&workspace_root)?;
         let record_max = recovery
             .frames
@@ -1278,23 +1653,6 @@ impl ArtifactStore {
             .checked_add(1)
             .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
         recovery.next_job_id = JobId::new(next_job_id)?;
-        let mut committed_jobs = BTreeMap::new();
-        for frame in &recovery.frames {
-            let ProtectedRecord::Job(record) = &frame.record else {
-                continue;
-            };
-            if record.workspace_incarnation == workspace_incarnation
-                && record.state.is_terminal()
-                && committed_jobs
-                    .insert(record.job_id, record.clone())
-                    .is_some()
-            {
-                return Err(integrity(
-                    0,
-                    "duplicate terminal artifact record for current job id",
-                ));
-            }
-        }
         ensure_record_sequence_counter(&lock, &recovery)?;
         ensure_checkpoint_barrier_counter(&lock, &recovery, &workspace_incarnation)?;
         let job_root = lock
@@ -1358,14 +1716,17 @@ impl ArtifactStore {
 
     /// A readable terminal record, or authoritative absence. Unread history is a refusal, never
     /// evidence that a numeric job was not admitted.
-    pub fn sealed(&mut self, job_id: JobId) -> Result<Option<&JobArtifactRecord>, ArtifactError> {
+    pub fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJobReader>, ArtifactError> {
         if !self.committed_jobs.contains_key(&job_id) {
             let path = records_path(&self.workspace_root);
             let lock = RecordsLock::acquire(&path, CONTROL)?;
             self.refresh_under_lock(&lock)?;
         }
         if let Some(record) = self.committed_jobs.get(&job_id) {
-            return Ok(Some(record));
+            return Ok(Some(SealedJobReader {
+                workspace_root: Arc::clone(&self.workspace_root),
+                record: Arc::clone(record),
+            }));
         }
         if self.readable_jobs.contains(&job_id) {
             return Ok(None);
@@ -1419,21 +1780,8 @@ impl ArtifactStore {
             &self.config,
             &recovery,
         )?;
-        let (terminal_jobs, validated_manifest) = validate_recovered_files_since(
-            &self.workspace_root,
-            &self.workspace_incarnation,
-            &recovery,
-            Some(&self.committed_jobs),
-            self.validated_manifest,
-        )?;
-        if let Some(set_aside) = &recovery.set_aside
-            && set_aside.layout >= FIRST_KEYED_LAYOUT
-        {
-            record_set_aside_incarnation(set_aside, &self.workspace_incarnation)?;
-        }
-        let admissions = AdmissionIndex::recover(&recovery, &self.workspace_incarnation)?;
-        let unread_history = history_set_aside(job_root, &self.workspace_incarnation)?;
-        let retained_job_floor = read_counter(&job_floor_path(lock)?, &JOB_FLOOR)?;
+        let admissions = AdmissionIndex::recover(&recovery, &self.workspace_incarnation);
+        let set_aside = recovery.set_aside.clone();
         let readable_jobs = recovery
             .frames
             .iter()
@@ -1446,16 +1794,28 @@ impl ArtifactStore {
                 _ => None,
             })
             .collect();
-        let mut new_terminals = BTreeMap::new();
-        for frame in &recovery.frames {
-            if let ProtectedRecord::Job(record) = &frame.record
-                && record.workspace_incarnation == self.workspace_incarnation
-                && record.state.is_terminal()
-                && !self.committed_jobs.contains_key(&record.job_id)
-            {
-                new_terminals.insert(record.job_id, record.clone());
-            }
+        let RecoveredFiles {
+            terminal_jobs,
+            mut new_jobs,
+            validated_manifest,
+        } = validate_recovered_files_since(
+            &self.workspace_root,
+            &self.workspace_incarnation,
+            recovery
+                .frames
+                .into_iter()
+                .map(|frame| (std::borrow::Cow::Owned(frame.record), frame.batch_sha256)),
+            Some(&self.committed_jobs),
+            self.validated_manifest,
+        )?;
+        if let Some(set_aside) = &set_aside
+            && set_aside.layout >= FIRST_KEYED_LAYOUT
+        {
+            record_set_aside_incarnation(set_aside, &self.workspace_incarnation)?;
         }
+        let admissions = admissions?;
+        let unread_history = history_set_aside(job_root, &self.workspace_incarnation)?;
+        let retained_job_floor = read_counter(&job_floor_path(lock)?, &JOB_FLOOR)?;
         for job_id in self.committed_jobs.keys() {
             if !terminal_jobs.contains(job_id) {
                 return Err(integrity(
@@ -1465,7 +1825,7 @@ impl ArtifactStore {
             }
         }
         let records_seen = RecordsIdentity::of(lock.records)?;
-        self.committed_jobs.append(&mut new_terminals);
+        self.committed_jobs.append(&mut new_jobs);
         self.readable_jobs = readable_jobs;
         self.admissions = admissions;
         self.unread_history = unread_history;
@@ -1530,7 +1890,7 @@ impl ArtifactStore {
             outlived: Vec::new(),
             outlived_incomplete: false,
         };
-        self.append_record(record)?;
+        self.append_record(AppendJob::Admission(record))?;
         let replaced = self.live_jobs.insert(
             job_id,
             LiveJobState {
@@ -1604,23 +1964,30 @@ impl ArtifactStore {
                 StreamKind::Stderr,
                 &admission.stderr,
             )?;
-            sealed.push(self.append_record(JobArtifactRecord {
-                sequence: 0,
-                state: JobState::Failed,
-                output_limit: None,
-                stdout,
-                stderr,
-                failure: Some(crate::api::dto::JobFailure::SupervisorLost),
-                ..admission
-            })?);
+            let mut record = admission.try_map_streams(|_| Ok(stdout), |_| Ok(stderr))?;
+            record.sequence = 0;
+            record.state = JobState::Failed;
+            record.output_limit = None;
+            record.failure = Some(crate::api::dto::JobFailure::SupervisorLost);
+            sealed.push(self.append_record(AppendJob::Terminal(record))?);
         }
         Ok(sealed)
     }
 
     fn append_record(
         &mut self,
-        record: JobArtifactRecord,
+        pending: AppendJob,
     ) -> Result<(JobArtifactRecord, Sha256Digest), ArtifactError> {
+        let (mut record, mut terminal) = match pending {
+            AppendJob::Admission(record) => (record, None),
+            AppendJob::Terminal(record) => {
+                let wire = record.clone().try_map_streams(
+                    |stream| Ok(stream.into_info()),
+                    |stream| Ok(stream.into_info()),
+                )?;
+                (wire, Some(record))
+            }
+        };
         let path = records_path(&self.workspace_root);
         let lock = RecordsLock::acquire(&path, CONTROL)?;
         self.refresh_under_lock(&lock)?;
@@ -1640,9 +2007,14 @@ impl ArtifactStore {
                 .check(record.job_id, admission, &self.unread_history)?;
         }
         let sequence = allocate_record_sequence(&lock)?;
-        let mut record = record;
         record.sequence = sequence;
         record.validate()?;
+        if record.state.is_terminal() != terminal.is_some() {
+            return Err(integrity(
+                0,
+                "terminal artifact publication requires typed sealed storage",
+            ));
+        }
         let batch = job_record_to_batch(&record)?;
         let payload = encode_batch(&batch)?;
         let digest = Sha256Digest::compute(&payload);
@@ -1653,8 +2025,10 @@ impl ArtifactStore {
         if let Some(admission) = &record.admission {
             self.admissions.admit(&record, admission);
         }
-        if record.state.is_terminal() {
-            self.committed_jobs.insert(record.job_id, record.clone());
+        if let Some(mut terminal) = terminal.take() {
+            terminal.sequence = sequence;
+            self.committed_jobs
+                .insert(record.job_id, Arc::new(terminal));
         }
         self.records_seen = RecordsIdentity::of(&path)?;
         Ok((record, digest))
@@ -1732,23 +2106,19 @@ fn orphan_stream(
     job_id: JobId,
     stream: StreamKind,
     admitted: &StreamInfo,
-) -> Result<StreamInfo, ArtifactError> {
+) -> Result<SealedStream, ArtifactError> {
     let relative = protected_stream_path(job_id, stream);
     let absolute = workspace_root.join(&relative);
-    let (artifact, bytes, sha256) = match fs::symlink_metadata(&absolute) {
+    let (storage, bytes, sha256) = match fs::symlink_metadata(&absolute) {
         Ok(metadata) if metadata.is_file() => {
-            // Sealed as the job's own end would have: read-only and synced, then hashed.
-            let file = OpenOptions::new()
-                .read(true)
-                .open(&absolute)
-                .map_err(|error| io_error(&absolute, error))?;
+            let path = WorkspacePath::new(&relative)?;
+            let file = open_artifact_no_follow(workspace_root, &path)?;
             seal_file(file, &absolute)?;
+            let (digest, generation) = read_file_commitment(workspace_root, &path, metadata.len())?;
             (
-                ProtectedOutput::File {
-                    path: WorkspacePath::new(&relative)?,
-                },
+                SealedStorage::File { path, generation },
                 metadata.len(),
-                hash_file_incrementally(&absolute)?,
+                digest,
             )
         }
         Ok(_) => {
@@ -1758,30 +2128,21 @@ fn orphan_stream(
             ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => (
-            ProtectedOutput::Inline {
-                data: BinaryData::new(Vec::new())?,
-            },
+            SealedStorage::Inline(BinaryData::new(Vec::new())?),
             0,
             Sha256Digest::compute(&[]),
         ),
-        Err(error) => {
-            return Err(ArtifactError::Io {
-                path: absolute,
-                message: error.to_string(),
-            });
-        }
+        Err(error) => return Err(io_error(&absolute, error)),
     };
-    let storage = match &admitted.storage {
-        OutputStorage::Captured { .. } => OutputStorage::Captured { artifact },
-        OutputStorage::Redirect { source, .. } => OutputStorage::Redirect {
-            source: source.clone(),
-            artifact,
-        },
+    let source = match &admitted.storage {
+        OutputStorage::Captured { .. } => None,
+        OutputStorage::Redirect { source, .. } => Some(source.clone()),
     };
-    Ok(StreamInfo {
+    Ok(SealedStream {
         storage,
         bytes,
         sha256,
+        source,
         summary: safe_output_summary(),
     })
 }
@@ -2148,7 +2509,8 @@ impl ArtifactStore {
                 outlived,
                 outlived_incomplete,
             };
-            let (record, terminal_batch_sha256) = self.append_record(record)?;
+            let (record, terminal_batch_sha256) =
+                self.append_record(AppendJob::Terminal(record))?;
             Ok(SealedJobArtifacts {
                 record,
                 terminal_batch_sha256,
@@ -2389,7 +2751,7 @@ impl StreamWriterState {
         workspace_root: &Path,
         budget: &mut BufferBudget,
         job_id: JobId,
-    ) -> Result<StreamInfo, ArtifactError> {
+    ) -> Result<SealedStream, ArtifactError> {
         let digest = Sha256Digest::from_bytes(self.hasher.clone().finalize().into());
         let target = std::mem::replace(&mut self.target, StreamTarget::Captured);
         if let StreamTarget::Redirect { source, descriptor } = &target {
@@ -2398,11 +2760,9 @@ impl StreamWriterState {
                 .sync_file(descriptor)
                 .map_err(|error| io_error(&source_absolute, error))?;
         }
-        let artifact = if let Some(buffer) = self.buffer.take() {
+        let storage = if let Some(buffer) = self.buffer.take() {
             self.release_reserved(budget);
-            ProtectedOutput::Inline {
-                data: BinaryData::new(buffer)?,
-            }
+            SealedStorage::Inline(BinaryData::new(buffer)?)
         } else {
             let path = protected_relative(job_id, self.kind)?;
             seal_file(
@@ -2411,21 +2771,20 @@ impl StreamWriterState {
                     .expect("spilled stream has a canonical file"),
                 &protected_absolute(workspace_root, job_id, self.kind),
             )?;
-            verify_file_content(workspace_root, &path, self.bytes, digest)?;
-            ProtectedOutput::File { path }
+            let generation = verify_file_content(workspace_root, &path, self.bytes, digest)?;
+            SealedStorage::File { path, generation }
         };
-        let storage = match target {
-            StreamTarget::Captured => OutputStorage::Captured { artifact },
-            StreamTarget::Redirect { source, .. } => OutputStorage::Redirect { source, artifact },
+        let source = match target {
+            StreamTarget::Captured => None,
+            StreamTarget::Redirect { source, .. } => Some(source),
         };
-        let info = StreamInfo {
+        Ok(SealedStream {
             storage,
             bytes: self.bytes,
             sha256: digest,
             summary: safe_output_summary(),
-        };
-        info.validate()?;
-        Ok(info)
+            source,
+        })
     }
 
     fn release_reserved(&mut self, budget: &mut BufferBudget) {
@@ -2526,15 +2885,70 @@ fn verify_file_content(
     relative: &WorkspacePath,
     expected_bytes: u64,
     expected_digest: Sha256Digest,
-) -> Result<(), ArtifactError> {
-    read_file_verified(
-        workspace_root,
-        relative,
-        expected_bytes,
-        expected_digest,
-        false,
+) -> Result<FileGeneration, ArtifactError> {
+    let (digest, generation) = read_file_commitment(workspace_root, relative, expected_bytes)?;
+    if digest != expected_digest {
+        return Err(integrity(
+            0,
+            &format!(
+                "sealed artifact {} does not match committed bytes and digest",
+                workspace_root.join(relative.as_path()).display()
+            ),
+        ));
+    }
+    Ok(generation)
+}
+
+fn read_file_commitment(
+    workspace_root: &Path,
+    relative: &WorkspacePath,
+    expected_bytes: u64,
+) -> Result<(Sha256Digest, FileGeneration), ArtifactError> {
+    let path = workspace_root.join(relative.as_path());
+    let mut file = open_artifact_no_follow(workspace_root, relative)?;
+    let metadata = file.metadata().map_err(|error| io_error(&path, error))?;
+    verify_sealed_metadata(&path, &metadata, expected_bytes)?;
+    let generation = FileGeneration::of(&metadata);
+    let (observed, digest) = hash_artifact(&mut file, &path, expected_bytes)?;
+    generation.check(&file, &path, expected_bytes)?;
+    if observed != expected_bytes {
+        return Err(integrity(
+            0,
+            &format!(
+                "sealed artifact {} does not match its committed byte count",
+                path.display()
+            ),
+        ));
+    }
+    Ok((digest, generation))
+}
+
+fn hash_artifact(
+    file: &mut File,
+    path: &Path,
+    expected_bytes: u64,
+) -> Result<(u64, Sha256Digest), ArtifactError> {
+    hash_reader(
+        file,
+        |chunk, observed| {
+            if observed > expected_bytes {
+                return Err(integrity(
+                    0,
+                    &format!(
+                        "sealed artifact {} exceeds its committed byte count",
+                        path.display()
+                    ),
+                ));
+            }
+            #[cfg(test)]
+            observe_artifact_read(ArtifactRead::Digest(chunk.len()));
+            #[cfg(not(test))]
+            let _ = chunk;
+            Ok(())
+        },
+        |error| io_error(path, error),
+        integrity(0, "protected artifact byte count overflow"),
     )
-    .map(|_| ())
 }
 
 pub(super) fn hash_reader<R, E>(
@@ -2562,60 +2976,6 @@ where
         on_chunk(&buffer[..read], bytes)?;
     }
     Ok((bytes, Sha256Digest::from_bytes(hasher.finalize().into())))
-}
-
-fn read_file_verified(
-    workspace_root: &Path,
-    relative: &WorkspacePath,
-    expected_bytes: u64,
-    expected_digest: Sha256Digest,
-    collect: bool,
-) -> Result<Vec<u8>, ArtifactError> {
-    let path = workspace_root.join(relative.as_path());
-    let mut file = open_artifact_no_follow(workspace_root, relative)?;
-    let metadata = file.metadata().map_err(|error| io_error(&path, error))?;
-    if !metadata.is_file() || !metadata.permissions().readonly() {
-        return Err(ArtifactError::Integrity {
-            offset: 0,
-            message: format!("protected artifact {} is not sealed", path.display()),
-        });
-    }
-    reject_hardlink(&path, &metadata)?;
-    verify_private_file_mode(&path, &metadata, true)?;
-    let mut output = Vec::new();
-    let (observed, observed_digest) = hash_reader(
-        &mut file,
-        |chunk, observed| {
-            if observed > expected_bytes {
-                return Err(ArtifactError::Integrity {
-                    offset: 0,
-                    message: format!(
-                        "sealed artifact {} exceeds its committed byte count",
-                        path.display()
-                    ),
-                });
-            }
-            if collect {
-                output
-                    .try_reserve(chunk.len())
-                    .map_err(|_| ArtifactError::BufferAllocation)?;
-                output.extend_from_slice(chunk);
-            }
-            Ok(())
-        },
-        |error| io_error(&path, error),
-        integrity(0, "protected artifact byte count overflow"),
-    )?;
-    if observed != expected_bytes || observed_digest != expected_digest {
-        return Err(ArtifactError::Integrity {
-            offset: 0,
-            message: format!(
-                "sealed artifact {} does not match committed bytes and digest",
-                path.display()
-            ),
-        });
-    }
-    Ok(output)
 }
 
 fn open_artifact_no_follow(
@@ -2695,159 +3055,6 @@ fn hash_file_incrementally(path: &Path) -> Result<Sha256Digest, ArtifactError> {
     Ok(digest)
 }
 
-enum VerifiedStreamSource<'a> {
-    Inline { bytes: &'a [u8], offset: usize },
-    File(File),
-}
-
-pub struct VerifiedStreamReader<'a> {
-    path: PathBuf,
-    source: VerifiedStreamSource<'a>,
-    expected_bytes: u64,
-    expected_digest: Sha256Digest,
-    observed_bytes: u64,
-    hasher: Sha256,
-    verified: bool,
-}
-
-impl VerifiedStreamReader<'_> {
-    pub fn read_chunk(&mut self, output: &mut [u8]) -> Result<usize, ArtifactError> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        let read = match &mut self.source {
-            VerifiedStreamSource::Inline { bytes, offset } => {
-                let available = &bytes[*offset..];
-                let read = available.len().min(output.len());
-                output[..read].copy_from_slice(&available[..read]);
-                *offset += read;
-                read
-            }
-            VerifiedStreamSource::File(file) => file
-                .read(output)
-                .map_err(|error| io_error(&self.path, error))?,
-        };
-        if read == 0 {
-            let digest = Sha256Digest::from_bytes(self.hasher.clone().finalize().into());
-            if self.observed_bytes != self.expected_bytes || digest != self.expected_digest {
-                return Err(integrity(
-                    0,
-                    "artifact stream does not match committed bytes and digest",
-                ));
-            }
-            self.verified = true;
-            return Ok(0);
-        }
-        self.observed_bytes = self
-            .observed_bytes
-            .checked_add(read as u64)
-            .ok_or_else(|| integrity(0, "artifact stream byte count overflow"))?;
-        if self.observed_bytes > self.expected_bytes {
-            return Err(integrity(
-                0,
-                "artifact stream exceeds its committed byte count",
-            ));
-        }
-        self.hasher.update(&output[..read]);
-        Ok(read)
-    }
-
-    pub fn finish(mut self) -> Result<(), ArtifactError> {
-        let mut buffer = [0_u8; IO_BUFFER_BYTES];
-        while self.read_chunk(&mut buffer)? != 0 {}
-        Ok(())
-    }
-
-    pub fn is_verified(&self) -> bool {
-        self.verified
-    }
-}
-
-pub fn open_stream_reader<'a>(
-    workspace_root: &Path,
-    stream: &'a StreamInfo,
-) -> Result<VerifiedStreamReader<'a>, ArtifactError> {
-    stream.validate()?;
-    let (path, source) = match stream.storage.artifact() {
-        ProtectedOutput::Inline { data } => {
-            if data.as_bytes().len() as u64 != stream.bytes
-                || Sha256Digest::compute(data.as_bytes()) != stream.sha256
-            {
-                return Err(integrity(
-                    0,
-                    "inline artifact does not match committed bytes and digest",
-                ));
-            }
-            (
-                PathBuf::from("<inline>"),
-                VerifiedStreamSource::Inline {
-                    bytes: data.as_bytes(),
-                    offset: 0,
-                },
-            )
-        }
-        ProtectedOutput::File { path } => {
-            let absolute = workspace_root.join(path.as_path());
-            let file = open_artifact_no_follow(workspace_root, path)?;
-            let metadata = file
-                .metadata()
-                .map_err(|error| io_error(&absolute, error))?;
-            if !metadata.is_file() || !metadata.permissions().readonly() {
-                return Err(integrity(
-                    0,
-                    "protected artifact is not a sealed regular file",
-                ));
-            }
-            reject_hardlink(&absolute, &metadata)?;
-            verify_private_file_mode(&absolute, &metadata, true)?;
-            if metadata.len() != stream.bytes {
-                return Err(integrity(
-                    0,
-                    "protected artifact length differs from its commitment",
-                ));
-            }
-            (absolute, VerifiedStreamSource::File(file))
-        }
-    };
-    Ok(VerifiedStreamReader {
-        path,
-        source,
-        expected_bytes: stream.bytes,
-        expected_digest: stream.sha256,
-        observed_bytes: 0,
-        hasher: Sha256::new(),
-        verified: false,
-    })
-}
-
-pub fn read_stream(workspace_root: &Path, stream: &StreamInfo) -> Result<Vec<u8>, ArtifactError> {
-    let limit = MAX_INLINE_OUTPUT_BYTES as u64;
-    if stream.bytes > limit {
-        return Err(ArtifactError::StreamTooLarge {
-            limit_bytes: limit,
-            bytes: stream.bytes,
-        });
-    }
-    let capacity = usize::try_from(stream.bytes).map_err(|_| ArtifactError::StreamTooLarge {
-        limit_bytes: limit,
-        bytes: stream.bytes,
-    })?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(capacity)
-        .map_err(|_| ArtifactError::BufferAllocation)?;
-    let mut reader = open_stream_reader(workspace_root, stream)?;
-    let mut buffer = [0_u8; IO_BUFFER_BYTES];
-    loop {
-        let read = reader.read_chunk(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-    }
-    Ok(bytes)
-}
-
 fn validate_recovered_authority(
     owned_repo_ids: &OwnedRepoIds,
     current_incarnation: &WorkspaceIncarnation,
@@ -2881,37 +3088,77 @@ fn validate_recovered_authority(
     Ok(())
 }
 
+struct RecoveredFiles {
+    terminal_jobs: BTreeSet<JobId>,
+    new_jobs: BTreeMap<JobId, Arc<ValidatedJob>>,
+    validated_manifest: Option<Sha256Digest>,
+}
+
 fn validate_recovered_files(
     workspace_root: &Path,
     current_incarnation: &WorkspaceIncarnation,
     recovery: &RecoveryReport,
-) -> Result<(BTreeSet<JobId>, Option<Sha256Digest>), ArtifactError> {
-    validate_recovered_files_since(workspace_root, current_incarnation, recovery, None, None)
+) -> Result<RecoveredFiles, ArtifactError> {
+    validate_recovered_files_since(
+        workspace_root,
+        current_incarnation,
+        recovery.frames.iter().map(|frame| {
+            (
+                std::borrow::Cow::Borrowed(&frame.record),
+                frame.batch_sha256,
+            )
+        }),
+        None,
+        None,
+    )
 }
 
-fn validate_recovered_files_since(
+fn validate_recovered_files_since<'a>(
     workspace_root: &Path,
     current_incarnation: &WorkspaceIncarnation,
-    recovery: &RecoveryReport,
-    known: Option<&BTreeMap<JobId, JobArtifactRecord>>,
+    records: impl IntoIterator<Item = (std::borrow::Cow<'a, ProtectedRecord>, Sha256Digest)>,
+    known: Option<&BTreeMap<JobId, Arc<ValidatedJob>>>,
     known_manifest: Option<Sha256Digest>,
-) -> Result<(BTreeSet<JobId>, Option<Sha256Digest>), ArtifactError> {
+) -> Result<RecoveredFiles, ArtifactError> {
     let mut terminal_jobs = BTreeSet::new();
+    let mut new_jobs = BTreeMap::new();
     let mut latest_manifest = None;
-    for frame in &recovery.frames {
-        match &frame.record {
-            ProtectedRecord::Job(record)
-                if &record.workspace_incarnation == current_incarnation
-                    && record.state.is_terminal() =>
+    for (record, digest) in records {
+        match record.as_ref() {
+            ProtectedRecord::Job(raw)
+                if &raw.workspace_incarnation == current_incarnation && raw.state.is_terminal() =>
             {
-                if !terminal_jobs.insert(record.job_id) {
+                let job_id = raw.job_id;
+                if !terminal_jobs.insert(job_id) {
                     return Err(integrity(
                         0,
                         "duplicate terminal artifact record for current job id",
                     ));
                 }
-                match known.and_then(|known| known.get(&record.job_id)) {
-                    Some(before) if before == record => {}
+                // Opening clones only newly learned terminals out of its retained recovery report.
+                // A changed refresh owns its recovered rows and moves them through this same path.
+                let ProtectedRecord::Job(raw) = record.into_owned() else {
+                    unreachable!("the selected record is a terminal job");
+                };
+                let before = known.and_then(|known| known.get(&job_id));
+                let validated = raw.try_map_streams(
+                    |info| {
+                        SealedStream::recovered(
+                            workspace_root,
+                            info,
+                            before.map(|record| &record.stdout),
+                        )
+                    },
+                    |info| {
+                        SealedStream::recovered(
+                            workspace_root,
+                            info,
+                            before.map(|record| &record.stderr),
+                        )
+                    },
+                )?;
+                match before {
+                    Some(before) if before.as_ref() == &validated => {}
                     Some(_) => {
                         return Err(integrity(
                             0,
@@ -2919,22 +3166,24 @@ fn validate_recovered_files_since(
                         ));
                     }
                     None => {
-                        validate_stream_file(workspace_root, &record.stdout)?;
-                        validate_stream_file(workspace_root, &record.stderr)?;
+                        new_jobs.insert(job_id, Arc::new(validated));
                     }
                 }
             }
             ProtectedRecord::CheckpointManifest(manifest)
                 if &manifest.origin_incarnation == current_incarnation =>
             {
-                latest_manifest = Some((manifest, frame.batch_sha256));
+                latest_manifest = Some((record, digest));
             }
             _ => {}
         }
     }
-    if let Some((manifest, digest)) = latest_manifest
-        && known_manifest != Some(digest)
+    if let Some((record, digest)) = &latest_manifest
+        && known_manifest != Some(*digest)
     {
+        let ProtectedRecord::CheckpointManifest(manifest) = record.as_ref() else {
+            unreachable!("the selected record is a checkpoint manifest");
+        };
         for job in &manifest.visible_jobs {
             if &job.workspace_incarnation != current_incarnation
                 || terminal_jobs.contains(&job.job_id)
@@ -2945,14 +3194,11 @@ fn validate_recovered_files_since(
             validate_visible_file(workspace_root, &job.stderr)?;
         }
     }
-    Ok((terminal_jobs, latest_manifest.map(|(_, digest)| digest)))
-}
-
-fn validate_stream_file(workspace_root: &Path, stream: &StreamInfo) -> Result<(), ArtifactError> {
-    if let ProtectedOutput::File { path } = stream.storage.artifact() {
-        verify_file_content(workspace_root, path, stream.bytes, stream.sha256)?;
-    }
-    Ok(())
+    Ok(RecoveredFiles {
+        terminal_jobs,
+        new_jobs,
+        validated_manifest: latest_manifest.map(|(_, digest)| digest),
+    })
 }
 
 fn validate_visible_file(
@@ -6563,6 +6809,425 @@ mod tests {
         ArtifactStore::open(root, OwnedRepoIds::sole(repo()), incarnation(), config).unwrap()
     }
 
+    struct ArtifactReadWatch;
+
+    impl ArtifactReadWatch {
+        fn new(observer: impl FnMut(ArtifactRead) + 'static) -> Self {
+            ARTIFACT_READ_OBSERVER.with(|slot| {
+                assert!(
+                    slot.borrow().is_none(),
+                    "one observer per artifact test thread"
+                );
+                *slot.borrow_mut() = Some(Box::new(observer));
+            });
+            Self
+        }
+    }
+
+    impl Drop for ArtifactReadWatch {
+        fn drop(&mut self) {
+            ARTIFACT_READ_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn range_fixture(label: &str) -> crate::temp_root::TempRoot {
+        crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), label)
+    }
+
+    fn range_job(store: &mut ArtifactStore, bytes: &[u8]) -> JobArtifactToken {
+        let token = store
+            .begin_job(
+                store.next_job_id().unwrap(),
+                1,
+                &argv_true(),
+                None,
+                JobScheduling::default(),
+                OutputTargets::default(),
+            )
+            .unwrap();
+        store.append(&token, StreamKind::Stdout, bytes).unwrap();
+        token
+    }
+
+    fn overwrite_artifact(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"X")
+            .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+    }
+
+    #[test]
+    fn sealed_range_plan_and_generation_equality_are_exact() {
+        for (range, expected) in [
+            (0..0, Some(0..0)),
+            (0..2, Some(0..2)),
+            (3..5, Some(3..5)),
+            (5..6, Some(5..6)),
+            (6..6, Some(6..6)),
+            (6..7, None),
+            (7..7, None),
+            (std::ops::Range { start: 4, end: 3 }, None),
+        ] {
+            assert_eq!(range_bounds(6, range.clone()).ok(), expected, "{range:?}");
+        }
+        assert!(matches!(
+            range_bounds(65537, 0..65537),
+            Err(ArtifactError::StreamTooLarge { .. })
+        ));
+        let identity = serde_json::json!({"device":1,"inode":2,"size":3,"mode":33024,"mtime":[4,5],"ctime":[6,7]});
+        let baseline = FileGeneration {
+            identity: serde_json::from_value(identity.clone()).unwrap(),
+            links: 1,
+        };
+        assert_eq!(baseline, baseline.clone());
+        for (field, value) in [
+            ("device", serde_json::json!(9)),
+            ("inode", serde_json::json!(9)),
+            ("size", serde_json::json!(9)),
+            ("mode", serde_json::json!(9)),
+            ("mtime", serde_json::json!([9, 5])),
+            ("mtime", serde_json::json!([4, 9])),
+            ("ctime", serde_json::json!([9, 7])),
+            ("ctime", serde_json::json!([6, 9])),
+        ] {
+            let mut changed = identity.clone();
+            changed[field] = value;
+            let generation = FileGeneration {
+                identity: serde_json::from_value(changed).unwrap(),
+                links: 1,
+            };
+            assert_ne!(baseline, generation, "{field} is part of the attestation");
+        }
+        assert_ne!(
+            baseline,
+            FileGeneration {
+                links: 2,
+                ..baseline.clone()
+            }
+        );
+    }
+
+    #[test]
+    fn sealed_range_inline_projection_shares_the_canonical_entry_and_root() {
+        let root = range_fixture("sealed-range-inline-owner");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let bytes = b"canonical inline bytes";
+        let token = range_job(&mut store, bytes);
+        let id = token.job_id();
+        store.finish(token, JobState::Exited).unwrap();
+        let first = store
+            .sealed(id)
+            .unwrap()
+            .expect("first terminal projection");
+        let second = store
+            .sealed(id)
+            .unwrap()
+            .expect("second terminal projection");
+        assert!(
+            Arc::ptr_eq(&first.record, &second.record),
+            "projection shares the payload-owning record"
+        );
+        assert!(
+            Arc::ptr_eq(&first.workspace_root, &second.workspace_root),
+            "projection shares the canonical root"
+        );
+        assert_eq!(
+            first.bytes(StreamKind::Stdout),
+            u64::try_from(bytes.len()).unwrap()
+        );
+        assert_eq!(first.bytes(StreamKind::Stderr), 0);
+        assert_eq!(
+            first.read_range(StreamKind::Stdout, 2..7).unwrap(),
+            &bytes[2..7]
+        );
+        assert_eq!(first.read_range(StreamKind::Stderr, 0..0).unwrap(), b"");
+        drop(store);
+        assert_eq!(
+            second
+                .read_range(StreamKind::Stdout, 0..u64::try_from(bytes.len()).unwrap())
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn sealed_range_inline_boundary_uses_the_record_validator_and_refuses_files() {
+        let mut altered = valid_job_record(7);
+        altered.stdout = inline_stream(b"inline commitment");
+        altered.stdout.sha256 = Sha256Digest::compute(b"different");
+        assert!(SealedJobReader::inline(altered).is_err());
+        let mut file = valid_job_record(7);
+        file.stdout.storage = OutputStorage::Captured {
+            artifact: ProtectedOutput::File {
+                path: protected_relative(file.job_id, StreamKind::Stdout).unwrap(),
+            },
+        };
+        assert!(
+            matches!(SealedJobReader::inline(file), Err(ArtifactError::Integrity { message, .. }) if message.contains("cannot grant file authority"))
+        );
+    }
+
+    #[test]
+    fn sealed_range_paging_reads_only_requested_bytes_and_hashes_only_at_seal_open() {
+        use crate::api::{JobTailBytes, JobTailLimits};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let root = range_fixture("sealed-range-paging");
+        let counts = Rc::new(Cell::new((0_usize, 0_usize)));
+        let observed = Rc::clone(&counts);
+        let _watch = ArtifactReadWatch::new(move |event| {
+            let (digest, range) = observed.get();
+            observed.set(match event {
+                ArtifactRead::Digest(n) => (digest + n, range),
+                ArtifactRead::Range(n) => (digest, range + n),
+            });
+        });
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let window = MAX_INLINE_OUTPUT_BYTES;
+        let bytes: Vec<u8> = (0..3 * window + 1)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let token = range_job(&mut store, &bytes);
+        let id = token.job_id();
+        store.finish(token, JobState::Exited).unwrap();
+        assert_eq!(
+            counts.get(),
+            (bytes.len(), 0),
+            "one required full seal digest pass"
+        );
+        let reader = store.sealed(id).unwrap().expect("sealed paging job");
+        for start in (0..bytes.len()).step_by(window) {
+            let end = bytes.len().min(start + window);
+            assert_eq!(
+                reader
+                    .read_range(
+                        StreamKind::Stdout,
+                        u64::try_from(start).unwrap()..u64::try_from(end).unwrap()
+                    )
+                    .unwrap(),
+                bytes[start..end]
+            );
+        }
+        assert_eq!(
+            counts.get(),
+            (bytes.len(), bytes.len()),
+            "paging B bytes reads B, not prefix sums"
+        );
+        let tail = crate::api::journal_tail::tail_journals(
+            None,
+            JobTailLimits {
+                bytes_per_stream: JobTailBytes::new(u32::try_from(window).unwrap()).unwrap(),
+                lines_per_stream: std::num::NonZeroU32::new(u32::MAX).unwrap(),
+            },
+            (
+                reader.bytes(StreamKind::Stdout),
+                reader.bytes(StreamKind::Stderr),
+            ),
+            |stream, range| {
+                Ok(reader
+                    .read_range(stream.into(), range)
+                    .expect("exact sealed tail range"))
+            },
+        )
+        .unwrap();
+        assert_eq!(tail.stdout.as_bytes(), &bytes[bytes.len() - window..]);
+        assert_eq!(tail.stderr.as_bytes(), b"");
+        assert_eq!(
+            counts.get(),
+            (bytes.len(), bytes.len() + window),
+            "latest raw tail reads only its window"
+        );
+        eprintln!(
+            "sealed-range counts: B={} seal_hash={} paging={} tail={}",
+            bytes.len(),
+            bytes.len(),
+            bytes.len(),
+            window
+        );
+        drop(store);
+        counts.set((0, 0));
+        let mut reopened = store_at(&root, ArtifactConfig::default());
+        assert_eq!(
+            counts.get(),
+            (bytes.len(), 0),
+            "open performs one required full digest pass"
+        );
+        let end = u64::try_from(bytes.len()).unwrap();
+        assert_eq!(
+            reopened
+                .sealed(id)
+                .unwrap()
+                .expect("reopened paging job")
+                .read_range(StreamKind::Stdout, end - 1..end)
+                .unwrap(),
+            bytes[bytes.len() - 1..]
+        );
+        assert_eq!(
+            counts.get(),
+            (bytes.len(), 1),
+            "recovered generation permits positioned reads without another digest"
+        );
+    }
+
+    #[test]
+    fn sealed_range_refresh_retains_old_proof_and_hashes_only_new_streams() {
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::rc::Rc;
+        let root = range_fixture("sealed-range-refresh");
+        let config = ArtifactConfig {
+            inline_cap_bytes: 1,
+            ..ArtifactConfig::default()
+        };
+        let mut writer = store_at(&root, config.clone());
+        let first = range_job(&mut writer, b"first");
+        let first_id = first.job_id();
+        writer.finish(first, JobState::Exited).unwrap();
+        let mut reader = store_at(&root, config);
+        let retained = reader
+            .sealed(first_id)
+            .unwrap()
+            .expect("original terminal projection");
+        let counts = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&counts);
+        let _watch = ArtifactReadWatch::new(move |event| {
+            if let ArtifactRead::Digest(n) = event {
+                observed.set(observed.get() + n);
+            }
+        });
+        assert!(reader.sealed(JobId::new(99).unwrap()).unwrap().is_none());
+        assert_eq!(
+            counts.get(),
+            0,
+            "unchanged records retain proofs without hashing"
+        );
+        let second = range_job(&mut writer, b"second");
+        let second_id = second.job_id();
+        writer.finish(second, JobState::Exited).unwrap();
+        counts.set(0);
+        let old_path = root.join(".cowshed/job/1/out");
+        fs::set_permissions(&old_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&old_path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(reader.sealed(second_id).unwrap().is_some());
+        let unchanged = reader
+            .sealed(first_id)
+            .unwrap()
+            .expect("retained terminal projection");
+        assert!(
+            Arc::ptr_eq(&retained.record, &unchanged.record),
+            "refresh keeps the original canonical entry and evidence"
+        );
+        assert_eq!(
+            counts.get(),
+            b"second".len(),
+            "refresh verifies only the newly learned file"
+        );
+        assert_eq!(
+            reader
+                .sealed(second_id)
+                .unwrap()
+                .expect("newly learned terminal")
+                .read_range(StreamKind::Stdout, 1..4)
+                .unwrap(),
+            b"eco"
+        );
+        assert!(
+            matches!(reader.sealed(first_id).unwrap().expect("retained terminal").read_range(StreamKind::Stdout, 0..1), Err(ArtifactError::Integrity { message, .. }) if message.contains("changed since"))
+        );
+        assert_eq!(
+            counts.get(),
+            b"second".len(),
+            "old generation is retained, never silently reattested"
+        );
+    }
+
+    #[test]
+    fn sealed_range_refuses_mutation_interleaved_with_real_positioned_read() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let root = range_fixture("sealed-range-during-read");
+        let mut store = store_at(
+            &root,
+            ArtifactConfig {
+                inline_cap_bytes: 1,
+                ..ArtifactConfig::default()
+            },
+        );
+        let token = range_job(&mut store, b"original");
+        let id = token.job_id();
+        store.finish(token, JobState::Exited).unwrap();
+        let reader = store.sealed(id).unwrap().expect("sealed read job");
+        let path = root.join(".cowshed/job/1/out");
+        let fired = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&fired);
+        let _watch = ArtifactReadWatch::new(move |event| {
+            if let ArtifactRead::Range(_) = event {
+                assert!(!observed.replace(true));
+                overwrite_artifact(&path);
+            }
+        });
+        assert!(
+            matches!(reader.read_range(StreamKind::Stdout, 2..5), Err(ArtifactError::Integrity { message, .. }) if message.contains("changed since"))
+        );
+        assert!(
+            fired.get(),
+            "mutation occurred after the actual read and before its closing attestation"
+        );
+    }
+
+    #[test]
+    fn sealed_range_digest_pass_cannot_attest_a_generation_changed_after_hashing() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        for at_open in [false, true] {
+            let root = range_fixture("sealed-range-during-digest");
+            let config = ArtifactConfig {
+                inline_cap_bytes: 1,
+                ..ArtifactConfig::default()
+            };
+            let mut store = store_at(&root, config.clone());
+            let token = range_job(&mut store, b"original");
+            let id = token.job_id();
+            let token = if at_open {
+                store.finish(token, JobState::Exited).unwrap();
+                None
+            } else {
+                Some(token)
+            };
+            let path = root.join(".cowshed/job/1/out");
+            let fired = Rc::new(Cell::new(false));
+            let observed = Rc::clone(&fired);
+            let _watch = ArtifactReadWatch::new(move |event| {
+                if let ArtifactRead::Digest(_) = event {
+                    assert!(!observed.replace(true));
+                    overwrite_artifact(&path);
+                }
+            });
+            let error = match token {
+                Some(token) => {
+                    let error = store.finish(token, JobState::Exited).unwrap_err();
+                    assert!(store.sealed(id).unwrap().is_none());
+                    error
+                }
+                None => {
+                    ArtifactStore::open(&*root, OwnedRepoIds::sole(repo()), incarnation(), config)
+                        .err()
+                        .expect("mutating open cannot publish a proof")
+                }
+            };
+            assert!(fired.get());
+            assert!(
+                matches!(error, ArtifactError::Integrity { message, .. } if message.contains("changed since")),
+                "the hashed bytes still match; before/after descriptor equality must refuse, at_open={at_open}"
+            );
+        }
+    }
+
     /// Names the lock file [`holds_the_records_lock_until_its_stdin_ends`] holds.
     const HELD_RECORDS_LOCK: &str = "COWSHED_TEST_HELD_RECORDS_LOCK";
 
@@ -8585,22 +9250,28 @@ mod tests {
             .sealed(ran)
             .unwrap()
             .expect("the ended job's record");
-        assert_eq!(read.containment.as_ref(), Some(&containment));
-        assert_eq!(read.outlived, outlived);
-        assert!(!read.outlived_incomplete);
+        assert_eq!(read.record().containment.as_ref(), Some(&containment));
+        assert_eq!(read.record().outlived, outlived);
+        assert!(!read.record().outlived_incomplete);
         let read = reopened
             .sealed(incomplete)
             .unwrap()
             .expect("the incomplete receipt");
-        assert_eq!(read.containment, Some(JobContainment::Kernel));
-        assert!(read.outlived.is_empty());
-        assert!(read.outlived_incomplete);
+        assert_eq!(read.record().containment, Some(JobContainment::Kernel));
+        assert!(read.record().outlived.is_empty());
+        assert!(read.record().outlived_incomplete);
         let read = reopened
             .sealed(refused)
             .unwrap()
             .expect("the refused job's record");
-        assert_eq!((read.containment.as_ref(), read.outlived.len()), (None, 0));
-        assert!(!read.outlived_incomplete);
+        assert_eq!(
+            (
+                read.record().containment.as_ref(),
+                read.record().outlived.len()
+            ),
+            (None, 0)
+        );
+        assert!(!read.record().outlived_incomplete);
         drop(reopened);
         fs::remove_dir_all(&root).unwrap();
     }
@@ -9056,7 +9727,10 @@ mod tests {
             .sealed(job_id)
             .unwrap()
             .expect("the terminal record");
-        assert_eq!((record.scheduling, record.nice), (gate(8), Some(0)));
+        assert_eq!(
+            (record.record().scheduling, record.record().nice),
+            (gate(8), Some(0))
+        );
     }
 
     fn argv_true() -> ExecCommand {
@@ -9228,7 +9902,7 @@ mod tests {
             reader
                 .sealed(readable_id)
                 .unwrap()
-                .map(|record| record.job_id),
+                .map(|record| record.record().job_id),
             Some(readable_id),
             "a sealed cache miss learns another writer's actual terminal record",
         );
@@ -9268,7 +9942,7 @@ mod tests {
             reader
                 .sealed(readable_id)
                 .unwrap()
-                .map(|record| record.job_id),
+                .map(|record| record.record().job_id),
             Some(readable_id)
         );
 
@@ -9371,7 +10045,10 @@ mod tests {
         fs::write(&spill, correct).unwrap();
         fs::set_permissions(&spill, sealed_mode.clone()).unwrap();
         assert_eq!(
-            reader.sealed(spill_id).unwrap().map(|record| record.job_id),
+            reader
+                .sealed(spill_id)
+                .unwrap()
+                .map(|record| record.record().job_id),
             Some(spill_id),
             "the restored sealed bytes are learned by the next refresh"
         );
@@ -9607,12 +10284,13 @@ mod tests {
             )
             .unwrap();
         let namespace = token.namespace;
-        let sealed = store.finish(token, JobState::Exited).unwrap();
+        store.finish(token, JobState::Exited).unwrap();
         let records = records_path(&root);
         let sealed_len = fs::metadata(&records).unwrap().len();
 
+        let duplicate = store.sealed(job_id).unwrap().expect("existing terminal");
         assert!(matches!(
-            store.append_record(sealed.record.clone()),
+            store.append_record(AppendJob::Terminal(duplicate.record().clone())),
             Err(ArtifactError::Integrity { message, .. })
                 if message.contains("duplicate terminal")
         ));
@@ -9691,10 +10369,9 @@ mod tests {
         let sealed = store
             .sealed(resident_id)
             .unwrap()
-            .expect("the sealed resident reads back")
-            .clone();
+            .expect("the sealed resident reads back");
         assert_eq!(
-            (sealed.scheduling.class(), sealed.nice),
+            (sealed.record().scheduling.class(), sealed.record().nice),
             (ExecClass::Resident, Some(10))
         );
 
@@ -10387,7 +11064,12 @@ mod tests {
 
         let sealed = store.finish(token, JobState::Exited).unwrap();
         assert_eq!(
-            read_stream(&root, &sealed.record.stdout).unwrap(),
+            store
+                .sealed(sealed.record.job_id)
+                .unwrap()
+                .expect("sealed checkpoint job")
+                .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+                .unwrap(),
             b"before-checkpoint-after"
         );
         drop(store);
@@ -10483,7 +11165,9 @@ mod tests {
         assert!(counter.is_file());
         assert_eq!(
             migrated
-                .append_record(valid_job_record(2))
+                .append_record(AppendJob::Terminal(
+                    ValidatedJob::from_inline(valid_job_record(2)).unwrap(),
+                ))
                 .unwrap()
                 .0
                 .sequence,
@@ -10494,7 +11178,9 @@ mod tests {
         let mut reopened = store_at(&root, ArtifactConfig::default());
         assert_eq!(
             reopened
-                .append_record(valid_job_record(3))
+                .append_record(AppendJob::Terminal(
+                    ValidatedJob::from_inline(valid_job_record(3)).unwrap(),
+                ))
                 .unwrap()
                 .0
                 .sequence,
@@ -10507,13 +11193,20 @@ mod tests {
     fn serialized_append_preserves_sequence_after_a_truncated_tail() {
         let root = temp_root("serialized-truncated-tail-sequence");
         let mut store = store_at(&root, ArtifactConfig::default());
-        let first = store.append_record(valid_job_record(1)).unwrap().0;
+        let first = store
+            .append_record(AppendJob::Terminal(
+                ValidatedJob::from_inline(valid_job_record(1)).unwrap(),
+            ))
+            .unwrap()
+            .0;
         let path = records_path(&root);
         let retained_len = fs::metadata(&path).unwrap().len();
         // Another writer serialized behind the records lock dies mid-append. Its frame is cut
         // before this store validated it, so only the handed-out sequence outlives the tail.
         let second = store_at(&root, ArtifactConfig::default())
-            .append_record(valid_job_record(2))
+            .append_record(AppendJob::Terminal(
+                ValidatedJob::from_inline(valid_job_record(2)).unwrap(),
+            ))
             .unwrap()
             .0;
         assert_eq!((first.sequence, second.sequence), (1, 2));
@@ -10523,7 +11216,12 @@ mod tests {
             .unwrap();
         file.sync_data().unwrap();
 
-        let after_tail_loss = store.append_record(valid_job_record(3)).unwrap().0;
+        let after_tail_loss = store
+            .append_record(AppendJob::Terminal(
+                ValidatedJob::from_inline(valid_job_record(3)).unwrap(),
+            ))
+            .unwrap()
+            .0;
         assert!(
             after_tail_loss.sequence > second.sequence,
             "a serialized append reused handed-out sequence {} after recovering an incomplete tail: {}",
@@ -10540,10 +11238,18 @@ mod tests {
     fn a_lost_tail_cannot_take_a_terminal_record_this_store_validated() {
         let root = temp_root("validated-terminal-tail-loss");
         let mut store = store_at(&root, ArtifactConfig::default());
-        store.append_record(valid_job_record(1)).unwrap();
+        store
+            .append_record(AppendJob::Terminal(
+                ValidatedJob::from_inline(valid_job_record(1)).unwrap(),
+            ))
+            .unwrap();
         let path = records_path(&root);
         let retained_len = fs::metadata(&path).unwrap().len();
-        store.append_record(valid_job_record(2)).unwrap();
+        store
+            .append_record(AppendJob::Terminal(
+                ValidatedJob::from_inline(valid_job_record(2)).unwrap(),
+            ))
+            .unwrap();
 
         let file = OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
@@ -10551,7 +11257,7 @@ mod tests {
         file.sync_data().unwrap();
 
         assert!(matches!(
-            store.append_record(valid_job_record(3)),
+            store.append_record(AppendJob::Terminal(ValidatedJob::from_inline(valid_job_record(3)).unwrap())),
             Err(ArtifactError::Integrity { message, .. })
                 if message == "a validated terminal job disappeared from protected records"
         ));
@@ -10585,12 +11291,18 @@ mod tests {
     fn handed_out_sequence_remains_monotonic_across_repair() {
         let root = temp_root("repair-sequence-watermark");
         let mut store = store_at(&root, ArtifactConfig::default());
-        store.append_record(valid_job_record(1)).unwrap();
+        store
+            .append_record(AppendJob::Terminal(
+                ValidatedJob::from_inline(valid_job_record(1)).unwrap(),
+            ))
+            .unwrap();
         let path = records_path(&root);
         let retained_len = fs::metadata(&path).unwrap().len();
         // Another writer's frame: the tail that repair cuts is one this store never validated.
         let before_repair = store_at(&root, ArtifactConfig::default())
-            .append_record(valid_job_record(2))
+            .append_record(AppendJob::Terminal(
+                ValidatedJob::from_inline(valid_job_record(2)).unwrap(),
+            ))
             .unwrap()
             .0;
 
@@ -10604,7 +11316,12 @@ mod tests {
         )
         .unwrap();
 
-        let after_repair = store.append_record(valid_job_record(3)).unwrap().0;
+        let after_repair = store
+            .append_record(AppendJob::Terminal(
+                ValidatedJob::from_inline(valid_job_record(3)).unwrap(),
+            ))
+            .unwrap()
+            .0;
         assert!(
             after_repair.sequence > before_repair.sequence,
             "repair lowered the durable sequence watermark from {} to {}",
@@ -10619,7 +11336,11 @@ mod tests {
         let root = temp_root("repair-barrier-watermark");
         let mut store = store_at(&root, ArtifactConfig::default());
         let path = records_path(&root);
-        store.append_record(valid_job_record(1)).unwrap();
+        store
+            .append_record(AppendJob::Terminal(
+                ValidatedJob::from_inline(valid_job_record(1)).unwrap(),
+            ))
+            .unwrap();
         let retained_len = fs::metadata(&path).unwrap().len();
         let before_repair = store.checkpoint().unwrap().record.barrier_id;
         let counter = root
@@ -10879,7 +11600,9 @@ mod tests {
                     let barrier = Arc::clone(&barrier);
                     thread::spawn(move || {
                         barrier.wait();
-                        store.append_record(valid_job_record(index as u64 + 1))
+                        store.append_record(AppendJob::Terminal(
+                            ValidatedJob::from_inline(valid_job_record(index as u64 + 1)).unwrap(),
+                        ))
                     })
                 })
                 .collect::<Vec<_>>();
@@ -10977,7 +11700,7 @@ mod tests {
                         // Each append is another writer's, so a lost tail only ever cuts a job
                         // frame no live reader has validated.
                         store_at(&root, ArtifactConfig::default())
-                            .append_record(valid_job_record(next_job_id))
+                            .append_record(AppendJob::Terminal(ValidatedJob::from_inline(valid_job_record(next_job_id)).unwrap()))
                             .unwrap();
                         next_job_id += 1;
                     }

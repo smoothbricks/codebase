@@ -954,14 +954,17 @@ Protected in-volume records and artifacts are the authoritative evidence of what
 commitments above are telemetry about it and decide nothing. The protected tier carries its own checks. Every complete
 frame keeps its `batch_sha256`, so a mutated frame is caught. Each terminal job record holds its artifacts' byte counts
 and SHA-256 digests, and opening the store verifies them, as it does the files a checkpoint manifest's visible jobs
-name, so a missing or altered artifact is caught. A checkpoint manifest binds the record prefix it covers through
-`records_sha256`. The checked counters beside the records only move forward: `records.sequence` and each incarnation's
-`records.barrier.*` are published before the records they number, and `records.job-floor` holds the highest job id a
-set-aside store handed out. At open, a sequence counter behind the log is advanced to it ("Durability of a job's own
-records", above), and a barrier counter that trails a durable checkpoint barrier is detected as a rollback of the
-counter. Nothing in the volume detects a rollback of the whole image, records and counters together: the commitments
-record what happened for whoever reads the audit trail, and cowshed does not read them for a decision. Any detected
-fault, a duplicate durable key, or an incarnation outside the marker lineage returns typed `Integrity`, stops
+name, so a missing or altered artifact is caught. A sealed range checks the file generation attested by that full digest
+pass before and after its positioned read, as defined by 07_api.md "Captured-content authority"; a mismatch is
+`Integrity`. The seal-time re-read remains required: the writer's incremental digest proves its writes, not the bytes an
+outside same-user process may have changed before sealing. A checkpoint manifest binds the record prefix it covers
+through `records_sha256`. The checked counters beside the records only move forward: `records.sequence` and each
+incarnation's `records.barrier.*` are published before the records they number, and `records.job-floor` holds the
+highest job id a set-aside store handed out. At open, a sequence counter behind the log is advanced to it ("Durability
+of a job's own records", above), and a barrier counter that trails a durable checkpoint barrier is detected as a
+rollback of the counter. Nothing in the volume detects a rollback of the whole image, records and counters together: the
+commitments record what happened for whoever reads the audit trail, and cowshed does not read them for a decision. Any
+detected fault, a duplicate durable key, or an incarnation outside the marker lineage returns typed `Integrity`, stops
 status/restore/export from presenting the record as valid, and preserves the evidence for diagnosis; cowshed never
 overwrites it or chooses whichever copy appears newer. Grant authority remains in controller-owned grant files and
 gateway decisions remain in controller-owned audit segments.

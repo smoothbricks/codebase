@@ -20,8 +20,8 @@ use cowshed_core::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, JobArtifactToken, JobScheduling, OutputTargets,
     ProtectedRecord, PublicationStage, StreamKind, StreamTarget, controller_commitment_schema,
     controller_commitments_to_batch, decode_controller_commitment, decode_controller_commitments,
-    encode_controller_commitment, open_stream_reader, protected_record_schema, read_stream,
-    recover_records, recover_records_with_budget,
+    encode_controller_commitment, protected_record_schema, recover_records,
+    recover_records_with_budget,
 };
 use proptest::prelude::*;
 
@@ -201,11 +201,21 @@ fn threshold_crossing_spills_only_the_crossing_stream_and_round_trips_arrow() {
         0o600
     );
     assert_eq!(
-        read_stream(root.path(), &sealed.record.stdout).unwrap(),
+        store
+            .sealed(sealed.record.job_id)
+            .map(|job| job.expect("sealed terminal"))
+            .unwrap()
+            .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+            .unwrap(),
         b"four"
     );
     assert_eq!(
-        read_stream(root.path(), &sealed.record.stderr).unwrap(),
+        store
+            .sealed(sealed.record.job_id)
+            .map(|job| job.expect("sealed terminal"))
+            .unwrap()
+            .read_range(StreamKind::Stderr, 0..sealed.record.stderr.bytes)
+            .unwrap(),
         b"spill"
     );
     assert_eq!(store.buffered_bytes(), 0);
@@ -387,7 +397,12 @@ fn combined_quota_accepts_exact_boundary_and_reports_first_crossing() {
         ProtectedRecord::Job(record) if record.output_limit == sealed.record.output_limit
     ));
     assert_eq!(
-        read_stream(crossed_root.path(), &sealed.record.stderr).unwrap(),
+        crossed
+            .sealed(sealed.record.job_id)
+            .map(|job| job.expect("sealed terminal"))
+            .unwrap()
+            .read_range(StreamKind::Stderr, 0..sealed.record.stderr.bytes)
+            .unwrap(),
         b"45"
     );
 }
@@ -498,7 +513,12 @@ fn invalid_utf8_is_tagged_base64_and_survives_json_and_arrow() {
     invalid_stream_json["bytes"] = serde_json::json!(bytes.len() + 1);
     assert!(serde_json::from_value::<StreamInfo>(invalid_stream_json).is_err());
     assert_eq!(
-        read_stream(root.path(), &sealed.record.stdout).unwrap(),
+        store
+            .sealed(sealed.record.job_id)
+            .map(|job| job.expect("sealed terminal"))
+            .unwrap()
+            .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+            .unwrap(),
         bytes
     );
     let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
@@ -585,7 +605,12 @@ fn redirect_sealing_uses_owned_descriptor_and_reads_only_independent_artifact() 
     ));
 
     assert_eq!(
-        read_stream(root.path(), &sealed.record.stdout).unwrap(),
+        store
+            .sealed(sealed.record.job_id)
+            .map(|job| job.expect("sealed terminal"))
+            .unwrap()
+            .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+            .unwrap(),
         b"protected"
     );
     #[cfg(unix)]
@@ -643,7 +668,12 @@ fn host_controller_redirect_artifact_rejects_planted_hardlink_alias() {
         .unwrap();
     let sealed = store.finish(token, JobState::Exited).unwrap();
     assert_eq!(
-        read_stream(root.path(), &sealed.record.stdout).unwrap(),
+        store
+            .sealed(sealed.record.job_id)
+            .map(|job| job.expect("sealed terminal"))
+            .unwrap()
+            .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+            .unwrap(),
         b"protected"
     );
     fs::hard_link(
@@ -651,7 +681,12 @@ fn host_controller_redirect_artifact_rejects_planted_hardlink_alias() {
         root.path().join("workspace-alias"),
     )
     .unwrap();
-    let error = read_stream(root.path(), &sealed.record.stdout).unwrap_err();
+    let error = store
+        .sealed(sealed.record.job_id)
+        .map(|job| job.expect("sealed terminal"))
+        .unwrap()
+        .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+        .unwrap_err();
     assert!(matches!(
         error,
         ArtifactError::Integrity { message, .. } if message.contains("hardlink aliases")
@@ -970,7 +1005,12 @@ fn sealed_output_publication_is_atomic_independent_and_policy_checked() {
 
     fs::write(&destination, b"caller mutation").unwrap();
     assert_eq!(
-        read_stream(root.path(), &sealed.record.stdout).unwrap(),
+        store
+            .sealed(sealed.record.job_id)
+            .map(|job| job.expect("sealed terminal"))
+            .unwrap()
+            .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+            .unwrap(),
         b"sealed output"
     );
     let error = store
@@ -1233,6 +1273,11 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
         Truncated,
         Extended,
         SameLengthHash,
+        ModeRestored,
+        WorldReadable,
+        Replaced,
+        Recreated,
+        Missing,
         Symlink,
         Directory,
     }
@@ -1242,6 +1287,11 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
         Mutation::Truncated,
         Mutation::Extended,
         Mutation::SameLengthHash,
+        Mutation::ModeRestored,
+        Mutation::WorldReadable,
+        Mutation::Replaced,
+        Mutation::Recreated,
+        Mutation::Missing,
         Mutation::Symlink,
         Mutation::Directory,
     ] {
@@ -1267,7 +1317,12 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
             assert_eq!(metadata.len(), expected.len() as u64);
         }
         assert_eq!(
-            read_stream(root.path(), &sealed.record.stdout).unwrap(),
+            store
+                .sealed(sealed.record.job_id)
+                .map(|job| job.expect("sealed terminal"))
+                .unwrap()
+                .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+                .unwrap(),
             expected
         );
 
@@ -1302,6 +1357,27 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
                 file.sync_all().unwrap();
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
             }
+            Mutation::ModeRestored => {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            Mutation::WorldReadable => {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+            }
+            Mutation::Replaced => {
+                let replacement = path.with_extension("replacement");
+                fs::write(&replacement, expected).unwrap();
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o400)).unwrap();
+                fs::rename(replacement, &path).unwrap();
+            }
+            Mutation::Recreated => {
+                fs::remove_file(&path).unwrap();
+                fs::write(&path, expected).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            Mutation::Missing => {
+                fs::remove_file(&path).unwrap();
+            }
             Mutation::Symlink => {
                 use std::os::unix::fs::symlink;
 
@@ -1316,25 +1392,26 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
             }
         }
 
-        let error = read_stream(root.path(), &sealed.record.stdout).unwrap_err();
-        match mutation {
-            Mutation::WritableMode | Mutation::Directory => assert!(
-                matches!(
-                    &error,
-                    ArtifactError::Integrity { message, .. } if message.contains("sealed regular file")
-                ),
-                "{mutation:?}: {error:?}"
-            ),
-            Mutation::Truncated | Mutation::Extended => assert!(matches!(
-                error,
-                ArtifactError::Integrity { message, .. } if message.contains("length differs")
-            )),
-            Mutation::SameLengthHash => assert!(matches!(
-                error,
-                ArtifactError::Integrity { message, .. } if message.contains("does not match")
-            )),
-            Mutation::Symlink => assert!(matches!(error, ArtifactError::Io { .. })),
-        }
+        let error = store
+            .sealed(sealed.record.job_id)
+            .map(|job| job.expect("sealed terminal"))
+            .unwrap()
+            .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+            .unwrap_err();
+        let cause = match mutation {
+            Mutation::WritableMode | Mutation::Directory => "sealed regular file",
+            Mutation::Truncated | Mutation::Extended => "length differs",
+            Mutation::SameLengthHash
+            | Mutation::ModeRestored
+            | Mutation::Replaced
+            | Mutation::Recreated => "changed since",
+            Mutation::WorldReadable => "mode",
+            Mutation::Symlink | Mutation::Missing => "artifact I/O failed",
+        };
+        assert!(
+            matches!(&error, ArtifactError::Integrity { message, .. } if message.contains(cause) && message.contains(&path.display().to_string())),
+            "{mutation:?}: {error:?}"
+        );
         if matches!(mutation, Mutation::WritableMode) {
             assert!(matches!(
                 ArtifactStore::open(
@@ -1344,7 +1421,7 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
                     ArtifactConfig::default(),
                 ),
                 Err(ArtifactError::Integrity { message, .. })
-                    if message.contains("not sealed")
+                    if message.contains("sealed regular file")
             ));
         }
         if matches!(mutation, Mutation::Directory) {
@@ -1378,12 +1455,22 @@ fn host_controller_verified_file_rejects_planted_hardlink_aliases() {
     assert_eq!(metadata.nlink(), 1);
     assert_eq!(metadata.len(), expected.len() as u64);
     assert_eq!(
-        read_stream(root.path(), &sealed.record.stdout).unwrap(),
+        store
+            .sealed(sealed.record.job_id)
+            .map(|job| job.expect("sealed terminal"))
+            .unwrap()
+            .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+            .unwrap(),
         expected
     );
 
     fs::hard_link(&path, root.path().join("protected-alias")).unwrap();
-    let error = read_stream(root.path(), &sealed.record.stdout).unwrap_err();
+    let error = store
+        .sealed(sealed.record.job_id)
+        .map(|job| job.expect("sealed terminal"))
+        .unwrap()
+        .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
+        .unwrap_err();
     assert!(matches!(
         error,
         ArtifactError::Integrity { message, .. } if message.contains("hardlink aliases")
@@ -1393,7 +1480,6 @@ fn host_controller_verified_file_rejects_planted_hardlink_aliases() {
 #[test]
 fn verified_open_rejects_a_symlinked_workspace_root() {
     use std::os::unix::fs::symlink;
-
     let container = TempRoot::new("symlinked-workspace-root");
     let actual = container.path().join("actual");
     fs::create_dir(&actual).unwrap();
@@ -1409,21 +1495,24 @@ fn verified_open_rejects_a_symlinked_workspace_root() {
         .append(&token, StreamKind::Stdout, b"protected")
         .unwrap();
     let sealed = store.finish(token, JobState::Exited).unwrap();
-    let alias = container.path().join("alias");
-    symlink(&actual, &alias).unwrap();
-
+    let reader = store
+        .sealed(sealed.record.job_id)
+        .map(|job| job.expect("sealed terminal"))
+        .unwrap();
+    let moved = container.path().join("moved");
+    fs::rename(&actual, &moved).unwrap();
+    symlink(&moved, &actual).unwrap();
     assert!(matches!(
-        read_stream(&alias, &sealed.record.stdout),
-        Err(ArtifactError::Io { .. }) | Err(ArtifactError::Integrity { .. })
+        reader.read_range(StreamKind::Stdout, 0..1),
+        Err(ArtifactError::Integrity { .. })
     ));
-
-    let protected = actual.join(".cowshed");
-    let backing = actual.join(".cowshed-real");
-    fs::rename(&protected, &backing).unwrap();
-    symlink(".cowshed-real", &protected).unwrap();
+    fs::remove_file(&actual).unwrap();
+    fs::rename(&moved, &actual).unwrap();
+    fs::rename(actual.join(".cowshed"), actual.join(".cowshed-real")).unwrap();
+    symlink(".cowshed-real", actual.join(".cowshed")).unwrap();
     assert!(matches!(
-        read_stream(&actual, &sealed.record.stdout),
-        Err(ArtifactError::Io { .. }) | Err(ArtifactError::Integrity { .. })
+        reader.read_range(StreamKind::Stdout, 0..1),
+        Err(ArtifactError::Integrity { .. })
     ));
 }
 
@@ -1498,65 +1587,9 @@ fn completion_seals_before_independent_publication_outcomes() {
 }
 
 #[test]
-fn incremental_reader_verifies_large_files_while_vec_convenience_is_bounded() {
-    let root = TempRoot::new("incremental-reader");
-    let mut store = store(
-        root.path(),
-        ArtifactConfig {
-            inline_cap_bytes: 1,
-            ..ArtifactConfig::default()
-        },
-    );
-    let bytes = vec![0x5a; MAX_INLINE_OUTPUT_BYTES + 1];
-    let token = begin(&mut store, 1, OutputTargets::default());
-    store.append(&token, StreamKind::Stdout, &bytes).unwrap();
-    let sealed = store.finish(token, JobState::Exited).unwrap();
-    assert!(matches!(
-        read_stream(root.path(), &sealed.record.stdout),
-        Err(ArtifactError::StreamTooLarge {
-            limit_bytes,
-            bytes
-        }) if limit_bytes == MAX_INLINE_OUTPUT_BYTES as u64
-            && bytes == MAX_INLINE_OUTPUT_BYTES as u64 + 1
-    ));
-
-    let mut reader = open_stream_reader(root.path(), &sealed.record.stdout).unwrap();
-    let mut chunk = [0_u8; 777];
-    let mut observed = 0_usize;
-    loop {
-        let read = reader.read_chunk(&mut chunk).unwrap();
-        if read == 0 {
-            break;
-        }
-        assert!(chunk[..read].iter().all(|byte| *byte == 0x5a));
-        observed += read;
-    }
-    assert_eq!(observed, bytes.len());
-    assert!(reader.is_verified());
-
-    let path = match sealed.record.stdout.storage.artifact() {
-        ProtectedOutput::File { path } => root.path().join(path.as_path()),
-        ProtectedOutput::Inline { .. } => unreachable!(),
-    };
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    let mut file = OpenOptions::new().write(true).open(&path).unwrap();
-    file.seek(SeekFrom::Start((MAX_INLINE_OUTPUT_BYTES / 2) as u64))
-        .unwrap();
-    file.write_all(&[0x00]).unwrap();
-    file.sync_all().unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-    assert!(matches!(
-        open_stream_reader(root.path(), &sealed.record.stdout)
-            .unwrap()
-            .finish(),
-        Err(ArtifactError::Integrity { .. })
-    ));
-}
-
-#[test]
-fn verified_reader_bounds_chunks_and_finish_consumes_the_exact_remainder() {
+fn sealed_ranges_preserve_inline_file_raw_bounds_and_empty_streams() {
     for inline_cap_bytes in [64, 1] {
-        let root = TempRoot::new(&format!("reader-bound-{inline_cap_bytes}"));
+        let root = TempRoot::new(&format!("sealed-ranges-{inline_cap_bytes}"));
         let mut store = store(
             root.path(),
             ArtifactConfig {
@@ -1564,40 +1597,66 @@ fn verified_reader_bounds_chunks_and_finish_consumes_the_exact_remainder() {
                 ..ArtifactConfig::default()
             },
         );
-        let expected = b"abcdef";
+        let bytes = b"\0\xffa\nbc";
         let token = begin(&mut store, 1, OutputTargets::default());
-        store.append(&token, StreamKind::Stdout, expected).unwrap();
+        store.append(&token, StreamKind::Stdout, bytes).unwrap();
         let sealed = store.finish(token, JobState::Exited).unwrap();
-
-        let mut partial = open_stream_reader(root.path(), &sealed.record.stdout).unwrap();
-        assert_eq!(partial.read_chunk(&mut []).unwrap(), 0);
-        assert!(!partial.is_verified());
-        let mut bounded = [0xa5; 3];
-        assert_eq!(partial.read_chunk(&mut bounded[..2]).unwrap(), 2);
-        assert_eq!(&bounded[..2], b"ab");
-        assert_eq!(bounded[2], 0xa5);
-        partial.finish().unwrap();
-
-        let mut exact = open_stream_reader(root.path(), &sealed.record.stdout).unwrap();
-        let mut observed = Vec::new();
-        let mut chunk = [0_u8; 2];
-        for expected_read in [2, 2, 2, 0] {
-            let read = exact.read_chunk(&mut chunk).unwrap();
-            assert_eq!(read, expected_read);
-            observed.extend_from_slice(&chunk[..read]);
+        let reader = store
+            .sealed(sealed.record.job_id)
+            .map(|job| job.expect("sealed terminal"))
+            .unwrap();
+        for range in [0..2, 2..4, 4..6, 6..6, 3..3, 0..0] {
+            assert_eq!(
+                reader
+                    .read_range(StreamKind::Stdout, range.clone())
+                    .unwrap(),
+                bytes[usize::try_from(range.start).unwrap()..usize::try_from(range.end).unwrap()],
+                "cap={inline_cap_bytes}, range={range:?}"
+            );
         }
-        assert_eq!(observed, expected);
-        assert!(exact.is_verified());
+        for range in [6..7, 7..7, std::ops::Range { start: 4, end: 3 }] {
+            assert!(
+                matches!(
+                    reader.read_range(StreamKind::Stdout, range.clone()),
+                    Err(ArtifactError::Integrity { .. })
+                ),
+                "cap={inline_cap_bytes}, range={range:?}"
+            );
+        }
+        assert_eq!(reader.read_range(StreamKind::Stderr, 0..0).unwrap(), b"");
+        assert!(reader.read_range(StreamKind::Stderr, 0..1).is_err());
     }
+}
 
-    let empty_root = TempRoot::new("reader-empty");
-    let mut empty_store = store(empty_root.path(), ArtifactConfig::default());
-    let empty_token = begin(&mut empty_store, 1, OutputTargets::default());
-    let sealed = empty_store.finish(empty_token, JobState::Exited).unwrap();
-    let mut empty = open_stream_reader(empty_root.path(), &sealed.record.stdout).unwrap();
-    let mut byte = [0_u8; 1];
-    assert_eq!(empty.read_chunk(&mut byte).unwrap(), 0);
-    assert!(empty.is_verified());
+#[test]
+fn same_length_overwrite_before_seal_refuses_the_terminal_record() {
+    let root = TempRoot::new("overwrite-before-seal");
+    let mut store = store(
+        root.path(),
+        ArtifactConfig {
+            inline_cap_bytes: 1,
+            ..ArtifactConfig::default()
+        },
+    );
+    let token = begin(&mut store, 1, OutputTargets::default());
+    let id = token.job_id();
+    store
+        .append(&token, StreamKind::Stdout, b"original")
+        .unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(root.path().join(".cowshed/job/1/out"))
+        .unwrap()
+        .write_all(b"modified")
+        .unwrap();
+    assert!(
+        matches!(store.finish(token, JobState::Exited), Err(ArtifactError::Integrity { message, .. }) if message.contains("bytes and digest"))
+    );
+    assert!(store.sealed(id).unwrap().is_none());
+    let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
+    assert!(!recovered.frames.iter().any(
+        |frame| matches!(&frame.record, ProtectedRecord::Job(record) if record.state.is_terminal())
+    ));
 }
 
 proptest! {
@@ -1641,7 +1700,11 @@ fn jobs_a_lost_supervisor_ran_are_sealed_failed_once_with_what_they_spilled() {
     );
     assert_eq!(record.grant_revision, 3);
     assert_eq!(
-        read_stream(root.path(), &record.stdout).unwrap(),
+        next.sealed(record.job_id)
+            .map(|job| job.expect("sealed recovered terminal"))
+            .unwrap()
+            .read_range(StreamKind::Stdout, 0..record.stdout.bytes)
+            .unwrap(),
         b"spilled bytes",
         "what the job spilled before the loss is its sealed stdout"
     );
