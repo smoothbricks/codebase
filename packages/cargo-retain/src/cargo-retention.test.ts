@@ -148,7 +148,7 @@ it('accounts a removed inode census exactly, including hardlinks inside and acro
     readonly before: ReadonlyMap<string, number>;
     readonly bytes: number;
     readonly linkedBytes: number;
-    readonly after: ReadonlyMap<string, number>;
+    readonly after: Map<string, number>;
   }[] = [
     {
       name: 'an empty census leaves another generation ledger entry alone',
