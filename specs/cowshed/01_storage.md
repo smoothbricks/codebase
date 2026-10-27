@@ -116,6 +116,9 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
   (workspaces mount under one fixed per-user root; macOS path and provisioning: 01a_apfs.md, "Stable workspace mount root")
 ```
 
+Each process makes a project deletion-log name power-loss durable by one successful parent sync per held parent
+directory identity, whether created or opened; later appends sync only the file and a replacement parent starts again.
+
 **Owners are marked, never inferred.** Every walker of the store root reads only the directories that hold
 `.cowshed-owner` and are not reserved names (dotted names and the controller's own namespaces above): one `lstat` passes
 over anything else, however much it holds. Nothing is ever read as a repository under a reserved name. A project's

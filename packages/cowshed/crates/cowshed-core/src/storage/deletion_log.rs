@@ -37,11 +37,17 @@
 //!   which of the guards it overrode, each named — so a removal nobody expected can be traced to
 //!   whoever asked for it.
 
-use std::fs::OpenOptions;
+use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
+use cowshed_os::fsio::{Durability, sync_held_directory};
 use serde::{Deserialize, Serialize};
 
 use crate::metadata::WorkspaceName;
@@ -487,6 +493,41 @@ fn find_companion_removal(project_root: &Path, image: &Path) -> Option<Controlle
     newest
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ParentIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn sync_parent_once(directory: &File) -> std::io::Result<()> {
+    static SYNCED: LazyLock<ArcSwap<BTreeSet<ParentIdentity>>> =
+        LazyLock::new(|| ArcSwap::from_pointee(BTreeSet::new()));
+    static WRITER: Mutex<()> = Mutex::new(());
+
+    let metadata = directory.metadata()?;
+    let identity = ParentIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    if SYNCED.load().contains(&identity) {
+        return Ok(());
+    }
+
+    // Only a first successful sync publishes an identity; failed attempts remain retryable.
+    let _writer = WRITER
+        .lock()
+        .expect("deletion-log parent sync lock poisoned");
+    let current = SYNCED.load();
+    if current.contains(&identity) {
+        return Ok(());
+    }
+    sync_held_directory(directory)?;
+    let mut synced = (**current).clone();
+    synced.insert(identity);
+    SYNCED.store(Arc::new(synced));
+    Ok(())
+}
+
 /// Append with an fsync so a crash right after the unlink cannot lose the line that
 /// explains it. Every error — open, write, sync — is swallowed by contract.
 fn append_entry(project_root: &Path, entry: &DeletionLogEntry) {
@@ -494,19 +535,50 @@ fn append_entry(project_root: &Path, entry: &DeletionLogEntry) {
         return;
     };
     line.push(b'\n');
-    let path = project_root.join(DELETION_LOG_FILE);
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+    // Hold the parent once: the log is opened through this descriptor and the same
+    // descriptor is the one synced once per identity, so a retire/recreate of the
+    // project root between two path lookups can never cache a directory that does
+    // not hold the line just written.
+    let Ok(directory) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(project_root)
+    else {
+        return;
+    };
+    let name = c"deletion-log.jsonl";
+    // Never one O_CREAT open: racing openat creators of the same new name are answered
+    // ENOENT on macOS/APFS, losing their line. Open the existing log, exclusive-create
+    // it when absent, then open the log an EEXIST answer names; every open resolves
+    // through the one held parent descriptor above.
+    let open = |flags: libc::c_int| {
+        // SAFETY: the held directory fd and the NUL-terminated leaf name outlive the call.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0o666) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: a successful openat returned a new owned file descriptor.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    };
+    let append = libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC;
+    let Ok(mut file) = open(append)
+        .or_else(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => open(append | libc::O_CREAT | libc::O_EXCL),
+            _ => Err(error),
+        })
+        .or_else(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => open(append),
+            _ => Err(error),
+        })
+    else {
         return;
     };
     if file.write_all(&line).is_err() {
         return;
     }
-    let _ = file.sync_all();
-    // Best-effort directory sync so the directory entry itself is durable. Failure here
-    // loses nothing the file fsync did not already cover on most filesystems.
-    if let Ok(directory) = std::fs::File::open(project_root) {
-        let _ = directory.sync_all();
-    }
+    let _ = Durability::PowerLoss.sync_file(&file);
+    let _ = sync_parent_once(&directory);
 }
 
 /// Lexically locate the project root for an image path and derive its workspace name.
@@ -607,6 +679,242 @@ pub(crate) fn rfc3339_utc(now: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use cowshed_os::fsio::{Syncs, take_syncs};
+
+    fn append_sync_entry(project: &Path, ordinal: usize) {
+        let image = project.join(format!("sessions/ws-{ordinal}.dmg"));
+        log_deletion(
+            project,
+            DeletionOp::RemoveCompanion,
+            DeletionKind::Companion,
+            "ws",
+            Some(&image),
+            &companion_path_for(&image),
+        );
+    }
+
+    fn assert_sync_entries(project: &Path, count: usize) {
+        let text =
+            std::fs::read_to_string(project.join(DELETION_LOG_FILE)).unwrap_or_else(|error| {
+                assert!(
+                    count == 0 && error.kind() == std::io::ErrorKind::NotFound,
+                    "read deletion evidence for {}: {error}",
+                    project.display()
+                );
+                String::new()
+            });
+        let entries: Vec<DeletionLogEntry> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each append is a JSON evidence line"))
+            .collect();
+        assert_eq!(entries.len(), count, "every append keeps its evidence");
+        let mut artifacts = BTreeSet::new();
+        for entry in entries {
+            assert!(
+                !entry.at.is_empty(),
+                "evidence records when the removal happened"
+            );
+            assert_eq!(entry.op, DeletionOp::RemoveCompanion);
+            assert_eq!(entry.kind, DeletionKind::Companion);
+            assert_eq!(entry.workspace, "ws");
+            assert_eq!(
+                entry.artifact,
+                companion_path_for(entry.image.as_deref().expect("the recorded image"))
+            );
+            assert!(entry.git.is_none());
+            assert!(entry.retired_by.is_none());
+            assert!(entry.retained.is_none());
+            assert!(entry.recovered_to.is_none());
+            assert!(artifacts.insert(entry.artifact), "no duplicate evidence");
+        }
+        let expected: BTreeSet<_> = (0..count)
+            .map(|ordinal| companion_path_for(&project.join(format!("sessions/ws-{ordinal}.dmg"))))
+            .collect();
+        assert_eq!(
+            artifacts, expected,
+            "every exact removed artifact is recorded"
+        );
+    }
+
+    #[test]
+    fn append_syncs_each_file_and_each_parent_identity_once() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &std::env::temp_dir(),
+            "cowshed-deletion-sync-counts",
+        );
+        // Keep every table parent alive until all cases finish, so no inode can be reused.
+        for preexisting in [false, true] {
+            for count in [0, 1, 8, 64] {
+                let project = root.join(format!("existing-{preexisting}-count-{count}"));
+                std::fs::create_dir(&project).expect("a distinct project parent");
+                if preexisting {
+                    // Model an earlier creator that never made the log name durable.
+                    std::fs::write(project.join(DELETION_LOG_FILE), b"")
+                        .expect("an existing, unsynced empty log");
+                }
+                take_syncs();
+                for ordinal in 0..count {
+                    append_sync_entry(&project, ordinal);
+                }
+                let syncs = take_syncs();
+                assert_eq!(
+                    syncs,
+                    Syncs {
+                        fsync: 0,
+                        full: count + usize::from(count > 0),
+                    },
+                    "preexisting={preexisting}, appends={count}: file per append, parent once"
+                );
+                assert_sync_entries(&project, count);
+            }
+        }
+    }
+
+    #[test]
+    fn append_syncs_distinct_project_parents_independently() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &std::env::temp_dir(),
+            "cowshed-deletion-sync-projects",
+        );
+        let projects = [root.join("first"), root.join("second")];
+        for project in &projects {
+            std::fs::create_dir(project).expect("a distinct project parent");
+        }
+        take_syncs();
+        for project in &projects {
+            append_sync_entry(project, 0);
+        }
+        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 4 });
+        for project in &projects {
+            append_sync_entry(project, 1);
+        }
+        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 2 });
+        for project in &projects {
+            assert_sync_entries(project, 2);
+        }
+    }
+
+    #[test]
+    fn append_syncs_a_replacement_parent_but_remembers_the_retired_identity() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &std::env::temp_dir(),
+            "cowshed-deletion-sync-replacement",
+        );
+        let project = root.join("project");
+        let retired = root.join("retired");
+        std::fs::create_dir(&project).expect("the original project parent");
+        let original = File::open(&project).expect("hold the original parent alive");
+        let original_identity = original.metadata().expect("original parent identity");
+        take_syncs();
+        append_sync_entry(&project, 0);
+        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 2 });
+        std::fs::rename(&project, &retired).expect("retire without destroying the original parent");
+        std::fs::create_dir(&project).expect("readopt at the same project path");
+        let replacement = File::open(&project).expect("hold the replacement parent alive");
+        let replacement_identity = replacement.metadata().expect("replacement parent identity");
+        assert_ne!(
+            (original_identity.dev(), original_identity.ino()),
+            (replacement_identity.dev(), replacement_identity.ino()),
+            "the same path now names a different directory identity"
+        );
+        append_sync_entry(&project, 0);
+        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 2 });
+        append_sync_entry(&project, 1);
+        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 1 });
+        assert_sync_entries(&project, 2);
+        append_sync_entry(&retired, 1);
+        assert_eq!(
+            take_syncs(),
+            Syncs { fsync: 0, full: 1 },
+            "renaming a cached parent does not require another parent sync"
+        );
+        let lines: Vec<DeletionLogEntry> = std::fs::read_to_string(retired.join(DELETION_LOG_FILE))
+            .expect("retired parent keeps its historical evidence")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("retired evidence remains JSON"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].artifact,
+            companion_path_for(&project.join("sessions/ws-0.dmg"))
+        );
+        assert_eq!(
+            lines[1].artifact,
+            companion_path_for(&retired.join("sessions/ws-1.dmg"))
+        );
+    }
+
+    #[test]
+    fn a_failed_log_open_does_not_skip_the_next_parent_sync() {
+        let project = crate::temp_root::TempRoot::new_in(
+            &std::env::temp_dir(),
+            "cowshed-deletion-sync-failed-open",
+        );
+        let path = project.join(DELETION_LOG_FILE);
+        std::fs::create_dir(&path).expect("block the log open");
+        take_syncs();
+        append_sync_entry(&project, 0);
+        assert_eq!(
+            take_syncs(),
+            Syncs::default(),
+            "a failed open stays best-effort"
+        );
+        std::fs::remove_dir(&path).expect("allow the real append to create its log");
+        append_sync_entry(&project, 0);
+        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 2 });
+        append_sync_entry(&project, 1);
+        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 1 });
+        assert_sync_entries(&project, 2);
+    }
+
+    #[test]
+    fn concurrent_first_appends_publish_one_successful_parent_sync() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &std::env::temp_dir(),
+            "cowshed-deletion-sync-concurrent",
+        );
+        for preexisting in [false, true] {
+            let project = root.join(format!("existing-{preexisting}"));
+            std::fs::create_dir(&project).expect("a concurrent project's parent");
+            if preexisting {
+                std::fs::write(project.join(DELETION_LOG_FILE), b"")
+                    .expect("an existing, unsynced empty log");
+            }
+            let first_append = std::sync::Barrier::new(8);
+            let syncs = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..8)
+                    .map(|ordinal| {
+                        let project = &project;
+                        let first_append = &first_append;
+                        scope.spawn(move || {
+                            take_syncs();
+                            first_append.wait();
+                            append_sync_entry(project, ordinal);
+                            take_syncs()
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("concurrent append completes"))
+                    .fold(Syncs::default(), |mut total, syncs| {
+                        total.fsync += syncs.fsync;
+                        total.full += syncs.full;
+                        total
+                    })
+            });
+            assert_eq!(
+                syncs,
+                Syncs { fsync: 0, full: 9 },
+                "eight file syncs share one successful parent sync: preexisting={preexisting}"
+            );
+            take_syncs();
+            append_sync_entry(&project, 8);
+            assert_eq!(take_syncs(), Syncs { fsync: 0, full: 1 });
+            assert_sync_entries(&project, 9);
+        }
+    }
 
     fn temp_project(name: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
