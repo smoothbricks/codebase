@@ -96,15 +96,6 @@ where
         MacOsApfsExecutionHost::build_volume_written(self, layout, id)
     }
 
-    fn mark_seed_written(
-        &self,
-        layout: &BuildVolumeLayout,
-        seed: &BuildVolumeId,
-        written: SystemTime,
-    ) -> Result<(), ApfsStorageError> {
-        MacOsApfsExecutionHost::mark_seed_written(self, layout, seed, written)
-    }
-
     fn capture_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,

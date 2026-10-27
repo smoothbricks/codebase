@@ -93,12 +93,6 @@ pub(crate) trait RuntimeStorageHost:
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
     ) -> Result<SystemTime, ApfsStorageError>;
-    fn mark_seed_written(
-        &self,
-        layout: &BuildVolumeLayout,
-        seed: &BuildVolumeId,
-        written: SystemTime,
-    ) -> Result<(), ApfsStorageError>;
     /// Fork step 3's capture of `seed` into a new live volume registered as `registration`
     /// (16_build_volumes.md, "Fork"): the only step of it that reads `seed`, so the only one the
     /// fork takes under its source's image lock. Not yet proven or published.

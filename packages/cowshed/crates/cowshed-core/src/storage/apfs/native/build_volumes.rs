@@ -517,9 +517,8 @@ where
     }
 
     /// Record the write instant held by seed `seed`, taken from the clone before its own
-    /// extent-map write, never from the live source after capture. A fork's mount and dropped
-    /// daemon record likewise do not add reusable build state. Admitted jobs can write only
-    /// after the claim or Quiet's stopped socket lease is released.
+    /// extent-map write, never from the live source after capture. Admitted jobs can write
+    /// only after the claim or Quiet's stopped socket lease is released.
     pub fn mark_seed_written(
         &self,
         layout: &BuildVolumeLayout,

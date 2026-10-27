@@ -1250,18 +1250,18 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
 
     /// The rest of the fork, once the checkout `destination` is about to become is staged at
     /// `checkout`: the checkout links the live volume whose own seed [`Self::ready_fork`] made.
-    /// Without a prepared volume the checkout must link nothing, or something is wrong, which
-    /// refuses.
+    /// That is all: the own seed keeps the clock its capture fixed. Without a prepared volume
+    /// the checkout must link nothing, or something is wrong, which refuses.
     pub async fn finish_fork(
         &self,
         prepared: Option<PreparedFork>,
         destination: Owner,
         checkout: PathBuf,
     ) -> Result<Option<BuildVolumeId>> {
-        self.blocking(move |host, layout| {
+        self.blocking(move |_, _| {
             let Some(PreparedFork {
                 seed,
-                own_seed,
+                own_seed: _,
                 live,
                 mount,
                 started,
@@ -1280,11 +1280,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 return Ok(None);
             };
             link::point(&checkout, &mount)?;
-            // The own seed holds everything the live volume does but its mount's writes and the
-            // dropped daemon record, so it starts as fresh as the live volume.
-            let written = host.build_volume_written(layout, &live).map_err(storage)?;
-            host.mark_seed_written(layout, &own_seed, written)
-                .map_err(storage)?;
+            // The own seed keeps its clone's pre-mount clock (16_build_volumes.md, "Targets and
+            // seeds"): mounting the live volume may leave it reading behind, which the next
+            // fork from this workspace reseeds like any behind seed. Sampling a flushed live
+            // clock here to pre-pay that would sync the volume on every fork.
             cowshed_os::timing::event("build-volume", || {
                 format!(
                     "fork {} from seed {seed} in {:?}",

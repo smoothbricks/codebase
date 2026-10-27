@@ -365,9 +365,10 @@ time. Capture fixes the cloned image's clock as the immutable seed freshness mar
 write. It does not sample a later live-source clock and claim that a cache write after the snapshot was captured.
 Supervised admission remains closed through publication: a direct capture retains its exclusive build hold, and a land
 retains its stopped supervisor socket lease and shared GC hold. A seed is behind when the live volume's image, its
-volume flushed first, was modified after the seed's mark. A fork sets its own seed's time to its new live volume's, so a
-new workspace starts with a fresh seed rather than one behind by its own mount. Output restoration and later work on an
-adopted volume reach the seed through the next fork's reseed.
+volume flushed first, was modified after the seed's mark. A fork's own seed keeps its clone's clock, taken before the
+live volume mounts; the mount's own writes can leave it reading behind, and the next fork from that workspace reseeds it
+as any behind seed — no flush on the fork path samples a live clock to pre-pay that. Output restoration and later work
+on an adopted volume reach the seed through the next fork's reseed.
 
 **A reseed excludes the named non-transactional writers, not every open file.** It runs under the target's image lock,
 which every fork of the target holds while it clones the seed, so a reseed never deletes a seed a fork is cloning:
@@ -442,7 +443,8 @@ compare, said on stderr), farther than any count. Fork step 2 decides, under the
    near and written after the seed (behind, above). A seed nearer than the live volume is kept however much later the
    live volume was written, and the live volume is not sealed at all: a landed seed beats a live volume built at an
    older tree, and a long-lived reader of the target's volume (an editor, an indexing server) costs such a fork nothing.
-   Both at the same tree: the target ran tasks on the adopted volume after its land.
+   Both at the same tree: the target ran tasks on the adopted volume after its land, or the volume's own mount wrote it
+   after its seed was cloned.
 
 A skip names each holder and leaves the seed as it was: the fork is colder, never wrong, and the next fork tries again.
 
