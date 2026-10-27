@@ -201,12 +201,23 @@ impl<P: fmt::Display> fmt::Display for Expired<P> {
 impl<P: fmt::Debug + fmt::Display> std::error::Error for Expired<P> {}
 
 /// The silence of a long wait's holder, measured from its last progress.
+///
+/// The waiter judges that silence only over time it was itself running to see progress: a look
+/// ([`Idle::look`]) that comes later than the silence allowed plus one heartbeat period after the
+/// previous look or progress means the waiter did not run in between (its thread was blocked, its
+/// process stopped), so whatever the holder sent meanwhile is still unread. Such a late look gives
+/// the holder one period more from then before it is judged (05_gateway.md "Deadlines").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Idle {
     op: &'static str,
     idle: Duration,
     started_ns: u64,
+    /// The holder's last progress, as reported.
     last_ns: u64,
+    /// Where the silence being judged starts: the last progress, or later after a late look.
+    judged_ns: u64,
+    /// The waiter's last look or progress.
+    looked_ns: u64,
     last: Progress,
 }
 
@@ -218,6 +229,8 @@ impl Idle {
             idle,
             started_ns: now,
             last_ns: now,
+            judged_ns: now,
+            looked_ns: now,
             last: Progress::Nothing,
         }
     }
@@ -243,14 +256,29 @@ impl Idle {
 
     /// The holder showed `progress`: the silence starts over.
     pub fn observe(&mut self, progress: Progress, clock: &dyn Clock) {
-        self.last_ns = clock.monotonic_nanos();
+        let now = clock.monotonic_nanos();
+        self.last_ns = now;
+        self.judged_ns = now;
+        self.looked_ns = now;
         self.last = progress;
+    }
+
+    /// The waiter looks at the wait now, before it judges it. A look more than the silence
+    /// allowed plus `period` after the previous one is late: the waiter itself did not run in
+    /// between, so the holder is given `period` more from now, once, before it is judged.
+    pub fn look(&mut self, period: Duration, clock: &dyn Clock) {
+        let now = clock.monotonic_nanos();
+        if now.saturating_sub(self.looked_ns) > nanos(self.idle).saturating_add(nanos(period)) {
+            let rearmed = now.saturating_sub(nanos(self.idle).saturating_sub(nanos(period)));
+            self.judged_ns = self.judged_ns.max(rearmed);
+        }
+        self.looked_ns = now;
     }
 
     /// How much more silence the holder is allowed; `None` once it has been silent too long.
     pub fn remaining(&self, clock: &dyn Clock) -> Option<Duration> {
         let left =
-            nanos(self.idle).saturating_sub(clock.monotonic_nanos().saturating_sub(self.last_ns));
+            nanos(self.idle).saturating_sub(clock.monotonic_nanos().saturating_sub(self.judged_ns));
         (left != 0).then(|| Duration::from_nanos(left))
     }
 
@@ -404,6 +432,47 @@ mod tests {
             silent.to_string(),
             "SILENT: job terminal: supervisor pid 81200 showed no progress for 15s (idle bound 15s); waited 39s in all, last progress: heartbeat 2"
         );
+    }
+
+    #[test]
+    fn a_waiter_whose_own_process_stalled_past_the_bound_reports_no_silence_for_that_stall() {
+        let clock = Manual::at(0);
+        let period = Duration::from_secs(5);
+        let mut idle = Idle::start("controller call", Duration::from_secs(15), &clock);
+        idle.observe(Progress::Heartbeat { seq: 14 }, &clock);
+        // The waiter's own process does not run for 27 s, the holder's heartbeats unread.
+        clock.advance(Duration::from_secs(27));
+        idle.look(period, &clock);
+        assert_eq!(idle.remaining(&clock), Some(period));
+        // Once the waiter runs again, a holder that stays silent is judged after that period.
+        clock.advance(Duration::from_secs(4));
+        idle.look(period, &clock);
+        assert_eq!(idle.remaining(&clock), Some(Duration::from_secs(1)));
+        clock.advance(Duration::from_secs(1));
+        idle.look(period, &clock);
+        assert_eq!(idle.remaining(&clock), None);
+        // The silence it reports is the holder's whole one, from its last progress.
+        let silent = idle.silent("controller pid 64889", &clock);
+        assert_eq!(silent.silent_for, Duration::from_secs(32));
+        assert_eq!(silent.last, Progress::Heartbeat { seq: 14 });
+    }
+
+    #[test]
+    fn a_waiter_that_looks_in_time_judges_the_holders_silence_as_measured() {
+        let clock = Manual::at(0);
+        let period = Duration::from_secs(5);
+        let mut idle = Idle::start("controller call", Duration::from_secs(15), &clock);
+        for _ in 0..3 {
+            clock.advance(period);
+            idle.look(period, &clock);
+        }
+        assert_eq!(idle.remaining(&clock), None);
+        // A heartbeat buffered across a late look still restarts the silence when it is read.
+        clock.advance(Duration::from_secs(30));
+        idle.look(period, &clock);
+        assert_eq!(idle.remaining(&clock), Some(period));
+        idle.observe(Progress::Heartbeat { seq: 15 }, &clock);
+        assert_eq!(idle.remaining(&clock), Some(Duration::from_secs(15)));
     }
 
     #[test]
