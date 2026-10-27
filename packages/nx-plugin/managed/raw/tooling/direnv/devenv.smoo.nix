@@ -109,6 +109,11 @@
     ];
   };
 in {
+  # The one evaluation of the nixpkgs-go package set, as a module argument. A
+  # repository's devenv.nix that needs this Go takes `goPkgs` instead of
+  # importing the same Go inputs again and repeating package-set evaluation.
+  _module.args.goPkgs = goPkgs;
+
   # nixpkgs carries actionlint, not the jdx fork. Supply the immutable upstream
   # release as a normal package, with the same pin in developer shells and CI.
   # Nix fetches/verifies it once; validation never installs or compiles a tool.

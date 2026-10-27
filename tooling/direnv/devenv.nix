@@ -7,7 +7,10 @@
 }:
 # https://devenv.sh/inputs/
 let
-  git-format-staged = inputs.git-format-staged.packages.${pkgs.stdenv.system}.default;
+  # Built from the shell's own package set: the flake's `packages` output imports
+  # a whole nixpkgs of its own (the same revision, through `follows`) just to
+  # call this one recipe.
+  git-format-staged = pkgs.callPackage "${inputs.git-format-staged}/packages/git-format-staged.nix" {};
   # LLD 21 snapshots CPU affinity before its worker pool exists. Incus can grow
   # the mask between those reads, so workers outnumber the relocation shards
   # they index. Patch only the lld the Rust linker uses: an overlay on

@@ -589,7 +589,9 @@ nothing when nothing changed:
   host with ttsc's compiler. Transform diagnostics stay enforced where the transform runs: `tsc-js` for the lib program,
   the test runner's transform for executed test files. The variable is a hashed input, so a revision bump misses the
   cache. Emit, editors and ttsc plugins keep the npm `@typescript/native` compiler. A target run outside the devenv
-  shell fails on the unset variable rather than checking with another compiler under the same key.
+  shell fails on the unset variable rather than checking with another compiler under the same key. The module publishes
+  that one `nixpkgs-go` package set as the module argument `goPkgs`. A repository's `devenv.nix` takes Go from it
+  instead of importing the same Go inputs again, so both producers use one evaluated package set.
 - `tooling/direnv/nx-socket-dir.sh` exports `NX_WORKSPACE_ROOT_PATH` and `NX_SOCKET_DIR`. A checkout gets its own socket
   dir under `DEVENV_RUNTIME`; an inherited one that resolves into another checkout is dropped. A cowshed workspace
   (`.cowshed/workspace.json`) uses `<link>/nx`, where `<link>` is the `COWSHED_RUNTIME_LINK` its `.cowshed/env` names:
