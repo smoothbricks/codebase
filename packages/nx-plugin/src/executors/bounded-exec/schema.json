@@ -32,7 +32,7 @@
     "idleTimeoutMs": {
       "type": "number",
       "minimum": 1,
-      "description": "Kill the process tree when no test has finished for this many milliseconds: a nextest status line with its run counter, a bun result line or dot. Output that reports no finished test (a SLOW warning, a heartbeat) is not progress. A command that reports no tests makes progress only by exiting. Omit for no progress bound."
+      "description": "Kill the process tree when no test has finished for this many milliseconds: a runner's finished-test, file or package report, including Vitest reporter results, or a bun dot. Output that reports no finished test (a SLOW warning, a heartbeat) is not progress. A command that reports no tests makes progress only by exiting. Omit for no progress bound."
     },
     "killAfterMs": {
       "type": "number",

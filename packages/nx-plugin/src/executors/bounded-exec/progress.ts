@@ -16,6 +16,9 @@ import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
  *   spells `classname name`.
  * - libtest (`cargo test`): `test tests::quick ... ok` (or `FAILED`, `ignored`); a test still running is named by
  *   `test tests::slow has been running for over 60 seconds`.
+ * - vitest: timed ✓/× test results, timed ❯ failed-file results, and ↓ skipped-file results. The default
+ *   reporter prints a completed file as ✓ file (N tests) Xms, plus slow or failed tests beneath it.
+ *   Reporter headers, summaries and stack locations report no new completion.
  * - bun: a line of dots, one per test finished (`--dots`, which `withProgressReport` asks for: bun prints nothing
  *   per passing test when it believes an agent runs it), or a `(pass)`/`(fail)`/`(skip)`/`(todo)` line. bun names
  *   no test before it finishes, so a bun run names nothing in flight.
@@ -26,7 +29,7 @@ import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
  * Execution phases are owned by the private supervisor channel in runner-lifecycle.ts, never these text reports.
  */
 export interface RunProgress {
-  /** One chunk of one of the command's output streams; true when it reports a finished test or Go package. */
+  /** One chunk of one output stream; true when it reports a finished test, file or Go package. */
   scan(stream: OutputStream, chunk: string): boolean;
   /** The tests the runner reported running and has not reported finished, in the order it first named them. */
   inFlight(): string[];
@@ -35,11 +38,14 @@ export interface RunProgress {
 export type OutputStream = 'stdout' | 'stderr';
 
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`, 'g');
-/** Lines naming a test that finished; group 1 is its name. */
+/** Lines naming a test or file that finished; group 1 is its name. */
 const FINISHED = [
   /^\s*(?:[A-Z0-9][A-Z0-9-]*\s+)+\[\s*[0-9.]+s\]\s+\(\s*\d+\/\d+\)\s+(\S.*)$/,
   /^test (\S+) \.\.\. (?:ok|FAILED|ignored)\b/,
   /^\((?:pass|fail|skip|todo)\) (.+)$/,
+  /^\s*[✓×]\s+(\S.*?)\s+\d+ms\b/,
+  /^\s*❯\s+(\S.*?)\s+\(\d+ tests?(?: \| \d+ (?:failed|skipped|todo))*\)\s+\d+ms\b/,
+  /^\s*↓\s+(\S.*?)\s+\(\d+ tests?(?: \| \d+ (?:skipped|todo))+\)$/,
 ];
 /** Lines naming a test still running; group 1 is its name. */
 const RUNNING = [

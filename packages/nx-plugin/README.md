@@ -1847,19 +1847,21 @@ installed.
 
 A test target is bounded by progress alone: `idleTimeoutMs`, 180 s (`BOUNDED_TEST_IDLE_TIMEOUT_MS`, the hang backstop of
 `specs/cowshed/08_testing.md`), with no `timeoutMs`. The bound re-arms whenever the runner reports a finished test: a
-nextest status line carrying its run counter (`PASS [   0.438s] (1/4) …`), a libtest `test … ... ok` line, or a bun
-result line or dot. Output that finishes no test is not progress: nextest's `SLOW` warning, repeated every slow-timeout
-period for a test still running, and a hung test's heartbeat both keep printing. A suite that keeps finishing tests
-therefore runs as long as it needs, however slow the host, and a test that never returns ends the run 180 s after the
-last test that finished. bun prints nothing per passing test when it believes an agent runs it, so the executor asks a
-lone `bun test` for `--dots`, one dot per finished test. Without a recognised execution lifecycle, the clock starts at
-command spawn; a command that reports no tests makes progress only by exiting. nextest's slow-timeout and the serial
-groups' code-time classes only warn; no per-test bound kills a test or fails one that passed. Bun has a per-test
-deadline of its own, 5000 ms unless the command sets one, and it reads no bunfig for it, so every bun leg deletes it
-with `bun test --timeout=0` (`BUN_TEST_TIMEOUT_FLAG`; `0` means no deadline, measured on the pinned Bun 1.4.2). A test
-waits for the event it is waiting for, however long a loaded host makes the work take; one that never returns still ends
-the run through `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that report no tests; a target names
-at least one of the two.
+nextest status line carrying its run counter (`PASS [   0.438s] (1/4) …`), a libtest `test … ... ok` line, a bun result
+line or dot, or a Vitest default-reporter file/test result. Timed Vitest `✓` and `×` lines count, as does a failed-file
+`❯ file (N tests | M failed) Xms` result or skipped-file `↓ file (N tests | M skipped)` result. Reporter headers,
+failure stack locations and final summary counts do not count. Output that finishes no test is not progress: the nextest
+`SLOW` warning, repeated every slow-timeout period for a test still running, and a hung test heartbeat both keep
+printing. A suite that keeps finishing tests therefore runs as long as it needs, however slow the host, and a test that
+never returns ends the run 180 s after the last test that finished. bun prints nothing per passing test when it believes
+an agent runs it, so the executor asks a lone `bun test` for `--dots`, one dot per finished test. Without a recognised
+execution lifecycle, the clock starts at command spawn; a command that reports no tests makes progress only by exiting.
+nextest's slow-timeout and the serial groups' code-time classes only warn; no per-test bound kills a test or fails one
+that passed. Bun has a per-test deadline of its own, 5000 ms unless the command sets one, and it reads no bunfig for it,
+so every bun leg deletes it with `bun test --timeout=0` (`BUN_TEST_TIMEOUT_FLAG`; `0` means no deadline, measured on the
+pinned Bun 1.4.2). A test waits for the event it is waiting for, however long a loaded host makes the work take; one
+that never returns still ends the run through `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that
+report no tests; a target names at least one of the two.
 
 On POSIX hosts, direct Go and Cargo test commands (including chains joined by `&&`, `||`, or `;`) share one private
 runner lifecycle: `build`, `active`, and `terminal`. A per-command Node supervisor reports phases over an acknowledged

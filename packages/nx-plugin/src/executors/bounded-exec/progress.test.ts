@@ -80,6 +80,46 @@ describe('run progress', () => {
     expect(progress.inFlight()).toEqual([]);
   });
 
+  it('counts captured Vitest file and test completions, not reporter noise', () => {
+    // Vitest 4.1.11 default reporter captures from a worker suite and a deliberately failing fixture.
+    // Plain rows have only ANSI colour removed; the streamed case below retains the captured colour.
+    for (const [line, finished] of [
+      [' ✓ src/runner/do-runner-integration.test.ts (54 tests) 3362ms', true],
+      [' ✓ src/runner/do-runner-signal-identity.test.ts (1 test) 694ms', true],
+      ['       ✓ keeps a future same-label timer scheduled during successful alarm execution  575ms', true],
+      [' ↓ src/runner/do-runner-ingress-cell.test.ts (1 test | 1 skipped)', true],
+      [' ❯ reporter.test.js (3 tests | 1 failed | 1 skipped) 4ms', true],
+      ['   ✓ reports a passing test 1ms', true],
+      ['   × reports a failed test 3ms', true],
+      ['stdout | src/runner/do-runner-integration.test.ts', false],
+      [' Test Files  24 passed | 1 skipped (25)', false],
+      ['      Tests  236 passed | 1 skipped (237)', false],
+      [' ❯ src/pending.test.ts (2 tests | 1 failed)', false],
+      [' ✓ still waiting...', false],
+      [' FAIL  reporter.test.js > reports a failed test', false],
+      [' ❯ reporter.test.js:2:47', false],
+    ] as const) {
+      for (const stream of ['stdout', 'stderr'] as const) {
+        expect(createRunProgress('bun vitest run').scan(stream, `${line}\n`)).toBe(finished);
+      }
+    }
+  });
+
+  it('buffers ANSI-coloured Vitest results until their line finishes', () => {
+    const progress = createRunProgress('bun vitest run');
+    expect(progress.scan('stdout', ' \u001b[32m✓\u001b[39m src/runner/do-runner-integration.test.ts ')).toBe(false);
+    expect(progress.scan('stderr', 'still waiting...\n')).toBe(false);
+    expect(
+      progress.scan(
+        'stdout',
+        '\u001b[2m(\u001b[22m\u001b[2m54 tests\u001b[22m\u001b[2m)\u001b[22m\u001b[33m 3362\u001b[2mms\u001b[22m\u001b[39m',
+      ),
+    ).toBe(false);
+    expect(progress.scan('stdout', '\n')).toBe(true);
+    expect(progress.scan('stdout', '\n')).toBe(false);
+    expect(progress.inFlight()).toEqual([]);
+  });
+
   it("counts bun's result lines and each new dot, however the chunks split them", () => {
     const progress = createRunProgress();
     expect(progress.scan('stderr', '(pass) suite > one [0.02ms]\n')).toBe(true);
