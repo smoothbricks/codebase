@@ -1152,6 +1152,10 @@ mod tests {
     }
 
     impl Site {
+        fn path_hash(&self) -> String {
+            crate::api::dto::hex_lower(&Sha256::digest(self.root.as_os_str().as_bytes()))
+        }
+
         fn baseline(&self) -> BTreeMap<OsString, OsString> {
             let (root, name, port) = (self.root.display(), self.name, self.port);
             [
@@ -1160,7 +1164,10 @@ mod tests {
                 ("XDG_RUNTIME_DIR", self.link.to_owned()),
                 ("TMPDIR", format!("/store/tmp/{name}")),
                 ("COWSHED_PORT_BASE", port.to_string()),
-                ("COWSHED_PORT_BLOCK_SIZE", "64".to_owned()),
+                (
+                    "COWSHED_PORT_BLOCK_SIZE",
+                    crate::metadata::NEW_PORT_BLOCK_SIZE.to_string(),
+                ),
                 (
                     "HTTPS_PROXY",
                     format!("http://{name}-token@127.0.0.1:{port}"),
@@ -1213,12 +1220,14 @@ mod tests {
     const NOTHING: Extra = |_| Vec::new();
 
     /// The origin that evaluates first, a witness that evaluates the same inputs second, and the
-    /// clone that adopts.
+    /// clone that adopts, plus the adopter under an unmeasured parent.
     struct Sites {
         scratch: PathBuf,
         origin: Site,
         witness: Site,
         clone: Site,
+
+        unmeasured: Site,
     }
 
     impl Drop for Sites {
@@ -1240,28 +1249,54 @@ mod tests {
             "cowshed-inherit-{label}-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let site = |path: &str, link, name, port| Site {
+        let site = |path: &str, link, name| Site {
             root: scratch.join(path),
             link,
             name,
-            port,
+            port: u32::from(cowshed_gateway_types::MACOS_FIXTURE_PORT_MIN),
         };
-        let sites = Sites {
-            origin: site("dev/repo", "/tmp/cs-aaaaaaaaaaaa", "origin", 42240),
-            witness: site(
-                "mnt/owner/repo/first",
-                "/tmp/cs-cccccccccccc",
-                "first",
-                42368,
-            ),
-            clone: site(
-                "mnt/owner/repo/shed",
-                "/tmp/cs-bbbbbbbbbbbb",
-                "clone",
-                42304,
-            ),
+        let mut sites = Sites {
+            origin: site("dev/repo", "/tmp/cs-aaaaaaaaaaaa", "origin"),
+            witness: site("mnt/owner/repo/first", "/tmp/cs-cccccccccccc", "first"),
+            clone: site("mnt/owner/repo/shed", "/tmp/cs-bbbbbbbbbbbb", "clone"),
+            unmeasured: site("slots/slot@1", "/tmp/cs-dddddddddddd", "slot"),
             scratch: scratch.clone(),
         };
+        // Namespace uniqueness is not an oracle input: neither real paths nor their derived
+        // hashes may accidentally look like a port of a different workspace in these fixtures.
+        let values: Vec<_> = [
+            &sites.origin,
+            &sites.witness,
+            &sites.clone,
+            &sites.unmeasured,
+        ]
+        .into_iter()
+        .flat_map(|site| {
+            site.export(NOTHING)
+                .into_values()
+                .flatten()
+                .chain(std::iter::once(site.path_hash()))
+        })
+        .collect();
+        let mut ports =
+            crate::metadata::PortBlock::macos_candidates(crate::metadata::PortAllocation::Fixture)
+                .filter(|block| {
+                    let range = (u32::from(block.base()), u32::from(block.size()));
+                    values.iter().all(|value| !names_port(value, range))
+                });
+        for site in [
+            &mut sites.origin,
+            &mut sites.witness,
+            &mut sites.clone,
+            &mut sites.unmeasured,
+        ] {
+            site.port = u32::from(
+                ports
+                    .next()
+                    .expect("a disjoint fixture block for every site's path inputs")
+                    .base(),
+            );
+        }
         for checkout in [&sites.origin, &sites.witness, &sites.clone] {
             let root = &checkout.root;
             std::fs::create_dir_all(root.join("tooling/direnv")).unwrap();
@@ -1335,8 +1370,8 @@ mod tests {
 
     /// The lineage as it happens: the origin evaluates; the witness carries its record, cannot
     /// adopt an uncertified one, evaluates the same inputs and so certifies or not; the clone then
-    /// carries the origin's record as it stands. Returns what the witness's record did.
-    fn lineage(sites: &Sites, extra: Extra) -> Certification {
+    /// carries the origin's record as it stands. Preserve the actual adoption refusal for the oracle.
+    fn lineage(sites: &Sites, extra: Extra) -> Result<Certification, AdoptionMiss> {
         evaluate(&sites.origin, extra, None);
         std::fs::copy(
             record_path(&sites.origin.root),
@@ -1344,10 +1379,10 @@ mod tests {
         )
         .unwrap();
         let certification = match verify_at(&sites.witness) {
-            Err(miss) => match miss.into_uncertified() {
-                Some(inherited) => evaluate(&sites.witness, extra, Some(&inherited)),
-                None => Certification::NotAttempted(NotAttempted::NothingInherited),
-            },
+            Err(AdoptionMiss::Uncertified(inherited)) => {
+                Ok(evaluate(&sites.witness, extra, Some(inherited.as_ref())))
+            }
+            Err(miss) => Err(miss),
             Ok(_) => panic!("an uncertified record of another checkout was adopted"),
         };
         std::fs::copy(
@@ -1359,10 +1394,29 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_decimal_in_the_fixture_root_is_an_actual_port_residue() {
+        let mut sites = sites("fixed-42240");
+        sites.origin.port = 42240;
+        assert!(names_port(
+            &sites.witness.root.display().to_string(),
+            (
+                sites.origin.port,
+                u32::from(crate::metadata::NEW_PORT_BLOCK_SIZE)
+            ),
+        ));
+        let miss = lineage(&sites, NOTHING).expect_err("the root names the origin's port range");
+        assert!(
+            matches!(&miss, AdoptionMiss::Residue { .. }),
+            "actual refusal: {miss:?}"
+        );
+        eprintln!("fixed-root counterexample: {miss:?}");
+    }
+
+    #[test]
     fn a_clone_adopts_a_certified_export_moved_and_never_its_credentials() {
-        let sites = sites("adopt");
+        let sites = sites("fixed-42240");
         assert_eq!(
-            lineage(&sites, NOTHING),
+            lineage(&sites, NOTHING).expect("portable fixture reaches certification"),
             Certification::Certified {
                 origin: Origin::Updated
             }
@@ -1441,7 +1495,7 @@ mod tests {
         };
         let sites = sites("compile-cache");
         assert_eq!(
-            lineage(&sites, compile_cache),
+            lineage(&sites, compile_cache).expect("portable cache fixture reaches certification"),
             Certification::Certified {
                 origin: Origin::Updated
             }
@@ -1472,7 +1526,7 @@ mod tests {
     #[test]
     fn a_record_without_its_root_is_malformed() {
         let sites = sites("rootless");
-        lineage(&sites, NOTHING);
+        lineage(&sites, NOTHING).expect("portable fixture reaches certification");
         let path = record_path(&sites.clone.root);
         let mut record: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -1589,13 +1643,8 @@ mod tests {
     #[test]
     fn a_clone_under_an_unmeasured_parent_evaluates() {
         let sites = sites("unmeasured-parent");
-        lineage(&sites, NOTHING);
-        let elsewhere = Site {
-            root: sites.scratch.join("slots/slot@1"),
-            link: "/tmp/cs-dddddddddddd",
-            name: "slot",
-            port: 42432,
-        };
+        lineage(&sites, NOTHING).expect("portable fixture reaches certification");
+        let elsewhere = &sites.unmeasured;
         for input in INPUTS
             .iter()
             .chain([&crate::storage::WORKSPACE_MARKER_PATH])
@@ -1611,7 +1660,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            verify_at(&elsewhere),
+            verify_at(elsewhere),
             Err(AdoptionMiss::Uncertified(_))
         ));
         assert!(
@@ -1645,12 +1694,9 @@ mod tests {
     #[test]
     fn a_value_hashed_from_the_checkout_path_never_certifies() {
         let sites = sites("hashed-pwd");
-        let hashed: Extra = |site| {
-            let digest = Sha256::digest(site.root.as_os_str().as_bytes());
-            vec![("PWD_HASH", Some(crate::api::dto::hex_lower(&digest)))]
-        };
+        let hashed: Extra = |site| vec![("PWD_HASH", Some(site.path_hash()))];
         assert_eq!(
-            lineage(&sites, hashed),
+            lineage(&sites, hashed).expect("hash fixture reaches producer comparison"),
             Certification::Differs {
                 name: "PWD_HASH".into()
             }
@@ -1664,7 +1710,7 @@ mod tests {
     #[test]
     fn a_changed_input_byte_misses() {
         let sites = sites("key");
-        lineage(&sites, NOTHING);
+        lineage(&sites, NOTHING).expect("portable fixture reaches certification");
         std::fs::write(sites.clone.root.join("bun.lock"), "lock2\n").unwrap();
         assert!(matches!(
             verify_at(&sites.clone),
@@ -1675,7 +1721,7 @@ mod tests {
     #[test]
     fn a_rewrite_of_the_same_bytes_still_adopts() {
         let sites = sites("same-bytes");
-        lineage(&sites, NOTHING);
+        lineage(&sites, NOTHING).expect("portable fixture reaches certification");
         std::fs::remove_file(sites.clone.root.join("bun.lock")).unwrap();
         std::fs::write(sites.clone.root.join("bun.lock"), "lock\n").unwrap();
         assert!(verify_at(&sites.clone).is_ok());
@@ -1684,7 +1730,7 @@ mod tests {
     #[test]
     fn another_baseline_misses() {
         let sites = sites("baseline");
-        lineage(&sites, NOTHING);
+        lineage(&sites, NOTHING).expect("portable fixture reaches certification");
         let mut baseline = sites.clone.baseline();
         baseline.insert("EXTRA".into(), "1".into());
         assert!(matches!(
@@ -1706,7 +1752,7 @@ mod tests {
             ]
         };
         assert_eq!(
-            lineage(&sites, places),
+            lineage(&sites, places).expect("portable places fixture reaches certification"),
             Certification::Certified {
                 origin: Origin::Updated
             }
@@ -1733,7 +1779,7 @@ mod tests {
                 Some(format!("http://127.0.0.1:{}/", site.port + 10)),
             )]
         };
-        lineage(&sites, port);
+        lineage(&sites, port).expect_err("the witness must reject the explicit port residue");
         assert!(matches!(
             verify_at(&sites.clone),
             Err(AdoptionMiss::Residue { name }) if name == "LEFTOVER"
@@ -1746,7 +1792,7 @@ mod tests {
                 Some(format!("/prefix{}/lib", site.root.display())),
             )]
         };
-        lineage(&sites, glued);
+        lineage(&sites, glued).expect_err("the witness must reject the explicit path residue");
         assert!(matches!(
             verify_at(&sites.clone),
             Err(AdoptionMiss::Residue { name }) if name == "LEFTOVER"
@@ -1755,7 +1801,7 @@ mod tests {
         let sites = self::sites("place-residue");
         let scratch: Extra =
             |site| vec![("LEFTOVER", Some(format!("/store/tmp/{}/cache", site.name)))];
-        lineage(&sites, scratch);
+        lineage(&sites, scratch).expect("portable scratch fixture reaches certification");
         let mut baseline = sites.clone.baseline();
         baseline.remove(std::ffi::OsStr::new("TMPDIR"));
         assert!(matches!(

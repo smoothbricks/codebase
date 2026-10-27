@@ -401,6 +401,13 @@ clone evaluates, says its producer is not certified, and holds its own hash. The
 `.envrc`, not a repository's; the sandboxed lane covers the record, key, move, certification and host protocol
 (`shell_inherit.rs`, `script_host.rs`) without it.
 
+Record-level inherited-shell fixtures keep namespace uniqueness separate from the values their oracle judges. They
+choose disjoint valid fixture port blocks deterministically from the canonical candidates, using the existing residue
+predicate to exclude blocks named by their actual root and derived-hash exports. Expected ports derive from each site's
+selected block. A pinned decimal-root counterexample preserves the conservative production refusal; unexpected adoption
+misses retain their actual reason instead of becoming absent history. These are test data, not listener allocations, and
+no retry, delay or production-policy weakening supplies a portable export.
+
 The build-state CLI probe launches the installed `cowshed` binary through private `tools/bin` beneath the executed-child
 profile in both read-write and read-only modes. Its program link and resolved executable have literal read access with
 metadata-only ancestors, matching the installed-binary contract in the package guide. The probe requires the checkout's
