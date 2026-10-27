@@ -34,6 +34,7 @@ import {
   clearLock,
   clearReceipt,
   DAY3,
+  declaredCli,
   emptyHash,
   exists,
   expectFresh,
@@ -52,6 +53,7 @@ import {
   nestedOf,
   nestedPlanned,
   only,
+  PACKAGE_DIR,
   type PlannedOutcome,
   type ProcMacro,
   parseReport,
@@ -802,7 +804,7 @@ async function reclaimsNestedRoot(fx: Churn): Promise<void> {
 async function cliPlansReadOnlyAndApplies(fx: Churn, superseded: readonly string[]): Promise<void> {
   const check = labelled('the CLI plans read-only, applies with a receipt, and exits 3 on a refused pass');
   await clearReceipt(fx.target);
-  const bin = join(import.meta.dir, '..', 'dist', 'ts', 'node-cli.js');
+  const bin = await declaredCli(PACKAGE_DIR);
   const cli = async (args: string[]): Promise<CargoRun> => {
     const child = Bun.spawn(['node', bin, ...args], { cwd: fx.ws, env: cargoEnv(), stdout: 'pipe', stderr: 'pipe' });
     const [code, stdout, stderr] = await Promise.all([

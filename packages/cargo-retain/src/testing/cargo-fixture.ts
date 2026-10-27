@@ -7,6 +7,7 @@ import { expect } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, utimes, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import typia from 'typia';
 import {
   RECENT_USE_MS,
@@ -27,6 +28,28 @@ import { outsideTreesTmpdir } from './outside-trees.js';
  */
 export const RETENTION_MODULE_URL = import.meta.resolve('@smoothbricks/cargo-retain');
 export const NODE_LOCKS_MODULE_URL = import.meta.resolve('@smoothbricks/cargo-retain/locks-node');
+
+/** This package's root, resolved through its published `./package.json` export. */
+export const PACKAGE_DIR = dirname(fileURLToPath(import.meta.resolve('@smoothbricks/cargo-retain/package.json')));
+
+/** The command `package.json#bin` declares; the native build of the CLI carries the same name. */
+export const CLI_NAME = 'smoo-nx-cargo-retain';
+
+interface DeclaredBin {
+  readonly bin: Readonly<Record<typeof CLI_NAME, string>>;
+}
+const validateDeclaredBin = typia.createValidate<DeclaredBin>();
+
+/**
+ * The executable `package.json#bin` declares for {@link CLI_NAME} in the package rooted at `packageDir` (this checkout or
+ * an unpacked tarball), as an absolute path: what npm links, where a hand-joined emit path would bypass the declaration.
+ */
+export async function declaredCli(packageDir: string): Promise<string> {
+  const manifest = join(packageDir, 'package.json');
+  const checked = validateDeclaredBin(JSON.parse(await readFile(manifest, 'utf8')));
+  if (!checked.success) throw new Error(`${manifest}: no bin.${CLI_NAME}: ${JSON.stringify(checked.errors)}`);
+  return join(packageDir, checked.data.bin[CLI_NAME]);
+}
 
 /** Three days past the newest stamp a fixture build can carry: drops only the recency root. */
 export const DAY3 = 3 * RECENT_USE_MS;

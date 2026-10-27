@@ -48,7 +48,7 @@
     }
   },
   "bin": {
-    "smoo-nx-cargo-retain": "./dist/ts/bin/smoo-nx-cargo-retain.js"
+    "smoo-nx-cargo-retain": "./dist/ts/node-cli.js"
   },
   "files": [
     "dist",
@@ -73,6 +73,9 @@
     "scriptc": "0.4.4"
   },
   "scriptc": {
+    "entries": {
+      "smoo-nx-cargo-retain": "./dist/ts/bin/smoo-nx-cargo-retain.js"
+    },
     "ffi": {
       "manifest": "ffi.json",
       "declarations": {

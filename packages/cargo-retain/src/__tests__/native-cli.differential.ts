@@ -1,28 +1,34 @@
 /**
- * The native CLI against the Node CLI on copies of one churned real Cargo target: each scenario's stdout, stderr, exit
- * status and resulting tree must be identical, and each must end where it should (reclaimed, busy, refused), so two
- * binaries failing alike prove nothing. This file is not `*.test.ts`, so a plain `bun test` skips it; the native
- * target names it (`bun test ./src/__tests__/native-cli.differential.ts`) after building
+ * The native CLI against the published Node CLI on copies of one churned real Cargo target: each scenario's stdout,
+ * stderr, exit status and resulting tree must be identical, and each must end where it should (reclaimed, busy,
+ * refused), so two binaries failing alike prove nothing. The Node side is the executable the packed tarball's
+ * `package.json#bin` declares, run through its own shebang and execute bit: a published bin npm cannot run, or one whose
+ * locks Node cannot bind, fails every scenario past usage. This file is not `*.test.ts`, so a plain `bun test` skips
+ * it; the native target names it (`bun test ./src/__tests__/native-cli.differential.ts`) after building
  * `dist/bin/<platform>-<arch>/smoo-nx-cargo-retain`, and a missing binary fails the run.
  */
 import { describe, it } from 'bun:test';
 import { type SpawnSyncReturns, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { constants } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { RETENTION_RECEIPT, type RetentionOutcome } from '../cargo-retention.js';
 import {
   backdate,
   build,
+  CLI_NAME,
   cargoEnv,
   churnFixture,
   churnGenerations,
+  declaredCli,
   exists,
   holdProfile,
   inFixture,
   labelled,
   metasOf,
+  PACKAGE_DIR,
   parseReport,
   put,
   RETENTION_LOCK,
@@ -36,16 +42,32 @@ import { useFixtureCargoHome } from '../testing/fixture-cargo-home.js';
 
 useFixtureCargoHome();
 
-const NODE_CLI = join(import.meta.dir, '..', '..', 'dist', 'ts', 'node-cli.js');
-const NATIVE_CLI = join(
-  import.meta.dir,
-  '..',
-  '..',
-  'dist',
-  'bin',
-  `${process.platform}-${process.arch}`,
-  'smoo-nx-cargo-retain',
-);
+const NATIVE_CLI = join(PACKAGE_DIR, 'dist', 'bin', `${process.platform}-${process.arch}`, CLI_NAME);
+
+function ran(command: string, args: readonly string[], cwd: string): void {
+  const done = spawnSync(command, args, { cwd, encoding: 'utf8' });
+  if (done.status !== 0) {
+    throw new Error(
+      `${command} ${args.join(' ')} failed: ${done.error?.message ?? `exit ${done.status}`}\n${done.stderr}`,
+    );
+  }
+}
+
+/**
+ * This package as npm ships it: `bun pm pack`, the command smoo's release pack and packed-package validation run, packs
+ * the checkout into `base`, and the tarball unpacks where a consumer's install puts it, beside the typia its emit
+ * imports. Returns the executable the packed `package.json#bin` declares.
+ */
+async function packedCli(base: string): Promise<string> {
+  const tarball = join(base, 'cargo-retain.tgz');
+  const modules = join(base, 'consumer', 'node_modules');
+  const installed = join(modules, '@smoothbricks', 'cargo-retain');
+  await mkdir(installed, { recursive: true });
+  ran(process.execPath, ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], PACKAGE_DIR);
+  ran('tar', ['-xzf', tarball, '-C', installed, '--strip-components=1'], base);
+  await symlink(dirname(fileURLToPath(import.meta.resolve('typia/package.json'))), join(modules, 'typia'));
+  return declaredCli(installed);
+}
 
 interface Run {
   readonly status: number | null;
@@ -64,6 +86,7 @@ function normalized(text: string, copy: string): string {
 
 /** What a CLI printed and how it exited, comparable across copies. */
 function comparable(run: SpawnSyncReturns<string>, copy: string): Run {
+  if (run.error !== undefined) throw run.error;
   return { status: run.status, stdout: normalized(run.stdout, copy), stderr: normalized(run.stderr, copy) };
 }
 
@@ -226,6 +249,7 @@ describe('the native CLI against the Node CLI on copies of one churned Cargo tar
     }
     await inFixture(async (base) => {
       const check = labelled('the native CLI matches the Node CLI');
+      const publishedCli = await packedCli(base);
       const original = join(base, 'original');
       await mkdir(original);
       const fx = await churnFixture(original, false);
@@ -252,13 +276,13 @@ describe('the native CLI against the Node CLI on copies of one churned Cargo tar
       };
       for (const scenario of SCENARIOS) {
         const { name } = scenario;
-        const run = async (copy: string, command: string, prefix: readonly string[]): Promise<Run> => {
+        const run = async (copy: string, command: string): Promise<Run> => {
           const release = scenario.hold === undefined ? undefined : await holdProfile(scenario.hold(copy));
           try {
             const operand = scenario.operand === undefined ? [] : [scenario.operand(copy)];
             const cwd = scenario.operand === undefined ? workspaceOf(copy) : copy;
             return comparable(
-              spawnSync(command, [...prefix, ...scenario.args, ...operand], {
+              spawnSync(command, [...scenario.args, ...operand], {
                 cwd,
                 // Keep NO_COLOR and every other input; Nx's contradictory FORCE_COLOR makes Node warn under its own PID.
                 env: Object.fromEntries(Object.entries(cargoEnv()).filter(([name]) => name !== 'FORCE_COLOR')),
@@ -273,8 +297,8 @@ describe('the native CLI against the Node CLI on copies of one churned Cargo tar
         const node = await copyOf(`${name}-node`);
         const native = await copyOf(`${name}-native`);
         for (const copy of [node, native]) await scenario.prepare?.(copy);
-        const expected = await run(node, 'node', [NODE_CLI]);
-        const actual = await run(native, NATIVE_CLI, []);
+        const expected = await run(node, publishedCli);
+        const actual = await run(native, NATIVE_CLI);
         for (const copy of [node, native]) await scenario.restore?.(copy);
         if (scenario.reason === undefined) {
           check(actual, `${name}: stdout, stderr and exit status`).toEqual(expected);
