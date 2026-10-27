@@ -892,19 +892,17 @@ command from that activated environment, so only the first command after the wor
 direnv/devenv evaluation. Those inputs are exactly what direnv itself watches — the `.envrc`, `devenv.nix`,
 `devenv.lock`, anything named with `watch_file` or `watch_dir`. Change one's bytes and the next command re-activates,
 showing direnv's output on its stderr; rewriting a file with the same bytes (a checkout, a stash) re-activates nothing.
-A fresh fork does not evaluate at all when its inputs are byte-for-byte its origin's and that shell has been certified:
-it inherits the origin's shell, moved to the fork's own paths, and reads only its own `.cowshed/env` and `.envrc-local`.
-The first fork after an input change evaluates instead, and its agreeing export is the certification the later forks
-rely on; whenever a fork evaluates, its first command says why on stderr (`cowshed: evaluating the workspace shell: …`).
-Every other command starts warm with only its own output. A `cd` or `export` inside one command never reaches the next.
-The warm shells belong to the workspace supervisor, a process the cowshed daemon (`cowshed gateway`) starts on the first
-command a workspace gets and keeps: every later `cowshed exec`, from any terminal or tool, runs in the same warm shells,
-and a job keeps running and capturing after the `cowshed` that started it exits. The supervisor retires after 30 minutes
-with no named session, no running job and, in a workspace, no Nx daemon (its Nx daemon stops five minutes after the
-workspace was last in use: no job or session, and no Nx run holding the task database), and
-`cowshed detach`/`cowshed rm` retire it at once; the next command starts another, which activates once. A
-`cowshed grant` or `revoke` takes effect for the very next command, which gets a shell activated under the new grants;
-jobs already running keep the access they started with.
+A fresh fork does not evaluate at all when its inputs are byte-for-byte its origin's: it inherits the origin's shell,
+moved to the fork's own paths, and reads only its own `.cowshed/env` and `.envrc-local`. Whenever a fork evaluates, its
+first command says why on stderr (`cowshed: evaluating the workspace shell: …`). Every other command starts warm with
+only its own output. A `cd` or `export` inside one command never reaches the next. The warm shells belong to the
+workspace supervisor, a process the cowshed daemon (`cowshed gateway`) starts on the first command a workspace gets and
+keeps: every later `cowshed exec`, from any terminal or tool, runs in the same warm shells, and a job keeps running and
+capturing after the `cowshed` that started it exits. The supervisor retires after 30 minutes with no named session, no
+running job and, in a workspace, no Nx daemon (its Nx daemon stops five minutes after the workspace was last in use: no
+job or session, and no Nx run holding the task database), and `cowshed detach`/`cowshed rm` retire it at once; the next
+command starts another, which activates once. A `cowshed grant` or `revoke` takes effect for the very next command,
+which gets a shell activated under the new grants; jobs already running keep the access they started with.
 
 Interrupting `cowshed` itself — Ctrl-C, a closed terminal, SIGTERM — while it still runs a command ends that command and
 every job it started and still runs: SIGTERM, then SIGKILL after a short grace. `cowshed` then dies by the same signal,

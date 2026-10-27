@@ -523,8 +523,7 @@ fn inheritor(
     )
     .expect(".envrc-local");
     workspace.envrc(envrc);
-    // The controller's marker: a clone's lineage names the workspace it was cloned from, which
-    // is what lets its supervisor give that origin's record a proof.
+    // The controller's marker: a clone's lineage names the workspace it was cloned from.
     let incarnation = uuid::Uuid::new_v4().simple().to_string();
     let lineage = match from {
         Some(from) => {
@@ -570,11 +569,10 @@ fn inherited_record(workspace: &Workspace) -> PathBuf {
         .join(".cowshed/shell-host/activation.json")
 }
 
-/// The two-root equivalence the inherited shell rests on (11_shell.md, "Inherited shells"). The
-/// origin evaluates; the first clone cannot adopt an uncertified record, evaluates, and its
-/// agreeing export certifies the origin's record; a later clone adopts it without evaluating
-/// and ends with exactly the environment its own evaluation gives, credentials and flag-glued
-/// paths included. A shell exporting a hash of `$PWD` never certifies, so its clones evaluate.
+/// The equivalence the inherited shell rests on (11_shell.md, "Inherited shells"). The origin
+/// evaluates; its first clone adopts the record it carries without evaluating, and a later
+/// clone ends with exactly the environment its own evaluation gives, credentials and
+/// flag-glued paths included.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_evaluation() {
@@ -596,17 +594,13 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
     let ran = run(&first.supervisor(false), sh("true")).await.ok();
     assert_eq!(
         first.activations(),
-        1,
-        "an uncertified record is never adopted"
-    );
-    assert!(
-        ran.stderr.contains("producer is not certified"),
-        "{}",
+        0,
+        "the first clone adopts its origin's record without evaluating: {}",
         ran.stderr
     );
 
     let probe = "env";
-    // Beside the first clone: certification covers clones under a parent a measured root has.
+    // Beside the first clone, as sibling sheds are.
     let adopter = inheritor(
         "inherit-adopter",
         41_520,
@@ -618,7 +612,7 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
     assert_eq!(
         adopter.activations(),
         0,
-        "the first clone certified the origin's record: {}",
+        "a later clone adopts it too: {}",
         adopted.stderr
     );
     let evaluator = inheritor("inherit-evaluator", 41_536, envrc, None, None);
@@ -645,44 +639,6 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
             .contains("evaluating the workspace shell: the inherited shell's inputs differ"),
         "{}",
         ran.stderr
-    );
-
-    // A value derived from a hash of the checkout path: the first clone's evaluation disagrees
-    // with the moved one, nothing certifies, and every later clone evaluates its own.
-    let hashed = "export PWD_HASH=\"$(printf %s \"$PWD\" | shasum -a 256)\"\n\
-                  watch_file bun.lock\nsource_env_if_exists .envrc-local\n";
-    let hashed_origin = inheritor("inherit-hash-origin", 41_568, hashed, None, None);
-    run(&hashed_origin.supervisor(false), sh("true")).await.ok();
-    let hashed_first = inheritor(
-        "inherit-hash-first",
-        41_584,
-        hashed,
-        Some(&hashed_origin),
-        None,
-    );
-    run(&hashed_first.supervisor(false), sh("true")).await.ok();
-    let hashed_later = inheritor(
-        "inherit-hash-later",
-        41_600,
-        hashed,
-        Some(&hashed_origin),
-        Some(&hashed_first),
-    );
-    let handle = hashed_later.supervisor(false);
-    let ran = run(&handle, sh("printf %s \"$PWD_HASH\"")).await.ok();
-    assert_eq!(hashed_later.activations(), 1, "{}", ran.stderr);
-    assert!(
-        ran.stderr.contains("producer is not certified"),
-        "{}",
-        ran.stderr
-    );
-    let own = run(&handle, sh("printf %s \"$PWD\" | shasum -a 256"))
-        .await
-        .ok();
-    assert_eq!(
-        ran.stdout,
-        own.stdout.trim_end(),
-        "the clone's hash is its own, not the origin's"
     );
 }
 

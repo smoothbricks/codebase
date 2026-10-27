@@ -42,7 +42,7 @@ when it cannot collect the host at all.
 **Inherited shells.** Every activation whose inputs stayed put while it ran (below) leaves its export in
 `.cowshed/shell-host/activation.json`, written by the supervisor, so the APFS clone carries it to every workspace forked
 from this one, and a fork of a fork carries it again. A host that starts with no live generation adopts that export
-instead of evaluating when four checks pass, and evaluates otherwise (the checkout the record was written in needs only
+instead of evaluating when three checks pass, and evaluates otherwise (the checkout the record was written in needs only
 the first two: nothing moves):
 
 - **The inputs are the same bytes.** The record keeps the activation's watch list, each input relative to the checkout
@@ -67,41 +67,22 @@ the first two: nothing moves):
   `-Wl,-rpath,/x/repo/lib`, never `/x/repo-worktrees` or `/w/x/repo`); devenv's `DEVENV_RUNTIME`, a hash of the dotfile
   path, is recomputed as devenv computes it. The check after the move is stricter than the move: a value in which an
   origin place still ends a component anywhere, or that holds a number inside the origin's port block, refuses adoption,
-  since a false refusal costs one evaluation and a false pass would hand the clone the origin's tree.
-- **The producer is certified.** No check of the values can see one derived from a hash of the checkout path (an
-  `.envrc` exporting a hash of `$PWD`) or from a fact cowshed does not publish, so a record moves only once its input
-  generation's producer has been measured at more than one root. A clone whose inherited record is uncertified for it
-  evaluates, as every clone used to; when its own export, for the same input bytes over an equivalent baseline, equals
-  the moved one variable for variable (withheld names by name), the supervisor writes its own record first, with the
-  proof — the roots measured so far plus its own — and then gives the origin's record the same proof. Any disagreement
-  leaves both uncertified, names the variable on the supervisor's stderr, and every later clone of that generation
-  evaluates; a hash of `$PWD` therefore never reaches a clone. Agreeing roots certify only what differs between them:
-  two sibling sheds agree on anything derived from their common parent directory or depth. So a clone adopts only when
-  its parent directory is the parent of a measured root; a clone elsewhere (a slot, a worktree, another parent) is
-  uncertified for that record, evaluates, and on agreement joins the proof. The cost is one evaluation per input
-  generation per parent, by its first clone there.
+  since a false refusal costs one evaluation and a false pass would hand the clone the origin's tree. Nothing else is
+  asked. A fork is its origin's exact clone — the same inputs, already installed — so the first clone under any parent
+  adopts, and no second checkout evaluates the same inputs to vouch for the move. What no check can see is a value
+  derived from the origin in a way the move does not name (an `.envrc` exporting a hash of `$PWD`, arithmetic on
+  anything that differs between checkouts beyond the places above): such a value is inherited as the origin computed it,
+  in every clone, until an input or the baseline changes. That is the accepted price of never evaluating a clone whose
+  inputs and baseline are already proven.
 
-  The origin's record therefore has two writers: its own supervisor, whenever it activates, and the supervisor of a
-  clone that certifies it. Both hold an exclusive lock on `.cowshed/shell-host/activation.lock` across what they read,
-  compare and write, so the proof is given only if the record is still the one the clone read (compared by its bytes'
-  SHA-256) and a newer record is never overwritten. The origin's own activation waits for that lock as long as it is
-  held; the clone tries it every 20 ms for at most 1 s (50 tries), so an origin supervisor that hangs holding it parks
-  no thread of the clone's, and a lock still busy then leaves the origin's record as it is and is reported, like an
-  unwritable origin. That second is a production bound on how long a clone keeps trying, not an ordering anything relies
-  on: the clone's own record is already written, nothing waits for the origin's proof, and no test contends for the
-  lock, so none races the bound. The origin's path comes from bytes in the clone's image, so it is a write target only
-  once the controller's markers agree: the origin's `workspaceIncarnation` must be in the clone's marker `lineage`, and
-  no link may redirect its `.cowshed/shell-host`. Anything else, an unwritable or retired origin included, leaves the
-  origin's record as it is and is reported; it never costs the clone its own record. When the origin is main, this is a
-  write into main's source image: one small copy-on-write extent per input generation, and it moves main's image mtime,
-  which the seed-freshness rule of 16_build_volumes.md reads.
+The record has one writer: the checkout's own supervisor, when it activates, in one atomic publish. No clone writes into
+its origin's image — when the origin is main, nothing moves main's image for a clone's sake — and a missing or stale
+source record is refreshed at the source (below), never repaired by a fork that found it so.
 
-  The two-root fixture (08_testing.md) runs this end to end, the `$PWD` hash included, and a devenv monorepo's export
-  was measured against a fresh evaluation of a fork (of its 71 variables, 51 equal as recorded, 16 equal after the move,
-  `DEVENV_RUNTIME` recomputed, `DIRENV_WATCHES` rebuilt, `COWSHED_RUNTIME_LINK` read from the tail, and
-  `DEVENV_TASK_FILE` dropped), the comparison a certification makes. Two agreeing roots are evidence about the producer,
-  not a proof for every third root: a value that varies only along a dimension no two measured roots differ in, other
-  than their parent, would still pass.
+The clone fixture (08_testing.md) runs this end to end, and a devenv monorepo's export was measured against a fresh
+evaluation of a fork (of its 71 variables, 51 equal as recorded, 16 equal after the move, `DEVENV_RUNTIME` recomputed,
+`DIRENV_WATCHES` rebuilt, `COWSHED_RUNTIME_LINK` read from the tail, and `DEVENV_TASK_FILE` dropped): the moved export
+is the origin's evaluation, relocated.
 
 Main's record stays current at its source: initial adoption activates main once through its own supervisor, including
 projects without Cargo, and every target-changing land refreshes the chosen target once after delivery

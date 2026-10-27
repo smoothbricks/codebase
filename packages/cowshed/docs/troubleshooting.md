@@ -34,12 +34,12 @@ step uses) is not on that list: add `watch_file <path>` to the `.envrc`, and edi
 directory a devenv module reads whole is never on it (devenv hands direnv only files): name it with `watch_dir <dir>`.
 
 **A fork's first command evaluated its shell.** The line `cowshed: evaluating the workspace shell: …` on its stderr says
-why it did not inherit its origin's: no record (the origin never finished a stable activation), the producer is not yet
-certified (this fork is the first since the inputs changed, and its evaluation certifies them for the next forks), the
-inputs' bytes differ, the baseline environment differs, a value still names the origin after the move, or the fork's own
-`.envrc-local` does not supply a credential the origin's shell had. If every fork says "not certified", the supervisor
-log names the variable whose value differs between checkouts beyond their paths — a hash of the checkout path, say — and
-that shell is evaluated per checkout by design. The evaluation is correct either way.
+why it did not inherit its origin's: no record (the origin never finished a stable activation), the inputs' bytes
+differ, the baseline environment differs, a value still names the origin after the move, or the fork's own
+`.envrc-local` does not supply a credential the origin's shell had. The evaluation is correct either way, and it leaves
+the fork's own record for the workspaces cloned from it. One derivation no check can see: a value computed from the
+checkout path itself, a hash of `$PWD` say, is inherited as the origin computed it, in every fork, until an input or the
+baseline environment changes.
 
 **`cowshed adopt` or `cowshed push` refused with exit 4 naming files.** The secrets gate found credential-shaped content
 (`.env*`, key files, known token prefixes, `.envrc` secret exports). For adopt: move each value into the gateway

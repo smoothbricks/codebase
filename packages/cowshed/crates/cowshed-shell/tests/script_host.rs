@@ -1474,20 +1474,17 @@ fn linux_refused_cgroup_placement_never_runs_the_command() {
 /// `.envrc-local` sets it. Returns the clone and the adoption request.
 fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>) {
     use cowshed_core::runtime::shell_host::{Inherited, SHELL_HOST_DIRECTORY};
-    use cowshed_core::runtime::shell_inherit::{
-        Certification, Origin, Placement, record_path, verify, write_record,
-    };
+    use cowshed_core::runtime::shell_inherit::{Placement, record_path, verify, write_record};
     use cowshed_core::runtime::shell_watch::{WatchEntry, certify};
 
     let origin = host.directory.join("origin");
-    let witness = host.directory.join("witness");
     let clone = host.directory.join("clone");
     let local = if tail_supplies_token {
         "export LOCAL_TOKEN=from-local\n"
     } else {
         "export LOCAL_OTHER=1\n"
     };
-    for root in [&origin, &witness, &clone] {
+    for root in [&origin, &clone] {
         std::fs::create_dir_all(root.join(SHELL_HOST_DIRECTORY)).unwrap();
         std::fs::write(root.join(".envrc"), "use devenv\n").unwrap();
         let name = root.file_name().unwrap().to_string_lossy().into_owned();
@@ -1497,34 +1494,6 @@ fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>
         )
         .unwrap();
         std::fs::write(root.join(".envrc-local"), local).unwrap();
-        // The controller's marker: the origin is main, the others its clones; a clone writes
-        // only an ancestor in its lineage.
-        let (role, workspace, incarnation, lineage) = match name.as_str() {
-            "origin" => ("main", "main", "a".repeat(32), "[]".to_owned()),
-            "witness" => (
-                "workspace",
-                "witness",
-                "b".repeat(32),
-                format!("[\"{}\"]", "a".repeat(32)),
-            ),
-            _ => (
-                "workspace",
-                "clone",
-                "c".repeat(32),
-                format!("[\"{}\"]", "a".repeat(32)),
-            ),
-        };
-        std::fs::write(
-            root.join(".cowshed/workspace.json"),
-            format!(
-                "{{\"version\":1,\"repoId\":\"owner/repo\",\"projectRoot\":\"/p\",\
-                 \"workspace\":\"{workspace}\",\"workspaceIncarnation\":\"{incarnation}\",\
-                 \"role\":\"{role}\",\"baseCommit\":\"0\",\"createdAt\":\"2026-01-01T00:00:00Z\",\
-                 \"forkedFrom\":null,\"createdTrace\":\"t\",\"lineage\":{lineage},\
-                 \"ownedLinksRevision\":1}}"
-            ),
-        )
-        .unwrap();
     }
     let baseline: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> = [
         ("PATH", std::env::var_os("PATH").expect("PATH")),
@@ -1533,53 +1502,39 @@ fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>
     .into_iter()
     .map(|(name, value)| (name.into(), value))
     .collect();
-    // Each checkout's own evaluation, as recorded: the origin's first, then a witness's, which
-    // certifies the producer at a second root before any clone may adopt.
-    let evaluate =
-        |root: &Path, inherited: Option<&cowshed_core::runtime::shell_inherit::Uncertified>| {
-            let entries: Vec<WatchEntry> = [".envrc", ".cowshed/env", ".envrc-local"]
-                .iter()
-                .map(|input| WatchEntry {
-                    path: root.join(input),
-                    exists: true,
-                })
-                .collect();
-            let (_, contents) = certify(entries.iter().map(|entry| entry.path.as_path())).unwrap();
-            let name = root.file_name().unwrap().to_string_lossy().into_owned();
-            let export = [
-                ("AT_ROOT", Some(format!("{}/tool", root.display()))),
-                ("LOCAL_TOKEN", Some("from-local".to_owned())),
-                ("COWSHED_RUNTIME_LINK", Some(format!("/tmp/cs-{name}"))),
-            ]
-            .into_iter()
-            .map(|(name, value)| (name.to_owned(), value))
+    // The origin's own evaluation, as recorded; the clone then carries its record.
+    let evaluate = |root: &Path| {
+        let entries: Vec<WatchEntry> = [".envrc", ".cowshed/env", ".envrc-local"]
+            .iter()
+            .map(|input| WatchEntry {
+                path: root.join(input),
+                exists: true,
+            })
             .collect();
-            write_record(
-                &Placement::of(root, &baseline),
-                &baseline,
-                &entries,
-                &contents,
-                &export,
-                inherited,
-            )
-            .unwrap()
-        };
-    evaluate(&origin, None);
+        let (_, contents) = certify(entries.iter().map(|entry| entry.path.as_path())).unwrap();
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        let export = [
+            ("AT_ROOT", Some(format!("{}/tool", root.display()))),
+            ("LOCAL_TOKEN", Some("from-local".to_owned())),
+            ("COWSHED_RUNTIME_LINK", Some(format!("/tmp/cs-{name}"))),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect();
+        write_record(
+            &Placement::of(root, &baseline),
+            &baseline,
+            &entries,
+            &contents,
+            &export,
+        )
+        .unwrap()
+    };
+    evaluate(&origin);
     let written = std::fs::read_to_string(record_path(&origin)).unwrap();
     assert!(
         !written.contains("from-local"),
         "the record holds no credential value"
-    );
-    std::fs::copy(record_path(&origin), record_path(&witness)).unwrap();
-    let uncertified = verify(&Placement::of(&witness, &baseline), &baseline)
-        .expect_err("an uncertified record of another checkout is never adopted")
-        .into_uncertified()
-        .expect("only for want of certification");
-    assert_eq!(
-        evaluate(&witness, Some(&uncertified)),
-        Certification::Certified {
-            origin: Origin::Updated
-        }
     );
     std::fs::copy(record_path(&origin), record_path(&clone)).unwrap();
     let verified =

@@ -400,17 +400,15 @@ unreaped through the exit observation. The setuid leader fixture uses its sleepi
 readiness, so the next `NOTE_EXEC` belongs to `top` rather than the shell trampoline.
 
 The inherited-shell equivalence fixture (`cowshed-shell` `shell_pool.rs`,
-`host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_evaluation`) is the two-root test 11_shell.md
-"Inherited shells" rests on. Workspaces of one tree at different roots, port blocks and runtime links: the origin
-evaluates; the first clone carries its record, may not adopt it uncertified, evaluates and, agreeing, certifies the
-origin's record; the adopter then carries that record and must serve its first command without evaluating; the evaluator
-has no record and evaluates. The adopter's and the evaluator's job environments, with each fixture's own root and
-runtime link replaced by fixed names and the per-job and per-port-block variables left out, must be equal, a credential
-from `.envrc-local` and `-I`/`-L`/`-Wl,-rpath` paths included, and the record must hold no credential value. A workspace
-with one changed input byte must evaluate and say why. A shell exporting a hash of `$PWD` must never certify: its later
-clone evaluates, says its producer is not certified, and holds its own hash. The fixture's shell is cowshed's own
-`.envrc`, not a repository's; the sandboxed lane covers the record, key, move, certification and host protocol
-(`shell_inherit.rs`, `script_host.rs`) without it.
+`host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_evaluation`) is the test 11_shell.md "Inherited
+shells" rests on. Workspaces of one tree at different roots, port blocks and runtime links: the origin evaluates; the
+first clone carries its record and must serve its first command without evaluating, and so must a later clone beside it
+(the adopter); the evaluator has no record and evaluates. The adopter's and the evaluator's job environments, with each
+fixture's own root and runtime link replaced by fixed names and the per-job and per-port-block variables left out, must
+be equal, a credential from `.envrc-local` and `-I`/`-L`/`-Wl,-rpath` paths included, and the record must hold no
+credential value. A workspace with one changed input byte must evaluate and say why. The fixture's shell is cowshed's
+own `.envrc`, not a repository's; the sandboxed lane covers the record, key, move and host protocol (`shell_inherit.rs`,
+`script_host.rs`) without it.
 
 Record-level inherited-shell fixtures keep namespace uniqueness separate from the values their oracle judges. They
 choose disjoint valid fixture port blocks deterministically from the canonical candidates, using the existing residue

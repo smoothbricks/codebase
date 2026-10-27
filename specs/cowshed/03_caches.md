@@ -203,11 +203,12 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   `/usr/bin/xcrun` bypass the shim and degrade to dev-local simulators — the safe default.
 - **Cargo reads its budget from its holder, never from a `cargo` of cowshed's** (2026-10-19, after the owner asked on
   2026-10-17 why cargo wrappers are needed, rather than configuring it properly). `cargo` in the managed environment is
-  the project toolchain's own; nothing installed answers to the name, and an install removes the `cargo` link earlier installs planted
-  (05_gateway.md, "The installed cowshed"). A job's jobserver reaches Cargo as the variables Cargo already reads,
-  exported by the supervisor that serves it: `CARGO_MAKEFLAGS` and `MAKEFLAGS` naming the job's make jobserver fifo, and
-  `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its count where unset (05_gateway.md, "Cargo reads its holder's
-  jobserver"). A Cargo no job started — a host shell's, rust-analyzer's — runs exactly as Cargo does unconfigured.
+  the project toolchain's own; nothing installed answers to the name, and an install removes the `cargo` link earlier
+  installs planted (05_gateway.md, "The installed cowshed"). A job's jobserver reaches Cargo as the variables Cargo
+  already reads, exported by the supervisor that serves it: `CARGO_MAKEFLAGS` and `MAKEFLAGS` naming the job's make
+  jobserver fifo, and `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its count where unset (05_gateway.md, "Cargo
+  reads its holder's jobserver"). A Cargo no job started — a host shell's, rust-analyzer's — runs exactly as Cargo does
+  unconfigured.
 - **Tool homes stay where the tool keeps them.** Every layer-3 cache lives at its tool's own default location in the
   host user's HOME, the one place the host's own tools already use without configuration, and cowshed shares that exact
   path into the sandbox of every project whose detector names the tool (15_capabilities.md). There is no cache volume,
@@ -308,10 +309,9 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   never answers for the clone, and no shared writable cache, however content-addressed, serves executable shell exports.
   What a clone does take is its origin's export carried in its own image (`.cowshed/shell-host/activation.json`,
   11_shell.md "Inherited shells"), and only within this boundary: keyed by the bytes of the activation's recorded inputs
-  and by its baseline environment, both recomputed at the clone; taken only once its producer is certified, two
-  checkouts' own evaluations of those bytes having agreed after the move; moved to the clone's root, runtime link and
-  dotfile, with any value still naming the origin refused; never carrying `DEVENV_TASK_FILE`, a shell hook, a variable
-  the secret convention names, or what `.cowshed/env` publishes per workspace, whose values the clone reads from its own
+  and by its baseline environment, both recomputed at the clone; moved to the clone's root, runtime link and dotfile,
+  with any value still naming the origin refused; never carrying `DEVENV_TASK_FILE`, a shell hook, a variable the secret
+  convention names, or what `.cowshed/env` publishes per workspace, whose values the clone reads from its own
   `.cowshed/env` and `.envrc-local`; recomputable by evaluation and deletable at any time, a lost record costing one
   evaluation. It is a byproduct of an activation that already ran, in the workspace it ran in, not a second store.
 

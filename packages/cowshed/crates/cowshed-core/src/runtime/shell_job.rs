@@ -1357,22 +1357,17 @@ impl HostActivator {
             shell_inherit::verify(&Placement::of(&mount, &baseline), &baseline)
         })
         .await;
-        // An uncertified record of another checkout is kept: this evaluation is the second root
-        // its producer needs, and agreeing with it certifies the records ([`Self::record`]).
-        let (miss, inherited) = match verified {
+        let miss = match verified {
             Ok(Ok(verified)) => match self
                 .adopt_host(host, owner, envrc_directory, &verified, &stderr)
                 .await
             {
                 Ok(Ok(())) => return HostActivation::Ready(Ok(verified.into_evidence())),
-                Ok(Err(refused)) => (refused, None),
+                Ok(Err(refused)) => refused,
                 Err(error) => return HostActivation::Broken(error),
             },
-            Ok(Err(miss)) => {
-                let reason = miss.to_string();
-                (reason, miss.into_uncertified())
-            }
-            Err(error) => (format!("the inheritance check failed: {error}"), None),
+            Ok(Err(miss)) => miss.to_string(),
+            Err(error) => format!("the inheritance check failed: {error}"),
         };
         report_on(
             &stderr,
@@ -1495,30 +1490,17 @@ impl HostActivator {
                     && evidence.stable()
                     && let Some(contents) = &evidence.contents
                 {
-                    self.record(
-                        evidence.entries.clone(),
-                        contents.clone(),
-                        export,
-                        inherited,
-                    )
-                    .await;
+                    self.record(evidence.entries.clone(), contents.clone(), export)
+                        .await;
                 }
                 HostActivation::Ready(evidence)
             }
         }
     }
 
-    /// Leave a stable evaluation's export in this checkout's host directory, certifying the
-    /// uncertified record this checkout inherited when its export agrees with it after the move.
-    /// A record that cannot be written only means a clone evaluates for itself; that, and a
-    /// producer that disagrees, is reported.
-    async fn record(
-        &self,
-        entries: Vec<WatchEntry>,
-        contents: Contents,
-        export: Vec<u8>,
-        inherited: Option<shell_inherit::Uncertified>,
-    ) {
+    /// Leave a stable evaluation's export in this checkout's host directory for its clones.
+    /// A record that cannot be written only means a clone evaluates for itself; that is reported.
+    async fn record(&self, entries: Vec<WatchEntry>, contents: Contents, export: Vec<u8>) {
         let mount = self.workspace_mount.clone();
         let baseline = self.keyed_baseline();
         let written = tokio::task::spawn_blocking(move || {
@@ -1532,49 +1514,18 @@ impl HostActivator {
                 &entries,
                 &contents,
                 &export,
-                inherited.as_ref(),
             )
             .map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| error.to_string())
         .and_then(|written| written);
-        use shell_inherit::{Certification, NotAttempted, Origin};
         let mount = self.workspace_mount.display();
-        match written {
-            Ok(Certification::NotAttempted(NotAttempted::NothingInherited)) => {}
-            Ok(Certification::NotAttempted(NotAttempted::KeyMoved)) => cowshed_os::eprintln!(
-                "cowshed: the workspace shell of {mount} could not check its origin's export: its \
-                 evaluation read other input bytes than the record keyed"
-            ),
-            Ok(Certification::NotAttempted(NotAttempted::BaselineMoved { name })) => {
-                cowshed_os::eprintln!(
-                    "cowshed: the workspace shell of {mount} could not check its origin's export: it \
-                 ran over another baseline environment than the record keyed ({name} differs)"
-                )
-            }
-            Ok(Certification::Certified { origin }) => cowshed_os::eprintln!(
-                "cowshed: the workspace shell of {mount} certified its origin's export at another root{}",
-                match origin {
-                    Origin::Updated => "; clones of either adopt it".to_owned(),
-                    Origin::Changed => {
-                        "; the origin's record had changed, so only clones of this one adopt it"
-                            .to_owned()
-                    }
-                    Origin::Refused(reason) => {
-                        format!("; the origin's record was not given the proof ({reason})")
-                    }
-                }
-            ),
-            Ok(Certification::Differs { name }) => cowshed_os::eprintln!(
-                "cowshed: the workspace shell of {mount} exports {name} differently from its origin's \
-                 after the move (a value derived from the checkout path, not a path in it); its \
-                 producer is not certified and clones evaluate their own"
-            ),
-            Err(reason) => cowshed_os::eprintln!(
+        if let Err(reason) = written {
+            cowshed_os::eprintln!(
                 "cowshed: the workspace shell's export is not left for clones of {mount} ({reason}); \
                  each clone evaluates its own"
-            ),
+            );
         }
     }
 
