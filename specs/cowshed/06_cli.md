@@ -714,14 +714,17 @@ verb attaches anyway.
 
 ### Resident workspaces
 
-`path <ws>` and `exec <ws> -- …` name one workspace, and when that workspace is mounted and its daemon-owned supervisor
-(11_shell.md) already serves its current authority — or a newer grant revision of it, published since the records were
-read — every fact they depend on is live. They are answered from that state without opening the project controller. The
-answer reads, fresh on every call, only the records that decide this workspace: the in-image marker at the invocation's
-Git root (which names the project), the named workspace's marker at its mount and its active sidecar, the project's
-policy (whose revision is part of the effective grant revision), slot records (which place the mount), and the
-lifecycle-intent journal. It asks the host two things: whether a filesystem is mounted exactly at the mount path, and
-which authority the supervisor's socket reports. `exec` also asks the gateway whether the workspace's session is
+`path <ws>` and `exec <ws> -- …` name one workspace. When that workspace is mounted, every fact `path` depends on is
+live, and `exec`'s are too once its daemon-owned supervisor (11_shell.md) already serves its current authority — or a
+newer grant revision of it, published since the records were read. They are answered from that state without opening the
+project controller. The answer reads, fresh on every call, only the records that decide this workspace: the in-image
+marker at the invocation's Git root (which names the project), the named workspace's marker at its mount and its active
+sidecar, slot records (which place the mount), and the lifecycle-intent journal; `exec` also reads the project's policy
+(whose revision is part of the effective grant revision). `path` asks the host one thing, whether a filesystem is
+mounted exactly at the mount path, and never asks the supervisor: it runs no work there, so it answers while a
+supervisor of another build drains its jobs (11_shell.md, "Draining a supervisor of another build"), as the controller
+does, whose attach of a mounted workspace attaches nothing (02_workspaces.md, "`cowshed attach` / `cowshed detach`").
+`exec` also asks which authority the supervisor's socket reports, and whether the gateway has the workspace's session
 installed at that revision — exactly the case in which the controller's pre-exec reconcile would install nothing for it.
 And `exec` admits a job only onto build state the controller's refresh (16_build_volumes.md, "Refresh") would leave as
 it is: every fixed link the checkout's build volume records is in place and reaches its volume directory (a declared
@@ -729,17 +732,17 @@ path nothing occupies needs none), and the tracked build inputs still have the f
 as the refresh computes it (one `git ls-files`, one more per declared pattern, and a hash of the tracked manifests). The
 job then runs through the supervisor's socket, relayed as the controller path relays it.
 
-Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached,
-unserved, served under an older grant or another incarnation, a gateway session not yet at the served revision, build
-inputs whose fingerprint moved (a `.cowshed.toml` `[build] state` edit, a new manifest), a checkout that links no build
-volume or whose volume records no fingerprint (only discovery says what build state it has), a build-state link a tool
-displaced or removed, a linked worktree, or unfinished lifecycle work on the workspace, on `main`, or on the project
-identity. Git discovery steered by `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_CEILING_DIRECTORIES` or
-`GIT_DISCOVERY_ACROSS_FILESYSTEM`, an omitted `<ws>`, `path --slot`, and `exec --session` always go through the
-controller. No directory is listed: a project with a thousand retired sessions answers as fast as one with a single
-workspace. Once the supervisor admits the job, every later failure is that job's and is reported, never retried through
-the controller. A discard an earlier refresh left pending is resumed by the next refresh that opens the controller, or
-by `cowshed gc`.
+Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached; for
+`exec`, one unserved, served under an older grant or another incarnation, a gateway session not yet at the served
+revision, build inputs whose fingerprint moved (a `.cowshed.toml` `[build] state` edit, a new manifest), a checkout that
+links no build volume or whose volume records no fingerprint (only discovery says what build state it has), a
+build-state link a tool displaced or removed, a linked worktree, or unfinished lifecycle work on the workspace, on
+`main`, or on the project identity. Git discovery steered by `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`,
+`GIT_CEILING_DIRECTORIES` or `GIT_DISCOVERY_ACROSS_FILESYSTEM`, an omitted `<ws>`, `path --slot`, and `exec --session`
+always go through the controller. No directory is listed: a project with a thousand retired sessions answers as fast as
+one with a single workspace. Once the supervisor admits the job, every later failure is that job's and is reported,
+never retried through the controller. A discard an earlier refresh left pending is resumed by the next refresh that
+opens the controller, or by `cowshed gc`.
 
 What a resident answer does not re-check is what the serving supervisor proved when it opened: the project binding
 against Git's remotes. The recorded binding changes only through cowshed verbs, which change the records read above; a

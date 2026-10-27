@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use arrow_ipc::reader::StreamReader;
 use cowshed_core::api::ControllerCommitment;
 use cowshed_core::api::dto::{
-    AdoptOptions, ForkOptions, LandMode, LandOptions, RemoveOptions, RevisionTarget,
+    AdoptOptions, AttachOptions, ForkOptions, LandMode, LandOptions, RemoveOptions, RevisionTarget,
 };
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
@@ -41,6 +41,9 @@ mod scratch_namespace;
 
 #[path = "../support/scratch_directory.rs"]
 mod scratch_directory;
+
+#[path = "../support/other_build_supervisor.rs"]
+mod other_build_supervisor;
 
 use scratch_directory::ScratchRoot;
 
@@ -3363,6 +3366,47 @@ async fn a_detached_fork_source_is_refused_with_its_attach_command() {
             .image()
             .exists(),
         "a refused fork leaves no destination image"
+    );
+    runtime.shutdown().await.expect("stop the runtime");
+}
+
+/// An attach of a mounted workspace attaches nothing (02_workspaces.md, "`cowshed attach` /
+/// `cowshed detach`"), so it asks the workspace's supervisor nothing: one of another build,
+/// still draining its jobs after an install, refuses the verbs that would run work there, never
+/// an attach, and never `path`, whose attach this is (11_shell.md "Draining a supervisor of
+/// another build").
+#[tokio::test]
+async fn an_attach_of_a_mounted_workspace_asks_no_supervisor() {
+    let fixture = Fixture::new("r-att");
+    let runtime = fixture.adopt().await;
+    fixture
+        .mint(&runtime, "a", ForkOptions::default())
+        .await
+        .expect("mint a");
+    runtime
+        .shutdown()
+        .await
+        .expect("stop the runtime serving a's supervisor");
+    let draining = other_build_supervisor::OtherBuild::serve(
+        &supervisor_socket::socket_path(fixture.storage.store(), &fixture.repo, &name("a")),
+        br#"{"ok":{"value":{"build":"another build","pid":1},"bytes":0}}"#,
+    );
+    let runtime = fixture
+        .open_naming("a")
+        .await
+        .expect("open a verb naming a");
+    fixture
+        .call(
+            &runtime,
+            "workspace.attach",
+            json!({ "repoId": fixture.repo, "workspace": "a", "options": AttachOptions::default() }),
+        )
+        .await
+        .expect("an attach of mounted a attaches nothing");
+    assert_eq!(
+        draining.hellos(),
+        0,
+        "the attach asked a's supervisor who it is"
     );
     runtime.shutdown().await.expect("stop the runtime");
 }

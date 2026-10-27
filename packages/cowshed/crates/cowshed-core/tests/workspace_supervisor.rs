@@ -44,6 +44,8 @@ use cowshed_core::runtime::supervisor::{
     WorkspaceSupervisorHandle,
 };
 
+#[path = "support/other_build_supervisor.rs"]
+mod other_build_supervisor;
 #[path = "support/publication.rs"]
 mod publication;
 #[path = "support/temp_parent.rs"]
@@ -4399,7 +4401,6 @@ async fn a_pending_wait_holds_up_no_other_call_to_a_served_supervisor() {
 /// been built before builds were named, none.
 #[tokio::test]
 async fn a_supervisor_of_another_build_is_refused_by_name() {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     for (answer, named) in [
         (
             &br#"{"ok":{"value":{"build":"another build","shape":"future"},"bytes":0}}"#[..],
@@ -4411,24 +4412,13 @@ async fn a_supervisor_of_another_build_is_refused_by_name() {
         ),
     ] {
         let path = SocketPath::new();
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut length = [0_u8; 4];
-            stream.read_exact(&mut length).await.unwrap();
-            let mut request = vec![0_u8; u32::from_be_bytes(length) as usize];
-            stream.read_exact(&mut request).await.unwrap();
-            stream
-                .write_all(&u32::try_from(answer.len()).unwrap().to_be_bytes())
-                .await
-                .unwrap();
-            stream.write_all(answer).await.unwrap();
-        });
+        let other = other_build_supervisor::OtherBuild::serve(&path, answer);
         let refused = cowshed_core::runtime::supervisor_socket::hello(&path)
             .await
             .unwrap_err();
         assert_eq!(refused.code, ErrorCode::Conflict);
         assert!(refused.message.contains(named), "{}", refused.message);
+        assert_eq!(other.hellos(), 1);
     }
 }
 

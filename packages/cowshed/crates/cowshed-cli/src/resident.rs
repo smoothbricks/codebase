@@ -1,12 +1,13 @@
 //! `path` and `exec` answered by a resident workspace (06_cli.md "Resident workspaces").
 //!
-//! A named workspace that is mounted, whose daemon-owned supervisor serves its current authority,
-//! and — for `exec` — whose gateway session is current and whose build state the controller's
-//! refresh would leave as it is, is answered here without opening the project controller:
-//! [`cowshed_core::resident::resolve`] reads its records and asks the live state, and the job
-//! runs through the supervisor's socket. Everything else — and every workspace the resolution
-//! declines — falls through to the controller untouched, so this path never answers what the
-//! controller would answer differently.
+//! A named workspace that is mounted, and whose records agree with its mount, is answered here
+//! for `path` without opening the project controller and without asking its supervisor anything
+//! ([`cowshed_core::resident::mounted`]): `path` runs no work there. `exec` also needs the
+//! workspace's daemon-owned supervisor to serve its current authority, its gateway session to be
+//! current and its build state to be what the controller's refresh would leave as it is
+//! ([`cowshed_core::resident::resolve`]), and the job runs through the supervisor's socket.
+//! Everything else — and every workspace the resolution declines — falls through to the
+//! controller untouched, so this path never answers what the controller would answer differently.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cowshed_core::api::{ExecRequest, JobId, JobInfo};
 use cowshed_core::metadata::WorkspaceName;
-use cowshed_core::resident::{Decline, HostProbe, Resident, resolve};
+use cowshed_core::resident::{Decline, HostProbe, Mounted, Resident, mounted, resolve};
 use cowshed_core::runtime::supervisor::WorkspaceSupervisorHandle;
 use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_core::storage::job_artifact::StreamKind;
@@ -53,15 +54,15 @@ where
             let Some(workspace) = args.workspace.as_deref() else {
                 return Ok(Answer::Declined(stdin));
             };
-            let Some(resident) = resident(cli, workspace).await? else {
+            let Some(mounted) = mounted_workspace(cli, workspace)? else {
                 return Ok(Answer::Declined(stdin));
             };
             emit_mount_path(
                 output,
                 json,
-                &resident.workspace,
-                &resident.mount,
-                resident.base_commit.as_ref(),
+                &mounted.workspace,
+                &mounted.mount,
+                mounted.base_commit.as_ref(),
             )?;
             Ok(Answer::Answered(success()))
         }
@@ -103,9 +104,24 @@ where
     }
 }
 
-/// The resident workspace `name` of the invocation's project, or `None` when the controller has
-/// to answer. The reason for a decline is a timing line, never output: the controller path gives
-/// the caller the same answer either way.
+/// The mounted workspace `name` of the invocation's project, as `path` answers it, or `None`
+/// when the controller has to answer.
+fn mounted_workspace(cli: &Cli, name: &str) -> Result<Option<Mounted>> {
+    let Ok(workspace) = WorkspaceName::new(name) else {
+        return Ok(None);
+    };
+    let start = invocation_start(cli.global.project.as_deref())?;
+    let _span = span("resident", "mounted");
+    Ok(answered(mounted(
+        Path::new(STORE_ROOT),
+        &start,
+        &workspace,
+        &HostProbe,
+    )))
+}
+
+/// The resident workspace `name` of the invocation's project, as `exec` runs in it, or `None`
+/// when the controller has to answer.
 async fn resident(cli: &Cli, name: &str) -> Result<Option<Resident>> {
     let Ok(workspace) = WorkspaceName::new(name) else {
         return Ok(None);
@@ -117,15 +133,16 @@ async fn resident(cli: &Cli, name: &str) -> Result<Option<Resident>> {
         resolve(Path::new(STORE_ROOT), &start, &workspace, &HostProbe),
     )
     .await;
-    Ok(match resolved {
-        Ok(resident) => Some(resident),
-        Err(decline) => {
-            declined(decline);
-            None
-        }
-    })
+    Ok(answered(resolved))
 }
 
+/// `resolved`, or `None` once the reason it declined is said.
+fn answered<T>(resolved: std::result::Result<T, Decline>) -> Option<T> {
+    resolved.map_err(declined).ok()
+}
+
+/// The reason for a decline is a timing line, never output: the controller path gives the caller
+/// the same answer either way.
 fn declined(decline: Decline) {
     event("resident", || format!("declined: {}", decline.reason()));
 }

@@ -1,19 +1,21 @@
 //! A workspace answered from the live state its daemon already holds (06_cli.md "Resident
 //! workspaces").
 //!
-//! `path` and `exec` name one workspace. When that workspace is mounted and its daemon-owned
-//! supervisor already serves the workspace's current authority, every fact the two verbs depend
-//! on is live: the mount, the supervisor's socket, and the authority each call names. Opening the
-//! project controller re-derives all of it — host storage validation, the inventory of every
-//! workspace in the project, the binding against Git's remotes — only to reach the same
-//! supervisor.
+//! `path` and `exec` name one workspace. When that workspace is mounted, every fact `path`
+//! answers is live: the mount and the records that place it. `exec` also needs the workspace's
+//! daemon-owned supervisor to serve its current authority, and then every fact it depends on is
+//! live as well: the supervisor's socket and the authority each call names. Opening the project
+//! controller re-derives all of it — host storage validation, the inventory of every workspace in
+//! the project, the binding against Git's remotes — only to reach the same mount and supervisor.
 //!
-//! [`resolve`] reads the records that decide this one workspace's answer, each fresh on every
-//! call and none kept, and declines whenever one of them disagrees with the live state. A
-//! declined verb opens the controller exactly as before, so the controller still answers every
-//! case that needs work done: a detached or unserved workspace, a grant the supervisor does not
-//! serve yet, unfinished lifecycle work. Nothing here lists a directory: a project with a
-//! thousand retired sessions costs what a project with one does.
+//! [`mounted`] reads the records that decide this one workspace's answer, each fresh on every
+//! call and none kept, and declines whenever one of them disagrees with the live state; it asks
+//! the supervisor nothing, so `path` answers while a supervisor of another build drains its jobs
+//! (11_shell.md "Draining a supervisor of another build"). [`resolve`] adds the supervisor's
+//! hello for `exec`. A declined verb opens the controller exactly as before, so the controller
+//! still answers every case that needs work done: a detached or unserved workspace, a grant the
+//! supervisor does not serve yet, unfinished lifecycle work. Nothing here lists a directory: a
+//! project with a thousand retired sessions costs what a project with one does.
 //!
 //! What a resident answer does not re-check is what the serving supervisor already proved when
 //! it started: the project binding it opened under. A binding changes only through a cowshed
@@ -154,6 +156,16 @@ fn mount_point_of(_path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// A mounted workspace whose records agree with its mount: everything `path` answers.
+pub struct Mounted {
+    pub repo_id: RepoId,
+    pub workspace: WorkspaceName,
+    pub mount: PathBuf,
+    pub base_commit: Option<GitOid>,
+    layout: StorageLayout,
+    metadata: DetachedWorkspaceMetadata,
+}
+
 /// A mounted workspace whose supervisor serves its current authority.
 pub struct Resident {
     pub repo_id: RepoId,
@@ -230,16 +242,17 @@ pub async fn follow(
     )))
 }
 
-/// Answer `workspace` of the project containing `start` from live state, or say why not.
+/// Answer `workspace` of the project containing `start` from its records and the mount table
+/// alone, or say why not. The supervisor is never asked: `path` runs no work there.
 ///
 /// Every read names its file; none lists a directory. `store_root` is the store the daemon
 /// serves (`STORE_ROOT` in production).
-pub async fn resolve(
+pub fn mounted(
     store_root: &Path,
     start: &Path,
     workspace: &WorkspaceName,
     probe: &impl LiveProbe,
-) -> Result<Resident, Decline> {
+) -> Result<Mounted, Decline> {
     if GIT_DISCOVERY_ENVIRONMENT
         .iter()
         .any(|name| std::env::var_os(name).is_some())
@@ -281,7 +294,7 @@ pub async fn resolve(
     }
     drop(journal_span);
 
-    let workspace_span = cowshed_os::timing::span("resident", "workspace");
+    let _workspace_span = cowshed_os::timing::span("resident", "workspace");
     let mount = layout
         .main_aware_workspace_mount(&origin.project_root, workspace)
         .map_err(|_| Decline::Records)?;
@@ -308,7 +321,34 @@ pub async fn resolve(
     let base_commit = Some(
         GitOid::new(metadata.info_snapshot.base_commit.clone()).map_err(|_| Decline::Records)?,
     );
+    Ok(Mounted {
+        repo_id: repo,
+        workspace: workspace.clone(),
+        mount,
+        base_commit,
+        layout,
+        metadata,
+    })
+}
 
+/// Answer `workspace` of the project containing `start` from live state, or say why not: the
+/// [`mounted`] workspace, once its supervisor serves the workspace's current authority.
+pub async fn resolve(
+    store_root: &Path,
+    start: &Path,
+    workspace: &WorkspaceName,
+    probe: &impl LiveProbe,
+) -> Result<Resident, Decline> {
+    let Mounted {
+        repo_id: repo,
+        mount,
+        base_commit,
+        layout,
+        metadata,
+        ..
+    } = mounted(store_root, start, workspace, probe)?;
+    let grants_span = cowshed_os::timing::span("resident", "grants");
+    let project = layout.project();
     // The revision a supervisor serves covers the project's standing grants too.
     let policy = crate::project_policy::ProjectPolicy::read(&project.policy)
         .map_err(|_| Decline::Records)?;
@@ -324,7 +364,7 @@ pub async fn resolve(
         lifecycle_revision: 0,
     };
     let build_volume = build_volume_grant(project, workspace, &mount, probe)?;
-    drop(workspace_span);
+    drop(grants_span);
     let socket = supervisor_socket::socket_path(store_root, &repo, workspace);
     let hello = cowshed_os::timing::spanned("resident", "hello", probe.hello(&socket))
         .await
@@ -661,6 +701,47 @@ mod tests {
         .expect("resident");
         assert_eq!(resident.mount, store.raven_mount);
         assert_eq!(resident.authority(), &serving);
+    }
+
+    /// The mount table, and a supervisor of another build at raven's socket, still draining its
+    /// jobs after an install: its hello names a build this one is not.
+    struct Draining {
+        mounted: Vec<PathBuf>,
+    }
+
+    impl LiveProbe for Draining {
+        fn mounted_at(&self, path: &Path) -> bool {
+            self.mounted.iter().any(|mounted| mounted == path)
+        }
+
+        async fn hello(&self, socket: &Path) -> crate::Result<Hello> {
+            Err(crate::CowshedError::conflict(
+                format!(
+                    "the workspace supervisor at {} is cowshed build another build; this cowshed \\
+                     is build this build",
+                    socket.display()
+                ),
+                "it admits nothing more and retires once its running jobs end",
+            ))
+        }
+    }
+
+    /// `path` runs no work in the workspace, so it asks its supervisor nothing: it answers the
+    /// mount while a supervisor of another build drains there (11_shell.md "Draining a supervisor
+    /// of another build"), and only `exec`, which would run work there, goes to the controller.
+    #[tokio::test]
+    async fn path_answers_while_a_supervisor_of_another_build_drains() {
+        let store = Store::new();
+        let draining = Draining {
+            mounted: vec![store.checkout.clone(), store.raven_mount.clone()],
+        };
+        let answered =
+            mounted(&store.store, &store.checkout, &raven(), &draining).expect("mounted");
+        assert_eq!(answered.mount, store.raven_mount);
+        let declined = resolve(&store.store, &store.checkout, &raven(), &draining)
+            .await
+            .err();
+        assert_eq!(declined, Some(Decline::Unserved));
     }
 
     /// The effective revision is the workspace's grant revision plus the project's: a

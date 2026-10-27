@@ -9862,8 +9862,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
         }
         // Every verb that runs work in a workspace arrives here, so this is where the
-        // git-worktree precondition belongs: exec, sessions, and `path`'s implicit attach all get
-        // the same refusal rather than a mount whose git is broken.
+        // git-worktree precondition belongs: exec, sessions, and an attach that mounts the workspace
+        // all get the same refusal rather than a mount whose git is broken.
         if is_git_worktree(&current.metadata) {
             self.require_main_mounted_for_git_worktree(name).await?;
             current = self.current(name).await?;
@@ -15059,10 +15059,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             )
             .await
             .map_err(native_storage_error)?;
+        // An attach of a mounted workspace attaches nothing (02_workspaces.md, "`cowshed attach` /
+        // `cowshed detach`"): its supervisor is for the verbs that run work there, and one of
+        // another build still draining its jobs refuses those, never an attach or a `path`.
         if was_detached {
             self.advance_gateway_revision(&current).await?;
+            self.ensure_supervisor(&workspace).await?;
         }
-        self.ensure_supervisor(&workspace).await?;
         // `observed` is where the caller actually stands, which is the only evidence that a
         // hand-moved checkout produces. Repairing against `descriptor.git_root` instead would
         // rewrite the record to the path the controller already believes, so a moved checkout
