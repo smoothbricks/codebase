@@ -60,7 +60,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, lstatSync, openSync, readdirSync, readFileSync, writeSync } from 'node:fs';
+import { closeSync, lstatSync, openSync, readdirSync, readFileSync, rmSync, writeSync } from 'node:fs';
 import { lstat, mkdir, readdir, readFile, realpath, rename, rmdir, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, normalize, relative, resolve, sep } from 'node:path';
@@ -743,13 +743,20 @@ interface Bytes {
   linkedBytes: number;
 }
 
-/** Allocated bytes under `path` (never following a link): those whose every link is inside it, and the rest. */
-async function measureTree(path: string): Promise<Bytes> {
-  const inodes = new Map<string, { seen: number; nlink: number; blocks: number }>();
-  const walk = async (entry: string): Promise<void> => {
-    const stats = await lstat(entry);
+/** A filesystem census counts names, not copies of an inode's allocation. */
+export interface CountedInode {
+  seen: number;
+  readonly nlink: number;
+  readonly blocks: number;
+}
+
+/** Census without following symlinks or dispatching per-file async work. */
+function censusTree(path: string): Map<string, CountedInode> {
+  const inodes = new Map<string, CountedInode>();
+  const walk = (entry: string): void => {
+    const stats = lstatSync(entry);
     if (stats.isDirectory()) {
-      for (const name of await readdir(entry)) await walk(join(entry, name));
+      for (const name of readdirSync(entry)) walk(join(entry, name));
       return;
     }
     const key = `${stats.dev}:${stats.ino}`;
@@ -757,43 +764,45 @@ async function measureTree(path: string): Promise<Bytes> {
     if (known === undefined) inodes.set(key, { seen: 1, nlink: stats.nlink, blocks: stats.blocks });
     else known.seen += 1;
   };
-  await walk(path);
+  walk(path);
+  return inodes;
+}
+
+/**
+ * Bytes that unlinking this census frees or leaves linked elsewhere, counting each inode once.
+ * Preview omits the pass ledger; after successful removal the shell supplies it, so a later
+ * generation's last link removes the inode from the pass's still-linked total.
+ */
+export function accountInodes(
+  inodes: ReadonlyMap<string, Readonly<CountedInode>>,
+  linked?: Map<string, number>,
+): Bytes {
   let bytes = 0;
   let linkedBytes = 0;
-  for (const inode of inodes.values()) {
-    if (inode.seen >= inode.nlink) bytes += inode.blocks * SECTOR;
-    else linkedBytes += inode.blocks * SECTOR;
+  for (const [key, inode] of inodes) {
+    const allocated = inode.blocks * SECTOR;
+    if (inode.seen >= inode.nlink) {
+      bytes += allocated;
+      linked?.delete(key);
+    } else {
+      linkedBytes += allocated;
+      linked?.set(key, allocated);
+    }
   }
   return { bytes, linkedBytes };
 }
 
-/**
- * Unlink everything under `path`, never following a link. `bytes` are freed by these unlinks;
- * `linkedBytes` were still linked elsewhere when unlinked. `linked` carries the inodes still
- * linked across the pass, so a later unlink that frees one takes it out again.
- */
-async function removeTree(path: string, linked: Map<string, number>): Promise<Bytes> {
-  let freed = 0;
-  let stillLinked = 0;
-  const remove = async (entry: string): Promise<void> => {
-    const stats = await lstat(entry);
-    if (stats.isDirectory()) {
-      for (const name of await readdir(entry)) await remove(join(entry, name));
-      await rmdir(entry);
-      return;
-    }
-    const key = `${stats.dev}:${stats.ino}`;
-    await unlink(entry);
-    if (stats.nlink === 1) {
-      freed += stats.blocks * SECTOR;
-      linked.delete(key);
-    } else {
-      linked.set(key, stats.blocks * SECTOR);
-      stillLinked += stats.blocks * SECTOR;
-    }
-  };
-  await remove(path);
-  return { bytes: freed, linkedBytes: stillLinked };
+/** One native recursive removal, outside the Cargo hold; publish accounting only after it succeeds. */
+function removeTree(path: string, expected: Moved, linked: Map<string, number>): Result<Bytes, 'unproven-trash-entry'> {
+  const inodes = censusTree(path);
+  // The census precedes the native removal: prove the manifest's root again immediately before deleting it.
+  const stats = lstatSync(path);
+  const identity = exactIdentity(stats.dev, stats.ino);
+  if (!stats.isDirectory() || identity?.dev !== expected.dev || identity?.ino !== expected.ino) {
+    return { ok: false, error: 'unproven-trash-entry' };
+  }
+  rmSync(path, { recursive: true });
+  return { ok: true, value: accountInodes(inodes, linked) };
 }
 
 // ---- Trash ----
@@ -895,7 +904,12 @@ async function purgeTrash(profile: string, linked: Map<string, number>): Promise
           });
           continue;
         }
-        reclaimed.push({ path: entry.from, ...(await removeTree(moved, linked)), reason: 'superseded-generation' });
+        const removed = removeTree(moved, entry, linked);
+        if (!removed.ok) {
+          retained.push({ path: moved, reason: removed.error, detail: `not the generation moved from ${entry.from}` });
+          continue;
+        }
+        reclaimed.push({ path: entry.from, ...removed.value, reason: 'superseded-generation' });
       }
       const left = await readdir(passDir);
       for (const name of left) {
@@ -1308,7 +1322,7 @@ async function pass(
     const reclaim: Reclaimable[] = [];
     for (const meta of selection.reclaim) {
       try {
-        reclaim.push({ path: meta.path, ...(await measureTree(meta.path)), reason: 'superseded-generation' });
+        reclaim.push({ path: meta.path, ...accountInodes(censusTree(meta.path)), reason: 'superseded-generation' });
       } catch (error) {
         return { ok: false, error: ioError('measure', meta.path, error) };
       }

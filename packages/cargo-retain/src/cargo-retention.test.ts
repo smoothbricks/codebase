@@ -5,6 +5,8 @@ import { chmod, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, symli
 import { dirname, join, relative } from 'node:path';
 import {
   AUTOMATIC_INTERVAL_MS,
+  accountInodes,
+  type CountedInode,
   describeRetention,
   exactIdentity,
   fingerprintIdentity,
@@ -66,6 +68,7 @@ import {
   snapshot,
   TRASH,
   toggleFeature,
+  validatePurgeWork,
   validateScanWork,
   withEnv,
   writeMid,
@@ -137,6 +140,83 @@ function exactIdentityRefusesWhatADoubleCannotHold(): void {
   check(exactIdentity(2 ** 60, 1), 'a device 2^53 or more').toBeUndefined();
   check(exactIdentity(1, Number.NaN), 'not a number').toBeUndefined();
 }
+
+it('accounts a removed inode census exactly, including hardlinks inside and across generations', () => {
+  const rows: {
+    readonly name: string;
+    readonly census: ReadonlyMap<string, CountedInode>;
+    readonly before: ReadonlyMap<string, number>;
+    readonly bytes: number;
+    readonly linkedBytes: number;
+    readonly after: ReadonlyMap<string, number>;
+  }[] = [
+    {
+      name: 'an empty census leaves another generation ledger entry alone',
+      census: new Map(),
+      before: new Map([['other', 8192]]),
+      bytes: 0,
+      linkedBytes: 0,
+      after: new Map([['other', 8192]]),
+    },
+    {
+      name: 'two names inside one generation free their inode once',
+      census: new Map([['local', { seen: 2, nlink: 2, blocks: 8 }]]),
+      before: new Map(),
+      bytes: 4096,
+      linkedBytes: 0,
+      after: new Map(),
+    },
+    {
+      name: 'two internal names and an outside alias leave one allocation linked',
+      census: new Map([['outside', { seen: 2, nlink: 3, blocks: 8 }]]),
+      before: new Map(),
+      bytes: 0,
+      linkedBytes: 4096,
+      after: new Map([['outside', 4096]]),
+    },
+    {
+      name: 'a shared inode stays linked after the first generation',
+      census: new Map([['shared', { seen: 1, nlink: 2, blocks: 8 }]]),
+      before: new Map([['other', 8192]]),
+      bytes: 0,
+      linkedBytes: 4096,
+      after: new Map([
+        ['other', 8192],
+        ['shared', 4096],
+      ]),
+    },
+    {
+      name: 'the later generation frees the shared inode and clears its ledger entry',
+      census: new Map([['shared', { seen: 1, nlink: 1, blocks: 8 }]]),
+      before: new Map([
+        ['other', 8192],
+        ['shared', 4096],
+      ]),
+      bytes: 4096,
+      linkedBytes: 0,
+      after: new Map([['other', 8192]]),
+    },
+    {
+      name: 'equal-sized distinct inodes both count, and sparse inodes add no bytes',
+      census: new Map([
+        ['one', { seen: 1, nlink: 1, blocks: 8 }],
+        ['two', { seen: 1, nlink: 1, blocks: 8 }],
+        ['sparse', { seen: 1, nlink: 2, blocks: 0 }],
+      ]),
+      before: new Map(),
+      bytes: 8192,
+      linkedBytes: 0,
+      after: new Map([['sparse', 0]]),
+    },
+  ];
+  for (const row of rows) {
+    const expected = { bytes: row.bytes, linkedBytes: row.linkedBytes };
+    expect(accountInodes(row.census), row.name).toEqual(expected);
+    const linked = new Map(row.before);
+    expect(accountInodes(row.census, linked), row.name).toEqual(expected);
+    expect(linked, row.name).toEqual(row.after);
+  }
+});
 
 /** What `JSON.parse` makes of `text` with every integer a bigint from its source digits: the oracle for the exact reader. */
 function oracleParse(text: string): unknown {
@@ -573,7 +653,44 @@ async function reclaimsOnlyProvenTrash(fx: Churn, superseded: readonly string[])
   await rename(mismatchedVictim, join(passDir, '1'));
   await put(join(passDir, '2', 'sentinel.txt'), 'unlisted\n');
   await put(join(trash, 'stray.txt'), 'stray\n');
-  const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+  const module = join(import.meta.dir, '..', 'dist', 'ts', 'cargo-retention.js');
+  const locksModule = join(import.meta.dir, '..', 'dist', 'ts', 'locks-node.js');
+  const source = lines(
+    'import fs from "node:fs";',
+    'import promises from "node:fs/promises";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'const nativeTrees = [], asyncFiles = [];',
+    'const originalRm = fs.rmSync;',
+    'fs.rmSync = function(path, ...args) { nativeTrees.push(String(path)); return originalRm.call(this, path, ...args); };',
+    'for (const name of ["lstat", "readdir", "unlink"]) {',
+    '  const original = promises[name];',
+    '  promises[name] = function(path, ...args) {',
+    '    const suffix = String(path).split("/.smoo-retention-trash/")[1];',
+    '    if (suffix !== undefined && suffix.split("/").length >= 3) asyncFiles.push(name + ":" + path);',
+    '    return original.call(this, path, ...args);',
+    '  };',
+    '}',
+    'syncBuiltinESMExports();',
+    // Install forwarding counters before loading the product; a static import runs too early.
+    `const { retainCargoWorkspace } = await import(${JSON.stringify(module)});`,
+    `const { nodeLocks } = await import(${JSON.stringify(locksModule)});`,
+    `const result = await retainCargoWorkspace(${JSON.stringify(fx.ws)}, { apply: true, now: ${future()} }, nodeLocks);`,
+    'if (!result.ok) throw new Error(JSON.stringify(result.error));',
+    'console.log(JSON.stringify({ report: result.value, nativeTrees, asyncFiles }));',
+  );
+  const child = spawnSync('node', ['--input-type=module', '-e', source], {
+    cwd: fx.ws,
+    env: { ...process.env },
+    encoding: 'utf8',
+  });
+  check(child.status, child.stderr).toBe(0);
+  const observed = validatePurgeWork(JSON.parse(child.stdout));
+  if (!observed.success) throw new Error(JSON.stringify(observed.errors));
+  const applied = planned(observed.data.report);
+  check(observed.data.nativeTrees).toContain(join(passDir, '0'));
+  check(observed.data.nativeTrees).toHaveLength(applied.reclaim.length);
+  check(new Set(observed.data.nativeTrees).size).toBe(observed.data.nativeTrees.length);
+  check(observed.data.asyncFiles).toEqual([]);
   check(reclaimPaths(applied)).toContain(provenVictim);
   check(await exists(join(passDir, '0'))).toBe(false);
   check(keepReason(applied, join(passDir, '1'))).toBe('unproven-trash-entry');

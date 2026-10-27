@@ -567,6 +567,13 @@ interface ScanWork {
   readonly children: readonly string[];
 }
 export const validateScanWork = typia.createValidateEquals<ScanWork>();
+
+interface PurgeWork {
+  readonly report: RetentionReport;
+  readonly nativeTrees: readonly string[];
+  readonly asyncFiles: readonly string[];
+}
+export const validatePurgeWork = typia.createValidateEquals<PurgeWork>();
 export type RetentionRun =
   | { readonly ok: true; readonly value: RetentionReport }
   | { readonly ok: false; readonly error: RetentionError };
