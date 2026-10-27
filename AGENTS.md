@@ -20,8 +20,9 @@ is the host-installed CLI of `packages/cowshed`.
   warm copy-on-write clone of `main` with its own branch and build volume. `cowshed fork <ws> --project <checkout>`
   creates one, `cowshed path <ws>` prints its directory, `cowshed rm <ws>` retires it; `<ws>` is the shed's name (its
   `.cowshed/workspace.json` `workspace` field, whose `role` says shed or main). **main** is the shared checkout
-  (`cowshed path main`); never edit code there. These commands run from the trusted host shell: a sandboxed worker's
-  cowshed CLI is refused at its first write, so it hands fork, land, `rm` and `gc` to its lead.
+  (`cowshed path main`); while agents work concurrently, none edits code there (rule 3). These commands run from the
+  trusted host shell: a sandboxed worker's cowshed CLI is refused at its first write, so it hands fork, land, `rm` and
+  `gc` to its lead.
 - **cowshed exec**: `cowshed exec <ws> -- <cmd>` runs a build, test or bench as a cowshed job: its class sets the
   priority the kernel schedules it at, and its own jobserver (`--want`, at most one token per core) bounds the compiler
   and test threads it starts. Work started outside it has neither, so it competes with every job unweighted and
@@ -63,10 +64,12 @@ is the host-installed CLI of `packages/cowshed`.
    shed, comes before local polish. Combine related fixes into one train, with one lander per project: a second land of
    the same project loses the cache hits the first just wrote. _Enforced by: the land turn and `tooling/land-host.sh`;
    `cowshed rm`'s containment refusal; review for the flags._
-3. **Edits.** When you are about to edit → work in your own shed (one owner per unit, no git worktrees, never a peer's
-   path until released). Use absolute workspace paths in filesystem and edit tools, so a session's cwd cannot redirect
-   an edit into `main`. Markdown that belongs to no code unit goes straight to `main` with the doc commit (see
-   Commands). _Enforced by: review._
+3. **Edits.** When you are about to edit while other agents work in the repository → work in your own shed (one owner
+   per unit, no git worktrees, never a peer's path until released). Use absolute workspace paths in filesystem and edit
+   tools, so a session's cwd cannot redirect an edit into `main`. Markdown that belongs to no code unit goes straight to
+   `main` with the doc commit (see Commands). Sheds isolate concurrent work: an agent working serially as the
+   repository's only editor edits and commits on `main` directly, and the next land gates its commits with the rest.
+   _Enforced by: review._
 4. **Diagnosis.** When you are about to rerun something, or to name a cause → read the evidence first: the run's LMAO
    spans, the Nx task history and prior verdicts (`.nx/workspace-data/bounded-exec/<task>/verdict.json`). Never decode
    traces by hand, and never pass `--skip-nx-cache`, not even to diagnose. Never answer a failure with a retry or an
