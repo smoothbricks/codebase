@@ -191,6 +191,47 @@ impl Repo {
             &["status", "--porcelain", "--untracked-files=all"],
         )
     }
+
+    /// Install a git that counts the binary's own git runs, then becomes the real git by
+    /// exec, so its pid, stdin and exit are the real one's. It stands in this test HOME's
+    /// installed binary directory, first on the bootstrap PATH a doc commit's pure
+    /// environment resolves git through, so every git the production runner spawns in
+    /// that environment is one line of the log and nothing behind git is reproduced.
+    fn counting_git(&self) {
+        let real = std::env::split_paths(&std::env::var_os("PATH").expect("the test PATH"))
+            .map(|directory| directory.join("git"))
+            .find(|candidate| {
+                candidate.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            })
+            .expect("git on the test PATH");
+        let directory = cowshed_core::host_dirs::installed_binary_directory(&self.home());
+        fs::create_dir_all(&directory).expect("create the installed binary directory");
+        let path = directory.join("git");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexec \"{}\" \"$@\"\n",
+                self.root.join("git-calls.log").display(),
+                real.display()
+            ),
+        )
+        .expect("write the counting git");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make the counting git executable");
+    }
+
+    /// How many of the counted git runs named the given verb (ls-files, ls-tree, ...).
+    fn git_calls(&self, verb: &str) -> usize {
+        let Ok(calls) = fs::read_to_string(self.root.join("git-calls.log")) else {
+            return 0;
+        };
+        calls
+            .lines()
+            .filter(|line| line.split_whitespace().any(|word| word == verb))
+            .count()
+    }
 }
 
 impl Drop for Repo {
@@ -214,6 +255,31 @@ fn git(directory: &Path, args: &[&str]) {
         "git {args:?} failed in {}",
         directory.display()
     );
+}
+
+fn git_fails(directory: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
+        .status_bounded()
+        .expect("run git");
+    assert!(
+        !status.success(),
+        "git {args:?} succeeded in {}",
+        directory.display()
+    );
+}
+
+fn git_bytes(directory: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
+        .output_bounded()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    output.stdout
 }
 
 fn stdout(directory: &Path, args: &[&str]) -> String {
@@ -524,4 +590,284 @@ fn a_repository_without_a_declared_doc_lane_is_refused() {
         "{}",
         said(&output)
     );
+}
+
+/// Keeping the paths main holds uncommitted reads the index once, however many it holds,
+/// and not at all when it holds none: one counted ls-files for 1, 8 and 64 held paths,
+/// none for zero, with the edit itself committing exactly as before.
+#[test]
+fn keeping_held_paths_reads_the_index_once_however_many_are_held() {
+    for held in [0usize, 1, 8, 64] {
+        let repo = Repo::new("paths = [\"*.md\"]\n");
+        for index in 0..held {
+            fs::write(repo.main().join(format!("held-{index}.md")), "held\n").expect("a held path");
+        }
+        repo.counting_git();
+        repo.icm("printf 'more\\n' >> \"$4/README.md\"\necho '{\"state\":\"OK\"}'");
+        let program = repo.file("edit.ts", "// the fake icm ignores its program\n");
+        let output = repo.run(&[
+            "doc-commit",
+            "-m",
+            "docs: icm",
+            "--icm",
+            program.to_str().unwrap(),
+        ]);
+        assert!(output.status.success(), "held={held}: {}", said(&output));
+        assert_eq!(
+            repo.git_calls("ls-files"),
+            usize::from(held > 0),
+            "held={held}: one index read, counted at the git the hold ran"
+        );
+        assert_eq!(
+            stdout(&repo.main(), &["show", "HEAD:README.md"]),
+            "# readme\nmore",
+            "held={held}"
+        );
+    }
+}
+
+/// Putting a refused edit back runs a constant number of git batches however many paths
+/// it restores: one HEAD classification, two index batches for the held paths (their
+/// current stages removed, their kept stages replayed), one restore of the paths HEAD
+/// has and one index removal of the paths it lacks -- the same counts for 1, 8 and 64
+/// paths of each kind, and no index work at all when none are held.
+#[test]
+fn putting_back_runs_a_constant_number_of_git_batches_however_many_paths_it_restores() {
+    for held in [0usize, 1, 8, 64] {
+        let repo = Repo::new("paths = [\"*.md\"]\n");
+        let main = repo.main();
+        for index in 0..held {
+            fs::write(main.join(format!("held-{index}.md")), "held base\n").expect("held base");
+            fs::write(main.join(format!("tracked-{index}.md")), "tracked\n").expect("tracked");
+        }
+        if held > 0 {
+            git(&main, &["add", "-A"]);
+            git(&main, &["commit", "-q", "-m", "held and tracked"]);
+        }
+        let before = repo.head();
+        for index in 0..held {
+            fs::write(main.join(format!("held-{index}.md")), "held edit\n").expect("held edit");
+        }
+        repo.counting_git();
+        let mut script = String::from("root=$4\n");
+        for index in 0..held {
+            script.push_str(&format!(
+                "printf 'clobbered\\n' > \"$root/held-{index}.md\"\n"
+            ));
+            script.push_str(&format!(
+                "printf 'more\\n' >> \"$root/tracked-{index}.md\"\n"
+            ));
+            script.push_str(&format!("printf 'new\\n' > \"$root/new-{index}.md\"\n"));
+        }
+        script.push_str(
+            "printf 'more\\n' >> \"$root/README.md\"\nprintf 'new\\n' > \"$root/created.md\"\nprintf 'x\\n' >> \"$root/src/lib.rs\"\necho '{\"state\":\"OK\"}'",
+        );
+        repo.icm(&script);
+        let program = repo.file("edit.ts", "// the fake icm ignores its program\n");
+        let output = repo.run(&[
+            "doc-commit",
+            "-m",
+            "docs: icm",
+            "--icm",
+            program.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "held={held}: {}",
+            said(&output)
+        );
+        assert_eq!(repo.head(), before, "held={held}");
+        assert_eq!(
+            repo.git_calls("ls-files"),
+            usize::from(held > 0),
+            "held={held}"
+        );
+        assert_eq!(repo.git_calls("ls-tree"), 1, "held={held}");
+        assert_eq!(
+            repo.git_calls("update-index"),
+            if held > 0 { 2 } else { 0 },
+            "held={held}"
+        );
+        assert_eq!(repo.git_calls("restore"), 1, "held={held}");
+        assert_eq!(repo.git_calls("rm"), 1, "held={held}");
+        for index in 0..held {
+            assert_eq!(
+                fs::read_to_string(main.join(format!("held-{index}.md"))).unwrap(),
+                "held edit\n",
+                "held={held} index={index}"
+            );
+            assert_eq!(
+                fs::read_to_string(main.join(format!("tracked-{index}.md"))).unwrap(),
+                "tracked\n",
+                "held={held} index={index}"
+            );
+            assert!(
+                !main.join(format!("new-{index}.md")).exists(),
+                "held={held} index={index}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(main.join("README.md")).unwrap(),
+            "# readme\n"
+        );
+        assert_eq!(
+            fs::read_to_string(main.join("src/lib.rs")).unwrap(),
+            "fn lib() {}\n"
+        );
+        assert!(!main.join("created.md").exists());
+        assert_eq!(repo.status().lines().count(), held, "held={held}");
+    }
+}
+
+/// A held path is put back with the very index stages it was kept with -- a merge
+/// conflict's three stages byte for byte, its conflict-marked entry bytes, and another
+/// held path's mode -- while the refused edit's tracked paths return to HEAD and its
+/// created path goes.
+#[test]
+fn a_refused_icm_program_puts_back_held_conflict_stages_bytes_and_mode() {
+    let repo = Repo::new("paths = [\"*.md\"]\n");
+    let main = repo.main();
+    fs::write(main.join("conflict.md"), "base\n").expect("write conflict.md");
+    fs::write(main.join("mode.md"), "mode\n").expect("write mode.md");
+    git(&main, &["add", "conflict.md", "mode.md"]);
+    git(&main, &["commit", "-q", "-m", "conflict and mode"]);
+    git(&main, &["checkout", "-q", "-b", "side"]);
+    fs::write(main.join("conflict.md"), "side\n").expect("side of the conflict");
+    git(&main, &["commit", "-q", "-am", "side"]);
+    git(&main, &["checkout", "-q", "main"]);
+    fs::write(main.join("conflict.md"), "main\n").expect("main of the conflict");
+    git(&main, &["commit", "-q", "-am", "main side"]);
+    git_fails(&main, &["merge", "-q", "side"]);
+    let before = repo.head();
+    let conflict_index = git_bytes(&main, &["ls-files", "-s", "-z", "--", "conflict.md"]);
+    assert_eq!(
+        conflict_index
+            .split(|&byte| byte == 0)
+            .filter(|record| !record.is_empty())
+            .count(),
+        3,
+        "the conflict is held at three stages"
+    );
+    let conflict_entry = fs::read(main.join("conflict.md")).expect("the conflicted entry");
+    fs::write(main.join("mode.md"), "held mode\n").expect("a held mode edit");
+    fs::set_permissions(main.join("mode.md"), fs::Permissions::from_mode(0o755))
+        .expect("a held mode");
+    let mode_index = git_bytes(&main, &["ls-files", "-s", "-z", "--", "mode.md"]);
+    repo.icm(
+        "root=$4\nprintf 'clobbered\\n' > \"$root/conflict.md\"\nprintf 'clobbered\\n' > \"$root/mode.md\"\nchmod 644 \"$root/mode.md\"\nprintf 'more\\n' >> \"$root/README.md\"\nprintf 'new\\n' > \"$root/new.md\"\nprintf 'x\\n' >> \"$root/src/lib.rs\"\necho '{\"state\":\"OK\"}'",
+    );
+    let program = repo.file("edit.ts", "// the fake icm ignores its program\n");
+    let output = repo.run(&[
+        "doc-commit",
+        "-m",
+        "docs: held",
+        "--icm",
+        program.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(4), "{}", said(&output));
+    assert_eq!(repo.head(), before);
+    assert_eq!(
+        git_bytes(&main, &["ls-files", "-s", "-z", "--", "conflict.md"]),
+        conflict_index,
+        "every conflict stage is back byte for byte"
+    );
+    assert_eq!(
+        fs::read(main.join("conflict.md")).unwrap(),
+        conflict_entry,
+        "the conflicted entry is back byte for byte"
+    );
+    assert_eq!(
+        git_bytes(&main, &["ls-files", "-s", "-z", "--", "mode.md"]),
+        mode_index
+    );
+    assert_eq!(
+        fs::read_to_string(main.join("mode.md")).unwrap(),
+        "held mode\n"
+    );
+    assert_eq!(
+        fs::metadata(main.join("mode.md"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "the held mode is back"
+    );
+    assert_eq!(
+        fs::read_to_string(main.join("README.md")).unwrap(),
+        "# readme\n"
+    );
+    assert_eq!(
+        fs::read_to_string(main.join("src/lib.rs")).unwrap(),
+        "fn lib() {}\n"
+    );
+    assert!(!main.join("new.md").exists());
+    assert_eq!(repo.status(), "UU conflict.md\n M mode.md");
+}
+
+/// A patch's rename is judged on both its sides, and a check that then refuses puts both
+/// back: the side HEAD has restored, the side it created removed.
+#[test]
+fn a_rename_whose_check_refuses_puts_back_both_sides() {
+    let repo = Repo::new("paths = [\"*.md\"]\ncheck = [\"sh\", \"-c\", \"exit 1\", \"check\"]\n");
+    let main = repo.main();
+    fs::write(main.join("old.md"), "old\n").expect("write old.md");
+    git(&main, &["add", "old.md"]);
+    git(&main, &["commit", "-q", "-m", "old"]);
+    let before = repo.head();
+    let patch = repo.file(
+        "rename.diff",
+        "diff --git a/old.md b/renamed.md\nsimilarity index 100%\nrename from old.md\nrename to renamed.md\n",
+    );
+    let output = repo.run(&[
+        "doc-commit",
+        "-m",
+        "docs: rename",
+        "--patch",
+        patch.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(4), "{}", said(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("declared doc check"),
+        "{}",
+        said(&output)
+    );
+    assert_eq!(repo.head(), before);
+    assert_eq!(fs::read_to_string(main.join("old.md")).unwrap(), "old\n");
+    assert!(!main.join("renamed.md").exists());
+    assert_eq!(repo.status(), "");
+}
+
+/// A HEAD that moved under the hold means the edit landed before the stop: the doc
+/// commit still refuses -- its own commit then has nothing left to commit -- but puts
+/// nothing back, so the landed edit stays exactly as HEAD has it.
+#[test]
+fn a_head_that_moved_under_the_hold_is_not_put_back() {
+    let repo = Repo::new(
+        "paths = [\"*.md\"]\ncheck = [\"sh\", \"-c\", \"git add README.md && git commit -q -m checked\", \"check\"]\n",
+    );
+    let before = repo.head();
+    repo.icm("printf 'more\\n' >> \"$4/README.md\"\necho '{\"state\":\"OK\"}'");
+    let program = repo.file("edit.ts", "// the fake icm ignores its program\n");
+    let output = repo.run(&[
+        "doc-commit",
+        "-m",
+        "docs: icm",
+        "--icm",
+        program.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(4), "{}", said(&output));
+    assert!(
+        said(&output).contains("nothing to put back"),
+        "{}",
+        said(&output)
+    );
+    assert_ne!(repo.head(), before);
+    assert_eq!(
+        stdout(&repo.main(), &["show", "HEAD:README.md"]),
+        "# readme\nmore",
+        "the landed edit stays committed"
+    );
+    assert_eq!(repo.status(), "");
 }

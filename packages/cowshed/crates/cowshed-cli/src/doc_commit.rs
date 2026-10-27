@@ -9,7 +9,7 @@
 //! tree and its ref turn; resolving main through the gateway held every doc commit for as long as
 //! the gateway hung (20 to 60+ minutes on 2026-10-22).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{Read as _, Write};
 use std::path::{Path, PathBuf};
@@ -252,12 +252,11 @@ impl Drop for Scratch {
 struct Basis {
     head: GitOid,
     before: Vec<StatusEntry>,
-    kept: Vec<Kept>,
+    kept: BTreeMap<String, Kept>,
 }
 
 /// A path main held uncommitted before the edit: its directory entry and its index entries.
 struct Kept {
-    path: String,
     entry: Entry,
     index: Vec<u8>,
 }
@@ -331,6 +330,83 @@ impl Entry {
     }
 }
 
+/// The paths a rollback puts back, split by how each is restored: a held path from its kept
+/// entry and index stages, another from HEAD when HEAD has it, and a path HEAD does not have
+/// by removing it.
+#[derive(Debug, Eq, PartialEq)]
+struct Rollback {
+    held: Vec<String>,
+    tracked: Vec<String>,
+    absent: Vec<String>,
+}
+
+/// Group one ls-files -s -z read by held path, each record byte for byte as git printed it,
+/// terminator included, so the kept mode, hash and every conflict stage replay through
+/// --index-info unchanged. The path starts after the first tab: a path may itself hold tabs,
+/// newlines or glob spellings. Only held paths are matched, by their bytes, so an unrelated
+/// record git lists -- its path not UTF-8, or holding no tab this reader knows -- is passed
+/// over, never a new refusal, and no hash spelling is guessed at.
+fn index_records_by_path(listed: &[u8], held: &BTreeSet<String>) -> BTreeMap<String, Vec<u8>> {
+    let by_bytes: BTreeMap<&[u8], &String> =
+        held.iter().map(|path| (path.as_bytes(), path)).collect();
+    let mut grouped: BTreeMap<String, Vec<u8>> =
+        held.iter().map(|path| (path.clone(), Vec::new())).collect();
+    for record in listed.split(|&byte| byte == 0) {
+        let Some(tab) = record.iter().position(|&byte| byte == b'\t') else {
+            continue;
+        };
+        let Some(path) = by_bytes.get(&record[tab + 1..]) else {
+            continue;
+        };
+        if let Some(records) = grouped.get_mut(*path) {
+            records.extend_from_slice(record);
+            records.push(0);
+        }
+    }
+    grouped
+}
+
+/// Split the paths a failed hold wrote by how each is put back, against one ls-tree -z read
+/// of HEAD: both sides of a rename land on their own side -- the side HEAD has tracked, the
+/// side it lacks absent -- and names HEAD lists that are not UTF-8 are matched by bytes and
+/// otherwise passed over.
+fn partition_rollback(
+    paths: &BTreeSet<String>,
+    kept: &BTreeMap<String, Kept>,
+    head: &[u8],
+) -> Rollback {
+    let in_head: BTreeSet<&[u8]> = head
+        .split(|&byte| byte == 0)
+        .filter(|name| !name.is_empty())
+        .collect();
+    let mut rollback = Rollback {
+        held: Vec::new(),
+        tracked: Vec::new(),
+        absent: Vec::new(),
+    };
+    for path in paths {
+        if kept.contains_key(path) {
+            rollback.held.push(path.clone());
+        } else if in_head.contains(path.as_bytes()) {
+            rollback.tracked.push(path.clone());
+        } else {
+            rollback.absent.push(path.clone());
+        }
+    }
+    rollback
+}
+
+/// Paths as one NUL-terminated stdin list, for the git reads and writes that take theirs so:
+/// no path travels on a command line, whatever it spells or however many there are.
+fn nul_paths(paths: &[String]) -> Vec<u8> {
+    let mut listed = Vec::new();
+    for path in paths {
+        listed.extend_from_slice(path.as_bytes());
+        listed.push(0);
+    }
+    listed
+}
+
 /// Everything the ref-turn hold runs with: every command it runs is bound to the turn.
 struct Hold<'a> {
     main: &'a Path,
@@ -359,7 +435,7 @@ impl Hold<'_> {
                     &Basis {
                         head,
                         before,
-                        kept: Vec::new(),
+                        kept: BTreeMap::new(),
                     },
                     &paths,
                     edit,
@@ -423,8 +499,7 @@ impl Hold<'_> {
                             "repair the program by its digest, then run cowshed doc-commit again",
                         ));
                     }
-                    let held: BTreeSet<String> =
-                        kept.iter().map(|kept| kept.path.clone()).collect();
+                    let held: BTreeSet<String> = kept.keys().cloned().collect();
                     declared::admit(written, &held, doc)
                         .map_err(|refusal| refused(self.main, &refusal))?
                 }
@@ -556,10 +631,17 @@ impl Hold<'_> {
             .collect()
     }
 
-    /// The directory entry and the index entries (`git ls-files -s -z`) of each path main held
+    /// The directory entry and the index entries (git ls-files -s -z) of each path main held
     /// uncommitted, kept so an edit that writes one is seen and that path put back exactly.
-    async fn keep(&mut self, held: &BTreeSet<String>) -> Result<Vec<Kept>> {
-        let mut kept = Vec::with_capacity(held.len());
+    /// The whole index is read once and grouped in memory, however many paths are held; none
+    /// held, it is not read at all.
+    async fn keep(&mut self, held: &BTreeSet<String>) -> Result<BTreeMap<String, Kept>> {
+        if held.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let listed = self.git(&["ls-files", "-s", "-z"], None).await?;
+        let mut index = index_records_by_path(&listed, held);
+        let mut kept = BTreeMap::new();
         for path in held {
             let file = self.main.join(path);
             let entry = Entry::read(&file).map_err(|error| {
@@ -568,135 +650,163 @@ impl Hold<'_> {
                     file.display()
                 ))
             })?;
-            let index = self
-                .git(
-                    &["--literal-pathspecs", "ls-files", "-s", "-z", "--", path],
-                    None,
-                )
-                .await?;
-            kept.push(Kept {
-                path: path.clone(),
-                entry,
-                index,
-            });
+            kept.insert(
+                path.clone(),
+                Kept {
+                    entry,
+                    index: index.remove(path).unwrap_or_default(),
+                },
+            );
         }
         Ok(kept)
     }
 
     /// What main's tree differs in from the read before the edit.
-    async fn written(&mut self, before: &[StatusEntry], kept: &[Kept]) -> Result<BTreeSet<String>> {
+    async fn written(
+        &mut self,
+        before: &[StatusEntry],
+        kept: &BTreeMap<String, Kept>,
+    ) -> Result<BTreeSet<String>> {
         let after = self.status().await?;
         let rewritten = kept
             .iter()
-            .filter(|kept| {
-                Entry::read(&self.main.join(&kept.path)).ok().as_ref() != Some(&kept.entry)
+            .filter(|(path, held)| {
+                Entry::read(&self.main.join(path)).ok().as_ref() != Some(&held.entry)
             })
-            .map(|kept| kept.path.clone())
+            .map(|(path, _held)| path.clone())
             .collect::<Vec<_>>();
         Ok(declared::written(before, &after, rewritten))
     }
 
-    /// Put `paths` back as HEAD has them, and each kept path back as it was; every path is
-    /// attempted and each one that fails is said.
+    /// Put paths back as HEAD has them, and each kept path back as it was. Each partition of
+    /// the rollback is one git batch however many paths it holds -- held index entries
+    /// removed and replayed, HEAD's paths restored, paths HEAD lacks removed from the
+    /// index -- with paths on NUL stdin, never a command line, and no batch runs empty.
+    /// A batch answers one exit for its whole partition, never which of its paths git
+    /// applied, so a failed batch names its whole attempted partition and skips only that
+    /// partition's dependent step (a held entry after its index, an unlink after its index
+    /// removal); every independent partition still runs. Filesystem entries and unlinks
+    /// stay per path, each failure named on its own.
     async fn put_back<W: Write + Send, E: Write + Send>(
         &mut self,
         paths: &BTreeSet<String>,
-        kept: &[Kept],
+        kept: &BTreeMap<String, Kept>,
         output: &mut Output<W, E>,
     ) -> Result<()> {
         let mut failed = Vec::new();
-        for path in paths {
-            if let Some(kept) = kept.iter().find(|kept| &kept.path == path) {
-                // The index first, then the entry: `--index-info` takes the kept stages back
-                // exactly, a conflict's included, after the path's current ones are removed.
-                let removed = self
-                    .git(
-                        &[
-                            "--literal-pathspecs",
-                            "update-index",
-                            "--force-remove",
-                            "--",
-                            path,
-                        ],
-                        None,
-                    )
-                    .await;
-                let indexed = match removed {
-                    Ok(_) if kept.index.is_empty() => Ok(Vec::new()),
-                    Ok(_) => {
-                        self.git(&["update-index", "-z", "--index-info"], Some(&kept.index))
-                            .await
-                    }
-                    Err(error) => Err(error),
-                };
-                let restored = indexed.is_ok() && kept.entry.restore(&self.main.join(path)).is_ok();
-                if !restored {
-                    failed.push(path.clone());
-                }
-                continue;
-            }
-            let tracked = self
+        // HEAD is classified once, before anything is put back, when a path no kept copy
+        // covers needs it. A read that fails knows nothing of HEAD, so splitting against
+        // an empty one lands every such path on the absent side: those are named and
+        // neither restored nor removed, while the held paths are still put back.
+        let unheld = paths.iter().any(|path| !kept.contains_key(path));
+        let classified = if unheld {
+            self.git(&["ls-tree", "-r", "-z", "--name-only", "HEAD"], None)
+                .await
+                .ok()
+        } else {
+            Some(Vec::new())
+        };
+        let mut rollback = partition_rollback(paths, kept, classified.as_deref().unwrap_or(&[]));
+        if classified.is_none() {
+            failed.append(&mut rollback.absent);
+        }
+
+        // The index first, then the entries: one removal of the held paths' current stages,
+        // one replay of their kept stages exactly, a conflict's included, then each kept
+        // entry back over its file.
+        if !rollback.held.is_empty() {
+            let removed = self
                 .git(
                     &[
                         "--literal-pathspecs",
-                        "ls-tree",
-                        "--name-only",
-                        "HEAD",
-                        "--",
-                        path,
+                        "update-index",
+                        "--force-remove",
+                        "-z",
+                        "--stdin",
                     ],
-                    None,
+                    Some(&nul_paths(&rollback.held)),
                 )
-                .await
-                .map(|listed| !listed.is_empty());
-            let tracked = match tracked {
-                Ok(tracked) => tracked,
-                // Not knowing whether HEAD has it, neither restore nor removal is safe: said.
-                Err(_) => {
-                    failed.push(path.clone());
-                    continue;
+                .await;
+            if removed.is_err() {
+                failed.extend(rollback.held.iter().cloned());
+            } else {
+                let mut replay = Vec::new();
+                for path in &rollback.held {
+                    if let Some(held) = kept.get(path) {
+                        replay.extend_from_slice(&held.index);
+                    }
                 }
-            };
-            let restored = if tracked {
-                self.git(
+                let indexed = replay.is_empty()
+                    || self
+                        .git(&["update-index", "-z", "--index-info"], Some(&replay))
+                        .await
+                        .is_ok();
+                for path in &rollback.held {
+                    let Some(held) = kept.get(path) else {
+                        continue;
+                    };
+                    // A failed replay names the paths it carried -- the ones a kept index
+                    // was replayed for; a held path with none was already put back in the
+                    // index by the removal, so its entry still goes back.
+                    let restored = (indexed || held.index.is_empty())
+                        && held.entry.restore(&self.main.join(path)).is_ok();
+                    if !restored {
+                        failed.push(path.clone());
+                    }
+                }
+            }
+        }
+
+        if !rollback.tracked.is_empty() {
+            let restored = self
+                .git(
                     &[
                         "--literal-pathspecs",
                         "restore",
                         "--source=HEAD",
                         "--staged",
                         "--worktree",
-                        "--",
-                        path,
+                        "--pathspec-from-file=-",
+                        "--pathspec-file-nul",
                     ],
-                    None,
+                    Some(&nul_paths(&rollback.tracked)),
                 )
-                .await
-                .is_ok()
-            } else {
-                self.git(
+                .await;
+            if restored.is_err() {
+                failed.extend(rollback.tracked.iter().cloned());
+            }
+        }
+
+        if !rollback.absent.is_empty() {
+            let removed = self
+                .git(
                     &[
                         "--literal-pathspecs",
                         "rm",
                         "-q",
                         "--cached",
                         "--ignore-unmatch",
-                        "--",
-                        path,
+                        "--pathspec-from-file=-",
+                        "--pathspec-file-nul",
                     ],
-                    None,
+                    Some(&nul_paths(&rollback.absent)),
                 )
-                .await
-                .is_ok()
-                    && match std::fs::remove_file(self.main.join(path)) {
-                        Ok(()) => true,
-                        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                .await;
+            if removed.is_err() {
+                failed.extend(rollback.absent.iter().cloned());
+            } else {
+                for path in &rollback.absent {
+                    match std::fs::remove_file(self.main.join(path)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => failed.push(path.clone()),
                     }
-            };
-            if !restored {
-                failed.push(path.clone());
+                }
             }
         }
+
         if !failed.is_empty() {
+            failed.sort();
             return Err(CowshedError::conflict(
                 format!(
                     "the edit did not commit, and main's tree still differs from HEAD at: {}",
@@ -966,5 +1076,155 @@ fn refused(main: &Path, refusal: &DocRefusal) -> CowshedError {
             ),
             "wait for that edit's owner to commit or put it back, then run cowshed doc-commit again",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn held(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    fn kept(paths: &[&str]) -> BTreeMap<String, Kept> {
+        paths
+            .iter()
+            .map(|path| {
+                (
+                    (*path).to_owned(),
+                    Kept {
+                        entry: Entry::Absent,
+                        index: Vec::new(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn terminated(record: &[u8]) -> Vec<u8> {
+        let mut bytes = record.to_vec();
+        bytes.push(0);
+        bytes
+    }
+
+    /// One whole-index read groups onto its held paths alone: every conflict stage in its
+    /// printed order, modes and hashes spelled as git printed them (their widths differ here
+    /// on purpose, since nothing parses them), paths holding a tab, a newline or glob
+    /// spellings matched after the first tab, and records for other paths -- one not UTF-8,
+    /// one holding no tab -- passed over rather than refused.
+    #[test]
+    fn index_records_group_losslessly_by_held_path() {
+        let stage1 = format!("100644 {} 1\tconflict.md", "a".repeat(40)).into_bytes();
+        let stage2 = format!("100644 {} 2\tconflict.md", "b".repeat(64)).into_bytes();
+        let stage3 = b"100755 abc123 3\tconflict.md".to_vec();
+        let tabbed = format!("100755 {} 0\twith\ttab.md", "c".repeat(40)).into_bytes();
+        let globbed = format!("120000 {} 0\tglob*\nline?.md", "d".repeat(40)).into_bytes();
+        let mut listed = Vec::new();
+        for record in [&stage1, &stage2, &stage3, &tabbed, &globbed] {
+            listed.extend_from_slice(&terminated(record));
+        }
+        listed.extend_from_slice(&terminated(b"100644 eeee 0\tother.md"));
+        let mut foreign = b"100644 ffff 0\t".to_vec();
+        foreign.extend_from_slice(&[0xff, 0xfe]);
+        foreign.extend_from_slice(b".md");
+        listed.extend_from_slice(&terminated(&foreign));
+        listed.extend_from_slice(&terminated(b"not a staged record"));
+
+        let paths = held(&[
+            "conflict.md",
+            "with\ttab.md",
+            "glob*\nline?.md",
+            "untracked.md",
+        ]);
+        let mut conflict = terminated(&stage1);
+        conflict.extend_from_slice(&terminated(&stage2));
+        conflict.extend_from_slice(&terminated(&stage3));
+        let expected: BTreeMap<String, Vec<u8>> = [
+            ("conflict.md".to_owned(), conflict),
+            ("with\ttab.md".to_owned(), terminated(&tabbed)),
+            ("glob*\nline?.md".to_owned(), terminated(&globbed)),
+            ("untracked.md".to_owned(), Vec::new()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(index_records_by_path(&listed, &paths), expected);
+
+        // Nothing held reads nothing onto any path, and an empty read keeps every held
+        // path's empty index, which is its untracked spelling.
+        assert_eq!(
+            index_records_by_path(&listed, &BTreeSet::new()),
+            BTreeMap::new()
+        );
+        assert_eq!(
+            index_records_by_path(b"", &paths),
+            paths
+                .iter()
+                .map(|path| (path.clone(), Vec::new()))
+                .collect::<BTreeMap<_, _>>()
+        );
+    }
+
+    /// The rollback split: held before HEAD, HEAD's own names matched by bytes (a glob
+    /// spelling literal, a name that is not UTF-8 passed over), both sides of a rename on
+    /// their own sides, and the empty splits.
+    #[test]
+    fn rollback_partitions_held_tracked_and_absent_paths() {
+        let paths = held(&[
+            "conflict.md",
+            "with\ttab.md",
+            "tracked.md",
+            "new.md",
+            "old-name.md",
+            "renamed.md",
+            "glob*\nline?.md",
+        ]);
+        let mut head = Vec::new();
+        for name in [
+            "tracked.md",
+            "old-name.md",
+            "glob*\nline?.md",
+            "with\ttab.md",
+        ] {
+            head.extend_from_slice(&terminated(name.as_bytes()));
+        }
+        head.extend_from_slice(&terminated(&[0xff, b'.', b'm', b'd']));
+        assert_eq!(
+            partition_rollback(&paths, &kept(&["conflict.md", "with\ttab.md"]), &head),
+            Rollback {
+                held: vec!["conflict.md".to_owned(), "with\ttab.md".to_owned()],
+                tracked: vec![
+                    "glob*\nline?.md".to_owned(),
+                    "old-name.md".to_owned(),
+                    "tracked.md".to_owned(),
+                ],
+                absent: vec!["new.md".to_owned(), "renamed.md".to_owned()],
+            }
+        );
+        assert_eq!(
+            partition_rollback(&BTreeSet::new(), &kept(&[]), b""),
+            Rollback {
+                held: Vec::new(),
+                tracked: Vec::new(),
+                absent: Vec::new(),
+            }
+        );
+        assert_eq!(
+            partition_rollback(&paths, &kept(&[]), b""),
+            Rollback {
+                held: Vec::new(),
+                tracked: Vec::new(),
+                absent: paths.iter().cloned().collect(),
+            }
+        );
+    }
+
+    #[test]
+    fn nul_paths_terminates_each_path() {
+        assert_eq!(nul_paths(&[]), Vec::<u8>::new());
+        assert_eq!(
+            nul_paths(&["a.md".to_owned(), "b\tc.md".to_owned()]),
+            b"a.md\0b\tc.md\0".to_vec()
+        );
     }
 }

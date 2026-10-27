@@ -1376,10 +1376,16 @@ it has ended:
 
 Whatever stops the hold short of the commit puts every path the edit or the check wrote back: a path `HEAD` has is
 restored in the index and the tree, a path it created goes, a held path gets its copied bytes back, and the refusal
-exits 4; bad usage is exit 2. A `HEAD` that moved means the commit landed before the stop, and nothing is put back. A
-doc commit that lands while a land's gate runs is a commit main gained, which that land's step 5 rebases onto and
-re-gates: a document some gate task hashes is gated by the next land, visibly, never here. The report is
-`{commit, paths}`, bare `commit` on stdout without `--json`.
+exits 4; bad usage is exit 2. A `HEAD` that moved means the commit landed before the stop, and nothing is put back. The
+index stages a held path is put back with are its own from before the edit, taken in one index read and grouped in
+memory by path; putting back reads `HEAD`'s tree once when a path needs it and runs one git batch per restoration kind
+with its paths on NUL stdin, a held path's copied bytes going back only after its index stages. One batch answers one
+exit, which cannot say which of its paths git applied: a failed batch therefore names its whole attempted partition and
+skips only that partition's dependent step, while every other partition still runs; a `HEAD` tree that cannot be read
+names the paths it would have classified, and the held paths are still put back. A doc commit that lands while a land's
+gate runs is a commit main gained, which that land's step 5 rebases onto and re-gates: a document some gate task hashes
+is gated by the next land, visibly, never here. The report is `{commit, paths}`, bare `commit` on stdout without
+`--json`.
 
 ### Lanes: `fork` and `--into`
 
