@@ -300,19 +300,34 @@ interface LinkedPluginCheckout {
   readonly plugin: string;
   readonly entry: string;
   readonly lock: string;
+  /** A file in the package that its `files` negates: npm does not publish it, so no change to it is the plugin's. */
+  readonly unpublished: string;
 }
 
-/** A developer link's target: the plugin is a package of another checkout, which has its own lockfile. */
+/** A developer link's target: the plugin is a package of another checkout, which has its own lockfile and installs
+ * the npm-packlist the daemon reads the package's published files with. */
 async function linkedPluginCheckout(root: string, name: string): Promise<LinkedPluginCheckout> {
   const plugin = join(root, name, 'plugin');
   await mkdir(join(plugin, 'dist'), { recursive: true });
   await writeFile(join(root, name, 'bun.lock'), 'checkout lock one\n');
+  await symlink(join(repositoryRoot, 'node_modules'), join(root, name, 'node_modules'), 'dir');
   await writeFile(
     join(plugin, 'package.json'),
-    JSON.stringify({ name: 'linked-plugin', version: '1.0.0', main: 'dist/index.js', files: ['dist'] }),
+    JSON.stringify({
+      name: 'linked-plugin',
+      version: '1.0.0',
+      main: 'dist/index.js',
+      files: ['dist', '!dist/**/*.test.js'],
+    }),
   );
   await writeFile(join(plugin, 'dist', 'index.js'), pluginInference('one'));
-  return { plugin, entry: join(plugin, 'dist', 'index.js'), lock: join(root, name, 'bun.lock') };
+  await writeFile(join(plugin, 'dist', 'index.test.js'), '// a test of the plugin, never published\n');
+  return {
+    plugin,
+    entry: join(plugin, 'dist', 'index.js'),
+    lock: join(root, name, 'bun.lock'),
+    unpublished: join(plugin, 'dist', 'index.test.js'),
+  };
 }
 
 async function processEntry(pid: number): Promise<ProcessEntry> {
@@ -1060,7 +1075,7 @@ it('stops a daemon once the workspace nx link points at a different version, and
   );
 });
 
-it('restarts a daemon once a plugin linked from outside the workspace changes its bytes, in place or by a moved link, and only then', async () => {
+it('restarts a daemon once a file a linked plugin publishes changes its bytes, in place or by a moved link, and only then', async () => {
   await withNxFixture(
     'nx-daemon-validity-plugin-',
     async ({ root, socketDirectory, workspace }) => {
@@ -1097,6 +1112,9 @@ it('restarts a daemon once a plugin linked from outside the workspace changes it
       let daemon = await startDaemon(workspace, env);
       await writeFile(first.entry, pluginInference('one'));
       await serves(daemon, 'a same-bytes rewrite of the linked plugin');
+      // npm reads `files` with its negations: a file the package does not publish is not the plugin's to judge.
+      await writeFile(first.unpublished, '// the test changed\n');
+      await serves(daemon, 'a change to a file the linked plugin does not publish');
       await relink(copy.plugin);
       await serves(daemon, 'the link moving to a copy with the same bytes');
       await writeFile(copy.entry, pluginInference('two'));

@@ -352,14 +352,18 @@ A plugin `nx.json` names whose package resolves outside the workspace, a develop
 behind that link with no workspace lockfile change. The daemon then kept serving the graph the old plugin code inferred,
 so every task it hashed afterwards was keyed on a project configuration no fresh process computes: a consumer's land
 gate keyed `cargo-lint-cross` on the configuration this plugin inferred before a mid-gate land, and the push that
-followed missed. The same baseline captures, before watch/scan, every file such a plugin's manifest publishes (`files`,
-negations ignored; the whole package when the list is absent or a glob) and the lockfiles of the nearest directory above
-it that holds one, keyed by plugin and package-relative path. A request resolves each plugin's link, stats the files
-already known and re-hashes only one whose stat moved; a moved link, and at most once per safety interval anyway, takes
-the full census, which finds a file added beside them. Only changed bytes restart the daemon (`LINKED_PLUGIN_CHANGED`),
-so a rebuild that rewrites identical files, or a link moved to a copy with the same bytes, keeps it. A plugin package
-installed inside the workspace changes only with its lockfile and is not watched this way. A local plugin — one whose
-entry resolves to source inside the checkout, outside `node_modules` — reloads its worker instead of the daemon:
+followed missed. The same baseline captures, before watch/scan, every file npm would publish of such a plugin and the
+lockfiles of the nearest directory above it that holds one, keyed by plugin and package-relative path. npm's own reading
+decides what is published: npm-packlist, resolved from that checkout, reads `files` with its negations and globs as
+`npm pack` does, so a test the package keeps beside its sources but does not publish never restarts a consumer's daemon.
+A package whose manifest does not parse, or whose checkout installs no npm-packlist, is judged whole, and the daemon log
+says so once. A request resolves each plugin's link, stats the files already known at the link's current target and
+re-hashes only one whose stat moved; a moved link, and at most once per safety interval anyway, starts the full census
+in the background, which finds a file added beside them and restarts the daemon when a file changed. Only changed bytes
+restart the daemon (`LINKED_PLUGIN_CHANGED`), so a rebuild that rewrites identical files, or a link moved to a copy with
+the same bytes, keeps it. A plugin package installed inside the workspace changes only with its lockfile and is not
+watched this way. A local plugin — one whose entry resolves to source inside the checkout, outside `node_modules` —
+reloads its worker instead of the daemon:
 
 A local plugin is always loaded in a plugin worker, even under `NX_ISOLATE_PLUGINS=false`, because a module loaded into
 the daemon's own process cannot be evicted: purging `require.cache` does not unload an ESM module, so an in-process

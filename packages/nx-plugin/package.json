@@ -386,6 +386,8 @@
     "generators.json",
     "executors.json",
     "!**/*.tsbuildinfo",
+    "!src/**/*.test.ts",
+    "!src/**/__tests__",
     "managed"
   ],
   "license": "MIT",

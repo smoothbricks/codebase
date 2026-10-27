@@ -30,6 +30,7 @@
     "eslint-stdout": "workspace:*",
     "jiti": "^2.7.0",
     "mitata": "^1.0.34",
+    "npm-packlist": "11.3.0",
     "nx": "23.2.1",
     "prettier": "^3.9.8",
     "tslib": "^2.8.1",

@@ -1470,7 +1470,7 @@ index c2a2f8f70fe71940e47c97931c5925bac1fbd480..00774360849ccb5f0ed64ba4cf6d572d
          // Bump generation synchronously so any in-flight compute fails its
 diff --git a/dist/src/daemon/server/restart-checks.d.ts b/dist/src/daemon/server/restart-checks.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..3c6c7182b7f5cf29f8f6912e000d46115cc11165
+index 0000000000000000000000000000000000000000..5a83ab16c263a4563b5e8c7452f254ded8061d91
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.d.ts
 @@ -0,0 +1,12 @@
@@ -1479,7 +1479,7 @@ index 0000000000000000000000000000000000000000..3c6c7182b7f5cf29f8f6912e000d4611
 +export declare const DAEMON_VALIDITY_SAFETY_INTERVAL_MS = 5000;
 +export declare const relativeServerProcess: string;
 +export declare function registerDaemonForRestartChecks(server: Server, sockets: Iterable<Socket>, socketPath: string): void;
-+export declare function recordInstallationBaseline(): void;
++export declare function recordInstallationBaseline(): Promise<void>;
 +export declare function restartDaemonIfLockFilesChanged(paths: string[]): boolean;
 +export declare function stopDaemonIfReplaced(events: WatchEvent[]): boolean;
 +export declare function stopDaemonIfOutdated(): boolean;
@@ -1488,10 +1488,10 @@ index 0000000000000000000000000000000000000000..3c6c7182b7f5cf29f8f6912e000d4611
 +export declare function stopDaemonForStoppedWatcher(reason: string): void;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db33149567e
+index 0000000000000000000000000000000000000000..0c065105dff1ed0847e28672661b1792f80cea29
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.js
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,391 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
 +exports.relativeServerProcess = exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS = void 0;
@@ -1543,11 +1543,11 @@ index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db3
 +}
 +// The startup baseline of everything a restart judges by bytes: the root
 +// lockfiles and the linked plugins below.
-+function recordInstallationBaseline() {
++async function recordInstallationBaseline() {
 +    lockFileHash = hashLockFiles();
 +    const roots = linkedPluginRoots() ?? [];
 +    linkedPluginRootKey = JSON.stringify(roots);
-+    linkedPluginFiles = hashCensus(linkedPluginCensus(roots), new Map());
++    linkedPluginFiles = hashCensus(await linkedPluginCensus(roots), new Map());
 +    linkedPluginCensusAt = Date.now();
 +}
 +function lockFileHashChanged() {
@@ -1564,18 +1564,23 @@ index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db3
 +// developer link into another checkout) changes behind that link with no
 +// lockfile change here. The daemon kept serving the graph the old plugin code
 +// inferred, so every task hashed after the change was keyed on a configuration
-+// no fresh process computes. Its published files and the lockfiles of the
-+// checkout it lives in are judged like the root lockfiles: a file whose stat
-+// moved is hashed again, and only changed bytes restart the daemon. Files are
-+// keyed by plugin and package-relative path, so a link moved to a copy with the
-+// same bytes keeps the daemon. A request resolves each link and stats the files
-+// already known; a moved link, and at most once per safety interval anyway, takes
-+// the full census, which finds a file added beside them. A package inside the
++// no fresh process computes. The files npm would publish of it — its `files`,
++// negations and globs as `npm pack` reads them, from npm-packlist resolved in
++// the checkout it lives in — and that checkout's lockfiles are judged like the
++// root lockfiles: a file whose stat moved is hashed again, and only changed
++// bytes restart the daemon. Files are keyed by plugin and package-relative
++// path, so a link moved to a copy with the same bytes keeps the daemon. A
++// request resolves each link and stats the files already known at the link's
++// current target; a moved link, and at most once per safety interval anyway,
++// starts the full census in the background, which finds a file added beside
++// them and restarts the daemon when one changed. A package inside the
 +// workspace changes only with its lockfile.
 +let linkedPluginRootKey;
 +let linkedPluginFiles;
 +let linkedPluginCensusAt = 0;
-+const PACKAGE_GLOB = /[*?[{]/;
++let linkedPluginCensusRunning = false;
++const linkedPluginCheckouts = new Map();
++const linkedPluginsWithoutPacklist = new Set();
 +function pluginSpecifiers() {
 +    let plugins;
 +    try {
@@ -1635,30 +1640,65 @@ index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db3
 +        census.set(`${prefix}${(0, path_1.relative)(base, path)}`, { path, stat: statKey(stat) });
 +    }
 +}
-+// Every file each linked plugin publishes and its checkout's lockfiles.
-+function linkedPluginCensus(roots) {
++// The checkout a linked package lives in: the nearest directory above it that
++// holds a lockfile, or the file system's root.
++function checkoutOf(root) {
++    let checkout = linkedPluginCheckouts.get(root);
++    if (checkout !== undefined) return checkout;
++    for (checkout = root; ; checkout = (0, path_1.dirname)(checkout)) {
++        const parent = (0, path_1.dirname)(checkout);
++        if (parent === checkout || LOCK_FILE_NAMES.some((lock) => (0, fs_1.existsSync)((0, path_1.join)(checkout, lock)))) break;
++    }
++    linkedPluginCheckouts.set(root, checkout);
++    return checkout;
++}
++// npm's own reading of what a package publishes (npm-packlist, as `npm pack`
++// and `npm publish` read it), from the checkout that publishes the package;
++// null when that checkout has none.
++function npmPacklist(checkout) {
++    let resolved;
++    try {
++        resolved = require.resolve('npm-packlist', { paths: [checkout] });
++    }
++    catch (error) {
++        if (error.code === 'MODULE_NOT_FOUND') return null;
++        throw error;
++    }
++    return require(resolved);
++}
++// Every file each linked plugin publishes and its checkout's lockfiles. A
++// package whose manifest does not parse, or whose checkout has no npm-packlist
++// to read it, is judged whole.
++async function linkedPluginCensus(roots) {
 +    const census = new Map();
 +    for (const [name, root] of roots) {
 +        const manifest = (0, path_1.join)(root, 'package.json');
 +        addFiles(census, `${name}\0`, root, manifest);
-+        // A manifest with no plain `files` list (absent, a glob, or bytes that do
-+        // not parse, which the census holds too) publishes the whole package.
-+        let files;
++        const checkout = checkoutOf(root);
++        let packageJson;
 +        try {
-+            files = JSON.parse((0, fs_1.readFileSync)(manifest, 'utf8')).files;
++            packageJson = JSON.parse((0, fs_1.readFileSync)(manifest, 'utf8'));
 +        }
 +        catch {
-+            files = undefined;
++            packageJson = undefined;
 +        }
-+        const listed = Array.isArray(files) ? files.filter((file) => typeof file !== 'string' || !file.startsWith('!')) : [];
-+        const published = listed.length > 0 && listed.every((file) => typeof file === 'string' && !PACKAGE_GLOB.test(file));
-+        for (const file of published ? listed : ['.']) addFiles(census, `${name}\0`, root, (0, path_1.join)(root, file));
-+        for (let directory = root; ; directory = (0, path_1.dirname)(directory)) {
-+            const locks = LOCK_FILE_NAMES.map((lock) => (0, path_1.join)(directory, lock)).filter((lock) => (0, fs_1.existsSync)(lock));
-+            if (locks.length > 0 || (0, path_1.dirname)(directory) === directory) {
-+                for (const lock of locks) addFiles(census, `${name}\0lock\0`, directory, lock);
-+                break;
++        const packlist = packageJson && typeof packageJson === 'object' ? npmPacklist(checkout) : null;
++        if (packlist) {
++            // A project-root node of npm's tree with no bundled dependencies: what
++            // npm-packlist reads of a package it packs alone.
++            const files = await packlist({ path: root, package: packageJson, isProjectRoot: true, edgesOut: new Map(), workspaces: null });
++            for (const file of files) addFiles(census, `${name}\0`, root, (0, path_1.join)(root, file));
++        }
++        else {
++            if (packageJson && !linkedPluginsWithoutPacklist.has(name)) {
++                linkedPluginsWithoutPacklist.add(name);
++                logger_1.serverLogger.log(`[Server] linked plugin ${name}: ${checkout} has no npm-packlist to read what it publishes, so every file of the package is judged`);
 +            }
++            addFiles(census, `${name}\0`, root, root);
++        }
++        for (const lock of LOCK_FILE_NAMES) {
++            const path = (0, path_1.join)(checkout, lock);
++            if ((0, fs_1.existsSync)(path)) addFiles(census, `${name}\0lock\0`, checkout, path);
 +        }
 +    }
 +    return census;
@@ -1675,10 +1715,18 @@ index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db3
 +    }
 +    return files;
 +}
-+// The known files' stats, a vanished one left out.
-+function knownFileStats() {
++// The known files' stats at each link's current target, a vanished one and one
++// of a plugin no longer linked left out.
++function knownFileStats(roots) {
++    const located = new Map(roots);
 +    const census = new Map();
-+    for (const [key, { path }] of linkedPluginFiles) {
++    for (const key of linkedPluginFiles.keys()) {
++        const [name, ...rest] = key.split('\0');
++        const root = located.get(name);
++        if (root === undefined) continue;
++        const path = rest.length === 2 && rest[0] === 'lock'
++            ? (0, path_1.join)(checkoutOf(root), rest[1])
++            : (0, path_1.join)(root, rest[0]);
 +        let stat;
 +        try {
 +            stat = (0, fs_1.statSync)(path, { bigint: true });
@@ -1691,20 +1739,10 @@ index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db3
 +    }
 +    return census;
 +}
-+// The first linked plugin file whose bytes moved since the baseline, described;
-+// null when none did.
-+function linkedPluginsChanged() {
-+    if (linkedPluginFiles === undefined) return null;
-+    const roots = linkedPluginRoots();
-+    if (roots === null) return null;
-+    const rootKey = JSON.stringify(roots);
-+    const now = Date.now();
-+    const full = rootKey !== linkedPluginRootKey || now - linkedPluginCensusAt >= exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS;
-+    const census = full ? linkedPluginCensus(roots) : knownFileStats();
-+    if (full) {
-+        linkedPluginRootKey = rootKey;
-+        linkedPluginCensusAt = now;
-+    }
++// Judge `census` against the files known so far, which it then replaces: the
++// first file that appeared, changed its bytes or disappeared, described; null
++// when none did.
++function judgeLinkedPlugins(census) {
 +    const files = hashCensus(census, linkedPluginFiles);
 +    let change = null;
 +    for (const [key, { path, hash }] of files) {
@@ -1718,6 +1756,41 @@ index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db3
 +    linkedPluginFiles = files;
 +    if (change !== null) logger_1.serverLogger.log(`[Server] linked plugin file ${change}`);
 +    return change;
++}
++// The first linked plugin file whose bytes moved since the baseline among the
++// files already known, described; null when none did. A moved link, or the
++// safety interval, starts the full census in the background.
++function linkedPluginsChanged() {
++    if (linkedPluginFiles === undefined) return null;
++    const roots = linkedPluginRoots();
++    if (roots === null) return null;
++    const rootKey = JSON.stringify(roots);
++    const now = Date.now();
++    if (!linkedPluginCensusRunning &&
++        (rootKey !== linkedPluginRootKey || now - linkedPluginCensusAt >= exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS)) {
++        linkedPluginRootKey = rootKey;
++        linkedPluginCensusAt = now;
++        linkedPluginCensusRunning = true;
++        linkedPluginCensus(roots).then((census) => {
++            linkedPluginCensusRunning = false;
++            const change = judgeLinkedPlugins(census);
++            if (change !== null) restartForLinkedPlugin(change);
++        }, (error) => {
++            linkedPluginCensusRunning = false;
++            logger_1.serverLogger.log(`[Server] the linked plugin census failed, so a file added beside the known ones is not seen before the next census: ${error.message}`);
++        });
++    }
++    return judgeLinkedPlugins(knownFileStats(roots));
++}
++// Every graph this daemon served, and so every task a connected command
++// planned and keyed by it, came from the plugin code before the change. A
++// successor, or the command's own process, would load the new code, so no
++// command resumes: each is told why and fails (DaemonClient.loseDaemon).
++function restartForLinkedPlugin(change) {
++    const reason = `LINKED_PLUGIN_CHANGED (linked plugin file ${change})`;
++    const notice = new Error(`The Nx daemon (pid ${process.pid}) stopped: ${reason}. This command's project graph and task hashes came from the plugin before that change; run it again.`);
++    notice.daemonGraphChanged = true;
++    restartDaemon('LINKED_PLUGIN_CHANGED', notice);
 +}
 +// Applied paths have been hashed by the native workspace context; same-byte
 +// rewrites were dropped already. No lockfile is read on this watcher path.
@@ -1774,14 +1847,7 @@ index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db3
 +    }
 +    const change = linkedPluginsChanged();
 +    if (change !== null) {
-+        // Every graph this daemon served, and so every task a connected command
-+        // planned and keyed by it, came from the plugin code before the change. A
-+        // successor, or the command's own process, would load the new code, so no
-+        // command resumes: each is told why and fails (DaemonClient.loseDaemon).
-+        const reason = `LINKED_PLUGIN_CHANGED (linked plugin file ${change})`;
-+        const notice = new Error(`The Nx daemon (pid ${process.pid}) stopped: ${reason}. This command's project graph and task hashes came from the plugin before that change; run it again.`);
-+        notice.daemonGraphChanged = true;
-+        restartDaemon('LINKED_PLUGIN_CHANGED', notice);
++        restartForLinkedPlugin(change);
 +        return true;
 +    }
 +    return false;
@@ -1818,7 +1884,7 @@ index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db3
 +    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets, notice });
 +}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index b1c143e244efd435b28642ed86e999d6c86f7d94..e9ff19d900a4cc51059111a3cab4029c04ca0a3a 100644
+index b1c143e244efd435b28642ed86e999d6c86f7d94..e1edb6a44c8eaf6bf6ac09ad8cbafec0687daca3 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -7,17 +7,13 @@ const fs_1 = require("fs");
@@ -2073,7 +2139,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..e9ff19d900a4cc51059111a3cab4029c
 +    }
 +    (0, restart_checks_1.registerDaemonForRestartChecks)(server, exports.openSockets, socketPath);
 +    // Record before watch/scan so a lockfile or linked plugin changed during boot is not lost.
-+    (0, restart_checks_1.recordInstallationBaseline)();
++    await (0, restart_checks_1.recordInstallationBaseline)();
      // Watch before scan: a file written during boot must be visible to the
      // watcher or the scan below. Scan-first left a blind window where such
      // files stayed invisible to both until an unrelated change arrived.
