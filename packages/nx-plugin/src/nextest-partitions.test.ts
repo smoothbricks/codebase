@@ -9,6 +9,7 @@ import { NEXTEST_EXTRACTION_DIRECTORY, nextestExtractionKey } from '@smoothbrick
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
+import { SERIAL_TEST_GROUP_PLATFORM } from './cargo-workspace.js';
 import type { NxTaskContext } from './executors/bounded-exec/executor.js';
 import type { BoundedExecOptions } from './executors/bounded-exec/schema.js';
 import {
@@ -18,7 +19,7 @@ import {
   taskDirectory,
   writeRecord,
 } from './executors/bounded-exec/verdict.js';
-import { createNodesV2ForPlatform } from './index.js';
+import { createNodesV2 } from './index.js';
 import { descendantsDiagnostic } from './testing.js';
 
 useFixtureCargoHome();
@@ -44,7 +45,7 @@ const expected = [...ordinary, ...exceptional, ...serial];
 interface SharedFixture {
   readonly root: string;
   readonly targets: Readonly<Record<string, TargetConfiguration>>;
-  readonly passingSeed: BoundedExecRecord;
+  readonly passingSeed: BoundedExecRecord | undefined;
 }
 
 /** A child this test started and has not yet seen close, with the command line that names it. */
@@ -87,7 +88,7 @@ beforeAll(
         '',
         '[[profile.default.overrides]]',
         "filter = 'test(/serial_probe_/)'",
-        `platform = 'cfg(target_os="macos")'`,
+        `platform = '${SERIAL_TEST_GROUP_PLATFORM}'`,
         "test-group = 'serial-probe'",
         '',
       ].join('\n'),
@@ -114,7 +115,7 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.
     await symlink(await installation.nodeModules(), join(root, 'node_modules'), 'dir');
     await run(root, ['git', 'init', '--quiet']);
     await run(root, ['cargo', 'generate-lockfile', '--offline']);
-    const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
+    const [, infer] = createNodesV2;
     const result = await infer(['package.json'], undefined, { workspaceRoot: root, nxJsonConfiguration: {} });
     const targets = result[0]?.[1].projects?.['.']?.targets;
     if (targets === undefined) throw new Error('Cargo fixture inferred no targets');
@@ -122,7 +123,7 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.
     // Nx gives every task its hash; the archive command writes it beside the archive as the runners' extraction key.
     await run(root, ['sh', '-c', command(targets, 'cargo-test-archive')], { NX_TASK_HASH: '424242' });
     const source = { root, targets };
-    const passingSeed = await groupSucceeds(source);
+    const passingSeed = targets[GROUP_TARGET] === undefined ? undefined : await groupSucceeds(source);
     shared = { ...source, passingSeed };
   }),
 );
@@ -263,12 +264,12 @@ function groupOptions(
  */
 async function executesEveryTestOnce(): Promise<void> {
   const { root, targets } = fixture();
-  // One log per runner kind, so the proof is exact selection and not only coverage: the ordinary shards ran
-  // every ordinary test once and nothing else, the exceptional shards did the same for theirs, and the serial
-  // group ran its class once in one unpartitioned runner.
+  // macOS gives the serial probes their own runner; off macOS the ordinary pieces own them.
+  // Deterministic per-platform inference is covered separately in index.test.ts.
+  const hasGroup = targets[GROUP_TARGET] !== undefined;
   const serialLog = join(root, 'serial.log');
   const partitions = [
-    { kind: 'shard', log: join(root, 'ordinary.log'), tests: ordinary },
+    { kind: 'shard', log: join(root, 'ordinary.log'), tests: hasGroup ? ordinary : [...ordinary, ...serial] },
     { kind: 'exceptions-shard', log: join(root, 'exceptional.log'), tests: exceptional },
   ];
   await Promise.all([
@@ -279,9 +280,9 @@ async function executesEveryTestOnce(): Promise<void> {
         }),
       ),
     ),
-    run(root, ['sh', '-c', command(targets, GROUP_TARGET)], { PARTITION_EXECUTIONS: serialLog }),
+    ...(hasGroup ? [run(root, ['sh', '-c', command(targets, GROUP_TARGET)], { PARTITION_EXECUTIONS: serialLog })] : []),
   ]);
-  for (const { log, tests } of [...partitions, { log: serialLog, tests: serial }]) {
+  for (const { log, tests } of [...partitions, ...(hasGroup ? [{ log: serialLog, tests: serial }] : [])]) {
     const observed = (await readFile(log, 'utf8')).trim().split('\n').sort();
     expect(observed).toEqual([...tests].sort());
   }
@@ -292,7 +293,7 @@ async function executesEveryTestOnce(): Promise<void> {
   ]);
   expect((await readdir(join(root, '.cache/nextest'))).sort()).toEqual(['archive.tar.zst', 'archive.tar.zst.key']);
   // The serial group is one unpartitioned runner.
-  expect(command(targets, GROUP_TARGET)).not.toContain('--partition');
+  if (hasGroup) expect(command(targets, GROUP_TARGET)).not.toContain('--partition');
 }
 
 /**
@@ -332,6 +333,7 @@ async function groupSucceeds(source: Pick<SharedFixture, 'root' | 'targets'> = f
  */
 async function emptySelectionFails(): Promise<void> {
   const { root, targets, passingSeed } = fixture();
+  if (passingSeed === undefined) throw new Error('the inferred serial group has no passing seed');
   const directory = groupDirectory(root);
   await writeRecord(directory, passingSeed);
   await writeFile(join(directory, JUNIT_FILE), 'stale report\n');
@@ -379,18 +381,23 @@ async function continuesPastFailures(): Promise<void> {
   expect((await readFile(failureLog, 'utf8')).trim().split('\n').sort()).toEqual([...serial].sort());
 }
 
-it(
-  'executes every archived test once across ordinary, exceptional and serial-group runners',
-  caseBody(executesEveryTestOnce),
-);
-it(
-  'runs the serial group through the real default executor and keeps its passing verdict',
-  caseBody(async () => {
-    await groupSucceeds();
-  }),
-);
-it('fails a serial group whose filter selects no test, replacing the previous verdict', caseBody(emptySelectionFails));
-it('runs the serial group past failing probes and reports all four', caseBody(continuesPastFailures));
+it('executes every archived test once across the actual host runners', caseBody(executesEveryTestOnce));
+
+// Serial groups are a macOS capability, not a simulated Darwin plan to execute on another host.
+// Every host still executes all fixture tests above through its real inferred partition.
+if (process.platform === 'darwin') {
+  it(
+    'runs the serial group through the real default executor and keeps its passing verdict',
+    caseBody(async () => {
+      await groupSucceeds();
+    }),
+  );
+  it(
+    'fails a serial group whose filter selects no test, replacing the previous verdict',
+    caseBody(emptySelectionFails),
+  );
+  it('runs the serial group past failing probes and reports all four', caseBody(continuesPastFailures));
+}
 
 function command(targets: Readonly<Record<string, TargetConfiguration>>, name: string): string {
   const single: unknown = targets[name]?.options?.command;
