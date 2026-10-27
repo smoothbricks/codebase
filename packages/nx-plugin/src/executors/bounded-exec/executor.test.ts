@@ -212,17 +212,16 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).not.toContain('Command timed out after');
   });
 
-  it('runs the fixture first, outside the progress bound, then the command', async () => {
+  it('runs the fixture first, then the command', async () => {
     const workspace = await createWorkspace();
 
-    // The fixture's whole job is to take longer than the progress bound: compilation outlasting a test gap.
-    // What ends each phase is the process exiting, never the test's own clock.
+    // Both bounds sit at the backstop, so each phase ends on its process exiting, never on a clock.
     const result = await runBoundedExec(
       {
         command: 'node -e "console.log(\'main-done\')"',
-        fixtureCommand: 'node -e "setTimeout(() => console.log(\'fixture-done\'), 1200)"',
-        fixtureTimeoutMs: 60_000,
-        idleTimeoutMs: 500,
+        fixtureCommand: 'node -e "console.log(\'fixture-done\')"',
+        fixtureTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: 0,
       },
       workspace.context,
@@ -233,7 +232,31 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.success).toBe(true);
     expect(result.terminalOutput.indexOf('fixture-done')).toBeGreaterThanOrEqual(0);
     expect(result.terminalOutput.indexOf('main-done')).toBeGreaterThan(result.terminalOutput.indexOf('fixture-done'));
+  });
+
+  it('runs the fixture outside the progress bound: only its own ceiling ends a silent fixture', async () => {
+    const workspace = await createWorkspace();
+
+    // The fixture never exits and never speaks, so only a bound can end it. The progress bound is the shorter one: were
+    // it armed during the fixture it would fire first, so the fixture's ceiling firing proves the fixture runs outside it.
+    const result = await runBoundedExec(
+      {
+        command: "node -e \"console.log('main' + '-ran')\"",
+        fixtureCommand: 'node -e "process.stdin.resume()"',
+        fixtureTimeoutMs: 200,
+        idleTimeoutMs: 100,
+        killAfterMs: 0,
+      },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('Fixture command timed out after');
+    expect(result.terminalOutput).toContain('fixtureTimeoutMs=200');
     expect(result.terminalOutput).not.toContain('Command made no progress');
+    expect(result.terminalOutput).not.toContain('main-ran');
   });
 
   it('fails the run on a failed fixture and never starts the command', async () => {
