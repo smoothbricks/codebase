@@ -1304,7 +1304,7 @@ fn host_controller_recovery_refuses_a_mounted_temp_subtree_and_keeps_the_image()
     let mount = exec_temp.join("mounted");
     fs::create_dir_all(&mount).unwrap();
     let backend = MacOsApfsBackend::new(SystemCommandRunner::new(HostNamespace::Test(namespace)));
-    let attachment = backend
+    let (attachment, _) = backend
         .attach_mounted(&mount_image, &mount, MountAccess::ReadWrite, false)
         .unwrap();
     assert_ne!(
@@ -1441,7 +1441,7 @@ fn host_controller_recovery_refuses_a_mounted_temp_root_and_keeps_the_image() {
         .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
     crate::blank_image::blank_image(namespace, &mount_image);
     let backend = MacOsApfsBackend::new(SystemCommandRunner::new(HostNamespace::Test(namespace)));
-    let attachment = backend
+    let (attachment, _) = backend
         .attach_mounted(&mount_image, &exec_temp, MountAccess::ReadWrite, false)
         .unwrap();
     assert_ne!(

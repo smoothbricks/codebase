@@ -186,12 +186,18 @@ impl CommandRunner for RecordingRunner {
         E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
     {
         if check()? {
-            self.run(request).map(Some).map_err(E::from)
+            self.run(request, "guarded disk command")
+                .map(|run| Some(run.output))
+                .map_err(E::from)
         } else {
             Ok(None)
         }
     }
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+    fn run(
+        &self,
+        request: &CommandRequest,
+        _operation: &'static str,
+    ) -> Result<cowshed_apfs::CommandRun, CommandRunError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requests
             .lock()
@@ -211,7 +217,10 @@ impl CommandRunner for RecordingRunner {
                 .lock()
                 .expect("mounts")
                 .insert(mount_point, request.args[2].to_string_lossy().into_owned());
-            return Ok(CommandOutput::success([]));
+            return Ok(cowshed_apfs::CommandRun {
+                output: CommandOutput::success([]),
+                work_elapsed: None,
+            });
         }
         if request.program == Path::new("/usr/bin/hdiutil")
             && request
@@ -243,12 +252,15 @@ impl CommandRunner for RecordingRunner {
                 .trim_start_matches("/dev/")
                 .to_owned();
             let volume_name = self.volume_name.lock().expect("volume name").clone();
-            Ok(CommandOutput::success(device_info_plist(
-                &device,
-                &volume_name,
-            )))
+            Ok(cowshed_apfs::CommandRun {
+                output: CommandOutput::success(device_info_plist(&device, &volume_name)),
+                work_elapsed: None,
+            })
         } else {
-            Ok(self.inventory.respond(request))
+            Ok(cowshed_apfs::CommandRun {
+                output: self.inventory.respond(request),
+                work_elapsed: None,
+            })
         }
     }
     fn image_lease(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
@@ -343,13 +355,22 @@ impl CommandRunner for UnreadableFirstInventoryRunner {
         E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
     {
         if check()? {
-            self.run(request).map(Some).map_err(E::from)
+            self.run(request, "guarded disk command")
+                .map(|run| Some(run.output))
+                .map_err(E::from)
         } else {
             Ok(None)
         }
     }
-    fn run(&self, _: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        Ok(CommandOutput::success([]))
+    fn run(
+        &self,
+        _: &CommandRequest,
+        _: &'static str,
+    ) -> Result<cowshed_apfs::CommandRun, CommandRunError> {
+        Ok(cowshed_apfs::CommandRun {
+            output: CommandOutput::success([]),
+            work_elapsed: None,
+        })
     }
     fn image_lease(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         Ok(None)
@@ -534,16 +555,20 @@ impl RealFixture {
     pub(super) fn remount(&self, volume_device: &str, mount_point: &Path, options: &str) {
         std::fs::create_dir_all(mount_point).expect("mount point");
         let mounted = SystemCommandRunner::new(self.host_namespace())
-            .run(&CommandRequest::new(
-                "/sbin/mount_apfs",
-                [
-                    "-o".as_ref(),
-                    options.as_ref(),
-                    volume_device.as_ref(),
-                    mount_point.as_os_str(),
-                ],
-            ))
-            .expect("run mount_apfs");
+            .run(
+                &CommandRequest::new(
+                    "/sbin/mount_apfs",
+                    [
+                        "-o".as_ref(),
+                        options.as_ref(),
+                        volume_device.as_ref(),
+                        mount_point.as_os_str(),
+                    ],
+                ),
+                "fixture mount",
+            )
+            .expect("run mount_apfs")
+            .output;
         assert!(
             mounted.succeeded(),
             "mount_apfs -o {options} {volume_device} {}: {}",
@@ -569,11 +594,15 @@ fn helper_system() -> SystemCommandRunner {
 
 fn unmount(mount: &Path) {
     let unmounted = helper_system()
-        .run(&CommandRequest::new(
-            "/usr/sbin/diskutil",
-            ["unmount".as_ref(), mount.as_os_str()],
-        ))
-        .expect("Disk Arbitration unmount");
+        .run(
+            &CommandRequest::new(
+                "/usr/sbin/diskutil",
+                ["unmount".as_ref(), mount.as_os_str()],
+            ),
+            "fixture unmount",
+        )
+        .expect("Disk Arbitration unmount")
+        .output;
     assert!(
         unmounted.succeeded(),
         "diskutil unmount {}: {}",
@@ -3045,7 +3074,8 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
     );
     let cloned = host
         .backend()
-        .clone_image(image.image(), &destination, ImageCapture::Detached);
+        .prepare_clone(image.image(), &destination, ImageCapture::Detached)
+        .and_then(|admitted| admitted.clone_image());
     assert!(
         cloned.is_err(),
         "an attached image must never be captured detached: {cloned:?}"
@@ -3404,17 +3434,26 @@ impl CommandRunner for UnformattedAttachment {
         E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
     {
         if check()? {
-            self.run(request).map(Some).map_err(E::from)
+            self.run(request, "guarded disk command")
+                .map(|run| Some(run.output))
+                .map_err(E::from)
         } else {
             Ok(None)
         }
     }
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+    fn run(
+        &self,
+        request: &CommandRequest,
+        _operation: &'static str,
+    ) -> Result<cowshed_apfs::CommandRun, CommandRunError> {
         self.requests
             .lock()
             .expect("requests")
             .push(request.clone());
-        Ok(CommandOutput::success([]))
+        Ok(cowshed_apfs::CommandRun {
+            output: CommandOutput::success([]),
+            work_elapsed: None,
+        })
     }
     fn image_lease(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         Ok(None)
@@ -3580,7 +3619,7 @@ fn real_apfs_unmount_verified_twice_preserves_the_attached_image() {
     let mount = fixture.root().join("mounted");
     fixture.blank_image(&image);
     let backend = MacOsApfsBackend::new(SystemCommandRunner::new(fixture.host_namespace()));
-    let attachment = backend
+    let (attachment, _) = backend
         .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)
         .expect("mount owned image");
     assert_eq!(
@@ -3660,7 +3699,9 @@ impl EjectAtFsck {
             self.owned.display(),
         );
         let started = Instant::now();
-        let eject = system.run(&eject_request);
+        let eject = system
+            .run(&eject_request, "fixture forced detach")
+            .map(|run| run.output);
         cowshed_os::eprintln!(
             "raw-pin attack end wall={:?} elapsed={:?} image={} whole={whole} \
          volume={volume_device} result={eject:?}",
@@ -3671,7 +3712,12 @@ impl EjectAtFsck {
         let eject = eject?;
         if eject.succeeded() {
             self.ejected.store(1, Ordering::SeqCst);
-            let attached = system.run(&foreign_kernel_attach(&self.foreign, true))?;
+            let attached = system
+                .run(
+                    &foreign_kernel_attach(&self.foreign, true),
+                    "fixture foreign attach",
+                )?
+                .output;
             assert!(
                 attached.succeeded(),
                 "foreign image attach failed: {attached:?}"
@@ -3740,7 +3786,11 @@ impl CommandRunner for EjectAtFsck {
     {
         self.system.run_guarded(request, check)
     }
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+    fn run(
+        &self,
+        request: &CommandRequest,
+        _operation: &'static str,
+    ) -> Result<cowshed_apfs::CommandRun, CommandRunError> {
         let volume = if request.program == Path::new("/sbin/fsck_apfs") {
             request
                 .args
@@ -3760,7 +3810,7 @@ impl CommandRunner for EjectAtFsck {
             cowshed_os::eprintln!("raw-pin attack hook request={request:?}");
             self.try_recycle(volume)?;
         }
-        self.system.run(request)
+        self.system.run(request, _operation)
     }
 
     fn image_lease(&self, identity: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
@@ -3835,12 +3885,17 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
         ["detach", "-force", attachment.whole_device()],
     );
     let image_driver_ejected = SystemCommandRunner::new(fixture.host_namespace())
-        .run(&image_driver_request)
-        .expect("external image-driver forced detach");
+        .run(&image_driver_request, "fixture image-driver detach")
+        .expect("external image-driver forced detach")
+        .output;
     if image_driver_ejected.succeeded() {
         let attached_foreign = SystemCommandRunner::new(fixture.host_namespace())
-            .run(&foreign_kernel_attach(&foreign, true))
-            .expect("external foreign attachment");
+            .run(
+                &foreign_kernel_attach(&foreign, true),
+                "fixture foreign attach",
+            )
+            .expect("external foreign attachment")
+            .output;
         assert!(
             attached_foreign.succeeded(),
             "foreign RAW mount: {attached_foreign:?}"
@@ -3903,8 +3958,12 @@ fn foreign_kernel_attach(image: &Path, mount: bool) -> CommandRequest {
 /// Attach `image` the way another process does, outside every cowshed image lease and check.
 fn attach_behind_cowshed(image: &Path) {
     let attached = helper_system()
-        .run(&foreign_kernel_attach(image, false))
-        .expect("foreign kernel attach");
+        .run(
+            &foreign_kernel_attach(image, false),
+            "foreign kernel attach",
+        )
+        .expect("foreign kernel attach")
+        .output;
     assert!(
         attached.succeeded(),
         "attach {}: {}",
@@ -4032,9 +4091,13 @@ impl CommandRunner for EjectAfterAttach {
     {
         self.system.run_guarded(request, check)
     }
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+    fn run(
+        &self,
+        request: &CommandRequest,
+        _operation: &'static str,
+    ) -> Result<cowshed_apfs::CommandRun, CommandRunError> {
         let system = self.system;
-        let output = system.run(request)?;
+        let output = system.run(request, _operation)?;
         if request.program == Path::new("/sbin/fsck_apfs") {
             self.fscks.fetch_add(1, Ordering::SeqCst);
         }
@@ -4046,21 +4109,28 @@ impl CommandRunner for EjectAfterAttach {
                 .is_some_and(|arg| arg == self.owned.as_os_str())
             && self.ejected.fetch_add(1, Ordering::SeqCst) == 0
         {
-            assert!(output.succeeded(), "owner attach failed: {output:?}");
+            assert!(output.output.succeeded(), "owner attach failed: {output:?}");
             let owned = cowshed_apfs::MacOsApfsBackend::new(self.system)
                 .existing_attachment(&self.owned)
                 .expect("exact current owner mapping")
                 .expect("the recorded fixture image is attached");
             let whole = owned.whole_device();
-            let ejected = system.run(&CommandRequest::new(
-                "/usr/bin/hdiutil",
-                ["detach", "-force", whole],
-            ))?;
+            let ejected = system
+                .run(
+                    &CommandRequest::new("/usr/bin/hdiutil", ["detach", "-force", whole]),
+                    "fixture detach",
+                )?
+                .output;
             assert!(
                 ejected.succeeded(),
                 "unheld exact whole must detach: {ejected:?}"
             );
-            let attached = system.run(&foreign_kernel_attach(&self.foreign, true))?;
+            let attached = system
+                .run(
+                    &foreign_kernel_attach(&self.foreign, true),
+                    "fixture foreign attach",
+                )?
+                .output;
             assert!(attached.succeeded(), "foreign mount failed: {attached:?}");
             let replacement = cowshed_apfs::MacOsApfsBackend::new(self.system)
                 .existing_attachment(&self.foreign)
@@ -7123,8 +7193,12 @@ impl CommandRunner for ImmutableDuringResize {
     {
         self.system.run_guarded(request, check)
     }
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        self.system.run(request)
+    fn run(
+        &self,
+        request: &CommandRequest,
+        _operation: &'static str,
+    ) -> Result<cowshed_apfs::CommandRun, CommandRunError> {
+        self.system.run(request, _operation)
     }
 
     fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
@@ -7522,21 +7596,32 @@ mod build_mount_races {
             E: From<CommandRunError> + std::fmt::Display,
         {
             if check()? {
-                self.run(request).map(Some).map_err(E::from)
+                self.run(request, "guarded disk command")
+                    .map(|run| Some(run.output))
+                    .map_err(E::from)
             } else {
                 Ok(None)
             }
         }
 
-        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            let output = self.recorded.run(request)?;
+        fn run(
+            &self,
+            request: &CommandRequest,
+            _operation: &'static str,
+        ) -> Result<cowshed_apfs::CommandRun, CommandRunError> {
+            let output = self.recorded.run(request, _operation)?;
             if request.program != Path::new("/sbin/mount_apfs") {
                 return Ok(output);
             }
             let point = PathBuf::from(request.args.last().unwrap());
             let mut rows = self.mounts.rows.lock();
             let observation = match self.completion {
-                Completion::Mount if !rows.is_empty() => return Ok(already_in_progress()),
+                Completion::Mount if !rows.is_empty() => {
+                    return Ok(cowshed_apfs::CommandRun {
+                        output: already_in_progress(),
+                        work_elapsed: None,
+                    });
+                }
                 Completion::Mount | Completion::OtherFailure => Observation::Expected,
                 Completion::InProgress(observation) => observation,
             };
@@ -7556,13 +7641,16 @@ mod build_mount_races {
                 .into_iter()
                 .map(|(point, device)| KernelMountSnapshot::new(1, point, device, true, true))
                 .collect();
-            Ok(match self.completion {
-                Completion::Mount => output,
-                Completion::InProgress(_) => already_in_progress(),
-                Completion::OtherFailure => CommandOutput {
-                    status: ProcessStatus::Exit(1),
-                    stdout: Vec::new(),
-                    stderr: b"injected unrelated mount failure\n".to_vec(),
+            Ok(cowshed_apfs::CommandRun {
+                work_elapsed: output.work_elapsed,
+                output: match self.completion {
+                    Completion::Mount => output.output,
+                    Completion::InProgress(_) => already_in_progress(),
+                    Completion::OtherFailure => CommandOutput {
+                        status: ProcessStatus::Exit(1),
+                        stdout: Vec::new(),
+                        stderr: b"injected unrelated mount failure\n".to_vec(),
+                    },
                 },
             })
         }
@@ -7668,9 +7756,11 @@ mod build_mount_races {
             .mount_build_volume(layout, id);
             resume.send(()).unwrap();
             let loser = loser.join().unwrap();
-            assert_eq!(winner.expect("winner mounts"), layout.mount(id));
+            assert_eq!(winner.expect("winner mounts").0, layout.mount(id));
             assert_eq!(
-                loser.expect("loser adopts the winner under the reacquired lease"),
+                loser
+                    .expect("loser adopts the winner under the reacquired lease")
+                    .0,
                 layout.mount(id)
             );
         });
@@ -7700,7 +7790,8 @@ mod build_mount_races {
         .unwrap();
         assert_eq!(
             host.mount_build_volume(&layout, &id)
-                .expect("adopt observed mount"),
+                .expect("adopt observed mount")
+                .0,
             layout.mount(&id)
         );
         assert_eq!(mount_commands(&recorded), 1);

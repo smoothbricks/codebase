@@ -5488,7 +5488,11 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         "/sbin/umount",
         [fixture.checkout.as_os_str().to_os_string()],
     );
-    let result = fixture.runner().run(&unmount).unwrap();
+    let result = fixture
+        .runner()
+        .run(&unmount, "fixture unmount")
+        .unwrap()
+        .output;
     assert!(result.succeeded(), "own main unmount: {result:?}");
     fs::write(
         fixture.checkout.join("publication-blocker"),
@@ -5504,7 +5508,11 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             fixture.checkout.as_os_str().to_os_string(),
         ],
     );
-    let result = fixture.runner().run(&remount).unwrap();
+    let result = fixture
+        .runner()
+        .run(&remount, "fixture remount")
+        .unwrap()
+        .output;
     assert!(result.succeeded(), "own main remount: {result:?}");
     assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
     assert_eq!(fs::read(warm.join("build.ninja")).unwrap(), b"warm\n");
@@ -5635,7 +5643,11 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             "/usr/sbin/diskutil",
             [OsString::from("unmount"), OsString::from(device)],
         );
-        let result = fixture.runner().run(&unmount).unwrap();
+        let result = fixture
+            .runner()
+            .run(&unmount, "fixture unmount")
+            .unwrap()
+            .output;
         assert!(
             result.succeeded(),
             "normal own retained-input unmount: {result:?}"
@@ -5653,7 +5665,11 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
                 OsString::from(device),
             ],
         );
-        let result = fixture.runner().run(&remount).unwrap();
+        let result = fixture
+            .runner()
+            .run(&remount, "fixture remount")
+            .unwrap()
+            .output;
         assert!(
             result.succeeded(),
             "normal own readonly remount: {result:?}"
@@ -6372,7 +6388,11 @@ async fn real_apfs_a_resumed_re_adopt_whose_retained_build_is_gone_publishes_it_
             main_image.as_os_str().to_os_string(),
         ],
     );
-    let attached = fixture.runner().run(&attach).expect("reattach main");
+    let attached = fixture
+        .runner()
+        .run(&attach, "fixture reattach")
+        .expect("reattach main")
+        .output;
     assert!(attached.succeeded(), "reattach main: {attached:?}");
     let mut interrupted = fixture.open().await;
     let (refused, _, _) = run(

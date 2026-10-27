@@ -52,7 +52,7 @@ where
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError> {
         MacOsApfsExecutionHost::clone_build_volume(self, layout, source, destination, registration)
     }
 
@@ -62,7 +62,7 @@ where
         quiet: &crate::runtime::build_volumes::Quiet,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError> {
         MacOsApfsExecutionHost::clone_quiet_build_volume(
             self,
             layout,
@@ -78,7 +78,7 @@ where
         claim: &ReleaseClaim,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError> {
         MacOsApfsExecutionHost::clone_claimed_build_volume(
             self,
             layout,
@@ -119,7 +119,7 @@ where
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
-    ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
+    ) -> Result<(BuildVolumeId, PathBuf, Option<std::time::Duration>), ApfsStorageError> {
         MacOsApfsExecutionHost::ready_fork_build_volume(self, layout, captured, own_seed)
     }
 
@@ -135,7 +135,7 @@ where
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
-    ) -> Result<PathBuf, ApfsStorageError> {
+    ) -> Result<(PathBuf, Option<std::time::Duration>), ApfsStorageError> {
         MacOsApfsExecutionHost::mount_build_volume(self, layout, id)
     }
 
@@ -254,15 +254,6 @@ where
         MacOsApfsExecutionHost::defragment_build_volume(self, layout, claim)
     }
 
-    fn seed_extents(
-        &self,
-        layout: &BuildVolumeLayout,
-        seed: &BuildVolumeId,
-        stop_at: u64,
-    ) -> Result<Option<ExtentCount>, ApfsStorageError> {
-        MacOsApfsExecutionHost::seed_extents(self, layout, seed, stop_at).map(Some)
-    }
-
     fn release_seed_compaction_leftovers(
         &self,
         layout: &BuildVolumeLayout,
@@ -280,9 +271,10 @@ where
     fn copy_seed_compaction(
         &self,
         source: CompactionSource,
+        minimum_extents: u64,
         keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
     ) -> Result<SeedCompaction, ApfsStorageError> {
-        MacOsApfsExecutionHost::copy_seed_compaction(self, source, keep_going)
+        MacOsApfsExecutionHost::copy_seed_compaction(self, source, minimum_extents, keep_going)
     }
 
     fn publish_seed_compaction(

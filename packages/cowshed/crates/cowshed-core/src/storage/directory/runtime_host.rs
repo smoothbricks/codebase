@@ -73,8 +73,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError> {
         DirectoryExecutionHost::clone_build_volume(self, layout, source, destination, registration)
+            .map(|()| None)
     }
 
     fn clone_quiet_build_volume(
@@ -83,8 +84,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         quiet: &Quiet,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError> {
         self.clone_held_build_volume(layout, quiet.id(), destination, registration)
+            .map(|()| None)
     }
 
     fn clone_claimed_build_volume(
@@ -93,8 +95,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         claim: &ReleaseClaim,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError> {
         self.clone_held_build_volume(layout, claim.id(), destination, registration)
+            .map(|()| None)
     }
 
     fn build_volume_written(
@@ -128,8 +131,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
-    ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
+    ) -> Result<(BuildVolumeId, PathBuf, Option<std::time::Duration>), ApfsStorageError> {
         DirectoryExecutionHost::ready_fork_build_volume(self, layout, captured, own_seed)
+            .map(|(id, mount)| (id, mount, None))
     }
 
     fn abandon_captured_build_volume(
@@ -144,8 +148,8 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
-    ) -> Result<PathBuf, ApfsStorageError> {
-        DirectoryExecutionHost::mount_build_volume(self, layout, id)
+    ) -> Result<(PathBuf, Option<std::time::Duration>), ApfsStorageError> {
+        DirectoryExecutionHost::mount_build_volume(self, layout, id).map(|mount| (mount, None))
     }
 
     fn release_build_volume(
@@ -258,16 +262,6 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         Err(unsupported("defragmenting a build volume"))
     }
 
-    fn seed_extents(
-        &self,
-        _layout: &BuildVolumeLayout,
-        _seed: &BuildVolumeId,
-        _stop_at: u64,
-    ) -> Result<Option<crate::storage::lifecycle::ExtentCount>, ApfsStorageError> {
-        // A directory seed is a tree of files, not an image: no extent map, nothing to compact.
-        Ok(None)
-    }
-
     fn release_seed_compaction_leftovers(
         &self,
         _layout: &BuildVolumeLayout,
@@ -285,6 +279,7 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
     fn copy_seed_compaction(
         &self,
         _source: crate::storage::apfs::native::CompactionSource,
+        _minimum_extents: u64,
         _keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
     ) -> Result<crate::storage::apfs::native::SeedCompaction, ApfsStorageError> {
         Err(unsupported("compacting a seed"))

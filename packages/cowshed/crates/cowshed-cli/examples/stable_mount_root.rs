@@ -214,7 +214,8 @@ mod native {
         })?;
         let (mds_before, before) = census(receipts, "before-mount")?;
         let started = Instant::now();
-        let attachment = backend.attach_mounted(&image, mount, MountAccess::ReadWrite, false)?;
+        let (attachment, _) =
+            backend.attach_mounted(&image, mount, MountAccess::ReadWrite, false)?;
         fs::write(mount.join("tracked"), b"stable mount-root proof\n")?;
         if fs::canonicalize(alias)? != mount
             || fs::read(alias.join("tracked"))? != b"stable mount-root proof\n"

@@ -1206,6 +1206,46 @@ fn seed_capture_skip_shapes_preserve_the_named_writer_and_refusal() {
 }
 
 #[test]
+fn seed_compaction_reports_only_observed_foreground_facts() {
+    use cowshed_core::api::dto::{LandSeedCompaction, SeedCompactionReport};
+    assert_eq!(
+        serde_json::to_value(LandSeedCompaction::NotAdvised).unwrap(),
+        json!({"kind": "notAdvised"})
+    );
+    assert_eq!(
+        serde_json::to_value(LandSeedCompaction::Started {
+            pid: 42,
+            log: "/fixture/compaction.log".into(),
+        })
+        .unwrap(),
+        json!({"kind": "started", "pid": 42, "log": "/fixture/compaction.log"})
+    );
+    for obsolete in [
+        json!({"kind": "recent", "secondsAgo": 1}),
+        json!({"kind": "below", "extents": 499999}),
+        json!({"kind": "noSeed"}),
+        json!({"kind": "started", "pid": 42, "log": "/fixture/compaction.log", "extents": 500000}),
+    ] {
+        assert!(
+            serde_json::from_value::<LandSeedCompaction>(obsolete.clone()).is_err(),
+            "obsolete foreground report: {obsolete}"
+        );
+    }
+    assert!(
+        serde_json::from_value::<SeedCompactionReport>(json!({"kind": "recent", "secondsAgo": 1}))
+            .is_err()
+    );
+    assert_eq!(
+        serde_json::to_value(SeedCompactionReport::Below { extents: 499999 }).unwrap(),
+        json!({"kind": "below", "extents": 499999})
+    );
+    assert_eq!(
+        serde_json::to_value(SeedCompactionReport::NoSeed).unwrap(),
+        json!({"kind": "noSeed"})
+    );
+}
+
+#[test]
 fn reports_gateway_and_audit_shapes_are_frozen() {
     let push = PushReport {
         source_head: oid('a'),

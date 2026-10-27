@@ -115,7 +115,12 @@ The custom columns are:
 - Allocation: `allocated_bytes_before`, `allocated_bytes_after`, `allocated_bytes_delta`. Deltas are signed
   after-minus-before values.
 - Time: `elapsed_us` covers only the operation; `measurement_us` reports the separate cost of reading both boundaries.
-  The span's start/end timestamps cover the operation, not counting or sealing.
+  The span's start/end timestamps cover the operation, not counting or sealing. Main-seed compaction advice consumes the
+  live necessary capture-work receipt, not an Arrow row or warning. Capture's source-bound image lease is admitted
+  before its existing work timer; source sync and descriptor clone stay inside it. Attach/mount advice likewise uses
+  actual command-work receipts measured inside granted disk leases, excluding admission, fsck and metadata. Existing
+  outer attach/mount diagnostics still include their waits. These are operation byproducts, not a second clock, counter,
+  rolling window or persistent advice cache (16_build_volumes.md, "Seed compaction").
 - I/O: `process_io_write_bytes_before`, `process_io_write_bytes_after`, `process_io_write_bytes_delta`,
   `process_io_scope`, `process_io_error`. The existing macOS process sampler reads
   `proc_pid_rusage(RUSAGE_INFO_V4).ri_diskio_byteswritten` immediately around the operation. Both log and trace carry

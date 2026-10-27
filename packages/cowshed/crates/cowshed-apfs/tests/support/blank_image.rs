@@ -90,7 +90,8 @@ pub fn blank_image(namespace: TestNamespace, destination: &Path) {
         .unwrap_or_else(|error| panic!("image directory {}: {error}", directory.display()));
     let template = TEMPLATE.get_or_init(|| mint_once(namespace)).as_path();
     MacOsApfsBackend::new(runner(namespace))
-        .clone_image(template, destination, ImageCapture::Detached)
+        .prepare_clone(template, destination, ImageCapture::Detached)
+        .and_then(|admitted| admitted.clone_image())
         .unwrap_or_else(|error| {
             panic!(
                 "clone the run's blank image {} to {}: {error}",

@@ -280,6 +280,9 @@ pub struct CapturedBuildVolume {
     pub written: std::time::SystemTime,
     /// Whose volume the bytes came from: a refused extent proof names its defragmentation.
     pub source_owner: WorkspaceName,
+    /// Necessary native capture work, excluding registration, metadata and extent proofs.
+    /// A directory test substrate performs no native image operation.
+    pub capture_elapsed: Option<std::time::Duration>,
     pub creating: BuildVolumeHold,
 }
 

@@ -359,7 +359,7 @@ operations! {
     internal json "coordinator.serveSupervisor" CoordinatorServeSupervisor(WorkspaceRequest) -> EmptyResult;
     /// Refreshes a mounted workspace's build state.
     internal json "coordinator.refreshBuildState" CoordinatorRefreshBuildState(WorkspaceRequest) -> BuildStateRefresh;
-    /// Compacts main's seed once a land found it past the extent bound.
+    /// Checks the refreshed immutable main seed and compacts it when it reaches the extent bound.
     internal json "coordinator.compactSeed" CoordinatorCompactSeed(RepoRequest) -> SeedCompactionReport;
     /// Admits one job; inline stdin travels as the upload frame.
     worker upload "worker.exec" WorkerExec(ExecParams) -> JobId;

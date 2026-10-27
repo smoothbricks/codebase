@@ -53,8 +53,12 @@ fn a_failing_tool_passes_its_own_status_and_bytes_through() {
         TestNamespace::mint().expect("a test namespace"),
     ));
     let expected = runner
-        .run(&CommandRequest::new("/usr/sbin/diskutil", argv))
-        .expect("the runner answers diskutil");
+        .run(
+            &CommandRequest::new("/usr/sbin/diskutil", argv),
+            "fixture diskutil",
+        )
+        .expect("the runner answers diskutil")
+        .output;
     let ProcessStatus::Exit(code) = expected.status else {
         panic!("diskutil exits on its own: {expected:?}");
     };

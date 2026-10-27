@@ -56,9 +56,13 @@ mod kernel_unmount {
     }
 
     impl CommandRunner for WitnessedNativeUnmount {
-        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        fn run(
+            &self,
+            request: &CommandRequest,
+            operation: &'static str,
+        ) -> Result<cowshed_apfs::CommandRun, CommandRunError> {
             self.observe_command(request);
-            self.system.run(request)
+            self.system.run(request, operation)
         }
 
         fn run_guarded<E>(
@@ -148,7 +152,7 @@ mod kernel_unmount {
         fixture.blank_image(&image);
         fixture.blank_image(&foreign_image);
         let system = MacOsApfsBackend::new(SystemCommandRunner::new(fixture.host_namespace()));
-        let foreign = system
+        let (foreign, _) = system
             .attach_mounted(
                 &foreign_image,
                 &foreign_mount,

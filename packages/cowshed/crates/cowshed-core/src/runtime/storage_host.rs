@@ -18,7 +18,6 @@ use crate::storage::apfs::native::{
 };
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, Labelled};
 use crate::storage::lifecycle::DerivedWorkspace;
-use crate::storage::lifecycle::ExtentCount;
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::storage::recovery::ReAdoptSource;
 use cowshed_apfs::image::ImageCapacity;
@@ -70,14 +69,14 @@ pub(crate) trait RuntimeStorageHost:
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError>;
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError>;
     fn clone_quiet_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         quiet: &super::build_volumes::Quiet,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError>;
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError>;
     /// Capture the source `claim` claimed into seed `destination`, under that claim: a reseed
     /// takes it before it stops the source's Nx daemon, so no job (the daemon keeper's start job
     /// included) is admitted on the source until the capture is done (16_build_volumes.md,
@@ -88,7 +87,7 @@ pub(crate) trait RuntimeStorageHost:
         claim: &ReleaseClaim,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError>;
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError>;
     fn build_volume_written(
         &self,
         layout: &BuildVolumeLayout,
@@ -117,7 +116,7 @@ pub(crate) trait RuntimeStorageHost:
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
-    ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError>;
+    ) -> Result<(BuildVolumeId, PathBuf, Option<std::time::Duration>), ApfsStorageError>;
     /// Release a capture its failed fork never readies.
     fn abandon_captured_build_volume(
         &self,
@@ -128,7 +127,7 @@ pub(crate) trait RuntimeStorageHost:
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
-    ) -> Result<PathBuf, ApfsStorageError>;
+    ) -> Result<(PathBuf, Option<std::time::Duration>), ApfsStorageError>;
     fn release_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -202,14 +201,6 @@ pub(crate) trait RuntimeStorageHost:
         claim: &ReleaseClaim,
     ) -> Result<crate::storage::lifecycle::DefragmentOutcome, ApfsStorageError>;
 
-    /// Seed compaction (16_build_volumes.md, "Seed compaction"). `None` when the seed's backend
-    /// keeps no extent map, so there is nothing to compact.
-    fn seed_extents(
-        &self,
-        layout: &BuildVolumeLayout,
-        seed: &BuildVolumeId,
-        stop_at: u64,
-    ) -> Result<Option<ExtentCount>, ApfsStorageError>;
     fn release_seed_compaction_leftovers(
         &self,
         layout: &BuildVolumeLayout,
@@ -222,6 +213,7 @@ pub(crate) trait RuntimeStorageHost:
     fn copy_seed_compaction(
         &self,
         source: CompactionSource,
+        minimum_extents: u64,
         keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
     ) -> Result<SeedCompaction, ApfsStorageError>;
     fn publish_seed_compaction(

@@ -217,7 +217,7 @@ impl ImageTelemetry {
         operation: &'static str,
         images: &[Image<'_>],
         work: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
+    ) -> (Result<T, E>, Duration) {
         let measuring = Instant::now();
         let before: Vec<_> = images.iter().map(|image| {
             let snapshot = Snapshot::read(image.before);
@@ -233,7 +233,8 @@ impl ImageTelemetry {
         let start = SystemTime::now();
         let started = Instant::now();
         let result = work();
-        let elapsed_us = micros(started.elapsed());
+        let elapsed = started.elapsed();
+        let elapsed_us = micros(elapsed);
         let end = SystemTime::now();
         let io_after = own_io();
         let measuring = Instant::now();
@@ -343,7 +344,7 @@ impl ImageTelemetry {
             id: Uuid::new_v4(),
             rows,
         });
-        result
+        (result, elapsed)
     }
 
     fn publish(&self, observation: Observation) {
@@ -679,6 +680,7 @@ mod tests {
                         .write_all_at(&[0x5a; 4096], 0)
                 },
             )
+            .0
             .unwrap();
         telemetry
             .measure(
@@ -690,6 +692,7 @@ mod tests {
                 }],
                 || fs::rename(&image, &trash),
             )
+            .0
             .unwrap();
         drop(telemetry);
         let batches = fixture.batches();
@@ -727,6 +730,7 @@ mod tests {
                 }],
                 || fs::rename(&image, &entry),
             )
+            .0
             .unwrap();
         drop(telemetry);
         let batches = fixture.batches();
@@ -805,7 +809,7 @@ mod tests {
             }],
             || Err::<(), _>("first block is short"),
         );
-        assert_eq!(result, Err("first block is short"));
+        assert_eq!(result.0, Err("first block is short"));
         drop(telemetry);
         let batches = fixture.batches();
         assert_eq!(kind(&batches[0], 1), "span-err");
@@ -967,6 +971,7 @@ mod tests {
                 }],
                 || Ok::<_, std::io::Error>(()),
             )
+            .0
             .unwrap();
         drop(telemetry);
         assert_eq!(failed.load(Ordering::Relaxed), 1);

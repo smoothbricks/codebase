@@ -34,7 +34,9 @@ impl CommandRunner for StubRunner {
         E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
     {
         if check()? {
-            self.run(request).map(Some).map_err(E::from)
+            self.run(request, "guarded disk command")
+                .map(|run| Some(run.output))
+                .map_err(E::from)
         } else {
             Ok(None)
         }
@@ -42,8 +44,12 @@ impl CommandRunner for StubRunner {
     fn run(
         &self,
         _request: &CommandRequest,
-    ) -> Result<CommandOutput, cowshed_apfs::CommandRunError> {
-        Ok(CommandOutput::success(Vec::new()))
+        _: &'static str,
+    ) -> Result<cowshed_apfs::CommandRun, cowshed_apfs::CommandRunError> {
+        Ok(cowshed_apfs::CommandRun {
+            output: CommandOutput::success(Vec::new()),
+            work_elapsed: None,
+        })
     }
     fn image_lease(
         &self,

@@ -2012,16 +2012,9 @@ export type LandSeedCompaction =
       readonly error: string;
       readonly secondsAgo: number & tags.Type<'uint64'>;
     })
-  | ({ readonly kind: 'recent' } & {
-      readonly secondsAgo: number & tags.Type<'uint64'>;
-    })
-  | ({ readonly kind: 'below' } & {
-      readonly extents: number & tags.Type<'uint64'>;
-    })
-  | { readonly kind: 'noSeed' }
+  | { readonly kind: 'notAdvised' }
   | ({ readonly kind: 'started' } & {
       readonly pid: number & tags.Type<'uint32'>;
-      readonly extents: number & tags.Type<'uint64'>;
       readonly log: string;
     })
   | ({ readonly kind: 'failed' } & {
@@ -3243,13 +3236,10 @@ export type SeedCatchUp = {
 
 /**
  * What one seed compaction did (16_build_volumes.md, "Seed compaction"): the result of the
- * internal `coordinator.compactSeed`, which the process a land starts runs.
+ * internal `coordinator.compactSeed`, run by the process a fork or land starts.
  */
 export type SeedCompactionReport =
   | { readonly kind: 'running' }
-  | ({ readonly kind: 'recent' } & {
-      readonly secondsAgo: number & tags.Type<'uint64'>;
-    })
   | ({ readonly kind: 'below' } & {
       readonly extents: number & tags.Type<'uint64'>;
     })

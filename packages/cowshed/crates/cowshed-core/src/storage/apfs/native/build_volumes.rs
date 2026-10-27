@@ -8,7 +8,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use super::{Image, MacOsApfsExecutionHost, io_error};
 use crate::build_volume::{
@@ -73,12 +73,31 @@ impl CompactedSeed {
 /// What a seed compaction's copy did.
 #[derive(Debug)]
 pub enum Compaction {
+    /// The current immutable clone is below the bound; no copy was created.
+    Below {
+        extents: ExtentCount,
+    },
     Copied(CompactedSeed),
     /// Stopped once `bytes` were copied, because `why`; the copy is removed.
     Stopped {
         bytes: u64,
         why: String,
     },
+}
+
+/// The extent provider is called once, and its count is the copy's before result.
+fn counted_compaction<S>(
+    source: S,
+    minimum_extents: u64,
+    count: impl FnOnce(&S) -> Result<ExtentCount, ApfsStorageError>,
+    copy: impl FnOnce(S, ExtentCount) -> Result<Compaction, ApfsStorageError>,
+) -> Result<Compaction, ApfsStorageError> {
+    let before = count(&source)?;
+    if before.get() < minimum_extents {
+        Ok(Compaction::Below { extents: before })
+    } else {
+        copy(source, before)
+    }
 }
 
 /// What catching a compaction's copy up to the seed that replaced its own did.
@@ -197,7 +216,7 @@ where
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<Option<Duration>, ApfsStorageError> {
         if self.mounted_at(&layout.mount(source))?.is_some() {
             let claim = self.claim_capture_source(layout, source)?;
             return self.clone_claimed_build_volume(layout, &claim, destination, registration);
@@ -248,7 +267,7 @@ where
         quiet: &crate::runtime::build_volumes::Quiet,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<Option<Duration>, ApfsStorageError> {
         let source = quiet.id();
         self.verify_controller_path(&layout.image(source))?;
         let mount = layout.mount(source);
@@ -273,7 +292,7 @@ where
         claim: &ReleaseClaim,
         destination: &BuildVolumeId,
         registration: &Registration,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<Option<Duration>, ApfsStorageError> {
         let source = claim.id();
         self.verify_controller_path(&layout.image(source))?;
         let mount = layout.mount(source);
@@ -296,10 +315,12 @@ where
         destination: &BuildVolumeId,
         registration: &Registration,
         mount: Option<&Path>,
-    ) -> Result<(), ApfsStorageError> {
+    ) -> Result<Option<Duration>, ApfsStorageError> {
         let captured =
             self.capture_build_volume_under_hold(layout, source, destination, registration, mount)?;
+        let elapsed = captured.capture_elapsed;
         self.finish_captured_build_volume(layout, captured)
+            .map(|()| elapsed)
     }
 
     /// Register `destination` and capture `source` into it, nothing more: the step a fork takes
@@ -344,17 +365,32 @@ where
                 after: &to,
             },
         ];
-        let capture = || self.capture_build_seed(&from, mount, &to);
-        let captured = self
-            .image_telemetry
-            .measure(operation, &images, capture)
-            .and_then(|()| written_at(&to));
+        let mode = if mount.is_some() {
+            cowshed_apfs::ImageCapture::Live
+        } else {
+            cowshed_apfs::ImageCapture::Detached
+        };
+        let admitted = match self.backend.prepare_clone(&from, &to, mode) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return Err(self.unregister(
+                    layout,
+                    destination,
+                    creating,
+                    ApfsStorageError::from(cowshed_apfs::ApfsError::from(error)),
+                ));
+            }
+        };
+        let capture = || self.capture_build_seed(&admitted, mount);
+        let (captured, elapsed) = self.image_telemetry.measure(operation, &images, capture);
+        let captured = captured.and_then(|()| written_at(&to));
         match captured {
             Ok(written) => Ok(CapturedBuildVolume {
                 id: destination.clone(),
                 registration: registration.clone(),
                 written,
                 source_owner,
+                capture_elapsed: Some(elapsed),
                 creating,
             }),
             Err(error) => Err(self.unregister(layout, destination, creating, error)),
@@ -380,6 +416,7 @@ where
             written,
             source_owner,
             creating,
+            ..
         } = captured;
         let to = layout.image(&destination);
         let finished = (|| {
@@ -526,27 +563,31 @@ where
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
-    ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
+    ) -> Result<(BuildVolumeId, PathBuf, Option<Duration>), ApfsStorageError> {
         let live = captured.id.clone();
+        let capture_elapsed = captured.capture_elapsed;
         self.finish_captured_build_volume(layout, captured)?;
         let made = match own_seed {
             Some((seed, registration)) => {
                 match self.clone_build_volume_under_hold(layout, &live, seed, registration, None) {
-                    Ok(()) => Some(seed),
+                    Ok(_) => Some(seed),
                     Err(primary) => return Err(self.release_unready(layout, &[&live], primary)),
                 }
             }
             None => None,
         };
-        let mounted = self.mount_build_volume(layout, &live).and_then(|mount| {
-            let state = crate::build_volume::BuildVolumeState::read(&mount)
-                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-            crate::build_volume::nx::discard_daemon_records(&mount, &state)
-                .map_err(|error| io_error("discard the seed's Nx daemon record", &mount, error))?;
-            Ok(mount)
-        });
+        let mounted = self
+            .mount_build_volume(layout, &live)
+            .and_then(|(mount, elapsed)| {
+                let state = crate::build_volume::BuildVolumeState::read(&mount)
+                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                crate::build_volume::nx::discard_daemon_records(&mount, &state).map_err(
+                    |error| io_error("discard the seed's Nx daemon record", &mount, error),
+                )?;
+                Ok((mount, capture_elapsed.max(elapsed)))
+            });
         match mounted {
-            Ok(mount) => Ok((live, mount)),
+            Ok((mount, elapsed)) => Ok((live, mount, elapsed)),
             Err(primary) => {
                 let made: Vec<&BuildVolumeId> = std::iter::once(&live).chain(made).collect();
                 Err(self.release_unready(layout, &made, primary))
@@ -588,16 +629,17 @@ where
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
-    ) -> Result<PathBuf, ApfsStorageError> {
+    ) -> Result<(PathBuf, Option<Duration>), ApfsStorageError> {
         let image = layout.image(id);
         let mount = layout.mount(id);
         self.verify_controller_path(&image)?;
         let attachment = match self.backend.existing_attachment_for_mount(&image)? {
             Some(attachment) => attachment,
             None => {
-                self.backend
-                    .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)?;
-                return Ok(mount);
+                let (_, elapsed) =
+                    self.backend
+                        .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)?;
+                return Ok((mount, elapsed));
             }
         };
         let lease = self.backend.prepare_mount(&attachment)?;
@@ -629,25 +671,28 @@ where
         // mounter may have won that gap: decide only after reacquiring the lease, and retain it
         // through both the command and any re-observation of the kernel's refusal.
         if observed()? {
-            return Ok(mount);
+            return Ok((mount, None));
         }
-        if let Err(error) = lease.mount(&mount, MountAccess::ReadWrite, false) {
-            if !mount_is_in_progress(&error) {
-                return Err(error.into());
+        let elapsed = match lease.mount(&mount, MountAccess::ReadWrite, false) {
+            Ok(elapsed) => elapsed,
+            Err(error) => {
+                if !mount_is_in_progress(&error) {
+                    return Err(error.into());
+                }
+                let finding = match observed() {
+                    Ok(true) => return Ok((mount, None)),
+                    Ok(false) => "the expected mount is absent".to_owned(),
+                    Err(observation) => observation.to_string(),
+                };
+                return Err(ApfsStorageError::Host(format!(
+                    "cannot adopt build volume {id} image {} device {} at {}: {error}; {finding}",
+                    image.display(),
+                    attachment.volume_device(),
+                    mount.display(),
+                )));
             }
-            let finding = match observed() {
-                Ok(true) => return Ok(mount),
-                Ok(false) => "the expected mount is absent".to_owned(),
-                Err(observation) => observation.to_string(),
-            };
-            return Err(ApfsStorageError::Host(format!(
-                "cannot adopt build volume {id} image {} device {} at {}: {error}; {finding}",
-                image.display(),
-                attachment.volume_device(),
-                mount.display(),
-            )));
-        }
-        Ok(mount)
+        };
+        Ok((mount, elapsed))
     }
 
     /// The kernel mount at `mount`, if a volume is mounted exactly there.
@@ -879,19 +924,22 @@ where
             }
             self.backend.detach(&attachment, DetachIntent::Release)?;
         }
-        let removed = self.image_telemetry.measure(
-            "retire",
-            &[Image {
-                role: "image",
-                before: &image,
-                after: &image,
-            }],
-            || {
-                layout
-                    .release_image(id)
-                    .map_err(|error| io_error("release a build volume image", &image, error))
-            },
-        )?;
+        let removed = self
+            .image_telemetry
+            .measure(
+                "retire",
+                &[Image {
+                    role: "image",
+                    before: &image,
+                    after: &image,
+                }],
+                || {
+                    layout
+                        .release_image(id)
+                        .map_err(|error| io_error("release a build volume image", &image, error))
+                },
+            )
+            .0?;
         if removed {
             layout.journal_release(id, recorded.as_ref(), true);
             self.nudge_cleanup(&layout.released(id));
@@ -943,13 +991,13 @@ where
                     },
                 ),
             )?;
-            let (_, mount) = self.ready_fork_build_volume(layout, captured, None)?;
+            let (_, mount, _) = self.ready_fork_build_volume(layout, captured, None)?;
             link::point(checkout, &mount).map_err(host)
         };
         match layout.resolve_link(workspace, linked).map_err(host)? {
             LinkResolution::Keep => self.mount_build_volume(layout, linked).map(|_| ()),
             LinkResolution::Repoint(own) => {
-                let mount = self.mount_build_volume(layout, &own)?;
+                let (mount, _) = self.mount_build_volume(layout, &own)?;
                 link::point(checkout, &mount).map_err(host)
             }
             LinkResolution::Refork(seed) => refork(&seed),
@@ -1091,18 +1139,6 @@ where
         })
     }
 
-    /// How many extents seed `seed`'s image holds, counted no further than `stop_at`.
-    pub fn seed_extents(
-        &self,
-        layout: &BuildVolumeLayout,
-        seed: &BuildVolumeId,
-        stop_at: u64,
-    ) -> Result<ExtentCount, ApfsStorageError> {
-        let image = layout.image(seed);
-        self.verify_controller_path(&image)?;
-        extents::count_extents_to(&image, stop_at)
-    }
-
     /// Hand what a compaction left in [`BuildVolumeLayout::compacting`], every seed's clone and
     /// the copy, to the gateway's cleanup (16_build_volumes.md, "Seed compaction", "Leftovers").
     /// The caller holds the project's compaction lock, so they are garbage, and no image lock.
@@ -1139,7 +1175,12 @@ where
             .map_err(|error| io_error("create the seed compaction directory", &directory, error))?;
         let clone = directory.join(format!("{seed}.dmg"));
         let written = written_at(&image)?;
-        self.capture_build_seed(&image, None, &clone)?;
+        let admitted = self
+            .backend
+            .prepare_clone(&image, &clone, cowshed_apfs::ImageCapture::Detached)
+            .map_err(cowshed_apfs::ApfsError::from)?;
+        self.capture_build_seed(&admitted, None)?;
+        drop(admitted);
         Ok(CompactionSource {
             seed: seed.clone(),
             clone,
@@ -1155,20 +1196,27 @@ where
     pub fn copy_seed_compaction(
         &self,
         source: CompactionSource,
+        minimum_extents: u64,
         keep_going: &mut dyn FnMut(u64) -> ControlFlow<String>,
     ) -> Result<Compaction, ApfsStorageError> {
-        let copy = source.clone.with_file_name(COMPACTION_COPY);
-        let before = extents::count_extents(&source.clone)?;
-        Ok(
-            match extents::copy_contiguously(&source.clone, &copy, keep_going)? {
-                Copied::Stopped { bytes, why } => Compaction::Stopped { bytes, why },
-                Copied::Complete { bytes } => Compaction::Copied(CompactedSeed {
-                    after: extents::count_extents(&copy)?,
-                    source,
-                    copy,
-                    before,
-                    bytes,
-                }),
+        counted_compaction(
+            source,
+            minimum_extents,
+            |source| extents::count_extents(&source.clone),
+            |source, before| {
+                let copy = source.clone.with_file_name(COMPACTION_COPY);
+                Ok(
+                    match extents::copy_contiguously(&source.clone, &copy, keep_going)? {
+                        Copied::Stopped { bytes, why } => Compaction::Stopped { bytes, why },
+                        Copied::Complete { bytes } => Compaction::Copied(CompactedSeed {
+                            after: extents::count_extents(&copy)?,
+                            source,
+                            copy,
+                            before,
+                            bytes,
+                        }),
+                    },
+                )
             },
         )
     }
@@ -1380,6 +1428,49 @@ impl<'a> MountPoint<'a> {
     }
 }
 
+#[cfg(test)]
+mod compaction_count_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn the_current_clone_is_counted_once_and_below_never_copies() {
+        for extents in [499_999, 500_000, 500_001] {
+            let counts = Cell::new(0);
+            let copies = Cell::new(0);
+            let result = counted_compaction(
+                (),
+                500_000,
+                |_| {
+                    counts.set(counts.get() + 1);
+                    Ok(ExtentCount::new(extents))
+                },
+                |(), before| {
+                    copies.set(copies.get() + 1);
+                    Ok(Compaction::Stopped {
+                        bytes: before.get(),
+                        why: "count receipt".to_owned(),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(counts.get(), 1, "extents={extents}");
+            assert_eq!(
+                copies.get(),
+                u32::from(extents >= 500_000),
+                "extents={extents}"
+            );
+            match result {
+                Compaction::Below { extents: counted } => assert_eq!(counted.get(), extents),
+                Compaction::Stopped { bytes, .. } => {
+                    assert_eq!(bytes, extents, "the copy reuses the count")
+                }
+                Compaction::Copied(_) => panic!("the injected copier returned no copied image"),
+            }
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::super::{KernelMountSource, SystemKernelMountSource};
@@ -1470,7 +1561,7 @@ mod tests {
         let source = BuildVolumeId::mint();
         let (system, layout) = fixture(root.namespace(), root.path());
         crate::blank_image::blank_image(root.namespace(), &layout.image(&source));
-        let mount = system.mount_build_volume(&layout, &source).unwrap();
+        let (mount, _) = system.mount_build_volume(&layout, &source).unwrap();
         layout.write_record(&source, &linked("main")).unwrap();
         fs::write(mount.join("warm"), b"captured build state\n").unwrap();
         fs::create_dir(mount.join("cache")).unwrap();
@@ -1575,7 +1666,7 @@ mod tests {
             &registered(linked("inspection")),
         )
         .unwrap();
-        let captured = host.mount_build_volume(&layout, &inspection).unwrap();
+        let (captured, _) = host.mount_build_volume(&layout, &inspection).unwrap();
         assert!(!captured.join("after-admission").exists());
         assert_eq!(snapshot(&captured), before);
         assert_eq!(fs::read(layout.record(&source)).unwrap(), owner);
@@ -1602,7 +1693,7 @@ mod tests {
         let checkout = root.path().join("checkout");
         fs::create_dir_all(checkout.join(".cowshed")).unwrap();
         crate::blank_image::blank_image(root.namespace(), &layout.image(&source));
-        let mount = system.mount_build_volume(&layout, &source).unwrap();
+        let (mount, _) = system.mount_build_volume(&layout, &source).unwrap();
         crate::build_volume::BuildVolumeState::default()
             .write(&mount)
             .unwrap();
@@ -1801,7 +1892,7 @@ mod tests {
             &registered(linked("inspection")),
         )
         .unwrap();
-        let captured = host.mount_build_volume(&layout, &inspection).unwrap();
+        let (captured, _) = host.mount_build_volume(&layout, &inspection).unwrap();
         assert!(!captured.join("after-admission").exists());
         assert_eq!(snapshot(&captured), before);
         assert_eq!(fs::read(layout.record(&source)).unwrap(), owner);
@@ -1851,7 +1942,7 @@ mod tests {
             crate::blank_image::blank_image(namespace, &image);
             let checkout = root.join("lane");
             fs::create_dir_all(&checkout).unwrap();
-            let attachment = host
+            let (attachment, _) = host
                 .backend
                 .attach_mounted(&image, &checkout, MountAccess::ReadWrite, false)
                 .expect("attach and mount the workspace");
@@ -1859,7 +1950,7 @@ mod tests {
 
             let build_id = BuildVolumeId::mint();
             crate::blank_image::blank_image(namespace, &layout.image(&build_id));
-            let build_mount = host
+            let (build_mount, _) = host
                 .mount_build_volume(layout, &build_id)
                 .expect("mount the build volume");
             layout.write_record(&build_id, &linked("lane")).unwrap();
@@ -1925,7 +2016,7 @@ mod tests {
         let id = BuildVolumeId::mint();
         let image = layout.image(&id);
         crate::blank_image::blank_image(root.namespace(), &image);
-        let mount = host.mount_build_volume(&layout, &id).unwrap();
+        let (mount, _) = host.mount_build_volume(&layout, &id).unwrap();
         layout.write_record(&id, &linked("main")).unwrap();
         fs::write(mount.join("warm"), b"old build state\n").unwrap();
         let before = snapshot(&mount);
@@ -1996,13 +2087,13 @@ mod tests {
         // Creation is proven by first touch (build_volume::migrate) and adoption; this test's
         // source is a clone of the run's blank image, mounted the way a fork's volume is.
         crate::blank_image::blank_image(root.namespace(), &layout.image(&source));
-        let mount = host
+        let (mount, _) = host
             .mount_build_volume(&layout, &source)
             .expect("mount a build volume");
         layout.write_record(&source, &linked("main")).unwrap();
         assert_eq!(mount, layout.mount(&source));
         assert_eq!(
-            host.mount_build_volume(&layout, &source).unwrap(),
+            host.mount_build_volume(&layout, &source).unwrap().0,
             mount,
             "idempotent"
         );
@@ -2055,7 +2146,7 @@ mod tests {
         );
         drop(claim);
         let started = Instant::now();
-        let clone_mount = host
+        let (clone_mount, _) = host
             .mount_build_volume(&layout, &clone)
             .expect("mount the clone");
         let mounted = started.elapsed();
@@ -2164,8 +2255,12 @@ mod tests {
 
     fn diskutil(namespace: HostNamespace, args: &[&str]) -> String {
         let output = SystemCommandRunner::new(namespace)
-            .run(&CommandRequest::new(cowshed_apfs::device::DISKUTIL, args))
-            .expect("run diskutil");
+            .run(
+                &CommandRequest::new(cowshed_apfs::device::DISKUTIL, args),
+                "fixture diskutil",
+            )
+            .expect("run diskutil")
+            .output;
         assert!(
             output.succeeded(),
             "diskutil {args:?}: {}{}",

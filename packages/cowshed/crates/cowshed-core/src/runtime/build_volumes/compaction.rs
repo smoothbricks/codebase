@@ -1,12 +1,8 @@
-//! Seed compaction (16_build_volumes.md, "Seed compaction"): once a land captures main's seed
-//! past [`SEED_COMPACTION_EXTENTS`] and no compaction has succeeded within
-//! [`SEED_COMPACTION_INTERVAL`], the land starts a background process
-//! ([`SEED_COMPACTION_VERB`]) that copies the seed into contiguous space and publishes the copy
-//! in its place. Only the refreshes, the clones and the publication take the target's image lock;
-//! the copy holds nothing a fork or a land waits on, and it waits while a land runs.
-//! A seed that replaces the copied one meanwhile is caught up to, writing only what it changed. A
-//! compaction that fails is recorded, and no land of the build that failed starts another until
-//! one succeeds.
+//! Seed compaction (16_build_volumes.md, "Seed compaction"): necessary main-seed capture
+//! or attach/mount work over ten seconds advises a detached compactor. Only the compactor
+//! counts the refreshed immutable clone immediately before copying. The copy holds nothing
+//! a fork or land waits on, catches up to newer seeds, and holds while a land runs.
+//! A failure holds later advice by the same cowshed build until a compaction succeeds.
 use std::fs::{self, File, OpenOptions};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -37,9 +33,6 @@ use cowshed_os::fork_lock::Fenced;
 /// data regions (57,320 there), which keeps a compacted seed far under this bound.
 pub(crate) const SEED_COMPACTION_EXTENTS: u64 = 500_000;
 
-/// At most one successful compaction per project within this long.
-pub(crate) const SEED_COMPACTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
 /// How many bytes a compaction copies between asking whether to go on.
 const CHECK_EVERY_BYTES: u64 = 1 << 30;
 
@@ -64,15 +57,12 @@ pub(crate) enum Admission {
     Stop(String),
 }
 
-/// In [`crate::build_volume::BuildVolumeLayout::compacting`]: the lock one compaction at a time
-/// holds, the file whose modification time is the last success, the last failure's record, and
-/// the started process's log.
+/// In the compaction directory: the one-at-a-time lock, last failure and child log.
 const LOCK: &str = "lock";
-const SUCCEEDED: &str = "succeeded";
 const FAILED: &str = "failed";
 const LOG: &str = "log";
 
-/// The last compaction that failed: the build that ran it and its error. A land writes it when it
+/// The last compaction that failed: the build that ran it and its error. Foreground advice writes it when it
 /// cannot decide or start a compaction, the compaction process when it ends in an error, and a
 /// success removes it.
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -82,7 +72,7 @@ pub(crate) struct Failure {
     error: String,
 }
 
-/// A failed compaction a land holds back for: its error, and when it failed.
+/// A failed compaction foreground advice holds back for: its error, and when it failed.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Held {
     pub error: String,
@@ -194,40 +184,10 @@ pub(crate) fn start_compaction(
         .map_err(|error| io("start the seed compaction", program, &error))?;
     Ok((process, log))
 }
-/// Whether a target's latest seed is due a compaction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CompactionDue {
-    /// The seed holds at least `extents` extents, the bound, and no compaction succeeded within
-    /// the interval.
-    Due { extents: u64 },
-    /// The seed holds `extents`, under the bound.
-    Below { extents: u64 },
-    /// A compaction succeeded at `at`, within the interval.
-    Recent { at: SystemTime },
-    /// The target has no published seed, or its backend keeps no extent map.
-    NoSeed,
-}
-
-/// The decision from the last success, the clock and the seed's extent count, which is read only
-/// once the interval has passed (`None`: no seed, or no extent map). A last success later than
-/// `now` is recent: the clock moved back, and the interval is not proven to have passed.
-pub(crate) fn decide(
-    last: Option<SystemTime>,
-    now: SystemTime,
-    extents: impl FnOnce() -> Result<Option<u64>>,
-) -> Result<CompactionDue> {
-    if let Some(at) = last
-        && now
-            .duration_since(at)
-            .map_or(true, |elapsed| elapsed < SEED_COMPACTION_INTERVAL)
-    {
-        return Ok(CompactionDue::Recent { at });
-    }
-    Ok(match extents()? {
-        None => CompactionDue::NoSeed,
-        Some(extents) if extents >= SEED_COMPACTION_EXTENTS => CompactionDue::Due { extents },
-        Some(extents) => CompactionDue::Below { extents },
-    })
+/// Whether necessary work on main's seed advises a background compaction. The receipt
+/// covers one capture or the actual attach plus mount, never queueing, fsck or metadata.
+pub(crate) fn advised(main: bool, operation_elapsed: Option<Duration>) -> bool {
+    main && operation_elapsed.is_some_and(|elapsed| elapsed > Duration::from_secs(10))
 }
 
 /// This project's one compaction at a time: an exclusive `flock` of the compaction lock, taken
@@ -239,16 +199,8 @@ pub(crate) struct CompactionTurn {
 }
 
 impl CompactionTurn {
-    /// Record a success: the interval starts now, and no land holds back for an earlier failure.
+    /// A successful publication removes the earlier failure; success is not a timing guard.
     pub fn succeeded(&self) -> Result<()> {
-        let succeeded = self.directory.join(SUCCEEDED);
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&succeeded)
-            .and_then(|file| file.set_modified(SystemTime::now()))
-            .map_err(|error| io("record the seed compaction's success", &succeeded, &error))?;
         let failed = self.directory.join(FAILED);
         match fs::remove_file(&failed) {
             Ok(()) => Ok(()),
@@ -306,6 +258,75 @@ pub(crate) enum Published {
 }
 
 impl<H: RuntimeStorageHost> BuildVolumes<H> {
+    /// Foreground advice uses only the operation receipt. No extent provider is reachable here.
+    /// Start failures are values and retain the same-build hold rather than failing a fork or land.
+    pub fn advise_compaction(
+        &self,
+        target: &Owner,
+        operation_elapsed: Option<Duration>,
+        project_root: &Path,
+    ) -> crate::api::dto::LandSeedCompaction {
+        use crate::api::dto::LandSeedCompaction;
+        if !target.name.is_main() {
+            return LandSeedCompaction::NotMain;
+        }
+        if !advised(true, operation_elapsed) {
+            return LandSeedCompaction::NotAdvised;
+        }
+        let start = || -> Result<LandSeedCompaction> {
+            if let Some(held) = self.compaction_held()? {
+                return Ok(LandSeedCompaction::Held {
+                    error: held.error,
+                    seconds_ago: seconds_since(held.at),
+                });
+            }
+            let executable = std::env::current_exe().map_err(|error| {
+                io("find this cowshed executable", Path::new("cowshed"), &error)
+            })?;
+            let (mut child, log) =
+                start_compaction(&executable, project_root, &self.layout.compacting())?;
+            let pid = child.id();
+            // WHY unbounded: a detached reaper, with no waiter, collects the child when it ends.
+            #[allow(clippy::disallowed_methods)]
+            let reaper = std::thread::Builder::new()
+                .name("seed-compaction-reaper".to_owned())
+                .spawn(move || {
+                    if let Err(error) = child.wait() {
+                        cowshed_os::eprintln!("cowshed: the seed compaction process {pid} could not be reaped: {error}");
+                    }
+                });
+            if let Err(error) = reaper {
+                let mut failure = io("reap the seed compaction", &executable, &error);
+                if let Err(recording) = self.record_compaction_failure(&failure.message) {
+                    failure.message = format!(
+                        "{}; recording that failure failed too: {}",
+                        failure.message, recording.message
+                    );
+                }
+                cowshed_os::eprintln!(
+                    "cowshed: seed compaction process {pid} started, logging to {}, but its reaper could not be created: {}",
+                    log.display(),
+                    failure.message
+                );
+            }
+            Ok(LandSeedCompaction::Started { pid, log })
+        };
+        match start() {
+            Ok(report) => report,
+            Err(mut error) => {
+                if let Err(recording) = self.record_compaction_failure(&error.message) {
+                    error.message = format!(
+                        "{}; recording that failure failed too: {}",
+                        error.message, recording.message
+                    );
+                }
+                LandSeedCompaction::Failed {
+                    error: error.message,
+                }
+            }
+        }
+    }
+
     /// Take this project's compaction turn without waiting, or `None` while another process holds
     /// it.
     pub fn try_compaction_turn(&self) -> Result<Option<CompactionTurn>> {
@@ -391,32 +412,6 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             .map_err(|error| io("record the failed seed compaction", &path, &error))
     }
 
-    /// Whether `target`'s latest seed is due a compaction ([`decide`]); its extents are counted no
-    /// further than the bound.
-    pub async fn compaction_due(&self, target: Owner) -> Result<CompactionDue> {
-        self.blocking(move |host, layout| {
-            let succeeded = layout.compacting().join(SUCCEEDED);
-            let last = match fs::metadata(&succeeded) {
-                Ok(metadata) => Some(metadata.modified().map_err(|error| {
-                    io("read the last seed compaction's time", &succeeded, &error)
-                })?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(io("inspect the last seed compaction", &succeeded, &error));
-                }
-            };
-            decide(last, SystemTime::now(), || {
-                let Some((seed, _)) = layout.seed_of(&target.name, &target.incarnation)? else {
-                    return Ok(None);
-                };
-                host.seed_extents(layout, &seed, SEED_COMPACTION_EXTENTS)
-                    .map(|extents| extents.map(|extents| extents.get()))
-                    .map_err(storage)
-            })
-        })
-        .await
-    }
-
     /// Hand what a compaction left in `build/.compacting` to the gateway's cleanup, under the
     /// project's compaction turn and with no image lock held: an interrupted run's, before the
     /// target's image lock is first taken, and this run's, before it answers. Each is one rename
@@ -452,10 +447,11 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     pub async fn copy_compaction(
         &self,
         source: CompactionSource,
+        minimum_extents: u64,
         admit: Box<dyn FnMut() -> Admission + Send>,
     ) -> Result<SeedCompaction> {
         self.blocking(move |host, _| {
-            host.copy_seed_compaction(source, &mut between_checks(admit))
+            host.copy_seed_compaction(source, minimum_extents, &mut between_checks(admit))
                 .map_err(storage)
         })
         .await
@@ -528,8 +524,6 @@ mod tests {
     use super::*;
     use cowshed_os::test_backstop::ChildBackstop as _;
 
-    const HOUR: Duration = Duration::from_secs(60 * 60);
-
     #[test]
     fn a_gateway_that_is_not_running_holds_no_land_turn_and_one_unread_stops_the_copy() {
         use crate::api::dto::{LandTurnName, LandTurnQueue};
@@ -572,42 +566,24 @@ mod tests {
     }
 
     #[test]
-    fn a_seed_under_the_bound_is_left_alone_and_one_past_it_is_due() {
-        assert_eq!(
-            decide(None, now(), || Ok(Some(SEED_COMPACTION_EXTENTS - 1))).unwrap(),
-            CompactionDue::Below {
-                extents: SEED_COMPACTION_EXTENTS - 1
+    fn only_necessary_main_seed_work_strictly_over_ten_seconds_advises() {
+        for main in [false, true] {
+            for (elapsed, slow) in [
+                (None, false),
+                (Some(Duration::from_secs(9)), false),
+                (Some(Duration::from_secs(10)), false),
+                (
+                    Some(Duration::from_secs(10) + Duration::from_nanos(1)),
+                    true,
+                ),
+            ] {
+                assert_eq!(
+                    advised(main, elapsed),
+                    main && slow,
+                    "main={main}, elapsed={elapsed:?}"
+                );
             }
-        );
-        assert_eq!(
-            decide(None, now(), || Ok(Some(SEED_COMPACTION_EXTENTS))).unwrap(),
-            CompactionDue::Due {
-                extents: SEED_COMPACTION_EXTENTS
-            }
-        );
-        assert_eq!(
-            decide(None, now(), || Ok(None)).unwrap(),
-            CompactionDue::NoSeed
-        );
-    }
-
-    #[test]
-    fn a_success_within_the_interval_is_recent_without_counting_extents() {
-        for last in [now() - 23 * HOUR, now() + HOUR] {
-            assert_eq!(
-                decide(Some(last), now(), || panic!("counted extents")).unwrap(),
-                CompactionDue::Recent { at: last }
-            );
         }
-        assert_eq!(
-            decide(Some(now() - 24 * HOUR), now(), || Ok(Some(
-                SEED_COMPACTION_EXTENTS
-            )))
-            .unwrap(),
-            CompactionDue::Due {
-                extents: SEED_COMPACTION_EXTENTS
-            }
-        );
     }
 
     #[test]

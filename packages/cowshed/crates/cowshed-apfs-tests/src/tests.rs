@@ -228,8 +228,9 @@ impl CommandRunner for ForcedUnmountBeforeNaming {
     fn run(
         &self,
         request: &CommandRequest,
-    ) -> Result<cowshed_apfs::CommandOutput, cowshed_apfs::CommandRunError> {
-        self.0.run(request)
+        operation: &'static str,
+    ) -> Result<cowshed_apfs::CommandRun, cowshed_apfs::CommandRunError> {
+        self.0.run(request, operation)
     }
     fn run_guarded<E>(
         &self,
@@ -311,18 +312,16 @@ fn real_apfs_a_rename_names_only_its_own_held_volume_root() {
     let result = (|| -> Result<(), ApfsError> {
         crate::blank_image::blank_image(root.namespace(), &outer_image);
         crate::blank_image::blank_image(root.namespace(), &inner_image);
-        let outer = outer_cleanup.track(backend.attach_mounted(
-            &outer_image,
-            &outer_mount,
-            MountAccess::ReadWrite,
-            false,
-        )?);
-        let inner = inner_cleanup.track(backend.attach_mounted(
-            &inner_image,
-            &inner_mount,
-            MountAccess::ReadWrite,
-            false,
-        )?);
+        let outer = outer_cleanup.track(
+            backend
+                .attach_mounted(&outer_image, &outer_mount, MountAccess::ReadWrite, false)?
+                .0,
+        );
+        let inner = inner_cleanup.track(
+            backend
+                .attach_mounted(&inner_image, &inner_mount, MountAccess::ReadWrite, false)?
+                .0,
+        );
         let outer_name = name_at(&outer_mount);
         assert_ne!(outer_name, label);
 
@@ -390,8 +389,11 @@ fn real_apfs_one_image_is_matched_by_the_url_its_driver_registered() {
     let mut cleanup = RealImageCleanup::new(&backend, image.clone());
     let result = (|| -> Result<(), ApfsError> {
         crate::blank_image::blank_image(root.namespace(), &image);
-        let attached =
-            cleanup.track(backend.attach_mounted(&image, &mount, MountAccess::ReadWrite, false)?);
+        let attached = cleanup.track(
+            backend
+                .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)?
+                .0,
+        );
         let whole: Vec<_> = system
             .attached_disk_images()
             .map_err(ApfsError::KernelInventory)?
@@ -544,7 +546,7 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
             .join("lease-held-capture")
             .with_extension(IMAGE_EXTENSION);
         assert!(matches!(
-            backend.clone_image(&image_a, &capture, ImageCapture::Detached),
+            backend.prepare_clone(&image_a, &capture, ImageCapture::Detached).and_then(|admitted| admitted.clone_image()),
             Err(cowshed_apfs::CloneFileError::SourceAttached { source }) if source == image_a
         ));
         assert!(
@@ -622,12 +624,11 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
                     let created = backend
                         .create_staged_image(&lease_test_image(stem_b, "cowshed-lease-free"))?;
                     report(Progress::Step("attach-mount"));
-                    let attachment = cleanup.track(backend.attach_mounted(
-                        &created,
-                        mount_b,
-                        MountAccess::ReadWrite,
-                        false,
-                    )?);
+                    let attachment = cleanup.track(
+                        backend
+                            .attach_mounted(&created, mount_b, MountAccess::ReadWrite, false)?
+                            .0,
+                    );
                     fs::write(mount_b.join("written-beside-a-held-lease"), b"independent")
                         .expect("write into B's volume");
                     report(Progress::Step("unmount"));

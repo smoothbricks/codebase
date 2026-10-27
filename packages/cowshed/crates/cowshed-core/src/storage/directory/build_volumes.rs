@@ -460,6 +460,7 @@ impl DirectoryExecutionHost {
                 registration: registration.clone(),
                 written,
                 source_owner: source_record.role.owner().clone(),
+                capture_elapsed: None,
                 creating,
             }),
             Err(error) => Err(self.unregister(layout, destination, creating, error)),

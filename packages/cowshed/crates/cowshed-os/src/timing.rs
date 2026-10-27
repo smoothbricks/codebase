@@ -171,23 +171,50 @@ pub fn timed_over<T, E: fmt::Display>(
     slow: Duration,
     work: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
+    timed_over_with_elapsed(scope, step, slow, work).0
+}
+
+/// Run the existing synchronous span and return its work duration, also when work fails.
+/// Step publication and diagnostics are outside this duration; no second clock is started.
+pub fn timed_with_elapsed<T, E: fmt::Display>(
+    scope: &'static str,
+    step: fmt::Arguments<'_>,
+    work: impl FnOnce() -> Result<T, E>,
+) -> (Result<T, E>, Duration) {
+    timed_over_with_elapsed(scope, step, Duration::ZERO, work)
+}
+
+fn timed_over_with_elapsed<T, E: fmt::Display>(
+    scope: &'static str,
+    step: fmt::Arguments<'_>,
+    slow: Duration,
+    work: impl FnOnce() -> Result<T, E>,
+) -> (Result<T, E>, Duration) {
     crate::eprintln!("cowshed: {scope} {step} start");
-    let started = Instant::now();
-    let result = match OpenStep::start(scope, || step.to_string()) {
+    let open = OpenStep::start(scope, || step.to_string());
+    let (result, elapsed) = match open {
         Some(open) => {
-            let result = STEPS.sync_scope(open.inside(), work);
+            let (result, elapsed) = STEPS.sync_scope(open.inside(), || {
+                let started = Instant::now();
+                let result = work();
+                (result, started.elapsed())
+            });
             open.end(&result);
-            result
+            (result, elapsed)
         }
-        None => work(),
+        None => {
+            let started = Instant::now();
+            let result = work();
+            (result, started.elapsed())
+        }
     };
-    done(
+    done_elapsed(
         format_args!("{scope} {step}"),
-        started,
+        elapsed,
         slow,
         result.is_ok(),
     );
-    result
+    (result, elapsed)
 }
 
 /// [`timed_async`] whose `done` line prints only when the step took at least `slow`, as
@@ -220,7 +247,10 @@ pub async fn timed_async_over<T, E: fmt::Display>(
 
 /// The step's `done` line, when it took at least `slow`.
 fn done(label: fmt::Arguments<'_>, started: Instant, slow: Duration, ok: bool) {
-    let elapsed = started.elapsed();
+    done_elapsed(label, started.elapsed(), slow, ok);
+}
+
+fn done_elapsed(label: fmt::Arguments<'_>, elapsed: Duration, slow: Duration, ok: bool) {
     if elapsed >= slow {
         crate::eprintln!(
             "cowshed: {label} done elapsed={elapsed:?} status={}",

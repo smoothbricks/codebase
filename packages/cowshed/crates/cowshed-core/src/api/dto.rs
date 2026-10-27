@@ -4002,44 +4002,28 @@ pub enum LandSeedCompaction {
     /// The target is not main; only main's seed is compacted.
     NotMain,
     /// A compaction by this cowshed build failed `secondsAgo` seconds ago with `error`, so none
-    /// was started: no land of this build starts one until a compaction succeeds.
+    /// was started: no fork or land of this build starts one until a compaction succeeds.
     Held {
         error: String,
         #[serde(rename = "secondsAgo")]
         seconds_ago: u64,
     },
-    /// A compaction succeeded `secondsAgo` seconds ago, within the interval.
-    Recent {
-        #[serde(rename = "secondsAgo")]
-        seconds_ago: u64,
-    },
-    /// The seed holds `extents`, under the bound.
-    Below { extents: u64 },
-    /// Main has no published seed, or its backend keeps no extent map.
-    NoSeed,
-    /// Process `pid` compacts the seed, which holds at least `extents` extents, in the
-    /// background, its stderr appended to `log`.
-    Started {
-        pid: u32,
-        extents: u64,
-        log: PathBuf,
-    },
+    /// No necessary main-seed capture or attach/mount operation exceeded ten seconds.
+    NotAdvised,
+    /// Process `pid` checks the current seed and compacts it in the background when due,
+    /// its stderr appended to `log`. No foreground extent count is made.
+    Started { pid: u32, log: PathBuf },
     /// Deciding or starting the compaction failed with `error`. The failure is recorded, so the
     /// next lands of this build hold back for it.
     Failed { error: String },
 }
 /// What one seed compaction did (16_build_volumes.md, "Seed compaction"): the result of the
-/// internal `coordinator.compactSeed`, which the process a land starts runs.
+/// internal `coordinator.compactSeed`, run by the process a fork or land starts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum SeedCompactionReport {
     /// Another process holds the project's compaction turn.
     Running,
-    /// A compaction succeeded this many seconds ago, within the interval.
-    Recent {
-        #[serde(rename = "secondsAgo")]
-        seconds_ago: u64,
-    },
     /// The seed holds `extents`, under the bound: left as it is.
     Below { extents: u64 },
     /// Main has no published seed, none any more once the copy was done, or its backend keeps no
@@ -4102,10 +4086,6 @@ impl std::fmt::Display for SeedCompactionReport {
             Self::Running => {
                 formatter.write_str("another process is compacting this project's seed")
             }
-            Self::Recent { seconds_ago } => write!(
-                formatter,
-                "a compaction succeeded {seconds_ago} s ago, within the interval: nothing to do"
-            ),
             Self::Below { extents } => {
                 write!(
                     formatter,

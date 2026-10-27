@@ -940,7 +940,11 @@ mod tests {
     }
 
     impl CommandRunner for RefuseFirstMount {
-        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        fn run(
+            &self,
+            request: &CommandRequest,
+            _: &'static str,
+        ) -> Result<cowshed_apfs::CommandRun, CommandRunError> {
             assert_eq!(request.program, Path::new("/usr/bin/hdiutil"));
             assert_eq!(request.args[0], "attach");
             assert!(
@@ -970,7 +974,9 @@ mod tests {
             E: From<CommandRunError> + std::fmt::Display,
         {
             if check()? {
-                self.run(request).map(Some).map_err(E::from)
+                self.run(request, "guarded disk command")
+                    .map(|run| Some(run.output))
+                    .map_err(E::from)
             } else {
                 Ok(None)
             }

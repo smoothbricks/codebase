@@ -395,8 +395,9 @@ which every fork of the target holds while it clones the seed, so a reseed never
 Native capture, clone and release operations record each image's allocated bytes before and after, their signed delta,
 operation and measurement time, and explicitly process-window disk-write bytes. Telemetry walks no extent map: nothing
 consumed those counts, and their three walks cost about 85 seconds around an 81 ms seed clone under concurrent forks.
-Compaction, doctor and forkability retain their required counts. See 13_telemetry.md, "Native image observations", for
-allocation thresholds, the measured basis, Arrow fields, batching and queries.
+Compaction's foreground advice reuses the necessary operation's live duration receipt, never diagnostic rows or a new
+extent query. Only its child counts the refreshed immutable source before copying; doctor and forkability keep their
+required authority counts. See 13_telemetry.md, "Native image observations", for the audit-only measurements.
 
 Land already owns a shared GC hold on its quiet source. Its typed quiet capture retains the stopped supervisor socket
 lease that refuses replacement admission, from before the jobs stop through capture and adoption. It does not take a
@@ -488,12 +489,17 @@ precedence; lifecycle seed lookups remain fresh.
 
 ### Seed compaction
 
-A seed is detached and immutable, so rewriting it into contiguous space stops no live shell. A land into main that froze
-main's seed starts the compaction when the seed holds at least **500,000 extents**, no compaction of the project has
-succeeded in the last **24 hours**, and no compaction by the land's own cowshed build has failed since (Failures). No
-timer starts it. A seed that replaces the copied one while the copy runs does not stop it: the copy is caught up to the
-new seed (Catch-up). A compaction that cannot tell whether a gate or a land runs, or whose seed keeps being replaced
-faster than it catches up, is started again by the next land that freezes main's seed.
+A seed is detached and immutable, so rewriting it into contiguous space stops no live shell. Necessary main-seed capture
+or attach/mount work **strictly over 10 seconds** advises the existing background compactor, at a foreground fork of
+main or a land that froze main's seed. A capture receipt includes the existing source sync and descriptor clone, with
+source-bound image-lease admission completed before that work is timed. The attach/mount receipt sums only the actual
+attach and mount command work inside their granted disk leases; it excludes lease waits, fsck, metadata,
+destination-seed capture and the rest of build-ready. A fork of a non-main source never advises main's compaction from
+its own slow work. No timer, rolling window, advice cache, Arrow query or foreground extent walk decides it. A
+successful compaction leaves no recent-success guard or success marker: an adopted lineage cannot inherit another
+lineage's old suppression. The same-build failure hold remains (Failures). The compactor alone verifies the existing
+**500,000-extent** bound on its current immutable source immediately before copying. A seed replaced during the copy is
+caught up to (Catch-up); a later qualifying foreground operation can advise another run if one stopped.
 
 - **Why 500,000.** A fork's first write costs 0.1 to 0.2 ms per extent of its seed's map, and every fork pays it twice
   (its volume, then its own seed's capture), so 500,000 extents cost a fork about 140 s. A compaction writes the whole
@@ -501,30 +507,33 @@ faster than it catches up, is started again by the next land that freezes main's
   100,000 for a 209 GB seed); larger write chunks and `F_PREALLOCATE` do not lower it. It pays for itself within four
   forks, and a seed growing about 110,000 extents a day is due again after a few days. Compacting at every land would
   rewrite the seed every time and hold main's image lock for minutes.
-- **Off the land path.** The land decides, with the seed's extents counted no further than the bound, and starts
-  `cowshed __compact-seed <project-root>` in a session of its own, holding no descriptor of the land's but its stdio,
-  its stderr appended to `build/.compacting/log` (the land creates `build/.compacting` first). The land answers without
-  waiting for it.
-- **The land reports it.** The land report's frozen seed carries what the land did about compaction: `notMain`; `recent`
-  or `below` (with the age of the last success or the extents counted); `noSeed`; `started` (the process, the extents
-  and the log); `held` (the recorded failure of this build and its age); or `failed` (deciding or starting failed now,
-  and why). None of these fails the land.
-- **Failures.** A land whose decision or start fails, and a compaction that ends in an error, write
+- **Off the foreground path.** Advice starts `cowshed __compact-seed <project-root>` in a session of its own, holding no
+  descriptor of the fork or land but its stdio, its stderr appended to `build/.compacting/log` (the foreground creates
+  `build/.compacting` first). The foreground answers without waiting for the child or counting any extents for advice.
+  The operation receipt already proves a seed was captured or prepared: advice enumerates no build records and makes no
+  seed-existence probe. Only the child's refreshed source determines whether a seed still exists and reaches the bound.
+- **The land reports it.** The frozen seed carries `notMain`, `notAdvised` (no usable qualifying live operation),
+  `started` (the actual process and log, never an unobserved extent count), `held` (the same-build failure and its age),
+  or `failed` (deciding or starting failed, and why). None fails the land. A start whose reaper cannot be created still
+  reports started; the reaper failure is recorded as the compaction failure.
+- **Failures.** A foreground decision or start that fails, and a compaction ending in an error, write
   `build/.compacting/failed`: the cowshed build that failed (its `BuildId`, 11_shell.md "Draining a supervisor of
-  another build") and the error, written aside and renamed into place. While the record names the land's own build, the
-  land starts nothing and reports `held`, so a cause that does not change is not met again at every land. A land of
-  another build starts a compaction as usual, since a new build is how a fix ships.
-  `cowshed __compact-seed <project-root>` run by hand does not read the record, and any success removes it. A compaction
-  that cannot tell whether a gate or a land runs, gives up catching up, or finds another one running has not failed.
+  another build") and the error, written aside and renamed into place. Advice by that same build starts nothing and
+  reports `held`, so an unchanged cause is not met at every fork or land. Another build can start as usual, since a new
+  build is how a fix ships. `cowshed __compact-seed <project-root>` run by hand does not read the record, and any
+  success removes it. A compaction that cannot tell whether a gate or a land runs, gives up catching up, or finds
+  another one running has not failed.
 - **One at a time.** The process takes the project's compaction lock (`build/.compacting/lock`) without waiting and
-  exits if another process holds it. It reads the last success (the modification time of `build/.compacting/succeeded`)
-  and the bound again. It then refreshes main's seed exactly as a fork of main does (Fork step 2), under main's image
-  lock. The copy then holds what main's live volume holds, so the next fork's reseed keeps the compacted seed instead of
-  replacing it with a capture of a volume written after the seed.
+  exits if another process holds it. It refreshes main's seed exactly as a fork of main does (Fork step 2), under main's
+  image lock, without recursively advising another compaction. The copy then holds what main's live volume holds, so the
+  next fork's reseed keeps the compacted seed instead of replacing it with a later capture.
 - **Only the refreshes, the clones and the publication hold main's image lock.** Still under the lock that the refresh
   took, the seed is cloned to `build/.compacting/<seed>.dmg` (milliseconds; the clone is never written, so a land or
-  reseed that retires the seed meanwhile changes nothing it reads). With no lock held, the clone's data is copied with
-  plain `pread`/`pwrite` into `build/.compacting/copy.dmg`, keeping holes, as `defrag` copies (01a_apfs.md, "Images").
+  reseed that retires the seed meanwhile changes nothing it reads). With no lock held, one full extent count of this
+  refreshed immutable clone is taken immediately before copying. Below 500,000 it reports the actual count, creates no
+  copy and hands the staged clone to cleanup. At the bound it copies the clone's data with plain `pread`/`pwrite` into
+  `build/.compacting/copy.dmg`, keeping holes, as `defrag` copies (01a_apfs.md, "Images"); the same count becomes the
+  report's `before`, with no separate threshold walk. After-copy, catch-up, forkability and doctor counts remain real.
   The copy runs at normal disk priority and past the cache (`F_NOCACHE` on both descriptors): it holds for every gate
   and land (below), so between them the disk is its to use, and it passes each byte once, so caching it would only evict
   the working set of the rest of the host. Measured 2026-10-25 on this host: throttled (`IOPOL_THROTTLE`), a 367 GB seed
@@ -544,7 +553,7 @@ faster than it catches up, is started again by the next land that freezes main's
   before its image exists, renamed into place, and given that seed's freshness mark (its bytes are that seed's, so they
   are no newer). It is proven forkable and published, as a captured seed is. Every older seed is then claimed under the
   lock and committed to `build/.deleting` once the compaction lets the lock go, as a fork's seed refresh retires the
-  seeds it replaces (Garbage collection). A publication records the success.
+  seeds it replaces (Garbage collection). A successful publication removes its prior failure record.
 - **Catch-up.** When a land, a fork's reseed or the publication's own refresh replaced the seed the copy holds, the new
   latest seed is cloned aside under the same lock, and the lock is let go. With no lock held, the copy is made to hold
   the new seed's bytes: wherever the new seed's data sits on the same device blocks as the old seed's clone at the same
@@ -588,12 +597,13 @@ faster than it catches up, is started again by the next land that freezes main's
   The compaction cuts nothing: the gateway's cleanup is the only cutter on the store's container. Measured 2026-10-26, a
   compaction that freed its old seed's clone itself beside the cleanup took 67.98 s for its first cut and 1 to 14 s for
   later ones, the cleanup's cuts beside it 14 and 17 s, and unrelated opens on the host waited up to 49 s.
-- The process reports one line on stderr: running elsewhere, recent, below the bound, no seed, stopped and why, or
-  compacted with both extent counts, the bytes written, the time taken, each catch-up, and whether main's volume moved
-  or why it was kept.
-- **Enforced by**: unit tests of the decision (a seed under the bound is left alone; one at the bound is due; a success
-  within the interval, or one dated after the clock, is recent without counting extents) and of the hold (a failure of
-  the land's build holds it; another build's does not); a test in which the first start, with no `build/.compacting`,
+- The process reports one line on stderr: running elsewhere, below the bound with the child's actual count, no seed,
+  stopped and why, or compacted with both extent counts, the bytes written, the time taken, each catch-up, and whether
+  main's volume moved or why it was kept.
+- **Enforced by**: pure injected-duration advice tables below, at and strictly above ten seconds, main and non-main,
+  absent observations, and actual attach-plus-mount composition; an injected-clock adapter witness excludes admission
+  queueing from command work; the production count seam counts once, makes no copy below 500,000 and reuses its count at
+  the bound; the failure hold admits only another build. A test in which the first start, with no `build/.compacting`,
   starts a process that holds none of the land's descriptors; a held copy asks again until it may go on; a copy that a
   stop interrupts removes its copy and leaves the source unchanged; a real-APFS test of the catch-up writing nothing for
   a plain clone of the copied seed and, for a clone with a range rewritten, data written into a hole and a range
@@ -949,8 +959,8 @@ without failing the land.
 8. **Retire the workspace**. An adopted build volume is now the target's and does not retire with it. After a
    compare-and-swap at step 3 nothing adopted it, so it is still the workspace's.
 
-A land into main whose seed capture published a seed then starts that seed's compaction when it is due (Seed
-compaction).
+A land into main whose capture published a seed uses that capture's necessary-work receipt to advise its background
+compactor (Seed compaction); the child, not the land, decides whether its refreshed immutable source reaches the bound.
 
 ### Adoption copies nothing
 

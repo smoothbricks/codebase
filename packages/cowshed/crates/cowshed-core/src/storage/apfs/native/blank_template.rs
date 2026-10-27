@@ -38,7 +38,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             )?;
             timed_apfs_step(leg, "clonefile", || {
                 self.backend
-                    .clone_image(&template, image, cowshed_apfs::ImageCapture::Detached)
+                    .prepare_clone(&template, image, cowshed_apfs::ImageCapture::Detached)
+                    .and_then(|admitted| admitted.clone_image())
                     .map_err(ApfsError::from)
             })?;
             sync_parent_path(image)?;
@@ -46,7 +47,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .backend
                 .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
             {
-                Ok(attachment) => Ok(attachment),
+                Ok((attachment, _)) => Ok(attachment),
                 Err(
                     primary @ (ApfsError::AttachmentCleanupFailed { .. }
                     | ApfsError::VerificationAndDetachFailed { .. }),

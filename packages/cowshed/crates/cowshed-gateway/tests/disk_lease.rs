@@ -482,7 +482,8 @@ async fn contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease()
     let clone = |name: String| {
         let image = images.join(name).with_extension(IMAGE_EXTENSION);
         backend
-            .clone_image(&source, &image, cowshed_apfs::ImageCapture::Detached)
+            .prepare_clone(&source, &image, cowshed_apfs::ImageCapture::Detached)
+            .and_then(|admitted| admitted.clone_image())
             .expect("clone");
         image
     };

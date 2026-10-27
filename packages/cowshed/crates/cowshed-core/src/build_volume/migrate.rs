@@ -109,7 +109,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
             (id, creating)
         }
     };
-    let mount = host
+    let (mount, _) = host
         .mount_build_volume(layout, &id)
         .map_err(storage_error)?;
     let previous = BuildVolumeState::read(&mount)?;

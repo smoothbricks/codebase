@@ -468,16 +468,20 @@ mod macos {
             let image = project.join("main.dmg");
             let count = || {
                 let output = runner
-                    .run(&CommandRequest::new(
-                        "/usr/sbin/ioclasscount",
-                        [
-                            "AppleDiskImageDevice",
-                            "DIDeviceIOUserClient",
-                            "AppleAPFSVolume",
-                            "IOMedia",
-                        ],
-                    ))
-                    .unwrap();
+                    .run(
+                        &CommandRequest::new(
+                            "/usr/sbin/ioclasscount",
+                            [
+                                "AppleDiskImageDevice",
+                                "DIDeviceIOUserClient",
+                                "AppleAPFSVolume",
+                                "IOMedia",
+                            ],
+                        ),
+                        "count image classes",
+                    )
+                    .unwrap()
+                    .output;
                 assert!(output.succeeded(), "{output:?}");
                 String::from_utf8(output.stdout).unwrap()
             };

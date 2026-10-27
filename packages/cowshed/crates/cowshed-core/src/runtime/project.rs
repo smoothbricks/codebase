@@ -6011,7 +6011,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .to_owned();
         let locked = match volumes
             .try_lock_target(
-                owner,
+                owner.clone(),
                 lock,
                 crate::api::held_lock::LockHolding::of(
                     crate::api::held_lock::LockOperation::Land,
@@ -6033,15 +6033,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // A busy seal keeps the previous seed and the adoption still runs: the seal fences only
         // the captured bytes, and the restored volume is as quiet for the target as before. The
         // seeds a freeze replaced are claimed under the lock and retired once it is let go.
-        let (seal_busy, superseded) = match timed_async(
+        let (seal_busy, superseded, operation_elapsed) = match timed_async(
             "land",
             "freeze-seed",
             volumes.freeze_seed(&locked, &quiet, tree.clone()),
         )
         .await?
         {
-            Ok(super::build_volumes::Freeze::Frozen { superseded }) => (None, Some(superseded)),
-            Ok(super::build_volumes::Freeze::SealBusy { reason }) => (Some(reason), None),
+            Ok(super::build_volumes::Freeze::Frozen {
+                superseded,
+                operation_elapsed,
+            }) => (None, Some(superseded), operation_elapsed),
+            Ok(super::build_volumes::Freeze::SealBusy { reason }) => (Some(reason), None, None),
             Err(reason) => return Ok(skipped(reason)),
         };
         let closed = match closed {
@@ -6052,7 +6055,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     volumes.retire_superseded(superseded).await;
                 }
                 return Ok(LandBuildVolume {
-                    seed: self.land_seed(&into.name, seal_busy, &volumes).await,
+                    seed: self.land_seed(&owner, seal_busy, operation_elapsed, &volumes),
                     adoption: Adoption::Skipped { reason },
                 });
             }
@@ -6155,112 +6158,46 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
         };
         Ok(LandBuildVolume {
-            seed: self.land_seed(&into.name, seal_busy, &volumes).await,
+            seed: self.land_seed(&owner, seal_busy, operation_elapsed, &volumes),
             adoption,
         })
     }
 
-    /// What the land's freeze did with `target`'s seed, `seal_busy` being why a conflicting claim
-    /// refused its capture. Once main's seed is frozen, the land starts
-    /// its compaction when it is due (16_build_volumes.md, "Seed compaction") and answers without
-    /// waiting for it. A decision or start that fails is the report's value, not the land's error:
-    /// the land has succeeded. It is recorded, so the next lands of this build hold back for it
-    /// instead of failing the same way.
-    async fn land_seed(
-        &mut self,
-        target: &WorkspaceName,
+    /// A frozen seed's foreground advice is the necessary operation's live receipt, not an
+    /// extent query. Background start failures remain report values and retain the build hold.
+    fn land_seed(
+        &self,
+        target: &super::build_volumes::Owner,
         seal_busy: Option<String>,
+        operation_elapsed: Option<std::time::Duration>,
         volumes: &super::build_volumes::BuildVolumes<H>,
     ) -> crate::api::dto::LandSeed {
-        use crate::api::dto::{LandSeed, LandSeedCompaction};
+        use crate::api::dto::LandSeed;
         match seal_busy {
             Some(reason) => LandSeed::SealBusy { reason },
-            None if !target.is_main() => LandSeed::Frozen {
-                compaction: LandSeedCompaction::NotMain,
-            },
             None => LandSeed::Frozen {
-                compaction: match self.start_seed_compaction(volumes).await {
-                    Ok(compaction) => compaction,
-                    Err(mut error) => {
-                        if let Err(recording) = volumes.record_compaction_failure(&error.message) {
-                            error.message = format!(
-                                "{}; recording that failure failed too: {}",
-                                error.message, recording.message
-                            );
-                        }
-                        LandSeedCompaction::Failed {
-                            error: error.message,
-                        }
-                    }
-                },
+                compaction: volumes.advise_compaction(
+                    target,
+                    operation_elapsed,
+                    &self.descriptor.git_root,
+                ),
             },
         }
-    }
-
-    /// Main's seed compaction, started in a process of its own ([`super::build_volumes::start_compaction`])
-    /// when the seed is due and no failure of this build is held; a thread reaps it.
-    async fn start_seed_compaction(
-        &mut self,
-        volumes: &super::build_volumes::BuildVolumes<H>,
-    ) -> Result<crate::api::dto::LandSeedCompaction> {
-        use super::build_volumes::{CompactionDue, io, seconds_since};
-        use crate::api::dto::LandSeedCompaction;
-        if let Some(held) = volumes.compaction_held()? {
-            return Ok(LandSeedCompaction::Held {
-                error: held.error,
-                seconds_ago: seconds_since(held.at),
-            });
-        }
-        let main = main_name();
-        let current = self.current(&main).await?;
-        let owner = super::build_volumes::Owner {
-            name: main,
-            incarnation: current.derived.workspace.incarnation().clone(),
-        };
-        let extents = match volumes.compaction_due(owner).await? {
-            CompactionDue::Due { extents } => extents,
-            CompactionDue::Below { extents } => return Ok(LandSeedCompaction::Below { extents }),
-            CompactionDue::Recent { at } => {
-                return Ok(LandSeedCompaction::Recent {
-                    seconds_ago: seconds_since(at),
-                });
-            }
-            CompactionDue::NoSeed => return Ok(LandSeedCompaction::NoSeed),
-        };
-        let executable = std::env::current_exe()
-            .map_err(|error| io("find this cowshed executable", Path::new("cowshed"), &error))?;
-        let (mut child, log) = super::build_volumes::start_compaction(
-            &executable,
-            &self.descriptor.git_root,
-            &volumes.layout.compacting(),
-        )?;
-        let pid = child.id();
-        // WHY unbounded: a detached reaper thread: nothing waits on it; it collects the compaction
-        // process whenever that exits, and says when it cannot.
-        #[allow(clippy::disallowed_methods)]
-        std::thread::Builder::new()
-            .name("seed-compaction-reaper".to_owned())
-            .spawn(move || {
-                if let Err(error) = child.wait() {
-                    cowshed_os::eprintln!(
-                        "cowshed: the seed compaction process {pid} could not be reaped: {error}"
-                    );
-                }
-            })
-            .map_err(|error| io("reap the seed compaction", &executable, &error))?;
-        Ok(LandSeedCompaction::Started { pid, extents, log })
     }
 
     /// `coordinator.compactSeed` (16_build_volumes.md, "Seed compaction"). Under the project's
-    /// compaction turn, once main's seed is due: [`Self::compact_due_seed`], then whatever the run
+    /// compaction turn, refresh and stage main's seed in [`Self::compact_due_seed`], then whatever the run
     /// left in `build/.compacting` (the seeds' clones, a copy it did not publish) is handed to the
     /// gateway's cleanup with no lock held, as the next run would hand over an interrupted one's.
     async fn compact_main_seed(&mut self) -> Result<crate::api::dto::SeedCompactionReport> {
-        use super::build_volumes::{CompactionDue, Owner};
+        use super::build_volumes::Owner;
         use crate::api::dto::SeedCompactionReport;
         let started = std::time::Instant::now();
         self.validate_binding().await?;
         let volumes = self.build_volumes()?;
+        if !H::HAS_PHYSICAL_VOLUMES {
+            return Ok(SeedCompactionReport::NoSeed);
+        }
         let Some(turn) = volumes.try_compaction_turn()? else {
             return Ok(SeedCompactionReport::Running);
         };
@@ -6270,18 +6207,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             name: main.clone(),
             incarnation: current.derived.workspace.incarnation().clone(),
         };
-        match volumes.compaction_due(owner.clone()).await? {
-            CompactionDue::Due { .. } => {}
-            CompactionDue::Below { extents } => {
-                return Ok(SeedCompactionReport::Below { extents });
-            }
-            CompactionDue::Recent { at } => {
-                return Ok(SeedCompactionReport::Recent {
-                    seconds_ago: super::build_volumes::seconds_since(at),
-                });
-            }
-            CompactionDue::NoSeed => return Ok(SeedCompactionReport::NoSeed),
-        }
         volumes.release_compaction_leftovers().await?;
         let compacted = self.compact_due_seed(&volumes, owner, &turn, started).await;
         let released = volumes.release_compaction_leftovers().await;
@@ -6343,9 +6268,20 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             return Ok(SeedCompactionReport::NoSeed);
         };
         let mut compacted = match self
-            .between_gates(|admit| volumes.copy_compaction(source, admit))
+            .between_gates(|admit| {
+                volumes.copy_compaction(
+                    source,
+                    super::build_volumes::SEED_COMPACTION_EXTENTS,
+                    admit,
+                )
+            })
             .await?
         {
+            SeedCompaction::Below { extents } => {
+                return Ok(SeedCompactionReport::Below {
+                    extents: extents.get(),
+                });
+            }
             SeedCompaction::Stopped { bytes, why } => {
                 return Ok(SeedCompactionReport::Stopped { bytes, why });
             }
@@ -13833,8 +13769,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         capture,
                         ready: {
                             let name = destination.clone();
+                            let project_root = self.descriptor.git_root.to_path_buf();
                             move |captured, incarnation| async move {
-                                timed_async(
+                                let prepared = timed_async(
                                     "fork",
                                     "build-volume-ready",
                                     readying.ready_fork(
@@ -13842,7 +13779,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                         super::build_volumes::Owner { name, incarnation },
                                     ),
                                 )
-                                .await
+                                .await?;
+                                readying.advise_fork_compaction(prepared.as_ref(), &project_root);
+                                Ok(prepared)
                             }
                         },
                         abandon_captured: move |captured| async move {
@@ -14260,8 +14199,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             capture,
                             ready: {
                                 let name = forked.clone();
+                                let project_root = self.descriptor.git_root.to_path_buf();
                                 move |captured, incarnation| async move {
-                                    timed_async(
+                                    let prepared = timed_async(
                                         "fork",
                                         "build-volume-ready",
                                         readying.ready_fork(
@@ -14269,7 +14209,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                             super::build_volumes::Owner { name, incarnation },
                                         ),
                                     )
-                                    .await
+                                    .await?;
+                                    readying.advise_fork_compaction(prepared.as_ref(), &project_root);
+                                    Ok(prepared)
                                 }
                             },
                             abandon_captured: move |captured| async move {
@@ -22798,7 +22740,9 @@ mod retired_recovery_tests {
             E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
         {
             if check()? {
-                self.run(request).map(Some).map_err(E::from)
+                self.run(request, "guarded disk command")
+                    .map(|run| Some(run.output))
+                    .map_err(E::from)
             } else {
                 Ok(None)
             }
@@ -22806,8 +22750,8 @@ mod retired_recovery_tests {
         fn run(
             &self,
             request: &cowshed_apfs::CommandRequest,
-        ) -> std::result::Result<cowshed_apfs::CommandOutput, cowshed_apfs::CommandRunError>
-        {
+            _: &'static str,
+        ) -> std::result::Result<cowshed_apfs::CommandRun, cowshed_apfs::CommandRunError> {
             panic!("reclaiming a detached retired image ran a disk command: {request:?}");
         }
         fn image_lease(
@@ -29340,7 +29284,9 @@ mod volume_labeller_tests {
             E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
         {
             if check()? {
-                self.run(request).map(Some).map_err(E::from)
+                self.run(request, "guarded disk command")
+                    .map(|run| Some(run.output))
+                    .map_err(E::from)
             } else {
                 Ok(None)
             }
@@ -29348,12 +29294,16 @@ mod volume_labeller_tests {
         fn run(
             &self,
             request: &CommandRequest,
-        ) -> std::result::Result<CommandOutput, CommandRunError> {
+            _: &'static str,
+        ) -> std::result::Result<cowshed_apfs::CommandRun, CommandRunError> {
             self.0
                 .lock()
                 .expect("recorded disk commands")
                 .push(request.clone());
-            Ok(CommandOutput::success([]))
+            Ok(cowshed_apfs::CommandRun {
+                output: CommandOutput::success([]),
+                work_elapsed: None,
+            })
         }
         fn image_lease(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
             Ok(None)

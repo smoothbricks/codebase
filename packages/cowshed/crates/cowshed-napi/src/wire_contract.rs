@@ -979,7 +979,6 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             seed: cowshed_core::api::dto::LandSeed::Frozen {
                 compaction: cowshed_core::api::dto::LandSeedCompaction::Started {
                     pid: 4243,
-                    extents: 612_000,
                     log: PathBuf::from("/Users/fixture/.cache/cowshed/build/.compacting/log"),
                 },
             },
@@ -995,6 +994,15 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         folded: Vec::new(),
         ..land_first.clone()
+    };
+    let land_not_advised = cowshed_core::api::dto::LandedReport {
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seed: cowshed_core::api::dto::LandSeed::Frozen {
+                compaction: cowshed_core::api::dto::LandSeedCompaction::NotAdvised,
+            },
+            ..land_held.build_volume.clone()
+        },
+        ..land_held.clone()
     };
     let land_opening = cowshed_core::api::dto::LandedReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
@@ -1230,6 +1238,10 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                 (
                     "firstLanding",
                     document("land report", &LandReport::Landed(land_first)),
+                ),
+                (
+                    "compactionNotAdvised",
+                    document("land report", &LandReport::Landed(land_not_advised)),
                 ),
                 (
                     "retired",

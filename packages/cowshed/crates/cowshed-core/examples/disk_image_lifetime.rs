@@ -47,15 +47,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ApfsSubstrateConfig::new(HostNamespace::Test(namespace), &root, &mount),
     )?;
     let count = |cycle: usize, phase: &str| -> Result<(), Box<dyn std::error::Error>> {
-        let output = runner.run(&CommandRequest::new(
-            "/usr/sbin/ioclasscount",
-            [
-                "AppleDiskImageDevice",
-                "DIDeviceIOUserClient",
-                "AppleAPFSVolume",
-                "IOMedia",
-            ],
-        ))?;
+        let output = runner
+            .run(
+                &CommandRequest::new(
+                    "/usr/sbin/ioclasscount",
+                    [
+                        "AppleDiskImageDevice",
+                        "DIDeviceIOUserClient",
+                        "AppleAPFSVolume",
+                        "IOMedia",
+                    ],
+                ),
+                "count image classes",
+            )?
+            .output;
         if !output.succeeded() {
             return Err(
                 format!("ioclasscount: {}", String::from_utf8_lossy(&output.stderr)).into(),
@@ -85,17 +90,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             count(cycle, "before")?;
             if mode == "commands" {
                 // No I/O Registry walk, raw-device pin, fsck or mount while attached.
-                let output = runner.run(&CommandRequest::new(
-                    "/usr/sbin/diskutil",
-                    [
-                        "image".as_ref(),
-                        "attach".as_ref(),
-                        "--nobrowse".as_ref(),
-                        "--noMount".as_ref(),
-                        "--plist".as_ref(),
-                        image.as_os_str(),
-                    ],
-                ))?;
+                let output = runner
+                    .run(
+                        &CommandRequest::new(
+                            "/usr/sbin/diskutil",
+                            [
+                                "image".as_ref(),
+                                "attach".as_ref(),
+                                "--nobrowse".as_ref(),
+                                "--noMount".as_ref(),
+                                "--plist".as_ref(),
+                                image.as_os_str(),
+                            ],
+                        ),
+                        "attach image",
+                    )?
+                    .output;
                 if !output.succeeded() {
                     return Err(
                         format!("attach: {}", String::from_utf8_lossy(&output.stderr)).into(),
@@ -111,8 +121,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|entity| entity.get("dev-entry"))
                     .and_then(plist::Value::as_string)
                     .ok_or("attach has no whole-device entry")?;
-                let output =
-                    runner.run(&CommandRequest::new("/usr/bin/hdiutil", ["detach", device]))?;
+                let output = runner
+                    .run(
+                        &CommandRequest::new("/usr/bin/hdiutil", ["detach", device]),
+                        "detach image",
+                    )?
+                    .output;
                 if !output.succeeded() {
                     return Err(format!(
                         "detach {device}: {}",
@@ -126,15 +140,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     host.backend()
                         .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)?
+                        .0
                 };
                 let device = attachment.whole_device().to_owned();
                 // Release the raw pin before the deliberately independent eject comparison.
                 drop(attachment);
                 if mode == "eject" {
-                    let output = runner.run(&CommandRequest::new(
-                        "/usr/sbin/diskutil",
-                        ["eject", &device],
-                    ))?;
+                    let output = runner
+                        .run(
+                            &CommandRequest::new("/usr/sbin/diskutil", ["eject", &device]),
+                            "eject image",
+                        )?
+                        .output;
                     if !output.succeeded() {
                         return Err(format!(
                             "eject {device}: {}",

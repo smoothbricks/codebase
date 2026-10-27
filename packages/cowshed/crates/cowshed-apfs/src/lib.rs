@@ -393,8 +393,143 @@ impl std::error::Error for CommandRunError {
     }
 }
 
+/// A command's output and its actual granted work duration. Recording boundaries that do
+/// not execute a command explicitly carry no observation, never a synthetic zero.
+#[derive(Clone, Debug)]
+pub struct CommandRun {
+    pub output: CommandOutput,
+    pub work_elapsed: Option<Duration>,
+}
+
+fn measure_command_work(
+    request: &CommandRequest,
+    operation: &'static str,
+    work: &mut dyn FnMut() -> Result<CommandOutput, CommandRunError>,
+) -> (Result<CommandOutput, CommandRunError>, Duration) {
+    enum Failed<'a> {
+        Run(CommandRunError),
+        Status {
+            request: &'a CommandRequest,
+            operation: &'static str,
+            output: CommandOutput,
+        },
+    }
+    impl fmt::Display for Failed<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Run(error) => error.fmt(f),
+                Self::Status {
+                    request,
+                    operation,
+                    output,
+                } => fmt_command_failure(
+                    f,
+                    operation,
+                    request.program.as_os_str(),
+                    &request.args,
+                    output,
+                ),
+            }
+        }
+    }
+    let (result, elapsed) =
+        cowshed_os::timing::timed_with_elapsed("apfs-command", format_args!("{operation}"), || {
+            let output = work().map_err(Failed::Run)?;
+            if output.succeeded() {
+                Ok(output)
+            } else {
+                Err(Failed::Status {
+                    request,
+                    operation,
+                    output,
+                })
+            }
+        });
+    // The raw runner promises the child's output even for a nonzero exit; only its span marks
+    // that exit failed. Backend run_checked remains the owner of the operation's refusal.
+    let result = match result {
+        Ok(output) | Err(Failed::Status { output, .. }) => Ok(output),
+        Err(Failed::Run(error)) => Err(error),
+    };
+    (result, elapsed)
+}
+
+fn admitted_work(
+    admit: impl FnOnce(
+        &mut dyn FnMut() -> Result<CommandRun, CommandRunError>,
+    ) -> Result<CommandRun, CommandRunError>,
+    mut work: impl FnMut() -> Result<CommandOutput, CommandRunError>,
+    mut measure: impl FnMut(
+        &mut dyn FnMut() -> Result<CommandOutput, CommandRunError>,
+    ) -> (Result<CommandOutput, CommandRunError>, Duration),
+) -> Result<CommandRun, CommandRunError> {
+    admit(&mut || {
+        let (output, elapsed) = measure(&mut work);
+        output.map(|output| CommandRun {
+            output,
+            work_elapsed: Some(elapsed),
+        })
+    })
+}
+
+fn attach_mount_elapsed(attach: Option<Duration>, mount: Option<Duration>) -> Option<Duration> {
+    attach.zip(mount).map(|(attach, mount)| attach + mount)
+}
+
+#[cfg(test)]
+mod command_work_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn admission_queue_time_never_enters_the_command_work_receipt() {
+        for queue in [Duration::ZERO, Duration::from_secs(30)] {
+            let clock = Cell::new(Duration::ZERO);
+            let command = Duration::from_secs(11);
+            let run = admitted_work(
+                |work| {
+                    clock.set(clock.get() + queue);
+                    work()
+                },
+                || {
+                    clock.set(clock.get() + command);
+                    Ok(CommandOutput::success([]))
+                },
+                |work| {
+                    let started = clock.get();
+                    let result = work();
+                    (result, clock.get() - started)
+                },
+            )
+            .unwrap();
+            assert_eq!(run.work_elapsed, Some(command), "queue={queue:?}");
+        }
+    }
+
+    #[test]
+    fn attach_and_mount_combine_only_actual_observed_command_work() {
+        for (attach, mount, expected) in [
+            (None, Some(11), None),
+            (Some(11), None, None),
+            (Some(4), Some(5), Some(9)),
+            (Some(4), Some(6), Some(10)),
+            (Some(6), Some(6), Some(12)),
+        ] {
+            let duration = |seconds: Option<u64>| seconds.map(Duration::from_secs);
+            assert_eq!(
+                attach_mount_elapsed(duration(attach), duration(mount)),
+                duration(expected)
+            );
+        }
+    }
+}
+
 pub trait CommandRunner {
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError>;
+    fn run(
+        &self,
+        request: &CommandRequest,
+        operation: &'static str,
+    ) -> Result<CommandRun, CommandRunError>;
     /// The uid Disk Arbitration sees as this runner's caller (release_authority.rs).
     fn caller_uid(&self) -> libc::uid_t {
         current_euid()
@@ -659,6 +794,7 @@ impl SystemCommandRunner {
     ) -> Result<CommandOutput, CommandRunError> {
         self.run_admitted(
             request,
+            "disk command",
             CommandDeadline::new(deadline),
             ChildInput::Null,
             |deadline, run| {
@@ -671,6 +807,7 @@ impl SystemCommandRunner {
                 )
             },
         )
+        .map(|run| run.output)
     }
 
     /// `hdiutil detach <device>` of the image device a caller inventoried as registry entry
@@ -689,6 +826,7 @@ impl SystemCommandRunner {
         // A detach reads nothing, and a host connection's own input is its protocol socket.
         self.run_admitted(
             request,
+            "detach image",
             CommandDeadline::new(DISK_CHILD_DEADLINE),
             ChildInput::Null,
             |deadline, run| {
@@ -698,6 +836,7 @@ impl SystemCommandRunner {
                 })
             },
         )
+        .map(|run| run.output)
     }
 
     pub fn run_with_inherited_input(
@@ -738,9 +877,10 @@ impl SystemCommandRunner {
         } else {
             deadline
         };
-        self.run_admitted(request, deadline, input, |deadline, run| {
+        self.run_admitted(request, "disk command", deadline, input, |deadline, run| {
             self.admit(request, gateway_socket, deadline, run)
         })
+        .map(|run| run.output)
     }
 
     fn admit(
@@ -748,8 +888,8 @@ impl SystemCommandRunner {
         request: &CommandRequest,
         gateway_socket: Option<&Path>,
         deadline: Option<CommandDeadline>,
-        run: impl FnOnce() -> Result<CommandOutput, CommandRunError>,
-    ) -> Result<CommandOutput, CommandRunError> {
+        run: impl FnOnce() -> Result<CommandRun, CommandRunError>,
+    ) -> Result<CommandRun, CommandRunError> {
         match gateway_socket {
             Some(socket) => {
                 crate::disk_lease::leased_on(socket, &request.program, &request.args, deadline, run)
@@ -772,36 +912,42 @@ impl SystemCommandRunner {
         deadline: Duration,
         lease: impl FnOnce(
             Option<CommandDeadline>,
-            &mut dyn FnMut() -> Result<CommandOutput, CommandRunError>,
-        ) -> Result<CommandOutput, CommandRunError>,
+            &mut dyn FnMut() -> Result<CommandRun, CommandRunError>,
+        ) -> Result<CommandRun, CommandRunError>,
     ) -> Result<CommandOutput, CommandRunError> {
         self.run_admitted(
             request,
+            "disk command",
             CommandDeadline::new(deadline),
             ChildInput::Null,
             lease,
         )
+        .map(|run| run.output)
     }
 
     /// One runner owns admission, spawn, deadline policy and attach-pool bookkeeping.
     fn run_admitted(
         &self,
         request: &CommandRequest,
+        operation: &'static str,
         deadline: CommandDeadline,
         input: ChildInput,
         lease: impl FnOnce(
             Option<CommandDeadline>,
-            &mut dyn FnMut() -> Result<CommandOutput, CommandRunError>,
-        ) -> Result<CommandOutput, CommandRunError>,
-    ) -> Result<CommandOutput, CommandRunError> {
+            &mut dyn FnMut() -> Result<CommandRun, CommandRunError>,
+        ) -> Result<CommandRun, CommandRunError>,
+    ) -> Result<CommandRun, CommandRunError> {
         let policy = DeadlinePolicy::for_request(request, deadline.duration);
         let total = matches!(policy.past_deadline, PastDeadline::Kill).then_some(deadline);
-        let output = lease(total, &mut || {
-            Self::run_unleased(request, input.clone(), policy, total, &mut |elapsed| {
-                warn_outlived(request, policy.deadline, elapsed)
-            })
-        })?;
-        Ok(output)
+        admitted_work(
+            |run| lease(total, run),
+            || {
+                Self::run_unleased(request, input.clone(), policy, total, &mut |elapsed| {
+                    warn_outlived(request, policy.deadline, elapsed)
+                })
+            },
+            |work| measure_command_work(request, operation, work),
+        )
     }
 
     /// Run `request` reading `input` under `policy`, calling `warn` each time a warning is due.
@@ -1103,8 +1249,18 @@ impl CommandRunner for SystemCommandRunner {
         Ok(output)
     }
 
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        self.run_with_deadline(request, DISK_CHILD_DEADLINE)
+    fn run(
+        &self,
+        request: &CommandRequest,
+        operation: &'static str,
+    ) -> Result<CommandRun, CommandRunError> {
+        self.run_admitted(
+            request,
+            operation,
+            CommandDeadline::new(DISK_CHILD_DEADLINE),
+            ChildInput::Null,
+            |deadline, run| self.admit(request, None, deadline, run),
+        )
     }
 
     fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
@@ -2486,6 +2642,40 @@ pub enum ImageCapture {
     Detached,
 }
 
+/// Admission for exactly one source and destination, with no caller-supplied path at capture.
+/// Keeping this value alive keeps the detached source's image lease alive.
+pub struct CloneLease<'a> {
+    source: &'a Path,
+    destination: &'a Path,
+    capture: ImageCapture,
+    _lease: Option<Fenced<File>>,
+}
+
+impl CloneLease<'_> {
+    /// The exact source this admission holds; capture accepts no replacement path.
+    pub fn source(&self) -> &Path {
+        self.source
+    }
+
+    /// Open the admitted source once without following links, flush it and descriptor-clone it.
+    /// The existing nonblocking source lock and attached-source refusal remain authoritative.
+    pub fn clone_image(&self) -> Result<(), CloneFileError> {
+        #[cfg(target_os = "macos")]
+        {
+            let leg = apfs_step_leg(self.destination);
+            let held = timed_apfs_step(leg, "hold-source", || {
+                ImageSource::hold(self.source, self.destination, self.capture)
+            })?;
+            timed_apfs_step(leg, "clonefile", || held.clone_to(self.destination))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (self.destination, self.capture);
+            Err(CloneFileError::UnsupportedPlatform)
+        }
+    }
+}
+
 pub trait ApfsBackend {
     fn create_staged_image(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsError>;
     /// Write the blank, unattached sparse RAW file `staged_stem.dmg` and nothing else: the one step
@@ -2511,17 +2701,6 @@ pub trait ApfsBackend {
     /// host with dozens of workspaces building, against 3–676 ms for the source volume alone.
     fn sync_for_freshness(&self, image: &Path, mount_point: Option<&Path>)
     -> Result<(), ApfsError>;
-    /// Descriptor-clone `source` to a destination that must not exist. Open the source once,
-    /// without following symlinks, and flush that descriptor before cloning. A detached capture
-    /// additionally holds a nonblocking shared lock excluding image attachment; live source
-    /// captures do not change the source's attachment or mount state. The cloned APFS volume is
-    /// verified before its first mount.
-    fn clone_image(
-        &self,
-        source: &Path,
-        destination: &Path,
-        capture: ImageCapture,
-    ) -> Result<(), CloneFileError>;
     /// Rename `attachment`'s volume, mounted at `mount_point`, through that mount root held open,
     /// never through a path or Disk Arbitration ([`OwnedVolumeRoot`]). Under the image's lease and
     /// a raw pin, the device is proven still to be that image's, and `mount_point`, held open,
@@ -2541,7 +2720,7 @@ pub trait ApfsBackend {
         mount_point: &Path,
         access: MountAccess,
         browse: bool,
-    ) -> Result<AttachedImage, ApfsError>;
+    ) -> Result<(AttachedImage, Option<Duration>), ApfsError>;
     fn mount(
         &self,
         attachment: &AttachedImage,
@@ -2591,7 +2770,7 @@ impl<R: CommandRunner, S: Sleeper> MountLease<'_, R, S> {
         mount_point: &Path,
         access: MountAccess,
         browse: bool,
-    ) -> Result<(), ApfsError> {
+    ) -> Result<Option<Duration>, ApfsError> {
         let attachment = self.attachment;
         let backend = self.backend;
         fs::create_dir_all(mount_point).map_err(|source| ApfsError::FileOperation {
@@ -2621,7 +2800,7 @@ impl<R: CommandRunner, S: Sleeper> MountLease<'_, R, S> {
             }
             _ => Ok(()),
         };
-        mounted.and(opted_out)
+        mounted.and_then(|run| opted_out.map(|()| run.work_elapsed))
     }
 }
 
@@ -2658,6 +2837,42 @@ impl<R, S> MacOsApfsBackend<R, S> {
 }
 
 impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
+    /// Admit one source-bound clone before measuring its necessary capture work. The detached
+    /// source's existing image lease is acquired once and stays owned through the clone.
+    pub fn prepare_clone<'a>(
+        &self,
+        source: &'a Path,
+        destination: &'a Path,
+        capture: ImageCapture,
+    ) -> Result<CloneLease<'a>, CloneFileError> {
+        validate_clone_path(source)?;
+        validate_clone_path(destination)?;
+        #[cfg(target_os = "macos")]
+        {
+            let lease = match capture {
+                ImageCapture::Detached => image_identity(source)
+                    .and_then(|identity| self.runner.image_lease(&identity))
+                    .map_err(|error| CloneFileError::Io {
+                        source_path: source.to_owned(),
+                        destination_path: destination.to_owned(),
+                        source: error,
+                    })?,
+                ImageCapture::Live => None,
+            };
+            Ok(CloneLease {
+                source,
+                destination,
+                capture,
+                _lease: lease,
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = capture;
+            Err(CloneFileError::UnsupportedPlatform)
+        }
+    }
+
     /// Acquire mount authority before consulting the mount table. A recovered attachment's
     /// pin fences its device across this reacquisition, but another mounter may have won.
     pub fn prepare_mount<'a>(
@@ -3076,15 +3291,13 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         &self,
         operation: &'static str,
         request: CommandRequest,
-    ) -> Result<CommandOutput, ApfsError> {
-        cowshed_os::timing::timed("apfs-command", format_args!("{operation}"), || {
-            let output = self.runner.run(&request)?;
-            if output.succeeded() {
-                Ok(output)
-            } else {
-                Err(command_failed(operation, request, output))
-            }
-        })
+    ) -> Result<CommandRun, ApfsError> {
+        let run = self.runner.run(&request, operation)?;
+        if run.output.succeeded() {
+            Ok(run)
+        } else {
+            Err(command_failed(operation, request, run.output))
+        }
     }
 
     /// Opt the read-write volume just mounted at `mount_point` out of fseventsd's persistent
@@ -3243,7 +3456,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 return Err(self.failed_image_attachment(path, &attached_before, primary));
             }
         };
-        let whole_device = match parse_blank_image_whole_device(&output.stdout) {
+        let whole_device = match parse_blank_image_whole_device(&output.output.stdout) {
             Ok(device) => device,
             Err(primary) => {
                 return Err(self.failed_image_attachment(path, &attached_before, primary));
@@ -3316,7 +3529,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 OsString::from(raw_device_from(&attachment.volume_device)),
             ],
         );
-        let output = timed_apfs_step(leg, "fsck", || self.runner.run(&request.clone()))?;
+        let output = timed_apfs_step(leg, "fsck", || {
+            self.runner.run(&request.clone(), "check APFS volume")
+        })?
+        .output;
         if !output.succeeded() {
             return Err(ApfsError::VerificationFailed { request, output });
         }
@@ -3489,7 +3705,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         image: &Path,
         request: CommandRequest,
         cleanup: DetachIntent,
-    ) -> Result<AttachedImage, ApfsError> {
+    ) -> Result<(AttachedImage, Option<Duration>), ApfsError> {
         let attached_before = self.refuse_second_attach(image)?;
         let output = match self.run_checked("attach image without mounting", request) {
             Ok(output) => output,
@@ -3497,18 +3713,21 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 return Err(self.failed_attachment(image, &attached_before, primary, cleanup));
             }
         };
-        let (whole_device, volume_device) = match parse_attachment_plist(&output.stdout) {
+        let (whole_device, volume_device) = match parse_attachment_plist(&output.output.stdout) {
             Ok(attachment) => attachment,
             Err(primary) => {
                 return Err(self.failed_attachment(image, &attached_before, primary, cleanup));
             }
         };
-        Ok(AttachedImage {
-            image: image.to_owned(),
-            whole_device,
-            volume_device,
-            pin: std::sync::Mutex::new(None),
-        })
+        Ok((
+            AttachedImage {
+                image: image.to_owned(),
+                whole_device,
+                volume_device,
+                pin: std::sync::Mutex::new(None),
+            },
+            output.work_elapsed,
+        ))
     }
 
     fn verify_attachment(
@@ -3520,7 +3739,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         let leg = apfs_step_leg(image);
         let (mut attachment, request, output, pin) = {
             let _lease = self.image_lease(image)?;
-            let attachment = timed_apfs_step(leg, "attach", || {
+            let (attachment, _) = timed_apfs_step(leg, "attach", || {
                 self.attach_without_mounting(image, request, cleanup)
             })?;
             // The same raw descriptor carries the exact-image proof from fsck through mount.
@@ -3533,7 +3752,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                     OsString::from(raw_device_from(&attachment.volume_device)),
                 ],
             );
-            let output = timed_apfs_step(leg, "fsck", || self.runner.run(&request))?;
+            let output = timed_apfs_step(leg, "fsck", || {
+                self.runner.run(&request, "check APFS volume")
+            })?
+            .output;
             (attachment, request, output, pin)
         };
         if output.succeeded() {
@@ -3879,42 +4101,6 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             })
     }
 
-    fn clone_image(
-        &self,
-        source: &Path,
-        destination: &Path,
-        capture: ImageCapture,
-    ) -> Result<(), CloneFileError> {
-        validate_clone_path(source)?;
-        validate_clone_path(destination)?;
-        #[cfg(target_os = "macos")]
-        {
-            let leg = apfs_step_leg(destination);
-            // Cowshed attaches only under the image's lease, so a detached capture holds the
-            // source's lease through the clone: an in-kernel attachment takes no file lock
-            // that the source's shared lock could exclude (01a_apfs.md, "Images").
-            let _lease = match capture {
-                ImageCapture::Detached => image_identity(source)
-                    .and_then(|identity| self.runner.image_lease(&identity))
-                    .map_err(|error| CloneFileError::Io {
-                        source_path: source.to_owned(),
-                        destination_path: destination.to_owned(),
-                        source: error,
-                    })?,
-                ImageCapture::Live => None,
-            };
-            let held = timed_apfs_step(leg, "hold-source", || {
-                ImageSource::hold(source, destination, capture)
-            })?;
-            timed_apfs_step(leg, "clonefile", || held.clone_to(destination))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = capture;
-            Err(CloneFileError::UnsupportedPlatform)
-        }
-    }
-
     fn rename_volume(
         &self,
         attachment: &AttachedImage,
@@ -3961,7 +4147,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         mount_point: &Path,
         access: MountAccess,
         browse: bool,
-    ) -> Result<AttachedImage, ApfsError> {
+    ) -> Result<(AttachedImage, Option<Duration>), ApfsError> {
         validate_image_path(image)?;
         let _lease = self.image_lease(image)?;
         fs::create_dir_all(mount_point).map_err(|source| ApfsError::FileOperation {
@@ -3969,7 +4155,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             path: mount_point.to_owned(),
             source,
         })?;
-        let attachment = timed_apfs_step(apfs_step_leg(image), "attach", || {
+        let (attachment, attach_elapsed) = timed_apfs_step(apfs_step_leg(image), "attach", || {
             self.attach_without_mounting(
                 image,
                 in_kernel_attach(image, access),
@@ -3986,14 +4172,16 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
                     OsString::from(raw_device_from(&attachment.volume_device)),
                 ],
             );
-            let output =
-                timed_apfs_step(apfs_step_leg(image), "fsck", || self.runner.run(&request))?;
+            let output = timed_apfs_step(apfs_step_leg(image), "fsck", || {
+                self.runner.run(&request, "check APFS volume")
+            })?
+            .output;
             if !output.succeeded() {
                 return Err(ApfsError::VerificationFailed { request, output });
             }
             let options = mount_options(access, browse);
             mount_attempted = true;
-            timed_apfs_step(apfs_step_leg(image), "mount", || {
+            let mounted = timed_apfs_step(apfs_step_leg(image), "mount", || {
                 self.run_checked(
                     "mount verified APFS volume",
                     mount_request(&attachment, options, mount_point),
@@ -4020,10 +4208,10 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             if access == MountAccess::ReadWrite {
                 self.opt_out_of_event_log(&attachment, mount_point, options)?;
             }
-            Ok(())
+            Ok(attach_mount_elapsed(attach_elapsed, mounted.work_elapsed))
         })();
         match mounted {
-            Ok(()) => Ok(attachment),
+            Ok(elapsed) => Ok((attachment, elapsed)),
             Err(primary) => {
                 if mount_attempted {
                     // Even a refused mount may have changed the namespace. Re-prove and unmount
@@ -4064,6 +4252,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     ) -> Result<(), ApfsError> {
         self.prepare_mount(attachment)?
             .mount(mount_point, access, browse)
+            .map(|_| ())
     }
 
     fn detach(&self, attachment: &AttachedImage, intent: DetachIntent) -> Result<(), ApfsError> {
@@ -4133,18 +4322,16 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             ],
         );
         // Timed like every other disk-tool call: `resizeContainer` queues on storagekitd too.
-        cowshed_os::timing::timed("apfs-command", format_args!("grow APFS container"), || {
-            let output = self.runner.run(&request)?;
-            if output.succeeded() || container_already_spans_image(&output) {
-                Ok(())
-            } else {
-                Err(ApfsError::CommandFailed {
-                    operation: "grow APFS container into image",
-                    request,
-                    output,
-                })
-            }
-        })
+        let output = self.runner.run(&request, "grow APFS container")?.output;
+        if output.succeeded() || container_already_spans_image(&output) {
+            Ok(())
+        } else {
+            Err(ApfsError::CommandFailed {
+                operation: "grow APFS container into image",
+                request,
+                output,
+            })
+        }
     }
 
     fn attached_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError> {
@@ -7274,12 +7461,18 @@ mod tests {
             E: From<crate::CommandRunError> + std::fmt::Display,
         {
             if check()? {
-                self.run(request).map(Some).map_err(E::from)
+                self.run(request, "guarded disk command")
+                    .map(|run| Some(run.output))
+                    .map_err(E::from)
             } else {
                 Ok(None)
             }
         }
-        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        fn run(
+            &self,
+            request: &CommandRequest,
+            _operation: &'static str,
+        ) -> Result<CommandRun, CommandRunError> {
             match self.next_reply(Seen::Command(request.clone())) {
                 Reply::Command(output) => {
                     if output.succeeded() {
@@ -7294,7 +7487,10 @@ mod tests {
                                 .insert(device.to_string_lossy().into_owned(), mounted);
                         }
                     }
-                    Ok(output)
+                    Ok(CommandRun {
+                        output,
+                        work_elapsed: None,
+                    })
                 }
                 other => panic!("test scripted {other:?} where {request:?} ran"),
             }
@@ -7749,12 +7945,18 @@ mod tests {
             E: From<crate::CommandRunError> + std::fmt::Display,
         {
             if check()? {
-                self.run(request).map(Some).map_err(E::from)
+                self.run(request, "guarded disk command")
+                    .map(|run| Some(run.output))
+                    .map_err(E::from)
             } else {
                 Ok(None)
             }
         }
-        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        fn run(
+            &self,
+            request: &CommandRequest,
+            _operation: &'static str,
+        ) -> Result<CommandRun, CommandRunError> {
             self.steps.borrow_mut().push(Seen::Command(request.clone()));
             let args = argv(request);
             if request.program == Path::new(HDIUTIL)
@@ -7765,7 +7967,10 @@ mod tests {
                     .entry(self.image.clone())
                     .or_default()
                     .insert(self.new_device.clone());
-                return Ok(CommandOutput::success("<plist><dict><key>malformed"));
+                return Ok(CommandRun {
+                    output: CommandOutput::success("<plist><dict><key>malformed"),
+                    work_elapsed: None,
+                });
             }
             assert!(
                 request.program == Path::new(HDIUTIL)
@@ -7773,14 +7978,20 @@ mod tests {
                 "unexpected command: {request:?}"
             );
             if self.fail_detach {
-                return Ok(CommandOutput::failure(16, "busy"));
+                return Ok(CommandRun {
+                    output: CommandOutput::failure(16, "busy"),
+                    work_elapsed: None,
+                });
             }
             self.attached
                 .borrow_mut()
                 .get_mut(&self.image)
                 .expect("target image is inventoried")
                 .remove(&self.new_device);
-            Ok(CommandOutput::success([]))
+            Ok(CommandRun {
+                output: CommandOutput::success([]),
+                work_elapsed: None,
+            })
         }
         fn image_lease(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
             Ok(None)
@@ -7820,26 +8031,34 @@ mod tests {
     #[test]
     fn system_runner_reports_output_spawn_errors_and_signal_status() {
         let output = test_runner()
-            .run(&CommandRequest::new(
-                "/bin/sh",
-                ["-c", "printf stdout; printf stderr >&2; exit 7"],
-            ))
-            .unwrap();
+            .run(
+                &CommandRequest::new(
+                    "/bin/sh",
+                    ["-c", "printf stdout; printf stderr >&2; exit 7"],
+                ),
+                "fixture disk command",
+            )
+            .unwrap()
+            .output;
         assert_eq!(output.status, ProcessStatus::Exit(7));
         assert_eq!(output.stdout, b"stdout");
         assert_eq!(output.stderr, b"stderr");
 
         let signaled = test_runner()
-            .run(&CommandRequest::new("/bin/sh", ["-c", "kill -TERM $$"]))
-            .unwrap();
+            .run(
+                &CommandRequest::new("/bin/sh", ["-c", "kill -TERM $$"]),
+                "fixture disk command",
+            )
+            .unwrap()
+            .output;
         assert_eq!(signaled.status, ProcessStatus::Signal(libc::SIGTERM));
 
         let missing = temp_path("missing-command", "bin");
         let error = test_runner()
-            .run(&CommandRequest::new(
-                &missing,
-                std::iter::empty::<OsString>(),
-            ))
+            .run(
+                &CommandRequest::new(&missing, std::iter::empty::<OsString>()),
+                "fixture disk command",
+            )
             .unwrap_err();
         assert_eq!(error.request.program, missing);
         assert!(error.to_string().contains("could not run"));
@@ -7899,8 +8118,12 @@ mod tests {
         );
         // The queue continues: a fast child right after the kill still runs.
         let output = test_runner()
-            .run(&CommandRequest::new("/bin/sh", ["-c", "printf 'next\\n'"]))
-            .unwrap();
+            .run(
+                &CommandRequest::new("/bin/sh", ["-c", "printf 'next\\n'"]),
+                "fixture disk command",
+            )
+            .unwrap()
+            .output;
         assert_eq!(output.stdout, b"next\n");
     }
 
@@ -8451,7 +8674,10 @@ mod tests {
             ],
         );
         if std::env::var_os(DISK_CHILD_INPUT_ROLE).is_some() {
-            let null = test_runner().run(&read).expect("null-input child");
+            let null = test_runner()
+                .run(&read, "fixture disk command")
+                .expect("null-input child")
+                .output;
             let inherited = test_runner()
                 .run_with_inherited_input(&read, CommandDeadline::new(DISK_CHILD_DEADLINE), None)
                 .expect("inheriting child");
@@ -9669,11 +9895,12 @@ mod tests {
             ("main.dmg", "session.sparseimage", "session.sparseimage"),
         ] {
             let error = backend
-                .clone_image(
+                .prepare_clone(
                     Path::new(source),
                     Path::new(destination),
                     crate::ImageCapture::Detached,
                 )
+                .and_then(|admitted| admitted.clone_image())
                 .unwrap_err();
             assert!(matches!(
                 error,
@@ -9684,7 +9911,8 @@ mod tests {
         let source = temp_path("validated-missing-source", IMAGE_EXTENSION);
         let destination = temp_path("validated-missing-destination", IMAGE_EXTENSION);
         let error = backend
-            .clone_image(&source, &destination, crate::ImageCapture::Detached)
+            .prepare_clone(&source, &destination, crate::ImageCapture::Detached)
+            .and_then(|admitted| admitted.clone_image())
             .unwrap_err();
         #[cfg(target_os = "macos")]
         assert!(matches!(error, CloneFileError::Io { .. }));
@@ -9738,9 +9966,16 @@ mod tests {
             commands: RefCell<Vec<CommandRequest>>,
         }
         impl CommandRunner for RecycledDuringWait {
-            fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+            fn run(
+                &self,
+                request: &CommandRequest,
+                _operation: &'static str,
+            ) -> Result<CommandRun, CommandRunError> {
                 self.commands.borrow_mut().push(request.clone());
-                Ok(CommandOutput::success([]))
+                Ok(CommandRun {
+                    output: CommandOutput::success([]),
+                    work_elapsed: None,
+                })
             }
             fn run_guarded<E>(
                 &self,
@@ -9753,7 +9988,9 @@ mod tests {
                 // Waiting for the storage phase let our image depart and RAM reuse disk12.
                 self.granted.set(true);
                 if check()? {
-                    self.run(request).map(Some).map_err(E::from)
+                    self.run(request, "guarded disk command")
+                        .map(|run| Some(run.output))
+                        .map_err(E::from)
                 } else {
                     Ok(None)
                 }
@@ -10298,7 +10535,9 @@ mod tests {
         let system = test_runner();
         for verb in ["rename", "renameVolume", "RENAMEVOLUME", "ReNaMe"] {
             for refused in [
-                system.run(&request(verb)),
+                system
+                    .run(&request(verb), "fixture disk command")
+                    .map(|run| run.output),
                 system.run_with_inherited_input(
                     &request(verb),
                     CommandDeadline::new(DISK_CHILD_DEADLINE),
@@ -10321,7 +10560,7 @@ mod tests {
             }
         }
         let other = system
-            .run(&request("info"))
+            .run(&request("info"), "fixture disk command")
             .expect_err("the stand-in diskutil does not exist");
         assert!(
             matches!(other.failure, CommandRunFailure::Spawn(_)),
@@ -10402,13 +10641,19 @@ mod tests {
             E: From<crate::CommandRunError> + std::fmt::Display,
         {
             if check()? {
-                self.run(request).map(Some).map_err(E::from)
+                self.run(request, "guarded disk command")
+                    .map(|run| Some(run.output))
+                    .map_err(E::from)
             } else {
                 Ok(None)
             }
         }
-        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            self.recorded.run(request)
+        fn run(
+            &self,
+            request: &CommandRequest,
+            _operation: &'static str,
+        ) -> Result<CommandRun, CommandRunError> {
+            self.recorded.run(request, _operation)
         }
         fn name_volume(&self, root: &OwnedVolumeRoot, volume_name: &str) -> io::Result<()> {
             self.held_at_rename.replace(Some(self.newest_pin_held()));
@@ -10518,19 +10763,25 @@ mod tests {
             E: From<crate::CommandRunError> + std::fmt::Display,
         {
             if check()? {
-                self.run(request).map(Some).map_err(E::from)
+                self.run(request, "guarded disk command")
+                    .map(|run| Some(run.output))
+                    .map_err(E::from)
             } else {
                 Ok(None)
             }
         }
-        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        fn run(
+            &self,
+            request: &CommandRequest,
+            _operation: &'static str,
+        ) -> Result<CommandRun, CommandRunError> {
             assert_eq!(request.program, Path::new(MOUNT_APFS));
             assert!(request.args.iter().any(|arg| arg == "/dev/disk25s1"));
             assert!(
                 self.pins.newest_pin_held(),
                 "mount must keep the recovered pin"
             );
-            self.pins.run(request)
+            self.pins.run(request, _operation)
         }
 
         fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
@@ -10885,7 +11136,11 @@ mod tests {
     fn one_image_questions_never_read_every_attached_image() {
         struct OneImage(AttachedDiskImage);
         impl CommandRunner for OneImage {
-            fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+            fn run(
+                &self,
+                request: &CommandRequest,
+                _operation: &'static str,
+            ) -> Result<CommandRun, CommandRunError> {
                 panic!("a one-image question spawned {request:?}")
             }
             fn run_guarded<E>(
@@ -11315,12 +11570,18 @@ mod tests {
                 E: From<crate::CommandRunError> + std::fmt::Display,
             {
                 if check()? {
-                    self.run(request).map(Some).map_err(E::from)
+                    self.run(request, "guarded disk command")
+                        .map(|run| Some(run.output))
+                        .map_err(E::from)
                 } else {
                     Ok(None)
                 }
             }
-            fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+            fn run(
+                &self,
+                request: &CommandRequest,
+                _operation: &'static str,
+            ) -> Result<CommandRun, CommandRunError> {
                 panic!("growing spawned {request:?}");
             }
             fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
@@ -11498,7 +11759,8 @@ mod tests {
         let source = temp_path("missing-clone-source", IMAGE_EXTENSION);
         let destination = temp_path("missing-clone-destination", IMAGE_EXTENSION);
         let error = MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination, crate::ImageCapture::Detached)
+            .prepare_clone(&source, &destination, crate::ImageCapture::Detached)
+            .and_then(|admitted| admitted.clone_image())
             .unwrap_err();
         #[cfg(target_os = "macos")]
         assert!(matches!(error, CloneFileError::Io { .. }));
@@ -11567,7 +11829,8 @@ mod tests {
         let attached = lock_as_attached(&source).unwrap();
 
         let error = MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination, crate::ImageCapture::Detached)
+            .prepare_clone(&source, &destination, crate::ImageCapture::Detached)
+            .and_then(|admitted| admitted.clone_image())
             .unwrap_err();
         assert!(
             matches!(&error, CloneFileError::SourceAttached { source: refused } if *refused == source),
@@ -11610,7 +11873,8 @@ mod tests {
         fs::write(&source, bytes).unwrap();
         let attached = lock_as_attached(&source).unwrap();
         MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination, ImageCapture::Live)
+            .prepare_clone(&source, &destination, ImageCapture::Live)
+            .and_then(|admitted| admitted.clone_image())
             .unwrap();
         assert_eq!(fs::read(&source).unwrap(), bytes);
         assert_eq!(fs::read(&destination).unwrap(), bytes);
@@ -11632,7 +11896,8 @@ mod tests {
         std::os::unix::fs::symlink(&target, &source).unwrap();
 
         let error = MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination, crate::ImageCapture::Detached)
+            .prepare_clone(&source, &destination, crate::ImageCapture::Detached)
+            .and_then(|admitted| admitted.clone_image())
             .unwrap_err();
         assert!(
             matches!(&error, CloneFileError::Io { source, .. } if source.raw_os_error() == Some(libc::ELOOP)),
@@ -12123,7 +12388,7 @@ mod tests {
                 ok([]),
                 Reply::Mount("/dev/disk5s1", true),
             ]));
-            let attached = backend
+            let (attached, _) = backend
                 .attach_mounted(&image, &mount, access, browse)
                 .unwrap();
             let commands = backend.runner().requests();
@@ -12212,8 +12477,12 @@ mod tests {
             }
             self.recorded.unmount_guarded(mode, prove)
         }
-        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            self.recorded.run(request)
+        fn run(
+            &self,
+            request: &CommandRequest,
+            _operation: &'static str,
+        ) -> Result<CommandRun, CommandRunError> {
+            self.recorded.run(request, _operation)
         }
         fn volume_mount(
             &self,

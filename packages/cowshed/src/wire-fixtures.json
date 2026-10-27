@@ -2916,7 +2916,6 @@
         },
         "seed": {
           "compaction": {
-            "extents": 612000,
             "kind": "started",
             "log": "/Users/fixture/.cache/cowshed/build/.compacting/log",
             "pid": 4243
@@ -2951,6 +2950,35 @@
             "error": "build volume storage failed: the copy could not be written",
             "kind": "held",
             "secondsAgo": 3600
+          },
+          "kind": "frozen"
+        }
+      },
+      "folded": [],
+      "kind": "landed",
+      "landedHead": "1111111111111111111111111111111111111111",
+      "retired": false,
+      "targetBranch": "main",
+      "targetWasCheckedOut": false
+    },
+    "compactionNotAdvised": {
+      "buildVolume": {
+        "adoption": {
+          "kind": "skipped",
+          "reason": {
+            "database": "/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db",
+            "holders": [
+              {
+                "command": "node nx run-many -t build",
+                "pid": 4242
+              }
+            ],
+            "kind": "targetHeld"
+          }
+        },
+        "seed": {
+          "compaction": {
+            "kind": "notAdvised"
           },
           "kind": "frozen"
         }

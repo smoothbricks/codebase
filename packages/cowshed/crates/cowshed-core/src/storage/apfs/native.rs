@@ -2074,7 +2074,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         fs::create_dir_all(mount_point)
             .map_err(|error| io_error("create recovery mount", mount_point, error))?;
-        let attachment =
+        let (attachment, _) =
             self.backend
                 .attach_mounted(image, mount_point, MountAccess::ReadOnly, false)?;
         let incarnation = WorkspaceMarker::read_from(&mount_point.join(WORKSPACE_MARKER_PATH))
@@ -2805,18 +2805,22 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             workspace.name(),
             workspace.incarnation(),
         );
-        let released = self.image_telemetry.measure(
-            "retire",
-            &[Image {
-                role: "image",
-                before: image,
-                after: image,
-            }],
-            || {
-                super::release::commit_release(image, &entry)
-                    .map_err(|error| io_error("release a retired workspace image", image, error))
-            },
-        )?;
+        let released = self
+            .image_telemetry
+            .measure(
+                "retire",
+                &[Image {
+                    role: "image",
+                    before: image,
+                    after: image,
+                }],
+                || {
+                    super::release::commit_release(image, &entry).map_err(|error| {
+                        io_error("release a retired workspace image", image, error)
+                    })
+                },
+            )
+            .0?;
         if released {
             self.nudge_cleanup(&entry);
             deletion_log::log_deletion_for_image(
@@ -4179,7 +4183,7 @@ where
             .backend
             .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
             .map_err(ApfsStorageError::from)
-            .and_then(|attachment| {
+            .and_then(|(attachment, _)| {
                 self.retain_checked_mount(workspace, attachment, mount_point, cleanup)
             }) {
             Ok(()) => primary,
@@ -4196,18 +4200,15 @@ where
     /// exempt cache/index handles stay open. Immutable sources retain detached capture.
     fn capture_build_seed(
         &self,
-        source: &Path,
+        admitted: &cowshed_apfs::CloneLease<'_>,
         source_mount: Option<&Path>,
-        destination: &Path,
     ) -> Result<(), ApfsStorageError> {
-        let capture = if source_mount.is_some() {
-            self.backend.sync_for_freshness(source, source_mount)?;
-            cowshed_apfs::ImageCapture::Live
-        } else {
-            cowshed_apfs::ImageCapture::Detached
-        };
-        self.backend
-            .clone_image(source, destination, capture)
+        if source_mount.is_some() {
+            self.backend
+                .sync_for_freshness(admitted.source(), source_mount)?;
+        }
+        admitted
+            .clone_image()
             .map_err(ApfsError::from)
             .map_err(ApfsStorageError::from)
     }
@@ -4519,7 +4520,8 @@ where
         Self::ensure_parent(destination)?;
         self.backend.sync_for_freshness(source, source_mount)?;
         self.backend
-            .clone_image(source, destination, cowshed_apfs::ImageCapture::Live)
+            .prepare_clone(source, destination, cowshed_apfs::ImageCapture::Live)
+            .and_then(|admitted| admitted.clone_image())
             .map_err(ApfsError::from)
             .map_err(ApfsStorageError::from)
     }
@@ -4731,6 +4733,7 @@ where
         self.verify_controller_path(mount_point)?;
         self.backend
             .attach_mounted(image, mount_point, access, browse)
+            .map(|(attachment, _)| attachment)
             .map_err(Into::into)
     }
 
@@ -4791,7 +4794,7 @@ where
             return self
                 .backend
                 .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
-                .map(|attachment| super::ResumedMount {
+                .map(|(attachment, _)| super::ResumedMount {
                     attachment,
                     found: super::FoundMount::Detached,
                 })
@@ -5368,7 +5371,7 @@ where
         };
 
         if was_mounted {
-            let attachment =
+            let (attachment, _) =
                 self.backend
                     .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)?;
             self.retain_checked_mount(workspace, attachment, mount_point, DEFRAGMENT_CLEANUP)?;
@@ -5855,15 +5858,17 @@ where
         self.verify_controller_path(trash)?;
         Self::ensure_parent(trash)?;
         self.validate_staged_companion(&companion_path(canonical))?;
-        self.image_telemetry.measure(
-            "retire",
-            &[Image {
-                role: "image",
-                before: canonical,
-                after: trash,
-            }],
-            || retire_payload(canonical, trash),
-        )
+        self.image_telemetry
+            .measure(
+                "retire",
+                &[Image {
+                    role: "image",
+                    before: canonical,
+                    after: trash,
+                }],
+                || retire_payload(canonical, trash),
+            )
+            .0
     }
 
     fn release_workspace(
@@ -8332,7 +8337,9 @@ mod tests {
             E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
         {
             if check()? {
-                self.run(request).map(Some).map_err(E::from)
+                self.run(request, "guarded disk command")
+                    .map(|run| Some(run.output))
+                    .map_err(E::from)
             } else {
                 Ok(None)
             }
@@ -8340,12 +8347,16 @@ mod tests {
         fn run(
             &self,
             request: &cowshed_apfs::CommandRequest,
-        ) -> Result<cowshed_apfs::CommandOutput, cowshed_apfs::CommandRunError> {
+            _: &'static str,
+        ) -> Result<cowshed_apfs::CommandRun, cowshed_apfs::CommandRunError> {
             self.commands
                 .lock()
                 .expect("recorded commands")
                 .push(request.clone());
-            Ok(cowshed_apfs::CommandOutput::success([]))
+            Ok(cowshed_apfs::CommandRun {
+                output: cowshed_apfs::CommandOutput::success([]),
+                work_elapsed: None,
+            })
         }
         fn volume_mount(&self, volume_device: &str) -> io::Result<Option<KernelMountSnapshot>> {
             Ok(self

@@ -769,7 +769,8 @@ fn real_apfs_adopt_resumes_a_fenced_image_killed_between_clone_and_attach() {
     )
     .expect("the seeded template");
     backend
-        .clone_image(&template, &world.image, ImageCapture::Detached)
+        .prepare_clone(&template, &world.image, ImageCapture::Detached)
+        .and_then(|admitted| admitted.clone_image())
         .expect("the template cloned under the canonical name");
 
     let adopted = world.adopt().expect("adopt resumes");

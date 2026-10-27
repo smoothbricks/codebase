@@ -77,7 +77,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     )));
                 }
             };
-            let mount = host.mount_build_volume(layout, &volume).map_err(storage)?;
+            let (mount, _) = host.mount_build_volume(layout, &volume).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
             let closing = |error: std::io::Error| io("close the checkout's Nx state", &mount, &error);
             if let Err(busy) = nx::close(&mount, &state).map_err(closing)? {

@@ -2143,7 +2143,7 @@ mod tests {
         let backend = MacOsApfsBackend::new(SystemCommandRunner::new(HostNamespace::Test(
             root.namespace(),
         )));
-        let attachment = backend
+        let (attachment, _) = backend
             .attach_mounted(&image, &destination, MountAccess::ReadWrite, false)
             .unwrap();
         assert_ne!(

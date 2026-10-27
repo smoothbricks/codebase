@@ -47,8 +47,8 @@ mod compaction;
 mod nx_clear;
 mod reseed;
 pub(crate) use compaction::{
-    Admission, CompactionDue, CompactionTurn, Published, SEED_COMPACTION_CATCH_UPS,
-    SEED_COMPACTION_WAIT, seconds_since, start_compaction,
+    Admission, CompactionTurn, Published, SEED_COMPACTION_CATCH_UPS, SEED_COMPACTION_EXTENTS,
+    SEED_COMPACTION_WAIT,
 };
 pub(crate) use reseed::ReseedWorkspace;
 
@@ -123,6 +123,8 @@ pub(crate) struct CapturedFork {
     seed: BuildVolumeId,
     tree: Option<GitOid>,
     captured: CapturedBuildVolume,
+    source: Owner,
+    operation_elapsed: Option<Duration>,
     started: Instant,
 }
 
@@ -137,6 +139,8 @@ pub(crate) struct PreparedFork {
     own_seed: BuildVolumeId,
     live: BuildVolumeId,
     mount: PathBuf,
+    source: Owner,
+    operation_elapsed: Option<Duration>,
     started: Instant,
 }
 
@@ -212,7 +216,10 @@ impl<H: RuntimeStorageHost> Contended<H> {
 pub(crate) enum Freeze {
     /// The seed is captured from the guarded landing volume, and every older seed claimed for
     /// its retirement once the target's image lock is let go.
-    Frozen { superseded: SupersededSeeds },
+    Frozen {
+        superseded: SupersededSeeds,
+        operation_elapsed: Option<Duration>,
+    },
     /// A conflicting storage claim refused capture; the previous seed stays.
     SealBusy { reason: String },
 }
@@ -378,6 +385,7 @@ pub(crate) struct Refreshed {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Refresh {
+    // Capture receipts are local byproducts, never persisted advice.
     /// The target links no build volume: it has no seed to keep up.
     NoBuildVolume,
     /// The seed stays: it is nearer the fork's tree than the live volume, or as near and holds
@@ -388,6 +396,7 @@ pub(crate) enum Refresh {
     Reseeded {
         behind_ms: Option<u64>,
         elapsed_ms: u64,
+        operation_elapsed: Option<Duration>,
     },
     /// The target's branch moved to `tree` outside `cowshed land`, and the seed is now a capture
     /// of the build volume of `workspace`, which has that tree checked out.
@@ -395,6 +404,7 @@ pub(crate) enum Refresh {
         workspace: WorkspaceName,
         tree: GitOid,
         elapsed_ms: u64,
+        operation_elapsed: Option<Duration>,
     },
     /// The seed stays behind: the live volume has a writer, and a clone of it could hold a
     /// half-written Cargo unit or Nx database. The next fork tries again.
@@ -402,6 +412,20 @@ pub(crate) enum Refresh {
         behind_ms: Option<u64>,
         reason: CaptureSkip,
     },
+}
+
+impl Refresh {
+    fn operation_elapsed(&self) -> Option<Duration> {
+        match self {
+            Self::Reseeded {
+                operation_elapsed, ..
+            }
+            | Self::Landed {
+                operation_elapsed, ..
+            } => *operation_elapsed,
+            Self::NoBuildVolume | Self::Kept | Self::Skipped { .. } => None,
+        }
+    }
 }
 
 /// Why a live workspace at the fork's tree did not seed the target; the seed stays as it was.
@@ -962,7 +986,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     }));
                 }
             };
-            let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
+            let (mount, _) = host.mount_build_volume(layout, &id).map_err(storage)?;
             let held = BuildVolumeState::read(&mount)?;
             let (state, added) = match discovered {
                 Discovered::Unchanged => (held.clone(), Vec::new()),
@@ -1094,6 +1118,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         };
         say_refresh(&source.name, &destination, &refreshed);
         let superseded = refreshed.superseded.take();
+        let operation_elapsed = refreshed.outcome.operation_elapsed();
         let captured = self
             .blocking(move |host, layout| {
                 let Some((seed, record)) = layout.seed_of(&source.name, &source.incarnation)?
@@ -1123,6 +1148,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 Ok(Some(CapturedFork {
                     seed,
                     tree: record.tree,
+                    source,
+                    operation_elapsed: operation_elapsed.max(captured.capture_elapsed),
                     captured,
                     started,
                 }))
@@ -1148,6 +1175,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             tree,
             captured,
             started,
+            source,
+            operation_elapsed,
         }) = captured?
         else {
             return Ok(None);
@@ -1164,7 +1193,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 ),
                 Registrant::Intent,
             );
-            let (live, mount) = host
+            let (live, mount, elapsed) = host
                 .ready_fork_build_volume(layout, captured, Some((&own_seed, &registration)))
                 .map_err(storage)?;
             Ok(Some(PreparedFork {
@@ -1173,9 +1202,28 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 live,
                 mount,
                 started,
+                source,
+                operation_elapsed: operation_elapsed.max(elapsed),
             }))
         })
         .await
+    }
+
+    /// Only a foreground fork consumes this receipt; compaction's own refresh never starts one.
+    pub fn advise_fork_compaction(&self, prepared: Option<&PreparedFork>, project_root: &Path) {
+        let Some(prepared) = prepared else {
+            return;
+        };
+        let advice =
+            self.advise_compaction(&prepared.source, prepared.operation_elapsed, project_root);
+        if matches!(
+            advice,
+            crate::api::dto::LandSeedCompaction::Started { .. }
+                | crate::api::dto::LandSeedCompaction::Held { .. }
+                | crate::api::dto::LandSeedCompaction::Failed { .. }
+        ) {
+            cowshed_os::eprintln!("cowshed: main seed compaction: {advice:?}");
+        }
     }
 
     /// Release what [`Self::capture_fork`] answered for a fork whose own image was never
@@ -1217,6 +1265,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 live,
                 mount,
                 started,
+                ..
             }) = prepared
             else {
                 if link::linked(&checkout)?.is_some() {
@@ -1316,7 +1365,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         let target = self.layout.linked(&target_checkout)?;
         self.blocking(move |host, layout| {
             let Landing { id, hold } = landing;
-            let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
+            let (mount, _) = host.mount_build_volume(layout, &id).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
             // Read-only: the landing's daemon was stopped by the land's ledger-proven plan before this
             // point; quiesce never rereads a record to signal anything.
@@ -1479,7 +1528,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let Some(id) = previous else {
                 return Ok(Err(AdoptionSkip::NoTargetVolume));
             };
-            let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
+            let (mount, _) = host.mount_build_volume(layout, &id).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
             if let Err(busy) = nx::close(&mount, &state)
                 .map_err(|error| io("close the target's Nx state", &mount, &error))?
@@ -1764,7 +1813,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     pub async fn ready_refork(&self, refork: Refork) -> Result<()> {
         let Refork { captured, checkout } = refork;
         self.blocking(move |host, layout| {
-            let (live, mount) = host
+            let (live, mount, _) = host
                 .ready_fork_build_volume(layout, captured, None)
                 .map_err(storage)?;
             if let Err(error) = link::point(&checkout, &mount) {
@@ -1805,7 +1854,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             ));
         };
         self.blocking(move |host, layout| {
-            let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
+            let (mount, _) = host.mount_build_volume(layout, &id).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
             if let Err(busy) = nx::close(&mount, &state)
                 .map_err(|error| io("close the build volume's Nx state", &mount, &error))?
@@ -1861,7 +1910,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     ));
                 }
                 if linked {
-                    let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
+                    let (mount, _) = host.mount_build_volume(layout, &id).map_err(storage)?;
                     let state = BuildVolumeState::read(&mount)?;
                     if let Err(busy) = nx::close(&mount, &state)
                         .map_err(|error| io("close the build volume's Nx state", &mount, &error))?
@@ -2562,7 +2611,8 @@ fn seal(
         return Ok(Err(skip(busy, Side::Landing)));
     }
     match host.clone_quiet_build_volume(layout, quiet, &BuildVolumeId::mint(), registration) {
-        Ok(()) => Ok(Ok(Freeze::Frozen {
+        Ok(operation_elapsed) => Ok(Ok(Freeze::Frozen {
+            operation_elapsed,
             superseded: claim_superseded(host, layout, target, previous)?,
         })),
         Err(ApfsStorageError::BuildVolumeHeld { image, open, .. }) => Ok(Ok(Freeze::SealBusy {
@@ -2891,12 +2941,13 @@ fn seed_from_landed(
             continue;
         };
         match capture(host, layout, target, &live, Some(aim.tree.clone()))? {
-            Ok((elapsed_ms, superseded)) => {
+            Ok((elapsed_ms, operation_elapsed, superseded)) => {
                 return Ok(Some((
                     Refresh::Landed {
                         workspace: peer.name.clone(),
                         tree: aim.tree.clone(),
                         elapsed_ms,
+                        operation_elapsed,
                     },
                     superseded,
                 )));
@@ -2921,10 +2972,11 @@ fn reseed(
     }
     let behind_ms = age.behind().map(millis);
     Ok(match capture(host, layout, target, &age.live, age.tree)? {
-        Ok((elapsed_ms, superseded)) => (
+        Ok((elapsed_ms, operation_elapsed, superseded)) => (
             Refresh::Reseeded {
                 behind_ms,
                 elapsed_ms,
+                operation_elapsed,
             },
             Some(superseded),
         ),
@@ -2946,9 +2998,9 @@ fn capture(
     target: &Owner,
     source: &BuildVolumeId,
     tree: Option<GitOid>,
-) -> Result<std::result::Result<(u64, SupersededSeeds), CaptureSkip>> {
+) -> Result<std::result::Result<(u64, Option<Duration>, SupersededSeeds), CaptureSkip>> {
     let started = Instant::now();
-    let mount = host.mount_build_volume(layout, source).map_err(storage)?;
+    let (mount, mount_elapsed) = host.mount_build_volume(layout, source).map_err(storage)?;
     let state = BuildVolumeState::read(&mount)?;
     // Claim before stopping Nx: the source's keeper must not admit a replacement job.
     // Retain the claim through mounted capture and immutable seed publication.
@@ -2998,7 +3050,7 @@ fn capture(
     {
         return Ok(Err(capture_skip(busy)));
     }
-    match host.clone_claimed_build_volume(
+    let capture_elapsed = match host.clone_claimed_build_volume(
         layout,
         &claim,
         &BuildVolumeId::mint(),
@@ -3015,20 +3067,24 @@ fn capture(
             },
         ),
     ) {
-        Ok(()) => {}
+        Ok(elapsed) => elapsed,
         Err(ApfsStorageError::BuildVolumeHeld { image, open, .. }) => {
             return Ok(Err(CaptureSkip::VolumeBusy {
                 reason: volume_busy_reason(&image, &open),
             }));
         }
         Err(error) => return Err(storage(error)),
-    }
+    };
     let superseded = claim_superseded(host, layout, target, previous)?;
     let elapsed_ms = millis(started.elapsed());
     cowshed_os::timing::event("build-volume", || {
         format!("seed {} from {source} in {elapsed_ms} ms", target.name)
     });
-    Ok(Ok((elapsed_ms, superseded)))
+    Ok(Ok((
+        elapsed_ms,
+        mount_elapsed.max(capture_elapsed),
+        superseded,
+    )))
 }
 
 /// Say on stderr what a seed refresh of `target` did beyond keeping a seed that needed nothing:
@@ -3050,6 +3106,7 @@ pub(crate) fn say_refresh(
             workspace,
             tree,
             elapsed_ms,
+            ..
         } => cowshed_os::eprintln!(
             "cowshed: {target}'s branch moved to tree {tree} outside cowshed land; its seed is now {workspace}'s build volume ({elapsed_ms} ms)"
         ),
@@ -5677,7 +5734,7 @@ mod tests {
                     "the landing capture admits exempt open caches"
                 );
             } else {
-                let (_, superseded) = capture(
+                let (_, _, superseded) = capture(
                     &*scratch.host,
                     &scratch.layout,
                     &target,
@@ -5710,7 +5767,7 @@ mod tests {
                     &registered(BuildVolumeRecord::new(Some(tree), linked("fork"))),
                 )
                 .unwrap();
-            let fork_mount = scratch
+            let (fork_mount, _) = scratch
                 .host
                 .mount_build_volume(&scratch.layout, &fork)
                 .unwrap();
@@ -6238,7 +6295,7 @@ fn main() {
         let database = mount.join("nx/workspace-data/T-v3.db");
         fs::write(&database, b"").unwrap();
         let target = owner("main", '0');
-        let (_, superseded) = capture(&*scratch.host, &scratch.layout, &target, &live, None)
+        let (_, _, superseded) = capture(&*scratch.host, &scratch.layout, &target, &live, None)
             .unwrap()
             .expect("the initial capture has no holder");
         retire_seeds(&*scratch.host, &scratch.layout, superseded).unwrap();
@@ -7280,6 +7337,7 @@ fn main() {
         layout.publish(id, registration).unwrap();
         host.mount_build_volume(layout, id)
             .expect("mount a build volume")
+            .0
     }
 
     #[cfg(target_os = "macos")]
@@ -7293,7 +7351,7 @@ fn main() {
 
     async fn retired<H: RuntimeStorageHost>(volumes: &BuildVolumes<H>, freeze: Freeze) -> Froze {
         match freeze {
-            Freeze::Frozen { superseded } => {
+            Freeze::Frozen { superseded, .. } => {
                 volumes.retire_superseded(superseded).await;
                 Froze::Frozen
             }
@@ -8093,7 +8151,7 @@ fn main() {
                     .freeze_seed(&locked, &quiet, tree.clone())
                     .await?
                     .expect("nothing holds the landing volume");
-                let Freeze::Frozen { superseded } = frozen else {
+                let Freeze::Frozen { superseded, .. } = frozen else {
                     panic!("nothing holds the landing volume: {frozen:?}");
                 };
                 let adopted = volumes
@@ -8124,23 +8182,22 @@ fn main() {
             )
             .expect("the new captures the seed it read under main's image lock");
         let own_seed = BuildVolumeId::mint();
-        let (live, mount) = scratch
-            .host
-            .ready_fork_build_volume(
-                &scratch.layout,
-                captured,
-                Some((
-                    &own_seed,
-                    &registered(BuildVolumeRecord::new(
-                        record.tree,
-                        BuildVolumeRole::Seed {
-                            target: lane.name.clone(),
-                            incarnation: lane.incarnation.clone(),
-                        },
-                    )),
+        let (live, mount, operation_elapsed) = RuntimeStorageHost::ready_fork_build_volume(
+            scratch.host.as_ref(),
+            &scratch.layout,
+            captured,
+            Some((
+                &own_seed,
+                &registered(BuildVolumeRecord::new(
+                    record.tree,
+                    BuildVolumeRole::Seed {
+                        target: lane.name.clone(),
+                        incarnation: lane.incarnation.clone(),
+                    },
                 )),
-            )
-            .expect("the new readies its capture");
+            )),
+        )
+        .expect("the new readies its capture");
         assert!(
             scratch.layout.image(&main_live).exists(),
             "a land released the volume main linked while a new of main held main's image lock"
@@ -8154,6 +8211,8 @@ fn main() {
                     live: live.clone(),
                     mount,
                     started,
+                    source: main.clone(),
+                    operation_elapsed,
                 }),
                 lane.clone(),
                 staged.clone(),
@@ -8798,6 +8857,7 @@ fn main() {
             .volumes
             .copy_compaction(
                 stage().await,
+                0,
                 Box::new(|| super::Admission::Stop("a land holds a turn".to_owned())),
             )
             .await
@@ -8843,6 +8903,7 @@ fn main() {
             .volumes
             .copy_compaction(
                 stage().await,
+                0,
                 Box::new(move || {
                     // Held twice, as while a land runs, then let go on.
                     if counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
@@ -9026,7 +9087,7 @@ fn main() {
         // Between the copy and its publication: a land whose seed shares all but one MiB.
         let SeedCompaction::Copied(compacted) = scratch
             .volumes
-            .copy_compaction(stage().await, Box::new(|| super::Admission::Copy))
+            .copy_compaction(stage().await, 0, Box::new(|| super::Admission::Copy))
             .await
             .unwrap()
         else {
@@ -9052,7 +9113,7 @@ fn main() {
         let (landed, bytes, mark) = land('c', &|image| fs::write(image, vec![7_u8; 4096]).unwrap());
         let SeedCompaction::Copied(compacted) = scratch
             .volumes
-            .copy_compaction(source, Box::new(|| super::Admission::Copy))
+            .copy_compaction(source, 0, Box::new(|| super::Admission::Copy))
             .await
             .unwrap()
         else {

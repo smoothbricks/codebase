@@ -172,7 +172,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 }
             };
             require_current(layout, &plan)?;
-            let old_mount = host.mount_build_volume(layout, &plan.previous).map_err(storage)?;
+            let (old_mount, _) = host.mount_build_volume(layout, &plan.previous).map_err(storage)?;
             let state = BuildVolumeState::read(&old_mount)?;
             if let Err(busy) = nx::close(&old_mount, &state)
                 .map_err(|error| io("close the reseeded volume's Nx state", &old_mount, &error))?
@@ -196,7 +196,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     ),
                     Registrant::Workspace { incarnation: plan.workspace.owner.incarnation.clone() },
                 )).map_err(storage)?;
-                let mount = host.mount_build_volume(layout, &replacement).map_err(storage)?;
+                let (mount, _) = host.mount_build_volume(layout, &replacement).map_err(storage)?;
                 let state = BuildVolumeState::read(&mount)?;
                 nx::discard_daemon_records(&mount, &state)
                     .map_err(|error| io("discard the seed's Nx daemon record", &mount, &error))?;
