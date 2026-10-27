@@ -34,7 +34,7 @@ import { CARGO_TOOLCHAIN_NAMED_INPUT, cargoToolchainInputs } from './cargo-toolc
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
-import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform } from './index.js';
+import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform, scriptcBinModules } from './index.js';
 import { isRecord } from './type-guards.js';
 import { applyWorkspaceConfig, isTestRunnerTargetName, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
 
@@ -325,6 +325,86 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  describe('scriptc bin module selection', () => {
+    const bins = new Map([
+      ['tool', './dist/ts/node-cli.js'],
+      ['other', 'dist/ts/bin/other.js'],
+    ]);
+    const defaults = { tool: 'node-cli.js', other: 'bin/other.js' };
+    it.each([
+      ['absent scriptc', undefined, defaults],
+      ['empty scriptc', {}, defaults],
+      ['empty overrides', { entries: {} }, defaults],
+      ['FFI only', { ffi: {} }, defaults],
+      [
+        'partial override',
+        { entries: { tool: './dist/ts/bin/native-cli.js' } },
+        { ...defaults, tool: 'bin/native-cli.js' },
+      ],
+      [
+        'normalized override',
+        { entries: { tool: 'dist/ts/bin/../native-cli.js' } },
+        { ...defaults, tool: 'native-cli.js' },
+      ],
+      [
+        'both overrides',
+        { entries: { tool: 'dist/ts/a.js', other: './dist/ts/b.js' } },
+        { tool: 'a.js', other: 'b.js' },
+      ],
+    ] as const)('%s', (_name, scriptc, expected) => {
+      expect(scriptcBinModules(bins, scriptc, 'package.json', 'dist/ts')).toEqual(expected);
+    });
+
+    it.each([
+      ['null scriptc', null, 'scriptc must be an object'],
+      ['array scriptc', [], 'scriptc must be an object'],
+      ['string scriptc', 'native-cli.js', 'scriptc must be an object'],
+      ['null map', { entries: null }, 'scriptc.entries must be an object'],
+      ['array map', { entries: [] }, 'scriptc.entries must be an object'],
+      ['string map', { entries: 'dist/ts/native-cli.js' }, 'scriptc.entries must be an object'],
+      ['unknown name', { entries: { added: 'dist/ts/native-cli.js' } }, 'scriptc.entries.added is not declared in bin'],
+      ['empty value', { entries: { tool: '' } }, 'scriptc.entries.tool must be a non-empty module path'],
+      ['null value', { entries: { tool: null } }, 'scriptc.entries.tool must be a non-empty module path'],
+      ['number value', { entries: { tool: 7 } }, 'scriptc.entries.tool must be a non-empty module path'],
+      ['object value', { entries: { tool: {} } }, 'scriptc.entries.tool must be a non-empty module path'],
+      ['absolute path', { entries: { tool: '/dist/ts/native-cli.js' } }, 'scriptc.entries.tool must name JavaScript'],
+      [
+        'outside project',
+        { entries: { tool: '../dist/ts/native-cli.js' } },
+        'scriptc.entries.tool must name JavaScript',
+      ],
+      [
+        'outside outDir',
+        { entries: { tool: 'dist/ts/../native-cli.js' } },
+        'scriptc.entries.tool must name JavaScript',
+      ],
+      ['native output', { entries: { tool: 'dist/bin/native-cli.js' } }, 'scriptc.entries.tool must name JavaScript'],
+      [
+        'outDir prefix',
+        { entries: { tool: 'dist/ts-other/native-cli.js' } },
+        'scriptc.entries.tool must name JavaScript',
+      ],
+      [
+        'TypeScript source',
+        { entries: { tool: 'dist/ts/native-cli.ts' } },
+        'scriptc.entries.tool must name JavaScript',
+      ],
+    ] as const)('refuses %s', (_name, scriptc, message) => {
+      expect(() => scriptcBinModules(bins, scriptc, 'package.json', 'dist/ts')).toThrow(`package.json: ${message}`);
+    });
+
+    it('validates public bin paths even when their native modules are overridden', () => {
+      expect(() =>
+        scriptcBinModules(
+          new Map([['tool', 'outside/node-cli.js']]),
+          { entries: { tool: 'dist/ts/native-cli.js' } },
+          'package.json',
+          'dist/ts',
+        ),
+      ).toThrow('package.json: bin.tool must name JavaScript tsc-js emits under dist/ts/');
+    });
+  });
+
   it('compiles the bins of a scriptc package into dist/bin/<platform>, one target per platform', async () => {
     const workspace = await createWorkspace();
     try {
@@ -386,6 +466,18 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       for (const [name] of platforms) expect(linux[name]).toEqual(mac[name]);
       expect(linux.build?.dependsOn).toContain('scriptc-x64-linux');
       expect(linux.build?.dependsOn).not.toContain('scriptc-arm64-macos');
+      await workspace.write(
+        'packages/tool/package.json',
+        JSON.stringify({ ...manifest, scriptc: { entries: { 'smoo-nx-tool': './dist/ts/native-cli.js' } } }),
+      );
+      const overridden = await inferProjectTargets(workspace, 'packages/tool/package.json');
+      for (const [name] of platforms) {
+        expect(overridden[name]).toEqual({
+          ...mac[name],
+          options: { ...mac[name]?.options, entries: { 'smoo-nx-tool': 'native-cli.js' } },
+        });
+      }
+      expect(overridden['tsc-js']).toEqual(mac['tsc-js']);
       expect(Object.keys(await inferProjectTargets(workspace, 'packages/plain/package.json'))).not.toContainEqual(
         expect.stringMatching(/^scriptc-/),
       );
@@ -401,6 +493,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         return failure.errors[0]?.[1]?.message;
       };
       // A pack missing, or at another version than the compiler, is refused by name.
+      await workspace.write(
+        'packages/tool/package.json',
+        JSON.stringify({ ...manifest, scriptc: { entries: { added: 'dist/ts/native-cli.js' } } }),
+      );
+      expect(await refusal()).toContain('scriptc.entries.added is not declared in bin; entries cannot add executables');
       const { '@scriptc/runtime-darwin-x64': _dropped, ...threePacks } = packs;
       await workspace.write(
         'packages/tool/package.json',
@@ -438,7 +535,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         name: '@scope/tool',
         bin: { 'smoo-nx-tool': './dist/ts/bin/smoo-nx-tool.js' },
         devDependencies: { ...packs, scriptc: '0.4.4' },
-        scriptc: { ffi },
+        scriptc: { ffi, entries: { 'smoo-nx-tool': './dist/ts/native-cli.js' } },
       };
       await workspace.write(
         'packages/tool/tsconfig.lib.json',
@@ -448,7 +545,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = await inferProjectTargets(workspace, 'packages/tool/package.json');
       const names = ['scriptc-arm64-macos', 'scriptc-x64-macos', 'scriptc-arm64-linux', 'scriptc-x64-linux'];
       for (const name of names) {
-        expect(targets[name]?.options).toMatchObject({ ffi });
+        expect(targets[name]?.options).toMatchObject({ ffi, entries: { 'smoo-nx-tool': 'native-cli.js' } });
         // Change the manifest, a declaration or a C source and the executable is stale.
         for (const input of ['{projectRoot}/ffi.json', '{projectRoot}/src/ffi.d.ts', '{projectRoot}/native/lock.c']) {
           expect(targets[name]?.inputs).toContain(input);
@@ -485,7 +582,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(await refusal({ ffi: { ...ffi, declarations: { 'src/ffi.d.ts': '/tmp/ffi.d.ts' } } })).toMatch(
         /scriptc\.ffi names "\/tmp\/ffi\.d\.ts", which is not a path beneath the emitted JavaScript's root/,
       );
-      expect(await refusal({})).toMatch(/scriptc\.ffi must be an object/);
+      expect(await refusal({ ffi: null })).toMatch(/scriptc\.ffi must be an object/);
     } finally {
       await workspace.cleanup();
     }

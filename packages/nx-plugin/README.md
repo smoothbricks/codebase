@@ -1084,31 +1084,39 @@ Concrete targets come from concrete files:
   platform's runtime pack at the same version (`@scriptc/runtime-darwin-arm64`, `-darwin-x64`, `-linux-arm64-musl`,
   `-linux-x64-musl`); inference refuses a missing or mismatched pack by name. Each run emits the package's transformed
   JavaScript from `tsconfig.lib.json` with ttsc into private staging under `.cache/scriptc/` (removed when it ends) and
-  compiles every `package.json#bin` entry's module there with `scriptc build --strip --no-keep-llvm` into
+  compiles every executable declared in `package.json#bin` with `scriptc build --strip --no-keep-llvm` into
   `dist/bin/<platform>/<name>` (`darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64`, the directories
-  `@smoothbricks/cowshed`'s launcher reads); a failed run removes the executables it wrote. Every host builds every
-  platform the same way, `SCRIPTC_TARGET=<triple>` with `SCRIPTC_CC=zigcc` (zig from the devenv shell): the triples are
-  `aarch64-macos`, `x86_64-macos`, `aarch64-linux-musl` and `x86_64-linux-musl`, so the Linux executables are static
-  musl, as cowshed's CLI is. Like every platform target, the host's own joins `build` and the publish legs build and
-  collect the others by family (`*-linux` on the Linux runner, `*-<arch>-macos` on each macOS leg), so a published
-  tarball carries all four. A platform target's closure stays in its family and the four are collected on different
-  hosts, so each emits on its own rather than depending on `tsc-js` or sharing its output; scriptc type-checks the
-  staged JavaScript under a strict `tsconfig.json` the run writes beside it, with a `package.json` naming it ES modules.
-  Such a package still emits its `tsc-js` JavaScript into `dist/ts` (`outDir`; inference refuses `dist` itself or
-  `dist/bin`), so that JavaScript and the executables are disjoint outputs. Before compiling, a run fails on any call
-  through a `typia` import binding (default, namespace, named, or destructured from one; the `typia/lib/internal/`
-  helpers the transform itself emits calls to are not such imports) left in the staged JavaScript (`file:line:column`
-  and the call): ttsc emits a typia call untransformed, without an error, when the emitting package does not list
-  `typia` itself, and such a call throws at run time. A package whose executables call C through scriptc's FFI declares
-  it in `package.json#scriptc.ffi` (`manifest`, the FFI manifest; `declarations`, each ambient `.d.ts` mapped to where
-  it is staged beside the emitted JavaScript; `sources`, the C files): every run copies the declarations there, compiles
-  the sources for its triple with zig (`zig cc -target <triple> -O2 -fno-sanitize=undefined`, since zig's Debug default
-  calls UBSan handlers only a zig link carries, then `zig ar`) into one archive, and hands scriptc (`--ffi`) a staged
-  copy of the manifest that keeps its fields and links that archive. The manifest lists no `libraries` (every platform
-  builds it, and a prebuilt archive holds one triple's code), and every path stays beneath its root (the project; for a
-  declaration's staged path, the emitted JavaScript's root) or inference and the run refuse it by name. The manifest,
-  declarations and sources are inputs of every platform target (a header a source includes is not one, so keep the C
-  self-contained), and a failed compile writes no executable.
+  `@smoothbricks/cowshed`'s launcher reads); a failed run removes the executables it wrote. Bin names, coverage and
+  output paths always come from `bin`. By default each native executable compiles its public bin module. Optional
+  `package.json#scriptc.entries` maps an already-declared bin name to a different emitted JavaScript module, for example
+  `{ "tool": "./dist/ts/native-cli.js" }` when `bin.tool` names `./dist/ts/node-cli.js`. Values use the same
+  package-root-relative spelling as `bin` and must name `.js` modules under the same declared `outDir`; inference
+  converts them to paths relative to the emitted JavaScript's root for every platform. Unlisted bins keep their default
+  module. Unknown names, malformed maps or values, and paths outside that root or not ending in `.js` are refused. Entry
+  overrides require no FFI declaration; when `scriptc.ffi` is present, staging and native inputs are unchanged. Every
+  host builds every platform the same way, `SCRIPTC_TARGET=<triple>` with `SCRIPTC_CC=zigcc` (zig from the devenv
+  shell): the triples are `aarch64-macos`, `x86_64-macos`, `aarch64-linux-musl` and `x86_64-linux-musl`, so the Linux
+  executables are static musl, as cowshed's CLI is. Like every platform target, the host's own joins `build` and the
+  publish legs build and collect the others by family (`*-linux` on the Linux runner, `*-<arch>-macos` on each macOS
+  leg), so a published tarball carries all four. A platform target's closure stays in its family and the four are
+  collected on different hosts, so each emits on its own rather than depending on `tsc-js` or sharing its output;
+  scriptc type-checks the staged JavaScript under a strict `tsconfig.json` the run writes beside it, with a
+  `package.json` naming it ES modules. Such a package still emits its `tsc-js` JavaScript into `dist/ts` (`outDir`;
+  inference refuses `dist` itself or `dist/bin`), so that JavaScript and the executables are disjoint outputs. Before
+  compiling, a run fails on any call through a `typia` import binding (default, namespace, named, or destructured from
+  one; the `typia/lib/internal/` helpers the transform itself emits calls to are not such imports) left in the staged
+  JavaScript (`file:line:column` and the call): ttsc emits a typia call untransformed, without an error, when the
+  emitting package does not list `typia` itself, and such a call throws at run time. A package whose executables call C
+  through scriptc's FFI declares it in `package.json#scriptc.ffi` (`manifest`, the FFI manifest; `declarations`, each
+  ambient `.d.ts` mapped to where it is staged beside the emitted JavaScript; `sources`, the C files): every run copies
+  the declarations there, compiles the sources for its triple with zig
+  (`zig cc -target <triple> -O2 -fno-sanitize=undefined`, since zig's Debug default calls UBSan handlers only a zig link
+  carries, then `zig ar`) into one archive, and hands scriptc (`--ffi`) a staged copy of the manifest that keeps its
+  fields and links that archive. The manifest lists no `libraries` (every platform builds it, and a prebuilt archive
+  holds one triple's code), and every path stays beneath its root (the project; for a declaration's staged path, the
+  emitted JavaScript's root) or inference and the run refuse it by name. The manifest, declarations and sources are
+  inputs of every platform target (a header a source includes is not one, so keep the C self-contained), and a failed
+  compile writes no executable.
 - Commands this plugin infers run the tool packages' executables for the inferring host,
   `node_modules/@smoothbricks/nx-plugin/../<tool>/dist/bin/<platform>/<bin>`: `smoo-nx-build-inputs` after a napi build.
   When the tool package is a project of the workspace being inferred, the command's target depends on that tool's

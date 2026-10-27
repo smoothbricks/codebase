@@ -1187,7 +1187,7 @@ interface PackageJson {
   napi?: Record<string, unknown>;
   /** npm's own "never published" flag, which is what makes a package a deployable target rather than a library. */
   private?: boolean;
-  /** What a scriptc package declares beyond its dependencies: the C its executables call (`ffi`). */
+  /** Native entry overrides (`entries`) and the C the executables call (`ffi`). */
   scriptc?: unknown;
   scripts?: Record<string, unknown>;
   nx?: {
@@ -1224,6 +1224,49 @@ function packageBinEntries(packageJson: PackageJson, packageJsonPath: string): M
   return entries;
 }
 
+/** Resolve declared bins and optional package-root-relative native overrides to emit-root-relative modules. */
+export function scriptcBinModules(
+  bins: ReadonlyMap<string, string>,
+  scriptc: unknown,
+  packageJsonPath: string,
+  javascriptRoot: string,
+): Record<string, string> {
+  const modulePath = (name: string, entry: string, field: string): string => {
+    const emitted = posix.normalize(entry);
+    if (!/^[\w.-]+$/.test(name) || !emitted.startsWith(`${javascriptRoot}/`) || !emitted.endsWith('.js')) {
+      throw new Error(
+        `${packageJsonPath}: ${field} must name JavaScript tsc-js emits under ${javascriptRoot}/ (it is ${entry})`,
+      );
+    }
+    return emitted.slice(javascriptRoot.length + 1);
+  };
+  const modules: Record<string, string> = {};
+  for (const [name, entry] of bins) {
+    modules[name] = modulePath(name, entry, `bin.${name}`);
+  }
+  if (scriptc === undefined) return modules;
+  if (!isRecord(scriptc) || Array.isArray(scriptc)) {
+    throw new Error(`${packageJsonPath}: scriptc must be an object`);
+  }
+  const overrides = scriptc.entries;
+  if (overrides === undefined) return modules;
+  if (!isRecord(overrides) || Array.isArray(overrides)) {
+    throw new Error(`${packageJsonPath}: scriptc.entries must be an object mapping declared bin names to module paths`);
+  }
+  for (const [name, entry] of Object.entries(overrides)) {
+    if (!bins.has(name)) {
+      throw new Error(
+        `${packageJsonPath}: scriptc.entries.${name} is not declared in bin; entries cannot add executables`,
+      );
+    }
+    if (typeof entry !== 'string' || entry.length === 0) {
+      throw new Error(`${packageJsonPath}: scriptc.entries.${name} must be a non-empty module path`);
+    }
+    modules[name] = modulePath(name, entry, `scriptc.entries.${name}`);
+  }
+  return modules;
+}
+
 /**
  * Every platform a scriptc package ships an executable for, with the triple `SCRIPTC_TARGET` names for it and the
  * runtime pack scriptc links that triple against. Linux executables are static musl, as cowshed's CLI is, so one file
@@ -1256,7 +1299,7 @@ const SCRIPTC_PLATFORMS: readonly (NapiPlatform & { readonly triple: string; rea
  * beside the emitted JavaScript and builds for its triple. Absent for a package that calls no C.
  */
 function scriptcFfi(packageJson: PackageJson, packageJsonPath: string): ScriptcNativeFfi | undefined {
-  if (packageJson.scriptc === undefined) {
+  if (packageJson.scriptc === undefined || (isRecord(packageJson.scriptc) && packageJson.scriptc.ffi === undefined)) {
     return undefined;
   }
   const refusal = (what: string): Error =>
@@ -1355,17 +1398,7 @@ function scriptcPlatformTargets(
   if (entries.size === 0) {
     throw new Error(`${packageJsonPath}: a scriptc package names the executables it compiles in bin`);
   }
-  // Each bin's module, relative to the root of an emit of tsconfig.lib.json wherever it is written.
-  const modules: Record<string, string> = {};
-  for (const [name, entry] of entries) {
-    const emitted = posix.normalize(entry);
-    if (!/^[\w.-]+$/.test(name) || !emitted.startsWith(`${javascriptRoot}/`) || !emitted.endsWith('.js')) {
-      throw new Error(
-        `${packageJsonPath}: bin.${name} must name JavaScript tsc-js emits under ${javascriptRoot}/ (it is ${entry})`,
-      );
-    }
-    modules[name] = emitted.slice(javascriptRoot.length + 1);
-  }
+  const modules = scriptcBinModules(entries, packageJson.scriptc, packageJsonPath, javascriptRoot);
   const ffi = scriptcFfi(packageJson, packageJsonPath);
   const targets: Record<string, TargetConfiguration> = {};
   for (const platform of SCRIPTC_PLATFORMS) {
