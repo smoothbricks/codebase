@@ -1152,32 +1152,6 @@ enum NameScope {
     Foreign,
 }
 
-/// The newest retired incarnation of every name present in trash.
-///
-/// Read off the trash filenames rather than each sidecar because `retired_authority` already proves
-/// the two agree for every entry a plan contains, and because this answer must be identical during
-/// preview and at execution time or every plan would revalidate as stale.
-fn retired_name_owners(images: &[PathBuf]) -> BTreeMap<WorkspaceName, WorkspaceIncarnation> {
-    let mut owners = BTreeMap::new();
-    for image in images {
-        let Some((name, incarnation)) = image
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(split_retired_stem)
-        else {
-            continue;
-        };
-        match owners.get_mut(&name) {
-            Some(owner) if *owner < incarnation => *owner = incarnation,
-            Some(_) => {}
-            None => {
-                owners.insert(name, incarnation);
-            }
-        }
-    }
-    owners
-}
-
 type MountKey = (RepoId, WorkspaceName);
 
 enum RegistryCommand {
@@ -2636,6 +2610,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         repo: &RepoId,
         trash_image: &Path,
         expected: Option<&RetiredRef>,
+        observation: Option<&mut super::RetiredNameOwners>,
     ) -> Result<Option<RootHeldMountpoint>, ApfsStorageError>
     where
         R: CommandRunner + Send + Sync + 'static,
@@ -2661,18 +2636,27 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 )));
             }
         };
-        // Recomputed per entry instead of carried in the plan, because `reclaim_retired` runs this
-        // with no plan at all. A scope only ever widens as siblings are collected, so an entry that
-        // runs after its name's owner converges on the same already-removed shared paths.
-        let trash = project
-            .join(SESSIONS_DIRECTORY)
-            .join(super::TRASH_NAMESPACE);
-        let owners = retired_name_owners(&self.retired_trash_images(&trash)?);
-        let scope = self.retired_name_scope(
-            authority.workspace(),
-            owners.get(authority.workspace().name()),
-        )?;
-        self.reclaim_workspace_artifacts(project, &authority, trash_image, scope)
+        let reclaim = |owners: &super::RetiredNameOwners| {
+            let scope = self.retired_name_scope(
+                authority.workspace(),
+                owners.get(authority.workspace().name()),
+            )?;
+            self.reclaim_workspace_artifacts(project, &authority, trash_image, scope)
+        };
+        match observation {
+            Some(owners) => {
+                let result = reclaim(owners);
+                owners.after_reclaim(&authority, trash_image, |kind| kind.is_file(), result)
+            }
+            None => {
+                let trash = project
+                    .join(SESSIONS_DIRECTORY)
+                    .join(super::TRASH_NAMESPACE);
+                let owners =
+                    super::RetiredNameOwners::from_images(&self.retired_trash_images(&trash)?);
+                reclaim(&owners)
+            }
+        }
     }
 
     /// The name owner alone may remove its disposable environment. Recovery export and
@@ -2895,6 +2879,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     }
 
     fn retired_trash_images(&self, trash: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+        #[cfg(test)]
+        super::record_retired_trash_observation();
         let mut images = BTreeSet::new();
         for path in regular_file_children(trash)? {
             if is_image_path(&path) {
@@ -3068,7 +3054,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         observed_at: std::time::SystemTime,
         held_locks: &[PathBuf],
         options: StorageGcOptions,
-    ) -> Result<StorageGcPlan, ApfsStorageError>
+    ) -> Result<(StorageGcPlan, super::RetiredNameOwners), ApfsStorageError>
     where
         R: CommandRunner + Send + Sync + 'static,
     {
@@ -3098,7 +3084,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
 
         let trash = sessions.join(super::TRASH_NAMESPACE);
         let trash_images = self.retired_trash_images(&trash)?;
-        let name_owners = retired_name_owners(&trash_images);
+        let name_owners = super::RetiredNameOwners::from_images(&trash_images);
         let mut claimed_checkpoint_names = BTreeSet::new();
         // Every name a mountpoint may legitimately carry: the canonical workspace (its image
         // lives outside `sessions`, so no discovery pass names it), retired records (their
@@ -3572,20 +3558,23 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         lock_paths.sort();
         lock_paths.dedup();
         root_held_mountpoints.sort_by(|left, right| left.mount_point().cmp(right.mount_point()));
-        Ok(StorageGcPlan {
-            repo: repo.clone(),
-            observed_at,
-            options,
-            candidates,
-            lock_paths,
-            examined,
-            retained: StorageGcRetained {
-                pinned: retained_pinned,
-                recent: retained_recent,
-                active: retained_active,
+        Ok((
+            StorageGcPlan {
+                repo: repo.clone(),
+                observed_at,
+                options,
+                candidates,
+                lock_paths,
+                examined,
+                retained: StorageGcRetained {
+                    pinned: retained_pinned,
+                    recent: retained_recent,
+                    active: retained_active,
+                },
+                root_held_mountpoints,
             },
-            root_held_mountpoints,
-        })
+            name_owners,
+        ))
     }
     fn orphan_session_image_mount_blocker(
         &self,
@@ -3656,7 +3645,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             },
         )?
         .ok_or(ApfsStorageError::GcPlanStale)?;
-        let current = self.preview_gc_project(
+        let (current, mut name_owners) = self.preview_gc_project(
             project,
             plan.repo(),
             plan.observed_at(),
@@ -3690,6 +3679,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             plan.repo(),
                             candidate.path(),
                             None,
+                            Some(&mut name_owners),
                         )? {
                             report.root_held_mountpoints.push(retained);
                         }
@@ -4379,7 +4369,7 @@ where
         let trash = project
             .join(SESSIONS_DIRECTORY)
             .join(super::TRASH_NAMESPACE);
-        let owners = retired_name_owners(&self.retired_trash_images(&trash)?);
+        let owners = super::RetiredNameOwners::from_images(&self.retired_trash_images(&trash)?);
         if self.retired_name_scope(
             authority.workspace(),
             owners.get(authority.workspace().name()),
@@ -5980,8 +5970,14 @@ where
         if !trash_exists && !sidecar_exists {
             return Ok(());
         }
-        self.reclaim_retired_authority(&project, retired.workspace().repo(), &trash, Some(retired))
-            .map(|_| ())
+        self.reclaim_retired_authority(
+            &project,
+            retired.workspace().repo(),
+            &trash,
+            Some(retired),
+            None,
+        )
+        .map(|_| ())
     }
 
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
@@ -6692,6 +6688,7 @@ where
         }
         let project = layout(config, repo)?.project().project_root.clone();
         self.preview_gc_project(&project, repo, std::time::SystemTime::now(), &[], options)
+            .map(|(plan, _)| plan)
     }
 
     fn execute_gc(
@@ -7669,7 +7666,7 @@ mod tests {
         assert!(refusal.to_string().contains("src/unsaved.rs"), "{refusal}");
         assert_untouched();
         let refusal = host
-            .reclaim_retired_authority(&fixture.project, &repo, &trash, None)
+            .reclaim_retired_authority(&fixture.project, &repo, &trash, None, None)
             .expect_err("execution rechecks unknown work");
         assert!(refusal.to_string().contains("src/unsaved.rs"), "{refusal}");
         assert_eq!(

@@ -70,6 +70,16 @@ pub trait Substrate: LifecyclePlanner {
 failure local to one candidate is returned in `StorageGcReport.deferred: Vec<StorageGcDeferred { path, diagnostic }>`;
 later candidates still run. Only a stale plan or unsafe ownership/integrity proof refuses the sweep.
 
+The locked revalidation's trash observation also supplies the remaining retired incarnations of each workspace name.
+APFS and directory execution share that selection owner, not their payload effects. Each candidate still checks its
+exact retirement record and current canonical workspace before cleanup. After a cleanup attempt, including one that
+failed after unlinking, only that entry's payload and grants record are inspected: a surviving entry keeps its name,
+while an absent pair removes its incarnation from the operation-local observation. A failed inspection retains the
+observed owner and reports its cause alongside any cleanup failure. No candidate re-enumerates the whole trash; the
+observation and these exact probes cost O(T + K) namespace observations for T trash entries and K candidates, excluding
+the separately required work on each candidate's artifacts. Standalone retirement observes trash once for its own call.
+Nothing persists this selection, carries it across lock admission or changes recovery-image retention.
+
 A candidate's identity is a digest of what `stat` reports, plus the content of the small records beside an image. Each
 file it names contributes its path, length, allocated bytes and modification time. A record (grants sidecar, CA key,
 checkpoint and restore-recovery facts) also contributes its content; every other file, above all an image, contributes

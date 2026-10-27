@@ -330,6 +330,146 @@ fn directory_source_release_keeps_canonical_authority_on_cleanup_refusal() {
     assert!(!storage.project().sessions.join(".trash").exists());
 }
 
+#[test]
+fn directory_gc_observes_retired_owners_once_per_phase_not_per_candidate() {
+    use super::*;
+    use crate::storage::apfs::retired_trash_observations;
+    use crate::storage::lifecycle::StorageGcReason;
+
+    for candidates in [1_usize, 8, 64, 128] {
+        let scratch = Scratch::new("gc-retired-owner-count");
+        let (host, _, metadata) = published_directory(&scratch, "kept", 1);
+        let storage = layout(&host.config, &metadata.repo_id).unwrap();
+        let sessions = &storage.project().sessions;
+        fs::create_dir_all(sessions.join(".trash")).unwrap();
+        let mut retired = Vec::new();
+        for index in 0..candidates {
+            let mut record = metadata.clone();
+            record.workspace = WorkspaceName::session(format!("gone-{index}")).unwrap();
+            record.workspace_incarnation =
+                WorkspaceIncarnation::new(format!("{:032x}", index + 2)).unwrap();
+            let image = crate::storage::apfs::retired_image_below(
+                sessions,
+                &record.workspace,
+                &record.workspace_incarnation,
+            );
+            record.write_for_image(&image).unwrap();
+            retired.push(image);
+        }
+        let mut record = metadata.clone();
+        record.workspace = WorkspaceName::session("retained").unwrap();
+        let retained = crate::storage::apfs::retired_image_below(
+            sessions,
+            &record.workspace,
+            &record.workspace_incarnation,
+        );
+        fs::create_dir(&retained).unwrap();
+        fs::write(retained.join("only-copy"), b"retained recovery evidence").unwrap();
+        record.write_for_image(&retained).unwrap();
+
+        let before = retired_trash_observations();
+        let plan = host
+            .preview_gc(&host.config, &metadata.repo_id, StorageGcOptions::default())
+            .unwrap();
+        assert_eq!(
+            plan.candidates()
+                .iter()
+                .filter(|candidate| candidate.reason() == StorageGcReason::RetiredWorkspace)
+                .count(),
+            candidates
+        );
+        assert_eq!(
+            retired_trash_observations() - before,
+            1,
+            "one read-only preview observation"
+        );
+        let report = host.execute_gc(&host.config, plan).unwrap();
+        assert_eq!(report.reclaimed, candidates);
+        assert!(report.deferred.is_empty(), "{:?}", report.deferred);
+        assert_eq!(
+            retired_trash_observations() - before,
+            2,
+            "one fresh locked revalidation, no per-candidate census; candidates={candidates}"
+        );
+        for image in retired {
+            assert!(!sidecar_path(&image).exists());
+        }
+        assert_eq!(
+            fs::read(retained.join("only-copy")).unwrap(),
+            b"retained recovery evidence"
+        );
+        assert!(sidecar_path(&retained).exists());
+        cowshed_os::eprintln!(
+            "retired-owner observations: candidates={candidates} preview=1 execution=1"
+        );
+    }
+}
+
+#[test]
+fn retired_owner_completion_uses_residual_authority_even_when_cleanup_failed() {
+    use super::*;
+    use crate::storage::apfs::RetiredNameOwners;
+
+    for (payload, record, failed) in [
+        (true, true, true),
+        (false, true, true),
+        (true, false, true),
+        (false, false, true),
+        (false, false, false),
+    ] {
+        let scratch = Scratch::new("retired-owner-partial-cleanup");
+        let (host, _, metadata) = published_directory(&scratch, "selected", 2);
+        let storage = layout(&host.config, &metadata.repo_id).unwrap();
+        let trash = crate::storage::apfs::retired_image_below(
+            &storage.project().sessions,
+            &metadata.workspace,
+            &metadata.workspace_incarnation,
+        );
+        fs::create_dir_all(trash.parent().unwrap()).unwrap();
+        let older = WorkspaceIncarnation::new(format!("{:032x}", 1)).unwrap();
+        let older_image = crate::storage::apfs::retired_image_below(
+            &storage.project().sessions,
+            &metadata.workspace,
+            &older,
+        );
+        let mut owners = RetiredNameOwners::from_images(&[older_image, trash.clone()]);
+        if payload {
+            fs::create_dir(&trash).unwrap();
+        }
+        if record {
+            metadata.write_for_image(&trash).unwrap();
+        }
+        let retired = RetiredRef::new(metadata_workspace_ref(&metadata).unwrap(), Revision::new(1));
+        let cleanup = if failed {
+            Err(ApfsStorageError::Host(
+                "cleanup's original failure".to_owned(),
+            ))
+        } else {
+            Ok(())
+        };
+        let result = owners.after_reclaim(&retired, &trash, |kind| kind.is_dir(), cleanup);
+        if failed {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cleanup's original failure")
+            );
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            owners.get(&metadata.workspace),
+            Some(if payload || record {
+                &metadata.workspace_incarnation
+            } else {
+                &older
+            }),
+            "payload={payload} record={record} failed={failed}",
+        );
+    }
+}
+
 /// The store paths a published fixture's release and a project's terminal-storage guard
 /// both name: its project root, and the per-workspace temp dir below it. Shared so a test
 /// outside this module composes the actual release with that guard on one store.

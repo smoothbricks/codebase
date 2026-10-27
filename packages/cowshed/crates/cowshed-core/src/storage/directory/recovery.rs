@@ -5,7 +5,7 @@
 //! interrupted operation converges the same way. Only the payload differs: a directory, read
 //! in place (a marker is a file in it, not a mount away) and removed as a tree.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -88,29 +88,6 @@ fn payload_gc_paths(image: &Path) -> Vec<PathBuf> {
         checkpoint_fact_path(image),
         restore_recovery_fact_path(image),
     ]
-}
-
-/// The newest retired incarnation of every name in the trash, read off the trash names so the
-/// answer is identical at preview and at execution.
-fn retired_name_owners(images: &[PathBuf]) -> BTreeMap<WorkspaceName, WorkspaceIncarnation> {
-    let mut owners: BTreeMap<WorkspaceName, WorkspaceIncarnation> = BTreeMap::new();
-    for image in images {
-        let Some((name, incarnation)) = image
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(split_retired_stem)
-        else {
-            continue;
-        };
-        match owners.get_mut(&name) {
-            Some(owner) if *owner < incarnation => *owner = incarnation,
-            Some(_) => {}
-            None => {
-                owners.insert(name, incarnation);
-            }
-        }
-    }
-    owners
 }
 
 /// The identity of one reclamation, fencing it against any change between preview and
@@ -858,7 +835,13 @@ impl DirectoryExecutionHost {
         if !path_exists(&trash)? && !path_exists(&sidecar_path(&trash))? {
             return Ok(());
         }
-        self.reclaim_retired_authority(&project, retired.workspace().repo(), &trash, Some(retired))
+        self.reclaim_retired_authority(
+            &project,
+            retired.workspace().repo(),
+            &trash,
+            Some(retired),
+            None,
+        )
     }
 
     /// The retirement a trash payload records, or `None` when its sidecar is already gone.
@@ -895,6 +878,8 @@ impl DirectoryExecutionHost {
     }
 
     fn retired_trash_images(trash: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+        #[cfg(test)]
+        crate::storage::apfs::record_retired_trash_observation();
         let mut images = BTreeSet::new();
         for path in directory_children(trash)? {
             if is_image_path(&path) {
@@ -1072,6 +1057,7 @@ impl DirectoryExecutionHost {
         repo: &RepoId,
         trash_image: &Path,
         expected: Option<&RetiredRef>,
+        observation: Option<&mut crate::storage::apfs::RetiredNameOwners>,
     ) -> Result<(), ApfsStorageError> {
         let authority = match (
             self.retired_authority(project, repo, trash_image)?,
@@ -1092,11 +1078,24 @@ impl DirectoryExecutionHost {
                 )));
             }
         };
-        let trash = project.join(SESSIONS_DIRECTORY).join(TRASH_NAMESPACE);
-        let owners = retired_name_owners(&Self::retired_trash_images(&trash)?);
-        let scope =
-            self.retired_name_scope(&authority, owners.get(authority.workspace().name()))?;
-        self.reclaim_workspace_artifacts(project, &authority, trash_image, scope)
+        let reclaim = |owners: &crate::storage::apfs::RetiredNameOwners| {
+            let scope =
+                self.retired_name_scope(&authority, owners.get(authority.workspace().name()))?;
+            self.reclaim_workspace_artifacts(project, &authority, trash_image, scope)
+        };
+        match observation {
+            Some(owners) => {
+                let result = reclaim(owners);
+                owners.after_reclaim(&authority, trash_image, |kind| kind.is_dir(), result)
+            }
+            None => {
+                let trash = project.join(SESSIONS_DIRECTORY).join(TRASH_NAMESPACE);
+                let owners = crate::storage::apfs::RetiredNameOwners::from_images(
+                    &Self::retired_trash_images(&trash)?,
+                );
+                reclaim(&owners)
+            }
+        }
     }
 
     pub(super) fn release_canonical_workspace(
@@ -1262,7 +1261,7 @@ impl DirectoryExecutionHost {
         observed_at: SystemTime,
         held_locks: &[PathBuf],
         options: StorageGcOptions,
-    ) -> Result<StorageGcPlan, ApfsStorageError> {
+    ) -> Result<(StorageGcPlan, crate::storage::apfs::RetiredNameOwners), ApfsStorageError> {
         let mut candidates = Vec::new();
         let mut lock_paths = Vec::new();
         let mut examined = 0_usize;
@@ -1271,7 +1270,7 @@ impl DirectoryExecutionHost {
         // Retired workspaces in the trash.
         let sessions = project.join(SESSIONS_DIRECTORY);
         let trash_images = Self::retired_trash_images(&sessions.join(TRASH_NAMESPACE))?;
-        let owners = retired_name_owners(&trash_images);
+        let owners = crate::storage::apfs::RetiredNameOwners::from_images(&trash_images);
         for path in trash_images {
             let Some(retired) = self.retired_authority(project, repo, &path)? else {
                 warn_session_image_issue(
@@ -1449,7 +1448,7 @@ impl DirectoryExecutionHost {
             else {
                 continue;
             };
-            if owners.contains_key(&workspace_name)
+            if owners.get(&workspace_name).is_some()
                 && !path_exists(storage.canonical_image(&workspace_name)?.image())?
             {
                 continue;
@@ -1512,16 +1511,19 @@ impl DirectoryExecutionHost {
         });
         lock_paths.sort();
         lock_paths.dedup();
-        Ok(StorageGcPlan {
-            repo: repo.clone(),
-            observed_at,
-            options,
-            candidates,
-            lock_paths,
-            examined,
-            retained,
-            root_held_mountpoints: Vec::new(),
-        })
+        Ok((
+            StorageGcPlan {
+                repo: repo.clone(),
+                observed_at,
+                options,
+                candidates,
+                lock_paths,
+                examined,
+                retained,
+                root_held_mountpoints: Vec::new(),
+            },
+            owners,
+        ))
     }
 
     pub(super) fn execute_gc_plan(
@@ -1540,7 +1542,7 @@ impl DirectoryExecutionHost {
             },
         )?
         .ok_or(ApfsStorageError::GcPlanStale)?;
-        let current = self.preview_gc_project(
+        let (current, mut owners) = self.preview_gc_project(
             project,
             plan.repo(),
             plan.observed_at(),
@@ -1560,9 +1562,13 @@ impl DirectoryExecutionHost {
         for candidate in plan.candidates() {
             let path = candidate.path();
             let result = match candidate.reason() {
-                StorageGcReason::RetiredWorkspace => {
-                    self.reclaim_retired_authority(project, plan.repo(), path, None)
-                }
+                StorageGcReason::RetiredWorkspace => self.reclaim_retired_authority(
+                    project,
+                    plan.repo(),
+                    path,
+                    None,
+                    Some(&mut owners),
+                ),
                 StorageGcReason::OrphanSessionImage
                 | StorageGcReason::OrphanStagingImage
                 | StorageGcReason::ExpiredCheckpoint => self.reclaim_image(path),
@@ -1679,7 +1685,9 @@ impl crate::storage::recovery_image::RecoveryEnvironment for DirectoryExecutionH
             return Ok(());
         };
         let trash = project.join(SESSIONS_DIRECTORY).join(TRASH_NAMESPACE);
-        let owners = retired_name_owners(&Self::retired_trash_images(&trash)?);
+        let owners = crate::storage::apfs::RetiredNameOwners::from_images(
+            &Self::retired_trash_images(&trash)?,
+        );
         if self.retired_name_scope(&authority, owners.get(authority.workspace().name()))?
             == NameScope::Owned
         {

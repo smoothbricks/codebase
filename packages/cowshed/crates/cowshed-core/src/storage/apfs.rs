@@ -4238,6 +4238,114 @@ pub(crate) fn split_retired_stem(stem: &str) -> Option<(WorkspaceName, Workspace
     ))
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static RETIRED_TRASH_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::storage) fn record_retired_trash_observation() {
+    RETIRED_TRASH_OBSERVATIONS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(in crate::storage) fn retired_trash_observations() -> usize {
+    RETIRED_TRASH_OBSERVATIONS.with(std::cell::Cell::get)
+}
+
+/// The remaining trash incarnations from one observation. Preview and its locked revalidation
+/// share this owner; execution removes only an entry whose exact payload and record are gone.
+#[derive(Default)]
+pub(in crate::storage) struct RetiredNameOwners {
+    remaining:
+        std::collections::BTreeMap<WorkspaceName, std::collections::BTreeSet<WorkspaceIncarnation>>,
+}
+
+impl RetiredNameOwners {
+    pub(in crate::storage) fn from_images(images: &[PathBuf]) -> Self {
+        let mut owners = Self::default();
+        for image in images {
+            let Some((name, incarnation)) = image
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(split_retired_stem)
+            else {
+                continue;
+            };
+            owners
+                .remaining
+                .entry(name)
+                .or_default()
+                .insert(incarnation);
+        }
+        owners
+    }
+
+    pub(in crate::storage) fn get(&self, name: &WorkspaceName) -> Option<&WorkspaceIncarnation> {
+        self.remaining
+            .get(name)
+            .and_then(|remaining| remaining.last())
+    }
+
+    fn remove(&mut self, name: &WorkspaceName, incarnation: &WorkspaceIncarnation) {
+        if let Some(remaining) = self.remaining.get_mut(name) {
+            remaining.remove(incarnation);
+            if remaining.is_empty() {
+                self.remaining.remove(name);
+            }
+        }
+    }
+
+    /// A failed cleanup can already have unlinked its last authority before a directory sync
+    /// fails. Inspect only that entry, not the whole trash, and preserve both failures if this
+    /// observation also fails. A surviving payload or grants record still owns its name.
+    pub(in crate::storage) fn after_reclaim<T>(
+        &mut self,
+        retired: &RetiredRef,
+        image: &Path,
+        payload: impl Fn(std::fs::FileType) -> bool,
+        result: Result<T, ApfsStorageError>,
+    ) -> Result<T, ApfsStorageError> {
+        fn present(
+            path: &Path,
+            keep: impl Fn(std::fs::FileType) -> bool,
+        ) -> Result<bool, ApfsStorageError> {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) => Ok(keep(metadata.file_type())),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(source) => Err(ApfsStorageError::Io {
+                    operation: "inspect remaining retired authority",
+                    path: path.to_owned(),
+                    source,
+                }),
+            }
+        }
+        let observation = present(image, payload).and_then(|remains| {
+            if remains {
+                Ok(true)
+            } else {
+                present(&crate::metadata::sidecar_path(image), |kind| kind.is_file())
+            }
+        });
+        let update = observation.map(|remains| {
+            if !remains {
+                self.remove(
+                    retired.workspace().name(),
+                    retired.workspace().incarnation(),
+                );
+            }
+        });
+        match result {
+            Ok(value) => update.map(|()| value),
+            Err(primary) => combine_cleanup(
+                "observe a retired entry after its cleanup failed",
+                primary,
+                update,
+            ),
+        }
+    }
+}
+
 fn retired_image_path(
     config: &ApfsSubstrateConfig,
     workspace: &LifecycleWorkspace,
@@ -4307,6 +4415,55 @@ pub fn build_volume_label(
 mod tests {
     use super::*;
     use crate::metadata::GrantSet;
+
+    #[test]
+    fn retired_name_owners_follow_remaining_incarnations_in_every_cleanup_order() {
+        let name = WorkspaceName::session("topic").unwrap();
+        let other = WorkspaceName::session("retained").unwrap();
+        let incarnation = |value: u128| WorkspaceIncarnation::new(format!("{value:032x}")).unwrap();
+        for input in [[1, 2, 3], [3, 1, 2], [2, 3, 1]] {
+            for (cleanup, expected) in [
+                ([1, 2, 3], [Some(3), Some(3), None]),
+                ([3, 2, 1], [Some(2), Some(1), None]),
+                ([2, 3, 1], [Some(3), Some(1), None]),
+            ] {
+                let mut images: Vec<_> = input
+                    .into_iter()
+                    .map(|value| {
+                        retired_image_below(Path::new("sessions"), &name, &incarnation(value))
+                    })
+                    .collect();
+                images.push(images[0].clone());
+                images.push(PathBuf::from("sessions/.trash/not-an-incarnation.dmg"));
+                images.push(retired_image_below(
+                    Path::new("sessions"),
+                    &other,
+                    &incarnation(9),
+                ));
+                let mut owners = RetiredNameOwners::from_images(&images);
+                assert_eq!(owners.get(&name), Some(&incarnation(3)));
+                owners.remove(&name, &incarnation(7));
+                assert_eq!(
+                    owners.get(&name),
+                    Some(&incarnation(3)),
+                    "an absent entry changes nothing"
+                );
+                for (value, expected) in cleanup.into_iter().zip(expected) {
+                    owners.remove(&name, &incarnation(value));
+                    assert_eq!(
+                        owners.get(&name).cloned(),
+                        expected.map(incarnation),
+                        "input={input:?} cleanup={cleanup:?} removed={value}"
+                    );
+                    assert_eq!(
+                        owners.get(&other),
+                        Some(&incarnation(9)),
+                        "retained evidence keeps its own name"
+                    );
+                }
+            }
+        }
+    }
 
     /// A busy build volume names what holds it: the job when its hold file is held, the process
     /// with the volume open otherwise (live: a host `cat` with its cwd on the mount, pid 64266,

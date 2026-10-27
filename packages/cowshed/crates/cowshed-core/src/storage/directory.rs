@@ -2567,6 +2567,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         }
         let project = layout(config, repo)?.project().project_root.clone();
         self.preview_gc_project(&project, repo, std::time::SystemTime::now(), &[], options)
+            .map(|(plan, _)| plan)
     }
 
     fn execute_gc(
