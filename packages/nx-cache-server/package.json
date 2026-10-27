@@ -53,25 +53,14 @@
     ],
     "targets": {
       "lint": {},
-      "test-warmup": {
-        "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": false,
-        "//": "Build prerequisite for test, not a test: each TypeScript project test loads through the compiler preload compiles its own typia native plugin key, which takes minutes on a cold Go cache and would blow test's 180s idle bound before any test finishes (canonical 39038263857: build still active at idle expiry, compiler at 116.8% CPU, no test named). The 600s budget here is a build budget, not a test timeout increase. cache:false is load-bearing — the ttsc plugin cache lives outside Nx outputs, so a cached skip on a fresh runner would run the test cold again. Follows wire-warmup in packages/cowshed/package.json; uses the same compiler preload specifier as bunfig.toml. The trace preload is absent on purpose (its setup calls afterAll(), which throws outside `bun test`), so the script imports the LMAO test harness it loads instead: that module routes through LMAO's own project, a second plugin key (publish 39079862820 built it cold inside test).",
-        "options": {
-          "command": "bun --preload @smoothbricks/lmao/bun/preload scripts/warm-ttsc-plugins.mjs",
-          "cwd": "{projectRoot}",
-          "timeoutMs": 600000,
-          "killAfterMs": 10000
-        }
-      },
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "dependsOn": [
-          "test-warmup"
-        ],
+        "//": "Its typia plugin warmth is the fixture segment below: each TypeScript project the test loads through the compiler preload compiles its own native plugin key, minutes on a cold Go cache, which blew the 180s progress bound before any test finished (canonical 39038263857: build still active at idle expiry, compiler at 116.8% CPU, no test named). The plugin cache lives outside Nx outputs, so the warming cannot be an Nx cache entry of its own; as this task's build interval under a 600s budget it runs exactly when the test executes, and a cache hit warms nothing. Uses the same compiler preload specifier as bunfig.toml; the trace preload is absent on purpose (its setup calls afterAll(), which throws outside bun test).",
         "options": {
           "command": "bun test --timeout=0",
           "cwd": "{projectRoot}",
+          "fixtureCommand": "bun --preload @smoothbricks/lmao/bun/preload scripts/warm-ttsc-plugins.mjs",
+          "fixtureTimeoutMs": 600000,
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }

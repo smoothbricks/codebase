@@ -11,16 +11,23 @@ export interface RunnerPhaseEvent {
   phase: RunnerPhase;
 }
 
+/** One segment's supervisor invocation: the runtime that adopts the inherited duplex descriptor, then the hook, its id and kind. */
+function hookInvocation(id: number, kind: string, runner: string): string {
+  const hook = fileURLToPath(
+    new URL(import.meta.url.endsWith('.ts') ? './runner-hook.ts' : './runner-hook.js', import.meta.url),
+  );
+  // The hook owns an inherited duplex descriptor, which Bun's net.Socket({fd}) does not adopt.
+  const runtime = process.versions.bun === undefined ? process.execPath : 'node';
+  return `${shellWord(runtime)} ${shellWord(hook)} ${id} ${kind} ${runner}`;
+}
+
 /** Only complete, direct chains have a known lifecycle. Shell wrappers remain bounded from spawn. */
-export function withRunnerLifecycle(command: string): { command: string; runners: number } | null {
+export function withRunnerLifecycle(command: string, firstId = 0): { command: string; runners: number } | null {
   // Redirections could replace the private descriptor; newlines/backticks/escapes need a real shell parser.
   if (/[<>\n\r`\\]/.test(command)) return null;
   let rest = command.trim();
   const parts: string[] = [];
   let runners = 0;
-  const hook = fileURLToPath(
-    new URL(import.meta.url.endsWith('.ts') ? './runner-hook.ts' : './runner-hook.js', import.meta.url),
-  );
   while (rest !== '') {
     const kind = rest.search(GO_TEST) === 0 ? 'go' : CARGO_TEST.test(rest) ? 'cargo' : null;
     if (kind === null) return null;
@@ -40,9 +47,7 @@ export function withRunnerLifecycle(command: string): { command: string; runners
           true,
         ) + runner.slice(end);
     }
-    // The hook owns an inherited duplex descriptor, which Bun's net.Socket({fd}) does not adopt.
-    const runtime = process.versions.bun === undefined ? process.execPath : 'node';
-    parts.push(`${shellWord(runtime)} ${shellWord(hook)} ${runners} ${kind} ${runner}`);
+    parts.push(hookInvocation(firstId + runners, kind, runner));
     runners += 1;
     rest = rest.slice(argsEnd).trimStart();
     if (rest === '') break;
@@ -53,6 +58,24 @@ export function withRunnerLifecycle(command: string): { command: string; runners
     if (rest === '') return null;
   }
   return runners === 0 ? null : { command: parts.join(' '), runners };
+}
+
+/**
+ * `command` preceded by its compiler-fixture producer (`fixtureCommand`, schema.ts): segment 0 supervises the
+ * fixture as a build interval for its whole life, and the command follows under `&&`, so a fixture failure ends
+ * the run before any test starts. A direct `cargo test`/`go test` chain keeps its own phases behind a brace
+ * group, so a `||` inside it cannot run a leg the fixture refused. Any other command runs as one `run`
+ * segment: active from its spawn, its output on the progress bound exactly as an unhooked command's is, with no
+ * descendant holding the private descriptor. The fixture is arbitrary shell, so it rides under `/bin/sh -c`;
+ * this lifecycle is POSIX-only, as the channel itself is.
+ */
+export function withFixtureLifecycle(fixtureCommand: string, command: string): { command: string; runners: number } {
+  const fixture = hookInvocation(0, 'build', `/bin/sh -c ${shellWord(fixtureCommand)}`);
+  const main = withRunnerLifecycle(command, 1);
+  if (main !== null) {
+    return { command: `${fixture} && { ${main.command}; }`, runners: main.runners + 1 };
+  }
+  return { command: `${fixture} && ${hookInvocation(1, 'run', `/bin/sh -c ${shellWord(command)}`)}`, runners: 2 };
 }
 
 /** A private supervisor channel, not runner output, grants authority to pause the test clock. */

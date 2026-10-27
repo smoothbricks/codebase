@@ -6,8 +6,10 @@ import { describeHolders, type LockWait, type Opener } from './lock-wait.js';
  * Why one bounded run ended, recorded per Nx task so a caller can tell a load-sensitive bound
  * from a real failure without reading the run's output.
  *
+
  * - `bound`: the run hit a wall-clock bound and nothing else failed. Either the command
- *   outlived `timeoutMs` (`total`), or every failing test in the runner's report failed on
+ *   outlived `timeoutMs` (`total`), its fixture segment outlived `fixtureTimeoutMs`
+ *   (`fixture`), or every failing test in the runner's report failed on
  *   its runner's per-test timeout (`test`). A loaded host produces exactly these.
  * - `wedged`: `idleTimeoutMs` fired: no test finished for that long during a chargeable test interval. This proves
  *   the suite's completion bound was exceeded, not that every process stopped: an expensive active fixture can
@@ -23,7 +25,12 @@ import { describeHolders, type LockWait, type Opener } from './lock-wait.js';
  */
 export type BoundedExecVerdict =
   | { readonly outcome: 'passed' }
-  | { readonly outcome: 'bound'; readonly bound: 'total'; readonly limitMs: number; readonly elapsedMs: number }
+  | {
+      readonly outcome: 'bound';
+      readonly bound: 'total' | 'fixture';
+      readonly limitMs: number;
+      readonly elapsedMs: number;
+    }
   | { readonly outcome: 'bound'; readonly bound: 'test'; readonly tests: readonly string[] }
   | {
       readonly outcome: 'wedged';
@@ -217,7 +224,8 @@ function decodeEntities(value: string): string {
 }
 
 /**
- * The bound that ended a run. `total` is a wall-clock ceiling: it answers "is this run unbounded?". `idle` is the
+ * The bound that ended a run. `total` is a wall-clock ceiling: it answers "is this run unbounded?". `fixture` is
+ * that ceiling over the run's fixture segment alone: the command it prepares never started. `idle` is the
  * no-progress bound: it answers "is this run hung?", and carries the tests the runner reported still running.
  *
  * These are different questions and one number cannot answer both. A ceiling tight enough to catch a hang promptly
@@ -226,6 +234,7 @@ function decodeEntities(value: string): string {
  */
 export type ExpiredBound =
   | { readonly kind: 'total'; readonly limitMs: number }
+  | { readonly kind: 'fixture'; readonly limitMs: number }
   | { readonly kind: 'idle'; readonly limitMs: number; readonly tests: readonly string[] };
 
 /** How a run ended, as the executor saw it. */
@@ -264,8 +273,9 @@ export function judgeRun(run: RunEnd): BoundedExecVerdict {
   // The tests the runner aborted when the ceiling's SIGTERM reached it are the bound's casualties: they are in the
   // report as failures, but nothing about them failed. Aborted with no total bound to explain it, they are failures,
   // whatever else the run shows: a zero exit or a per-test timeout does not excuse a test someone else stopped.
-  if (run.expiry?.kind === 'total') {
-    return { outcome: 'bound', bound: 'total', limitMs: run.expiry.limitMs, elapsedMs: run.elapsedMs };
+
+  if (run.expiry?.kind === 'total' || run.expiry?.kind === 'fixture') {
+    return { outcome: 'bound', bound: run.expiry.kind, limitMs: run.expiry.limitMs, elapsedMs: run.elapsedMs };
   }
   if (run.report !== null && run.report.cancelled.length > 0) {
     return { outcome: 'failed', exitCode: run.exitCode, tests: run.report.cancelled };
@@ -403,8 +413,12 @@ function parseVerdict(value: unknown): BoundedExecVerdict {
       case 'passed':
         return { outcome: 'passed' };
       case 'bound':
-        if (value.bound === 'total' && typeof value.limitMs === 'number' && typeof value.elapsedMs === 'number') {
-          return { outcome: 'bound', bound: 'total', limitMs: value.limitMs, elapsedMs: value.elapsedMs };
+        if (
+          (value.bound === 'total' || value.bound === 'fixture') &&
+          typeof value.limitMs === 'number' &&
+          typeof value.elapsedMs === 'number'
+        ) {
+          return { outcome: 'bound', bound: value.bound, limitMs: value.limitMs, elapsedMs: value.elapsedMs };
         }
         if (value.bound === 'test' && isStrings(value.tests)) {
           return { outcome: 'bound', bound: 'test', tests: value.tests };
@@ -552,9 +566,11 @@ export function describeVerdict(verdict: BoundedExecVerdict): string {
     case 'passed':
       return 'passed';
     case 'bound':
-      return verdict.bound === 'total'
-        ? `outlived its ${verdict.limitMs}ms bound (${verdict.elapsedMs}ms)`
-        : `per-test timeout only: ${verdict.tests.join(', ')}`;
+      return verdict.bound === 'test'
+        ? `per-test timeout only: ${verdict.tests.join(', ')}`
+        : verdict.bound === 'fixture'
+          ? `its fixture outlived its ${verdict.limitMs}ms bound (${verdict.elapsedMs}ms)`
+          : `outlived its ${verdict.limitMs}ms bound (${verdict.elapsedMs}ms)`;
     case 'wedged':
       return `wedged: no test finished for ${verdict.idleMs}ms after ${verdict.elapsedMs}ms; ${
         verdict.tests.length > 0

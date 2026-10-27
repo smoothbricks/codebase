@@ -23,7 +23,7 @@ async function collect(stream: Readable): Promise<Buffer> {
 }
 
 async function runHook(
-  runner: 'cargo' | 'go',
+  runner: 'cargo' | 'go' | 'build' | 'run',
   executable: string,
   args: string[],
   acknowledge: (line: string) => string = (line) => `${line}\n`,
@@ -188,6 +188,28 @@ describe('standalone native runner hook', () => {
     expect(result.phases).toEqual([
       { id: 7, phase: 'build' },
       { id: 7, phase: 'active' },
+    ]);
+  });
+
+  it('opens a fixture build segment in build and never goes active, whatever it prints', async () => {
+    const stdout = ['{"reason":"build-finished","success":true}\n', 'test fixture::warm ... ok\n'];
+    const result = await runHook('build', process.execPath, ['-e', emit(stdout, '', 'process.exitCode = 5;')]);
+    expect(result.code).toBe(5);
+    expect(result.stdout).toEqual(Buffer.from(stdout.join('')));
+    expect(result.phases).toEqual([
+      { id: 7, phase: 'build' },
+      { id: 7, phase: 'terminal' },
+    ]);
+  });
+
+  it('opens a plain run segment active, with no build interval', async () => {
+    const stdout = ['..\n', '2 pass\n'];
+    const result = await runHook('run', process.execPath, ['-e', emit(stdout)]);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toEqual(Buffer.from(stdout.join('')));
+    expect(result.phases).toEqual([
+      { id: 7, phase: 'active' },
+      { id: 7, phase: 'terminal' },
     ]);
   });
 });

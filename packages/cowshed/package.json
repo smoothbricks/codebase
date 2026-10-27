@@ -605,75 +605,57 @@
           "cwd": "packages/cowshed"
         }
       },
-      "capability-probe-warmup": {
-        "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": false,
-        "dependsOn": [
-          {
-            "target": "cargo-test-archive",
-            "projects": [
-              "@smoothbricks/codebase"
-            ]
-          }
-        ],
-        "//": "Build prerequisite for the cowshed-core exceptional shards, not a test. public_api_contracts' capability probe cargo-checks its case crates against cowshed-core, and its dependency build exceeded the 120s test bound on a cold hosted arm64 runner. This runs the ignored capability_probe_dependencies_check from the same archive with empty case crates, warming the shared target/ before the bounded shards. The 600s budget is a build budget, as in wire-warmup. cache:false is required because target/ is not an Nx output: a cached skip on a fresh runner would leave the probe cold. It reuses the generated runners' content-keyed extraction under Cargo's target directory rather than `--archive-file`, which unpacks into a fresh $TMPDIR/nextest-archive-* that a killed run never removes.",
-        "options": {
-          "command": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
-          "cwd": ".",
-          "timeoutMs": 600000,
-          "killAfterMs": 10000
-        }
-      },
       "cargo-test-cowshed-core-exceptions-shard1": {
         "dependsOn": [
-          "...",
-          "capability-probe-warmup"
-        ]
+          "..."
+        ],
+        "//": "The exceptional shards carry the capability probe's compiler fixture as a bounded-exec fixture segment: public_api_contracts' probe cargo-checks its case crates against cowshed-core, whose dependency build exceeds the progress bound on a cold runner, so an executing shard first runs the ignored capability_probe_dependencies_check from the same archive under the 600s fixture budget, warming the shared target/. A cached shard restores its verdict and warms nothing. The fixture reuses the generated runners' content-keyed extraction under Cargo's target directory rather than --archive-file, which unpacks into a fresh $TMPDIR/nextest-archive-* that a killed run never removes.",
+        "options": {
+          "fixtureCommand": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
+          "fixtureTimeoutMs": 600000
+        }
       },
       "cargo-test-cowshed-core-exceptions-shard2": {
         "dependsOn": [
-          "...",
-          "capability-probe-warmup"
-        ]
+          "..."
+        ],
+        "options": {
+          "fixtureCommand": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
+          "fixtureTimeoutMs": 600000
+        }
       },
       "cargo-test-cowshed-core-exceptions-shard3": {
         "dependsOn": [
-          "...",
-          "capability-probe-warmup"
-        ]
+          "..."
+        ],
+        "options": {
+          "fixtureCommand": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
+          "fixtureTimeoutMs": 600000
+        }
       },
       "cargo-test-cowshed-core-exceptions-shard4": {
         "dependsOn": [
-          "...",
-          "capability-probe-warmup"
-        ]
+          "..."
+        ],
+        "options": {
+          "fixtureCommand": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
+          "fixtureTimeoutMs": 600000
+        }
       },
       "cargo-test-cowshed-core-exceptions-shard5": {
         "dependsOn": [
-          "...",
-          "capability-probe-warmup"
-        ]
-      },
-      "wire-warmup": {
-        "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": false,
-        "dependsOn": [
-          "api-check"
+          "..."
         ],
-        "//": "Build prerequisite for wire-test, not a test: the first load of each project through the compiler preload compiles the typia native plugin, which takes minutes on a cold Go cache and would blow wire-test's 120s bound. The 600s budget here is a build budget, not a test timeout increase: it bounds the compilation while staying inside the workflow's overall bound, and fails loudly instead of hanging release. cache:false is load-bearing — the ttsc plugin cache lives outside Nx outputs, so a cached skip on a fresh runner would run the test cold and hang it again. Uses the same compiler preload specifier as bunfig.toml; the trace preload is absent on purpose (its setup calls afterAll(), which throws outside `bun test`) and adds no plugin key (measured: harness import alone builds the full runtime key set).",
         "options": {
-          "command": "bun --preload @smoothbricks/lmao/bun/preload scripts/warm-ttsc-plugins.mjs",
-          "cwd": "packages/cowshed",
-          "timeoutMs": 600000,
-          "killAfterMs": 10000
+          "fixtureCommand": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
+          "fixtureTimeoutMs": 600000
         }
       },
       "declaration-model-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "dependsOn": [
-          "typecheck-tests",
-          "wire-warmup"
+          "typecheck-tests"
         ],
         "inputs": [
           {
@@ -693,10 +675,12 @@
           "{workspaceRoot}/patches/**/*",
           "!{workspaceRoot}/patches/**/*.md"
         ],
-        "//": "The public declaration IR runs its source lint before the real admission oracle, using the actual prebuilt owner generator and one Typia world. It needs no N-API wire corpus or native runtime fixture.",
+        "//": "The public declaration IR runs its source lint before the real admission oracle, using the actual prebuilt owner generator and one Typia world. It needs no N-API wire corpus or native runtime fixture. Its typia plugin warmth is the fixture segment below, shared with wire-test.",
         "options": {
           "command": "biome check --files-ignore-unknown=true declaration-model.test.ts && eslint declaration-model.test.ts && bun test --config=../bunfig.toml --timeout=0 declaration-model.test.ts",
           "cwd": "{projectRoot}/src",
+          "fixtureCommand": "bun --preload @smoothbricks/lmao/bun/preload ../scripts/warm-ttsc-plugins.mjs",
+          "fixtureTimeoutMs": 600000,
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }
@@ -717,13 +701,14 @@
         ],
         "dependsOn": [
           "typecheck-tests",
-          "wire-fixtures",
-          "wire-warmup"
+          "wire-fixtures"
         ],
-        "//": "Runs from source under the typia transform because the validators under test are the point. Depends on wire-fixtures (the corpus is a generated output, current by construction) and not on cargo-test: the Rust half proves the same corpus through include_str!, and cowshed:test already joins both legs; a cargo-test edge here only meant an unrelated Rust failure deleted this target from the run.",
+        "//": "Runs from source under the typia transform because the validators under test are the point. Depends on wire-fixtures (the corpus is a generated output, current by construction) and not on cargo-test: the Rust half proves the same corpus through include_str!, and cowshed:test already joins both legs; a cargo-test edge here only meant an unrelated Rust failure deleted this target from the run. Its typia plugin warmth is the fixture segment below: the first load through the compiler preload compiles the native plugin for minutes on a cold Go cache, in a cache outside Nx outputs, so it runs as this task's build interval under a 600s budget, where a cache hit restores the verdict without warming anything.",
         "options": {
           "command": "bun test --config=../bunfig.toml --timeout=0 wire-contract.test.ts exec.test.ts",
           "cwd": "{projectRoot}/src",
+          "fixtureCommand": "bun --preload @smoothbricks/lmao/bun/preload ../scripts/warm-ttsc-plugins.mjs",
+          "fixtureTimeoutMs": 600000,
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }

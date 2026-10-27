@@ -26,6 +26,24 @@ export interface BoundedExecCommand {
    */
   idleTimeoutMs?: number;
   killAfterMs?: number;
+
+  /**
+   * A compiler-fixture producer for `command`: a shell command run first, in the same cwd, environment and CPU
+   * grant, whose whole life is a lifecycle build interval — the progress bound does not run during it, as it does
+   * not run during a `cargo test` build. Its failure fails the run; `command` starts only after it exits 0.
+   *
+   * It exists for warmth that lives outside Nx outputs (a compiler plugin cache, a Cargo target directory). As a
+   * separate `cache: false` prerequisite that warmth was paid even when every consumer then hit the cache, since
+   * Nx reaches a cached consumer only after its uncached dependencies; as plain text at the head of `command`
+   * its cold minutes would spend the progress bound. Inside the consumer's own task the cache decides: a hit
+   * restores the verdict and warms nothing, an execution warms first.
+   */
+  fixtureCommand?: string;
+  /**
+   * The fixture segment's own wall-clock ceiling: a build budget, required with `fixtureCommand`. It bounds
+   * only the fixture interval, never the command it prepares.
+   */
+  fixtureTimeoutMs?: number;
   /**
    * The most threads or processes the command runs at once, which is how many CPU tokens it asks
    * its live parent pool for. Absent, the runner in the command decides:

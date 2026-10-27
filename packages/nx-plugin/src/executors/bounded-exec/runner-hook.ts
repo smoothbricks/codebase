@@ -1,16 +1,20 @@
 /**
- * Standalone supervisor: <runtime> runner-hook.js <id> <go|cargo> <executable> [args...].
+ * Standalone supervisor: <runtime> runner-hook.js <id> <go|cargo|build|run> <executable> [args...].
  * The parent requests native JSON output and supplies a private duplex socket on fd 3.
  * Each newline JSON {id,phase} must be echoed exactly after applying the watchdog state.
- * Build is acknowledged before spawn; each native transition is acknowledged before its
+ * The opening phase is acknowledged before spawn; each native transition is acknowledged before its
  * stdout record is forwarded. Terminal follows child close and drained output, then its
  * acknowledgement closes the channel. The tool receives only descriptors 0, 1, and 2.
+ *
+ * `go` and `cargo` open in build and go active on their native records. `build` is a compiler-fixture
+ * producer: compilation with no tests of its own, so it opens in build and never goes active. `run` is a
+ * command with no build interval to report: it opens active, bounded from spawn as an unhooked command is.
  */
 import { type ChildProcess, spawn } from 'node:child_process';
 import { Socket } from 'node:net';
 import type { Readable, Writable } from 'node:stream';
 
-type Runner = 'go' | 'cargo';
+type Runner = 'go' | 'cargo' | 'build' | 'run';
 type Phase = 'build' | 'active' | 'terminal';
 
 interface Lifecycle {
@@ -32,6 +36,7 @@ function write(stream: Writable, bytes: Buffer | string): Promise<Error | null> 
 
 /** Only native stdout records change the lifecycle; arbitrary runner text never does. */
 function nativePhase(runner: Runner): (line: Buffer) => Phase | null {
+  if (runner === 'build' || runner === 'run') return () => null;
   const packages = new Set<string>();
   let cargoActive = false;
   return (line) => {
@@ -210,11 +215,11 @@ async function main([idText, runner, executable, ...args]: readonly string[]): P
     idText === undefined ||
     !/^\d+$/.test(idText) ||
     !Number.isSafeInteger(id) ||
-    (runner !== 'go' && runner !== 'cargo') ||
+    (runner !== 'go' && runner !== 'cargo' && runner !== 'build' && runner !== 'run') ||
     executable === undefined ||
     executable === ''
   ) {
-    process.stderr.write('runner-hook: usage: <invocation-id> <go|cargo> <executable> [arguments...]\n');
+    process.stderr.write('runner-hook: usage: <invocation-id> <go|cargo|build|run> <executable> [arguments...]\n');
     process.exitCode = 2;
     return;
   }
@@ -244,7 +249,7 @@ async function main([idText, runner, executable, ...args]: readonly string[]): P
   let exitSignal: NodeJS.Signals | null = null;
   try {
     channel = lifecycle(id, fail);
-    const ready = await channel.announce('build');
+    const ready = await channel.announce(runner === 'run' ? 'active' : 'build');
     if (ready !== null) fail(ready);
     if (!failed && interrupted === null) {
       // Descriptor 3 belongs only to this supervisor, never the tool or its descendants.

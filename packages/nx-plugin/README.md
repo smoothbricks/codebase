@@ -1888,15 +1888,28 @@ watchdog.
 
 The unchanged 180 s interval re-arms on finished tests/packages. Initial Go linking, inter-package Go compilation, and
 initial or inter-command Cargo compilation spend no test idle budget. **Compiler-process activity is deliberately not a
-signal:** Go linking and Rust compilation before execution are build work; Bun's cold-compiler fixture (and a Rust test
-compiling a fixture) is active-test work and must still expire. Build output and heartbeats never reset the bound. Cargo
-uses its native build declaration without replacing configured target runners; a nested `test result` or
-`build-finished` line cannot retire the owned process or exempt its teardown. Absolute `timeoutMs`, when supplied, is
-unchanged.
+signal:** Go linking and Rust compilation before execution are build work; Bun's cold-compiler load inside `bun test`
+(and a Rust test compiling a fixture) is active-test work and must still expire; only a declared fixture segment
+(below), finished before the runner starts, is build work. Build output and heartbeats never reset the bound. Cargo uses
+its native build declaration without replacing configured target runners; a nested `test result` or `build-finished`
+line cannot retire the owned process or exempt its teardown. Absolute `timeoutMs`, when supplied, is unchanged.
 
 Separately building test binaries and then executing them under the unchanged bound is a **workaround** for callers
 without a native lifecycle hook, not evidence that their combined cold-build command is safe. Direct Go/Cargo commands
 use the lifecycle channel instead; unknown wrappers retain conservative spawn accounting.
+
+A target may name a `fixtureCommand` with its `fixtureTimeoutMs`: a compiler-fixture producer the executor runs first,
+in the same cwd, environment and CPU grant, as segment 0 of the same lifecycle — a build interval for its whole life,
+under its own supervisor and acknowledged like a runner's phases. The command follows under `&&` (a direct Go/Cargo
+chain keeps its phases behind a brace group; any other command runs as one segment active from its spawn), so a fixture
+failure ends the run before a test starts, and fixture output earns no progress. `fixtureTimeoutMs` is the segment's own
+wall-clock ceiling, a build budget; the segment's terminal retires it, and expiring it records a `fixture` bound, since
+no test was running. The pair is refused unpaired, and a run that names it names no shadow record of warmth. This exists
+for warmth that lives outside Nx outputs — a compiler plugin cache, a Cargo `target/`: it cannot be a cacheable output,
+and as a `cache: false` prerequisite it executed even when every consumer then restored its verdict from cache, because
+Nx runs an uncached dependency before reaching its cached consumer. Inside the consumer's own task the cache decides: a
+hit restores the verdict and warms nothing; an execution warms first. Without the lifecycle channel (Windows) the
+fixture is plain shell text ahead of the command, bounded from spawn like any wrapper, and its ceiling does not apply.
 
 Process-group timeout fixtures retain cleanup authority only until the command leader exits and every descendant closes
 its inherited lifetime FIFO. EOF is the terminal ownership event; a later `afterEach` must not signal the retired PGID
@@ -2261,13 +2274,14 @@ own pool like any other (`specs/cowshed/05_gateway.md`, "Host scheduling", "Clas
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:
 
-- `bound`: nothing failed but a wall-clock bound. Either the command outlived `timeoutMs`, or every failing test in the
-  runner's JUnit report failed on its runner's per-test timeout (`cargo-nextest` writes `type="test timeout"` where a
-  configuration still sets `terminate-after`, `bun test` writes `type="TimeoutError"`). A loaded host produces exactly
-  these. When `timeoutMs` fires, the tests `cargo-nextest` was still running are reported as failures of
-  `type="test abort"`, `process aborted with signal 15 (SIGTERM)` (SIGKILL once the force-kill follows); they are the
-  bound's casualties and do not make the run `failed`. A test that dies of any other signal, or that is aborted with no
-  bound to explain it, does.
+- `bound`: nothing failed but a wall-clock bound. Either the command outlived `timeoutMs`, its fixture segment outlived
+  `fixtureTimeoutMs` (`bound: "fixture"`; the command never started), or every failing test in the runner's JUnit report
+  failed on its runner's per-test timeout (`cargo-nextest` writes `type="test timeout"` where a configuration still sets
+  `terminate-after`, `bun test` writes `type="TimeoutError"`). A loaded host produces exactly these. When `timeoutMs`
+  fires, the tests `cargo-nextest` was still running are reported as failures of `type="test abort"`,
+  `process aborted with signal 15 (SIGTERM)` (SIGKILL once the force-kill follows); they are the bound's casualties and
+  do not make the run `failed`. A test that dies of any other signal, or that is aborted with no bound to explain it,
+  does.
 - `wedged`: `idleTimeoutMs` fired: no test finished during that much active test time. This proves the completion
   interval was exceeded, not that every process stopped: an oversized fixture can exceed it too. Its `tests` name those
   the runner reported running (nextest's `SLOW`, libtest's `has been running for over`) and never finished, and those

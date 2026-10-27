@@ -381,6 +381,20 @@ ${abort('t::crash', '11 (SIGSEGV)')}
     });
   });
 
+  it('records a run its fixture ceiling stopped as a fixture bound, whose tests never started', () => {
+    const fixture = { kind: 'fixture', limitMs: 600_000 } as const;
+    const verdict = judgeRun({
+      exitCode: 143,
+      elapsedMs: 600_120,
+      expiry: fixture,
+      report: null,
+      noSpace: null,
+      lockWaits: [],
+    });
+    expect(verdict).toEqual({ outcome: 'bound', bound: 'fixture', limitMs: 600_000, elapsedMs: 600_120 });
+    expect(describeVerdict(verdict)).toBe('its fixture outlived its 600000ms bound (600120ms)');
+  });
+
   it('records a run its ceiling stopped as a bound when the only failures are the tests the stop aborted', () => {
     const total = { kind: 'total', limitMs: 120_000 } as const;
     const cut = { timedOut: [], cancelled: ['nt t::cut'], failed: [] };

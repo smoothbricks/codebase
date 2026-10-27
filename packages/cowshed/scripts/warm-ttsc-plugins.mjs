@@ -1,12 +1,13 @@
 /**
- * Build prerequisite for the `wire-test` target (see `wire-warmup` in
- * `packages/cowshed/package.json`).
+ * The compiler-fixture producer for the `wire-test` and `declaration-model-test`
+ * targets: their `fixtureCommand` (see `packages/cowshed/package.json`) runs it
+ * as the bounded-exec fixture segment, a build interval ahead of the tests.
  *
  * The first load of each project through the compiler preload compiles the
  * typia native plugin (`ttsc: building source plugin ... can take several
- * minutes on a cold Go cache`). That compilation must never run inside the
- * 120s-bounded `wire-test`: importing the same non-test module graph here
- * pays it in an unbounded build step, and the test then reuses the warm keys.
+ * minutes on a cold Go cache`). That compilation must never spend the tests'
+ * progress bound: importing the same non-test module graph here pays it in
+ * the fixture interval, and the test then reuses the warm keys.
  *
  * Plain `.mjs` on purpose: the ttsc router only claims TypeScript files, so
  * this entry loads through Bun natively while every TypeScript module it

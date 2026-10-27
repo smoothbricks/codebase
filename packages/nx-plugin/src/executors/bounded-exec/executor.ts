@@ -50,7 +50,7 @@ import {
   RamTempVolume,
   ramTempPaths,
 } from './ram-temp.js';
-import { createRunnerLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
+import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
 import { CPU_TOKENS_ENV, runnerDemand, sizeRunner } from './runner-sizing.js';
 import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import type { BoundedExecOptions } from './schema.js';
@@ -300,6 +300,10 @@ export async function runBoundedExec(
   const timeoutMs = options.timeoutMs;
   const idleTimeoutMs = options.idleTimeoutMs;
   const killAfterMs = options.killAfterMs ?? DEFAULT_KILL_AFTER_MS;
+  const fixture: { command: string; timeoutMs: number } | null =
+    options.fixtureCommand !== undefined && options.fixtureTimeoutMs !== undefined
+      ? { command: options.fixtureCommand, timeoutMs: options.fixtureTimeoutMs }
+      : null;
   const outputChunks: string[] = [];
   const state: RunState = {
     settled: false,
@@ -334,11 +338,27 @@ export async function runBoundedExec(
     }
   };
 
+  // The fixture pair names one segment: a fixture with no build budget, or a budget with no fixture, is a
+  // target that does not say what it runs, so it does not run.
+  if (
+    (options.fixtureCommand === undefined) !== (options.fixtureTimeoutMs === undefined) ||
+    (fixture !== null && !(fixture.timeoutMs > 0))
+  ) {
+    appendStderr(
+      'bounded-exec: fixtureCommand and a positive fixtureTimeoutMs must be named together; refusing to run the command\n',
+    );
+    if (context.record !== undefined) {
+      const { task, directory: recordDirectory } = context.record;
+      await writeRecord(recordDirectory, { task: task.id, hash: task.hash, verdict: judgeOperationalFailure(1, null) });
+    }
+    return { success: false, terminalOutput: outputChunks.join('') };
+  }
+
   // A leg that runs bun runs the Bun its workspace declares, or it does not run. This comes before the RAM lease and the
   // CPU tokens: a refusal that waited in its pool's queue first would say nothing for minutes.
   const runtime = await checkRuntimePin({
     root: context.root,
-    command: requested,
+    command: fixture === null ? requested : `${fixture.command} && ${requested}`,
     env: { ...withoutPoolEnv(process.env), ...options.env },
     cwd,
     pathSource: options.env?.PATH === undefined ? 'the inherited environment' : "the target's env",
@@ -593,14 +613,21 @@ export async function runBoundedExec(
     ...sized.env,
     ...(pool?.environment ?? {}),
   };
-  const hooked = process.platform === 'win32' ? null : withRunnerLifecycle(command);
+  // A fixture rides as segment 0 of the lifecycle. Without the channel (Windows) it is plain shell text ahead
+  // of the command: the progress bound runs during it and its own ceiling does not.
+  const hooked =
+    process.platform === 'win32'
+      ? null
+      : fixture === null
+        ? withRunnerLifecycle(command)
+        : withFixtureLifecycle(fixture.command, command);
   const lifecycle = hooked === null ? null : createRunnerLifecycle(hooked.runners);
   let lifecycleFailure: string | null = null;
   const isTesting = (): boolean => lifecycleFailure !== null || (lifecycle?.isTesting() ?? true);
   const startedAt = Date.now();
   // With a supervisor, `cowshed subtree-root` asks it for a handle on itself, writes the answer to the handle
   // descriptor, and execs `/bin/sh -c command` in the same process: the command's pid, group and life are unchanged.
-  const shellCommand = hooked?.command ?? command;
+  const shellCommand = hooked?.command ?? (fixture === null ? command : `${fixture.command} && ${command}`);
   const root = owner?.rootArgv(shellCommand);
   let child: ChildProcess;
   try {
@@ -652,6 +679,9 @@ export async function runBoundedExec(
     return { line, volume: held === null ? null : ((await tempVolume?.space(held)) ?? null) };
   };
   let idleTimer: NodeJS.Timeout | undefined;
+  let fixtureTimer: NodeJS.Timeout | undefined;
+  // The fixture's own output is compilation, not the command's progress: it is not scanned for finished tests.
+  let fixtureDone = fixture === null || lifecycle === null;
   let captureTimer: NodeJS.Timeout | undefined;
   let idleCapture: { expiresAtMs: number; controller: AbortController; result: IdleDiagnosticResult } | undefined;
   const cancelCapture = (): void => {
@@ -724,6 +754,7 @@ export async function runBoundedExec(
     }
   };
   const scanProgress = (stream: 'stdout' | 'stderr', text: string): void => {
+    if (!fixtureDone) return;
     updateIdle(progress.scan(stream, text), isTesting());
   };
   if (lifecycle !== null) {
@@ -743,6 +774,10 @@ export async function runBoundedExec(
         return;
       }
       updateIdle(false, wasTesting);
+      if (event.id === 0 && event.phase === 'terminal' && fixture !== null) {
+        fixtureDone = true;
+        clearTimeout(fixtureTimer);
+      }
       // Tool startup and native lifecycle-bearing stdout wait for their phase acknowledgement.
       channel.write(`${JSON.stringify(event)}\n`);
     });
@@ -835,6 +870,7 @@ export async function runBoundedExec(
     state.expiry = bound;
     clearTimeout(totalTimer);
     clearTimeout(idleTimer);
+    clearTimeout(fixtureTimer);
     const elapsedMs = Date.now() - startedAt;
     appendStderr(
       bound.kind === 'idle'
@@ -843,7 +879,9 @@ export async function runBoundedExec(
               ? `still running: ${bound.tests.join(', ')}`
               : 'the runner named no test still running'
           } (cwd=${cwd}): ${command}\n`
-        : `\nCommand timed out after ${elapsedMs}ms (timeoutMs=${bound.limitMs}, cwd=${cwd}): ${command}\n`,
+        : bound.kind === 'fixture'
+          ? `\nFixture command timed out after ${elapsedMs}ms (fixtureTimeoutMs=${bound.limitMs}, cwd=${cwd}): ${fixture?.command ?? command}\n`
+          : `\nCommand timed out after ${elapsedMs}ms (timeoutMs=${bound.limitMs}, cwd=${cwd}): ${command}\n`,
     );
     if (bound.kind === 'idle') {
       const observed = idleCapture?.result;
@@ -936,6 +974,11 @@ export async function runBoundedExec(
 
   const totalTimer =
     timeoutMs === undefined ? undefined : setTimeout(() => expire({ kind: 'total', limitMs: timeoutMs }), timeoutMs);
+  // The fixture's ceiling lives and dies with its segment: the segment's terminal clears it, so it can never
+  // fire on a command the fixture already handed over to.
+  if (fixture !== null && lifecycle !== null) {
+    fixtureTimer = setTimeout(() => expire({ kind: 'fixture', limitMs: fixture.timeoutMs }), fixture.timeoutMs);
+  }
   armIdleTimer();
 
   // A grant's connection is a ledger entry, not the command's owner: the lending parent's exit ends it, and what runs
@@ -958,6 +1001,7 @@ export async function runBoundedExec(
   await termination;
   clearTimeout(totalTimer);
   clearTimeout(idleTimer);
+  clearTimeout(fixtureTimer);
   cancelCapture();
   removeSignalHandlers();
   // The runner is gone. Its sub-pool closes first, so no descendant still draws on tokens the grant returns;

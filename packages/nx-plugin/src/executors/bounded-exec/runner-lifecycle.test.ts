@@ -1,7 +1,42 @@
 import { describe, expect, it } from 'bun:test';
-import { createRunnerLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
+import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
 
 const event = (id: number, phase: string): string => JSON.stringify({ id, phase });
+
+describe('fixture segments', () => {
+  it('pauses the test clock for the fixture alone, then runs the command active', () => {
+    const lifecycle = createRunnerLifecycle(2);
+    lifecycle.accept(event(0, 'build'));
+    expect(lifecycle.isTesting()).toBe(false);
+    lifecycle.accept(event(0, 'terminal'));
+    expect(lifecycle.isTesting()).toBe(true);
+    lifecycle.accept(event(1, 'active'));
+    expect(lifecycle.isTesting()).toBe(true);
+    lifecycle.accept(event(1, 'terminal'));
+    expect(lifecycle.error()).toBeNull();
+  });
+
+  it('supervises arbitrary shell as segment 0 and a plain command as one active segment', () => {
+    const chained = withFixtureLifecycle('bun --preload x warm.mjs', 'bun test --timeout=0 src');
+    expect(chained.runners).toBe(2);
+    expect(chained.command).toContain("0 build /bin/sh -c 'bun --preload x warm.mjs' && ");
+    expect(chained.command).toContain("1 run /bin/sh -c 'bun test --timeout=0 src'");
+  });
+
+  it('keeps a direct cargo chain behind the fixture, braced against its own separators', () => {
+    const chained = withFixtureLifecycle('warm.sh --flag', 'cargo test --lib || cargo test --doc');
+    expect(chained.runners).toBe(3);
+    expect(chained.command).toContain("0 build /bin/sh -c 'warm.sh --flag' && { ");
+    expect(chained.command).toContain('1 cargo cargo test --message-format=json-render-diagnostics --lib || ');
+    expect(chained.command).toContain('2 cargo cargo test --message-format=json-render-diagnostics --doc; }');
+  });
+
+  it('shell-quotes the fixture as one word however it is spelled', () => {
+    const fixture = 'x="$(probe \'a b\')" && run "$x"';
+    const chained = withFixtureLifecycle(fixture, 'bun test');
+    expect(chained.command).toContain('/bin/sh -c \'x="$(probe \'"\'"\'a b\'"\'"\')" && run "$x"\'');
+  });
+});
 
 describe('private runner lifecycle', () => {
   it('bounds startup and active execution, never build intervals, through the final owned close', () => {

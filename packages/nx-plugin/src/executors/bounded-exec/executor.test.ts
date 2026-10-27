@@ -212,6 +212,98 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).not.toContain('Command timed out after');
   });
 
+  it('runs the fixture first, outside the progress bound, then the command', async () => {
+    const workspace = await createWorkspace();
+
+    // The fixture's whole job is to take longer than the progress bound: compilation outlasting a test gap.
+    // What ends each phase is the process exiting, never the test's own clock.
+    const result = await runBoundedExec(
+      {
+        command: 'node -e "console.log(\'main-done\')"',
+        fixtureCommand: 'node -e "setTimeout(() => console.log(\'fixture-done\'), 1200)"',
+        fixtureTimeoutMs: 60_000,
+        idleTimeoutMs: 500,
+        killAfterMs: 0,
+      },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput.indexOf('fixture-done')).toBeGreaterThanOrEqual(0);
+    expect(result.terminalOutput.indexOf('main-done')).toBeGreaterThan(result.terminalOutput.indexOf('fixture-done'));
+    expect(result.terminalOutput).not.toContain('Command made no progress');
+  });
+
+  it('fails the run on a failed fixture and never starts the command', async () => {
+    const workspace = await createWorkspace();
+
+    const result = await runBoundedExec(
+      {
+        command: "node -e \"console.log('main' + '-ran')\"",
+        fixtureCommand: 'node -e "console.error(\'fixture-broke\'); process.exit(3)"',
+        fixtureTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        killAfterMs: 0,
+      },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('fixture-broke');
+    expect(result.terminalOutput).not.toContain('main-ran');
+  });
+
+  it('ends a fixture that outlives its own ceiling as a fixture bound, not a wedge', async () => {
+    const workspace = await createWorkspace();
+
+    // The fixture prints a finished-test line, then stalls: compilation output is not the command's progress,
+    // so only the fixture ceiling can end it, and it must name itself rather than the hang it is not.
+    const result = await runBoundedExec(
+      {
+        command: "node -e \"console.log('main' + '-ran')\"",
+        fixtureCommand: 'node -e "console.log(\'test fixture::warm ... ok\'); process.stdin.resume()"',
+        fixtureTimeoutMs: 150,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        killAfterMs: 0,
+      },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('Fixture command timed out after');
+    expect(result.terminalOutput).toContain('fixtureTimeoutMs=150');
+    expect(result.terminalOutput).not.toContain('Command made no progress');
+    expect(result.terminalOutput).not.toContain('main-ran');
+  });
+
+  it('refuses a fixture named without its ceiling, running neither command', async () => {
+    const workspace = await createWorkspace();
+
+    const result = await runBoundedExec(
+      {
+        // The type requires one bound; an Nx option set is untyped, so the refusal is the executor's to give.
+        command: 'node -e "console.log(\'main-ran\')"',
+        fixtureCommand: 'node -e "console.log(\'fixture-ran\')"',
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        killAfterMs: 0,
+      },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('fixtureCommand and a positive fixtureTimeoutMs must be named together');
+    expect(result.terminalOutput).not.toContain('fixture-ran');
+    expect(result.terminalOutput).not.toContain('main-ran');
+  });
+
   it('kills a runner that keeps warning of a slow test but finishes none, and names the test', async () => {
     const workspace = await createWorkspace();
     // nextest's own lines: one test finishes, then the other only ever says SLOW, every 50ms.

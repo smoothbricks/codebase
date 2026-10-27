@@ -40,6 +40,15 @@
       "default": 10000,
       "description": "Most milliseconds a timed-out or CPU-grant-revoked command gets after graceful termination before its process group is force-killed. The grace ends early when the command exits; whatever it leaves in its process group is force-killed then."
     },
+    "fixtureCommand": {
+      "type": "string",
+      "description": "A compiler-fixture producer for command: a shell command run first, in the same cwd, environment and CPU grant, as a lifecycle build interval the progress bound does not run during. Its failure fails the run and command starts only after it exits 0. For warmth outside Nx outputs (a compiler plugin cache, a Cargo target directory): inside the consumer's task a cache hit restores the verdict and warms nothing, an execution warms first. Requires fixtureTimeoutMs."
+    },
+    "fixtureTimeoutMs": {
+      "type": "number",
+      "minimum": 1,
+      "description": "The fixture segment's own wall-clock ceiling in milliseconds: a build budget bounding only the fixture interval, never the command it prepares. Required with fixtureCommand."
+    },
     "parallelism": {
       "type": "integer",
       "minimum": 1,
