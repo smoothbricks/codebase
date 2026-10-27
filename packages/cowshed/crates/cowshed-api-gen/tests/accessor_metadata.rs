@@ -14,6 +14,7 @@ fn source_accessors_are_closed_metadata_and_never_guessed() {
     "#;
     let mut api = cowshed_api_gen::ir::Api::default();
     records::parse(source, &mut api, "fixture::units").expect("real source metadata parses");
+    api.refresh_layouts();
     for (name, accessor, wire) in [
         ("Count", ScalarAccessor::Get, "get"),
         ("Text", ScalarAccessor::AsStr, "as-str"),

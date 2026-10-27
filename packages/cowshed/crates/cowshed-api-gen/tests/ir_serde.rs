@@ -34,6 +34,7 @@ fn serialized_declarations_carry_the_actual_owner_metadata_and_type_graph() {
     let mut api = Api::default();
     records::parse(source, &mut api, FIXTURE_MODULE)
         .expect("the actual owner parser reads the declaration");
+    api.refresh_layouts();
     let serialized = serde_json::to_value(&api).expect("the public IR serializes itself");
     let record = &serialized["records"]["Example"];
     assert_eq!(record["module"], FIXTURE_MODULE);
@@ -101,20 +102,20 @@ fn native_copy_and_static_size_follow_the_source_graph() {
         FIXTURE_MODULE,
     )
     .expect("source records");
-    assert!(api.records["Small"].copy);
-    assert_eq!(api.records["Small"].static_size, Some(8));
-    assert_eq!(api.records["Large"].static_size, Some(256));
-    assert!(!api.records["Nested"].copy);
-    assert_eq!(api.records["Nested"].static_size, Some(12));
-    assert_eq!(api.records["Forward"].static_size, None);
-    assert_eq!(api.records["Symbolic"].static_size, None);
-    assert_eq!(api.records["Aligned"].static_size, None);
     records::parse(
         "#[derive(Serialize, Clone, Copy)] pub struct Later { pub count: u32 }",
         &mut api,
         FIXTURE_MODULE,
     )
     .expect("later source file");
+    api.refresh_layouts();
+    assert!(api.records["Small"].copy);
+    assert_eq!(api.records["Small"].static_size, Some(8));
+    assert_eq!(api.records["Large"].static_size, Some(256));
+    assert!(!api.records["Nested"].copy);
+    assert_eq!(api.records["Nested"].static_size, Some(12));
+    assert_eq!(api.records["Symbolic"].static_size, None);
+    assert_eq!(api.records["Aligned"].static_size, None);
     assert_eq!(api.records["Forward"].static_size, Some(4));
 }
 
@@ -148,6 +149,7 @@ fn numeric_refinements_import_tags_from_the_owner_emitter() {
         FIXTURE_MODULE,
     )
     .expect("the source declares a numeric refinement");
+    api.refresh_layouts();
     let tagged = typescript::emit(&api, "numeric source", "./tagged.js")
         .expect("the actual owner emits its numeric refinement");
     assert!(tagged.types.contains("import type { tags }"));

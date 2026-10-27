@@ -42,6 +42,7 @@ mod tests {
     fn declaration(source: &str) -> Api {
         let mut api = Api::default();
         crate::records::parse(source, &mut api, "cowshed_core::error").expect("canonical error");
+        api.refresh_layouts();
         api
     }
 

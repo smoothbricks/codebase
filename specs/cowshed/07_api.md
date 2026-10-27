@@ -860,6 +860,7 @@ package dependency; no consumer generator produces an input to its own generic s
 
 The declaration IR also retains whether the Rust AST derives `Copy` and its static native byte size. The owner computes
 sizes from primitives, literal fixed arrays, tuples, nested records and aliases, including native alignment padding.
+Native layouts are finalized once after complete declaration collection, with each declaration evaluated once per pass.
 Sequential-discriminant enums carry a tag plus their largest payload; a single-data-arm enum reuses spare discriminant
 values in that payload when available. Explicit representations or discriminants, symbolic lengths, unresolved types and
 recursive layouts have unknown size. These are native calling-convention facts, not VO wire widths. A consumer that

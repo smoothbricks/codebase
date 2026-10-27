@@ -1084,7 +1084,9 @@ mod tests {
 
     fn output(table: &str) -> Result<Output, String> {
         let operations = crate::operations::parse(table).expect("table");
-        emit(&operations, &api(), &[])
+        let mut api = api();
+        api.refresh_layouts();
+        emit(&operations, &api, &[])
     }
 
     #[test]
@@ -1320,6 +1322,7 @@ mod tests {
             "cowshed_core::api::fixture",
         )
         .expect("records");
+        api.refresh_layouts();
         let operations = crate::operations::parse(
             r#"operations! {
                 /// Moves a workspace.
@@ -1366,6 +1369,7 @@ mod tests {
             "cowshed_core::api::fixture",
         )
         .expect("records");
+        api.refresh_layouts();
         let operations = crate::operations::parse(
             r#"operations! {
                 /// Skips a field.
@@ -1450,6 +1454,7 @@ mod tests {
                 "#[derive(Serialize, Deserialize)] #[serde(rename_all = \"camelCase\", deny_unknown_fields)] pub struct ShapedRequest {{ pub repo_id: RepoId, {field} }}"
             ), &mut api, "cowshed_core::api::fixture")
             .expect("records");
+            api.refresh_layouts();
             let operations = crate::operations::parse(
                 r#"operations! {
                     /// Shapes a request.
@@ -1483,6 +1488,7 @@ mod tests {
             "cowshed_core::api::fixture",
         )
         .expect("records");
+        api.refresh_layouts();
         let operations = crate::operations::parse(
             r#"operations! {
                 /// Indexes a root.
@@ -1524,6 +1530,7 @@ mod tests {
             "cowshed_core::api::fixture",
         )
         .expect("records");
+        api.refresh_layouts();
         let operations = crate::operations::parse(
             r#"operations! {
                 /// Reads one workspace's grants.

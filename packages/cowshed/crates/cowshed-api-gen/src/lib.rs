@@ -55,6 +55,7 @@ pub fn collect_api(project: &Path) -> Result<ir::Api, String> {
         let module = module_of("cowshed_gateway_types", name)?;
         parse_module(&source, &module, true, &mut api)?;
     }
+    api.refresh_layouts();
     Ok(api)
 }
 
@@ -263,6 +264,7 @@ pub fn ir_types(types_module: &str) -> Result<typescript::Output, String> {
     let mut api = ir::Api::default();
     records::parse(include_str!("ir.rs"), &mut api, "cowshed_api_gen::ir")
         .map_err(|error| format!("public declaration IR: {error}"))?;
+    api.refresh_layouts();
     typescript::emit(&api, "cowshed-api-gen public declaration IR", types_module)
 }
 
@@ -354,4 +356,26 @@ pub fn check(files: &[GeneratedFile]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod layout_collection_tests {
+    use super::*;
+
+    #[test]
+    fn complete_owner_collection_enters_native_finalization_once() {
+        let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("cargo and nextest export the executing checkout's manifest path");
+        let project = Path::new(&manifest).join("../..");
+        ir::layout_counts::take();
+        let api = collect_api(&project).expect("complete owner declarations");
+        let counts = ir::layout_counts::take();
+        assert!(
+            !api.records.is_empty(),
+            "the real owner collection must be reached"
+        );
+        ir::layout_counts::assert_one_pass(&api, &counts, "complete owner collection");
+        assert_eq!(api.records["ProcessCoverage"].static_size, Some(8));
+        assert_eq!(api.records["ProcessCoverageGap"].static_size, Some(8));
+    }
 }

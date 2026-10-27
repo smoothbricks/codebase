@@ -8,6 +8,7 @@ use syn::{Attribute, Expr, Item, Lit, Meta, Visibility};
 /// Parses one API source file. `module` is the Rust module the file defines, such as
 /// `cowshed_core::api::dto`: every retained record carries it, extended by each inline `mod` that
 /// encloses the record.
+/// Collection does not finalize native sizes; call Api::refresh_layouts after all sources are parsed.
 pub fn parse(source: &str, api: &mut Api, module: &str) -> syn::Result<()> {
     parse_file(syn::parse_file(source)?, api, module, true)
 }
@@ -25,6 +26,7 @@ pub(crate) fn parse_file(
 /// records are never exported. A name that an API source or another source already declares is
 /// refused as a duplicate, so support records neither shadow nor get shadowed by API declarations.
 /// `module` is the Rust module the source defines, as for `parse`.
+/// Finalize native sizes with Api::refresh_layouts only after the complete collection.
 pub fn parse_support(source: &str, api: &mut Api, module: &str) -> syn::Result<()> {
     parse_items(syn::parse_file(source)?.items, api, module, false)
 }
@@ -215,7 +217,6 @@ fn parse_items(items: Vec<Item>, api: &mut Api, module: &str, exported: bool) ->
             }
         }
     }
-    api.refresh_layouts();
     Ok(())
 }
 
