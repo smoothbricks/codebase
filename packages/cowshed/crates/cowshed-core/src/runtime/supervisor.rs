@@ -9601,6 +9601,62 @@ mod workspace_toolchain_tests {
         );
     }
 
+    /// The land enumerates declared outputs in a job of the landing workspace's own shell
+    /// (16_build_volumes.md, step 5.3): that job adopts the activation record a read-write job of
+    /// the workspace published, as every exec there does, instead of evaluating devenv again.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_land_source_paths_job_adopts_the_workspace_shell_record() {
+        async fn keyed(
+            policy: &SandboxPolicy,
+            mode: crate::api::dto::RunSandboxMode,
+            shell: &Path,
+        ) -> BTreeMap<OsString, OsString> {
+            let (sandbox, _) = policy.child(mode);
+            let environment = sandbox_environment(sandbox, &BTreeMap::new())
+                .await
+                .expect("environment");
+            super::super::shell_job::inherited_baseline(&environment.base(), &sandbox.grants, shell)
+        }
+        let root = scratch("source-paths-shell");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(super::super::shell_host::SHELL_HOST_DIRECTORY))
+            .expect("shell host directory");
+        std::fs::create_dir_all(root.join("home")).expect("home");
+        std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        std::fs::write(mount.join(".envrc"), "use devenv\n").expect("envrc");
+        let mut sandbox = sandbox_at(&mount);
+        sandbox
+            .configure_capabilities()
+            .expect("detect capabilities");
+        let policy = SandboxPolicy::render(sandbox).expect("render");
+
+        let published = keyed(&policy, crate::api::dto::RunSandboxMode::ReadWrite, &mount).await;
+        let entries = [super::super::shell_watch::WatchEntry {
+            path: mount.join(".envrc"),
+            exists: true,
+        }];
+        let (_, contents) =
+            super::super::shell_watch::certify(entries.iter().map(|entry| entry.path.as_path()))
+                .expect("certify the inputs");
+        super::super::shell_inherit::write_record(
+            &super::super::shell_inherit::Placement::of(&mount, &published),
+            &published,
+            &entries,
+            &contents,
+            &BTreeMap::new(),
+        )
+        .expect("publish the record");
+
+        let land = keyed(&policy, super::super::project::SOURCE_PATHS_MODE, &mount).await;
+        if let Err(miss) = super::super::shell_inherit::verify(
+            &super::super::shell_inherit::Placement::of(&mount, &land),
+            &land,
+        ) {
+            panic!("the land's source-path job must adopt the workspace's shell record: {miss}");
+        }
+    }
+
     /// A plain repository gets the core contract, including the two exact port-0 loader options,
     /// but no capability wiring. Its trust bundle uses only the core Git and OpenSSL anchors.
     #[cfg(target_os = "macos")]

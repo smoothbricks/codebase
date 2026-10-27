@@ -1215,20 +1215,30 @@ pub(super) struct HostActivator {
     activation: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// The inherited baseline of a host: its environment, the grants it runs under and the
+/// directory its shell is selected from. Reserved names cannot collide with environment
+/// variables.
+pub(super) fn inherited_baseline(
+    environment: &BTreeMap<OsString, OsString>,
+    grants: &crate::sandbox::SandboxGrants,
+    shell: &Path,
+) -> BTreeMap<OsString, OsString> {
+    let mut keyed = environment.clone();
+    keyed.insert(
+        shell_inherit::GRANTS_KEY.into(),
+        shell_inherit::keyed_grants(grants),
+    );
+    keyed.insert(
+        shell_inherit::SHELL_KEY.into(),
+        shell.as_os_str().to_owned(),
+    );
+    keyed
+}
+
 impl HostActivator {
-    /// The inherited baseline: the host environment, grants and selected shell directory.
-    /// Reserved names cannot collide with environment variables.
+    /// This host's inherited baseline ([`inherited_baseline`]).
     fn keyed_baseline(&self) -> BTreeMap<OsString, OsString> {
-        let mut keyed = self.environment.clone();
-        keyed.insert(
-            shell_inherit::GRANTS_KEY.into(),
-            shell_inherit::keyed_grants(&self.grants),
-        );
-        keyed.insert(
-            shell_inherit::SHELL_KEY.into(),
-            self.home().as_os_str().to_owned(),
-        );
-        keyed
+        inherited_baseline(&self.environment, &self.grants, self.home())
     }
 
     /// Where the host starts: the `.envrc`'s directory, or the workspace root.

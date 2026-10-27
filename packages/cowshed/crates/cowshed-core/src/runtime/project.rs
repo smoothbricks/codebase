@@ -72,6 +72,15 @@ pub const DEFAULT_LANDING_BRANCH: &str = "main";
 /// compaction"). It is the CLI's on every platform: only a host with build volumes compacts.
 pub const SEED_COMPACTION_VERB: &str = "__compact-seed";
 
+/// The sandbox the land's declared-output helper runs in (16_build_volumes.md, step 5.3): the
+/// landing workspace's read-write one, whose shell pool adopts the activation record the
+/// workspace's other jobs left, so the helper finds its `node` without evaluating anything.
+/// A read-only job keeps its environment in exec temp: its port-0 loader options name another
+/// preload, so that record misses (`BUN_OPTIONS differs`), and the devenv evaluation that
+/// follows cannot write the checkout's `.devenv`.
+#[cfg(target_os = "macos")]
+pub(super) const SOURCE_PATHS_MODE: RunSandboxMode = RunSandboxMode::ReadWrite;
+
 /// Immutable facts returned by one authoritative substrate enumeration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceSnapshot {
@@ -6605,7 +6614,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         root.as_os_str().to_owned().into(),
                     ]),
                     cwd: None,
-                    mode: RunSandboxMode::ReadOnly,
+                    mode: SOURCE_PATHS_MODE,
                     env: std::collections::HashMap::new(),
                     trace: None,
                     stdin: StdinSource::Inline(bytes::Bytes::from_static(
