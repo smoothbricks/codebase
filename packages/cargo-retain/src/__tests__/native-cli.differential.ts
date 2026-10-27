@@ -9,6 +9,7 @@ import { describe, it } from 'bun:test';
 import { type SpawnSyncReturns, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { chmod, cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { constants } from 'node:os';
 import { join } from 'node:path';
 import { RETENTION_RECEIPT, type RetentionOutcome } from '../cargo-retention.js';
 import {
@@ -80,6 +81,8 @@ interface Scenario {
   readonly exit: number;
   /** The report's outcome kind; absent when the CLI prints no report. */
   readonly kind?: RetentionOutcome['kind'];
+  /** An exact canonical refusal, still subject to byte-identical output comparison. */
+  readonly exactReason?: string;
   /**
    * For a refusal whose reason each runtime words its own way, the operating system's text rather than ours: both reasons
    * must match this, and the two outputs are not compared byte for byte.
@@ -192,6 +195,7 @@ const SCENARIOS: readonly Scenario[] = [
     operand: workspaceOf,
     exit: 3,
     kind: 'refused',
+    exactReason: `cannot attempt Cargo's locks: open '<copy>/ws/target/debug/.cargo-lock': errno ${constants.errno.EACCES}: permission denied`,
   },
   {
     name: 'trash entries nobody can prove',
@@ -256,7 +260,8 @@ describe('the native CLI against the Node CLI on copies of one churned Cargo tar
             return comparable(
               spawnSync(command, [...prefix, ...scenario.args, ...operand], {
                 cwd,
-                env: cargoEnv(),
+                // Keep NO_COLOR and every other input; Nx's contradictory FORCE_COLOR makes Node warn under its own PID.
+                env: Object.fromEntries(Object.entries(cargoEnv()).filter(([name]) => name !== 'FORCE_COLOR')),
                 encoding: 'utf8',
               }),
               copy,
@@ -281,6 +286,10 @@ describe('the native CLI against the Node CLI on copies of one churned Cargo tar
           }
         }
         check(expected.status, `${name}: exit status`).toBe(scenario.exit);
+        if (scenario.exactReason !== undefined) {
+          const outcome = parseReport(actual.stdout).outcome;
+          check(outcome.kind === 'refused' ? outcome.reason : '', `${name}: exact refusal`).toBe(scenario.exactReason);
+        }
         if (scenario.kind !== undefined) {
           check(parseReport(expected.stdout).outcome.kind, `${name}: outcome`).toBe(scenario.kind);
         }

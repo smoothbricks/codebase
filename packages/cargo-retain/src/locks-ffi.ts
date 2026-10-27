@@ -7,22 +7,14 @@
  * Only EWOULDBLOCK is `busy`. Any other failure of flock(2), such as a file system that has none, is `unavailable` with
  * its cause, as the Node provider answers, so the pass is refused with the reason instead of skipped for ever.
  */
-import { closeSync, constants, openSync } from 'node:fs';
-import { describeCause } from './errors.js';
-import type { HoldAttempt, LockMode, LockProvider } from './locks.js';
+import { closeSync } from 'node:fs';
+import { describeLockFailure, type HoldAttempt, type LockMode, type LockProvider } from './locks.js';
 
 /** What `tryLockFd` answers besides a negative failure. */
 const HELD = 0;
 const CONTENDED = 1;
 
-/** The open never waits either: a lock path that is a FIFO fails its flock(2) instead of blocking the pass. */
-function openLock(path: string, mode: LockMode): number {
-  return mode === 'create'
-    ? openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_CREAT, 0o644)
-    : openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
-}
-
-/** The `strerror` text `tryLockFd` wrote, up to its NUL. */
+/** The errno and OS cause the C wrapper wrote, up to its NUL. */
 function failureText(cause: Uint8Array): string {
   return new TextDecoder().decode(cause.subarray(0, cause.indexOf(0)));
 }
@@ -37,21 +29,19 @@ async function tryHold(paths: readonly string[], mode: LockMode): Promise<HoldAt
     for (let fd = held.pop(); fd !== undefined; fd = held.pop()) closeSync(fd);
   };
   for (const path of paths) {
-    let fd: number;
-    try {
-      fd = openLock(path, mode);
-    } catch (error) {
-      await letGo();
-      return { kind: 'unavailable', reason: describeCause(error) };
-    }
     const cause = new Uint8Array(256);
+    const fd = openLockFd(new TextEncoder().encode(`${path}\0`), mode === 'create' ? 1 : 0, cause);
+    if (fd < 0) {
+      await letGo();
+      return { kind: 'unavailable', reason: describeLockFailure('open', path, failureText(cause)) };
+    }
     const verdict = tryLockFd(fd, cause);
     if (verdict !== HELD) {
       closeSync(fd);
       await letGo();
       return verdict === CONTENDED
         ? { kind: 'busy', lock: path }
-        : { kind: 'unavailable', reason: `${path}: ${failureText(cause)}` };
+        : { kind: 'unavailable', reason: describeLockFailure('flock', path, failureText(cause)) };
     }
     held.push(fd);
   }

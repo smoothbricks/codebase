@@ -10,6 +10,11 @@
 
 export type LockMode = 'existing' | 'create';
 
+/** Runtime-independent refusal text: retain the operation, exact path, errno and OS cause. */
+export function describeLockFailure(operation: 'open' | 'flock', path: string, cause: string): string {
+  return `${operation} '${path}': ${cause.toLowerCase()}`;
+}
+
 export interface Hold {
   release(): Promise<void>;
 }

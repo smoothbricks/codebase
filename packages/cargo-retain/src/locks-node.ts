@@ -9,8 +9,9 @@ import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { type FileHandle, open } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
+import { getSystemErrorMessage } from 'node:util';
 import { describeCause, errorCode, type Result } from './errors.js';
-import type { HoldAttempt, LockMode, LockProvider } from './locks.js';
+import { describeLockFailure, type HoldAttempt, type LockMode, type LockProvider } from './locks.js';
 import { O_EXLOCK } from './open-flags.js';
 
 const LOCK_HELPER = [
@@ -18,8 +19,8 @@ const LOCK_HELPER = [
   'my $mode = shift @ARGV; my @held;',
   'for my $path (@ARGV) {',
   '  my $flags = $mode eq "create" ? O_RDONLY | O_CREAT : O_RDONLY;',
-  '  sysopen(my $fh, $path, $flags, 0644) or do { print "error\\t$path\\t$!\\n"; exit 0 };',
-  '  if (!flock($fh, LOCK_EX | LOCK_NB)) { print(($!{EWOULDBLOCK} ? "busy\\t$path\\n" : "error\\t$path\\t$!\\n")); exit 0 }',
+  '  sysopen(my $fh, $path, $flags, 0644) or do { my $cause = 0 + $!; print "error\\t$path\\topen\\terrno $cause: $!\\n"; exit 0 };',
+  '  if (!flock($fh, LOCK_EX | LOCK_NB)) { my $cause = 0 + $!; print(($!{EWOULDBLOCK} ? "busy\\t$path\\n" : "error\\t$path\\tflock\\terrno $cause: $!\\n")); exit 0 }',
   '  push @held, $fh;',
   '}',
   'print "held\\n";',
@@ -48,7 +49,16 @@ async function holdInProcess(paths: readonly string[], mode: LockMode): Promise<
       await letGo();
       return errorCode(error) === 'EAGAIN'
         ? { kind: 'busy', lock: path }
-        : { kind: 'unavailable', reason: describeCause(error) };
+        : {
+            kind: 'unavailable',
+            reason: describeLockFailure(
+              'open',
+              path,
+              error instanceof Error && 'errno' in error && typeof error.errno === 'number'
+                ? `errno ${Math.abs(error.errno)}: ${getSystemErrorMessage(error.errno)}`
+                : describeCause(error),
+            ),
+          };
     }
   }
   return { kind: 'held', hold: { release: letGo } };
@@ -87,7 +97,7 @@ async function holdThroughPerl(paths: readonly string[], mode: LockMode): Promis
     child.stdin.destroy();
     return { kind: 'unavailable', reason: first.error };
   }
-  const [verdict, path, detail] = first.value.split('\t');
+  const [verdict, path, operation, detail] = first.value.split('\t');
   if (verdict === 'held') {
     return {
       kind: 'held',
@@ -104,6 +114,12 @@ async function holdThroughPerl(paths: readonly string[], mode: LockMode): Promis
   if (verdict === 'busy' && path !== undefined) return { kind: 'busy', lock: path };
   return {
     kind: 'unavailable',
-    reason: verdict === 'error' ? `${path}: ${detail}` : `unexpected answer ${first.value}`,
+    reason:
+      verdict === 'error' &&
+      path !== undefined &&
+      (operation === 'open' || operation === 'flock') &&
+      detail !== undefined
+        ? describeLockFailure(operation, path, detail)
+        : `unexpected answer ${first.value}`,
   };
 }
