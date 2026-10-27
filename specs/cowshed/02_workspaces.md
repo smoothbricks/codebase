@@ -1064,11 +1064,17 @@ and are refused together (exit 2).
 
 - Default mode: fetch the selected host revision inside the workspace, then rebase the `cowshed/<name>` branch onto that
   exact object ID. The whole step runs **inside the workspace sandbox** — the fetch from the main workspace mount is a
-  read (covered by the baseline), and every write lands in the workspace's own repository. A dirty tree is refused
-  before the rebase starts (exit 4, commit or discard first): the rebase runs with `--no-autostash` whatever the
-  repository's config says, because an autostash re-apply that conflicts leaves unmerged paths and a parked stash yet
-  exits 0. Conflicts abort the rebase (`git rebase --abort`), leave the workspace exactly as it was, and exit 4 with
-  `next:` hints naming the conflicted paths and the by-hand replay.
+  read (covered by the baseline), and every write lands in the workspace's own repository. The replay starts after the
+  branch's leading commits whose own change, from its parent, the destination already holds by the two proofs `rm` step
+  1 applies (content or patch identity), asked of each commit in order: `git rebase --onto <destination> <last held>`. A
+  unit stacked on another unit's commits keeps them after its lane folded them as rewritten twins, and replaying those
+  over the lane's own version, once the lane edited past it, would conflict; a commit the destination does not hold,
+  such as an amended copy of a folded one, stops the skip and replays, so nothing is dropped. A branch with a merge in
+  the range replays from its merge base. A dirty tree is refused before the rebase starts (exit 4, commit or discard
+  first): the rebase runs with `--no-autostash` whatever the repository's config says, because an autostash re-apply
+  that conflicts leaves unmerged paths and a parked stash yet exits 0. Conflicts abort the rebase
+  (`git rebase --abort`), leave the workspace exactly as it was, and exit 4 with `next:` hints naming the conflicted
+  paths, the by-hand replay that conflicted, and the cowshed command to run again once it is resolved.
 - `--fresh`: divergence-shedding rebase. Create a new clone from the selected current host revision, replay the branch
   onto it (`git format-patch`/`am`, or cherry-pick range), then **transplant identity** — the new clone inherits the
   workspace's name, canonical mount path, token, and grant-file binding; the old clone is destroyed (11_shell.md

@@ -11910,7 +11910,11 @@ mod rebase_recovery_tests {
     }
 
     fn unit_commit(root: &Path, file: &str, message: &str) {
-        std::fs::write(root.join(file), format!("{message}\n")).expect("write unit file");
+        commit_contents(root, file, &format!("{message}\n"), message);
+    }
+
+    fn commit_contents(root: &Path, file: &str, contents: &str, message: &str) {
+        std::fs::write(root.join(file), contents).expect("write unit file");
         run_git(root, &["add", file]);
         run_git(root, &["commit", "-m", message]);
     }
@@ -13003,6 +13007,123 @@ mod rebase_recovery_tests {
         assert_eq!(
             git_oid(store_root, &lane.lane).await.expect("lane head"),
             rebased
+        );
+    }
+
+    /// A lane whose first unit folded as a rewritten twin, after another unit landed, and which a
+    /// later unit then edited past, beside a clone of the first unit's original commit. Answers
+    /// the lane, the clone and the lane's tip.
+    async fn a_lane_edited_past_a_folded_unit(label: &str) -> (Lane, PathBuf, GitOid) {
+        let lane = Lane::new(label);
+        let store_root = lane.store.shared();
+        commit_contents(&lane.lane, "shared.txt", "a\n1\nx\n2\nb\n", "seed");
+        let first = lane.unit("first");
+        commit_contents(&first, "shared.txt", "a\n1\nfirst\n2\nb\n", "first");
+        let stacked = Lane::clone_of(&lane.base, &first, &format!("{label}-stacked"));
+        commit_contents(&lane.lane, "shared.txt", "A\n1\nx\n2\nb\n", "other");
+        let first_head = git_oid(store_root, &first).await.expect("first head");
+        let onto = fetch_target_branch(store_root, &first, &lane.lane, &Lane::name("lane"))
+            .await
+            .expect("fetch the lane base's branch");
+        run_git_rebase_atomically(store_root, &first, &onto, &first_head)
+            .await
+            .expect("the first unit replays onto the other unit's work");
+        let folded = git_oid(store_root, &first).await.expect("folded head");
+        deliver_into(
+            &Lane::name("lane"),
+            &crate::git::GitRepository::from_root(store_root, &lane.lane),
+            NativeLandingSource {
+                mount: &first,
+                workspace: &Lane::name("first"),
+                branch: "cowshed/first",
+                head: &folded,
+            },
+            "cowshed/lane",
+            LandPlan::Gated,
+            None,
+        )
+        .await
+        .expect("the first unit lands");
+        commit_contents(
+            &lane.lane,
+            "shared.txt",
+            "A\n1\nfirst\nsecond\n2\nb\n",
+            "second",
+        );
+        let tip = git_oid(store_root, &lane.lane).await.expect("lane tip");
+        (lane, stacked, tip)
+    }
+
+    /// A unit stacked on another unit's commit replays only its own commits once its lane folded
+    /// that commit, even after the lane edited past it, where replaying the original conflicts.
+    /// A unit carrying nothing but folded commits replays nothing and sits on the lane's tip.
+    #[tokio::test]
+    async fn a_unit_stacked_on_a_folded_unit_replays_only_its_own_commits() {
+        let (lane, only, tip) = a_lane_edited_past_a_folded_unit("stacked").await;
+        let store_root = lane.store.shared();
+        let stacked = Lane::clone_of(&lane.base, &only, "own");
+        commit_contents(&stacked, "own.txt", "own\n", "own");
+        let stacked_head = git_oid(store_root, &stacked).await.expect("stacked head");
+        let onto = fetch_target_branch(store_root, &stacked, &lane.lane, &Lane::name("lane"))
+            .await
+            .expect("fetch the lane base's branch");
+        run_git_rebase_atomically(store_root, &stacked, &onto, &stacked_head)
+            .await
+            .expect("only the unit's own commit replays");
+        assert_eq!(
+            git_revision_oid(store_root, &stacked, "HEAD^")
+                .await
+                .expect("parent"),
+            tip
+        );
+        assert_eq!(
+            std::fs::read_to_string(stacked.join("shared.txt")).expect("shared"),
+            "A\n1\nfirst\nsecond\n2\nb\n"
+        );
+        assert!(stacked.join("own.txt").exists());
+
+        let only_head = git_oid(store_root, &only).await.expect("only head");
+        let onto = fetch_target_branch(store_root, &only, &lane.lane, &Lane::name("lane"))
+            .await
+            .expect("fetch the lane base's branch");
+        run_git_rebase_atomically(store_root, &only, &onto, &only_head)
+            .await
+            .expect("nothing replays");
+        assert_eq!(git_oid(store_root, &only).await.expect("only head"), tip);
+    }
+
+    /// A unit that amended a commit its lane folded, keeping its message and author, still
+    /// replays it: the lane does not hold the amended change, so the rebase refuses on the
+    /// conflict and the amendment stays in the unit, never dropped as already folded.
+    #[tokio::test]
+    async fn an_amended_copy_of_a_folded_commit_still_replays() {
+        let (lane, amended, _) = a_lane_edited_past_a_folded_unit("amended").await;
+        let store_root = lane.store.shared();
+        std::fs::write(amended.join("shared.txt"), "a\n1\nfirst amended\n2\nb\n")
+            .expect("amend the folded change");
+        run_git(&amended, &["add", "shared.txt"]);
+        run_git(&amended, &["commit", "--amend", "--no-edit"]);
+        let amended_head = git_oid(store_root, &amended).await.expect("amended head");
+        let onto = fetch_target_branch(store_root, &amended, &lane.lane, &Lane::name("lane"))
+            .await
+            .expect("fetch the lane base's branch");
+        let refused = run_git_rebase_atomically(store_root, &amended, &onto, &amended_head)
+            .await
+            .expect_err("the amended change conflicts with the lane's");
+        assert!(
+            matches!(
+                refused.fence_source(),
+                Some(FenceRefusal::ReplayConflicted { .. })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            git_oid(store_root, &amended).await.expect("unmoved head"),
+            amended_head
+        );
+        assert_eq!(
+            std::fs::read_to_string(amended.join("shared.txt")).expect("shared"),
+            "a\n1\nfirst amended\n2\nb\n"
         );
     }
 
@@ -21052,7 +21173,28 @@ async fn run_git_rebase_atomically(
     // and a parked stash yet exits 0, so this verb would report success over a conflicted tree.
     // Without it git refuses a dirty tree before touching anything, which the classifier below
     // turns into "commit or discard the uncommitted work".
-    let output = invoke(store_root, root, &["rebase", "--no-autostash", onto]).await?;
+    // A unit stacked on a folded unit replays from after the commits its destination already
+    // holds: replaying a folded original over the destination's own version conflicts again.
+    let upstream = crate::git::GitRepository::from_root(store_root, root)
+        .held_prefix(onto, source_head.as_str())
+        .await?;
+    let output = match upstream.as_ref() {
+        Some(upstream) => {
+            invoke(
+                store_root,
+                root,
+                &[
+                    "rebase",
+                    "--no-autostash",
+                    "--onto",
+                    onto,
+                    upstream.as_str(),
+                ],
+            )
+            .await?
+        }
+        None => invoke(store_root, root, &["rebase", "--no-autostash", onto]).await?,
+    };
     let primary = match require_git_success("git operation", &output) {
         Ok(()) => return Ok(()),
         Err(error) => error,
@@ -21144,8 +21286,12 @@ async fn run_git_rebase_atomically(
             },
             primary.message,
             format!(
-                "the rebase was rolled back and the workspace is as it was; {}: run `git rebase {onto}` inside the workspace, resolve the conflicts git names, and finish that rebase there",
-                conflicted_paths(unmerged)
+                "the rebase was rolled back and the workspace is as it was; {}: run `git rebase {}` inside the workspace, resolve the conflicts git names, finish that rebase there, then run this cowshed command again",
+                conflicted_paths(unmerged),
+                upstream.as_ref().map_or_else(
+                    || onto.to_owned(),
+                    |upstream| format!("--onto {onto} {}", upstream.as_str())
+                ),
             ),
         ))
     } else if failures.is_empty() {

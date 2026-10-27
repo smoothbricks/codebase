@@ -2180,6 +2180,64 @@ impl GitRepository {
         Ok(ContentNotHeld { paths, commits })
     }
 
+    /// The newest commit of `revision..head`, oldest first, up to which `revision` holds every
+    /// commit's own change: its change from its parent, held by the two proofs
+    /// [`Self::content_not_held`] applies to a whole branch (02_workspaces.md, `rm` step 1),
+    /// asked of one commit at a time. `None` when `revision` does not hold the first commit's
+    /// change, or when the range has a merge, whose history is not one line.
+    ///
+    /// A unit stacked on another unit's commits still carries them after its lane folded them as
+    /// rewritten twins, and replaying them over the lane's version conflicts wherever the lane
+    /// edited past them. A rebase replays from after this commit instead (`git rebase --onto
+    /// <revision> <it>`): every commit it skips has its change in `revision` by the proofs `rm`
+    /// trusts, so a skip never drops work, and an amended copy of a folded commit is not held and
+    /// replays.
+    pub async fn held_prefix(&self, revision: &str, head: &str) -> Result<Option<GitOid>> {
+        self.require_commits([revision, head]).await?;
+        // Unrelated histories have no change of `head`'s to judge.
+        self.merge_base(revision, head).await?;
+        let listing = self.range_listing(revision, head).await?;
+        let range = parse_range_listing(&listing)?;
+        if range.iter().any(|commit| commit.merge) {
+            return Ok(None);
+        }
+        let patch_held = self.held_commits(revision, head).await?;
+        let mut held = None;
+        for commit in &range {
+            if !patch_held.contains(commit.oid) && !self.holds_change(revision, commit.oid).await? {
+                break;
+            }
+            held = Some(commit.oid);
+        }
+        held.map(|oid| parse_oid(oid.to_owned(), "a commit the destination holds"))
+            .transpose()
+    }
+
+    /// Whether `revision` holds by content the change `commit` made to its parent: each file the
+    /// commit changed has `revision`'s entry, or merging the commit's change into `revision`'s
+    /// version holds it ([`content_proof`], [`Self::merged_changes`]).
+    async fn holds_change(&self, revision: &str, commit: &str) -> Result<bool> {
+        let changed = self.tree_changes(&format!("{commit}^"), commit).await?;
+        let differing = self.tree_changes(revision, commit).await?;
+        let mut merges = Vec::new();
+        for (path, (base, here)) in &changed {
+            // A file `revision` has as the commit leaves it holds the commit's change to it.
+            let Some((target, _)) = differing.get(path) else {
+                continue;
+            };
+            match content_proof(base.as_ref(), here.as_ref(), target.as_ref()) {
+                ContentProof::Held => {}
+                ContentProof::Unheld(_) => return Ok(false),
+                ContentProof::Merge(merge) => merges.push(merge),
+            }
+        }
+        Ok(self
+            .merged_changes(&merges)
+            .await?
+            .iter()
+            .all(Option::is_none))
+    }
+
     /// Merge each workspace change (`base` to `here`) into the target's version of a file both
     /// sides changed, and judge whether the target's version already holds it
     /// ([`crate::held_change`]): a conflicted region is held when the target has the workspace's

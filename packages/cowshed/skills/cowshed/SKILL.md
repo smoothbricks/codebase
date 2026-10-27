@@ -96,20 +96,21 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    `cowshed rm <ws>`, never land again. With `--no-retire`, `rm` once main contains HEAD and every other local branch (a
    fork keeps only `cowshed/<ws>`; one branch per shed); after `push`, `rm` once the pushed ref keeps HEAD: it is that
    commit or a descendant of it.
-5. `--force` on `rm` waives only transient state (dirty tree, the workspace's own running jobs; never a process cowshed
-   does not run holding the mount) and destroys the uncommitted tree; it can never waive containment, and it is never
-   the answer to a refusal. `--abandon` is the sole way to destroy unlanded commits (they are bundled to
-   `sessions/.trash/` first), and a shed whose work main holds, or `push` preserved, never needs it. Use it, then
-   `cowshed gc --abandoned` (which deletes the bundles), only for a shed whose work was deliberately dropped: superseded
-   or obsolete, the reason clear from history. Work still wanted is landed or folded into a batch (below). Never answer
-   an `rm` refusal by reflex: read what it names.
+5. `--abandon` is for work that is not going to be merged in: superseded or obsolete, the reason clear from history. It
+   is the sole way to destroy unlanded commits (they are bundled to `sessions/.trash/` first); follow it with
+   `cowshed gc --abandoned`, which deletes the bundles. A shed whose work main holds, a batch folded, or `push`
+   preserved never needs it, and it is never the answer to an `rm` refusal. `--force` waives only transient state (a
+   dirty tree, the workspace's own running jobs; never a process cowshed does not run holding the mount), destroys the
+   uncommitted tree, can never waive containment, and is never the answer to a refusal either.
 6. Batch work is lane work: see "Batch a round of units" below.
 7. A shed whose work main already holds, that carries none, or whose branch `push` preserved, is removed with plain
-   `cowshed rm <ws>` and no check first: rm proves containment against live main, over every local branch: a commit is
-   held when main's content carries its change or main holds a patch-equivalent commit (`git cherry`), so a cherry-pick
-   main later edited past still counts. A containment refusal names the commits held by neither, and that shed is folded
-   into the batch (below). Every other refusal (a workspace younger than the age floor, a dirty tree, a process holding
-   the mount, a lifecycle operation in progress) names its own remedy.
+   `cowshed rm <ws>` and no check first, and plain `rm` just works: rm proves containment against live main, over every
+   local branch: a commit is held when main's content carries its change or main holds a patch-equivalent commit
+   (`git cherry`), so a cherry-pick main later edited past still counts. A containment refusal names the commits held by
+   neither, and that shed is folded into the batch (below). A dirty-tree refusal names the files: commit and fold real
+   work, delete junk you have read; never `git reset --hard` or `git clean` a shed to make `rm` pass. Every other
+   refusal (a workspace younger than the age floor, a process holding the mount, a lifecycle operation in progress)
+   names its own remedy, and one that names none of the shed's own work is cowshed's defect: report it.
 
 ## Batch a round of units
 
@@ -118,15 +119,18 @@ A round of finished units reaches main as one change behind one gate, not one ga
 Cowshed stores nothing about it, so whoever runs the round tracks which units belong to it.
 
 1. Fork one batch shed from main per round: `cowshed fork <batch>`.
-2. Fork each unit from the batch, not from main: `cowshed fork <batch> <unit>`. A unit that wants its batch-mates' work
-   before it finishes takes it with `cowshed rebase <unit> --into <batch>`, Git alone.
+2. Fork each unit from the batch, not from main: `cowshed fork <batch> <unit>`; a unit that builds on another unit forks
+   from it, `cowshed fork <unit> <next>`. A unit that wants its batch-mates' work before it finishes takes it with
+   `cowshed rebase <unit> --into <batch>`, Git alone.
 3. Fold every finished unit as soon as it is done: `cowshed land <unit> --into <batch> --ungated`. It is Git alone, in
-   one command. It rebases the unit onto the batch's branch (a commit the batch already holds by patch drops out),
-   fast-forwards the batch and retires the unit's shed, so a finished unit never stays mounted. It runs no check and
-   does no Nx cache initialization, seed freeze or build-volume adoption: the batch keeps its own volume and seed, and
-   the unit's volume is released with the unit. A conflict stops it before anything moves, names the paths and leaves
-   the unit as it was: resolve it in the unit and land again. `--ungated` needs `--into <batch>` (main refuses it) and
-   conflicts with `--check` and `--push-only`.
+   one command. It rebases the unit onto the batch's branch, fast-forwards the batch and retires the unit's shed, so a
+   finished unit never stays mounted. The rebase replays only the unit's own work: a commit the batch already holds by
+   patch drops out, and a unit stacked on another unit's commits, folded before it, replays from after them, since the
+   batch holds their change (by patch or by content, one commit at a time). It runs no check and does no Nx cache
+   initialization, seed freeze or build-volume adoption: the batch keeps its own volume and seed, and the unit's volume
+   is released with the unit. A conflict stops it before anything moves, names the paths and the replay that conflicted,
+   and leaves the unit as it was: resolve it in the unit and run the same `cowshed land` again. `--ungated` needs
+   `--into <batch>` (main refuses it) and conflicts with `--check` and `--push-only`.
 4. Gate once, when the round's units are folded: land the batch like any shed (Merge flow step 3), with
    `cowshed rebase <batch>` and then `cowshed land <batch> --check '<bare command>'`, or through the repository's own
    land route. That one gate builds every unit together.
