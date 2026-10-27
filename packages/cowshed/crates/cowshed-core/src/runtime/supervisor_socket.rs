@@ -1000,7 +1000,7 @@ fn stuck(silent: Silent<String>, supervisor_pid: Option<i32>) -> CowshedError {
         silent.to_string(),
         "the supervisor has not published the job's end; cowshed doctor --json names the supervisor",
     )
-    .with_wait(Some(WaitFailure::silent(&silent, supervisor_pid)))
+    .with_wait(Some(WaitFailure::silent(&silent, supervisor_pid, SUPERVISOR)))
 }
 
 // ---------------------------------------------------------------------------------------------

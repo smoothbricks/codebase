@@ -357,12 +357,38 @@ pub fn seal_segment(
     stem: &str,
     batch: &RecordBatch,
 ) -> Result<PathBuf, TraceSegmentError> {
-    if stem.is_empty() || stem.starts_with('.') || stem.contains('/') {
-        return Err(TraceSegmentError::InvalidStem(stem.to_owned()));
+    seal_file(root, date, &format!("{stem}.arrow"), |file| {
+        let mut writer = StreamWriter::try_new(file, &batch.schema())?;
+        writer.write(batch)?;
+        writer.finish()?;
+        Ok(())
+    })
+}
+
+/// Publish diagnostic bytes with the same private, durable, no-replace custody as trace segments.
+pub fn seal_bytes(
+    root: &Path,
+    date: TelemetryDate,
+    name: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, TraceSegmentError> {
+    use std::io::Write as _;
+    seal_file(root, date, name, |file| {
+        file.write_all(bytes).map_err(at(SealStep::CreatingSegment))
+    })
+}
+
+fn seal_file(
+    root: &Path,
+    date: TelemetryDate,
+    sealed_name: &str,
+    write: impl FnOnce(&mut std::fs::File) -> Result<(), TraceSegmentError>,
+) -> Result<PathBuf, TraceSegmentError> {
+    if sealed_name.is_empty() || sealed_name.starts_with('.') || sealed_name.contains('/') {
+        return Err(TraceSegmentError::InvalidStem(sealed_name.to_owned()));
     }
-    let invalid_stem = || TraceSegmentError::InvalidStem(stem.to_owned());
-    let sealed_name = format!("{stem}.arrow");
-    let sealed = CString::new(sealed_name.as_str()).map_err(|_| invalid_stem())?;
+    let invalid_stem = || TraceSegmentError::InvalidStem(sealed_name.to_owned());
+    let sealed = CString::new(sealed_name).map_err(|_| invalid_stem())?;
     let temporary = CString::new(
         temp_name(OsStr::new(&sealed_name), Uuid::new_v4().simple()).into_encoded_bytes(),
     )
@@ -383,11 +409,7 @@ pub fn seal_segment(
     let mut file =
         create_private_file_at(&directory, &temporary).map_err(at(SealStep::CreatingSegment))?;
     let cleanup = TemporaryAt::new(&directory, &temporary);
-    {
-        let mut writer = StreamWriter::try_new(&mut file, &batch.schema())?;
-        writer.write(batch)?;
-        writer.finish()?;
-    }
+    write(&mut file)?;
     Durability::PowerLoss
         .sync_file(&file)
         .map_err(at(SealStep::SyncingSegment))?;

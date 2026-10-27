@@ -14,7 +14,9 @@ use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::operations::{ListLanding, ReAdoption};
-use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
+#[cfg(test)]
+use cowshed_core::api::server::serve_controller_connection;
+use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection_in_process};
 use cowshed_core::api::{
     AbandonedWork, AdoptOptions, AttachOptions, BranchLandings, BranchName, CheckpointInfo,
     CheckpointOptions, CheckpointResult, CommandArg, Coordinator, DefragmentResult, DoctorReport,
@@ -598,17 +600,19 @@ impl ActorBridge {
             repo_id: runtime.descriptor().repo_id.clone(),
         };
         let descriptor: OwnedFd = server.into();
-        let connection = tokio::spawn(serve_controller_connection(
+        let local_waits = cowshed_core::api::server::LocalWaitCauses::default();
+        let connection = tokio::spawn(serve_controller_connection_in_process(
             descriptor,
             authority,
             runtime.router(),
+            local_waits.clone(),
         ));
         let client_descriptor: OwnedFd = client.into();
 
         let (cowshed, token) = match cowshed_os::timing::timed_async(
             "controller-open",
             "connect",
-            cowshed_core::Cowshed::connect(client_descriptor),
+            cowshed_core::Cowshed::connect_in_process(client_descriptor, local_waits),
         )
         .await
         {
@@ -1246,18 +1250,33 @@ pub(crate) async fn relay_foreground(
     stdout: &mut (dyn Write + Send),
     stderr: &mut (dyn Write + Send),
 ) -> Result<ExecResult> {
+    let diagnose = |error: CowshedError| {
+        if error
+            .wait_source()
+            .and_then(|failure| failure.supervisor_stack_pid())
+            .is_some()
+        {
+            crate::run::record_wait(&crate::run::wait_spans(), error)
+        } else {
+            error
+        }
+    };
     let finished = async {
-        match presentation {
-            ExecPresentation::Control => job.wait().await,
-            ExecPresentation::Raw => {
-                let (info, (), ()) = tokio::try_join!(
-                    job.wait(),
-                    job.relay(JobStream::Stdout, stdout),
-                    job.relay(JobStream::Stderr, stderr),
-                )?;
-                Ok(info)
+        let outcome = async {
+            match presentation {
+                ExecPresentation::Control => job.wait().await,
+                ExecPresentation::Raw => {
+                    let (info, (), ()) = tokio::try_join!(
+                        job.wait(),
+                        job.relay(JobStream::Stdout, stdout),
+                        job.relay(JobStream::Stderr, stderr),
+                    )?;
+                    Ok(info)
+                }
             }
         }
+        .await;
+        outcome.map_err(diagnose)
     };
     tokio::pin!(finished);
     let finished_now = |info| ExecResult {
@@ -1271,7 +1290,7 @@ pub(crate) async fn relay_foreground(
         info = &mut finished => return Ok(finished_now(info?)),
         () = tokio::time::sleep(timeout) => {}
     }
-    let info = job.status().await?;
+    let info = job.status().await.map_err(diagnose)?;
     if info.state.is_terminal() {
         return Ok(finished_now(finished.await?));
     }

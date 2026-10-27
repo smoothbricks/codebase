@@ -11,7 +11,7 @@ use std::io;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use cowshed_core::CowshedError;
-use cowshed_core::runtime::wait_spans::{WaitFailure, WaitSpans};
+use cowshed_core::runtime::wait_spans::WaitSpans;
 use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
@@ -273,10 +273,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     let mut output = output::Output::stdio(parsed.global.quiet);
     // A wait that expires under this command is sealed as its span in the host's telemetry, in the
     // trace its caller exported (13_telemetry.md, "Wait spans").
-    let waits = WaitSpans::adopting(
-        CanonicalRoots::global().telemetry().to_path_buf(),
-        std::env::var("TRACEPARENT").ok().as_deref(),
-    );
+    let waits = wait_spans();
     // Help is an answer, not a diagnostic: it goes to stdout, exits 0, and is never suppressed by
     // --quiet, because it is the output the caller asked for.
     if let args::Command::Help(topic) = &parsed.command {
@@ -640,9 +637,7 @@ fn finish<W: io::Write, E: io::Write>(
     match outcome {
         Ok(exit_code) => exit_code,
         Err(error) => {
-            if let Some(failure) = error.wait_source() {
-                record_wait(waits, failure);
-            }
+            let error = record_wait(waits, error);
             let exit_code = i32::from(error.exit_code());
             if let Err(write_error) = write_error(output, error, json, None) {
                 cowshed_os::eprintln!("cowshed: failed to write command result: {write_error}");
@@ -654,15 +649,44 @@ fn finish<W: io::Write, E: io::Write>(
     }
 }
 
-/// Seal the expired wait a command failed with as its span. A seal that fails is said on stderr and
-/// never changes the command's outcome, whose own report names the wait either way.
-fn record_wait(waits: &WaitSpans, failure: &WaitFailure) {
-    if let Err(error) = waits.seal(failure, std::time::SystemTime::now()) {
+mod stack_sample;
+
+/// The command's trace context and host telemetry root, also used before a relay releases its hold.
+pub(crate) fn wait_spans() -> WaitSpans {
+    WaitSpans::adopting(
+        CanonicalRoots::global().telemetry().to_path_buf(),
+        std::env::var("TRACEPARENT").ok().as_deref(),
+    )
+}
+
+/// Keep one receipt across the relay and final error boundaries. Capture/seal failures never
+/// replace the original wait failure or its exit code.
+pub(crate) fn record_wait(waits: &WaitSpans, mut error: CowshedError) -> CowshedError {
+    let Some(failure) = error.wait_source() else {
+        return error;
+    };
+    if failure.receipt.is_some() {
+        return error;
+    }
+    let mut failure = failure.clone();
+    let original_message_len = failure.message.len();
+    waits.record(
+        &mut failure,
+        std::time::SystemTime::now(),
+        stack_sample::capture,
+    );
+    if let Some(receipt) = &failure.receipt
+        && let Err(reason) = &receipt.span
+    {
         cowshed_os::eprintln!(
-            "cowshed: the expired wait's span could not be sealed under {}: {error}",
+            "cowshed: the expired wait's span could not be sealed under {}: {reason}",
             waits.root().display()
         );
     }
+    error
+        .message
+        .push_str(&failure.message[original_message_len..]);
+    error.with_wait(Some(failure))
 }
 fn emit_error(error: CowshedError, command_map: Option<&str>, json: bool, quiet: bool) -> i32 {
     let exit_code = i32::from(error.exit_code());
@@ -695,6 +719,113 @@ fn write_error<W: io::Write, E: io::Write>(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// One real shell wiring check: our SILENT value reaches the unprivileged sampler and one
+    /// private retained receipt; the final error boundary consumes that same receipt.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_silent_supervisor_retains_one_stack_sample_and_one_wait_receipt() {
+        use cowshed_core::runtime::wait_spans::WaitFailure;
+        use cowshed_os::deadline::{Progress, Silent};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "cswait-sample",
+        );
+        let waits = WaitSpans::adopting(root.to_path_buf(), None);
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let silent = Silent {
+            op: "wait",
+            holder: "workspace supervisor",
+            idle: Duration::from_secs(15),
+            silent_for: Duration::from_secs(15),
+            elapsed: Duration::from_secs(265),
+            last: Progress::Received { bytes: 3841 },
+        };
+        let failure = WaitFailure::silent(&silent, Some(pid), "workspace supervisor");
+        let error = CowshedError::environment_missing(
+            failure.message.clone(),
+            "inspect the retained stacks",
+        )
+        .with_wait(Some(failure));
+        let exit_code = i32::from(error.exit_code());
+        // The host exec bridge uses this real socketpair path, not the resident direct client.
+        let expected = error.wait_source().cloned();
+        let local_waits = cowshed_core::api::server::LocalWaitCauses::default();
+        let (router, mut commands) =
+            cowshed_core::api::server::RouterHandle::channel(std::num::NonZeroUsize::MIN);
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let served = tokio::spawn(
+            cowshed_core::api::server::serve_controller_connection_in_process(
+                server.into(),
+                cowshed_core::api::server::ConnectionAuthority::Coordinator {
+                    repo_id: cowshed_core::repository::RepoId::parse("acme/widget").unwrap(),
+                },
+                router,
+                local_waits.clone(),
+            ),
+        );
+        let (controller, token) =
+            cowshed_core::Cowshed::connect_in_process(client.into(), local_waits)
+                .await
+                .unwrap();
+        drop(token);
+        let routed = tokio::spawn(async move {
+            let (_, reply) = commands.recv().await.unwrap().into_parts();
+            assert!(reply.send(Err(error)).is_ok());
+        });
+        let error = match controller.open(&*root).await {
+            Err(error) => error,
+            Ok(_) => panic!("the injected route failure was lost"),
+        };
+        assert_eq!(
+            error.wait_source(),
+            expected.as_ref(),
+            "host loopback retains the typed wait"
+        );
+        routed.await.unwrap();
+        drop(controller);
+        served.abort();
+        match served.await {
+            Ok(Ok(())) => {}
+            Err(error) if error.is_cancelled() => {}
+            other => panic!("owned controller teardown: {other:?}"),
+        }
+        let error = record_wait(&waits, error);
+        let receipt = error.wait_source().unwrap().receipt.clone().unwrap();
+        let span = receipt.span.as_ref().unwrap();
+        let sample = receipt.sample.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(span.parent(), sample.parent());
+        assert_eq!(
+            span.file_stem().unwrap().to_str().unwrap(),
+            sample
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .strip_suffix(".sample.txt")
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(sample).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!std::fs::read(sample).unwrap().is_empty());
+        assert!(
+            error.message.contains(&sample.display().to_string()),
+            "{}",
+            error.message
+        );
+        let mut output = output::Output::new(Vec::new(), Vec::new(), false);
+        assert_eq!(finish(Err(error), &mut output, false, &waits), exit_code);
+        let entries: Vec<_> = std::fs::read_dir(span.parent().unwrap()).unwrap().collect();
+        assert_eq!(
+            entries.len(),
+            2,
+            "only one span and sample, no second recording attempt"
+        );
+    }
 
     #[test]
     fn a_lands_gates_rebase_and_land_wait_for_an_install_and_ordinary_work_does_not() {

@@ -51,11 +51,18 @@ cowshed has no reader verb for it: each segment is an Arrow IPC stream, readable
   <yyyy-mm-dd>/commitment-*.arrow   # controller commitments: lifecycle and job continuity records
   <yyyy-mm-dd>/job-*.arrow          # each job's span, one segment per row: its start, the unattributed usage its terminal sample states, and its end
   <yyyy-mm-dd>/process-*.arrow      # a job's process.run spans, one segment per batch of process events
+  <yyyy-mm-dd>/wait-*.arrow         # terminal waits: TIMEOUT, SILENT and PEER_LOST
+  <yyyy-mm-dd>/wait-*.sample.txt    # retained supervisor stacks on macOS SILENT
   gateway/<yyyy-mm-dd>/gateway-*.arrow   # gateway egress decisions, one event per decision
   daemon-stderr.log, sccache-stderr.log  # launchd stderr of the two agents, for crashes before tracing starts
 ```
 
 Those segments are compact continuity records, not a second copy of job stdout/stderr.
+
+A CLI supervisor SILENT names its retained stack report in the error. On macOS the unprivileged sampler runs for two
+seconds before a foreground relay releases its job hold. The private report sits beside its Arrow wait receipt;
+wait_stack_sample records its path, or wait_stack_error states why capture failed. The original wait keeps its expiry,
+bound and exit code. The final error boundary reuses that receipt, never sampling or sealing it twice.
 
 ## Tiered job authority and writers
 

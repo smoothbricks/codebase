@@ -948,9 +948,18 @@ impl Cowshed {
 
     #[cfg(unix)]
     pub async fn connect(descriptor: OwnedFd) -> Result<(Self, CoordinatorToken)> {
-        acquire_coordinator_token(descriptor).await
+        acquire_coordinator_token(descriptor, None).await
     }
 
+    /// Connect the client end of an in-process controller pair, retaining private wait causes
+    /// by request id outside its unchanged wire frames (05_gateway.md, Deadlines, Spans).
+    #[cfg(unix)]
+    pub async fn connect_in_process(
+        descriptor: OwnedFd,
+        local_waits: super::server::LocalWaitCauses,
+    ) -> Result<(Self, CoordinatorToken)> {
+        acquire_coordinator_token(descriptor, Some(local_waits)).await
+    }
     pub fn coordinator(&self, project: &Project, token: CoordinatorToken) -> Result<Coordinator> {
         if !Arc::ptr_eq(&self.runtime, &project.runtime)
             || !Arc::ptr_eq(&self.runtime, &token.channel.runtime)
@@ -1439,6 +1448,7 @@ fn spawn_controller_actor(
     reader: impl AsyncRead + Unpin + Send + 'static,
     writer: impl AsyncWrite + Unpin + Send + 'static,
     controller: Peer,
+    local_waits: Option<super::server::LocalWaitCauses>,
 ) -> (
     Arc<dyn ControllerRuntime>,
     watch::Receiver<Option<OtherBuild>>,
@@ -1453,6 +1463,7 @@ fn spawn_controller_actor(
         Arc::clone(&downloads),
         answers,
         other_build,
+        local_waits,
     ));
     tokio::spawn(run_controller_actor(
         receiver,
@@ -1570,9 +1581,10 @@ async fn read_answers(
     downloads: Downloads,
     answers: mpsc::UnboundedSender<Result<Inbound>>,
     other_build: watch::Sender<Option<OtherBuild>>,
+    local_waits: Option<super::server::LocalWaitCauses>,
 ) {
     loop {
-        let inbound = read_inbound(&mut reader, &downloads).await;
+        let inbound = read_inbound(&mut reader, &downloads, local_waits.as_ref()).await;
         if let Ok(Inbound::Answer(Answer {
             outcome: Err(error),
             ..
@@ -1599,6 +1611,7 @@ async fn read_answers(
 async fn read_inbound(
     reader: &mut (impl AsyncRead + Unpin),
     downloads: &Downloads,
+    local_waits: Option<&super::server::LocalWaitCauses>,
 ) -> Result<Inbound> {
     let frame = read_rpc_frame(reader).await?;
     match codec::decode_server_frame(&frame).map_err(|error| {
@@ -1607,9 +1620,11 @@ async fn read_inbound(
         codec::DecodedServerFrame::Step { id, report } => Ok(Inbound::Step { id, report }),
         codec::DecodedServerFrame::Progress { seq, busy } => Ok(Inbound::Progress { seq, busy }),
         codec::DecodedServerFrame::Event { id, event } => Ok(Inbound::Event { id, event }),
-        codec::DecodedServerFrame::Response(response) => read_answer(reader, downloads, response)
-            .await
-            .map(Inbound::Answer),
+        codec::DecodedServerFrame::Response(response) => {
+            read_answer(reader, downloads, response, local_waits)
+                .await
+                .map(Inbound::Answer)
+        }
     }
 }
 
@@ -1620,12 +1635,17 @@ async fn read_answer(
     reader: &mut (impl AsyncRead + Unpin),
     downloads: &Downloads,
     response: codec::DecodedRpcResponse,
+    local_waits: Option<&super::server::LocalWaitCauses>,
 ) -> Result<Answer> {
     let (id, ok, result, error, binary_length) = response.into_parts();
     let download = downloads
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&id);
+    let error = error.map(|error| match local_waits {
+        Some(local) => local.attach(id, error),
+        None => error,
+    });
     let result = match (ok, result, error) {
         (true, Some(result), None) => result,
         (false, None | Some(Value::Null), Some(error)) => {
@@ -2005,7 +2025,10 @@ async fn send_call(
 }
 
 #[cfg(unix)]
-async fn acquire_coordinator_token(descriptor: OwnedFd) -> Result<(Cowshed, CoordinatorToken)> {
+async fn acquire_coordinator_token(
+    descriptor: OwnedFd,
+    local_waits: Option<super::server::LocalWaitCauses>,
+) -> Result<(Cowshed, CoordinatorToken)> {
     verify_peer(&descriptor)?;
     let stream = std::os::unix::net::UnixStream::from(descriptor);
     stream.set_nonblocking(true).map_err(|error| {
@@ -2033,7 +2056,7 @@ async fn acquire_coordinator_token(descriptor: OwnedFd) -> Result<(Cowshed, Coor
     }
     let controller = paired_peer("cowshed controller", pid)?;
     let (reader, writer) = stream.into_split();
-    let (runtime, other_build) = spawn_controller_actor(reader, writer, controller);
+    let (runtime, other_build) = spawn_controller_actor(reader, writer, controller, local_waits);
     let token = CoordinatorToken {
         repo_id,
         channel: AuthenticatedControllerChannel {
@@ -2140,7 +2163,7 @@ async fn connect_host(descriptor: OwnedFd, role: HostRole) -> Result<Arc<dyn Con
     };
     let controller = paired_peer(role_name, pid)?;
     let (reader, writer) = stream.into_split();
-    let (runtime, _other_build) = spawn_controller_actor(reader, writer, controller);
+    let (runtime, _other_build) = spawn_controller_actor(reader, writer, controller, None);
     Ok(runtime)
 }
 
@@ -3267,7 +3290,7 @@ mod tests {
     fn actor_pair() -> (Arc<dyn ControllerRuntime>, tokio::net::UnixStream) {
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
         let (reader, writer) = client.into_split();
-        let (runtime, _) = spawn_controller_actor(reader, writer, controller());
+        let (runtime, _) = spawn_controller_actor(reader, writer, controller(), None);
         (runtime, server)
     }
 
@@ -3278,7 +3301,7 @@ mod tests {
     fn actor_in_memory() -> (Arc<dyn ControllerRuntime>, tokio::io::DuplexStream) {
         let (client, server) = tokio::io::duplex(MAX_RPC_BYTES);
         let (reader, writer) = tokio::io::split(client);
-        let (runtime, _) = spawn_controller_actor(reader, writer, controller());
+        let (runtime, _) = spawn_controller_actor(reader, writer, controller(), None);
         (runtime, server)
     }
 
@@ -4881,7 +4904,7 @@ mod tests {
     async fn a_refusal_of_the_controllers_build_marks_its_connection() {
         let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
         let (reader, writer) = client.into_split();
-        let (runtime, other_build) = spawn_controller_actor(reader, writer, controller());
+        let (runtime, other_build) = spawn_controller_actor(reader, writer, controller(), None);
         let coordinator = coordinator_over(runtime, other_build);
         let refused = OtherBuild {
             daemon: crate::runtime::supervisor_socket::BuildId::current()

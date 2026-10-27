@@ -1037,7 +1037,19 @@ the handshake bound.
   (`status`, session install and removal, `session-current`, `nx-cache-clear`). A `BLOCKED` peer and a failed I/O call
   are not expiries and write no span. Neither does an answered wait, whose time the command owns, nor an expiry the
   caller takes as an answer (doctor's unanswered gateway, a probe of whether a gateway runs). The stderr line stays: the
-  command's own report names the failure, and a seal that fails is said there and never changes the outcome.
+  command's own report names the failure, and a seal that fails is said there and never changes the outcome. A CLI
+  foreground relay that fails SILENT on a workspace supervisor captures that peer's stacks before releasing its job
+  hold. On macOS it invokes unprivileged /usr/bin/sample for 2 seconds, within one 10 s ffi bound, without signalling
+  the supervisor. It retains the report as a private 0600 wait-<uuid>.sample.txt beside the wait span, names it in the
+  error, and records its path as wait_stack_sample (or the capture failure as wait_stack_error). Other command failures
+  use the same final error boundary. The local receipt is reused there: one capture and one seal attempt per failure,
+  even when either failed. The wait's expiry timestamp, elapsed time, bound and exit code are fixed before sampling;
+  diagnostics neither retry the operation nor renew its silence. An in-process controller socketpair retains each typed
+  wait cause in that pair alone, under its response id, before encoding the unchanged error frame. Its reader takes and
+  reattaches the cause before delivering Err. The client's pending-call cap and the connection's open-stream cap bound
+  retained causes. Process-external connections share no custody and encode no private cause. Host exec and a declined
+  resident path therefore retain the same diagnostic facts as a direct resident call, without extending the public error
+  wire.
 - **Enforcement.** TypeScript: the `deadline/no-unbounded-wait` ESLint rule (`tooling/checks/no-unbounded-wait.ts`,
   wired in `eslint.config.ts` over `packages/*/src`) refuses `fetch` without a `signal`, a socket connect (`net`/`tls`
   `connect`, `createConnection`, `Socket#connect`, `Bun.connect`), a Bun child's `exited`, `events.once` on a child,

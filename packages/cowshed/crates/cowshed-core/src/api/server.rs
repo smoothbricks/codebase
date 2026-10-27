@@ -1148,6 +1148,33 @@ impl RouterHandle {
     }
 }
 
+/// Typed wait causes omitted from the wire, owned only by one in-process controller pair.
+/// Client pending calls and connection open streams bound custody; each cause is consumed by id.
+#[derive(Clone, Debug, Default)]
+pub struct LocalWaitCauses(
+    Arc<std::sync::Mutex<std::collections::HashMap<u64, crate::runtime::wait_spans::WaitFailure>>>,
+);
+
+impl LocalWaitCauses {
+    fn retain(&self, id: u64, error: &CowshedError) {
+        if let Some(failure) = error.wait_source() {
+            self.0
+                .lock()
+                .expect("local wait custody mutex poisoned")
+                .insert(id, failure.clone());
+        }
+    }
+
+    pub(super) fn attach(&self, id: u64, error: CowshedError) -> CowshedError {
+        let failure = self
+            .0
+            .lock()
+            .expect("local wait custody mutex poisoned")
+            .remove(&id);
+        error.with_wait(failure)
+    }
+}
+
 /// Serves one inherited stream descriptor until a clean disconnect or a fatal protocol failure.
 ///
 /// Requests arrive in id order and are answered as each completes, not in arrival order: a
@@ -1161,10 +1188,32 @@ impl RouterHandle {
 ///
 /// Dropping this future owns only connection state: its unanswered requests are abandoned, its
 /// streams end, and routed jobs remain owned by the router actor.
+/// Serve a process-external controller connection; private error causes never cross its wire.
 pub async fn serve_controller_connection(
     descriptor: OwnedFd,
     authority: ConnectionAuthority,
     router: RouterHandle,
+) -> Result<()> {
+    serve_controller_connection_inner(descriptor, authority, router, None).await
+}
+
+/// Serve the server end of an in-process pair with its connection-local wait custody.
+/// The client must use the same custody with Cowshed::connect_in_process. Client pending-call
+/// and connection open-stream caps bound retained causes; each response consumes its cause once.
+pub async fn serve_controller_connection_in_process(
+    descriptor: OwnedFd,
+    authority: ConnectionAuthority,
+    router: RouterHandle,
+    local_waits: LocalWaitCauses,
+) -> Result<()> {
+    serve_controller_connection_inner(descriptor, authority, router, Some(local_waits)).await
+}
+
+async fn serve_controller_connection_inner(
+    descriptor: OwnedFd,
+    authority: ConnectionAuthority,
+    router: RouterHandle,
+    local_waits: Option<LocalWaitCauses>,
 ) -> Result<()> {
     verify_peer(&descriptor)?;
     let stream = std::os::unix::net::UnixStream::from(descriptor);
@@ -1175,16 +1224,27 @@ pub async fn serve_controller_connection(
         connection_error(format!("controller descriptor setup failed: {error}"))
     })?;
     let (reader, writer) = stream.into_split();
-    serve_connection(reader, writer, authority, router).await
+    serve_connection_with_waits(reader, writer, authority, router, local_waits).await
 }
 
 /// [`serve_controller_connection`] past its descriptor's checks: the handshake, then the calls.
 /// It takes the connection's two halves, so a test drives it over an in-memory stream.
+#[cfg(test)]
 pub(crate) async fn serve_connection<W: AsyncWrite + Unpin + Send + 'static>(
+    reader: impl AsyncRead + Unpin,
+    writer: W,
+    authority: ConnectionAuthority,
+    router: RouterHandle,
+) -> Result<()> {
+    serve_connection_with_waits(reader, writer, authority, router, None).await
+}
+
+async fn serve_connection_with_waits<W: AsyncWrite + Unpin + Send + 'static>(
     mut reader: impl AsyncRead + Unpin,
     mut writer: W,
     authority: ConnectionAuthority,
     router: RouterHandle,
+    local_waits: Option<LocalWaitCauses>,
 ) -> Result<()> {
     let hello = read_required_frame(
         &mut reader,
@@ -1223,7 +1283,10 @@ pub(crate) async fn serve_connection<W: AsyncWrite + Unpin + Send + 'static>(
     )
     .await?;
 
-    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let writer = Arc::new(ControllerWriter {
+        stream: tokio::sync::Mutex::new(writer),
+        local_waits,
+    });
     let mut answers = tokio::task::JoinSet::new();
     // Where each open stream-lane call's demands go, by call id: a subset of `answers`, entered
     // when its answer starts and removed when that answer ends.
@@ -1329,7 +1392,7 @@ pub(crate) async fn serve_connection<W: AsyncWrite + Unpin + Send + 'static>(
             _ = beats.tick(), if beating && !answers.is_empty() => {
                 beat = beat.saturating_add(1);
                 let busy = router.busy().current();
-                write_rpc_progress(&mut *writer.lock().await, beat, busy.as_deref()).await?;
+                write_rpc_progress(&mut *writer.stream.lock().await, beat, busy.as_deref()).await?;
             }
             Some(outcome) = answers.join_next() => {
                 let (id, outcome) = outcome.map_err(|error| {
@@ -1393,7 +1456,20 @@ const MAX_WAITING_REQUESTS: usize = 64;
 /// Stream-lane calls one connection may have open at once.
 const MAX_OPEN_STREAMS: usize = 64;
 
-type ConnectionWriter<W> = Arc<tokio::sync::Mutex<W>>;
+struct ControllerWriter<W> {
+    stream: tokio::sync::Mutex<W>,
+    local_waits: Option<LocalWaitCauses>,
+}
+
+impl<W> ControllerWriter<W> {
+    fn retain_wait(&self, id: u64, error: &CowshedError) {
+        if let Some(local) = &self.local_waits {
+            local.retain(id, error);
+        }
+    }
+}
+
+type ConnectionWriter<W> = Arc<ControllerWriter<W>>;
 
 /// One frame a client sends: a request with its upload frame, or a demand on an open stream.
 enum ClientFrame {
@@ -1441,7 +1517,7 @@ async fn refuse<W: AsyncWrite + Unpin + Send + 'static>(
     error: CowshedError,
     fatal: bool,
 ) -> (u64, Result<()>) {
-    let outcome = match write_rpc_error(&mut *writer.lock().await, id, &error).await {
+    let outcome = match write_rpc_error(&mut *writer.stream.lock().await, id, &error).await {
         Ok(()) if fatal => Err(error),
         written => written,
     };
@@ -1469,10 +1545,13 @@ async fn answer<W: AsyncWrite + Unpin + Send + 'static>(
         } else {
             router.route(authority, operation, upload, None).await
         };
+        if let Err(error) = &response {
+            writer.retain_wait(request_id, error);
+        }
         let body = match response {
             Ok(response) => response.into_body(),
             Err(error) => {
-                return write_rpc_error(&mut *writer.lock().await, request_id, &error).await;
+                return write_rpc_error(&mut *writer.stream.lock().await, request_id, &error).await;
             }
         };
         match (body, demands) {
@@ -1480,7 +1559,7 @@ async fn answer<W: AsyncWrite + Unpin + Send + 'static>(
                 stream_events(&writer, request_id, source, demands).await
             }
             (RouterBody::Answer { result, binary }, None) => {
-                let mut writer = writer.lock().await;
+                let mut writer = writer.stream.lock().await;
                 let writer = &mut *writer;
                 let lane = match (download_offset, binary.as_ref()) {
                     (Some(offset), Some(bytes)) => {
@@ -1506,14 +1585,14 @@ async fn answer<W: AsyncWrite + Unpin + Send + 'static>(
             }
             (RouterBody::Answer { .. }, Some(_)) => {
                 let error = protocol_error("controller router answered a stream-lane call once");
-                write_rpc_error(&mut *writer.lock().await, request_id, &error).await?;
+                write_rpc_error(&mut *writer.stream.lock().await, request_id, &error).await?;
                 Err(error)
             }
             (RouterBody::Events(_), None) => {
                 let error = protocol_error(
                     "controller router answered a call that is no stream with events",
                 );
-                write_rpc_error(&mut *writer.lock().await, request_id, &error).await?;
+                write_rpc_error(&mut *writer.stream.lock().await, request_id, &error).await?;
                 Err(error)
             }
         }
@@ -1537,13 +1616,13 @@ async fn stream_events<W: AsyncWrite + Unpin + Send + 'static>(
             biased;
             demand = demands.recv() => match demand {
                 Some(Demand::Close) => {
-                    return write_rpc_success(&mut *writer.lock().await, id, &ended, None).await;
+                    return write_rpc_success(&mut *writer.stream.lock().await, id, &ended, None).await;
                 }
                 Some(Demand::Next) => {
                     let error = protocol_error(
                         "controller RPC demanded a stream event while one was unanswered",
                     );
-                    write_rpc_error(&mut *writer.lock().await, id, &error).await?;
+                    write_rpc_error(&mut *writer.stream.lock().await, id, &error).await?;
                     return Err(error);
                 }
                 // The connection is gone, and nobody reads an answer.
@@ -1551,17 +1630,24 @@ async fn stream_events<W: AsyncWrite + Unpin + Send + 'static>(
             },
             event = source.next() => event,
         };
+        if let Some(Err(error)) = &event {
+            writer.retain_wait(id, error);
+        }
         match event {
-            Some(Ok(event)) => write_rpc_event(&mut *writer.lock().await, id, &event).await?,
-            Some(Err(error)) => {
-                return write_rpc_error(&mut *writer.lock().await, id, &error).await;
+            Some(Ok(event)) => {
+                write_rpc_event(&mut *writer.stream.lock().await, id, &event).await?
             }
-            None => return write_rpc_success(&mut *writer.lock().await, id, &ended, None).await,
+            Some(Err(error)) => {
+                return write_rpc_error(&mut *writer.stream.lock().await, id, &error).await;
+            }
+            None => {
+                return write_rpc_success(&mut *writer.stream.lock().await, id, &ended, None).await;
+            }
         }
         match demands.recv().await {
             Some(Demand::Next) => {}
             Some(Demand::Close) => {
-                return write_rpc_success(&mut *writer.lock().await, id, &ended, None).await;
+                return write_rpc_success(&mut *writer.stream.lock().await, id, &ended, None).await;
             }
             None => return Ok(()),
         }
@@ -1586,12 +1672,12 @@ async fn route_reporting_steps<W: AsyncWrite + Unpin + Send + 'static>(
         tokio::select! {
             biased;
             Some(report) = reports.recv() => {
-                write_rpc_step(&mut *writer.lock().await, request_id, &report.into()).await?;
+                write_rpc_step(&mut *writer.stream.lock().await, request_id, &report.into()).await?;
             }
             response = &mut routed => {
                 // Every step the call reported before it answered is already queued.
                 while let Ok(report) = reports.try_recv() {
-                    write_rpc_step(&mut *writer.lock().await, request_id, &report.into()).await?;
+                    write_rpc_step(&mut *writer.stream.lock().await, request_id, &report.into()).await?;
                 }
                 return Ok(response);
             }
@@ -1966,6 +2052,66 @@ fn authority_error(message: impl Into<String>) -> CowshedError {
         message,
         "use a capability bound to the requested repository and workspace incarnation",
     )
+}
+
+#[cfg(test)]
+mod local_wait_tests {
+    use super::*;
+    use crate::runtime::wait_spans::WaitFailure;
+    use cowshed_os::deadline::{Progress, Silent};
+    use std::time::Duration;
+
+    #[test]
+    fn local_wait_causes_are_request_scoped_consumed_once_and_never_encoded() {
+        let local = LocalWaitCauses::default();
+        let other_pair = LocalWaitCauses::default();
+        let mut responses = Vec::new();
+        for (id, op) in [(1, "wait"), (2, "log-read")] {
+            let silent = Silent {
+                op,
+                holder: "workspace supervisor",
+                idle: Duration::from_secs(15),
+                silent_for: Duration::from_secs(15),
+                elapsed: Duration::from_secs(265),
+                last: Progress::Received { bytes: 3841 },
+            };
+            let failure = WaitFailure::silent(&silent, Some(42), "workspace supervisor");
+            let error =
+                CowshedError::environment_missing(failure.message.clone(), "inspect stacks")
+                    .with_wait(Some(failure.clone()));
+            local.retain(id, &error);
+            let wire = codec::encode_rpc_error(id, &error).unwrap();
+            let codec::DecodedServerFrame::Response(response) =
+                codec::decode_server_frame(&wire).unwrap()
+            else {
+                panic!("error frame was not a response");
+            };
+            let (decoded_id, _, _, error, _) = response.into_parts();
+            let error = error.unwrap();
+            assert_eq!(decoded_id, id);
+            assert!(
+                error.wait_source().is_none(),
+                "private cause must stay off the wire"
+            );
+            assert_eq!(
+                codec::encode_rpc_error(id, &error).unwrap(),
+                wire,
+                "wire bytes unchanged by private custody"
+            );
+            assert!(other_pair.attach(id, error.clone()).wait_source().is_none());
+            responses.push((id, failure, error));
+        }
+        for (id, failure, error) in responses.into_iter().rev() {
+            assert_eq!(
+                local.attach(id, error.clone()).wait_source(),
+                Some(&failure)
+            );
+            assert!(
+                local.attach(id, error).wait_source().is_none(),
+                "cause consumed exactly once"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
