@@ -786,6 +786,11 @@ reporter is unavailable replay only its final 64 KiB under a 10-second bound (th
 failure stops the land. The reporter reads the complete file, not the replayed suffix. The pre-rewrite ancestry cutoff
 remains a separate guard before rebase.
 
+The land-shell fixtures disable Git automatic gc and maintenance in their fixture-only environment (`gc.auto=0`,
+`maintenance.auto=false`), as the native Git fixtures do. Their commits must not detach maintenance that races a later
+local clone by creating and removing `objects/maintenance.lock`, or outlives fixture teardown. This changes no workspace
+or production Git configuration.
+
 A red names the commits to read first. The wrapper reads the run summary the gate's Nx wrote (`run.json` in Nx's cache
 directory, refusing one whose `run.startTime` precedes the second the gate began in) and lists the tasks that failed; a
 task Nx skipped because a task it waits for failed has no row and is not listed. For each failed task it prints the

@@ -219,14 +219,20 @@ esac
 };
 
 // Like the release Git fixtures: no user hooks/prompts and no fsync for repositories deleted after each test.
+// A commit's detached maintenance can remove objects/maintenance.lock while the next local clone copies it.
+// These ephemeral repositories own no background Git work, matching the native Git fixtures.
 const GIT_FIXTURE_ENV: Record<string, string> = {
   GIT_CONFIG_GLOBAL: '/dev/null',
   GIT_CONFIG_SYSTEM: '/dev/null',
   GIT_TERMINAL_PROMPT: '0',
   GIT_OPTIONAL_LOCKS: '0',
-  GIT_CONFIG_COUNT: '1',
+  GIT_CONFIG_COUNT: '3',
   GIT_CONFIG_KEY_0: 'core.fsync',
   GIT_CONFIG_VALUE_0: 'none',
+  GIT_CONFIG_KEY_1: 'gc.auto',
+  GIT_CONFIG_VALUE_1: '0',
+  GIT_CONFIG_KEY_2: 'maintenance.auto',
+  GIT_CONFIG_VALUE_2: 'false',
   GIT_AUTHOR_NAME: 'land test',
   GIT_AUTHOR_EMAIL: 'land@test.invalid',
   GIT_COMMITTER_NAME: 'land test',
