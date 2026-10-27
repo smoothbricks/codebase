@@ -193,30 +193,32 @@ with no such `TRACEPARENT` it is the root of a fresh trace. A wait that is answe
 that time. A seal that fails is said on stderr and never changes the command's outcome; the command's own report names
 the failure either way.
 
-| Column               | Type     | Meaning                                                                                                 |
-| -------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
-| `wait_op`            | `Utf8`   | The op that waited (`hello`, `status`, `process-events`, …).                                            |
-| `wait_peer`          | `Utf8`   | The peer or holder, as the failure names it: its role, socket and pid.                                  |
-| `wait_peer_pid`      | `u32`    | The pid the kernel reported for the peer; null when it reported none.                                   |
-| `wait_class`         | `Utf8`   | A `TIMEOUT`'s latency class (`control`, `handshake`, …); null otherwise.                                |
-| `wait_bound_us`      | `u64`    | A `TIMEOUT`'s request bound or a `SILENT`'s silence bound; null for `PEER_LOST`.                        |
-| `wait_code`          | `S.enum` | `TIMEOUT`, `SILENT` or `PEER_LOST`, on the `span-err` row only.                                         |
-| `wait_elapsed_us`    | `u64`    | The whole wait, on the `span-err` row only.                                                             |
-| `wait_last`          | `Utf8`   | The last progress the waiter saw, on the `span-err` row only.                                           |
-| wait_stack_sample    | Utf8     | The retained supervisor stack report path, on the span-err row only; null without a successful capture. |
-| wait_stack_error     | Utf8     | The stack capture or publication failure, on the span-err row only; null without a failed capture.      |
-| `process_id`         | `u32`    | The process that waited.                                                                                |
-| `w3c_parent_span_id` | `u64`    | The adopted `TRACEPARENT`'s span id; null in a minted trace.                                            |
+| Column               | Type     | Meaning                                                                                                                               |
+| -------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `wait_op`            | `Utf8`   | The op that waited (`hello`, `status`, `process-events`, …).                                                                          |
+| `wait_peer`          | `Utf8`   | The peer or holder, as the failure names it: its role, socket and pid.                                                                |
+| `wait_peer_pid`      | `u32`    | The pid the kernel reported for the peer; null when it reported none.                                                                 |
+| `wait_class`         | `Utf8`   | A `TIMEOUT`'s latency class (`control`, `handshake`, …); null otherwise.                                                              |
+| `wait_bound_us`      | `u64`    | A `TIMEOUT`'s request bound or a `SILENT`'s silence bound; null for `PEER_LOST`.                                                      |
+| `wait_code`          | `S.enum` | `TIMEOUT`, `SILENT` or `PEER_LOST`, on the `span-err` row only.                                                                       |
+| `wait_elapsed_us`    | `u64`    | The whole wait, on the `span-err` row only.                                                                                           |
+| `wait_last`          | `Utf8`   | The last progress the waiter saw, on the `span-err` row only.                                                                         |
+| `wait_stack_sample`  | `Utf8`   | The retained stack report path of the silent supervisor or controller, on the `span-err` row only; null without a successful capture. |
+| `wait_stack_error`   | `Utf8`   | The stack capture or publication failure, on the `span-err` row only; null without a failed capture.                                  |
+| `process_id`         | `u32`    | The process that waited.                                                                                                              |
+| `w3c_parent_span_id` | `u64`    | The adopted `TRACEPARENT`'s span id; null in a minted trace.                                                                          |
 
-The expiries that reach this boundary come from every workspace-supervisor call and from the gateway control requests
-that reconciliation and the CLI make; 05_gateway.md ("Deadlines", Spans) lists them and the expiries that write no span.
-`lmao-q --dir "$STORE/telemetry/$DAY" errors` lists each with its sentence.
+The expiries that reach this boundary come from every workspace-supervisor call, every call on a process-external
+controller connection and the gateway control requests that reconciliation and the CLI make; 05_gateway.md ("Deadlines",
+Spans) lists them and the expiries that write no span. `lmao-q --dir "$STORE/telemetry/$DAY" errors` lists each with its
+sentence.
 
-A CLI supervisor SILENT on macOS also retains wait-<uuid>.sample.txt beside that segment, using the same private,
-no-replace durable publication. Its unprivileged 2-second sample runs before a foreground relay drops its job hold; the
-final error boundary reuses the local receipt rather than sampling or sealing twice. Capture failure is stated in the
-original error and wait_stack_error, never as a successful empty report. Diagnostic work does not move the span's start
-or expiry timestamps, change the original failure, or signal the supervisor.
+A CLI supervisor SILENT, or a SILENT call on a process-external controller connection, on macOS also retains
+wait-<uuid>.sample.txt of the silent process beside that segment, using the same private, no-replace durable
+publication. Its unprivileged 2-second sample runs before a foreground relay drops its job hold; the final error
+boundary reuses the local receipt rather than sampling or sealing twice. Capture failure is stated in the original error
+and wait_stack_error, never as a successful empty report. Diagnostic work does not move the span's start or expiry
+timestamps, change the original failure, or signal the supervisor.
 
 ## Process-tree spans
 

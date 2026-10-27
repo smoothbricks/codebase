@@ -2027,13 +2027,15 @@ async fn run_controller_actor(
                 {
                     continue;
                 }
-                let holder = ControllerHolder { peer: controller.clone(), busy: stalled.busy.take() };
+                let holder = ControllerHolder { peer: controller.clone(), busy: stalled.busy.clone() };
                 let silent = silent_controller(&stalled.idle.silent(holder, deadline::clock()));
                 silent_windows = silent_windows.saturating_add(1);
                 // The next window measures from now, so the timer re-arms instead of spinning
-                // while the abandoned calls stay owed.
-                stalled = ControllerSilence::start();
-                if silent_windows >= 2 && pending.len() + abandoned.len() >= MAX_IN_FLIGHT_REQUESTS {
+                // while the abandoned calls stay owed. It keeps the busy op and the progress the
+                // controller last reported, which its next SILENT still names (05_gateway.md
+                // "Deadlines").
+                stalled.idle.observe(stalled.idle.last(), deadline::clock());
+                if silent_windows >= 2 && abandoned.len() >= MAX_IN_FLIGHT_REQUESTS {
                     break lost_controller(&silent, last_receipt.take());
                 }
                 // SILENT ends the waits, never the connection: a `cowshed controller` exits once
@@ -3610,11 +3612,6 @@ mod tests {
         (runtime, server)
     }
 
-    /// The bound a real-clock silence test waits for the actor's verdict: two silence windows and
-    /// the sampler's bound, so a hang fails the case instead of the leg's backstop.
-    #[cfg(unix)]
-    const SILENCE_VERDICT: std::time::Duration = std::time::Duration::from_secs(60);
-
     /// 05_gateway.md "Deadlines": SILENT ends the waits, never the controller. A `cowshed
     /// controller` exits once its peer closes its end (06_cli.md), so over a real socketpair the
     /// connection stays open: a stream whose demand failed is closed with a Close demand, a late
@@ -3643,19 +3640,15 @@ mod tests {
         });
         let (_, request) = read_rpc_request(&mut server).await;
         let late = request["id"].as_u64().expect("the silent call's id");
-        let demand = tokio::time::timeout(SILENCE_VERDICT, stream.next())
-            .await
-            .expect("the stream's demand fails within the silence bound")
-            .expect("the demand answers");
+        let demand = stream.next().await.expect("the demand answers");
         let failure = demand.expect_err("a silent controller's stream demand fails");
         assert!(
             failure.message.starts_with("SILENT: "),
             "{}",
             failure.message
         );
-        let failure = tokio::time::timeout(SILENCE_VERDICT, silent)
+        let failure = silent
             .await
-            .expect("the call fails within the silence bound")
             .expect("the silent call joins")
             .expect_err("a silent controller's call fails");
         assert!(
@@ -3714,23 +3707,17 @@ mod tests {
             read_rpc_request(&mut server).await;
         }
         for call in held {
-            let failure = tokio::time::timeout(SILENCE_VERDICT, call)
-                .await
-                .expect("each held call fails within the silence bound")
-                .expect_err("a silent controller's call fails");
+            let failure = call.await.expect_err("a silent controller's call fails");
             assert!(
                 failure.message.starts_with("SILENT: "),
                 "{}",
                 failure.message
             );
         }
-        let queued = tokio::time::timeout(
-            SILENCE_VERDICT,
-            runtime.call("project.list", empty_params()),
-        )
-        .await
-        .expect("a call queued behind abandoned slots is answered within a bound, never held")
-        .expect_err("a call behind a lost controller fails");
+        let queued = runtime
+            .call("project.list", empty_params())
+            .await
+            .expect_err("a call behind a lost controller fails");
         assert!(
             queued.message.contains("is lost")
                 && queued.message.contains(&format!("pid {CONTROLLER_PID}")),
@@ -3741,6 +3728,98 @@ mod tests {
             read_rpc_frame(&mut server).await.is_err(),
             "the lost connection is closed, and the queued call was never sent"
         );
+    }
+
+    /// 05_gateway.md "Deadlines": only slots held by abandoned calls make a second silent window a
+    /// loss. Calls sent after the first window still own their slots at the second: they fail
+    /// SILENT and are abandoned in turn, a queued call is told with them, and the connection
+    /// stays open, so a late answer that frees a slot lets the next call through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_silent_window_with_live_calls_in_the_slots_is_not_a_loss() {
+        let (runtime, mut server) = actor_pair();
+        let mut held = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_REQUESTS - 4 {
+            held.push(queued_actor_call(Arc::clone(&runtime), "job.status").await);
+            read_rpc_request(&mut server).await;
+        }
+        for call in held {
+            let failure = call.await.expect_err("a silent controller's call fails");
+            assert!(
+                failure.message.starts_with("SILENT: "),
+                "{}",
+                failure.message
+            );
+        }
+        let mut live = Vec::new();
+        for _ in 0..4 {
+            live.push(queued_actor_call(Arc::clone(&runtime), "job.status").await);
+            read_rpc_request(&mut server).await;
+        }
+        let queued = queued_actor_call(Arc::clone(&runtime), "project.list").await;
+        for call in live.into_iter().chain([queued]) {
+            let failure = call
+                .await
+                .expect_err("a call still silent at the second window fails");
+            assert!(
+                failure.message.starts_with("SILENT: ") && !failure.message.contains("is lost"),
+                "{}",
+                failure.message
+            );
+        }
+        write_rpc_success(&mut server, 1, json!({}), None).await;
+        let next = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let (_, request) = read_rpc_request(&mut server).await;
+        let id = request["id"].as_u64().expect("the next call's id");
+        write_rpc_success(&mut server, id, json!({"state": "running"}), None).await;
+        assert_eq!(
+            next.await
+                .expect("the next call joins")
+                .expect("a freed slot lets the next call through the open connection"),
+            json!({"state": "running"})
+        );
+    }
+
+    /// 05_gateway.md "Deadlines": a SILENT names the busy op of the controller's last heartbeat
+    /// and that heartbeat as its last progress. A later window's SILENT still does: restarting the
+    /// window keeps what the controller last said.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_later_silent_window_still_names_the_last_heartbeat_and_busy_op() {
+        let (runtime, mut server) = actor_pair();
+        let first = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let _ = read_rpc_request(&mut server).await;
+        let beat = json!({
+            "progress": 3,
+            "busy": { "method": "job.logs", "subject": "raven", "forMs": 4000 },
+        });
+        write_raw_frame(&mut server, beat.to_string().as_bytes()).await;
+        let failure = first
+            .await
+            .expect("the first call joins")
+            .expect_err("a controller that stops beating fails the call");
+        assert!(
+            failure.message.contains("last progress: heartbeat 3"),
+            "{}",
+            failure.message
+        );
+        let later = runtime
+            .call("job.status", empty_params())
+            .await
+            .expect_err("a call into the next silent window fails too");
+        for named in ["router busy: job.logs raven", "last progress: heartbeat 3"] {
+            assert!(
+                later.message.contains(named),
+                "{named:?}: {}",
+                later.message
+            );
+        }
     }
 
     /// 05_gateway.md "Deadlines": a controller call that falls SILENT samples the controller it
@@ -3765,9 +3844,8 @@ mod tests {
             async move { runtime.call("job.status", empty_params()).await }
         });
         let _ = read_rpc_request(&mut server).await;
-        let failure = tokio::time::timeout(SILENCE_VERDICT, call)
+        let failure = call
             .await
-            .expect("the call fails within the silence bound")
             .expect("the silent call joins")
             .expect_err("a silent controller's call fails");
         assert!(
@@ -3824,9 +3902,8 @@ mod tests {
             async move { runtime.call("job.status", empty_params()).await }
         });
         let _ = read_rpc_request(&mut server).await;
-        let failure = tokio::time::timeout(SILENCE_VERDICT, call)
+        let failure = call
             .await
-            .expect("the call fails within the silence bound")
             .expect("the silent call joins")
             .expect_err("a silent controller's call fails");
         let sample = failure

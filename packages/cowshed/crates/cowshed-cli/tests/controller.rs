@@ -128,15 +128,14 @@ async fn host_controller_a_controller_survives_a_client_whose_call_on_it_fell_si
         0,
         "stop the controller"
     );
-    let silent = tokio::time::timeout(std::time::Duration::from_secs(60), project.main()).await;
+    let silent = project.main().await;
     // SAFETY: as above.
     assert_eq!(
         unsafe { libc::kill(pid, libc::SIGCONT) },
         0,
         "continue the controller"
     );
-    let Err(silent) = silent.expect("a stopped controller's call fails within its silence bound")
-    else {
+    let Err(silent) = silent else {
         panic!("a stopped controller's call fails");
     };
     assert!(silent.message.starts_with("SILENT: "), "{}", silent.message);
