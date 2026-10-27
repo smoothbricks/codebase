@@ -13273,6 +13273,61 @@ mod rebase_recovery_tests {
         );
     }
 
+    /// A commit resolved at a stop is carried, whatever the resolution made of its change: the
+    /// branch holds its rewritten twin, so `--continue` finishes clean against the plan the rebase
+    /// recorded when it started, with no `--drop` (02_workspaces.md, "The recorded plan").
+    #[tokio::test]
+    async fn a_commit_resolved_at_a_stop_is_carried_not_lost() {
+        let (lane, stacked, tip, head, onto) =
+            a_stacked_unit_with_its_own_and_a_conflicting_commit("carried").await;
+        let store_root = lane.store.shared();
+        let plan = crate::git::GitRepository::from_root(store_root, &stacked)
+            .replay_plan(&onto, head.as_str(), &[])
+            .await
+            .expect("plan the replay");
+        // As the verb does, the plan is recorded before the replay starts.
+        let base = git_merge_base(store_root, &stacked, &tip, &head)
+            .await
+            .expect("where the unit left the lane");
+        record_plan(store_root, &stacked, base.as_str(), head.as_str())
+            .await
+            .expect("record the plan");
+        replay(store_root, &stacked, &onto, &head, plan, ConflictEnd::Stop)
+            .await
+            .expect_err("mine conflicts with the lane");
+        // The resolution reworks the conflicting commit's line: neither its patch nor its content
+        // survives as the commit made it.
+        let resolved = "A\n1\nfirst\nsecond\nMINE\n2\nb\n";
+        std::fs::write(stacked.join("shared.txt"), resolved).expect("resolve the conflict");
+        let RebaseReport::Rebased { oid, commits, .. } = resume_rebase(
+            store_root,
+            &stacked,
+            &Lane::name("carried"),
+            crate::api::dto::RebaseResume::Continue,
+        )
+        .await
+        .expect("continue finishes a resolved replay clean") else {
+            panic!("a finished continue answers the rebased head");
+        };
+        assert_eq!(
+            crate::api::dto::ReplayedCommit::summary(&commits),
+            format!(
+                "replayed 2, dropped 1 held ({}), dropped 0 unheld",
+                &commits[0].oid.as_str()[..10]
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(stacked.join("shared.txt")).expect("shared"),
+            resolved
+        );
+        assert_eq!(
+            git_optional_ref_oid(store_root, &stacked, RECORDED_HEAD)
+                .await
+                .expect("read the record"),
+            Some(oid)
+        );
+    }
+
     /// `--abort` of a stopped replay puts the branch back exactly where it started.
     #[tokio::test]
     async fn abort_puts_a_stopped_replay_back_where_it_started() {

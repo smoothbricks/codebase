@@ -1011,10 +1011,13 @@ together (exit 2).
   (`refs/worktree/cowshed-plan/{base,head}`), the head it starts from and where that head left its destination, and,
   once it finishes, the head it left and the destination. An ungated land's replay records the same. Before a rebase, an
   ungated land and every retirement (`rm`, a land's retire of its unit and of the workspaces it folded), cowshed asks
-  which commits of the recorded `base..head` the branch has since lost: neither reachable from it nor held, by patch
-  identity or content, by it or by the destination. Such a commit refuses the operation
-  (`FenceRefusal::RecordedWorkLost`, exit 4) naming it: a by-hand rebase, reset or `--skip` dropped work only that
-  workspace still knew. Restore it (`git cherry-pick`), or name the loss with
+  which commits of the recorded `base..head` the branch has since lost: neither reachable from it, nor carried by it
+  rewritten, nor held, by patch identity or content, by it or by the destination. Such a commit refuses the operation
+  (`FenceRefusal::RecordedWorkLost`, exit 4) naming it. A commit of the branch's own, reachable from neither the
+  recorded head nor the destination, that has a recorded commit's author, author date and message carries it rewritten,
+  one recorded commit each: a replay leaves a commit so, whatever the resolution of its conflict made of its change, and
+  `--continue` needs no `--drop` for it. A lost commit is work only that workspace still knew, which a by-hand rebase,
+  reset or `--skip` dropped. Restore it (`git cherry-pick`), or name the loss with
   `cowshed rebase <ws> --drop <commit> --drop-unheld`, which records a new plan; `rm --abandon` loses it too and says so
   on stderr. A workspace with no recorded plan has nothing to compare.
 - `--fresh`: divergence-shedding rebase. Create a new clone from the selected current host revision, replay the branch

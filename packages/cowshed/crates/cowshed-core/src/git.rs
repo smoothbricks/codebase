@@ -2459,8 +2459,9 @@ impl GitRepository {
     }
 
     /// The commits of `base..recorded`, merges excepted, oldest first, that `head` has lost:
-    /// neither reachable from `head` nor held, by patch identity or content, by `head` or by
-    /// `holder`, the destination (02_workspaces.md, "`cowshed rebase`", "The recorded plan").
+    /// neither reachable from `head`, nor carried by it rewritten ([`Self::rewritten_twins`]), nor
+    /// held, by patch identity or content, by `head` or by `holder`, the destination
+    /// (02_workspaces.md, "`cowshed rebase`", "The recorded plan").
     pub async fn lost_since(
         &self,
         base: &str,
@@ -2488,6 +2489,13 @@ impl GitRepository {
         }
         let by_head = self.held_commits(head, recorded).await?;
         let by_holder = self.held_commits(holder, recorded).await?;
+        let recorded_commits: Vec<&str> = candidates
+            .iter()
+            .filter_map(|line| line.split_once('\0').map(|(oid, _)| oid))
+            .collect();
+        let rewritten = self
+            .rewritten_twins(&recorded_commits, head, recorded, holder)
+            .await?;
         let mut lost = Vec::new();
         for line in candidates {
             let (oid, subject) = line.split_once('\0').ok_or_else(|| {
@@ -2498,6 +2506,7 @@ impl GitRepository {
             })?;
             if by_head.contains(oid)
                 || by_holder.contains(oid)
+                || rewritten.contains(oid)
                 || self.holds_change(head, oid).await?
                 || self.holds_change(holder, oid).await?
             {
@@ -2509,6 +2518,73 @@ impl GitRepository {
             });
         }
         Ok(lost)
+    }
+
+    /// The commits of `commits` that `head` carries rewritten: a commit of its own, reachable
+    /// from neither `recorded` nor `holder`, with the commit's author, author date and message,
+    /// as a replay leaves a commit whatever the resolution of its conflict made of its change. Each
+    /// such commit carries one.
+    async fn rewritten_twins(
+        &self,
+        commits: &[&str],
+        head: &str,
+        recorded: &str,
+        holder: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let mut twins = std::collections::BTreeMap::<Vec<u8>, usize>::new();
+        let (recorded, holder) = (format!("^{recorded}"), format!("^{holder}"));
+        for (_, authorship) in self.authorships(&[head, &recorded, &holder]).await? {
+            *twins.entry(authorship).or_default() += 1;
+        }
+        let mut carried = std::collections::BTreeSet::new();
+        if twins.is_empty() || commits.is_empty() {
+            return Ok(carried);
+        }
+        let mut listed = vec!["--no-walk=unsorted"];
+        listed.extend_from_slice(commits);
+        for (oid, authorship) in self.authorships(&listed).await? {
+            if let Some(count) = twins.get_mut(&authorship).filter(|count| **count > 0) {
+                *count -= 1;
+                carried.insert(oid);
+            }
+        }
+        Ok(carried)
+    }
+
+    /// Each non-merge commit `git log` lists for `revisions`, in its order, with its authorship:
+    /// the author's name, email and date as the commit holds them, and its raw message.
+    async fn authorships(&self, revisions: &[&str]) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut args = vec![
+            "log",
+            "-z",
+            "--no-merges",
+            "--date=raw",
+            "--format=%H%n%an <%ae> %ad%n%B",
+        ];
+        args.extend_from_slice(revisions);
+        let output = self.run(args).await?;
+        if !output.status.success() {
+            return Err(git_internal("read the authorship of commits", &output));
+        }
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .map(|record| {
+                let unreadable = || {
+                    CowshedError::integrity(
+                        "git reported an unreadable commit authorship",
+                        "repair the git installation",
+                    )
+                };
+                let split = record
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .ok_or_else(unreadable)?;
+                let oid = std::str::from_utf8(&record[..split]).map_err(|_| unreadable())?;
+                Ok((oid.to_owned(), record[split + 1..].to_vec()))
+            })
+            .collect()
     }
 
     /// Whether `revision` holds by content the change `commit` made to its parent: each file the
