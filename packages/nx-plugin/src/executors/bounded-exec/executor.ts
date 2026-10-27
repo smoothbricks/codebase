@@ -682,6 +682,8 @@ export async function runBoundedExec(
   let fixtureTimer: NodeJS.Timeout | undefined;
   // The fixture's own output is compilation, not the command's progress: it is not scanned for finished tests.
   let fixtureDone = fixture === null || lifecycle === null;
+  // Whether a segment past the fixture ever announced: without one, the shell's exit is the fixture's.
+  let mainStarted = fixture === null || lifecycle === null;
   let captureTimer: NodeJS.Timeout | undefined;
   let idleCapture: { expiresAtMs: number; controller: AbortController; result: IdleDiagnosticResult } | undefined;
   const cancelCapture = (): void => {
@@ -778,6 +780,7 @@ export async function runBoundedExec(
         fixtureDone = true;
         clearTimeout(fixtureTimer);
       }
+      if (event.id > 0) mainStarted = true;
       // Tool startup and native lifecycle-bearing stdout wait for their phase acknowledgement.
       channel.write(`${JSON.stringify(event)}\n`);
     });
@@ -1010,7 +1013,11 @@ export async function runBoundedExec(
 
   const code = exitCode ?? signalToExitCode(exitSignal);
   if (code !== 0 && state.expiry === null) {
-    appendStderr(`Command exited with status ${code}: ${command}\n`);
+    appendStderr(
+      fixture !== null && !mainStarted
+        ? `Fixture command exited with status ${code}: ${fixture.command}\n`
+        : `Command exited with status ${code}: ${command}\n`,
+    );
   }
 
   if (state.expiry !== null && !state.forceKillNeeded) {

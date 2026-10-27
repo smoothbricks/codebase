@@ -254,6 +254,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     expect(result.success).toBe(false);
     expect(result.terminalOutput).toContain('fixture-broke');
+    expect(result.terminalOutput).toContain('Fixture command exited with status 3');
     expect(result.terminalOutput).not.toContain('main-ran');
   });
 
