@@ -46,6 +46,10 @@ stderr carries logfmt events, byte counts, timings, and refusal reasons. The sup
 package writes no permanent text log. SIGTERM/SIGINT drains requests before exiting. SIGKILL can leave staged bytes,
 which the next startup reclaims and reports, never a partial hit.
 
+A request has no idle timeout: an upload that pauses, on a loaded host or by design, keeps its connection however long
+it waits, where Bun's default would close it after 10 s and lose the bytes. The listener is loopback-only, so a client
+that dies closes its socket in the kernel, which releases its staging reservation.
+
 With `--exit-on-stdin-eof`, the parent holds the write end of the process's stdin pipe for the child's lifetime. When
 the parent dies, the kernel closes the pipe; EOF drains requests and the process exits. Without the flag, the process
 keeps the SIGTERM/SIGINT behavior described above. The flag is argv-only and is not inherited through an environment

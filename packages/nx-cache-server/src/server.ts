@@ -137,6 +137,11 @@ export async function startCacheServer(config: CacheServerConfig): Promise<Cache
       hostname: HOST,
       port: config.port,
       maxRequestBodySize: FRAMING_CEILING,
+      // A paused upload keeps its connection. Bun's default closes a request idle for 10 s: an Nx upload
+      // stalled on a loaded host lost its bytes with a 500, and process.test.ts's drain case, whose
+      // upload waits on purpose, hung on the staged file that close removed. The listener is
+      // loopback-only, so a client that dies closes its socket in the kernel and frees its reservation.
+      idleTimeout: 0,
       routes: {
         [CACHE_ROUTE]: {
           GET: (request) => handleGet(store, request),

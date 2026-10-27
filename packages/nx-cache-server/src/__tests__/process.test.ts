@@ -333,7 +333,10 @@ test('stdin EOF drains an in-flight upload while the lease still refuses a secon
     socket.once('connect', connected.resolve);
     socket.once('error', connected.reject);
     await connected.promise;
-    const staged = awaitStaged(staging, abort.signal, first.child.exited);
+    // The upload connection closing ends the wait: its staged file goes with it, and nothing else would.
+    const dropped = new AbortController();
+    socket.once('close', () => dropped.abort(new Error('the upload connection closed before its bytes were staged')));
+    const staged = awaitStaged(staging, AbortSignal.any([abort.signal, dropped.signal]), first.child.exited);
     socket.write(`PUT /v1/cache/drained HTTP/1.1\r\nHost: localhost\r\nContent-Length: ${body.byteLength}\r\n\r\n`);
     socket.write(body.subarray(0, 64 * 1024));
     await staged;
