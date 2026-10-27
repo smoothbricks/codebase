@@ -443,6 +443,15 @@ impl Drop for GitScratch {
     }
 }
 
+/// A scratch object store read-only merges write into, the stores they read through
+/// (`GIT_ALTERNATE_OBJECT_DIRECTORIES`) and the merge-driver overrides they run with
+/// ([`GitRepository::merge_scratch`]). Its owner removes it with `scratch.cleanup()`.
+struct MergeScratch {
+    scratch: GitScratch,
+    read: OsString,
+    overrides: Vec<String>,
+}
+
 /// A bundle staged beside its final name belongs to the write that staged it, including when its
 /// caller drops that future: it is renamed into place or removed, never left as a `.partial`
 /// that no sweep owns.
@@ -1760,6 +1769,31 @@ impl GitRepository {
         head: &str,
     ) -> Result<crate::landing::MergedTree> {
         self.require_commits([target, head]).await?;
+        let merge = self.merge_scratch().await?;
+        let output = self
+            .run_merging(
+                &merge,
+                ["merge-tree", "--write-tree", "--no-messages", target, head],
+            )
+            .await;
+        let cleanup = merge.scratch.cleanup().await;
+        let output = output?;
+        cleanup?;
+        match output.status.code() {
+            Some(0) => Ok(crate::landing::MergedTree::Clean(parse_oid(
+                parse_one_string(&output.stdout, "merge into the target")?,
+                "the merged tree",
+            )?)),
+            // Exit 1 is git's answer, not a failure: the merge conflicts.
+            Some(1) => Ok(crate::landing::MergedTree::Conflicted),
+            _ => Err(git_internal("merge into the target", &output)),
+        }
+    }
+
+    /// The scratch object store a read-only merge writes into, in this repository's git directory,
+    /// and every store it reads, with every merge driver this repository's config names, and
+    /// `union`, failing ([`Self::merged_tree`]).
+    async fn merge_scratch(&self) -> Result<MergeScratch> {
         let listing = self.run(["config", "-z", "--name-only", "--list"]).await?;
         if !listing.status.success() {
             return Err(git_internal("read the Git config", &listing));
@@ -1805,7 +1839,20 @@ impl GitRepository {
                         "move the repository to a path without a colon",
                     )
                 })?;
-        let scratch = GitScratch::create(git_dir, ScratchUse::MergeObjects)?;
+        Ok(MergeScratch {
+            scratch: GitScratch::create(git_dir, ScratchUse::MergeObjects)?,
+            read,
+            overrides,
+        })
+    }
+
+    /// Run git with `merge`'s scratch store as the one it writes and the repository's as the ones
+    /// it reads.
+    async fn run_merging<I, S>(&self, merge: &MergeScratch, args: I) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let mut command = git_command_with_objects(
             #[cfg(target_os = "macos")]
             &self.store_root,
@@ -1814,7 +1861,7 @@ impl GitRepository {
             #[cfg(target_os = "macos")]
             None,
         )?;
-        for setting in &overrides {
+        for setting in &merge.overrides {
             command.arg("-c").arg(setting);
         }
         // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
@@ -1823,25 +1870,13 @@ impl GitRepository {
         // pinned timeout (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never
         // waited out.
         #[allow(clippy::disallowed_methods)]
-        let output = command
-            .env("GIT_OBJECT_DIRECTORY", &scratch.path)
-            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", read)
-            .args(["merge-tree", "--write-tree", "--no-messages", target, head])
+        command
+            .env("GIT_OBJECT_DIRECTORY", &merge.scratch.path)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &merge.read)
+            .args(args)
             .output_locked()
             .await
-            .map_err(|error| git_spawn_error(&error));
-        let cleanup = scratch.cleanup().await;
-        let output = output?;
-        cleanup?;
-        match output.status.code() {
-            Some(0) => Ok(crate::landing::MergedTree::Clean(parse_oid(
-                parse_one_string(&output.stdout, "merge into the target")?,
-                "the merged tree",
-            )?)),
-            // Exit 1 is git's answer, not a failure: the merge conflicts.
-            Some(1) => Ok(crate::landing::MergedTree::Conflicted),
-            _ => Err(git_internal("merge into the target", &output)),
-        }
+            .map_err(|error| git_spawn_error(&error))
     }
 
     /// The tree `revision` records.
@@ -2196,37 +2231,284 @@ impl GitRepository {
         Ok(ContentNotHeld { paths, commits })
     }
 
-    /// The newest commit of `revision..head`, oldest first, up to which `revision` holds every
-    /// commit's own change: its change from its parent, held by the two proofs
-    /// [`Self::content_not_held`] applies to a whole branch (02_workspaces.md, `rm` step 1),
-    /// asked of one commit at a time. `None` when `revision` does not hold the first commit's
-    /// change, or when the range has a merge, whose history is not one line.
+    /// What a rebase of `head` onto `onto` does with each commit it replays, oldest first
+    /// (02_workspaces.md, "`cowshed rebase`"): the commits of `onto..head`, merges excepted, since a
+    /// rebase does not replay a merge. A commit whose own change, from its parent, `onto` already
+    /// holds by the two proofs `rm` trusts (02_workspaces.md, `rm` step 1), asked of that commit
+    /// alone, is held and left out: by patch identity, naming its twin in `onto`, or by content,
+    /// naming the commit of `onto` that changed its files last. Of the rest, one `drops` names is
+    /// dropped unheld; every other replays, conflict-expected with its paths when an in-memory
+    /// replay after the replays before it conflicts ([`Self::predict_conflicts`]).
     ///
     /// A unit stacked on another unit's commits still carries them after its lane folded them as
     /// rewritten twins, and replaying them over the lane's version conflicts wherever the lane
-    /// edited past them. A rebase replays from after this commit instead (`git rebase --onto
-    /// <revision> <it>`): every commit it skips has its change in `revision` by the proofs `rm`
-    /// trusts, so a skip never drops work, and an amended copy of a folded commit is not held and
-    /// replays.
-    pub async fn held_prefix(&self, revision: &str, head: &str) -> Result<Option<GitOid>> {
-        self.require_commits([revision, head]).await?;
+    /// edited past them: they are held, so they are left out. An amended copy of a folded commit
+    /// is not held and replays.
+    pub async fn replay_plan(
+        &self,
+        onto: &str,
+        head: &str,
+        drops: &[GitOid],
+    ) -> Result<Vec<crate::api::dto::ReplayedCommit>> {
+        use crate::api::dto::{HeldBy, ReplayStep, ReplayedCommit};
+
+        self.require_commits([onto, head]).await?;
         // Unrelated histories have no change of `head`'s to judge.
-        self.merge_base(revision, head).await?;
-        let listing = self.range_listing(revision, head).await?;
+        self.merge_base(onto, head).await?;
+        let listing = self.range_listing(onto, head).await?;
         let range = parse_range_listing(&listing)?;
-        if range.iter().any(|commit| commit.merge) {
+        let patch_held = self.held_commits(onto, head).await?;
+        let twins = if patch_held.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            self.patch_twins(onto, head).await?
+        };
+        let onto_tip = self.commit_oid(onto).await?;
+        let mut plan = Vec::with_capacity(range.len());
+        for commit in range.iter().filter(|commit| !commit.merge) {
+            let oid = parse_oid(commit.oid.to_owned(), "a commit the rebase replays")?;
+            let step = if patch_held.contains(commit.oid) {
+                ReplayStep::Held {
+                    by: HeldBy::PatchIdentity {
+                        holder: twins
+                            .get(commit.oid)
+                            .cloned()
+                            .unwrap_or_else(|| onto_tip.clone()),
+                    },
+                }
+            } else if self.holds_change(onto, commit.oid).await? {
+                ReplayStep::Held {
+                    by: HeldBy::Content {
+                        holder: self
+                            .last_change(onto, &commit.paths)
+                            .await?
+                            .unwrap_or_else(|| onto_tip.clone()),
+                    },
+                }
+            } else if drops.contains(&oid) {
+                ReplayStep::DroppedUnheld
+            } else {
+                ReplayStep::Replay
+            };
+            plan.push(ReplayedCommit {
+                oid,
+                subject: commit.subject.to_owned(),
+                step,
+            });
+        }
+        self.predict_conflicts(onto, &mut plan).await?;
+        Ok(plan)
+    }
+
+    /// Replay `plan`'s replays in memory onto `onto`'s tree, in order, each after the ones before
+    /// it (`git merge-tree --merge-base=<its parent>`), writing only into a scratch object store
+    /// ([`Self::merge_scratch`]). One whose merge conflicts becomes
+    /// [`crate::api::dto::ReplayStep::ConflictExpected`] naming its paths, and the replays after it
+    /// are predicted as if it had kept the destination's side.
+    async fn predict_conflicts(
+        &self,
+        onto: &str,
+        plan: &mut [crate::api::dto::ReplayedCommit],
+    ) -> Result<()> {
+        use crate::api::dto::ReplayStep;
+
+        if !plan.iter().any(|commit| commit.step == ReplayStep::Replay) {
+            return Ok(());
+        }
+        let mut tree = self.tree_of(onto).await?;
+        let merge = self.merge_scratch().await?;
+        let predicted = async {
+            for commit in plan
+                .iter_mut()
+                .filter(|commit| commit.step == ReplayStep::Replay)
+            {
+                let base = format!("--merge-base={}^", commit.oid.as_str());
+                let output = self
+                    .run_merging(
+                        &merge,
+                        [
+                            "merge-tree",
+                            "--write-tree",
+                            "--no-messages",
+                            "--name-only",
+                            "-z",
+                            base.as_str(),
+                            tree.as_str(),
+                            commit.oid.as_str(),
+                        ],
+                    )
+                    .await?;
+                let mut fields = output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter(|field| !field.is_empty());
+                match output.status.code() {
+                    Some(0) => {
+                        tree = parse_oid(
+                            String::from_utf8_lossy(fields.next().unwrap_or_default()).into_owned(),
+                            "a tree replayed in memory",
+                        )?;
+                    }
+                    // Exit 1 is git's answer: the replay conflicts. The tree it wrote holds the
+                    // conflict markers, so the next replays merge onto the tree before it.
+                    Some(1) => {
+                        let _conflicted = fields.next();
+                        commit.step = ReplayStep::ConflictExpected {
+                            paths: fields
+                                .map(|path| String::from_utf8_lossy(path).into_owned())
+                                .collect(),
+                        };
+                    }
+                    _ => return Err(git_internal("replay a commit in memory", &output)),
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let cleanup = merge.scratch.cleanup().await;
+        predicted?;
+        cleanup
+    }
+
+    /// The patch-equivalent commit of `head..onto` for each commit of `onto..head` that has one,
+    /// matched by `git patch-id` as `git cherry` matches them: the twin a plan names for a commit
+    /// it leaves out.
+    async fn patch_twins(
+        &self,
+        onto: &str,
+        head: &str,
+    ) -> Result<std::collections::BTreeMap<String, GitOid>> {
+        let theirs: std::collections::BTreeMap<String, String> = self
+            .patch_ids(&format!("{head}..{onto}"))
+            .await?
+            .into_iter()
+            .map(|(commit, id)| (id, commit))
+            .collect();
+        self.patch_ids(&format!("{onto}..{head}"))
+            .await?
+            .into_iter()
+            .filter_map(|(commit, id)| theirs.get(&id).map(|twin| (commit, twin.clone())))
+            .map(|(commit, twin)| Ok((commit, parse_oid(twin, "a patch twin")?)))
+            .collect()
+    }
+
+    /// Each non-merge commit of `range` with its patch id (`git patch-id`), newest first.
+    async fn patch_ids(&self, range: &str) -> Result<Vec<(String, String)>> {
+        let patches = self
+            .run([
+                "log",
+                "-p",
+                "--no-merges",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--format=commit %H",
+                range,
+            ])
+            .await?;
+        if !patches.status.success() {
+            return Err(git_internal("list the patches of a range", &patches));
+        }
+        if patches.stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = self.run_input(["patch-id"], patches.stdout).await?;
+        if !ids.status.success() {
+            return Err(git_internal("compute patch ids", &ids));
+        }
+        parse_lines(&ids.stdout, "patch id")?
+            .into_iter()
+            .map(|line| {
+                let (id, commit) = line.split_once(' ').ok_or_else(|| {
+                    CowshedError::integrity(
+                        format!("git reported an unreadable patch id line: {line}"),
+                        "repair the git installation",
+                    )
+                })?;
+                Ok((commit.to_owned(), id.to_owned()))
+            })
+            .collect()
+    }
+
+    /// The newest commit of `revision` that changed one of `paths`, when one did.
+    async fn last_change(&self, revision: &str, paths: &[&[u8]]) -> Result<Option<GitOid>> {
+        if paths.is_empty() {
             return Ok(None);
         }
-        let patch_held = self.held_commits(revision, head).await?;
-        let mut held = None;
-        for commit in &range {
-            if !patch_held.contains(commit.oid) && !self.holds_change(revision, commit.oid).await? {
-                break;
-            }
-            held = Some(commit.oid);
+        let mut args = vec![
+            OsString::from("--literal-pathspecs"),
+            OsString::from("log"),
+            OsString::from("-1"),
+            OsString::from("--format=%H"),
+            OsString::from(revision),
+            OsString::from("--"),
+        ];
+        args.extend(paths.iter().map(|path| OsStr::from_bytes(path).to_owned()));
+        let output = self.run(args).await?;
+        if !output.status.success() {
+            return Err(git_internal(
+                "find the commit that changed a file last",
+                &output,
+            ));
         }
-        held.map(|oid| parse_oid(oid.to_owned(), "a commit the destination holds"))
+        parse_lines(&output.stdout, "last change")?
+            .into_iter()
+            .next()
+            .map(|oid| parse_oid(oid, "the commit that changed a file last"))
             .transpose()
+    }
+
+    /// The commits of `base..recorded`, merges excepted, oldest first, that `head` has lost:
+    /// neither reachable from `head` nor held, by patch identity or content, by `head` or by
+    /// `holder`, the destination (02_workspaces.md, "`cowshed rebase`", "The recorded plan").
+    pub async fn lost_since(
+        &self,
+        base: &str,
+        recorded: &str,
+        head: &str,
+        holder: &str,
+    ) -> Result<Vec<CommitSubject>> {
+        let output = self
+            .run([
+                "log",
+                "--reverse",
+                "--no-merges",
+                "--format=%H%x00%s",
+                recorded,
+                &format!("^{base}"),
+                &format!("^{head}"),
+            ])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("list the recorded plan's commits", &output));
+        }
+        let candidates = parse_lines(&output.stdout, "a recorded commit")?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let by_head = self.held_commits(head, recorded).await?;
+        let by_holder = self.held_commits(holder, recorded).await?;
+        let mut lost = Vec::new();
+        for line in candidates {
+            let (oid, subject) = line.split_once('\0').ok_or_else(|| {
+                CowshedError::integrity(
+                    format!("git reported an unreadable commit line: {line}"),
+                    "repair the git installation",
+                )
+            })?;
+            if by_head.contains(oid)
+                || by_holder.contains(oid)
+                || self.holds_change(head, oid).await?
+                || self.holds_change(holder, oid).await?
+            {
+                continue;
+            }
+            lost.push(CommitSubject {
+                oid: parse_oid(oid.to_owned(), "a lost commit")?,
+                subject: subject.to_owned(),
+            });
+        }
+        Ok(lost)
     }
 
     /// Whether `revision` holds by content the change `commit` made to its parent: each file the

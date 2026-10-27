@@ -1074,9 +1074,12 @@ impl ProjectRuntimeHost for FakeHost {
                 "refresh and retry",
             ));
         }
-        Ok(cowshed_core::api::dto::RebaseReport {
-            oid: GitOid::new("1111111111111111111111111111111111111111")
-                .map_err(|error| CowshedError::internal(error.to_string()))?,
+        let head = GitOid::new("1111111111111111111111111111111111111111")
+            .map_err(|error| CowshedError::internal(error.to_string()))?;
+        Ok(cowshed_core::api::dto::RebaseReport::Rebased {
+            oid: head.clone(),
+            onto: head,
+            commits: Vec::new(),
         })
     }
 

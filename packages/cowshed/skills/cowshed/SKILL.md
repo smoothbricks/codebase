@@ -60,12 +60,14 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 | Inspect compile cache   | `cowshed sccache status`                                             | Check daemon health and cache hits before debugging misses.                                                                                                                                                                                |
 | Attach or detach        | `cowshed attach <ws>` / `cowshed detach <ws>`                        | Mount or park one session workspace.                                                                                                                                                                                                       |
 | Attach or detach all    | `cowshed attach --all` / `cowshed detach --all`                      | Mount or park all session workspaces.                                                                                                                                                                                                      |
-| Rebase                  | `cowshed rebase <ws>`                                                | Rebase the workspace branch onto main.                                                                                                                                                                                                     |
+| Rebase                  | `cowshed rebase <ws> [--into <lane>]`                                | Replay the branch onto main, or with `--into` a lane base's branch, by cowshed's plan: a commit the destination holds drops, a conflict stops in progress. Never `git rebase` in a shed.                                                   |
+| Plan a rebase           | `cowshed rebase <ws> [--into <lane>] --plan`                         | Each commit's fate before anything moves: replay, held-drop naming the commit that holds it, or conflict-expected naming its paths.                                                                                                        |
+| Resume a stopped rebase | `cowshed rebase <ws> --continue` / `cowshed rebase <ws> --abort`     | Stage the resolved paths and replay the rest, or put the branch back where the rebase started.                                                                                                                                             |
+| Drop commits            | `cowshed rebase <ws> --drop <commit>… [--drop-unheld]`               | Leave commits out of the replay; one the destination does not hold drops only with `--drop-unheld`, which names the loss.                                                                                                                  |
 | Preflight a land        | `cowshed land <ws> --preflight`                                      | Land's fences before its check, mutating nothing: exit 4 with land's own refusal (a dirty tree included), else 0.                                                                                                                          |
 | Land a declared repo    | `cowshed land <ws> [--no-push]`                                      | Where main declares `[land]`: turn, rebase, the repository's gate, fast-forward and retire, push.                                                                                                                                          |
 | Commit docs to main     | `cowshed doc-commit -m '<msg>' (--patch <file> \| --icm <program>)`  | Where main declares `[doc]`: one Markdown edit under the ref turn, no shed, no gate.                                                                                                                                                       |
 | Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Check, fast-forward main, and retire on success.                                                                                                                                                                                           |
-| Rebase within a lane    | `cowshed rebase <ws> --into <lane>`                                  | Optional: take lane-mates' work before landing, by Git alone. An ungated land rebases by itself.                                                                                                                                           |
 | Fold into a lane base   | `cowshed land <ws> --into <lane> --ungated`                          | Rebase onto the lane base's branch, fast-forward it by Git alone, and retire; the lane base's own land into main gates. Main refuses it.                                                                                                   |
 | Deliver a branch        | `cowshed push <ws> --branch <name>`                                  | Put the workspace branch in main's repository for review.                                                                                                                                                                                  |
 | Retire                  | `cowshed rm <ws>`                                                    | Remove a shed whose work main holds or `push` preserved; a containment refusal names commits to fold into the batch.                                                                                                                       |
@@ -85,11 +87,18 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 1. Work and commit in the shed. Never reuse sheds across tasks.
 2. A repository whose main `.cowshed.toml` declares `[land]` lands by one verb: `cowshed land <ws>` takes its land turn,
    rebases onto main, runs the repository's declared gate on the host, fast-forwards (rebasing and gating again if main
-   moved), then retires, pushes and runs its after-land commands detached (`--no-push` skips the push). Resolve a rebase
-   conflict in the shed and land again. Its Markdown commits go `cowshed doc-commit -m '<msg>' --patch <file>` or
-   `--icm <program>`, in main: no shed, no gate, under the ref turn only.
-3. Elsewhere: `cowshed rebase <ws>` onto current main, resolve conflicts in the shed, then
-   `cowshed land <ws> --check '<cmd>'` (repeatable; runs inside the sandbox after grant sync).
+   moved), then retires, pushes and runs its after-land commands detached (`--no-push` skips the push). A rebase
+   conflict stops the land with the shed as it was: `cowshed rebase <ws>`, resolve the paths it stops at,
+   `cowshed rebase <ws> --continue`, and land again. Its Markdown commits go
+   `cowshed doc-commit -m '<msg>' --patch <file>` or `--icm <program>`, in main: no shed, no gate, under the ref turn
+   only.
+3. Elsewhere: `cowshed rebase <ws>` onto current main (resolve a conflict it stops at, then `--continue`), then
+   `cowshed land <ws> --check '<cmd>'` (repeatable; runs inside the sandbox after grant sync). Move a shed's commits
+   only with `cowshed rebase` and folds, never `git rebase`, `git reset` or `git rebase --skip` by hand: cowshed drops
+   only what the destination holds and says so (`replayed N, dropped K held (…), dropped U unheld (…)`). Read
+   `cowshed rebase <ws> --plan` first. A commit the plan cowshed last recorded carried, which the branch then lost and
+   nothing else holds, stops the next rebase, land, fold or `rm` until it is restored or named with
+   `cowshed rebase <ws> --drop <commit> --drop-unheld`.
 4. A successful land retires by default. If retire was refused after the fast-forward, main already moved: run
    `cowshed rm <ws>`, never land again. With `--no-retire`, `rm` once main contains HEAD and every other local branch (a
    fork keeps only `cowshed/<ws>`; one branch per shed); after `push`, `rm` once the pushed ref keeps HEAD: it is that
@@ -122,13 +131,13 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
    `cowshed rebase <unit> --into <batch>`, Git alone.
 3. Fold every finished unit as soon as it is done: `cowshed land <unit> --into <batch> --ungated`. It is Git alone, in
    one command. It rebases the unit onto the batch's branch, fast-forwards the batch and retires the unit's shed, so a
-   finished unit never stays mounted. The rebase replays only the unit's own work: a commit the batch already holds by
-   patch drops out, and a unit stacked on another unit's commits, folded before it, replays from after them, since the
-   batch holds their change (by patch or by content, one commit at a time). It runs no check and does no Nx cache
-   initialization, seed freeze or build-volume adoption: the batch keeps its own volume and seed, and the unit's volume
-   is released with the unit. A conflict stops it before anything moves, names the paths and the replay that conflicted,
-   and leaves the unit as it was: resolve it in the unit and run the same `cowshed land` again. `--ungated` needs
-   `--into <batch>` (main refuses it) and conflicts with `--check` and `--push-only`.
+   finished unit never stays mounted. The rebase replays only the unit's own work: a commit whose change the batch
+   already holds, by patch or by content, drops out, so a unit stacked on units folded before it replays only its own
+   commits. It runs no check and does no Nx cache initialization, seed freeze or build-volume adoption: the batch keeps
+   its own volume and seed, and the unit's volume is released with the unit. A conflict stops it before anything moves
+   and names the paths, leaving the unit as it was: `cowshed rebase <unit> --into <batch>`, resolve the paths it stops
+   at, `cowshed rebase <unit> --continue`, then fold again. `--ungated` needs `--into <batch>` (main refuses it) and
+   conflicts with `--check` and `--push-only`.
 4. Gate once, when the round's units are folded: land the batch like any shed (Merge flow step 3), with
    `cowshed rebase <batch>` and then `cowshed land <batch> --check '<bare command>'`, or through the repository's own
    land route. That one gate builds every unit together.

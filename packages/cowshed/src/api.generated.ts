@@ -910,6 +910,16 @@ export type FenceRefusal =
     })
   | ({ readonly reason: 'replayConflicted' } & {
       readonly rolledBackTo: GitOid;
+    })
+  | ({ readonly reason: 'replayStopped' } & {
+      readonly at: GitOid;
+      readonly paths: ReadonlyArray<string>;
+    })
+  | ({ readonly reason: 'recordedWorkLost' } & {
+      readonly commits: ReadonlyArray<GitOid>;
+    })
+  | ({ readonly reason: 'dropUnheld' } & {
+      readonly commits: ReadonlyArray<GitOid>;
     });
 
 export type Finding = {
@@ -1192,6 +1202,15 @@ export type HeldBirth =
   | ({ readonly kind: 'unobserved' } & {
       readonly reason: string;
     });
+
+export type HeldBy =
+  | ({ readonly proof: 'patchIdentity' } & {
+      readonly holder: GitOid;
+    })
+  | ({ readonly proof: 'content' } & {
+      readonly holder: GitOid;
+    })
+  | { readonly proof: 'emptied' };
 
 /**
  * The kernel's name of one descriptor the leader was handed, read from the holder's own copy,
@@ -2782,15 +2801,43 @@ export type RebaseOptions = {
   readonly expectedWorkspaceIncarnation?: WorkspaceIncarnation;
   readonly expectedSourceHead?: GitOid;
   readonly expectedOntoHead?: GitOid;
+  /**
+   * Answer what the rebase would do and write nothing (`--plan`): [`RebaseReport::Planned`].
+   */
+  readonly plan?: boolean;
+  /**
+   * Commits to leave out of the replay (`--drop`). One the destination does not hold, by content
+   * or patch identity, is refused unless `drop_unheld` names the loss; a commit the last plan
+   * cowshed recorded carried and the branch has since lost is named here the same way.
+   */
+  readonly drop?: ReadonlyArray<GitOid>;
+  /**
+   * `--drop-unheld`: drop the commits of `drop` the destination does not hold, losing them.
+   */
+  readonly dropUnheld?: boolean;
+  /**
+   * Finish or undo the rebase this verb stopped at a conflict (`--continue`, `--abort`).
+   */
+  readonly resume?: RebaseResume;
 };
 
 /**
- * What `cowshed rebase` did: the workspace's new head. A rebase is Git alone
- * (02_workspaces.md, "`cowshed rebase`").
+ * What `cowshed rebase` did. A rebase is Git alone (02_workspaces.md, "`cowshed rebase`").
  */
-export type RebaseReport = {
-  readonly oid: GitOid;
-};
+export type RebaseReport =
+  | ({ readonly kind: 'rebased' } & {
+      readonly oid: GitOid;
+      readonly onto: GitOid;
+      readonly commits: ReadonlyArray<ReplayedCommit>;
+    })
+  | ({ readonly kind: 'planned' } & {
+      readonly oid: GitOid;
+      readonly onto: GitOid;
+      readonly commits: ReadonlyArray<ReplayedCommit>;
+    })
+  | ({ readonly kind: 'aborted' } & {
+      readonly oid: GitOid;
+    });
 
 /**
  * A unit's rebase: the unit, what it lands into (main when absent), and its options.
@@ -2801,6 +2848,11 @@ export type RebaseRequest = {
   readonly into?: WorkspaceTarget;
   readonly options: RebaseOptions;
 };
+
+/**
+ * The rebase a conflict stopped, carried on (02_workspaces.md, "`cowshed rebase`").
+ */
+export type RebaseResume = 'continue' | 'abort';
 
 /**
  * `cowshed gc --recover <image> --to <dir>`: move the recovery image at `image`, one of the
@@ -2961,6 +3013,25 @@ export type RemoveReport = {
 export type RemovedWorkspace = {
   readonly workspace: WorkspaceName;
   readonly report: RemoveReport;
+};
+
+export type ReplayStep =
+  | { readonly kind: 'replay' }
+  | ({ readonly kind: 'conflictExpected' } & {
+      readonly paths: ReadonlyArray<string>;
+    })
+  | ({ readonly kind: 'held' } & {
+      readonly by: HeldBy;
+    })
+  | { readonly kind: 'droppedUnheld' };
+
+/**
+ * One commit of the branch a rebase replays, and what the rebase does with it.
+ */
+export type ReplayedCommit = {
+  readonly oid: GitOid;
+  readonly subject: string;
+  readonly step: ReplayStep;
 };
 
 /**

@@ -4740,7 +4740,7 @@ async fn an_ungated_fold_into_a_lane_base_is_git_alone(
     let envelope: JsonEnvelope<RebaseReport> = serde_json::from_slice(&stdout).unwrap();
     let rebased = envelope.result().expect("a successful rebase").clone();
     let unit_head = git_stdout(&unit, &["rev-parse", "HEAD"]);
-    assert_eq!(rebased.oid.as_str(), unit_head);
+    assert_eq!(rebased.oid().as_str(), unit_head);
     // A lane-mate's work lands in the lane base after that rebase, so the unit is behind it again.
     fs::write(lane.join("lane.txt"), b"lane-mate\n").unwrap();
     git(&lane, &["add", "lane.txt"]);

@@ -1071,8 +1071,10 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         folded: Vec::new(),
         ..land_first.clone()
     };
-    let rebased = RebaseReport {
+    let rebased = RebaseReport::Rebased {
         oid: oid("7777777777777777777777777777777777777777"),
+        onto: oid("8888888888888888888888888888888888888888"),
+        commits: Vec::new(),
     };
 
     let push_new = PushReport {

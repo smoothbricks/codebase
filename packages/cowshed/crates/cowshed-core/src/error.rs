@@ -410,6 +410,23 @@ pub enum FenceRefusal {
     ReplayConflicted {
         rolled_back_to: crate::api::dto::GitOid,
     },
+    /// The replay of `at` conflicted in these paths and stopped there, in progress: resolve them,
+    /// then `cowshed rebase --continue`, or `--abort` to return to the head it started from.
+    ReplayStopped {
+        at: crate::api::dto::GitOid,
+        paths: Vec<String>,
+    },
+    /// The branch has lost these commits since the plan cowshed last recorded for it, and
+    /// neither it nor the destination holds their change: restore them, or name the loss with
+    /// `cowshed rebase --drop <commit>… --drop-unheld`.
+    RecordedWorkLost {
+        commits: Vec<crate::api::dto::GitOid>,
+    },
+    /// `--drop` named these commits, which the destination does not hold, without
+    /// `--drop-unheld`.
+    DropUnheld {
+        commits: Vec<crate::api::dto::GitOid>,
+    },
 }
 
 impl FenceRefusal {

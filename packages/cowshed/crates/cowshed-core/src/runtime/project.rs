@@ -7903,6 +7903,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// abandonment and there is genuinely something to abandon, and the ref that keeps the head when
     /// one does: the caller bundles before deleting, and the deletion log names the only copy that
     /// survives.
+    ///
+    /// A branch that has lost commits since the plan cowshed last recorded for it, which neither it
+    /// nor the target holds, is refused first (02_workspaces.md, "`cowshed rebase`", "The recorded
+    /// plan"): the image is the one place that still knows them. `--abandon` loses them too, and
+    /// says so.
     async fn require_session_landed(
         &self,
         workspace: &WorkspaceName,
@@ -7910,6 +7915,36 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         abandon: bool,
         containment: &NativeContainment,
     ) -> Result<NativeLandedAuthority> {
+        let store_root = std::sync::Arc::clone(self.git.store_root());
+        let target_tip = git_optional_ref_oid(
+            &store_root,
+            &containment.mount,
+            &format!("refs/heads/{}", containment.branch),
+        )
+        .await?;
+        let target_objects = crate::git::GitRepository::from_root(&store_root, &containment.mount)
+            .object_directory()
+            .await?;
+        let lost = recorded_losses(
+            &store_root,
+            &self.workspace_mount_path(workspace)?,
+            &fence.head,
+            target_tip
+                .as_ref()
+                .map_or(fence.head.as_str(), GitOid::as_str),
+            Some(&target_objects),
+        )
+        .await?;
+        if !lost.is_empty() {
+            if !abandon {
+                return Err(recorded_work_lost(workspace, &lost));
+            }
+            cowshed_os::eprintln!(
+                "cowshed: --abandon also loses what {workspace}'s branch lost since its recorded \
+                 plan: {}",
+                named_commits(&lost)
+            );
+        }
         let landed = self
             .landed_state(workspace, &fence.head, containment)
             .await?;
@@ -11713,9 +11748,10 @@ mod rebase_recovery_tests {
         );
         assert!(
             error.hint.contains("rolled back")
-                && error.hint.contains("git rebase main")
+                && error.hint.contains("cowshed rebase --continue")
+                && !error.hint.contains("git rebase")
                 && error.hint.contains("it conflicted in README.md"),
-            "the hint names the by-hand replay, not markers the rollback removed: {}",
+            "the hint names cowshed's own replay, never a by-hand git rebase: {}",
             error.hint
         );
         assert_eq!(
@@ -13077,6 +13113,275 @@ mod rebase_recovery_tests {
         );
     }
 
+    /// A unit stacked on a folded unit, with a commit of its own and one the lane conflicts with,
+    /// beside the lane's tip: answers the lane, the unit, the lane's tip and the unit's head.
+    async fn a_stacked_unit_with_its_own_and_a_conflicting_commit(
+        label: &str,
+    ) -> (Lane, PathBuf, GitOid, GitOid, String) {
+        let (lane, stacked, tip) = a_lane_edited_past_a_folded_unit(label).await;
+        let store_root = lane.store.shared();
+        commit_contents(&stacked, "own.txt", "own\n", "own");
+        commit_contents(&stacked, "shared.txt", "a\n1\nfirst\nmine\n2\nb\n", "mine");
+        let head = git_oid(store_root, &stacked).await.expect("stacked head");
+        let onto = fetch_target_branch(store_root, &stacked, &lane.lane, &Lane::name("lane"))
+            .await
+            .expect("fetch the lane base's branch");
+        (lane, stacked, tip, head, onto)
+    }
+
+    /// `cowshed rebase --plan` (02_workspaces.md "`cowshed rebase`"): the folded commit is held by
+    /// the lane's content, naming the lane commit that changed its file last, the unit's own
+    /// commit replays, and the commit the lane conflicts with is expected to conflict in its path.
+    /// Planning moves nothing: no head, no rebase state, no recorded plan.
+    #[tokio::test]
+    async fn a_plan_names_what_each_commit_does_and_moves_nothing() {
+        use crate::api::dto::{HeldBy, ReplayStep};
+
+        let (lane, stacked, tip, head, onto) =
+            a_stacked_unit_with_its_own_and_a_conflicting_commit("plan").await;
+        let store_root = lane.store.shared();
+        let plan = crate::git::GitRepository::from_root(store_root, &stacked)
+            .replay_plan(&onto, head.as_str(), &[])
+            .await
+            .expect("plan the replay");
+        let steps: Vec<(&str, &ReplayStep)> = plan
+            .iter()
+            .map(|commit| (commit.subject.as_str(), &commit.step))
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (
+                    "first",
+                    &ReplayStep::Held {
+                        by: HeldBy::Content { holder: tip }
+                    }
+                ),
+                ("own", &ReplayStep::Replay),
+                (
+                    "mine",
+                    &ReplayStep::ConflictExpected {
+                        paths: vec![String::from("shared.txt")]
+                    }
+                ),
+            ]
+        );
+        assert_eq!(git_oid(store_root, &stacked).await.expect("head"), head);
+        assert!(!stacked.join(".git/rebase-merge").exists());
+        assert_eq!(
+            git_optional_ref_oid(store_root, &stacked, RECORDED_HEAD)
+                .await
+                .expect("read the record"),
+            None
+        );
+    }
+
+    /// A replay that conflicts stops in progress, naming the commit and its path; once the path is
+    /// resolved, `--continue` stages it and finishes, the held commit left out, and records the
+    /// plan of the branch it left.
+    #[tokio::test]
+    async fn a_conflict_stops_the_replay_and_continue_finishes_it() {
+        let (lane, stacked, tip, head, onto) =
+            a_stacked_unit_with_its_own_and_a_conflicting_commit("stop").await;
+        let store_root = lane.store.shared();
+        let plan = crate::git::GitRepository::from_root(store_root, &stacked)
+            .replay_plan(&onto, head.as_str(), &[])
+            .await
+            .expect("plan the replay");
+        let stopped = replay(store_root, &stacked, &onto, &head, plan, ConflictEnd::Stop)
+            .await
+            .expect_err("mine conflicts with the lane");
+        assert_eq!(
+            stopped.fence_source(),
+            Some(&FenceRefusal::ReplayStopped {
+                at: head.clone(),
+                paths: vec![String::from("shared.txt")],
+            })
+        );
+        assert!(
+            stopped.hint.contains("cowshed rebase --continue")
+                && !stopped.hint.contains("git rebase "),
+            "{}",
+            stopped.hint
+        );
+        assert!(stacked.join(".git/rebase-merge").exists());
+
+        let refused = resume_rebase(
+            store_root,
+            &stacked,
+            &Lane::name("stop"),
+            crate::api::dto::RebaseResume::Continue,
+        )
+        .await
+        .expect_err("the markers are still there");
+        assert!(
+            refused.message.contains("shared.txt"),
+            "{}",
+            refused.message
+        );
+
+        std::fs::write(
+            stacked.join("shared.txt"),
+            "A\n1\nfirst\nsecond\nmine\n2\nb\n",
+        )
+        .expect("resolve the conflict");
+        let RebaseReport::Rebased {
+            oid,
+            onto: based,
+            commits,
+        } = resume_rebase(
+            store_root,
+            &stacked,
+            &Lane::name("stop"),
+            crate::api::dto::RebaseResume::Continue,
+        )
+        .await
+        .expect("continue finishes the replay")
+        else {
+            panic!("a finished continue answers the rebased head");
+        };
+        assert_eq!(based, tip);
+        assert_eq!(
+            crate::api::dto::ReplayedCommit::summary(&commits),
+            format!(
+                "replayed 2, dropped 1 held ({}), dropped 0 unheld",
+                &commits[0].oid.as_str()[..10]
+            )
+        );
+        assert_eq!(
+            git_revision_oid(store_root, &stacked, "HEAD~2")
+                .await
+                .expect("base"),
+            tip
+        );
+        assert!(!stacked.join(".git/rebase-merge").exists());
+        assert!(!stacked.join(".git").join(STOPPED_REBASE).exists());
+        assert_eq!(
+            git_optional_ref_oid(store_root, &stacked, RECORDED_HEAD)
+                .await
+                .expect("read the record"),
+            Some(oid)
+        );
+    }
+
+    /// `--abort` of a stopped replay puts the branch back exactly where it started.
+    #[tokio::test]
+    async fn abort_puts_a_stopped_replay_back_where_it_started() {
+        let (lane, stacked, _, head, onto) =
+            a_stacked_unit_with_its_own_and_a_conflicting_commit("abort").await;
+        let store_root = lane.store.shared();
+        let plan = crate::git::GitRepository::from_root(store_root, &stacked)
+            .replay_plan(&onto, head.as_str(), &[])
+            .await
+            .expect("plan the replay");
+        replay(store_root, &stacked, &onto, &head, plan, ConflictEnd::Stop)
+            .await
+            .expect_err("mine conflicts with the lane");
+        assert_eq!(
+            resume_rebase(
+                store_root,
+                &stacked,
+                &Lane::name("abort"),
+                crate::api::dto::RebaseResume::Abort,
+            )
+            .await
+            .expect("abort"),
+            RebaseReport::Aborted { oid: head.clone() }
+        );
+        assert_eq!(git_oid(store_root, &stacked).await.expect("head"), head);
+        assert!(!stacked.join(".git/rebase-merge").exists());
+        assert!(!stacked.join(".git").join(STOPPED_REBASE).exists());
+        assert_eq!(
+            String::from_utf8_lossy(&git(&stacked, &["symbolic-ref", "--short", "HEAD"]).stdout)
+                .trim(),
+            "cowshed/abort-stacked"
+        );
+    }
+
+    /// The loss this guards against, as it happened: a land's replay conflicts and rolls back,
+    /// recording the head it started from; a by-hand reset then drops the unit's unlanded
+    /// commits. The next land refuses, naming them, and only `--drop … --drop-unheld` names the
+    /// loss and lets it go.
+    #[tokio::test]
+    async fn a_land_refuses_a_unit_whose_branch_lost_a_recorded_commit() {
+        let lane = Lane::new("lost");
+        let store_root = lane.store.shared();
+        let unit = lane.unit("unit");
+        commit_file(&unit, "unit\n", "unit rewrites the readme");
+        let rewrite = git_oid(store_root, &unit).await.expect("rewrite");
+        unit_commit(&unit, "keep.txt", "unlanded work");
+        let source_head = git_oid(store_root, &unit).await.expect("unit head");
+        commit_file(&lane.lane, "lane\n", "lane-mate rewrites the readme");
+        let land = |head: GitOid| {
+            let (unit, lane_root) = (unit.clone(), lane.lane.clone());
+            async move {
+                rebase_onto_target_branch(
+                    store_root,
+                    &Lane::name("unit"),
+                    &unit,
+                    &lane_root,
+                    &Lane::name("lane"),
+                    "cowshed/lane",
+                    &head,
+                )
+                .await
+            }
+        };
+        let conflicted = land(source_head.clone())
+            .await
+            .expect_err("the replay conflicts");
+        assert!(matches!(
+            conflicted.fence_source(),
+            Some(FenceRefusal::ReplayConflicted { .. })
+        ));
+
+        run_git(
+            &unit,
+            &["reset", "--hard", "refs/cowshed/targets/lane/cowshed/lane"],
+        );
+        let dropped = git_oid(store_root, &unit).await.expect("dropped head");
+        let refused = land(dropped.clone())
+            .await
+            .expect_err("the unit lost recorded commits");
+        assert_eq!(
+            refused.fence_source(),
+            Some(&FenceRefusal::RecordedWorkLost {
+                commits: vec![rewrite.clone(), source_head.clone()],
+            })
+        );
+        assert!(
+            refused.hint.contains("--drop-unheld"),
+            "the refusal names the way to accept the loss: {}",
+            refused.hint
+        );
+
+        let lost = recorded_losses(store_root, &unit, &dropped, dropped.as_str(), None)
+            .await
+            .expect("read the losses");
+        let named = |drop_unheld: bool| RebaseOptions {
+            drop: vec![rewrite.clone(), source_head.clone()],
+            drop_unheld,
+            ..RebaseOptions::default()
+        };
+        let mut plan = Vec::new();
+        let unaccepted = judge_drops(&Lane::name("unit"), &mut plan, lost.clone(), &named(false))
+            .expect_err("naming the loss takes --drop-unheld");
+        assert!(matches!(
+            unaccepted.fence_source(),
+            Some(FenceRefusal::DropUnheld { .. })
+        ));
+        judge_drops(&Lane::name("unit"), &mut plan, lost, &named(true))
+            .expect("--drop-unheld names the loss");
+        assert_eq!(
+            crate::api::dto::ReplayedCommit::summary(&plan),
+            format!(
+                "replayed 0, dropped 0 held, dropped 2 unheld ({}, {})",
+                &rewrite.as_str()[..10],
+                &source_head.as_str()[..10]
+            )
+        );
+    }
+
     /// `cowshed land unit --into lane --ungated` with the lane base moved past the unit's base
     /// (02_workspaces.md "`cowshed land`", `--ungated`): the land's rebase replays the unit onto
     /// the lane base's tip, and the same land fast-forwards the lane base to it. Had the lane base
@@ -13126,8 +13431,9 @@ mod rebase_recovery_tests {
             behind.hint
         );
 
-        let landing = rebase_onto_target_branch(
+        let (landing, commits) = rebase_onto_target_branch(
             store_root,
+            &Lane::name("unit"),
             &unit,
             &lane.lane,
             &Lane::name("lane"),
@@ -13136,6 +13442,10 @@ mod rebase_recovery_tests {
         )
         .await
         .expect("the land's rebase replays the unit onto the lane base");
+        assert_eq!(
+            crate::api::dto::ReplayedCommit::summary(&commits),
+            "replayed 1, dropped 0 held, dropped 0 unheld"
+        );
         assert_ne!(landing, source_head, "the unit's commit was replayed");
         assert_eq!(
             git_oid(store_root, &unit).await.expect("unit head"),
@@ -13168,8 +13478,9 @@ mod rebase_recovery_tests {
         unit_commit(&unit, "unit.txt", "unit work");
         let source_head = git_oid(store_root, &unit).await.expect("unit head");
 
-        let landing = rebase_onto_target_branch(
+        let (landing, commits) = rebase_onto_target_branch(
             store_root,
+            &Lane::name("unit"),
             &unit,
             &lane.lane,
             &Lane::name("lane"),
@@ -13178,6 +13489,7 @@ mod rebase_recovery_tests {
         )
         .await
         .expect("a based unit needs no rebase");
+        assert!(commits.is_empty(), "nothing was planned: {commits:?}");
         assert_eq!(landing, source_head);
         assert!(
             !git(
@@ -13235,6 +13547,7 @@ mod rebase_recovery_tests {
 
         let refused = rebase_onto_target_branch(
             store_root,
+            &Lane::name("unit"),
             &unit,
             &lane.lane,
             &Lane::name("lane"),
@@ -13252,10 +13565,9 @@ mod rebase_recovery_tests {
         );
         assert!(
             refused.hint.contains("it conflicted in README.md")
-                && refused
-                    .hint
-                    .contains("git rebase refs/cowshed/targets/lane/cowshed/lane"),
-            "the refusal names the conflicted path and the by-hand replay: {}",
+                && refused.hint.contains("cowshed rebase --continue")
+                && !refused.hint.contains("git rebase"),
+            "the refusal names the conflicted path and cowshed's own replay: {}",
             refused.hint
         );
         assert_eq!(
@@ -15997,6 +16309,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
             Self::require_exact_incarnation(&current, expected)?;
         }
+        if let Some(resume) = options.resume {
+            let root = current_snapshot_mount(self, &current)?;
+            return resume_rebase(store_root, &root, &workspace, resume).await;
+        }
         let into = self
             .landing_into(&workspace, into, DetachedTarget::Attach)
             .await?;
@@ -16044,9 +16360,39 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         };
         let onto_head = git_revision_oid(store_root, &root, &onto).await?;
         require_onto_head(options.expected_onto_head.as_ref(), &onto, &onto_head)?;
-        run_git_rebase_atomically(store_root, &root, &onto, &source_head).await?;
+        let mut plan = crate::git::GitRepository::from_root(store_root, &root)
+            .replay_plan(onto_head.as_str(), source_head.as_str(), &options.drop)
+            .await?;
+        let lost =
+            recorded_losses(store_root, &root, &source_head, onto_head.as_str(), None).await?;
+        judge_drops(&workspace, &mut plan, lost, &options)?;
+        if options.plan {
+            return Ok(RebaseReport::Planned {
+                oid: source_head,
+                onto: onto_head,
+                commits: plan,
+            });
+        }
+        // Recorded before the replay: a replay stopped at a conflict and then finished by hand is
+        // judged against the branch it started from.
+        let base = git_merge_base(store_root, &root, &onto_head, &source_head).await?;
+        record_plan(store_root, &root, base.as_str(), source_head.as_str()).await?;
+        let commits = replay(
+            store_root,
+            &root,
+            onto_head.as_str(),
+            &source_head,
+            plan,
+            ConflictEnd::Stop,
+        )
+        .await?;
         let oid = git_oid(store_root, &root).await?;
-        Ok(RebaseReport { oid })
+        record_plan(store_root, &root, onto_head.as_str(), oid.as_str()).await?;
+        Ok(RebaseReport::Rebased {
+            oid,
+            onto: onto_head,
+            commits,
+        })
     }
 
     async fn land(
@@ -16144,11 +16490,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let source_head = match plan {
             LandPlan::Gated => source_head,
             LandPlan::Ungated => {
-                let landing = timed_async(
+                let (landing, commits) = timed_async(
                     "land",
                     "rebase",
                     rebase_onto_target_branch(
                         store_root,
+                        &workspace,
                         &source_mount,
                         &into.root,
                         &into.name,
@@ -16166,8 +16513,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 })?;
                 if landing != source_head {
                     cowshed_os::eprintln!(
-                        "cowshed: rebased {workspace} onto {}'s {target_branch}: landing {landing}, replayed from {source_head}",
-                        into.name
+                        "cowshed: rebased {workspace} onto {}'s {target_branch}: landing {landing}, replayed from {source_head}: {}",
+                        into.name,
+                        crate::api::dto::ReplayedCommit::summary(&commits)
                     );
                 }
                 landing
@@ -20568,28 +20916,31 @@ async fn fetch_target_ref(
 }
 
 /// An ungated land's rebase (02_workspaces.md "`cowshed land`", `--ungated`), answering the head
-/// the land fast-forwards its lane base to. A unit whose head already holds the tip of the lane
-/// base's `target_branch`, or whose target branch has no commit yet, is based on it and lands as
-/// it is: nothing is fetched and nothing replayed. Otherwise the branch is fetched into the unit,
-/// as `rebase --into` fetches it, and the unit is replayed onto it by Git alone; a replay that
-/// conflicts is rolled back and refused as the rebase refuses it, naming the conflicted paths,
-/// with the unit as it was.
+/// the land fast-forwards its lane base to and what became of each commit it replayed. A unit
+/// whose head already holds the tip of the lane base's `target_branch`, or whose target branch has
+/// no commit yet, is based on it and lands as it is: nothing is fetched and nothing replayed.
+/// Otherwise the branch is fetched into the unit, as `rebase --into` fetches it, and the unit is
+/// replayed onto it by Git alone, as `cowshed rebase` plans it; a replay that conflicts is rolled
+/// back and refused, naming the conflicted paths, with the unit as it was. Either way a unit whose
+/// branch has lost commits since the plan cowshed last recorded for it, which neither it nor the
+/// lane base holds, does not land: its fold would retire the one branch that knew them.
 #[cfg(target_os = "macos")]
 async fn rebase_onto_target_branch(
     store_root: &std::sync::Arc<Path>,
+    unit: &WorkspaceName,
     unit_root: &Path,
     target_root: &Path,
     target: &WorkspaceName,
     target_branch: &str,
     source_head: &GitOid,
-) -> Result<GitOid> {
+) -> Result<(GitOid, Vec<crate::api::dto::ReplayedCommit>)> {
     let tip = git_optional_ref_oid(
         store_root,
         target_root,
         &format!("refs/heads/{target_branch}"),
     )
     .await?;
-    let based = match tip {
+    let based = match tip.as_ref() {
         None => true,
         Some(tip) => {
             crate::git::GitRepository::from_root(store_root, unit_root)
@@ -20597,12 +20948,48 @@ async fn rebase_onto_target_branch(
                 .await?
         }
     };
-    if based {
-        return Ok(source_head.clone());
+    let onto = if based {
+        None
+    } else {
+        Some(fetch_target_ref(store_root, unit_root, target_root, target, target_branch).await?)
+    };
+    let holder = onto
+        .as_deref()
+        .or(tip.as_ref().map(GitOid::as_str))
+        .unwrap_or(source_head.as_str());
+    let lost = recorded_losses(store_root, unit_root, source_head, holder, None).await?;
+    if !lost.is_empty() {
+        return Err(recorded_work_lost(unit, &lost));
     }
-    let onto = fetch_target_ref(store_root, unit_root, target_root, target, target_branch).await?;
-    run_git_rebase_atomically(store_root, unit_root, &onto, source_head).await?;
-    git_oid(store_root, unit_root).await
+    let Some(onto) = onto else {
+        return Ok((source_head.clone(), Vec::new()));
+    };
+    let onto_head = git_revision_oid(store_root, unit_root, &onto).await?;
+    let base = git_merge_base(store_root, unit_root, &onto_head, source_head).await?;
+    record_plan(store_root, unit_root, base.as_str(), source_head.as_str()).await?;
+    let commits =
+        run_git_rebase_atomically(store_root, unit_root, onto_head.as_str(), source_head).await?;
+    let landing = git_oid(store_root, unit_root).await?;
+    record_plan(store_root, unit_root, onto_head.as_str(), landing.as_str()).await?;
+    Ok((landing, commits))
+}
+
+/// Where `head` left `onto`: their merge base, in the repository at `root`.
+#[cfg(target_os = "macos")]
+async fn git_merge_base(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    onto: &GitOid,
+    head: &GitOid,
+) -> Result<GitOid> {
+    let output = invoke_git(
+        store_root,
+        root,
+        &["merge-base", onto.as_str(), head.as_str()],
+    )
+    .await?;
+    require_git_success("find where the branch left its destination", &output)?;
+    GitOid::new(String::from_utf8_lossy(&output.stdout).trim_end()).map_err(native_integrity_error)
 }
 
 /// A rebase has one destination: what the unit lands into, or an explicit revision.
@@ -20914,13 +21301,98 @@ async fn invoke_git(
     })
 }
 
+/// How a replay that conflicts ends: stopped in progress, for `cowshed rebase --continue` or
+/// `--abort` (the rebase verb), or rolled back with the workspace as it was (a land's replay,
+/// which leaves no unit half-replayed).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConflictEnd {
+    Stop,
+    RollBack,
+}
+
+/// The file in the workspace's git directory a replay's todo is written to, for git's sequence
+/// editor to copy over its own.
+#[cfg(target_os = "macos")]
+const REBASE_TODO: &str = "cowshed-rebase-todo";
+
+/// The file in the workspace's git directory that names the rebase cowshed started, from before
+/// its replay until the replay ends: what `--continue` and `--abort` resume, and the proof that a
+/// stopped rebase is cowshed's to carry on.
+#[cfg(target_os = "macos")]
+const STOPPED_REBASE: &str = "cowshed-rebase.json";
+
+/// The plan cowshed last recorded for a workspace's branch (02_workspaces.md, "`cowshed rebase`",
+/// "The recorded plan"): the branch's head and where it left its destination. Per-worktree refs,
+/// so a git-worktree workspace's record is its own.
+#[cfg(target_os = "macos")]
+const RECORDED_BASE: &str = "refs/worktree/cowshed-plan/base";
+#[cfg(target_os = "macos")]
+const RECORDED_HEAD: &str = "refs/worktree/cowshed-plan/head";
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoppedRebase {
+    source_ref: String,
+    source_head: GitOid,
+    onto: GitOid,
+    commits: Vec<crate::api::dto::ReplayedCommit>,
+}
+
+/// Whether a plan's step picks its commit.
+#[cfg(target_os = "macos")]
+fn replays(step: &crate::api::dto::ReplayStep) -> bool {
+    matches!(
+        step,
+        crate::api::dto::ReplayStep::Replay | crate::api::dto::ReplayStep::ConflictExpected { .. }
+    )
+}
+
+/// Replay the branch at `source_head` onto `onto` as [`crate::git::GitRepository::replay_plan`]
+/// plans it with nothing dropped, rolling a conflict back: a land's replay (02_workspaces.md,
+/// "`cowshed land`", `--ungated`).
 #[cfg(target_os = "macos")]
 async fn run_git_rebase_atomically(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
     onto: &str,
     source_head: &GitOid,
-) -> Result<()> {
+) -> Result<Vec<crate::api::dto::ReplayedCommit>> {
+    let plan = crate::git::GitRepository::from_root(store_root, root)
+        .replay_plan(onto, source_head.as_str(), &[])
+        .await?;
+    replay(
+        store_root,
+        root,
+        onto,
+        source_head,
+        plan,
+        ConflictEnd::RollBack,
+    )
+    .await
+}
+
+/// Replay `plan`, the plan of the branch at `source_head` onto `onto`, by an interactive rebase
+/// whose todo is the plan's replays alone, in order (`noop` when none replays, which leaves the
+/// branch on `onto`): a held or dropped commit is never picked. Answers the plan as the replay
+/// ended it ([`replayed_steps`]).
+///
+/// `--no-autostash` overrides `rebase.autoStash` from every config layer, including a
+/// repository's tracked include that enables it for all its clones. Autostash stashes a dirty
+/// tree, rebases, then re-applies the stash; a re-apply that conflicts leaves unmerged paths and a
+/// parked stash yet exits 0, so this verb would report success over a conflicted tree. Without it
+/// git refuses a dirty tree before touching anything, which is refused as dirty. A replay that
+/// conflicts stops in progress or rolls back, as `end` says.
+#[cfg(target_os = "macos")]
+async fn replay(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    onto: &str,
+    source_head: &GitOid,
+    plan: Vec<crate::api::dto::ReplayedCommit>,
+    end: ConflictEnd,
+) -> Result<Vec<crate::api::dto::ReplayedCommit>> {
     use self::invoke_git as invoke;
 
     let source_ref_output = invoke(store_root, root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
@@ -20929,57 +21401,92 @@ async fn run_git_rebase_atomically(
         .map_err(|error| CowshedError::integrity(error.to_string(), "repair the git repository"))?;
     let source_ref = source_ref.trim_end();
 
-    let git_dir_output = invoke(store_root, root, &["rev-parse", "--absolute-git-dir"]).await?;
-    require_git_success("resolve git directory", &git_dir_output)?;
-    let git_dir = String::from_utf8(git_dir_output.stdout)
-        .map_err(|error| CowshedError::integrity(error.to_string(), "repair the git repository"))?;
-    let git_dir = PathBuf::from(git_dir.trim_end());
+    let git_dir = workspace_git_dir(store_root, root).await?;
     let rebase_state = [git_dir.join("rebase-merge"), git_dir.join("rebase-apply")];
-    let had_rebase_state = rebase_state.iter().any(|path| path.exists());
-
-    // `--no-autostash` overrides `rebase.autoStash` from every config layer, including a
-    // repository's tracked include that enables it for all its clones. Autostash stashes a dirty
-    // tree, rebases, then re-applies the stash; a re-apply that conflicts leaves unmerged paths
-    // and a parked stash yet exits 0, so this verb would report success over a conflicted tree.
-    // Without it git refuses a dirty tree before touching anything, which the classifier below
-    // turns into "commit or discard the uncommitted work".
-    // A unit stacked on a folded unit replays from after the commits its destination already
-    // holds: replaying a folded original over the destination's own version conflicts again.
-    let upstream = crate::git::GitRepository::from_root(store_root, root)
-        .held_prefix(onto, source_head.as_str())
-        .await?;
-    let output = match upstream.as_ref() {
-        Some(upstream) => {
-            invoke(
-                store_root,
-                root,
-                &[
-                    "rebase",
-                    "--no-autostash",
-                    "--onto",
-                    onto,
-                    upstream.as_str(),
-                ],
-            )
-            .await?
-        }
-        None => invoke(store_root, root, &["rebase", "--no-autostash", onto]).await?,
-    };
-    let primary = match require_git_success("git operation", &output) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-    // git's "could not apply <commit>" is a replayed commit that conflicted. The rollback below
-    // removes every conflict marker, so the classifier's "resolve the git conflict" would send
-    // the reader after markers that are gone; a replay conflict gets the by-hand replay instead.
-    let replay_conflicted = String::from_utf8_lossy(&output.stderr).contains("could not apply");
-
-    // A state that predates this command belongs to the user. Never turn a refused retry into
-    // authority to abort or delete an operation cowshed did not start.
-    if had_rebase_state {
-        return Err(primary);
+    // A state that predates this command belongs to whoever started it. Never turn a rebase into
+    // authority to abort or delete an operation it did not start.
+    if rebase_state.iter().any(|path| path.exists()) {
+        return Err(rebase_in_progress(&git_dir));
     }
 
+    let onto_oid = git_revision_oid(store_root, root, onto).await?;
+    let base = invoke(
+        store_root,
+        root,
+        &["merge-base", onto_oid.as_str(), source_head.as_str()],
+    )
+    .await?;
+    require_git_success("find where the branch left its destination", &base)?;
+    let base = String::from_utf8_lossy(&base.stdout).trim_end().to_owned();
+    let mut todo = String::new();
+    for commit in plan.iter().filter(|commit| replays(&commit.step)) {
+        todo.push_str(&format!(
+            "pick {} {}\n",
+            commit.oid.as_str(),
+            commit.subject
+        ));
+    }
+    if todo.is_empty() {
+        todo.push_str("noop\n");
+    }
+    let todo_path = git_dir.join(REBASE_TODO);
+    let marker = git_dir.join(STOPPED_REBASE);
+    let stopped = StoppedRebase {
+        source_ref: source_ref.to_owned(),
+        source_head: source_head.clone(),
+        onto: onto_oid.clone(),
+        commits: plan,
+    };
+    let written = serde_json::to_vec(&stopped).map_err(|error| {
+        CowshedError::internal(format!("cannot encode the rebase cowshed starts: {error}"))
+    })?;
+    for (path, bytes) in [(&todo_path, todo.into_bytes()), (&marker, written)] {
+        tokio::fs::write(path, bytes).await.map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot write {}: {error}", path.display()),
+                "check the workspace's git directory, then retry",
+            )
+        })?;
+    }
+    let editor = format!("sequence.editor=cp '{}'", todo_path.display());
+    let output = invoke(
+        store_root,
+        root,
+        &[
+            "-c",
+            &editor,
+            "-c",
+            "rebase.missingCommitsCheck=ignore",
+            "rebase",
+            "--interactive",
+            "--no-autosquash",
+            "--no-autostash",
+            "--empty=drop",
+            "--no-rebase-merges",
+            "--no-update-refs",
+            "--onto",
+            onto_oid.as_str(),
+            &base,
+        ],
+    )
+    .await;
+    let _ = tokio::fs::remove_file(&todo_path).await;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&marker).await;
+            return Err(error);
+        }
+    };
+    let primary = match require_git_success("replay the branch", &output) {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&marker).await;
+            return replayed_steps(store_root, root, &onto_oid, stopped.commits).await;
+        }
+        Err(error) => error,
+    };
+    // git's "could not apply <commit>" is a replayed commit that conflicted.
+    let replay_conflicted = String::from_utf8_lossy(&output.stderr).contains("could not apply");
     let owns_rebase_state = rebase_state.iter().any(|path| path.exists());
     let current_ref = invoke(store_root, root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
     let current_ref_matches = current_ref.status.success()
@@ -20988,6 +21495,7 @@ async fn run_git_rebase_atomically(
     let current_head_matches = current_head.status.success()
         && String::from_utf8_lossy(&current_head.stdout).trim_end() == source_head.as_str();
     if !owns_rebase_state && current_ref_matches && current_head_matches {
+        let _ = tokio::fs::remove_file(&marker).await;
         // git refused before touching anything. A dirty tree is the refusal a caller acts on, so
         // it names the paths that block the rebase.
         if String::from_utf8_lossy(&output.stderr).contains("cannot rebase: ") {
@@ -21003,7 +21511,7 @@ async fn run_git_rebase_atomically(
         return Err(primary);
     }
 
-    // A replay conflict's paths are read before the rollback removes them: git prints them on
+    // A replay conflict's paths are read before a rollback removes them: git prints them on
     // stdout, which the failure above does not carry, and the refusal names them
     // (02_workspaces.md "`cowshed rebase`"). Reading them never stops the rollback.
     let unmerged = if replay_conflicted {
@@ -21011,11 +21519,73 @@ async fn run_git_rebase_atomically(
     } else {
         None
     };
+    if end == ConflictEnd::Stop
+        && let Some(Ok(paths)) = unmerged.as_ref()
+    {
+        let at = git_revision_oid(store_root, root, "REBASE_HEAD").await?;
+        return Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::ReplayStopped {
+                at: at.clone(),
+                paths: paths.clone(),
+            },
+            format!(
+                "the replay of {} stopped at a conflict, in progress: {}",
+                at.as_str(),
+                conflicted_paths(Ok(paths.clone()))
+            ),
+            "resolve those paths in the workspace, then run `cowshed rebase --continue` on it; or \
+             `cowshed rebase --abort` to put the branch back where it started. Never finish it with \
+             `git rebase` by hand",
+        ));
+    }
+    let _ = tokio::fs::remove_file(&marker).await;
     // Abort is the lossless path because Git owns the sequencer state. A damaged sequencer may
     // refuse abort, so cowshed then removes only the two rebase directories it just created and
     // restores the exact ref and commit captured before mutation.
+    let failures = roll_back(store_root, root, &rebase_state, source_ref, source_head).await?;
+    if failures.is_empty()
+        && let Some(unmerged) = unmerged
+    {
+        Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::ReplayConflicted {
+                rolled_back_to: source_head.clone(),
+            },
+            primary.message,
+            format!(
+                "the replay was rolled back and the workspace is as it was; {}: run `cowshed rebase` \
+                 on the workspace onto the same destination, resolve the paths it stops at and run \
+                 `cowshed rebase --continue`, then run this command again",
+                conflicted_paths(unmerged),
+            ),
+        ))
+    } else if failures.is_empty() {
+        Err(primary)
+    } else {
+        Err(CowshedError::integrity(
+            format!(
+                "{}; automatic rebase rollback failed: {}",
+                primary.message,
+                failures.join("; ")
+            ),
+            "inspect git status and run cowshed doctor --json",
+        ))
+    }
+}
+
+/// Abort the rebase cowshed started, then put the branch back exactly: `source_ref` attached at
+/// `source_head`, both rebase directories gone. Answers what could not be restored.
+#[cfg(target_os = "macos")]
+async fn roll_back(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    rebase_state: &[PathBuf; 2],
+    source_ref: &str,
+    source_head: &GitOid,
+) -> Result<Vec<String>> {
+    use self::invoke_git as invoke;
+
     let _ = invoke(store_root, root, &["rebase", "--abort"]).await;
-    for path in &rebase_state {
+    for path in rebase_state {
         if path.exists() {
             let _ = tokio::fs::remove_dir_all(path).await;
         }
@@ -21024,7 +21594,7 @@ async fn run_git_rebase_atomically(
     let _ = invoke(store_root, root, &["reset", "--hard", source_head.as_str()]).await;
 
     let mut failures = Vec::new();
-    for path in &rebase_state {
+    for path in rebase_state {
         match tokio::fs::try_exists(path).await {
             Ok(false) => {}
             Ok(true) => failures.push(format!("{} still exists", path.display())),
@@ -21046,36 +21616,393 @@ async fn run_git_rebase_atomically(
         )),
         Err(error) => failures.push(format!("cannot resolve restored HEAD: {}", error.message)),
     }
+    Ok(failures)
+}
 
-    if failures.is_empty()
-        && let Some(unmerged) = unmerged
-    {
-        Err(CowshedError::fence_refusal(
-            crate::error::FenceRefusal::ReplayConflicted {
-                rolled_back_to: source_head.clone(),
-            },
-            primary.message,
-            format!(
-                "the rebase was rolled back and the workspace is as it was; {}: run `git rebase {}` inside the workspace, resolve the conflicts git names, finish that rebase there, then run this cowshed command again",
-                conflicted_paths(unmerged),
-                upstream.as_ref().map_or_else(
-                    || onto.to_owned(),
-                    |upstream| format!("--onto {onto} {}", upstream.as_str())
-                ),
-            ),
-        ))
-    } else if failures.is_empty() {
-        Err(primary)
+/// The workspace's absolute git directory.
+#[cfg(target_os = "macos")]
+async fn workspace_git_dir(store_root: &std::sync::Arc<Path>, root: &Path) -> Result<PathBuf> {
+    let output = invoke_git(store_root, root, &["rev-parse", "--absolute-git-dir"]).await?;
+    require_git_success("resolve git directory", &output)?;
+    let git_dir = String::from_utf8(output.stdout)
+        .map_err(|error| CowshedError::integrity(error.to_string(), "repair the git repository"))?;
+    Ok(PathBuf::from(git_dir.trim_end()))
+}
+
+/// The refusal of a rebase while one is in progress: cowshed's own, to carry on, or one it did
+/// not start, which it never touches.
+#[cfg(target_os = "macos")]
+fn rebase_in_progress(git_dir: &Path) -> CowshedError {
+    if git_dir.join(STOPPED_REBASE).exists() {
+        CowshedError::conflict(
+            "a rebase cowshed stopped at a conflict is in progress in this workspace",
+            "resolve its paths and run `cowshed rebase --continue`, or `cowshed rebase --abort`",
+        )
     } else {
-        Err(CowshedError::integrity(
-            format!(
-                "{}; automatic rebase rollback failed: {}",
-                primary.message,
-                failures.join("; ")
-            ),
-            "inspect git status and run cowshed doctor --json",
-        ))
+        CowshedError::conflict(
+            "a rebase cowshed did not start is in progress in this workspace",
+            "finish or abort it in the workspace (`git status` names it), then retry",
+        )
     }
+}
+
+/// `plan` as the replay ended it: a replay whose commit the branch's new range does not carry,
+/// matched by author, author time and subject, which a replay keeps, became empty because its
+/// change was already held, and is [`crate::api::dto::HeldBy::Emptied`].
+#[cfg(target_os = "macos")]
+async fn replayed_steps(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    onto: &GitOid,
+    mut plan: Vec<crate::api::dto::ReplayedCommit>,
+) -> Result<Vec<crate::api::dto::ReplayedCommit>> {
+    use crate::api::dto::{HeldBy, ReplayStep};
+    const SIGNATURE: &str = "--format=%H%x00%an%x00%ae%x00%at%x00%s";
+
+    let picked: Vec<&str> = plan
+        .iter()
+        .filter(|commit| replays(&commit.step))
+        .map(|commit| commit.oid.as_str())
+        .collect();
+    if picked.is_empty() {
+        return Ok(plan);
+    }
+    let signatures = |output: &std::process::Output| -> std::collections::BTreeMap<String, String> {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split_once('\0'))
+            .map(|(oid, signature)| (oid.to_owned(), signature.to_owned()))
+            .collect()
+    };
+    let range = format!("{}..HEAD", onto.as_str());
+    let carried = invoke_git(store_root, root, &["log", SIGNATURE, &range]).await?;
+    require_git_success("list the replayed commits", &carried)?;
+    let carried: std::collections::BTreeSet<String> = signatures(&carried).into_values().collect();
+    let mut args = vec!["log", "--no-walk=unsorted", SIGNATURE];
+    args.extend(picked);
+    let originals = invoke_git(store_root, root, &args).await?;
+    require_git_success("read the planned commits", &originals)?;
+    let originals = signatures(&originals);
+    for commit in plan.iter_mut().filter(|commit| replays(&commit.step)) {
+        commit.step = if originals
+            .get(commit.oid.as_str())
+            .is_some_and(|signature| carried.contains(signature))
+        {
+            ReplayStep::Replay
+        } else {
+            ReplayStep::Held {
+                by: HeldBy::Emptied,
+            }
+        };
+    }
+    Ok(plan)
+}
+
+/// Record the plan of the branch at `head`, which left its destination at `base`
+/// ([`RECORDED_BASE`], [`RECORDED_HEAD`]).
+#[cfg(target_os = "macos")]
+async fn record_plan(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    base: &str,
+    head: &str,
+) -> Result<()> {
+    for (reference, oid) in [(RECORDED_BASE, base), (RECORDED_HEAD, head)] {
+        let output = invoke_git(store_root, root, &["update-ref", reference, oid]).await?;
+        require_git_success("record the rebase plan", &output)?;
+    }
+    Ok(())
+}
+
+/// The commits the plan cowshed last recorded for this workspace carried that its branch at
+/// `head` has since lost, and neither that branch nor `holder`, its destination, holds; none
+/// without a record. `holder_objects` is the store that holds `holder`, when this repository's
+/// own does not.
+#[cfg(target_os = "macos")]
+async fn recorded_losses(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    head: &GitOid,
+    holder: &str,
+    holder_objects: Option<&Path>,
+) -> Result<Vec<crate::git::CommitSubject>> {
+    let (Some(base), Some(recorded)) = (
+        git_optional_ref_oid(store_root, root, RECORDED_BASE).await?,
+        git_optional_ref_oid(store_root, root, RECORDED_HEAD).await?,
+    ) else {
+        return Ok(Vec::new());
+    };
+    let mut git = crate::git::GitRepository::from_root(store_root, root);
+    if let Some(objects) = holder_objects {
+        git = git.with_alternate_objects(objects)?;
+    }
+    git.lost_since(base.as_str(), recorded.as_str(), head.as_str(), holder)
+        .await
+}
+
+/// The refusal of a branch that lost `lost` since the plan cowshed last recorded for it.
+#[cfg(target_os = "macos")]
+fn recorded_work_lost(
+    workspace: &WorkspaceName,
+    lost: &[crate::git::CommitSubject],
+) -> CowshedError {
+    CowshedError::fence_refusal(
+        crate::error::FenceRefusal::RecordedWorkLost {
+            commits: lost.iter().map(|commit| commit.oid.clone()).collect(),
+        },
+        format!(
+            "{workspace} has lost {} commit(s) since the plan cowshed last recorded for it, and \
+             neither its branch nor the destination holds their change: {}",
+            lost.len(),
+            named_commits(lost)
+        ),
+        format!(
+            "restore them in the workspace (`git cherry-pick <commit>`), or name the loss: \
+             `cowshed rebase {workspace} --drop <commit>… --drop-unheld`"
+        ),
+    )
+}
+
+/// Commits as a refusal names them: ten, each with its subject, then a count of the rest.
+#[cfg(target_os = "macos")]
+fn named_commits(commits: &[crate::git::CommitSubject]) -> String {
+    const NAMED: usize = 10;
+    let named = commits
+        .iter()
+        .take(NAMED)
+        .map(|commit| format!("{} {}", commit.oid.as_str(), commit.subject))
+        .collect::<Vec<_>>()
+        .join("; ");
+    match commits.len().saturating_sub(NAMED) {
+        0 => named,
+        rest => format!("{named}; and {rest} more"),
+    }
+}
+
+/// Judge a rebase's `--drop` commits against its plan and the commits the branch lost since its
+/// recorded plan. Every drop names one of those; every lost commit must be named; a dropped or
+/// lost commit the destination does not hold needs `--drop-unheld`. The lost commits so named
+/// join the plan, dropped unheld.
+#[cfg(target_os = "macos")]
+fn judge_drops(
+    workspace: &WorkspaceName,
+    plan: &mut Vec<crate::api::dto::ReplayedCommit>,
+    lost: Vec<crate::git::CommitSubject>,
+    options: &RebaseOptions,
+) -> Result<()> {
+    use crate::api::dto::{ReplayStep, ReplayedCommit};
+
+    let unknown: Vec<&str> = options
+        .drop
+        .iter()
+        .filter(|drop| {
+            !plan.iter().any(|commit| &commit.oid == *drop)
+                && !lost.iter().any(|commit| &commit.oid == *drop)
+        })
+        .map(GitOid::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(CowshedError::usage(
+            format!(
+                "--drop names commits the replay of {workspace} does not carry: {}",
+                unknown.join(", ")
+            ),
+            "name commits `cowshed rebase --plan` lists, by their full object id",
+        ));
+    }
+    let unnamed: Vec<crate::git::CommitSubject> = lost
+        .iter()
+        .filter(|commit| !options.drop.contains(&commit.oid))
+        .cloned()
+        .collect();
+    if !unnamed.is_empty() {
+        return Err(recorded_work_lost(workspace, &unnamed));
+    }
+    let unheld: Vec<GitOid> = plan
+        .iter()
+        .filter(|commit| commit.step == ReplayStep::DroppedUnheld)
+        .map(|commit| commit.oid.clone())
+        .chain(lost.iter().map(|commit| commit.oid.clone()))
+        .collect();
+    if !unheld.is_empty() && !options.drop_unheld {
+        return Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::DropUnheld {
+                commits: unheld.clone(),
+            },
+            format!(
+                "--drop would lose {} commit(s) the destination does not hold: {}",
+                unheld.len(),
+                unheld
+                    .iter()
+                    .map(GitOid::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "add --drop-unheld to lose them, or leave them out of --drop",
+        ));
+    }
+    plan.extend(lost.into_iter().map(|commit| ReplayedCommit {
+        oid: commit.oid,
+        subject: commit.subject,
+        step: ReplayStep::DroppedUnheld,
+    }));
+    Ok(())
+}
+
+/// `--continue` or `--abort` of the rebase cowshed stopped at a conflict in the workspace at
+/// `root` (02_workspaces.md, "`cowshed rebase`"). Only a stopped rebase this verb started, which
+/// its [`STOPPED_REBASE`] file names, is carried on.
+#[cfg(target_os = "macos")]
+async fn resume_rebase(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    workspace: &WorkspaceName,
+    resume: crate::api::dto::RebaseResume,
+) -> Result<RebaseReport> {
+    use self::invoke_git as invoke;
+
+    let git_dir = workspace_git_dir(store_root, root).await?;
+    let marker = git_dir.join(STOPPED_REBASE);
+    let stopped: StoppedRebase = match tokio::fs::read(&marker).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "{} is not a rebase cowshed started: {error}",
+                    marker.display()
+                ),
+                "inspect the workspace's rebase state with `git status`",
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CowshedError::conflict(
+                format!("no rebase cowshed stopped is in progress in {workspace}"),
+                format!("cowshed rebase {workspace} --plan"),
+            ));
+        }
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!("cannot read {}: {error}", marker.display()),
+                "check the workspace's git directory, then retry",
+            ));
+        }
+    };
+    let rebase_state = [git_dir.join("rebase-merge"), git_dir.join("rebase-apply")];
+    let in_progress = rebase_state.iter().any(|path| path.exists());
+    match resume {
+        crate::api::dto::RebaseResume::Abort => {
+            if in_progress {
+                let failures = roll_back(
+                    store_root,
+                    root,
+                    &rebase_state,
+                    &stopped.source_ref,
+                    &stopped.source_head,
+                )
+                .await?;
+                if !failures.is_empty() {
+                    return Err(CowshedError::integrity(
+                        format!("the rebase could not be aborted: {}", failures.join("; ")),
+                        "inspect git status and run cowshed doctor --json",
+                    ));
+                }
+            }
+            let _ = tokio::fs::remove_file(&marker).await;
+            Ok(RebaseReport::Aborted {
+                oid: git_oid(store_root, root).await?,
+            })
+        }
+        crate::api::dto::RebaseResume::Continue => {
+            if in_progress {
+                let unmerged = unmerged_paths(store_root, root).await?;
+                let marked: Vec<&String> = unmerged
+                    .iter()
+                    .filter(|path| has_conflict_markers(&root.join(path)))
+                    .collect();
+                if !marked.is_empty() {
+                    return Err(CowshedError::conflict(
+                        format!(
+                            "these paths still carry conflict markers: {}",
+                            marked
+                                .iter()
+                                .map(|path| path.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        "resolve them, then run `cowshed rebase --continue` again",
+                    ));
+                }
+                if !unmerged.is_empty() {
+                    let mut add = vec!["add", "--"];
+                    add.extend(unmerged.iter().map(String::as_str));
+                    let output = invoke(store_root, root, &add).await?;
+                    require_git_success("stage the resolved paths", &output)?;
+                }
+                let output = invoke(
+                    store_root,
+                    root,
+                    &["-c", "core.editor=true", "rebase", "--continue"],
+                )
+                .await?;
+                if let Err(primary) = require_git_success("continue the replay", &output) {
+                    if !String::from_utf8_lossy(&output.stderr).contains("could not apply") {
+                        return Err(primary);
+                    }
+                    let paths = unmerged_paths(store_root, root).await?;
+                    let at = git_revision_oid(store_root, root, "REBASE_HEAD").await?;
+                    return Err(CowshedError::fence_refusal(
+                        crate::error::FenceRefusal::ReplayStopped {
+                            at: at.clone(),
+                            paths: paths.clone(),
+                        },
+                        format!(
+                            "the replay of {} stopped at a conflict, in progress: {}",
+                            at.as_str(),
+                            conflicted_paths(Ok(paths))
+                        ),
+                        "resolve those paths, then run `cowshed rebase --continue` again; or \
+                         `cowshed rebase --abort`",
+                    ));
+                }
+            }
+            // Finished, by this continue or by hand: whatever finished it, nothing the plan
+            // replays may be missing from the branch it left.
+            let oid = git_oid(store_root, root).await?;
+            let accepted: Vec<&GitOid> = stopped
+                .commits
+                .iter()
+                .filter(|commit| commit.step == crate::api::dto::ReplayStep::DroppedUnheld)
+                .map(|commit| &commit.oid)
+                .collect();
+            let lost: Vec<crate::git::CommitSubject> =
+                recorded_losses(store_root, root, &oid, stopped.onto.as_str(), None)
+                    .await?
+                    .into_iter()
+                    .filter(|commit| !accepted.contains(&&commit.oid))
+                    .collect();
+            if !lost.is_empty() {
+                return Err(recorded_work_lost(workspace, &lost));
+            }
+            let commits = replayed_steps(store_root, root, &stopped.onto, stopped.commits).await?;
+            record_plan(store_root, root, stopped.onto.as_str(), oid.as_str()).await?;
+            let _ = tokio::fs::remove_file(&marker).await;
+            Ok(RebaseReport::Rebased {
+                oid,
+                onto: stopped.onto,
+                commits,
+            })
+        }
+    }
+}
+
+/// Whether a resolved file still carries a conflict marker line git writes (`<<<<<<< `,
+/// `>>>>>>> `); a file that cannot be read, deleted in the resolution, carries none.
+#[cfg(target_os = "macos")]
+fn has_conflict_markers(path: &Path) -> bool {
+    std::fs::read(path).is_ok_and(|bytes| {
+        bytes
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.starts_with(b"<<<<<<< ") || line.starts_with(b">>>>>>> "))
+    })
 }
 
 /// The unmerged paths of a replay that stopped on a conflict.

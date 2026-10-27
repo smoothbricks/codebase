@@ -25,9 +25,9 @@ use cowshed_core::api::{
     LandReport, LandTurnName, LandingCommits, MountResult, OutputPublication, ProjectGrantDelta,
     ProjectGrants, PublicationPolicy, PushOptions, PushReport, RebaseOptions, RebaseReport,
     RefLockPath, RekeyResult, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
-    RemoveReport, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus,
-    StdinSource as CoreStdinSource, UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo,
-    WorkspacePath, WorkspaceState, validate_command_argv,
+    RemoveReport, ReplayedCommit, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode,
+    SccacheStatus, StdinSource as CoreStdinSource, UnlandedPaths, UnprovenWorkspace, UtcTimestamp,
+    WorkspaceInfo, WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -2141,6 +2141,14 @@ where
                     .transpose()?,
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_onto_head: args.expected_onto_head.map(os_git_oid).transpose()?,
+                plan: args.plan,
+                drop: args
+                    .drop
+                    .into_iter()
+                    .map(os_git_oid)
+                    .collect::<Result<_>>()?,
+                drop_unheld: args.drop_unheld,
+                resume: args.resume,
             };
             let report = service
                 .rebase(&workspace, args.into.as_deref(), options)
@@ -2148,9 +2156,36 @@ where
             if json {
                 output.success(report).map_err(output_error)?;
             } else {
-                output
-                    .bare_line(report.oid.as_str().as_bytes())
-                    .map_err(output_error)?;
+                match &report {
+                    RebaseReport::Rebased { oid, onto, commits } => {
+                        output
+                            .bare_line(oid.as_str().as_bytes())
+                            .map_err(output_error)?;
+                        output
+                            .guidance(&format!(
+                                "rebased {workspace} onto {}: {}",
+                                onto.as_str(),
+                                ReplayedCommit::summary(commits)
+                            ))
+                            .map_err(output_error)?;
+                    }
+                    RebaseReport::Planned { commits, .. } => {
+                        for line in ReplayedCommit::plan_lines(commits) {
+                            output.bare_line(line.as_bytes()).map_err(output_error)?;
+                        }
+                    }
+                    RebaseReport::Aborted { oid } => {
+                        output
+                            .bare_line(oid.as_str().as_bytes())
+                            .map_err(output_error)?;
+                        output
+                            .guidance(&format!(
+                                "aborted the stopped rebase of {workspace}; it is back at {}",
+                                oid.as_str()
+                            ))
+                            .map_err(output_error)?;
+                    }
+                }
             }
             Ok(success())
         }

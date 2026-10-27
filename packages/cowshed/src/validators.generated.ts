@@ -570,6 +570,11 @@ export const parseHeldBirth = (json: string): Api.HeldBirth => assertHeldBirth(J
 export const assertHeldBirthList = typia.createAssertEquals<readonly Api.HeldBirth[]>();
 export const parseHeldBirthList = (json: string): readonly Api.HeldBirth[] => assertHeldBirthList(JSON.parse(json));
 
+export const assertHeldBy = typia.createAssertEquals<Api.HeldBy>();
+export const parseHeldBy = (json: string): Api.HeldBy => assertHeldBy(JSON.parse(json));
+export const assertHeldByList = typia.createAssertEquals<readonly Api.HeldBy[]>();
+export const parseHeldByList = (json: string): readonly Api.HeldBy[] => assertHeldByList(JSON.parse(json));
+
 export const assertHeldDescriptor = typia.createAssertEquals<Api.HeldDescriptor>();
 export const parseHeldDescriptor = (json: string): Api.HeldDescriptor => assertHeldDescriptor(JSON.parse(json));
 export const assertHeldDescriptorList = typia.createAssertEquals<readonly Api.HeldDescriptor[]>();
@@ -1328,6 +1333,12 @@ export const assertRebaseRequestList = typia.createAssertEquals<readonly Api.Reb
 export const parseRebaseRequestList = (json: string): readonly Api.RebaseRequest[] =>
   assertRebaseRequestList(JSON.parse(json));
 
+export const assertRebaseResume = typia.createAssertEquals<Api.RebaseResume>();
+export const parseRebaseResume = (json: string): Api.RebaseResume => assertRebaseResume(JSON.parse(json));
+export const assertRebaseResumeList = typia.createAssertEquals<readonly Api.RebaseResume[]>();
+export const parseRebaseResumeList = (json: string): readonly Api.RebaseResume[] =>
+  assertRebaseResumeList(JSON.parse(json));
+
 export const assertRecoverImageRequest = typia.createAssertEquals<Api.RecoverImageRequest>();
 export const parseRecoverImageRequest = (json: string): Api.RecoverImageRequest =>
   assertRecoverImageRequest(JSON.parse(json));
@@ -1410,6 +1421,17 @@ export const parseRemovedWorkspace = (json: string): Api.RemovedWorkspace => ass
 export const assertRemovedWorkspaceList = typia.createAssertEquals<readonly Api.RemovedWorkspace[]>();
 export const parseRemovedWorkspaceList = (json: string): readonly Api.RemovedWorkspace[] =>
   assertRemovedWorkspaceList(JSON.parse(json));
+
+export const assertReplayStep = typia.createAssertEquals<Api.ReplayStep>();
+export const parseReplayStep = (json: string): Api.ReplayStep => assertReplayStep(JSON.parse(json));
+export const assertReplayStepList = typia.createAssertEquals<readonly Api.ReplayStep[]>();
+export const parseReplayStepList = (json: string): readonly Api.ReplayStep[] => assertReplayStepList(JSON.parse(json));
+
+export const assertReplayedCommit = typia.createAssertEquals<Api.ReplayedCommit>();
+export const parseReplayedCommit = (json: string): Api.ReplayedCommit => assertReplayedCommit(JSON.parse(json));
+export const assertReplayedCommitList = typia.createAssertEquals<readonly Api.ReplayedCommit[]>();
+export const parseReplayedCommitList = (json: string): readonly Api.ReplayedCommit[] =>
+  assertReplayedCommitList(JSON.parse(json));
 
 export const assertRepoId = typia.createAssertEquals<Api.RepoId>();
 export const parseRepoId = (json: string): Api.RepoId => assertRepoId(JSON.parse(json));

@@ -5,7 +5,7 @@ use cowshed_core::api::held_lock::DecimalU64;
 use cowshed_core::api::hold::KernelAddress;
 use cowshed_core::api::operations::FdHoldersRequest;
 use cowshed_core::api::server::HostRole;
-use cowshed_core::api::{ExecClass, ExecScope, GrantDelta, LandMode, LandTurnName};
+use cowshed_core::api::{ExecClass, ExecScope, GrantDelta, LandMode, LandTurnName, RebaseResume};
 use cowshed_core::metadata::{EgressMode, EgressRule, MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
@@ -642,6 +642,10 @@ pub struct RebaseArgs {
     pub expected_workspace_incarnation: Option<OsString>,
     pub expected_source_head: Option<OsString>,
     pub expected_onto_head: Option<OsString>,
+    pub plan: bool,
+    pub drop: Vec<OsString>,
+    pub drop_unheld: bool,
+    pub resume: Option<RebaseResume>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1044,6 +1048,11 @@ pub fn cli_command() -> ClapCommand {
             value("expected-workspace-incarnation"),
             value("expected-source-head"),
             value("expected-onto-head"),
+            flag("plan"),
+            append_value("drop"),
+            flag("drop-unheld"),
+            flag("continue"),
+            flag("abort"),
         ]))
         .subcommand(leaf("land").arg(positional("workspace", 0..=1)).args([
             value("into"),
@@ -3862,7 +3871,7 @@ const REBASE: CommandSpec = CommandSpec {
     trailing: "",
     summary: "rebase a workspace",
     about: &[
-        "Brings the workspace branch up to current main: fetches main's checkout into the workspace and rebases onto it, by Git alone: it runs no job and touches no build volume. A dirty tree is refused before anything moves; commit or discard the uncommitted work first. A conflict aborts cleanly and names the conflicted paths, leaving the workspace as it was. Naming no workspace rebases the one you are standing in. The new head prints on stdout.",
+        "Brings the workspace branch up to current main: fetches main's checkout into the workspace and rebases onto it, by Git alone: it runs no job and touches no build volume. A dirty tree is refused before anything moves; commit or discard the uncommitted work first. A conflict stops the replay in progress and names the conflicted paths: resolve them and run `cowshed rebase --continue`, or `cowshed rebase --abort` to return to where it started. Never run `git rebase` by hand in a workspace: cowshed replays only what its destination does not already hold and says what it dropped. Naming no workspace rebases the one you are standing in. The new head prints on stdout.",
         "With `--into <lane>`, the destination is what the unit lands into instead: the branch the lane base <lane> has checked out, fetched from its mount, so a unit forked from a lane base catches up with what its lane-mates have landed there.",
     ],
     options: &[
@@ -3880,6 +3889,26 @@ const REBASE: CommandSpec = CommandSpec {
             spelling: "--expected-onto-head <oid>",
             meaning: "refuse unless the revision being rebased onto is still this commit",
         },
+        Opt {
+            spelling: "--plan",
+            meaning: "answer what the rebase would do and write nothing: the commits it would replay and the ones it would drop",
+        },
+        Opt {
+            spelling: "--drop <commit>",
+            meaning: "leave this commit out of the replay; repeatable; refused when the destination does not hold it unless --drop-unheld names the loss",
+        },
+        Opt {
+            spelling: "--drop-unheld",
+            meaning: "drop the --drop commits the destination does not hold, losing them; needs --drop",
+        },
+        Opt {
+            spelling: "--continue",
+            meaning: "after resolving a conflict, stage the resolved paths and replay the rest of the plan; takes no other option",
+        },
+        Opt {
+            spelling: "--abort",
+            meaning: "after a conflict, put the branch back at the head the stopped rebase started from; takes no other option",
+        },
     ],
 };
 
@@ -3890,13 +3919,51 @@ fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
     if into.is_some() && onto.is_some() {
         return Err(UsageError::new("--into conflicts with --onto", USAGE));
     }
+    let expected_workspace_incarnation = os(matches, "expected-workspace-incarnation");
+    let expected_source_head = os(matches, "expected-source-head");
+    let expected_onto_head = os(matches, "expected-onto-head");
+    let plan = flagged(matches, "plan");
+    let drop: Vec<OsString> = matches
+        .get_many::<OsString>("drop")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    let drop_unheld = flagged(matches, "drop-unheld");
+    let resume = match (flagged(matches, "continue"), flagged(matches, "abort")) {
+        (true, true) => return Err(UsageError::new("--continue conflicts with --abort", USAGE)),
+        (true, false) => Some((RebaseResume::Continue, "continue")),
+        (false, true) => Some((RebaseResume::Abort, "abort")),
+        (false, false) => None,
+    };
+    if let Some((_, verb)) = resume {
+        let other = into.is_some()
+            || onto.is_some()
+            || expected_workspace_incarnation.is_some()
+            || expected_source_head.is_some()
+            || expected_onto_head.is_some()
+            || plan
+            || !drop.is_empty()
+            || drop_unheld;
+        if other {
+            return Err(UsageError::new(
+                format!("--{verb} takes no other option"),
+                USAGE,
+            ));
+        }
+    }
+    if drop_unheld && drop.is_empty() {
+        return Err(UsageError::new("--drop-unheld needs --drop", USAGE));
+    }
     Ok(Command::Rebase(RebaseArgs {
         workspace: optional_workspace(matches, "workspace", false, USAGE)?,
         into,
         onto,
-        expected_workspace_incarnation: os(matches, "expected-workspace-incarnation"),
-        expected_source_head: os(matches, "expected-source-head"),
-        expected_onto_head: os(matches, "expected-onto-head"),
+        expected_workspace_incarnation,
+        expected_source_head,
+        expected_onto_head,
+        plan,
+        drop,
+        drop_unheld,
+        resume: resume.map(|(resume, _)| resume),
     }))
 }
 
@@ -5828,6 +5895,52 @@ mod tests {
         for argv in [
             &["rebase", "raven", "--gate"][..],
             &["rebase", "raven", "--into", "lane", "--ungated"],
+        ] {
+            assert!(parse_args(argv.iter().copied()).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn rebase_plan_drop_and_resume_flags_parse_and_refuse_mixed_options() {
+        let rebase = |argv: &[&str]| {
+            let Command::Rebase(args) = parse_args(argv.iter().copied()).unwrap().command else {
+                panic!("expected rebase")
+            };
+            args
+        };
+        let planned = rebase(&[
+            "rebase",
+            "raven",
+            "--plan",
+            "--drop",
+            "1111111111111111111111111111111111111111",
+            "--drop",
+            "2222222222222222222222222222222222222222",
+            "--drop-unheld",
+        ]);
+        assert!(planned.plan);
+        assert_eq!(planned.drop.len(), 2);
+        assert!(planned.drop_unheld);
+        assert_eq!(planned.resume, None);
+        assert_eq!(
+            rebase(&["rebase", "raven", "--continue"]).resume,
+            Some(RebaseResume::Continue)
+        );
+        assert_eq!(
+            rebase(&["rebase", "--abort"]).resume,
+            Some(RebaseResume::Abort)
+        );
+        for argv in [
+            &["rebase", "raven", "--continue", "--abort"][..],
+            &["rebase", "raven", "--abort", "--plan"],
+            &[
+                "rebase",
+                "raven",
+                "--continue",
+                "--drop",
+                "1111111111111111111111111111111111111111",
+            ],
+            &["rebase", "raven", "--drop-unheld"],
         ] {
             assert!(parse_args(argv.iter().copied()).is_err(), "{argv:?}");
         }

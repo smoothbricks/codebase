@@ -83,6 +83,10 @@ type ReaderName =
   | 'GC_REASON'
   | 'GC_REPORT'
   | 'GRANT_SET'
+  | 'HELD_BY'
+  | 'HELD_BY__CONTENT'
+  | 'HELD_BY__EMPTIED'
+  | 'HELD_BY__PATCH_IDENTITY'
   | 'HOST_JOBS'
   | 'HOST_LOAD_SAMPLE'
   | 'HOST_READINGS'
@@ -208,6 +212,9 @@ type ReaderName =
   | 'PUSH_REF'
   | 'PUSH_REPORT'
   | 'REBASE_REPORT'
+  | 'REBASE_REPORT__ABORTED'
+  | 'REBASE_REPORT__PLANNED'
+  | 'REBASE_REPORT__REBASED'
   | 'RECOVERED_IMAGE'
   | 'RECOVERY_CAUSE'
   | 'RECOVERY_CAUSE__ABANDONED'
@@ -222,6 +229,12 @@ type ReaderName =
   | 'REMOVED_WORKSPACE'
   | 'REMOVE_PROJECT_REPORT'
   | 'REMOVE_REPORT'
+  | 'REPLAYED_COMMIT'
+  | 'REPLAY_STEP'
+  | 'REPLAY_STEP__CONFLICT_EXPECTED'
+  | 'REPLAY_STEP__DROPPED_UNHELD'
+  | 'REPLAY_STEP__HELD'
+  | 'REPLAY_STEP__REPLAY'
   | 'RESIZE_RESULT'
   | 'RESIZE_VOLUME'
   | 'RE_ADOPTION'
@@ -257,6 +270,7 @@ type ReaderName =
   | 'SEQ__PROJECT_WORKSPACES'
   | 'SEQ__RECOVERY_CAUSE'
   | 'SEQ__REMOVED_WORKSPACE'
+  | 'SEQ__REPLAYED_COMMIT'
   | 'SEQ__SCRIPT_VALUE'
   | 'SEQ__SIM_VERB'
   | 'SEQ__SKILL_INSTALL'
@@ -807,6 +821,18 @@ const READERS: Readers<ReaderName> = {
       ['loopbackAny', 'LEAF'],
     ],
   },
+  HELD_BY: {
+    kind: 'internal',
+    tag: 'proof',
+    arms: [
+      ['patchIdentity', 'HELD_BY__PATCH_IDENTITY'],
+      ['content', 'HELD_BY__CONTENT'],
+      ['emptied', 'HELD_BY__EMPTIED'],
+    ],
+  },
+  HELD_BY__CONTENT: { kind: 'record', fields: [['holder', 'LEAF']] },
+  HELD_BY__EMPTIED: { kind: 'record', fields: [] },
+  HELD_BY__PATCH_IDENTITY: { kind: 'record', fields: [['holder', 'LEAF']] },
   HOST_JOBS: {
     kind: 'record',
     fields: [
@@ -1627,7 +1653,32 @@ const READERS: Readers<ReaderName> = {
       ['previousDestinationHead', 'LEAF'],
     ],
   },
-  REBASE_REPORT: { kind: 'record', fields: [['oid', 'LEAF']] },
+  REBASE_REPORT: {
+    kind: 'internal',
+    tag: 'kind',
+    arms: [
+      ['rebased', 'REBASE_REPORT__REBASED'],
+      ['planned', 'REBASE_REPORT__PLANNED'],
+      ['aborted', 'REBASE_REPORT__ABORTED'],
+    ],
+  },
+  REBASE_REPORT__ABORTED: { kind: 'record', fields: [['oid', 'LEAF']] },
+  REBASE_REPORT__PLANNED: {
+    kind: 'record',
+    fields: [
+      ['oid', 'LEAF'],
+      ['onto', 'LEAF'],
+      ['commits', 'SEQ__REPLAYED_COMMIT'],
+    ],
+  },
+  REBASE_REPORT__REBASED: {
+    kind: 'record',
+    fields: [
+      ['oid', 'LEAF'],
+      ['onto', 'LEAF'],
+      ['commits', 'SEQ__REPLAYED_COMMIT'],
+    ],
+  },
   RECOVERED_IMAGE: {
     kind: 'record',
     fields: [
@@ -1699,6 +1750,28 @@ const READERS: Readers<ReaderName> = {
     ],
   },
   REMOVE_REPORT: { kind: 'record', fields: [['abandoned', 'ABANDONED_WORK']] },
+  REPLAYED_COMMIT: {
+    kind: 'record',
+    fields: [
+      ['oid', 'LEAF'],
+      ['subject', 'LEAF'],
+      ['step', 'REPLAY_STEP'],
+    ],
+  },
+  REPLAY_STEP: {
+    kind: 'internal',
+    tag: 'kind',
+    arms: [
+      ['replay', 'REPLAY_STEP__REPLAY'],
+      ['conflictExpected', 'REPLAY_STEP__CONFLICT_EXPECTED'],
+      ['held', 'REPLAY_STEP__HELD'],
+      ['droppedUnheld', 'REPLAY_STEP__DROPPED_UNHELD'],
+    ],
+  },
+  REPLAY_STEP__CONFLICT_EXPECTED: { kind: 'record', fields: [['paths', 'LEAF']] },
+  REPLAY_STEP__DROPPED_UNHELD: { kind: 'record', fields: [] },
+  REPLAY_STEP__HELD: { kind: 'record', fields: [['by', 'HELD_BY']] },
+  REPLAY_STEP__REPLAY: { kind: 'record', fields: [] },
   RESIZE_RESULT: {
     kind: 'record',
     fields: [
@@ -1803,6 +1876,7 @@ const READERS: Readers<ReaderName> = {
   SEQ__PROJECT_WORKSPACES: { kind: 'seq', element: 'PROJECT_WORKSPACES' },
   SEQ__RECOVERY_CAUSE: { kind: 'seq', element: 'RECOVERY_CAUSE' },
   SEQ__REMOVED_WORKSPACE: { kind: 'seq', element: 'REMOVED_WORKSPACE' },
+  SEQ__REPLAYED_COMMIT: { kind: 'seq', element: 'REPLAYED_COMMIT' },
   SEQ__SCRIPT_VALUE: { kind: 'seq', element: 'SCRIPT_VALUE' },
   SEQ__SIM_VERB: { kind: 'seq', element: 'SIM_VERB' },
   SEQ__SKILL_INSTALL: { kind: 'seq', element: 'SKILL_INSTALL' },

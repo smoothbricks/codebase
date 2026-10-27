@@ -290,6 +290,17 @@ static GRANT_SET: Reader = Reader::Record(&[
     ("sim", &SEQ__SIM_VERB),
     ("loopbackAny", &LEAF),
 ]);
+static HELD_BY: Reader = Reader::Internal {
+    tag: "proof",
+    arms: &[
+        ("patchIdentity", &HELD_BY__PATCH_IDENTITY),
+        ("content", &HELD_BY__CONTENT),
+        ("emptied", &HELD_BY__EMPTIED),
+    ],
+};
+static HELD_BY__CONTENT: Reader = Reader::Record(&[("holder", &LEAF)]);
+static HELD_BY__EMPTIED: Reader = Reader::Record(&[]);
+static HELD_BY__PATCH_IDENTITY: Reader = Reader::Record(&[("holder", &LEAF)]);
 static HOST_JOBS: Reader = Reader::Record(&[
     ("counts", &SEQ__JOB_COUNT),
     ("unanswered", &SEQ__UNANSWERED_SUPERVISOR),
@@ -817,7 +828,25 @@ static PUSH_REPORT: Reader = Reader::Record(&[
     ("destinationRef", &LEAF),
     ("previousDestinationHead", &LEAF),
 ]);
-static REBASE_REPORT: Reader = Reader::Record(&[("oid", &LEAF)]);
+static REBASE_REPORT: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("rebased", &REBASE_REPORT__REBASED),
+        ("planned", &REBASE_REPORT__PLANNED),
+        ("aborted", &REBASE_REPORT__ABORTED),
+    ],
+};
+static REBASE_REPORT__ABORTED: Reader = Reader::Record(&[("oid", &LEAF)]);
+static REBASE_REPORT__PLANNED: Reader = Reader::Record(&[
+    ("oid", &LEAF),
+    ("onto", &LEAF),
+    ("commits", &SEQ__REPLAYED_COMMIT),
+]);
+static REBASE_REPORT__REBASED: Reader = Reader::Record(&[
+    ("oid", &LEAF),
+    ("onto", &LEAF),
+    ("commits", &SEQ__REPLAYED_COMMIT),
+]);
 static RECOVERED_IMAGE: Reader = Reader::Record(&[
     ("workspace", &LEAF),
     ("incarnation", &LEAF),
@@ -868,6 +897,21 @@ static REMOVE_PROJECT_REPORT: Reader = Reader::Record(&[
     ("restored", &REMOVE_REPORT),
 ]);
 static REMOVE_REPORT: Reader = Reader::Record(&[("abandoned", &ABANDONED_WORK)]);
+static REPLAYED_COMMIT: Reader =
+    Reader::Record(&[("oid", &LEAF), ("subject", &LEAF), ("step", &REPLAY_STEP)]);
+static REPLAY_STEP: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("replay", &REPLAY_STEP__REPLAY),
+        ("conflictExpected", &REPLAY_STEP__CONFLICT_EXPECTED),
+        ("held", &REPLAY_STEP__HELD),
+        ("droppedUnheld", &REPLAY_STEP__DROPPED_UNHELD),
+    ],
+};
+static REPLAY_STEP__CONFLICT_EXPECTED: Reader = Reader::Record(&[("paths", &LEAF)]);
+static REPLAY_STEP__DROPPED_UNHELD: Reader = Reader::Record(&[]);
+static REPLAY_STEP__HELD: Reader = Reader::Record(&[("by", &HELD_BY)]);
+static REPLAY_STEP__REPLAY: Reader = Reader::Record(&[]);
 static REPOSITORY_BINDING: Reader = Reader::Record(&[
     ("version", &LEAF),
     ("identities", &SEQ__BOUND_IDENTITY),
@@ -939,6 +983,7 @@ static SEQ__PRESERVED_REF: Reader = Reader::Seq(&PRESERVED_REF);
 static SEQ__PROCESS_COVERAGE_GAP: Reader = Reader::Seq(&PROCESS_COVERAGE_GAP);
 static SEQ__RECOVERY_CAUSE: Reader = Reader::Seq(&RECOVERY_CAUSE);
 static SEQ__REMOVED_WORKSPACE: Reader = Reader::Seq(&REMOVED_WORKSPACE);
+static SEQ__REPLAYED_COMMIT: Reader = Reader::Seq(&REPLAYED_COMMIT);
 static SEQ__SCRIPT_VALUE: Reader = Reader::Seq(&SCRIPT_VALUE);
 static SEQ__SIM_VERB: Reader = Reader::Seq(&SIM_VERB);
 static SEQ__SKILL_INSTALL: Reader = Reader::Seq(&SKILL_INSTALL);

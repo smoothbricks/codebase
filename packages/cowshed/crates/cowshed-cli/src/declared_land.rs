@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use cowshed_core::api::dto::{
-    ExpectedRefHead, GitOid, LandOptions, LandReport, LandedReport, RebaseOptions,
+    ExpectedRefHead, GitOid, LandOptions, LandReport, LandedReport, RebaseOptions, RebaseResume,
 };
 use cowshed_core::declared_land::{
     self as declared, AfterFastForward, AfterRequest, LandDeclaration, LandEvent, LandRecord,
 };
 use cowshed_core::land_turn::{Turn, TurnAsk};
-use cowshed_core::{CowshedError, ErrorCode, Result};
+use cowshed_core::{CowshedError, ErrorCode, FenceRefusal, Result};
 use cowshed_os::fork_lock::Run as _;
 
 use crate::output::Output;
@@ -479,7 +479,7 @@ where
             )
             .await;
         match rebased {
-            Ok(report) => return Ok((base, report.oid)),
+            Ok(report) => return Ok((base, report.oid().clone())),
             Err(error) if declared::rebase_again(error.fence_source()) => {
                 say(
                     output,
@@ -489,7 +489,29 @@ where
                     ),
                 )?;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if matches!(
+                    error.fence_source(),
+                    Some(FenceRefusal::ReplayStopped { .. })
+                ) {
+                    // A conflict leaves the replay stopped, and a land leaves its workspace as it
+                    // was: the stopped replay is aborted before the conflict is reported.
+                    let abort = RebaseOptions {
+                        resume: Some(RebaseResume::Abort),
+                        ..RebaseOptions::default()
+                    };
+                    if let Err(failure) = service.rebase(workspace, None, abort).await {
+                        say(
+                            output,
+                            &format!(
+                                "could not abort the stopped rebase ({}); clear it with cowshed rebase {workspace} --abort",
+                                failure.message
+                            ),
+                        )?;
+                    }
+                }
+                return Err(error);
+            }
         }
     }
 }

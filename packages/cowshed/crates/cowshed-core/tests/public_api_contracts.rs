@@ -1117,6 +1117,7 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         expected_workspace_incarnation: Some(incarnation()),
         expected_source_head: Some(oid('a')),
         expected_onto_head: None,
+        ..RebaseOptions::default()
     };
     let rebase_json = serde_json::to_value(&rebase).unwrap();
     assert_eq!(

@@ -966,28 +966,57 @@ to `refs/cowshed/<ws>/wip` — see "Autosave") remain the crash-safety net. Cows
 scheduling, review, remote publication, and branch-selection policy are coordinator work (12_mcp.md), deliberately not
 baked in.
 
-### `cowshed rebase <ws> [--onto <branch-or-ref> | --into <lane>]`
+### `cowshed rebase <ws> [--onto <branch-or-ref> | --into <lane>] [--plan] [--drop <commit>… [--drop-unheld]] | --continue | --abort`
 
 Brings a workspace's branch up to the selected host revision. The default is `main`; `--onto` accepts a validated local
 branch or fully qualified ref in the main workspace repository. An object ID may be used as an immutable replay base,
 but `land` still requires a named branch as its fast-forward target. `--into <lane>` selects what the workspace lands
 into instead — the branch the lane base `<lane>` has checked out, fetched from the lane base's mount into the workspace
-as `refs/cowshed/targets/<lane>/<branch>` (see "Lanes" below). `--onto` and `--into` are two destinations for one rebase
-and are refused together (exit 2).
+as `refs/cowshed/targets/<lane>/<branch>` (see "Lanes" below); any workspace can be that lane base, so this is how a
+shed's work moves onto a batch's branch. `--onto` and `--into` are two destinations for one rebase and are refused
+together (exit 2).
 
-- Default mode: fetch the selected host revision inside the workspace, then rebase the `cowshed/<name>` branch onto that
-  exact object ID. The whole step runs **inside the workspace sandbox** — the fetch from the main workspace mount is a
-  read (covered by the baseline), and every write lands in the workspace's own repository. The replay starts after the
-  branch's leading commits whose own change, from its parent, the destination already holds by the two proofs `rm` step
-  1 applies (content or patch identity), asked of each commit in order: `git rebase --onto <destination> <last held>`. A
-  unit stacked on another unit's commits keeps them after its lane folded them as rewritten twins, and replaying those
-  over the lane's own version, once the lane edited past it, would conflict; a commit the destination does not hold,
-  such as an amended copy of a folded one, stops the skip and replays, so nothing is dropped. A branch with a merge in
-  the range replays from its merge base. A dirty tree is refused before the rebase starts (exit 4, commit or discard
-  first): the rebase runs with `--no-autostash` whatever the repository's config says, because an autostash re-apply
-  that conflicts leaves unmerged paths and a parked stash yet exits 0. Conflicts abort the rebase
-  (`git rebase --abort`), leave the workspace exactly as it was, and exit 4 with `next:` hints naming the conflicted
-  paths, the by-hand replay that conflicted, and the cowshed command to run again once it is resolved.
+- Default mode: fetch the selected host revision inside the workspace, then replay the branch onto that exact object ID
+  by its **plan**. The whole step runs **inside the workspace sandbox** — the fetch from the main workspace mount is a
+  read (covered by the baseline), and every write lands in the workspace's own repository. The plan takes each commit of
+  `<destination>..<branch>` a rebase replays, merges excepted (a rebase does not replay a merge), oldest first. A commit
+  whose own change, from its parent, the destination already holds by the two proofs `rm` step 1 applies, asked of that
+  commit alone, is **held**: by patch identity, naming its twin in the destination, or by content, naming the
+  destination commit that changed its files last. A held commit is left out of the replay, wherever it sits: a unit
+  stacked on another unit's commits keeps them after its lane folded them as rewritten twins, and replaying those over
+  the lane's own version, once the lane edited past it, would conflict, while an amended copy of a folded commit is not
+  held and replays, so nothing is dropped that the destination lacks. Every other commit **replays**; the plan replays
+  each in memory after the ones before it (`git merge-tree --merge-base=<its parent>`, into a scratch object store) and
+  marks one whose merge conflicts **conflict-expected**, naming its paths. The replay is one interactive rebase whose
+  todo is the plan's replays and nothing else (`noop` when none replays), run with `--no-autostash` whatever the
+  repository's config says, because an autostash re-apply that conflicts leaves unmerged paths and a parked stash yet
+  exits 0. A dirty tree is refused before anything moves (exit 4, commit or discard first). A commit whose replay comes
+  out empty, its change already held, is dropped and reported held. Every rebase reports, on stderr,
+  `replayed N, dropped K held (<commits>), dropped U unheld (<commits>)`, and in `--json` each commit with what became
+  of it (`RebaseReport.rebased.commits`).
+- `--plan` answers that plan (`RebaseReport.planned`) and moves nothing: no branch, worktree, rebase state or recorded
+  plan, only the fetch of the destination every rebase makes. Read it first.
+- A replay that conflicts **stops in progress** and exits 4, naming the commit and its conflicted paths
+  (`FenceRefusal::ReplayStopped`). Resolve the paths in the workspace, then `cowshed rebase <ws> --continue`: it refuses
+  a path that still carries a conflict marker, stages the resolved ones and replays the rest, stopping again at the next
+  conflict. `cowshed rebase <ws> --abort` puts the branch back at the head it started from. Both carry on only a rebase
+  this verb started (`<git dir>/cowshed-rebase.json` names it); a rebase in progress that cowshed did not start refuses
+  the verb, and cowshed never aborts or deletes it. Nobody finishes a stopped rebase with `git rebase` by hand: that is
+  how a commit got lost.
+- `--drop <commit>…` leaves those commits out of the replay. A dropped commit the destination holds is a held drop
+  anyway; one it does not hold is refused (`FenceRefusal::DropUnheld`, exit 4) unless `--drop-unheld` names the loss,
+  and is then reported dropped unheld. A `--drop` naming a commit neither the replay nor the recorded plan carries is a
+  usage error (exit 2).
+- **The recorded plan.** Every rebase records, in the workspace's own per-worktree refs
+  (`refs/worktree/cowshed-plan/{base,head}`), the head it starts from and where that head left its destination, and,
+  once it finishes, the head it left and the destination. An ungated land's replay records the same. Before a rebase, an
+  ungated land and every retirement (`rm`, a land's retire of its unit and of the workspaces it folded), cowshed asks
+  which commits of the recorded `base..head` the branch has since lost: neither reachable from it nor held, by patch
+  identity or content, by it or by the destination. Such a commit refuses the operation
+  (`FenceRefusal::RecordedWorkLost`, exit 4) naming it: a by-hand rebase, reset or `--skip` dropped work only that
+  workspace still knew. Restore it (`git cherry-pick`), or name the loss with
+  `cowshed rebase <ws> --drop <commit> --drop-unheld`, which records a new plan; `rm --abandon` loses it too and says so
+  on stderr. A workspace with no recorded plan has nothing to compare.
 - `--fresh`: divergence-shedding rebase. Create a new clone from the selected current host revision, replay the branch
   onto it (`git format-patch`/`am`, or cherry-pick range), then **transplant identity** — the new clone inherits the
   workspace's name, canonical mount path, token, and grant-file binding; the old clone is destroyed (11_shell.md
@@ -1218,8 +1247,10 @@ unchanged.
    a land killed alone leaves its gate holding the turn, never a second land beside it.
 3. **Rebase.** It rebases `<ws>` onto main's head as `cowshed rebase <ws> --expected-onto-head <head>` does, and again
    onto the newer head when main moved before the rebase began (`OntoMoved`). A conflict stops the land with the
-   rebase's own refusal and the workspace as it was. A turn lost while the rebase runs stops the land once the rebase
-   has ended, and one found lost before the fast-forward (step 5) stops it before main moves.
+   rebase's own refusal and the workspace as it was: the land aborts the replay the rebase stopped (`--abort`), and the
+   conflict is resolved through `cowshed rebase <ws>` and `--continue` before landing again. A turn lost while the
+   rebase runs stops the land once the rebase has ended, and one found lost before the fast-forward (step 5) stops it
+   before main moves.
 4. **The declared gate.** It runs `[land] gate`, `{workspace}` replaced by `<ws>`, on the host in main's pure
    environment (below), its stdout and stderr on the land's stderr. A nonzero exit stops the land (exit 4, naming the
    gate and how it ended) and keeps the workspace. The gate checks the tree; it moves neither main nor the workspace,
