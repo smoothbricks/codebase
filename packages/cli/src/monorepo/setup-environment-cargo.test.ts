@@ -8,7 +8,14 @@ import {
   GIT_HTTP_LOW_SPEED_LIMIT,
   GIT_HTTP_LOW_SPEED_TIME_S,
 } from '../../../nx-plugin/managed/raw/tooling/direnv/cargo-fetch-bound.ts';
-import { edit, HEALTHY, repository, withManagedRepository } from './__tests__/helpers/shell-entry.js';
+import {
+  edit,
+  HEALTHY,
+  INSTALL_LOCK_WAIT,
+  repository,
+  withInstallLockHeld,
+  withManagedRepository,
+} from './__tests__/helpers/shell-entry.js';
 
 describe('what shell entry fetches for a Cargo workspace', () => {
   // The Nx plugin resolves a Cargo workspace wherever a project's Cargo.toml declares
@@ -40,6 +47,44 @@ describe('what shell entry fetches for a Cargo workspace', () => {
   const CI = { cargo: true, ciSecrets: { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' } } as const;
   /** What Cargo says when its fetch can reach no registry. */
   const REFUSAL = 'failed to download from `https://index.crates.io/config.json`';
+
+  for (const [mode, options] of [
+    ['local', CARGO],
+    ['CI', CI],
+  ] as const) {
+    it(`fetches on ${mode} while another entry holds the node_modules install lock`, async () => {
+      await withManagedRepository(
+        { workspaces: ['packages/*'], files: CARGO_PROJECT },
+        async ({ root, xdgCache, startShell, enterShell: enter, cargoRuns, count }) => {
+          await withInstallLockHeld(root, async (holder) => {
+            const entry = startShell(options);
+            const stdout = new Response(entry.stdout).text();
+            let stderr = '';
+            try {
+              // The old wrapper reports contention before it waits. End it on that event so
+              // over-serialization fails an assertion, never a timeout.
+              for await (const chunk of entry.stderr) {
+                stderr += new TextDecoder().decode(chunk);
+                if (stderr.includes(INSTALL_LOCK_WAIT)) entry.kill('SIGKILL');
+              }
+              expect(stderr).not.toContain(INSTALL_LOCK_WAIT);
+              expect(await entry.exited).toBe(0);
+              expect(holder.exitCode).toBeNull();
+              expect(cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('packages/native/Cargo.toml')]);
+              expect(stamps(xdgCache)).toHaveLength(2);
+              expect(count('install')).toBe(0);
+              expect(existsSync(join(root, 'node_modules', '.smoo-install'))).toBe(false);
+              expect(await enter(CHECK)).toEqual(HEALTHY);
+            } finally {
+              if (entry.exitCode === null) entry.kill('SIGKILL');
+              await entry.exited;
+              await stdout;
+            }
+          });
+        },
+      );
+    });
+  }
 
   // One repository, entered in sequence: each step starts from what the one before it left, and asserts only what it
   // adds to the ledger of runs, so the order is the case.

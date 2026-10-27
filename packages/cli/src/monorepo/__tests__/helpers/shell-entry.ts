@@ -380,13 +380,94 @@ export function startShell(root: string, state: string, bin: string, options: En
 
 export async function finished(proc: ShellProcess): Promise<ShellEntry> {
   const [stderr, exitCode] = await Promise.all([
-    new Response(proc.stderr).text(),
+    remainingText(proc.stderr),
     (async () => {
       await new Response(proc.stdout).text();
       return proc.exited;
     })(),
   ]);
   return { exitCode, stderr };
+}
+
+/**
+ * The rest of a stream as text. A reader, not a Response: waitForInstallLock may have read and released the start of
+ * an entry's stderr, and a Response refuses a body that was already read from.
+ */
+async function remainingText(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) return text + decoder.decode();
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/** Another shell entry's install, reduced to its native lock and a readiness pipe. */
+export async function withInstallLockHeld(
+  root: string,
+  run: (holder: Bun.Subprocess<'pipe', 'pipe', 'inherit'>) => Promise<void>,
+): Promise<void> {
+  const holder = Bun.spawn({
+    cmd: [
+      'bun',
+      '-e',
+      [
+        "const { dlopen, FFIType } = require('bun:ffi');",
+        "const { openSync } = require('node:fs');",
+        "const libc = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {",
+        '  flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },',
+        '});',
+        `if (libc.symbols.flock(openSync(${JSON.stringify(join(root, 'node_modules', '.smoo-install.lock'))}, 'a'), 2) !== 0) process.exit(1);`,
+        "process.stdout.write('held\\n');",
+        'process.stdin.resume();',
+      ].join('\n'),
+    ],
+    stdout: 'pipe',
+    stderr: 'inherit',
+    stdin: 'pipe',
+  });
+  try {
+    const reader = holder.stdout.getReader();
+    let ready = '';
+    try {
+      while (!ready.endsWith('\n')) {
+        const chunk = await reader.read();
+        if (chunk.done) throw new Error('install-lock holder exited before readiness');
+        ready += new TextDecoder().decode(chunk.value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    if (ready !== 'held\n') throw new Error(`unexpected install-lock readiness: ${ready}`);
+    await run(holder);
+  } finally {
+    if (holder.exitCode === null) holder.kill('SIGKILL');
+    await holder.exited;
+  }
+}
+
+export const INSTALL_LOCK_WAIT = "setup-environment: waiting for another shell entry's install";
+
+/** Consume through the entry's first lock-contention event, leaving the rest for finished. */
+export async function waitForInstallLock(entry: ShellProcess): Promise<string> {
+  const reader = entry.stderr.getReader();
+  let stderr = '';
+  try {
+    while (!stderr.includes(INSTALL_LOCK_WAIT)) {
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error(`shell entry exited without waiting for the held install lock: ${stderr}`);
+      stderr += new TextDecoder().decode(chunk.value);
+    }
+    return stderr;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 /** Change a file the way an editor or a pull does: new bytes, a newer mtime. */

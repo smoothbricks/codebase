@@ -305,12 +305,11 @@ try {
   // variable as GITHUB_*. Not `CI`: agent harnesses set CI=true on every command
   // they run, and this branch installs unconditionally.
   if (process.env.GITHUB_ACTIONS === 'true' && cargoMode) {
-    await withInstallLock(async () => {
-      for (const fetch of cargoFetches) {
-        const error = await fetch.install({ quiet: false });
-        if (error !== undefined) reportSetupFailure(error);
-      }
-    });
+    // Cargo owns CARGO_HOME's package-cache locks; this task never mutates node_modules.
+    for (const fetch of cargoFetches) {
+      const error = await fetch.install({ quiet: false });
+      if (error !== undefined) reportSetupFailure(error);
+    }
   } else if (process.env.GITHUB_ACTIONS === 'true') {
     const uv = uvInstaller(uvInputs, { locked: true });
     await resolveSecrets();
@@ -372,9 +371,7 @@ try {
     });
   } else if (cargoMode) {
     // A failed fetch loads the shell like a failed install; the graph then names Cargo's refusal.
-    const fetchError = await withInstallLock(() =>
-      installLocalDependencies(cargoFetches.filter((fetch) => !fetch.isCurrent())),
-    );
+    const fetchError = await installLocalDependencies(cargoFetches.filter((fetch) => !fetch.isCurrent()));
     if (fetchError !== undefined) {
       reportDegradedSetup(fetchError);
     }
@@ -443,9 +440,9 @@ async function resolveSecrets(): Promise<void> {
 
 /**
  * Runs every installer whose inputs changed since its last successful run.
- * Returned, not thrown: the caller still keeps the git config, then reports a
- * degraded shell. The caller selects them under the install lock, so an
- * installer another shell entry just ran is already current there.
+ * Returned, not thrown: the caller reports a degraded shell after any remaining
+ * checkout setup. Bun/uv callers select under the install lock so another
+ * entry's completed install is current; Cargo uses its own package-cache locks.
  */
 async function installLocalDependencies(pending: readonly Installer[]): Promise<unknown> {
   if (pending.length === 0) {
@@ -468,13 +465,12 @@ async function installLocalDependencies(pending: readonly Installer[]): Promise<
 }
 
 /**
- * One install at a time per checkout, across processes. Shell entries race
- * whenever two shells load at once — a shell pool warming several, two
- * terminals, an editor beside a terminal — and two installs into one
- * node_modules collide on its links (`EEXIST … symlink`). The second entry
- * waits, then finds the first entry's stamps current and installs nothing.
- * The repository's git config and hooks are kept under the same lock, for the
- * same reason.
+ * One Bun/uv install or installed-package mutation at a time per checkout,
+ * across processes. Shell entries race whenever two shells load at once, and
+ * two installs into one node_modules collide on its links (EEXIST symlink).
+ * The second entry waits, then finds the first entry's stamps current.
+ * Alias/link repair and repository git config/hooks share this lock. Cargo
+ * fetch changes CARGO_HOME instead and uses Cargo's own package-cache locks.
  *
  * flock(2), not a lock directory or file the script creates and removes: the
  * kernel releases it when the holder exits however it exits, so a killed

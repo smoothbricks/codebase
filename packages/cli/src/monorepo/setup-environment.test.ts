@@ -11,6 +11,8 @@ import {
   HEALTHY,
   MANAGED,
   type ShellProcess,
+  waitForInstallLock,
+  withInstallLockHeld,
   withManagedRepository,
 } from './__tests__/helpers/shell-entry.js';
 
@@ -145,19 +147,30 @@ describe('what shell entry installs', () => {
     );
   });
 
-  it('installs once when two shell entries start together', async () => {
-    // A shell pool warms two shells at once in one checkout. The second must
-    // wait for the first install and then find nothing left to do, not run a
-    // second install into the same node_modules. The prepare script's real
-    // second holds the first install open so the two entries overlap; the
-    // race is between processes, so there is no clock to fake.
-    await withManagedRepository({ prepare: `sleep 1; printf 'x\\n' >> installed` }, async ({ root, startShell }) => {
-      const entries = await Promise.all([finished(startShell()), finished(startShell())]);
-      expect(entries.map((entry) => entry.exitCode)).toEqual([0, 0]);
-      expect(entries.map((entry) => entry.stderr).join('')).toBe(
-        `setup-environment: waiting for another shell entry's install in ${root}\n`,
-      );
-      expect(readFileSync(join(root, 'installed'), 'utf8')).toBe('x\n');
+  it('waits for the node_modules lock and installs once when two entries are released together', async () => {
+    await withManagedRepository({}, async ({ root, startShell, count }) => {
+      await withInstallLockHeld(root, async (holder) => {
+        const entries = [startShell(), startShell()];
+        try {
+          // Each process has attempted the held lock before it is released. Both then
+          // contend for the same install, and the second must recheck the first's stamp.
+          const waits = await Promise.all(entries.map(waitForInstallLock));
+          expect(waits).toEqual(
+            entries.map(() => `setup-environment: waiting for another shell entry's install in ${root}\n`),
+          );
+          expect(count('install')).toBe(0);
+          holder.stdin.end();
+          expect(await holder.exited).toBe(0);
+          const entered = await Promise.all(entries.map(finished));
+          expect(entered).toEqual([HEALTHY, HEALTHY]);
+          expect(count('install')).toBe(1);
+        } finally {
+          for (const entry of entries) {
+            if (entry.exitCode === null) entry.kill('SIGKILL');
+          }
+          await Promise.all(entries.map((entry) => entry.exited));
+        }
+      });
     });
   });
 

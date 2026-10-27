@@ -3,7 +3,16 @@ import { describe, expect, it } from 'bun:test';
 import { readFileSync, readlinkSync, symlinkSync } from 'node:fs';
 import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { edit, finished, HEALTHY, linkEntry, withManagedRepository } from './__tests__/helpers/shell-entry.js';
+import {
+  edit,
+  finished,
+  HEALTHY,
+  INSTALL_LOCK_WAIT,
+  linkEntry,
+  waitForInstallLock,
+  withInstallLockHeld,
+  withManagedRepository,
+} from './__tests__/helpers/shell-entry.js';
 import { keepDeveloperLinks } from './developer-links.js';
 
 // What a declaration and an install do to the trees, called directly, is developer-links-declared.test.ts. These
@@ -128,57 +137,27 @@ describe('what shell entry keeps linked', () => {
   );
 
   describe('as smoo.developerLinks declares them', () => {
-    it('the --links task links without an install lock or a reinstall, says what it cannot link, and links nothing on CI', async () => {
+    it('probes without an install lock, serializes declared link writes, and links nothing on CI', async () => {
       await withManagedRepository(
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '../absent-lib' } },
         async ({ root, startShell, enterShell: enter, count }) => {
           expect(await finished(startShell())).toEqual(HEALTHY);
-          // Another entry's install, reduced to its lock: a process holding flock(2) on the checkout's install lock
-          // until its stdin closes or it is killed. It says `held` once it has it.
-          const holder = Bun.spawn({
-            cmd: [
-              'bun',
-              '-e',
-              [
-                "const { dlopen, FFIType } = require('bun:ffi');",
-                "const { openSync } = require('node:fs');",
-                "const libc = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {",
-                '  flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },',
-                '});',
-                `if (libc.symbols.flock(openSync(${JSON.stringify(join(root, 'node_modules', '.smoo-install.lock'))}, 'a'), 2) !== 0) process.exit(1);`,
-                "process.stdout.write('held\\n');",
-                'process.stdin.resume();',
-              ].join('\n'),
-            ],
-            stdout: 'pipe',
-            stderr: 'inherit',
-            stdin: 'pipe',
-          });
-          try {
-            const said = holder.stdout.getReader();
-            const first = await said.read();
-            expect(new TextDecoder().decode(first.value)).toBe('held\n');
-            said.releaseLock();
-
+          await withInstallLockHeld(root, async () => {
             // The entry prints its wait line the moment it finds the lock held and then polls until the holder
             // dies, so reading its stderr up to that line or its exit decides the case without a clock.
             const entry = startShell({ links: true });
-            const waited = "setup-environment: waiting for another shell entry's install";
             let stderr = '';
             for await (const chunk of entry.stderr) {
               stderr += new TextDecoder().decode(chunk);
-              if (stderr.includes(waited)) entry.kill('SIGKILL');
+              if (stderr.includes(INSTALL_LOCK_WAIT)) entry.kill('SIGKILL');
             }
-            expect(stderr).not.toContain(waited);
+            expect(stderr).not.toContain(INSTALL_LOCK_WAIT);
             expect(await entry.exited).toBe(0);
             expect(stderr).toContain(
               `! smoo.developerLinks @fixture/lib: ${join(dirname(root), 'absent-lib')} does not exist on this machine; the installed version stays`,
             );
             expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
-          } finally {
-            holder.kill('SIGKILL');
-            await holder.exited;
-          }
+          });
 
           // An absent declared checkout is current for the status, which says nothing about it.
           expect(await enter({ links: true, check: true })).toEqual(HEALTHY);
@@ -191,9 +170,24 @@ describe('what shell entry keeps linked', () => {
           expect(await enter({ links: true, check: true, ciSecrets: RUNNER })).toEqual(HEALTHY);
           expect(await enter({ links: true, ciSecrets: RUNNER })).toEqual(HEALTHY);
           expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
-          const linked = await enter({ links: true });
-          expect(linked.exitCode).toBe(0);
-          expect(linked.stderr).toContain(`linked declared packages to local checkouts: @fixture/lib -> ${local}`);
+          await withInstallLockHeld(root, async (holder) => {
+            const entry = startShell({ links: true });
+            try {
+              const waited = await waitForInstallLock(entry);
+              expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+              expect(count('install')).toBe(1);
+              holder.stdin.end();
+              expect(await holder.exited).toBe(0);
+              const linked = await finished(entry);
+              expect(linked.exitCode).toBe(0);
+              expect(waited + linked.stderr).toContain(
+                `linked declared packages to local checkouts: @fixture/lib -> ${local}`,
+              );
+            } finally {
+              if (entry.exitCode === null) entry.kill('SIGKILL');
+              await entry.exited;
+            }
+          });
           expect(readlinkSync(join(root, LINKED))).toBe(local);
           expect(count('install')).toBe(1);
           expect((await enter({ links: true, check: true })).exitCode).toBe(0);
