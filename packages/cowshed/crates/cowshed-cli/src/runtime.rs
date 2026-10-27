@@ -1253,10 +1253,10 @@ pub(crate) async fn relay_foreground(
     let diagnose = |error: CowshedError| {
         if error
             .wait_source()
-            .and_then(|failure| failure.supervisor_stack_pid())
+            .and_then(|failure| failure.stack_pid())
             .is_some()
         {
-            crate::run::record_wait(&crate::run::wait_spans(), error)
+            crate::run::wait_spans().record(error)
         } else {
             error
         }

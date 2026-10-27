@@ -11,8 +11,7 @@ use std::io;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use cowshed_core::CowshedError;
-use cowshed_core::runtime::wait_spans::WaitSpans;
-use cowshed_core::storage::bootstrap::CanonicalRoots;
+use cowshed_core::runtime::wait_spans::WaitRecording;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
 use crate::capabilities::sccache;
@@ -632,12 +631,12 @@ fn finish<W: io::Write, E: io::Write>(
     outcome: Result<i32, CowshedError>,
     output: &mut output::Output<W, E>,
     json: bool,
-    waits: &WaitSpans,
+    waits: &WaitRecording,
 ) -> i32 {
     match outcome {
         Ok(exit_code) => exit_code,
         Err(error) => {
-            let error = record_wait(waits, error);
+            let error = waits.record(error);
             let exit_code = i32::from(error.exit_code());
             if let Err(write_error) = write_error(output, error, json, None) {
                 cowshed_os::eprintln!("cowshed: failed to write command result: {write_error}");
@@ -649,44 +648,10 @@ fn finish<W: io::Write, E: io::Write>(
     }
 }
 
-mod stack_sample;
-
-/// The command's trace context and host telemetry root, also used before a relay releases its hold.
-pub(crate) fn wait_spans() -> WaitSpans {
-    WaitSpans::adopting(
-        CanonicalRoots::global().telemetry().to_path_buf(),
-        std::env::var("TRACEPARENT").ok().as_deref(),
-    )
-}
-
-/// Keep one receipt across the relay and final error boundaries. Capture/seal failures never
-/// replace the original wait failure or its exit code.
-pub(crate) fn record_wait(waits: &WaitSpans, mut error: CowshedError) -> CowshedError {
-    let Some(failure) = error.wait_source() else {
-        return error;
-    };
-    if failure.receipt.is_some() {
-        return error;
-    }
-    let mut failure = failure.clone();
-    let original_message_len = failure.message.len();
-    waits.record(
-        &mut failure,
-        std::time::SystemTime::now(),
-        stack_sample::capture,
-    );
-    if let Some(receipt) = &failure.receipt
-        && let Err(reason) = &receipt.span
-    {
-        cowshed_os::eprintln!(
-            "cowshed: the expired wait's span could not be sealed under {}: {reason}",
-            waits.root().display()
-        );
-    }
-    error
-        .message
-        .push_str(&failure.message[original_message_len..]);
-    error.with_wait(Some(failure))
+/// The command's wait recording: the host's telemetry root and the trace its caller exported, also
+/// used before a relay releases its hold.
+pub(crate) fn wait_spans() -> WaitRecording {
+    WaitRecording::host()
 }
 fn emit_error(error: CowshedError, command_map: Option<&str>, json: bool, quiet: bool) -> i32 {
     let exit_code = i32::from(error.exit_code());
@@ -733,7 +698,10 @@ mod tests {
             &crate::temp_parent::scratch_parent(),
             "cswait-sample",
         );
-        let waits = WaitSpans::adopting(root.to_path_buf(), None);
+        let waits = WaitRecording::new(
+            cowshed_core::runtime::wait_spans::WaitSpans::adopting(root.to_path_buf(), None),
+            cowshed_core::runtime::stack_sample::capture,
+        );
         let pid = i32::try_from(std::process::id()).unwrap();
         let silent = Silent {
             op: "wait",
@@ -792,7 +760,7 @@ mod tests {
             Err(error) if error.is_cancelled() => {}
             other => panic!("owned controller teardown: {other:?}"),
         }
-        let error = record_wait(&waits, error);
+        let error = waits.record(error);
         let receipt = error.wait_source().unwrap().receipt.clone().unwrap();
         let span = receipt.span.as_ref().unwrap();
         let sample = receipt.sample.as_ref().unwrap().as_ref().unwrap();
@@ -995,9 +963,12 @@ mod tests {
         let _silent = std::os::unix::net::UnixListener::bind(&socket).expect("silent supervisor");
         let telemetry = root.join("telemetry");
         std::fs::create_dir(&telemetry).expect("telemetry root");
-        let waits = WaitSpans::adopting(
-            telemetry.clone(),
-            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        let waits = WaitRecording::new(
+            cowshed_core::runtime::wait_spans::WaitSpans::adopting(
+                telemetry.clone(),
+                Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            ),
+            cowshed_core::runtime::stack_sample::capture,
         );
 
         let outcome = cowshed_core::runtime::supervisor_socket::hello(&socket)

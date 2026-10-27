@@ -1,16 +1,17 @@
-//! The unprivileged macOS stack sampler used only after a workspace-supervisor SILENT.
+//! The unprivileged macOS stack sampler a wait recording takes a silent workspace supervisor's or
+//! cowshed controller's stacks with ([`super::wait_spans::WaitRecording`]).
 
 #[cfg(target_os = "macos")]
-pub(super) fn capture(pid: i32) -> Result<Vec<u8>, String> {
+pub fn capture(pid: i32) -> Result<Vec<u8>, String> {
     use cowshed_os::deadline::{self, Bound, LatencyClass};
     // Two seconds of stacks, with the existing 10-second ffi class for the helper's whole run.
     let bound = Bound::new(LatencyClass::Ffi, deadline::LAUNCHCTL.within);
     let output = deadline::output_within(
-        "supervisor stack sampler",
+        "silent peer stack sampler",
         std::process::Command::new("/usr/bin/sample")
             .arg(pid.to_string())
             .args(["2", "-mayDie", "-file", "/dev/stdout"]),
-        &deadline::start("sample silent supervisor", bound),
+        &deadline::start("sample silent peer", bound),
     )
     .map_err(|error| error.to_string())?;
     if !output.status.success() {
@@ -30,7 +31,7 @@ pub(super) fn capture(pid: i32) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(super) fn capture(pid: i32) -> Result<Vec<u8>, String> {
+pub fn capture(pid: i32) -> Result<Vec<u8>, String> {
     Err(format!(
         "stack sampling pid {pid} is unsupported on this platform"
     ))

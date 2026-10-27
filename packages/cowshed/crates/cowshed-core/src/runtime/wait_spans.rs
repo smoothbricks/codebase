@@ -85,10 +85,15 @@ impl WaitFailure {
             .ok_or(WaitSpanError::BeforeEpoch)?;
         Ok((began, ended))
     }
-    /// Only a silent workspace supervisor with a kernel-reported pid is a stack target.
-    pub fn supervisor_stack_pid(&self) -> Option<i32> {
+    /// A silent peer the recording samples: a workspace supervisor or a cowshed controller, each
+    /// with a kernel- or hello-reported pid.
+    pub fn stack_pid(&self) -> Option<i32> {
         match (self.code, self.peer_role, self.peer_pid) {
-            (WaitCode::Silent, "workspace supervisor", Some(pid)) if pid > 0 => Some(pid),
+            (WaitCode::Silent, "workspace supervisor" | "cowshed controller", Some(pid))
+                if pid > 0 =>
+            {
+                Some(pid)
+            }
             _ => None,
         }
     }
@@ -209,6 +214,72 @@ pub struct WaitSpans {
     parent: Option<SpanId>,
 }
 
+/// The OS sampler a recording takes a silent peer's stacks with: the peer's pid in, the report's
+/// bytes or why there is none out.
+pub type StackCapture = fn(i32) -> std::result::Result<Vec<u8>, String>;
+
+/// Where a client seals the waits its own calls expire in, and how it samples the stacks of the
+/// peer that fell silent: one recording attempt per failure (`WaitSpans::record`).
+#[derive(Clone, Debug)]
+pub struct WaitRecording {
+    spans: WaitSpans,
+    capture: StackCapture,
+}
+
+impl WaitRecording {
+    pub fn new(spans: WaitSpans, capture: StackCapture) -> Self {
+        Self { spans, capture }
+    }
+
+    /// The host's: its telemetry root, the trace the caller exported in `TRACEPARENT`, and the
+    /// OS's unprivileged sampler.
+    pub fn host() -> Self {
+        Self::new(
+            WaitSpans::adopting(
+                crate::storage::bootstrap::CanonicalRoots::global()
+                    .telemetry()
+                    .to_path_buf(),
+                std::env::var("TRACEPARENT").ok().as_deref(),
+            ),
+            super::stack_sample::capture,
+        )
+    }
+
+    /// The telemetry root the spans are sealed under.
+    pub fn root(&self) -> &Path {
+        self.spans.root()
+    }
+
+    /// Record `error`'s expired wait once, sampling a silent peer first: the error comes back
+    /// naming the sample and carrying the receipt, so a later boundary that sees it records
+    /// nothing again. Capture and seal failures never replace the original failure or its exit
+    /// code. An error with no expired wait comes back as it was.
+    pub fn record(&self, mut error: crate::CowshedError) -> crate::CowshedError {
+        let Some(failure) = error.wait_source() else {
+            return error;
+        };
+        if failure.receipt.is_some() {
+            return error;
+        }
+        let mut failure = failure.clone();
+        let original_message_len = failure.message.len();
+        self.spans
+            .record(&mut failure, SystemTime::now(), self.capture);
+        if let Some(receipt) = &failure.receipt
+            && let Err(reason) = &receipt.span
+        {
+            cowshed_os::eprintln!(
+                "cowshed: the expired wait's span could not be sealed under {}: {reason}",
+                self.spans.root().display()
+            );
+        }
+        error
+            .message
+            .push_str(&failure.message[original_message_len..]);
+        error.with_wait(Some(failure))
+    }
+}
+
 impl WaitSpans {
     /// Seal under the telemetry `root`, in the trace `traceparent` names: a W3C `traceparent`, as
     /// a traced caller exports it in `TRACEPARENT`. With none, or one that does not parse, each
@@ -254,7 +325,7 @@ impl WaitSpans {
         let segment = Uuid::new_v4();
         let stem = format!("wait-{}", segment.simple());
         let date = TelemetryDate::from_unix_seconds(began.as_secs());
-        let sample = failure.supervisor_stack_pid().map(|pid| {
+        let sample = failure.stack_pid().map(|pid| {
             capture(pid).and_then(|bytes| {
                 crate::storage::trace_segment::seal_bytes(
                     &self.root,
@@ -266,12 +337,15 @@ impl WaitSpans {
             })
         });
         match &sample {
-            Some(Ok(path)) => failure
-                .message
-                .push_str(&format!("; supervisor stacks: {}", path.display())),
-            Some(Err(error)) => failure
-                .message
-                .push_str(&format!("; supervisor stack capture failed: {error}")),
+            Some(Ok(path)) => failure.message.push_str(&format!(
+                "; {} stacks: {}",
+                failure.peer_role,
+                path.display()
+            )),
+            Some(Err(error)) => failure.message.push_str(&format!(
+                "; {} stack capture failed: {error}",
+                failure.peer_role
+            )),
             None => {}
         }
         let span = self
@@ -370,6 +444,7 @@ mod tests {
             (WaitCode::Silent, "workspace supervisor", None, None),
             (WaitCode::Silent, "workspace supervisor", Some(0), None),
             (WaitCode::Silent, "gateway", Some(42), None),
+            (WaitCode::Silent, "cowshed controller", Some(42), Some(42)),
             (WaitCode::Timeout, "workspace supervisor", Some(42), None),
             (WaitCode::PeerLost, "workspace supervisor", Some(42), None),
         ] {
@@ -383,11 +458,7 @@ mod tests {
             };
             let mut failure = WaitFailure::silent(&silent, pid, role);
             failure.code = code;
-            assert_eq!(
-                failure.supervisor_stack_pid(),
-                expected,
-                "{code:?} {role} {pid:?}"
-            );
+            assert_eq!(failure.stack_pid(), expected, "{code:?} {role} {pid:?}");
             let (began, ended) = failure.interval(clock()).unwrap();
             assert_eq!((began.as_secs(), ended.as_secs()), (35, 300));
             for sample in [

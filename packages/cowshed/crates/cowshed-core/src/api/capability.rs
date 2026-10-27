@@ -1449,6 +1449,7 @@ fn spawn_controller_actor(
     writer: impl AsyncWrite + Unpin + Send + 'static,
     controller: Peer,
     local_waits: Option<super::server::LocalWaitCauses>,
+    recording: Option<crate::runtime::wait_spans::WaitRecording>,
 ) -> (
     Arc<dyn ControllerRuntime>,
     watch::Receiver<Option<OtherBuild>>,
@@ -1472,6 +1473,7 @@ fn spawn_controller_actor(
         writer,
         downloads,
         answer_receiver,
+        recording,
     ));
     (Arc::new(ActorRuntime { sender, closes }), refused)
 }
@@ -1569,10 +1571,16 @@ impl ControllerSilence {
 /// waiting caller's error. Nothing was stopped.
 #[cfg(unix)]
 fn silent_controller(silent: &Silent<ControllerHolder>) -> CowshedError {
+    let failure = crate::runtime::wait_spans::WaitFailure::silent(
+        silent,
+        crate::runtime::wait_spans::peer_pid(&silent.holder.peer),
+        silent.holder.peer.role,
+    );
     CowshedError::environment_missing(
         silent.to_string(),
         "the controller is alive and not answering on its connection; nothing was stopped, and its pid is named above",
     )
+    .with_wait(Some(failure))
 }
 
 #[cfg(unix)]
@@ -1731,6 +1739,7 @@ async fn run_controller_actor(
     mut writer: impl AsyncWrite + Unpin,
     downloads: Downloads,
     mut answers: mpsc::UnboundedReceiver<Result<Inbound>>,
+    recording: Option<crate::runtime::wait_spans::WaitRecording>,
 ) {
     let mut pending =
         std::collections::HashMap::<u64, oneshot::Sender<Result<ActorResponse>>>::new();
@@ -1921,7 +1930,21 @@ async fn run_controller_actor(
                     continue;
                 }
                 let holder = ControllerHolder { peer: controller.clone(), busy: stalled.busy.take() };
-                let silent = silent_controller(&stalled.idle.silent(holder, deadline::clock()));
+                let mut silent = silent_controller(&stalled.idle.silent(holder, deadline::clock()));
+                // Sampled while the controller is still silent, before any waiting call is told:
+                // the sampler and the seal block, so they run off this task (05_gateway.md
+                // "Deadlines", Spans).
+                if let Some(recording) = recording.clone() {
+                    let unrecorded = silent.clone();
+                    silent = tokio::task::spawn_blocking(move || recording.record(silent))
+                        .await
+                        .unwrap_or_else(|error| {
+                            cowshed_os::eprintln!(
+                                "cowshed: recording a silent controller's wait failed: {error}"
+                            );
+                            unrecorded
+                        });
+                }
                 // SILENT ends the waits, never the connection: a `cowshed controller` exits once
                 // its peer closes its end (06_cli.md), and every other op shares it.
                 for (id, reply) in pending.drain() {
@@ -2092,7 +2115,13 @@ async fn acquire_coordinator_token(
     }
     let controller = paired_peer("cowshed controller", pid)?;
     let (reader, writer) = stream.into_split();
-    let (runtime, other_build) = spawn_controller_actor(reader, writer, controller, local_waits);
+    // A process-external controller is sampled and its silence sealed by this client: no
+    // boundary of the controller's own records a wait its peer gave up on.
+    let recording = local_waits
+        .is_none()
+        .then(crate::runtime::wait_spans::WaitRecording::host);
+    let (runtime, other_build) =
+        spawn_controller_actor(reader, writer, controller, local_waits, recording);
     let token = CoordinatorToken {
         repo_id,
         channel: AuthenticatedControllerChannel {
@@ -2199,7 +2228,7 @@ async fn connect_host(descriptor: OwnedFd, role: HostRole) -> Result<Arc<dyn Con
     };
     let controller = paired_peer(role_name, pid)?;
     let (reader, writer) = stream.into_split();
-    let (runtime, _other_build) = spawn_controller_actor(reader, writer, controller, None);
+    let (runtime, _other_build) = spawn_controller_actor(reader, writer, controller, None, None);
     Ok(runtime)
 }
 
@@ -3326,7 +3355,7 @@ mod tests {
     fn actor_pair() -> (Arc<dyn ControllerRuntime>, tokio::net::UnixStream) {
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
         let (reader, writer) = client.into_split();
-        let (runtime, _) = spawn_controller_actor(reader, writer, controller(), None);
+        let (runtime, _) = spawn_controller_actor(reader, writer, controller(), None, None);
         (runtime, server)
     }
 
@@ -3337,7 +3366,7 @@ mod tests {
     fn actor_in_memory() -> (Arc<dyn ControllerRuntime>, tokio::io::DuplexStream) {
         let (client, server) = tokio::io::duplex(MAX_RPC_BYTES);
         let (reader, writer) = tokio::io::split(client);
-        let (runtime, _) = spawn_controller_actor(reader, writer, controller(), None);
+        let (runtime, _) = spawn_controller_actor(reader, writer, controller(), None, None);
         (runtime, server)
     }
 
@@ -3482,6 +3511,62 @@ mod tests {
             .expect("the next call joins")
             .expect("the next call is answered, and the late answer before it was dropped");
         assert_eq!(answered, json!({"state": "running"}));
+    }
+
+    /// 05_gateway.md "Deadlines": a controller call that falls SILENT samples the controller it
+    /// waited on, by the pid its hello reported, before the waiting calls fail, and seals the
+    /// `cowshed.wait` span with the sample's path as its typed `wait_stack_sample` column. The
+    /// caller's error names the sample, so the next silence names its stalled call.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_controller_call_samples_the_controller_and_seals_its_wait_span() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-silent-controller-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("a telemetry root, as the host's exists");
+        let recording = crate::runtime::wait_spans::WaitRecording::new(
+            crate::runtime::wait_spans::WaitSpans::adopting(root.clone(), None),
+            |pid| Ok(format!("stacks of {pid}").into_bytes()),
+        );
+        let (client, mut server) = tokio::io::duplex(MAX_RPC_BYTES);
+        let (reader, writer) = tokio::io::split(client);
+        let (runtime, _) =
+            spawn_controller_actor(reader, writer, controller(), None, Some(recording));
+        let call = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let _ = read_rpc_request(&mut server).await;
+        let failure = call
+            .await
+            .expect("the silent call joins")
+            .expect_err("a silent controller's call fails");
+        let wait = failure
+            .wait_source()
+            .expect("a SILENT controller call carries its wait")
+            .clone();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            failure.message.contains("cowshed controller stacks: "),
+            "{}",
+            failure.message
+        );
+        let receipt = wait
+            .receipt
+            .expect("the controller's silence was recorded once");
+        assert!(
+            receipt.span.is_ok(),
+            "the wait span was sealed: {:?}",
+            receipt.span
+        );
+        let sample = receipt
+            .sample
+            .expect("a silent controller is a stack target");
+        assert!(
+            sample.is_ok_and(|path| path.to_string_lossy().ends_with(".sample.txt")),
+            "the controller was sampled into the telemetry root"
+        );
     }
 
     /// 05_gateway.md "Deadlines": a controller that heartbeats keeps a slow call waiting however
@@ -4986,7 +5071,8 @@ mod tests {
     async fn a_refusal_of_the_controllers_build_marks_its_connection() {
         let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
         let (reader, writer) = client.into_split();
-        let (runtime, other_build) = spawn_controller_actor(reader, writer, controller(), None);
+        let (runtime, other_build) =
+            spawn_controller_actor(reader, writer, controller(), None, None);
         let coordinator = coordinator_over(runtime, other_build);
         let refused = OtherBuild {
             daemon: crate::runtime::supervisor_socket::BuildId::current()

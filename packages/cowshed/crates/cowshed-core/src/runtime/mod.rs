@@ -43,6 +43,7 @@ pub mod shell_inherit;
 mod shell_job;
 pub mod shell_pool;
 pub mod shell_watch;
+pub mod stack_sample;
 #[cfg(target_os = "macos")]
 pub(crate) mod storage_host;
 pub mod supervisor;
