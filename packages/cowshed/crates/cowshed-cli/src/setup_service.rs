@@ -2022,7 +2022,7 @@ fn repair_status(
         || matches!(readiness.cli, Some(CliInstall::Downgrade { .. }))
     {
         return String::from(
-            "host storage is set up, but the installed cowshed was kept: the invoking build is older than it",
+            "host storage is set up, but the installed cowshed was kept: the invoking build is not shown to contain it",
         );
     }
     let cli_changed = matches!(

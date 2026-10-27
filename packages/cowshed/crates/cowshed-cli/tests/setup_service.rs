@@ -923,7 +923,7 @@ async fn a_refused_downgrade_repairs_the_rest_and_then_fails_the_run_naming_the_
     );
     assert!(
         streams.stderr.contains(
-            "cowshed: host storage is set up, but the installed cowshed was kept: the invoking build is older than it\n"
+            "cowshed: host storage is set up, but the installed cowshed was kept: the invoking build is not shown to contain it\n"
         ),
         "{}",
         streams.stderr
