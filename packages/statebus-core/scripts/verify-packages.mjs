@@ -187,6 +187,16 @@ function pinnedConsumerGraph(roots, directDependencies, packedNames) {
               assert.ok(childLockKey, `cannot pin below ${dep}@${version}: it is absent from the workspace lock`);
             } else if (kind === 'peerDependencies') {
               version = directDependencies[dep] ?? null;
+            } else {
+              // A ranged dependency the installed tree lacks is platform-filtered as an exact one is
+              // (fsevents, optional and darwin-only, off macOS): the lock records what it resolved to
+              // below this package, and that is what a consumer's install on another host gets.
+              const parentKey = lockKeyFor(manifest.name, manifest.version);
+              const child = parentKey === null ? null : lockChild(parentKey, dep);
+              if (child) {
+                childLockKey = child.key;
+                version = child.version;
+              }
             }
             assert.ok(
               version,
