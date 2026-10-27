@@ -217,9 +217,9 @@ struct LeverageWork {
 
 #[cfg(test)]
 thread_local! {
-    static LEVERAGE_WORK: std::cell::Cell<LeverageWork> = std::cell::Cell::new(LeverageWork {
-        passes: 0,
-    });
+    static LEVERAGE_WORK: std::cell::Cell<LeverageWork> = const {
+        std::cell::Cell::new(LeverageWork { passes: 0 })
+    };
 }
 
 #[cfg(test)]
