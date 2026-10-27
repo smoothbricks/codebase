@@ -1561,7 +1561,9 @@ ready unit acquires a lease. Strong models propose task boundaries and interface
   coordinator's `urgent` override, the unit's leverage (the distinct units transitively depending on it), the
   cache-domain deadline (known deadlines first, soonest first; an unknown deadline sorts behind known ones and is never
   invented), and finally the stable unit id. The schedule is recomputed at every event and at the oldest waiter's age
-  bound; the same facts always produce the same order.
+  bound; the same facts always produce the same order. Within one unchanged-graph operation, selection, ready order and
+  queue status share one leverage observation; an actual post-selection abandonment before the queue reply is the sole
+  invalidation, and the reply then takes one fresh leverage pass over the abandoned graph.
 - **Ownership.** A unit keeps exactly one live attempt: its admission connection is the attempt, held like a disk lease.
   A second admission of a live unit is refused. A connection that closes without a terminal outcome abandons its
   attempt, and a delayed holder of a settled attempt can never advance a newer one.

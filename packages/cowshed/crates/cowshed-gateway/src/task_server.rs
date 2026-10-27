@@ -37,7 +37,7 @@
 
 use std::cell::LazyCell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -207,6 +207,77 @@ enum Effect {
     Release { ticket: u64 },
 }
 
+/// Actual leverage computations witnessed on the current thread. A pass on another
+/// thread never changes this thread's count.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LeverageWork {
+    passes: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEVERAGE_WORK: std::cell::Cell<LeverageWork> = std::cell::Cell::new(LeverageWork {
+        passes: 0,
+    });
+}
+
+#[cfg(test)]
+fn record_leverage_pass() {
+    LEVERAGE_WORK.with(|work| {
+        let mut current = work.get();
+        current.passes += 1;
+        work.set(current);
+    });
+}
+
+#[cfg(test)]
+fn reset_leverage_work() {
+    LEVERAGE_WORK.with(|work| work.set(LeverageWork::default()));
+}
+
+#[cfg(test)]
+fn leverage_work() -> LeverageWork {
+    LEVERAGE_WORK.with(|work| work.get())
+}
+
+/// One operation's leverage counts over an unchanged dependency graph. It is created for one
+/// actor turn (or one pure operation), shared by selection, ready order and queue status, and
+/// dropped with the operation: the ledger keeps no leverage cache. Selection does not
+/// invalidate it, because a selected unit stays live and neither deps nor terminal facts
+/// change there. An abandonment made through leave below is the one invalidation: only an
+/// actual abandoned attempt drops the counts, and the next use takes one fresh pass.
+#[derive(Debug)]
+struct LeverageObservation {
+    counts: Option<HashMap<Arc<str>, usize>>,
+}
+
+impl LeverageObservation {
+    fn new() -> Self {
+        Self { counts: None }
+    }
+
+    fn counts(&mut self, ledger: &Ledger) -> &HashMap<Arc<str>, usize> {
+        self.counts.get_or_insert_with(|| ledger.leverage())
+    }
+
+    /// Abandon the attempt behind ticket while this observation is live. A stale ticket
+    /// changes no graph fact and keeps the counts; an actual abandonment makes the unit
+    /// terminal, so the counts go and the next reader recomputes them once.
+    fn leave(
+        &mut self,
+        ledger: &mut Ledger,
+        ticket: u64,
+        effects: &mut Vec<Effect>,
+    ) -> Option<TaskFacts> {
+        let facts = ledger.leave(ticket, effects);
+        if facts.is_some() {
+            self.counts = None;
+        }
+        facts
+    }
+}
+
 /// The schedule's whole state: one live attempt per unit, the lease classes' holders, and the
 /// terminal facts every dependent reads. Invariants: a ticket appears in exactly one live unit;
 /// a holder list names exactly the selected tickets that declared the class; a terminal unit
@@ -330,11 +401,12 @@ impl Ledger {
     fn select(
         &mut self,
         now: Instant,
+        observation: &mut LeverageObservation,
         read_memory: impl FnOnce() -> Result<MemoryPressure, HostPressureError>,
         effects: &mut Vec<Effect>,
     ) {
         let reading = LazyCell::new(|| read_memory().map_err(|error| error.to_string()));
-        for ticket in self.ready_order(now) {
+        for ticket in self.ready_order(now, observation) {
             let Some((unit, attempt)) = self.tickets.get(&ticket).cloned() else {
                 continue;
             };
@@ -369,15 +441,15 @@ impl Ledger {
     }
 
     /// The ready units in the exact order the scheduler would grant them.
-    fn ready_order(&self, now: Instant) -> Vec<u64> {
-        let leverage = self.leverage();
+    fn ready_order(&self, now: Instant, observation: &mut LeverageObservation) -> Vec<u64> {
+        let leverage = observation.counts(self);
         let mut ready: Vec<&Unit> = self
             .units
             .values()
             .filter(|unit| matches!(unit.state, State::Queued))
             .filter(|unit| unit.facts.deps.iter().all(|dep| self.landed(dep)))
             .collect();
-        ready.sort_by(|a, b| self.order_cmp(a, b, now, &leverage));
+        ready.sort_by(|a, b| self.order_cmp(a, b, now, leverage));
         ready.into_iter().map(|unit| unit.ticket).collect()
     }
 
@@ -393,23 +465,37 @@ impl Ledger {
 
     /// The distinct live units transitively depending on each unit: the leverage ordering key.
     fn leverage(&self) -> HashMap<Arc<str>, usize> {
+        #[cfg(test)]
+        record_leverage_pass();
         let mut counts: HashMap<Arc<str>, usize> = HashMap::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&Arc<str>> = Vec::new();
         for unit in self
             .units
             .values()
             .filter(|unit| !matches!(unit.state, State::Terminal { .. }))
         {
-            let mut seen: Vec<Arc<str>> = Vec::new();
-            let mut stack = unit.facts.deps.clone();
+            let source = &*unit.facts.unit;
+            seen.clear();
+            stack.clear();
+            stack.extend(unit.facts.deps.iter());
             while let Some(dep) = stack.pop() {
-                if dep == unit.facts.unit || seen.contains(&dep) {
+                let name = &**dep;
+                if name == source {
                     continue;
                 }
-                seen.push(dep.clone());
-                if let Some(entry) = self.units.get(&dep) {
-                    stack.extend(entry.facts.deps.iter().cloned());
+                if !seen.insert(name) {
+                    continue;
                 }
-                *counts.entry(dep).or_default() += 1;
+                if let Some(entry) = self.units.get(name) {
+                    stack.extend(entry.facts.deps.iter());
+                }
+                match counts.get_mut(name) {
+                    Some(count) => *count += 1,
+                    None => {
+                        counts.insert(Arc::clone(dep), 1);
+                    }
+                }
             }
         }
         counts
@@ -508,10 +594,10 @@ impl Ledger {
 
     /// The whole fold at this instant: the ready order with what holds each ready unit back, what
     /// waits on what, and who holds each lease.
-    fn status(&self, now: Instant) -> TaskQueueStatus {
-        let leverage = self.leverage();
-        let ready = self
-            .ready_order(now)
+    fn status(&self, now: Instant, observation: &mut LeverageObservation) -> TaskQueueStatus {
+        let ready_tickets = self.ready_order(now, observation);
+        let leverage = observation.counts(self);
+        let ready = ready_tickets
             .into_iter()
             .filter_map(|ticket| {
                 let entry = self.unit_of(ticket)?;
@@ -787,11 +873,15 @@ async fn run(limits: TaskServerLimits, mut receiver: mpsc::UnboundedReceiver<Mes
             },
             _ = wake_at(ledger.wake(Instant::now())) => {}
         }
+
+        let mut observation = LeverageObservation::new();
         ledger.select(
             Instant::now(),
+            &mut observation,
             host_pressure::read_memory_pressure,
             &mut follow,
         );
+
         for effect in follow {
             match effect {
                 Effect::Release { ticket } => {
@@ -819,7 +909,7 @@ async fn run(limits: TaskServerLimits, mut receiver: mpsc::UnboundedReceiver<Mes
                     );
                     let Some(reply) = replies.remove(&ticket) else {
                         // The client left before its turn: abandon the attempt it freed.
-                        ledger.leave(ticket, &mut Vec::new());
+                        observation.leave(&mut ledger, ticket, &mut Vec::new());
                         continue;
                     };
                     let _ = reply.send(Ok(TaskGrant {
@@ -831,7 +921,7 @@ async fn run(limits: TaskServerLimits, mut receiver: mpsc::UnboundedReceiver<Mes
             }
         }
         for reply in pending_queue.drain(..) {
-            let _ = reply.send(ledger.status(Instant::now()));
+            let _ = reply.send(ledger.status(Instant::now(), &mut observation));
         }
     }
 }
@@ -882,8 +972,10 @@ mod tests {
 
         fn select_under(&mut self, ms: u64, pressure: MemoryPressure) -> Vec<String> {
             let mut effects = Vec::new();
+            let mut observation = LeverageObservation::new();
             self.ledger
-                .select(self.at(ms), || Ok(pressure), &mut effects);
+                .select(self.at(ms), &mut observation, || Ok(pressure), &mut effects);
+
             effects
                 .iter()
                 .filter_map(|effect| match effect {
@@ -909,9 +1001,15 @@ mod tests {
             effects
         }
 
+        fn status(&self, ms: u64) -> TaskQueueStatus {
+            let mut observation = LeverageObservation::new();
+            self.ledger.status(self.at(ms), &mut observation)
+        }
+
         fn ready(&self, ms: u64) -> Vec<String> {
+            let mut observation = LeverageObservation::new();
             self.ledger
-                .ready_order(self.at(ms))
+                .ready_order(self.at(ms), &mut observation)
                 .into_iter()
                 .filter_map(|ticket| {
                     self.ledger
@@ -999,9 +1097,9 @@ mod tests {
         clock.admit(0, 2, background).unwrap();
         clock.admit(0, 3, facts("y-gate")).unwrap();
         clock.admit(0, 4, land).unwrap();
+
         let bands: Vec<(String, TaskBand)> = clock
-            .ledger
-            .status(clock.at(0))
+            .status(0)
             .ready
             .into_iter()
             .map(|ready| (ready.unit, ready.band))
@@ -1038,7 +1136,9 @@ mod tests {
             level: DarwinPressureLevel::Warning,
         };
         assert_eq!(clock.select_under(0, warning), ["gate"]);
-        let status = clock.ledger.status(clock.at(0));
+
+        let status = clock.status(0);
+
         let held = status
             .ready
             .iter()
@@ -1141,7 +1241,9 @@ mod tests {
         clock.admit(0, 1, fork_a).unwrap();
         clock.admit(0, 2, fork_b).unwrap();
         assert_eq!(clock.select(0), ["fork-a"], "one cowshed new at a time");
-        let status = clock.ledger.status(clock.at(0));
+
+        let status = clock.status(0);
+
         let fork_b_status = status
             .ready
             .iter()
@@ -1230,6 +1332,299 @@ mod tests {
             ["accepted-first"],
             "the fold's entry order, not the caller's ticket mint, is the land order"
         );
+    }
+
+    fn clock_with_deps(pieces: &[(&str, &[&str])]) -> Clock {
+        let mut clock = Clock::new(30_000);
+        for (index, (unit, deps)) in pieces.iter().enumerate() {
+            let mut admitted = facts(unit);
+            admitted.deps = deps.iter().map(|dep| Arc::from(*dep)).collect();
+            clock
+                .admit(0, u64::try_from(index + 1).expect("ticket"), admitted)
+                .unwrap();
+        }
+        clock
+    }
+
+    fn sorted_leverage(clock: &Clock) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = clock
+            .ledger
+            .leverage()
+            .into_iter()
+            .map(|(unit, count)| (unit.to_string(), count))
+            .collect();
+        counts.sort();
+        counts
+    }
+
+    fn named_counts(rows: &[(&str, usize)]) -> Vec<(String, usize)> {
+        rows.iter()
+            .map(|(unit, count)| (unit.to_string(), *count))
+            .collect()
+    }
+
+    /// The leverage table: distinct transitive dependents alone count, across chains,
+    /// diamonds with repeated deps, cycles, self-deps, missing deps and terminal units. A
+    /// terminal unit is no longer a counting source, but a walk still passes through its
+    /// deps and still counts it when a live unit depends on it.
+    #[test]
+    fn leverage_counts_distinct_transitive_dependents_across_graph_shapes() {
+        let chain = clock_with_deps(&[("a", &[]), ("b", &["a"]), ("c", &["b"]), ("d", &["c"])]);
+        assert_eq!(
+            sorted_leverage(&chain),
+            named_counts(&[("a", 3), ("b", 2), ("c", 1)]),
+            "a chain counts every unit behind each link once"
+        );
+
+        let diamond = clock_with_deps(&[
+            ("base", &[]),
+            ("left", &["base"]),
+            ("right", &["base"]),
+            ("top", &["left", "right", "left"]),
+        ]);
+        assert_eq!(
+            sorted_leverage(&diamond),
+            named_counts(&[("base", 3), ("left", 1), ("right", 1)]),
+            "a diamond and a repeated dep name still count each dependent once"
+        );
+
+        let cycle = clock_with_deps(&[("x", &["y"]), ("y", &["x", "z"]), ("z", &["y"])]);
+        assert_eq!(
+            sorted_leverage(&cycle),
+            named_counts(&[("x", 2), ("y", 2), ("z", 2)]),
+            "a cycle counts the other live units and never the source itself"
+        );
+
+        let self_dep = clock_with_deps(&[("s", &["s", "a"]), ("a", &[])]);
+        assert_eq!(
+            sorted_leverage(&self_dep),
+            named_counts(&[("a", 1)]),
+            "a self dep counts nothing for its own unit"
+        );
+
+        let missing = clock_with_deps(&[("m", &["ghost", "a"]), ("a", &["ghost"])]);
+        assert_eq!(
+            sorted_leverage(&missing),
+            named_counts(&[("a", 1), ("ghost", 2)]),
+            "a missing dep is counted where it is named and expands to nothing"
+        );
+
+        let mut terminal = clock_with_deps(&[
+            ("base", &[]),
+            ("mid", &["base"]),
+            ("leaf", &["mid"]),
+            ("other", &["base"]),
+        ]);
+        terminal.terminal("mid", TaskOutcome::Landed);
+        assert_eq!(
+            sorted_leverage(&terminal),
+            named_counts(&[("base", 2), ("mid", 1)]),
+            "the terminal mid no longer counts as a source, but leaf still reaches base through it"
+        );
+    }
+
+    /// Larger graph counts retain one actual computation per explicit pass without
+    /// asserting anything about the standard hash set's random comparison layout.
+    #[test]
+    fn leverage_counts_large_chains_and_shared_diamonds_in_one_pass() {
+        for n in [1_usize, 8, 64, 128, 256] {
+            let mut clock = Clock::new(30_000);
+            for index in 0..n {
+                let mut unit = facts(&format!("u{:03}", index));
+                if index > 0 {
+                    unit.deps = vec![Arc::from(format!("u{:03}", index - 1).as_str())];
+                }
+                clock
+                    .admit(0, u64::try_from(index + 1).expect("ticket"), unit)
+                    .unwrap();
+            }
+            reset_leverage_work();
+            let counts = clock.ledger.leverage();
+            let work = leverage_work();
+            assert_eq!(work.passes, 1, "one leverage call is one pass at n={}", n);
+            if n > 1 {
+                assert_eq!(counts.get("u000"), Some(&(n - 1)));
+                assert_eq!(counts.get(format!("u{:03}", n - 1).as_str()), None);
+            }
+        }
+
+        // A fan of diamonds: every mid reaches base, and top reaches base through all of
+        // them, so duplicate arrivals at the visited set are the common case.
+        let mut clock = Clock::new(30_000);
+        clock.admit(0, 1, facts("base")).unwrap();
+        let mut top = facts("top");
+        for index in 0..64_usize {
+            let mut mid = facts(&format!("m{:02}", index));
+            mid.deps = vec![Arc::from("base")];
+            top.deps.push(Arc::from(format!("m{:02}", index).as_str()));
+            clock
+                .admit(0, u64::try_from(index + 2).expect("ticket"), mid)
+                .unwrap();
+        }
+        top.deps.push(Arc::from("m00"));
+        clock.admit(0, 66, top).unwrap();
+        reset_leverage_work();
+        let counts = clock.ledger.leverage();
+        let work = leverage_work();
+        assert_eq!(counts.get("base"), Some(&65));
+        assert_eq!(counts.get("m37"), Some(&1));
+        assert_eq!(work.passes, 1);
+    }
+
+    /// The epoch rule at the observation the actor itself uses: selection and the queue
+    /// status after it share one leverage pass while the graph is unchanged. A stale leave
+    /// changes nothing and keeps that pass; actual post-selection abandonments drop it, and
+    /// however many land before the status, the status takes exactly one fresh pass and
+    /// reports the abandoned graph.
+    #[test]
+    fn an_observation_survives_a_stale_leave_and_refreshes_once_after_actual_abandonments() {
+        // x reaches r only through the landed t, so x is ready beside r and still counts
+        // toward r's leverage until x itself abandons. The one image place selects the
+        // urgent x and leaves r and z ready behind it.
+        let build = || {
+            let mut clock = Clock::new(30_000);
+            let mut r = facts("r");
+            r.leases = vec![LeaseClass::Image];
+            let mut t = facts("t");
+            t.deps = vec![Arc::from("r")];
+            let mut x = facts("x");
+            x.deps = vec![Arc::from("t")];
+            x.leases = vec![LeaseClass::Image];
+            x.urgent = true;
+            let mut z = facts("z");
+            z.leases = vec![LeaseClass::Image];
+            clock.admit(0, 1, r).unwrap();
+            clock.admit(0, 2, t).unwrap();
+            clock.admit(0, 3, x).unwrap();
+            clock.admit(0, 4, z).unwrap();
+            clock.terminal("t", TaskOutcome::Landed);
+            clock
+        };
+
+        let mut clock = build();
+        reset_leverage_work();
+        let mut observation = LeverageObservation::new();
+        let mut effects = Vec::new();
+        clock
+            .ledger
+            .select(clock.at(0), &mut observation, || Ok(NORMAL), &mut effects);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Select { ticket: 3, .. }]),
+            "the urgent x takes the one image place"
+        );
+        assert!(
+            observation
+                .leave(&mut clock.ledger, 999, &mut Vec::new())
+                .is_none(),
+            "an unknown ticket abandons nothing"
+        );
+        let status = clock.ledger.status(clock.at(0), &mut observation);
+        assert_eq!(
+            leverage_work().passes,
+            1,
+            "select and status share one pass, and a leave that returns None does not invalidate it"
+        );
+        assert_eq!(
+            status
+                .ready
+                .into_iter()
+                .map(|ready| (ready.unit, ready.leverage))
+                .collect::<Vec<_>>(),
+            named_counts(&[("r", 1), ("z", 0)]),
+            "x still counts toward r through the landed t"
+        );
+
+        let mut clock = build();
+        reset_leverage_work();
+        let mut observation = LeverageObservation::new();
+        let mut effects = Vec::new();
+        clock
+            .ledger
+            .select(clock.at(0), &mut observation, || Ok(NORMAL), &mut effects);
+        assert_eq!(
+            observation
+                .leave(&mut clock.ledger, 3, &mut Vec::new())
+                .map(|facts| facts.unit.to_string()),
+            Some("x".to_string()),
+            "the selected x actually abandons after selection"
+        );
+        assert!(
+            observation
+                .leave(&mut clock.ledger, 4, &mut Vec::new())
+                .is_some(),
+            "the queued z actually abandons too, before any status reads the graph"
+        );
+        let status = clock.ledger.status(clock.at(0), &mut observation);
+        assert_eq!(
+            leverage_work().passes,
+            2,
+            "two actual abandonments before the status still cost exactly one fresh pass"
+        );
+        assert_eq!(
+            status
+                .ready
+                .into_iter()
+                .map(|ready| (ready.unit, ready.leverage))
+                .collect::<Vec<_>>(),
+            named_counts(&[("r", 0)]),
+            "with x abandoned, nothing live counts toward r any more"
+        );
+    }
+
+    /// The epoch rule on the real actor: one queue turn runs selection and then answers
+    /// the queue from the same unchanged graph, so the whole turn takes one leverage pass.
+    /// The current-thread runtime pins the actor to this test thread, which is where the
+    /// thread-local pass counter lives: were the actor on another thread, this thread
+    /// would read zero passes and fail rather than count someone else's work.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_queue_turn_shares_one_leverage_pass_between_select_and_status() {
+        let server = TaskServer::start(TaskServerLimits::default());
+        let mut holder = facts("holder");
+        holder.leases = vec![LeaseClass::Image];
+        let mut api = facts("api");
+        api.leases = vec![LeaseClass::Image];
+        let mut other = facts("other");
+        other.leases = vec![LeaseClass::Image];
+        let mut dependent = facts("impl");
+        dependent.deps = vec![Arc::from("api")];
+        let mut leaf = facts("leaf");
+        leaf.deps = vec![Arc::from("impl")];
+        let mut tenures = Vec::new();
+        let mut grants = Vec::new();
+        for unit_facts in [holder, api, other, dependent, leaf] {
+            let (tenure, grant) = server.ask(unit_facts);
+            tenures.push(tenure);
+            grants.push(grant);
+        }
+        // The holder runs with the one image place; api and other stay ready behind it,
+        // and impl and leaf wait behind api. One queue reply settles every admission.
+        let settled = server.queue().await.expect("the queue settles the setup");
+        assert_eq!(
+            settled
+                .ready
+                .iter()
+                .map(|ready| ready.unit.as_str())
+                .collect::<Vec<_>>(),
+            ["api", "other"]
+        );
+        reset_leverage_work();
+        let status = server.queue().await.expect("the queue answers");
+        let work = leverage_work();
+        assert_eq!(
+            work.passes, 1,
+            "one queue turn selects and reports status from one leverage observation"
+        );
+        assert_eq!(
+            status
+                .ready
+                .into_iter()
+                .map(|ready| (ready.unit, ready.leverage))
+                .collect::<Vec<_>>(),
+            named_counts(&[("api", 2), ("other", 0)]),
+            "the shared observation still reports the exact leverage"
+        );
+        drop(grants);
+        drop(tenures);
     }
 
     /// Ownership: one live attempt per unit, and a delayed holder from a settled attempt can
