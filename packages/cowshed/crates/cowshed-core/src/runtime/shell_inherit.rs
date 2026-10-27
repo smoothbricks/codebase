@@ -1409,7 +1409,6 @@ mod tests {
             matches!(&miss, AdoptionMiss::Residue { .. }),
             "actual refusal: {miss:?}"
         );
-        eprintln!("fixed-root counterexample: {miss:?}");
     }
 
     #[test]
