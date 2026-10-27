@@ -49,11 +49,15 @@ through.
 ## Declared developer link pins
 
 `smoo.developerLinks` selects the package code a local consumer executes. The stable form is
-`{ "directory": "../provider/packages/api", "snapshot": "<64 lowercase hex digits>" }`: the ID of a sealed snapshot in
-the consumer's `.cache/linked-snapshots` store, not a Git ref or a provider directory to materialize. The existing
-snapshot census and producer provenance pin source, outputs and dependencies together. Resolving a pin verifies that
-census and identity and requires the receipt's package name to match the declaration. It never captures, builds,
-fetches, or falls back to a live directory or the installed version.
+`{ "directory": "../provider/packages/api", "snapshot": "<64 lowercase hex digits>" }`: the ID of a sealed snapshot, not
+a Git ref or a provider directory to materialize. The existing snapshot census and producer provenance pin source,
+outputs and dependencies together. Resolving a pin reads the snapshot from the consumer's own `.cache/linked-snapshots`
+store; a checkout whose store lacks it imports it from the store of its project's main checkout, the link anchor its
+`.cowshed/workspace.json` `projectRoot` names: it copies that sealed snapshot into a temporary entry of its own store,
+verifies its census and identity there and renames it into place, then binds it as a local one. A snapshot is
+content-addressed, so the import moves only bytes the ID already pins. Resolving verifies that census and identity and
+requires the receipt's package name to match the declaration. It never captures, builds, fetches from anywhere but the
+main checkout's store, or falls back to a live directory or the installed version.
 
 Capture must not fabricate outputs. A producer receipt records a target's actual successful completion, outputs and
 their hashes; a target that cannot prove its outputs refuses rather than inventing an empty output set. The provider's
@@ -69,8 +73,10 @@ malformed and wrong-package pins refuse with a nonzero result before any alias c
 
 The consumer deliberately captures and reviews a new snapshot with the existing snapshot machinery, then changes the
 declared ID to move the pin. Moving the provider branch alone never moves it. The snapshot store travels with a cowshed
-build volume; a new consumer needs the named sealed snapshot in its own store. It does not reconstruct a missing pin
-from today's provider. Existing manual-link ownership and receipt rules still apply.
+build volume, and a checkout forked before its main captured a pin imports it from main's store on its first resolve, so
+one capture in main serves every checkout of the project. A pin that neither the checkout's store nor its main's holds
+refuses, naming both stores; it is not reconstructed from today's provider. Existing manual-link ownership and receipt
+rules still apply.
 
 The directory-string form remains an explicit live link. The existing
 `{ directory, snapshot: { targets, artifactModules } }` form remains an explicit capture of current, attested provider
