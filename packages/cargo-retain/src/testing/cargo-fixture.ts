@@ -109,9 +109,14 @@ export function scopedTo(targetDir: string, run: () => Promise<void>): Promise<v
  * without any `CARGO_UNSTABLE_*` switch. Each fixture's `.cargo/config.toml` states the
  * unstable features it tests; cowshed exports `CARGO_UNSTABLE_MTIME_ON_USE=true` into
  * every job, which would otherwise turn mtime-on-use on for the fixture that tests it off.
+ * Nor `CI`: Cargo turns incremental compilation off for workspace crates whenever it is set
+ * (03_caches.md, "No CI in a dev environment"), and a CI runner sets it, so the incremental
+ * cases would find no incremental directories to keep or supersede.
  */
 export function cargoEnv(): NodeJS.ProcessEnv {
-  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('CARGO_UNSTABLE_')));
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !name.startsWith('CARGO_UNSTABLE_') && name !== 'CI'),
+  );
   return { ...env, RUSTC_WRAPPER: '', RUSTC_WORKSPACE_WRAPPER: '', CARGO_NET_OFFLINE: 'true' };
 }
 
