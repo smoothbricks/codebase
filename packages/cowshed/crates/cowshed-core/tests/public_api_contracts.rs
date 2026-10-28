@@ -1797,8 +1797,10 @@ fi
     assert_eq!(roots.len(), 2);
     assert_ne!(roots[0], roots[1]);
     // The stand-in reports `$PWD`, which the shell takes from getcwd(3), the physical path: where the temporary directory
-    // is reached through a link (`/var` -> `/private/var` on a macOS runner), the scratch path differs from it.
+    // is reached through a link (`/var` -> `/private/var` on a macOS runner), the scratch and manifest paths differ from
+    // it. The probe itself runs in exactly those directories; only the stand-in's report is physical.
     let scratch = fs::canonicalize(&scratch).unwrap();
+    let physical_manifest = fs::canonicalize(&manifest).unwrap();
     for root in roots {
         assert_eq!(root.parent(), Some(scratch.as_path()));
         assert!(!root.exists(), "run-owned root {} survived", root.display());
@@ -1806,7 +1808,7 @@ fi
     let metadata_cwds = fs::read_to_string(fixture.join("metadata-cwds")).unwrap();
     assert_eq!(
         metadata_cwds.lines().collect::<Vec<_>>(),
-        vec![manifest.to_str().unwrap(); 2]
+        vec![physical_manifest.to_str().unwrap(); 2]
     );
     let mut expected: Vec<OsString> = configs
         .iter()
