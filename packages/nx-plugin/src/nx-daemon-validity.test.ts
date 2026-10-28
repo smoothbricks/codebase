@@ -525,14 +525,26 @@ async function startKeptDaemon(workspace: string, env: Record<string, string>): 
     await exited.promise;
   };
   try {
+    // The record is the kept daemon's only sign of readiness, and a daemon that exits first never writes it: its exit,
+    // not only a change in the record directory, ends the wait (a gate's test sat 180 s on a kept daemon that had
+    // already exited, with nothing left to change the directory).
+    const recorded = Promise.withResolvers<void>();
     const record = await watchUntil(
       dirname(recordPath(workspace)),
       'the kept daemon to write its record',
       async () => {
         const current = await daemonRecord(workspace);
-        return current !== null && current.processId === kept.pid ? current : null;
+        if (current === null || current.processId !== kept.pid) return null;
+        recorded.resolve();
+        return current;
       },
-      async () => {},
+      () =>
+        Promise.race([
+          recorded.promise,
+          exited.promise.then((code) => {
+            throw new Error(`the kept daemon exited (${code}) before it wrote its record:\\n${log}`);
+          }),
+        ]),
     );
     return { daemon: await readyDaemon(workspace, record), log: () => log, exited: exited.promise, stop };
   } catch (error) {
