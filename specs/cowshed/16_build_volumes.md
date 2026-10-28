@@ -38,14 +38,17 @@ each of them.
    blocks (01a_apfs.md "Images", its clone-cost bullet): extents multiply under churn while clones are held, and the
    first write to a clone costs time per extent. Build state is where nearly all of main's churn comes from: every build
    of main rewrites gigabytes under `target/` and `.nx/cache` while sessions hold clones of main's image. With build
-   state on its own volume, main's source image changes only when its tree changes (a land's fast-forward, an edit).
-   Main's source image therefore fragments no faster than an image that has no clone, and `cowshed defrag main` is a
-   repair for imports, not a routine operation. Build volumes are not replaced by anything that sheds extents: a fork
-   clones its target's seed, a land adopts the landing volume and a seed is captured from it, so every build volume
-   inherits its parent's extent map and adds its own churn. SmoothBricks' main seed went from 434,000 to 881,000 extents
-   in four days, and reached 1.2 million extents and 397.7 GB allocated by 2026-10-27, when its `mount_apfs` outran the
-   120 s deadline. Nearly all of that churn was Cargo's `target/`, which an mbx project keeps on the build-cache volume
-   instead (item 4). Seed compaction (Targets and seeds) bounds what lineage remains.
+   state on its own volume, main's source image changes only when its tree does: a land's fast-forward, an edit, a
+   dependency install into `node_modules`, a build's declared outputs, Git's own packs. Each such rewrite still
+   fragments it while forks share its blocks, so main's source image stays fast to clone only while main stays still:
+   dependencies installed only when the lockfile changes, never wiped or force-reinstalled, and builds run in sheds. A
+   fork whose source clone takes more than 4 s says so and names the paths to look at and `cowshed defrag main`
+   (01a_apfs.md, "Clone cost follows extents, not size"). Build volumes are not replaced by anything that sheds extents:
+   a fork clones its target's seed, a land adopts the landing volume and a seed is captured from it, so every build
+   volume inherits its parent's extent map and adds its own churn. SmoothBricks' main seed went from 434,000 to 881,000
+   extents in four days, and reached 1.2 million extents and 397.7 GB allocated by 2026-10-27, when its `mount_apfs`
+   outran the 120 s deadline. Nearly all of that churn was Cargo's `target/`, which an mbx project keeps on the
+   build-cache volume instead (item 4). Seed compaction (Targets and seeds) bounds what lineage remains.
 2. **Without build volumes, a land rebuilds main from scratch, or main is never warm.** A workspace builds and checks
    its work, lands, and then main has to build the same tree again before the next fork can start warm. A warm step for
    main would be a background job that can fail, queue, or be skipped; while it lags, every fork starts cold, and

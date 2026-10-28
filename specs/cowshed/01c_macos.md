@@ -36,7 +36,7 @@ Find the symptom in the left column and follow the link.
 | `… is a .sparseimage file, not a RAW .dmg image`; `du` and `ls -l` disagree on an image's size                                                                                                           | [A RAW sparse file is a disk](#a-raw-sparse-file-is-a-disk)                                                                                     |
 | `du` of an image stays large after the guest deleted its files                                                                                                                                           | [`hdiutil compact` does not reclaim a RAW image](#hdiutil-compact-does-not-reclaim-a-raw-image)                                                 |
 | Two paths that differ only in case collide                                                                                                                                                               | [Case sensitivity is fixed at format time](#case-sensitivity-is-fixed-at-format-time)                                                           |
-| A fork's mount takes tens of seconds; `doctor` reports `main-extents` or warns about extents                                                                                                             | [A clone's first write pays for its extent map](#a-clones-first-write-pays-for-its-extent-map)                                                  |
+| A fork warns that cloning its source's image took over 4 s; a fork's mount takes tens of seconds                                                                                                         | [A clone's first write pays for its extent map](#a-clones-first-write-pays-for-its-extent-map)                                                  |
 | `clonefile requires source and destination on the same volume: …`                                                                                                                                        | [`clonefile` does not cross a filesystem](#clonefile-does-not-cross-a-filesystem)                                                               |
 | Two attached volumes report one `Volume UUID` and one name                                                                                                                                               | [A clone inherits its volume's UUID and name](#a-clone-inherits-its-volumes-uuid-and-name)                                                      |
 | A volume rename lands on the Data volume                                                                                                                                                                 | [A volume is named only through its held mount root](#a-volume-is-named-only-through-its-held-mount-root)                                       |
@@ -247,15 +247,16 @@ Find the symptom in the left column and follow the link.
   wherever it lands (a write at any offset, an append, even a metadata-only `ftruncate`), so the cost follows the extent
   count, not the size or the offset, and every write after it is free (_measured_). `hdiutil attach -nomount` does not
   trigger the copy; the read-write `mount_apfs` does, because APFS writes its checkpoint (_measured_).
-- **Rule.** A fork measures each fresh clone's extents before it mounts the clone, warns past 7,140 extents naming
-  `cowshed defrag`, and never refuses on the count; it forces no write ahead of the mount, whose first mutation pays for
-  the map. `defrag` rewrites an image with plain `pread`/`pwrite` because `clonefile`, `copyfile(3)` and `std::fs::copy`
-  would share the old map.
+- **Rule.** A fork forces no write ahead of the mount, whose first mutation pays for the map, and warns when its fresh
+  source-image clone spends more than 4 s of attach and mount work, naming the measured time, how to find the paths its
+  source rewrote and `cowshed defrag`; it never warns or refuses on an extent count. `defrag` rewrites an image with
+  plain `pread`/`pwrite` because `clonefile`, `copyfile(3)` and `std::fs::copy` would share the old map.
 - **Owners.** [01a_apfs.md §Images](./01a_apfs.md#images), “Clone cost follows extents, not size”;
   [08_testing.md §APFS / Seatbelt (macOS)](./08_testing.md#apfs--seatbelt-macos);
   [16_build_volumes.md §Why two volumes](./16_build_volumes.md#why-two-volumes). Code:
   [`cowshed-core/src/storage/apfs/extents.rs`] `count_extents`, `prove_forkable`, `rewrite_contiguously`;
-  [`cowshed-core/src/storage/lifecycle.rs`] `FORKABLE_MAX`; [`cowshed-core/src/storage/apfs/native.rs`] `defragment`.
+  [`cowshed-core/src/storage/lifecycle.rs`] `FORKABLE_MAX`, `SLOW_SOURCE_CLONE`, `source_clone_is_slow`;
+  [`cowshed-core/src/storage/apfs/native.rs`] `defragment`.
 
 ### `clonefile` does not cross a filesystem
 

@@ -5224,10 +5224,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         .map_err(|error| CowshedError::internal(format!("workspace read task failed: {error}")))?
         .map_err(native_storage_error)?
         .ok_or_else(|| {
-            CowshedError::not_found(
-                format!("workspace {name} does not exist"),
-                "list published workspaces and retry",
-            )
+            CowshedError::not_found(format!("workspace {name} does not exist"), "cowshed ls")
         })
     }
 
@@ -15109,10 +15106,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .into_iter()
             .find(|workspace| workspace.derived.workspace.name() == &main)
             .ok_or_else(|| {
-                CowshedError::not_found(
-                    "workspace main does not exist",
-                    "list published workspaces and retry",
-                )
+                CowshedError::not_found("workspace main does not exist", "cowshed ls")
             })?;
         let detached = matches!(
             current.derived.mount_state,
@@ -25211,7 +25205,8 @@ fn merge_driver_finding(
     }
 }
 
-/// A physical image's first-write sensitivity at the loaded RAW rate, never a whole-fork promise.
+/// A physical image's extent count, for the record: no count warns. A fork warns on its measured
+/// source clone time (`SLOW_SOURCE_CLONE`), which no count predicts.
 #[cfg(target_os = "macos")]
 fn image_extents_finding(
     workspace: &WorkspaceName,
@@ -25219,24 +25214,14 @@ fn image_extents_finding(
     image: PathBuf,
     extents: crate::storage::lifecycle::ExtentCount,
 ) -> crate::api::dto::Finding {
-    let observed = extents.observed_first_write_cost();
-    let costly = !extents.is_forkable();
     crate::api::dto::Finding {
         code: code.into(),
-        severity: if costly {
-            crate::api::dto::FindingSeverity::Warning
-        } else {
-            crate::api::dto::FindingSeverity::Info
-        },
+        severity: crate::api::dto::FindingSeverity::Info,
         message: format!(
-            "{workspace} {code} image {} has {extents} extents; loaded RAW sensitivity at 140.046964 us/extent: {observed:.3?}, standalone first-write limit 7140 extents. Cause unattributed, not causal calibration or a whole-fork guarantee: source and build images share the budget; attach, mount, identity and extent-proof work are additional",
+            "{workspace} {code} image {} has {extents} extents",
             image.display()
         ),
-        hint: if costly {
-            format!("cowshed defrag {workspace}")
-        } else {
-            String::new()
-        },
+        hint: String::new(),
         path: Some(image),
     }
 }
@@ -25253,7 +25238,7 @@ fn image_extents_unread(
         code: code.into(),
         severity: crate::api::dto::FindingSeverity::Warning,
         message: format!(
-            "could not prove {workspace} {code} image {} is within 7140 extents; its physical generation and first-write cost are unknown: {error}",
+            "could not count the extents of {workspace} {code} image {}: {error}",
             image.display()
         ),
         hint: format!(
@@ -26341,49 +26326,30 @@ mod doctor_hint_tests {
     }
 
     #[test]
-    fn source_and_seed_extents_warn_at_7141() {
+    fn extent_counts_never_warn() {
         use crate::api::dto::FindingSeverity;
         use crate::storage::lifecycle::ExtentCount;
 
         let workspace = WorkspaceName::main();
-        for (code, image) in [
-            ("main-extents", PathBuf::from("/store/acme/widget/main.dmg")),
-            (
-                "build-source-extents",
-                PathBuf::from("/store/acme/widget/build/live.dmg"),
-            ),
-            (
-                "build-seed-extents",
-                PathBuf::from("/store/acme/widget/build/seed.dmg"),
-            ),
-        ] {
-            let under =
-                image_extents_finding(&workspace, code, image.clone(), ExtentCount::new(7_140));
-            assert_eq!(under.code, code);
-            assert_eq!(under.severity, FindingSeverity::Info);
-            assert_eq!(under.hint, "");
-            assert!(under.message.contains("7140 extents"), "{}", under.message);
-            assert!(
-                under.message.contains("Cause unattributed"),
-                "{}",
-                under.message
+        let image = PathBuf::from("/store/acme/widget/main.dmg");
+        for extents in [0, 7_141, 1_198_506] {
+            let finding = image_extents_finding(
+                &workspace,
+                "main-extents",
+                image.clone(),
+                ExtentCount::new(extents),
             );
-            let over =
-                image_extents_finding(&workspace, code, image.clone(), ExtentCount::new(7_141));
-            assert_eq!(over.severity, FindingSeverity::Warning);
-            assert_eq!(over.hint, "cowshed defrag main");
-            assert_eq!(over.path, Some(image.clone()));
-            let unknown =
-                image_extents_unread(&workspace, code, image, "generation changed".into());
-            assert_eq!(unknown.severity, FindingSeverity::Warning);
-            assert!(unknown.message.contains("unknown"));
+            assert_eq!(finding.severity, FindingSeverity::Info);
+            assert_eq!(finding.hint, "");
+            assert_eq!(finding.path, Some(image.clone()));
         }
-        assert!(
-            ExtentCount::new(7_140).observed_first_write_cost() < std::time::Duration::from_secs(1)
+        let unknown = image_extents_unread(
+            &workspace,
+            "main-extents",
+            image,
+            "generation changed".into(),
         );
-        assert!(
-            ExtentCount::new(7_141).observed_first_write_cost() > std::time::Duration::from_secs(1)
-        );
+        assert_eq!(unknown.severity, FindingSeverity::Warning);
     }
 
     #[test]

@@ -92,23 +92,11 @@ impl ExtentProof {
     }
 }
 
-/// Refuse unknown or changing physical generations before publishing a forkable image, and warn
-/// about an oversized one: past the standalone first-write sensitivity bound the fork still
-/// proceeds, paying its first write, and the warning names that cost and the defrag remedy. The
-/// walk stops at 7141, not at the end of an arbitrarily fragmented image, so the count and cost
-/// it reports are lower bounds.
+/// Refuse unknown or changing physical generations before publishing a forkable image. The walk
+/// stops at 7141 runs, not at the end of an arbitrarily fragmented image; the count decides
+/// nothing, and a slow clone is warned about where it is measured, at the fork's mount.
 pub fn prove_forkable(image: &Path) -> Result<ExtentProof, ApfsStorageError> {
-    let proof = measure(image, Some(ExtentCount::FORKABLE_MAX.get() + 1))?;
-    if !proof.extents.is_forkable() {
-        cowshed_os::eprintln!(
-            "cowshed: warning: image {} has at least {} extents, above the {} standalone first-write sensitivity bound; its first write costs at least {:?} at the observed 140.046964 us/extent (cause unattributed); cowshed defrag <workspace> restores fast forks",
-            image.display(),
-            proof.extents,
-            ExtentCount::FORKABLE_MAX,
-            proof.extents.observed_first_write_cost()
-        );
-    }
-    Ok(proof)
+    measure(image, Some(ExtentCount::FORKABLE_MAX.get() + 1))
 }
 
 fn measure(path: &Path, stop_at: Option<u64>) -> Result<ExtentProof, ApfsStorageError> {

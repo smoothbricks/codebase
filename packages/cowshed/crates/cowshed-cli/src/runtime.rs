@@ -1996,8 +1996,6 @@ where
             Ok(success())
         }
         Command::Defrag(args) => {
-            use cowshed_core::storage::lifecycle::ExtentCount;
-
             let result = service.defragment(&args.workspace).await?;
             // Like resize: the workspace is back as it was found, on a new attachment.
             service.reconcile_gateway().await?;
@@ -2008,15 +2006,10 @@ where
                     .bare_line(result.extents.to_string().as_bytes())
                     .map_err(output_error)?;
             }
-            let previous = ExtentCount::new(result.previous_extents);
-            let extents = ExtentCount::new(result.extents);
             output
                 .guidance(&format!(
-                    "workspace {} rewritten contiguously: {previous} extents -> {extents}, {} bytes copied; a clone's first write now copies a map whose loaded RAW sensitivity is {:.3?} instead of {:.3?}",
-                    result.workspace,
-                    result.bytes,
-                    extents.observed_first_write_cost(),
-                    previous.observed_first_write_cost()
+                    "workspace {} rewritten contiguously: {} extents -> {}, {} bytes copied",
+                    result.workspace, result.previous_extents, result.extents, result.bytes,
                 ))
                 .map_err(output_error)?;
             Ok(success())

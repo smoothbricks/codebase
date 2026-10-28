@@ -1331,27 +1331,29 @@ registration.
 | `cowshed path` / `ls`            | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design                                   |
 | exec sandbox overhead            | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                                                              |
 
-**The fork extent warning is a standalone first-write sensitivity bound, not a whole-clone SLO, and never refuses a
-fork.** One loaded RAW observation was 60.845084042 s for 434,462 extents: 140.046964 µs/extent. At that observed rate,
-**7,140 extents** take less than 1 s and 7,141 exceed it; 1,785 fit 250 ms and 1,786 do not. The cause is unattributed.
-This is measured sensitivity, not causal calibration. Concurrent first writes and container-wide contention can change
-the rate, so it is not a latency guarantee. Further attribution found 440,074-extent first writes taking 50.004/39.605 s
-wall versus 5.981/5.633 s system CPU, reading 801–823 MB, while a 25,013-extent source took about 4.04 s (about 161
-µs/extent, above the selected 140 µs sensitivity). Off-CPU work is substantial; those observations do not establish a
-universal per-extent calibration.
+**A fork warns on its measured source-image clone time, never on an extent count, and never refuses.** The warning fires
+when the fresh source clone's attach and mount work, lease waits excluded, exceeds **4 s** (the owner's ruling,
+2026-10-28), measured on the fork itself rather than predicted. It replaced a 7,140-extent bound taken from one loaded
+RAW observation (60.845084042 s for 434,462 extents, 140.046964 µs/extent): every source and build image on the
+development host was past it, so it fired on every fork, and the cost it printed stopped at the bound's one second
+whatever the real count. First-write telemetry over 2026-10-21..26 measured 37 to 298 µs per extent (p10 to p90), so a
+count does not predict the time. Further attribution found 440,074-extent first writes taking 50.004/39.605 s wall
+versus 5.981/5.633 s system CPU, reading 801–823 MB, while a 25,013-extent source took about 4.04 s; off-CPU work is
+substantial.
 
-The extent warning applies to **both the workspace image and every build seed it publishes or clones**. The proof uses
+The extent proof applies to **both the workspace image and every build seed it publishes or clones**. The proof uses
 device/inode, length, allocated blocks, and nanosecond modification/change times before and after the extent walk; Git
-HEAD or the build tree is not a physical-generation identity. Unknown or changed generations refuse publication;
-oversized generations warn and proceed. Each admission or publication extent walk stops at the 7,141st run; proof work
-is additional, never an unbounded recount concealed in the cold-fork number. Doctor explicitly counts the workspace
-sources, live build sources and build seeds, reporting each image's own count and RAW sensitivity estimate.
+HEAD or the build tree is not a physical-generation identity. Unknown or changed generations refuse publication. Each
+admission or publication extent walk stops at the 7,141st run; proof work is additional, never an unbounded recount
+concealed in the cold-fork number. Doctor explicitly counts the workspace sources, live build sources and build seeds,
+reporting each image's own count as information.
 
 The cold-fork row remains a primitive-path regression target, not evidence that a production whole clone meets it.
-Attach, filesystem check/mount, identity work and proof collection consume additional time. Serialized first writes of
-multiple images share one budget: giving each image 7,140 extents does **not** put their sum below 1 s. No images are
-merged. Tests prove the 7,140/7,141 boundary, reject stale/replaced/missing generations, cover build-source and seed
-diagnostics, and prove that the named `cowshed defrag <workspace>` route reaches those registered images.
+Attach, filesystem check/mount, identity work and proof collection consume additional time, and serialized first writes
+of multiple images share one budget. No images are merged. Tests prove the 4 s decision as a pure function (4 s does not
+warn, anything longer does), that doctor's extent findings never warn, reject stale/replaced/missing generations, cover
+build-source and seed diagnostics, and prove that the named `cowshed defrag <workspace>` route reaches those registered
+images.
 
 **What the budgets are.** They are regression thresholds on medians of primitive-operation costs, not end-to-end cowshed
 SLOs: a median is stated because a small sample cannot fix a stable tail. Clone-backed images rather than shadow mounts

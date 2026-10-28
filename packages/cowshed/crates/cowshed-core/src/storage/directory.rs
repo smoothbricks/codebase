@@ -1464,7 +1464,11 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         bind(image, mount_point)?;
         let attachment = DirectoryAttachment::new(image.to_owned());
         attachment.set_bound(Some(mount_point.to_owned()));
-        Ok(ResumedMount { attachment, found })
+        Ok(ResumedMount {
+            attachment,
+            found,
+            attach_mount_work: None,
+        })
     }
 
     fn rename_volume(

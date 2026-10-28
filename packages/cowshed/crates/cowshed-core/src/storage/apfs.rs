@@ -23,8 +23,9 @@ use super::lifecycle::{
     Destination, ExecuteError, ForkPlan, ImmutablePlan, LifecycleBackend, LifecycleFact,
     LifecyclePlanner, LifecycleReceipt, LifecycleWorkspace, MountIntent, MountJoin, MountRefusal,
     MountRefusalReason, MountState, Operation, OperationIdentity, PlanError, PurePlanner,
-    ResizeOutcome, RetirePlan, RetiredRef, Revision, StorageFact, StorageGcOptions, StorageGcPlan,
-    StorageGcReport, Substrate, SubstrateStats, execute_checked, revalidate,
+    ResizeOutcome, RetirePlan, RetiredRef, Revision, SLOW_SOURCE_CLONE, StorageFact,
+    StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats, execute_checked,
+    revalidate, source_clone_is_slow,
 };
 use super::{StorageLayout, StorageLayoutError};
 
@@ -330,6 +331,9 @@ pub enum FoundMount {
 pub struct ResumedMount<A> {
     pub attachment: A,
     pub found: FoundMount,
+    /// The attach and mount work this call did, lease waits excluded, when it attached and
+    /// mounted the image itself; none when it reused a mount or a host measures nothing.
+    pub attach_mount_work: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Error)]
@@ -571,6 +575,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         Ok(ResumedMount {
             attachment: self.attach_mounted(image, mount_point, MountAccess::ReadWrite, false)?,
             found: FoundMount::Detached,
+            attach_mount_work: None,
         })
     }
     /// Rename the volume of `attachment`, a verified attachment of an image under the store
@@ -1721,6 +1726,7 @@ where
                         identity,
                         image,
                     },
+                    None,
                     None,
                     true,
                 )?;
@@ -3021,7 +3027,32 @@ fn stage_captured_clone<H: ApfsExecutionHost>(
                 ))
             })?;
     }
-    mount_clone_stage(host, config, clone, fork.then_some(&source), resuming)
+    mount_clone_stage(
+        host,
+        config,
+        clone,
+        fork.then_some(&source),
+        (!resuming).then_some(&source),
+        resuming,
+    )
+}
+
+/// A fork's fresh source-image clone that took longer than [`SLOW_SOURCE_CLONE`] says so: every
+/// fork of `source` pays the same until its image is rewritten (01a_apfs.md, "Clone cost follows
+/// extents, not size").
+fn warn_slow_source_clone(source: &WorkspaceName, work: std::time::Duration) {
+    if !source_clone_is_slow(work) {
+        return;
+    }
+    cowshed_os::eprintln!(
+        "cowshed: warning: cloning {source}'s source image took {work:.1?}, over {SLOW_SOURCE_CLONE:?}, and every fork of {source} pays it: the clone's mount, its first write, copies the extent map of {source}'s image, which grows each time {source} rewrites files its forks share (a dependency reinstall, build outputs written in {source})"
+    );
+    cowshed_os::eprintln!(
+        "cowshed: find what {source} rewrote in the last day: cd \"$(cowshed path {source})\" && find . -xdev -type f -ctime -1 | cut -d/ -f2-3 | sort | uniq -c | sort -rn | head -20"
+    );
+    cowshed_os::eprintln!(
+        "cowshed: keep {source} still: install there only when its lockfile changed, never delete or force-reinstall its node_modules, and build in sheds; then, with {source} idle, cowshed defrag {source} rewrites its image contiguously"
+    );
 }
 
 fn mount_clone_stage<H: ApfsExecutionHost>(
@@ -3029,6 +3060,7 @@ fn mount_clone_stage<H: ApfsExecutionHost>(
     config: &ApfsSubstrateConfig,
     clone: ResumableClone,
     forked_from: Option<&WorkspaceName>,
+    clone_of: Option<&WorkspaceName>,
     resuming: bool,
 ) -> Result<PreparedClone<H::Attachment>, ApfsStorageError> {
     let ResumableClone {
@@ -3039,8 +3071,14 @@ fn mount_clone_stage<H: ApfsExecutionHost>(
     let canonical_mount = mount_point(config, &workspace)?;
     let canonical_companion = companion_path(&canonical_image);
     // An attach refusal preserves the pending payload: it can be reporting a crash-left mount.
-    let ResumedMount { attachment, found } =
-        host.attach_and_mount_resumable(&canonical_image, &canonical_mount, &workspace)?;
+    let ResumedMount {
+        attachment,
+        found,
+        attach_mount_work,
+    } = host.attach_and_mount_resumable(&canonical_image, &canonical_mount, &workspace)?;
+    if let (Some(source), Some(work)) = (clone_of, attach_mount_work) {
+        warn_slow_source_clone(source, work);
+    }
     let prepared = timed_apfs_step("canonical", "creds", || {
         host.mint_workspace_credentials(
             &workspace,

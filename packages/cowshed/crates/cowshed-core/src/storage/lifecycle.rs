@@ -667,30 +667,17 @@ pub struct ResizeOutcome {
 
 /// How many physically contiguous runs a file's allocated bytes occupy.
 ///
-/// This governs the first-write map-copy cost, not the whole clone: `clonefile` shares the
-/// source's extent map, and the first write to either file copies it (01a_apfs.md, "Clone cost
-/// follows extents, not size"). Attach, mount, identity and proof collection cost extra.
+/// The first write to a clone copies the extent map it shares with its source (01a_apfs.md,
+/// "Clone cost follows extents, not size"), so the count drives that cost; how long it takes is
+/// measured, not predicted from the count.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ExtentCount(u64);
 
 impl ExtentCount {
-    /// Standalone first-write sensitivity limit from one loaded RAW observation:
-    /// 60.845084042 s / 434,462 extents = 140.046964 µs/extent. The cause is unattributed.
-    /// This does not budget attach, mount, identity work, proof collection or other images.
+    /// Where a fork's extent proof stops walking runs, so proof work stays bounded however
+    /// fragmented an image is. Nothing warns or refuses on a count: a fork warns on its measured
+    /// source clone time instead ([`SLOW_SOURCE_CLONE`]).
     pub const FORKABLE_MAX: Self = Self(7_140);
-    pub const OBSERVED_FIRST_WRITE_NANOS: u64 = 60_845_084_042;
-    pub const OBSERVED_EXTENTS: u64 = 434_462;
-
-    pub const fn is_forkable(self) -> bool {
-        self.0 <= Self::FORKABLE_MAX.0
-    }
-
-    /// Sensitivity at the observed RAW rate.
-    pub fn observed_first_write_cost(self) -> Duration {
-        let nanos = u128::from(self.0) * u128::from(Self::OBSERVED_FIRST_WRITE_NANOS)
-            / u128::from(Self::OBSERVED_EXTENTS);
-        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
-    }
 
     pub const fn new(extents: u64) -> Self {
         Self(extents)
@@ -699,6 +686,16 @@ impl ExtentCount {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+/// A fork whose source-image clone does more attach and mount work than this warns, naming the
+/// cost and what keeps it down (01a_apfs.md, "Clone cost follows extents, not size"). The mount is
+/// the clone's first write, so it carries the extent-map copy; lease waits are not counted.
+pub const SLOW_SOURCE_CLONE: Duration = Duration::from_secs(4);
+
+/// Whether a fork's measured source-image clone work warns.
+pub fn source_clone_is_slow(work: Duration) -> bool {
+    work > SLOW_SOURCE_CLONE
 }
 
 impl fmt::Display for ExtentCount {
@@ -990,22 +987,18 @@ pub trait Substrate: LifecyclePlanner {
 
 #[cfg(test)]
 mod extent_policy_tests {
-    use super::ExtentCount;
+    use super::{SLOW_SOURCE_CLONE, source_clone_is_slow};
     use std::time::Duration;
 
     #[test]
-    fn standalone_sensitivity_admits_7140_but_not_7141() {
-        let under = ExtentCount::new(7_140);
-        let over = ExtentCount::new(7_141);
-        assert!(under.is_forkable());
-        assert!(!over.is_forkable());
-        assert!(under.observed_first_write_cost() < Duration::from_secs(1));
-        assert!(over.observed_first_write_cost() > Duration::from_secs(1));
-        assert!(ExtentCount::new(1_785).observed_first_write_cost() < Duration::from_millis(250));
-        assert!(ExtentCount::new(1_786).observed_first_write_cost() > Duration::from_millis(250));
-        assert_eq!(
-            ExtentCount::new(ExtentCount::OBSERVED_EXTENTS).observed_first_write_cost(),
-            Duration::from_nanos(60_845_084_042),
-        );
+    fn a_source_clone_warns_only_past_four_seconds() {
+        for (work, slow) in [
+            (Duration::ZERO, false),
+            (SLOW_SOURCE_CLONE, false),
+            (SLOW_SOURCE_CLONE + Duration::from_nanos(1), true),
+            (Duration::from_millis(6_288), true),
+        ] {
+            assert_eq!(source_clone_is_slow(work), slow, "{work:?}");
+        }
     }
 }

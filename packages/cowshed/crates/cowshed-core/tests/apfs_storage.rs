@@ -424,11 +424,13 @@ impl ApfsExecutionHost for FakeHost {
             return Ok(ResumedMount {
                 attachment: FakeAttachment,
                 found: FoundMount::Mounted,
+                attach_mount_work: None,
             });
         }
         Ok(ResumedMount {
             attachment: self.attach_mounted(image, mount_point, MountAccess::ReadWrite, false)?,
             found: FoundMount::Detached,
+            attach_mount_work: None,
         })
     }
 

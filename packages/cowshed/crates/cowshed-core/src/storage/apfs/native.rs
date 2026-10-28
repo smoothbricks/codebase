@@ -4023,6 +4023,7 @@ where
             return Ok(super::ResumedMount {
                 attachment,
                 found: super::FoundMount::Mounted,
+                attach_mount_work: None,
             });
         }
 
@@ -4030,9 +4031,10 @@ where
             return self
                 .backend
                 .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
-                .map(|(attachment, _)| super::ResumedMount {
+                .map(|(attachment, attach_mount_work)| super::ResumedMount {
                     attachment,
                     found: super::FoundMount::Detached,
+                    attach_mount_work,
                 })
                 .map_err(Into::into);
         };
@@ -4041,6 +4043,7 @@ where
             Ok(()) => Ok(super::ResumedMount {
                 attachment,
                 found: super::FoundMount::Attached,
+                attach_mount_work: None,
             }),
             Err(primary) => match self.detach(attachment, DetachIntent::Release) {
                 Ok(()) => Err(primary),
