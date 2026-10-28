@@ -3963,21 +3963,6 @@ async fn eventually(mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// Wait for the last job hold on build volume `id` to drop. Jobs hold the volume by a shared
-/// lock on its hold file ([`BuildVolumeLayout::hold`]), so an exclusive lock on it is granted at
-/// the very event: the last job's terminal event releasing its hold, or the kernel releasing a
-/// dead holder's. The lock is let go at once, leaving the volume for the gc after it.
-async fn job_holds_released(layout: &BuildVolumeLayout, id: &BuildVolumeId) {
-    let hold = layout.hold_path(id);
-    let released = tokio::task::spawn_blocking(move || {
-        fs::File::open(&hold).and_then(|file| file.lock_bounded())
-    });
-    released
-        .await
-        .expect("the hold wait's thread")
-        .expect("lock build volume's hold file");
-}
-
 fn file_len(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
@@ -5153,11 +5138,10 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     );
 
     fs::write(&stop, b"").unwrap();
-    job_holds_released(&layout, &old).await;
-    assert!(
-        old_mount.join("target/ticking/exited").is_file(),
-        "the job ran to its end in the previous volume"
-    );
+    // The job writes `exited` as its last act. The test takes no lock on the volume's hold file:
+    // an exclusive lock taken as the job's hold drops is the very probe the job-end release finds
+    // held, and the release then leaves the volume for a later collection this test never runs.
+    eventually(|| old_mount.join("target/ticking/exited").is_file()).await;
     // The job's end releases it, inside the controller: no later collection is needed.
     eventually(|| !layout.image(&old).exists() && !layout.record(&old).exists()).await;
     service.shutdown().await.expect("stop the runtime");
