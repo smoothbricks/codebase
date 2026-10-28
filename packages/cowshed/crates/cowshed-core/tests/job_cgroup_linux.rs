@@ -815,10 +815,22 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
             cached > 0,
             "the job's 64 MiB file left no page in the cache to attribute"
         );
+        // memory.stat is not exact: a read flushes the memcg's per-CPU counters only once their pending
+        // updates exceed MEMCG_CHARGE_BATCH (64) pages per online CPU (mm/memcontrol.c,
+        // memcg_vmstats_needs_flush: stats_updates > MEMCG_CHARGE_BATCH * num_online_cpus()), so
+        // its "file" can trail what is charged by up to that many pages. A 4-CPU runner read 254
+        // pages short of the cached file; the contract is the bound, not equality.
+        // SAFETY: sysconf takes a constant.
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
+        // SAFETY: sysconf takes a constant.
+        let online = u64::try_from(unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) })
+            .expect("online CPUs");
+        let unflushed = 64 * online * page;
         assert!(
-            regular_file >= cached,
+            regular_file + unflushed >= cached,
             "every cached page of the job's regular file is charged as non-shmem cache: \
-             regular-file cache {regular_file} B, the file's cached pages {cached} B"
+             regular-file cache {regular_file} B (memory.stat may trail by {unflushed} B), \
+             the file's cached pages {cached} B"
         );
     } else {
         assert_eq!(
