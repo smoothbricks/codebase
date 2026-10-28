@@ -665,6 +665,7 @@ fn acquired_keeps_the_state_channel_until_the_command_ends() {
 /// Block until every reader of the pipe `writer` writes to has closed it: kqueue's EVFILT_WRITE
 /// reports EV_EOF on the write end once the last read end is gone. No duration: a reader that
 /// never closes is named by the runner's no-progress bound.
+#[cfg(target_os = "macos")]
 fn await_no_reader(writer: &impl std::os::fd::AsRawFd) {
     use std::os::fd::{FromRawFd as _, OwnedFd};
     // SAFETY: kqueue takes no arguments; a negative answer is an error.
@@ -711,6 +712,34 @@ fn await_no_reader(writer: &impl std::os::fd::AsRawFd) {
         }
         registered = true;
         if fired == 1 && event.flags & libc::EV_EOF != 0 {
+            return;
+        }
+    }
+}
+
+/// Block until every reader of the pipe `writer` writes to has closed it: Linux reports POLLERR
+/// on a pipe's write end once its last read end is gone, and asking for no event waits for that
+/// alone. No duration: a reader that never closes is named by the runner's no-progress bound.
+#[cfg(target_os = "linux")]
+fn await_no_reader(writer: &impl std::os::fd::AsRawFd) {
+    let mut watch = libc::pollfd {
+        fd: writer.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd, no timeout: block until the descriptor reports a condition.
+        let ready = unsafe { libc::poll(&raw mut watch, 1, -1) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EINTR),
+                "watch the pipe: {error}"
+            );
+            continue;
+        }
+        if watch.revents & libc::POLLERR != 0 {
             return;
         }
     }
