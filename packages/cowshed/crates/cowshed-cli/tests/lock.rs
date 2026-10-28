@@ -1262,7 +1262,10 @@ fn bsd_lockf_and_cowshed_lock_exclude_each_other_on_the_same_file() {
     assert_eq!(line(&mut said), "held");
     let mut waiter = lock_command(&lock, "echo ran", &[]);
     let mut wait_line = String::new();
-    BufReader::new(waiter.stderr.take().expect("stderr"))
+    // Kept open until the waiter ends: a waiter still queued past HOLDER_REPORT says so on stderr,
+    // and a closed reader would end it there (EPIPE) before it ever ran its command.
+    let mut stderr = BufReader::new(waiter.stderr.take().expect("stderr"));
+    stderr
         .read_line(&mut wait_line)
         .expect("read the wait line");
     assert!(
