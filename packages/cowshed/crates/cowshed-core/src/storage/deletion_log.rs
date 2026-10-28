@@ -271,14 +271,11 @@ fn parent_process(pid: libc::pid_t) -> Option<CallerProcess> {
     })
 }
 
-/// A guard a forced removal overrode.
+/// A guard a forced removal overrode. `--force` waives no dirt and no in-progress operation
+/// (02_workspaces.md, `rm` step 1): the age floor is the one guard it overrides.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "guard", rename_all = "camelCase")]
 pub enum Overridden {
-    /// The tree held uncommitted work.
-    Dirty,
-    /// A Git operation was in progress.
-    InProgress { operation: String },
     /// The workspace was younger than the removal age floor.
     #[serde(rename_all = "camelCase")]
     Young {
@@ -1072,19 +1069,15 @@ mod tests {
         assert_eq!(entry.retired_by, None);
         let by = RetiredBy {
             caller: Caller::this_process(),
-            forced: Some(vec![
-                Overridden::Dirty,
-                Overridden::Young {
-                    created_at: "2026-01-01T00:00:00Z".to_owned(),
-                    age_seconds: Some(42),
-                },
-            ]),
+            forced: Some(vec![Overridden::Young {
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                age_seconds: Some(42),
+            }]),
         };
         assert_eq!(by.caller.pid, std::process::id());
         assert_eq!(
             serde_json::to_value(&by.forced).unwrap(),
             serde_json::json!([
-                { "guard": "dirty" },
                 { "guard": "young", "createdAt": "2026-01-01T00:00:00Z", "ageSeconds": 42 },
             ])
         );

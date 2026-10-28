@@ -2024,7 +2024,7 @@ async fn a_new_workspace_is_proven_after_its_clone_and_before_its_attach() {
 }
 
 #[tokio::test]
-async fn staged_retire_fences_after_durable_undiscovery_and_preserves_trash_on_failure() {
+async fn staged_retire_releases_before_its_fence_and_never_keeps_a_trash_image() {
     let host = FakeHost::default();
     let current = workspace("raven", 4);
     host.seed(&current);
@@ -2033,38 +2033,30 @@ async fn staged_retire_fences_after_durable_undiscovery_and_preserves_trash_on_f
     let callback_host = host.clone();
 
     let error = substrate
-        .execute_retire_staged(
-            plan,
-            cowshed_core::storage::apfs::RetirementDisposition::Recovery,
-            move |retired| async move {
-                assert_eq!(retired.workspace().name().as_str(), "raven");
-                assert!(
-                    callback_host
-                        .events()
-                        .contains(&"atomic-retire-to-trash".to_owned()),
-                    "retirement must be durable before its lifecycle fence"
-                );
-                Err::<(), _>("injected commitment failure")
-            },
-        )
+        .execute_retire_staged(plan, move |retired| async move {
+            assert_eq!(retired.workspace().name().as_str(), "raven");
+            assert!(
+                callback_host
+                    .events()
+                    .contains(&"physical-release".to_owned()),
+                "the release must be durable before its lifecycle fence"
+            );
+            Err::<(), _>("injected commitment failure")
+        })
         .await
-        .expect_err("fence failure must preserve a recoverable retired reference");
-    let RetireExecutionError::Fence { source, retired } = error else {
+        .expect_err("fence failure is reported");
+    let RetireExecutionError::Fence { source, .. } = error else {
         panic!("expected forward-only retirement fence failure");
     };
     assert_eq!(source, "injected commitment failure");
     assert!(
-        !host.events().contains(&"idempotent-reclaim".to_owned()),
-        "fence failure must not reclaim unpublished retirement trash"
+        !host.events().contains(&"atomic-retire-to-trash".to_owned()),
+        "a retirement keeps no recovery image"
     );
-
-    substrate.reclaim(retired).await.expect("recovery reclaim");
-    assert!(host.events().contains(&"idempotent-reclaim".to_owned()));
 }
 
 #[tokio::test]
 async fn failed_direct_source_unlink_does_not_publish_retirement_or_fall_back_to_trash() {
-    use cowshed_core::storage::apfs::RetirementDisposition;
     let host = FakeHost::default();
     let current = workspace("raven", 4);
     host.seed(&current);
@@ -2073,7 +2065,7 @@ async fn failed_direct_source_unlink_does_not_publish_retirement_or_fall_back_to
     let plan = substrate.plan_retire(&current).unwrap();
     let callback_host = host.clone();
     let failed = substrate
-        .execute_retire_staged(plan, RetirementDisposition::Release, move |_| async move {
+        .execute_retire_staged(plan, move |_| async move {
             callback_host.record("retirement-commitment");
             Ok::<(), &'static str>(())
         })
@@ -2089,16 +2081,13 @@ async fn failed_direct_source_unlink_does_not_publish_retirement_or_fall_back_to
     );
     let retry = substrate.plan_retire(&current).unwrap();
     substrate
-        .execute_retire_staged(retry, RetirementDisposition::Release, |_| async {
-            Ok::<(), &'static str>(())
-        })
+        .execute_retire_staged(retry, |_| async { Ok::<(), &'static str>(()) })
         .await
         .expect("same release retries");
 }
 
 #[tokio::test]
 async fn cancelling_the_retirement_commitment_never_recreates_released_source_trash() {
-    use cowshed_core::storage::apfs::RetirementDisposition;
     let host = FakeHost::default();
     let current = workspace("raven", 4);
     host.seed(&current);
@@ -2109,7 +2098,7 @@ async fn cancelling_the_retirement_commitment_never_recreates_released_source_tr
     let callback_host = host.clone();
     let task = tokio::spawn(async move {
         substrate
-            .execute_retire_staged(plan, RetirementDisposition::Release, move |_| async move {
+            .execute_retire_staged(plan, move |_| async move {
                 assert!(
                     callback_host
                         .events()
@@ -2729,7 +2718,7 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     let refusal = substrate
         .execute_pending_clone_retirement(metadata.clone(), original.clone(), |stage| async move {
             assert!(stage.resuming);
-            Err::<(cowshed_core::storage::apfs::RetirementDisposition, ()), _>(stage.mount_point)
+            Err::<(), _>(stage.mount_point)
         })
         .await;
     let Err(StagedExecutionError::Initializer(mount)) = refusal else {
@@ -2754,7 +2743,7 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     host.clear_events();
     let refusal = substrate
         .execute_pending_clone_retirement(metadata.clone(), original.clone(), |_| async move {
-            Err::<(cowshed_core::storage::apfs::RetirementDisposition, ()), _>("unlanded commits")
+            Err::<(), _>("unlanded commits")
         })
         .await;
     assert!(matches!(
@@ -2782,13 +2771,7 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
                 cancelling_identity,
                 |_| async move {
                     callback_entered.store(true, Ordering::SeqCst);
-                    std::future::pending::<
-                        Result<
-                            (cowshed_core::storage::apfs::RetirementDisposition, ()),
-                            &'static str,
-                        >,
-                    >()
-                    .await
+                    std::future::pending::<Result<(), &'static str>>().await
                 },
             )
             .await
@@ -2808,10 +2791,7 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     let (retired, proof) = substrate
         .execute_pending_clone_retirement(metadata, original, |stage| async move {
             assert_eq!(stage.workspace, pending);
-            Ok::<_, &'static str>((
-                cowshed_core::storage::apfs::RetirementDisposition::Recovery,
-                "landed",
-            ))
+            Ok::<_, &'static str>("landed")
         })
         .await
         .expect("retire verified pending clone");
@@ -2820,7 +2800,11 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     let events = host.events();
     assert!(events.iter().any(|event| event == "lock:1"));
     assert!(!events.iter().any(|event| event == "lock:2"));
-    assert!(events.iter().any(|event| event == "atomic-retire-to-trash"));
+    assert!(events.iter().any(|event| event == "physical-release"));
+    assert!(
+        !events.iter().any(|event| event == "atomic-retire-to-trash"),
+        "an unfinished clone's retirement keeps no recovery image"
+    );
     assert!(!events.iter().any(|event| event == "activate-pending"));
     assert!(!events.iter().any(|event| event.as_str() == "clone"));
 }

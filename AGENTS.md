@@ -55,15 +55,15 @@ is the host-installed CLI of `packages/cowshed`.
    keeps `cowshed/<ws>`, `--branch <b>` another, the checked-out one included), which keeps each in main's repository,
    then removed with plain `cowshed rm`, never `--abandon` (clear dirt first, and push again after a later commit); a
    shed whose work was deliberately dropped (superseded or obsolete, the reason clear from the brief, the git log or the
-   session JSONL) is removed with `cowshed rm --abandon` (clear dirt first: `--abandon` waives none), then
+   session JSONL) is removed with `cowshed rm --abandon` (it commits the dirt into its bundle), then
    `cowshed gc --abandoned`; a shed with real unlanded work and a live owner, failed or partly landed, is landed, or
    left to that owner. `--abandon` bundles the unlanded tips it destroys into `sessions/.trash/`, and `gc --abandoned`
-   deletes all of the project's bundles, each the only copy of its commits; `--force` destroys the uncommitted tree.
-   Maintainer rulings of 2026-10-18 and 2026-10-26: cleaning up is as important as creating, if not more, and
-   `--abandon` may be used for it. A fix that removes a fleet bottleneck, such as a failure that blocks more than one
-   shed, comes before local polish. Combine related fixes into one train, with one lander per project: a second land of
-   the same project loses the cache hits the first just wrote. _Enforced by: the land turn and `tooling/land-host.sh`;
-   `cowshed rm`'s containment refusal; review for the flags._
+   deletes all of the project's bundles, each the only copy of its commits; `--force` waives no dirt. Maintainer rulings
+   of 2026-10-18 and 2026-10-26: cleaning up is as important as creating, if not more, and `--abandon` may be used for
+   it. A fix that removes a fleet bottleneck, such as a failure that blocks more than one shed, comes before local
+   polish. Combine related fixes into one train, with one lander per project: a second land of the same project loses
+   the cache hits the first just wrote. _Enforced by: the land turn and `tooling/land-host.sh`; `cowshed rm`'s
+   containment refusal; review for the flags._
 3. **Edits.** When you are about to edit while other agents work in the repository → work in your own shed (one owner
    per unit, no git worktrees, never a peer's path until released). Use absolute workspace paths in filesystem and edit
    tools, so a session's cwd cannot redirect an edit into `main`. Markdown that belongs to no code unit goes straight to

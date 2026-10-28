@@ -1411,50 +1411,55 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    HEAD is kept so by `refs/cowshed/<ws>/heads/<branch>` for its checked-out branch, where `push` preserves it: those
    commits live in main's repository, which outlives the image, so a shed pushed for review retires with no flag. A HEAD
    the target holds asks no ref. A detached HEAD is on no branch, so no ref is its to read, and a HEAD ahead of its ref
-   (committed since the push, or diverged from it) is kept only as far as the ref goes, which is not the head. A dirty
-   tree refuses first, whatever keeps HEAD. A branch other than HEAD also passes when its tip equals or is an ancestor
-   of main's repository branch of the same name or of the ref `push` wrote for it. The refusal names each branch that
-   did not pass with its tip, how many of its commits neither proof holds, each unheld file with why main lacks its
-   change (`missing`, `conflict`, `added`, `deleted`, `changed` where main deleted the file, `mode`, or `unmergeable`
-   with git's reason), ten files per branch and a count of the rest, and then those commits, each with its subject, ten
-   and a count of the rest; `ls --landed` applies the same measurement. This is not the install gate's question
-   (05_gateway.md, "The installed cowshed"), which asks whether a build holds the installed commits themselves, by
-   ancestry or patch identity alone. `--force` permits loss of dirty/in-progress state, not unlanded work. An explicit
-   `rm` (and a project purge, for each session it removes) also refuses a workspace younger than ten minutes, measured
-   from the creation time its record carries, after every other gate has passed: a clean workspace at main is
-   indistinguishable from a landed one, and one its owner forked minutes ago may not have its first edit yet. The
-   refusal names the age and the floor, and its hint the remedies that keep the work; a creation time that cannot be
+   (committed since the push, or diverged from it) is kept only as far as the ref goes, which is not the head.
+   Uncommitted work refuses first, whatever keeps HEAD, and the refusal names it, ten paths and a count of the rest: a
+   tracked change, staged or not and hidden or not, and an untracked file no ignore rule covers. An untracked hidden
+   path (one with a `.` component) is junk, and so is an untracked path the target checkout's current rules ignore or
+   that it holds byte for byte (or by the same symlink target); a path the workspace's own rules ignore is never work.
+   An in-progress Git operation refuses the same way. A branch other than HEAD also passes when its tip equals or is an
+   ancestor of main's repository branch of the same name or of the ref `push` wrote for it. The refusal names each
+   branch that did not pass with its tip, how many of its commits neither proof holds, each unheld file with why main
+   lacks its change (`missing`, `conflict`, `added`, `deleted`, `changed` where main deleted the file, `mode`, or
+   `unmergeable` with git's reason), ten files per branch and a count of the rest, and then those commits, each with its
+   subject, ten and a count of the rest; `ls --landed` applies the same measurement. This is not the install gate's
+   question (05_gateway.md, "The installed cowshed"), which asks whether a build holds the installed commits themselves,
+   by ancestry or patch identity alone. `--force` waives neither uncommitted work, an in-progress operation nor unlanded
+   work. An explicit `rm` (and a project purge, for each session it removes) also refuses a workspace younger than ten
+   minutes, measured from the creation time its record carries, after every other gate has passed: a clean workspace at
+   main is indistinguishable from a landed one, and one its owner forked minutes ago may not have its first edit yet.
+   The refusal names the age and the floor, and its hint the remedies that keep the work; a creation time that cannot be
    read refuses the same way. It alone carries `removal: {reason: "young", createdAt, removableAt}`: `removableAt` is
    the first second the floor lets the workspace go, absent when the creation cannot be read, so a caller that owns the
    workspace waits for that second instead of copying the floor. `--force` overrides it. A `land` retiring the unit it
    landed or a workspace it folded (`land` step 5), and the replay of a removal already authorized, are not asked.
-   Explicit `--abandon` requires a verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and
-   every branch that did not pass as refs, before retiring unlanded work. It is written beside that name and renamed
-   into place once verified; a retried removal that finds a bundle verifying for the same range keeps it instead of
-   writing another. The bundle is the only copy: nothing is written into main's repository, whose refs are the branches
-   people check out and the ones `push` writes, never a namespace per abandonment that nobody reads. It stays in the
-   trash until `gc --abandoned` releases it (01_storage.md, "Retention"). The report names it (`AbandonedWork.bundle`),
-   and `AbandonedWork.preserved` says what else keeps the tips: absent (`bundleOnly`) for every session abandonment;
-   `nothingToPreserve` for main's own `--restore --abandon` (below), where main is what is being restored and its bundle
-   is the copy; or `preserved` with each ref, in a record an earlier build wrote when abandonments also wrote refs into
-   main's repository, which no build writes or reads now. A measurement's files (`unlandedPaths`) are `named`, or
-   `predatesPaths` for a record from a build that counted commits by patch identity and named no file. A command
-   reporting a predating record warns once on stderr, naming what it does not record (00_overview.md).
+   Explicit `--abandon` authorizes losing all three. It requires a verified recovery bundle,
+   `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and every branch that did not pass as refs, and, when the tree
+   holds uncommitted work, one more commit on top of HEAD holding the work tree as it stands, under
+   `refs/cowshed/uncommitted` (`AbandonedWork.uncommitted`): each dirty path taken as the tree holds it and one the tree
+   lost as its deletion, staged through a private index so the workspace's own index, HEAD and branches are untouched.
+   An in-progress operation's own state (`MERGE_HEAD`, a rebase's plan) is not kept; its work tree is. No image is kept
+   (step 5). The bundle is written beside that name and renamed into place once verified; a retried removal that finds a
+   bundle verifying for the same range keeps it instead of writing another. The bundle is the only copy: nothing is
+   written into main's repository, whose refs are the branches people check out and the ones `push` writes, never a
+   namespace per abandonment that nobody reads. It stays in the trash until `gc --abandoned` releases it (01_storage.md,
+   "Retention"). The report names it (`AbandonedWork.bundle`), and `AbandonedWork.preserved` says what else keeps the
+   tips: absent (`bundleOnly`) for every session abandonment; `nothingToPreserve` for main's own `--restore --abandon`
+   (below), where main is what is being restored and its bundle is the copy; or `preserved` with each ref, in a record
+   an earlier build wrote when abandonments also wrote refs into main's repository, which no build writes or reads now.
+   A measurement's files (`unlandedPaths`) are `named`, or `predatesPaths` for a record from a build that counted
+   commits by patch identity and named no file. A command reporting a predating record warns once on stderr, naming what
+   it does not record (00_overview.md).
 
    Every retirement, abandoned or not, appends a `retire-workspace` line to the project's `deletion-log.jsonl`
-   (01_storage.md) once the source release is committed or the recovery retirement completes: the head and every local
-   branch tip read before the image went, each with what keeps it — `{"by":"bundle","path":…}` naming the abandon bundle
-   for a tip the abandonment kept, `{"by":"target",…}` naming the branch and head that held a tip the gate passed, or,
-   for the head a `push` ref alone kept, the ref and its commit (`"branch":"refs/cowshed/<ws>/heads/<branch>"`), which
-   is then the only copy; any other tip is named by the branch the gate measured against, whichever proof passed it. The
-   line also says who retired the workspace (`retiredBy`): the `caller`, the process that ran the removal with its pid
-   and argv and its parent's, which is the shell, script or agent that asked; and, for a forced removal, `forced`,
-   naming each guard the force overrode (`dirty`, `inProgress` with the operation, `young` with `createdAt` and
-   `ageSeconds`), empty when it overrode none. A retirement that keeps its image as recovery (step 5) also names the
-   trash path it kept (`image`) and every reason it kept it (`retained`): `inProgress` with the operation, `dirty`,
-   `abandoned`, `onlyCopy` with the first untracked leaf the target checkout does not hold, or `main` for main's own
-   retirement. A retirement whose tips could not be read says so on stderr and writes the line without Git facts; it is
-   never refused for that.
+   (01_storage.md) once the source release is committed: the head and every local branch tip read before the image went,
+   each with what keeps it — `{"by":"bundle","path":…}` naming the abandon bundle for a tip the abandonment kept,
+   `{"by":"target",…}` naming the branch and head that held a tip the gate passed, or, for the head a `push` ref alone
+   kept, the ref and its commit (`"branch":"refs/cowshed/<ws>/heads/<branch>"`), which is then the only copy; any other
+   tip is named by the branch the gate measured against, whichever proof passed it. The line also says who retired the
+   workspace (`retiredBy`): the `caller`, the process that ran the removal with its pid and argv and its parent's, which
+   is the shell, script or agent that asked; and, for a forced removal, `forced`, naming each guard the force overrode
+   (`young` with `createdAt` and `ageSeconds`, the one guard it overrides), empty when it overrode none. A retirement
+   whose tips could not be read says so on stderr and writes the line without Git facts; it is never refused for that.
 
    The refusal reports whether the published branch already holds HEAD's commits; it never authorizes a removal. Only
    once the gate has refused HEAD does it measure HEAD, with the same landing module `ls` reads, against the primary

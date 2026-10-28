@@ -26,6 +26,7 @@ static ABANDONED_WORK: Reader = Reader::Record(&[
     ("branches", &SEQ__BRANCH_LANDING),
     ("preserved", &ABANDONED_PRESERVATION),
     ("bundle", &LEAF),
+    ("uncommitted", &LEAF),
 ]);
 static ABANDONMENT: Reader =
     Reader::Record(&[("atUnixMs", &LEAF), ("ticket", &TICKET), ("reason", &LEAF)]);

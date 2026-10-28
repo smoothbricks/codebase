@@ -102,15 +102,14 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 4. A successful land retires by default. If retire was refused after the fast-forward, main already moved: run
    `cowshed rm <ws>`, never land again. With `--no-retire`, `rm` once main contains HEAD and every other local branch (a
    fork keeps only `cowshed/<ws>`; one branch per shed); after `push`, `rm` once the pushed ref keeps HEAD: it is that
-   commit or a descendant of it.
-5. `--abandon` is for work that is not going to be merged in: superseded or obsolete, the reason clear from history. It
-   is the sole way to destroy unlanded commits (they are bundled to `sessions/.trash/` first); follow it with
+   commit or a descendant of it. is the sole way to destroy unlanded commits or uncommitted work (they are bundled to
+   `sessions/.trash/` first, the work tree as one commit on top of HEAD, and no image is kept); follow it with
    `cowshed gc --abandoned`, which deletes the bundles. A shed whose work main holds, a batch folded, or `push`
-   preserved never needs it, and it is never the answer to an `rm` refusal. `--force` waives only transient state (a
-   dirty tree, the workspace's own running jobs; never a process cowshed does not run holding the mount), destroys the
-   uncommitted tree, can never waive containment, and is never the answer to a refusal either.
-6. Batch work is lane work: see "Batch a round of units" below.
-7. A shed whose work main already holds, that carries none, or whose branch `push` preserved, is removed with plain
+   preserved never needs it, and it is never the answer to an `rm` refusal. `--force` waives only the workspace's own
+   running jobs and its youth (never a dirty tree, never a process cowshed does not run holding the mount), can never
+   waive containment, and is never the answer to a refusal either.
+5. Batch work is lane work: see "Batch a round of units" below.
+6. A shed whose work main already holds, that carries none, or whose branch `push` preserved, is removed with plain
    `cowshed rm <ws>` and no check first, and plain `rm` just works: rm proves containment against live main, over every
    local branch: a commit is held when main's content carries its change or main holds a patch-equivalent commit
    (`git cherry`), so a cherry-pick main later edited past still counts. A containment refusal names the commits held by

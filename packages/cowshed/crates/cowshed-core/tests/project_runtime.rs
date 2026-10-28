@@ -907,12 +907,11 @@ impl ProjectRuntimeHost for FakeHost {
                     "finish or discard Git work",
                 ));
             }
-            // Transient state is force's business; unlanded commits are abandon's, and neither
-            // flag stands in for the other.
-            if !workspace.is_main() && !options.force && self.removal.dirty.contains(&workspace) {
+            // Dirt is `--abandon`'s to commit into the bundle; `--force` waives none of it.
+            if !workspace.is_main() && !options.abandon && self.removal.dirty.contains(&workspace) {
                 return Err(CowshedError::conflict(
-                    "workspace has uncommitted Git work",
-                    "commit the work and land it",
+                    "workspace has uncommitted work",
+                    "commit what is work and land it",
                 ));
             }
             if !workspace.is_main()
@@ -933,6 +932,7 @@ impl ProjectRuntimeHost for FakeHost {
             }
             if self.removal.unlanded.contains(&workspace) {
                 abandoned = Some(AbandonedWork {
+                    uncommitted: None,
                     head: GitOid::new("4".repeat(40)).expect("fixed head"),
                     target_branch: "main".to_owned(),
                     target_head: Some(GitOid::new("1".repeat(40)).expect("fixed tip")),
@@ -5882,9 +5882,9 @@ async fn remove_stops_supervisor_before_retirement() {
     );
 }
 
-/// Dirt is `--force`'s business and nothing else's: it must not authorize a commit loss.
+/// Dirt refuses a removal, `--force` or not; `--abandon` is what lets it through.
 #[tokio::test]
-async fn session_removal_refuses_dirty_work_until_forced() {
+async fn session_removal_refuses_dirty_work_until_abandoned() {
     let root = test_root();
     let name = WorkspaceName::new("unsafe").expect("name");
     let mut removal = FakeRemoval::default();
@@ -5916,8 +5916,7 @@ async fn session_removal_refuses_dirty_work_until_forced() {
         events.try_recv().is_err(),
         "safe refusal must not stop or retire"
     );
-
-    route(
+    let error = route(
         &router,
         coordinator(repo.clone()),
         "coordinator.destroy",
@@ -5928,7 +5927,22 @@ async fn session_removal_refuses_dirty_work_until_forced() {
         }),
     )
     .await
-    .expect("force overrides transient state");
+    .expect_err("--force waives no dirt");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(events.recv().await, Some(Event::GitSafety(name.clone())));
+
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({
+            "repoId": repo,
+            "workspace": "unsafe",
+            "options": RemoveOptions { force: false, restore: false, abandon: true }
+        }),
+    )
+    .await
+    .expect("--abandon takes the dirt into its bundle");
     assert_eq!(events.recv().await, Some(Event::GitSafety(name.clone())));
     assert_eq!(events.recv().await, Some(Event::Stop(name.clone())));
     assert_eq!(events.recv().await, Some(Event::Retire(name)));

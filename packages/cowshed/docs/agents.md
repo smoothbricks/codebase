@@ -81,10 +81,11 @@ Notes for harness integration:
   merge queue) takes over. Never push to main's checked-out branch.
 - `cowshed rm` refuses (exit 4) unless each local branch of the workspace, `HEAD`'s first, is contained by `main` or
   kept by the ref `cowshed push` wrote for it — the image about to be deleted is where those commits live, so the
-  refusal is your signal that work would be lost. Land it, or push it for review. `--force` overrides only _transient_
-  state (dirty tree, in-progress merge, the workspace's own running jobs; never a process cowshed does not run holding
-  the mount) and deliberately cannot get past this gate; `--abandon` is the sole authorization for destroying unlanded
-  commits, and it bundles them into `sessions/.trash` first.
+  refusal is your signal that work would be lost. Land it, or push it for review. Uncommitted work and an in-progress
+  merge refuse too, named. `--force` overrides only the workspace's own running jobs and its youth (never a process
+  cowshed does not run holding the mount) and deliberately cannot get past either gate; `--abandon` is the sole
+  authorization for destroying unlanded commits and uncommitted work, and it bundles both into `sessions/.trash` first,
+  the work tree as one commit on top of `HEAD`.
 - **Never turn a removal conflict into a blind retry with a flag.** The gate is the whole point: a coordinator script
   that answers exit 4 by adding `--force` is the failure mode this design exists to prevent. `--abandon` is not a retry
   but a decision about the work, made once for a workspace whose work was deliberately dropped (superseded or obsolete,

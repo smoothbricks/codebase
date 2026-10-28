@@ -1027,6 +1027,7 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
     assert_eq!(
         serde_json::to_value(RemoveReport {
             abandoned: Some(AbandonedWork {
+                uncommitted: None,
                 head: GitOid::new("4".repeat(40)).unwrap(),
                 target_branch: "main".into(),
                 target_head: Some(GitOid::new("1".repeat(40)).unwrap()),

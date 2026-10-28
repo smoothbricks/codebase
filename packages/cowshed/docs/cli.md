@@ -642,10 +642,10 @@ them. A refusal is reported separately with its own `next:` hint and exit code. 
 
 The two overrides authorize different losses and neither substitutes for the other:
 
-| Flag        | Overrides                                                                                                                       | Does **not** override                                                     |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `--force`   | transient state: a dirty tree, an in-progress merge, the workspace's own running jobs; and a workspace younger than ten minutes | the landed-content gate; a process cowshed does not run holding the mount |
-| `--abandon` | the landed-content gate — changes neither `main` nor a `push` ref holds                                                         | transient state                                                           |
+| Flag        | Overrides                                                                                                                          | Does **not** override                                                                                             |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `--force`   | the workspace's own running jobs, and a workspace younger than ten minutes                                                         | uncommitted work; an in-progress merge; the landed-content gate; a process cowshed does not run holding the mount |
+| `--abandon` | the landed-content gate, uncommitted work and an in-progress merge: each goes into the bundle, the work tree as one commit on HEAD | a process cowshed does not run holding the mount; the age floor                                                   |
 
 `--force` stops that workspace's running jobs (TERM, then KILL after the grace period) before detaching; without it,
 removal lets the supervisor finish its active jobs. A leftover `.git/AUTO_MERGE` alone is not an in-progress operation
@@ -653,7 +653,9 @@ and does not require `--force`.
 
 A dirty tree is a tracked change, or an untracked file that is not hidden, not ignored by main's current gitignore
 rules, and not held by main's checkout with the same content at the same path: an untracked file left in main arrives in
-every clone and is not the workspace's work.
+every clone and is not the workspace's work. The refusal names the dirty paths, ten and a count of the rest. `--abandon`
+commits them, through a private index, as one commit on top of `HEAD` (`refs/cowshed/uncommitted` in the bundle,
+`abandoned.uncommitted` in the report); no image of the workspace is kept.
 
 A clean workspace at main reads exactly like a landed one, so `rm` also refuses a workspace younger than ten minutes —
 one whose owner may not have written in it yet — naming how long ago it was created. Remove it once it is ten minutes

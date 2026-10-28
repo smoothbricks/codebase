@@ -1068,48 +1068,46 @@ impl GitRepository {
     /// path.
     pub async fn dirty_paths_by(&self, checkout: Option<&Path>) -> Result<Vec<PathBuf>> {
         let output = self.porcelain_status("read repository status").await?;
-        let mut work: Vec<PathBuf> = Vec::new();
-        let mut untracked: Vec<&[u8]> = Vec::new();
-        for (status, path) in porcelain_records(&output.stdout) {
-            if is_untracked_junk(status, path) {
-                continue;
-            }
-            if status == b"??" {
-                untracked.push(path);
-            } else {
-                work.push(PathBuf::from(OsStr::from_bytes(path)));
-            }
-        }
-        let Some(checkout) = checkout.filter(|_| !untracked.is_empty()) else {
-            work.extend(
-                untracked
-                    .into_iter()
-                    .map(|path| PathBuf::from(OsStr::from_bytes(path))),
-            );
-            return Ok(work);
-        };
-        let untracked: Vec<Vec<u8>> = untracked.into_iter().map(<[u8]>::to_vec).collect();
+        let records: Vec<(Vec<u8>, Vec<u8>)> = porcelain_records(&output.stdout)
+            .map(|(status, path)| (status.to_vec(), path.to_vec()))
+            .collect();
         let root = self.root.clone();
-        let checkout = checkout.to_path_buf();
-        let unheld = tokio::task::spawn_blocking(move || {
-            // One check-ignore for every untracked path, not one process per path. It answers
-            // in input order, so the ignored paths are a subsequence of `untracked` and one pass
-            // separates them.
-            let asked: Vec<&[u8]> = untracked.iter().map(Vec::as_slice).collect();
-            let ignored = ignored_by_rules(&checkout, &asked)?;
-            let mut ignored = ignored.iter().map(Vec::as_slice).peekable();
+        let checkout = checkout.map(Path::to_path_buf);
+        tokio::task::spawn_blocking(move || {
+            // Only a record the rule asks the target about is read against it: one check-ignore
+            // for all of them, and a byte comparison only for a path the target's rules do not
+            // ignore.
+            let asked: Vec<&[u8]> = records
+                .iter()
+                .filter(|(status, path)| asks_target(status, path))
+                .map(|(_, path)| path.as_slice())
+                .collect();
+            let ignored: std::collections::BTreeSet<Vec<u8>> = match &checkout {
+                Some(checkout) => ignored_by_rules(checkout, &asked)?.into_iter().collect(),
+                None => std::collections::BTreeSet::new(),
+            };
             Ok::<_, std::io::Error>(
-                untracked
-                    .into_iter()
-                    .filter(|path| {
-                        let is_ignored = ignored.peek() == Some(&path.as_slice());
-                        if is_ignored {
-                            ignored.next();
-                        }
-                        !is_ignored
+                records
+                    .iter()
+                    .filter(|(status, path)| {
+                        let target = checkout
+                            .as_deref()
+                            .filter(|_| asks_target(status, path))
+                            .map(|checkout| {
+                                let ignored = ignored.contains(path);
+                                TargetReading {
+                                    ignored,
+                                    held: !ignored
+                                        && held_by_checkout(
+                                            &root,
+                                            checkout,
+                                            Path::new(OsStr::from_bytes(path)),
+                                        ),
+                                }
+                            });
+                        is_dirt(status, path, target)
                     })
-                    .map(|path| PathBuf::from(OsString::from_vec(path)))
-                    .filter(|relative| !held_by_checkout(&root, &checkout, relative))
+                    .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
                     .collect::<Vec<_>>(),
             )
         })
@@ -1122,84 +1120,6 @@ impl GitRepository {
         .map_err(|error| {
             CowshedError::internal(format!(
                 "cannot judge untracked files against main's ignore rules: {error}"
-            ))
-        })?;
-        work.extend(unheld);
-        Ok(work)
-    }
-
-    /// Gitignored paths are disposable by the project's own declaration and never keep a recovery
-    /// image (02_workspaces.md, `rm` step 5): ignored by the workspace's own rules (`git ls-files
-    /// --exclude-standard`) or by the target checkout's current ones (`ignored_by_rules`, as
-    /// [`Self::dirty_paths_by`] reads main's). Hidden untracked leaves (a `.`-component) are junk,
-    /// as they are to rm's dirty fence (`is_untracked_junk`): never the only copy (Danny, "junk is
-    /// junk"; a fold once kept a whole recovery image for one `.cache/*.log`). Every other leaf must
-    /// survive in the target checkout, byte for byte or by the same symlink target, unless cowshed itself
-    /// made it: its `.cowshed/` directory, the volume's own bookkeeping, and each link of
-    /// `build_state` exactly as `link::link_paths` made it (16_build_volumes.md, "One link per
-    /// checkout"). This is the first leaf that does not survive, in `git ls-files` order, or
-    /// `None` when every one does.
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) async fn first_unheld_untracked(
-        &self,
-        checkout: &Path,
-        build_state: Vec<crate::capabilities::BuildStatePath>,
-    ) -> Result<Option<PathBuf>> {
-        let mut args = vec![
-            "ls-files".to_owned(),
-            "--others".to_owned(),
-            "--exclude-standard".to_owned(),
-            "-z".to_owned(),
-        ];
-        for directory in std::iter::once(".cowshed").chain(cowshed_apfs::VOLUME_METADATA) {
-            args.push(format!("--exclude=/{directory}/"));
-        }
-        args.push(format!("--exclude=/{}", cowshed_apfs::SPOTLIGHT_OPT_OUT));
-        let output = self.run(args).await?;
-        if !output.status.success() {
-            return Err(git_internal("read retirement-only-copy paths", &output));
-        }
-        let root = self.root.clone();
-        let checkout = checkout.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let untracked: Vec<&[u8]> = output
-                .stdout
-                .split(|byte| *byte == 0)
-                .filter(|path| !path.is_empty())
-                .collect();
-            // One check-ignore for every path; it answers in input order, so the ignored paths
-            // are a subsequence of `untracked` and one pass separates them.
-            let ignored = ignored_by_rules(&checkout, &untracked)?;
-            let mut ignored = ignored.iter().map(Vec::as_slice).peekable();
-            Ok::<_, std::io::Error>(
-                untracked
-                    .into_iter()
-                    .filter(|path| {
-                        let is_ignored = ignored.peek() == Some(path);
-                        if is_ignored {
-                            ignored.next();
-                        }
-                        !is_ignored
-                    })
-                    .filter(|path| !is_hidden_path(path))
-                    .map(|path| Path::new(OsStr::from_bytes(path)))
-                    .filter(|path| {
-                        !build_state.iter().any(|state| {
-                            state.checkout.as_path() == *path
-                                && crate::build_volume::link::is_fixed_link(&root, state)
-                        })
-                    })
-                    .find(|path| !held_by_checkout(&root, &checkout, path))
-                    .map(Path::to_path_buf),
-            )
-        })
-        .await
-        .map_err(|error| {
-            CowshedError::internal(format!("compare retirement-only-copy paths: {error}"))
-        })?
-        .map_err(|error| {
-            CowshedError::internal(format!(
-                "cannot judge untracked files against the target checkout's ignore rules: {error}"
             ))
         })
     }
@@ -1232,6 +1152,106 @@ impl GitRepository {
             .filter(|path| !path.is_empty())
             .map(|path| PathBuf::from(OsStr::from_bytes(path)))
             .collect())
+    }
+
+    /// Commit `dirt`, the work tree's uncommitted work ([`Self::dirty_paths_by`]), as one commit on
+    /// top of HEAD for an abandonment's bundle (02_workspaces.md, `rm` step 1), point
+    /// [`UNCOMMITTED_REF`] at it and answer it. Staged through a private index seeded from HEAD,
+    /// so the repository's own index, HEAD and branches stay as they were, an unmerged index
+    /// included: each path is taken as the work tree holds it, and one the tree lost is its
+    /// deletion. The tracked paths `git diff HEAD` names go in too, which adds the source of a
+    /// rename `git status` reports only by its destination.
+    pub async fn commit_uncommitted(&self, dirt: &[PathBuf], workspace: &str) -> Result<GitOid> {
+        let git_dir = PathBuf::from(
+            self.read_one(
+                ["rev-parse", "--absolute-git-dir"],
+                "locate the Git directory",
+            )
+            .await?,
+        );
+        let tracked = self
+            .run(["diff", "--no-renames", "--name-only", "-z", "HEAD", "--"])
+            .await?;
+        if !tracked.status.success() {
+            return Err(git_internal("list the tracked changes", &tracked));
+        }
+        let mut paths: Vec<Vec<u8>> = dirt
+            .iter()
+            .map(|path| path.as_os_str().as_bytes().to_vec())
+            .chain(nul_fields(&tracked.stdout))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        let mut input = Vec::new();
+        for path in &paths {
+            input.extend_from_slice(path);
+            input.push(0);
+        }
+        let index = git_dir.join(format!(
+            "cowshed-uncommitted-{}.index",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let committed = async {
+            let seeded = self
+                .run_indexed(&index, ["read-tree", "HEAD"], Vec::new())
+                .await?;
+            if !seeded.status.success() {
+                return Err(git_internal("seed the uncommitted work's index", &seeded));
+            }
+            let staged = self
+                .run_indexed(
+                    &index,
+                    ["update-index", "--add", "--remove", "-z", "--stdin"],
+                    input,
+                )
+                .await?;
+            if !staged.status.success() {
+                return Err(git_internal("stage the uncommitted work", &staged));
+            }
+            let tree = self.run_indexed(&index, ["write-tree"], Vec::new()).await?;
+            if !tree.status.success() {
+                return Err(git_internal("write the uncommitted work's tree", &tree));
+            }
+            let tree = parse_one_string(&tree.stdout, "uncommitted work tree")?;
+            let message = format!("cowshed rm --abandon: {workspace}'s uncommitted work");
+            let commit = self
+                .read_one(
+                    [
+                        "-c",
+                        "user.name=cowshed",
+                        "-c",
+                        "user.email=cowshed@localhost",
+                        "commit-tree",
+                        "--no-gpg-sign",
+                        tree.as_str(),
+                        "-p",
+                        "HEAD",
+                        "-m",
+                        message.as_str(),
+                    ],
+                    "commit the uncommitted work",
+                )
+                .await?;
+            let pointed = self
+                .run(["update-ref", UNCOMMITTED_REF, commit.as_str()])
+                .await?;
+            if !pointed.status.success() {
+                return Err(git_internal("name the uncommitted work's commit", &pointed));
+            }
+            parse_oid(commit, "uncommitted work commit")
+        }
+        .await;
+        match tokio::fs::remove_file(&index).await {
+            Ok(()) => committed,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => committed,
+            Err(error) => committed.and(Err(CowshedError::environment_missing(
+                format!(
+                    "cannot remove the uncommitted work's index {}: {error}",
+                    index.display()
+                ),
+                "remove it, then retry the removal",
+            ))),
+        }
     }
 
     /// Exclude cowshed's runtime metadata, the volume's own bookkeeping
@@ -4200,6 +4220,40 @@ impl GitRepository {
         .await
     }
 
+    /// [`Self::run_input`] staging through the private index file `index` (`GIT_INDEX_FILE`)
+    /// instead of the repository's own.
+    // WHY unbounded: as [`Self::run_input`].
+    #[allow(clippy::disallowed_methods)]
+    async fn run_indexed<I, S>(&self, index: &Path, args: I, input: Vec<u8>) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut child = git_command_with_objects(
+            #[cfg(target_os = "macos")]
+            &self.store_root,
+            &self.root,
+            self.alternate_objects.as_deref(),
+            #[cfg(target_os = "macos")]
+            None,
+        )?
+        .env("GIT_INDEX_FILE", index)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .map_err(|error| git_spawn_error(&error))?;
+        let stdin = child.stdin.take();
+        let write = async move {
+            if let Some(mut stdin) = stdin {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, &input).await;
+            }
+        };
+        let ((), output) = tokio::join!(write, child.wait_with_output());
+        output.map_err(|error| git_spawn_error(&error))
+    }
+
     /// [`Self::run`] for a batch verb, with `input` on its stdin. The input is written while
     /// git's output is drained: a batch verb answers as it reads, so writing all of it before
     /// reading any answer deadlocks once the answers fill the stdout pipe. A write that fails
@@ -5521,11 +5575,44 @@ fn is_untracked_junk(status: &[u8], path: &[u8]) -> bool {
     status == b"??" && is_hidden_path(path)
 }
 
+/// How the surviving target checkout reads one untracked path, for [`is_dirt`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TargetReading {
+    /// The target's current ignore rules ignore it.
+    ignored: bool,
+    /// The target holds it byte for byte, or by the same symlink target.
+    held: bool,
+}
+
+/// Whether [`is_dirt`] needs the target's reading of this record: an untracked path that is not
+/// junk.
+fn asks_target(status: &[u8], path: &[u8]) -> bool {
+    status == b"??" && !is_hidden_path(path)
+}
+
+/// rm's dirt rule for one `git status --porcelain=v1` record (02_workspaces.md, `rm` step 1):
+/// the work plain `rm` refuses and names, and `rm --abandon` commits into its bundle. A tracked
+/// change is work, hidden or not. An untracked hidden path is junk, and `git status` never lists a
+/// path the workspace's own rules ignore. Any other untracked path is work unless the surviving
+/// target checkout answers for it, `target` saying how: its current rules ignore it, or it holds the
+/// same bytes. `None` when there is no target to ask.
+fn is_dirt(status: &[u8], path: &[u8], target: Option<TargetReading>) -> bool {
+    if status != b"??" {
+        return true;
+    }
+    !is_untracked_junk(status, path) && target.is_none_or(|target| !target.ignored && !target.held)
+}
+
 /// True when any component of a relative path starts with `.`.
 pub fn is_hidden_path(path: &[u8]) -> bool {
     path.split(|byte| *byte == b'/')
         .any(|component| component.first() == Some(&b'.'))
 }
+
+/// The ref [`GitRepository::commit_uncommitted`] points at the commit of a work tree's
+/// uncommitted work, so an abandonment's bundle can carry it: a bundle advertises refs, never a
+/// bare oid. It lives in the workspace being retired and goes with it.
+pub const UNCOMMITTED_REF: &str = "refs/cowshed/uncommitted";
 
 /// Remove the linked-worktree registrations a standalone clone inherited from its source
 /// (02_workspaces.md, fork mint step 6). Each `.git/worktrees/<id>` directory describes a
@@ -6898,119 +6985,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_release_requires_hidden_bytes_held_elsewhere_and_never_ignored_ones() {
-        let store = crate::temp_root::FixtureStore::new();
-        let root = repository();
-        let main = repository();
-        let git = GitRepository::from_root(store.shared(), &root);
-        fs::write(root.join(".git/info/exclude"), "/ignored\n").unwrap();
-        fs::write(root.join("ignored"), b"only copy\n").unwrap();
-        fs::write(root.join(".hidden"), b"hidden copy\n").unwrap();
-        fs::create_dir_all(root.join(".cache")).unwrap();
-        fs::write(root.join(".cache/r9-cr.log"), b"a run's log\n").unwrap();
-        assert!(!git.is_dirty_by(Some(&main)).await.unwrap());
-        // A fold's retirement kept a whole 300 GB recovery image for one `.cache/r9-*.log`: hidden
-        // paths are junk to rm's dirty fence, and so to the only-copy check (Danny, "junk is junk").
-        assert_eq!(
-            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            None,
-            "hidden and ignored leaves main does not hold are junk, never the only copy"
-        );
-        fs::write(root.join("notes.txt"), b"visible work\n").unwrap();
-        fs::write(root.join(".git/info/exclude"), "/ignored\n/notes.txt\n").unwrap();
-        assert_eq!(
-            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            None,
-            "a leaf the workspace's own rules ignore is disposable"
-        );
-        fs::write(root.join(".git/info/exclude"), "/ignored\n").unwrap();
-        assert_eq!(
-            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            Some(PathBuf::from("notes.txt")),
-            "a visible leaf no rule ignores is the only copy"
-        );
-        fs::write(main.join(".git/info/exclude"), "/notes.txt\n").unwrap();
-        assert_eq!(
-            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            None,
-            "a leaf the target's current rules ignore is disposable"
-        );
-        fs::create_dir_all(root.join(".cowshed")).unwrap();
-        fs::write(root.join(".cowshed/token"), b"controller identity").unwrap();
-        assert_eq!(
-            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            None
-        );
-    }
-
-    /// The leaves a fleet scratch session left in `git status --ignored` when its removal kept a
-    /// recovery image (02_workspaces.md, `rm` step 5): cowshed's `.cowshed/`, the build-state
-    /// links it made into the build volume, and the volume's own bookkeeping. Main had no build
-    /// volume linked at those paths, so none of them was "held" there, yet none is the
-    /// workspace's content. A hidden one is junk outright; a visible one is exempt by the build
-    /// volume's record, the same paths `link_paths` linked: a link at an unrecorded visible path,
-    /// or a recorded path linked elsewhere, is still content.
-    #[tokio::test]
-    async fn source_release_exempts_the_build_state_links_cowshed_made() {
-        use crate::build_volume::link;
-        use crate::capabilities::BuildStatePath;
-
-        let store = crate::temp_root::FixtureStore::new();
-        let root = repository();
-        let main = repository();
-        let volume = root.parent().unwrap().join("build-volume");
-        fs::create_dir_all(&volume).unwrap();
-        let git = GitRepository::from_root(store.shared(), &root);
-        let recorded = vec![
-            BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
-            BuildStatePath::new("codegraph", "codegraph").unwrap(),
-        ];
-        link::point(&root, &volume).unwrap();
-        link::link_paths(&root, &volume, &recorded).unwrap();
-        // `link_paths` also excludes each linked path, and an ignored path is disposable on its
-        // own. With the exclude block removed, as a user may edit it away, the checkout
-        // leaves only the volume's record to judge the links, which is what this test proves.
-        fs::write(root.join(".git/info/exclude"), "").unwrap();
-        fs::create_dir_all(root.join(".fseventsd")).unwrap();
-        fs::write(root.join(".fseventsd/no_log"), b"").unwrap();
-        fs::write(root.join(cowshed_apfs::SPOTLIGHT_OPT_OUT), b"").unwrap();
-        assert_eq!(
-            fs::read_link(root.join("codegraph")).unwrap(),
-            Path::new(".cowshed/build/codegraph")
-        );
-        assert_eq!(
-            git.first_unheld_untracked(&main, recorded.clone())
-                .await
-                .unwrap(),
-            None,
-            "cowshed's own links and bookkeeping are not the workspace's only copy"
-        );
-        assert_eq!(
-            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            Some(PathBuf::from("codegraph")),
-            "with no record naming it, a visible link is judged like any other leaf"
-        );
-
-        symlink(".cowshed/build/turbo", root.join("turbo")).unwrap();
-        assert_eq!(
-            git.first_unheld_untracked(&main, recorded.clone())
-                .await
-                .unwrap(),
-            Some(PathBuf::from("turbo")),
-            "a link into the build volume at a visible path no record names is content"
-        );
-        fs::remove_file(root.join("turbo")).unwrap();
-
-        fs::remove_file(root.join("codegraph")).unwrap();
-        symlink("/elsewhere/codegraph", root.join("codegraph")).unwrap();
-        assert_eq!(
-            git.first_unheld_untracked(&main, recorded).await.unwrap(),
-            Some(PathBuf::from("codegraph")),
-            "a recorded path linked anywhere but its volume directory is content"
-        );
-    }
-
-    #[tokio::test]
     async fn untracked_hidden_paths_are_junk_and_do_not_make_a_tree_dirty() {
         let store = crate::temp_root::FixtureStore::new();
         let root = repository();
@@ -7044,6 +7018,159 @@ mod tests {
         fs::write(root.join("bench/results/run-1/out.txt"), "1\n").expect("bench output");
         assert!(git.is_dirty().await.expect("own rules"));
         assert!(!git.is_dirty_by(Some(&main)).await.expect("main's rules"));
+    }
+
+    /// rm's dirt rule, as a table: what plain `rm` refuses and names, and `--abandon` commits.
+    #[test]
+    fn the_dirt_rule_reads_tracked_changes_as_work_and_hidden_ignored_or_held_paths_as_junk() {
+        use super::{TargetReading, asks_target, is_dirt};
+        let free = TargetReading {
+            ignored: false,
+            held: false,
+        };
+        let ignored = TargetReading {
+            ignored: true,
+            held: false,
+        };
+        let held = TargetReading {
+            ignored: false,
+            held: true,
+        };
+        for (case, status, path, target, dirt) in [
+            ("a tracked edit", &b" M"[..], &b"src/lib.rs"[..], None, true),
+            ("a staged deletion", b"D ", b"gone.rs", None, true),
+            ("a conflicted path", b"UU", b"src/lib.rs", None, true),
+            (
+                "a tracked hidden edit",
+                b" M",
+                b".github/ci.yml",
+                None,
+                true,
+            ),
+            (
+                "an untracked file, no target",
+                b"??",
+                b"notes.txt",
+                None,
+                true,
+            ),
+            (
+                "an untracked file the target lacks",
+                b"??",
+                b"notes.txt",
+                Some(free),
+                true,
+            ),
+            (
+                "an untracked hidden file",
+                b"??",
+                b".cache/r9.log",
+                None,
+                false,
+            ),
+            (
+                "a hidden leaf below a visible directory",
+                b"??",
+                b"bench/.out",
+                Some(free),
+                false,
+            ),
+            (
+                "an untracked file the target ignores",
+                b"??",
+                b"bench/out.txt",
+                Some(ignored),
+                false,
+            ),
+            (
+                "an untracked file the target holds",
+                b"??",
+                b"tooling/prune.ts",
+                Some(held),
+                false,
+            ),
+        ] {
+            assert_eq!(is_dirt(status, path, target), dirt, "{case}");
+        }
+        assert!(asks_target(b"??", b"notes.txt"));
+        assert!(!asks_target(b"??", b".cache/r9.log"));
+        assert!(!asks_target(b" M", b"notes.txt"));
+    }
+
+    /// An abandonment commits the work tree's dirt as one commit on top of HEAD through a private
+    /// index: the commit holds a tracked edit, a tracked deletion, a rename and a new visible file,
+    /// and none of the junk the dirt rule skips; the repository's HEAD, index and status are as
+    /// they were.
+    #[tokio::test]
+    async fn uncommitted_work_commits_on_head_and_leaves_the_repository_as_it_was() {
+        let store = crate::temp_root::FixtureStore::new();
+        let root = repository();
+        let repo = GitRepository::from_root(store.shared(), &root);
+        for name in ["gone", "moved"] {
+            fs::write(root.join(name), format!("{name}\n")).expect("tracked file");
+        }
+        git(&root, &["add", "gone", "moved"]);
+        git(&root, &["commit", "-q", "-m", "two more"]);
+        let head = git_stdout(&root, &["rev-parse", "HEAD"]).trim().to_owned();
+        fs::write(root.join("README"), "changed\n").expect("tracked edit");
+        fs::remove_file(root.join("gone")).expect("tracked deletion");
+        git(&root, &["mv", "moved", "renamed"]);
+        fs::write(root.join("notes.txt"), "visible work\n").expect("untracked work");
+        fs::create_dir_all(root.join(".cache")).expect("junk dir");
+        fs::write(root.join(".cache/run.log"), "junk\n").expect("hidden junk");
+        fs::write(root.join(".git/info/exclude"), "/ignored\n").expect("exclude");
+        fs::write(root.join("ignored"), "ignored\n").expect("ignored file");
+        let status = git_stdout(&root, &["status", "--porcelain=v1"]);
+
+        let dirt = repo.dirty_paths_by(None).await.expect("dirt");
+        let commit = repo
+            .commit_uncommitted(&dirt, "raven")
+            .await
+            .expect("commit the dirt");
+
+        assert_eq!(
+            git_stdout(&root, &["rev-parse", "HEAD"]).trim(),
+            head,
+            "HEAD stays"
+        );
+        assert_eq!(
+            git_stdout(&root, &["status", "--porcelain=v1"]),
+            status,
+            "the index and work tree stay"
+        );
+        assert_eq!(
+            git_stdout(&root, &["rev-parse", super::UNCOMMITTED_REF]).trim(),
+            commit.as_str()
+        );
+        assert_eq!(
+            git_stdout(&root, &["rev-parse", &format!("{commit}^")]).trim(),
+            head,
+            "the commit sits on HEAD"
+        );
+        assert_eq!(
+            git_stdout(
+                &root,
+                &[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-status",
+                    "--no-renames",
+                    "-r",
+                    commit.as_str()
+                ]
+            ),
+            "M\tREADME\nD\tgone\nD\tmoved\nA\tnotes.txt\nA\trenamed\n"
+        );
+        assert!(
+            !fs::read_dir(root.join(".git"))
+                .expect("git dir")
+                .any(|entry| entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("cowshed-uncommitted-")),
+            "the private index is removed"
+        );
     }
 
     #[tokio::test]

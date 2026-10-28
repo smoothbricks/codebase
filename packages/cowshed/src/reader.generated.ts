@@ -365,6 +365,7 @@ const READERS: Readers<ReaderName> = {
       ['branches', 'SEQ__BRANCH_LANDING'],
       ['preserved', 'ABANDONED_PRESERVATION'],
       ['bundle', 'LEAF'],
+      ['uncommitted', 'LEAF'],
     ],
   },
   ABANDONMENT: {

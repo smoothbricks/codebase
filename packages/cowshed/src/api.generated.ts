@@ -41,6 +41,12 @@ export type AbandonedWork = {
    */
   readonly preserved?: AbandonedPreservation;
   readonly bundle: string;
+  /**
+   * The commit the abandonment wrote on top of `head` of the work tree's uncommitted work, in
+   * the bundle under `refs/cowshed/uncommitted` (02_workspaces.md, `rm` step 1); absent when
+   * the tree was clean.
+   */
+  readonly uncommitted?: GitOid;
 };
 
 /**

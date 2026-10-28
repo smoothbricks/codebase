@@ -533,11 +533,12 @@ pub enum RevokeSelection {
 
 /// `rm <ws>` — retire one workspace.
 ///
-/// The two overrides are separate on purpose. `force` overrides *transient* state: a dirty tree, a
-/// half-finished merge, a mount that is still busy. `abandon` is the only flag that authorizes
-/// destroying commits `main` does not contain, and it has no short spelling — a script that carries
-/// `--force` to get past a stuck workspace must not thereby acquire the power to delete work that
-/// has no other home.
+/// The two overrides are separate on purpose. `force` overrides the workspace's own running jobs
+/// and its youth, and nothing else: no dirty tree, no half-finished merge. `abandon` is the only
+/// flag that authorizes destroying work `main` does not hold — commits, and the uncommitted tree,
+/// which it commits into the bundle — and it has no short spelling: a script that carries `--force`
+/// to get past a stuck workspace must not thereby acquire the power to delete work that has no
+/// other home.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoveArgs {
     pub workspace: String,
@@ -3424,7 +3425,7 @@ const REMOVE: CommandSpec = CommandSpec {
     options: &[
         Opt {
             spelling: "--force",
-            meaning: "waive transient state only — a dirty tree, an in-progress merge, the workspace's own running jobs — and the ten-minute floor on a workspace's age; the deletion log records which of them it waived and which process asked. It does not waive the containment gate or a process cowshed does not run holding the mount, and it does not preserve what it waives: an uncommitted tree is destroyed with no bundle and no record, so commit it first if it is the only copy",
+            meaning: "stop the workspace's own running jobs instead of waiting for them, and waive the ten-minute floor on a workspace's age; the deletion log records the age it waived and which process asked. It waives no uncommitted work, no in-progress Git operation, no containment gate and no process cowshed does not run holding the mount",
         },
         Opt {
             spelling: "--restore",
@@ -3432,7 +3433,7 @@ const REMOVE: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--abandon",
-            meaning: "the sole authorization for destroying work main does not hold, and needed only for that: a workspace whose changes main holds, or whose head the ref `cowshed push` wrote keeps, passes without it. Before deleting, HEAD and every local branch that did not pass are bundled into a verified recovery bundle, sessions/.trash/<ws>-<tip>.bundle, which is the only copy of those commits: nothing is written into main's repository, and `gc --abandoned` is what eventually deletes the bundle. The uncommitted tree is not bundled and does not survive. The project's deletion log names the head, every branch tip and the bundle that keeps each. With --restore on main, it authorizes restoring past commits nothing else preserves: they are bundled into .git/cowshed/abandoned-main-<tip>.bundle of the restored checkout first",
+            meaning: "the sole authorization for destroying work main does not hold, and needed only for that: a workspace whose changes main holds, or whose head the ref `cowshed push` wrote keeps, passes without it. Before deleting, HEAD and every local branch that did not pass are bundled into a verified recovery bundle, sessions/.trash/<ws>-<tip>.bundle, which is the only copy of those commits: nothing is written into main's repository, and `gc --abandoned` is what eventually deletes the bundle. It is also the sole authorization for removing uncommitted work: tracked edits and untracked files no ignore rule covers go into the same bundle as one commit on top of HEAD, refs/cowshed/uncommitted, and an in-progress operation's work tree with them. No image is kept. The project's deletion log names the head, every branch tip and the bundle that keeps each. With --restore on main, it authorizes restoring past commits nothing else preserves: they are bundled into .git/cowshed/abandoned-main-<tip>.bundle of the restored checkout first",
         },
         Opt {
             spelling: "--purge",

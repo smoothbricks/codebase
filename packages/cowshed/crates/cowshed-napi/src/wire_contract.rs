@@ -1165,6 +1165,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     let remove_plain = RemoveReport::default();
     let remove_abandoned = RemoveReport {
         abandoned: Some(AbandonedWork {
+            uncommitted: None,
             head: oid("5555555555555555555555555555555555555555"),
             target_branch: "main".to_owned(),
             target_head: Some(oid("6666666666666666666666666666666666666666")),
@@ -1176,6 +1177,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     };
     let remove_preserved = RemoveReport {
         abandoned: Some(AbandonedWork {
+            uncommitted: None,
             head: oid("5555555555555555555555555555555555555555"),
             target_branch: "main".to_owned(),
             target_head: Some(oid("6666666666666666666666666666666666666666")),

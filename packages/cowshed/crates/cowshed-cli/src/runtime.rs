@@ -1905,6 +1905,14 @@ where
                         ))
                         .map_err(output_error)?;
                 }
+                if let Some(commit) = abandoned.uncommitted.as_ref() {
+                    output
+                        .guidance(&format!(
+                            "committed the uncommitted work as {commit} on top of {}",
+                            abandoned.head
+                        ))
+                        .map_err(output_error)?;
+                }
                 output
                     .guidance(&format!("bundled to {}", abandoned.bundle.display()))
                     .map_err(output_error)?;

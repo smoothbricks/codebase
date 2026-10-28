@@ -4547,6 +4547,11 @@ pub struct AbandonedWork {
     )]
     pub preserved: AbandonedPreservation,
     pub bundle: PathBuf,
+    /// The commit the abandonment wrote on top of `head` of the work tree's uncommitted work, in
+    /// the bundle under `refs/cowshed/uncommitted` (02_workspaces.md, `rm` step 1); absent when
+    /// the tree was clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncommitted: Option<GitOid>,
 }
 
 /// What keeps an abandonment's tips besides its bundle.

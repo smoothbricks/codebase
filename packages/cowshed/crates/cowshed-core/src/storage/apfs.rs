@@ -353,14 +353,6 @@ pub enum StagedExecutionError<E> {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RetirementDisposition {
-    /// Every source byte is rebuildable or recoverable outside the retiring image.
-    Release,
-    /// Keep the complete source payload as recovery evidence.
-    Recovery,
-}
-
 #[derive(Debug, Error)]
 pub enum RetireExecutionError<F> {
     #[error("workspace retirement failed: {0}")]
@@ -1683,9 +1675,9 @@ where
         }
     }
 
-    /// Retire an unfinished clone without ever publishing it. Inspection runs on its verified
-    /// mount under the image lock; a refusal preserves the pending payload and leaves its mount
-    /// state as it found it.
+    /// Retire an unfinished clone without ever publishing it, releasing its image. Inspection runs
+    /// on its verified mount under the image lock; a refusal preserves the pending payload and
+    /// leaves its mount state as it found it.
     pub async fn execute_pending_clone_retirement<F, Fut, R, E>(
         &self,
         metadata: crate::metadata::DetachedWorkspaceMetadata,
@@ -1694,7 +1686,7 @@ where
     ) -> Result<(RetiredRef, R), StagedExecutionError<E>>
     where
         F: FnOnce(WorkspaceStage) -> Fut + Send,
-        Fut: Future<Output = Result<(RetirementDisposition, R), E>> + Send,
+        Fut: Future<Output = Result<R, E>> + Send,
         R: Send,
         E: Send,
     {
@@ -1740,8 +1732,8 @@ where
                 restore_prepared_mount(host, prepared)
             },
         );
-        let (disposition, value) = match inspect(prepared.get().1.stage.clone()).await {
-            Ok((disposition, value)) => (disposition, value),
+        let value = match inspect(prepared.get().1.stage.clone()).await {
+            Ok(value) => value,
             Err(error) => {
                 // Nothing was retired, so the image goes back as it was found: a removal that
                 // mounted it to inspect it must not leave it mounted.
@@ -1774,31 +1766,26 @@ where
                 let PreparedClone {
                     stage,
                     attachment,
-                    image,
+                    image: _,
                     found: _,
                 } = prepared;
-                let trash = retired_image_path(&config, &stage.workspace)?;
                 let revision = stage.workspace.revision().get().checked_add(1).ok_or(
                     ApfsStorageError::InvalidPlan("pending retirement revision overflow"),
                 )?;
                 host.detach(attachment, DetachIntent::Release)?;
                 let retired = RetiredRef::new(stage.workspace, Revision::new(revision));
-                match disposition {
-                    RetirementDisposition::Release => host.release_workspace(&config, &retired)?,
-                    RetirementDisposition::Recovery => host.retire_image(&image, &trash)?,
-                }
+                host.release_workspace(&config, &retired)?;
                 Ok(retired)
             })
             .await?;
         Ok((retired, value))
     }
 
-    /// Retire under the existing image fence, then publish the lifecycle commitment.
-    /// Clean recoverable sources are physically released; recovery sources retain trash.
+    /// Retire under the existing image fence by releasing the image, then publish the lifecycle
+    /// commitment (02_workspaces.md, `rm` step 5).
     pub async fn execute_retire_staged<F, Fut, E>(
         &self,
         plan: RetirePlan,
-        disposition: RetirementDisposition,
         fence: F,
     ) -> Result<RetiredRef, RetireExecutionError<E>>
     where
@@ -1806,31 +1793,24 @@ where
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send,
     {
-        let retired = match disposition {
-            RetirementDisposition::Recovery => match self.execute(&plan).await? {
-                Applied::Retired(retired) => retired,
-                _ => return Err(ApfsStorageError::UnexpectedResult.into()),
-            },
-            RetirementDisposition::Release => {
-                let locks = operation_lock_paths(&self.config, plan.expected(), plan.operation())?;
-                let holding = operation_holding(plan.operation());
-                self.dispatch_with_locks(locks, holding, true, move |host, config| {
-                    revalidate(plan.expected(), &host.observe(plan.expected())?)?;
-                    let Operation::Retire { workspace, .. } = plan.operation() else {
-                        return Err(ApfsStorageError::UnexpectedResult);
-                    };
-                    let current = active_expected(plan.expected(), workspace)?;
-                    let revision = current.revision().get().checked_add(1).ok_or(
-                        ApfsStorageError::InvalidPlan("retirement revision overflow"),
-                    )?;
-                    host.detach_mounted(&current, DetachIntent::Release)?;
-                    let retired = RetiredRef::new(current, Revision::new(revision));
-                    host.release_workspace(&config, &retired)?;
-                    Ok(retired)
-                })
-                .await?
-            }
-        };
+        let locks = operation_lock_paths(&self.config, plan.expected(), plan.operation())?;
+        let holding = operation_holding(plan.operation());
+        let retired = self
+            .dispatch_with_locks(locks, holding, true, move |host, config| {
+                revalidate(plan.expected(), &host.observe(plan.expected())?)?;
+                let Operation::Retire { workspace, .. } = plan.operation() else {
+                    return Err(ApfsStorageError::UnexpectedResult);
+                };
+                let current = active_expected(plan.expected(), workspace)?;
+                let revision = current.revision().get().checked_add(1).ok_or(
+                    ApfsStorageError::InvalidPlan("retirement revision overflow"),
+                )?;
+                host.detach_mounted(&current, DetachIntent::Release)?;
+                let retired = RetiredRef::new(current, Revision::new(revision));
+                host.release_workspace(&config, &retired)?;
+                Ok(retired)
+            })
+            .await?;
         if let Err(source) = fence(retired.clone()).await {
             return Err(RetireExecutionError::Fence { source, retired });
         }

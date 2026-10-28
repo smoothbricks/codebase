@@ -7598,8 +7598,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(NativeRemovalGitFence {
             incarnation: incarnation.clone(),
             head,
-            dirty: git
-                .is_dirty_by(Some(&self.substrate_config.checkout_path))
+            dirt: git
+                .dirty_paths_by(Some(&self.substrate_config.checkout_path))
                 .await?,
             in_progress: git.in_progress_operation().await?,
         })
@@ -7624,19 +7624,22 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // its own preservation proof is the retained checkout or a remote ref, which the
             // `--restore` path checks. What remains here is transient state — and unlike a session,
             // main's is not overridable, because there is no fork of it to fall back on.
-            Self::require_session_state_clean(workspace, fence)?;
+            let forced = removal_state_gate(
+                workspace,
+                RemoveOptions {
+                    abandon: false,
+                    ..options
+                },
+                fence,
+                None,
+            )?;
             return Ok(NativeRemovalAuthority {
                 abandoning: None,
                 head_kept_by: None,
-                forced: options.force.then(Vec::new),
+                forced,
             });
         }
-        let forced = if options.force {
-            Some(overridden_by_force(fence, young))
-        } else {
-            Self::require_session_state_clean(workspace, fence)?;
-            None
-        };
+        let forced = removal_state_gate(workspace, options, fence, young)?;
         let NativeLandedAuthority {
             abandoning,
             head_kept_by,
@@ -7723,7 +7726,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         &mut self,
         current: NativeWorkspace,
         nx_check: CheckoutNxCheck,
-        disposition: crate::storage::apfs::RetirementDisposition,
     ) -> Result<()> {
         let workspace = current.derived.workspace.name().clone();
         if matches!(
@@ -7741,67 +7743,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let git_worktree = is_git_worktree(&current.metadata);
         self.unregister_workspace_in_main(&workspace, git_worktree)
             .await?;
-        self.retire_workspace(current, disposition).await
-    }
-
-    /// Every reason a session's retirement keeps its complete source image as recovery, in the
-    /// order `rm` step 5 weighs them; empty when every source byte survives elsewhere and the
-    /// image is released (02_workspaces.md, "Recovery source"). Only a removal with no other
-    /// reason reads the untracked leaves.
-    async fn source_recovery_causes(
-        &self,
-        mount: &Path,
-        fence: &NativeRemovalGitFence,
-        abandoned: bool,
-        containment: &NativeContainment,
-    ) -> Result<Vec<crate::api::dto::RecoveryCause>> {
-        use crate::api::dto::RecoveryCause;
-        let mut causes = Vec::new();
-        if let Some(operation) = &fence.in_progress {
-            causes.push(RecoveryCause::InProgress {
-                operation: operation.clone(),
-            });
-        }
-        if fence.dirty {
-            causes.push(RecoveryCause::Dirty);
-        }
-        if abandoned {
-            causes.push(RecoveryCause::Abandoned);
-        }
-        if !causes.is_empty() {
-            return Ok(causes);
-        }
-        let git = crate::git::GitRepository::from_root(self.git.store_root(), mount);
-        // The build-state links are cowshed's, named by the record of the volume they reach
-        // (16_build_volumes.md, "One link per checkout"): never the workspace's only copy.
-        let build_state = crate::build_volume::BuildVolumeState::read(
-            &mount.join(crate::build_volume::BUILD_LINK),
-        )?
-        .paths;
-        Ok(git
-            .first_unheld_untracked(&containment.mount, build_state)
-            .await?
-            .map(|path| RecoveryCause::OnlyCopy { path })
-            .into_iter()
-            .collect())
-    }
-
-    /// Refuse a session removal whose workspace is in transient Git state.
-    ///
-    /// Transient means recoverable-by-hand: uncommitted edits, a half-finished merge. This is the
-    /// class `--force` overrides, and the hint names only remedies that lose nothing — naming the
-    /// override here is what taught coordinator scripts to reach for it by reflex.
-    fn require_session_state_clean(
-        workspace: &WorkspaceName,
-        fence: &NativeRemovalGitFence,
-    ) -> Result<()> {
-        if let Some(operation) = fence.in_progress.as_deref() {
-            return Err(removal_in_progress_refusal(workspace, operation));
-        }
-        if fence.dirty {
-            return Err(removal_dirty_refusal(workspace));
-        }
-        Ok(())
+        self.retire_workspace(current).await
     }
 
     /// Main as the branch a session's work has to reach: what `rm` measures against.
@@ -7999,7 +7941,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // Read before the decision takes the state: once the image is gone, that ref is the only
         // copy of the head.
         let head_kept_by = landed.commits.preserved_by().cloned();
-        let refused = match removal_landed_decision(landed, abandon) {
+        let refused = match removal_landed_decision(landed, !fence.dirt.is_empty(), abandon) {
             RemovalLandedDecision::Landed => {
                 return Ok(NativeLandedAuthority {
                     abandoning: None,
@@ -8079,7 +8021,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// Carrying both histories makes the bundle self-contained even after main was rewritten, and
     /// lets an empty recovery repository reconstruct the exact `main_tip..HEAD` range the report
     /// counted. The landing gate keeps its content policy; this artifact count is the
-    /// conservative oid range whose objects are actually being retired.
+    /// conservative oid range whose objects are actually being retired. A dirty tree's uncommitted
+    /// work goes in as one more commit on top of HEAD ([`crate::git::GitRepository::commit_uncommitted`]),
+    /// so nothing of the work tree survives only in the image.
     async fn bundle_abandoned_work(
         &self,
         workspace: &WorkspaceName,
@@ -8162,8 +8106,19 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .iter()
             .map(|branch| format!("refs/heads/{}", branch.branch))
             .collect();
+        let uncommitted = if fence.dirt.is_empty() {
+            None
+        } else {
+            Some(
+                git.commit_uncommitted(&fence.dirt, workspace.as_str())
+                    .await?,
+            )
+        };
         let mut heads = vec!["HEAD"];
         heads.extend(branch_refs.iter().map(String::as_str));
+        if uncommitted.is_some() {
+            heads.push(crate::git::UNCOMMITTED_REF);
+        }
         let unlanded_commits = git
             .bundle_commits(&bundle, target_head.as_ref().map(GitOid::as_str), &heads)
             .await?;
@@ -8175,6 +8130,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             branches,
             preserved: AbandonedPreservation::BundleOnly,
             bundle,
+            uncommitted,
         })
     }
 
@@ -8256,18 +8212,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 
     /// Journal a workspace's retirement (`retire-workspace`) once it committed: its Git tips when
-    /// they were read, who retired it, with what a force overrode (02_workspaces.md, `rm` step
-    /// 1), and, when `recovery` names why it kept the image, the trash path it kept it at. A
-    /// retirement whose tips could not be read still names its caller, and says on stderr why it
+    /// they were read, who retired it, and what a force overrode (02_workspaces.md, `rm` step 1).
+    /// A retirement whose tips could not be read still names its caller, and says on stderr why it
     /// records no Git facts.
     fn log_retirement(
         &self,
         workspace: &WorkspaceName,
-        incarnation: &WorkspaceIncarnation,
         mount: &Path,
         tips: std::result::Result<crate::storage::deletion_log::GitTips, String>,
         forced: Option<Vec<crate::storage::deletion_log::Overridden>>,
-        recovery: Vec<crate::api::dto::RecoveryCause>,
     ) {
         let git = match tips {
             Ok(tips) => Some(tips),
@@ -8288,14 +8241,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 caller: crate::storage::deletion_log::Caller::this_process(),
                 forced,
             },
-            (!recovery.is_empty()).then(|| crate::storage::deletion_log::KeptRecovery {
-                image: crate::storage::apfs::retired_image_below(
-                    &self.layout.project().sessions,
-                    workspace,
-                    incarnation,
-                ),
-                because: recovery,
-            }),
+            None,
         );
     }
 
@@ -8646,7 +8592,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .collect::<Vec<_>>();
         for destination in pending_renames {
             let cancel = format!(
-                "cancel the rename with cowshed rm {destination} --force, which keeps {workspace}; then retry"
+                "cancel the rename with cowshed rm {destination} --force (with --abandon if it carries uncommitted work), which keeps {workspace}; then retry"
             );
             if !self.claim_intent_lease(&destination)? {
                 return Err(CowshedError::conflict(
@@ -9098,13 +9044,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     containment,
                 )
                 .await;
-            let recovery = if workspace.is_main() {
-                vec![crate::api::dto::RecoveryCause::Main]
-            } else {
-                self.source_recovery_causes(&mount, &final_fence, abandoned.is_some(), containment)
-                    .await?
-            };
-            let incarnation = current.derived.workspace.incarnation().clone();
             if !workspace.is_main() {
                 self.build_volumes()?
                     .release_owned(
@@ -9116,9 +9055,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     )
                     .await?;
             }
-            self.finish_retirement(current, nx_check, retirement_disposition(&recovery))
-                .await?;
-            self.log_retirement(&workspace, &incarnation, &mount, tips, forced, recovery);
+            self.finish_retirement(current, nx_check).await?;
+            self.log_retirement(&workspace, &mount, tips, forced);
             Ok(RemoveReport { abandoned })
         }
         .await;
@@ -9169,7 +9107,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     ) -> Result<MainPreservation> {
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         let fence = self.removal_git_fence(workspace).await?;
-        if fence.dirty || fence.in_progress.is_some() {
+        if !fence.dirt.is_empty() || fence.in_progress.is_some() {
             return Err(CowshedError::conflict(
                 "main has uncommitted or in-progress Git work",
                 "commit or discard the changes, then retry",
@@ -9300,6 +9238,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             )
             .await?;
         Ok(AbandonedWork {
+            uncommitted: None,
             head,
             target_branch,
             target_head: base,
@@ -10982,7 +10921,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             )
             .await?;
         let result = async {
-            let (retired, (abandoned, tips, mount, forced, recovery)) = substrate
+            let (retired, (abandoned, tips, mount, forced)) = substrate
                 .execute_pending_clone_retirement(metadata, identity, |stage| {
                     let this = &mut *self;
                     let containment = &containment;
@@ -10990,12 +10929,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         let last = this
                             .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
                             .await?;
-                        let forced = if options.force {
-                            Some(overridden_by_force(&last, None))
-                        } else {
-                            Self::require_session_state_clean(workspace, &last)?;
-                            None
-                        };
+                        let forced = removal_state_gate(workspace, options, &last, None)?;
                         let NativeLandedAuthority {
                             abandoning,
                             head_kept_by,
@@ -11023,14 +10957,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 containment,
                             )
                             .await;
-                        let recovery = this
-                            .source_recovery_causes(
-                                &stage.mount_point,
-                                &last,
-                                abandoned.is_some(),
-                                containment,
-                            )
-                            .await?;
                         this.build_volumes()?
                             .release_owned(
                                 super::build_volumes::Owner {
@@ -11042,22 +10968,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             .await?;
                         this.unregister_workspace_in_main(workspace, git_worktree)
                             .await?;
-                        Ok::<_, CowshedError>((
-                            retirement_disposition(&recovery),
-                            (abandoned, tips, stage.mount_point.clone(), forced, recovery),
-                        ))
+                        Ok::<_, CowshedError>((abandoned, tips, stage.mount_point.clone(), forced))
                     }
                 })
                 .await
                 .map_err(native_staged_error)?;
-            self.log_retirement(
-                workspace,
-                retired.workspace().incarnation(),
-                &mount,
-                tips,
-                forced,
-                recovery,
-            );
+            self.log_retirement(workspace, &mount, tips, forced);
             self.commitments
                 .record(CommitmentDraft::WorkspaceRetired {
                     repo_id: self.descriptor.repo_id.clone(),
@@ -11092,11 +11008,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         result
     }
 
-    async fn retire_workspace(
-        &mut self,
-        current: NativeWorkspace,
-        disposition: crate::storage::apfs::RetirementDisposition,
-    ) -> Result<()> {
+    async fn retire_workspace(&mut self, current: NativeWorkspace) -> Result<()> {
         use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
 
@@ -11107,7 +11019,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let mut commitments = self.commitments.clone();
         let repo_id = self.descriptor.repo_id.clone();
         self.substrate
-            .execute_retire_staged(plan, disposition, move |retired| async move {
+            .execute_retire_staged(plan, move |retired| async move {
                 commitments
                     .record(super::supervisor::CommitmentDraft::WorkspaceRetired {
                         repo_id,
@@ -11117,7 +11029,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             })
             .await
             .map_err(native_retire_error)?;
-        // Physical release or durable recovery retirement completed before the slot is reusable.
+        // The release is committed before the slot is reusable.
         self.release_slot(current.derived.workspace.name()).await?;
         Ok(())
     }
@@ -11571,7 +11483,9 @@ fn validate_workspace_controller_root(
 struct NativeRemovalGitFence {
     incarnation: WorkspaceIncarnation,
     head: GitOid,
-    dirty: bool,
+    /// What `git status` reads as uncommitted work ([`crate::git::GitRepository::dirty_paths_by`]),
+    /// in its order; empty when the tree is clean.
+    dirt: Vec<PathBuf>,
     in_progress: Option<String>,
 }
 
@@ -12051,6 +11965,7 @@ mod rebase_recovery_tests {
         removal_landed_decision(
             measured_in(store_root, target, branch, unit, main).await,
             false,
+            false,
         )
     }
 
@@ -12274,7 +12189,7 @@ mod rebase_recovery_tests {
         );
         assert_eq!(kept_by(&unpushed), None, "nothing pushed keeps nothing");
         assert_eq!(
-            removal_landed_decision(unpushed.clone(), false),
+            removal_landed_decision(unpushed.clone(), false, false),
             RemovalLandedDecision::Refused(unpushed)
         );
 
@@ -12294,7 +12209,7 @@ mod rebase_recovery_tests {
             "the counts are still what main holds: {pushed:?}"
         );
         assert_eq!(
-            removal_landed_decision(pushed, false),
+            removal_landed_decision(pushed, false, false),
             RemovalLandedDecision::Landed,
             "a head the push ref keeps retires with no flag"
         );
@@ -12303,7 +12218,7 @@ mod rebase_recovery_tests {
         let ahead = gate().await;
         assert_eq!(kept_by(&ahead), None, "the head is past its push ref");
         assert_eq!(
-            removal_landed_decision(ahead.clone(), false),
+            removal_landed_decision(ahead.clone(), false, false),
             RemovalLandedDecision::Refused(ahead)
         );
 
@@ -12323,7 +12238,7 @@ mod rebase_recovery_tests {
             "a head the workspace moved back from is an ancestor of its ref"
         );
         assert_eq!(
-            removal_landed_decision(moved_back, false),
+            removal_landed_decision(moved_back, false, false),
             RemovalLandedDecision::Landed
         );
 
@@ -12335,7 +12250,7 @@ mod rebase_recovery_tests {
             "a detached head is on no branch, so no push ref is its to read"
         );
         assert_eq!(
-            removal_landed_decision(detached.clone(), false),
+            removal_landed_decision(detached.clone(), false, false),
             RemovalLandedDecision::Refused(detached)
         );
     }
@@ -14968,7 +14883,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 if fence.head != head {
                     return Err(CowshedError::conflict(
                         format!("workspace {source} HEAD changed from {head} to {} after {destination} was published", fence.head),
-                        format!("cancel the rename with cowshed rm {destination} --force, which keeps {source}; a commit no branch holds may still need --abandon"),
+                        format!("cancel the rename with cowshed rm {destination} --force, which keeps {source}; uncommitted work or a commit no branch holds needs --abandon"),
                     ));
                 }
                 if let Some(operation) = fence.in_progress.as_deref() {
@@ -15004,7 +14919,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             fresh_work.index == fenced_work.index,
                         ),
                         format!(
-                            "inspect both workspaces; the source was not retired; cowshed mv {source} {destination} only after preservation matches, or cancel with cowshed rm {destination} --force, which keeps the source (a commit no branch holds may still need --abandon)"
+                            "inspect both workspaces; the source was not retired; cowshed mv {source} {destination} only after preservation matches, or cancel with cowshed rm {destination} --force, which keeps the source (uncommitted work or a commit no branch holds may still need --abandon)"
                         ),
                     ));
                 }
@@ -15015,11 +14930,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         destination_incarnation: destination_incarnation.clone(),
                     })
                     .await?;
-                self.finish_retirement(
-                    current,
-                    CheckoutNxCheck::CloseRecorded,
-                    crate::storage::apfs::RetirementDisposition::Recovery,
-                ).await?;
+                self.finish_retirement(current, CheckoutNxCheck::CloseRecorded)
+                    .await?;
             }
             self.complete_lifecycle_intent(
                 &destination,
@@ -19346,12 +19258,12 @@ mod removal_refusal_tests {
         GitOid::new(fill.to_string().repeat(40)).expect("fixed oid")
     }
 
-    fn fence(dirty: bool, in_progress: Option<&str>) -> NativeRemovalGitFence {
+    fn fence(dirt: &[&str], in_progress: Option<&str>) -> NativeRemovalGitFence {
         NativeRemovalGitFence {
             incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
                 .expect("fixed incarnation"),
             head: oid('4'),
-            dirty,
+            dirt: dirt.iter().map(PathBuf::from).collect(),
             in_progress: in_progress.map(str::to_owned),
         }
     }
@@ -19417,7 +19329,7 @@ mod removal_refusal_tests {
     fn every_removal_refusal() -> Vec<CowshedError> {
         vec![
             removal_in_progress_refusal(&workspace(), "rebase-merge"),
-            removal_dirty_refusal(&workspace()),
+            removal_dirty_refusal(&workspace(), &[PathBuf::from("notes.txt")]),
             removal_unlanded_refusal(
                 &workspace(),
                 &oid('4'),
@@ -19448,11 +19360,18 @@ mod removal_refusal_tests {
                     age: Some(std::time::Duration::from_secs(180)),
                 },
             ),
-            NativeProjectRuntimeHost::require_session_state_clean(&workspace(), &fence(true, None))
-                .expect_err("dirty is refused"),
-            NativeProjectRuntimeHost::require_session_state_clean(
+            removal_state_gate(
                 &workspace(),
-                &fence(false, Some("MERGE_HEAD")),
+                RemoveOptions::default(),
+                &fence(&["notes.txt"], None),
+                None,
+            )
+            .expect_err("dirty is refused"),
+            removal_state_gate(
+                &workspace(),
+                RemoveOptions::default(),
+                &fence(&[], Some("MERGE_HEAD")),
+                None,
             )
             .expect_err("an in-progress operation is refused"),
         ]
@@ -19953,14 +19872,14 @@ mod removal_refusal_tests {
         // Landed by content alone: nothing ahead is unheld, though one commit is not an ancestor
         // of main. No flag, and nothing to bundle.
         assert_eq!(
-            removal_landed_decision(measured(0, 1), false),
+            removal_landed_decision(measured(0, 1), false, false),
             RemovalLandedDecision::Landed,
             "landed content needs no authorization"
         );
 
         // Nothing ahead at all — landed by ancestry — is the same answer by the same rule.
         assert_eq!(
-            removal_landed_decision(measured(0, 0), false),
+            removal_landed_decision(measured(0, 0), false, false),
             RemovalLandedDecision::Landed,
             "a workspace with nothing ahead needs no authorization"
         );
@@ -19969,7 +19888,7 @@ mod removal_refusal_tests {
         // The refusal is the measured state itself, so its text — and whatever explains it — is
         // built after the decision and cannot reach back into it.
         assert_eq!(
-            removal_landed_decision(measured(2, 1), false),
+            removal_landed_decision(measured(2, 1), false, false),
             RemovalLandedDecision::Refused(measured(2, 1)),
             "unheld commits must be refused"
         );
@@ -19977,7 +19896,7 @@ mod removal_refusal_tests {
         // `--abandon` is what turns that refusal into an authorized loss, and it answers with the
         // state to bundle rather than with a bare go-ahead.
         assert_eq!(
-            removal_landed_decision(measured(2, 1), true),
+            removal_landed_decision(measured(2, 1), false, true),
             RemovalLandedDecision::Abandoned(measured(2, 1)),
             "--abandon authorizes the loss"
         );
@@ -19985,12 +19904,12 @@ mod removal_refusal_tests {
         // An unanswered question is refused exactly as unheld work is, and `--abandon` is still the
         // only way past it — so a stale or unreadable target can never authorize a deletion.
         assert_eq!(
-            removal_landed_decision(indeterminate(), false),
+            removal_landed_decision(indeterminate(), false, false),
             RemovalLandedDecision::Refused(indeterminate()),
             "an indeterminate verdict must never read as landed"
         );
         assert_eq!(
-            removal_landed_decision(indeterminate(), true),
+            removal_landed_decision(indeterminate(), false, true),
             RemovalLandedDecision::Abandoned(indeterminate()),
             "--abandon authorizes a loss it cannot measure"
         );
@@ -20024,7 +19943,7 @@ mod removal_refusal_tests {
             unlanded: vec![side],
         });
         let RemovalLandedDecision::Refused(refused) =
-            removal_landed_decision(unlanded.clone(), false)
+            removal_landed_decision(unlanded.clone(), false, false)
         else {
             panic!("an unheld branch must be refused");
         };
@@ -20051,7 +19970,7 @@ mod removal_refusal_tests {
             "preserve each branch: cowshed push raven --branch side"
         );
         assert_eq!(
-            removal_landed_decision(unlanded.clone(), true),
+            removal_landed_decision(unlanded.clone(), false, true),
             RemovalLandedDecision::Abandoned(unlanded),
             "--abandon authorizes the loss"
         );
@@ -20060,23 +19979,130 @@ mod removal_refusal_tests {
             reason: String::from("git for-each-ref failed"),
         });
         assert_eq!(
-            removal_landed_decision(unjudged.clone(), false),
+            removal_landed_decision(unjudged.clone(), false, false),
             RemovalLandedDecision::Refused(unjudged),
             "branches that could not be judged must never read as landed"
         );
     }
 
-    /// `--force` and `--abandon` authorize different losses, and the dispatcher must not let either
-    /// stand in for the other. Only the transient half is overridable by `--force`.
+    /// The transient half of the removal gate, as a table (02_workspaces.md, `rm` step 1): plain
+    /// `rm` refuses an in-progress operation and uncommitted work, naming the work; `--abandon`
+    /// lets both through, for the bundle to keep; `--force` overrides neither, only the age floor,
+    /// which it reports for the deletion log.
     #[test]
-    fn force_overrides_transient_state_and_nothing_else() {
-        let clean = fence(false, None);
-        NativeProjectRuntimeHost::require_session_state_clean(&workspace(), &clean)
-            .expect("a clean workspace passes the transient gate");
-        assert!(
-            NativeProjectRuntimeHost::require_session_state_clean(&workspace(), &fence(true, None))
-                .is_err(),
-            "dirt is exactly what the transient gate is for"
+    fn plain_rm_names_its_dirt_abandon_takes_it_and_force_waives_only_youth() {
+        use crate::storage::deletion_log::Overridden;
+        let young = YoungWorkspace {
+            created_at: "2026-07-14T00:00:00Z".to_owned(),
+            age: Some(std::time::Duration::from_secs(180)),
+        };
+        let options = |force, abandon| RemoveOptions {
+            force,
+            abandon,
+            ..RemoveOptions::default()
+        };
+        let dirty = ["src/lib.rs", "notes.txt"];
+        let refused_dirt = "workspace raven has uncommitted work: src/lib.rs, notes.txt";
+        let refused_merge = "workspace raven has an in-progress MERGE_HEAD Git operation";
+        let forced_young = vec![Overridden::Young {
+            created_at: young.created_at.clone(),
+            age_seconds: Some(180),
+        }];
+        for (case, dirt, in_progress, young, options, expected) in [
+            (
+                "clean",
+                &[][..],
+                None,
+                None,
+                options(false, false),
+                Ok(None),
+            ),
+            (
+                "dirty",
+                &dirty[..],
+                None,
+                None,
+                options(false, false),
+                Err(refused_dirt),
+            ),
+            (
+                "dirty, forced",
+                &dirty[..],
+                None,
+                None,
+                options(true, false),
+                Err(refused_dirt),
+            ),
+            (
+                "dirty, abandoned",
+                &dirty[..],
+                None,
+                None,
+                options(false, true),
+                Ok(None),
+            ),
+            (
+                "dirty, abandoned and forced",
+                &dirty[..],
+                None,
+                None,
+                options(true, true),
+                Ok(Some(Vec::new())),
+            ),
+            (
+                "merging",
+                &[][..],
+                Some("MERGE_HEAD"),
+                None,
+                options(false, false),
+                Err(refused_merge),
+            ),
+            (
+                "merging, forced",
+                &[][..],
+                Some("MERGE_HEAD"),
+                None,
+                options(true, false),
+                Err(refused_merge),
+            ),
+            (
+                "merging, abandoned",
+                &dirty[..],
+                Some("MERGE_HEAD"),
+                None,
+                options(false, true),
+                Ok(None),
+            ),
+            (
+                "young, forced",
+                &[][..],
+                None,
+                Some(&young),
+                options(true, false),
+                Ok(Some(forced_young.clone())),
+            ),
+        ] {
+            assert_eq!(
+                removal_state_gate(&workspace(), options, &fence(dirt, in_progress), young)
+                    .map_err(|refusal| refusal.message),
+                expected.map_err(str::to_owned),
+                "{case}"
+            );
+        }
+        let many = (0..12)
+            .map(|index| PathBuf::from(format!("f{index}")))
+            .collect::<Vec<_>>();
+        let message = removal_dirty_refusal(&workspace(), &many).message;
+        assert!(message.ends_with("f9, and 2 more"), "{message}");
+        // Uncommitted work on landed commits is still work: an abandonment bundles it, and a clean
+        // landed workspace has nothing to bundle.
+        assert_eq!(
+            removal_landed_decision(measured(0, 1), true, true),
+            RemovalLandedDecision::Abandoned(measured(0, 1)),
+        );
+        assert_eq!(
+            removal_landed_decision(measured(0, 1), false, true),
+            RemovalLandedDecision::Landed,
         );
     }
 
@@ -20108,18 +20134,18 @@ mod removal_refusal_tests {
     /// work is, and uncommitted work refuses first, whatever keeps the head.
     #[test]
     fn a_head_the_push_ref_keeps_retires_with_no_flag_and_dirt_still_refuses() {
-        let verdict = |landed: NativeLandedState, dirty: bool| {
-            match NativeProjectRuntimeHost::require_session_state_clean(
-                &workspace(),
-                &fence(dirty, None),
-            ) {
-                Err(refusal) => format!("refused: {}", refusal.message),
-                Ok(()) => match removal_landed_decision(landed, false) {
-                    RemovalLandedDecision::Landed => String::from("retires"),
-                    RemovalLandedDecision::Refused(_) => String::from("refused: unlanded"),
-                    RemovalLandedDecision::Abandoned(_) => panic!("nothing asked to abandon"),
-                },
-            }
+        let verdict = |landed: NativeLandedState, dirty: bool| match removal_state_gate(
+            &workspace(),
+            RemoveOptions::default(),
+            &fence(if dirty { &["notes.txt"] } else { &[] }, None),
+            None,
+        ) {
+            Err(refusal) => format!("refused: {}", refusal.message),
+            Ok(_) => match removal_landed_decision(landed, false, false) {
+                RemovalLandedDecision::Landed => String::from("retires"),
+                RemovalLandedDecision::Refused(_) => String::from("refused: unlanded"),
+                RemovalLandedDecision::Abandoned(_) => panic!("nothing asked to abandon"),
+            },
         };
         for (case, landed, dirty, expected) in [
             (
@@ -20145,13 +20171,13 @@ mod removal_refusal_tests {
                 "HEAD is kept, the tree is dirty",
                 pushed_head(7, Some(push_ref_at('4'))),
                 true,
-                "refused: workspace raven has uncommitted Git work",
+                "refused: workspace raven has uncommitted work: notes.txt",
             ),
             (
                 "HEAD is ahead of the ref, the tree is dirty",
                 pushed_head(8, None),
                 true,
-                "refused: workspace raven has uncommitted Git work",
+                "refused: workspace raven has uncommitted work: notes.txt",
             ),
             ("main holds HEAD", measured(0, 3), false, "retires"),
         ] {
@@ -20169,6 +20195,7 @@ mod removal_refusal_tests {
         let elsewhere = oid('5');
         let kept = push_ref_at('9');
         let work = crate::api::dto::AbandonedWork {
+            uncommitted: None,
             head: oid('6'),
             target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
             target_head: Some(oid('1')),
@@ -24172,19 +24199,6 @@ fn workspace_lineage(
     Ok(marker.lineage.unwrap_or_default().into_iter().collect())
 }
 
-/// A retirement keeps its image as recovery when anything is a reason to, and releases it
-/// otherwise (02_workspaces.md, `rm` step 5).
-#[cfg(target_os = "macos")]
-fn retirement_disposition(
-    recovery: &[crate::api::dto::RecoveryCause],
-) -> crate::storage::apfs::RetirementDisposition {
-    if recovery.is_empty() {
-        crate::storage::apfs::RetirementDisposition::Release
-    } else {
-        crate::storage::apfs::RetirementDisposition::Recovery
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> CowshedError {
     match error {
@@ -24644,29 +24658,41 @@ struct NativeRemovalAuthority {
     forced: Option<Vec<crate::storage::deletion_log::Overridden>>,
 }
 
-/// Every guard `--force` overrode on `fence` and `young`, in the order the gates ask them.
+/// The transient half of the removal gate, asked before the landed proof (02_workspaces.md, `rm`
+/// step 1): an in-progress Git operation or uncommitted work refuses, named, unless `--abandon`
+/// authorizes committing the work tree into the abandon bundle. `--force` waives neither: it
+/// overrides only the age floor, which the caller asks last. Answers what the force overrode, for
+/// the deletion log, when the removal was forced.
 #[cfg(target_os = "macos")]
-fn overridden_by_force(
+fn removal_state_gate(
+    workspace: &WorkspaceName,
+    options: RemoveOptions,
     fence: &NativeRemovalGitFence,
     young: Option<&YoungWorkspace>,
+) -> Result<Option<Vec<crate::storage::deletion_log::Overridden>>> {
+    if !options.abandon {
+        if let Some(operation) = fence.in_progress.as_deref() {
+            return Err(removal_in_progress_refusal(workspace, operation));
+        }
+        if !fence.dirt.is_empty() {
+            return Err(removal_dirty_refusal(workspace, &fence.dirt));
+        }
+    }
+    Ok(options.force.then(|| overridden_by_force(young)))
+}
+
+/// Every guard `--force` overrode: the age floor, when `young` names it.
+#[cfg(target_os = "macos")]
+fn overridden_by_force(
+    young: Option<&YoungWorkspace>,
 ) -> Vec<crate::storage::deletion_log::Overridden> {
-    use crate::storage::deletion_log::Overridden;
-    let mut overridden = Vec::new();
-    if let Some(operation) = &fence.in_progress {
-        overridden.push(Overridden::InProgress {
-            operation: operation.clone(),
-        });
-    }
-    if fence.dirty {
-        overridden.push(Overridden::Dirty);
-    }
-    if let Some(young) = young {
-        overridden.push(Overridden::Young {
+    young
+        .map(|young| crate::storage::deletion_log::Overridden::Young {
             created_at: young.created_at.clone(),
             age_seconds: young.age.map(|age| age.as_secs()),
-        });
-    }
-    overridden
+        })
+        .into_iter()
+        .collect()
 }
 
 /// A removal refused for youth names the guard and its floor, never the flag that overrides it:
@@ -24698,10 +24724,25 @@ fn removal_young_refusal(workspace: &WorkspaceName, young: &YoungWorkspace) -> C
 }
 
 #[cfg(target_os = "macos")]
-fn removal_dirty_refusal(workspace: &WorkspaceName) -> CowshedError {
+/// The dirt refusal names what `git status` reads as work, ten paths and a count of the rest, and
+/// remedies that lose nothing.
+fn removal_dirty_refusal(workspace: &WorkspaceName, dirt: &[PathBuf]) -> CowshedError {
+    const NAMED: usize = 10;
+    let mut named = dirt
+        .iter()
+        .take(NAMED)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if dirt.len() > NAMED {
+        named.push_str(&format!(", and {} more", dirt.len() - NAMED));
+    }
     CowshedError::conflict(
-        format!("workspace {workspace} has uncommitted Git work"),
-        format!("commit the work and land it: cowshed land {workspace}"),
+        format!("workspace {workspace} has uncommitted work: {named}"),
+        format!(
+            "commit what is work and land it (cowshed land {workspace}); delete what you have read \
+             and know to be junk"
+        ),
     )
 }
 
@@ -24724,13 +24765,19 @@ enum RemovalLandedDecision {
 /// or refuses to, and a decision worth testing directly is worth being able to test without a
 /// substrate. `Refused` carries the measured state it refused: the decision is final there, and the
 /// caller only turns it into text with [`removal_unlanded_refusal`] — which is the one point
-/// allowed to read more, to explain it.
+/// allowed to read more, to explain it. `dirty` says the work tree holds uncommitted work, which an
+/// abandonment commits into its bundle as well, so a landed but dirty workspace still abandons.
 #[cfg(target_os = "macos")]
-fn removal_landed_decision(landed: NativeLandedState, abandon: bool) -> RemovalLandedDecision {
-    if landed.commits.fully_landed() && landed.branches.fully_landed() {
-        RemovalLandedDecision::Landed
-    } else if abandon {
+fn removal_landed_decision(
+    landed: NativeLandedState,
+    dirty: bool,
+    abandon: bool,
+) -> RemovalLandedDecision {
+    let held = landed.commits.fully_landed() && landed.branches.fully_landed();
+    if abandon && (!held || dirty) {
         RemovalLandedDecision::Abandoned(landed)
+    } else if held {
+        RemovalLandedDecision::Landed
     } else {
         RemovalLandedDecision::Refused(landed)
     }

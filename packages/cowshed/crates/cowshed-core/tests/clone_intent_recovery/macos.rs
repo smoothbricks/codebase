@@ -2481,9 +2481,9 @@ async fn store_recovery_retires_an_unfinished_fork_whose_source_is_gone() {
 }
 
 /// Losing a finished fork's source never authorizes losing its unlanded commits, and abandoning
-/// them keeps them in the verified bundle in the project's trash, their only copy. The deletion
-/// log names the head and that bundle, and nothing is written into main's repository; `gc
-/// --abandoned` releases the bundle as it releases any, and writes no ref either.
+/// them keeps them in the verified bundle in the project's trash, their only copy, and no image.
+/// The deletion log names the head and that bundle, and nothing is written into main's
+/// repository; `gc --abandoned` releases the bundle as it releases any, and writes no ref either.
 #[tokio::test]
 async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed() {
     let fixture = Fixture::new("rm-unlanded-fork");
@@ -2552,15 +2552,15 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
         )
         .await
         .expect("--abandon retires the unlanded fork");
-    let recovery = fixture
+    let trash_image = fixture
         .layout()
         .project()
         .sessions
         .join(format!(".trash/finished-{}.dmg", incarnation_of(&fork),));
-    assert_eq!(
-        head(&recovery),
-        original_head,
-        "unlanded history remains in recovery"
+    assert!(
+        !trash_image.exists(),
+        "an abandonment keeps no recovery image: {}",
+        trash_image.display()
     );
     rm.shutdown().await.expect("stop the abandoning runtime");
     let bundle = PathBuf::from(
@@ -2594,34 +2594,9 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
     gc.shutdown().await.expect("stop gc");
     assert!(!bundle.exists(), "the sweep deleted {}", bundle.display());
     assert_eq!(
-        head(&recovery),
-        original_head,
-        "bundle authorization does not discard its image"
-    );
-    assert_eq!(
         abandoned_refs_in(&fixture.checkout),
         Vec::<String>::new(),
         "gc --abandoned writes no ref either"
-    );
-
-    // A bundle is not permission to delete the complete recovery image. Terminal store
-    // removal refuses before main moves while that evidence remains.
-    let purge = fixture.gc().await;
-    let refusal = fixture
-        .call(
-            &purge,
-            "coordinator.removeProject",
-            json!({ "repoId": fixture.repo, "options": { "force": false, "abandon": true } }),
-        )
-        .await
-        .expect_err("recovery image refuses terminal project removal");
-    assert_eq!(refusal.code, cowshed_core::ErrorCode::Conflict);
-    assert_eq!(head(&recovery), original_head);
-    purge.shutdown().await.expect("stop the purging runtime");
-    assert_eq!(
-        abandoned_refs_in(&fixture.checkout),
-        Vec::<String>::new(),
-        "a refused purge writes no ref into main's repository"
     );
 }
 
@@ -2805,10 +2780,11 @@ async fn rm_run_from_inside_a_workspace_leaves_it_first_and_an_open_file_still_r
 }
 
 /// minute ago and has not written in yet. An explicit `rm` refuses a workspace that young, naming
-/// its age and the floor, and refuses a dirty one first; `--force` removes it, and the deletion
-/// log says which process forced it and past which guards (02_workspaces.md, `rm` step 1).
+/// its age and the floor, and refuses a dirty one, naming its dirt, `--force` or not; `--force
+/// --abandon` removes it, committing the dirt into the bundle and keeping no image, and the
+/// deletion log says which process forced it past the age floor (02_workspaces.md, `rm` step 1).
 #[tokio::test]
-async fn rm_refuses_a_young_or_dirty_workspace_unforced_and_journals_who_forced_it() {
+async fn rm_refuses_a_young_or_dirty_workspace_and_abandon_bundles_its_dirt() {
     let fixture = Fixture::new("rm-young");
     let runtime = fixture.adopt().await;
     let minted = fixture
@@ -2837,42 +2813,75 @@ async fn rm_refuses_a_young_or_dirty_workspace_unforced_and_journals_who_forced_
     assert!(!young.hint.contains("--force"), "{young:?}");
 
     fs::write(mount.join("draft"), b"first edit\n").expect("an uncommitted edit");
-    let dirty = unforced()
-        .await
-        .expect_err("uncommitted work is not removed unforced");
-    assert!(
-        dirty.message.contains("has uncommitted Git work"),
-        "{dirty:?}"
-    );
-    assert!(mount.join("draft").exists(), "a refusal keeps the edit");
+    for force in [false, true] {
+        let dirty = fixture
+            .call(
+                &runtime,
+                "coordinator.destroy",
+                json!({
+                    "repoId": fixture.repo, "workspace": "fresh",
+                    "options": RemoveOptions { force, ..RemoveOptions::default() },
+                }),
+            )
+            .await
+            .expect_err("uncommitted work is not removed without --abandon");
+        assert!(
+            dirty
+                .message
+                .contains("workspace fresh has uncommitted work: draft"),
+            "{dirty:?}"
+        );
+        assert!(mount.join("draft").exists(), "a refusal keeps the edit");
+    }
 
-    fixture
+    let abandoned = fixture
         .call(
             &runtime,
             "coordinator.destroy",
             json!({
                 "repoId": fixture.repo, "workspace": "fresh",
-                "options": RemoveOptions { force: true, ..RemoveOptions::default() },
+                "options": RemoveOptions { force: true, abandon: true, ..RemoveOptions::default() },
             }),
         )
         .await
-        .expect("--force removes it");
+        .expect("--force --abandon removes it");
     let image = fixture
         .layout()
         .session_image(&name("fresh"))
         .unwrap()
         .image()
         .to_owned();
-    assert!(
-        !image.exists(),
-        "forced dirty retirement leaves the live namespace"
-    );
-    let recovery = fixture
+    assert!(!image.exists(), "the retirement leaves the live namespace");
+    let trash_image = fixture
         .layout()
         .project()
         .sessions
         .join(format!(".trash/fresh-{}.dmg", incarnation_of(&minted),));
-    assert_eq!(fs::read(recovery.join("draft")).unwrap(), b"first edit\n");
+    assert!(
+        !trash_image.exists(),
+        "an abandonment keeps no recovery image"
+    );
+    let uncommitted = abandoned["abandoned"]["uncommitted"]
+        .as_str()
+        .expect("the dirt's commit is reported")
+        .to_owned();
+    let bundle = PathBuf::from(
+        abandoned["abandoned"]["bundle"]
+            .as_str()
+            .expect("bundle path"),
+    );
+    let heads = std::process::Command::new("git")
+        .arg("bundle")
+        .arg("list-heads")
+        .arg(&bundle)
+        .output_bounded()
+        .expect("list the bundle's heads");
+    assert!(heads.status.success(), "{heads:?}");
+    assert!(
+        String::from_utf8_lossy(&heads.stdout)
+            .contains(&format!("{uncommitted} refs/cowshed/uncommitted")),
+        "the bundle carries the dirt's commit: {heads:?}"
+    );
     runtime.shutdown().await.expect("stop the runtime");
     let retired = deletion_log(&fixture, "retire-workspace", "fresh");
     let by = &retired["retiredBy"];
@@ -2887,14 +2896,18 @@ async fn rm_refuses_a_young_or_dirty_workspace_unforced_and_journals_who_forced_
         "{retired}"
     );
     let forced = by["forced"].as_array().expect("a forced removal says so");
-    assert_eq!(forced[0], json!({ "guard": "dirty" }), "{retired}");
-    assert_eq!(forced[1]["guard"], "young", "{retired}");
     assert_eq!(
-        forced[1]["createdAt"], minted["info"]["createdAt"],
+        forced.len(),
+        1,
+        "--force overrode the age floor alone: {retired}"
+    );
+    assert_eq!(forced[0]["guard"], "young", "{retired}");
+    assert_eq!(
+        forced[0]["createdAt"], minted["info"]["createdAt"],
         "{retired}"
     );
     assert!(
-        forced[1]["ageSeconds"]
+        forced[0]["ageSeconds"]
             .as_u64()
             .is_some_and(|age| age < 600),
         "{retired}"
