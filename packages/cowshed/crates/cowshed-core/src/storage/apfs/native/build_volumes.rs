@@ -47,6 +47,17 @@ impl CompactionSource {
     pub fn seed(&self) -> &BuildVolumeId {
         &self.seed
     }
+
+    /// The bytes the clone has allocated: what a copy of it writes, holes kept.
+    pub fn allocated_bytes(&self) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(&self.clone)?.blocks().saturating_mul(512))
+    }
+
+    /// The staged clone.
+    pub fn clone_path(&self) -> &Path {
+        &self.clone
+    }
 }
 
 /// A seed's data copied into fresh, contiguous space, not yet published, with the clone of the

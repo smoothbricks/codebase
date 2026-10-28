@@ -238,6 +238,48 @@ fn between_checks(
     }
 }
 
+/// `checks`, first asking at each [`CHECK_EVERY_BYTES`], from the first chunk on, whether the store
+/// holding `store` has room for what the writer still writes, `total` less what it wrote: a copy
+/// that would take the store under its floor plus margin stops there, and its partial copy goes to
+/// cleanup as any stopped copy's does (16_build_volumes.md, "Seed compaction").
+fn with_room(
+    store: PathBuf,
+    total: u64,
+    mut checks: impl FnMut(u64) -> ControlFlow<String>,
+) -> impl FnMut(u64) -> ControlFlow<String> {
+    let mut next = 0_u64;
+    move |written| {
+        if written >= next {
+            next = written + CHECK_EVERY_BYTES;
+            if let Some(why) = room(&store, total.saturating_sub(written)) {
+                return ControlFlow::Break(why);
+            }
+        }
+        checks(written)
+    }
+}
+
+/// Why writing `bytes` more into the store holding `store` must not go on, or `None`: it would leave
+/// the store under its floor plus margin, or its free space cannot be read, and not knowing is no
+/// permission.
+fn room(store: &Path, bytes: u64) -> Option<String> {
+    use crate::storage::apfs::release::{
+        PRESSURE_MARGIN_PERCENT, STORE_FLOOR_PERCENT, store_space, writes_leave_floor,
+    };
+    match store_space(store) {
+        Err(error) => Some(format!(
+            "the store's free space cannot be read at {}: {error}",
+            store.display()
+        )),
+        Ok((free, capacity)) => (!writes_leave_floor(free, capacity, bytes)).then(|| {
+            format!(
+                "{bytes} more bytes into the store's {free} free of {capacity} would leave it under its \
+                 {STORE_FLOOR_PERCENT}% floor plus {PRESSURE_MARGIN_PERCENT}% margin, and retiring the old \
+                 seed frees none of the copy: its blocks stay shared with every volume cloned from it"
+            )
+        }),
+    }
+}
 /// What publishing a compacted copy did.
 #[derive(Debug)]
 pub(crate) enum Published {
@@ -448,37 +490,48 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     }
 
     /// Copy `source` contiguously with no lock held, asking every [`CHECK_EVERY_BYTES`], from the
-    /// first chunk on, what `admit` answers ([`between_checks`]). A seed that replaces `source`'s
-    /// meanwhile does not stop it: publication finds it and the copy is caught up to it.
+    /// first chunk on, whether the store has room for what the copy still writes ([`with_room`]) and
+    /// what `admit` answers ([`between_checks`]). A seed that replaces `source`'s meanwhile does not
+    /// stop it: publication finds it and the copy is caught up to it.
     pub async fn copy_compaction(
         &self,
         source: CompactionSource,
         minimum_extents: u64,
         admit: Box<dyn FnMut() -> Admission + Send>,
     ) -> Result<SeedCompaction> {
+        let store = self.layout.compacting();
         self.blocking(move |host, _| {
-            host.copy_seed_compaction(source, minimum_extents, &mut between_checks(admit))
+            let total = source.allocated_bytes().map_err(|error| {
+                io(
+                    "read the staged seed's allocation",
+                    source.clone_path(),
+                    &error,
+                )
+            })?;
+            let mut keep_going = with_room(store, total, between_checks(admit));
+            host.copy_seed_compaction(source, minimum_extents, &mut keep_going)
                 .map_err(storage)
         })
         .await
     }
 
     /// Catch `compacted` up to `next`, staged by [`Self::publish_compaction`], with no lock held:
-    /// only what `next` does not share with the seed the copy holds is written, asking `admit`
-    /// as the copy does.
+    /// only what `next` does not share with the seed the copy holds is written, asking for room
+    /// and `admit` as the copy does.
     pub async fn catch_up_compaction(
         &self,
         compacted: CompactedSeed,
         next: CompactionSource,
         admit: Box<dyn FnMut() -> Admission + Send>,
     ) -> Result<SeedCatchUp> {
+        let store = self.layout.compacting();
         self.blocking(move |host, _| {
-            host.catch_up_seed_compaction(compacted, next, &mut between_checks(admit))
+            let mut keep_going = with_room(store, 0, between_checks(admit));
+            host.catch_up_seed_compaction(compacted, next, &mut keep_going)
                 .map_err(storage)
         })
         .await
     }
-
     /// Under `locked`: when `compacted`'s seed is still the target's latest, the copy becomes
     /// its seed at the same tree and every older seed is claimed for its retirement once the lock
     /// is let go, as a fork's seed refresh claims the seeds it replaces. When another seed is the

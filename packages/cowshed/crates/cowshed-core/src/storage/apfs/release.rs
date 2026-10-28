@@ -127,6 +127,16 @@ pub fn drain_pace(free: u64, capacity: u64, queued: u64) -> DrainPace {
     }
 }
 
+/// Whether writing `bytes` more into a store with `free` of `capacity` bytes leaves it at or above
+/// [`STORE_FLOOR_PERCENT`] plus [`PRESSURE_MARGIN_PERCENT`] of capacity: what a seed compaction's copy
+/// needs before it starts and at each check (16_build_volumes.md, "Seed compaction"). Its old
+/// seed's blocks stay shared with every volume cloned from it, so the old seed's retirement frees
+/// none of what the copy wrote. A capacity nothing reported admits nothing.
+pub fn writes_leave_floor(free: u64, capacity: u64, bytes: u64) -> bool {
+    capacity > 0
+        && u128::from(free.saturating_sub(bytes)) * 100
+            >= u128::from(capacity) * u128::from(STORE_FLOOR_PERCENT + PRESSURE_MARGIN_PERCENT)
+}
 /// The free bytes an unprivileged writer has, and the capacity, of the filesystem holding `path`.
 pub fn store_space(path: &Path) -> io::Result<(u64, u64)> {
     let path = CString::new(path.as_os_str().as_bytes())
@@ -924,6 +934,39 @@ mod tests {
         );
     }
 
+    /// A seed compaction writes a whole copy whose old blocks stay shared with every volume
+    /// cloned from the seed, so retiring the old seed frees none of it: a copy starts, and goes on,
+    /// only while what it still writes leaves the store at or above the floor plus the margin.
+    #[test]
+    fn a_compaction_writes_only_what_leaves_the_floor_plus_margin() {
+        use super::writes_leave_floor;
+        const GIB: u64 = 1 << 30;
+        let capacity = 7_760 * GIB;
+        let line = capacity * 15 / 100;
+        for (free, bytes, fits) in [
+            // The 2026-10-28 copy: 415 GB into a store at 10.5% free, which it took to 8.6%.
+            (815 * GIB, 387 * GIB, false),
+            (line + 387 * GIB, 387 * GIB, true),
+            (line + 387 * GIB - 1, 387 * GIB, false),
+            (line, 0, true),
+            (line - 1, 0, false),
+            (100 * GIB, 400 * GIB, false),
+        ] {
+            assert_eq!(
+                writes_leave_floor(free, capacity, bytes),
+                fits,
+                "{bytes} more bytes into {free} free of {capacity}"
+            );
+        }
+        assert!(
+            !writes_leave_floor(u64::MAX, 0, 0),
+            "no capacity read admits nothing"
+        );
+        assert!(
+            writes_leave_floor(u64::MAX, u64::MAX, 0),
+            "no overflow at the largest sizes"
+        );
+    }
     use super::*;
 
     /// What the gateway's cleanup did over one deleting directory, in the shape these tests read.

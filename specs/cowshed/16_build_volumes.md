@@ -575,6 +575,13 @@ caught up to (Catch-up); a later qualifying foreground operation can advise anot
   copied at 26 MB/s, about four hours; at normal priority one copied 209 GB in 440 s. The clone stays until the copy is
   published, for a catch-up to read which blocks a newer seed still shares with it. Forks and lands of main proceed
   throughout the copy and clone the seed as it stands.
+- **Room for the copy.** The copy writes the whole seed while the old seed's blocks stay shared with main's live volume
+  and every fork cloned from it, so retiring the old seed frees none of what it wrote: on 2026-10-28 a 415 GB copy took
+  the store from 10.5% to 8.6% free and every gate failed under the floor. After its first chunk and every GiB after
+  that, the copy goes on only while what it still writes (the staged clone's allocated bytes less what it wrote) leaves
+  the store at or above its floor plus margin (05_gateway.md, `STORE_FLOOR_PERCENT` plus `PRESSURE_MARGIN_PERCENT`); a
+  catch-up only while the store is at or above that line. Otherwise, or when the free space cannot be read, it stops as
+  a land-turn read failure stops it: the copy is removed and the seed is as it was.
 - **It holds for lands.** After its first chunk and every GiB after that, the copy, and a catch-up's writes and its
   punches of at most 8 MiB alike, ask the gateway whether a land holds or waits for any repository's turn
   (05_gateway.md, "Land turns"); a land that starts the compaction still holds its own turn. A gate-class job outside a
