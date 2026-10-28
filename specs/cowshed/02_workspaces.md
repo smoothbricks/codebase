@@ -1503,8 +1503,9 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
 
    A gitignored path is disposable by the project's own declaration and never keeps a recovery image: one ignored by the
    workspace's own rules (`.gitignore`, `.git/info/exclude`, the user's excludes file) or by the surviving target
-   checkout's current rules. Only uncommitted work, unlanded commits and untracked leaves no rule ignores keep one.
-   Hidden untracked leaves are not work to `git status`, yet can be the only copy, so each must still be held. What
+   checkout's current rules. Only uncommitted work, unlanded commits and visible untracked leaves no rule ignores keep
+   one. A hidden untracked leaf (any `.`-component) is junk, as it is to the dirty fence (8d3fc40379, "junk is junk"):
+   never the only copy, so it keeps no image (a fold's retirement once kept a whole image for one `.cache/*.log`). What
    cowshed itself made in the checkout is not its content: `.cowshed/`, the volume's own bookkeeping (`.fseventsd`, the
    Spotlight, trash, temporary-items and revisions directories, and the Spotlight opt-out marker volumes adopted before
    2026-10-25 carry), and each build-state link exactly as cowshed made it for a path the record of the build volume the

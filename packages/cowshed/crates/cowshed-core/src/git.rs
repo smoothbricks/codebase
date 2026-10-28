@@ -1131,9 +1131,10 @@ impl GitRepository {
     /// Gitignored paths are disposable by the project's own declaration and never keep a recovery
     /// image (02_workspaces.md, `rm` step 5): ignored by the workspace's own rules (`git ls-files
     /// --exclude-standard`) or by the target checkout's current ones (`ignored_by_rules`, as
-    /// [`Self::dirty_paths_by`] reads main's). Hidden untracked leaves no rule ignores are not
-    /// work to `git status` (`is_untracked_junk`) yet may be the only copy, so each must survive
-    /// in the target checkout, byte for byte or by the same symlink target, unless cowshed itself
+    /// [`Self::dirty_paths_by`] reads main's). Hidden untracked leaves (a `.`-component) are junk,
+    /// as they are to rm's dirty fence (`is_untracked_junk`): never the only copy (Danny, "junk is
+    /// junk"; a fold once kept a whole recovery image for one `.cache/*.log`). Every other leaf must
+    /// survive in the target checkout, byte for byte or by the same symlink target, unless cowshed itself
     /// made it: its `.cowshed/` directory, the volume's own bookkeeping, and each link of
     /// `build_state` exactly as `link::link_paths` made it (16_build_volumes.md, "One link per
     /// checkout"). This is the first leaf that does not survive, in `git ls-files` order, or
@@ -1180,6 +1181,7 @@ impl GitRepository {
                         }
                         !is_ignored
                     })
+                    .filter(|path| !is_hidden_path(path))
                     .map(|path| Path::new(OsStr::from_bytes(path)))
                     .filter(|path| {
                         !build_state.iter().any(|state| {
@@ -6904,25 +6906,30 @@ mod tests {
         fs::write(root.join(".git/info/exclude"), "/ignored\n").unwrap();
         fs::write(root.join("ignored"), b"only copy\n").unwrap();
         fs::write(root.join(".hidden"), b"hidden copy\n").unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        fs::write(root.join(".cache/r9-cr.log"), b"a run's log\n").unwrap();
         assert!(!git.is_dirty_by(Some(&main)).await.unwrap());
-        assert_eq!(
-            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            Some(PathBuf::from(".hidden")),
-            "a hidden leaf no rule ignores is the only copy"
-        );
-        fs::copy(root.join(".hidden"), main.join(".hidden")).unwrap();
+        // A fold's retirement kept a whole 300 GB recovery image for one `.cache/r9-*.log`: hidden
+        // paths are junk to rm's dirty fence, and so to the only-copy check (Danny, "junk is junk").
         assert_eq!(
             git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
             None,
-            "an ignored leaf main does not hold is disposable"
+            "hidden and ignored leaves main does not hold are junk, never the only copy"
         );
-        fs::create_dir_all(root.join(".bench")).unwrap();
-        fs::write(root.join(".bench/out"), b"bench output\n").unwrap();
+        fs::write(root.join("notes.txt"), b"visible work\n").unwrap();
+        fs::write(root.join(".git/info/exclude"), "/ignored\n/notes.txt\n").unwrap();
         assert_eq!(
             git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            Some(PathBuf::from(".bench/out"))
+            None,
+            "a leaf the workspace's own rules ignore is disposable"
         );
-        fs::write(main.join(".git/info/exclude"), "/.bench/\n").unwrap();
+        fs::write(root.join(".git/info/exclude"), "/ignored\n").unwrap();
+        assert_eq!(
+            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
+            Some(PathBuf::from("notes.txt")),
+            "a visible leaf no rule ignores is the only copy"
+        );
+        fs::write(main.join(".git/info/exclude"), "/notes.txt\n").unwrap();
         assert_eq!(
             git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
             None,
@@ -6940,9 +6947,9 @@ mod tests {
     /// recovery image (02_workspaces.md, `rm` step 5): cowshed's `.cowshed/`, the build-state
     /// links it made into the build volume, and the volume's own bookkeeping. Main had no build
     /// volume linked at those paths, so none of them was "held" there, yet none is the
-    /// workspace's content. The exemption comes from the build volume's record, the same paths
-    /// `link_paths` linked: a link at an unrecorded path, or a recorded path linked elsewhere,
-    /// is still content.
+    /// workspace's content. A hidden one is junk outright; a visible one is exempt by the build
+    /// volume's record, the same paths `link_paths` linked: a link at an unrecorded visible path,
+    /// or a recorded path linked elsewhere, is still content.
     #[tokio::test]
     async fn source_release_exempts_the_build_state_links_cowshed_made() {
         use crate::build_volume::link;
@@ -6956,8 +6963,7 @@ mod tests {
         let git = GitRepository::from_root(store.shared(), &root);
         let recorded = vec![
             BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
-            BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
-            BuildStatePath::new(".codegraph", "codegraph").unwrap(),
+            BuildStatePath::new("codegraph", "codegraph").unwrap(),
         ];
         link::point(&root, &volume).unwrap();
         link::link_paths(&root, &volume, &recorded).unwrap();
@@ -6969,8 +6975,8 @@ mod tests {
         fs::write(root.join(".fseventsd/no_log"), b"").unwrap();
         fs::write(root.join(cowshed_apfs::SPOTLIGHT_OPT_OUT), b"").unwrap();
         assert_eq!(
-            fs::read_link(root.join(".nx/cache")).unwrap(),
-            Path::new("../.cowshed/build/nx/cache")
+            fs::read_link(root.join("codegraph")).unwrap(),
+            Path::new(".cowshed/build/codegraph")
         );
         assert_eq!(
             git.first_unheld_untracked(&main, recorded.clone())
@@ -6981,25 +6987,25 @@ mod tests {
         );
         assert_eq!(
             git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            Some(PathBuf::from(".codegraph")),
-            "with no record naming them, the links are judged like any other leaf"
+            Some(PathBuf::from("codegraph")),
+            "with no record naming it, a visible link is judged like any other leaf"
         );
 
-        symlink(".cowshed/build/turbo", root.join(".turbo")).unwrap();
+        symlink(".cowshed/build/turbo", root.join("turbo")).unwrap();
         assert_eq!(
             git.first_unheld_untracked(&main, recorded.clone())
                 .await
                 .unwrap(),
-            Some(PathBuf::from(".turbo")),
-            "a link into the build volume at a path no record names is content"
+            Some(PathBuf::from("turbo")),
+            "a link into the build volume at a visible path no record names is content"
         );
-        fs::remove_file(root.join(".turbo")).unwrap();
+        fs::remove_file(root.join("turbo")).unwrap();
 
-        fs::remove_file(root.join(".codegraph")).unwrap();
-        symlink("/elsewhere/codegraph", root.join(".codegraph")).unwrap();
+        fs::remove_file(root.join("codegraph")).unwrap();
+        symlink("/elsewhere/codegraph", root.join("codegraph")).unwrap();
         assert_eq!(
             git.first_unheld_untracked(&main, recorded).await.unwrap(),
-            Some(PathBuf::from(".codegraph")),
+            Some(PathBuf::from("codegraph")),
             "a recorded path linked anywhere but its volume directory is content"
         );
     }
