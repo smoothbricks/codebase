@@ -1565,7 +1565,7 @@ async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
     );
     // The kernel's wait for the child's exit: no poll.
     let exited = Some(
-        tokio::task::spawn_blocking(move || daemon.wait())
+        tokio::task::spawn_blocking(move || daemon.wait_bounded())
             .await
             .expect("the stand-in daemon's wait thread")
             .expect("wait for the stand-in daemon"),
