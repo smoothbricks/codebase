@@ -713,7 +713,19 @@ mod tests {
             cowshed_core::runtime::wait_spans::WaitSpans::adopting(root.to_path_buf(), None),
             cowshed_core::runtime::stack_sample::capture,
         );
-        let pid = i32::try_from(std::process::id()).unwrap();
+        // The silent peer is a small stand-in process, as a supervisor is a small one. Sampling this test's own debug
+        // binary made `sample` symbolize a large image, which ran past the sampler's 10 s ffi bound on a release runner.
+        let mut peer = {
+            use cowshed_os::fork_lock::Spawn as _;
+            std::process::Command::new("/bin/sleep")
+                .arg("600")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn_locked()
+                .unwrap()
+        };
+        let pid = i32::try_from(peer.id()).unwrap();
         let silent = Silent {
             op: "wait",
             holder: "workspace supervisor",
@@ -804,6 +816,9 @@ mod tests {
             2,
             "only one span and sample, no second recording attempt"
         );
+        use cowshed_os::test_backstop::ChildBackstop as _;
+        peer.kill().unwrap();
+        peer.wait_bounded().unwrap();
     }
 
     #[test]
