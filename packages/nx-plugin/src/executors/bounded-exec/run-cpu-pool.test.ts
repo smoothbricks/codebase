@@ -11,6 +11,14 @@ import { closeRunCpuPool, serveRunCpuPool } from './run-cpu-pool.js';
 import { CPU_TOKENS_ENV } from './runner-sizing.js';
 
 describe("an Nx run's own CPU pool", () => {
+  it("serves none in an mbx project, whose one pool is mbx's", async () => {
+    const env: NodeJS.ProcessEnv = { MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx' };
+    await serveRunCpuPool({ id: 'run-mbx' }, env, 4);
+    expect(readInheritedCpuPool(env)).toBeNull();
+    expect(env.CARGO_MAKEFLAGS).toBeUndefined();
+    await closeRunCpuPool({ id: 'run-mbx' });
+  });
+
   it('serves its tasks one pool of one token per core, so a second runner waits for the first', async () => {
     const env: NodeJS.ProcessEnv = {};
     await serveRunCpuPool({ id: 'run-477' }, env, 4);

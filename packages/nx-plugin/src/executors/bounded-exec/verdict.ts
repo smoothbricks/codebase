@@ -350,7 +350,7 @@ export async function withJunitReport(command: string, directory: string): Promi
   return command.replace(NEXTEST_RUN, () => `nextest run --tool-config-file ${shellQuote(`smoo-report:${config}`)}`);
 }
 
-function shellQuote(value: string): string {
+export function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 

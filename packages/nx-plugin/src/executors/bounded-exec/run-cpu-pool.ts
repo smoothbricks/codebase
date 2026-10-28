@@ -2,6 +2,7 @@ import { availableParallelism } from 'node:os';
 import { logger } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 import { type CpuPool, createCpuPool, readInheritedCpuPool } from './cpu-pool.js';
+import { mbxPool } from './mbx-pool.js';
 import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
 
 /**
@@ -33,7 +34,8 @@ export async function serveRunCpuPool(
   env: NodeJS.ProcessEnv = process.env,
   cores: number = availableParallelism(),
 ): Promise<void> {
-  if (readInheritedCpuPool(env) !== null) {
+  // With mbx, its pool is the host's one ledger, and a run pool beside it would count every leaf twice.
+  if (readInheritedCpuPool(env) !== null || mbxPool(env) !== null) {
     return;
   }
   const inherited = parseInheritedTokens(env[CPU_TOKENS_ENV]);
