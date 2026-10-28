@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, readdir, rm, stat, utimes, watch, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,7 +17,11 @@ const supervisor = fileURLToPath(new URL('./supervisor.fixture.ts', import.meta.
 
 interface StderrTap {
   readonly ended: Promise<void>;
-  until(fragment: string): Promise<void>;
+  /**
+   * Resolves once stderr holds the fragment. Rejects when stderr ends first, or when unless rejects, which is how a
+   * caller says that whatever would have produced the event is gone.
+   */
+  until(fragment: string, unless?: Promise<never>): Promise<void>;
 }
 
 interface ProcessFixture extends CacheServerReadyRecord {
@@ -57,10 +61,10 @@ function tapStderr(stream: ReadableStream<Uint8Array>): StderrTap {
   })();
   return {
     ended,
-    async until(fragment) {
+    async until(fragment, unless) {
       while (!text.includes(fragment)) {
         if (done) throw new Error(`stderr ended before ${fragment}: ${text}`);
-        await changed.promise;
+        await (unless === undefined ? changed.promise : Promise.race([changed.promise, unless]));
       }
     },
   };
@@ -89,6 +93,11 @@ async function start(
     }
     const ready = parseReady(text.slice(0, text.indexOf('\n')));
     return { child, stderr, ...ready };
+  } catch (failure) {
+    // A server whose ready record could not be read or parsed may still be running, and no caller holds it to stop it.
+    child.kill('SIGKILL');
+    await child.exited;
+    throw failure;
   } finally {
     reader.releaseLock();
   }
@@ -102,10 +111,18 @@ async function refuse(root: string): Promise<Refusal> {
     stderr: 'pipe',
   });
   const stderr = tapStderr(child.stderr);
-  const out = await new Response(child.stdout).text();
-  const code = await child.exited;
-  await stderr.ended;
-  return { code, failure: parseFailed(out.trim()) };
+  try {
+    // A refusal is one record and an exit. A second owner that started instead prints its ready record and serves on,
+    // so the read ends at the record, never at the end of the stream, and the child never outlives this call.
+    const [line] = await readLines(child.stdout, 1);
+    const failure = parseFailed(line);
+    const code = await child.exited;
+    await stderr.ended;
+    return { code, failure };
+  } finally {
+    child.kill('SIGKILL');
+    await child.exited;
+  }
 }
 
 async function readLines(stream: ReadableStream<Uint8Array>, count: number): Promise<string[]> {
@@ -128,77 +145,6 @@ async function readLines(stream: ReadableStream<Uint8Array>, count: number): Pro
     return lines;
   } finally {
     reader.releaseLock();
-  }
-}
-
-/**
- * Resolve once a staged upload file holds bytes, or reject when `signal` aborts or the server process `exited` first
- * (the error names its exit code): a dead server writes nothing, so waiting on it would only end at the leg's backstop.
- * The server emits no event after a staged write, and macOS reports no directory change when data is written into an
- * existing file, so a directory watch alone can sleep through the write. The directory watch wakes on the staged
- * file's creation; a watch on that file wakes on each data write (kqueue on macOS, inotify on Linux). The file is
- * stat'ed right after each watch is armed and after every wake, so bytes that landed before a watch existed still
- * resolve. Every watch is closed on the way out.
- */
-async function awaitStaged(staging: string, signal: AbortSignal, exited: Promise<number>): Promise<void> {
-  const local = new AbortController();
-  const scope = AbortSignal.any([signal, local.signal]);
-  void exited.then((code) =>
-    local.abort(new Error(`server exited with code ${code} before the staged upload materialized`)),
-  );
-  try {
-    await awaitStagedBytes(await awaitStagedFile(staging, scope), scope);
-  } catch (error) {
-    if (signal.aborted) throw new Error('staging wait aborted before the upload materialized', { cause: error });
-    if (local.signal.aborted) throw local.signal.reason;
-    throw error;
-  } finally {
-    local.abort();
-  }
-}
-
-/** First staged file's path. The directory watch is armed before the listing, so a creation between them is seen. */
-async function awaitStagedFile(staging: string, scope: AbortSignal): Promise<string> {
-  const creations = watch(staging, { signal: scope })[Symbol.asyncIterator]();
-  let wake = arm(creations);
-  for (;;) {
-    const [name] = await readdir(staging);
-    if (name !== undefined) return join(staging, name);
-    const change = await until(wake, scope);
-    if (change.done) throw new Error(`directory watch on ${staging} closed before a staged upload appeared`);
-    wake = arm(creations);
-  }
-}
-
-/** Resolve once `file` holds bytes. The file watch is armed before the first stat, so an earlier write still counts. */
-async function awaitStagedBytes(file: string, scope: AbortSignal): Promise<void> {
-  const writes = watch(file, { signal: scope })[Symbol.asyncIterator]();
-  let wake = arm(writes);
-  for (;;) {
-    if ((await stat(file)).size > 0) return;
-    const change = await until(wake, scope);
-    if (change.done) throw new Error(`file watch on ${file} closed before the staged upload held bytes`);
-    wake = arm(writes);
-  }
-}
-
-/** Starts the next wait on a watch. Waits abandoned by a return reject when the watch closes in cleanup; that is expected, so it is marked handled. */
-function arm(changes: AsyncIterator<unknown>): Promise<IteratorResult<unknown>> {
-  const wake = changes.next();
-  wake.catch(() => {});
-  return wake;
-}
-
-/** Await `wake`, or reject as soon as `scope` aborts. The abort listener lives only for the wait. */
-async function until(wake: Promise<IteratorResult<unknown>>, scope: AbortSignal): Promise<IteratorResult<unknown>> {
-  scope.throwIfAborted();
-  const aborted = Promise.withResolvers<never>();
-  const onAbort = () => aborted.reject(scope.reason);
-  scope.addEventListener('abort', onAbort, { once: true });
-  try {
-    return await Promise.race([wake, aborted.promise]);
-  } finally {
-    scope.removeEventListener('abort', onAbort);
   }
 }
 
@@ -233,7 +179,6 @@ test('hard death during a real upload leaves no hit and restart reclaims staging
   const first = await start(root);
   const socket = connect(first.port, '127.0.0.1');
   let restarted: ProcessFixture | undefined;
-  const abort = new AbortController();
   try {
     await new Promise<void>((resolve, reject) => {
       socket.once('connect', resolve);
@@ -242,7 +187,11 @@ test('hard death during a real upload leaves no hit and restart reclaims staging
     const staging = join(root, 'entries', '.staging');
     socket.write('PUT /v1/cache/interrupted HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8388608\r\n\r\n');
     socket.write(Buffer.alloc(64 * 1024, 7));
-    await awaitStaged(staging, abort.signal, first.child.exited);
+    // The server logs an upload's admission and starts its staged write in the same turn, and Bun creates the staged
+    // file when the write starts. It answers a later request in a later turn, so the GET below is answered after the
+    // staged file exists, which orders the kill after it. A reclaim count of 0 below would mean Bun now creates the
+    // file later than the call, and this order would no longer hold.
+    await first.stderr.until('ev=staging.reserved key=interrupted ');
     const before = await fetch(`${first.origin}/v1/cache/interrupted`);
     expect(before.status).toBe(404);
     first.child.kill('SIGKILL');
@@ -253,7 +202,6 @@ test('hard death during a real upload leaves no hit and restart reclaims staging
     expect(await readdir(staging)).toEqual([]);
     expect((await fetch(`${restarted.origin}/v1/cache/interrupted`)).status).toBe(404);
   } finally {
-    abort.abort();
     socket.destroy();
     first.child.kill('SIGKILL');
     await first.child.exited;
@@ -324,7 +272,6 @@ test('stdin EOF drains an in-flight upload while the lease still refuses a secon
   const root = await mkdtemp(join(tmpdir(), 'cache-drain-'));
   const first = await start(root, undefined, { exitOnStdinEof: true });
   const staging = join(root, 'entries', '.staging');
-  const abort = new AbortController();
   const body = new Uint8Array(1048576).fill(9);
   const socket = connect(first.port, '127.0.0.1');
   let fresh: ProcessFixture | undefined;
@@ -333,13 +280,20 @@ test('stdin EOF drains an in-flight upload while the lease still refuses a secon
     socket.once('connect', connected.resolve);
     socket.once('error', connected.reject);
     await connected.promise;
-    // The upload connection closing ends the wait: its staged file goes with it, and nothing else would.
-    const dropped = new AbortController();
-    socket.once('close', () => dropped.abort(new Error('the upload connection closed before its bytes were staged')));
-    const staged = awaitStaged(staging, AbortSignal.any([abort.signal, dropped.signal]), first.child.exited);
+    // The server logs an upload's admission, and once it has the stop below has an upload in flight to wait for. No event
+    // follows an upload whose connection closed first, so that ends the wait. The listener lives only for the wait, so the
+    // test's own destroy() later closes the connection with nothing left to reject.
+    const closed = Promise.withResolvers<never>();
+    const onClose = () =>
+      closed.reject(new Error('the upload connection closed before the server admitted its upload'));
+    socket.once('close', onClose);
     socket.write(`PUT /v1/cache/drained HTTP/1.1\r\nHost: localhost\r\nContent-Length: ${body.byteLength}\r\n\r\n`);
     socket.write(body.subarray(0, 64 * 1024));
-    await staged;
+    try {
+      await first.stderr.until('ev=staging.reserved key=drained ', closed.promise);
+    } finally {
+      socket.off('close', onClose);
+    }
     first.child.stdin.end();
     await first.stderr.until('ev=stopping reason=supervisor-eof');
     const refusal = await refuse(root);
@@ -362,7 +316,6 @@ test('stdin EOF drains an in-flight upload while the lease still refuses a secon
     expect(new Uint8Array(await got.arrayBuffer())).toEqual(body);
     expect(await readdir(staging)).toEqual([]);
   } finally {
-    abort.abort();
     socket.destroy();
     first.child.kill('SIGKILL');
     await first.child.exited;
@@ -433,21 +386,14 @@ test('full staging admission refuses 403 and cancellation releases its reservati
   const root = await mkdtemp(join(tmpdir(), 'cache-admission-'));
   const running = await start(root, 4096);
   const socket = connect(running.port, '127.0.0.1');
-  const abort = new AbortController();
   try {
     await new Promise<void>((resolve, reject) => {
       socket.once('connect', resolve);
       socket.once('error', reject);
     });
-    const staging = join(root, 'entries', '.staging');
-    const changes = watch(staging, { signal: abort.signal })[Symbol.asyncIterator]();
-    let changed = changes.next();
     socket.write('PUT /v1/cache/held HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4096\r\n\r\npartial');
-    for (;;) {
-      await changed;
-      if ((await readdir(staging)).length > 0) break;
-      changed = changes.next();
-    }
+    // The server logs a reservation in the turn that takes it, so once this event is out the next PUT meets a full budget.
+    await running.stderr.until('ev=staging.reserved key=held ');
     const refused = await fetch(`${running.origin}/v1/cache/refused`, {
       method: 'PUT',
       body: 'x',
@@ -462,7 +408,6 @@ test('full staging admission refuses 403 and cancellation releases its reservati
     expect(stored.status).toBe(200);
     expect((await fetch(`${running.origin}/v1/cache/held`)).status).toBe(404);
   } finally {
-    abort.abort();
     socket.destroy();
     running.child.kill('SIGTERM');
     expect(await running.child.exited).toBe(0);
