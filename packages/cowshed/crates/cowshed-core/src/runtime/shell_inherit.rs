@@ -120,6 +120,7 @@ fn workspace_owned(name: &str) -> bool {
     .contains(&name)
         || crate::capabilities::sccache::HOST_ENVIRONMENT.contains(&name)
         || crate::capabilities::cargo::HOST_ENVIRONMENT.contains(&name)
+        || crate::capabilities::mbx::HOST_ENVIRONMENT.contains(&name)
 }
 
 fn credential(name: &str, value: Option<&str>) -> bool {
@@ -618,6 +619,13 @@ impl VerifiedActivation {
             contents: Some(self.contents),
         }
     }
+}
+
+/// The key of the activation a checkout last recorded (SHA-256 over its watched inputs), or
+/// `None` when it records none: the canonical activation's input identity, which build-state
+/// discovery keys on (15_capabilities.md, "mbx detection").
+pub fn recorded_key(mount: &Path) -> Option<String> {
+    read_record(mount).ok().map(|record| record.key)
 }
 
 /// Read a checkout's record, refusing one no record may be: oversized, of another version,

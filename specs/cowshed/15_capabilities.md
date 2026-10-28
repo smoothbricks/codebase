@@ -151,8 +151,22 @@ answer. A resolved mbx whose pinned revision cannot be established refuses admis
 mismatched pin does (05_gateway.md, "Pool selection and revision"); detection never fails open into a successful answer.
 Detection does not run `mbx setup`, change shell configuration, create a target or start a build.
 
-**Enforced by:** the mbx detection and contribution tests listed under "Required evidence"; those tests must exist for
-Phase 2.
+**Where the answer comes from.** The canonical job environment that resolves `mbx` is build-state discovery's own Cargo
+job (16_build_volumes.md, "Refresh"): after the workspace shell's activation, before its first Cargo query, the job
+names the `mbx` its PATH resolves, and discovery keeps that executable's realpath. The checkout's build volume records
+it beside the discovered paths (`cowshed-build-state.json`, `mbx`), and the discovery fingerprint covers the canonical
+activation's key (11_shell.md, "Inherited shells") as well as the tracked Cargo inputs, so a changed pin rediscovers.
+The mbx capability is active exactly where that record names an mbx; it is a cache keyed by those inputs, never a second
+authority. Admission is derived at every `exec` admission, after that refresh, from the recorded realpath and the host
+link's (05_gateway.md, "Pool selection and revision"), so discovery itself, which must run to replace a stale answer, is
+never refused by one.
+
+**Enforced by:** `cowshed-core`'s
+`mbx_is_detected_from_the_recorded_resolution_and_contributes_the_canonical_environment`,
+`a_project_mbx_is_admitted_only_as_the_host_pin_itself`, `the_job_names_the_mbx_its_path_resolves_before_its_answers`,
+`tracked_independent_workspaces_contribute_once_and_honor_their_own_target_config` (its mbx arm) and
+`a_target_mbx_owns_leaves_the_state_and_the_mbx_is_recorded`. The content-freshness, target-override and wrapper
+refusals above, and the remaining tests listed under "Required evidence", must exist for Phase 2.
 
 ## One contribution contract
 

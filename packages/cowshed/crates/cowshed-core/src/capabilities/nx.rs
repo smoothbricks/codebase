@@ -46,6 +46,7 @@ pub const DETECTOR: Detector = Detector {
     any: &[],
     scope: DetectionScope::Project,
     reached_from: None,
+    gate: None,
     contribute,
 };
 

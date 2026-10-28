@@ -15,6 +15,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["flake.nix", "devenv.nix"],
     contribute,
     reached_from: Some(super::ReachedConvention::ProjectFile(reached_through_envrc)),
+    gate: None,
 };
 /// Nix's client fetcher cache. Not content-addressed: retirement keeps the host's copy.
 pub static CACHE_HOME: SharedToolHome = SharedToolHome {

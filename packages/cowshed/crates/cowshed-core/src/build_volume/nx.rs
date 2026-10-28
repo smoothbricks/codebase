@@ -1787,6 +1787,7 @@ mod tests {
                 BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
             ],
             fingerprint: None,
+            mbx: None,
         }
     }
 
@@ -2271,6 +2272,7 @@ mod tests {
                         BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
                     ],
                     fingerprint: None,
+                    mbx: None,
                 },
             }
         }
@@ -2488,6 +2490,7 @@ mod tests {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         // `lockf` takes the lock as Nx does (`flock`), then runs its command.
         let mut opening = std::process::Command::new("/usr/bin/lockf")
@@ -2644,6 +2647,7 @@ mod tests {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         let record = stock.record();
         stock.daemon("--start");
@@ -2847,6 +2851,7 @@ mod tests {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         let mut foreign = std::process::Command::new("/bin/sh")
             .arg("-c")

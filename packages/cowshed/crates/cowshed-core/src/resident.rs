@@ -865,6 +865,7 @@ mod tests {
             fingerprint: Some(
                 crate::capabilities::tracked_manifest_fingerprint(checkout).expect("fingerprint"),
             ),
+            mbx: None,
         }
         .write(&volume)
         .expect("state");

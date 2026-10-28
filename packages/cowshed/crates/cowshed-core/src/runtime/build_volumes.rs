@@ -535,12 +535,55 @@ impl std::fmt::Display for CaptureSkip {
 pub(crate) enum Discovered {
     /// The tracked build inputs still have the fingerprint the volume's state records.
     Unchanged,
-    /// Discovery ran at `fingerprint` and named `paths`; a first volume gets `capacity`.
+    /// Discovery ran at `fingerprint` and named `paths`; a first volume gets `capacity`. It
+    /// `released` the held paths whose owner moved off the volume (a Cargo target once mbx owns
+    /// it) and resolved `mbx` in the checkout's canonical job environment.
     Changed {
         paths: Vec<BuildStatePath>,
+        released: Vec<BuildStatePath>,
+        mbx: Option<PathBuf>,
         fingerprint: String,
         capacity: ImageCapacity,
     },
+}
+
+/// Take each `released` path off the checkout: its fixed link, which names the build volume,
+/// goes, so the owner that took it over places its own (mbx, at the checkout's first build:
+/// 16_build_volumes.md, "Refresh"); and the volume's directory for it moves aside and is deleted
+/// in the background like any discarded build state, so no fork or seed carries it again. A path
+/// that is no longer cowshed's link (mbx's managed-target link already) is left as it is.
+fn release_paths(checkout: &Path, volume: &Path, released: &[BuildStatePath]) {
+    for path in released {
+        let at = checkout.join(path.checkout.as_path());
+        if let Ok(target) = std::fs::read_link(&at) {
+            let parent = path
+                .checkout
+                .as_path()
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            if crate::inherited_links::resolve_in_source(checkout, parent, &target)
+                .starts_with(checkout.join(crate::build_volume::BUILD_LINK))
+                && let Err(error) = std::fs::remove_file(&at)
+            {
+                cowshed_os::eprintln!(
+                    "cowshed: cannot remove the released build-state link {}: {error}",
+                    at.display()
+                );
+            }
+        }
+        if std::fs::symlink_metadata(volume.join(path.volume.as_path())).is_ok()
+            && let Err(error) =
+                crate::build_volume::discard::move_aside(volume, path.volume.as_path())
+        {
+            cowshed_os::eprintln!(
+                "cowshed: cannot move the released build state {} aside: {error}",
+                volume.join(path.volume.as_path()).display()
+            );
+        }
+    }
+    if !released.is_empty() {
+        crate::build_volume::discard::reap(volume);
+    }
 }
 
 /// What collection found and did.
@@ -914,6 +957,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                         paths,
                         fingerprint,
                         capacity,
+                        mbx,
+                        ..
                     },
                 ) => {
                     let touched = lent.hold(|beside| {
@@ -925,6 +970,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                                 paths: &paths,
                                 fingerprint,
                                 capacity,
+                                mbx,
                                 beside,
                                 registration: Registration::new(
                                     BuildVolumeRecord::new(
@@ -979,12 +1025,17 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             };
             let (mount, _) = host.mount_build_volume(layout, &id).map_err(storage)?;
             let held = BuildVolumeState::read(&mount)?;
-            let (state, added) = match discovered {
-                Discovered::Unchanged => (held.clone(), Vec::new()),
+            let (state, added, released) = match discovered {
+                Discovered::Unchanged => (held.clone(), Vec::new(), Vec::new()),
                 Discovered::Changed {
-                    paths, fingerprint, ..
-                } => held.with_discovered(&paths, fingerprint, &mount)?,
+                    paths,
+                    released,
+                    mbx,
+                    fingerprint,
+                    ..
+                } => held.with_discovered(&paths, &released, mbx, fingerprint, &mount)?,
             };
+            release_paths(&checkout, &mount, &released);
             let displaced =
                 match crate::build_volume::migrate::adopt_paths(&checkout, &mount, &state.paths)? {
                     Ok(displaced) => displaced,
@@ -4608,6 +4659,7 @@ mod tests {
         BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
             fingerprint: None,
+            mbx: None,
         }
         .write(&mount)
         .unwrap();
@@ -5034,6 +5086,7 @@ mod tests {
                 BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
             ],
             fingerprint: None,
+            mbx: None,
         }
         .write(&mount)
         .unwrap();
@@ -5149,6 +5202,7 @@ mod tests {
             let state = BuildVolumeState {
                 paths,
                 fingerprint: Some("fixture".into()),
+                mbx: None,
             };
             let mut held = state.clone();
             if changed {
@@ -5253,6 +5307,7 @@ mod tests {
                     BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
                 ],
                 fingerprint: Some("fixture".into()),
+                mbx: None,
             };
             state.write(&mount).unwrap();
             link::link_paths(&checkout, &mount, &state.paths).unwrap();
@@ -5328,6 +5383,7 @@ mod tests {
         let state = BuildVolumeState {
             paths: vec![index.clone()],
             fingerprint: Some("fixture".into()),
+            mbx: None,
         };
         state.write(&mount).unwrap();
         link::link_paths(&checkout, &mount, &state.paths).unwrap();
@@ -5402,6 +5458,7 @@ mod tests {
                 BuildStatePath::new("target", "target").unwrap(),
             ],
             fingerprint: None,
+            mbx: None,
         };
         state.write(&mount).unwrap();
         link::link_paths(&checkout, &mount, &state.paths).unwrap();
@@ -5782,6 +5839,7 @@ fn main() {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new("target", "target").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("target/debug")).unwrap();
@@ -5882,6 +5940,7 @@ fn main() {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".lint-cache", "lint-cache").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("lint-cache")).unwrap();
@@ -5935,6 +5994,7 @@ fn main() {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         state.write(&mount).unwrap();
         let data = mount.join("nx/workspace-data");
@@ -6031,6 +6091,7 @@ fn main() {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
@@ -6090,6 +6151,7 @@ fn main() {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
@@ -6173,6 +6235,7 @@ fn main() {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         state.write(&mount).unwrap();
         let data = mount.join("nx/workspace-data");
@@ -6242,6 +6305,7 @@ fn main() {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".lint-cache", "lint-cache").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("lint-cache")).unwrap();
@@ -6774,6 +6838,7 @@ fn main() {
                 BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
             ],
             fingerprint: None,
+            mbx: None,
         };
         let sqlite = |mount: &Path, statement: &str| {
             let output = std::process::Command::new("/usr/bin/sqlite3")
@@ -6864,6 +6929,7 @@ fn main() {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
+            mbx: None,
         };
         state.write(&mount).unwrap();
         let data = mount.join("nx/workspace-data");
@@ -7279,6 +7345,8 @@ fn main() {
     fn discovered(paths: Vec<BuildStatePath>) -> Discovered {
         Discovered::Changed {
             paths,
+            released: Vec::new(),
+            mbx: None,
             fingerprint: "fixture".to_owned(),
             capacity: ImageCapacity::from_gibibytes(1),
         }
@@ -7479,6 +7547,8 @@ fn main() {
                 resized.clone(),
                 Discovered::Changed {
                     paths: vec![BuildStatePath::new("target", "target").unwrap()],
+                    released: Vec::new(),
+                    mbx: None,
                     fingerprint: "fixture".to_owned(),
                     capacity: ImageCapacity::from_gibibytes(2),
                 },

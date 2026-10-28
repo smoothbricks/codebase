@@ -45,6 +45,7 @@ fn checkout() -> (temp_root::TempRoot, PathBuf) {
     BuildVolumeState {
         paths: vec![BuildStatePath::new(".nx/cache", "nx/cache").unwrap()],
         fingerprint: None,
+        mbx: None,
     }
     .write(&volume)
     .unwrap();

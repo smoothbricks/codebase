@@ -20,6 +20,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["pnpm-lock.yaml"],
     contribute,
     reached_from: None,
+    gate: None,
 };
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {

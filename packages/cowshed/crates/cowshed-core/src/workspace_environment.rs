@@ -331,6 +331,7 @@ fn host_capability_names() -> impl Iterator<Item = &'static str> {
     crate::capabilities::sccache::HOST_ENVIRONMENT
         .into_iter()
         .chain(crate::capabilities::cargo::HOST_ENVIRONMENT)
+        .chain(crate::capabilities::mbx::HOST_ENVIRONMENT)
         .chain(["NX_MAX_CACHE_SIZE"])
 }
 fn write_shell_quoted(contents: &mut String, value: &str) {

@@ -11,6 +11,7 @@ pub const DETECTOR: Detector = Detector {
     all: &[".envrc"],
     any: &[],
     reached_from: None,
+    gate: None,
     contribute,
 };
 

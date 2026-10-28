@@ -29,6 +29,7 @@ pub const DETECTOR: Detector = Detector {
     ],
     contribute,
     reached_from: None,
+    gate: None,
 };
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {

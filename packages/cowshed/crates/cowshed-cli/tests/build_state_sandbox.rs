@@ -89,6 +89,7 @@ fn installed_cli_fixture(label: &str) -> (Scratch, SandboxConfig, PathBuf) {
     let state = BuildVolumeState {
         paths: vec![BuildStatePath::new(".nx/cache", "nx/cache").unwrap()],
         fingerprint: None,
+        mbx: None,
     };
     state.write(&volume).unwrap();
 

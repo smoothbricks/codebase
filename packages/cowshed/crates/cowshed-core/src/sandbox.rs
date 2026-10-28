@@ -283,6 +283,7 @@ impl SandboxConfig {
             RunSandboxMode::ReadWrite => self.workspace_mount.join(".cowshed"),
         };
         let runtime_dir = shared_daemon_runtime_link(self);
+        let build_cache = crate::storage::bootstrap::native::provisioned_build_cache();
         let workspace_ca = self
             .workspace_mount
             .join(crate::workspace_credentials::CA_CERTIFICATE_PATH);
@@ -314,6 +315,7 @@ impl SandboxConfig {
             runtime_dir: &runtime_dir,
             trust_bundle: has_workspace_ca.then_some(trust_bundle.as_path()),
             program_directories: &self.program_directories,
+            build_cache: build_cache.as_deref(),
         };
         discover(&context)
     }

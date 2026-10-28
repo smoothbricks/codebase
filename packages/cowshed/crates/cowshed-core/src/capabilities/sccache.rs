@@ -23,6 +23,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["Cargo.toml"],
     contribute,
     reached_from: Some(super::ReachedConvention::TrackedManifest("Cargo.toml")),
+    gate: None,
 };
 
 pub fn server_socket() -> PathBuf {
@@ -89,7 +90,10 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         scope: GrantScope::Literal,
         access: GrantAccess::Read,
     });
-    if let Some(client) = client(context.home)? {
+    // mbx is the one compiler cache of a project whose environment resolves it, and it caches
+    // nothing under a preset wrapper (16_build_volumes.md, "One Cargo environment on every path").
+    let mbx = super::mbx::recorded(context.workspace_root)?.is_some();
+    if !mbx && let Some(client) = client(context.home)? {
         contribution.env.insert(
             "RUSTC_WRAPPER",
             EnvAction::Own(client.clone().into_os_string()),

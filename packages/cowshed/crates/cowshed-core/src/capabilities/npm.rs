@@ -16,6 +16,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["package-lock.json", "npm-shrinkwrap.json"],
     contribute,
     reached_from: None,
+    gate: None,
 };
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {

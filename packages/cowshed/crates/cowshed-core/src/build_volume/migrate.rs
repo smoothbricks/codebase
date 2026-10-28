@@ -22,6 +22,8 @@ pub struct FirstTouch<'a> {
     pub checkout: &'a Path,
     pub paths: &'a [BuildStatePath],
     pub fingerprint: String,
+    /// The realpath of the mbx discovery resolved in the checkout's canonical job environment.
+    pub mbx: Option<std::path::PathBuf>,
     /// The capacity the checkout's `.cowshed.toml` asks of its first volume.
     pub capacity: ImageCapacity,
     pub beside: MintedBeside,
@@ -68,6 +70,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         checkout,
         paths,
         fingerprint,
+        mbx,
         capacity,
         beside,
         registration,
@@ -113,7 +116,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         .mount_build_volume(layout, &id)
         .map_err(storage_error)?;
     let previous = BuildVolumeState::read(&mount)?;
-    let (state, _) = previous.with_discovered(paths, fingerprint, &mount)?;
+    let (state, _, _) = previous.with_discovered(paths, &[], mbx, fingerprint, &mount)?;
     let displaced = adopt_preflighted(checkout, &mount, paths, &found)?;
     state.write(&mount)?;
     // Published only after every source directory has become its fixed link.
@@ -158,6 +161,7 @@ fn adopt_preflighted(
         let source_state = BuildVolumeState {
             paths: source_paths,
             fingerprint: None,
+            mbx: None,
         };
         if let Err(busy) = nx::close(checkout, &source_state)
             .map_err(|error| io_error("close Nx state before migration", checkout, error))?

@@ -14,6 +14,7 @@ pub const DETECTOR: Detector = Detector {
     all: &[".codegraph"],
     any: &[],
     reached_from: None,
+    gate: None,
     contribute,
 };
 

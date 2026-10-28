@@ -288,13 +288,16 @@ pub struct CapturedBuildVolume {
     pub creating: BuildVolumeHold,
 }
 
-/// The build-state paths a volume holds, as written at its root ([`STATE_FILE`]), and the
+/// The build-state paths a volume holds, as written at its root ([`STATE_FILE`]), the
 /// fingerprint of the tracked build inputs they were discovered from
-/// (`capabilities::tracked_manifest_fingerprint`): while it matches, nothing is rediscovered.
+/// (`capabilities::tracked_manifest_fingerprint`): while it matches, nothing is rediscovered, and
+/// the realpath of the mbx that discovery resolved in the checkout's canonical job environment,
+/// which turns on the mbx capability (15_capabilities.md, "mbx detection").
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BuildVolumeState {
     pub paths: Vec<BuildStatePath>,
     pub fingerprint: Option<String>,
+    pub mbx: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -304,6 +307,8 @@ struct StateWire {
     paths: Vec<PathWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mbx: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -341,6 +346,7 @@ impl BuildVolumeState {
         Ok(Some(Self {
             paths,
             fingerprint: wire.fingerprint,
+            mbx: wire.mbx,
         }))
     }
 
@@ -357,31 +363,51 @@ impl BuildVolumeState {
                 })
                 .collect(),
             fingerprint: self.fingerprint.clone(),
+            mbx: self.mbx.clone(),
         };
         write_json(&path, &wire).map_err(|error| record_error(&path, &error))
     }
 
-    /// This state with each `discovered` path it does not hold yet added, recorded at
-    /// `fingerprint`, and the paths added. A path already held keeps its volume name: links are
-    /// fixed once made (16_build_volumes.md, "One link per checkout"). A new path that overlaps
-    /// a held one is refused, naming both.
+    /// This state with each `discovered` path it does not hold yet added and each `released` path
+    /// dropped, recorded at `fingerprint` with the `mbx` discovery resolved, and the paths added
+    /// and dropped. A path already held keeps its volume name: links are fixed once made
+    /// (16_build_volumes.md, "One link per checkout"); only a discovery that found the path's owner
+    /// gone off the volume releases it (a Cargo target under mbx). A new path that overlaps a held
+    /// one is refused, naming both.
     pub fn with_discovered(
         &self,
         discovered: &[BuildStatePath],
+        released: &[BuildStatePath],
+        mbx: Option<PathBuf>,
         fingerprint: String,
         volume_root: &Path,
-    ) -> crate::Result<(Self, Vec<BuildStatePath>)> {
+    ) -> crate::Result<(Self, Vec<BuildStatePath>, Vec<BuildStatePath>)> {
+        let is_released = |held: &BuildStatePath| {
+            released
+                .iter()
+                .any(|path| path.checkout.as_path() == held.checkout.as_path())
+        };
+        let dropped: Vec<BuildStatePath> = self
+            .paths
+            .iter()
+            .filter(|held| is_released(held))
+            .cloned()
+            .collect();
+        let mut paths: Vec<BuildStatePath> = self
+            .paths
+            .iter()
+            .filter(|held| !is_released(held))
+            .cloned()
+            .collect();
         let added: Vec<BuildStatePath> = discovered
             .iter()
             .filter(|path| {
-                !self
-                    .paths
+                !paths
                     .iter()
                     .any(|held| held.checkout.as_path() == path.checkout.as_path())
             })
             .cloned()
             .collect();
-        let mut paths = self.paths.clone();
         paths.extend(added.iter().cloned());
         disjoint(&paths)
             .map_err(|(left, right)| overlapping(&volume_root.join(STATE_FILE), left, right))?;
@@ -389,8 +415,10 @@ impl BuildVolumeState {
             Self {
                 paths,
                 fingerprint: Some(fingerprint),
+                mbx,
             },
             added,
+            dropped,
         ))
     }
 
@@ -2046,6 +2074,7 @@ mod tests {
                     .unwrap(),
             ],
             fingerprint: Some("f1".to_owned()),
+            mbx: None,
         };
         assert_eq!(
             state.nx_workspace_data().collect::<Vec<_>>(),
@@ -2079,22 +2108,52 @@ mod tests {
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new("target", "target").unwrap()],
             fingerprint: Some("old".to_owned()),
+            mbx: None,
         };
         let discovered = [
             BuildStatePath::new("target", "elsewhere").unwrap(),
             BuildStatePath::new("tools/x/target", "tools-x-target").unwrap(),
         ];
-        let (next, added) = state
-            .with_discovered(&discovered, "new".to_owned(), Path::new("/v"))
+        let (next, added, dropped) = state
+            .with_discovered(&discovered, &[], None, "new".to_owned(), Path::new("/v"))
             .unwrap();
         assert_eq!(added, [discovered[1].clone()]);
         assert_eq!(next.paths, [state.paths[0].clone(), discovered[1].clone()]);
         assert_eq!(next.fingerprint.as_deref(), Some("new"));
         let inside = [BuildStatePath::new("target/sub", "sub").unwrap()];
         let error = state
-            .with_discovered(&inside, "new".to_owned(), Path::new("/v"))
+            .with_discovered(&inside, &[], None, "new".to_owned(), Path::new("/v"))
             .unwrap_err();
         assert!(error.message.contains("target/sub"), "{error:?}");
+        assert!(dropped.is_empty());
+        assert_eq!(next.mbx, None);
+    }
+
+    /// Once the canonical environment resolves mbx, discovery releases the Cargo target mbx owns:
+    /// the state drops it, names it as dropped, and records the mbx; nothing else moves.
+    #[test]
+    fn a_target_mbx_owns_leaves_the_state_and_the_mbx_is_recorded() {
+        let nx = BuildStatePath::new(".nx/cache", "nx/cache").unwrap();
+        let target = BuildStatePath::new("target", "target").unwrap();
+        let state = BuildVolumeState {
+            paths: vec![nx.clone(), target.clone()],
+            fingerprint: Some("old".to_owned()),
+            mbx: None,
+        };
+        let pin = PathBuf::from("/pinned/mbx-1.28.0/bin/mbx");
+        let (next, added, dropped) = state
+            .with_discovered(
+                std::slice::from_ref(&nx),
+                std::slice::from_ref(&target),
+                Some(pin.clone()),
+                "new".to_owned(),
+                Path::new("/v"),
+            )
+            .unwrap();
+        assert!(added.is_empty());
+        assert_eq!(dropped, [target]);
+        assert_eq!(next.paths, [nx]);
+        assert_eq!(next.mbx, Some(pin));
     }
 
     /// A land interrupted between moving a target's link and its records leaves a link naming a

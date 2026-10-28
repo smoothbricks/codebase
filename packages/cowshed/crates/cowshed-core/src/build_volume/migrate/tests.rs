@@ -297,7 +297,10 @@ fn configured_cargo_target_containing_tracked_source_refuses_before_mint_or_dele
     );
     let discovery = sandbox(&checkout)
         .with_detection_context(&checkout, |context| {
-            crate::capabilities::discover_build_state(context, &mut crate::capabilities::HostCargo)
+            crate::capabilities::discover_build_state(
+                context,
+                &mut crate::capabilities::HostCargo::default(),
+            )
         })
         .unwrap();
     assert!(discovery.findings.is_empty(), "{:?}", discovery.findings);
@@ -313,6 +316,7 @@ fn configured_cargo_target_containing_tracked_source_refuses_before_mint_or_dele
             checkout: &checkout,
             paths: &discovery.paths,
             fingerprint: "fixture".to_owned(),
+            mbx: None,
             capacity: ImageCapacity::from_gibibytes(1),
             beside: MintedBeside::Nothing,
             registration: linked_registration(),
@@ -378,6 +382,7 @@ fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
                 checkout: &checkout,
                 paths: &paths(),
                 fingerprint: "fixture".to_owned(),
+                mbx: None,
                 capacity: ImageCapacity::from_gibibytes(1),
                 beside: MintedBeside::Nothing,
                 registration: linked_registration(),
@@ -403,6 +408,7 @@ fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
                 checkout: &checkout,
                 paths: &paths(),
                 fingerprint: "fixture".to_owned(),
+                mbx: None,
                 capacity: ImageCapacity::from_gibibytes(1),
                 beside: MintedBeside::Nothing,
                 registration: linked_registration(),

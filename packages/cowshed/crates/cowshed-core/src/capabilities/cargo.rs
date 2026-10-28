@@ -34,6 +34,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["Cargo.toml"],
     scope: DetectionScope::Project,
     reached_from: Some(super::ReachedConvention::TrackedManifest("Cargo.toml")),
+    gate: None,
     contribute,
 };
 

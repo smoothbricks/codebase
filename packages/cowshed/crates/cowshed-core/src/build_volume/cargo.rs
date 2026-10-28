@@ -99,6 +99,7 @@ mod tests {
                 BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
             ],
             fingerprint: None,
+            mbx: None,
         }
     }
 

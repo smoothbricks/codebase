@@ -91,6 +91,11 @@ impl std::fmt::Display for BuildStateFinding {
 pub struct BuildStateDiscovery {
     pub paths: Vec<BuildStatePath>,
     pub findings: Vec<BuildStateFinding>,
+    /// The realpath of the `mbx` the canonical job environment resolves, which gives the project
+    /// the mbx capability (15_capabilities.md, "mbx detection").
+    pub mbx: Option<PathBuf>,
+    /// The Cargo target directories mbx owns now, which the build volume holds no longer.
+    pub released: Vec<BuildStatePath>,
 }
 
 impl BuildStateDiscovery {
@@ -132,7 +137,8 @@ impl BuildStateDiscovery {
 /// change. 2: Cargo is asked as a job, after the workspace shell's activation. 3: installed
 /// JavaScript packages contribute their `node_modules/.cache`. 5: Codegraph indexes are build-volume state.
 /// 6: a job that holds no `cargo` is one finding per shell, not one Cargo failure per manifest.
-const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 6";
+/// 7: the job resolves `mbx`, and the canonical activation's input identity keys the answer.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 7";
 
 /// The manifest whose directory, once installed, holds a JavaScript package's tool caches.
 const PACKAGE_MANIFEST: &str = "package.json";
@@ -150,6 +156,14 @@ const PACKAGE_MANIFEST: &str = "package.json";
 pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
     let mut digest = blake3::Hasher::new();
     digest.update(DISCOVERY_REVISION);
+    digest.update(&[0]);
+    // The canonical activation's input identity: a changed devenv pin or resolved mbx build
+    // cannot keep an earlier capability answer (15_capabilities.md, "mbx detection").
+    digest.update(
+        crate::runtime::shell_inherit::recorded_key(workspace)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     digest.update(&[0]);
     let mut tracked = TrackedManifests::default();
     for name in tracked
@@ -253,6 +267,13 @@ pub fn may_name_build_state(workspace: &Path) -> Result<bool> {
 /// Cargo's answer to one query discovery asks of it: its stdout, or why it gave none.
 pub type CargoAnswer = std::result::Result<Vec<u8>, CargoUnanswered>;
 
+/// One batch's answers, in query order, and the `mbx` its job resolved on its PATH.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CargoAnswers {
+    pub answers: Vec<CargoAnswer>,
+    pub mbx: Option<PathBuf>,
+}
+
 /// Why discovery has no answer from Cargo to one query.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CargoUnanswered {
@@ -272,10 +293,11 @@ pub struct CargoQuery {
     pub manifest: PathBuf,
 }
 
-/// Where discovery's Cargo runs. Answers every query of one batch, in order. `Err` is a failure
-/// to run anything at all, which leaves the whole discovery unanswered.
+/// Where discovery's Cargo runs. Answers every query of one batch, in order, with the `mbx` the
+/// job resolved. `Err` is a failure to run anything at all, which leaves the whole discovery
+/// unanswered.
 pub trait CargoRunner {
-    fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>>;
+    fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<CargoAnswers>;
 }
 
 /// Discovery's Cargo runs in the workspace's canonical supervisor and activated shell.
@@ -316,7 +338,7 @@ impl<'a> JobCargo<'a> {
 }
 
 impl CargoRunner for JobCargo<'_> {
-    fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>> {
+    fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<CargoAnswers> {
         let mut selected: BTreeMap<&Path, Option<PathBuf>> = BTreeMap::new();
         let mut shells: BTreeMap<Option<PathBuf>, Vec<usize>> = BTreeMap::new();
         for (index, query) in queries.iter().enumerate() {
@@ -336,6 +358,7 @@ impl CargoRunner for JobCargo<'_> {
             shells.entry(shell).or_default().push(index);
         }
         let mut answers: Vec<Option<CargoAnswer>> = vec![None; queries.len()];
+        let mut mbx = None;
         for (shell, indices) in shells {
             // Detection selects a shell only among the directories of the workspace it inspects.
             let shell = shell.map(|shell| {
@@ -409,14 +432,18 @@ impl CargoRunner for JobCargo<'_> {
                 output
             })?;
             let answered = driver_answers(&output, batch.len(), shell.as_deref());
-            for (index, answer) in indices.into_iter().zip(answered) {
+            mbx = mbx.or(answered.mbx);
+            for (index, answer) in indices.into_iter().zip(answered.answers) {
                 answers[index] = Some(answer);
             }
         }
-        Ok(answers
-            .into_iter()
-            .map(|answer| answer.expect("every query belongs to exactly one shell's batch"))
-            .collect())
+        Ok(CargoAnswers {
+            answers: answers
+                .into_iter()
+                .map(|answer| answer.expect("every query belongs to exactly one shell's batch"))
+                .collect(),
+            mbx,
+        })
     }
 }
 
@@ -475,7 +502,9 @@ pub(super) const DRIVER_PROGRAMS: [&str; 3] = ["cat", "mktemp", "rm"];
 /// path: NixOS keeps only `/bin/sh` and `/usr/bin/env`, so a job whose shell supplies none of
 /// them reaches `bash` and [`DRIVER_PROGRAMS`] through core's bootstrap links
 /// (15_capabilities.md, "Detection inputs"). A job whose PATH holds no `cargo` prints
-/// [`NO_CARGO`] alone, once for its whole batch, and asks nothing.
+/// [`NO_CARGO`] alone, once for its whole batch, and asks nothing. A job that holds one prints
+/// first the `mbx` its PATH resolves, or nothing, NUL-terminated: the canonical environment's mbx
+/// (15_capabilities.md, "mbx detection").
 const DRIVER: &str = r#"set -u
 parallel=$1
 count=$2
@@ -483,6 +512,7 @@ shift 2
 query=("${@:1:count}")
 shift "$count"
 command -v cargo >/dev/null || { printf 'no-cargo\0'; exit 127; }
+printf '%s\0' "$(command -v mbx)"
 work=$(mktemp -d) || exit 70
 trap 'rm -rf -- "$work"' EXIT
 while (($# >= 2)); do
@@ -530,25 +560,32 @@ fn driver_argv(args: &[&str], queries: &[&CargoQuery]) -> Vec<OsString> {
     argv
 }
 
-/// The driver's `count` answers, in query order. A query the driver never answered -- its
-/// shell's activation failed, or the job died -- carries the job's own exit and stderr, which
-/// is where the activation said what went wrong. A driver that found no `cargo` on its job's PATH
-/// answers every query with that, naming `shell`, the batch's checkout-relative workspace shell
-/// directory, if any.
+/// The driver's `count` answers, in query order, and the `mbx` its job resolved. A query the
+/// driver never answered -- its shell's activation failed, or the job died -- carries the job's
+/// own exit and stderr, which is where the activation said what went wrong. A driver that found no
+/// `cargo` on its job's PATH answers every query with that, naming `shell`, the batch's
+/// checkout-relative workspace shell directory, if any.
 fn driver_answers(
     output: &std::process::Output,
     count: usize,
     shell: Option<&Path>,
-) -> Vec<CargoAnswer> {
+) -> CargoAnswers {
     if output.stdout == NO_CARGO {
-        return vec![
-            Err(CargoUnanswered::NoCargo {
-                shell: shell.map(Path::to_owned),
-            });
-            count
-        ];
+        return CargoAnswers {
+            answers: vec![
+                Err(CargoUnanswered::NoCargo {
+                    shell: shell.map(Path::to_owned),
+                });
+                count
+            ],
+            mbx: None,
+        };
     }
     let mut fields = output.stdout.split(|byte| *byte == 0);
+    let mbx = fields
+        .next()
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path)));
     let mut answers: Vec<CargoAnswer> = std::iter::from_fn(|| {
         let status = fields.next()?;
         let stdout = fields.next()?;
@@ -579,20 +616,25 @@ fn driver_answers(
             String::from_utf8_lossy(&output.stderr).trim_end()
         ))));
     }
-    answers
+    CargoAnswers { answers, mbx }
 }
 
 /// Discovery's Cargo run straight on the host, in the test process's environment: the driver
-/// and its framing without a sandbox, for tests about what discovery does with the answers.
+/// and its framing without a sandbox, for tests about what discovery does with the answers. The
+/// test process's own PATH is no project's canonical environment, so the job reports the `mbx`
+/// a test names, none by default, never whatever the host shell happens to hold.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) struct HostCargo;
+#[derive(Default)]
+pub(crate) struct HostCargo {
+    pub(crate) mbx: Option<PathBuf>,
+}
 
 #[cfg(all(test, target_os = "macos"))]
 impl CargoRunner for HostCargo {
-    fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>> {
+    fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<CargoAnswers> {
         use cowshed_os::test_backstop::CommandBackstop as _;
         let Some(first) = queries.first() else {
-            return Ok(Vec::new());
+            return Ok(CargoAnswers::default());
         };
         let argv = driver_argv(args, &queries.iter().collect::<Vec<_>>());
         let output = std::process::Command::new(&argv[0])
@@ -603,7 +645,9 @@ impl CargoRunner for HostCargo {
             .env_remove("CARGO_BUILD_TARGET_DIR")
             .output_bounded()
             .map_err(|error| CowshedError::internal(format!("cannot run bash: {error}")))?;
-        Ok(driver_answers(&output, queries.len(), None))
+        let mut answered = driver_answers(&output, queries.len(), None);
+        answered.mbx = self.mbx.clone();
+        Ok(answered)
     }
 }
 
@@ -618,7 +662,7 @@ pub fn discover_build_state(
     let detected = super::detect_with(context, config.capabilities(), &mut tracked)?;
     let mut result = BuildStateDiscovery {
         paths: detected.contribution.build_state,
-        findings: Vec::new(),
+        ..BuildStateDiscovery::default()
     };
     let caches = javascript_tool_caches(
         context,
@@ -835,7 +879,13 @@ fn discover_cargo_targets(
         &["locate-project", "--workspace", "--message-format", "plain"],
         &queries,
     )?;
-    for (manifest, root) in manifests.into_iter().zip(located) {
+    // The job's PATH is the canonical environment's: the mbx it resolves is the project's, by
+    // realpath, the identity the host's pin is proven against at admission.
+    result.mbx = located
+        .mbx
+        .as_deref()
+        .and_then(|path| fs::canonicalize(path).ok());
+    for (manifest, root) in manifests.into_iter().zip(located.answers) {
         match root {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(root) => {
@@ -896,7 +946,7 @@ fn discover_cargo_targets(
         ],
         &queries,
     )?;
-    for (query, metadata) in queries.iter().zip(metadata) {
+    for (query, metadata) in queries.iter().zip(metadata.answers) {
         let relative_manifest = query
             .manifest
             .strip_prefix(context.workspace_root)
@@ -922,6 +972,9 @@ fn discover_cargo_targets(
             continue;
         };
         match BuildStatePath::from_paths(relative, relative) {
+            // mbx owns the target directory of a project whose environment resolves it
+            // (16_build_volumes.md, "One link per checkout"): the volume releases it.
+            Ok(path) if result.mbx.is_some() => result.released.push(path),
             Ok(path) => merge_build_state(&mut result.paths, vec![path])?,
             Err(error) => result.findings.push(BuildStateFinding::CargoUnavailable {
                 manifest: relative_manifest,
@@ -1241,7 +1294,10 @@ mod driver_tests {
         let only_the_fixture = fixture.root.join("bin").into_os_string();
         let output = run_driver_on(&fixture, &["locate-project"], &queries, only_the_fixture);
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(driver_answers(&output, 1, None), [Ok(b"answered".to_vec())]);
+        assert_eq!(
+            driver_answers(&output, 1, None).answers,
+            [Ok(b"answered".to_vec())]
+        );
         let notes = fs::read_to_string(fixture.root.join("ran")).unwrap();
         let mut ran: Vec<&str> = notes.lines().collect();
         ran.sort_unstable();
@@ -1408,7 +1464,7 @@ mod tests {
     }
 
     fn cargo_paths(fixture: &Fixture) -> BuildStateDiscovery {
-        discover_build_state(&fixture.context(), &mut HostCargo).unwrap()
+        discover_build_state(&fixture.context(), &mut HostCargo::default()).unwrap()
     }
 
     #[test]
@@ -1456,6 +1512,30 @@ mod tests {
             !fixture.root.join("target").exists(),
             "discovery never builds"
         );
+
+        // Once the canonical environment resolves mbx, mbx owns every Cargo target: the volume
+        // releases them, and the realpath of that mbx is the answer.
+        let pin = fixture.root.join("pin/bin/mbx");
+        fs::create_dir_all(pin.parent().unwrap()).unwrap();
+        fs::write(&pin, b"#!/bin/sh\n").unwrap();
+        let state = discover_build_state(
+            &fixture.context(),
+            &mut HostCargo {
+                mbx: Some(pin.clone()),
+            },
+        )
+        .unwrap();
+        assert!(state.findings.is_empty(), "{:?}", state.findings);
+        assert!(state.paths.is_empty(), "{:?}", state.paths);
+        assert_eq!(
+            state.released,
+            [
+                BuildStatePath::new("rust/target", "rust/target").unwrap(),
+                BuildStatePath::new("tooling/helper/build-target", "tooling/helper/build-target")
+                    .unwrap(),
+            ],
+        );
+        assert_eq!(state.mbx, Some(fs::canonicalize(&pin).unwrap()));
     }
 
     #[test]
@@ -1521,7 +1601,7 @@ mod tests {
     struct ShelllessCargo<'a>(&'a Fixture);
 
     impl CargoRunner for ShelllessCargo<'_> {
-        fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>> {
+        fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<CargoAnswers> {
             let bootstrap = self.0.root.join("bin").into_os_string();
             let output = run_driver_on(self.0, args, queries, bootstrap);
             Ok(driver_answers(&output, queries.len(), None))
@@ -1629,9 +1709,39 @@ printf '%s:%s\n' "$index" "$PWD"
                 }
             })
             .collect();
-        assert_eq!(driver_answers(&output, queries.len(), None), expected);
+        assert_eq!(
+            driver_answers(&output, queries.len(), None).answers,
+            expected
+        );
         for index in 0..9 {
             assert!(fixture.root.join(format!("done-{index}")).is_file());
+        }
+    }
+
+    /// The job names the `mbx` its PATH resolves before its first answer, and an empty field when
+    /// it resolves none: the canonical environment's mbx, never the controller's.
+    #[test]
+    fn the_job_names_the_mbx_its_path_resolves_before_its_answers() {
+        use std::os::unix::process::ExitStatusExt as _;
+        for (stdout, mbx) in [
+            (
+                b"/pin/bin/mbx\x000\0answer\0\0".to_vec(),
+                Some(PathBuf::from("/pin/bin/mbx")),
+            ),
+            (b"\x000\0answer\0\0".to_vec(), None),
+        ] {
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            };
+            assert_eq!(
+                driver_answers(&output, 1, None),
+                CargoAnswers {
+                    answers: vec![Ok(b"answer".to_vec())],
+                    mbx
+                }
+            );
         }
     }
 
@@ -1640,11 +1750,11 @@ printf '%s:%s\n' "$index" "$PWD"
         use std::os::unix::process::ExitStatusExt as _;
         let output = std::process::Output {
             status: std::process::ExitStatus::from_raw(1 << 8),
-            stdout: b"0\0/checkout/Cargo.toml\n\0\x00101\0\0error: no workspace\n\0".to_vec(),
+            stdout: b"\x000\0/checkout/Cargo.toml\n\0\x00101\0\0error: no workspace\n\0".to_vec(),
             stderr: b"direnv: error .envrc failed\n".to_vec(),
         };
         assert_eq!(
-            driver_answers(&output, 3, None),
+            driver_answers(&output, 3, None).answers,
             [
                 Ok(b"/checkout/Cargo.toml\n".to_vec()),
                 Err(CargoUnanswered::Failed(
@@ -1674,7 +1784,7 @@ printf '%s:%s\n' "$index" "$PWD"
         let mut discovery = BuildStateDiscovery::default();
         for (manifest, answer) in ["a/Cargo.toml", "b/Cargo.toml"]
             .into_iter()
-            .zip(driver_answers(&output, 2, Some(shell)))
+            .zip(driver_answers(&output, 2, Some(shell)).answers)
         {
             discovery.unanswered(
                 manifest.into(),
@@ -1978,7 +2088,7 @@ printf '%s:%s\n' "$index" "$PWD"
             "[build]\nstate = [\"vendor/upstream\"]\n",
         );
         let refused = |fixture: &Fixture| {
-            discover_build_state(&fixture.context(), &mut HostCargo).unwrap_err()
+            discover_build_state(&fixture.context(), &mut HostCargo::default()).unwrap_err()
         };
         let tracked = refused(&fixture);
         assert_eq!(
@@ -2082,7 +2192,8 @@ printf '%s:%s\n' "$index" "$PWD"
             ".cowshed.toml",
             "[build]\nstate = [\"packages/*/.cache/lmao\", \"packages/a/.cache\"]\n",
         );
-        let overlap = discover_build_state(&fixture.context(), &mut HostCargo).unwrap_err();
+        let overlap =
+            discover_build_state(&fixture.context(), &mut HostCargo::default()).unwrap_err();
         assert_eq!(
             overlap.message,
             ".cowshed.toml [build] state declares packages/a/.cache/lmao inside packages/a/.cache"

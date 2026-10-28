@@ -24,6 +24,7 @@ pub const DETECTOR: Detector = Detector {
     any: &["go.mod", "go.work"],
     scope: DetectionScope::Project,
     reached_from: Some(super::ReachedConvention::TrackedManifest("go.mod")),
+    gate: None,
     contribute,
 };
 

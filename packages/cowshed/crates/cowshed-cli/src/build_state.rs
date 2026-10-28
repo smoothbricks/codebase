@@ -169,6 +169,7 @@ mod tests {
                 BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
             ],
             fingerprint: Some("not part of the lint contract".to_owned()),
+            mbx: None,
         };
         state.write(&volume).unwrap();
         let mut output = Output::new(Vec::new(), Vec::new(), false);

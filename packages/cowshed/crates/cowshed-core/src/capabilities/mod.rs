@@ -55,6 +55,7 @@ pub enum CapabilityId {
     Zig,
     Gradle,
     Nix,
+    Mbx,
     Sccache,
     Codegraph,
 }
@@ -73,6 +74,7 @@ impl CapabilityId {
             Self::Zig => "zig",
             Self::Gradle => "gradle",
             Self::Nix => "nix",
+            Self::Mbx => "mbx",
             Self::Sccache => "sccache",
             Self::Codegraph => "codegraph",
         }
@@ -90,12 +92,13 @@ impl CapabilityId {
             Self::Zig => "capabilities.zig",
             Self::Gradle => "capabilities.gradle",
             Self::Nix => "capabilities.nix",
+            Self::Mbx => "capabilities.mbx",
             Self::Sccache => "capabilities.sccache",
             Self::Codegraph => "capabilities.codegraph",
         }
     }
 
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Direnv,
         Self::Nx,
         Self::Cargo,
@@ -107,6 +110,7 @@ impl CapabilityId {
         Self::Zig,
         Self::Gradle,
         Self::Nix,
+        Self::Mbx,
         Self::Sccache,
         Self::Codegraph,
     ];
@@ -136,6 +140,9 @@ pub struct DetectionContext<'a> {
     /// caller passes [`host_program_directories`]; a detector adds only its own tool's
     /// installation convention (15_capabilities.md, "Bootstrap executables").
     pub program_directories: &'a [PathBuf],
+    /// The provisioned build-cache volume's root (01a_apfs.md, "Dedicated build-cache volume"),
+    /// `None` on a host without one: where the mbx store lives.
+    pub build_cache: Option<&'a Path>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,6 +246,9 @@ pub struct Detector {
     pub contribute: fn(&DetectionContext<'_>) -> Result<CapabilityContribution>,
     /// A convention reached through another project file or a tracked nested manifest.
     pub reached_from: Option<ReachedConvention>,
+    /// A condition beyond the convention files: mbx is active only where the checkout's canonical
+    /// environment resolved it.
+    pub gate: Option<fn(&DetectionContext<'_>) -> Result<bool>>,
 }
 
 impl Detector {
@@ -277,7 +287,9 @@ impl Detector {
             }
             return Ok(None);
         }
-        if self.matches(context.workspace_root, context.project_root, tracked)? {
+        if self.matches(context.workspace_root, context.project_root, tracked)?
+            && self.gate.map_or(Ok(true), |gate| gate(context))?
+        {
             (self.contribute)(context).map(Some)
         } else {
             Ok(None)
@@ -317,7 +329,7 @@ impl Detector {
     }
 }
 
-pub static DETECTORS: [&Detector; 13] = [
+pub static DETECTORS: [&Detector; 14] = [
     &direnv::DETECTOR,
     &nx::DETECTOR,
     &cargo::DETECTOR,
@@ -329,6 +341,7 @@ pub static DETECTORS: [&Detector; 13] = [
     &zig::DETECTOR,
     &gradle::DETECTOR,
     &nix::DETECTOR,
+    &mbx::DETECTOR,
     &sccache::DETECTOR,
     &codegraph::DETECTOR,
 ];
@@ -1110,6 +1123,7 @@ pub mod test_support {
                 runtime_dir: &self.runtime,
                 trust_bundle: None,
                 program_directories: &self.program_directories,
+                build_cache: None,
             }
         }
         pub fn files(&self, files: &[&str]) {
@@ -1175,6 +1189,7 @@ pub fn mint_daemon_states(
 ) -> Result<Vec<PathBuf>> {
     let private = workspace.join(".cowshed");
     let runtime = private.join("run");
+    let build_cache = crate::storage::bootstrap::native::provisioned_build_cache();
     let context = DetectionContext {
         workspace_root: workspace,
         project_root: workspace,
@@ -1185,6 +1200,7 @@ pub fn mint_daemon_states(
         runtime_dir: &runtime,
         trust_bundle: None,
         program_directories,
+        build_cache: build_cache.as_deref(),
     };
     Ok(detect_for_workspace(&context)?
         .contribution
