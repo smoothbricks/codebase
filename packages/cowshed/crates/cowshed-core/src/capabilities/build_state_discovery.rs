@@ -503,8 +503,9 @@ pub(super) const DRIVER_PROGRAMS: [&str; 3] = ["cat", "mktemp", "rm"];
 /// them reaches `bash` and [`DRIVER_PROGRAMS`] through core's bootstrap links
 /// (15_capabilities.md, "Detection inputs"). A job whose PATH holds no `cargo` prints
 /// [`NO_CARGO`] alone, once for its whole batch, and asks nothing. A job that holds one prints
-/// first the `mbx` its PATH resolves, or nothing, NUL-terminated: the canonical environment's mbx
-/// (15_capabilities.md, "mbx detection").
+/// first the `mbx` its PATH resolves when its `cargo` is mbx's Cargo shim (the canonical route,
+/// 11_shell.md, "Canonical mbx environment"), or nothing, NUL-terminated: the shim is a short
+/// script that sets `MBX_CARGO_SHIM_MODE`, so its first bytes say so, and a plain Cargo's never do.
 const DRIVER: &str = r#"set -u
 parallel=$1
 count=$2
@@ -512,7 +513,13 @@ shift 2
 query=("${@:1:count}")
 shift "$count"
 command -v cargo >/dev/null || { printf 'no-cargo\0'; exit 127; }
-printf '%s\0' "$(command -v mbx)"
+cargo=$(command -v cargo)
+head=
+IFS= read -r -N 4096 head <"$cargo" 2>/dev/null || :
+case $head in
+*MBX_CARGO_SHIM_MODE*) printf '%s\0' "$(command -v mbx)" ;;
+*) printf '\0' ;;
+esac
 work=$(mktemp -d) || exit 70
 trap 'rm -rf -- "$work"' EXIT
 while (($# >= 2)); do
@@ -1268,6 +1275,40 @@ mod driver_tests {
                      real=$(PATH=$HOST_PATH command -v {name}) || exit 127\n\
                      exec \"$real\" \"$@\"\n"
                 ),
+            );
+        }
+    }
+
+    /// mbx is the project's only where its shell routes `cargo` through mbx: the Cargo shim
+    /// `mbx setup` produces (11_shell.md, "Canonical mbx environment"). An `mbx` that is merely on
+    /// PATH beside a plain `cargo` names nothing, or plain Cargo would write a real `target/`
+    /// into the source tree once the build volume released it.
+    #[test]
+    fn the_job_names_mbx_only_when_its_cargo_is_mbx_s_shim() {
+        let queries = [CargoQuery {
+            directory: PathBuf::from("/"),
+            manifest: "Cargo.toml".into(),
+        }];
+        for (cargo, named) in [
+            ("#!/bin/sh\necho answered\n", false),
+            (
+                "#!/bin/sh\nMBX_CARGO_SHIM_MODE=1\nexport MBX_CARGO_SHIM_MODE\necho answered\n",
+                true,
+            ),
+        ] {
+            let fixture = Fixture::new();
+            bootstrap_links(&fixture);
+            executable(&fixture, "bin/cargo", cargo);
+            executable(&fixture, "bin/mbx", "#!/bin/sh\nexit 0\n");
+            let only_the_fixture = fixture.root.join("bin").into_os_string();
+            let output = run_driver_on(&fixture, &["locate-project"], &queries, only_the_fixture);
+            assert!(output.status.success(), "{output:?}");
+            let answered = driver_answers(&output, 1, None);
+            assert_eq!(answered.answers, [Ok(b"answered".to_vec())]);
+            assert_eq!(
+                answered.mbx,
+                named.then(|| fixture.root.join("bin/mbx")),
+                "{cargo}"
             );
         }
     }
