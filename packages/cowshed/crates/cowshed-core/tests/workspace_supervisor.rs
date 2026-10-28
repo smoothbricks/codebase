@@ -7020,7 +7020,7 @@ async fn idle_named_handles_and_maintenance_do_not_keep_the_nx_daemon_resident()
     assert_eq!(command.request.job_id, job);
     complete(&command, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
-    tokio::time::sleep(NX_IDLE + NX_PROBES).await;
+    pass_idle(&h, NX_IDLE + NX_PROBES).await;
     let _ = h.handle.list().await.unwrap();
     let _ = h.handle.nx_daemon_keeper().await.unwrap();
     let same = open_named(&h.handle, "build").await;
@@ -7409,6 +7409,22 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
 /// A shed with a live daemon its start job left, and the harness over it. A named session puts
 /// the shed in use for the start and is closed once the daemon is up, so the shed is unused from
 /// then on.
+/// Pass `total` of paused test time as the keeper sees it: in steps of at most one probe interval,
+/// each advanced explicitly and then answered by the keeper. A sleep auto-advances only while no
+/// blocking work is in flight; the keeper probes and stops daemons on the blocking pool, and while
+/// that work runs a paused clock parks in real time until its next timer. Under host load a virtual
+/// interval of minutes became minutes of wall clock that way, and a land gate's 180 s progress
+/// bound expired in it (the stack: the time driver parked in kevent with a timeout).
+async fn pass_idle(h: &Harness, total: Duration) {
+    let mut left = total;
+    while !left.is_zero() {
+        let step = left.min(NX_PROBES);
+        tokio::time::advance(step).await;
+        h.handle.nx_daemon_keeper().await.unwrap();
+        left -= step;
+    }
+}
+
 /// Whether `daemon` still runs once the keeper's probe in flight has answered. The keeper stops a
 /// daemon on the blocking pool, in real time, and paused test time auto-advances while the actor
 /// awaits it, so a virtual sleep alone can end before the stop does: the probe's own answer is the
