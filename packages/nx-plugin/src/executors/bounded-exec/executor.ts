@@ -13,7 +13,7 @@ import {
   processGroupHasMembers,
   signalProcessGroup,
 } from '../../process-group.js';
-
+import { type BoundEvent, type BoundKind, type Bounds, earliestBound, stepBounds, UNARMED } from './bounds.js';
 import {
   CPU_POOL_ENV,
   type CpuPool,
@@ -678,8 +678,9 @@ export async function runBoundedExec(
     const held = lease;
     return { line, volume: held === null ? null : ((await tempVolume?.space(held)) ?? null) };
   };
-  let idleTimer: NodeJS.Timeout | undefined;
-  let fixtureTimer: NodeJS.Timeout | undefined;
+  // Which bound is armed, and when it expires, is bounds.ts's decision; one timer waits for the earliest of them.
+  let bounds: Bounds = UNARMED;
+  let boundTimer: NodeJS.Timeout | undefined;
   // The fixture's own output is compilation, not the command's progress: it is not scanned for finished tests.
   let fixtureDone = fixture === null || lifecycle === null;
   // Whether a segment past the fixture ever announced: without one, the shell's exit is the fixture's.
@@ -690,11 +691,9 @@ export async function runBoundedExec(
     clearTimeout(captureTimer);
     idleCapture?.controller.abort();
   };
-  const scheduleIdle = (limitMs: number): void => {
-    clearTimeout(idleTimer);
-    cancelCapture();
+  const scheduleCapture = (expiresAtMs: number): void => {
     const capture: NonNullable<typeof idleCapture> = {
-      expiresAtMs: Date.now() + limitMs,
+      expiresAtMs,
       controller: new AbortController(),
       result: { kind: 'pending', startedAtMs: null },
     };
@@ -732,28 +731,42 @@ export async function runBoundedExec(
             },
           );
       },
-      Math.max(0, limitMs - HANG_CAPTURE_MS),
+      Math.max(0, expiresAtMs - Date.now() - HANG_CAPTURE_MS),
     );
-    idleTimer = setTimeout(() => expire({ kind: 'idle', limitMs, tests: progress.inFlight() }), limitMs);
   };
-  const armIdleTimer = (): void => {
-    if (idleTimeoutMs === undefined || state.settled || state.expiry !== null || !isTesting()) {
-      return;
+  const expiredAs = (kind: BoundKind): ExpiredBound =>
+    kind === 'idle'
+      ? { kind, limitMs: idleTimeoutMs ?? 0, tests: progress.inFlight() }
+      : kind === 'fixture'
+        ? { kind, limitMs: fixture?.timeoutMs ?? 0 }
+        : { kind, limitMs: timeoutMs ?? 0 };
+  const stepTo = (event: BoundEvent): void => {
+    if (state.settled || state.expiry !== null) return;
+    const idleBefore = bounds.idle;
+    bounds = stepBounds(
+      bounds,
+      {
+        ...(idleTimeoutMs === undefined ? {} : { idleMs: idleTimeoutMs }),
+        ...(fixture === null || lifecycle === null ? {} : { fixtureMs: fixture.timeoutMs }),
+        ...(timeoutMs === undefined ? {} : { totalMs: timeoutMs }),
+      },
+      event,
+    );
+    if (bounds.idle !== idleBefore) {
+      cancelCapture();
+      idleCapture = undefined;
+      if (bounds.idle !== null) scheduleCapture(bounds.idle);
     }
-    scheduleIdle(idleTimeoutMs);
+    clearTimeout(boundTimer);
+    const next = earliestBound(bounds);
+    if (next !== null) boundTimer = setTimeout(() => expire(expiredAs(next.kind)), Math.max(0, next.at - Date.now()));
   };
 
   // Only the CHILD's own output is read for progress. The diagnostics below go
   // through appendStderr as well, and re-arming on those would let a teardown
   // message extend the very bound that just fired.
   const updateIdle = (finished: boolean, wasTesting: boolean): void => {
-    if (!isTesting()) {
-      clearTimeout(idleTimer);
-      cancelCapture();
-      idleCapture = undefined;
-    } else if (finished || !wasTesting) {
-      armIdleTimer();
-    }
+    stepTo({ kind: 'progress', at: Date.now(), testing: isTesting(), wasTesting, finished });
   };
   const scanProgress = (stream: 'stdout' | 'stderr', text: string): void => {
     if (!fixtureDone) return;
@@ -779,7 +792,7 @@ export async function runBoundedExec(
       updateIdle(false, wasTesting);
       if (event.id === 0 && event.phase === 'terminal' && fixture !== null) {
         fixtureDone = true;
-        clearTimeout(fixtureTimer);
+        stepTo({ kind: 'fixture-done' });
       }
       if (event.id > 0) mainStarted = true;
       // Tool startup and native lifecycle-bearing stdout wait for their phase acknowledgement.
@@ -875,9 +888,7 @@ export async function runBoundedExec(
       return;
     }
     state.expiry = bound;
-    clearTimeout(totalTimer);
-    clearTimeout(idleTimer);
-    clearTimeout(fixtureTimer);
+    clearTimeout(boundTimer);
     const elapsedMs = Date.now() - startedAt;
     appendStderr(
       bound.kind === 'idle'
@@ -979,14 +990,9 @@ export async function runBoundedExec(
     }
   };
 
-  const totalTimer =
-    timeoutMs === undefined ? undefined : setTimeout(() => expire({ kind: 'total', limitMs: timeoutMs }), timeoutMs);
   // The fixture's ceiling lives and dies with its segment: the segment's terminal clears it, so it can never
   // fire on a command the fixture already handed over to.
-  if (fixture !== null && lifecycle !== null) {
-    fixtureTimer = setTimeout(() => expire({ kind: 'fixture', limitMs: fixture.timeoutMs }), fixture.timeoutMs);
-  }
-  armIdleTimer();
+  stepTo({ kind: 'spawn', at: Date.now(), testing: isTesting(), fixture: fixture !== null && lifecycle !== null });
 
   // A grant's connection is a ledger entry, not the command's owner: the lending parent's exit ends it, and what runs
   // under it runs on over budget until it finishes. Its close, while the command runs, is said and changes nothing
@@ -1006,9 +1012,7 @@ export async function runBoundedExec(
 
   const { code: exitCode, signal: exitSignal } = await exitPromise;
   await termination;
-  clearTimeout(totalTimer);
-  clearTimeout(idleTimer);
-  clearTimeout(fixtureTimer);
+  clearTimeout(boundTimer);
   cancelCapture();
   removeSignalHandlers();
   // The runner is gone. Its sub-pool closes first, so no descendant still draws on tokens the grant returns;

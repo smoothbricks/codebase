@@ -236,27 +236,49 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   it('runs the fixture outside the progress bound: only its own ceiling ends a silent fixture', async () => {
     const workspace = await createWorkspace();
+    const stdout = process.stdout.write;
+    let output = '';
+    let advanced = false;
+    try {
+      // The fixture says it runs, which the runner hook lets it do only once its build is acknowledged; then it never
+      // exits or speaks again. Only the fake clock moves: past the progress bound (100) nothing may expire, so the
+      // fixture's ceiling (200) ending the run proves the fixture ran outside the progress bound. Which bound is armed
+      // when is bounds.test.ts's table; this is the one real-process check that the executor carries it out.
+      process.stdout.write = (chunk) => {
+        output += chunk.toString();
+        if (!advanced && output.includes('fixture-running\n')) {
+          advanced = true;
+          queueMicrotask(() => {
+            jest.advanceTimersByTime(150);
+            jest.advanceTimersByTime(100);
+          });
+        }
+        return true;
+      };
+      jest.useFakeTimers();
+      const result = await runBoundedExec(
+        {
+          command: "node -e \"console.log('main' + '-ran')\"",
+          fixtureCommand: 'node -e "console.log(\'fixture-running\'); process.stdin.resume()"',
+          fixtureTimeoutMs: 200,
+          idleTimeoutMs: 100,
+          killAfterMs: 0,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+      );
 
-    // The fixture never exits and never speaks, so only a bound can end it. The progress bound is the shorter one: were
-    // it armed during the fixture it would fire first, so the fixture's ceiling firing proves the fixture runs outside it.
-    const result = await runBoundedExec(
-      {
-        command: "node -e \"console.log('main' + '-ran')\"",
-        fixtureCommand: 'node -e "process.stdin.resume()"',
-        fixtureTimeoutMs: 200,
-        idleTimeoutMs: 100,
-        killAfterMs: 0,
-      },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-    );
-
-    expect(result.success).toBe(false);
-    expect(result.terminalOutput).toContain('Fixture command timed out after');
-    expect(result.terminalOutput).toContain('fixtureTimeoutMs=200');
-    expect(result.terminalOutput).not.toContain('Command made no progress');
-    expect(result.terminalOutput).not.toContain('main-ran');
+      expect(advanced, result.terminalOutput).toBe(true);
+      expect(result.success).toBe(false);
+      expect(result.terminalOutput).toContain('Fixture command timed out after');
+      expect(result.terminalOutput).toContain('fixtureTimeoutMs=200');
+      expect(result.terminalOutput).not.toContain('Command made no progress');
+      expect(result.terminalOutput).not.toContain('main-ran');
+    } finally {
+      jest.useRealTimers();
+      process.stdout.write = stdout;
+    }
   });
 
   it('fails the run on a failed fixture and never starts the command', async () => {
