@@ -28,6 +28,18 @@ let
   rustLinker = pkgs.writeShellScript "smoothbricks-rust-linker" ''
     exec ${lib.getExe pkgs.clang} --ld-path=${patchedBintools}/bin/ld.lld "$@"
   '';
+  mbx = inputs.mbx.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  # mbx's Cargo shim as `mbx setup` writes it, never a copy of our own: cowshed routes a checkout's Cargo through
+  # mbx, with its canonical environment (specs/cowshed/11_shell.md, "Canonical mbx environment"), only when the
+  # shell's `cargo` is this shim and its `mbx-target` names the host's pinned mbx. The shim execs mbx, which runs
+  # the toolchain's Cargo from the rest of PATH.
+  mbxCargoShim = pkgs.runCommand "mbx-cargo-shim" {} ''
+    export HOME="$TMPDIR/home"
+    ${mbx}/bin/mbx setup >/dev/null
+    shim="$(dirname "$(find "$HOME" -path '*/mbx/bin/cargo' -print -quit)")"
+    mkdir -p "$out/bin"
+    cp "$shim/cargo" "$shim/mbx-target" "$out/bin/"
+  '';
 in {
   # The SmoothBricks shell contract: PATH, toolchain, compiler-cache policy, and
   # the enterShell prologue/epilogue every repo shares. Managed by `smoo monorepo`.
@@ -101,9 +113,11 @@ in {
       jq # Used in pre-commit hook and generally useful
       alejandra # Nix formatter
     ])
-    # mbx by PATH name only: the binary, no wrapper and no environment of its own
-    # (cowshed's canonical mbx environment is specs/cowshed/11_shell.md's).
-    ++ [inputs.mbx.packages.${pkgs.stdenv.hostPlatform.system}.default]
+    # mbx by PATH name, and on macOS its Cargo shim ahead of the toolchain's `cargo` in the profile, which the
+    # shell's PATH writer puts first. Linux keeps plain Cargo: its CI builds outside cowshed's shared store, and
+    # moving the release builds' target into mbx's managed one is a change of its own.
+    ++ [mbx]
+    ++ lib.optionals pkgs.stdenv.isDarwin [(lib.hiPrio mbxCargoShim)]
     ++ lib.optionals pkgs.stdenv.isDarwin [
       (pkgs.writeShellScriptBin "smoothbricks-macos-linker"
         (builtins.readFile ../../packages/cowshed/scripts/macos-linker.sh))
