@@ -7402,6 +7402,15 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
 /// A shed with a live daemon its start job left, and the harness over it. A named session puts
 /// the shed in use for the start and is closed once the daemon is up, so the shed is unused from
 /// then on.
+/// Whether `daemon` still runs once the keeper's probe in flight has answered. The keeper stops a
+/// daemon on the blocking pool, in real time, and paused test time auto-advances while the actor
+/// awaits it, so a virtual sleep alone can end before the stop does: the probe's own answer is the
+/// signal that it finished.
+async fn running_after_probe(h: &Harness, daemon: &mut LiveDaemon) -> bool {
+    h.handle.nx_daemon_keeper().await.unwrap();
+    daemon.running()
+}
+
 async fn shed_with_live_nx_daemon(name: &str) -> (Harness, LiveDaemon, PathBuf, TempRoot) {
     shed_with_live_nx_daemon_publishing_after(name, Duration::ZERO).await
 }
@@ -7471,7 +7480,10 @@ async fn a_shed_stops_its_idle_nx_daemon_and_starts_another_only_for_a_job() {
     tokio::time::sleep(NX_IDLE - Duration::from_secs(30)).await;
     assert!(daemon.running(), "a daemon is kept for the whole interval");
     tokio::time::sleep(Duration::from_secs(60)).await;
-    assert!(!daemon.running(), "the idle daemon is stopped");
+    assert!(
+        !running_after_probe(&h, &mut daemon).await,
+        "the idle daemon is stopped"
+    );
     assert!(
         tokio::time::timeout(NX_PROBES, h.spawned.recv())
             .await
@@ -7534,7 +7546,10 @@ async fn a_shed_keeps_its_nx_daemon_while_a_job_runs() {
     tokio::time::sleep(NX_IDLE - Duration::from_secs(1)).await;
     assert!(daemon.running(), "the interval starts when the job ends");
     tokio::time::sleep(Duration::from_secs(10)).await;
-    assert!(!daemon.running(), "the daemon stops once the shed is idle");
+    assert!(
+        !running_after_probe(&h, &mut daemon).await,
+        "the daemon stops once the shed is idle"
+    );
 }
 
 /// A job's end starts the interval once the job has concluded, not where its conclusion began:
@@ -7564,7 +7579,10 @@ async fn a_jobs_idle_interval_starts_once_its_end_has_concluded() {
         "the interval starts once the job has concluded"
     );
     tokio::time::sleep(Duration::from_secs(20)).await;
-    assert!(!daemon.running(), "the daemon stops once the shed is idle");
+    assert!(
+        !running_after_probe(&h, &mut daemon).await,
+        "the daemon stops once the shed is idle"
+    );
 }
 
 /// The supervisor's ledger alone says whether a shed is in use (04_sandbox.md, "The Nx daemon
@@ -7590,7 +7608,7 @@ async fn a_shed_s_ledger_alone_says_it_is_in_use_and_its_supervisor_answers_thro
     tokio::time::sleep(Duration::from_secs(60)).await;
     let walked = cowshed_core::build_volume::nx::process_table_walks() - walks;
     assert!(
-        !daemon.running(),
+        !running_after_probe(&h, &mut daemon).await,
         "a client the ledger does not hold keeps no daemon"
     );
     assert_eq!(
@@ -7643,7 +7661,7 @@ async fn a_shed_supervisor_is_idle_only_once_its_nx_daemon_is_gone() {
         "a live daemon is something to come back for"
     );
     tokio::time::sleep(NX_IDLE + Duration::from_secs(60)).await;
-    assert!(!daemon.running());
+    assert!(!running_after_probe(&h, &mut daemon).await);
     assert!(
         h.handle.idle().await.unwrap(),
         "no job, no session and no daemon: nothing is left"
