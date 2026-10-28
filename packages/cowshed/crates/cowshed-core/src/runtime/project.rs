@@ -28790,8 +28790,11 @@ mod port_reservation_tests {
         let allocation = inventory.port_allocation();
         assert_eq!(allocation, PortAllocation::Fixture);
         let staging = root.join("store/.staging");
-        let count = PortBlock::macos_candidates(allocation).count();
-        let held = || PortBlock::macos_candidates(allocation).skip(count / 2);
+        // The fixture partition is shared by every fixture store on the host, and each live one
+        // binds a block of it: the test must not consume half of it, or concurrent fixtures of other
+        // tests (a land gate runs many) exhaust the rest (`no macOS workspace port block remains`).
+        // It holds the blocks a lowest-first allocator tries first, which the grant must skip.
+        let held = || PortBlock::macos_candidates(allocation).take(4);
         let mut used = crate::metadata::ReservedPortBlocks::default();
         for block in held() {
             used.insert(block);
