@@ -430,8 +430,8 @@ and `cowshed-mgr-*` roots without a record or the explicit pid grammar remain un
 `s.sock.lock`. A held socket kernel lease keeps a directory after its recorded creator has died.
 
 The shared test `TempRoot` uses the named single-owner protocol for socket and manager roots and its other private
-fixtures. The runtime write-site audit also covers Git's `cowshed-ignore-rules-*`, detached disk-command
-`cowshed-disk-image-*` stdout/stderr (both caller and detached child are owners), and the cache advisor's
+fixtures. The runtime write-site audit also covers Git's `cowshed-ignore-rules-*`, every disk command's
+`cowshed-disk-output-*` stdout/stderr (both caller and disk child are owners), and the cache advisor's
 `cowshed-advisor-*` (parent and probe child). Existing unmarked test scratch is reported but not guessed dead. Workspace
 runtime `cs-*` **symlinks** retain their existing `point_runtime_link` lifecycle; this directory reaper never follows or
 removes them. Workspace exec temp and sandbox profiles belong to the store's existing workspace and profile reclamation,

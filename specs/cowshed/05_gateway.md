@@ -944,11 +944,13 @@ the handshake bound.
     named as such. Once a child has exited, its piped stdout and stderr are read to their end within the reap bound
     (`OutputPumps`): a pipe still open then is held by a process the child started, and the run fails `TIMEOUT` naming
     the child and the stream. A failed read of either stream is a typed failure, never empty output. In both cases the
-    child, and whatever holds its pipe, is left as it is. Every disk child's run takes both waits
-    (`SystemCommandRunner`). A Linux job's retirement after `cgroup.kill` is the same wait over its cgroup: the
-    empty-membership notification and each signalled member's pidfd within one reap bound, past which it fails `TIMEOUT`
-    naming every member still alive with its pid, image and kernel state (07_api.md, "Complete job accounting and
-    observation reconciliation").
+    child, and whatever holds its pipe, is left as it is. A disk child's run (`SystemCommandRunner`) takes the exit
+    wait, but its output is no pipe: it writes two files, read whole once it has exited, so its output is what it wrote
+    before its exit and a process it started that keeps them open (`fsck_apfs`'s helper did, failing a build volume's
+    storage past the reap bound) holds no end the run waits for; a failed read of either is the same typed failure. A
+    Linux job's retirement after `cgroup.kill` is the same wait over its cgroup: the empty-membership notification and
+    each signalled member's pidfd within one reap bound, past which it fails `TIMEOUT` naming every member still alive
+    with its pid, image and kernel state (07_api.md, "Complete job accounting and observation reconciliation").
     - **A child whose output or CPU is its progress has a silence bound, not a total.** A long-running command that
       shows its work runs under `cowshed-os::deadline::run_by_progress` (`run_to_log` appends both streams to a log,
       `output_by_progress` collects them), its child a member of a source its caller names, which is authoritative for

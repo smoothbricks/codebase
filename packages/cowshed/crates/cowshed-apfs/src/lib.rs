@@ -254,8 +254,8 @@ pub enum CommandRunFailure {
         deadline: Duration,
         failure: Box<cowshed_os::deadline::ReapError>,
     },
-    /// The child ended with `ended`, but its output was not collected: a pipe a process it
-    /// started still held at the reap bound, or a read of it failed.
+    /// The child ended with `ended`, but its output was not collected: reading a file it wrote
+    /// failed.
     Output {
         ended: ProcessStatus,
         failure: Box<cowshed_os::deadline::OutputError>,
@@ -975,7 +975,7 @@ impl SystemCommandRunner {
             ChildInput::Bytes(bytes) => Some(Arc::clone(bytes)),
             ChildInput::Null | ChildInput::Inherited => None,
         };
-        let (mut child, output_files) =
+        let (mut child, output) =
             spawn_disk_child(request, input, total).map_err(|failure| CommandRunError {
                 request: request.clone(),
                 failure,
@@ -986,34 +986,31 @@ impl SystemCommandRunner {
         let mut feed = feed
             .zip(child.stdin.take())
             .map(|(bytes, stdin)| Feed::new(bytes, stdin));
-        // Drain both pipes on dedicated threads while the deadline poll runs, exactly as
-        // `Command::output` drains while it waits: a verbose child (fsck) must never wedge
-        // on a full pipe just because the parent is polling instead of reading. A disk-image
-        // command has no pipes to drain: its output lands in files (spawn_disk_child), so
-        // nothing it writes can wedge on a caller that is no longer there.
-        let pumps = output_files
-            .is_none()
-            .then(|| cowshed_os::deadline::OutputPumps::start(&mut child));
         let pid = child.id();
-        // Once the child has exited its pipes close with it, unless a process it started still
-        // holds one: that is waited for within the reap bound, and named past it.
-        let collect = |pumps: Option<cowshed_os::deadline::OutputPumps>| match &output_files {
-            Some(directory) => {
-                let read = |name: &str| fs::read(directory.join(name)).unwrap_or_default();
-                let output = (read("stdout"), read("stderr"));
-                let _ = fs::remove_dir_all(directory);
-                Ok(output)
-            }
-            None => pumps.map_or_else(
-                || Ok((Vec::new(), Vec::new())),
-                |pumps| {
-                    pumps.join(
-                        DISK_CHILD_ROLE,
+        // A disk child's output is what it wrote before it exited, read whole from its files
+        // (spawn_disk_child): a verbose child (fsck) never wedges on a full pipe, and a process it
+        // started that keeps the descriptors (fsck_apfs's) holds no end this run waits for.
+        let collect = || {
+            let read = |stream, name: &str| {
+                fs::read(output.join(name)).map_err(|source| {
+                    cowshed_os::deadline::OutputError::Read {
+                        op: "collect disk child output",
+                        role: DISK_CHILD_ROLE,
                         pid,
-                        &cowshed_os::deadline::start("collect disk child output", policy.reap),
-                    )
-                },
-            ),
+                        stream,
+                        source,
+                    }
+                })
+            };
+            let collected =
+                read(cowshed_os::deadline::OutputStream::Stdout, "stdout").and_then(|stdout| {
+                    Ok((
+                        stdout,
+                        read(cowshed_os::deadline::OutputStream::Stderr, "stderr")?,
+                    ))
+                });
+            let _ = fs::remove_dir_all(&output);
+            collected
         };
         let started = total.map_or_else(std::time::Instant::now, |deadline| deadline.started);
         let mut warned = 0;
@@ -1029,7 +1026,7 @@ impl SystemCommandRunner {
                     // Closed before the output is collected: a descendant that waits for the end
                     // of its input is not left waiting on this run.
                     let input_failure = feed.take().and_then(Feed::close);
-                    let collected = collect(pumps);
+                    let collected = collect();
                     let ended = ProcessStatus::from(status);
                     if let Some(source) = input_failure {
                         if let Err(failure) = &collected {
@@ -1087,7 +1084,7 @@ impl SystemCommandRunner {
                                 },
                             ) {
                                 Ok(status) => {
-                                    if let Err(failure) = collect(pumps) {
+                                    if let Err(failure) = collect() {
                                         warn_output_failed(request, &failure);
                                     }
                                     CommandRunFailure::Deadline {
@@ -1098,8 +1095,8 @@ impl SystemCommandRunner {
                                 }
                                 Err(failure) => {
                                     // The child is left as it is, named; its exit is collected
-                                    // whenever it comes, and its pumps, dropped here, free what
-                                    // they read and drain on without keeping.
+                                    // whenever it comes, and its output files stay with their
+                                    // recorded owners for the scratch reaper.
                                     cowshed_os::deadline::collect_later(DISK_CHILD_ROLE, child);
                                     CommandRunFailure::Reap {
                                         deadline: policy.deadline,
@@ -1552,7 +1549,7 @@ fn spawn_disk_child(
     request: &CommandRequest,
     input: ChildInput,
     total: Option<CommandDeadline>,
-) -> Result<(std::process::Child, Option<PathBuf>), CommandRunFailure> {
+) -> Result<(std::process::Child, PathBuf), CommandRunFailure> {
     spawn_disk_child_as(request, input, is_disk_image_command(request), total).map_err(|source| {
         match total {
             Some(deadline)
@@ -1692,30 +1689,25 @@ fn spawn_disk_child_as(
     input: ChildInput,
     detached: bool,
     total: Option<CommandDeadline>,
-) -> io::Result<(std::process::Child, Option<PathBuf>)> {
+) -> io::Result<(std::process::Child, PathBuf)> {
     let mut command = Command::new(&request.program);
     command.args(&request.args).stdin(match input {
         ChildInput::Null => std::process::Stdio::null(),
         ChildInput::Inherited => std::process::Stdio::inherit(),
         ChildInput::Bytes(_) => std::process::Stdio::piped(),
     });
-    let output_files = if detached {
-        let directory = std::env::temp_dir().join(format!(
-            "cowshed-disk-image-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        use std::os::unix::fs::DirBuilderExt as _;
-        fs::DirBuilder::new().mode(0o700).create(&directory)?;
-        let stdout = File::create(directory.join("stdout"))?;
-        let stderr = File::create(directory.join("stderr"))?;
-        command.stdout(stdout).stderr(stderr);
-        Some(directory)
-    } else {
-        command
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        None
-    };
+    // Every disk child writes its output to files, never pipes: its output is complete once it
+    // exits, a process it started that inherits the descriptors holds nothing its run waits for,
+    // and a detached disk-image command writes nothing that can wedge on a caller that is gone.
+    let output = std::env::temp_dir().join(format!(
+        "cowshed-disk-output-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new().mode(0o700).create(&output)?;
+    command
+        .stdout(File::create(output.join("stdout"))?)
+        .stderr(File::create(output.join("stderr"))?);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1753,18 +1745,17 @@ fn spawn_disk_child_as(
         }
     }
     let child = command.spawn_locked()?;
-    if let Some(directory) = &output_files
-        && let Err(error) =
-            cowshed_os::scratch::record_owners(directory, &[std::process::id(), child.id()])
+    if let Err(error) =
+        cowshed_os::scratch::record_owners(&output, &[std::process::id(), child.id()])
     {
         // The disk command is already running and must not be interrupted for bookkeeping.
         // Missing ownership is fail-closed: a reaper keeps this output, naming the failure.
         cowshed_os::eprintln!(
             "cowshed: cannot record disk command scratch owner at {}: {error}",
-            directory.display()
+            output.display()
         );
     }
-    Ok((child, output_files))
+    Ok((child, output))
 }
 
 /// Kill exactly the owned child's process group; retain any failure for the caller.
@@ -8273,9 +8264,8 @@ mod tests {
                 "kill -TERM $$; kill -HUP $$; printf done; printf err >&2",
             ],
         );
-        let (mut child, files) =
+        let (mut child, directory) =
             spawn_disk_child_as(&request, ChildInput::Null, true, None).expect("spawn detached");
-        let directory = files.expect("a detached child writes files");
         let status = child.wait_bounded().expect("reap the detached child");
         assert!(status.success(), "{status:?}");
         assert_eq!(fs::read(directory.join("stdout")).unwrap(), b"done");
@@ -8283,9 +8273,8 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
 
         let request = CommandRequest::new("/bin/sh", ["-c", "sleep 5"]);
-        let (mut child, files) =
+        let (mut child, directory) =
             spawn_disk_child_as(&request, ChildInput::Null, true, None).expect("spawn sleeper");
-        let directory = files.expect("the owned protected fixture writes files");
         let pid = child.id() as libc::pid_t;
         fs::remove_dir_all(directory).expect("unlink the exact fixture's open output files");
         // SAFETY: getpgid only reads the child's group; the child is ours, unreaped.
@@ -8317,9 +8306,8 @@ mod tests {
                 "--nocapture",
             ],
         );
-        let (mut child, files) =
+        let (mut child, directory) =
             spawn_disk_child_as(&request, ChildInput::Null, true, None).expect("spawn detached");
-        let directory = files.expect("a detached child writes files");
         let status = child.wait_bounded().expect("reap the detached child");
         let stdout = fs::read_to_string(directory.join("stdout")).unwrap();
         fs::remove_dir_all(directory).unwrap();
@@ -8622,13 +8610,11 @@ mod tests {
         owner.join().expect("the exact fork-lock owner finished");
         let (failure, unexpected_status) = match outcome {
             Err(failure) => (Some(failure), None),
-            Ok((mut child, files)) => {
+            Ok((mut child, directory)) => {
                 let status = child
                     .wait_bounded()
                     .expect("reap any unexpectedly executed owned fixture");
-                if let Some(directory) = files {
-                    fs::remove_dir_all(directory).expect("remove only the owned output files");
-                }
+                fs::remove_dir_all(directory).expect("remove only the owned output files");
                 (None, Some(ProcessStatus::from(status)))
             }
         };
@@ -8740,49 +8726,33 @@ mod tests {
         fs::remove_file(release).expect("remove owned release marker");
     }
 
-    /// A disk child that exits while a process it started keeps its stdout open is not waited for
-    /// past the reap bound: the run answers the child's exit and names the held pipe, where it
-    /// used to park its runner until that process ended.
+    /// A disk child that exits while a process it started keeps its stdout and stderr open answers
+    /// its exit with the output it wrote, at once: the run waits for no end that process holds, as
+    /// it did when fsck_apfs exited 0 and a helper it started kept its stderr pipe past the reap
+    /// bound, failing the build volume's storage.
     #[test]
-    fn a_disk_child_whose_own_child_holds_its_output_fails_naming_the_held_pipe() {
-        let request = CommandRequest::new("/bin/sh", ["-c", "sleep 600 & printf started; exit 0"]);
-        let policy = DeadlinePolicy {
-            deadline: DISK_CHILD_DEADLINE,
-            past_deadline: PastDeadline::Kill,
-            reap: cowshed_os::deadline::Bound::new(
-                cowshed_os::deadline::LatencyClass::Reap,
-                Duration::from_millis(50),
-            ),
-        };
-        let error = SystemCommandRunner::run_unleased(
+    fn a_disk_child_whose_own_child_holds_its_output_answers_with_what_it_wrote() {
+        let request = CommandRequest::new(
+            "/bin/sh",
+            ["-c", "sleep 600 & printf started; printf %s $! >&2; exit 0"],
+        );
+        let output = SystemCommandRunner::run_unleased(
             &request,
             ChildInput::Null,
-            policy,
+            DeadlinePolicy::for_request(&request, DISK_CHILD_DEADLINE),
             None,
             &mut |_| panic!("no deadline warning for a child that exits at once"),
         )
-        .expect_err("sleep keeps the pipes open");
-        let CommandRunFailure::Output { ended, failure } = &error.failure else {
-            panic!("expected the held pipe, got {error}");
-        };
-        let cowshed_os::deadline::OutputError::Held { stream, expired } = failure.as_ref() else {
-            panic!("expected the held pipe, got {error}");
-        };
-        // The disk child led its own group (setsid), which its sleep inherited.
-        let group = libc::pid_t::try_from(expired.peer.pid).expect("a pid");
-        // SAFETY: a negative pid addresses only the group this test's disk child led.
-        assert_eq!(unsafe { libc::kill(-group, libc::SIGKILL) }, 0);
-        assert_eq!(*ended, ProcessStatus::Exit(0));
-        assert_eq!(*stream, cowshed_os::deadline::OutputStream::Stdout);
-        assert_eq!(expired.op, "collect disk child output");
-        assert_eq!(expired.peer.role, "disk child");
-        assert!(expired.elapsed >= policy.reap.within, "{error}");
-        let message = error.to_string();
-        assert!(
-            message.contains("its output was not collected"),
-            "{message}"
-        );
-        assert!(message.contains("stdout is still open"), "{message}");
+        .expect("the child's exit answers the run, whatever its own child still holds");
+        let held: libc::pid_t = String::from_utf8(output.stderr)
+            .expect("the child wrote its sleep's pid")
+            .parse()
+            .expect("a pid");
+        // SAFETY: `held` is the sleep this test's disk child started, alive (it sleeps 600 s), so
+        // the run returned while it still held both descriptors.
+        assert_eq!(unsafe { libc::kill(held, libc::SIGKILL) }, 0);
+        assert_eq!(output.status, ProcessStatus::Exit(0));
+        assert_eq!(output.stdout, b"started");
     }
 
     const DISK_CHILD_INPUT_ROLE: &str = "COWSHED_TEST_DISK_CHILD_INPUT";
