@@ -640,7 +640,9 @@ impl ActorBridge {
         })
     }
 
-    fn coordinator(&self) -> Result<&Coordinator> {
+    /// The embedded coordinator: what reaches a job this bridge started in the background, as the
+    /// API's `worker(..).job(id)` does (integrations.md), for a caller that awaits its end.
+    pub fn coordinator(&self) -> Result<&Coordinator> {
         self.coordinator.as_ref().ok_or_else(|| {
             CowshedError::internal("the CLI controller bridge has already been shut down")
         })
