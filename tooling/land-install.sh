@@ -9,9 +9,10 @@
 # 1. Ask whether the land changed cowshed or a project it depends on (land-install.ts wanted). Nothing else happens
 #    when it did not; when Nx cannot say, the install goes on.
 # 2. Build the release CLI and stage it, as a land turn of its own: 'cowshed land-turn <repo>' queues behind the lands
-#    ahead and holds main still while the build compiles, so no land's fast-forward or build races it. The CLI and the
-#    Nx cache server bundle it installs with are copied to .cache/cowshed-release/<head>/, laid out as a distribution
-#    (<package>/dist/bin/<platform>/cowshed, the server under <package>/node_modules). The debug build every land
+#    ahead and holds main still while the build compiles, so no land's fast-forward or build races it. The CLI, the
+#    Nx cache server bundle it installs with and the mbx flake its setup pins are copied to .cache/cowshed-release/<head>/,
+#    laid out as a distribution (<package>/dist/bin/<platform>/cowshed, <package>/nix/mbx as the npm package ships it,
+#    the server under <package>/node_modules). The debug build every land
 #    replays into dist/bin replaces the release binary there; a stage no later build rewrites keeps the command this
 #    script prints true until three newer stages exist. The turn ends with the stage.
 # 3. With no turn held, ask the staged build's own doctor whether setup would raise an administrator dialog: its host
@@ -62,7 +63,7 @@ gateway_readiness() {
 # Runs under the repository's land turn, so main stands still. Exit 3 means it said why in a status line of its own.
 build_release() {
   stage=$(bun "$here/land-install.ts" stage-dir "$main" "$head")
-  if [ -x "$stage/dist/bin/$platform/cowshed" ] && [ -f "$stage/$server" ]; then
+  if [ -x "$stage/dist/bin/$platform/cowshed" ] && [ -f "$stage/$server" ] && [ -f "$stage/nix/mbx/flake.nix" ]; then
     say "the production build for $head is already staged in $stage"
     return 0
   fi
@@ -85,9 +86,10 @@ build_release() {
   root=$(dirname "$stage")
   mkdir -p "$root"
   rm -rf "$root"/*.partial "$stage"
-  mkdir -p "$stage.partial/dist/bin/$platform" "$stage.partial/$(dirname "$server")"
+  mkdir -p "$stage.partial/dist/bin/$platform" "$stage.partial/$(dirname "$server")" "$stage.partial/nix/mbx"
   cp -p "$built" "$stage.partial/dist/bin/$platform/cowshed"
   cp -p "$bundle" "$stage.partial/$server"
+  cp -p "$main/packages/cowshed/nix/mbx/flake.nix" "$main/packages/cowshed/nix/mbx/flake.lock" "$stage.partial/nix/mbx/"
   mv "$stage.partial" "$stage"
   # Newest first by modification time; stale only ever names full commit ids, so no other entry of the root is touched.
   # shellcheck disable=SC2012

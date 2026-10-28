@@ -531,6 +531,9 @@ function fixture(changed: readonly string[] = [COWSHED_CHANGE]): Install {
     cpSync(join(tooling, file), join(main, 'tooling', file));
   }
   writeFileSync(join(main, '.gitignore'), '.cache\npackages/*/dist\n');
+  mkdirSync(join(main, 'packages/cowshed/nix/mbx'), { recursive: true });
+  writeFileSync(join(main, 'packages/cowshed/nix/mbx/flake.nix'), '{ outputs = _: { }; }\n');
+  writeFileSync(join(main, 'packages/cowshed/nix/mbx/flake.lock'), '{}\n');
   git(main, 'init', '-q', '-b', 'main');
   git(main, 'add', '.');
   git(main, 'commit', '-q', '-m', 'chore: start');
@@ -639,6 +642,8 @@ describe('land-install.sh', () => {
         'utf8',
       ),
     ).toBe('server bundle\n');
+    // And setup finds the mbx flake it pins where a package ships it, above its binary.
+    expect(readFileSync(join(install.stage, 'nix/mbx/flake.nix'), 'utf8')).toBe('{ outputs = _: { }; }\n');
     expect(readdirSync(dirname(install.stage))).toEqual([install.head]);
     // Nx and setup run in main's devenv, whatever environment started the script; the doctor and status reads need none.
     expect(install.log('direnv.log')).toEqual([
@@ -857,6 +862,9 @@ describe('land-install.sh', () => {
     const server = join(install.stage, 'node_modules/@smoothbricks/nx-cache-server/dist/server/nx-cache-server.js');
     mkdirSync(dirname(server), { recursive: true });
     writeFileSync(server, 'staged earlier\n');
+    // A stage is whole only with the mbx flake its setup pins: one staged without it is built again.
+    mkdirSync(join(install.stage, 'nix/mbx'), { recursive: true });
+    writeFileSync(join(install.stage, 'nix/mbx/flake.nix'), 'staged earlier\n');
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
     expect(onlyLine(run.stdout).text).toBe('installed');
