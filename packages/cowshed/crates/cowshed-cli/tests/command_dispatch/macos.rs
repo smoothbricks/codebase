@@ -4432,28 +4432,6 @@ fn write_declared_project(checkout: &Path) {
     fs::write(upstream.join("build/build.ninja"), b"before cowshed\n").unwrap();
 }
 
-/// Run `nx_check` in `workspace` and answer the cache status of each task of that run.
-async fn nx_statuses(
-    service: &mut ActorBridge,
-    workspace: &str,
-    checkout: &Path,
-    nx_check: &str,
-) -> Vec<(String, nx::CacheStatus)> {
-    let spawned = SystemTime::now();
-    sh(service, workspace, nx_check).await;
-    let exited = SystemTime::now();
-    match nx::attribute(&checkout.join(".nx/cache"), nx_check, spawned, exited) {
-        nx::Attribution::Ours(run) => run
-            .tasks
-            .into_iter()
-            .map(|task| (task.task_id, task.cache))
-            .collect(),
-        nx::Attribution::Unattributed(reason) => {
-            panic!("{workspace}'s Nx run left no summary of its own: {reason:?}")
-        }
-    }
-}
-
 /// What main runs after a land reaches its seed, then a fork of a keeper-held workspace, on one
 /// served build-nx project: the scenarios share their setup (08_testing.md, "Host limit"). The
 /// reseed runs first: it asserts main keeps exactly one seed and that the land reclaimed the volume
@@ -4468,50 +4446,49 @@ async fn directory_main_reseeds_after_a_land_then_a_keeper_held_fork_substrate_l
     });
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
-    what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(&fixture, &mut service, &node)
-        .await;
-    a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(&mut fixture, service, &node).await;
+    what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(&fixture, &mut service).await;
+    a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(&mut fixture, service).await;
+}
+
+/// A command that leaves `name` as an entry of the workspace's Nx cache, on its build volume: what
+/// a land, main or a source shed has produced, for the volume a fork gets to show or lack. Cowshed's
+/// contract is which volume holds the entry; running Nx itself to produce one re-tests Nx.
+fn cache_entry(name: &str) -> String {
+    format!("mkdir -p .nx/cache && printf '%s\\n' {name} > .nx/cache/{name}")
+}
+
+/// The entry `cache_entry(name)` left in `checkout`'s Nx cache, or none.
+fn cached(checkout: &Path, name: &str) -> Option<Vec<u8>> {
+    fs::read(checkout.join(".nx/cache").join(name)).ok()
 }
 /// The retiring land first proves ownership, frozen-seed identity and tree, immediate reclamation
 /// of the old volume, its new label and the exact linked mounts (16_build_volumes.md, steps 5–7).
 /// What main runs after a land reaches main's seed (16_build_volumes.md, "Targets and seeds"):
 /// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
 /// volume at the same tree, is behind; doctor says so, and the next `fork` reseeds main
-/// from its volume before it clones the seed and hits main's run. No command does it by hand.
+/// from its volume before it clones the seed, so the fork holds main's work. No command does it by hand.
 /// A keeper-held workspace takes the separate busy-skip path:
 /// [`a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed`], which follows it on its project.
 async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
     fixture: &Fixture,
     service: &mut ActorBridge,
-    node: &Path,
 ) {
     let layout = build_volumes(fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
-    let nx_check = nx_run_many(node, "build test");
     let main = fixture.checkout.clone();
-
     let topic = new_workspace(service, "topic").await;
     fs::write(topic.join("a/src.txt"), b"src, landed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "land a"]);
     let landing = linked_volume(&layout, &topic);
     assert_ne!(landing, previous);
     let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
-    let report = land(service, "topic", true, &[&nx_check]).await;
+    let report = land(service, "topic", true, &[&cache_entry("landed")]).await;
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
     assert!(report.retired, "{report:?}");
     assert!(
         matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
         "{report:?}"
     );
-    match &report.build_volume.adoption {
-        Adoption::Adopted { check, .. } => {
-            assert_eq!(check.hits, 2, "a:build and a:test hit in main: {report:?}");
-            assert_eq!(check.misses, [], "{report:?}");
-            assert_eq!(check.failed, [], "{report:?}");
-            assert_eq!(check.unattributed, [], "{report:?}");
-        }
-        Adoption::Skipped { reason } => panic!("the adoption was skipped: {reason:?}"),
-    }
     assert_eq!(linked_volume(&layout, &fixture.checkout), landing);
     assert_eq!(
         layout.read_record(&landing).expect("adopted record").role,
@@ -4547,31 +4524,23 @@ async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
     );
 
     assert_eq!(
-        fs::read(main.join("a/generated.txt"))
-            .expect("the landed Nx output is available without running a check"),
-        b"generated\n"
+        cached(&main, "landed").as_deref(),
+        Some(&b"landed\n"[..]),
+        "main adopted the landing volume, with what the land's check left on it"
     );
     let warm = new_workspace(service, "warm").await;
-    let restored = nx_statuses(service, "warm", &warm, &nx_check).await;
-    assert_eq!(restored.len(), 2, "{restored:?}");
-    assert!(
-        restored
-            .iter()
-            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
-        "a fork immediately consumes the restored outputs and adopted cache: {restored:?}"
+    assert_eq!(
+        cached(&warm, "landed").as_deref(),
+        Some(&b"landed\n"[..]),
+        "a fork clones the seed frozen from the adopted volume"
     );
 
     let [(landed_seed, _)] = seeds_of_main(&layout).try_into().expect("one seed of main");
 
-    // Main's own work on the adopted volume, after the seed was frozen: a miss in main.
+    // Main's own work on the adopted volume, after the seed was frozen: an admitted job writes it.
     fs::write(main.join("a/src.txt"), b"src, changed in main\n").unwrap();
     git(&main, &["commit", "-q", "-am", "change a in main"]);
-    let ran = nx_statuses(service, "main", &main, &nx_check).await;
-    assert!(
-        ran.iter()
-            .all(|(_, status)| *status == nx::CacheStatus::Miss),
-        "main runs a:build and a:test itself: {ran:?}"
-    );
+    sh(service, "main", &cache_entry("main")).await;
 
     // Doctor exits 5 on any error finding the scratch host has; only its report matters here.
     let (_, stdout, _) = run(service, ["--json", "doctor"]).await;
@@ -4599,24 +4568,21 @@ async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
         Some(landed_tree.as_str()),
         "the seed records the tree its volume was adopted at"
     );
-    let hits = nx_statuses(service, "reseeded", &w1, &nx_check).await;
-    assert_eq!(hits.len(), 2, "{hits:?}");
-    assert!(
-        hits.iter()
-            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
-        "a fork hits what main ran after the land: {hits:?}"
+    assert_eq!(
+        cached(&w1, "main").as_deref(),
+        Some(&b"main\n"[..]),
+        "a fork after main's work holds it: the fork reseeded main from its volume"
     );
 }
 
 /// A foreground keeper holds `w1`'s volume, so `cowshed fork` cannot refresh its seed.
-/// It keeps the existing seed without waiting or bypassing the hold; `w2` therefore runs
-/// both tasks again. The no-keeper main case above retains the warm-fork `LocalHit` oracle.
+/// It keeps the existing seed without waiting or bypassing the hold; `w2` therefore lacks
+/// what w1 wrote after it. The no-keeper main case above shows a fork that holds the newer work.
 /// Before either fork, doctor diagnoses main's displaced workspace-data link and an exec restores
 /// it, so the forks never inherit a real directory in place of the build-volume link.
 async fn a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(
     fixture: &mut Fixture,
     mut service: ActorBridge,
-    node: &Path,
 ) {
     let layout = build_volumes(fixture);
     assert_eq!(build_link_findings(&mut service).await, [""; 0]);
@@ -4643,17 +4609,11 @@ async fn a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(
     assert_eq!(relinked.expect("the exec's refresh relinked it"), link);
     assert_eq!(after, [""; 0]);
 
-    let nx_check = nx_run_many(node, "build test");
-
     let w1 = new_workspace(&mut service, "w1").await;
     fs::write(w1.join("a/src.txt"), b"src, changed in w1\n").unwrap();
     git(&w1, &["commit", "-q", "-am", "change a in w1"]);
-    let ran = nx_statuses(&mut service, "w1", &w1, &nx_check).await;
-    assert!(
-        ran.iter()
-            .all(|(_, status)| *status == nx::CacheStatus::Miss),
-        "w1 runs a:build and a:test itself: {ran:?}"
-    );
+    // w1's own work on its volume, by an admitted job, which also starts its keeper's daemon.
+    sh(&mut service, "w1", &cache_entry("w1")).await;
 
     // A supervisor's own start is no use (04_sandbox.md, the kept daemon): w1's keeper starts its
     // daemon at the run's admission, alongside it, so the record may follow the run's end.
@@ -4678,13 +4638,15 @@ async fn a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(
         .await
         .expect("w2 is mounted")
         .mount;
-    let hits = nx_statuses(&mut service, "w2", &w2, &nx_check).await;
+    let forked = cached(&w2, "w1");
+    // w2's own job: a shed's keeper starts its daemon only once the shed is in use (04_sandbox.md).
+    sh(&mut service, "w2", "true").await;
     // Each shed's keeper keeps an Nx daemon with its plugin workers. The runtime's shutdown
     // retires the supervisors it serves, and a supervisor retires only once its keeper's daemon
     // stopped (04_sandbox.md): shutdown returns after that stop saw the daemon exit, and the
     // daemon's plugin workers follow it out.
-    // As for w1, w2's keeper starts its daemon at the run's admission, so the record may follow the
-    // run's end.
+    // As for w1, w2's keeper starts its daemon at the job's admission, so the record may follow the
+    // job's end.
     until_daemon_recorded(&w2).await;
     let kept = recorded_daemon(&w2).expect("w2's run left its kept daemon recorded");
     assert!(
@@ -4708,11 +4670,9 @@ async fn a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(
     }
     await_exits(&workers);
     fixture.stop_gateway().await;
-    assert_eq!(hits.len(), 2, "{hits:?}");
-    assert!(
-        hits.iter()
-            .all(|(_, status)| *status == nx::CacheStatus::Miss),
-        "a keeper-held fork keeps the older seed and runs both tasks again: {hits:?}"
+    assert_eq!(
+        forked, None,
+        "a keeper-held fork keeps the older seed: w1's own work is not on w2's volume"
     );
 }
 
