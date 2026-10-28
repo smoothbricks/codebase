@@ -1518,15 +1518,22 @@ The existing root LaunchDaemon script (`dev.cowshed.storage`, `mount-volumes.sh`
 UUID, as one more entry of the same per-UUID loop that mounts the store; no second daemon, script or keychain scheme
 exists for it. A volume that already exists at the canonical mountpoint under another label (an existing prototype
 volume is one) is **adopted by its UUID**: setup takes the UUID the kernel snapshot reports for the volume mounted
-there, attests it under the label it has, relabels it `cowshed.build-cache` inside the same authorization session,
-remounts it `nobrowse` if it is browsable, encrypts it in place if it is unencrypted, pins and boot-mounts it by that
-UUID, and never deletes it; labels are mutable and identity is the UUID, here as for the store, and after the relabel
-every later run finds the volume by its label as it finds the store. A second volume already labelled
-`cowshed.build-cache` beside such a prototype is refused, naming both, rather than one of them chosen. An existing
-volume is never deleted by setup, and `--uninstall` removes its pin and keychain items with the store's, never the
-volume. The `shared` parent is one of the fixed mount prefix's owned directories, provisioned and attested with the
-workspace mount root (01c_macos.md, "`/private/var/folders` is root-owned and swept"), and the volume's own provisioning
-attests it first, so a host whose store does not exist yet still gets the parent before the mountpoint.
+there, attests it under the label it has, names it `cowshed.build-cache` inside the same authorization session, remounts
+it `nobrowse` if it is browsable, encrypts it in place if it is unencrypted, pins and boot-mounts it by that UUID, and
+never deletes it; labels are mutable and identity is the UUID, here as for the store, and after the relabel every later
+run finds the volume by its label as it finds the store. A second volume already labelled `cowshed.build-cache` beside
+such a prototype is refused, naming both, rather than one of them chosen. An existing volume is never deleted by setup,
+and `--uninstall` removes its pin and keychain items with the store's, never the volume. The name is set as every
+volume's is, through the volume's mount root held open and never by Disk Arbitration (Ownership, identity, and the
+volume label, above): the volume is root-mounted, and only root may name it (as its owner, `fsetattrlist(ATTR_VOL_NAME)`
+on the held root returns `EACCES`, measured 2026-10-28), so the session runs the invoking cowshed as root for that one
+step, `cowshed __name-volume <device> <mount-point> <name>`. That hidden verb is answered first in `main`, before any
+runtime starts, holds the mountpoint, names nothing unless the held directory is the attested device's mount root
+(`cowshed_apfs::name_host_volume`), and names that root's descriptor. Every privileged session refuses a
+`diskutil rename` before it runs, a recording one included, so no plan cell can pass over a step the runner refuses. The
+`shared` parent is one of the fixed mount prefix's owned directories, provisioned and attested with the workspace mount
+root (01c_macos.md, "`/private/var/folders` is root-owned and swept"), and the volume's own provisioning attests it
+first, so a host whose store does not exist yet still gets the parent before the mountpoint.
 
 Its mountpoint is a plain directory on Data until the volume mounts, so the store's masking guard applies with one
 addition and one narrowing: the marker at the volume root distinguishes the mounted volume from the bare directory, and
@@ -1550,11 +1557,12 @@ the store's planning reads, so the two volumes' verdicts cannot observe differen
 `an_unencrypted_build_cache_is_encrypted_in_place`, `a_masked_build_cache_mountpoint_refuses_setup_naming_it`,
 `a_foreign_shared_parent_refuses_the_plan`, `foreign_entries_on_a_bare_build_cache_mountpoint_are_never_reclaimed`,
 `only_setup_and_doctor_read_the_build_cache_volume`), the provisioning session's
-`an_adopted_prototype_is_attested_under_its_label_then_relabelled_in_the_session` and
-`the_build_cache_volume_is_created_case_sensitive`, and the doctor goldens
-`the_build_cache_volume_reports_the_store_findings_at_its_mountpoint` (`cowshed-cli/src/runtime.rs`). A test that must
-exist: a real-APFS boot-mount cell proving the installed script mounts a throwaway second volume by UUID at its
-canonical path under a user-owned parent (08_testing.md); the store has no such cell either.
+`an_adopted_prototype_is_attested_under_its_label_then_named_through_its_held_root_in_the_session`,
+`every_privileged_session_refuses_a_disk_arbitration_rename_before_it_runs`, `cowshed-apfs`'s
+`a_host_volume_is_named_only_through_its_own_mount_root` and `the_build_cache_volume_is_created_case_sensitive`, and the
+doctor goldens `the_build_cache_volume_reports_the_store_findings_at_its_mountpoint` (`cowshed-cli/src/runtime.rs`). A
+test that must exist: a real-APFS boot-mount cell proving the installed script mounts a throwaway second volume by UUID
+at its canonical path under a user-owned parent (08_testing.md); the store has no such cell either.
 
 ## Retired mountpoint debris
 

@@ -2014,6 +2014,109 @@ impl OwnedVolumeRoot {
     }
 }
 
+/// Why [`name_host_volume`] named nothing.
+#[derive(Debug)]
+pub enum HostVolumeNameError {
+    /// The mountpoint could not be held open as a directory.
+    Hold {
+        mount_point: PathBuf,
+        source: io::Error,
+    },
+    /// What is held there is not the mount root of the device named: another volume, a directory
+    /// inside one, or the bare mountpoint of the volume beneath.
+    NotItsRoot {
+        mount_point: PathBuf,
+        volume_device: String,
+        found: String,
+        is_root: bool,
+    },
+    /// The kernel refused the name through the held root (a caller without the right to name a
+    /// root-mounted volume gets `EACCES`).
+    Refused {
+        mount_point: PathBuf,
+        volume_device: String,
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for HostVolumeNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hold {
+                mount_point,
+                source,
+            } => write!(
+                f,
+                "could not hold {} open to name its volume: {source}",
+                mount_point.display()
+            ),
+            Self::NotItsRoot {
+                mount_point,
+                volume_device,
+                found,
+                is_root,
+            } => write!(
+                f,
+                "{} is not the mount root of {volume_device}: it lies on {found}{}; nothing was named",
+                mount_point.display(),
+                if *is_root { "" } else { ", below its root" }
+            ),
+            Self::Refused {
+                mount_point,
+                volume_device,
+                source,
+            } => write!(
+                f,
+                "the kernel refused to name {volume_device} through its mount root {}: {source}",
+                mount_point.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HostVolumeNameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Hold { source, .. } | Self::Refused { source, .. } => Some(source),
+            Self::NotItsRoot { .. } => None,
+        }
+    }
+}
+
+/// Name the host volume `volume_device` (`disk3s9`) through its mount root at `mount_point`,
+/// held open: the one way a volume that is not a store image is named, for the build-cache volume
+/// setup adopts under another label (01a_apfs.md, "Dedicated build-cache volume"). The held
+/// descriptor must be that device's mount root, and the name is set on it
+/// (`fsetattrlist`, `ATTR_VOL_NAME`), so a volume unmounted since fails the call rather than
+/// naming the volume beneath ([`OwnedVolumeRoot`] states why no path or Disk Arbitration rename
+/// may). A root-mounted volume is named only by root, which is why setup runs this inside its
+/// authorization session.
+pub fn name_host_volume(
+    mount_point: &Path,
+    volume_device: &str,
+    volume_name: &str,
+) -> Result<(), HostVolumeNameError> {
+    let held = mounts::hold_mount(mount_point).map_err(|source| HostVolumeNameError::Hold {
+        mount_point: mount_point.to_owned(),
+        source,
+    })?;
+    let expected = device_path(volume_device);
+    if !held.is_root() || expected.as_deref() != Some(held.source_device()) {
+        return Err(HostVolumeNameError::NotItsRoot {
+            mount_point: mount_point.to_owned(),
+            volume_device: volume_device.to_owned(),
+            found: held.source_device().to_owned(),
+            is_root: held.is_root(),
+        });
+    }
+    held.set_volume_name(volume_name)
+        .map_err(|source| HostVolumeNameError::Refused {
+            mount_point: mount_point.to_owned(),
+            volume_device: volume_device.to_owned(),
+            source,
+        })
+}
+
 /// The authority that names retained inputs: a validated explicit re-adoption record. The
 /// workspace layer implements it for its record; this layer only asks whether a path is named.
 pub trait RetainedInputs {
@@ -7326,6 +7429,31 @@ mod tests {
     /// a volume with production's `[cowshed]`.
     fn test_namespace() -> HostNamespace {
         HostNamespace::Test(TestNamespace::mint().expect("a test namespace"))
+    }
+
+    /// Nothing is named unless the held directory is the named device's mount root: a directory
+    /// below a volume's root names nothing, nor does the root of another device. Both refuse
+    /// before the kernel is asked, so neither touches the volume they lie on.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_host_volume_is_named_only_through_its_own_mount_root() {
+        let below =
+            std::env::temp_dir().join(format!("cowshed-name-volume-{}", std::process::id()));
+        fs::create_dir_all(&below).expect("a directory below its volume's root");
+        let error = name_host_volume(&below, "disk3s9", "cowshed-test").unwrap_err();
+        let _ = fs::remove_dir(&below);
+        assert!(
+            matches!(
+                error,
+                HostVolumeNameError::NotItsRoot { is_root: false, .. }
+            ),
+            "{error}"
+        );
+        let error = name_host_volume(Path::new("/"), "disk999s9", "cowshed-test").unwrap_err();
+        assert!(
+            matches!(error, HostVolumeNameError::NotItsRoot { is_root: true, ref found, .. } if found != "/dev/disk999s9"),
+            "{error}"
+        );
     }
 
     /// A runner whose disk tools lease as a test namespace of the test's own.

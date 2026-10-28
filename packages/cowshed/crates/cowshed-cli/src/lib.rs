@@ -36,6 +36,7 @@ pub mod setup_service;
 pub mod skill;
 mod subtree;
 pub mod tree_holders;
+pub mod volume_name;
 pub mod workspace_supervisor;
 
 #[cfg(test)]

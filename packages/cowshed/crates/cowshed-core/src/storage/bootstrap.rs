@@ -41,6 +41,12 @@ pub const RETIRED_CACHES_MOUNTPOINT: &str = "/private/cowshed/caches";
 pub const APFS_BUILD_CACHE_VOLUME: &str = "cowshed.build-cache";
 #[cfg(target_os = "macos")]
 pub use crate::storage::host_config::BUILD_CACHE_MOUNTPOINT;
+/// The hidden verb setup runs the invoking cowshed as, as root inside its one authorization
+/// session, to name an adopted volume through its held mount root:
+/// `cowshed __name-volume <device> <mount-point> <name>` (01a_apfs.md, "Dedicated build-cache
+/// volume"). Disk Arbitration's rename is refused for every caller, and a root-mounted volume is
+/// named only by root.
+pub const VOLUME_NAME_VERB: &str = "__name-volume";
 /// Where launchd reads the storage mount service from; owned here so the CLI's doctor names the
 /// same file the macOS planner installs.
 pub const MOUNT_SERVICE_PLIST: &str = "/Library/LaunchDaemons/dev.cowshed.storage.plist";
@@ -1425,20 +1431,23 @@ impl ValidatedHostStorage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostCommand {
-    program: &'static str,
+    program: std::borrow::Cow<'static, str>,
     args: Vec<String>,
 }
 
 impl HostCommand {
-    fn new(program: &'static str, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    fn new(
+        program: impl Into<std::borrow::Cow<'static, str>>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Self {
-            program,
+            program: program.into(),
             args: args.into_iter().map(Into::into).collect(),
         }
     }
 
     pub fn program(&self) -> &str {
-        self.program
+        &self.program
     }
 
     pub fn args(&self) -> &[String] {

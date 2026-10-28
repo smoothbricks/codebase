@@ -7,6 +7,11 @@ use cowshed_cli::run::{Ending, prepare, run_interruptible};
 const INTERRUPTED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 fn main() {
+    // Setup runs this binary as root for one thing, naming the volume it adopts: answered before
+    // anything else, so the root process starts nothing (`volume_name`).
+    if let Some(code) = cowshed_cli::volume_name::dispatch() {
+        std::process::exit(code);
+    }
     // The gateway host launchd runs (05_gateway.md "The gateway host") does nothing but run its
     // child, so it runs before anything else: one thread, no warm-host registration.
     let mut host = std::env::args_os().skip(1);

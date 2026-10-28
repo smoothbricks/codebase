@@ -3118,6 +3118,9 @@ trait ApfsProvisionIo {
         require_nobrowse: bool,
     ) -> Result<(), HostError>;
     fn attest_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<(), HostError>;
+    /// This cowshed, which setup runs as root to name an adopted volume
+    /// ([`crate::storage::bootstrap::VOLUME_NAME_VERB`]).
+    fn cowshed_executable(&self) -> Result<PathBuf, HostError>;
     fn write_marker(&self, path: &Path, contents: &[u8]) -> Result<(), HostError>;
     /// The global kernel APFS inventory the create recheck refuses reserved names against.
     fn apfs_inventory(&self) -> Result<ApfsInventory, NativeBootstrapError>;
@@ -3183,6 +3186,12 @@ impl ApfsProvisionIo for SystemApfsProvisionIo {
             )));
         }
         Ok(())
+    }
+
+    fn cowshed_executable(&self) -> Result<PathBuf, HostError> {
+        std::env::current_exe()
+            .and_then(fs::canonicalize)
+            .map_err(|source| host_io_error("locate this cowshed", Path::new("cowshed"), source))
     }
 
     fn write_marker(&self, path: &Path, contents: &[u8]) -> Result<(), HostError> {
@@ -3330,11 +3339,19 @@ where
                     label,
                     volume.mountpoint(),
                 )?;
-                let rename = HostCommand::new(
-                    DISKUTIL,
-                    ["rename", exact_identifier.as_str(), volume.name()],
+                // Named through its mount root held open, by this cowshed run as root: a
+                // root-mounted volume is named only by root, and Disk Arbitration's rename, which
+                // names through a path it resolves later, is refused for every caller.
+                let name = HostCommand::new(
+                    path_argument(&io.cowshed_executable()?)?,
+                    [
+                        crate::storage::bootstrap::VOLUME_NAME_VERB.to_owned(),
+                        exact_identifier.clone(),
+                        path_argument(volume.mountpoint())?,
+                        volume.name().to_owned(),
+                    ],
                 );
-                run_privileged_command(session, &rename)?;
+                run_privileged_command(session, &name)?;
                 if *remount {
                     let unmount =
                         HostCommand::new(DISKUTIL, ["unmount", exact_identifier.as_str()]);
@@ -3536,6 +3553,9 @@ fn run_privileged_command(
     session: &mut impl PrivilegedCommandSession,
     command: &HostCommand,
 ) -> Result<HostCommandOutput, HostError> {
+    // The runner's own refusal (`disk_lease::leased`) meets only the authorized session, so a
+    // recording session would run a rename the host never can: every session refuses it here.
+    cowshed_apfs::disk_lease::refuse_volume_rename(Path::new(command.program()), command.args())?;
     let output = session.execute(command)?;
     if !output.succeeded() {
         return Err(HostError::new(
@@ -5377,8 +5397,32 @@ mod tests {
             .collect()
     }
 
+    /// The runner refuses every Disk Arbitration rename before it spawns (01a_apfs.md, "Ownership,
+    /// identity, and the volume label"), so a plan that issues one fails on the host whatever its
+    /// session. A recording session refuses it the same way, or a plan cell passes over a step the
+    /// host can never run.
     #[test]
-    fn an_adopted_prototype_is_attested_under_its_label_then_relabelled_in_the_session() {
+    fn every_privileged_session_refuses_a_disk_arbitration_rename_before_it_runs() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut session = FakePrivilegedSession {
+            events: Rc::clone(&events),
+            outputs: VecDeque::from([Ok(HostCommandOutput::default())]),
+        };
+        let rename = HostCommand::new(DISKUTIL, ["rename", "disk3s11", APFS_BUILD_CACHE_VOLUME]);
+        let error = run_privileged_command(&mut session, &rename).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a volume is named only through its held, owned mount root"),
+            "{error}"
+        );
+        drop(session);
+        assert_eq!(*events.borrow(), vec![ProvisionEvent::Free]);
+    }
+
+    #[test]
+    fn an_adopted_prototype_is_attested_under_its_label_then_named_through_its_held_root_in_the_session()
+     {
         let info = |name: &str| {
             HostCommandOutput::success(provision_info(
                 "disk3s11",
@@ -5408,9 +5452,15 @@ mod tests {
                 KernelRead::Forbidden,
             );
             let info = vec![DISKUTIL, "info", "-plist", "disk3s11"];
-            let rename = vec![DISKUTIL, "rename", "disk3s11", APFS_BUILD_CACHE_VOLUME];
+            let name = vec![
+                FAKE_COWSHED,
+                crate::storage::bootstrap::VOLUME_NAME_VERB,
+                "disk3s11",
+                BUILD_CACHE_MOUNTPOINT,
+                APFS_BUILD_CACHE_VOLUME,
+            ];
             let chown = vec![CHOWN, "501:20", BUILD_CACHE_MOUNTPOINT];
-            let mut expected = vec![info.clone(), rename];
+            let mut expected = vec![info.clone(), name];
             if remount {
                 expected.push(vec![DISKUTIL, "unmount", "disk3s11"]);
                 expected.push(vec![
@@ -6380,6 +6430,9 @@ mod tests {
         Free,
     }
 
+    /// The cowshed a recording provisioning run names as the program it runs as root.
+    const FAKE_COWSHED: &str = "/opt/cowshed/bin/cowshed";
+
     struct FakePrivilegedSession {
         events: Rc<RefCell<Vec<ProvisionEvent>>>,
         outputs: VecDeque<Result<HostCommandOutput, HostError>>,
@@ -6443,6 +6496,10 @@ mod tests {
                 .borrow_mut()
                 .push(ProvisionEvent::AttestOwner(path.to_owned(), uid, gid));
             Ok(())
+        }
+
+        fn cowshed_executable(&self) -> Result<PathBuf, HostError> {
+            Ok(PathBuf::from(FAKE_COWSHED))
         }
 
         fn write_marker(&self, path: &Path, contents: &[u8]) -> Result<(), HostError> {
