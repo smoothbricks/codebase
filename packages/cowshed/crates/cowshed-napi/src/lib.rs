@@ -865,7 +865,8 @@ mod parity_tests {
 
     use std::collections::BTreeSet;
 
-    use cowshed_cli::args::{COMMANDS, cli_command};
+    use cowshed_cli::args::cli_command;
+    use cowshed_cli::help::commands;
 
     /// Every leaf verb and every argument, keyed as the parity table keys them: `*` for the
     /// options every verb accepts, an empty argument for a leaf verb itself.
@@ -919,7 +920,7 @@ mod parity_tests {
             .get_subcommands()
             .map(clap::Command::get_name)
             .collect();
-        let mapped: BTreeSet<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
+        let mapped: BTreeSet<&str> = commands().map(|spec| spec.name).collect();
         assert_eq!(verbs, mapped);
     }
 }

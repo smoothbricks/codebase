@@ -14,53 +14,65 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use crate::help::{self, CommandSpec, EXPECTED_SOURCE_HEAD, EXPECTED_WORKSPACE_INCARNATION, Opt};
+use crate::help::{
+    self, CommandGroup, CommandSpec, EXPECTED_SOURCE_HEAD, EXPECTED_WORKSPACE_INCARNATION, Opt,
+};
 
 /// Every command, in the order the command map lists them.
 ///
 /// This is the list `cowshed --help` prints and the list an unknown command is corrected against,
 /// so a verb the parser dispatches is a verb the help knows about.
-pub static COMMANDS: &[&CommandSpec] = &[
-    &ADOPT,
-    &SETUP,
-    &FORK,
-    &MOVE,
-    &LIST,
-    &PATH,
-    &BUILD_STATE,
-    &EXEC,
-    &GRANT,
-    &REVOKE,
-    &REMOVE,
-    &FORGET,
-    &ATTACH,
-    &DETACH,
-    &MOUNT,
-    &RESIZE,
-    &DEFRAG,
-    &CACHE,
-    &REKEY,
-    &GC,
-    &PUSH,
-    &REBASE,
-    &LAND,
-    &DOC_COMMIT,
-    &DOCTOR,
-    &DISK_COMMAND,
-    &LAND_TURN,
-    &SUBTREE_ROOT,
-    &RETIRE_DESCENDANTS,
-    &LOCK,
-    &LOCK_HOLDERS,
-    &HOLD,
-    &TREE_HOLDERS,
-    &FD_HOLDERS,
-    &GATEWAY,
-    &CONTROLLER,
-    &HOST,
-    &CREDENTIAL,
-    &IDENTITY,
-    &SKILL,
+/// Every command the parser dispatches, grouped as the command map prints them: the verbs a person
+/// or agent uses every day first, the ones tools and embedding processes call last.
+pub static COMMAND_GROUPS: &[CommandGroup] = &[
+    CommandGroup {
+        heading: "workspace commands",
+        commands: &[&FORK, &LIST, &PATH, &EXEC, &ATTACH, &DETACH, &MOVE, &REMOVE],
+    },
+    CommandGroup {
+        heading: "integration commands",
+        commands: &[&REBASE, &LAND, &PUSH, &DOC_COMMIT],
+    },
+    CommandGroup {
+        heading: "grant commands",
+        commands: &[&GRANT, &REVOKE],
+    },
+    CommandGroup {
+        heading: "setup and repair commands",
+        commands: &[
+            &SETUP,
+            &ADOPT,
+            &DOCTOR,
+            &GATEWAY,
+            &CREDENTIAL,
+            &IDENTITY,
+            &SKILL,
+            &MOUNT,
+            &REKEY,
+            &FORGET,
+        ],
+    },
+    CommandGroup {
+        heading: "storage and cache commands",
+        commands: &[&GC, &RESIZE, &DEFRAG, &CACHE],
+    },
+    CommandGroup {
+        heading: "commands for tools and embedders",
+        commands: &[
+            &BUILD_STATE,
+            &DISK_COMMAND,
+            &LAND_TURN,
+            &SUBTREE_ROOT,
+            &RETIRE_DESCENDANTS,
+            &LOCK,
+            &LOCK_HOLDERS,
+            &HOLD,
+            &TREE_HOLDERS,
+            &FD_HOLDERS,
+            &CONTROLLER,
+            &HOST,
+        ],
+    },
 ];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2614,6 +2626,7 @@ const FORK: CommandSpec = CommandSpec {
     about: &[
         "Clones main by default, or any named source, carrying tracked edits, untracked files, dependencies and build state warm. Every fork mints its own cowshed/<ws> branch and fresh closed grants.",
         "--clean resets tracked edits and removes nonignored untracked files. --ref implies clean and selects a commit held by the source. Ignored build state stays warm.",
+        "A fork's branch lives in the fork's own repository until `push` or `land` hands it back. With --register, main also gets a `cowshed/<ws>` remote pointing at the workspace, so `git fetch cowshed/<ws>` in main reads the branch while the workspace lives; `rm` and `land` remove the remote.",
     ],
     options: &[
         Opt {
@@ -2634,7 +2647,7 @@ const FORK: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--register",
-            meaning: "also register the workspace as a remote in main",
+            meaning: "add a cowshed/<ws> remote in main, so main's git can fetch the workspace's branch",
         },
         Opt {
             spelling: "--git-worktree",
@@ -3595,7 +3608,7 @@ const DEFRAG: CommandSpec = CommandSpec {
     trailing: "",
     summary: "rewrite source and build images contiguously",
     about: &[
-        "Rewrites the workspace image, its registered live build source and every published seed of this incarnation. Doctor reports the actual source and seed counts separately. A fork warns, and proceeds, when a physical image generation has more than 7140 extents: a standalone first-write sensitivity limit from one loaded RAW observation at 140.046964 µs/extent, not a causal calibration or whole-fork latency guarantee. Multiple images and attach, mount, identity and proof work share the total budget.",
+        "Rewrites the workspace image, its registered live build source and every published seed of this incarnation contiguously, so a clone's first write, its mount, copies a short extent map again. Reach for it when a fork warns that cloning this workspace's source image took over 4 s; doctor lists each image's extent count for the record and never warns on it. An image fragments when its workspace rewrites files its clones share (a dependency reinstall, build outputs written in place): stop that churn first, or the extents come back. The fork's warning says how to find it.",
         "The workspace is detached the way `resize` detaches it — a volume with a file open or a job running refuses before the image is touched — then its data is copied with plain reads and writes into a sibling, flushed, renamed over the image, verified by attaching it, and mounted again if it was mounted. The copy needs as much free space as the image has allocated, and keeps it while older clones still share the old blocks.",
         "A refused pending clone may contain the only copy of dirty work. `defrag <pending-workspace>` rewrites that same payload without publishing or deleting it, and refuses while its original creator still holds the intent lease. Retry the original fork after the rewrite.",
     ],
@@ -3907,7 +3920,7 @@ const LAND: CommandSpec = CommandSpec {
 const DOC_COMMIT: CommandSpec = CommandSpec {
     name: "doc-commit",
     missing: "doc-commit needs a message (-m <msg> or -F <file>) and an edit (--patch <file> or --icm <program>)",
-    args: "(-m <msg> | -F <file>) (--patch <file> | --icm <program>) [--gateway-socket <path>]",
+    args: "",
     trailing: "",
     summary: "commit a documentation edit to main",
     about: &[
@@ -4045,7 +4058,7 @@ const DOCTOR: CommandSpec = CommandSpec {
     trailing: "",
     summary: "check invariants",
     about: &[
-        "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, autosave is fresh, and nothing reclaimable is stranded — retired trash, and staging entries (images, sidecars, mountpoints, attached volumes) that no running operation owns are each a finding with their byte count. Exit 0 when healthy, otherwise 5.",
+        "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, and nothing reclaimable is stranded — retired trash, and staging entries (images, sidecars, mountpoints, attached volumes) that no running operation owns are each a finding with their byte count. Exit 0 when healthy, otherwise 5.",
         "With `--repair`, first validates every mounted workspace artifact frame. Duplicate or regressed sequences are refused because resequencing would change store identity and make the rewritten log attest to itself; create a fresh store instead. Repair then runs the same sweep `gc` runs, so stranded trash and orphaned staging are retired under gc's rules and reported.",
     ],
     options: &[Opt {
@@ -5774,7 +5787,7 @@ mod tests {
         assert_eq!(error.kind, UsageErrorKind::MissingCommand);
         let map = error.command_map().unwrap();
         // Every verb the parser dispatches, including the ones a hand-written map forgot.
-        for spec in COMMANDS {
+        for spec in help::commands() {
             assert!(
                 map.lines()
                     .any(|line| line.trim_start().starts_with(spec.name)),
@@ -5914,7 +5927,7 @@ mod tests {
             "cowshed fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree] [--markdown-only]"
         );
 
-        for spec in COMMANDS {
+        for spec in help::commands() {
             let hint = spec.hint();
             for option in spec.options {
                 assert!(
@@ -6073,7 +6086,7 @@ mod tests {
 
     #[test]
     fn no_help_page_contains_provision_or_a_phantom_job_verb() {
-        for spec in COMMANDS {
+        for spec in help::commands() {
             let page = spec.page();
             assert!(
                 !page.contains("provision"),

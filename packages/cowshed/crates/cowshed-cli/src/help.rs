@@ -8,7 +8,7 @@
 
 use std::sync::LazyLock;
 
-use crate::args::COMMANDS;
+use crate::args::COMMAND_GROUPS;
 
 /// One flag, as typed, and the one line that says what it does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,12 +19,14 @@ pub struct Opt {
 }
 
 impl Opt {
-    /// The flag without its value, for the compact grammar the command map prints.
+    /// The flag without its value or its long spelling, for the compact grammar the command map
+    /// prints: `--slot` for `--slot <n>`, `-m` for `-m, --message <msg>`.
     fn flag(&self) -> &'static str {
-        match self.spelling.split_once(' ') {
-            Some((flag, _)) => flag,
-            None => self.spelling,
-        }
+        let end = self
+            .spelling
+            .find([' ', ','])
+            .unwrap_or(self.spelling.len());
+        &self.spelling[..end]
     }
 }
 
@@ -43,6 +45,20 @@ pub struct CommandSpec {
     /// Paragraphs answering what the command is for and what is not obvious about it.
     pub about: &'static [&'static str],
     pub options: &'static [Opt],
+}
+
+/// One heading of the command map and the commands under it, in the order the map prints them.
+#[derive(Clone, Copy, Debug)]
+pub struct CommandGroup {
+    pub heading: &'static str,
+    pub commands: &'static [&'static CommandSpec],
+}
+
+/// Every command, in command-map order.
+pub fn commands() -> impl Iterator<Item = &'static CommandSpec> {
+    COMMAND_GROUPS
+        .iter()
+        .flat_map(|group| group.commands.iter().copied())
 }
 
 impl CommandSpec {
@@ -211,7 +227,7 @@ pub fn overview() -> String {
 /// The command named exactly `name`.
 #[must_use]
 pub fn command_named(name: &str) -> Option<&'static CommandSpec> {
-    COMMANDS.iter().copied().find(|spec| spec.name == name)
+    commands().find(|spec| spec.name == name)
 }
 
 /// Commands within an edit distance of two of `name`, for correcting a typo like `sscache`.
@@ -224,7 +240,7 @@ pub fn nearest_commands(name: &str) -> Vec<&'static str> {
     const LIMIT: usize = 2;
     let mut best = LIMIT;
     let mut nearest = Vec::new();
-    for spec in COMMANDS {
+    for spec in commands() {
         let distance = edit_distance(name, spec.name);
         if distance > best {
             continue;
@@ -256,34 +272,37 @@ fn edit_distance(left: &str, right: &str) -> usize {
 }
 
 fn render_command_map() -> String {
-    let grammars: Vec<String> = COMMANDS.iter().map(|spec| spec.map_grammar()).collect();
     // The summary column starts after the widest grammar that still leaves the widest summary
-    // inside the page. Wider grammars put their summary on the next line at the same column;
-    // every summary wraps rather than pushing the map past the page width.
-    let widest_summary = COMMANDS
-        .iter()
-        .map(|spec| spec.summary.len())
-        .max()
-        .unwrap_or(0);
-    let column = grammars
-        .iter()
-        .map(String::len)
+    // inside the page, across every group, so the map reads as one table. Wider grammars put
+    // their summary on the next line at the same column; every summary wraps rather than pushing
+    // the map past the page width.
+    let widest_summary = commands().map(|spec| spec.summary.len()).max().unwrap_or(0);
+    let column = commands()
+        .map(|spec| spec.map_grammar().len())
         .filter(|width| 2 + width + 2 + widest_summary <= WIDTH)
         .max()
         .unwrap_or(0)
         + 2;
-    let mut map = String::from("commands:\n");
-    for (spec, grammar) in COMMANDS.iter().zip(&grammars) {
-        let written = 2 + grammar.len();
-        let summary_column = column + 2;
-        if written + 2 > summary_column {
-            wrap(&mut map, grammar, 2, 0);
-            wrap(&mut map, spec.summary, summary_column, 0);
-        } else {
-            pad(&mut map, 2);
-            map.push_str(grammar);
-            pad(&mut map, summary_column - written);
-            wrap(&mut map, spec.summary, summary_column, summary_column);
+    let mut map = String::new();
+    for group in COMMAND_GROUPS {
+        if !map.is_empty() {
+            map.push('\n');
+        }
+        map.push_str(group.heading);
+        map.push_str(":\n");
+        for spec in group.commands {
+            let grammar = spec.map_grammar();
+            let written = 2 + grammar.len();
+            let summary_column = column + 2;
+            if written + 2 > summary_column {
+                wrap(&mut map, &grammar, 2, 0);
+                wrap(&mut map, spec.summary, summary_column, 0);
+            } else {
+                pad(&mut map, 2);
+                map.push_str(&grammar);
+                pad(&mut map, summary_column - written);
+                wrap(&mut map, spec.summary, summary_column, summary_column);
+            }
         }
     }
     map
@@ -363,7 +382,7 @@ mod tests {
 
     #[test]
     fn every_command_page_documents_every_flag_of_its_usage_line() {
-        for spec in COMMANDS {
+        for spec in commands() {
             let page = spec.page();
             assert!(
                 page.starts_with(&format!("usage: cowshed {}", spec.usage())),
@@ -393,6 +412,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_command_is_listed_once() {
+        let mut names: Vec<&str> = commands().map(|spec| spec.name).collect();
+        let listed = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), listed, "a command is listed in two groups");
     }
 
     #[test]

@@ -1957,16 +1957,8 @@ fn setup_refuses_a_mount_root_option_whatever_it_is_paired_with() {
 /// Guidance can never name a verb the parser does not have (06_cli.md rule 4), and `setup` is now
 /// the verb storage guidance names.
 #[test]
-fn setup_is_in_the_command_map_between_adopt_and_fork() {
+fn setup_is_in_the_command_map() {
     let map = help::command_map();
-    let adopt = map.find("\n  adopt").expect("adopt is listed");
-    let setup = map.find("\n  setup").expect("setup is listed");
-    let fork = map.find("\n  fork").expect("fork is listed");
-    assert!(
-        adopt < setup && setup < fork,
-        "setup sits after adopt:\n{map}"
-    );
-
     let spec = help::command_named("setup").expect("setup has a help page");
     // The map prints the spec's own summary rather than a second copy of it, so this asserts the
     // coupling instead of duplicating the sentence and having to be edited alongside it.
