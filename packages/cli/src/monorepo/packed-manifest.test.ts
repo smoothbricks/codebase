@@ -91,4 +91,44 @@ describe('packed runtime dependency freshness', () => {
       );
     });
   });
+
+  it('refuses to publish a runtime pin on a dependency that has no stable release', async () => {
+    await withPackWorkspace(
+      async (root) => {
+        const source = listPublishablePackages(root).find((pkg) => pkg.projectName === 'app');
+        if (!source) throw new Error('fixture app publisher is missing');
+        const tarball = join(root, 'app.tgz');
+        const packed = await Bun.$`${bunBinary()} pm pack --filename ${tarball} --ignore-scripts --quiet`
+          .cwd(join(root, source.path))
+          .quiet()
+          .nothrow();
+        expect(packed.exitCode, packed.stderr.toString()).toBe(0);
+        const packedManifest = await readPackedPackageJson(root, tarball, source.name);
+        expect(packedManifest.dependencies?.['@pub.test/lib']).toBe('0.0.1-next.0');
+        expect(validatePackedWorkspaceDependencies(root, source, packedManifest, { mode: 'install' })).toEqual([]);
+        expect(validatePackedWorkspaceDependencies(root, source, packedManifest, { mode: 'publish' })).toEqual([
+          'packages/app: packed dependencies.@pub.test/lib would ship 0.0.1-next.0, a workspace-internal -next version no registry holds: lib has no stable release. Release lib in the same run (a first release needs --bump patch).',
+        ]);
+      },
+      {
+        packages: [
+          {
+            name: '@pub.test/lib',
+            projectName: 'lib',
+            path: 'packages/lib',
+            version: '0.0.1-next.0',
+            tags: ['npm:public'],
+          },
+          {
+            name: '@pub.test/app',
+            projectName: 'app',
+            path: 'packages/app',
+            version: '2.0.0',
+            tags: ['npm:public'],
+            dependencies: { '@pub.test/lib': 'workspace:*' },
+          },
+        ],
+      },
+    );
+  });
 });
