@@ -1009,6 +1009,9 @@ export function providerInputProof(
   ]) {
     if (existsSync(join(workspaceRoot, path))) files.add(path);
   }
+  // The graph witness the same probe wrote is the census's hash source: without it every proof re-read every file of
+  // the Nx, plugin and TypeScript closure (about 21,000 files), minutes of reads on a loaded host.
+  const witness = readGraphWitness(join(workspaceDataDirectoryForWorkspace(workspaceRoot), 'ensure-built-graph.json'));
   const installation = hasRuntime
     ? graphInstallationIdentity(
         workspaceRoot,
@@ -1022,11 +1025,13 @@ export function providerInputProof(
             workspaceRoot,
             new (requireNx('nx/src/native').WorkspaceContext)(
               workspaceRoot,
-              requireNx('nx/src/utils/cache-directory').workspaceDataDirectoryForWorkspace(workspaceRoot),
+              workspaceDataDirectoryForWorkspace(workspaceRoot),
             ),
             undefined,
           ),
         ),
+        undefined,
+        witness === null ? undefined : recordedInstallationCensus(witness.installation, witness.installationUnproven),
       )
     : null;
   const runtimeSource = boundedReceiptRuntimes(inputs, [...directories], [...files], installation !== null);

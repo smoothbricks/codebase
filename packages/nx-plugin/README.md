@@ -1525,7 +1525,10 @@ runs them in the workspace's Nx daemon, which runs inside the cowshed sandbox un
 sandbox denies the operator's global git configuration (specs/cowshed/04_sandbox.md, the runtime-input contract).
 
 A FILE-only source plan does not perform a redundant installation census for absent runtime recipes; the complete
-producer tool/module and output SHA evidence is still captured and independently revalidated on every product probe.
+producer tool/module and output SHA evidence is still captured and independently revalidated on every product probe. A
+plan with runtime recipes takes its installation census with the graph witness's census (`ensure-built-graph.json`,
+which the same probe wrote) as its hash source, as the graph reuse does: an unchanged closure reads no file bytes, where
+every probe once re-read all of Nx, this plugin and TypeScript (about 21,000 files), minutes of reads on a loaded host.
 
 A declared target names `cargoToolchain` for its toolchain identity and spells no version command of its own: a bare
 `rustc -vV` through the wrapper is no generator recipe, so a receipt target whose task graph reaches one is refused as

@@ -293,6 +293,8 @@ export interface GraphInstallationCensus {
  * physical target and package manifest. SHA-256 binds every regular file's
  * bytes, including manifest metadata; pre/post node stamps still reject a
  * tree that moved while reading. A missing optional dependency is recorded too.
+ * `previous` is a hash source only ({@link graphInstallationCensus}): a file whose stamp has not moved since it read
+ * the file is not read again.
  */
 export function graphInstallationIdentity(
   workspaceRoot: string,
@@ -301,8 +303,17 @@ export function graphInstallationIdentity(
   expand: typeof expandOutputs,
   localInputs: GraphInputContractProof | null,
   onUnproved?: (detail: string) => void,
+  previous?: GraphInstallationCensus,
 ): string | null {
-  const census = provenInstallationCensus(workspaceRoot, nxJson, resolvePackage, expand, localInputs, onUnproved);
+  const census = provenInstallationCensus(
+    workspaceRoot,
+    nxJson,
+    resolvePackage,
+    expand,
+    localInputs,
+    onUnproved,
+    previous,
+  );
   return census === null ? null : installationIdentityOf(census, localInputs);
 }
 
