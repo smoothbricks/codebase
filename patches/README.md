@@ -444,7 +444,7 @@ and fails the request with an error tagged `daemonStartForbidden` that names the
 cause. Every daemon request of a command continues from that error in its own process through
 `DaemonClient.orWithoutDaemon`, which notes the stop once per process and lets the connection go, so the caller's own
 in-process path answers: the project graph, task hashing (`DaemonBasedTaskHasher` builds the graph in this process once,
-for the in-process hasher's file data), output-hash record and compare (unverified outputs are copied), the pre/post
+for the in-process hasher's file data), output-hash record and compare (the outputs stamps below), the pre/post
 tasks-execution hooks, sync generators and the workspace-context file queries. A run whose daemon stops under it
 therefore finishes. The client never calls `startInBackground` implicitly, and an explicit `nx daemon --start`
 (`command-line/daemon/daemon.js`), which would call it directly, is refused as policy: exit 1 with a reason naming the
@@ -474,6 +474,26 @@ restarting daemon with the socket its clients were still writing to.
 Drop the hunk only when cowshed no longer ends a job's tree around a shared daemon, or upstream Nx has an equivalent
 setting; retain the regression. Stock Nx starting the daemon is not enough; see
 [Can the daemon hunks be dropped?](#can-the-daemon-hunks-be-dropped).
+
+## A cache hit keeps the outputs a run left, without a daemon
+
+Stock Nx keeps a cache hit's on-disk outputs only when its daemon recorded them (`outputsHashesMatchBatch`); a client
+with no daemon "can't verify on-disk outputs, always copy". A job's client starts none (above) and main keeps none, so
+every cached task with outputs was restored on every run, and the restore-time stamp re-dated each restored file. A
+producer that runs another task's output as its tool (`build-inputs:scriptc-*`, `build-inputs:tsc-js`) then saw its tool
+rewritten between capture and the end of every run, and refused its receipt (`producer-receipts.ts`), so no checkout
+could capture a snapshot from a producer basis.
+
+`tasks-runner/outputs-stamp.js` records, per task hash, the files a run or restore left in its outputs: path, inode,
+size, mtime and ctime, in `<workspace data>/outputs-stamps/<hash>.json`, written whole by a rename. It is recorded with
+or without a daemon (`recordOutputsHashBatch`), and verifies a hit whenever no daemon answers
+(`shouldCopyOutputsFromCacheBatch`, its daemon-gone fallback included). A hit keeps outputs that are still exactly those
+files; any write since changes the ctime, which no tool sets back, a replacement changes the inode, and an added or
+removed file changes the set, and each of those restores.
+
+`nx-cache-kept-outputs.test.ts` runs the installed Nx without a daemon: a second run keeps the very files the first
+left, a third keeps them again, an edited output restores and the restore is kept next, and a removed output restores.
+Drop the hunk, and keep the test, once the Nx in use verifies on-disk outputs without a daemon.
 
 ## A lost daemon ends the command
 

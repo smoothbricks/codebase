@@ -5131,6 +5131,83 @@ index ab0d47a6d12a4ce8cb6b140364b1ada923fab95a..894bbfc883a7108a9fdd118691d6e2bc
          });
          console.log(JSON.stringify(timings, null, 2));
      }
+diff --git a/dist/src/tasks-runner/outputs-stamp.js b/dist/src/tasks-runner/outputs-stamp.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..80e276f0681686cf4f47829bbdcfa7053c38051e
+--- /dev/null
++++ b/dist/src/tasks-runner/outputs-stamp.js
+@@ -0,0 +1,71 @@
++"use strict";
++/**
++ * Outputs a cache hit can keep without a daemon. Nx keeps a hit's on-disk
++ * outputs only when its daemon recorded them; a client with none copied every
++ * cached output again. A cowshed job's client starts no daemon
++ * (NX_DAEMON_START=never), so each run restored, and re-dated, every output,
++ * including the tools other tasks' producers run, which no producer receipt
++ * could then vouch for.
++ *
++ * Each run or restore records, per task hash, the files its outputs hold:
++ * path, inode, size, mtime and ctime. A later hit keeps outputs that are still
++ * exactly those files. Any write since changes the ctime, which no tool can
++ * set back, a replaced file changes the inode, and an added or removed file
++ * changes the set; each restores. The record lives in the checkout's workspace
++ * data, beside the outputs it describes.
++ */
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.recordOutputsStamps = recordOutputsStamps;
++exports.outputsStampsMatch = outputsStampsMatch;
++const node_fs_1 = require("node:fs");
++const node_path_1 = require("node:path");
++const native_1 = require("../native");
++const cache_directory_1 = require("../utils/cache-directory");
++const workspace_root_1 = require("../utils/workspace-root");
++function stampPath(hash) {
++    return (0, node_path_1.join)(cache_directory_1.workspaceDataDirectory, 'outputs-stamps', `${hash}.json`);
++}
++/** The files of each entry's outputs, as the daemon's tracking expands them. */
++function filesOf(entries) {
++    return (0, native_1.getFilesForOutputsBatch)(workspace_root_1.workspaceRoot, entries.map((entry) => entry.outputs));
++}
++/** What the files are now; throws when one is gone since the listing. */
++function stampOf(entry, files) {
++    return JSON.stringify({
++        outputs: entry.outputs,
++        files: [...files].sort().map((file) => {
++            const stats = (0, node_fs_1.lstatSync)((0, node_path_1.join)(workspace_root_1.workspaceRoot, file), { bigint: true });
++            return [file, `${stats.ino}`, `${stats.size}`, `${stats.mtimeNs}`, `${stats.ctimeNs}`];
++        }),
++    });
++}
++/** Record what each entry's run or restore left. A record that cannot be written costs the next hit a copy. */
++function recordOutputsStamps(entries) {
++    const files = filesOf(entries);
++    entries.forEach((entry, index) => {
++        const path = stampPath(entry.hash);
++        const written = `${path}.${process.pid}`;
++        try {
++            (0, node_fs_1.mkdirSync)((0, node_path_1.dirname)(path), { recursive: true });
++            (0, node_fs_1.writeFileSync)(written, stampOf(entry, files[index]));
++            (0, node_fs_1.renameSync)(written, path);
++        }
++        catch {
++            (0, node_fs_1.rmSync)(written, { force: true });
++        }
++    });
++}
++/** Whether each entry's outputs are still the files its record names; anything unreadable answers no. */
++function outputsStampsMatch(entries) {
++    const files = filesOf(entries);
++    return entries.map((entry, index) => {
++        if (files[index].length === 0)
++            return false;
++        try {
++            return (0, node_fs_1.readFileSync)(stampPath(entry.hash), 'utf8') === stampOf(entry, files[index]);
++        }
++        catch {
++            return false;
++        }
++    });
++}
 diff --git a/dist/src/tasks-runner/remote-cache-outage.d.ts b/dist/src/tasks-runner/remote-cache-outage.d.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..aecbe296f6bf80377fca38969c6efbf6d1b1a2b2
@@ -5733,18 +5810,19 @@ index 6d3dd021b050be5c74803555b361b6502f9693c7..8545dea5e1f4221191de652435a6a635
      private postRunSteps;
      private scheduleNextTasksAndReleaseThreads;
 diff --git a/dist/src/tasks-runner/task-orchestrator.js b/dist/src/tasks-runner/task-orchestrator.js
-index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a4018bd36 100644
+index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a85353b04792 100644
 --- a/dist/src/tasks-runner/task-orchestrator.js
 +++ b/dist/src/tasks-runner/task-orchestrator.js
-@@ -29,6 +29,7 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
+@@ -29,6 +29,8 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
  const task_env_1 = require("./task-env");
  const tasks_schedule_1 = require("./tasks-schedule");
  const utils_1 = require("./utils");
 +const { TaskOutputLeases } = require("./task-output-lease");
++const outputs_stamp_1 = require("./outputs-stamp");
  /**
   * Resolve a batch executor's per-task result to a TaskStatus. Prefers an
   * explicit `status` from the executor; falls back to the `success` boolean
-@@ -79,11 +80,9 @@ class TaskOrchestrator {
+@@ -79,11 +81,9 @@ class TaskOrchestrator {
          // underlying real tasks become the anchors.
          this.initializingTaskIds = (0, utils_1.expandInitiatingTasksThroughNoop)(this.initiatingTasks, this.taskGraph, this.projectGraph);
          this.processedTasks = new Map();
@@ -5759,7 +5837,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
          this.cacheMissedHashes = new Set();
          this.completedTasks = new Map();
          this.waitingForTasks = [];
-@@ -99,6 +98,7 @@ class TaskOrchestrator {
+@@ -99,6 +99,7 @@ class TaskOrchestrator {
          this.bailed = false;
          this.resolveStopPromise = null;
          this.stopRequested = false;
@@ -5767,7 +5845,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
          this.runningContinuousTasks = new Map();
          this.runningRunCommandsTasks = new Map();
          this.runningDiscreteTasks = new Map();
-@@ -106,6 +106,9 @@ class TaskOrchestrator {
+@@ -106,6 +107,9 @@ class TaskOrchestrator {
          this.continuousTaskExitHandled = new Map();
          this.cleanupPromise = null;
          this.signalHandlers = [];
@@ -5777,7 +5855,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
      }
      async init() {
          this.setupSignalHandlers();
-@@ -125,6 +128,20 @@ class TaskOrchestrator {
+@@ -125,6 +129,20 @@ class TaskOrchestrator {
          }
      }
      async run() {
@@ -5798,7 +5876,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
          await this.init();
          perf_hooks_1.performance.mark('task-execution:start');
          const { discrete, continuous, total } = getThreadPoolSize(this.options, this.taskGraph);
-@@ -159,8 +176,6 @@ class TaskOrchestrator {
+@@ -159,8 +177,6 @@ class TaskOrchestrator {
          if (!this.stopRequested) {
              this.cache.removeOldCacheRecords();
          }
@@ -5807,7 +5885,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
          // Public API (defaultTasksRunner) returns a plain object keyed by
          // task id. Internal state is a Map for faster lookup.
          return Object.fromEntries(this.completedTasks);
-@@ -413,12 +428,9 @@ class TaskOrchestrator {
+@@ -413,12 +429,9 @@ class TaskOrchestrator {
       * cache fetch + lifecycle to the public method. Returns true if any
       * tasks were resolved.
       *
@@ -5823,7 +5901,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
       */
      async resolveCachedTasksBulk() {
          const { scheduledTasks } = this.tasksSchedule.getAllScheduledTasks();
-@@ -514,6 +526,13 @@ class TaskOrchestrator {
+@@ -514,6 +527,13 @@ class TaskOrchestrator {
          await (0, hash_task_1.hashTasks)(this.hasher, this.projectGraph, this.fullTaskGraph, perTaskEnvs, this.taskDetails, tasks);
      }
      async applyFromCacheOrRunBatch(doNotSkipCache, batch, groupId) {
@@ -5837,7 +5915,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
          const applyFromCacheOrRunBatchStart = perf_hooks_1.performance.mark('TaskOrchestrator-apply-from-cache-or-run-batch:start');
          const taskEntries = Object.entries(batch.taskGraph.tasks);
          const tasks = taskEntries.map(([, task]) => task);
-@@ -571,7 +590,7 @@ class TaskOrchestrator {
+@@ -571,7 +591,7 @@ class TaskOrchestrator {
          const tasksCompleted = taskEntries.filter(([taskId]) => this.completedTasks.has(taskId));
          // Batch is still not done, run it again
          if (tasksCompleted.length !== taskEntries.length) {
@@ -5846,7 +5924,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
                  id: batch.id,
                  executorName: batch.executorName,
                  taskGraph: (0, utils_1.removeTasksFromTaskGraph)(batch.taskGraph, tasksCompleted.map(([taskId]) => taskId)),
-@@ -810,6 +829,20 @@ class TaskOrchestrator {
+@@ -810,6 +830,20 @@ class TaskOrchestrator {
       * don't actually compete for parallelism.
       */
      async resolveCachedTasks(doNotSkipCache, tasks, groupId) {
@@ -5867,7 +5945,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
          if (!doNotSkipCache || tasks.length === 0)
              return [];
          const cacheableTasks = tasks.filter((t) => t.cache);
-@@ -836,10 +869,8 @@ class TaskOrchestrator {
+@@ -836,10 +870,8 @@ class TaskOrchestrator {
      }
      /**
       * Fire a discrete-task worker and track it in pendingDiscreteWorkers until
@@ -5880,7 +5958,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
       */
      dispatchDiscreteWorker(doNotSkipCache, task, groupId) {
          const worker = this.runTaskDirectly(doNotSkipCache, task, groupId)
-@@ -870,11 +901,21 @@ class TaskOrchestrator {
+@@ -870,11 +902,21 @@ class TaskOrchestrator {
          await this.postRunSteps([{ task, status: 'failure', terminalOutput }], doNotSkipCache, groupId);
      }
      /**
@@ -5905,7 +5983,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
          // Wait for task to be processed
          const taskSpecificEnv = await this.processedTasks.get(task.id);
          await this.preRunSteps([task], { groupId });
-@@ -1063,6 +1104,10 @@ class TaskOrchestrator {
+@@ -1063,6 +1105,10 @@ class TaskOrchestrator {
          }
      }
      async startContinuousTask(task, groupId) {
@@ -5916,7 +5994,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
          if (this.runningTasksService &&
              this.runningTasksService.getRunningTasks([task.id]).length) {
              await this.preRunSteps([task], { groupId });
-@@ -1086,6 +1131,16 @@ class TaskOrchestrator {
+@@ -1086,6 +1132,16 @@ class TaskOrchestrator {
              await this.scheduleNextTasksAndReleaseThreads();
              return runningTask;
          }
@@ -5933,7 +6011,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
          const taskSpecificEnv = await this.processedTasks.get(task.id);
          await this.preRunSteps([task], { groupId });
          const pipeOutput = await this.pipeOutputCapture(task);
-@@ -1105,10 +1160,10 @@ class TaskOrchestrator {
+@@ -1105,10 +1161,10 @@ class TaskOrchestrator {
              groupId,
              ownsRunningTasksService: true,
          });
@@ -5948,27 +6026,41 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
              });
          }));
          await this.scheduleNextTasksAndReleaseThreads();
-@@ -1300,7 +1355,9 @@ class TaskOrchestrator {
+@@ -1300,22 +1356,28 @@ class TaskOrchestrator {
          if (tasks.length === 0)
              return resultMap;
          if (this.daemon?.enabled()) {
 -            const matches = await this.daemon.outputsHashesMatchBatch(tasks);
-+            // A daemon gone under a client that may never start one verifies
-+            // nothing: every output is copied, as below.
-+            const matches = await this.daemon.orWithoutDaemon(() => this.daemon.outputsHashesMatchBatch(tasks), () => tasks.map(() => false));
++            // A daemon gone under a client that may never start one leaves the
++            // recorded outputs stamps to verify them, as without one.
++            const matches = await this.daemon.orWithoutDaemon(() => this.daemon.outputsHashesMatchBatch(tasks), () => (0, outputs_stamp_1.outputsStampsMatch)(tasks));
              for (let i = 0; i < tasks.length; i++) {
                  resultMap.set(tasks[i].hash, !matches[i]);
              }
-@@ -1315,7 +1372,7 @@ class TaskOrchestrator {
+         }
+         else {
+-            // No daemon → can't verify on-disk outputs, always copy.
+-            for (const task of tasks) {
+-                resultMap.set(task.hash, true);
++            // No daemon: the outputs stamps a run or restore recorded verify the
++            // on-disk outputs (outputs-stamp.js); anything else is copied.
++            const matches = (0, outputs_stamp_1.outputsStampsMatch)(tasks);
++            for (let i = 0; i < tasks.length; i++) {
++                resultMap.set(tasks[i].hash, !matches[i]);
+             }
+         }
+         return resultMap;
      }
      async recordOutputsHashBatch(entries) {
++        // Recorded with or without a daemon: a later client may have none.
++        (0, outputs_stamp_1.recordOutputsStamps)(entries);
          if (this.daemon?.enabled()) {
 -            return this.daemon.recordOutputsHashBatch(entries);
 +            return this.daemon.orWithoutDaemon(() => this.daemon.recordOutputsHashBatch(entries), () => undefined);
          }
      }
      // endregion utils
-@@ -1376,6 +1433,8 @@ class TaskOrchestrator {
+@@ -1376,6 +1438,8 @@ class TaskOrchestrator {
          return this.cleanupPromise;
      }
      async performCleanup() {
@@ -5977,7 +6069,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..c61e9d8b0b701723f83ba033f475d76a
          // Mark all running tasks for intentional stop
          const reason = this.stopRequested ? 'interrupted' : 'fulfilled';
          for (const entry of this.runningContinuousTasks.values()) {
-@@ -1445,6 +1504,7 @@ class TaskOrchestrator {
+@@ -1445,6 +1509,7 @@ class TaskOrchestrator {
              if (this.stopRequested)
                  return;
              this.stopRequested = true;
