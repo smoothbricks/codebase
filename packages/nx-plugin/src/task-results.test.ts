@@ -108,7 +108,8 @@ it('records a task hint only under a controller receipt, and never on an ordinar
 
       const hit = await nx(workspace, { ...ordinary, [RECEIPT_ENV]: RECEIPT }, 'app:build');
       expect(hit.exitCode, hit.log).toBe(0);
-      expect(hit.log).toContain('local cache');
+      // A replay whose outputs are untouched keeps them in place (the Nx patch's outputs stamps).
+      expect(hit.log).toContain('existing outputs match the cache');
       expect(await runCount(workspace)).toBe(1);
       expect(await readdir(hints)).toEqual([RECEIPT]);
       expect(await readHint(join(hints, RECEIPT))).toMatchObject({
@@ -116,7 +117,13 @@ it('records a task hint only under a controller receipt, and never on an ordinar
         requestId: RECEIPT,
         workspaceRoot: workspace,
         run: { argv: [process.execPath, await realpath(nxEntry(workspace)), ...hit.argv.slice(2)] },
-        tasks: [{ task: { id: 'app:build', hash: expect.stringMatching(/^\d+$/) }, status: 'local-cache', code: 0 }],
+        tasks: [
+          {
+            task: { id: 'app:build', hash: expect.stringMatching(/^\d+$/) },
+            status: 'local-cache-kept-existing',
+            code: 0,
+          },
+        ],
       });
 
       const invalid = await nx(workspace, { ...ordinary, [RECEIPT_ENV]: 'NOT-A-REQUEST-ID' }, 'app:build');

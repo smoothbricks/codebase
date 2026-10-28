@@ -145,7 +145,8 @@ describe('cargo retention after real Nx runs', () => {
           const receiptBefore = await readFile(receiptPath, 'utf8');
           const replayed = await runNx('ws:build-cargo-fixture');
           expect(replayed.code, replayed.log).toBe(0);
-          expect(replayed.log).toContain('local cache');
+          // The replay keeps the untouched outputs in place (the Nx patch's outputs stamps).
+          expect(replayed.log).toContain('existing outputs match the cache');
           expect(await readFile(receiptPath, 'utf8')).toBe(receiptBefore);
           for (const path of current) expect(await exists(path)).toBe(true);
           const notDue = await runNx('ws:build-fails');
