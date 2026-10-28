@@ -1695,7 +1695,18 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             else {
                 return Ok(());
             };
-            let release = host.release_build_volume(layout, &id).map_err(storage)?;
+            let mut release = host.release_build_volume(layout, &id).map_err(storage)?;
+            // The job's own hold has just dropped, and its release probes the hold file without
+            // waiting: a transient copy of the dropped descriptor can still answer "held" with no job
+            // left to release the volume later. Waiting out the hold as its waiter tells that apart
+            // from a job that still runs; one reaping-class bound covers the copy's teardown.
+            if matches!(release, BuildVolumeRelease::Held { .. })
+                && layout
+                    .holds_gone_within(&id, cowshed_os::deadline::REAP)
+                    .map_err(|error| io("wait out the hold of", &layout.hold_path(&id), &error))?
+            {
+                release = host.release_build_volume(layout, &id).map_err(storage)?;
+            }
             if let BuildVolumeRelease::Deleted { .. } = release {
                 say_release(&id, &format!("{owner}'s superseded"), &release);
             }

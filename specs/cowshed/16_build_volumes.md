@@ -1618,8 +1618,11 @@ swap:
   when no user job has been admitted since the swap. Repository links alone never authorize a mount.
 - A job admitted before the swap keeps its grant and a shared build-volume hold, so the target's previous volume stays
   attached, recorded as the target's (superseded, at its incarnation), until the last such job exits. Its hold prevents
-  even a forced collection; each such job's end releases the volume once no hold is left. A host process with no job
-  hold does not own the superseded volume (Garbage collection).
+  even a forced collection; each such job's end releases the volume once no hold is left. The job's end judges "no hold
+  left" by an exclusive lock on the hold file granted as its waiter within the reaping bound, never by a probe alone: a
+  probe right after its own hold dropped can find a transient kernel copy of that descriptor (cowshed-os `fork_lock`),
+  and no later job end would release the volume. A host process with no job hold does not own the superseded volume
+  (Garbage collection).
 - A long-running job that starts builds (a development server, a file watcher) keeps the grant it was admitted with:
   builds it starts after a swap resolve the links into the new volume, which that grant does not name, and the sandbox
   denies them. Restarting the job admits it on the adopted volume. Its Nx client re-subscribes to file events when the

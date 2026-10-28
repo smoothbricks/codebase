@@ -985,6 +985,27 @@ impl BuildVolumeLayout {
         }
     }
 
+    /// Whether every hold on volume `id` is gone within `bound`: an exclusive lock on its hold file
+    /// granted as the lock's waiter, then let go at once. A probe right after the last hold's close
+    /// can still find it held through a transient kernel copy of the closed descriptor that another
+    /// thread's spawn made (cowshed-os `fork_lock`: such copies close moments later on their own, with
+    /// no owner and no event); only a waiter's grant proves the release. `false` when a hold
+    /// outlives `bound`: a job still runs on the volume.
+    pub fn holds_gone_within(
+        &self,
+        id: &BuildVolumeId,
+        bound: cowshed_os::deadline::Bound,
+    ) -> io::Result<bool> {
+        let path = self.hold_path(id);
+        let file = open_hold(&path)?;
+        let deadline = cowshed_os::deadline::start("wait out a build volume's last hold", bound);
+        match cowshed_os::flock::exclusive(file, &path, &deadline, |_| String::new()) {
+            Ok(_granted) => Ok(true),
+            Err(cowshed_os::flock::LockError::Expired(_)) => Ok(false),
+            Err(cowshed_os::flock::LockError::Io { source, .. }) => Err(source),
+        }
+    }
+
     /// [`Self::claim_release`] granted as the lock's waiter, within the test backstop. A probe
     /// right after the last hold's close can still see a transient kernel copy of its descriptor
     /// from another thread's spawn (cowshed-os `fork_lock`); the waiter's grant proves the release.
