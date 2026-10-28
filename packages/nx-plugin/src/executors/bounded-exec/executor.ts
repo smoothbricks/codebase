@@ -768,7 +768,8 @@ export async function runBoundedExec(
       appendStderr(`bounded-exec: runner lifecycle failed: ${detail}\n`);
       updateIdle(false, wasTesting);
     };
-    createInterface({ input: channel }).on('line', (line) => {
+    const lines = createInterface({ input: channel });
+    lines.on('line', (line) => {
       const wasTesting = isTesting();
       const event = lifecycle.accept(line);
       if (event === null) {
@@ -784,6 +785,9 @@ export async function runBoundedExec(
       // Tool startup and native lifecycle-bearing stdout wait for their phase acknowledgement.
       channel.write(`${JSON.stringify(event)}\n`);
     });
+    // readline re-emits its input's errors on the interface, where one with no listener is thrown: a
+    // runner killed with unread lifecycle bytes resets the channel (ECONNRESET on Linux).
+    lines.on('error', (error) => failLifecycle(error.message));
     channel.on('error', (error) => failLifecycle(error.message));
     channel.on('end', () => {
       if (!lifecycle.finished()) failLifecycle('supervisor channel ended without an owned terminal event');
