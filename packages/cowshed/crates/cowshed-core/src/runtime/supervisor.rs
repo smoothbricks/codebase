@@ -38,7 +38,9 @@ use crate::api::resources::{
 };
 #[cfg(target_os = "macos")]
 use crate::error::PriorityFailure;
-use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result, StdinRefusal};
+use crate::error::{
+    AdmissionField, AdmissionRefusal, CowshedError, CpuAdmissionRefusal, Result, StdinRefusal,
+};
 use crate::exec::{
     ExecError, ProfileLaunch, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
     prepare_child_descriptors,
@@ -198,6 +200,8 @@ pub struct WorkspaceSupervisorConfig {
     pub job_sampling: JobSamplingPolicy,
     /// Told each build volume whose job hold ended; `None` tells nothing.
     pub build_volume_released: Option<BuildVolumeReleased>,
+    /// Where the host's memory-pressure reports come from: the kernel's notification, or a test's.
+    pub memory_pressure: crate::host_pressure::Source,
     /// How long the shed may go unused before the keeper stops its Nx daemon: main's
     /// `.cowshed.toml` `[nx] daemon_idle` (04_sandbox.md, "The Nx daemon stays on").
     pub nx_daemon_idle: NxDaemonIdle,
@@ -384,6 +388,7 @@ impl Default for WorkspaceSupervisorConfig {
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
             build_volume_released: None,
+            memory_pressure: crate::host_pressure::Source::Kernel,
             nx_daemon_idle: NxDaemonIdle::DEFAULT,
         }
     }
@@ -4308,7 +4313,9 @@ impl WorkspaceSupervisor {
             job_sampling: config.job_sampling,
             sample_clock: None,
             build_volume_released: config.build_volume_released,
-            admissions: tokio::task::JoinSet::new(),
+            admission: super::job_admission::Admission::default(),
+            admission_effects: VecDeque::new(),
+            pressure: config.memory_pressure.open(),
         };
         // Whatever the checkout's volumes were cloned from, they are named for it from here.
         let build = actor.policy.ceiling().build_volume_mount.clone();
@@ -4995,9 +5002,9 @@ enum CpuStanding {
 /// What a queued job's spawn needs once it is admitted, as admission settled it: the authority
 /// and sandbox it was admitted under, never ones adopted while it waited.
 struct PendingSpawn {
-    /// Aborting it ends the admission's wait. Its task id tells this admission's answer from one a
-    /// withdrawn admission of the job delivered before its abort.
-    asking: tokio::task::AbortHandle,
+    /// The job's count, and the requester's jobserver it may share.
+    want: std::num::NonZeroUsize,
+    parent: Option<super::job_cpu::InheritedJobserver>,
     authority: WorkspaceAuthoritySnapshot,
     policy: SandboxPolicy,
     command: SpawnCommand,
@@ -5211,9 +5218,13 @@ struct SupervisorActor {
     sample_clock: Option<tokio::time::Interval>,
     /// See [`WorkspaceSupervisorConfig::build_volume_released`].
     build_volume_released: Option<BuildVolumeReleased>,
-    /// Each queued job's admission, answered off the actor's path, so status, kill and every
-    /// other command are served while a background start waits for memory.
-    admissions: tokio::task::JoinSet<(JobId, Result<Jobserver>)>,
+    /// This supervisor's job admission ([`super::job_admission`]), told of every start, spawn,
+    /// cancel and end, and of each memory-pressure report.
+    admission: super::job_admission::Admission,
+    /// What the admission answered that the actor has yet to carry out, in order.
+    admission_effects: VecDeque<super::job_admission::Effect>,
+    /// The host's memory pressure, as the kernel reports it.
+    pressure: crate::host_pressure::Feed,
 }
 
 /// Runtime teardown transfers the same jobs to one retirement worker. The actor joins for a
@@ -5480,7 +5491,10 @@ fn report_unsignalled(job: JobId, signalled: Result<()>) {
 
 impl SupervisorActor {
     async fn run(mut self) {
+        let reading = self.pressure.current();
+        self.admission_event(super::job_admission::Event::Pressure(reading));
         loop {
+            self.carry_out_admission().await;
             if self.command_lane_closed && !self.has_running_jobs() {
                 self.release_kept_nx_daemon().await;
                 self.begin_group_ledger_finish();
@@ -5523,16 +5537,8 @@ impl SupervisorActor {
                         None => break,
                     }
                 }
-                granted = self.admissions.join_next_with_id(), if !self.admissions.is_empty() => {
-                    match granted {
-                        Some(Ok((asked, (job_id, granted)))) => {
-                            self.spawn_admitted(asked, job_id, granted).await;
-                        }
-                        // A withdrawn request: its job ended while it was queued.
-                        Some(Err(error)) if error.is_cancelled() => {}
-                        Some(Err(error)) => std::panic::resume_unwind(error.into_panic()),
-                        None => {}
-                    }
+                reading = self.pressure.changed() => {
+                    self.admission_event(super::job_admission::Event::Pressure(reading));
                 }
                 labelled = self.labelling.join_next(), if !self.labelling.is_empty() => {
                     if let Some(Err(error)) = labelled {
@@ -5624,8 +5630,7 @@ impl SupervisorActor {
     /// A tick of the sampling clock: a supervisor boundary for every job that owns a process,
     /// each kept as its latest sample. With none left, the clock stops until a job owns one.
     /// A failed tick leaves the latest sample standing; every read observes again and returns
-    /// that failure itself. On macOS each tick also reads the host's memory pressure
-    /// ([`Self::end_for_memory`]).
+    /// that failure itself.
     fn sample_jobs(&mut self) {
         let mut live = false;
         for job in self.jobs.values_mut() {
@@ -5648,51 +5653,81 @@ impl SupervisorActor {
         if !live {
             self.sample_clock = None;
         }
-        #[cfg(target_os = "macos")]
-        self.end_for_memory();
     }
 
-    /// End the youngest background or resident job while the host is at critical memory pressure
-    /// (05_gateway.md "Memory pressure"), through the ordinary kill, one at a time on the sampling
-    /// tick while the pressure lasts: work nobody waits on gives way before the host swaps every job
-    /// (measured 2026-10-26: six acceptance runs of one repository put 5.9 of 7 GB in swap). The
-    /// job fails `memory`, its stderr naming the level and its resident memory. A gate and
-    /// interactive work are never ended; Linux leaves this to each job's cgroup ceilings.
-    #[cfg(target_os = "macos")]
-    fn end_for_memory(&mut self) {
-        use cowshed_gateway_types::host_status::MemoryPressure;
-        // One job at a time: the next is ended only once the last one ended for memory is gone.
-        if self
-            .jobs
-            .values()
-            .any(|job| !job.terminal() && job.kill_reason == Some(KillReason::Memory))
-        {
-            return;
+    /// Tell the admission `event`; its answers are carried out at the top of the actor's loop.
+    fn admission_event(&mut self, event: super::job_admission::Event) {
+        self.admission_effects
+            .extend(self.admission.step(Instant::now(), event));
+    }
+
+    /// Carry out what the admission answered, in order ([`super::job_admission::Effect`]). An
+    /// effect may tell the admission more -- a spawn, a failure that concludes its job -- whose
+    /// answers queue behind it.
+    async fn carry_out_admission(&mut self) {
+        use super::job_admission::Effect;
+        while let Some(effect) = self.admission_effects.pop_front() {
+            match effect {
+                Effect::Admit { job } => self.spawn_admitted(job).await,
+                Effect::WaitStarted { job, pressure } => self.process_output(
+                    job,
+                    StreamKind::Stderr,
+                    Bytes::from(format!(
+                        "cowshed: jobserver wait start queue=memory pressure={pressure}\n"
+                    )),
+                ),
+                Effect::WaitEnded { job, waited, ok } => {
+                    let status = if ok { "ok" } else { "err" };
+                    self.process_output(
+                        job,
+                        StreamKind::Stderr,
+                        Bytes::from(format!(
+                            "cowshed: jobserver wait done elapsed={waited:?} status={status}\n"
+                        )),
+                    );
+                }
+                Effect::Refuse { job, error } => {
+                    let Some(record) = self.jobs.get_mut(&job) else {
+                        continue;
+                    };
+                    if record.terminal() || !matches!(record.cpu, CpuStanding::Queued(_)) {
+                        continue;
+                    }
+                    record.cpu = CpuStanding::Settled;
+                    record.failure = Some(JobFailure::CpuAdmission);
+                    self.fail_before_command(
+                        job,
+                        KillReason::CpuAdmission,
+                        CowshedError::cpu_admission(CpuAdmissionRefusal::MemoryPressure { error }),
+                    )
+                    .await;
+                }
+                #[cfg(target_os = "macos")]
+                Effect::EndForMemory { job, level } => self.end_for_memory(job, level),
+                // PSI has no Critical level, so a Linux report never ends a job for memory.
+                #[cfg(not(target_os = "macos"))]
+                Effect::EndForMemory { .. } => {}
+            }
         }
-        let level = match crate::host_pressure::read_memory_pressure() {
-            Ok(MemoryPressure::Darwin { level }) => level,
-            Ok(MemoryPressure::Psi { .. }) => {
-                unreachable!("macOS reports a memorystatus level, never PSI")
-            }
-            Err(error) => {
-                cowshed_os::eprintln!(
-                    "cowshed: cannot read the host's memory pressure, so no job is ended for \
-                     memory: {error}"
-                );
-                return;
-            }
-        };
-        let running = self
-            .jobs
-            .iter()
-            .filter(|(_, job)| !job.terminal() && job.kill_reason.is_none() && job.birth.is_some())
-            .map(|(job_id, job)| (*job_id, job.info.class, job.started_at));
-        let Some(job_id) = crate::host_pressure::job_to_end(level, running) else {
-            return;
-        };
+    }
+
+    /// End `job_id`, the youngest background or resident job while the host is at critical
+    /// memory pressure (05_gateway.md "Memory pressure", "Admission"), through the ordinary kill:
+    /// work nobody waits on gives way before the host swaps every job (measured 2026-10-26: six
+    /// acceptance runs of one repository put 5.9 of 7 GB in swap). The job fails `memory`, its
+    /// stderr naming the level and its resident memory.
+    #[cfg(target_os = "macos")]
+    fn end_for_memory(
+        &mut self,
+        job_id: JobId,
+        level: cowshed_gateway_types::host_status::DarwinPressureLevel,
+    ) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
+        if job.terminal() {
+            return;
+        }
         job.failure = Some(JobFailure::Memory);
         let line = format!(
             "cowshed: the host is at {level:?} memory pressure; this {:?} job, the youngest that \
@@ -6844,12 +6879,18 @@ impl SupervisorActor {
             .map(WorkspacePath::as_path)
             .map(Path::to_path_buf)
             .unwrap_or_default();
-        let asking = self.admit_cpu(
-            job_id,
-            scheduling.class(),
-            scheduling.want(),
-            parent_jobserver,
-        );
+        let ledger = if self
+            .policy
+            .child(mode)
+            .0
+            .capabilities
+            .active
+            .contains(&crate::capabilities::CapabilityId::Mbx)
+        {
+            super::job_admission::Ledger::Mbx
+        } else {
+            super::job_admission::Ledger::Jobservers
+        };
         let job = JobStateRecord {
             info,
             started_at: Instant::now(),
@@ -6889,7 +6930,8 @@ impl SupervisorActor {
             session_identity,
             build_hold,
             cpu: CpuStanding::Queued(Box::new(PendingSpawn {
-                asking,
+                want: scheduling.want(),
+                parent: parent_jobserver,
                 authority: self.authority.clone(),
                 // Rendered when this authority was taken. The request may narrow the ceiling,
                 // never widen it, and narrowing one job alters no other job.
@@ -6904,6 +6946,11 @@ impl SupervisorActor {
             failure: None,
         };
         self.jobs.insert(job_id, job);
+        self.admission_event(super::job_admission::Event::Requested {
+            job: job_id,
+            class: scheduling.class(),
+            ledger,
+        });
         Ok(ExecAdmission::New(job_id))
     }
 
@@ -6925,21 +6972,13 @@ impl SupervisorActor {
         Ok(())
     }
 
-    /// `asked`, a queued job's admission, answered: spawn its command with its jobserver, or fail
-    /// the job with the refusal. A job that already ended, or one admitted again since (`asked` is
-    /// not its current admission), lets the jobserver go at once, by dropping it.
-    async fn spawn_admitted(
-        &mut self,
-        asked: tokio::task::Id,
-        job_id: JobId,
-        admitted: Result<Jobserver>,
-    ) {
+    /// `job_id` admitted: spawn its command with its jobserver, or fail the job when its jobserver
+    /// cannot be made. A job that already ended is left as it is.
+    async fn spawn_admitted(&mut self, job_id: JobId) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
-        if job.terminal()
-            || !matches!(&job.cpu, CpuStanding::Queued(pending) if pending.asking.id() == asked)
-        {
+        if job.terminal() || !matches!(&job.cpu, CpuStanding::Queued(_)) {
             return;
         }
         let CpuStanding::Queued(pending) = std::mem::replace(&mut job.cpu, CpuStanding::Settled)
@@ -6947,7 +6986,8 @@ impl SupervisorActor {
             return;
         };
         let PendingSpawn {
-            asking: _,
+            want,
+            parent,
             authority,
             policy,
             command,
@@ -6957,7 +6997,11 @@ impl SupervisorActor {
             scope,
             stdin,
         } = *pending;
-        let jobserver = match admitted {
+        let directory = super::job_cpu::cpu_pool_directory(
+            &policy.ceiling().store_root,
+            &authority.workspace_incarnation,
+        );
+        let jobserver = match super::job_cpu::jobserver(want, directory, parent) {
             Ok(jobserver) => jobserver,
             Err(error) => {
                 job.failure = Some(JobFailure::CpuAdmission);
@@ -7021,6 +7065,10 @@ impl SupervisorActor {
                 return;
             }
         };
+        self.admission_effects.extend(self.admission.step(
+            Instant::now(),
+            super::job_admission::Event::Spawned { job: job_id },
+        ));
         #[cfg(target_os = "macos")]
         {
             job.monitor = process.observations().cloned();
@@ -7147,30 +7195,6 @@ impl SupervisorActor {
                 "check the cowshed store's permissions and retry",
             )),
         }
-    }
-
-    /// Admit `job_id`'s command off the actor's path ([`super::job_cpu::admit`]): the actor keeps
-    /// serving every command while a background start waits for memory pressure to drop. Aborting
-    /// the returned handle -- a withdrawal, or this supervisor ending -- ends the wait.
-    fn admit_cpu(
-        &mut self,
-        job_id: JobId,
-        class: ExecClass,
-        want: std::num::NonZeroUsize,
-        parent: Option<super::job_cpu::InheritedJobserver>,
-    ) -> tokio::task::AbortHandle {
-        let directory = super::job_cpu::cpu_pool_directory(
-            &self.policy.ceiling().store_root,
-            &self.authority.workspace_incarnation,
-        );
-        self.admissions.spawn(super::job_cpu::reporting(
-            job_id,
-            self.events.clone(),
-            async move {
-                let admitted = super::job_cpu::admit(class, want, directory, parent).await;
-                (job_id, admitted)
-            },
-        ))
     }
 
     fn current_build_volume_grant(&self) -> Result<Option<PathBuf>> {
@@ -8007,14 +8031,11 @@ impl SupervisorActor {
         // A job still waiting for its admission has nothing to signal: withdrawing it ends its
         // wait, and the job ends without a command.
         if matches!(job.cpu, CpuStanding::Queued(_)) {
-            if let CpuStanding::Queued(pending) =
-                std::mem::replace(&mut job.cpu, CpuStanding::Withdrawn)
-            {
-                pending.asking.abort();
-            }
+            job.cpu = CpuStanding::Withdrawn;
             job.stdout_eof = true;
             job.stderr_eof = true;
             end_job_stdin(job);
+            self.admission_event(super::job_admission::Event::Cancelled { job: job_id });
             return Ok(());
         }
         // A command not yet born -- its warm host still activating outside the job's cgroup, or
@@ -8413,6 +8434,10 @@ impl SupervisorActor {
             }
         }
         job.cpu = CpuStanding::Settled;
+        self.admission_effects.extend(self.admission.step(
+            Instant::now(),
+            super::job_admission::Event::Concluded { job: job_id },
+        ));
         job.info.state = state;
         job.info.duration_ms = Some(duration_ms);
         job.info.exit = job.exit.clone();
@@ -11127,6 +11152,7 @@ mod lifecycle_commitment_tests {
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
             build_volume_released: None,
+            memory_pressure: crate::host_pressure::Source::Kernel,
             nx_daemon_idle: defaults.nx_daemon_idle,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's

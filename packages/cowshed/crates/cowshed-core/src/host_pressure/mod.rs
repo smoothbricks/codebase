@@ -10,9 +10,13 @@
 //! 5.9 GB; CPU at that load is the kernel's to share, the swap is not.
 //!
 //! A start that waits cannot help once the host is already short. On macOS, which charges no group
-//! a memory limit, the supervisor therefore ends one job per reading while the level is `Critical`:
+//! a memory limit, the supervisor therefore ends one job at a time while the level is `Critical`:
 //! the youngest running `background` or `resident` job ([`job_to_end`]), through the cancel path,
 //! reported `failed` with failure `memory`. Gate and interactive jobs are never ended. On Linux the
+//! kernel does this inside the job's cgroup (`memory.high`, `memory.swap.max` 0), and no loop runs.
+//!
+//! A supervisor is told of the pressure, never polls it ([`Feed`]): one reading when it opens its
+//! feed, then a new one each time the kernel notifies a change.
 //! kernel does this inside the job's cgroup (`memory.high`, `memory.swap.max` 0), and no loop runs.
 //!
 //! The readers are the platform's (`linux.rs`: `/proc/pressure/memory` and `/proc/meminfo`;
@@ -22,7 +26,7 @@
 //! threshold is tested without a pressured host. Allocation: none on the decision; a reader
 //! allocates only the text of a malformed reading.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use cowshed_gateway_types::host_status::{DarwinPressureLevel, MemoryPressure};
 
@@ -39,6 +43,94 @@ use macos as platform;
 
 pub use platform::{read_memory_pressure, read_swap};
 
+/// The host's memory pressure as the kernel last reported it, or why it cannot be read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Reading {
+    Known(MemoryPressure),
+    Unreadable(String),
+}
+
+/// The pressure the kernel publishes now, as a [`Reading`].
+pub fn reading() -> Reading {
+    match read_memory_pressure() {
+        Ok(pressure) => Reading::Known(pressure),
+        Err(error) => Reading::Unreadable(error.to_string()),
+    }
+}
+
+/// Where a supervisor's memory-pressure reports come from.
+#[derive(Clone, Debug, Default)]
+pub enum Source {
+    /// The kernel's notification: libdispatch's memory-pressure source on macOS, a PSI trigger
+    /// on Linux.
+    #[default]
+    Kernel,
+    /// Readings a caller sends: a test drives a supervisor's admission through it.
+    Driven(tokio::sync::watch::Receiver<Reading>),
+}
+
+impl Source {
+    /// Open the feed. A kernel that refuses the subscription leaves a feed whose one reading
+    /// names why: a host whose pressure cannot be followed is not shown to have room.
+    pub fn open(self) -> Feed {
+        match self {
+            Self::Driven(receiver) => Feed {
+                receiver,
+                _notifier: None,
+                _sender: None,
+            },
+            Self::Kernel => {
+                let (sender, receiver) = tokio::sync::watch::channel(reading());
+                match platform::notify(sender) {
+                    Ok(notifier) => Feed {
+                        receiver,
+                        _notifier: Some(notifier),
+                        _sender: None,
+                    },
+                    Err(error) => {
+                        let (sender, receiver) =
+                            tokio::sync::watch::channel(Reading::Unreadable(format!(
+                                "cannot subscribe to the kernel's memory-pressure notification: \
+                                 {error}"
+                            )));
+                        Feed {
+                            receiver,
+                            _notifier: None,
+                            _sender: Some(sender),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A supervisor's memory-pressure reports: one reading when it opens, then one at each change the
+/// kernel notifies. Dropping it ends the subscription.
+pub struct Feed {
+    receiver: tokio::sync::watch::Receiver<Reading>,
+    /// The kernel subscription, which sends each report.
+    _notifier: Option<platform::Notifier>,
+    /// The sender of a feed that never changes, kept so the feed stays open.
+    _sender: Option<tokio::sync::watch::Sender<Reading>>,
+}
+
+impl Feed {
+    /// The latest report.
+    pub fn current(&mut self) -> Reading {
+        self.receiver.borrow_and_update().clone()
+    }
+
+    /// The next report. Ended by the kernel's next notification; a feed whose sender is gone
+    /// reports nothing more, and this never returns.
+    pub async fn changed(&mut self) -> Reading {
+        if self.receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        self.current()
+    }
+}
+
 /// Why a host reading could not be taken. The field is `file`, not `source`: thiserror would
 /// take a `source` field as the error's cause.
 #[derive(Debug, thiserror::Error)]
@@ -52,11 +144,6 @@ pub enum HostPressureError {
     #[error("{file} is malformed: {text:?}")]
     Malformed { file: &'static str, text: String },
 }
-
-/// How long a waiting start sleeps before it takes the next reading. PSI's `avg10` moves over ten
-/// seconds and macOS changes its level on the memorystatus thread's own schedule, so a waiter sees
-/// the drop within this bound of the kernel publishing it.
-pub const RECHECK_EVERY: Duration = Duration::from_secs(2);
 
 /// The Linux `some avg10` of `/proc/pressure/memory`, in hundredths of a percent, above which a
 /// background start waits: some task stalled on memory for more than a tenth of the last ten
@@ -81,8 +168,8 @@ pub const fn waits_for_memory(class: ExecClass) -> bool {
 pub enum Decision {
     /// The host is not under memory pressure: start now.
     Start,
-    /// The host is under memory pressure: take the next reading after [`RECHECK_EVERY`]. The
-    /// reading is carried so the job's wait names it.
+    /// The host is under memory pressure: wait for the kernel's next report. The reading is
+    /// carried so the job's wait names it.
     Wait { pressure: MemoryPressure },
 }
 
@@ -132,6 +219,8 @@ const fn ends_for_memory(class: ExecClass) -> bool {
 #[cfg(test)]
 mod tests {
     use cowshed_gateway_types::host_status::CentiPercent;
+
+    use std::time::Duration;
 
     use super::*;
 

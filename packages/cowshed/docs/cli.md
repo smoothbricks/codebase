@@ -1707,14 +1707,14 @@ cores, or `--want <n>` if that is fewer, served by its supervisor and handed to 
 `MAKEFLAGS` and `CARGO_MAKEFLAGS`. It bounds how many compiler and test threads one build starts and never waits on
 another job. A `cowshed exec` a job starts in its own workspace shares that job's fifo.
 
-A background job waits to start while the host reports memory pressure (05_gateway.md, "Memory pressure"): macOS
-`kern.memorystatus_vm_pressure_level` at warning or above, Linux `/proc/pressure/memory` `some avg10` above 10%, read
-again every 2 s. It reads `queued` meanwhile, its stderr says
+A background job without mbx waits to start while the host reports memory pressure (05_gateway.md, "Memory pressure",
+"Admission"): macOS `kern.memorystatus_vm_pressure_level` at warning or above, Linux `/proc/pressure/memory`
+`some avg10` above 10%, as the kernel notifies each change. It reads `queued` meanwhile, its stderr says
 `cowshed: jobserver wait start queue=memory pressure=<reading>`, and it is never refused for pressure; a pressure that
-cannot be read fails it with `cpuAdmission`. On macOS, while the level is critical, the supervisor ends the youngest
-background or resident job as a cancel ends one, and that job fails with `memory`, its stderr naming the level and its
-resident bytes; a gate or interactive job is never ended. On Linux the kernel does this itself: a background job's
-cgroup carries `memory.high` and `memory.swap.max=0`.
+cannot be read fails it with `cpuAdmission`. An mbx project's jobs never wait here, since mbx's pool admits their work.
+On macOS, while the level is critical, the supervisor ends the youngest background or resident job as a cancel ends one,
+and that job fails with `memory`, its stderr naming the level and its resident bytes; a gate or interactive job is never
+ended. On Linux the kernel does this itself: a background job's cgroup carries `memory.high` and `memory.swap.max=0`.
 
 `JobInfo` reports the admitted `class` and `scope` and the observed `nice`. Each is the same typed field of the API's
 exec request (07_api.md, "Exec and grants"), so the CLI asks for nothing an embedding process cannot.

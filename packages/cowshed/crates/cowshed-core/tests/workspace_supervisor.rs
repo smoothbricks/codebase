@@ -520,6 +520,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         build_volume_released: None,
+        memory_pressure: cowshed_core::host_pressure::Source::Kernel,
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
     }
 }
@@ -1328,6 +1329,76 @@ async fn disconnect_does_not_cancel_background_process() {
     let info = survivor.wait(job).await.unwrap();
     assert_eq!(info.state, JobState::Exited);
     assert_eq!(info.stdout.bytes, 5);
+}
+
+/// Admission through the supervisor on a driven pressure feed (05_gateway.md "Admission"): under
+/// Warning a background start spawns nothing while a gate asked after it spawns at once; the
+/// reported drop spawns the background job, whose stderr names its wait.
+#[tokio::test]
+async fn a_background_start_waits_for_the_reported_drop_and_a_gate_does_not() {
+    use cowshed_core::host_pressure::{Reading, Source};
+    use cowshed_gateway_types::host_status::{DarwinPressureLevel, MemoryPressure};
+    let level = |level| Reading::Known(MemoryPressure::Darwin { level });
+    let (pressure, reports) = tokio::sync::watch::channel(level(DarwinPressureLevel::Warning));
+    let root = workspace_root(&temp_parent::scratch_parent(), "test-workspace");
+    let mut h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            memory_pressure: Source::Driven(reports),
+            ..config(&root)
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    let held = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let gated = h
+        .handle
+        .exec(
+            None,
+            None,
+            gate(request(StdinSource::Empty)),
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .unwrap();
+    let first = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        first.request.job_id, gated,
+        "the gate is not held behind it"
+    );
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "the background start is held"
+    );
+
+    pressure.send_replace(level(DarwinPressureLevel::Normal));
+    let second = h.spawned.recv().await.unwrap();
+    assert_eq!(second.request.job_id, held);
+    complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    complete(&first, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(h.handle.wait(held).await.unwrap().state, JobState::Exited);
+    let stderr = h
+        .handle
+        .log_read(held, StreamKind::Stderr, 0, false)
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&stderr.bytes);
+    assert!(
+        stderr.starts_with("cowshed: jobserver wait start queue=memory pressure=")
+            && stderr.contains("cowshed: jobserver wait done elapsed=")
+            && stderr.ends_with(" status=ok\n"),
+        "{stderr}"
+    );
 }
 
 #[tokio::test]

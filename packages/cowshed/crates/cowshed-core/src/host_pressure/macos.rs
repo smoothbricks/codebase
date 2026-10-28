@@ -6,12 +6,14 @@
 //! (xnu bsd/kern/kern_memorystatus_notify.c; doc/vm/memorystatus_notify.md). Any other value is
 //! `Malformed`, never `Normal`.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, c_void};
 use std::io;
+use std::ptr::NonNull;
 
 use cowshed_gateway_types::host_status::{DarwinPressureLevel, MemoryPressure, SwapUsage};
+use tokio::sync::watch;
 
-use super::HostPressureError;
+use super::{HostPressureError, Reading};
 
 const PRESSURE_LEVEL: &CStr = c"kern.memorystatus_vm_pressure_level";
 const SWAP_USAGE: &CStr = c"vm.swapusage";
@@ -109,6 +111,100 @@ const fn name(sysctl: &'static CStr) -> &'static str {
     }
 }
 
+/// libdispatch's memory-pressure source type, `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`
+/// (dispatch/source.h): libSystem's own, so no dependency.
+#[repr(C)]
+struct DispatchSourceType {
+    _opaque: [u8; 0],
+}
+
+unsafe extern "C" {
+    static _dispatch_source_type_memorypressure: DispatchSourceType;
+    fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
+    fn dispatch_source_create(
+        kind: *const DispatchSourceType,
+        handle: usize,
+        mask: usize,
+        queue: *mut c_void,
+    ) -> *mut c_void;
+    fn dispatch_set_context(object: *mut c_void, context: *mut c_void);
+    fn dispatch_source_set_event_handler_f(
+        source: *mut c_void,
+        handler: unsafe extern "C" fn(*mut c_void),
+    );
+    fn dispatch_source_set_cancel_handler_f(
+        source: *mut c_void,
+        handler: unsafe extern "C" fn(*mut c_void),
+    );
+    fn dispatch_resume(object: *mut c_void);
+    fn dispatch_source_cancel(source: *mut c_void);
+    fn dispatch_release(object: *mut c_void);
+}
+
+/// `DISPATCH_MEMORYPRESSURE_NORMAL | _WARN | _CRITICAL`: every level change, the drop included.
+const EVERY_LEVEL: usize = 0x01 | 0x02 | 0x04;
+const DISPATCH_QUEUE_PRIORITY_DEFAULT: isize = 0;
+
+/// The kernel's memory-pressure notification, sending a fresh reading of the level at each change.
+/// Dropping it cancels the source; the sender goes with the cancel handler, which libdispatch runs
+/// only once no event handler is running.
+pub struct Notifier {
+    source: NonNull<c_void>,
+}
+
+// SAFETY: a dispatch source may be cancelled and released from any thread.
+unsafe impl Send for Notifier {}
+
+/// Subscribe `sender` to the kernel's memory-pressure notification.
+pub fn notify(sender: watch::Sender<Reading>) -> io::Result<Notifier> {
+    let context = Box::into_raw(Box::new(sender)).cast::<c_void>();
+    // SAFETY: the source type is libdispatch's static; the queue is a global queue that needs no
+    // release; the context is the boxed sender, which the cancel handler alone frees.
+    unsafe {
+        let queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+        let source = dispatch_source_create(
+            &raw const _dispatch_source_type_memorypressure,
+            0,
+            EVERY_LEVEL,
+            queue,
+        );
+        let Some(source) = NonNull::new(source) else {
+            drop(Box::from_raw(context.cast::<watch::Sender<Reading>>()));
+            return Err(io::Error::other(
+                "dispatch_source_create made no memory-pressure source",
+            ));
+        };
+        dispatch_set_context(source.as_ptr(), context);
+        dispatch_source_set_event_handler_f(source.as_ptr(), on_change);
+        dispatch_source_set_cancel_handler_f(source.as_ptr(), on_cancel);
+        dispatch_resume(source.as_ptr());
+        Ok(Notifier { source })
+    }
+}
+
+/// A level change: the level the sysctl publishes now is the report.
+unsafe extern "C" fn on_change(context: *mut c_void) {
+    // SAFETY: the context is the sender `notify` boxed, freed only by the cancel handler, which
+    // runs after the last event handler returned.
+    let sender = unsafe { &*context.cast::<watch::Sender<Reading>>() };
+    sender.send_replace(super::reading());
+}
+
+unsafe extern "C" fn on_cancel(context: *mut c_void) {
+    // SAFETY: the context is the sender `notify` boxed; no event handler runs after this one.
+    drop(unsafe { Box::from_raw(context.cast::<watch::Sender<Reading>>()) });
+}
+
+impl Drop for Notifier {
+    fn drop(&mut self) {
+        // SAFETY: the source is this notifier's own, cancelled and released once.
+        unsafe {
+            dispatch_source_cancel(self.source.as_ptr());
+            dispatch_release(self.source.as_ptr());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +219,19 @@ mod tests {
         for raw in [0, 3, 8, -1] {
             assert_eq!(darwin_level(raw), Err(raw));
         }
+    }
+
+    /// The kernel's own feed: libdispatch makes the memory-pressure source, so the feed's first
+    /// report is the level the sysctl publishes, never the subscription's refusal; dropping it
+    /// cancels the source.
+    #[tokio::test]
+    async fn the_kernel_feed_opens_with_the_published_level() {
+        let mut feed = super::super::Source::Kernel.open();
+        let reading = feed.current();
+        assert!(
+            matches!(reading, Reading::Known(MemoryPressure::Darwin { .. })),
+            "{reading:?}"
+        );
+        drop(feed);
     }
 }

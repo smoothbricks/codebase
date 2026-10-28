@@ -20,11 +20,11 @@
 //!   transition — and nothing more; gate groups run concurrently, and an urgent land waits behind
 //!   the turn in progress in publication order.
 //! - **Memory.** A background unit is not selected while the host is under memory pressure
-//!   (05_gateway.md "Host scheduling", "Memory pressure"). A selection pass takes at most one
-//!   reading, and only when a background unit would otherwise be selected; while one is held, the
-//!   pass runs again every [`RECHECK_EVERY`]. A reading that cannot be taken holds the unit too and
-//!   the queue names why: an unreadable pressure is not an unpressured host. Gate and interactive
-//!   units never take a reading.
+//!   (05_gateway.md "Host scheduling", "Memory pressure"). The server holds the kernel's latest
+//!   report ([`host_pressure::Feed`]) and recomputes the schedule at each new one; a pass consults
+//!   it only when a background unit would otherwise be selected. A report that names a failed
+//!   reading holds the unit too and the queue names why: an unreadable pressure is not an
+//!   unpressured host. Gate and interactive units never consult it.
 //! - **Caps.** A unit may declare its own parallelism ceiling — the caps its run kind applies to
 //!   itself — and the grant reports it as declared. The grant allocates nothing: the kernel
 //!   schedules CPU among every runnable process, and this scheduler holds no CPU counter.
@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use cowshed_core::api::ExecClass;
-use cowshed_core::host_pressure::{self, Decision, HostPressureError, RECHECK_EVERY};
+use cowshed_core::host_pressure::{self, Decision, Reading};
 use cowshed_gateway_types::host_status::{MemoryPressure, MemoryPressureReading};
 use cowshed_gateway_types::{
     ConfigError, LeaseClass, TaskBand, TaskClass, TaskDepWait, TaskGrant, TaskLeaseStatus,
@@ -395,17 +395,17 @@ impl Ledger {
 
     /// Recompute the schedule at this instant and select every unit whose turn came, whose lease
     /// classes have room and that memory does not hold, in order. The order is a pure function of
-    /// the facts, and the memory decision of the facts and the one reading `read_memory` returns:
+    /// the facts, and the memory decision of the facts and the one report `read_memory` returns:
     /// the pass calls it at most once, and only when a unit that waits for memory would otherwise
     /// be selected. A lease- or memory-held unit holds up nothing beside it.
     fn select(
         &mut self,
         now: Instant,
         observation: &mut LeverageObservation,
-        read_memory: impl FnOnce() -> Result<MemoryPressure, HostPressureError>,
+        read_memory: impl FnOnce() -> Result<MemoryPressure, String>,
         effects: &mut Vec<Effect>,
     ) {
-        let reading = LazyCell::new(|| read_memory().map_err(|error| error.to_string()));
+        let reading = LazyCell::new(read_memory);
         for ticket in self.ready_order(now, observation) {
             let Some((unit, attempt)) = self.tickets.get(&ticket).cloned() else {
                 continue;
@@ -555,22 +555,15 @@ impl Ledger {
             .then_with(|| a.facts.unit.cmp(&b.facts.unit))
     }
 
-    /// When the actor must next recompute without an arrival: the oldest unaged waiter's age
-    /// bound, or the next memory reading while a unit is held for memory, whichever comes first.
+    /// When the actor must next recompute without an arrival or a pressure report: the oldest
+    /// unaged waiter's age bound.
     fn wake(&self, now: Instant) -> Option<Instant> {
-        let queued = || {
-            self.units
-                .values()
-                .filter(|unit| matches!(unit.state, State::Queued))
-        };
-        let aging = queued()
+        self.units
+            .values()
+            .filter(|unit| matches!(unit.state, State::Queued))
             .map(|unit| unit.admitted + self.limits.age_bound)
             .filter(|deadline| *deadline > now)
-            .min();
-        let recheck = queued()
-            .any(|unit| unit.memory_wait.is_some())
-            .then(|| now + RECHECK_EVERY);
-        aging.into_iter().chain(recheck).min()
+            .min()
     }
 
     fn unit_of(&self, ticket: u64) -> Option<&Unit> {
@@ -830,9 +823,11 @@ async fn run(limits: TaskServerLimits, mut receiver: mpsc::UnboundedReceiver<Mes
     let mut ledger = Ledger::new(limits);
     let mut replies: HashMap<u64, oneshot::Sender<Result<TaskGrant, TaskRefusal>>> = HashMap::new();
     let mut pending_queue: Vec<oneshot::Sender<TaskQueueStatus>> = Vec::new();
+    let mut pressure = host_pressure::Source::Kernel.open();
+    let mut memory = pressure.current();
     loop {
-        // Every message, the oldest waiter's age bound and, while a unit is held for memory, the
-        // next reading recompute the schedule.
+        // Every message, every pressure report and the oldest waiter's age bound recompute the
+        // schedule.
         let mut follow: Vec<Effect> = Vec::new();
         tokio::select! {
             message = receiver.recv() => match message {
@@ -871,6 +866,7 @@ async fn run(limits: TaskServerLimits, mut receiver: mpsc::UnboundedReceiver<Mes
                 Some(Message::Queue { reply }) => pending_queue.push(reply),
                 None => return,
             },
+            reading = pressure.changed() => memory = reading,
             _ = wake_at(ledger.wake(Instant::now())) => {}
         }
 
@@ -878,7 +874,10 @@ async fn run(limits: TaskServerLimits, mut receiver: mpsc::UnboundedReceiver<Mes
         ledger.select(
             Instant::now(),
             &mut observation,
-            host_pressure::read_memory_pressure,
+            || match &memory {
+                Reading::Known(pressure) => Ok(*pressure),
+                Reading::Unreadable(error) => Err(error.clone()),
+            },
             &mut follow,
         );
 
@@ -926,8 +925,8 @@ async fn run(limits: TaskServerLimits, mut receiver: mpsc::UnboundedReceiver<Mes
     }
 }
 
-/// Sleeps until `deadline`, or forever when nothing is due: the age bound and the memory
-/// re-check fire on this wake alone, needing no arrival.
+/// Sleeps until `deadline`, or forever when nothing is due: the age bound fires on this wake
+/// alone, needing no arrival.
 async fn wake_at(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,

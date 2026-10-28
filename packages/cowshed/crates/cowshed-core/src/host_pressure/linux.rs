@@ -9,18 +9,78 @@
 //! Each file is read whole into a stack buffer, so a reading allocates only the text of a
 //! malformed one.
 
-use std::fs::File;
-use std::io::{ErrorKind, Read as _};
+use std::fs::{File, OpenOptions};
+use std::io::{self, ErrorKind, Read as _, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::time::Duration;
 
 use cowshed_gateway_types::host_status::{CentiPercent, MemoryPressure, SwapUsage};
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
+use tokio::sync::watch;
 
-use super::HostPressureError;
+use super::{Decision, HostPressureError, Reading, may_start};
 
 const MEMORY_PRESSURE: &str = "/proc/pressure/memory";
 const MEMINFO: &str = "/proc/meminfo";
 
 /// Room for either file whole: `/proc/meminfo` is about 1.5 KiB on Linux 6.x, the PSI file two lines.
 const BUFFER: usize = 8192;
+
+/// The PSI trigger (psi.rst, "Userspace monitor usage"): notify when tasks stalled on memory for
+/// 1 s of a 10 s window, the share [`super::PSI_SOME_AVG10_LIMIT`] holds a start at. An
+/// unprivileged trigger's window must be a multiple of 2 s.
+const TRIGGER: &[u8] = b"some 1000000 10000000\0";
+const WINDOW: Duration = Duration::from_secs(10);
+
+/// The kernel's PSI trigger on `/proc/pressure/memory`, sending a fresh reading at each
+/// notification. Dropping it ends the task that holds the trigger, and the trigger with it.
+pub struct Notifier {
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for Notifier {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Subscribe `sender` to the kernel's PSI trigger. PSI notifies a rise only, so while the last
+/// reading holds a start the task reads again at each window's end, the first moment a drop can
+/// show; an unpressured host is read again only when the trigger fires.
+pub fn notify(sender: watch::Sender<Reading>) -> io::Result<Notifier> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(MEMORY_PRESSURE)?;
+    file.write_all(TRIGGER)?;
+    let trigger = AsyncFd::with_interest(file, Interest::PRIORITY)?;
+    let task = tokio::spawn(async move {
+        loop {
+            let held = matches!(
+                &*sender.borrow(),
+                Reading::Known(pressure) if may_start(*pressure) != Decision::Start
+            );
+            tokio::select! {
+                ready = trigger.ready(Interest::PRIORITY) => match ready {
+                    Ok(mut guard) => guard.clear_ready(),
+                    Err(error) => {
+                        sender.send_replace(Reading::Unreadable(format!(
+                            "the {MEMORY_PRESSURE} trigger failed: {error}"
+                        )));
+                        return;
+                    }
+                },
+                () = tokio::time::sleep(WINDOW), if held => {}
+            }
+            sender.send_replace(super::reading());
+        }
+    });
+    Ok(Notifier {
+        task: task.abort_handle(),
+    })
+}
 
 /// The host's memory pressure: `some avg10` of `/proc/pressure/memory`.
 pub fn read_memory_pressure() -> Result<MemoryPressure, HostPressureError> {

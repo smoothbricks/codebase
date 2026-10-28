@@ -226,6 +226,7 @@ impl Workspace {
             workspace_volume: None,
             job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
             build_volume_released: None,
+            memory_pressure: cowshed_core::host_pressure::Source::Kernel,
             nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
         };
         let artifacts = ArtifactStoreSink::open(

@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use cowshed_gateway_types::host_status::{DarwinPressureLevel, MemoryPressure};
 
 use crate::api::dto::{ExecClass, JobId};
+pub use crate::host_pressure::Reading;
 use crate::host_pressure::{Decision, job_to_end, may_start, waits_for_memory};
 
 /// Which authority admits a job's CPU and memory (05_gateway.md "Host scheduling").
@@ -35,13 +36,6 @@ pub enum Ledger {
     /// No mbx: the job's own jobserver bounds its tree, the kernel weighs the classes, and memory
     /// pressure holds background starts.
     Jobservers,
-}
-
-/// The host's memory pressure as the kernel last reported it, or why it cannot be read.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Reading {
-    Known(MemoryPressure),
-    Unreadable(String),
 }
 
 /// What the supervisor observed.

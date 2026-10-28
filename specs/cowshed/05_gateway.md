@@ -1426,9 +1426,9 @@ cowshed implementation.
 
 **Without mbx, a background start waits while the host reports memory pressure**: on Linux while `/proc/pressure/memory`
 reads `some avg10` above 10.00%, on macOS while `kern.memorystatus_vm_pressure_level` reads Warning or Critical. The
-supervisor reads the pressure when it would spawn a background job and, while the reading says wait, keeps the job
-`queued` and reads again every 2 s. The wait has no deadline and is never a refusal: it ends when the reading drops or
-the requester kills the job. The job's stderr says so, with the reading, as
+supervisor is told the pressure by the kernel, never polls it ("Admission"): it keeps the job `queued` until the
+kernel's report lets it start. The wait has no deadline and is never a refusal: it ends when a report drops below the
+threshold or the requester kills the job. The job's stderr says so, with the reading, as
 `cowshed: jobserver wait start queue=memory pressure=<reading>` and then
 `cowshed: jobserver wait done elapsed=<waited> status=ok|err`. A reading that cannot be taken fails the job (`failed`,
 failure `cpuAdmission`, naming the file or sysctl and its error): a host whose pressure cannot be read is not shown to
@@ -1436,18 +1436,62 @@ have room. Gate, interactive and either resident never wait; a resident's start 
 person or the land waits on.
 
 **Without mbx, at Critical, macOS ends background work.** macOS charges no job tree to a group the kernel could reclaim
-or kill as one, so the supervisor does it. At each job-sampling tick (one second, 07_api.md "Job monitoring") while
-`kern.memorystatus_vm_pressure_level` reads Critical, each workspace supervisor ends the youngest of its own running
-`memory`, its stderr naming the pressure level and the job's resident sum from that tick's sample. A supervisor ends one
-job at a time: while a job it ended for memory has not concluded, its grace still running, it ends no other, and once
-that job has concluded and the next reading is still Critical, it ends the next youngest, so each reading sees what the
-last ending freed. Gate, interactive and interactive-resident jobs are never ended. Linux runs no such loop: its kernel
-throttles the background class at `memory.high`, kills inside it at `memory.max`, and `memory.swap.max` 0 keeps it from
-swapping the host.
+or kill as one, so the supervisor does it. When the kernel reports Critical, each workspace supervisor ends the youngest
+of its own running `background` and `resident` jobs through the ordinary kill, reported `failed` with failure `memory`,
+its stderr naming the pressure level and the job's resident sum from its latest sample. A supervisor ends one job at a
+time: while a job it ended for memory has not concluded, its grace still running, it ends no other, and once that job
+has concluded while the last report is still Critical, it ends the next youngest, so each step sees what the last ending
+freed. Gate, interactive and interactive-resident jobs are never ended. Linux runs no such loop: its kernel throttles
+the background class at `memory.high`, kills inside it at `memory.max`, and `memory.swap.max` 0 keeps it from swapping
+the host.
 
 Measured 2026-10-26: six acceptance runs of one repository started together reached load 23 on 18 cores and put 5.9 of 7
 GB in swap; a CPU-only budget did not account for that memory. The non-mbx pressure policy above remains the fallback,
 while mbx supplies measured-memory admission when present. An ended run is not retried automatically.
+
+### Admission
+
+A workspace supervisor's admission is one state machine, `cowshed-core`'s `runtime::job_admission`: pure, with no clock,
+file or kernel of its own. The supervisor feeds it events, each stamped with the instant it observed, and carries out
+the effects it answers, in order.
+
+- **States.** A job is `queued` until the host's pressure is known, `waiting` while memory pressure holds it, `admitted`
+  once it may start, `running` from its first process's dispatch, `ending for memory` once Critical pressure chose it,
+  and concluded when it ends, which takes it out of the ledger.
+- **Events.** A start request (job, class, and whether the project has the mbx capability), a pressure report, a spawn,
+  a cancel and a job's end. A cancel removes a `queued` or `waiting` job at once; an admitted one leaves at its end.
+- **Effects.** Admit (make the jobserver and spawn), the wait's start and end lines, refuse (`cpuAdmission`, an
+  unreadable host) and end for memory.
+
+The policy it holds:
+
+- **Gate before background.** A gate, interactive work and residents are admitted at once whatever the host reports, and
+  are never ended for memory; only a background start waits. With mbx every class is admitted at once, and mbx's pool
+  orders the work by priority: `normal` for a gate, `low` for everything else ("Classes").
+- **Fairness between checkouts.** Each supervisor's ledger holds its own checkout's jobs; no job waits on another job's
+  tokens, so there is no cross-checkout queue to order. A drop in pressure releases every waiter of every supervisor
+  that hears it, oldest first within each. Contended CPU is shared by the kernel's class weights; with mbx, across
+  checkouts, by mbx's one pool, which admits each compile and test.
+- **Long holders.** A job's jobserver holds its own constant count `g`, never a share of a host ledger, so a grant made
+  on an idle host cannot hold a later start, however long its holder runs. This closes the 2026-10-19 hole, in which a
+  grant made while the host was idle never shrank, for cowshed's ledger in both modes (enforced by
+  `a_long_holder_admitted_on_an_idle_host_never_holds_a_later_start`). Inside an mbx project, mbx admits each rustc and,
+  with `MBX_SCHEDULER_TESTS=1`, each test process, so a long `cargo nextest` gives its grant back as each one exits. A
+  non-Cargo leaf's `mbx reserve` holds its `--cpus g` until the leaf concludes ("Tradeoff" under "Status"): the hole
+  stays open there, bounded by one leaf and its own `g`.
+
+**The kernel tells the supervisor the pressure.** Each supervisor opens one feed (`host_pressure::Feed`) when it starts:
+one reading, then a new reading each time the kernel notifies a change. On macOS the notification is libdispatch's
+memory-pressure source (`DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`, every level), and each notification reads
+`kern.memorystatus_vm_pressure_level` again. On Linux it is a PSI trigger on `/proc/pressure/memory`,
+`some 1000000 10000000` (1 s of stall in a 10 s window, the 10% threshold above). PSI notifies a rise only, so while the
+last reading holds a start the feed reads again at each window's end, the first moment a drop can show; an unpressured
+host is read again only when the trigger fires. A kernel that refuses the subscription leaves a feed whose one reading
+names why, which refuses every waiting start. Nothing samples the pressure on a timer.
+
+Enforced by the table tests in `runtime::job_admission`, one per rule above, and
+`a_background_start_waits_for_the_reported_drop_and_a_gate_does_not`, which drives a supervisor through a test's
+pressure feed.
 
 ### Parallelism inside a job
 

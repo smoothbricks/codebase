@@ -10089,6 +10089,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // A job's end releases the volume it held when an adoption or reseed superseded it
             // while the job ran: inside this controller, awaited before the job is told ended,
             // and a release that cannot run or fails is that job's terminal failure.
+            memory_pressure: crate::host_pressure::Source::Kernel,
             build_volume_released: Some({
                 let host = self.substrate.shared_host();
                 let layout = self.build_volume_layout()?;
