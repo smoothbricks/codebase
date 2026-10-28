@@ -662,6 +662,60 @@ fn acquired_keeps_the_state_channel_until_the_command_ends() {
     );
 }
 
+/// Block until every reader of the pipe `writer` writes to has closed it: kqueue's EVFILT_WRITE
+/// reports EV_EOF on the write end once the last read end is gone. No duration: a reader that
+/// never closes is named by the runner's no-progress bound.
+fn await_no_reader(writer: &impl std::os::fd::AsRawFd) {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    // SAFETY: kqueue takes no arguments; a negative answer is an error.
+    let queue = unsafe { libc::kqueue() };
+    assert!(queue >= 0, "kqueue: {}", io::Error::last_os_error());
+    // SAFETY: `queue` is a new descriptor only this function owns.
+    let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+    let watch = libc::kevent {
+        ident: usize::try_from(writer.as_raw_fd()).expect("a descriptor is nonnegative"),
+        filter: libc::EVFILT_WRITE,
+        flags: libc::EV_ADD | libc::EV_CLEAR,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let mut registered = false;
+    loop {
+        // SAFETY: an all-zero `kevent` is a valid value of the plain C struct.
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        let (changes, count) = if registered {
+            (std::ptr::null(), 0)
+        } else {
+            (&raw const watch, 1)
+        };
+        // SAFETY: at most one change in, room for one event out, no timeout: block until one fires.
+        let fired = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                changes,
+                count,
+                &raw mut event,
+                1,
+                std::ptr::null(),
+            )
+        };
+        if fired < 0 {
+            let error = io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EINTR),
+                "watch the pipe: {error}"
+            );
+            continue;
+        }
+        registered = true;
+        if fired == 1 && event.flags & libc::EV_EOF != 0 {
+            return;
+        }
+    }
+}
+
 /// An EOF oracle that never waits for a still-open writer and restores its reader's flags.
 fn at_end(reader: &impl std::os::fd::AsRawFd) -> bool {
     let descriptor = reader.as_raw_fd();
@@ -726,19 +780,29 @@ fn a_stateful_lock_relinquishes_all_command_streams_before_its_command_ends() {
         .read_to_string(&mut ready)
         .expect("read close witness");
     assert_eq!(ready, "closed");
-    assert!(
-        at_end(child.stdout.as_ref().expect("stdout")),
-        "only the command owned stdout"
-    );
-    assert!(
-        at_end(child.stderr.as_ref().expect("stderr")),
-        "only the command owned stderr"
-    );
-    let error = child
-        .child
-        .stdin
+    // Each stream is awaited to its end, never probed at an instant: a probe right after the command
+    // closed its copy can still find a transient kernel copy from a concurrent spawn (cowshed-os
+    // fork_lock), which closes moments later on its own. The command is still alive (it waits on
+    // the release FIFO), so an end reached now proves nothing but the command held these streams;
+    // a holder that kept one would hang here, and the runner's no-progress bound names it.
+    let mut rest = Vec::new();
+    child
+        .stdout
         .take()
-        .expect("stdin")
+        .expect("stdout")
+        .read_to_end(&mut rest)
+        .expect("read stdout to its end");
+    assert!(rest.is_empty(), "only the command owned stdout");
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_end(&mut rest)
+        .expect("read stderr to its end");
+    assert!(rest.is_empty(), "only the command owned stderr");
+    let stdin = child.child.stdin.take().expect("stdin");
+    await_no_reader(&stdin);
+    let error = (&stdin)
         .write_all(b"unread")
         .expect_err("no process retains command stdin");
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
