@@ -877,6 +877,9 @@ const READERS: Readers<ReaderName> = {
     fields: [
       ['waiting', 'LEAF'],
       ['unread', 'LEAF'],
+      ['floorPercent', 'LEAF'],
+      ['freePercent', 'LEAF'],
+      ['pressure', 'LEAF'],
     ],
   },
   JOB_ACCOUNTING: {

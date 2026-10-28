@@ -1564,12 +1564,27 @@ fn count_jobs(jobs: impl IntoIterator<Item = (ExecClass, JobState)>) -> Vec<JobC
     counts
 }
 
-/// The released images the store's `.deleting` directories hold for the gateway's cleanup, and
-/// each directory the listing could not read.
+/// The released images the store's `.deleting` directories hold for the gateway's cleanup, each
+/// directory the listing could not read, and the store's free space against its floor: the pace the
+/// cleanup's next entry takes ([`cowshed_core::storage::apfs::release::drain_pace`]).
 fn read_image_cleanup(store: &Path) -> ImageCleanup {
+    use cowshed_core::storage::apfs::release::{
+        DrainPace, STORE_FLOOR_PERCENT, drain_pace, store_space,
+    };
     let listing = cowshed_core::storage::apfs::deleter::leftovers(store);
+    let waiting = listing.entries.len() as u64;
+    let space = store_space(store)
+        .ok()
+        .filter(|(_, capacity)| *capacity > 0);
     ImageCleanup {
-        waiting: listing.entries.len() as u64,
+        waiting,
+        floor_percent: STORE_FLOOR_PERCENT,
+        free_percent: space.map(|(free, capacity)| {
+            u64::try_from(u128::from(free) * 100 / u128::from(capacity)).unwrap_or(100)
+        }),
+        pressure: space.is_some_and(|(free, capacity)| {
+            drain_pace(free, capacity, waiting) == DrainPace::Pressure
+        }),
         unread: listing
             .left
             .into_iter()
@@ -2204,8 +2219,18 @@ fn scheduling_lines(scheduling: &HostScheduling) -> Vec<String> {
         )
     }));
     lines.push(format!(
-        "gateway image cleanup: {} released images waiting",
-        scheduling.image_cleanup.waiting
+        "gateway image cleanup: {} released images waiting; store {} free, floor {}%: {}",
+        scheduling.image_cleanup.waiting,
+        scheduling
+            .image_cleanup
+            .free_percent
+            .map_or_else(|| "unreadable".to_owned(), |free| format!("{free}%")),
+        scheduling.image_cleanup.floor_percent,
+        if scheduling.image_cleanup.pressure {
+            "drains under pressure, one unlink per image"
+        } else {
+            "drains paced"
+        }
     ));
     lines.extend(
         scheduling

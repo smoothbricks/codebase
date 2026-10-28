@@ -95,6 +95,60 @@ pub const STEP_FLOOR: StepExtents = StepExtents(NonZeroU64::MIN.saturating_add(6
 /// sizing, and a probe's create+unlink beside them stalled 2.7 to 5.0 s under both.
 pub const CUT_TARGET: Duration = Duration::from_millis(250);
 
+/// The store's free-space floor, in percent of its capacity: below it a land gate fails for want of
+/// space. cowshed owns the number; `gateway status` reports it (`imageCleanup.floorPercent`), and
+/// a watchdog that judges the store reads it from there.
+pub const STORE_FLOOR_PERCENT: u64 = 10;
+
+/// How far above [`STORE_FLOOR_PERCENT`] the cleanup already drains under pressure ([`drain_pace`]).
+pub const PRESSURE_MARGIN_PERCENT: u64 = 5;
+
+/// How the gateway's cleanup frees its next entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainPace {
+    /// Cuts sized toward [`CUT_TARGET`], so a fork or a git call waits at most about one cut.
+    Paced,
+    /// One unlink of the whole entry. Measured on the 131,072-extent clone above, one unlink freed
+    /// it in 7.6 to 29 s against 35 to 62 s in cuts, while other writers stalled for seconds: under
+    /// the floor every gate fails anyway, so freeing faster is worth the stalls.
+    Pressure,
+}
+
+/// The pace for the next entry when the store has `free` of `capacity` bytes and `queued` entries
+/// wait: pressure once free space is under [`STORE_FLOOR_PERCENT`] plus [`PRESSURE_MARGIN_PERCENT`]
+/// of capacity and something waits, paced otherwise (and for a capacity nothing reported).
+pub fn drain_pace(free: u64, capacity: u64, queued: u64) -> DrainPace {
+    let threshold =
+        u128::from(capacity) * u128::from(STORE_FLOOR_PERCENT + PRESSURE_MARGIN_PERCENT);
+    if queued > 0 && capacity > 0 && u128::from(free) * 100 < threshold {
+        DrainPace::Pressure
+    } else {
+        DrainPace::Paced
+    }
+}
+
+/// The free bytes an unprivileged writer has, and the capacity, of the filesystem holding `path`.
+pub fn store_space(path: &Path) -> io::Result<(u64, u64)> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: `statfs` is plain old data; all-zero is a valid value for the kernel to overwrite.
+    let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is NUL-terminated and `stats` is a valid, writable `statfs`.
+    if unsafe { libc::statfs(path.as_ptr(), &raw mut stats) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // The fields' integer types differ by platform (Darwin's are unsigned, glibc's `f_bsize` is
+    // signed), so each converts checked; a value that does not fit reads as no space.
+    fn field<T: TryInto<u64>>(value: T) -> u64 {
+        value.try_into().unwrap_or(0)
+    }
+    let block = field(stats.f_bsize);
+    Ok((
+        field(stats.f_bavail).saturating_mul(block),
+        field(stats.f_blocks).saturating_mul(block),
+    ))
+}
+
 /// The size of the cut after one of `runs` extents that took `took`: the rate it observed carried
 /// to `target`, `runs × target / took`, so a cut past the target is followed at once by one the
 /// rate puts under it, however much smaller; never more than twice `runs`, since a rate measured
@@ -352,14 +406,15 @@ pub fn release_file(path: &Path, step: StepExtents) -> io::Result<Released> {
         Opened::Busy => Ok(Released::Busy),
     }
 }
-/// Free the one committed release at `entry` in bounded steps and unlink it: what the gateway's
-/// cleanup does with each entry it picks (05_gateway.md, "Deleting released images"). An entry
+/// Free the one committed release at `entry` and unlink it, at `pace`: in bounded cuts, or under
+/// pressure by one unlink ([`DrainPace`]). What the gateway's cleanup does with each entry it picks
+/// (05_gateway.md, "Deleting released images"). An entry
 /// another process holds is left to it ([`Released::Busy`]): another cleanup still cutting it, or
 /// an earlier deleter. One another deletion unlinked, or nothing there, is
 /// [`Released::Absent`]. The directory and its parent are synced before the first cut, since the
 /// releaser may have died between its rename and that rename's syncs, and the directory after the
 /// unlink. A link or any other non-regular file at `entry` refuses, untouched.
-pub fn free_committed(entry: &Path) -> io::Result<Released> {
+pub fn free_committed(entry: &Path, pace: DrainPace) -> io::Result<Released> {
     let (directory, name) = match anchor(entry) {
         Ok(anchored) => anchored,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Released::Absent),
@@ -382,7 +437,22 @@ pub fn free_committed(entry: &Path) -> io::Result<Released> {
     if let Some(parent) = entry.parent().and_then(Path::parent) {
         sync_held_directory(&open_directory_nofollow(parent)?)?;
     }
-    let released = Release::plan(directory.try_clone()?, name, file, STEP_FLOOR)?.finish_timed()?;
+    let released = match pace {
+        DrainPace::Paced => {
+            Release::plan(directory.try_clone()?, name, file, STEP_FLOOR)?.finish_timed()?
+        }
+        DrainPace::Pressure => {
+            let bytes = file.metadata()?.blocks().saturating_mul(SECTOR_BYTES);
+            // SAFETY: the held directory descriptor and the NUL-terminated name outlive the call.
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+            Released::Freed { bytes, steps: 0 }
+        }
+    };
     sync_held_directory(&directory)?;
     Ok(released)
 }
@@ -822,6 +892,38 @@ mod tests {
     use cowshed_os::test_backstop::FileBackstop as _;
     use proptest::prelude::*;
 
+    /// The cleanup drains by unlink once the store is under its 10% floor plus the 5% margin and
+    /// something waits; paced at or above that line, with nothing queued, or with no capacity read.
+    #[test]
+    fn the_drain_pace_follows_free_space_against_floor_plus_margin() {
+        use super::{DrainPace, drain_pace};
+        const TIB: u64 = 1 << 40;
+        let capacity = 100 * TIB;
+        for (free, queued, expected) in [
+            (50 * TIB, 30, DrainPace::Paced),
+            (16 * TIB, 30, DrainPace::Paced),
+            (15 * TIB, 30, DrainPace::Paced),
+            (15 * TIB - 1, 30, DrainPace::Pressure),
+            (12 * TIB, 1, DrainPace::Pressure),
+            (9 * TIB, 30, DrainPace::Pressure),
+            (0, 1, DrainPace::Pressure),
+            (9 * TIB, 0, DrainPace::Paced),
+            (0, 0, DrainPace::Paced),
+        ] {
+            assert_eq!(
+                drain_pace(free, capacity, queued),
+                expected,
+                "free {free} of {capacity}, {queued} queued"
+            );
+        }
+        assert_eq!(drain_pace(0, 0, 30), DrainPace::Paced, "no capacity read");
+        assert_eq!(
+            drain_pace(u64::MAX / 200, u64::MAX, 3),
+            DrainPace::Pressure,
+            "no overflow at the largest sizes"
+        );
+    }
+
     use super::*;
 
     /// What the gateway's cleanup did over one deleting directory, in the shape these tests read.
@@ -840,7 +942,7 @@ mod tests {
             left,
         };
         for entry in entries {
-            match free_committed(&entry)? {
+            match free_committed(&entry, DrainPace::Paced)? {
                 Released::Freed { bytes, .. } => pass.drained.add(Drained { images: 1, bytes }),
                 Released::Busy => pass.left.push(Left {
                     path: entry,
@@ -1276,7 +1378,7 @@ mod tests {
         let held = fs::File::open(&entry).expect("a releaser's descriptor");
         held.try_lock().expect("the releaser holds the entry");
         assert_eq!(
-            free_committed(&entry).expect("a held entry"),
+            free_committed(&entry, DrainPace::Paced).expect("a held entry"),
             Released::Busy
         );
         assert_eq!(
@@ -1285,7 +1387,9 @@ mod tests {
             "a held entry is never cut"
         );
         drop(held);
-        let Released::Freed { steps, .. } = free_committed(&entry).expect("the free") else {
+        let Released::Freed { steps, .. } =
+            free_committed(&entry, DrainPace::Paced).expect("the free")
+        else {
             panic!("the entry is freed once its releaser lets go");
         };
         assert!(steps >= 1, "an image is freed by cuts");

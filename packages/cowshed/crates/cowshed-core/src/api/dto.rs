@@ -4843,6 +4843,15 @@ pub struct ImageCleanup {
     /// Each directory the listing could not read, with why: its images are in no count.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unread: Vec<String>,
+    /// The store's free-space floor in percent of its capacity, cowshed's one copy of the number
+    /// (`release::STORE_FLOOR_PERCENT`); a watchdog judging the store reads it here.
+    pub floor_percent: u64,
+    /// The store's free space in percent of its capacity, rounded down; absent when it could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_percent: Option<u64>,
+    /// The cleanup frees its next entry by one unlink: the store is under its floor plus margin and
+    /// something waits (05_gateway.md "Deleting released images").
+    pub pressure: bool,
 }
 
 /// Health of the host-owned sccache LaunchAgent.

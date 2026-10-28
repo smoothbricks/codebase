@@ -1877,6 +1877,16 @@ store's container, with lsof, git, forks and execs in uninterruptible waits behi
   boundary, so an entry cut short is finished from its length. The thread says on stderr each entry it frees, with its
   bytes and cuts. An entry that is gone when its turn comes (freed already, or moved by a final unbinding) needs
   nothing; one whose free fails is said with its cause and stays in `.deleting` for the next pass.
+- **Under pressure, one unlink per entry** (the owner's ruling, 2026-10-28: when space runs out, progress stalls
+  anyway). Before each entry the thread reads the store's free space and capacity (`statfs`); when free space is under
+  the store's floor, 10% of capacity, plus a 5% margin, and an entry waits, it frees that entry by one `unlink` instead
+  of cuts (`release::drain_pace`, a pure function of free space, capacity and the entries left). Per-extent cost does
+  not shrink with the cut size, and two frees at once only slow each other on one container, so skipping the cuts is the
+  one faster path: one unlink freed the 131,072-extent clone in 7.6 to 29 s against 35 to 62 s in cuts, while other
+  writers stalled for seconds (01a_apfs.md, "Freeing an image"). It says on stderr each change between paced and
+  pressured draining. The floor is one constant cowshed owns (`release::STORE_FLOOR_PERCENT`): `cowshed gateway status`
+  reports it with the store's free share and the pace (`imageCleanup.floorPercent`, `freePercent`, `pressure`), and a
+  watchdog that judges the store reads the floor there rather than keeping a copy.
 - **A restart finishes what it cut.** An install's restart stops the thread mid-entry, and the next gateway's first
   listing finishes what it left: so a gateway restart or a reboot (the gateway is `RunAtLoad`) frees every entry left,
   an image cut short mid-free included.

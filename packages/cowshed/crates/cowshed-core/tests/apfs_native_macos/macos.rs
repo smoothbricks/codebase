@@ -4016,7 +4016,11 @@ fn a_workspace_release_is_reconciled_by_recovery_and_finished_by_the_next_delete
     assert_eq!(listing.entries, std::slice::from_ref(&entry), "{listing:?}");
     assert!(listing.left.is_empty(), "{listing:?}");
     assert!(matches!(
-        cowshed_core::storage::apfs::release::free_committed(&entry).expect("the cleanup's free"),
+        cowshed_core::storage::apfs::release::free_committed(
+            &entry,
+            cowshed_core::storage::apfs::release::DrainPace::Paced
+        )
+        .expect("the cleanup's free"),
         cowshed_core::storage::apfs::release::Released::Freed { .. }
     ));
     assert!(

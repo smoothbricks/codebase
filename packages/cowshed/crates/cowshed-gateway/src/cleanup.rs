@@ -14,7 +14,9 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use cowshed_core::storage::apfs::release::{Released, Why, free_committed};
+use cowshed_core::storage::apfs::release::{
+    DrainPace, Released, Why, drain_pace, free_committed, store_space,
+};
 
 /// A handle to the cleanup thread: nudges it to list the store again.
 #[derive(Clone, Debug)]
@@ -52,6 +54,7 @@ impl ImageCleanup {
 
 fn run(store: &Path, heard: &mpsc::Receiver<()>) {
     let mut first = true;
+    let mut pace = DrainPace::Paced;
     loop {
         let listing = cowshed_core::storage::apfs::deleter::leftovers(store);
         // A stray is named once, at the gateway's start; a directory that cannot be read, at every
@@ -64,8 +67,27 @@ fn run(store: &Path, heard: &mpsc::Receiver<()>) {
             cowshed_os::eprintln!("cowshed: {left}");
         }
         first = false;
-        for entry in oldest_first(listing.entries) {
-            match free_committed(&entry) {
+        let entries = oldest_first(listing.entries);
+        let total = entries.len();
+        for (index, entry) in entries.into_iter().enumerate() {
+            // The store's free space is read again before every entry: an entry freed, or anything
+            // else written, moves it. A store whose space cannot be read is drained paced.
+            let next = store_space(store).map_or(DrainPace::Paced, |(free, capacity)| {
+                drain_pace(free, capacity, (total - index) as u64)
+            });
+            if next != pace {
+                cowshed_os::eprintln!(
+                    "cowshed: image cleanup drains {}",
+                    match next {
+                        DrainPace::Pressure =>
+                            "under pressure: the store is under its free-space floor plus margin, so each released image goes by one unlink",
+                        DrainPace::Paced =>
+                            "paced again: the store is above its free-space floor plus margin",
+                    }
+                );
+                pace = next;
+            }
+            match free_committed(&entry, pace) {
                 Ok(Released::Freed { bytes, steps }) => cowshed_os::eprintln!(
                     "cowshed: freed released image {} ({bytes} bytes, {steps} cuts)",
                     entry.display()

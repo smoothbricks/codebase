@@ -322,7 +322,13 @@ static IDENTITY_REPORT: Reader = Reader::Record(&[
     ("identity", &BOUND_IDENTITY),
     ("identities", &SEQ__BOUND_IDENTITY),
 ]);
-static IMAGE_CLEANUP: Reader = Reader::Record(&[("waiting", &LEAF), ("unread", &LEAF)]);
+static IMAGE_CLEANUP: Reader = Reader::Record(&[
+    ("waiting", &LEAF),
+    ("unread", &LEAF),
+    ("floorPercent", &LEAF),
+    ("freePercent", &LEAF),
+    ("pressure", &LEAF),
+]);
 static JOB_ACCOUNTING: Reader = Reader::Internal {
     tag: "kind",
     arms: &[
