@@ -73,6 +73,11 @@ split-debuginfo = "unpacked"
 [profile.dev.package."*"]
 debug = 0
 
+# SHA-256 runs over whole images (a recovery image's every logical byte, holes included), and in a dev build sha2
+# is unoptimized: a 1 GiB sparse copy's verification and its test oracle ran past a release runner's 180 s
+# no-progress bound in a dev build. Optimizing the one leaf crate costs nothing above it.
+[profile.dev.package.sha2]
+opt-level = 3
 # Same debug level as package."*": a crate that both build scripts or proc
 # macros and ordinary code use is one unit only while both see the same level;
 # otherwise Cargo compiles it, and everything above it, twice.
