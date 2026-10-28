@@ -1653,6 +1653,13 @@ binding to release; under the intent lease, so a live creator is refused. Only t
 keep their grants. The retired image is validated by its exact trash path, repository, format and incarnation; being
 unpublished before retirement does not invalidate that recovery fact.
 
+An unfinished fork whose source workspace no longer exists can never finish, so recovery that would finish it (a `gc`'s
+store-wide pass, or any opening whose scope holds it) retires it instead of leaving it journaled for a later pass: its
+pending clone exactly as a named `rm` retires one, forced as an abandoned clone's retirement is, and an intent that left
+no clone with only its slot binding to release. A retirement refused there, say for history main lacks, keeps the fork
+journaled with that refusal. Kept journaled with no refusal of its own, such a fork held its clone, and every build
+volume it registered, deferred behind it on every pass.
+
 `cowshed rm main --restore` is the adoption rollback described above and maps to `RemoveOptions.restore`; plain
 `cowshed rm main` requires `--force` and a clean `git status` (exit 4 otherwise).
 

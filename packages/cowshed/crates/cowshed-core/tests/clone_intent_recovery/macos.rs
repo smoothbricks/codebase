@@ -2410,6 +2410,72 @@ async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
         .expect("stop the image-free removing runtime");
 }
 
+/// A fork whose source workspace is gone can never finish, so recovery does not leave it journaled
+/// for a later pass: the store-wide recovery `gc` opens with retires its pending clone as a named
+/// `rm` of it would, and retires an image-free one's slot and intent. Before, each stayed
+/// journaled as "could not be completed (not-found: workspace source does not exist)" on every
+/// pass, and every build volume it registered stayed deferred behind it.
+#[tokio::test]
+async fn store_recovery_retires_an_unfinished_fork_whose_source_is_gone() {
+    let fixture = Fixture::new("gc-gone-source");
+    let runtime = fixture.adopt().await;
+    fixture
+        .mint(&runtime, "source", ForkOptions::default())
+        .await
+        .expect("mint source");
+    fixture.plant_workspace_branch("wedged");
+    fixture
+        .call(
+            &runtime,
+            "coordinator.fork",
+            json!({ "repoId": fixture.repo, "source": "source", "workspace": "wedged", "options": worktree() }),
+        )
+        .await
+        .expect_err("main's stale destination branch interrupts the fork");
+    let image = fixture
+        .layout()
+        .session_image(&name("wedged"))
+        .expect("pending image")
+        .image()
+        .to_owned();
+    let origin = fixture.intent("wedged").expect("clone intent").operation;
+    fixture
+        .remove(&runtime, "source")
+        .await
+        .expect("retire the clean, landed source");
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Fork {
+            source: name("source"),
+            destination: name("empty"),
+            rename: false,
+        });
+        journal.mark_mutating(&name("empty"))
+    })
+    .expect("journal a fork stopped before its first image write");
+    runtime.shutdown().await.expect("stop the forking runtime");
+
+    let gc = fixture.gc().await;
+    assert!(!image.exists(), "the pending clone is physically released");
+    let retired = fixture.intent("wedged").expect("retirement record");
+    assert!(matches!(
+        retired.completion,
+        Some(LifecycleIntentCompletion::Retire(_))
+    ));
+    assert!(
+        matches!(retired.operation, LifecycleIntent::Retire { origin: Some(ref retained), .. } if **retained == origin)
+    );
+    assert!(matches!(
+        fixture.intent("empty").and_then(|record| record.completion),
+        Some(LifecycleIntentCompletion::Retire(_))
+    ));
+    assert_eq!(
+        fixture.listed(&gc).await,
+        ["main"],
+        "neither fork is activated"
+    );
+    gc.shutdown().await.expect("stop gc");
+}
+
 /// Losing a finished fork's source never authorizes losing its unlanded commits, and abandoning
 /// them keeps them in the verified bundle in the project's trash, their only copy. The deletion
 /// log names the head and that bundle, and nothing is written into main's repository; `gc

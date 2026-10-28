@@ -4720,6 +4720,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     &record.operation,
                     LifecycleIntent::Retire { origin: None, .. }
                 );
+            let operation = record.operation.clone();
             let replayed: Result<()> = async {
                 let phase = record.phase;
                 match record.operation {
@@ -4783,6 +4784,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                     cowshed_os::eprintln!("cowshed: discarded the unfinished {verb} of {workspace}: it ended before changing anything, so nothing is left to finish");
                                 } else if retiring {
                                     cowshed_os::eprintln!("cowshed: leaving the unfinished {verb} of {workspace} to the rm retiring it");
+                                } else if let Some(source) =
+                                    self.gone_source(options.from_workspace.as_ref()).await?
+                                {
+                                    self.retire_sourceless_clone(&workspace, operation.clone(), &source)
+                                        .await?;
                                 } else {
                                     self.resume_fork(workspace, options).await?;
                                 }
@@ -4839,6 +4845,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 cowshed_os::eprintln!("cowshed: discarded the unfinished {verb} of {destination}: it ended before changing anything, so nothing is left to finish");
                             } else if retiring {
                                 cowshed_os::eprintln!("cowshed: leaving the unfinished {verb} of {destination} to the rm retiring it");
+                            } else if let Some(gone) = self.gone_source(Some(&source)).await? {
+                                self.retire_sourceless_clone(&destination, operation.clone(), &gone)
+                                    .await?;
                             } else {
                                 self.clone_for_rename(source, destination, ClonePurpose::HistoricalFork).await?;
                             }
@@ -10749,6 +10758,66 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             };
             self.finish_residue(&workspace, &work).await?;
         }
+        Ok(())
+    }
+
+    /// `source`, when it names a workspace that no longer exists: a fork from it can never finish.
+    async fn gone_source(&self, source: Option<&WorkspaceName>) -> Result<Option<WorkspaceName>> {
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        match self.current(source).await {
+            Ok(_) => Ok(None),
+            Err(error) if error.code == ErrorCode::NotFound => Ok(Some(source.clone())),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Retire `workspace`'s unfinished fork `origin` for [`Self::replay_unfinished_intent`] once its
+    /// source workspace `source` no longer exists. The fork can never finish, and kept journaled it
+    /// would keep its clone, and every build volume it registered, deferred behind it on every pass.
+    /// It is retired as a named `rm` of it retires it: a pending clone through
+    /// [`Self::retire_pending_workspace`], forced as an abandoned clone's retirement is, since an
+    /// unpublished clone was never handed to anyone; one that left no clone by retiring its slot and
+    /// its intent. A retirement refused, say because the clone's history is not in main, keeps the
+    /// fork journaled with that refusal. The caller holds `workspace`'s intent lease.
+    async fn retire_sourceless_clone(
+        &mut self,
+        workspace: &WorkspaceName,
+        origin: crate::storage::recovery::LifecycleIntent,
+        source: &WorkspaceName,
+    ) -> Result<()> {
+        let options = RemoveOptions {
+            force: true,
+            ..RemoveOptions::default()
+        };
+        let pending = self
+            .pending_metadata()
+            .await?
+            .into_iter()
+            .find(|(_, metadata)| metadata.workspace == *workspace);
+        if let Some((_, metadata)) = pending {
+            self.retire_pending_workspace(workspace, options, origin, metadata)
+                .await?;
+        } else {
+            self.begin_lifecycle_intent(crate::storage::recovery::LifecycleIntent::Retire {
+                workspace: workspace.clone(),
+                options,
+                containment: None,
+                origin: Some(Box::new(origin)),
+            })
+            .await?;
+            self.mark_lifecycle_intent_mutating(workspace).await?;
+            self.release_slot(workspace).await?;
+            self.complete_lifecycle_intent(
+                workspace,
+                crate::storage::recovery::LifecycleIntentCompletion::Retire(RemoveReport::default()),
+            )
+            .await?;
+        }
+        cowshed_os::eprintln!(
+            "cowshed: retired the unfinished fork of {workspace}: its source {source} no longer exists, so the fork could never finish"
+        );
         Ok(())
     }
 
