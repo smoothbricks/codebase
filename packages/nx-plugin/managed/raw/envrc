@@ -13,7 +13,22 @@ if ! has devenv; then
 fi
 pushd tooling/direnv >/dev/null
 eval "$(devenv direnvrc)"
+# devenv's use_devenv answers an evaluation that failed with `exit 0`, keeping whatever environment
+# the shell had. Entered by direnv, or activated by cowshed for a workspace's jobs, that shell then
+# has none of this checkout's tools and says nothing (a cancelled evaluation left one recorded as a
+# workspace's shell). Entry fails instead: direnv's exit hook (__dump_at_exit) still dumps the
+# diff, now with this status. An inherited DEVENV_ROOT is another shell's, never this evaluation's.
+unset DEVENV_ROOT
+smoo_require_devenv() {
+  local status=$?
+  [ -n "${DEVENV_ROOT-}" ] && return "$status"
+  log_error "devenv built no environment (see above): this checkout's shell is not entered"
+  return 1
+}
+trap 'smoo_require_devenv; __dump_at_exit' EXIT
 use devenv
+trap __dump_at_exit EXIT
+unset -f smoo_require_devenv
 popd >/dev/null
 
 # devenv hands direnv only the files its evaluation read; a directory a devenv

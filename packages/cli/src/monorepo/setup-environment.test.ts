@@ -335,6 +335,67 @@ describe('what a CI install reports and records', () => {
   });
 });
 
+describe('the managed .envrc', () => {
+  // A devenv whose direnvrc is shaped like devenv's own: a failed evaluation is logged and answered
+  // with exit 0, keeping whatever environment the shell had; a good one exports DEVENV_ROOT.
+  const DEVENV_STUB = [
+    '#!/bin/sh',
+    'case "$1" in',
+    "  direnvrc) cat <<'RC'",
+    'use_devenv() {',
+    '  if ! env=$(devenv direnv-export); then',
+    '    log_error "failed to build the devenv environment. see above."',
+    '    exit 0',
+    '  fi',
+    '  eval "$env"',
+    '}',
+    'RC',
+    '  ;;',
+    '  direnv-export)',
+    '    [ -n "${STUB_DEVENV_FAILS-}" ] && { echo "devenv: evaluation killed" >&2; exit 137; }',
+    '    echo "export DEVENV_ROOT=$PWD"',
+    '  ;;',
+    'esac',
+    '',
+  ].join('\n');
+
+  it('fails shell entry when devenv builds no environment, and enters when it builds one', async () => {
+    const scratch = realpathSync(await mkdtemp(join(tmpdir(), 'smoo-envrc-')));
+    try {
+      const checkout = join(scratch, 'checkout');
+      await mkdir(join(checkout, 'tooling', 'direnv'), { recursive: true });
+      await copyFile(join(MANAGED, 'envrc'), join(checkout, '.envrc'));
+      const bin = join(scratch, 'bin');
+      await mkdir(bin);
+      await writeFile(join(bin, 'devenv'), DEVENV_STUB, { mode: 0o755 });
+      const home = join(scratch, 'home');
+      await mkdir(home);
+      const env = {
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        HOME: home,
+        XDG_CONFIG_HOME: join(scratch, 'config'),
+        XDG_DATA_HOME: join(scratch, 'data'),
+        XDG_CACHE_HOME: join(scratch, 'cache'),
+      };
+      expect(Bun.spawnSync(['direnv', 'allow', checkout], { env }).exitCode).toBe(0);
+
+      const failed = Bun.spawnSync(['direnv', 'export', 'json'], {
+        cwd: checkout,
+        env: { ...env, STUB_DEVENV_FAILS: '1' },
+      });
+      expect(failed.exitCode, failed.stderr.toString()).toBe(1);
+      expect(failed.stderr.toString()).toContain(
+        "devenv built no environment (see above): this checkout's shell is not entered",
+      );
+
+      const entered = Bun.spawnSync(['direnv', 'export', 'json'], { cwd: checkout, env });
+      expect(entered.exitCode, entered.stderr.toString()).toBe(0);
+      expect(JSON.parse(entered.stdout.toString()).DEVENV_ROOT).toBe(join(checkout, 'tooling', 'direnv'));
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+});
 describe('the project root a shell entry owns', () => {
   /**
    * A fresh git checkout holding the full managed direnv directory, so the real script and its
