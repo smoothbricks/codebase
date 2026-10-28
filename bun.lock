@@ -88,7 +88,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.12.22",
+      "version": "0.12.23",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -124,7 +124,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "bin": {
         "cowshed": "./bin/cowshed",
       },
@@ -300,7 +300,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.6.0",
+      "version": "0.6.1",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
