@@ -1059,7 +1059,9 @@ the handshake bound.
   foreground relay that fails SILENT on a workspace supervisor captures that peer's stacks before releasing its job
   hold. On macOS it invokes unprivileged /usr/bin/sample for 2 seconds, within one 10 s ffi bound, without signalling
   the supervisor. It retains the report as a private 0600 wait-<uuid>.sample.txt beside the wait span, names it in the
-  error, and records its path as wait_stack_sample (or the capture failure as wait_stack_error). A client whose call on
+  error, and records its path as wait_stack_sample (or the capture failure as wait_stack_error). A control-class
+  `TIMEOUT` on a workspace supervisor or a controller, a call it answers at once left unanswered past its control bound
+  (a job `hold`'s), is that peer's silence too, and is sampled the same way where it is recorded. A client whose call on
   a process-external controller connection fails SILENT samples that controller the same way and seals the
   `cowshed.wait` span itself under the host's telemetry root: the controller's own boundaries never see a wait its peer
   gave up on. It samples the pid the hello reported only while that pid's process started at the instant it read at the

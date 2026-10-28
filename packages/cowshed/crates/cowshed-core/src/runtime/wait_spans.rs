@@ -86,11 +86,14 @@ impl WaitFailure {
         Ok((began, ended))
     }
     /// A silent peer the recording samples: a workspace supervisor or a cowshed controller, each
-    /// with a kernel- or hello-reported pid.
+    /// with a kernel- or hello-reported pid, that went `SILENT`, or left a call it answers at once
+    /// unanswered past its control bound (a job hold's `TIMEOUT`): either way its actor turned no
+    /// answer out, and its stacks say what it was doing instead.
     pub fn stack_pid(&self) -> Option<i32> {
-        match (self.code, self.peer_role, self.peer_pid) {
-            (WaitCode::Silent, "workspace supervisor" | "cowshed controller", Some(pid))
-                if pid > 0 =>
+        match (self.code, self.class, self.peer_role, self.peer_pid) {
+            (WaitCode::Silent, _, role, Some(pid))
+            | (WaitCode::Timeout, Some(LatencyClass::Control), role, Some(pid))
+                if pid > 0 && matches!(role, "workspace supervisor" | "cowshed controller") =>
             {
                 Some(pid)
             }
@@ -452,14 +455,72 @@ mod tests {
             Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
         );
         let clock = || UNIX_EPOCH + Duration::from_secs(300);
-        for (code, role, pid, expected) in [
-            (WaitCode::Silent, "workspace supervisor", Some(42), Some(42)),
-            (WaitCode::Silent, "workspace supervisor", None, None),
-            (WaitCode::Silent, "workspace supervisor", Some(0), None),
-            (WaitCode::Silent, "gateway", Some(42), None),
-            (WaitCode::Silent, "cowshed controller", Some(42), Some(42)),
-            (WaitCode::Timeout, "workspace supervisor", Some(42), None),
-            (WaitCode::PeerLost, "workspace supervisor", Some(42), None),
+        for (code, class, role, pid, expected) in [
+            (
+                WaitCode::Silent,
+                None,
+                "workspace supervisor",
+                Some(42),
+                Some(42),
+            ),
+            (WaitCode::Silent, None, "workspace supervisor", None, None),
+            (
+                WaitCode::Silent,
+                None,
+                "workspace supervisor",
+                Some(0),
+                None,
+            ),
+            (WaitCode::Silent, None, "gateway", Some(42), None),
+            (
+                WaitCode::Silent,
+                None,
+                "cowshed controller",
+                Some(42),
+                Some(42),
+            ),
+            (
+                WaitCode::Timeout,
+                Some(LatencyClass::Control),
+                "workspace supervisor",
+                Some(42),
+                Some(42),
+            ),
+            (
+                WaitCode::Timeout,
+                Some(LatencyClass::Control),
+                "cowshed controller",
+                Some(42),
+                Some(42),
+            ),
+            (
+                WaitCode::Timeout,
+                Some(LatencyClass::Control),
+                "gateway",
+                Some(42),
+                None,
+            ),
+            (
+                WaitCode::Timeout,
+                Some(LatencyClass::Reap),
+                "workspace supervisor",
+                Some(42),
+                None,
+            ),
+            (
+                WaitCode::Timeout,
+                None,
+                "workspace supervisor",
+                Some(42),
+                None,
+            ),
+            (
+                WaitCode::PeerLost,
+                None,
+                "workspace supervisor",
+                Some(42),
+                None,
+            ),
         ] {
             let silent = Silent {
                 op: "wait",
@@ -471,7 +532,12 @@ mod tests {
             };
             let mut failure = WaitFailure::silent(&silent, pid, role);
             failure.code = code;
-            assert_eq!(failure.stack_pid(), expected, "{code:?} {role} {pid:?}");
+            failure.class = class;
+            assert_eq!(
+                failure.stack_pid(),
+                expected,
+                "{code:?} {class:?} {role} {pid:?}"
+            );
             let (began, ended) = failure.interval(clock()).unwrap();
             assert_eq!((began.as_secs(), ended.as_secs()), (35, 300));
             for sample in [
