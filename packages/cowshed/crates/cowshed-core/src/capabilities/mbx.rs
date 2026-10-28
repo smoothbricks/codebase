@@ -776,7 +776,7 @@ mod tests {
     fn the_pin_is_the_revision_the_shipped_lock_names() {
         assert_eq!(
             pinned_revision().as_deref(),
-            Some("44f50c329a83dedd012e1e49cf9f265f79226a83")
+            Some("72b0d2c535212e70422f37757008ff7c8cde3ac5")
         );
     }
 
