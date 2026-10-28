@@ -531,7 +531,7 @@ impl LaunchAgentSpec {
     /// The host-owned sccache server agent.
     ///
     /// launchd runs the sccache binary itself, straight out of the nix store path
-    /// `cowshed setup --sccache` built and rooted ([`StoreBackedProgram`] carries both, and states
+    /// an earlier `cowshed setup --sccache` built and rooted ([`StoreBackedProgram`] carries both, and states
     /// why the plist names the store path rather than the out-link). Server mode is selected
     /// entirely through the environment (`SCCACHE_START_SERVER=1` combined with any CLI
     /// argument is a parse error in sccache), so this is the one agent with an

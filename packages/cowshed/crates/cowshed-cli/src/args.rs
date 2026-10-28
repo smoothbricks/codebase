@@ -360,9 +360,6 @@ pub struct SetupArgs {
     /// Proceed with `--uninstall` although the volumes still hold workspaces, or although their
     /// occupancy could not be established at all.
     pub force: bool,
-    /// Build the patched sccache from cowshed's own nix flake, root the result, and start its
-    /// LaunchAgent. Opt-in because not every cowshed user writes Rust and it requires nix.
-    pub sccache: bool,
     /// Delete the retired caches volume inside setup's one authorization, once the migration has
     /// left it holding nothing but its marker. A plain setup never escalates for it.
     pub retire_caches_volume: bool,
@@ -898,7 +895,6 @@ pub fn cli_command() -> ClapCommand {
         .subcommand(leaf("setup").args([
             flag("uninstall"),
             flag("force"),
-            flag("sccache"),
             flag("retire-caches-volume"),
             flag("downgrade"),
         ]))
@@ -2613,7 +2609,7 @@ const SETUP: CommandSpec = CommandSpec {
         "To reach workspaces through a preferred path, make a symbolic link at that path pointing to the root, for example `ln -s /private/var/folders/cowshed/$(id -u)/mnt ~/workspaces` (on Linux, point it at `~/.cowshed/mnt`). The link runs from the preferred path to the root, never the other way round: the root stays a real directory, because the kernel-resolved physical mount path is what Spotlight's indexer admits. Cowshed's identity probe and workspace jobs use canonical mount paths; identity rules anchored only at an alias are not reliable.",
         "A `host.json` that still records a custom `mountRoot` is refused when read, naming that file, the recorded root and the required root. The refusal does not ignore the value, rewrite the file, move a mount or attach at the new path, and there is no automatic migration: with the previously installed build, stop workspace jobs and daemons, detach every session and build volume at the old root, resolve busy holders (Spotlight included), and audit path-bearing detached metadata and sandbox grants before reattaching. Only then remove `mountRoot` from `host.json`, keeping credential routes and mode 0600, and run this build's ordinary `cowshed setup`. A recorded root equal to the fixed root is harmless and is omitted the next time the file is saved.",
         "`--uninstall` is the same transaction backwards, and deliberately narrower: it removes the machine presence — the cowshed-tagged `/etc/fstab` pins, the gateway and sccache LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It refuses while the volumes still hold workspaces, or while their occupancy cannot be established, until `--force` says the caller means it anyway.",
-        "`--sccache` builds the patched sccache from the flake this package ships at `nix/sccache`, registers a nix GC root for the result under cowshed's support directory, and starts a LaunchAgent running that exact store path. It is opt-in: not every cowshed user writes Rust, and it needs nix. A host without nix is told so and the rest of the run still repairs storage. The plist names the resolved `/nix/store` path rather than the GC root symlink, so a rebuild is a plist change — and therefore an explicit restart — instead of a different binary appearing under a loaded agent.",
+        "Setup installs cowshed's pinned mbx beside the installed cowshed (14_nix.md, \"mbx\"): it builds the flake this package ships at `nix/mbx`, registers a nix GC root for the result under cowshed's support directory, and links `mbx` in cowshed's `bin` to the rooted executable, never a copy, so its realpath is the pinned build's store path. A host without nix is told so, keeps no mbx, and schedules Cargo without it; a failed build, or a file that is not cowshed's link where `mbx` goes, fails the run after everything else is repaired. `--uninstall` removes the link and the root, never the store path.",
         "`--retire-caches-volume` deletes the retired caches volume, removes its `/etc/fstab` pin and drops it from the storage mount service, inside the same single authorization. It refuses while the volume holds anything but its marker.",
     ],
     options: &[
@@ -2624,10 +2620,6 @@ const SETUP: CommandSpec = CommandSpec {
         Opt {
             spelling: "--force",
             meaning: "`--uninstall` only: proceed although workspaces remain, or although occupancy could not be established",
-        },
-        Opt {
-            spelling: "--sccache",
-            meaning: "build the patched sccache from the shipped nix flake, root it, and run it as a LaunchAgent (requires nix)",
         },
         Opt {
             spelling: "--retire-caches-volume",
@@ -2643,23 +2635,14 @@ const SETUP: CommandSpec = CommandSpec {
 /// `setup` takes no project: a host whose volumes are missing has no adopted checkout to select,
 /// so silently accepting `--project` would promise a scope the verb does not have. `--force`
 /// without `--uninstall` is refused rather than ignored — it confirms a refusal that the forward
-/// direction never makes, so accepting it would answer a question nobody asked. `--sccache`
-/// cannot combine with teardown: teardown releases the GC root an install registers, so asking
-/// for both in one command line names two opposite intents.
+/// direction never makes, so accepting it would answer a question nobody asked.
 fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &SETUP;
     reject_project(global, USAGE, "--project is not valid for setup")?;
     let uninstall = flagged(matches, "uninstall");
     let force = flagged(matches, "force");
-    let sccache = flagged(matches, "sccache");
     let retire_caches_volume = flagged(matches, "retire-caches-volume");
     let downgrade = flagged(matches, "downgrade");
-    if sccache && (uninstall || force) {
-        return Err(UsageError::new(
-            "--sccache installs sccache; --uninstall removes it",
-            USAGE,
-        ));
-    }
     if retire_caches_volume && (uninstall || force) {
         return Err(UsageError::new(
             "--retire-caches-volume repairs a host; --uninstall tears it down",
@@ -2681,7 +2664,6 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
     Ok(Command::Setup(SetupArgs {
         uninstall,
         force,
-        sccache,
         retire_caches_volume,
         downgrade,
     }))
@@ -5201,7 +5183,6 @@ mod tests {
         const REPAIR: SetupArgs = SetupArgs {
             uninstall: false,
             force: false,
-            sccache: false,
             retire_caches_volume: false,
             downgrade: false,
         };
@@ -5223,7 +5204,6 @@ mod tests {
             Command::Setup(SetupArgs {
                 uninstall: true,
                 force: false,
-                sccache: false,
                 retire_caches_volume: false,
                 downgrade: false,
             })
@@ -5235,28 +5215,9 @@ mod tests {
             Command::Setup(SetupArgs {
                 uninstall: true,
                 force: true,
-                sccache: false,
                 retire_caches_volume: false,
                 downgrade: false,
             })
-        );
-
-        // sccache is opt-in: absent by default, and it cannot ride along with the teardown that
-        // releases the very GC root it registers.
-        assert_eq!(
-            parse_args(["setup", "--sccache"]).unwrap().command,
-            Command::Setup(SetupArgs {
-                uninstall: false,
-                force: false,
-                sccache: true,
-                retire_caches_volume: false,
-                downgrade: false,
-            })
-        );
-        let error = parse_args(["setup", "--sccache", "--uninstall"]).unwrap_err();
-        assert_eq!(
-            error.message,
-            "--sccache installs sccache; --uninstall removes it"
         );
 
         // Deleting the retired caches volume is opt-in too, and never part of a teardown.
@@ -5326,7 +5287,6 @@ mod tests {
                 "/tmp/mnt",
             ],
             &["setup", "--mount-root", "/tmp/mnt", "--downgrade"],
-            &["setup", "--sccache", "--mount-root", "/tmp/mnt"],
             &[
                 "setup",
                 "--retire-caches-volume",

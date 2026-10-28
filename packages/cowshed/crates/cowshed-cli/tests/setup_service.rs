@@ -7,10 +7,10 @@
 
 use async_trait::async_trait;
 use cowshed_cli::args::{Command, GatewayCommand, ProjectDiscovery, SetupArgs, parse_args};
+use cowshed_cli::capabilities::mbx::MbxInstall;
 use cowshed_cli::capabilities::sccache::client_config::{
     ConfigChange, ConfigConflict, ConfigOutcome, ConfigReport,
 };
-use cowshed_cli::capabilities::sccache::nix::BuildRefusal;
 use cowshed_cli::gateway_service::{CliInstall, ServiceBinaryRefresh};
 use cowshed_cli::help;
 use cowshed_cli::launchd::RemovalOutcome;
@@ -19,7 +19,7 @@ use cowshed_cli::path_entry::PathEntryOutcome;
 use cowshed_cli::probe::GitIdentityGap;
 use cowshed_cli::setup_service::{
     GitIdentity, HostArtifactRemoval, HostSetup, MainMounts, ProjectBuildState, ProjectIdentity,
-    SccacheInstall, WorkspaceCensus, dispatch as setup_dispatch,
+    WorkspaceCensus, dispatch as setup_dispatch,
 };
 use cowshed_core::AdoptedProject;
 use cowshed_core::api::{SkillInstall, SkillInstallReport, SkillInstallStatus};
@@ -60,9 +60,9 @@ struct FakeHost {
     services: Vec<ServiceBinaryRefresh>,
     /// What installing the invoking build as the `cowshed` on PATH did.
     cli: Option<CliInstall>,
-    /// What `setup --sccache` found, so the opt-in rows and the non-zero exit are provable without
-    /// nix, a flake, or launchd.
-    sccache_install: SccacheInstall,
+    /// What installing cowshed's pinned mbx did, so its row and its failures are provable without
+    /// nix or a home; `None` like a test host's `cli`, so the storage goldens carry no mbx row.
+    mbx_install: Option<MbxInstall>,
     build_state: Vec<ProjectBuildState>,
     /// The owners the store layout migration marked, so its sentence is provable without a store.
     owners: Vec<PathBuf>,
@@ -146,12 +146,7 @@ impl Default for FakeHost {
             execute_error: None,
             services: Vec::new(),
             cli: None,
-            sccache_install: SccacheInstall::Running {
-                program: PathBuf::from("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache"),
-                gc_root: PathBuf::from(
-                    "/Users/dev/Library/Application Support/dev.cowshed/nix/sccache",
-                ),
-            },
+            mbx_install: None,
             build_state: Vec::new(),
             owners: Vec::new(),
             retirement: None,
@@ -258,9 +253,9 @@ impl HostSetup for FakeHost {
         Ok(self.sccache.clone())
     }
 
-    async fn install_sccache(&mut self) -> Result<SccacheInstall> {
-        self.events.push(String::from("install-sccache"));
-        Ok(self.sccache_install.clone())
+    async fn install_mbx(&mut self) -> Result<Option<MbxInstall>> {
+        self.events.push(String::from("install-mbx"));
+        Ok(self.mbx_install.clone())
     }
 
     async fn retire_caches_volume(&mut self) -> Result<Option<RetirementReport>> {
@@ -272,28 +267,18 @@ impl HostSetup for FakeHost {
 const REPAIR: SetupArgs = SetupArgs {
     uninstall: false,
     force: false,
-    sccache: false,
-    retire_caches_volume: false,
-    downgrade: false,
-};
-const REPAIR_WITH_SCCACHE: SetupArgs = SetupArgs {
-    uninstall: false,
-    force: false,
-    sccache: true,
     retire_caches_volume: false,
     downgrade: false,
 };
 const UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: false,
-    sccache: false,
     retire_caches_volume: false,
     downgrade: false,
 };
 const FORCED_UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: true,
-    sccache: false,
     retire_caches_volume: false,
     downgrade: false,
 };
@@ -756,6 +741,7 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
             "git-identity",
             "configure-sccache-client",
             "refresh-services",
+            "install-mbx",
             "build-state-projects",
             "retire-caches-volume",
             "census"
@@ -1309,6 +1295,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
             "git-identity",
             "configure-sccache-client",
             "refresh-services",
+            "install-mbx",
             "build-state-projects",
             "retire-caches-volume",
             "census"
@@ -2346,6 +2333,7 @@ async fn mount_service_install_is_disclosed_before_authorization() {
             "git-identity",
             "configure-sccache-client",
             "refresh-services",
+            "install-mbx",
             "build-state-projects",
             "retire-caches-volume",
             "census"
@@ -2353,143 +2341,116 @@ async fn mount_service_install_is_disclosed_before_authorization() {
     );
 }
 
-/// sccache is opt-in. A default `setup` must not build a nix flake, must not require nix to be
-/// installed, and must not print a line about a service the caller never asked for.
+fn installed(changed: bool) -> MbxInstall {
+    MbxInstall::Installed {
+        program: PathBuf::from("/pinned/mbx-1.28.0/bin/mbx"),
+        link: PathBuf::from("/home/dev/Library/Application Support/dev.cowshed/bin/mbx"),
+        changed,
+    }
+}
+
+/// Every repair installs cowshed's pinned mbx once storage is up and the cowshed it sits beside is
+/// installed, and names the link and the program it names, the identity every project's mbx is
+/// proven against.
 #[tokio::test]
-async fn a_default_setup_never_touches_sccache_at_all() {
-    let mut host = FakeHost::default();
+async fn a_repair_links_the_pinned_mbx_after_storage_and_names_it() {
+    let mut host = FakeHost {
+        mbx_install: Some(installed(true)),
+        ..FakeHost::default()
+    };
     let streams = run(&mut host, REPAIR, false, false).await;
 
     assert_eq!(streams.exit, 0);
     assert!(
-        !host.events.contains(&String::from("install-sccache")),
-        "a default setup asked the host to install sccache: {:?}",
+        streams.stderr.contains(
+            "cowshed: mbx: linked /home/dev/Library/Application Support/dev.cowshed/bin/mbx to /pinned/mbx-1.28.0/bin/mbx\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+    let position = |name: &str| {
+        host.events
+            .iter()
+            .position(|event| event == name)
+            .unwrap_or_else(|| panic!("no {name}: {:?}", host.events))
+    };
+    assert!(
+        position("execute") < position("install-mbx"),
+        "{:?}",
         host.events
     );
     assert!(
-        !streams.stderr.contains("nix"),
-        "a default setup mentioned nix: {}",
+        position("refresh-services") < position("install-mbx"),
+        "{:?}",
+        host.events
+    );
+
+    host.mbx_install = Some(installed(false));
+    let streams = run(&mut host, REPAIR, false, false).await;
+    assert!(
+        streams.stderr.contains(
+            "cowshed: mbx: /home/dev/Library/Application Support/dev.cowshed/bin/mbx already names /pinned/mbx-1.28.0/bin/mbx\n"
+        ),
+        "{}",
         streams.stderr
     );
 }
 
-/// The opt-in path: the store path and its GC root are both named, because the store path is the
-/// identity of the daemon this host now runs and the root is the only reason it survives
-/// `nix store gc`. A reader who cannot see both cannot tell a pinned install from a doomed one.
+/// A host without nix keeps no mbx and schedules Cargo without it, the specified non-mbx path:
+/// said, and no failure.
 #[tokio::test]
-async fn the_optin_names_the_store_path_and_its_gc_root() {
-    let mut host = FakeHost::default();
-    let streams = run(&mut host, REPAIR_WITH_SCCACHE, false, false).await;
+async fn a_host_without_nix_keeps_no_mbx_and_still_succeeds() {
+    let mut host = FakeHost {
+        mbx_install: Some(MbxInstall::NixMissing {
+            flake: PathBuf::from("/opt/cowshed/nix/mbx"),
+        }),
+        ..FakeHost::default()
+    };
+    let streams = run(&mut host, REPAIR, false, false).await;
 
     assert_eq!(streams.exit, 0);
     assert!(
         streams
             .stderr
-            .contains("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache"),
+            .contains("nix is not on PATH, so /opt/cowshed/nix/mbx could not be built"),
         "{}",
         streams.stderr
-    );
-    assert!(
-        streams
-            .stderr
-            .contains("Application Support/dev.cowshed/nix/sccache"),
-        "{}",
-        streams.stderr
-    );
-    // Last of the host's work: the daemon caches onto the caches volume, so it is built and started
-    // only after the volumes are up.
-    let install = host
-        .events
-        .iter()
-        .position(|event| event == "install-sccache")
-        .expect("the opt-in asks the host to install sccache");
-    let execute = host
-        .events
-        .iter()
-        .position(|event| event == "execute")
-        .expect("storage is executed");
-    assert!(
-        execute < install,
-        "sccache was built before the volumes came up: {:?}",
-        host.events
     );
 }
 
-/// A host that asked for sccache and has no nix: the storage rows are still printed, the missing
-/// prerequisite is named with the remedy, and the command does NOT exit 0 — a scripted setup that
-/// read exit 0 here would report a host as ready without the thing it was told to install.
+/// A failed build, or a file that is not cowshed's link where `mbx` goes, fails the run, after the
+/// storage rows are printed: the volumes this command repaired stay reported.
 #[tokio::test]
-async fn a_host_without_nix_is_told_so_and_still_repairs_storage() {
-    let mut host = FakeHost {
-        sccache_install: SccacheInstall::Unavailable {
-            flake: PathBuf::from("/opt/cowshed/nix/sccache"),
-            refusal: BuildRefusal::NixMissing,
-        },
-        ..FakeHost::default()
-    };
-
-    let (streams, error) = failing_run(&mut host, REPAIR_WITH_SCCACHE, false).await;
-
-    assert_eq!(error.code.as_str(), "environment-missing");
-    assert!(
-        error.message.contains("nix is not on PATH"),
-        "{}",
-        error.message
-    );
-    assert!(
-        error.hint.contains("cowshed setup --sccache"),
-        "{}",
-        error.hint
-    );
-    assert_ne!(streams.exit, 0, "a missing prerequisite must not exit 0");
-    // The rest of setup ran and reported: aborting on the opt-in would strand a host whose volumes
-    // this very command just repaired.
-    assert!(
-        streams.stderr.contains("/etc/fstab"),
-        "the storage rows are missing: {}",
-        streams.stderr
-    );
-    assert!(
-        streams
-            .stderr
-            .contains("nix is not on PATH, so /opt/cowshed/nix/sccache could not be built"),
-        "{}",
-        streams.stderr
-    );
-    assert!(
-        host.events
-            .contains(&String::from("configure-sccache-client")),
-        "the run stopped early: {:?}",
-        host.events
-    );
-}
-
-/// A build that succeeded and a daemon that did not start is a launchd problem, not a nix one: the
-/// store path stays named so nobody re-runs the build looking for the fault.
-#[tokio::test]
-async fn a_rooted_build_whose_daemon_never_answered_points_at_launchd() {
-    let mut host = FakeHost {
-        sccache_install: SccacheInstall::NotRunning {
-            program: PathBuf::from("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache"),
-            gc_root: PathBuf::from(
-                "/Users/dev/Library/Application Support/dev.cowshed/nix/sccache",
-            ),
-            reason: String::from("the agent is loaded but its socket does not answer"),
-        },
-        ..FakeHost::default()
-    };
-
-    let (streams, error) = failing_run(&mut host, REPAIR_WITH_SCCACHE, false).await;
-
-    assert_eq!(error.code.as_str(), "environment-missing");
-    assert_eq!(error.hint, "cowshed sccache status");
-    assert!(
-        streams
-            .stderr
-            .contains("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache is installed and rooted"),
-        "{}",
-        streams.stderr
-    );
+async fn a_failed_mbx_install_fails_the_run_after_storage_is_reported() {
+    for (install, code) in [
+        (
+            MbxInstall::BuildFailed {
+                flake: PathBuf::from("/opt/cowshed/nix/mbx"),
+                status: Some(1),
+                stderr: String::from("error: unable to download"),
+            },
+            "environment-missing",
+        ),
+        (
+            MbxInstall::Occupied {
+                link: PathBuf::from("/home/dev/Library/Application Support/dev.cowshed/bin/mbx"),
+            },
+            "conflict",
+        ),
+    ] {
+        let mut host = FakeHost {
+            mbx_install: Some(install),
+            ..FakeHost::default()
+        };
+        let (streams, error) = failing_run(&mut host, REPAIR, false).await;
+        assert_eq!(error.code.as_str(), code, "{}", error.message);
+        assert_ne!(streams.exit, 0);
+        assert!(
+            streams.stderr.contains("/etc/fstab"),
+            "the storage rows are missing: {}",
+            streams.stderr
+        );
+    }
 }
 
 fn moved(

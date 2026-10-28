@@ -30,6 +30,7 @@ pub mod go;
 pub mod gradle;
 mod installations;
 mod javascript;
+pub mod mbx;
 pub mod nix;
 pub mod npm;
 pub mod nx;

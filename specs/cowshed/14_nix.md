@@ -92,9 +92,23 @@ revision".
 There is nothing else to declare for mbx. It runs no daemon and owns no socket (03_caches.md, "mbx"), so
 `programs.cowshed` has no mbx option and neither mode installs an agent for it: home-manager owns the generation that
 puts the pin in place, and the cache it serves lives on the build-cache volume under mbx's own collection
-(03_caches.md). Enforced by tests that must exist: after an imperative `cowshed setup` and after a home-manager switch,
-`mbx` resolves by PATH to a symlink whose realpath is the pinned revision's executable beside the installed cowshed
-binary; and no install in either mode writes an mbx plist, socket or second copy anywhere.
+(03_caches.md).
+
+The imperative install is three steps of every `cowshed setup` that reaches its host services: build the flake the
+package ships at `nix/mbx` (its `flake.lock` locks mbx's own nixpkgs exactly as mbx's flake does, so the build is the
+store path a project's devenv pin realizes), root the result with `--out-link` at
+`~/Library/Application Support/dev.cowshed/nix/mbx`, and point `dev.cowshed/bin/mbx` at the rooted executable by an
+atomic rename of a fresh link. A link that already names it is left; one naming another build is retargeted; anything
+there that is not a link is not cowshed's and fails the run untouched. A host without `nix` keeps no mbx, which is the
+non-mbx scheduling path, not a failure (05_gateway.md, "Host scheduling"). `--uninstall` removes the link and the root
+and nothing under the nix store. Enforced by `cowshed-core`'s
+`the_host_link_is_made_once_retargeted_to_a_new_pin_and_never_replaces_a_foreign_file` and
+`the_link_is_observed_without_following_it`, `cowshed-cli`'s `the_host_mbx_is_one_link_to_the_rooted_executable` and the
+setup cells `a_repair_links_the_pinned_mbx_after_storage_and_names_it`,
+`a_host_without_nix_keeps_no_mbx_and_still_succeeds` and `a_failed_mbx_install_fails_the_run_after_storage_is_reported`.
+Tests that must exist beyond those: after an imperative `cowshed setup` and after a home-manager switch, `mbx` resolves
+by PATH to a symlink whose realpath is the pinned revision's executable beside the installed cowshed binary; and no
+install in either mode writes an mbx plist, socket or second copy anywhere.
 
 ## Deployment postures
 

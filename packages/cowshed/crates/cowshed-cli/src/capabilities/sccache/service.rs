@@ -103,7 +103,7 @@ pub(crate) fn parse_capacity(text: &str) -> Result<ImageCapacity> {
 /// the plist: sccache reads `SCCACHE_CACHE_SIZE` once, at server start, so the number has to be in
 /// launchd's environment rather than any client's.
 ///
-/// The program comes from the nix GC root `cowshed setup --sccache` registered, never from `PATH`.
+/// The program comes from the nix GC root an earlier `cowshed setup --sccache` registered, never from `PATH`.
 /// launchd hands a LaunchAgent none of the user's `PATH`, so a name would only ever have resolved
 /// because a person happened to run this from a shell that had sccache in it — which is how a host
 /// with sccache installed all along reported "sccache is not on PATH" on every boot.
@@ -664,7 +664,7 @@ mod tests {
             "the error must name the root it looked for; got {}",
             error.message
         );
-        assert_eq!(error.hint, "cowshed setup --sccache");
+        assert_eq!(error.hint, "cowshed sccache stop");
 
         let _ = fs::remove_dir_all(&home);
     }

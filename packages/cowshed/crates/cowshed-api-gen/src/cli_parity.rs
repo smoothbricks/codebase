@@ -159,7 +159,6 @@ pub const PARITY: &[Row] = &[
     row("setup", "", Counterpart::CliOnly { reason: SETUP_DIALOG }),
     row("setup", "uninstall", Counterpart::CliOnly { reason: SETUP_DIALOG }),
     row("setup", "force", Counterpart::CliOnly { reason: SETUP_DIALOG }),
-    row("setup", "sccache", Counterpart::CliOnly { reason: SETUP_DIALOG }),
     row("setup", "retire-caches-volume", Counterpart::CliOnly { reason: SETUP_DIALOG }),
     row("setup", "downgrade", Counterpart::CliOnly { reason: SETUP_DIALOG }),
 

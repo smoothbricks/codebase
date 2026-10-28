@@ -273,6 +273,22 @@ cowshed: data is safe on disk4s7; cowshed left it untouched
 cowshed: host storage is partially set up: 1 volume lives outside this host's container and left untouched
 ```
 
+`setup` installs **cowshed's pinned mbx** (specs/cowshed/14_nix.md, "mbx") on every run once storage is up and the
+invoking build is the installed cowshed. It builds the flake the package ships at `nix/mbx` (mbx v1.28.0 at the pinned
+revision, with mbx's own locked nixpkgs), roots the result with a nix GC root at
+`~/Library/Application Support/dev.cowshed/nix/mbx`, and links `mbx` in cowshed's `bin` beside the installed `cowshed`
+to the rooted executable: a link, never a copy, so its realpath is the pinned build's store path, the identity a
+project's own mbx is proven against. No agent, plist or socket is written for it:
+
+```
+cowshed: mbx: linked ~/Library/Application Support/dev.cowshed/bin/mbx to <store path>/bin/mbx
+```
+
+A host without `nix` on PATH is told so, keeps no mbx, and schedules Cargo without it, which is the specified non-mbx
+path and not a failure. A build that fails, or a file there that is not cowshed's link (left as it is), fails the run
+after every other row is printed. `setup --uninstall` removes the link and the root, never the store path, which is
+nix's to collect.
+
 `setup` also writes **sccache's own config file** — the one host-level thing that decides where a compile cache lands,
 and how large it may grow, for a client that has no cowshed environment at all. Every workspace gets `SCCACHE_DIR` from
 its supervisor, so a build inside a workspace already reaches the daemon; a `cargo` invoked anywhere else is still
@@ -600,12 +616,13 @@ both land there, but a build reached through some other route to the same files 
 into one) is a different compilation.
 
 Every workspace child cowshed launches — `cowshed exec` and every supervisor-run command alike — gets `RUSTC_WRAPPER`
-naming the sccache that `cowshed setup --sccache` pinned (the program the host daemon runs, by its store path, so a
-repository shell that ships no sccache still builds), `SCCACHE_BASEDIR_CWD=1`, `SCCACHE_BASEDIR=<workspace root>` and
-the cache endpoints (`SCCACHE_SERVER_UDS`, `SCCACHE_DIR`). A host without a pinned sccache gets no wrapper. Name mounts
-are not excluded: the bundled sccache normalizes the residual path-bearing key inputs against the request cwd and the
-workspace root, so sibling paths share entries with each other. A slot buys the one input normalization cannot reach —
-cargo's `-C metadata`, a hash sccache never sees — and same-path reuse of the units whose output names their checkout.
+naming the sccache that an earlier `cowshed setup --sccache` pinned (the program the host daemon runs, by its store
+path, so a repository shell that ships no sccache still builds), `SCCACHE_BASEDIR_CWD=1`,
+`SCCACHE_BASEDIR=<workspace root>` and the cache endpoints (`SCCACHE_SERVER_UDS`, `SCCACHE_DIR`). A host without a
+pinned sccache gets no wrapper. Name mounts are not excluded: the bundled sccache normalizes the residual path-bearing
+key inputs against the request cwd and the workspace root, so sibling paths share entries with each other. A slot buys
+the one input normalization cannot reach — cargo's `-C metadata`, a hash sccache never sees — and same-path reuse of the
+units whose output names their checkout.
 
 `CARGO_INCREMENTAL` is not set, at any mount and for any command, `cowshed land --check` included. Cargo decides it per
 profile, which serves both halves of a build: workspace crates in `dev` and `test` stay incremental and local (a

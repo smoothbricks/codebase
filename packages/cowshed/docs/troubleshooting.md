@@ -364,7 +364,8 @@ finish first.
 
 A workspace's cargo is wrapped with the sccache `cowshed setup --sccache` pinned, named by its store path. A host that
 never ran it, or whose pinned store path was collected (`cowshed doctor` reports `sccache-unpinned`), builds without a
-wrapper. Run `cowshed setup --sccache`; the next command in the workspace uses it.
+wrapper. Setup no longer builds sccache: cowshed's Cargo compiler cache is mbx (`cowshed setup` installs its pin), and
+`cowshed sccache stop` removes an agent whose program was collected.
 
 ## `cowshed exec` fails with `cannot run direnv from PATH …`
 

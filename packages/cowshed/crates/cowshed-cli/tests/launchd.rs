@@ -41,7 +41,7 @@ const BINARY_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support/
 const GATEWAY_HOST: &str =
     "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host";
 const SUPPORT_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed";
-/// The nix GC root `cowshed setup --sccache` registers, and the store path it pins. The sccache
+/// The nix GC root an earlier `cowshed setup --sccache` registered, and the store path it pins. The sccache
 /// agent names the store path, so the plist carries the build's own content hash rather than a
 /// symlink a later build could repoint under a loaded agent.
 const SCCACHE_GC_ROOT: &str =
