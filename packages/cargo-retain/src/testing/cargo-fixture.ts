@@ -349,8 +349,27 @@ export function refused(report: RetentionReport): { profile: string; reason: str
   return outcome;
 }
 
+/** The unit generations an outcome reclaims (or would). */
 export function reclaimPaths(outcome: PlannedOutcome): string[] {
-  return outcome.reclaim.map((entry) => entry.path).sort();
+  return outcome.reclaim
+    .filter((entry) => entry.reason === 'superseded-generation')
+    .map((entry) => entry.path)
+    .sort();
+}
+
+/** The `incremental/<crate>-<id>` directories an outcome reclaims (or would). */
+export function incrementalReclaimPaths(outcome: PlannedOutcome): string[] {
+  return outcome.reclaim
+    .filter((entry) => entry.reason === 'superseded-incremental')
+    .map((entry) => entry.path)
+    .sort();
+}
+
+/** Each directory under a profile's `incremental/`, by name, with its inode: a reused one keeps it. */
+export async function incrementalDirs(incremental: string): Promise<Map<string, number>> {
+  const dirs = new Map<string, number>();
+  for (const name of await readdir(incremental)) dirs.set(name, (await lstat(join(incremental, name))).ino);
+  return dirs;
 }
 
 export function keepReason(outcome: PlannedOutcome, path: string): string | undefined {

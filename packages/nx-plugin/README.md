@@ -276,11 +276,15 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   avoiding duplicate stats and one asynchronous dispatch per tiny file; it does not walk retained artifact contents or
   reuse an earlier graph that could miss in-place recompiles. `cargo-retention` runs that package's native
   `smoo-nx-cargo-retain` executable to preview the same selection, nested roots included, without changing anything.
-  `incremental/` and the split-debuginfo objects rustc keeps inside current generations (rust-lang/rust#161824) are not
-  reclaimed, so neither the target directory nor a nested root is bounded. Empty fingerprint hashes are kept as
-  unfinished compilations. The preservation proof covers Cargo's current unit and dependency records, not every debug
-  reference in copied binaries or other checkouts. In particular, a binary copied up before a failed link can outlive
-  the generation its debug map names; this pass does not establish that machine-wide debug closure.
+  Each profile's `incremental/<crate>-<id>/` directories go in the same pass: rustc keeps one per build variant and
+  never removes the one a feature, profile or flag change superseded. One is kept while its newest finished session
+  started inside the compile window (`invoked.timestamp` to the hash file's last write) of a kept unit of the same
+  crate, while it started within the recent-use window, or while the directory holds an unfinished or unreadable
+  session. The split-debuginfo objects rustc keeps inside current generations (rust-lang/rust#161824) are not reclaimed,
+  so a target directory is not bounded by them. Empty fingerprint hashes are kept as unfinished compilations. The
+  preservation proof covers Cargo's current unit and dependency records, not every debug reference in copied binaries or
+  other checkouts. In particular, a binary copied up before a failed link can outlive the generation its debug map
+  names; this pass does not establish that machine-wide debug closure.
 - **Scheduling:** inference never throttles Nx. It sets no `parallelism: false` or `parallel: false`, no cap, and no
   edge whose only purpose is keeping two cargo writers off one `target/`: Cargo owns that lock, and a second process
   waits inside cargo. An edge states a real consumer — fetch before frozen cargo, the archive before the runners,

@@ -44,6 +44,8 @@ import {
   future,
   type Generations,
   holdProfile,
+  incrementalDirs,
+  incrementalReclaimPaths,
   inFixture,
   keepReason,
   labelled,
@@ -453,7 +455,10 @@ async function plansAndKeepsRecent(fx: Churn, gen: Generations, label: string): 
   return plan;
 }
 
-/** Case: apply reclaims exactly the superseded generations and keeps the next build Fresh; a repeat is a no-op. */
+/**
+ * Case: apply reclaims exactly the superseded generations and the incremental directories only they compiled, keeps the
+ * next build Fresh and the kept incremental directories in place and reused; a repeat is a no-op.
+ */
 async function reclaimsSupersededAndRepeats(
   fx: Churn,
   gen: Generations,
@@ -462,7 +467,7 @@ async function reclaimsSupersededAndRepeats(
 ): Promise<void> {
   const check = labelled(label);
   const incremental = join(fx.target, 'debug', 'incremental');
-  const incrementalBefore = await snapshot(incremental);
+  const incrementalBefore = await incrementalDirs(incremental);
   const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
   check(applied.kind).toBe('reclaimed');
   check(reclaimPaths(applied)).toEqual(gen.superseded);
@@ -471,9 +476,29 @@ async function reclaimsSupersededAndRepeats(
   for (const path of gen.superseded) check(await exists(path), path).toBe(false);
   check(await exists(gen.leafOld)).toBe(true);
   check(await exists(gen.extMeta)).toBe(true);
-  check(await snapshot(incremental)).toEqual(incrementalBefore);
+  // The flip superseded the mid and app variants: their incremental directories go, and every other one stays as it was.
+  const goneIncremental = incrementalReclaimPaths(applied);
+  check(goneIncremental.length, 'the flip superseded incremental directories').toBeGreaterThan(0);
+  check(goneIncremental).toEqual(incrementalReclaimPaths(plan));
+  for (const path of goneIncremental) {
+    check(await exists(path), path).toBe(false);
+    check(/^ret_(mid|app)-/.test(relative(incremental, path)), path).toBe(true);
+  }
+  const incrementalAfter = await incrementalDirs(incremental);
+  check(incrementalAfter.size).toBe(incrementalBefore.size - goneIncremental.length);
+  for (const [name, ino] of incrementalAfter) check(incrementalBefore.get(name), name).toBe(ino);
   await expectFresh(fx.ws);
   check(execFileSync(join(fx.target, 'debug', 'ret-app'), { encoding: 'utf8' })).toBe('13\n');
+  // A follow-up edit compiles incrementally into the kept directories: no new variant directory, the same inodes.
+  const appLib = join(fx.ws, 'crates/app/src/lib.rs');
+  const appSource = await readFile(appLib, 'utf8');
+  await writeFile(appLib, `${appSource}// an edit\n`);
+  await build(fx.ws);
+  check(await incrementalDirs(incremental), 'the edit reused the kept incremental directories').toEqual(
+    incrementalAfter,
+  );
+  await writeFile(appLib, appSource);
+  await build(fx.ws);
   // A repeated pass is a no-op.
   const settled = await snapshot(fx.target, new Set([RETENTION_RECEIPT]));
   const second = planned(await retain(fx.ws, { apply: true, now: future() }));
@@ -764,7 +789,7 @@ async function reclaimsNestedRoot(fx: Churn): Promise<void> {
   if (nestedStale.length === 0 || ownStale.length === 0)
     throw new Error('the flip left a root with nothing superseded');
   const incremental = join(nested, 'debug', 'incremental');
-  const incrementalBefore = await snapshot(incremental);
+  const incrementalBefore = await incrementalDirs(incremental);
   // A plan writes nothing and names each root's own superseded generations.
   const beforePlan = await snapshot(nested);
   const planReport = await retain(fx.ws, { apply: false, now: future() });
@@ -789,7 +814,12 @@ async function reclaimsNestedRoot(fx: Churn): Promise<void> {
   for (const lock of ['.cargo-lock', '.cargo-build-lock']) {
     check(await exists(join(nested, 'debug', lock)), lock).toBe(true);
   }
-  check(await snapshot(incremental)).toEqual(incrementalBefore);
+  const goneIncremental = incrementalReclaimPaths(applied);
+  check(goneIncremental.length, "the flip superseded the nested root's incremental directories").toBeGreaterThan(0);
+  for (const path of goneIncremental) check(await exists(path), path).toBe(false);
+  const incrementalAfter = await incrementalDirs(incremental);
+  check(incrementalAfter.size).toBe(incrementalBefore.size - goneIncremental.length);
+  for (const [name, ino] of incrementalAfter) check(incrementalBefore.get(name), name).toBe(ino);
   await scopedTo(nested, async () => {
     await expectFresh(fx.ws);
   });

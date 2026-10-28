@@ -50,8 +50,15 @@
  * reclaimed, never a root or a profile, and a nested root holding no unit of a workspace member
  * has nothing proving it ours: it is kept whole, as `foreign-root`.
  *
- * Not reclaimed here: `incremental/` and the split-debuginfo objects rustc keeps inside current
- * units (rust-lang/rust#161824).
+ * Each profile's `incremental/<crate>-<id>/` directories are reclaimed in the same pass, under the same Cargo
+ * hold: rustc keeps one per build variant (`-C metadata`) and never removes the one a feature, profile or flag change
+ * superseded. Each holds sessions `s-<start µs, base 36>-<random>-<svh>`; one is kept while it holds an unfinished
+ * (`-working`) session or no finished session this selector can read, while its newest session started within
+ * {@link RECENT_USE_MS} of now, or while that session started inside the compile window (`invoked.timestamp` to the
+ * hash file's last write) of a kept unit of the same profile and crate. Fingerprints never read `incremental/`, so a
+ * wrong reclaim costs one non-incremental compile of that crate.
+ *
+ * Not reclaimed here: the split-debuginfo objects rustc keeps inside current units (rust-lang/rust#161824).
  *
  * Native build: scriptc compiles the emitted JavaScript, where a parameter carries no type. It infers one from the
  * call sites, and where that fails (an `any` reaching an overloaded Node API, a Stats handed to a parameter) the code
@@ -76,7 +83,7 @@ export type RetentionError =
   | { readonly kind: 'target-not-cargo'; readonly targetDir: string; readonly detail: string }
   | { readonly kind: 'io'; readonly operation: string; readonly path: string; readonly detail: string };
 
-export type ReclaimReason = 'superseded-generation';
+export type ReclaimReason = 'superseded-generation' | 'superseded-incremental';
 export type KeepReason =
   | 'newest-of-identity'
   | 'recently-used'
@@ -87,7 +94,10 @@ export type KeepReason =
   | 'incomplete-fingerprint'
   | 'unproven-trash-entry'
   | 'foreign-root'
-  | 'legacy-layout';
+  | 'legacy-layout'
+  | 'incremental-of-kept'
+  | 'incremental-recent'
+  | 'incremental-unproven';
 
 /** A reclaimed (or, planned, reclaimable) generation: `bytes` free with it, `linkedBytes` stay linked elsewhere. */
 export interface Reclaimable {
@@ -193,7 +203,13 @@ const validateMetadata = typia.createValidate<CargoMetadata>();
 
 interface TrashManifest {
   readonly version: 1;
-  readonly entries: readonly { readonly from: string; readonly dev: string; readonly ino: string }[];
+  readonly entries: readonly {
+    readonly from: string;
+    readonly dev: string;
+    readonly ino: string;
+    /** Absent in manifests from before incremental collection: a unit generation. */
+    readonly reason?: ReclaimReason;
+  }[];
 }
 const validateManifest = typia.createValidate<TrashManifest>();
 
@@ -501,6 +517,9 @@ interface Unit {
   readonly identity: string;
   readonly deps: readonly { readonly hash: string; readonly name: string }[];
   readonly lastUse: number;
+  /** When Cargo last started compiling the unit (`invoked.timestamp`), and last wrote its hash file. */
+  readonly invoked: number;
+  readonly hashed: number;
 }
 interface Meta {
   readonly profile: string;
@@ -508,12 +527,23 @@ interface Meta {
   readonly path: string;
   readonly units: Unit[];
 }
+/** One `<profile>/incremental/<crate>-<id>/`: the crate it is for and its newest finished session's start. */
+interface IncrementalDir {
+  readonly profile: string;
+  readonly path: string;
+  readonly crate: string;
+  /** Milliseconds since the epoch; `undefined` when no finished session's name can be read. */
+  readonly start: number | undefined;
+  /** An unfinished (`-working`) session is in it. */
+  readonly working: boolean;
+}
 interface ProfileScan {
   readonly root: string | undefined;
   readonly metas: readonly Meta[];
   readonly anomalies: readonly Retained[];
   /** Units whose hash file is newer than their compile by more than {@link RECENT_USE_MS}: Cargo stamped a use. */
   readonly stamped: number;
+  readonly incremental: readonly IncrementalDir[];
 }
 
 /**
@@ -646,6 +676,8 @@ function scanProfile(profile: string, targetDir: string): Result<ProfileScan, st
           identity: fingerprintIdentity(pkg, kind, fingerprint.value),
           deps: fingerprint.value.deps.map(([, depName, , depHash]) => ({ hash: hashText(depHash), name: depName })),
           lastUse: Math.max(hashTime, invoked),
+          invoked,
+          hashed: hashTime,
         });
       }
       metas.push(meta);
@@ -662,7 +694,85 @@ function scanProfile(profile: string, targetDir: string): Result<ProfileScan, st
       detail: 'old-layout unit records; this selector reads the current layout only',
     });
   }
-  return { ok: true, value: { root, metas, anomalies, stamped } };
+  return { ok: true, value: { root, metas, anomalies, stamped, incremental: scanIncremental(profile) } };
+}
+
+/** rustc's `s-<start µs, base 36>-<random>-<svh>`, or `-working` in the svh's place while the session is unfinished. */
+const SESSION_NAME = /^s-([0-9a-z]+)-[0-9a-z]+-([0-9a-z]+)$/;
+const INCREMENTAL_NAME = /^(.+)-[0-9a-z]+$/;
+
+/**
+ * Every `<profile>/incremental/<crate>-<id>/` and what its session names say. A profile without `incremental/` has none.
+ *
+ * @param {string} profile
+ */
+function scanIncremental(profile: string): IncrementalDir[] {
+  const root = join(profile, 'incremental');
+  const dirs: IncrementalDir[] = [];
+  if (lstatSync(root, { throwIfNoEntry: false })?.isDirectory() !== true) return dirs;
+  for (const entry of directoryEntries(root)) {
+    const crate = INCREMENTAL_NAME.exec(entry.name)?.[1];
+    if (!entry.isDirectory() || crate === undefined) continue;
+    const path = join(root, entry.name);
+    let start: number | undefined;
+    let working = false;
+    for (const session of directoryEntries(path)) {
+      const parsed = SESSION_NAME.exec(session.name);
+      if (!session.isDirectory() || parsed === null) continue;
+      if (parsed[2] === 'working') {
+        working = true;
+        continue;
+      }
+      const micros = Number.parseInt(parsed[1] ?? '', 36);
+      if (!Number.isFinite(micros)) continue;
+      const ms = Math.floor(micros / 1000);
+      if (start === undefined || ms > start) start = ms;
+    }
+    dirs.push({ profile, path, crate, start, working });
+  }
+  return dirs;
+}
+
+/**
+ * No slack around a unit's compile window: Cargo writes `invoked.timestamp` before it starts rustc, rustc names the
+ * session at its start, and the hash file is written after rustc ends, all on the one wall clock. A rebuild seconds
+ * after the variant it supersedes would otherwise claim that variant's sessions.
+ */
+const WINDOW_SLACK_MS = 0;
+
+/**
+ * Which incremental directories go: each whose newest finished session falls in no kept unit's compile window, is older
+ * than {@link RECENT_USE_MS} and is not unfinished. `kept` are the units of the profile's kept generations.
+ */
+function selectIncremental(
+  dirs: readonly IncrementalDir[],
+  kept: readonly Unit[],
+  now: number,
+): { readonly reclaim: readonly IncrementalDir[]; readonly kept: readonly Retained[] } {
+  const reclaim: IncrementalDir[] = [];
+  const keptDirs: Retained[] = [];
+  for (const dir of dirs) {
+    const start = dir.start;
+    if (dir.working || start === undefined) {
+      keptDirs.push({ path: dir.path, reason: 'incremental-unproven' });
+      continue;
+    }
+    if (now - start < RECENT_USE_MS) {
+      keptDirs.push({ path: dir.path, reason: 'incremental-recent' });
+      continue;
+    }
+    const suffix = `_${dir.crate.replaceAll('-', '_')}`;
+    const owned = kept.some(
+      (unit) =>
+        unit.meta.profile === dir.profile &&
+        unit.kind.replaceAll('-', '_').endsWith(suffix) &&
+        start >= unit.invoked - WINDOW_SLACK_MS &&
+        start <= unit.hashed + WINDOW_SLACK_MS,
+    );
+    if (owned) keptDirs.push({ path: dir.path, reason: 'incremental-of-kept' });
+    else reclaim.push(dir);
+  }
+  return { reclaim, kept: keptDirs };
 }
 
 // ---- Selection ----
@@ -819,10 +929,14 @@ interface Moved {
   readonly from: string;
   readonly dev: string;
   readonly ino: string;
+  readonly reason?: ReclaimReason;
 }
 
 /** Under the Cargo hold: manifest first, then each rename, so every trash entry has a proven origin. */
-async function moveToTrash(profile: string, victims: readonly Meta[]): Promise<Result<void, RetentionError>> {
+async function moveToTrash(
+  profile: string,
+  victims: readonly { readonly path: string; readonly reason: ReclaimReason }[],
+): Promise<Result<void, RetentionError>> {
   const trash = join(profile, TRASH);
   try {
     const trashStats = await lstatOrUndefined(trash);
@@ -842,7 +956,7 @@ async function moveToTrash(profile: string, victims: readonly Meta[]): Promise<R
           error: { kind: 'io', operation: 'identify superseded generation', path: victim.path, detail },
         };
       }
-      entries.push({ from: victim.path, ...identity });
+      entries.push({ from: victim.path, ...identity, reason: victim.reason });
     }
     const manifest: TrashManifest = { version: 1, entries };
     writeNew(join(trash, `${pass}.json`), JSON.stringify(manifest));
@@ -909,7 +1023,7 @@ async function purgeTrash(profile: string, linked: Map<string, number>): Promise
           retained.push({ path: moved, reason: removed.error, detail: `not the generation moved from ${entry.from}` });
           continue;
         }
-        reclaimed.push({ path: entry.from, ...removed.value, reason: 'superseded-generation' });
+        reclaimed.push({ path: entry.from, ...removed.value, reason: entry.reason ?? 'superseded-generation' });
       }
       const left = await readdir(passDir);
       for (const name of left) {
@@ -1267,7 +1381,9 @@ async function pass(
   const metas: Meta[] = [];
   let stamped = 0;
   const anomalies: Retained[] = [];
+  const incremental: IncrementalDir[] = [];
   let selection: Selection;
+  let incrementalSelection: ReturnType<typeof selectIncremental> = { reclaim: [], kept: [] };
   try {
     const scanStarted = performance.now();
     for (const profile of profiles) {
@@ -1297,6 +1413,7 @@ async function pass(
       for (const meta of scanned.value.metas) metas.push(meta);
       for (const anomaly of scanned.value.anomalies) anomalies.push(anomaly);
       stamped += scanned.value.stamped;
+      for (const dir of scanned.value.incremental) incremental.push(dir);
     }
     performance.measure('cargoRetention:scan', { start: scanStarted });
     const selectionStarted = performance.now();
@@ -1307,9 +1424,22 @@ async function pass(
         ? { reclaim: [], kept: [{ path: targetDir, reason: 'foreign-root', detail: 'no unit of a workspace member' }] }
         : select(metas, members, options.now);
     performance.measure('cargoRetention:select', { start: selectionStarted });
+    // A foreign root keeps everything, its incremental directories included.
+    if (!selection.kept.some((entry) => entry.reason === 'foreign-root')) {
+      const reclaimed = new Set(selection.reclaim);
+      const keptUnits: Unit[] = [];
+      for (const meta of metas) if (!reclaimed.has(meta)) for (const unit of meta.units) keptUnits.push(unit);
+      incrementalSelection = selectIncremental(incremental, keptUnits, options.now);
+    }
     if (options.apply) {
       for (const profile of ownedProfiles) {
-        const victims = selection.reclaim.filter((meta) => meta.profile === profile);
+        const victims: { path: string; reason: ReclaimReason }[] = [];
+        for (const meta of selection.reclaim) {
+          if (meta.profile === profile) victims.push({ path: meta.path, reason: 'superseded-generation' });
+        }
+        for (const dir of incrementalSelection.reclaim) {
+          if (dir.profile === profile) victims.push({ path: dir.path, reason: 'superseded-incremental' });
+        }
         if (victims.length === 0) continue;
         const moved = await moveToTrash(profile, victims);
         if (!moved.ok) return moved;
@@ -1320,21 +1450,30 @@ async function pass(
   }
   if (!options.apply) {
     const reclaim: Reclaimable[] = [];
-    for (const meta of selection.reclaim) {
+    const measured: { path: string; reason: ReclaimReason }[] = [];
+    for (const meta of selection.reclaim) measured.push({ path: meta.path, reason: 'superseded-generation' });
+    for (const dir of incrementalSelection.reclaim) measured.push({ path: dir.path, reason: 'superseded-incremental' });
+    for (const entry of measured) {
       try {
-        reclaim.push({ path: meta.path, ...accountInodes(censusTree(meta.path)), reason: 'superseded-generation' });
+        reclaim.push({ path: entry.path, ...accountInodes(censusTree(entry.path)), reason: entry.reason });
       } catch (error) {
-        return { ok: false, error: ioError('measure', meta.path, error) };
+        return { ok: false, error: ioError('measure', entry.path, error) };
       }
     }
     const linkedBytes = reclaim.reduce((sum, entry) => sum + entry.linkedBytes, 0);
     return complete(
-      outcome('planned', reclaim, linkedBytes, [...selection.kept, ...anomalies], recencyOf(metas, stamped)),
+      outcome(
+        'planned',
+        reclaim,
+        linkedBytes,
+        [...selection.kept, ...incrementalSelection.kept, ...anomalies],
+        recencyOf(metas, stamped),
+      ),
     );
   }
   const linked = new Map<string, number>();
   const reclaim: Reclaimable[] = [];
-  const retained: Retained[] = [...selection.kept, ...anomalies];
+  const retained: Retained[] = [...selection.kept, ...incrementalSelection.kept, ...anomalies];
   for (const profile of ownedProfiles) {
     const purged = await purgeTrash(profile, linked);
     if (!purged.ok) return purged;
