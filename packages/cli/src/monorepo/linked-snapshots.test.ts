@@ -6,6 +6,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -685,6 +686,36 @@ describe('snapshot declarations', () => {
     expect(said).toContain('continuing with the pin');
     expect(realpathSync(alias)).toBe(snapshot.directory);
     expect(await leafOf(join(alias, 'src/index.js'))).toBe('first');
+  });
+
+  it("imports a pin its store lacks from the main checkout's store, and names both stores for a pin neither holds", async () => {
+    const checkout = fixture();
+    const alias = declare(checkout);
+    const snapshot = snapshotOf(await capture(checkout));
+    pin(checkout, snapshot.id);
+    // A checkout of the consumer forked before its main captured the pin: its own store lacks the snapshot.
+    const fork = join(checkout.consumer, '..', 'fork');
+    cpSync(checkout.consumer, fork, { recursive: true, verbatimSymlinks: true });
+    const forkStore = join(fork, '.cache/linked-snapshots');
+    rmSync(forkStore, { recursive: true });
+    write(join(fork, '.cowshed/workspace.json'), JSON.stringify({ projectRoot: checkout.consumer }));
+    await postinstall(fork);
+    const imported = join(forkStore, snapshot.id);
+    expect(verifySnapshot(imported).id).toBe(snapshot.id);
+    expect(readdirSync(forkStore)).toEqual([snapshot.id]);
+    expect(realpathSync(join(fork, 'node_modules/linked-api'))).toBe(
+      join(imported, snapshot.directory.slice(join(checkout.consumer, '.cache/linked-snapshots', snapshot.id).length)),
+    );
+    expect(await leafOf(join(fork, 'node_modules/linked-api/src/index.js'))).toBe('first');
+    expect(readlinkSync(alias)).toBe('.bun/linked-api@1.0.0/node_modules/linked-api');
+    pin({ ...checkout, consumer: fork }, '0'.repeat(64));
+    const refusal = await postinstall(fork).then(
+      () => 'resolved',
+      (error: unknown) => String(error),
+    );
+    expect(refusal).toContain('cannot resolve pinned snapshot');
+    expect(refusal).toContain(forkStore);
+    expect(refusal).toContain(join(checkout.consumer, '.cache/linked-snapshots'));
   });
 
   for (const defect of ['missing', 'corrupt', 'wrong-package', 'malformed'] as const) {

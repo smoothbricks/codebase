@@ -738,10 +738,12 @@ root `package.json` names the snapshot's 64-digit lowercase SHA-256 ID:
 }
 ```
 
-Replace the example ID with the ID of an actual captured snapshot. The link resolves only from
-`.cache/linked-snapshots/<id>` in the consumer. The existing snapshot verifier checks its census, producer provenance,
-and package name before any alias changes. This pins source, built outputs and dependencies together; a Git commit alone
-does not identify the built outputs, and a tag can move. No second checkout materializer is involved.
+Replace the example ID with the ID of an actual captured snapshot. The link resolves from `.cache/linked-snapshots/<id>`
+in the consumer; a cowshed checkout whose store lacks it imports it from its project's main checkout store (the
+`projectRoot` its `.cowshed/workspace.json` names), copied into a temporary entry, verified there and renamed into
+place. The existing snapshot verifier checks its census, producer provenance, and package name before any alias changes.
+This pins source, built outputs and dependencies together; a Git commit alone does not identify the built outputs, and a
+tag can move. No second checkout materializer is involved.
 
 The `directory` is only the provider location for a freshness report. When its HEAD differs from the captured HEAD,
 `smoo:developer-links` reports a **stale pin**, names both commits, and continues successfully with the same snapshot.
@@ -752,9 +754,10 @@ with a nonzero result; there is no fallback to the moving checkout or the publis
 To select a pin, use the capture form below once and retain the snapshot ID it prints and records in
 `node_modules/.smoo-declared-links`'s link target. Replace the capture object with that ID. To move it, deliberately
 capture and review another build, then change the declared ID. An already-running process retains the code it loaded;
-new resolutions use the selected snapshot. A new consumer needs the sealed snapshot in its own store, with its receipt,
-census and relative layout intact; a cowshed fork carries the store on its build volume. Pin resolution never fetches,
-builds or reconstructs a missing snapshot from today's provider.
+new resolutions use the selected snapshot. A new consumer needs the sealed snapshot in its own store or, as a cowshed
+checkout, in its main checkout's, with its receipt, census and relative layout intact; one capture in main serves every
+checkout of the project. A pin neither store holds refuses, naming both. Pin resolution never fetches, builds or
+reconstructs a missing snapshot from today's provider.
 
 Existing forms keep working unchanged as explicit moving opt-ins. A directory string such as
 `"@smoothbricks/lmao": "../smoothbricks/packages/lmao"` links the live checkout. The capture object below selects a

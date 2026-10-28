@@ -125,6 +125,7 @@ import {
 import path from 'node:path';
 import type { BuildInputProducer, KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
 import {
+  linkAnchor,
   type ProducerProbe,
   packedFiles,
   pinnedSnapshot,
@@ -1288,26 +1289,6 @@ function declaredTarget(root: string, anchor: string, relative: string): string 
       existing = parent;
     }
   }
-}
-
-/**
- * The stable anchor for genuine sibling directories is the project's main checkout.
- * A cowshed marker names it without reading main's tree. Contained declared
- * directories are projected into the current checkout by `declaredTarget`, with
- * physical containment checked against symlink escapes.
- */
-function linkAnchor(root: string): string {
-  let marker: unknown;
-  try {
-    marker = JSON.parse(readFileSync(path.join(root, '.cowshed', 'workspace.json'), 'utf8'));
-  } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-      return root;
-    }
-    throw error;
-  }
-  const projectRoot = typeof marker === 'object' && marker !== null ? Reflect.get(marker, 'projectRoot') : undefined;
-  return typeof projectRoot === 'string' && path.isAbsolute(projectRoot) ? projectRoot : root;
 }
 
 /** Ownership is the link text we wrote, not merely an alias path we once used. */
