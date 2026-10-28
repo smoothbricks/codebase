@@ -792,11 +792,18 @@ impl Lent {
     }
 }
 
+/// How a store's free space is read: its free and total bytes at a path on it. Production reads the
+/// kernel's (`release::store_space`); a test of seed compaction's copy names the space it runs in,
+/// so the host disk's fullness decides nothing about it.
+pub(crate) type StoreSpace = fn(&std::path::Path) -> std::io::Result<(u64, u64)>;
+
 pub(crate) struct BuildVolumes<H: RuntimeStorageHost = Host> {
     host: Arc<H>,
     pub layout: BuildVolumeLayout,
     /// Blocking work and a cancelled mint's destructor can outlive the project actor.
     retirement_lease: Arc<crate::project_retirement::ProjectReadLease>,
+    /// The free space seed compaction's copy keeps the store's floor against.
+    pub(crate) store_space: StoreSpace,
 }
 
 impl<H: RuntimeStorageHost> Clone for BuildVolumes<H> {
@@ -805,6 +812,7 @@ impl<H: RuntimeStorageHost> Clone for BuildVolumes<H> {
             host: Arc::clone(&self.host),
             layout: self.layout.clone(),
             retirement_lease: Arc::clone(&self.retirement_lease),
+            store_space: self.store_space,
         }
     }
 }
@@ -819,6 +827,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             host,
             layout,
             retirement_lease: Arc::new(retirement_lease),
+            store_space: crate::storage::apfs::release::store_space,
         }
     }
 
@@ -8605,7 +8614,10 @@ fn main() {
     async fn real_apfs_seed_compaction_publishes_a_fragmented_seed_and_catches_a_replaced_one_up() {
         use crate::storage::apfs::native::{SeedCatchUp, SeedCompaction};
         const MIB: u64 = 1024 * 1024;
-        let scratch = Scratch::new("seed-compaction");
+        let mut scratch = Scratch::new("seed-compaction");
+        // The copy's own outcomes are under test, not the host disk's fullness (a gate's store at
+        // 14.8% free stopped it under the 10% floor plus 5% margin): a store with room to spare.
+        scratch.volumes.store_space = |_| Ok((1 << 50, 1 << 51));
         let target = owner("main", '0');
         let seed_registration = |tree: char| {
             Registration::new(

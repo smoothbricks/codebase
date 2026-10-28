@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BuildVolumes, Owner, RuntimeStorageHost, SupersededSeeds, TargetLock, claim_superseded, io,
-    seeds_of, storage,
+    BuildVolumes, Owner, RuntimeStorageHost, StoreSpace, SupersededSeeds, TargetLock,
+    claim_superseded, io, seeds_of, storage,
 };
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeRecord, BuildVolumeRole, Registrant, Registration,
@@ -245,13 +245,14 @@ fn between_checks(
 fn with_room(
     store: PathBuf,
     total: u64,
+    space: StoreSpace,
     mut checks: impl FnMut(u64) -> ControlFlow<String>,
 ) -> impl FnMut(u64) -> ControlFlow<String> {
     let mut next = 0_u64;
     move |written| {
         if written >= next {
             next = written + CHECK_EVERY_BYTES;
-            if let Some(why) = room(&store, total.saturating_sub(written)) {
+            if let Some(why) = room(&store, total.saturating_sub(written), space) {
                 return ControlFlow::Break(why);
             }
         }
@@ -262,11 +263,11 @@ fn with_room(
 /// Why writing `bytes` more into the store holding `store` must not go on, or `None`: it would leave
 /// the store under its floor plus margin, or its free space cannot be read, and not knowing is no
 /// permission.
-fn room(store: &Path, bytes: u64) -> Option<String> {
+fn room(store: &Path, bytes: u64, space: StoreSpace) -> Option<String> {
     use crate::storage::apfs::release::{
-        PRESSURE_MARGIN_PERCENT, STORE_FLOOR_PERCENT, store_space, writes_leave_floor,
+        PRESSURE_MARGIN_PERCENT, STORE_FLOOR_PERCENT, writes_leave_floor,
     };
-    match store_space(store) {
+    match space(store) {
         Err(error) => Some(format!(
             "the store's free space cannot be read at {}: {error}",
             store.display()
@@ -500,6 +501,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         admit: Box<dyn FnMut() -> Admission + Send>,
     ) -> Result<SeedCompaction> {
         let store = self.layout.compacting();
+        let space = self.store_space;
         self.blocking(move |host, _| {
             let total = source.allocated_bytes().map_err(|error| {
                 io(
@@ -508,7 +510,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     &error,
                 )
             })?;
-            let mut keep_going = with_room(store, total, between_checks(admit));
+            let mut keep_going = with_room(store, total, space, between_checks(admit));
             host.copy_seed_compaction(source, minimum_extents, &mut keep_going)
                 .map_err(storage)
         })
@@ -525,8 +527,9 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         admit: Box<dyn FnMut() -> Admission + Send>,
     ) -> Result<SeedCatchUp> {
         let store = self.layout.compacting();
+        let space = self.store_space;
         self.blocking(move |host, _| {
-            let mut keep_going = with_room(store, 0, between_checks(admit));
+            let mut keep_going = with_room(store, 0, space, between_checks(admit));
             host.catch_up_seed_compaction(compacted, next, &mut keep_going)
                 .map_err(storage)
         })
