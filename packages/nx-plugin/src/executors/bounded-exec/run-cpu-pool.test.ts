@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_POOL_ENV, readInheritedCpuPool, takeParentCpuTokens } from './cpu-pool.js';
 import { holdLease } from './gateway-lease.js';
-import { CpuLeaseWait } from './lease-wait.js';
+import { CpuLeaseWait, HEARTBEAT_MS } from './lease-wait.js';
 import { closeRunCpuPool, serveRunCpuPool } from './run-cpu-pool.js';
 import { CPU_TOKENS_ENV } from './runner-sizing.js';
 
@@ -141,6 +141,34 @@ it('decides CPU admission from control completion and advancing actor progress, 
     now = check.at;
     expect(wait.expired()?.code ?? null, check.name).toBe(check.code);
   }
+});
+
+it('judges only a silence the client was running to see: its own late wake gives the pool one heartbeat more', () => {
+  // 05_gateway.md "Deadlines": a client whose own event loop did not run past the silence bound plus a
+  // heartbeat (a loaded host) has not read what the pool sent meanwhile, so it re-arms one heartbeat.
+  let now = 0;
+  const wait = new CpuLeaseWait(() => now);
+  wait.sent();
+  now = 5_000;
+  wait.heartbeat(1);
+  // The client's timer, due at 20 s, fires at 32 s.
+  now = 32_000;
+  wait.look();
+  expect(wait.expired()).toBeNull();
+  expect(wait.remainingMs()).toBe(HEARTBEAT_MS);
+  // A pool still silent one heartbeat after the client runs again is SILENT.
+  now = 37_000;
+  wait.look();
+  expect(wait.expired()?.code).toBe('SILENT');
+  // A client that looks in time judges the pool at the bound.
+  now = 0;
+  const timely = new CpuLeaseWait(() => now);
+  timely.sent();
+  for (const at of [5_000, 10_000, 15_000]) {
+    now = at;
+    timely.look();
+  }
+  expect(timely.expired()?.code).toBe('SILENT');
 });
 
 it('accepts a CPU queue acknowledgement after the disk compatibility probe expires', async () => {

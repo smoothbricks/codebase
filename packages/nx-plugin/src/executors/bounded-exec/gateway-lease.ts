@@ -98,6 +98,7 @@ export function holdLease(
   const armCpu = (): void => {
     if (cpu === null || state === 'settled') return;
     wait(cpu.remainingMs(), () => {
+      cpu.look();
       const failure = cpu.expired();
       if (failure === null) {
         armCpu();

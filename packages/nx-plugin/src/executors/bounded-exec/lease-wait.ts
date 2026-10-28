@@ -23,13 +23,17 @@ export interface CpuWaitFailure {
 export class CpuLeaseWait {
   private readonly started: number;
   private state: CpuWaitState = { kind: 'sending' };
+  /** When the client last looked at its wait or read a frame of it. */
+  private looked: number;
 
   constructor(private readonly now: () => number = () => performance.now()) {
     this.started = now();
+    this.looked = this.started;
   }
 
   /** The kernel took the complete request; only peer silence bounds the answer from here. */
   sent(): void {
+    this.looked = this.now();
     if (this.state.kind === 'sending') {
       this.state = { kind: 'waiting', at: this.now(), last: 'request sent', sequence: 0 };
     }
@@ -50,6 +54,20 @@ export class CpuLeaseWait {
       return false;
     this.state = { kind: 'waiting', at: this.now(), last: `heartbeat ${sequence}`, sequence };
     return true;
+  }
+
+  /**
+   * The client looks at its wait before judging it. A look later than the silence bound plus a heartbeat
+   * after its previous look or frame means the client's own event loop did not run (a loaded host), so
+   * what the pool sent meanwhile is unread: the pool gets one heartbeat more from now (05_gateway.md
+   * "Deadlines"). A client that looks in time judges the pool at the bound.
+   */
+  look(): void {
+    const now = this.now();
+    if (this.state.kind === 'waiting' && now - this.looked > HEARTBEAT_SILENCE_MS + HEARTBEAT_MS) {
+      this.state = { ...this.state, at: Math.max(this.state.at, now - HEARTBEAT_SILENCE_MS + HEARTBEAT_MS) };
+    }
+    this.looked = now;
   }
 
   /** Milliseconds until the current phase's bound, clipped at zero. */
