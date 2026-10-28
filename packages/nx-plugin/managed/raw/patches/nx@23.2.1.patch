@@ -5810,7 +5810,7 @@ index 6d3dd021b050be5c74803555b361b6502f9693c7..8545dea5e1f4221191de652435a6a635
      private postRunSteps;
      private scheduleNextTasksAndReleaseThreads;
 diff --git a/dist/src/tasks-runner/task-orchestrator.js b/dist/src/tasks-runner/task-orchestrator.js
-index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a85353b04792 100644
+index 0b446cbce811319a741165e42a0100e0570e0a2f..ef2bb51da2a360cff60a3b0a2e37ad444fd84df0 100644
 --- a/dist/src/tasks-runner/task-orchestrator.js
 +++ b/dist/src/tasks-runner/task-orchestrator.js
 @@ -29,6 +29,8 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
@@ -5885,7 +5885,26 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
          // Public API (defaultTasksRunner) returns a plain object keyed by
          // task id. Internal state is a Map for faster lookup.
          return Object.fromEntries(this.completedTasks);
-@@ -413,12 +429,9 @@ class TaskOrchestrator {
+@@ -227,6 +243,18 @@ class TaskOrchestrator {
+                 const groupId = this.closeGroup();
+                 this.dispatchDiscreteWorker(doNotSkipCache, task, groupId);
+             }
++            // The jobserver is the CPU admission, not this count: cowshed gives every job a fifo with
++            // as many slots as the host has cores, served by its supervisor, and the kernel schedules
++            // what it admits. A slot here is a second admission, and a slot held by a test that runs at
++            // a tenth of a core holds back the gate's critical chain. So once every slot is held, the
++            // ready task heading the longest chain not yet started (TasksSchedule.nextCriticalTask)
++            // still starts, as one extra worker: never more than one beyond the parallelism.
++            if (this.pendingDiscreteWorkers.size === parallelism) {
++                const task = this.tasksSchedule.nextCriticalTask((t) => !t.continuous);
++                if (task) {
++                    this.dispatchDiscreteWorker(doNotSkipCache, task, this.options.parallel + this.continuousTasksStarted++);
++                }
++            }
+             // 6. Nothing left to dispatch and nothing in flight — done.
+             if (!this.tasksSchedule.hasTasks() &&
+                 this.pendingDiscreteWorkers.size === 0) {
+@@ -413,12 +441,9 @@ class TaskOrchestrator {
       * cache fetch + lifecycle to the public method. Returns true if any
       * tasks were resolved.
       *
@@ -5901,7 +5920,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
       */
      async resolveCachedTasksBulk() {
          const { scheduledTasks } = this.tasksSchedule.getAllScheduledTasks();
-@@ -514,6 +527,13 @@ class TaskOrchestrator {
+@@ -514,6 +539,13 @@ class TaskOrchestrator {
          await (0, hash_task_1.hashTasks)(this.hasher, this.projectGraph, this.fullTaskGraph, perTaskEnvs, this.taskDetails, tasks);
      }
      async applyFromCacheOrRunBatch(doNotSkipCache, batch, groupId) {
@@ -5915,7 +5934,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
          const applyFromCacheOrRunBatchStart = perf_hooks_1.performance.mark('TaskOrchestrator-apply-from-cache-or-run-batch:start');
          const taskEntries = Object.entries(batch.taskGraph.tasks);
          const tasks = taskEntries.map(([, task]) => task);
-@@ -571,7 +591,7 @@ class TaskOrchestrator {
+@@ -571,7 +603,7 @@ class TaskOrchestrator {
          const tasksCompleted = taskEntries.filter(([taskId]) => this.completedTasks.has(taskId));
          // Batch is still not done, run it again
          if (tasksCompleted.length !== taskEntries.length) {
@@ -5924,7 +5943,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
                  id: batch.id,
                  executorName: batch.executorName,
                  taskGraph: (0, utils_1.removeTasksFromTaskGraph)(batch.taskGraph, tasksCompleted.map(([taskId]) => taskId)),
-@@ -810,6 +830,20 @@ class TaskOrchestrator {
+@@ -810,6 +842,20 @@ class TaskOrchestrator {
       * don't actually compete for parallelism.
       */
      async resolveCachedTasks(doNotSkipCache, tasks, groupId) {
@@ -5945,7 +5964,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
          if (!doNotSkipCache || tasks.length === 0)
              return [];
          const cacheableTasks = tasks.filter((t) => t.cache);
-@@ -836,10 +870,8 @@ class TaskOrchestrator {
+@@ -836,10 +882,8 @@ class TaskOrchestrator {
      }
      /**
       * Fire a discrete-task worker and track it in pendingDiscreteWorkers until
@@ -5958,7 +5977,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
       */
      dispatchDiscreteWorker(doNotSkipCache, task, groupId) {
          const worker = this.runTaskDirectly(doNotSkipCache, task, groupId)
-@@ -870,11 +902,21 @@ class TaskOrchestrator {
+@@ -870,11 +914,21 @@ class TaskOrchestrator {
          await this.postRunSteps([{ task, status: 'failure', terminalOutput }], doNotSkipCache, groupId);
      }
      /**
@@ -5983,7 +6002,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
          // Wait for task to be processed
          const taskSpecificEnv = await this.processedTasks.get(task.id);
          await this.preRunSteps([task], { groupId });
-@@ -1063,6 +1105,10 @@ class TaskOrchestrator {
+@@ -1063,6 +1117,10 @@ class TaskOrchestrator {
          }
      }
      async startContinuousTask(task, groupId) {
@@ -5994,7 +6013,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
          if (this.runningTasksService &&
              this.runningTasksService.getRunningTasks([task.id]).length) {
              await this.preRunSteps([task], { groupId });
-@@ -1086,6 +1132,16 @@ class TaskOrchestrator {
+@@ -1086,6 +1144,16 @@ class TaskOrchestrator {
              await this.scheduleNextTasksAndReleaseThreads();
              return runningTask;
          }
@@ -6011,7 +6030,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
          const taskSpecificEnv = await this.processedTasks.get(task.id);
          await this.preRunSteps([task], { groupId });
          const pipeOutput = await this.pipeOutputCapture(task);
-@@ -1105,10 +1161,10 @@ class TaskOrchestrator {
+@@ -1105,10 +1173,10 @@ class TaskOrchestrator {
              groupId,
              ownsRunningTasksService: true,
          });
@@ -6026,7 +6045,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
              });
          }));
          await this.scheduleNextTasksAndReleaseThreads();
-@@ -1300,22 +1356,28 @@ class TaskOrchestrator {
+@@ -1300,22 +1368,28 @@ class TaskOrchestrator {
          if (tasks.length === 0)
              return resultMap;
          if (this.daemon?.enabled()) {
@@ -6060,7 +6079,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
          }
      }
      // endregion utils
-@@ -1376,6 +1438,8 @@ class TaskOrchestrator {
+@@ -1376,6 +1450,8 @@ class TaskOrchestrator {
          return this.cleanupPromise;
      }
      async performCleanup() {
@@ -6069,7 +6088,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..0e9d10f6eebb6683bc8363c99bf6a853
          // Mark all running tasks for intentional stop
          const reason = this.stopRequested ? 'interrupted' : 'fulfilled';
          for (const entry of this.runningContinuousTasks.values()) {
-@@ -1445,6 +1509,7 @@ class TaskOrchestrator {
+@@ -1445,6 +1521,7 @@ class TaskOrchestrator {
              if (this.stopRequested)
                  return;
              this.stopRequested = true;
@@ -6347,6 +6366,102 @@ index 0000000000000000000000000000000000000000..25a5647c236c3c1de0d638f6f50803ff
 +        }
 +    }
 +    exports.TaskOutputLeases = TaskOutputLeases;
++}
+diff --git a/dist/src/tasks-runner/tasks-schedule.d.ts b/dist/src/tasks-runner/tasks-schedule.d.ts
+index a4ba68a3174aec687ea74d223a77705f65763df4..966ba5c082f6b0bae1f1621a788293cd7731a503 100644
+--- a/dist/src/tasks-runner/tasks-schedule.d.ts
++++ b/dist/src/tasks-runner/tasks-schedule.d.ts
+@@ -34,6 +34,7 @@ export declare class TasksSchedule {
+         scheduledBatches: Batch[];
+     };
+     nextTask(filter?: (task: Task) => boolean): Task;
++    nextCriticalTask(filter: (task: Task) => boolean): Task | null;
+     nextBatch(): Batch;
+     getIncompleteTasks(): Task[];
+     private scheduleTasks;
+diff --git a/dist/src/tasks-runner/tasks-schedule.js b/dist/src/tasks-runner/tasks-schedule.js
+index 1a9212cb4ba5446e94cf6cb1e5fb913ae3ff3325..df57029bbad70785d5acc365f8326de45d57f8c5 100644
+--- a/dist/src/tasks-runner/tasks-schedule.js
++++ b/dist/src/tasks-runner/tasks-schedule.js
+@@ -29,6 +29,7 @@ class TasksSchedule {
+             this.estimatedTaskTimings =
+                 await this.taskHistory.getEstimatedTaskTimings(Object.values(this.taskGraph.tasks).map((t) => t.target));
+         }
++        this.criticalPaths = criticalPaths(this.taskGraph, this.estimatedTaskTimings);
+         for (const project of Object.values(this.taskGraph.tasks).map((t) => t.target.project)) {
+             this.projectDependencies[project] ??= (0, project_graph_utils_1.findAllProjectNodeDependencies)(project, this.reverseProjectGraph).length;
+         }
+@@ -77,6 +78,26 @@ class TasksSchedule {
+         const [taskId] = this.scheduledTasks.splice(idx, 1);
+         return this.taskGraph.tasks[taskId];
+     }
++    /**
++     * The ready task that heads the run's longest remaining chain, or null when a running task or
++     * one not yet ready heads a longer one: the one task the orchestrator dispatches past its
++     * parallelism while every slot is held (TaskOrchestrator.executeCoordinatorLoop). Scheduled
++     * tasks are sorted by critical path, so the first that passes `filter` is the longest ready one.
++     */
++    nextCriticalTask(filter) {
++        const first = this.scheduledTasks.find((id) => filter(this.taskGraph.tasks[id]));
++        if (first === undefined) {
++            return null;
++        }
++        const path = this.criticalPaths[first] ?? 0;
++        for (const id of [...this.runningTasks, ...Object.keys(this.notScheduledTaskGraph.tasks)]) {
++            if (id !== first && (this.criticalPaths[id] ?? 0) > path) {
++                return null;
++            }
++        }
++        this.scheduledTasks.splice(this.scheduledTasks.indexOf(first), 1);
++        return this.taskGraph.tasks[first];
++    }
+     nextBatch() {
+         return this.scheduledBatches.length > 0
+             ? this.scheduledBatches.shift()
+@@ -120,8 +141,12 @@ class TasksSchedule {
+         this.sortScheduledTasks();
+     }
+     sortScheduledTasks() {
+-        // NOTE: sort task by most dependent on first
++        // The longest remaining chain first (criticalPaths); then Nx's order: most dependents first.
+         this.scheduledTasks.sort((taskId1, taskId2) => {
++            const pathDifference = (this.criticalPaths?.[taskId2] ?? 0) - (this.criticalPaths?.[taskId1] ?? 0);
++            if (pathDifference !== 0) {
++                return pathDifference;
++            }
+             // First compare the length of task dependencies.
+             const taskDifference = this.reverseTaskDeps[taskId2].length -
+                 this.reverseTaskDeps[taskId1].length;
+@@ -256,3 +281,30 @@ class TasksSchedule {
+     }
+ }
+ exports.TasksSchedule = TasksSchedule;
++/**
++ * Each task's critical path: its estimated duration from task history (plus one, so a task with
++ * no history still counts as a step of its chain) and the longest critical path among the tasks
++ * that depend on it. A run ends when its longest chain does, so the ready task heading the longest
++ * remaining chain starts first.
++ */
++function criticalPaths(taskGraph, timings) {
++    const dependents = (0, utils_1.calculateReverseDeps)(taskGraph);
++    const paths = {};
++    const pathOf = (taskId) => {
++        if (paths[taskId] !== undefined) {
++            return paths[taskId];
++        }
++        // Nx refuses a cyclic task graph before scheduling; this only keeps a cycle from recursing.
++        paths[taskId] = 0;
++        let longest = 0;
++        for (const dependent of dependents[taskId] ?? []) {
++            longest = Math.max(longest, pathOf(dependent));
++        }
++        paths[taskId] = (timings[taskId] || 0) + 1 + longest;
++        return paths[taskId];
++    };
++    for (const taskId of Object.keys(taskGraph.tasks)) {
++        pathOf(taskId);
++    }
++    return paths;
 +}
 diff --git a/dist/src/utils/handle-errors.js b/dist/src/utils/handle-errors.js
 index 41697164fa6d52a98ed5cc95be6b24f64f2ced5b..500aca4f73f366ba2910cdbd93963333310313dd 100644

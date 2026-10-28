@@ -495,6 +495,29 @@ removed file changes the set, and each of those restores.
 left, a third keeps them again, an edited output restores and the restore is kept next, and a removed output restores.
 Drop the hunk, and keep the test, once the Nx in use verifies on-disk outputs without a daemon.
 
+## The longest chain starts first, past a full slot count
+
+Stock Nx orders ready tasks by how many tasks depend on them directly, then by project dependencies and history, and
+starts nothing while `--parallel` workers run. A gate's critical chain therefore started behind leaves with more direct
+dependents, and its next task waited for a slot while tests running at 0.1–0.3 cores held all of them: 119–320 s per
+gate, measured on the 2026-10-27 land gates.
+
+`tasks-schedule.js` computes each task's critical path once per run: its estimated duration from Nx's task history (plus
+one, so a task with no history still counts as a step) and the longest critical path among the tasks that depend on it.
+Ready tasks are sorted by it, Nx's order breaking ties. `nextCriticalTask` answers the ready task heading the run's
+longest remaining chain, or nothing while a running task or one not yet ready heads a longer one.
+
+`task-orchestrator.js` dispatches that task as one extra worker when every slot is held, never more than one beyond
+`--parallel`. The extra worker exists because the jobserver is the CPU admission: cowshed gives every job a fifo with as
+many slots as the host has cores, served by its supervisor, and the kernel schedules what it admits (05_gateway.md,
+"Parallelism inside a job", "Host scheduling"). An Nx slot is a second admission, and holding the chain behind it buys
+no CPU anyone else uses.
+
+`nx-critical-path-schedule.test.ts`: with `--parallel=1`, the head of a four-task chain starts before a task with two
+direct dependents that heads a chain of two; and `nextCriticalTask` offers nothing while the running head of the longest
+chain runs, and offers the next head once that chain's predecessor ended without freeing a slot. Drop the hunks, and
+keep the test, once the Nx in use schedules by critical path.
+
 ## A lost daemon ends the command
 
 A command's project graph, and every task key it computes from it, comes from the plugin code its daemon loaded. When a
