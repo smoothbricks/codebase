@@ -704,7 +704,7 @@ describe('publish workflow definition', () => {
     // versions must materialize that one package first -- never the whole CLI
     // dependency chain, which is what this step used to build.
     for (const job of [...candidates, finalJob]) {
-      expect(job).toContain('        run: ttsc -p tsconfig.lib.json --emit');
+      expect(job).toContain('        run: bun ../../tooling/ttsc-emit.ts');
       expect(job).not.toContain('run: nx build');
     }
     for (const candidate of candidates) {

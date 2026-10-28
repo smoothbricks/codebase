@@ -616,10 +616,11 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         '        #',
         '        # `nx` cannot do it: the project graph loads this very plugin, so',
         '        # `nx build nx-plugin` deadlocks on the executor it is building.',
-        '        # ttsc needs only the package tsconfig -- same bootstrap the devenv',
-        '        # shell runs (tooling/direnv/enter-shell.ts).',
+        '        # ttsc needs only the package tsconfig -- the bootstrap the shell entry',
+        '        # runs (tooling/direnv/enter-shell.ts) -- and emits as the typescript-emit',
+        '        # executor does (EMIT_OVERRIDES), so dist holds no build info.',
         '        working-directory: packages/nx-plugin',
-        '        run: ttsc -p tsconfig.lib.json --emit',
+        '        run: bun ../../tooling/ttsc-emit.ts',
       ];
     case PublishWorkflowStepKind.RepairPendingReleases:
       return [
@@ -835,14 +836,14 @@ function renderSingleJobPublishWorkflowSteps(
     lines.push('');
     if (producer && step.kind === PublishWorkflowStepKind.Checkout) {
       // A declared producer always runs, even when the graph selects no platform family.
-      lines.push('      # Step ' + stepNumber++, ...platformProducerPreflightStepLines(producer), '');
+      lines.push(`      # Step ${stepNumber++}`, ...platformProducerPreflightStepLines(producer), '');
     }
     if (
       step.kind === PublishWorkflowStepKind.Build &&
       (hasMacosPlatformTargets(options) || hasLinuxPlatformTargets(options))
     ) {
       lines.push(
-        '      # Step ' + stepNumber++,
+        `      # Step ${stepNumber++}`,
         '      - name: 🐧 Build supplemental Linux targets',
         "        if: steps.version.outputs.mode != 'none'",
         '        run:',
@@ -856,7 +857,7 @@ function renderSingleJobPublishWorkflowSteps(
       );
       if (crossOnThisRunner) {
         lines.push(
-          '      # Step ' + stepNumber++,
+          `      # Step ${stepNumber++}`,
           '      - name: 🍎 Build selected macOS and iOS release outputs',
           "        if: steps.version.outputs.mode != 'none'",
           '        run:',
@@ -871,7 +872,7 @@ function renderSingleJobPublishWorkflowSteps(
       }
     }
   }
-  return mergeProducerStepEnvironment(lines, producer).join('\n').trimEnd() + '\n';
+  return `${mergeProducerStepEnvironment(lines, producer).join('\n').trimEnd()}\n`;
 }
 
 function renderPlatformPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions): string {
@@ -1156,10 +1157,11 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
       '        #',
       '        # `nx` cannot do it: the project graph loads this very plugin, so',
       '        # `nx build nx-plugin` deadlocks on the executor it is building.',
-      '        # ttsc needs only the package tsconfig -- same bootstrap the devenv',
-      '        # shell runs (tooling/direnv/enter-shell.ts).',
+      '        # ttsc needs only the package tsconfig -- the bootstrap the shell entry',
+      '        # runs (tooling/direnv/enter-shell.ts) -- and emits as the typescript-emit',
+      '        # executor does (EMIT_OVERRIDES), so dist holds no build info.',
       '        working-directory: packages/nx-plugin',
-      '        run: ttsc -p tsconfig.lib.json --emit',
+      '        run: bun ../../tooling/ttsc-emit.ts',
     );
   }
   lines.push(
@@ -1303,10 +1305,11 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
       '        #',
       '        # `nx` cannot do it: the project graph loads this very plugin, so',
       '        # `nx build nx-plugin` deadlocks on the executor it is building.',
-      '        # ttsc needs only the package tsconfig -- same bootstrap the devenv',
-      '        # shell runs (tooling/direnv/enter-shell.ts).',
+      '        # ttsc needs only the package tsconfig -- the bootstrap the shell entry',
+      '        # runs (tooling/direnv/enter-shell.ts) -- and emits as the typescript-emit',
+      '        # executor does (EMIT_OVERRIDES), so dist holds no build info.',
       '        working-directory: packages/nx-plugin',
-      '        run: ttsc -p tsconfig.lib.json --emit',
+      '        run: bun ../../tooling/ttsc-emit.ts',
     );
   }
   lines.push(

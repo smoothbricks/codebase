@@ -82,8 +82,9 @@ jobs:
         #
         # `nx` cannot do it: the project graph loads this very plugin, so
         # `nx build nx-plugin` deadlocks on the executor it is building.
-        # ttsc needs only the package tsconfig -- same bootstrap the devenv
-        # shell runs (tooling/direnv/enter-shell.ts).
+        # ttsc needs only the package tsconfig -- the bootstrap the shell entry
+        # runs (tooling/direnv/enter-shell.ts) -- and emits as the typescript-emit
+        # executor does (EMIT_OVERRIDES), so dist holds no build info.
         working-directory: packages/nx-plugin
         run: bun ../../tooling/ttsc-emit.ts
 
@@ -258,8 +259,9 @@ jobs:
         #
         # `nx` cannot do it: the project graph loads this very plugin, so
         # `nx build nx-plugin` deadlocks on the executor it is building.
-        # ttsc needs only the package tsconfig -- same bootstrap the devenv
-        # shell runs (tooling/direnv/enter-shell.ts).
+        # ttsc needs only the package tsconfig -- the bootstrap the shell entry
+        # runs (tooling/direnv/enter-shell.ts) -- and emits as the typescript-emit
+        # executor does (EMIT_OVERRIDES), so dist holds no build info.
         working-directory: packages/nx-plugin
         run: bun ../../tooling/ttsc-emit.ts
 
@@ -373,8 +375,9 @@ jobs:
         #
         # `nx` cannot do it: the project graph loads this very plugin, so
         # `nx build nx-plugin` deadlocks on the executor it is building.
-        # ttsc needs only the package tsconfig -- same bootstrap the devenv
-        # shell runs (tooling/direnv/enter-shell.ts).
+        # ttsc needs only the package tsconfig -- the bootstrap the shell entry
+        # runs (tooling/direnv/enter-shell.ts) -- and emits as the typescript-emit
+        # executor does (EMIT_OVERRIDES), so dist holds no build info.
         working-directory: packages/nx-plugin
         run: bun ../../tooling/ttsc-emit.ts
 
