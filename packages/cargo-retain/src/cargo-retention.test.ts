@@ -729,6 +729,45 @@ async function reclaimsOnlyProvenTrash(fx: Churn, superseded: readonly string[])
   await rm(trash, { recursive: true });
 }
 
+/**
+ * Case: a volume too full for the trash's manifest (ENOSPC) deletes the superseded generations in place, under the same
+ * Cargo hold, and reports them reclaimed: moving to trash needs a write exactly when there is no space for one.
+ */
+async function deletesInPlaceOnAFullVolume(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled('deletes superseded generations in place when the volume refuses the trash manifest');
+  const trash = join(fx.target, 'debug', TRASH);
+  const source = lines(
+    'import fs from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'const originalOpen = fs.openSync;',
+    // The manifest is the trash's first write; a full volume refuses it.
+    'fs.openSync = function(path, ...args) {',
+    '  if (String(path).includes("/.smoo-retention-trash/")) {',
+    '    throw Object.assign(new Error("ENOSPC: no space left on device, open"), { code: "ENOSPC" });',
+    '  }',
+    '  return originalOpen.call(this, path, ...args);',
+    '};',
+    'syncBuiltinESMExports();',
+    `const { retainCargoWorkspace } = await import(${JSON.stringify(RETENTION_MODULE_URL)});`,
+    `const { nodeLocks } = await import(${JSON.stringify(NODE_LOCKS_MODULE_URL)});`,
+    `const result = await retainCargoWorkspace(${JSON.stringify(fx.ws)}, { apply: true, now: ${future()} }, nodeLocks);`,
+    'if (!result.ok) throw new Error(JSON.stringify(result.error));',
+    'console.log(JSON.stringify(result.value));',
+  );
+  const child = spawnSync('node', ['--input-type=module', '-e', source], {
+    cwd: fx.ws,
+    env: { ...process.env },
+    encoding: 'utf8',
+  });
+  check(child.status, child.stderr).toBe(0);
+  const applied = planned(parseReport(child.stdout));
+  check(reclaimPaths(applied)).toEqual([...superseded]);
+  for (const path of superseded) check(await exists(path), path).toBe(false);
+  // No pass reached the trash: nothing waits there for a purge.
+  check((await exists(trash)) ? await readdir(trash) : []).toEqual([]);
+  await expectFresh(fx.ws);
+  await rm(trash, { recursive: true, force: true });
+}
 /** Case: keeps a nested target root holding no unit of a workspace member whole, and reports it as a nested root. */
 async function keepsForeignNestedRoot(fx: Churn, superseded: readonly string[]): Promise<void> {
   const check = labelled('keeps a nested target root holding no unit of a workspace member whole and reports it');
@@ -1368,6 +1407,7 @@ describe('cargo retention against real Cargo target layouts', () => {
         await reclaimsAroundLegacyEntries(fx, await toggleFeature(fx));
         await keepsSymlinkedGeneration(fx, await toggleFeature(fx));
         await reclaimsOnlyProvenTrash(fx, await toggleFeature(fx));
+        await deletesInPlaceOnAFullVolume(fx, await toggleFeature(fx));
         await keepsForeignNestedRoot(fx, await toggleFeature(fx));
         await reclaimsNestedRoot(fx);
         await cliPlansReadOnlyAndApplies(fx, await toggleFeature(fx));

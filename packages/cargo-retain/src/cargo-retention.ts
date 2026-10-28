@@ -67,7 +67,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, lstatSync, openSync, readdirSync, readFileSync, rmSync, writeSync } from 'node:fs';
+import { closeSync, lstatSync, openSync, readdirSync, readFileSync, rmSync, statfsSync, writeSync } from 'node:fs';
 import { lstat, mkdir, readdir, readFile, realpath, rename, rmdir, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, normalize, relative, resolve, sep } from 'node:path';
@@ -932,11 +932,32 @@ interface Moved {
   readonly reason?: ReclaimReason;
 }
 
-/** Under the Cargo hold: manifest first, then each rename, so every trash entry has a proven origin. */
+/**
+ * The volume's free space, in percent of its capacity, under which a pass deletes in place instead of moving to trash:
+ * cowshed's store floor (10%) plus its pressure margin (5%), the line under which its image cleanup unlinks whole.
+ */
+const PRESSURE_PERCENT = 15;
+
+/** Whether the volume holding `path` is under {@link PRESSURE_PERCENT} free; a volume that cannot be read is not. */
+function underPressure(path: string): boolean {
+  try {
+    const space = statfsSync(path);
+    return space.bavail * 100 < space.blocks * PRESSURE_PERCENT;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Under the Cargo hold: manifest first, then each rename, so every trash entry has a proven origin. `no-space` when
+ * the volume refused the trash's manifest or directory (ENOSPC): the one write the move needs is the one a full volume
+ * cannot take, and the caller deletes the victims where they lie instead. A manifest written before the refusal names
+ * no pass directory, which the purge skips.
+ */
 async function moveToTrash(
   profile: string,
   victims: readonly { readonly path: string; readonly reason: ReclaimReason }[],
-): Promise<Result<void, RetentionError>> {
+): Promise<Result<'moved' | 'no-space', RetentionError>> {
   const trash = join(profile, TRASH);
   try {
     const trashStats = await lstatOrUndefined(trash);
@@ -962,8 +983,9 @@ async function moveToTrash(
     writeNew(join(trash, `${pass}.json`), JSON.stringify(manifest));
     await mkdir(join(trash, pass));
     for (const [index, entry] of entries.entries()) await rename(entry.from, join(trash, pass, String(index)));
-    return { ok: true, value: undefined };
+    return { ok: true, value: 'moved' };
   } catch (error) {
+    if (errorCode(error) === 'ENOSPC') return { ok: true, value: 'no-space' };
     return { ok: false, error: ioError('move superseded generations to trash', trash, error) };
   }
 }
@@ -1383,6 +1405,9 @@ async function pass(
   const anomalies: Retained[] = [];
   const incremental: IncrementalDir[] = [];
   let selection: Selection;
+  // Deleted in place under the Cargo hold, when the volume was full or under pressure (deleteInPlace).
+  const deletedInPlace: Reclaimable[] = [];
+  const linkedInPlace = new Map<string, number>();
   let incrementalSelection: ReturnType<typeof selectIncremental> = { reclaim: [], kept: [] };
   try {
     const scanStarted = performance.now();
@@ -1441,8 +1466,31 @@ async function pass(
           if (dir.profile === profile) victims.push({ path: dir.path, reason: 'superseded-incremental' });
         }
         if (victims.length === 0) continue;
-        const moved = await moveToTrash(profile, victims);
-        if (!moved.ok) return moved;
+        // A full volume, or one under pressure, deletes in place, under this hold: a build waits for the deletion,
+        // as cowshed's image cleanup unlinks whole under pressure, but no write is needed to free the space.
+        let inPlace = underPressure(profile);
+        if (!inPlace) {
+          const moved = await moveToTrash(profile, victims);
+          if (!moved.ok) return { ok: false, error: moved.error };
+          inPlace = moved.value === 'no-space';
+        }
+        if (inPlace) {
+          for (const victim of victims) {
+            try {
+              const inodes = censusTree(victim.path);
+              rmSync(victim.path, { recursive: true });
+              const freed = accountInodes(inodes, linkedInPlace);
+              deletedInPlace.push({
+                path: victim.path,
+                bytes: freed.bytes,
+                linkedBytes: freed.linkedBytes,
+                reason: victim.reason,
+              });
+            } catch (error) {
+              return { ok: false, error: ioError('delete a superseded generation in place', victim.path, error) };
+            }
+          }
+        }
       }
     }
   } finally {
@@ -1472,7 +1520,7 @@ async function pass(
     );
   }
   const linked = new Map<string, number>();
-  const reclaim: Reclaimable[] = [];
+  const reclaim: Reclaimable[] = deletedInPlace.slice();
   const retained: Retained[] = [...selection.kept, ...incrementalSelection.kept, ...anomalies];
   for (const profile of ownedProfiles) {
     const purged = await purgeTrash(profile, linked);
@@ -1482,6 +1530,7 @@ async function pass(
   }
   let linkedBytes = 0;
   for (const blocks of linked.values()) linkedBytes += blocks;
+  for (const blocks of linkedInPlace.values()) linkedBytes += blocks;
   return complete(outcome('reclaimed', reclaim, linkedBytes, retained, recencyOf(metas, stamped)));
 }
 
