@@ -116,6 +116,66 @@ pub fn observe_host(home: &Path) -> HostMbx {
     }
 }
 
+/// The installed mbx's host-global scheduler settings, each `None` where it is unset and mbx
+/// computes its default: read through the installed mbx's own settings interface, never copied
+/// into a cowshed configuration (11_shell.md, "Canonical mbx environment").
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostScheduler {
+    pub cpus: Option<String>,
+    pub reserve_cpus: Option<String>,
+    pub memory: Option<String>,
+}
+
+impl HostScheduler {
+    /// `scheduler.memory = "none"`: the pool keeps no measured-memory ledger, which mbx-mode
+    /// admission refuses (05_gateway.md, "Pool selection and revision").
+    pub fn memory_unscheduled(&self) -> bool {
+        self.memory.as_deref() == Some("none")
+    }
+}
+
+/// Ask the installed mbx at `executable` for its host-global scheduler settings, with nothing of
+/// this process's environment but `home`: a job's or a caller's `MBX_*` must not stand in for
+/// the host's file.
+pub fn read_host_scheduler(executable: &Path, home: &Path) -> Result<HostScheduler> {
+    use cowshed_os::fork_lock::Run as _;
+    let get = |key: &str| -> Result<Option<String>> {
+        // WHY unbounded: `mbx settings get` reads one TOML file and prints; it waits on nothing.
+        #[allow(clippy::disallowed_methods)]
+        let output = std::process::Command::new(executable)
+            .env_clear()
+            .env("HOME", home)
+            .args(["settings", "get", key])
+            .output_locked()
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "mbx-host-missing: the mbx installed beside cowshed, {}, cannot be executed: {error}",
+                        executable.display()
+                    ),
+                    "cowshed setup",
+                )
+            })?;
+        if !output.status.success() {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "the mbx installed beside cowshed, {}, could not read {key}: {}",
+                    executable.display(),
+                    String::from_utf8_lossy(&output.stderr).trim_end()
+                ),
+                "repair mbx's global configuration with mbx settings",
+            ));
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        Ok((!value.is_empty()).then_some(value))
+    };
+    Ok(HostScheduler {
+        cpus: get("scheduler.cpus")?,
+        reserve_cpus: get("scheduler.reserve_cpus")?,
+        memory: get("scheduler.memory")?,
+    })
+}
+
 /// Whether work of a project whose canonical environment resolved mbx may run on this host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Admission {
@@ -131,6 +191,8 @@ pub enum Admission {
     Skew {
         host: PathBuf,
     },
+    /// The host's `scheduler.memory` is `"none"` (`mbx-memory-unscheduled`).
+    MemoryUnscheduled,
     /// No provisioned build-cache volume holds the store (01a_apfs.md, "Dedicated build-cache
     /// volume").
     NoBuildCache,
@@ -180,6 +242,13 @@ impl Admission {
                 ),
                 "align the project's devenv mbx pin with the revision cowshed pins, or disable the mbx capability",
             )),
+            Self::MemoryUnscheduled => Some(CowshedError::environment_missing(
+                format!(
+                    "mbx-memory-unscheduled: the mbx installed beside cowshed has scheduler.memory = \"none\", so its pool keeps no memory ledger for {}",
+                    project.display()
+                ),
+                "set a memory budget: mbx settings set scheduler.memory <size>, or unset it for mbx's default",
+            )),
             Self::NoBuildCache => Some(CowshedError::environment_missing(
                 format!(
                     "mbx-build-cache-missing: this project's canonical environment resolves mbx at {}, and this host has no provisioned build-cache volume for its store",
@@ -215,7 +284,15 @@ pub fn admit_checkout(checkout: &Path, home: &Path, build_cache: Option<&Path>) 
     let Some(project) = recorded(checkout)? else {
         return Ok(());
     };
-    match admit(&project, &observe_host(home), build_cache).refusal(&project) {
+    let host = observe_host(home);
+    let mut verdict = admit(&project, &host, build_cache);
+    if verdict == Admission::Admit
+        && let HostMbx::Installed(executable) = &host
+        && read_host_scheduler(executable, home)?.memory_unscheduled()
+    {
+        verdict = Admission::MemoryUnscheduled;
+    }
+    match verdict.refusal(&project) {
         Some(refusal) => Err(refusal),
         None => Ok(()),
     }
@@ -223,13 +300,21 @@ pub fn admit_checkout(checkout: &Path, home: &Path, build_cache: Option<&Path>) 
 
 /// Host shells source the same canonical mbx environment as supervisor children (11_shell.md,
 /// "Canonical mbx environment"). `RUSTC_WRAPPER` is the compiler-cache client's name already.
-pub const HOST_ENVIRONMENT: [&str; 6] = [
+pub const HOST_ENVIRONMENT: [&str; 14] = [
     "MBX_CACHE_DIR",
     "MBX_TARGET_VIEWS",
     "MBX_TARGET_ROOT",
     "MBX_DISABLE",
     "MBX_INCREMENTAL",
     "RUSTC_WORKSPACE_WRAPPER",
+    "MBX_SCHEDULER",
+    "MBX_SCHEDULER_PRESSURE",
+    "MBX_SCHEDULER_SUSPEND",
+    "MBX_SCHEDULER_TESTS",
+    "MBX_SCHEDULER_PRIORITY",
+    "MBX_SCHEDULER_CPUS",
+    "MBX_SCHEDULER_RESERVE_CPUS",
+    "MBX_SCHEDULER_MEMORY",
 ];
 
 pub const DETECTOR: Detector = Detector {
@@ -280,6 +365,34 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     contribution
         .env
         .insert("MBX_TARGET_VIEWS", EnvAction::Own("1".into()));
+    // The one pool (05_gateway.md, "Host scheduling"), at the host's own settings, which a
+    // project's `.mbx.toml` or a caller cannot change; never freezing a process. A job's
+    // priority is its class's, set at its spawn; outside a job it is the non-gate value.
+    for (name, value) in [
+        ("MBX_SCHEDULER", "1"),
+        ("MBX_SCHEDULER_PRESSURE", "1"),
+        ("MBX_SCHEDULER_SUSPEND", "0"),
+        ("MBX_SCHEDULER_TESTS", "1"),
+        ("MBX_SCHEDULER_PRIORITY", "low"),
+    ] {
+        contribution.env.insert(name, EnvAction::Own(value.into()));
+    }
+    let host = match observe_host(context.home) {
+        HostMbx::Installed(executable) => {
+            read_host_scheduler(&executable, context.home).unwrap_or_default()
+        }
+        HostMbx::Absent | HostMbx::Unresolved { .. } => HostScheduler::default(),
+    };
+    for (name, value) in [
+        ("MBX_SCHEDULER_CPUS", host.cpus),
+        ("MBX_SCHEDULER_RESERVE_CPUS", host.reserve_cpus),
+        ("MBX_SCHEDULER_MEMORY", host.memory),
+    ] {
+        contribution.env.insert(
+            name,
+            value.map_or(EnvAction::Unset, |value| EnvAction::Own(value.into())),
+        );
+    }
     for unset in [
         "MBX_TARGET_ROOT",
         "MBX_DISABLE",
@@ -453,6 +566,47 @@ mod tests {
             contribution.daemon_isolation.discard_at_mint,
             [PathBuf::from("target")]
         );
+    }
+
+    /// The host's scheduler settings come from the installed mbx's own settings interface, with
+    /// none of this process's environment but HOME, and an unset one stays unset; `"none"` memory
+    /// is the unscheduled finding.
+    #[test]
+    fn the_host_scheduler_is_read_through_the_installed_mbx_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root =
+            std::env::temp_dir().join(format!("cowshed-mbx-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mbx = root.join("mbx");
+        std::fs::write(
+            &mbx,
+            "#!/bin/sh\n[ -z \"$MBX_SCHEDULER_CPUS\" ] || exit 9\ncase \"$3\" in\nscheduler.cpus) echo 8 ;;\nscheduler.memory) echo none ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&mbx, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: this test alone names the variable, and only to prove it never reaches mbx.
+        unsafe { std::env::set_var("MBX_SCHEDULER_CPUS", "99") };
+        let read = read_host_scheduler(&mbx, &root).unwrap();
+        unsafe { std::env::remove_var("MBX_SCHEDULER_CPUS") };
+        assert_eq!(
+            read,
+            HostScheduler {
+                cpus: Some("8".into()),
+                reserve_cpus: None,
+                memory: Some("none".into()),
+            }
+        );
+        assert!(read.memory_unscheduled());
+        assert!(!HostScheduler::default().memory_unscheduled());
+        let refusal = Admission::MemoryUnscheduled
+            .refusal(Path::new("/pinned/mbx-1.28.0/bin/mbx"))
+            .unwrap();
+        assert!(
+            refusal.message.starts_with("mbx-memory-unscheduled"),
+            "{}",
+            refusal.message
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

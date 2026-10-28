@@ -599,6 +599,8 @@ pub struct ProcessSpawnRequest {
 pub struct CpuPlacement {
     pub fifo: PathBuf,
     pub tokens: std::num::NonZeroUsize,
+    /// The job's class, which sets its priority in mbx's pool when the project has mbx.
+    pub class: ExecClass,
     #[cfg(target_os = "macos")]
     pub nice: i32,
 }
@@ -607,10 +609,15 @@ impl CpuPlacement {
     /// The variables only the job's supervisor sets, laid over the caller's: a caller cannot name
     /// a jobserver or a count its job was not served. Test threads take no jobserver token, so they
     /// are sized to the count where the caller named none (05_gateway.md "Cargo reads its holder's
-    /// jobserver").
+    /// jobserver"). In a project with the mbx capability (`mbx`), the job's priority in mbx's one
+    /// pool follows its class, land gates `normal` and every other class `low`, and its count is
+    /// each Cargo build's ceiling, `CARGO_BUILD_JOBS`, not a reservation around it (05_gateway.md,
+    /// "Classes", "Parallelism inside a job"). Cargo keeps the job's fifo: it bounds that build
+    /// tree's own fan-out, never host capacity, which only mbx's pool admits.
     pub(super) fn environment(
         &self,
         caller: &BTreeMap<String, String>,
+        mbx: bool,
     ) -> Vec<(OsString, OsString)> {
         let tokens = OsString::from(self.tokens.to_string());
         let mut flags = OsString::from(super::job_cpu::JOBSERVER_FIFO_FLAGS);
@@ -634,6 +641,16 @@ impl CpuPlacement {
             OsString::from(crate::workspace_environment::NX_PARALLEL_RESTORE_ENV),
             tasks,
         ));
+        if mbx {
+            environment.push((
+                OsString::from("MBX_SCHEDULER_PRIORITY"),
+                OsString::from(match self.class {
+                    ExecClass::Gate => "normal",
+                    _ => "low",
+                }),
+            ));
+            environment.push((OsString::from("CARGO_BUILD_JOBS"), tokens));
+        }
         environment
     }
 }
@@ -655,6 +672,47 @@ fn nx_parallel(caller: &BTreeMap<String, String>, tokens: usize) -> usize {
 mod cpu_placement_tests {
     use super::*;
 
+    /// With mbx, the job's class sets its priority in the one pool (land gates `normal`, every
+    /// other class `low`) and `g` is its Cargo ceiling, never another reservation; without mbx
+    /// none of that environment appears (05_gateway.md, "Classes", "Parallelism inside a job").
+    #[test]
+    fn an_mbx_job_names_its_pool_priority_and_cargo_ceiling_and_a_plain_job_neither() {
+        for (class, mbx, priority) in [
+            (ExecClass::Gate, true, Some("normal")),
+            (ExecClass::Interactive, true, Some("low")),
+            (ExecClass::Background, true, Some("low")),
+            (ExecClass::Resident, true, Some("low")),
+            (ExecClass::Gate, false, None),
+        ] {
+            let placement = CpuPlacement {
+                fifo: PathBuf::from("/pool/j"),
+                tokens: std::num::NonZeroUsize::new(4).expect("four"),
+                class,
+                #[cfg(target_os = "macos")]
+                nice: 10,
+            };
+            let exported: BTreeMap<OsString, OsString> = placement
+                .environment(&BTreeMap::new(), mbx)
+                .into_iter()
+                .collect();
+            let read = |name: &str| {
+                exported
+                    .get(OsStr::new(name))
+                    .map(|value| value.to_string_lossy().into_owned())
+            };
+            assert_eq!(
+                read("MBX_SCHEDULER_PRIORITY").as_deref(),
+                priority,
+                "{class:?}"
+            );
+            assert_eq!(
+                read("CARGO_BUILD_JOBS").as_deref(),
+                mbx.then_some("4"),
+                "{class:?}"
+            );
+        }
+    }
+
     /// A caller's own counts below the job's are the caller's, a percentage or a larger count is
     /// the job's, and the jobserver is the job's whatever the caller sent.
     #[test]
@@ -662,6 +720,7 @@ mod cpu_placement_tests {
         let placement = CpuPlacement {
             fifo: PathBuf::from("/pool/j"),
             tokens: std::num::NonZeroUsize::new(4).expect("four"),
+            class: ExecClass::Background,
             #[cfg(target_os = "macos")]
             nice: 10,
         };
@@ -670,7 +729,7 @@ mod cpu_placement_tests {
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect();
-            placement.environment(&caller).into_iter().collect()
+            placement.environment(&caller, false).into_iter().collect()
         };
         let read = |exported: &BTreeMap<OsString, OsString>, name: &str| {
             exported
@@ -2965,6 +3024,10 @@ impl SpawnSink for SystemSpawnSink {
             grant_revision: request.authority.grant_revision,
             grants: &sandbox.grants,
             cpu: &request.cpu,
+            mbx: sandbox
+                .capabilities
+                .active
+                .contains(&crate::capabilities::CapabilityId::Mbx),
             #[cfg(target_os = "linux")]
             cgroup: Arc::clone(&cgroup),
             #[cfg(target_os = "macos")]
@@ -3000,7 +3063,11 @@ impl SpawnSink for SystemSpawnSink {
         }
         let mut environment = environment.child(&request.env);
         // The job's jobserver and count are its supervisor's, laid over whatever the caller named.
-        environment.extend(request.cpu.environment(&request.env));
+        let mbx = sandbox
+            .capabilities
+            .active
+            .contains(&crate::capabilities::CapabilityId::Mbx);
+        environment.extend(request.cpu.environment(&request.env, mbx));
         if let Some(program) = argv.first() {
             // Shell activation, when the profile has one, sets PATH inside the sandbox.
             let path = sandbox
@@ -3087,7 +3154,17 @@ fn host_gate_command(request: &ProcessSpawnRequest, cwd: &Path) -> Result<tokio:
         .args(arguments)
         .current_dir(cwd)
         .envs(caller_environment(&request.env))
-        .envs(request.cpu.environment(&request.env))
+        .envs(
+            request.cpu.environment(
+                &request.env,
+                request
+                    .policy
+                    .ceiling()
+                    .capabilities
+                    .active
+                    .contains(&crate::capabilities::CapabilityId::Mbx),
+            ),
+        )
         .env("NX_DAEMON_START", "never")
         .env("PWD", cwd);
     Ok(command)
@@ -6892,6 +6969,7 @@ impl SupervisorActor {
         let cpu = CpuPlacement {
             fifo: jobserver.fifo().to_path_buf(),
             tokens: jobserver.tokens(),
+            class: job.info.class,
             #[cfg(target_os = "macos")]
             nice: super::placement::macos::nice_from(
                 super::placement::macos::own_nice(),
@@ -9902,6 +9980,7 @@ mod workspace_toolchain_tests {
             cpu: CpuPlacement {
                 fifo: PathBuf::from("/pool/j"),
                 tokens: std::num::NonZeroUsize::MIN,
+                class: ExecClass::Background,
                 #[cfg(target_os = "macos")]
                 nice: 0,
             },
@@ -11518,6 +11597,7 @@ mod sandbox_environment_tests {
             cpu: CpuPlacement {
                 fifo: PathBuf::from("/pool/j"),
                 tokens: std::num::NonZeroUsize::MIN,
+                class: ExecClass::Background,
                 #[cfg(target_os = "macos")]
                 nice: 0,
             },

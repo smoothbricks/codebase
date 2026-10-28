@@ -1131,6 +1131,7 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
         cpu: cowshed_core::runtime::supervisor::CpuPlacement {
             fifo: std::path::PathBuf::from("/pool/j"),
             tokens: std::num::NonZeroUsize::MIN,
+            class: cowshed_core::api::dto::ExecClass::Background,
             #[cfg(target_os = "macos")]
             nice: 0,
         },

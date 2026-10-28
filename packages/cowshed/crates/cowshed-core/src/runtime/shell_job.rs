@@ -130,6 +130,8 @@ pub(super) struct PooledSpawn<'a> {
     /// The job's jobserver and, on macOS, its class nice, which the command alone runs under, never
     /// its host.
     pub cpu: &'a super::supervisor::CpuPlacement,
+    /// Whether the project has the mbx capability, which names the job's pool priority.
+    pub mbx: bool,
     #[cfg(target_os = "macos")]
     pub monitor: super::process_monitor::ProcessMonitor,
 }
@@ -180,7 +182,7 @@ impl WorkspaceShells {
         };
         // The job's jobserver and count are its supervisor's, laid over whatever the caller named.
         let mut overlay = spawn.environment.overlay(spawn.caller);
-        overlay.extend(spawn.cpu.environment(spawn.caller));
+        overlay.extend(spawn.cpu.environment(spawn.caller, spawn.mbx));
         let (stdin_read, stdin_write) = pipe().map_err(pipe_error)?;
         let (stdout_read, stdout_write) = pipe().map_err(pipe_error)?;
         let (stderr_read, stderr_write) = pipe().map_err(pipe_error)?;

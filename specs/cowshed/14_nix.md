@@ -74,9 +74,11 @@ host-bootstrap-owned and outside workspace authority.
 ## mbx
 
 Cowshed's package pins mbx by git revision as a flake input; `cowshed setup` installs that revision beside the installed
-cowshed binary, and the gateway invokes it by the PATH name `mbx` for external-work reservations (05_gateway.md, "Host
-scheduling"). The pin is mbx v1.28.0, rev `44f50c329a83dedd012e1e49cf9f265f79226a83`, and each project pins the same
-revision in its devenv through mbx's flake, so a job's canonical environment also resolves `mbx` by that PATH name (the
+cowshed binary, and cowshed invokes it through that link for its own reads and for external-work reservations
+(05_gateway.md, "Host scheduling"), never by a PATH lookup: a launchd agent's PATH is whatever shell set it up, and on
+this host it led with a project's devenv profile, whose `mbx` is exactly the arbitrary one 05_gateway.md says selects
+nothing. The pin is mbx v1.28.0, rev `44f50c329a83dedd012e1e49cf9f265f79226a83`, and each project pins the same revision
+in its devenv through mbx's flake, so a job's canonical environment also resolves `mbx` by that PATH name (the
 capability is 15_capabilities.md's). Neither copy is ever spelled as a Nix store path or a host path where a command is
 spawned; the store path appears only as the identity the pin proves.
 

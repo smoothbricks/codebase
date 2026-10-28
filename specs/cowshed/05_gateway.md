@@ -1449,15 +1449,18 @@ the job's `--want`, or `cores` when absent; every class uses the same rule and a
 
 **With mbx, Cargo and non-Cargo leaves enter the same pool once.** A Cargo leaf runs through mbx under its job's
 priority, with `CARGO_BUILD_JOBS=g` as that build's CPU ceiling, not an enclosing resource reservation. It takes no
-cowshed host grant; mbx admits the actual compiler and supported test work. A non-Cargo leaf runs under the host's
-installed `mbx reserve --cpus g --priority <job-priority> -- <command>`. The grant is the job's admission: its command
-stays queued until mbx grants it, then its existing jobserver, runner flags and thread variables are bounded by that
-grant. The memory request is the same task identity's last recorded resource peak from existing LMAO job/process spans
-(13_telemetry.md, "Job resource peaks"), passed as `--memory <bytes>`; no cowshed peak ledger or prediction table
-exists. [INFERENCE] The task-identity key needed to select that span is not verified for Nx leaves; until the span
-carries it, or when no prior peak exists, `--memory` is omitted. mbx defines an omitted memory request as a zero-byte
-charge, not a measurement or a memory guarantee. This open keying question does not authorize a second store (AGENTS.md,
-rule 8).
+cowshed host grant; mbx admits the actual compiler and supported test work. It keeps its job's jobserver fifo: the fifo
+bounds one build tree's own fan-out at the same `g`, never host capacity, so it is no second ledger, and Cargo reads
+`MAKEFLAGS` as well as `CARGO_MAKEFLAGS`, so withholding one would bound nothing. A non-Cargo leaf runs under
+`mbx reserve --cpus g --priority <job-priority> -- <command>`, the host's installed mbx invoked through its link beside
+the installed cowshed (14_nix.md, "mbx"), `g` being the job's own count from its `--want`, never a host figure. The
+grant is the job's admission: its command stays queued until mbx grants it, then its existing jobserver, runner flags
+and thread variables are bounded by that grant. The memory request is the same task identity's last recorded resource
+peak from existing LMAO job/process spans (13_telemetry.md, "Job resource peaks"), passed as `--memory <bytes>`; no
+cowshed peak ledger or prediction table exists. [INFERENCE] The task-identity key needed to select that span is not
+verified for Nx leaves; until the span carries it, or when no prior peak exists, `--memory` is omitted. mbx defines an
+omitted memory request as a zero-byte charge, not a measurement or a memory guarantee. This open keying question does
+not authorize a second store (AGENTS.md, rule 8).
 
 The boundary is the actual leaf runner (`bounded-exec` and equivalent direct runners), not an enclosing orchestration
 command. An Nx run mixing Cargo and non-Cargo leaves holds no reservation of its own: Cargo leaves use mbx, non-Cargo
