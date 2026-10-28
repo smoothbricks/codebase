@@ -970,6 +970,36 @@ fn discover_cargo_targets(
                 continue;
             }
         };
+        // mbx manages `<workspace>/target` alone and leaves a configured one unmanaged, so in an
+        // mbx project that build would land in the checkout once the volume released it
+        // (16_build_volumes.md, "One Cargo environment on every path").
+        if result.mbx.is_some() {
+            let own = metadata.workspace_root.join("target");
+            let configured = Some(&metadata.target_directory)
+                .filter(|directory| **directory != own)
+                .map(|directory| ("build.target-dir", directory))
+                .or_else(|| {
+                    metadata
+                        .build_directory
+                        .as_ref()
+                        .filter(|directory| **directory != metadata.target_directory)
+                        .map(|directory| ("build.build-dir", directory))
+                });
+            if let Some((key, directory)) = configured {
+                return Err(crate::CowshedError::usage(
+                    format!(
+                        "mbx-target-dir: {} builds into {} ({key}), which mbx leaves unmanaged, so \
+                         its build would land in the checkout",
+                        relative_manifest.display(),
+                        directory.display()
+                    ),
+                    format!(
+                        "remove {key} from the tracked Cargo configuration, or disable the mbx \
+                         capability"
+                    ),
+                ));
+            }
+        }
         // The tool's logical target path is inside the checkout. After provisioning its fixed
         // link deliberately resolves outside the source volume, through .cowshed/build.
         let Ok(relative) = metadata
@@ -996,6 +1026,10 @@ fn discover_cargo_targets(
 #[derive(Deserialize)]
 struct CargoMetadata {
     target_directory: PathBuf,
+    workspace_root: PathBuf,
+    /// Cargo's `build.build-dir`, where it reports one: the target directory when unset.
+    #[serde(default)]
+    build_directory: Option<PathBuf>,
 }
 
 /// The JavaScript tool caches of every package a detected JavaScript package manager installed:
@@ -1546,25 +1580,41 @@ mod tests {
         );
 
         // Once the canonical environment resolves mbx, mbx owns every Cargo target: the volume
-        // releases them, and the realpath of that mbx is the answer.
+        // releases them, and the realpath of that mbx is the answer. A tracked target directory
+        // mbx would leave unmanaged is refused, naming its manifest and the remedy
+        // (16_build_volumes.md, "One Cargo environment on every path").
         let pin = fixture.root.join("pin/bin/mbx");
         fs::create_dir_all(pin.parent().unwrap()).unwrap();
         fs::write(&pin, b"#!/bin/sh\n").unwrap();
-        let state = discover_build_state(
-            &fixture.context(),
-            &mut HostCargo {
-                mbx: Some(pin.clone()),
-            },
-        )
-        .unwrap();
+        let mut resolving = HostCargo {
+            mbx: Some(pin.clone()),
+        };
+        let refused = discover_build_state(&fixture.context(), &mut resolving)
+            .expect_err("a tracked target-dir under mbx is refused");
+        assert!(
+            refused.message.starts_with("mbx-target-dir:")
+                && refused.message.contains("tooling/helper/Cargo.toml")
+                && refused.message.contains("build-target"),
+            "{refused:?}"
+        );
+        git(
+            &fixture,
+            &[
+                "rm",
+                "--cached",
+                "--quiet",
+                "tooling/helper/.cargo/config.toml",
+            ],
+        );
+        fs::remove_file(fixture.root.join("tooling/helper/.cargo/config.toml")).unwrap();
+        let state = discover_build_state(&fixture.context(), &mut resolving).unwrap();
         assert!(state.findings.is_empty(), "{:?}", state.findings);
         assert!(state.paths.is_empty(), "{:?}", state.paths);
         assert_eq!(
             state.released,
             [
                 BuildStatePath::new("rust/target", "rust/target").unwrap(),
-                BuildStatePath::new("tooling/helper/build-target", "tooling/helper/build-target")
-                    .unwrap(),
+                BuildStatePath::new("tooling/helper/target", "tooling/helper/target").unwrap(),
             ],
         );
         assert_eq!(state.mbx, Some(fs::canonicalize(&pin).unwrap()));
