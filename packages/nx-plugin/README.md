@@ -405,7 +405,10 @@ Every cached cargo target names the npm packages its command runs as `externalDe
 `@smoothbricks/nx-plugin` for a target that runs its executor or reads its installed files (the nextest tool config, the
 archive extractor). Without that input Nx keys a task whose executor is not an `@nx/` one on every package in the
 lockfile, so a lockfile-only commit re-ran every cargo verdict. Inside this repository the plugin is a workspace
-project, which Nx refuses as an external dependency, so the list is empty here. A second entry names the Cargo
+project, which Nx refuses as an external dependency, so the list is empty here. The plugin tells the two apart by the
+workspace's own `node_modules/@smoothbricks/nx-plugin`: one that resolves inside the workspace and outside every
+`node_modules` is a workspace project, whatever path the running process loaded the plugin's code through (a daemon of
+this repository once loaded it through one, and the land gate refused the graph). A second entry names the Cargo
 lock-scope node of the crates the target builds (`cargoClosure` carries it; a target that names neither gets the node of
 the directory it runs in). An entry naming only `cargo-lock:` nodes does not count as naming npm packages.
 

@@ -866,6 +866,7 @@ function createCargoCrossTestTargets(
   toolConfig: string,
   crossTarget: CargoCrossTestTarget,
   archiveInputs: NonNullable<TargetConfiguration['inputs']>,
+  pluginInstalled: boolean,
 ): Record<string, TargetConfiguration> {
   const { target: triple, cargo } = crossTarget;
   const archiveFile = cargoCrossTestArchiveFile(triple);
@@ -896,7 +897,9 @@ function createCargoCrossTestTargets(
         ...cargoToolchainInputs(),
         ...(cargo === undefined ? [] : [`{projectRoot}/${cargo}`]),
         cargoRuntimeInput(projectRoot, 'rustc -vV && cargo -V && cargo nextest --version'),
-        { externalDependencies: cargoCommandNpmPackages({ executor: archiveExecutor }, archiveCommand) },
+        {
+          externalDependencies: cargoCommandNpmPackages({ executor: archiveExecutor }, archiveCommand, pluginInstalled),
+        },
         // The Cargo.lock entries the whole workspace reaches, for the same reason.
         { externalDependencies: [cargoLockNodeName(projectRoot)] },
       ],
@@ -957,14 +960,49 @@ const PLUGIN_NEXTEST_CODE_BOUND = fileURLToPath(new URL('../src/nextest-code-bou
 
 const PLUGIN_PACKAGE = '@smoothbricks/nx-plugin';
 /**
- * Whether this plugin runs as an installed npm package. Inside the repository
- * that develops it, it is a workspace project, and Nx refuses a workspace
- * project named as an `externalDependencies` entry.
+ * Whether this plugin's code was loaded from an installed npm package: a path
+ * through `node_modules`. Not enough alone to name it as an
+ * `externalDependencies` entry ({@link pluginInstalledIn}).
  */
-const PLUGIN_IS_INSTALLED = fileURLToPath(new URL('..', import.meta.url))
+const PLUGIN_LOADED_FROM_NODE_MODULES = fileURLToPath(new URL('..', import.meta.url))
   .split(sep)
   .includes('node_modules');
 
+const workspaceProjectPlugins = new Map<string, boolean>();
+
+/**
+ * Whether the workspace at `workspaceRoot` runs this plugin as an installed npm package, whose lockfile node an
+ * `externalDependencies` entry can name. In the repository that develops it the plugin is a workspace project: the
+ * workspace's own `node_modules/@smoothbricks/nx-plugin` resolves to a directory of the workspace outside every
+ * `node_modules`, and Nx refuses a workspace project named as an `externalDependencies` entry ("could not be
+ * found"), whatever path this process loaded the plugin's code through. A daemon of that repository did load it
+ * through one with `node_modules` in it, and every cargo target it inferred afterwards named the plugin, so a gate
+ * refused the graph.
+ */
+export function pluginInstalledIn(
+  workspaceRoot: string,
+  loadedFromNodeModules = PLUGIN_LOADED_FROM_NODE_MODULES,
+): boolean {
+  if (!loadedFromNodeModules) return false;
+  let workspaceProject = workspaceProjectPlugins.get(workspaceRoot);
+  if (workspaceProject === undefined) {
+    let linked: string | null = null;
+    try {
+      linked = relative(realpathSync(workspaceRoot), realpathSync(join(workspaceRoot, 'node_modules', PLUGIN_PACKAGE)));
+    } catch {
+      // No such package in the workspace: whatever runs the plugin, it is not a project of this workspace.
+    }
+    workspaceProject =
+      linked !== null &&
+      linked !== '' &&
+      !isAbsolute(linked) &&
+      linked !== '..' &&
+      !linked.startsWith(`..${sep}`) &&
+      !linked.split(sep).includes('node_modules');
+    workspaceProjectPlugins.set(workspaceRoot, workspaceProject);
+  }
+  return !workspaceProject;
+}
 /**
  * The npm packages a cached cargo target runs, for its `externalDependencies`.
  * Cargo runs none. A target this plugin's executor runs, or whose command reads
@@ -976,7 +1014,7 @@ const PLUGIN_IS_INSTALLED = fileURLToPath(new URL('..', import.meta.url))
 export function cargoCommandNpmPackages(
   target: TargetConfiguration,
   commandText: string,
-  installed = PLUGIN_IS_INSTALLED,
+  installed: boolean,
 ): string[] {
   const runsPlugin =
     target.executor?.startsWith(`${PLUGIN_PACKAGE}:`) === true ||
@@ -1768,10 +1806,13 @@ async function createProjectTargets(
     for (const crossTarget of listCargoCrossTestTargets(join(workspaceRoot, cargoWorkspaceRoot))) {
       Object.assign(
         targets,
-        createCargoCrossTestTargets(cargoWorkspaceRoot, nextestToolConfigArg(cargoWorkspaceRoot), crossTarget, [
-          ...workspaceCargoInputs,
-          `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`,
-        ]),
+        createCargoCrossTestTargets(
+          cargoWorkspaceRoot,
+          nextestToolConfigArg(cargoWorkspaceRoot),
+          crossTarget,
+          [...workspaceCargoInputs, `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`],
+          pluginInstalledIn(workspaceRoot),
+        ),
       );
     }
     // A serial group's filter can span members, so no single crate owns it. The root
@@ -2050,7 +2091,9 @@ async function createProjectTargets(
       ...inputs,
       ...cargoToolchainInputs(),
       cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `rustc -vV && cargo -V${versions}`),
-      ...(namesPackages ? [] : [{ externalDependencies: cargoCommandNpmPackages(target, text) }]),
+      ...(namesPackages
+        ? []
+        : [{ externalDependencies: cargoCommandNpmPackages(target, text, pluginInstalledIn(workspaceRoot)) }]),
       ...(namesLock
         ? []
         : cargoSourcesUnder(lockDirectory, cargoWorkspaces).length > 0

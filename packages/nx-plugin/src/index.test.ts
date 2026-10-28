@@ -34,7 +34,13 @@ import { CARGO_TOOLCHAIN_NAMED_INPUT, cargoToolchainInputs } from './cargo-toolc
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
-import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform, scriptcBinModules } from './index.js';
+import {
+  cargoCommandNpmPackages,
+  createNodesV2,
+  createNodesV2ForPlatform,
+  pluginInstalledIn,
+  scriptcBinModules,
+} from './index.js';
 import { isRecord } from './type-guards.js';
 import { applyWorkspaceConfig, isTestRunnerTargetName, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
 
@@ -2169,6 +2175,36 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     ]);
     expect(cargoCommandNpmPackages({ executor: 'nx:run-commands' }, clippy, true)).toEqual([]);
     expect(cargoCommandNpmPackages(runner, archive, false)).toEqual([]);
+  });
+
+  it('names itself an external dependency only where it is no project of the workspace, however its code was loaded', async () => {
+    const base = await realpath(await mkdtemp(join(tmpdir(), 'plugin-installed-')));
+    try {
+      // The repository that develops the plugin: its own link resolves into the workspace, outside node_modules.
+      const developing = join(base, 'developing');
+      await mkdir(join(developing, 'packages/nx-plugin'), { recursive: true });
+      await mkdir(join(developing, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink('../../packages/nx-plugin', join(developing, 'node_modules/@smoothbricks/nx-plugin'));
+      expect(pluginInstalledIn(developing, true)).toBe(false);
+      // A consumer: the link resolves into Bun's store, or to another checkout.
+      const consumer = join(base, 'consumer');
+      const store = join(
+        consumer,
+        'node_modules/.bun/@smoothbricks+nx-plugin@0.5.7/node_modules/@smoothbricks/nx-plugin',
+      );
+      await mkdir(store, { recursive: true });
+      await mkdir(join(consumer, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(store, join(consumer, 'node_modules/@smoothbricks/nx-plugin'));
+      expect(pluginInstalledIn(consumer, true)).toBe(true);
+      const linking = join(base, 'linking');
+      await mkdir(join(linking, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(join(developing, 'packages/nx-plugin'), join(linking, 'node_modules/@smoothbricks/nx-plugin'));
+      expect(pluginInstalledIn(linking, true)).toBe(true);
+      // Code loaded from no node_modules path keeps the earlier rule: not installed.
+      expect(pluginInstalledIn(join(base, 'unloaded'), false)).toBe(false);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
   });
 
   // The property that decides whether Rust can ever use a shared cache. A cargo
