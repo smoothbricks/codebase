@@ -61,6 +61,9 @@ struct FakeHost {
     mbx_install: Option<MbxInstall>,
     /// What naming the mains and shed trees in mbx's target lists added.
     mbx_targets: Option<TargetCollection>,
+    /// What resolving the build's mbx flake fails with, so a build that cannot install its mbx is
+    /// provable without a staged distribution.
+    mbx_flake_error: Option<CowshedError>,
     build_state: Vec<ProjectBuildState>,
     /// The owners the store layout migration marked, so its sentence is provable without a store.
     owners: Vec<PathBuf>,
@@ -140,6 +143,7 @@ impl Default for FakeHost {
             cli: None,
             mbx_install: None,
             mbx_targets: None,
+            mbx_flake_error: None,
             build_state: Vec::new(),
             owners: Vec::new(),
             retirement: None,
@@ -246,7 +250,14 @@ impl HostSetup for FakeHost {
         Ok(self.legacy.clone())
     }
 
-    async fn install_mbx(&mut self) -> Result<Option<MbxInstall>> {
+    fn mbx_flake(&mut self) -> Result<Option<PathBuf>> {
+        match self.mbx_flake_error.take() {
+            Some(error) => Err(error),
+            None => Ok(Some(PathBuf::from("/fake/nix/mbx"))),
+        }
+    }
+
+    async fn install_mbx(&mut self, _flake: &std::path::Path) -> Result<Option<MbxInstall>> {
         self.events.push(String::from("install-mbx"));
         Ok(self.mbx_install.clone())
     }
@@ -2779,4 +2790,21 @@ async fn build_state_migration_never_runs_after_storage_failure_or_during_uninst
             .any(|event| event == "build-state-projects"
                 || event.starts_with("migrate-build-state:"))
     );
+}
+
+/// A build without its mbx flake (a staged release CLI that lacks `nix/mbx`, say) is refused
+/// before setup changes anything: it once restarted the gateway on the new build and installed it
+/// as the CLI, then failed at the mbx step, leaving the daemon and the CLI on different builds.
+#[tokio::test]
+async fn a_build_that_cannot_find_its_mbx_flake_changes_nothing() {
+    let mut host = FakeHost {
+        mbx_flake_error: Some(CowshedError::environment_missing(
+            "could not find the mbx flake (nix/mbx/flake.nix) above the staged cowshed",
+            "reinstall cowshed",
+        )),
+        ..FakeHost::default()
+    };
+    let (_, error) = failing_run(&mut host, REPAIR, false).await;
+    assert_eq!(error.code, ErrorCode::EnvironmentMissing, "{error:?}");
+    assert_eq!(host.events, Vec::<String>::new(), "setup changed nothing");
 }

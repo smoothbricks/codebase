@@ -206,12 +206,19 @@ pub trait HostSetup: Send {
     async fn retire_legacy_sccache(&mut self) -> Result<Vec<HostArtifactRemoval>> {
         Ok(Vec::new())
     }
+    /// The mbx flake this build ships (14_nix.md, "mbx"), resolved before setup changes anything:
+    /// a build that cannot install its mbx installs nothing, rather than restarting the gateway on
+    /// it and installing it as the CLI before failing. `None` for a test host, which must never
+    /// build or link into a real home.
+    fn mbx_flake(&mut self) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
     /// Install cowshed's pinned mbx beside the installed cowshed (14_nix.md, "mbx"): build the
-    /// shipped flake, root it, link the host's `mbx` to it.
+    /// shipped `flake`, root it, link the host's `mbx` to it.
     ///
     /// `None` for a test host, which must never build or link into a real home; the native host
     /// answers always.
-    async fn install_mbx(&mut self) -> Result<Option<MbxInstall>> {
+    async fn install_mbx(&mut self, _flake: &Path) -> Result<Option<MbxInstall>> {
         Ok(None)
     }
     /// Name every adopted main in the host mbx's `target.keep` and every shed mount tree in its
@@ -575,9 +582,12 @@ impl HostSetup for NativeHostSetup {
     }
 
     /// Nix's build runs on this task: setup's own work, which the operator's interrupt ends.
-    async fn install_mbx(&mut self) -> Result<Option<MbxInstall>> {
-        let flake = crate::capabilities::mbx::flake_directory()?;
-        crate::capabilities::mbx::install(&self.home, &flake).map(Some)
+    fn mbx_flake(&mut self) -> Result<Option<PathBuf>> {
+        crate::capabilities::mbx::flake_directory().map(Some)
+    }
+
+    async fn install_mbx(&mut self, flake: &Path) -> Result<Option<MbxInstall>> {
+        crate::capabilities::mbx::install(&self.home, flake).map(Some)
     }
 
     async fn configure_mbx_targets(&mut self) -> Result<Option<TargetCollection>> {
@@ -771,6 +781,8 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    // Before anything changes: a build that cannot install its own mbx installs nothing at all.
+    let mbx_flake = setup.mbx_flake()?;
     // Steps 1–3 of the caches retirement run first, while an existing volume is mounted and
     // without authorization, so `--retire-caches-volume` can plan its deletion into the one
     // authorization the rest of setup uses. A volume setup first has to mount is retired after.
@@ -848,7 +860,10 @@ where
     // After the cowshed it sits beside: the host's mbx is that build's own pin.
     let mbx = match &failure {
         Some(_) => None,
-        None => setup.install_mbx().await?,
+        None => match &mbx_flake {
+            Some(flake) => setup.install_mbx(flake).await?,
+            None => None,
+        },
     };
     // Once the host's mbx is the installed pin, its target lists name each main and shed tree.
     let mbx_targets = match &mbx {
