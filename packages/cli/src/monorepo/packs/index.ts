@@ -50,6 +50,11 @@ export interface MonorepoContext {
    */
   projects?: readonly string[];
   /**
+   * The run repairs pending releases before it publishes (Publish's repair step), so a
+   * packed pin at a tagged version the registry lacks is published by then.
+   */
+  repairsPending?: boolean;
+  /**
    * Reads the resolved Nx project graph the post-build packs check. Absent,
    * Nx resolves it (`readProjectTargets`).
    */
@@ -210,7 +215,7 @@ const packs: MonorepoPack[] = [
   {
     name: 'packed-package-manifest',
     validatePostBuild(ctx) {
-      return validatePackedPublishablePackageManifest(ctx.root, ctx.projects);
+      return validatePackedPublishablePackageManifest(ctx.root, ctx.projects, ctx.repairsPending === true);
     },
   },
   {

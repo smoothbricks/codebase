@@ -410,7 +410,9 @@ describe('publish workflow definition', () => {
     const rendered = renderPublishWorkflowYaml(codebaseWorkflowOptions);
     // validate builds and pack-checks the release's candidates, not every project:
     // unscoped it compiled binaries the release did not contain.
-    expect(rendered).toContain('smoo monorepo validate --projects "${{ steps.version.outputs.projects }}"');
+    expect(rendered).toContain(
+      'smoo monorepo validate --projects "${{ steps.version.outputs.projects }}" --repairs-pending',
+    );
     const packageRoot = join(import.meta.dir, '..', '..', '..');
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/publish.yml'), 'utf8')).resolves.toBe(
       await formattedPublishWorkflow(rendered),

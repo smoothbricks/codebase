@@ -687,10 +687,12 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
       // Scoped to the release's candidates: the build phase and the packed-package
       // checks cover what ships. Unscoped, validate compiled every project - on a
       // release touching no Rust that was 3m30 of the cowshed CLI on the critical
-      // path, for a binary the release did not contain.
+      // path, for a binary the release did not contain. The publish job repairs
+      // pending releases before it publishes, so a pin at a tagged version the
+      // registry still lacks is published by then (--repairs-pending).
       return conditionalRunStep(
         step,
-        `smoo monorepo validate --projects "${githubExpression('steps.version.outputs.projects')}"`,
+        `smoo monorepo validate --projects "${githubExpression('steps.version.outputs.projects')}" --repairs-pending`,
       );
     case PublishWorkflowStepKind.TagRelease:
       return tagReleaseStepLines(step.name);

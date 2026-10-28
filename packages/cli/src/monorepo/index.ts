@@ -58,6 +58,8 @@ export interface ValidateOptions {
   verbose?: boolean;
   /** Nx project names to build and pack-validate; see MonorepoContext.projects. */
   projects?: readonly string[];
+  /** See MonorepoContext.repairsPending. */
+  repairsPending?: boolean;
 }
 
 export interface ValidateCommitMessageOptions {
@@ -94,7 +96,13 @@ export async function initMonorepo(root: string, options: InitOptions): Promise<
 
 export async function validateMonorepo(root: string, options: ValidateOptions = {}): Promise<void> {
   const result = await runValidatePacks(
-    { root, syncRuntime: false, verbose: options.verbose === true, projects: options.projects },
+    {
+      root,
+      syncRuntime: false,
+      verbose: options.verbose === true,
+      projects: options.projects,
+      repairsPending: options.repairsPending,
+    },
     options,
   );
   if (result.failures > 0) {

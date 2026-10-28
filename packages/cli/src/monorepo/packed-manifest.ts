@@ -114,12 +114,16 @@ function walkExportConditions(
  * whose stale publish still advertised a `development` export). The fix is to
  * release the dependency too, never to ship the pin. Prerelease pins are
  * workspace-internal (`-next`) and never what ships, so they are not judged.
+ * A tagged pin must also be on the registry, unless `repairsPending`: the run
+ * (Publish) repairs every pending release, publishing each tagged version the
+ * registry lacks, before it publishes the packages pinning them.
  */
 export async function validatePackedDependencyFreshness(
   root: string,
   sourcePackage: PackageInfo,
   packedPackage: PackageJson,
   releasing: readonly string[] = [],
+  repairsPending = false,
 ): Promise<string[]> {
   const workspacePackages = getWorkspacePackages(root);
   const shell = await releaseCandidateShell(root);
@@ -131,8 +135,8 @@ export async function validatePackedDependencyFreshness(
       const verdict = await packagePinFreshness(shell, dep, pinned);
       if (verdict === 'fresh') {
         // The tag is the promise; the registry is the fact. A publish that failed
-        // after tagging leaves a pin every consumer install refuses.
-        if (!(await npmVersionExists(root, name, pinned))) {
+        // after tagging leaves a pin every consumer install refuses, until a repair publishes it.
+        if (!repairsPending && !(await npmVersionExists(root, name, pinned))) {
           failures.push(
             `${sourcePackage.path}: packed ${field}.${name} pins ${pinned}, which the registry does not hold; publish ${dep.projectName}@${pinned} first (release repair-pending) or release ${dep.projectName} in the same run.`,
           );

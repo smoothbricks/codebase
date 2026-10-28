@@ -109,6 +109,10 @@ function buildProgram(): Command {
       '--projects <names>',
       'comma-separated Nx project names to build and pack-validate (a release selection); default: every project',
     )
+    .option(
+      '--repairs-pending',
+      'the run repairs pending releases before it publishes (Publish), so a pin at a tagged version the registry lacks is accepted',
+    )
     .action(
       async ({
         onlyIfNewWorkspacePackage,
@@ -120,6 +124,7 @@ function buildProgram(): Command {
         onlyIfNewWorkspacePackage?: boolean;
         verbose?: boolean;
         projects?: string;
+        repairsPending?: boolean;
       }) => {
         const root = await findRepoRoot();
         // The pre-commit hook asks on every commit; only a staged new package pays for the validator's Nx graph.

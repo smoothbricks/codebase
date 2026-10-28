@@ -46,11 +46,12 @@ export async function validatePackedPublishablePackagePublint(
 export async function validatePackedPublishablePackageManifest(
   root: string,
   projects?: readonly string[],
+  repairsPending = false,
 ): Promise<number> {
   let failures = 0;
   for (const pkg of selectedPublishablePackages(root, projects)) {
     failures += await validatePackedPublishablePackageTool(root, pkg, (r, p, packed) =>
-      validatePackedManifest(r, p, packed, projects ?? []),
+      validatePackedManifest(r, p, packed, projects ?? [], repairsPending),
     );
   }
   return failures;
@@ -103,13 +104,14 @@ async function validatePackedManifest(
   pkg: PackageInfo,
   packed: { path: string; arrayBuffer: ArrayBuffer },
   releasing: readonly string[],
+  repairsPending: boolean,
 ): Promise<number> {
   let failures = 0;
   const packedPackage = await readPackedPackageJson(root, packed.path, pkg.name);
   const messages = [
     ...validatePackedWorkspaceDependencies(root, pkg, packedPackage, { mode: 'install' }),
     ...validatePackedExportConditions(pkg, packedPackage),
-    ...(await validatePackedDependencyFreshness(root, pkg, packedPackage, releasing)),
+    ...(await validatePackedDependencyFreshness(root, pkg, packedPackage, releasing, repairsPending)),
   ];
   for (const message of messages) {
     console.error(message);

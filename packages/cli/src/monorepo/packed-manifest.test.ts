@@ -2,8 +2,9 @@ import { describe, expect, it } from 'bun:test';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { listPublishablePackages, readPackageJson, workspaceDependencyFields } from '../lib/workspace.js';
+import { git } from '../release/__tests__/helpers/fixture-repo.js';
 import { withPackWorkspace } from '../release/__tests__/helpers/pack-workspace.js';
-import { bunBinary } from '../release/__tests__/helpers/private-registry.js';
+import { bunBinary, withPrivateNpmFixture } from '../release/__tests__/helpers/private-registry.js';
 import {
   readPackedPackageJson,
   validatePackedDependencyFreshness,
@@ -47,6 +48,47 @@ describe('packed runtime dependency freshness', () => {
         untaggedRefusal('optionalDependencies'),
         untaggedRefusal('peerDependencies'),
       ]);
+    });
+  });
+
+  it('refuses a tagged pin the registry does not hold, unless the run repairs pending releases first', async () => {
+    await withPrivateNpmFixture(async (fixture) => {
+      await withPackWorkspace(
+        async (root) => {
+          // Registry reads land on the loopback public stand-in, which holds nothing.
+          await writeFile(join(root, '.npmrc'), `registry=${fixture.publicRegistry.registry}\n`);
+          await git(root, ['add', '.npmrc']);
+          await git(root, ['commit', '-qm', 'read the loopback registry']);
+          // lib@1.0.0 is tagged at HEAD, so app's pin on it is fresh: what a publish that failed after tagging leaves.
+          await git(root, ['tag', 'lib@1.0.0']);
+          const source = listPublishablePackages(root).find((pkg) => pkg.projectName === 'app');
+          if (!source) throw new Error('fixture app publisher is missing');
+          const tarball = join(root, 'app.tgz');
+          const packed = await Bun.$`${bunBinary()} pm pack --filename ${tarball} --ignore-scripts --quiet`
+            .cwd(join(root, source.path))
+            .quiet()
+            .nothrow();
+          expect(packed.exitCode, packed.stderr.toString()).toBe(0);
+          const packedManifest = await readPackedPackageJson(root, tarball, source.name);
+          expect(await validatePackedDependencyFreshness(root, source, packedManifest)).toEqual([
+            'packages/app: packed dependencies.@pub.test/lib pins 1.0.0, which the registry does not hold; publish lib@1.0.0 first (release repair-pending) or release lib in the same run.',
+          ]);
+          expect(await validatePackedDependencyFreshness(root, source, packedManifest, [], true)).toEqual([]);
+        },
+        {
+          packages: [
+            { name: '@pub.test/lib', projectName: 'lib', path: 'packages/lib', version: '1.0.0', tags: ['npm:public'] },
+            {
+              name: '@pub.test/app',
+              projectName: 'app',
+              path: 'packages/app',
+              version: '2.0.0',
+              tags: ['npm:public'],
+              dependencies: { '@pub.test/lib': 'workspace:*' },
+            },
+          ],
+        },
+      );
     });
   });
 });

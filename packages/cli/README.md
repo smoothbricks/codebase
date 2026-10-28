@@ -29,7 +29,7 @@ entry builds the CLI before it can be called; the launcher loads no source trans
 
 ```bash
 smoo monorepo init [--runtime-only] [--sync-runtime]
-smoo monorepo validate [--fail-fast] [--only-if-new-workspace-package]
+smoo monorepo validate [--fail-fast] [--only-if-new-workspace-package] [--projects <projects>] [--repairs-pending]
 smoo monorepo update
 smoo monorepo check
 smoo monorepo diff
