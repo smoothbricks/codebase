@@ -7,6 +7,7 @@ pub mod commitment_feed;
 pub(crate) mod daemon_watch;
 #[cfg(target_os = "macos")]
 pub mod job_accounting;
+pub mod job_admission;
 #[cfg(target_os = "macos")]
 mod job_attribution;
 #[cfg(target_os = "linux")]
