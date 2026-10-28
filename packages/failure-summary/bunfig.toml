@@ -1,2 +1,8 @@
 [test]
-preload = ["@smoothbricks/validation/bun/preload"]
+# No ttsc preload: this package has no Typia or LMAO transform callsite and lists no ttsc
+# transformer, so @smoothbricks/validation/bun/preload only routed its sources through ttsc's
+# plain native compiler host and returned them unchanged. On a fresh runner that host is a cold Go
+# build inside the test's idle bound: Publish 40751269308's macOS leg spent the whole 180 s in it
+# (`go build -o .ttsc-plugin ./cmd/ttsc`) before any test finished. Restore the preload, and the
+# @smoothbricks/validation devDependency, with the first callsite: an untransformed one fails
+# loudly with `no transform has been configured`.
