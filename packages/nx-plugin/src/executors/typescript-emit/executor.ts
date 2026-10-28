@@ -15,6 +15,7 @@ import {
   writeBuildInputs,
 } from '@smoothbricks/build-inputs';
 import { readJsonFile } from 'nx/src/devkit-exports.js';
+import { EMIT_OVERRIDES } from './emit-overrides.js';
 import type { TypeScriptEmitOptions } from './schema.js';
 
 interface TypeScriptEmitContext {
@@ -38,26 +39,6 @@ export interface CompilerInvocation {
 }
 
 export type CompilerRunner = (invocation: CompilerInvocation) => Promise<boolean>;
-
-/**
- * What the emit changes about the project's own options: JavaScript and declarations from one non-incremental program.
- * They ride the command line onto the project's tsconfig. A synthesized config would have to sit beside that tsconfig,
- * because `${configDir}` and `paths` anchor to the directory of the config that consumes them, and a transient file there
- * changes the directory listing a concurrent ttsc transform of another project proves while it compiles; that
- * transform then refuses with `graph/accessible-entries-changed`.
- */
-const EMIT_OVERRIDES = [
-  '--composite',
-  'false',
-  '--declaration',
-  'true',
-  '--declarationMap',
-  'true',
-  '--emitDeclarationOnly',
-  'false',
-  '--incremental',
-  'false',
-];
 
 export default function typescriptEmitExecutor(
   options: TypeScriptEmitOptions,

@@ -53,7 +53,8 @@ function staleCheckout() {
 
   const bin = join(root, 'bin');
   mkdirSync(bin);
-  writeFileSync(join(bin, 'ttsc'), '#!/bin/sh\nexit 0\n');
+  // Each call's arguments, one line per call, beside `bin`.
+  writeFileSync(join(bin, 'ttsc'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$(dirname "$0")/../ttsc-calls"\nexit 0\n');
   chmodSync(join(bin, 'ttsc'), 0o755);
   mkdirSync(join(root, 'tooling/direnv'), { recursive: true });
 
@@ -69,7 +70,7 @@ function staleCheckout() {
         GITHUB_ACTIONS: 'true',
       },
     });
-  return { plugin, volume, link, enter, dispose: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, plugin, volume, link, enter, dispose: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 /**
@@ -120,6 +121,27 @@ it('a stale plugin build clears the daemon record and project graph through its 
   }
 });
 
+/**
+ * The entry's rebuild emits exactly as nx-plugin's typescript-emit executor does (its EMIT_OVERRIDES): one
+ * non-composite, non-incremental program. An incremental emit wrote `dist/tsconfig.lib.tsbuildinfo`, which no Nx output
+ * produces, and the 2026-10-28 Publish refused the CLI's verified dist at its merge boundary for that file.
+ */
+it('the rebuild emits as the Nx emit does, writing no build info into dist', () => {
+  const { root, enter, dispose } = staleCheckout();
+  try {
+    const entered = enter();
+    expect(entered.status, `${entered.stdout}${entered.stderr}`).toBe(0);
+    const calls = readFileSync(join(root, 'ttsc-calls'), 'utf8').trim().split('\n');
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call).toBe(
+        '-p tsconfig.lib.json --emit --composite false --declaration true --declarationMap true --emitDeclarationOnly false --incremental false',
+      );
+    }
+  } finally {
+    dispose();
+  }
+});
 /**
  * A Cargo resolution holds `cargo-resolve/<id>/resolve.lock` while locked, offline Cargo runs, then publishes its
  * entry by a temporary file and a rename in that directory. A shell entry that emptied `.nx/workspace-data` removed

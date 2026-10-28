@@ -2,6 +2,7 @@
 import { mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { $ } from 'bun';
+import { EMIT_OVERRIDES } from '../../packages/nx-plugin/src/executors/typescript-emit/emit-overrides.js';
 
 const devenvRoot = process.env.DEVENV_ROOT;
 if (!devenvRoot) {
@@ -117,8 +118,9 @@ async function rebuildWorkspaceToolsIfStale(): Promise<void> {
     // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the build marker.
     if (markerStat && built && !(await hasFileNewerThanMarker(directory, markerStat.mtimeMs))) continue;
     // Bootstrap invokes neither nx (whose graph loads the plugin) nor smoo (whose launcher needs CLI dist).
-    // ttsc only needs the package tsconfig, so both tools can start from missing outputs without a cycle.
-    await runQuietly('ttsc', ['-p', 'tsconfig.lib.json', '--emit'], directory);
+    // ttsc only needs the package tsconfig, so both tools can start from missing outputs without a cycle. It emits as
+    // nx-plugin's typescript-emit executor does (EMIT_OVERRIDES, the one definition of a dist's emit).
+    await runQuietly('ttsc', ['-p', 'tsconfig.lib.json', '--emit', ...EMIT_OVERRIDES], directory);
     // The marker records when dist was last VERIFIED current, not when tsc last
     // chose to write bytes. ttsc is content-incremental, so an mtime-only change —
     // a checkout, a revert, a formatter rewriting a file identically — makes it

@@ -85,7 +85,7 @@ jobs:
         # ttsc needs only the package tsconfig -- same bootstrap the devenv
         # shell runs (tooling/direnv/enter-shell.ts).
         working-directory: packages/nx-plugin
-        run: ttsc -p tsconfig.lib.json --emit
+        run: bun ../../tooling/ttsc-emit.ts
 
       # Step 6
       - name: 🧭 Plan release
@@ -261,7 +261,7 @@ jobs:
         # ttsc needs only the package tsconfig -- same bootstrap the devenv
         # shell runs (tooling/direnv/enter-shell.ts).
         working-directory: packages/nx-plugin
-        run: ttsc -p tsconfig.lib.json --emit
+        run: bun ../../tooling/ttsc-emit.ts
 
       # Step 5
       - name: 🤖 Configure release author
@@ -376,7 +376,7 @@ jobs:
         # ttsc needs only the package tsconfig -- same bootstrap the devenv
         # shell runs (tooling/direnv/enter-shell.ts).
         working-directory: packages/nx-plugin
-        run: ttsc -p tsconfig.lib.json --emit
+        run: bun ../../tooling/ttsc-emit.ts
 
       # --- Repair -------------------------------------------------------------
 
