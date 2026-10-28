@@ -101,6 +101,9 @@ in {
       jq # Used in pre-commit hook and generally useful
       alejandra # Nix formatter
     ])
+    # mbx by PATH name only: the binary, no wrapper and no environment of its own
+    # (cowshed's canonical mbx environment is specs/cowshed/11_shell.md's).
+    ++ [inputs.mbx.packages.${pkgs.stdenv.hostPlatform.system}.default]
     ++ lib.optionals pkgs.stdenv.isDarwin [
       (pkgs.writeShellScriptBin "smoothbricks-macos-linker"
         (builtins.readFile ../../packages/cowshed/scripts/macos-linker.sh))
