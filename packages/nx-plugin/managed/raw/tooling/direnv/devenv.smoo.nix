@@ -510,8 +510,15 @@ in {
   # A runner links nothing.
   #
   # A failed task does not fail shell entry (devenv reports it and the shell
-  # still loads, so the tools to repair it stay available). CI runs both with
-  # `devenv tasks run`, which does fail; setup-environment.ts is strict there.
+  # still loads, so the tools to repair it stay available), with one
+  # exception: smoo:developer-links refusing the declared links. A shell on
+  # links its declaration does not describe runs another build than it says
+  # (a live checkout whose build is stale, with no sealed snapshot to serve
+  # instead), and the repair is in the provider checkout, not in this shell.
+  # The refused exec leaves node_modules/.smoo-links-refused, which the
+  # prologue below says and fails on; the next `--links` run that finds the
+  # links current removes it. CI runs both with `devenv tasks run`, which
+  # does fail; setup-environment.ts is strict there.
   tasks = let
     setup = ''bun "$DEVENV_ROOT/setup-environment.ts"'';
   in {
@@ -651,6 +658,13 @@ in {
     # they run.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
+      # smoo:developer-links refused the declared links (tasks above): fail
+      # shell entry with its reason rather than run on links it refused.
+      if [ -f node_modules/.smoo-links-refused ]; then
+        echo "smoo:developer-links refused this checkout's declared links; shell entry fails until they are current:" >&2
+        cat node_modules/.smoo-links-refused >&2
+        exit 1
+      fi
       # A bare assignment: export's status would hide repo-path's refusal of a
       # cowshed workspace it could not serve, and the shell would enter with an
       # empty PATH.

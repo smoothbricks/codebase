@@ -223,6 +223,11 @@ const { values: flags } = parseArgs({
   },
 });
 const cargoMode = flags.cargo === true;
+// What a `--links` exec that refused leaves for the enterShell prologue (devenv.smoo.nix), which then fails shell entry
+// with its reason: a shell must not run on links the declaration does not describe (a live checkout whose build is
+// stale with no sealed snapshot to serve, a declaration smoo refuses), and the repair is in the provider checkout, not
+// in this shell. Every `--links` run that finds the links current, or makes them so, removes it.
+const linksRefusal = path.join(projectRoot, 'node_modules', '.smoo-links-refused');
 
 // The Nx plugin's test for a Cargo workspace root manifest (CARGO_WORKSPACE_PATTERN), which
 // cargoWorkspaces applies during the bootstrap block; declared above it for the same reason.
@@ -253,13 +258,12 @@ try {
         plan.changes.length === 0 && plan.unavailable.every((unavailable) => unavailable.kind === 'absent');
       // A stale pin is informational, not a stale install: say it even when devenv skips the exec.
       if (current && plan.reports.length > 0) applyDeclaredLinks(projectRoot, plan);
-      process.exit(
+      const linked =
         current &&
-          !hasStaleDeveloperLinks(projectRoot, ['nx']) &&
-          danglingStoreLinks(projectRoot, () => workspaceMemberModules(projectRoot)).length === 0
-          ? 0
-          : 1,
-      );
+        !hasStaleDeveloperLinks(projectRoot, ['nx']) &&
+        danglingStoreLinks(projectRoot, () => workspaceMemberModules(projectRoot)).length === 0;
+      if (linked) rmSync(linksRefusal, { force: true });
+      process.exit(linked ? 0 : 1);
     }
     // Planning reads, apart from a snapshot it may capture, which seals by an atomic rename (linked-snapshots.ts),
     // and applying a plan with no changes only says what this machine cannot honour. So an entry with nothing to
@@ -272,6 +276,7 @@ try {
       !hasStaleDeveloperLinks(projectRoot, ['nx'])
     ) {
       applyDeclaredLinks(projectRoot, plan);
+      rmSync(linksRefusal, { force: true });
       process.exit(0);
     }
     await withInstallLock(async () => {
@@ -290,6 +295,7 @@ try {
       }
       applyDeclaredLinks(projectRoot, await planDeclaredLinks(projectRoot));
     });
+    rmSync(linksRefusal, { force: true });
     process.exit(0);
   }
   // Bootstrap only: install deps + wire local git hooks/config.
@@ -410,6 +416,11 @@ try {
     }
   }
 } catch (error) {
+  // Thrown out of a `--links` exec, an error is the links refused (an install failure reports itself and exits).
+  if (flags.links === true && flags.check !== true) {
+    mkdirSync(path.dirname(linksRefusal), { recursive: true });
+    writeFileSync(linksRefusal, `${error instanceof Error ? error.message : String(error)}\n`);
+  }
   reportSetupFailure(error);
 }
 

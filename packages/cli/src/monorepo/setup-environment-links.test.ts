@@ -1,6 +1,6 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell fixture scripts are literal shell text. */
 import { describe, expect, it } from 'bun:test';
-import { readFileSync, readlinkSync, symlinkSync } from 'node:fs';
+import { existsSync, readFileSync, readlinkSync, symlinkSync } from 'node:fs';
 import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
@@ -199,6 +199,17 @@ describe('what shell entry keeps linked', () => {
           expect(refused.stderr).toContain(
             'smoo.developerLinks @fixture/lib must be a directory relative to the main checkout, not "/opt/lib"',
           );
+
+          // The refused exec leaves its reason where the enterShell prologue fails shell entry on it
+          // (devenv.smoo.nix), and the next run that finds the links current removes it.
+          const marker = join(root, 'node_modules/.smoo-links-refused');
+          expect((await enter({ links: true })).exitCode).toBe(1);
+          expect(readFileSync(marker, 'utf8')).toContain(
+            'smoo.developerLinks @fixture/lib must be a directory relative to the main checkout, not "/opt/lib"',
+          );
+          await declare(root, { '@fixture/lib': '../local-lib' });
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+          expect(existsSync(marker)).toBe(false);
         },
       );
     });
