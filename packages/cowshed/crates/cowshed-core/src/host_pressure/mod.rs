@@ -70,6 +70,21 @@ pub enum Source {
 }
 
 impl Source {
+    /// A feed that only ever reports no pressure (Normal on macOS, no stall on Linux): what a test
+    /// harness runs a supervisor on, so the host's own pressure decides none of its admissions.
+    /// A test of admission under pressure drives its own feed ([`Self::Driven`]).
+    pub fn calm() -> Self {
+        #[cfg(target_os = "macos")]
+        let reading = Reading::Known(MemoryPressure::Darwin {
+            level: DarwinPressureLevel::Normal,
+        });
+        #[cfg(not(target_os = "macos"))]
+        let reading = Reading::Known(MemoryPressure::Psi {
+            some_avg10: cowshed_gateway_types::host_status::CentiPercent::new(0)
+                .expect("no stall is a share"),
+        });
+        Self::Driven(tokio::sync::watch::channel(reading).1)
+    }
     /// Open the feed. A kernel that refuses the subscription leaves a feed whose one reading
     /// names why: a host whose pressure cannot be followed is not shown to have room.
     pub fn open(self) -> Feed {

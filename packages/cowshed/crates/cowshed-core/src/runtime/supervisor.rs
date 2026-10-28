@@ -11152,7 +11152,7 @@ mod lifecycle_commitment_tests {
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
             build_volume_released: None,
-            memory_pressure: crate::host_pressure::Source::Kernel,
+            memory_pressure: crate::host_pressure::Source::calm(),
             nx_daemon_idle: defaults.nx_daemon_idle,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's

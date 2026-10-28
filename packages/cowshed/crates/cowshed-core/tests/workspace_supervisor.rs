@@ -520,7 +520,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         build_volume_released: None,
-        memory_pressure: cowshed_core::host_pressure::Source::Kernel,
+        memory_pressure: cowshed_core::host_pressure::Source::calm(),
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
     }
 }
@@ -6711,6 +6711,11 @@ fn nx_project_with_config(
 ) -> (WorkspaceSupervisorConfig, TempRoot) {
     supervisor_config.authority.workspace = WorkspaceName::new(name).unwrap();
     supervisor_config.default_cwd = None;
+    // These tests sleep through the keeper's idle bound on a paused clock, which steps through
+    // every sampling tick on the way: at the default 1 s period that is hundreds of real
+    // process-table walks, whose cost grows with the host's process count (one ran past a land
+    // gate's 180 s progress bound). Sampling at the probe cadence keeps the steps few.
+    supervisor_config.job_sampling.cpu_sample_period = NX_PROBES;
     std::fs::write(supervisor_config.workspace_root.join("nx.json"), "{}").unwrap();
     let node = fixture_node(&supervisor_config.workspace_root);
     std::fs::create_dir_all(node.parent().unwrap()).unwrap();
