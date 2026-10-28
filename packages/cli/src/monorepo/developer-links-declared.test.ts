@@ -6,6 +6,7 @@ import { dirname, join, relative } from 'node:path';
 import {
   applyDeclaredLinks,
   type DeclaredLinksPlan,
+  declaredDirectory,
   keepDeveloperLinks,
   planDeclaredLinks,
   type UnavailableDeclaredLink,
@@ -137,6 +138,17 @@ describe('as smoo.developerLinks declares them', () => {
   });
   afterAll(() => {
     if (runner !== undefined) process.env.GITHUB_ACTIONS = runner;
+  });
+
+  it('names the directory a declaration resolves to: siblings beside the main checkout, contained ones here', async () => {
+    await withInstalled(WORKSPACE, { '@fixture/lib': '../provider/lib', util: '.cache/owned-util' }, async (root) => {
+      const main = join(dirname(root), 'projects', 'main');
+      await mkdir(join(root, '.cowshed'), { recursive: true });
+      await writeFile(join(root, '.cowshed', 'workspace.json'), JSON.stringify({ projectRoot: main }));
+      expect(declaredDirectory(root, '@fixture/lib')).toBe(join(dirname(main), 'provider', 'lib'));
+      expect(declaredDirectory(root, 'util')).toBe(join(root, '.cache', 'owned-util'));
+      expect(declaredDirectory(root, 'app')).toBeNull();
+    });
   });
 
   it('links each installed declared package beside the main checkout a cowshed marker names', async () => {

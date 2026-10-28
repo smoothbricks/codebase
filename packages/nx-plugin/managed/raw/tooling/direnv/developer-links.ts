@@ -1267,6 +1267,17 @@ function readDeclaredLinks(root: string): DeclaredLink[] {
   });
 }
 
+/**
+ * The directory `name`'s declaration in `root`'s `smoo.developerLinks` names, resolved as its links are: a sibling
+ * directory beside the project's main checkout (`linkAnchor`), a contained one in this checkout. Null when nothing
+ * declares `name`. A consumer that judges a provider's revisions reads them here, where a retired capture root no
+ * longer is.
+ */
+export function declaredDirectory(root: string, name: string): string | null {
+  const declaration = readDeclaredLinks(root).find((link) => link.name === name);
+  return declaration === undefined ? null : declaredTarget(root, linkAnchor(root), declaration.directory);
+}
+
 /** Project-contained declared directories follow their checkout; siblings retain the shared main anchor. */
 function declaredTarget(root: string, anchor: string, relative: string): string {
   const shared = path.resolve(anchor, relative);

@@ -759,6 +759,12 @@ checkout, in its main checkout's, with its receipt, census and relative layout i
 checkout of the project. A pin neither store holds refuses, naming both. Pin resolution never fetches, builds or
 reconstructs a missing snapshot from today's provider.
 
+Tooling that needs the provider directory a declaration resolves to, to read the provider's revisions and tags say,
+calls `declaredDirectory(root, name)` from the managed `tooling/direnv/developer-links.ts`: it resolves the declaration
+as its links do, a sibling beside the project's main checkout and a contained directory in this checkout, and answers
+null for a name nothing declares. A snapshot's `provenance.root` can name a checkout since retired; the declared
+directory is where the provider stays.
+
 Existing forms keep working unchanged as explicit moving opt-ins. A directory string such as
 `"@smoothbricks/lmao": "../smoothbricks/packages/lmao"` links the live checkout. The capture object below selects a
 fresh attested snapshot at each install or shell entry, not a fixed pin. Managed-file drift checks keep their own rules:
