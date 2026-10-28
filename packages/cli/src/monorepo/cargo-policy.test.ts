@@ -124,18 +124,26 @@ describe('Cargo cache policy', () => {
     expect(standalone.messages).toEqual([]);
   });
 
-  it('rejects CARGO_INCREMENTAL in a Justfile', async () => {
-    const result = await check({ Justfile: 'set export CARGO_INCREMENTAL := "1"\n' });
-    expect(result.failures).toBe(1);
-    expect(result.messages[0]).toContain("incremental compilation is mbx's to manage");
-    expect(result.messages[0]).toContain('leave CARGO_INCREMENTAL unset');
-  });
-
-  it('rejects CARGO_INCREMENTAL in Cargo config env', async () => {
-    const result = await check({ '.cargo/config.toml': '[env]\nCARGO_INCREMENTAL = "0"\n' });
-    expect(result.failures).toBe(1);
-    expect(result.messages[0]).toContain('.cargo/config.toml');
-    expect(result.messages[0]).toContain('a committed value overrides it for every checkout');
+  it('refuses committed CARGO_INCREMENTAL and a target directory outside the repository root', async () => {
+    const cases: ReadonlyArray<readonly [Record<string, string>, readonly string[]]> = [
+      [
+        { Justfile: 'set export CARGO_INCREMENTAL := "1"\n' },
+        ["incremental compilation is mbx's to manage", 'leave CARGO_INCREMENTAL unset'],
+      ],
+      [
+        { '.cargo/config.toml': '[env]\nCARGO_INCREMENTAL = "0"\n' },
+        ['.cargo/config.toml', 'a committed value overrides it for every checkout'],
+      ],
+      [
+        { '.cargo/config.toml': '[build]\ntarget-dir = "/tmp/smoo-target"\n' },
+        ['build.target-dir', 'repository-relative'],
+      ],
+    ];
+    for (const [files, named] of cases) {
+      const result = await check(files);
+      expect(result.failures).toBe(1);
+      for (const text of named) expect(result.messages[0]).toContain(text);
+    }
   });
 
   it('flags profile tables in workspace members but not standalone package roots', async () => {
@@ -145,13 +153,6 @@ describe('Cargo cache policy', () => {
     });
     expect(result.failures).toBe(1);
     expect(result.messages[0]).toContain('Cargo ignores profile tables');
-  });
-
-  it('flags a target directory outside the repository root', async () => {
-    const result = await check({ '.cargo/config.toml': '[build]\ntarget-dir = "/tmp/smoo-target"\n' });
-    expect(result.failures).toBe(1);
-    expect(result.messages[0]).toContain('build.target-dir');
-    expect(result.messages[0]).toContain('repository-relative');
   });
 
   it('flags an absolute foreign linker', async () => {
