@@ -213,6 +213,12 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/git-reword-commit',
+    target: 'tooling/git-reword-commit',
+    executable: true,
+  },
+  {
+    kind: 'raw',
     source: 'git-format-staged.yml',
     target: '.git-format-staged.yml',
   },

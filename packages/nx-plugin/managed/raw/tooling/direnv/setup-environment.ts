@@ -1427,14 +1427,15 @@ async function applyWorkspaceGitConfig(root: string): Promise<void> {
 
   const gitDir = path.resolve(root, new TextDecoder().decode(gitDirResult.stdout).trim());
   const tooling = path.join(root, 'tooling');
-  linkHook(gitDir, tooling, 'pre-commit');
+  linkHook(gitDir, path.join(tooling, 'git-hooks', 'pre-commit.sh'));
   installPostCommitHook(gitDir, tooling);
-  linkHook(gitDir, tooling, 'commit-msg');
-  linkHook(gitDir, tooling, 'pre-push');
+  linkHook(gitDir, path.join(tooling, 'git-hooks', 'commit-msg.sh'));
+  linkHook(gitDir, path.join(tooling, 'git-hooks', 'pre-push.sh'));
 }
 
-function linkHook(gitDir: string, tooling: string, name: string): void {
-  const source = path.join(tooling, 'git-hooks', `${name}.sh`);
+/** Links `.git/hooks/<name>` to the hook source `<name>.sh`. */
+function linkHook(gitDir: string, source: string): void {
+  const name = path.basename(source, '.sh');
   if (!existsSync(source)) {
     throw new Error(`Missing ${name} hook source: ${source}`);
   }

@@ -991,19 +991,6 @@ export function readSealed(directory: string): SnapshotReceipt | null {
   return receipt;
 }
 
-/** The sealed snapshot `target` lies in, found by its receipt above it, or null. */
-export function sealedSnapshotOf(
-  target: string,
-): { readonly directory: string; readonly receipt: SnapshotReceipt } | null {
-  for (let at = path.dirname(target); ; at = path.dirname(at)) {
-    if (lstatSync(path.join(at, SNAPSHOT_RECEIPT), { throwIfNoEntry: false }) !== undefined) {
-      const receipt = readSealed(at);
-      return receipt === null ? null : { directory: at, receipt };
-    }
-    if (path.dirname(at) === at) return null;
-  }
-}
-
 /**
  * The sealed snapshot of `name` in this checkout's store that `linkText`, an alias's recorded link at `entry`, binds,
  * once it verifies; or null when that text names no snapshot left in the store. When no new snapshot can be made the

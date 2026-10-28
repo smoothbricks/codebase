@@ -97,7 +97,7 @@ beforeEach(async () => {
     join(root, 'tooling', 'smoo'),
     '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$SMOO_TEST_ORDER"\nexec "$SMOO_TEST_BUN" "$SMOO_TEST_LAUNCHER" "$@"\n',
   );
-  for (const hook of ['pre-commit', 'commit-msg']) {
+  for (const hook of ['pre-commit', 'commit-msg', 'pre-push']) {
     const target = join(root, 'tooling', 'git-hooks', `${hook}.sh`);
     await copyFile(join(managedAssetsRoot, 'raw', 'tooling', 'git-hooks', `${hook}.sh`), target);
     await chmod(target, 0o755);
@@ -328,6 +328,15 @@ describe('managed public denylist commit hooks', () => {
       const sent = runGit(root, 'commit', '-m', 'fix: neutral summary', ...refused.flatMap((line) => ['-m', line]));
       expect(sent.exitCode).not.toBe(0);
       for (const line of refused) expect(sent.stderr).toContain(line);
+
+      // The push refuses a message the commit gate never saw, and says how to rewrite it in place.
+      git('commit', '--quiet', '--no-verify', '-m', 'fix: neutral summary', ...refused.flatMap((line) => ['-m', line]));
+      const remote = join(container, 'remote.git');
+      expect(runGit(container, 'init', '--quiet', '--bare', remote).exitCode).toBe(0);
+      git('remote', 'add', 'public', remote);
+      const pushed = runGit(root, 'push', 'public', 'HEAD:refs/heads/main');
+      expect(pushed.exitCode).not.toBe(0);
+      expect(pushed.stderr).toContain('tooling/git-reword-commit <commit>');
     });
   });
 

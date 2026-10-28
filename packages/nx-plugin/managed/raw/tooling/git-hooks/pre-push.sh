@@ -70,7 +70,10 @@ while read -r _local_ref local_sha _remote_ref _remote_sha; do
   esac
 done
 if [ "${#pushed[@]}" -gt 0 ]; then
-  smoo monorepo check-public-denylist --remote "$1" "${pushed[@]}" || exit 1
+  smoo monorepo check-public-denylist --remote "$1" "${pushed[@]}" || {
+    echo 'pre-push: rewrite a refused commit message in place with tooling/git-reword-commit <commit> (the new message on stdin), then push again' >&2
+    exit 1
+  }
 fi
 
 case "$(uname -s)" in
