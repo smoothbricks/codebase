@@ -126,6 +126,7 @@
     "src/executors/bounded-exec/runner-lifecycle.test.ts": 6,
     "src/executors/bounded-exec/runner-sizing.test.ts": 6,
     "src/executors/bounded-exec/mbx-pool.test.ts": 5,
+    "src/cargo-retention-hook.test.ts": 5,
     "src/executors/bounded-exec/owned-subtree.test.ts": 5,
     "src/executors/bounded-exec/bounds.test.ts": 3
   }

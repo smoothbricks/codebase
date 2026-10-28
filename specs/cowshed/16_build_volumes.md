@@ -1668,9 +1668,12 @@ A host moves to this model in one release, in this order:
 3. **The store fills on first builds.** The mbx store starts empty and fills with the first build of each crate, after
    which every checkout restores it. A checkout's first Cargo build under mbx is cold, once.
 4. **What is deleted with it.** sccache, with its four patches, its daemon and its wiring, and the smoo sccache-patches
-   check. For projects with the mbx capability, the Nx plugin's Cargo retention, its purge, and the `postTasksExecution`
-   hook step that runs it after each Nx run (Garbage collection; `packages/nx-plugin/README.md`, "Cargo Workspace
-   Layouts"); Rust projects without mbx keep all three.
+   check. For projects with the mbx capability, the Nx plugin's automatic Cargo retention, its purge with it: the
+   `postTasksExecution` hook step does nothing where the run's environment is the canonical mbx one (Garbage collection;
+   `packages/nx-plugin/README.md`, "Cargo Workspace Layouts"; enforced by
+   `packages/nx-plugin/src/cargo-retention-hook.test.ts`). Rust projects without mbx keep it. SmoothBricks' macOS dev
+   shell carries mbx's Cargo shim (`tooling/direnv/devenv.nix`); its Linux shell, which CI uses outside cowshed's shared
+   store, keeps plain Cargo.
 5. **The linker wrapper goes only if linking through mbx is faster.** After a project's mbx cutover, on one host, it
    links the same fixtures (two test binaries of the project's largest dependency graphs) both ways: through the
    repository's wrapper, and through Apple's clang driver ("One Cargo environment on every path"). Each way is timed on

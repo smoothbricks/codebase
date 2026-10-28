@@ -41,12 +41,23 @@ function ran(status: TaskStatus): boolean {
 export const CARGO_PRODUCER_METADATA = { cargoProducer: true } as const;
 
 /**
+ * Whether the run's environment is an mbx project's canonical one, which names the shared store beside mbx-managed
+ * target views (specs/cowshed/11_shell.md, "Canonical mbx environment"). Such a project's targets are mbx's to collect,
+ * so the plugin retains and purges nothing in them (specs/cowshed/16_build_volumes.md, "Migration" step 4).
+ */
+export function mbxManagesTargets(environment: Readonly<NodeJS.ProcessEnv>): boolean {
+  return Boolean(environment.MBX_CACHE_DIR) && environment.MBX_TARGET_VIEWS === '1';
+}
+
+/**
  * After a run that executed a Cargo producer task ({@link CARGO_PRODUCER_METADATA}), check whether
  * each Cargo workspace is due for its daily maintenance. A successful receipt schedules only;
  * every due pass reads the current graph under Cargo's locks and is awaited by this Nx process.
- * Maintenance never fails the run it follows: every outcome, a refused or busy pass included, is only reported.
+ * Maintenance never fails the run it follows: every outcome, a refused or busy pass included, is only reported. In an
+ * mbx project ({@link mbxManagesTargets}) it does nothing.
  */
 export async function postTasksExecution(_options: unknown, context: PostTasksExecutionContext): Promise<void> {
+  if (mbxManagesTargets(process.env)) return;
   const executed = Object.values(context.taskResults).filter(({ status }) => ran(status));
   if (executed.length === 0) return;
   let graph: ProjectGraph;
