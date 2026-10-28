@@ -382,13 +382,12 @@ async fn a_land_retires_the_units_its_train_folded_and_keeps_live_dirty_and_unla
     runtime.shutdown().await.expect("stop the landing runtime");
 }
 /// A gitignored path is disposable by the project's own declaration, and a hidden untracked one is
-/// junk, so neither keeps a recovery image (02_workspaces.md, `rm` step 5): a tree whose only extra
-/// files are ignored or hidden retires with its image released. A visible untracked file no rule
-/// ignores is still the only copy, and keeps its complete recovery image across shutdown, startup,
-/// plain gc and bundle-only gc.
+/// junk, so a tree whose only extra files are ignored or hidden retires with its image released. A
+/// visible untracked file no rule ignores is uncommitted work: `rm` refuses it by name, `--force`
+/// or not, and `--abandon` commits it into the bundle and keeps no image (02_workspaces.md, `rm`
+/// steps 1 and 5).
 #[tokio::test]
-async fn ignored_and_hidden_content_is_released_and_visible_only_copy_content_keeps_recovery_trash()
-{
+async fn ignored_and_hidden_content_is_released_and_visible_content_is_refused_until_abandoned() {
     let fixture = Fixture::new("only-copy-source");
     let runtime = fixture.adopt().await;
     let minted = fixture
@@ -451,73 +450,46 @@ async fn ignored_and_hidden_content_is_released_and_visible_only_copy_content_ke
         .unwrap()
         .write_all(b"\n/ignored-notes\n")
         .unwrap();
-    fixture
+    let refusal = fixture
         .remove(&runtime, "notes")
         .await
-        .expect("retire to recovery");
-    let recovery = fixture.layout().project().sessions.join(format!(
-        ".trash/notes-{}.dmg",
-        metadata.workspace_incarnation,
-    ));
-    assert!(!image.exists());
-    assert_eq!(
-        fs::read(recovery.join("private-notes")).unwrap(),
-        b"only visible copy\n"
+        .expect_err("--force waives no uncommitted work");
+    assert!(
+        refusal
+            .message
+            .ends_with("workspace notes has uncommitted work: private-notes"),
+        "{refusal:?}"
     );
-    assert_eq!(
-        fs::read(recovery.join("ignored-notes")).unwrap(),
-        b"only ignored copy\n"
-    );
-    runtime.shutdown().await.expect("stop runtime");
-    let restarted = fixture.gc().await;
-    for abandoned in [false, true] {
-        fixture
-            .call(
-                &restarted,
-                "coordinator.gc",
-                json!({
-                    "repoId": fixture.repo,
-                    "options": { "dryRun": false, "abandoned": abandoned },
-                }),
-            )
-            .await
-            .expect("collection preserves source recovery");
-        assert_eq!(
-            fs::read(recovery.join("private-notes")).unwrap(),
-            b"only visible copy\n"
-        );
-        assert_eq!(
-            fs::read(recovery.join("ignored-notes")).unwrap(),
-            b"only ignored copy\n"
-        );
-        assert!(cowshed_core::metadata::sidecar_path(&recovery).exists());
-    }
-    restarted.shutdown().await.expect("stop restarted runtime");
-    fs::remove_file(cowshed_core::metadata::sidecar_path(&recovery)).unwrap();
-    let missing_record = fixture.gc().await;
-    fixture
+    assert!(image.exists(), "a refusal keeps the image");
+    let abandoned = fixture
         .call(
-            &missing_record,
-            "coordinator.gc",
+            &runtime,
+            "coordinator.destroy",
             json!({
-                "repoId": fixture.repo,
-                "options": { "dryRun": false, "abandoned": true },
+                "repoId": fixture.repo, "workspace": "notes",
+                "options": RemoveOptions { force: true, abandon: true, ..RemoveOptions::default() },
             }),
         )
         .await
-        .expect("missing grants do not authorize byte deletion");
-    assert_eq!(
-        fs::read(recovery.join("private-notes")).unwrap(),
-        b"only visible copy\n"
+        .expect("--abandon bundles the visible only copy");
+    assert!(!image.exists());
+    assert!(
+        !fixture
+            .layout()
+            .project()
+            .sessions
+            .join(format!(
+                ".trash/notes-{}.dmg",
+                metadata.workspace_incarnation
+            ))
+            .exists(),
+        "an abandonment keeps no recovery image"
     );
-    assert_eq!(
-        fs::read(recovery.join("ignored-notes")).unwrap(),
-        b"only ignored copy\n"
+    assert!(
+        abandoned["abandoned"]["uncommitted"].is_string(),
+        "{abandoned}"
     );
-    missing_record
-        .shutdown()
-        .await
-        .expect("stop missing-record runtime");
+    runtime.shutdown().await.expect("stop runtime");
 }
 
 /// A restore whose unbinding fails after main retired is finished by the same command again
