@@ -7544,8 +7544,10 @@ async fn real_apfs_rm_reaps_the_keepers_start_in_its_restart_backoff_before_its_
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
     let topic = new_workspace(&mut service, "outputs").await;
-    let log = topic.join("keeper-starts");
-    let release = topic.join("keeper-release");
+    // Hidden, so junk to rm's dirt rule: `--force` waives no uncommitted work, and these files
+    // are the test's scaffolding, not the workspace's.
+    let log = topic.join(".keeper-starts");
+    let release = topic.join(".keeper-release");
     let fifo = std::ffi::CString::new(release.as_os_str().as_bytes()).expect("a FIFO path");
     // SAFETY: a NUL-terminated path and a mode; -1 is an error.
     assert_eq!(
