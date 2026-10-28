@@ -1427,8 +1427,10 @@ Concretely:
   **Under mbx the wrapper links but is never cached.** mbx identifies a `-C linker` only when its file name is `clang`
   or `clang++`, and any other bypasses the link cache while the link still runs (mbx limits, "Linker overrides and link
   arguments"); it models `-C link-arg=-fuse-ld=<absolute path>` and keys that linker's path and version. The form mbx
-  caches is `linker = "/usr/bin/clang"` for the macOS target in `.cargo/config.toml`, `MBX_LINKER=path:/usr/bin/ld`
-  exported by the dev shell, and the dev shell's `SDKROOT` selecting the SDK. Measured 2026-10-27: the wrapper bypasses
+  caches is Apple's clang driver as the macOS target's Rust linker (`/usr/bin/clang`), with no wrapper and no
+  `MBX_LINKER`: the driver picks its own toolchain `ld`, and the dev shell's `SDKROOT` selects the SDK. A repository
+  whose tracked config may not name a system path exports it from its dev shell as
+  `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER`, beside its compiler variables. Measured 2026-10-27: the wrapper bypasses
   as `unportable-native-link`, and in the cached form a native test link restores from the store with no compiler run.
   An mbx project switches to the cached form only on the link measurement in Migration. The Darwin dev shell disables
   devenv's C tools, uses a compiler-free stdenv, and removes only the Rust toolchain's propagated Nix compiler while
@@ -1671,11 +1673,22 @@ A host moves to this model in one release, in this order:
    Layouts"); Rust projects without mbx keep all three.
 5. **The linker wrapper goes only if linking through mbx is faster.** After a project's mbx cutover, on one host, it
    links the same fixtures (two test binaries of the project's largest dependency graphs) both ways: through the
-   repository's wrapper, and through `/usr/bin/clang` with `MBX_LINKER` ("One Cargo environment on every path"). Each
-   way is timed on a link-cache miss and on a hit, the hit being an edit of one leaf crate and the relink. Both sides
-   are measured in the same session, never against a recorded baseline, because the expected gain is under tenfold. The
-   wrapper is removed only when the mbx form is faster on the miss, or faster on the hit at no greater cost on the miss.
-   The measured link times are recorded here, with the decision they gave.
+   repository's wrapper, and through Apple's clang driver ("One Cargo environment on every path"). Each way is timed on
+   a link-cache miss and on a hit, the hit being an edit of one leaf crate and the relink. Both sides are measured in
+   the same session, never against a recorded baseline, because the expected gain is under tenfold. The wrapper is
+   removed only when the mbx form is faster on the miss, or faster on the hit at no greater cost on the miss. The
+   measured link times are recorded here, with the decision they gave.
+
+   Measured 2026-10-28 on the first project to cut over: one fork, one session, two library test binaries (a miss is a
+   fresh `--cfg`, a hit a touch and the same `--cfg`), seconds per binary:
+
+   | Form                        | Miss       | Hit        |
+   | --------------------------- | ---------- | ---------- |
+   | wrapper (median of 3)       | 12.3 / 8.5 | 10.8 / 9.5 |
+   | clang driver via mbx (of 6) | 12.7 / 8.3 | 2.5 / 2.7  |
+
+   About four times faster on the hit, and the misses within each other's ranges (+3% / −2%): that project removed its
+   wrapper. SmoothBricks measures its own at its cutover.
 
 **Overlap with the cowshed-core crate split.** The split moves the code this model changes (00_overview.md, "Crate
 map"). The model's code lands in the existing module at each item's planned crate, so the split later moves it

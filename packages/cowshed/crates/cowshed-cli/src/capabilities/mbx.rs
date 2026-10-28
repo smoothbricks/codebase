@@ -266,6 +266,114 @@ fn flake_directory_from(search_from: &Path) -> Result<PathBuf> {
     ))
 }
 
+/// What setup or adopt added to mbx's two target-collection lists (03_caches.md, "mbx"): the
+/// mains now in `target.keep` and the shed mount trees now in `target.evict_first`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TargetCollection {
+    pub kept: Vec<PathBuf>,
+    pub evicted_first: Vec<PathBuf>,
+}
+
+impl TargetCollection {
+    /// One line per path this run added, `target.keep` first.
+    pub fn phrases(&self) -> impl Iterator<Item = String> + '_ {
+        let named = |key: &'static str| {
+            move |path: &PathBuf| format!("mbx: {key} names {}", path.display())
+        };
+        self.kept.iter().map(named(mbx::TARGET_KEEP)).chain(
+            self.evicted_first
+                .iter()
+                .map(named(mbx::TARGET_EVICT_FIRST)),
+        )
+    }
+}
+
+/// Name `mains` in the host mbx's `target.keep` and `shed_trees` in its `target.evict_first`,
+/// keeping every entry the operator wrote (03_caches.md, "mbx"). `None` on a host that keeps no
+/// cowshed mbx. Run with a cleared environment, as every read of the host's settings is, so a
+/// caller's `MBX_*` cannot redirect the write.
+pub fn configure_target_collection(
+    home: &Path,
+    mains: &[PathBuf],
+    shed_trees: &[PathBuf],
+) -> Result<Option<TargetCollection>> {
+    let executable = mbx::host_link(home);
+    if std::fs::symlink_metadata(&executable).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(TargetCollection {
+        kept: name_in(&executable, home, mbx::TARGET_KEEP, mains)?,
+        evicted_first: name_in(&executable, home, mbx::TARGET_EVICT_FIRST, shed_trees)?,
+    }))
+}
+
+/// Add `required` to the list setting `key`; the paths it added.
+fn name_in(
+    executable: &Path,
+    home: &Path,
+    key: &str,
+    required: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let printed = settings(executable, home, &["get", key])?;
+    let current = mbx::parse_setting_list(&printed).map_err(|text| {
+        CowshedError::environment_missing(
+            format!("mbx's {key} reads {text:?}, which is no list of paths"),
+            format!("repair it with mbx settings set {key} <paths>"),
+        )
+    })?;
+    let Some(list) = mbx::with_required(&current, required).map_err(|path| {
+        CowshedError::usage(
+            format!("{path} cannot be named in mbx's {key}: mbx takes its items comma-separated"),
+            "move the checkout to a path without a comma",
+        )
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    settings(executable, home, &["set", key, &list.join(",")])?;
+    Ok(required
+        .iter()
+        .filter(|path| {
+            !current
+                .iter()
+                .any(|entry| Path::new(entry) == path.as_path())
+        })
+        .cloned()
+        .collect())
+}
+
+/// `mbx settings <args>` with a cleared environment; its stdout.
+fn settings(executable: &Path, home: &Path, args: &[&str]) -> Result<String> {
+    // WHY unbounded: `mbx settings` reads or writes one TOML file and prints; it waits on nothing.
+    #[allow(clippy::disallowed_methods)]
+    let output = Command::new(executable)
+        .env_clear()
+        .env("HOME", home)
+        .arg("settings")
+        .args(args)
+        .output_locked()
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "the mbx installed beside cowshed, {}, cannot be executed: {error}",
+                    executable.display()
+                ),
+                "cowshed setup",
+            )
+        })?;
+    if !output.status.success() {
+        return Err(CowshedError::environment_missing(
+            format!(
+                "mbx settings {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            ),
+            "repair mbx's global configuration with mbx settings",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Remove the host's mbx link and release its GC root, for `setup --uninstall`: a link only, never
 /// a file cowshed did not make, and nothing under the nix store, which is nix's to collect.
 pub fn uninstall(home: &Path) -> Result<[crate::launchd::RemovalOutcome; 2]> {

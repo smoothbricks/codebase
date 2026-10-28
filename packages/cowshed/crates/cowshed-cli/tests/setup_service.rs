@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use cowshed_cli::args::{Command, GatewayCommand, ProjectDiscovery, SetupArgs, parse_args};
-use cowshed_cli::capabilities::mbx::MbxInstall;
+use cowshed_cli::capabilities::mbx::{MbxInstall, TargetCollection};
 use cowshed_cli::gateway_service::{CliInstall, ServiceBinaryRefresh};
 use cowshed_cli::help;
 use cowshed_cli::launchd::RemovalOutcome;
@@ -59,6 +59,8 @@ struct FakeHost {
     /// What installing cowshed's pinned mbx did, so its row and its failures are provable without
     /// nix or a home; `None` like a test host's `cli`, so the storage goldens carry no mbx row.
     mbx_install: Option<MbxInstall>,
+    /// What naming the mains and shed trees in mbx's target lists added.
+    mbx_targets: Option<TargetCollection>,
     build_state: Vec<ProjectBuildState>,
     /// The owners the store layout migration marked, so its sentence is provable without a store.
     owners: Vec<PathBuf>,
@@ -137,6 +139,7 @@ impl Default for FakeHost {
             services: Vec::new(),
             cli: None,
             mbx_install: None,
+            mbx_targets: None,
             build_state: Vec::new(),
             owners: Vec::new(),
             retirement: None,
@@ -246,6 +249,11 @@ impl HostSetup for FakeHost {
     async fn install_mbx(&mut self) -> Result<Option<MbxInstall>> {
         self.events.push(String::from("install-mbx"));
         Ok(self.mbx_install.clone())
+    }
+
+    async fn configure_mbx_targets(&mut self) -> Result<Option<TargetCollection>> {
+        self.events.push(String::from("configure-mbx-targets"));
+        Ok(self.mbx_targets.clone())
     }
 
     async fn retire_caches_volume(&mut self) -> Result<Option<RetirementReport>> {
@@ -2299,6 +2307,53 @@ async fn a_repair_links_the_pinned_mbx_after_storage_and_names_it() {
         ),
         "{}",
         streams.stderr
+    );
+}
+
+/// Once mbx is installed, setup names each adopted main in `target.keep` and each shed mount tree
+/// in `target.evict_first`, one line for each it added (03_caches.md, "mbx"); a host without
+/// mbx writes neither.
+#[tokio::test]
+async fn an_installed_mbx_keeps_each_main_and_evicts_shed_targets_first() {
+    let mut host = FakeHost {
+        mbx_install: Some(installed(true)),
+        mbx_targets: Some(TargetCollection {
+            kept: vec![PathBuf::from("/home/dev/src/widget")],
+            evicted_first: vec![PathBuf::from("/mnt/acme/widget")],
+        }),
+        ..FakeHost::default()
+    };
+    let streams = run(&mut host, REPAIR, false, false).await;
+    assert_eq!(streams.exit, 0);
+    assert!(
+        streams.stderr.contains(
+            "cowshed: mbx: target.keep names /home/dev/src/widget\ncowshed: mbx: target.evict_first names /mnt/acme/widget\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+    let position = |name: &str| host.events.iter().position(|event| event == name);
+    assert!(
+        position("install-mbx") < position("configure-mbx-targets"),
+        "{:?}",
+        host.events
+    );
+
+    let mut host = FakeHost {
+        mbx_install: Some(MbxInstall::NixMissing {
+            flake: PathBuf::from("/pkg/nix/mbx"),
+        }),
+        ..FakeHost::default()
+    };
+    let streams = run(&mut host, REPAIR, false, false).await;
+    assert_eq!(streams.exit, 0);
+    assert!(
+        !host
+            .events
+            .iter()
+            .any(|event| event == "configure-mbx-targets"),
+        "{:?}",
+        host.events
     );
 }
 

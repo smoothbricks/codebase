@@ -486,12 +486,16 @@ Within those budgets, mbx removes a managed target whose checkout is gone, regar
 objects, and when the store itself must shrink, compilations no live checkout uses go first. Cowshed bends that order
 exactly twice, through mbx's host-global settings: `target.keep` names each project's main checkout, whose managed
 target is never collected for age or size, and `target.evict_first` names the shed mount tree, whose targets go before
-any other when the targets are over budget. A kept target is still removed when its checkout is gone. `cowshed setup`
-writes both settings and `adopt` adds a project's main to `target.keep` [INFERENCE: the writing step's exact mechanics
-are the implementation's; the settings live in mbx's host-global configuration, never in a repository file]. Enforced by
-tests that must exist: after `setup` and `adopt`, mbx's effective settings show the shed tree in `target.evict_first`
-and each adopted main in `target.keep`; a removed shed's managed target is collected while main's survives an
-over-budget sweep; and a cowshed garbage-collection run leaves every byte under `<bc>/mbx` untouched.
+any other when the targets are over budget. A kept target is still removed when its checkout is gone. `cowshed setup`,
+once mbx is installed, names every adopted main in `target.keep` and every project's shed mount tree in
+`target.evict_first`, and `adopt` does the same for the set it joins. Both write through the installed mbx's
+`mbx settings set` with a cleared environment, append only what is missing after the operator's own entries, and say
+each path they added; an adoption whose write fails is still done, says so and names `cowshed setup`. Enforced by
+`a_printed_list_setting_is_unset_or_a_toml_array_of_strings`,
+`a_required_path_is_appended_once_after_the_operators_entries` and
+`an_installed_mbx_keeps_each_main_and_evicts_shed_targets_first`. Tests that must exist beyond those: a removed shed's
+managed target is collected while main's survives an over-budget sweep; and a cowshed garbage-collection run leaves
+every byte under `<bc>/mbx` untouched.
 
 The volume mounts `noatime` (01a_apfs.md). What that costs mbx, and whether the volume keeps `noatime` under that cost,
 is 16_build_volumes.md, "Open questions", not a choice made here.

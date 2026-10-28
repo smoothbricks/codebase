@@ -1577,6 +1577,29 @@ where
                 .clone()
                 .unwrap_or_else(|| DEFAULT_IMAGE_CAPACITY.to_string());
             let (info, re_adoption) = service.adopt(options).await?;
+            // The adopted main's managed target is kept, and its sheds' go first (03_caches.md,
+            // "mbx"). The adoption is done either way: a list this could not write is said, and
+            // the next `cowshed setup` writes it.
+            let home = cowshed_core::gateway_sessions::canonical_home()?;
+            let targets = match crate::setup_service::adopted_target_paths(&home)
+                .await
+                .and_then(|(mains, shed_trees)| {
+                    crate::capabilities::mbx::configure_target_collection(
+                        &home,
+                        &mains,
+                        &shed_trees,
+                    )
+                }) {
+                Ok(targets) => targets,
+                Err(error) => {
+                    output
+                        .guidance(&format!("mbx: target lists not updated: {}", error.message))
+                        .map_err(output_error)?;
+                    output.hint("cowshed setup").map_err(output_error)?;
+                    None
+                }
+            };
+            crate::setup_service::emit_mbx_targets(targets.as_ref(), output)?;
             let outcome = match &re_adoption {
                 Some(re_adoption) => AdoptionOutcome::Replaced(re_adoption),
                 None => AdoptionOutcome::Created {

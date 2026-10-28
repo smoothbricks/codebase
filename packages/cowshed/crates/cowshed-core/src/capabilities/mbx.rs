@@ -413,9 +413,111 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     Ok(contribution)
 }
 
+/// The host-global mbx list that names checkouts whose managed targets mbx never collects for
+/// age or size (03_caches.md, "mbx"): each adopted project's main.
+pub const TARGET_KEEP: &str = "target.keep";
+/// The host-global mbx list whose checkouts' targets go first when the targets are over budget:
+/// each adopted project's shed mount tree.
+pub const TARGET_EVICT_FIRST: &str = "target.evict_first";
+
+/// A list setting as `mbx settings get` prints it: nothing when unset, else a TOML array of
+/// strings. Anything else is the text itself as the error.
+pub fn parse_setting_list(printed: &str) -> std::result::Result<Vec<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct Printed {
+        list: Vec<String>,
+    }
+    let text = printed.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    toml::from_str::<Printed>(&format!("list = {text}"))
+        .map(|printed| printed.list)
+        .map_err(|_| text.to_owned())
+}
+
+/// The list `current` with every `required` path in it: the operator's entries kept, in their
+/// order, and each missing path appended after them. `None` when every path is already there,
+/// so nothing is written. A path mbx's comma-separated list input cannot carry is the error.
+pub fn with_required(
+    current: &[String],
+    required: &[PathBuf],
+) -> std::result::Result<Option<Vec<String>>, String> {
+    let mut list = current.to_vec();
+    for path in required {
+        let Some(text) = path.to_str().filter(|text| !text.contains(',')) else {
+            return Err(path.display().to_string());
+        };
+        if !list.iter().any(|entry| entry == text) {
+            list.push(text.to_owned());
+        }
+    }
+    Ok((list.len() != current.len()).then_some(list))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_printed_list_setting_is_unset_or_a_toml_array_of_strings() {
+        for (printed, parsed) in [
+            ("", Ok(vec![])),
+            ("\n", Ok(vec![])),
+            ("[]\n", Ok(vec![])),
+            (
+                "[\"/a b\", \"/c\"]\n",
+                Ok(vec!["/a b".to_owned(), "/c".to_owned()]),
+            ),
+            ("\"/a\"\n", Err("\"/a\"".to_owned())),
+            ("[1]\n", Err("[1]".to_owned())),
+        ] {
+            assert_eq!(parse_setting_list(printed), parsed, "{printed:?}");
+        }
+    }
+
+    /// Setup and adopt add each required path once and keep what the operator listed, in its
+    /// order; a list that already names every path is not written again.
+    #[test]
+    fn a_required_path_is_appended_once_after_the_operators_entries() {
+        let main = PathBuf::from("/home/dev/src/widget");
+        let sheds = PathBuf::from("/mnt/acme/widget");
+        let own = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| (*item).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for (current, required, written) in [
+            (
+                own(&[]),
+                vec![main.clone()],
+                Ok(Some(own(&["/home/dev/src/widget"]))),
+            ),
+            (
+                own(&["~/work"]),
+                vec![main.clone(), sheds.clone()],
+                Ok(Some(own(&[
+                    "~/work",
+                    "/home/dev/src/widget",
+                    "/mnt/acme/widget",
+                ]))),
+            ),
+            (own(&["/home/dev/src/widget"]), vec![main.clone()], Ok(None)),
+            (own(&["/x"]), vec![], Ok(None)),
+            (
+                own(&[]),
+                vec![PathBuf::from("/home/dev/a,b")],
+                Err("/home/dev/a,b".to_owned()),
+            ),
+        ] {
+            assert_eq!(
+                with_required(&current, &required),
+                written,
+                "{current:?} {required:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_project_mbx_is_admitted_only_as_the_host_pin_itself() {

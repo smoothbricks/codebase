@@ -94,12 +94,11 @@ revision".
 There is nothing else to declare for mbx. It runs no daemon and owns no socket (03_caches.md, "mbx"), so
 `programs.cowshed` has no mbx option and neither mode installs an agent for it: home-manager owns the generation that
 puts the pin in place, and the cache it serves lives on the build-cache volume under mbx's own collection
-(03_caches.md).
-
-**The host mbx's settings are the operator's.** Cowshed reads the installed mbx's scheduler settings with
-`mbx settings get` and writes none. One is recommended above its default: `events_max_size`. At the 16 MiB default an a
-large workspace's warm-up truncated its event recording, and `mbx explain --last` then answered "no earlier recording"
-for the units it had dropped (measured 2026-10-28).
+(03_caches.md). **The host mbx's settings are the operator's.** Cowshed reads the installed mbx's scheduler settings
+with `mbx settings get`, and writes only `target.keep` and `target.evict_first`, appending to what the operator listed
+(03_caches.md, "mbx"). One more is recommended above its default: `events_max_size`. At the 16 MiB default a large
+workspace's warm-up truncated its event recording, and `mbx explain --last` then answered "no earlier recording" for the
+units it had dropped (measured 2026-10-28). for the units it had dropped (measured 2026-10-28).
 
 The imperative install is three steps of every `cowshed setup` that reaches its host services: build the flake the
 package ships at `nix/mbx` (its `flake.lock` locks mbx's own nixpkgs exactly as mbx's flake does, so the build is the

@@ -17,7 +17,7 @@
 //! prompt and `--force` is the answer.
 
 use crate::args::SetupArgs;
-use crate::capabilities::mbx::MbxInstall;
+use crate::capabilities::mbx::{MbxInstall, TargetCollection};
 use crate::gateway_service::{
     CliInstall, Downgrade, ServiceBinaryRefresh, canonical_home, gateway_launch_agent,
     output_error, remove_host_stable_executable, remove_launch_agent, remove_path_entries,
@@ -212,6 +212,13 @@ pub trait HostSetup: Send {
     /// `None` for a test host, which must never build or link into a real home; the native host
     /// answers always.
     async fn install_mbx(&mut self) -> Result<Option<MbxInstall>> {
+        Ok(None)
+    }
+    /// Name every adopted main in the host mbx's `target.keep` and every shed mount tree in its
+    /// `target.evict_first` (03_caches.md, "mbx"), after mbx is installed.
+    ///
+    /// `None` for a test host, which must never write a real home's mbx settings.
+    async fn configure_mbx_targets(&mut self) -> Result<Option<TargetCollection>> {
         Ok(None)
     }
     /// Steps 1–3 of retiring the caches volume (03_caches.md): move everything it holds to its
@@ -572,6 +579,38 @@ impl HostSetup for NativeHostSetup {
         let flake = crate::capabilities::mbx::flake_directory()?;
         crate::capabilities::mbx::install(&self.home, &flake).map(Some)
     }
+
+    async fn configure_mbx_targets(&mut self) -> Result<Option<TargetCollection>> {
+        let (mains, shed_trees) = adopted_target_paths(&self.home).await?;
+        crate::capabilities::mbx::configure_target_collection(&self.home, &mains, &shed_trees)
+    }
+}
+
+/// Every adopted project's main checkout and its shed mount tree, for mbx's target lists.
+pub(crate) async fn adopted_target_paths(home: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let storage = validate_existing_host_storage(home).await?;
+    let projects = NativeGatewayInventory::new(storage.clone())
+        .adopted_projects()
+        .await
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("could not enumerate adopted projects for mbx's target lists: {error}"),
+                "cowshed doctor",
+            )
+        })?;
+    let mut mains = Vec::with_capacity(projects.len());
+    let mut shed_trees = Vec::with_capacity(projects.len());
+    for project in projects {
+        let layout = StorageLayout::new(storage.store(), &project.repo_id).map_err(|error| {
+            CowshedError::internal(format!(
+                "could not resolve the layout of {}: {error}",
+                project.repo_id
+            ))
+        })?;
+        shed_trees.push(layout.project().host_mount_root.clone());
+        mains.push(project.project_root);
+    }
+    Ok((mains, shed_trees))
 }
 
 /// The `[caches] home` paths every adopted project's main declares, for placing a repository's
@@ -811,6 +850,11 @@ where
         Some(_) => None,
         None => setup.install_mbx().await?,
     };
+    // Once the host's mbx is the installed pin, its target lists name each main and shed tree.
+    let mbx_targets = match &mbx {
+        Some(MbxInstall::Installed { .. }) => setup.configure_mbx_targets().await?,
+        _ => None,
+    };
     let build_state = match &failure {
         Some(_) => Vec::new(),
         None => {
@@ -855,12 +899,29 @@ where
                 // has to resolve still reaches them in a scripted run.
                 emit_legacy_sccache(&legacy, output)?;
                 emit_mbx_install(mbx.as_ref(), output)?;
+                emit_mbx_targets(mbx_targets.as_ref(), output)?;
                 emit_build_state(&build_state, output)?;
             }
-            _ => render_repair(&plan, &report, &readiness, &legacy, mbx.as_ref(), output)?,
+            _ => render_repair(
+                &plan,
+                &report,
+                &readiness,
+                &legacy,
+                mbx.as_ref(),
+                mbx_targets.as_ref(),
+                output,
+            )?,
         }
     } else {
-        render_repair(&plan, &report, &readiness, &legacy, mbx.as_ref(), output)?;
+        render_repair(
+            &plan,
+            &report,
+            &readiness,
+            &legacy,
+            mbx.as_ref(),
+            mbx_targets.as_ref(),
+            output,
+        )?;
     }
     let retirement_refused =
         emit_retirement(retirement.as_ref(), retire_requested, retire, output)?;
@@ -1381,6 +1442,7 @@ fn render_repair<W: Write, E: Write>(
     readiness: &RepairReadiness<'_>,
     legacy: &[HostArtifactRemoval],
     mbx: Option<&MbxInstall>,
+    mbx_targets: Option<&TargetCollection>,
     output: &mut Output<W, E>,
 ) -> Result<()> {
     // The per-action outcomes come first and only when there is something to say: they are the
@@ -1415,6 +1477,7 @@ fn render_repair<W: Write, E: Write>(
     // host rather than about one file.
     emit_legacy_sccache(legacy, output)?;
     emit_mbx_install(mbx, output)?;
+    emit_mbx_targets(mbx_targets, output)?;
     // An exhaustive match, not an `if let`: an outcome this module does not render is an outcome
     // the host silently kept to itself, which is the one thing a repair report must never do.
     for refresh in readiness.services {
@@ -1624,6 +1687,17 @@ fn emit_legacy_sccache<W: Write, E: Write>(
                 .guidance(&format!("removed the {}", removal.what))
                 .map_err(output_error)?;
         }
+    }
+    Ok(())
+}
+
+/// One line per path the run added to mbx's target lists, and nothing when it added none.
+pub(crate) fn emit_mbx_targets<W: Write, E: Write>(
+    targets: Option<&TargetCollection>,
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    for phrase in targets.into_iter().flat_map(TargetCollection::phrases) {
+        output.guidance(&phrase).map_err(output_error)?;
     }
     Ok(())
 }
