@@ -213,6 +213,17 @@ pub fn admit(project: &Path, host: &HostMbx, build_cache: Option<&Path>) -> Admi
 }
 
 impl Admission {
+    /// The finding code doctor and admission name this verdict by, or `None` when it admits.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Admit => None,
+            Self::HostMissing | Self::HostUnresolved { .. } => Some("mbx-host-missing"),
+            Self::Skew { .. } => Some("mbx-revision-skew"),
+            Self::MemoryUnscheduled => Some("mbx-memory-unscheduled"),
+            Self::NoBuildCache => Some("mbx-build-cache-missing"),
+        }
+    }
+
     /// The refusal a job of the project gets, or `None` when it is admitted. No arm selects
     /// another pool or falls back to cowshed's own ledger.
     pub fn refusal(&self, project: &Path) -> Option<CowshedError> {
@@ -281,8 +292,25 @@ pub fn recorded(checkout: &Path) -> Result<Option<PathBuf>> {
 /// Admit or refuse work of `checkout` on this host: a checkout whose canonical environment
 /// resolved no mbx is admitted as it always was.
 pub fn admit_checkout(checkout: &Path, home: &Path, build_cache: Option<&Path>) -> Result<()> {
+    match checkout_verdict(checkout, home, build_cache)? {
+        Some((project, verdict)) => match verdict.refusal(&project) {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        },
+        None => Ok(()),
+    }
+}
+
+/// The verdict for `checkout`'s jobs beside the realpath of the mbx its discovery recorded, or
+/// `None` for a checkout whose canonical environment resolves no mbx: what admission refuses
+/// with and doctor reports (05_gateway.md, "Pool selection and revision").
+pub fn checkout_verdict(
+    checkout: &Path,
+    home: &Path,
+    build_cache: Option<&Path>,
+) -> Result<Option<(PathBuf, Admission)>> {
     let Some(project) = recorded(checkout)? else {
-        return Ok(());
+        return Ok(None);
     };
     let host = observe_host(home);
     let mut verdict = admit(&project, &host, build_cache);
@@ -292,10 +320,7 @@ pub fn admit_checkout(checkout: &Path, home: &Path, build_cache: Option<&Path>) 
     {
         verdict = Admission::MemoryUnscheduled;
     }
-    match verdict.refusal(&project) {
-        Some(refusal) => Err(refusal),
-        None => Ok(()),
-    }
+    Ok(Some((project, verdict)))
 }
 
 /// Host shells source the same canonical mbx environment as supervisor children (11_shell.md,
@@ -515,6 +540,42 @@ mod tests {
                 with_required(&current, &required),
                 written,
                 "{current:?} {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_refusing_verdict_has_the_code_its_message_leads_with() {
+        let project = Path::new("/pinned/mbx-1.28.0/bin/mbx");
+        for (verdict, code) in [
+            (Admission::Admit, None),
+            (Admission::HostMissing, Some("mbx-host-missing")),
+            (
+                Admission::HostUnresolved {
+                    link: PathBuf::from("/home/dev/bin/mbx"),
+                    cause: "gone".to_owned(),
+                },
+                Some("mbx-host-missing"),
+            ),
+            (
+                Admission::Skew {
+                    host: PathBuf::from("/pinned/mbx-1.27.0/bin/mbx"),
+                },
+                Some("mbx-revision-skew"),
+            ),
+            (Admission::MemoryUnscheduled, Some("mbx-memory-unscheduled")),
+            (Admission::NoBuildCache, Some("mbx-build-cache-missing")),
+        ] {
+            assert_eq!(verdict.code(), code, "{verdict:?}");
+            assert_eq!(
+                verdict.refusal(project).map(|refusal| refusal
+                    .message
+                    .split(':')
+                    .next()
+                    .unwrap()
+                    .to_owned()),
+                code.map(str::to_owned),
+                "{verdict:?}"
             );
         }
     }

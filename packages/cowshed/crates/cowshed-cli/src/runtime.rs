@@ -4696,6 +4696,54 @@ fn retired_mount_layout_findings(store_root: &Path) -> Vec<Finding> {
     }
 }
 
+/// The mbx refusal each adopted main's jobs would get (05_gateway.md, "Pool selection and
+/// revision"), said by doctor before a job says it: the host's mbx missing or unresolved, a
+/// project pin of another build, an unscheduled memory ledger, or no build-cache volume.
+async fn mbx_findings(home: &Path) -> Vec<Finding> {
+    let mains = match crate::setup_service::adopted_target_paths(home).await {
+        Ok((mains, _)) => mains,
+        Err(error) => {
+            return vec![Finding {
+                code: "mbx".into(),
+                severity: FindingSeverity::Warning,
+                message: format!("cannot judge the adopted mains' mbx: {}", error.message),
+                hint: error.hint,
+                path: None,
+            }];
+        }
+    };
+    let build_cache = cowshed_core::storage::bootstrap::native::provisioned_build_cache();
+    mains
+        .into_iter()
+        .filter_map(|main| {
+            match cowshed_core::capabilities::mbx::checkout_verdict(
+                &main,
+                home,
+                build_cache.as_deref(),
+            ) {
+                Ok(Some((project, verdict))) => {
+                    let refusal = verdict.refusal(&project)?;
+                    Some(Finding {
+                        code: verdict.code()?.into(),
+                        severity: FindingSeverity::Error,
+                        message: refusal.message,
+                        hint: refusal.hint,
+                        path: Some(main),
+                    })
+                }
+                Ok(None) => None,
+                Err(error) => Some(Finding {
+                    code: "mbx".into(),
+                    severity: FindingSeverity::Error,
+                    message: format!("cannot judge {}'s mbx: {}", main.display(), error.message),
+                    hint: error.hint,
+                    path: Some(main),
+                }),
+            }
+        })
+        .collect()
+}
+
 /// The retired caches volume, while it exists, with the command that finishes its retirement:
 /// `cowshed setup` moves what it still holds, and `cowshed setup --retire-caches-volume` deletes
 /// it once only its marker is left (03_caches.md).
@@ -5033,6 +5081,7 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
         }],
     };
     findings.extend(probe_value("caches-volume", async { caches_volume_finding() }).await);
+    findings.extend(probe_value("mbx", mbx_findings(&home)).await);
     let gateway = probe("gateway-status", async {
         waits_on(
             format_args!("gateway-status"),
