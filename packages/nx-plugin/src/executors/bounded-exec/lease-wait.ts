@@ -1,3 +1,5 @@
+import type { tags } from 'typia';
+
 /** Peer wait classes from specs/cowshed/05_gateway.md, "Deadlines". */
 export const CONTROL_MS = 5_000;
 export const HEARTBEAT_MS = 5_000;
@@ -9,7 +11,19 @@ export interface CpuLeaseProgress {
   progress: number;
 }
 
-type CpuWaitState = { kind: 'sending' } | { kind: 'waiting'; at: number; last: string; sequence: number };
+/**
+ * The CPU pool's queue acknowledgement, shared by its server and lease client. `server` is the pid of the process the
+ * pool runs in, so a wait that falls silent names the process to look at.
+ */
+export interface CpuLeaseQueued {
+  ok: true;
+  lease: 'queued';
+  server: number & tags.Type<'uint32'>;
+}
+
+type CpuWaitState =
+  | { kind: 'sending' }
+  | { kind: 'waiting'; at: number; last: string; sequence: number; server: number | null };
 
 /** A failed wait, not a failed command: expiry ends this client's admission only. */
 export interface CpuWaitFailure {
@@ -17,6 +31,15 @@ export interface CpuWaitFailure {
   boundMs: number;
   elapsedMs: number;
   last: string;
+  /** The last advancing heartbeat sequence the client read; 0 before the first. */
+  sequence: number;
+  /** The pool's pid as its queue acknowledgement named it; null before one, or from a pool that names none. */
+  server: number | null;
+}
+
+/** An expired CPU wait as its client keeps it: the failure, and the socket of the pool it waited on. */
+export interface CpuWaitRow extends CpuWaitFailure {
+  socket: string;
 }
 
 /** Pure CPU admission policy; its injected monotonic clock performs no I/O or scheduling. */
@@ -35,15 +58,18 @@ export class CpuLeaseWait {
   sent(): void {
     this.looked = this.now();
     if (this.state.kind === 'sending') {
-      this.state = { kind: 'waiting', at: this.now(), last: 'request sent', sequence: 0 };
+      this.state = { kind: 'waiting', at: this.now(), last: 'request sent', sequence: 0, server: null };
     }
   }
 
-  /** A queue entry proves actor progress, not a deadline for returning a token. */
-  queued(): void {
+  /**
+   * A queue entry proves actor progress, not a deadline for returning a token. It names the pool's pid when the pool
+   * says it.
+   */
+  queued(server: number | null): void {
     this.sent();
     if (this.state.kind === 'waiting') {
-      this.state = { ...this.state, at: this.now(), last: 'queued' };
+      this.state = { ...this.state, at: this.now(), last: 'queued', server };
     }
   }
 
@@ -52,7 +78,7 @@ export class CpuLeaseWait {
     this.sent();
     if (this.state.kind !== 'waiting' || !Number.isSafeInteger(sequence) || sequence <= this.state.sequence)
       return false;
-    this.state = { kind: 'waiting', at: this.now(), last: `heartbeat ${sequence}`, sequence };
+    this.state = { ...this.state, at: this.now(), last: `heartbeat ${sequence}`, sequence };
     return true;
   }
 
@@ -79,11 +105,12 @@ export class CpuLeaseWait {
   /** No total queue age exists: an advancing heartbeat keeps the wait alive indefinitely. */
   expired(): CpuWaitFailure | null {
     if (this.remainingMs() > 0) return null;
-    return {
-      code: this.state.kind === 'sending' ? 'TIMEOUT' : 'SILENT',
-      boundMs: this.state.kind === 'sending' ? CONTROL_MS : HEARTBEAT_SILENCE_MS,
-      elapsedMs: this.now() - this.started,
-      last: this.state.kind === 'sending' ? 'connecting or sending request' : this.state.last,
-    };
+    const elapsedMs = this.now() - this.started;
+    if (this.state.kind === 'sending') {
+      const last = 'connecting or sending request';
+      return { code: 'TIMEOUT', boundMs: CONTROL_MS, elapsedMs, last, sequence: 0, server: null };
+    }
+    const { last, sequence, server } = this.state;
+    return { code: 'SILENT', boundMs: HEARTBEAT_SILENCE_MS, elapsedMs, last, sequence, server };
   }
 }

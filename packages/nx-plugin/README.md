@@ -2276,11 +2276,22 @@ instead of each sizing its runner to the whole host. Its scope is one run. A com
 as configured, sized only by the ceilings it inherits, and nothing is said; a cowshed job's own jobserver fifo still
 reaches it by Cargo's own rule ("Cargo reads its holder's jobserver").
 
+The pool runs on a worker thread of its own (`cpu-pool-thread.ts`). The process that serves the run, the Nx daemon when
+installed plugins load in it or the Nx CLI without one, hashes tasks and builds the project graph in synchronous calls
+on its main thread; a pool on that thread wrote no heartbeat behind a 14.2 s `hashPlans`, and every runner queued on it
+failed `SILENT` while it was alive. Under Bun, which tests the source, the thread takes the transform preload the
+package's bunfig names, since a Bun worker starts without its parent's preloads. The `test-pool-silence` target proves
+the thread: a runner in another process, queued on a 1-token run pool, stays queued while the test's own thread blocks
+for 20 s, and is granted when the holder returns its token. Its file is not `*.test.ts`, so the shards skip its
+real-time waits.
+
 CPU admission connects and sends within the 5 s control bound, then waits for the queue acknowledgement and grant under
 15 s of actor silence, not a total queue deadline (`specs/cowshed/05_gateway.md`, "Deadlines"). A queued reply past 2 s
 is accepted; the disk gateway's old-protocol half-close is not CPU admission policy. While tokens are held, the pool
-actor sends an advancing heartbeat every 5 s, so a live queue waits until tokens return. A silent actor fails admission
-as `SILENT` with its endpoint, bound, waited time and last progress; the command never runs outside the pool.
+actor sends an advancing heartbeat every 5 s, so a live queue waits until tokens return. The queue acknowledgement names
+the pid of the process the pool runs in. A silent actor fails admission as `SILENT` with its endpoint, that pid, bound,
+waited time and last progress, and the refused run's verdict record keeps the failure as its typed `cpuWait` row; the
+command never runs outside the pool.
 
 A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual token count, and the same count as a make
 jobserver fifo beside it: `g − 1` token bytes, the command holding the implicit first, which the pool lends a socket

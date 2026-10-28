@@ -1,22 +1,31 @@
 import { describe, expect, it, jest } from 'bun:test';
 import { rm } from 'node:fs/promises';
-import { connect, createServer, type Socket } from 'node:net';
+import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
-import { createInterface } from 'node:readline';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_POOL_ENV, readInheritedCpuPool, takeParentCpuTokens } from './cpu-pool.js';
 import { holdLease } from './gateway-lease.js';
-import { CpuLeaseWait, HEARTBEAT_MS } from './lease-wait.js';
-import { closeRunCpuPool, serveRunCpuPool } from './run-cpu-pool.js';
+import { CONTROL_MS, CpuLeaseWait, HEARTBEAT_MS, HEARTBEAT_SILENCE_MS } from './lease-wait.js';
+import { closeRunCpuPool, runPoolTokens, serveRunCpuPool } from './run-cpu-pool.js';
 import { CPU_TOKENS_ENV } from './runner-sizing.js';
 
 describe("an Nx run's own CPU pool", () => {
-  it("serves none in an mbx project, whose one pool is mbx's", async () => {
-    const env: NodeJS.ProcessEnv = { MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx' };
-    await serveRunCpuPool({ id: 'run-mbx' }, env, 4);
-    expect(readInheritedCpuPool(env)).toBeNull();
-    expect(env.CARGO_MAKEFLAGS).toBeUndefined();
-    await closeRunCpuPool({ id: 'run-mbx' });
+  it('holds one token per core, or a smaller inherited count, and is none beside an inherited pool or mbx', () => {
+    const cases = [
+      { name: 'no inherited count', env: {}, cores: 4, tokens: 4 },
+      { name: "a cowshed job's smaller count", env: { [CPU_TOKENS_ENV]: '3' }, cores: 8, tokens: 3 },
+      { name: 'never more than the cores', env: { [CPU_TOKENS_ENV]: '16' }, cores: 8, tokens: 8 },
+      {
+        name: "a pool the run inherits, an enclosing executor's",
+        env: { [CPU_POOL_ENV]: '/parent/pool.sock', [CPU_TOKENS_ENV]: '2' },
+        cores: 4,
+        tokens: null,
+      },
+      { name: "mbx's one pool", env: { MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx' }, cores: 4, tokens: null },
+    ] satisfies { name: string; env: NodeJS.ProcessEnv; cores: number; tokens: number | null }[];
+    for (const check of cases) {
+      expect(runPoolTokens(check.env, check.cores), check.name).toBe(check.tokens);
+    }
   });
 
   it('serves its tasks one pool of one token per core, so a second runner waits for the first', async () => {
@@ -57,18 +66,6 @@ describe("an Nx run's own CPU pool", () => {
     const env: NodeJS.ProcessEnv = { [CPU_POOL_ENV]: '/parent/pool.sock', [CPU_TOKENS_ENV]: '2' };
     await serveRunCpuPool({ id: 'nested' }, env, 4);
     expect(env).toEqual({ [CPU_POOL_ENV]: '/parent/pool.sock', [CPU_TOKENS_ENV]: '2' });
-  });
-
-  it("takes a cowshed job's smaller inherited count as its size, and never more than the cores", async () => {
-    for (const [inherited, cores, size] of [
-      ['3', 8, 3],
-      ['16', 8, 8],
-    ] as const) {
-      const env: NodeJS.ProcessEnv = { [CPU_TOKENS_ENV]: inherited };
-      await serveRunCpuPool({ id: `sized-${inherited}` }, env, cores);
-      expect(readInheritedCpuPool(env)?.tokens).toBe(size);
-      await closeRunCpuPool({ id: `sized-${inherited}` });
-    }
   });
 });
 
@@ -139,7 +136,7 @@ it('decides CPU admission from control completion and advancing actor progress, 
           wait.sent();
           break;
         case 'queued':
-          wait.queued();
+          wait.queued(null);
           break;
         case 'heartbeat':
           wait.heartbeat(event.sequence);
@@ -179,6 +176,35 @@ it('judges only a silence the client was running to see: its own late wake gives
   expect(timely.expired()?.code).toBe('SILENT');
 });
 
+it("answers a failure naming the pool's pid and the last heartbeat sequence the client read", () => {
+  let now = 0;
+  const unsent = new CpuLeaseWait(() => now);
+  now = CONTROL_MS;
+  expect(unsent.expired()).toEqual({
+    code: 'TIMEOUT',
+    boundMs: CONTROL_MS,
+    elapsedMs: CONTROL_MS,
+    last: 'connecting or sending request',
+    sequence: 0,
+    server: null,
+  });
+  now = 0;
+  const queued = new CpuLeaseWait(() => now);
+  queued.sent();
+  now = 1_000;
+  queued.queued(4242);
+  now = 6_000;
+  queued.heartbeat(1);
+  now = 6_000 + HEARTBEAT_SILENCE_MS;
+  expect(queued.expired()).toEqual({
+    code: 'SILENT',
+    boundMs: HEARTBEAT_SILENCE_MS,
+    elapsedMs: 6_000 + HEARTBEAT_SILENCE_MS,
+    last: 'heartbeat 1',
+    sequence: 1,
+    server: 4242,
+  });
+});
 it('accepts a CPU queue acknowledgement after the disk compatibility probe expires', async () => {
   const directory = await ownedSocketDirectory('cpu-admission-', 'p.sock');
   const socket = join(directory, 'p.sock');
@@ -212,32 +238,50 @@ it('accepts a CPU queue acknowledgement after the disk compatibility probe expir
   }
 });
 
-it('heartbeats a real CPU queue on its actor until a holder returns the token', async () => {
+it("keeps a silent pool's wait as a typed row naming its socket and the pid its acknowledgement gave", async () => {
+  const directory = await ownedSocketDirectory('cpu-silent-', 'p.sock');
+  const socket = join(directory, 'p.sock');
+  const { promise: requested, resolve: sawRequest } = Promise.withResolvers<Socket>();
+  const peers = new Set<Socket>();
+  const server = createServer({ allowHalfOpen: true }, (peer) => {
+    peers.add(peer);
+    peer.once('data', () => sawRequest(peer));
+  });
+  const { promise: listening, resolve: ready, reject } = Promise.withResolvers<void>();
+  server.once('error', reject);
+  server.listen(socket, ready);
+  await listening;
   jest.useFakeTimers();
-  const context = { id: 'heartbeat-wire' };
-  const env: NodeJS.ProcessEnv = {};
-  let child: Socket | undefined;
-  let release: (() => void) | undefined;
   try {
-    await serveRunCpuPool(context, env, 1);
-    const pool = readInheritedCpuPool(env);
-    if (pool === null) throw new Error('the run published no CPU pool');
-    const holder = await takeParentCpuTokens(pool, 1);
-    if (!holder.granted) throw new Error(holder.reason);
-    release = holder.release;
-    child = connect(pool.socket);
-    const lines = createInterface({ input: child })[Symbol.asyncIterator]();
-    child.once('connect', () => child?.write('{"op":"cpu-pool","want":1}\n'));
-    expect((await lines.next()).value).toBe('{"ok":true,"lease":"queued"}');
-    const progress = lines.next();
-    jest.advanceTimersByTime(5_000);
-    expect((await progress).value).toBe('{"ok":true,"progress":1}');
-    holder.release();
-    expect((await lines.next()).value).toBe('{"ok":true,"lease":"granted","tokens":1}');
+    let now = 0;
+    const { promise: queued, resolve: sawQueued } = Promise.withResolvers<void>();
+    const wait = new CpuLeaseWait(() => now);
+    const pending = holdLease(socket, { op: 'cpu-pool', want: 1 }, 'the parent CPU pool', wait, sawQueued);
+    const peer = await requested;
+    peer.write('{"ok":true,"lease":"queued","server":4242}\n');
+    await queued;
+    // The pool writes nothing more: its silence bound passes on the client's clock and timer alike.
+    now = HEARTBEAT_SILENCE_MS;
+    jest.advanceTimersByTime(HEARTBEAT_SILENCE_MS);
+    const lease = await pending;
+    expect(lease).toMatchObject({
+      granted: false,
+      code: 'SILENT',
+      wait: {
+        code: 'SILENT',
+        boundMs: HEARTBEAT_SILENCE_MS,
+        elapsedMs: HEARTBEAT_SILENCE_MS,
+        last: 'queued',
+        sequence: 0,
+        server: 4242,
+        socket,
+      },
+    });
+    expect(lease.granted ? '' : lease.reason).toContain(`the lease endpoint ${socket} (pid 4242) exceeded`);
   } finally {
-    child?.destroy();
-    release?.();
-    await closeRunCpuPool(context);
     jest.useRealTimers();
+    for (const peer of peers) peer.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true });
   }
 });

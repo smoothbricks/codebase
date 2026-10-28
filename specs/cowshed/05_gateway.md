@@ -917,10 +917,17 @@ the handshake bound.
   heartbeat-silence bound, never a total queue-age bound. A valid queued answer arriving after 2 s is still accepted:
   the disk lease's 2 s half-close probes a gateway predating that protocol and has no place in CPU admission. While
   requests wait for tokens, the pool actor writes `{"ok":true,"progress":n}` every 5 s. Only an advancing positive
-  sequence renews silence, as does the queued acknowledgement. The heartbeat runs on the same event loop that admits and
-  grants, not an independent liveness thread. A queue that keeps heartbeating waits until a token returns; a silent
-  actor fails admission as `SILENT`, naming the socket, bound, elapsed wait and last progress. Expiry ends only this
-  client's wait and releases its connection; it neither runs the command unbudgeted nor signals the pool.
+  sequence renews silence, as does the queued acknowledgement, `{"ok":true,"lease":"queued","server":pid}`, which names
+  the process the pool runs in. The heartbeat runs on the same event loop that admits and grants, not an independent
+  liveness thread, and that loop is the pool's own. An Nx run's pool runs on a worker thread of the process that serves
+  the run: that process (the Nx daemon when installed plugins load in it, the Nx CLI without one) hashes tasks and
+  builds the project graph in synchronous calls on its main thread, and a pool on that thread fell silent behind a 14.2
+  s `hashPlans` while it still worked. A granted `bounded-exec`'s sub-pool runs on its executor's thread, in the task
+  process Nx forks for that executor alone, which blocks on nothing longer than milliseconds. A queue that keeps
+  heartbeating waits until a token returns; a silent actor fails admission as `SILENT`, naming the socket, the pool's
+  pid, bound, elapsed wait and last progress, and a refused `bounded-exec` keeps that failure as the typed `cpuWait` row
+  of its verdict record. Expiry ends only this client's wait and releases its connection; it neither runs the command
+  unbudgeted nor signals the pool.
 - **The gateway control plane heartbeats the same way.** A one-shot request is connected, written and half-closed within
   the control bound. While its answer is not ready, and while an audit-tail follow waits for events, the gateway writes
   `{"ok":true,"progress":n}` every 5 s, once its actor has answered a ping. A heartbeat line, once begun, is written
@@ -1530,10 +1537,13 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   child takes the fifo's bytes first and the implicit token last, and its close writes them back, so a Cargo reading the
   fifo and a nested runner holding a grant never count one token twice. A granted `bounded-exec` serves its grant the
   same way, as a pool its own nested runners take from; no runner asks the gateway. A pool's end ends accounting, never
-  work: a command whose lending parent exits runs on to its own exit and is judged by that exit alone. The run's
-  `postTasksExecution` closes the pool; a run that dies first takes it with its process. The plugin's
-  `run-cpu-pool.test.ts` holds that shape over a real socket: two sweeps each asking 31 of a 4-token run pool, the first
-  granted 4 and the second queued until the first returned them.
+  work: a command whose lending parent exits runs on to its own exit and is judged by that exit alone. The run's pool
+  runs on a thread of its own ("Deadlines"); the run's `postTasksExecution` closes it, and a run that dies first takes
+  it with its process. The plugin's `run-cpu-pool.test.ts` holds that shape over a real socket: two sweeps each asking
+  31 of a 4-token run pool, the first granted 4 and the second queued until the first returned them. Its
+  `cpu-pool.silence.ts`, which the `test-pool-silence` target runs, queues a runner in another process on a 1-token run
+  pool and blocks the thread that served the run for the silence bound plus a heartbeat (20 s): the runner stays queued
+  and is granted once the holder returns its token.
 - **Runners are sized to the count.** The `bounded-exec` executor reads each runner's requested parallelism from the
   runner's own flag rather than assuming the core count, since a runner's flag and its actual concurrency can disagree:
   a `nextest run` names `--test-threads` or defaults to one per core, and one with `--no-capture` (`--nocapture` past

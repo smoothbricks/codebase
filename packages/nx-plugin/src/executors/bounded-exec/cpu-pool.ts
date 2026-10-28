@@ -7,14 +7,15 @@ import { promisify } from 'node:util';
 import typia from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
 import { holdLease, type Unleased } from './gateway-lease.js';
-import { type CpuLeaseProgress, CpuLeaseWait, HEARTBEAT_MS } from './lease-wait.js';
+import { type CpuLeaseProgress, type CpuLeaseQueued, CpuLeaseWait, HEARTBEAT_MS } from './lease-wait.js';
 import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
 
 /**
  * A CPU pool: the tokens a process lends the runners it starts, held live rather than inherited as a
  * bare count (specs/cowshed/05_gateway.md, "Host scheduling", "Parallelism inside a job"). An Nx run
- * serves one (`run-cpu-pool.ts`), and every granted bounded-exec serves a sub-pool of its grant to
- * its own descendants, so the runners of one build tree together stay within the tree's count.
+ * serves one on a thread of its own (`run-cpu-pool.ts`), and every granted bounded-exec serves a
+ * sub-pool of its grant to its own descendants, so the runners of one build tree together stay
+ * within the tree's count.
  *
  * The pool is a private Unix socket in a directory the process owns: the directory 0700, the socket
  * 0600. A child asks it for a count with one request line, in `holdLease`'s framing. The pool
@@ -52,7 +53,7 @@ export interface CpuPool {
   close(): Promise<CloseOutcome>;
 }
 
-type CloseOutcome = { ok: true } | { ok: false; error: string };
+export type CloseOutcome = { ok: true } | { ok: false; error: string };
 
 /** The one line a child sends: a count of whole tokens, at least one. */
 interface CpuPoolRequest {
@@ -63,7 +64,7 @@ interface CpuPoolRequest {
 /** The pool's answers, in `holdLease`'s framing. */
 type CpuPoolReply =
   | CpuLeaseProgress
-  | { ok: true; lease: 'queued' }
+  | CpuLeaseQueued
   | { ok: true; lease: 'granted'; tokens: number }
   | { ok: false; code: 'invalid-request'; error: string };
 
@@ -528,7 +529,7 @@ export async function createCpuPool(
       const request = parsed;
       child.phase = { kind: 'queued' };
       queue.push({ child, want: request.want });
-      socket.write(frame({ ok: true, lease: 'queued' }));
+      socket.write(frame({ ok: true, lease: 'queued', server: process.pid }));
       drain(0);
     });
   };

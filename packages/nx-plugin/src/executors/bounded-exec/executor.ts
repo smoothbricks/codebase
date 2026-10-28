@@ -26,6 +26,7 @@ import {
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
+import type { CpuWaitRow } from './lease-wait.js';
 import type { LockWait } from './lock-wait.js';
 import { mbxLeaf, mbxPool, withMbxLeaf } from './mbx-pool.js';
 import { createNoSpaceWatch } from './no-space.js';
@@ -516,6 +517,7 @@ export async function runBoundedExec(
   // instead. A pool whose endpoint is gone (its holder exited) lends nothing, and the run goes on as asked.
   let grant: GrantedTokens | null = null;
   let parentRefusal: string | null = null;
+  let parentWait: CpuWaitRow | undefined;
   if (inherited !== null) {
     const fromParent = await takeParentCpuTokens(inherited, demand.want);
     if (fromParent.granted) {
@@ -524,6 +526,7 @@ export async function runBoundedExec(
       appendStderr(`cowshed: cpu-pool parent pool absent: ${fromParent.reason}; running the command as asked\n`);
     } else {
       parentRefusal = fromParent.reason;
+      parentWait = fromParent.wait;
     }
   }
   const waitedMs = Date.now() - asked;
@@ -583,7 +586,13 @@ export async function runBoundedExec(
     if (verdict.outcome === 'bound' && verdict.bound === 'test') {
       appendStderr(`Every failing test failed only on its per-test timeout: ${verdict.tests.join(', ')}\n`);
     }
-    await writeRecord(recordDirectory, { task: task.id, hash: task.hash, verdict, ...(cpu ? { cpu } : {}) });
+    await writeRecord(recordDirectory, {
+      task: task.id,
+      hash: task.hash,
+      verdict,
+      ...(cpu ? { cpu } : {}),
+      ...(parentWait ? { cpuWait: parentWait } : {}),
+    });
   };
   // A run refused before its command starts says why, gives back its grant and RAM, and records the failure.
   const refuse = async (message: string): Promise<BoundedExecResult> => {

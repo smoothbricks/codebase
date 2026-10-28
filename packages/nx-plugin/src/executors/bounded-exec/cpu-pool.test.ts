@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it, jest } from 'bun:test';
 import {
   chmodSync,
   closeSync,
@@ -15,6 +15,7 @@ import {
 import { writeFile } from 'node:fs/promises';
 import { connect, type Socket } from 'node:net';
 import { dirname, join } from 'node:path';
+import { createInterface } from 'node:readline';
 import typia from 'typia';
 import { ownedSocketDirectory, socketNamespace } from '../../testing.js';
 import {
@@ -26,13 +27,13 @@ import {
   type TokenGrant,
   takeParentCpuTokens,
 } from './cpu-pool.js';
-import type { CpuLeaseProgress } from './lease-wait.js';
+import { type CpuLeaseProgress, type CpuLeaseQueued, HEARTBEAT_MS } from './lease-wait.js';
 import { CPU_TOKENS_ENV } from './runner-sizing.js';
 
 /** The pool's replies as the wire carries them, one line each. */
 type PoolReply =
   | CpuLeaseProgress
-  | { ok: true; lease: 'queued' }
+  | CpuLeaseQueued
   | { ok: true; lease: 'granted'; tokens: number }
   | { ok: false; code: 'invalid-request'; error: string };
 
@@ -53,7 +54,7 @@ interface Opened {
 }
 
 const NEVER: Promise<void> = new Promise<void>(() => {});
-const QUEUED: PoolReply = { ok: true, lease: 'queued' };
+const QUEUED: PoolReply = { ok: true, lease: 'queued', server: process.pid };
 const pools: CpuPool[] = [];
 const sockets: Socket[] = [];
 const directories: string[] = [];
@@ -310,6 +311,26 @@ describe('the parent-held CPU pool', () => {
     const next = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 2 }));
     expect(await next.next()).toEqual(QUEUED);
     expect(await next.next()).toEqual({ ok: true, lease: 'granted', tokens: 2 });
+  });
+
+  it('heartbeats a queued child on its actor every heartbeat until a holder returns the token', async () => {
+    jest.useFakeTimers();
+    try {
+      const { parent } = await openPool(1);
+      const holder = await takeOrThrow(parent, 1);
+      const child = connect(parent.socket);
+      sockets.push(child);
+      const lines = createInterface({ input: child })[Symbol.asyncIterator]();
+      child.once('connect', () => child.write('{"op":"cpu-pool","want":1}\n'));
+      expect((await lines.next()).value).toBe(`{"ok":true,"lease":"queued","server":${process.pid}}`);
+      const progress = lines.next();
+      jest.advanceTimersByTime(HEARTBEAT_MS);
+      expect((await progress).value).toBe('{"ok":true,"progress":1}');
+      holder.release();
+      expect((await lines.next()).value).toBe('{"ok":true,"lease":"granted","tokens":1}');
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it("returns a SIGKILLed holder's tokens to its queued sibling", async () => {

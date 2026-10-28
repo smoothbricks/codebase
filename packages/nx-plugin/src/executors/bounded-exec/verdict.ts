@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { CpuWaitRow } from './lease-wait.js';
 import { describeHolders, type LockWait, type Opener } from './lock-wait.js';
 
 /**
@@ -79,6 +80,12 @@ export interface BoundedExecRecord {
     readonly want: number;
     readonly waitedMs: number;
   };
+  /**
+   * The parent CPU pool's wait that expired and refused the run: its code, bound and elapsed time, the last heartbeat
+   * sequence it read, and the pool's socket and pid (specs/cowshed/05_gateway.md, "Deadlines"). Absent when no wait
+   * expired; written for the reader of a refused run, never read back.
+   */
+  readonly cpuWait?: CpuWaitRow;
 }
 
 /** The Nx task a run executes as. Nx gives an executor no task id, only its parts. */

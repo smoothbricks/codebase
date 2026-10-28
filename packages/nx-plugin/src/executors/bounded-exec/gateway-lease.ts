@@ -1,8 +1,9 @@
 import { connect } from 'node:net';
 import typia from 'typia';
-import { type CpuLeaseProgress, CpuLeaseWait } from './lease-wait.js';
+import { type CpuLeaseProgress, type CpuLeaseQueued, CpuLeaseWait, type CpuWaitRow } from './lease-wait.js';
 
 const isCpuProgress = typia.createEquals<CpuLeaseProgress>();
+const isCpuQueued = typia.createEquals<CpuLeaseQueued>();
 
 /**
  * The client half of a lease held on a unix socket: the gateway's host disk-lifecycle lease
@@ -35,8 +36,8 @@ export interface LeaseBounds {
  */
 export type UnleasedCause = 'absent' | 'predates' | 'predates-field' | 'other';
 
-/** A refusal: the lease is not held, and why. */
-export type Unleased = { granted: false; cause: UnleasedCause; reason: string; code?: string };
+/** A refusal: the lease is not held, and why. A CPU wait that expired carries its typed row. */
+export type Unleased = { granted: false; cause: UnleasedCause; reason: string; code?: string; wait?: CpuWaitRow };
 
 /**
  * A granted lease with its `granted` answer, held until released, or why there is none. `closed`
@@ -89,8 +90,14 @@ export function holdLease(
     }
     resolve(outcome);
   };
-  const unleased = (reason: string, cause: UnleasedCause = 'other', code?: string) =>
-    settle({ granted: false, cause, reason, ...(code === undefined ? {} : { code }) });
+  const unleased = (reason: string, cause: UnleasedCause = 'other', code?: string, wait?: CpuWaitRow) =>
+    settle({
+      granted: false,
+      cause,
+      reason,
+      ...(code === undefined ? {} : { code }),
+      ...(wait === undefined ? {} : { wait }),
+    });
   const wait = (ms: number, onExpiry: () => void) => {
     clearTimeout(timer);
     timer = setTimeout(onExpiry, ms);
@@ -104,10 +111,12 @@ export function holdLease(
         armCpu();
         return;
       }
+      const peer = failure.server === null ? socket : `${socket} (pid ${failure.server})`;
       unleased(
-        `${failure.code}: cpu-pool: the lease endpoint ${socket} exceeded ${failure.boundMs} ms (waited ${failure.elapsedMs} ms; last progress: ${failure.last})`,
+        `${failure.code}: cpu-pool: the lease endpoint ${peer} exceeded ${failure.boundMs} ms (waited ${failure.elapsedMs} ms; last progress: ${failure.last})`,
         'other',
         failure.code,
+        { ...failure, socket },
       );
     });
   };
@@ -161,7 +170,8 @@ export function holdLease(
       state = 'queued';
       onQueued?.();
       if (bounds instanceof CpuLeaseWait) {
-        bounds.queued();
+        // A pool from before its acknowledgement named its process names none.
+        bounds.queued(isCpuQueued(parsed) ? parsed.server : null);
         armCpu();
       } else if (bounds.grantMs === null) {
         clearTimeout(timer);

@@ -263,8 +263,25 @@
           "test-shard2",
           "test-shard3",
           "test-shard4",
-          "test-host"
+          "test-host",
+          "test-pool-silence"
         ]
+      },
+      "test-pool-silence": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^dependencyDefault",
+          "bunToolchain",
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
+        ],
+        "options": {
+          "command": "bun test --timeout=0 ./src/executors/bounded-exec/__tests__/cpu-pool.silence.ts",
+          "cwd": "{projectRoot}",
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
+        }
       },
       "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
