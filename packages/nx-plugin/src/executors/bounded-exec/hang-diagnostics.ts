@@ -25,6 +25,8 @@ const PS_FIELDS = 'pid=,ppid=,pgid=,stat=,%cpu=,etime=,lstart=,command=';
  */
 const MAX_SAMPLED_LEAVES = 4;
 const SAMPLE_SECONDS = 1;
+/** How long a process in an uninterruptible kernel wait has its file-system calls traced. */
+const FS_USAGE_SECONDS = 5;
 /**
  * A process census's limit. The stack samples run until the closing census is this far from the window's end.
  */
@@ -236,6 +238,31 @@ export function captureHangDiagnostics(
         }),
       );
     };
+    /**
+     * A process in an uninterruptible kernel wait (state U) is in a file-system or device call no signal ends, and its
+     * stack stops at the system call. Its file-system calls over a few seconds (fs_usage) name the volume and files it
+     * waits on, which tells a fixture doing its I/O on a contended shared volume from one serialised behind one APFS
+     * operation. Bounded like the stack samples; one fs_usage sudo refuses is named as no trace.
+     */
+    const kernelWaits = async (tree: readonly ObservedProcess[]): Promise<void> => {
+      const waiting = tree.filter((entry) => entry.stat.startsWith('U')).slice(0, MAX_SAMPLED_LEAVES);
+      const limitMs = endsAtMs - Date.now() - CENSUS_LIMIT_MS;
+      await Promise.all(
+        waiting.map(async ({ pid }) => {
+          const name = `fs_usage pid ${pid}`;
+          const args = ['-n', 'fs_usage', '-w', '-t', String(FS_USAGE_SECONDS), '-f', 'filesys', String(pid)];
+          const result = await probe(name, 'sudo', args, limitMs);
+          if (finished) return;
+          if (result.stdout.trim() !== '') {
+            lines.push(`${name} (${FS_USAGE_SECONDS}s of file-system calls):\n${result.stdout.trimEnd()}`);
+            return;
+          }
+          lines.push(
+            `${name}: no trace; sudo -n fs_usage gave none, so the files this process waits on are not observed.`,
+          );
+        }),
+      );
+    };
     const collect = async (): Promise<void> => {
       const before = await census('ps before');
       if (finished) return;
@@ -294,7 +321,7 @@ export function captureHangDiagnostics(
             }
           }
         };
-        await Promise.all([openFiles(), stackSamples(before)]);
+        await Promise.all([openFiles(), stackSamples(before), kernelWaits(before)]);
         if (finished) return;
       } else {
         lines.push(`Open-file census not provided on ${source.platform}; observations below name processes only.`);

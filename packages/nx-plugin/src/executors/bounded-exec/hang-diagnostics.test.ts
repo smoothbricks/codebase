@@ -43,6 +43,9 @@ const SAMPLE_REPORT = [
   '',
 ].join('\n');
 
+/** An `fs_usage -w -f filesys` line: a process waiting in a read of an image on the store volume. */
+const FS_USAGE_REPORT =
+  '12:00:00.000000  RdData[A]  D=0x0001  B=0x1000  /dev/disk3s1  /fixture/store/image.dmg  0.512 W child.303\n';
 /**
  * Answers the census probes in order from `results`, and every `sudo -n sample` stack probe, which runs beside them,
  * from `sample`.
@@ -53,6 +56,7 @@ function scriptedHost(
 ) {
   const calls: { file: string; args: readonly string[]; timeoutMs: number }[] = [];
   const samples: { pid: number; args: readonly string[]; timeoutMs: number }[] = [];
+  const traces: { pid: number; args: readonly string[]; timeoutMs: number }[] = [];
   let index = 0;
   const host: HangDiagnosticHost = {
     platform: 'darwin',
@@ -62,13 +66,17 @@ function scriptedHost(
         samples.push({ pid, args, timeoutMs });
         return sample(pid);
       }
+      if (file === 'sudo' && args[1] === 'fs_usage') {
+        traces.push({ pid: Number(args.at(-1)), args, timeoutMs });
+        return exited(FS_USAGE_REPORT);
+      }
       calls.push({ file, args, timeoutMs });
       const result = results[index++];
       if (result === undefined) throw new Error(`unexpected probe ${file}`);
       return result;
     },
   };
-  return { host, calls, samples };
+  return { host, calls, samples, traces };
 }
 
 /** The first complete line a process prints. A stream that ends first fails, naming what it did print. */
@@ -361,6 +369,17 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.outcome, capture.text).toBe('none');
     expect(samples.map((sample) => sample.pid)).toEqual([ROOT, 601, 602, 603, 604]);
     expect(capture.text).toContain('not sampled: pid 605, 606\n');
+  });
+
+  it('traces the file-system calls of a process in an uninterruptible kernel wait beside its stack', async () => {
+    const stuck = `303 202 ${ROOT} UN 0.0 02:59 ${STARTED} grandchild stuck in the kernel`;
+    const rows = [rootRow, childRow, stuck].join('\n');
+    const { host, traces } = scriptedHost([exited(rows), exited('', 1), exited(rows)]);
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(traces.map((trace) => trace.args)).toEqual([['-n', 'fs_usage', '-w', '-t', '5', '-f', 'filesys', '303']]);
+    for (const trace of traces) expect(trace.timeoutMs).toBeLessThanOrEqual(HANG_CAPTURE_MS - 1_000);
+    expect(capture.text).toContain('fs_usage pid 303 (5s of file-system calls):');
+    expect(capture.text).toContain('/fixture/store/image.dmg');
   });
 
   it('records a stack sample sudo refuses as no stack, keeping the holder outcome and the closing census', async () => {
