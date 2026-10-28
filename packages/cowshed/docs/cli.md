@@ -39,7 +39,7 @@ $ cowshed fork raven --json
 
 $ cowshed path nonesuch --json
 {"ok":false,"error":{"code":"not-found",
- "message":"no workspace 'nonesuch' in project 'example-project'",
+ "message":"workspace nonesuch does not exist",
  "hint":"cowshed ls"}}
 ```
 
@@ -54,10 +54,12 @@ read.
 - `--project <git-root>` — select an adopted repository explicitly. Default: discover the standalone Git root owning the
   current directory, then validate its cowshed repository binding. Exit 3 if neither resolves.
 - `-q` / `--quiet` — suppress `cowshed:` progress lines on stderr; errors and `next:` hints still print.
-- `--help` / `-h` — the command map, or one command's full usage when a verb precedes it. `cowshed help [<command>]` is
-  the same request. Help is an answer, not a diagnostic: it goes to stdout and exits 0, and `--help` anywhere in a
-  command's own arguments answers instead of refusing the half-typed grammar it appears in. Past `--` the argument
-  belongs to the child, so `cowshed exec raven -- cargo --help` runs cargo's help inside the workspace.
+- `--help` / `-h` — the command map, grouped by use (workspace, integration, grant, setup and repair, storage and cache,
+  and last the commands tools and embedders call), or one command's full usage when a verb precedes it.
+  `cowshed help [<command>]` is the same request. Help is an answer, not a diagnostic: it goes to stdout and exits 0,
+  and `--help` anywhere in a command's own arguments answers instead of refusing the half-typed grammar it appears in.
+  Past `--` the argument belongs to the child, so `cowshed exec raven -- cargo --help` runs cargo's help inside the
+  workspace.
 
 Usage lines are generated from the same option table the parser reads, so a flag a command accepts is a flag its usage
 line and its `--help` page name, with one line saying what it does. A mistyped verb is corrected against the command
@@ -958,15 +960,17 @@ Rewrite one workspace's image so its data is contiguous again, and print the ext
 ```
 $ cowshed defrag main
 6
-cowshed: workspace main rewritten contiguously: 2110000 extents -> 6, 239059476480 bytes copied; a clone's first write now copies a map whose loaded RAW sensitivity is 840.282µs instead of 295.499s
+cowshed: workspace main rewritten contiguously: 2110000 extents -> 6, 239059476480 bytes copied
 ```
 
 `fork` clones an image in milliseconds because the clone shares the source's extent map, but the first write to the
-clone copies that map, at about 140 µs per extent in one loaded RAW observation (60.8 s for 434,462 extents). Main
-fragments with every write it takes while clones share its blocks, so a long-used main can hold millions of extents.
-`cowshed doctor` reports main's extent count and that sensitivity as `main-extents`, and warns with this verb as the
-hint past 7,140 extents, about one second at that rate. A fork past that bound warns, naming the measured first-write
-cost and `cowshed defrag <workspace>`, and proceeds.
+clone, its mount, copies that map, so its cost grows with the source's extents. An image gains extents whenever it is
+rewritten while clones share its blocks: a dependency reinstall or a build in main, not work in its sheds. A fork whose
+source-image clone spends more than 4 s attaching and mounting warns, naming the measured time, how to find the paths
+main rewrote and this verb, and proceeds
+([troubleshooting](troubleshooting.md#a-fork-warns-that-cloning-mains-source-image-took-over-4-s)). `cowshed doctor`
+lists each image's extent count as `main-extents`, `source-extents`, `build-source-extents` and `build-seed-extents`,
+for the record; it never warns on a count.
 
 The workspace leaves the kernel exactly as it does for `resize`: a volume with a file open or a job running refuses
 before the image is touched, so run it while the checkout is idle. The data is then copied with plain reads and writes
@@ -976,7 +980,8 @@ the workspace back on its mount.
 
 The copy needs as much free space on the store volume as the image has allocated, checked before anything is detached,
 and it keeps that space: clones taken earlier still share the old blocks, so the space comes back only as they are
-removed. Main fragments again as it takes writes while new clones share it; rerun the verb when `doctor` warns.
+removed. Main fragments again as it is rewritten while new clones share it; stop the rewrites first, or the warning
+returns.
 
 ### `cowshed cache clear [<name|main>]`
 

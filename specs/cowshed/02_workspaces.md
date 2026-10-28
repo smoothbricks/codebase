@@ -38,7 +38,7 @@ directory for a linked worktree.
 
 ### Secrets enforcement
 
-The invariant is checked, not assumed. One built-in scanner (`cowshed-core::secrets`), three call sites:
+The invariant is checked once, where it is cheap: one built-in scanner (`cowshed-core::secrets`) gates `cowshed adopt`.
 
 - **`cowshed adopt` — blocking gate.** Full-tree scan before the image is created (skipping cache roots and `.git`
   objects). Findings refuse the adopt (exit 4) with per-file stderr guidance: migrate the value to the gateway Keychain,
@@ -46,20 +46,16 @@ The invariant is checked, not assumed. One built-in scanner (`cowshed-core::secr
   `/private/cowshed/store/<owner>/<repo>/quarantine/` (the primary component-safe `repo_id` path; mode 0600, original
   paths preserved) so dependent tooling fails loudly instead of leaking silently. There is no "adopt anyway" flag —
   main's image is cloned to every future workspace; adopt is the one moment the invariant is cheap to establish.
-- **`cowshed push` and autosave — delta gate.** Scans only content new relative to the base commit (cheap). Push refuses
-  with exit 4 and names the offending hunks; autosave skips the snapshot and emits one `cowshed:` warning — it never
-  blocks work, but it never propagates a finding to the host repo either. This closes the write side: an agent that
-  pastes a token into a file cannot export it through cowshed.
-- **`cowshed doctor` — recurring audit.** Re-scans every workspace incrementally (mtime-bounded) and reports findings
-  with `fix:` hints; `--json` for fleet automation.
+- **No other verb scans** (the owner's ruling, 2026-10-28). `fork` does not scan each clone, and `push`, autosave and
+  `doctor` run no secret gate or audit; none is planned. A secret written into main after adopt is the operator's to
+  keep out: credentials belong in the gateway Keychain, never in a checkout.
 
 Detection is convention-tiered, no configuration: filename rules (`.env*`, `*.pem`, `id_*`, `.netrc`, `.npmrc`/`.pypirc`
 with auth keys, cloud credential dirs) plus content rules for well-known token shapes (`ghp_…`, `xoxb-…`, `sk-…`,
 `AKIA…`, PEM blocks) and `.envrc`/shell exports of `*_TOKEN|*_SECRET|*_KEY` variables. No entropy heuristics — cowshed
-prefers zero false positives over exhaustiveness, and says so; `cowshed doctor --secrets-deep` shells out to `gitleaks`
-when installed for the paranoid pass. Waivers are explicit and controller-owned: per-path entries in the project's
-waivers file next to the grant files (never inside the image), each with a required `reason`, shown by `cowshed doctor`
-so waived paths stay visible.
+prefers zero false positives over exhaustiveness, and says so. Waivers are explicit and controller-owned: per-path
+entries in the project's waivers file next to the grant files (never inside the image), each with a required `reason`; a
+waiver unblocks adoption while every waived finding stays retained for audit.
 
 ## `cowshed adopt` — create the main workspace
 
@@ -912,9 +908,8 @@ A per-project launchd user agent (installed at adopt; systemd user timer on Linu
 into the host repository on a 10-minute cadence (`.cowshed.toml` `[autosave] interval`). The mechanism is a host-side
 fetch — the workspace branch plus `+HEAD:refs/cowshed/<ws>/wip` — the same pull-based direction as `cowshed push`, for
 the same trust reason. `refs/cowshed/…` (singular) is the canonical namespace; `land` prunes a workspace's refs at
-retire. Each snapshot is gated by the secrets delta-scan (see "Secrets enforcement"): a finding skips that workspace's
-snapshot with one `cowshed:` warning and never blocks work. Uncommitted work between autosaves is the only loss window —
-images are excluded from backup by design (01a_apfs.md).
+retire. Autosave runs no secret scan ("Secrets enforcement": adopt is the only gate). Uncommitted work between autosaves
+is the only loss window — images are excluded from backup by design (01a_apfs.md).
 
 ## Remote code ingress: `cowshed repo`
 

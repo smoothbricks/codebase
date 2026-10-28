@@ -30,7 +30,10 @@ cowshed fork task-4821 --project "$PROJECT" --json
   foreground streaming of `cowshed exec`, the API's `JobHandle.logs` and `JobHandle.attach`, or artifact reads.
 - **Read stderr.** All guidance lives there, in greppable, prefixed lines:
   - `cowshed: ...` — what just happened, or why something failed
-  - `next: <command>` — concrete follow-up commands, valid to run as-is
+  - `next: <command>` — concrete follow-up commands, valid to run as-is. Some refusals still carry a prose remedy on
+    their `next:` line instead of a command (a known gap against
+    [06_cli.md, "Self-driving conventions"](../../../specs/cowshed/06_cli.md#self-driving-conventions)); run a `next:`
+    line only when it is a command, and read it as the remedy otherwise.
 
 An agent's loop is: parse the control answer, scan stderr for `next:` lines when deciding what to do, and switch on the
 exit code when something fails. Treat explicit raw streams as opaque bytes; do not decode them merely to move or retain
@@ -53,6 +56,12 @@ cowshed fork task-4821 --project ~/src/api --json | jq -r .result.mount
 Pattern: one cowshed workspace per agent task, instead of `git worktree add`. You get full isolation (the agent can
 trash anything inside; the host is safe), warm caches (builds and installs are incremental from main's state), and O(1)
 cleanup.
+
+Do not use a harness's own worktree isolation in an adopted repository: Claude Code's `--worktree`, its
+`isolation: worktree` subagents and its background sessions create cold `git worktree`s under `.claude/worktrees/`
+inside the checkout, which is main's image. Everything they install or build is a rewrite of main while its forks share
+its blocks, so it slows every later fork's clone, and as untracked files it is carried into every later fork. Give each
+agent a shed instead: `cowshed fork <ws>`, then `cowshed exec <ws> -- <cmd>`.
 
 ```sh
 # spawn

@@ -248,3 +248,32 @@ next: cowshed exec <second-proof-ws> -- <cmd>
 
 No owner or cause was established for the empty list. No raw process kill, forced unmount, image deletion, cache bypass,
 live database copy, or implementation change was attempted for this failure.
+
+## CLI guidance gaps left by the DX pass of 2026-10-28
+
+The DX pass that replaced the fork extent warning with the clone-time rule and grouped the command map changed help,
+warning and hint text only, by the owner's ruling of 2026-10-28. These gaps stay, each with its owner and its count:
+
+- **Prose `next:` hints.** About 1,070 of about 1,380 `CowshedError` hints in the crates' production sources (tests
+  excluded) are prose remedies, not commands, against `specs/cowshed/06_cli.md` "Self-driving conventions" ("every
+  failure's stderr includes the exact command that would resolve it"). The counts are a syntactic scan of each
+  constructor's second argument; the largest holders are `cowshed-core/src/runtime/project.rs` (318),
+  `cowshed-core/src/git.rs` (112) and `cowshed-core/src/runtime/supervisor.rs` (108). The pass fixed the two the v2
+  comparison report named (`workspace <name> does not exist` and `workspace main does not exist` now hint `cowshed ls`).
+  The owner ruled out a rewrite sweep and a rendering rule for now. Owner: the cowshed CLI contract
+  (`specs/cowshed/06_cli.md`), staffed by the lead.
+- **`controller-open` lifecycle spans on `ls` and `path`.** `cowshed ls` and `cowshed path` print
+  `cowshed: controller-open connect|project start|done` lines on every call (`cowshed-cli/src/runtime.rs`, the
+  `controller-open` spans). `cowshed-os/src/timing.rs` makes lifecycle spans unconditional and reserves
+  `COWSHED_TIMING`-gated latency spans for verbs whose stderr belongs to someone else, naming `path`; the controller
+  open on these verbs is the lifecycle kind. An env-var gate is a workaround shape (AGENTS.md rule 6). Owner:
+  cowshed-cli runtime, staffed by the lead.
+- **Per-fork image-allocation warnings.** Every build-volume clone prints
+  `cowshed: warning image clone before|after … reason=allocated_absolute` (a 128 GiB `ALLOCATED_WARN`,
+  `cowshed-core/src/storage/apfs/native/image_telemetry.rs`); one fork of SmoothBricks main on 2026-10-28 printed six,
+  because every build image there is 392 GiB or more allocated. It is the same per-fork noise the extent warning was.
+  Owner: the image telemetry in `cowshed-core/src/storage/apfs/native/image_telemetry.rs`, staffed by the lead.
+- **No measured source-clone time outside the fork.** Doctor's extent findings are information only, and the clone-time
+  warning fires only on the fork that measured it; no record keeps the last measured time, so doctor cannot apply the
+  same 4 s decision (`source_clone_is_slow` in `cowshed-core/src/storage/lifecycle.rs`). A record would be a second
+  store unless an existing authority (the fork's spans) already answers it. Owner: cowshed doctor, staffed by the lead.

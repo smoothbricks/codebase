@@ -205,17 +205,17 @@ capability, not from store reads
 Two different mechanisms save build time, and it helps to keep them apart.
 
 **The clone is why a workspace starts warm.** A fork clones the target's source image and its latest immutable
-build-volume seed. Cargo target directories and Nx state live in that separate private APFS image, reached through
-`.cowshed/build` and fixed relative links; `.codegraph` is one of them, a link to `.cowshed/build/codegraph`, so the
-index is build-volume state carried like the rest. Every gated land freezes a seed from the landing workspace's warm
-volume; an ungated lane fold (`land --into <lane> --ungated`) moves Git alone and leaves the lane base's seed as it was.
-A plain Git fast-forward is detected at the next fork, including `--ref` at the target's current tree: a quiet live
-workspace at exactly that tree seeds the target automatically. Between lands, the fork captures newer live state only
-when it is at least as near the requested tree and has no writer. A nearer landed seed beats an older live volume. There
-is no manual seed-refresh or warm step. `doctor` reports target-only `seed-age`, `seed-tree-behind` and
-`target-moved-outside-land`; land records its actual seeded/adopted/skipped outcome durably, including holders. An owned
-index link points back to source only through a verified sealed snapshot; a holder refuses that change without losing
-bytes or being forced off.
+build-volume seed. Nx state, and Cargo target directories in a project without mbx, live in that separate private APFS
+image (an mbx project's `target` is mbx's managed-target link instead), reached through `.cowshed/build` and fixed
+relative links; `.codegraph` is one of them, a link to `.cowshed/build/codegraph`, so the index is build-volume state
+carried like the rest. Every gated land freezes a seed from the landing workspace's warm volume; an ungated lane fold
+(`land --into <lane> --ungated`) moves Git alone and leaves the lane base's seed as it was. A plain Git fast-forward is
+detected at the next fork, including `--ref` at the target's current tree: a quiet live workspace at exactly that tree
+seeds the target automatically. Between lands, the fork captures newer live state only when it is at least as near the
+requested tree and has no writer. A nearer landed seed beats an older live volume. There is no manual seed-refresh or
+warm step. `doctor` reports target-only `seed-age`, `seed-tree-behind` and `target-moved-outside-land`; land records its
+actual seeded/adopted/skipped outcome durably, including holders. An owned index link points back to source only through
+a verified sealed snapshot; a holder refuses that change without losing bytes or being forced off.
 
 **A fresh baseline carries source and build state together.** Fork from the newer baseline instead of replacing an
 existing workspace's build volume. Rebase and land keep that workspace's own build state, so ordinary mtime-based tools
@@ -265,7 +265,7 @@ sits at a different path.
 | No compile-time checkout path, tests included: `env!("CARGO_MANIFEST_DIR")` | Cargo does not fingerprint where the checkout lives, so a workspace runs the units it cloned from main as they are: a baked path makes a test read main's files, not the workspace's. Read `CARGO_MANIFEST_DIR` at run time (cargo and nextest set it for every test) and name compiled-in files relative to their source.                                                                                                                                                                                                                                                          |
 | Nothing machine-specific above the build directory in `.cargo/config.toml`  | An absolute `linker`, `rustflags` entry, `[env]` value, or `target-dir` outside the checkout pins the key to one machine.                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | One toolchain for every checkout                                            | A different compiler is a different cache. Pin it once in the project's own environment, and make sure every shell and sandbox resolves the same `rustc`: a `rust-toolchain.toml` that one toolchain honours and another ignores silently splits the cache.                                                                                                                                                                                                                                                                                                                         |
-| Do not point cargo at a shared external `target/`                           | It undoes the isolation the clone gave you and serialises builds.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Do not point cargo at a shared external `target/`                           | `target` is mbx's managed-target link for the checkout; a `CARGO_TARGET_DIR`, `build.target-dir` or `build.build-dir` leaves the target unmanaged, and job admission refuses it.                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `-C target-cpu=native` ties the cache to one CPU class                      | Fine for a single host; it means the store cannot be shared with a different machine generation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ### The same rules for other toolchains

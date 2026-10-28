@@ -9,14 +9,16 @@ description:
 
 # cowshed — warm workspaces for parallel agents
 
-A cowshed workspace is a full standalone checkout — source, `.git`, `node_modules`, `target/`, every build cache —
-cloned copy-on-write from the repository's warm `main` image. A `git worktree` gives an agent a cold tree whose build
-cache starts empty and a first build that costs minutes; a cowshed workspace starts warm. On a long-used repository
-`cowshed fork` is dominated by two steps. The clone call returns in milliseconds, but the clone's read-write mount, its
-first write, makes APFS copy the extent map of main's image file: one loaded RAW observation took about 140 µs per
-extent, and main's image fragments with every write it takes while clones share its blocks. Past 7,140 extents, about a
-second at that rate, fork warns, goes on, and names `cowshed defrag main`. Then setup walks the whole tree for symlinks
-that point outside it, about 5 s over a million entries. The number of attached images does not matter.
+A cowshed workspace is a full standalone checkout — source, `.git`, `node_modules`, build state — cloned copy-on-write
+from the repository's warm `main` image. A `git worktree` gives an agent a cold tree whose build cache starts empty and
+a first build that costs minutes; a cowshed workspace starts warm. On a long-used repository `cowshed fork` is dominated
+by two steps. The clone call returns in milliseconds, but each clone's read-write mount, its first write, makes APFS
+copy the extent map of the image it was cloned from, so the mount's cost grows with that image's extents. An image gains
+extents whenever it is rewritten while clones share its blocks: a dependency reinstall or a build in main fragments
+main's source image, while writes in a shed never touch main. When cloning the source image takes over 4 s, fork warns,
+says every fork of that source pays it, prints the command that finds what was rewritten, names
+`cowshed defrag <source>`, and proceeds. Then setup walks the whole tree for symlinks that point outside it, about 5 s
+over a million entries. The number of attached images does not matter.
 
 `fork [<src>] <ws>` is the only creation verb; the source defaults to main. Every fork carries source edits and
 untracked files by default on its own `cowshed/<ws>` branch. `--clean` discards tracked edits and nonignored untracked
@@ -24,8 +26,9 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 
 ## Use it
 
-1. Adopt once: `cowshed adopt <path> --capacity <size>`. Adoption runs a secret gate first; `--quarantine` moves
-   findings aside, a waiver in the named `waivers.json` is only for committed synthetic fixtures.
+1. Adopt once: `cowshed adopt <path> --capacity <size>`. Adoption runs a secret gate first, the only secret scan cowshed
+   runs (`fork`, `push` and `doctor` do not scan); `--quarantine` moves findings aside, a waiver in the named
+   `waivers.json` is only for committed synthetic fixtures.
 2. Host storage missing → `cowshed doctor` (bare doctor mutates nothing; `--repair` also runs the gc sweep), then its
    `next:` command, usually `cowshed setup`. Setup installs the invoking build as the one installed cowshed (CLI and
    daemon, one artifact): typing `cowshed setup` runs the installed copy and installs nothing new, so install a
@@ -34,9 +37,14 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    only when intended).
 3. One workspace per agent; work there, never in shared `main` (standalone Markdown unrelated to any shed's code is the
    exception: see "Batch a round of units"). Pass `--project <git-root>` explicitly rather than trusting cwd. Retire
-   finished sheds; storage grows with divergence, not clone count.
+   finished sheds; storage grows with divergence, not clone count. Never use a harness's own worktree isolation (Claude
+   Code's `--worktree` or `isolation: worktree` subagents): it makes cold `git worktree`s inside main's image, rewriting
+   main under its forks. Fork a shed instead.
 4. Workspaces publish `.cowshed/env`; direnv users need nothing extra (`source_env_if_exists .cowshed/env` is the
    optional hook). After a reboot or eject, `cowshed attach` re-mounts; it is idempotent.
+5. Keep main still: install dependencies there only when its lockfile changed, never wipe or force-reinstall its
+   `node_modules`, and build in sheds. A fork that warns its source clone took over 4 s names the command that lists
+   what main rewrote; stop that churn, then `cowshed defrag main` with main idle.
 
 ## Commands
 
@@ -47,6 +55,7 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 | Create at a stable slot | `cowshed fork <ws> --slot <n>`                                       | Recycle a stable path for path-keyed caches.                                                                                                                                                                                               |
 | Create clean            | `cowshed fork [<src>] <ws> --clean`                                  | Reset tracked edits and remove nonignored untracked files.                                                                                                                                                                                 |
 | Create at a ref         | `cowshed fork [<src>] <ws> --ref <rev>`                              | Clean and branch at the source's revision.                                                                                                                                                                                                 |
+| Show a branch to main   | `cowshed fork [<src>] <ws> --register`                               | Also add a `cowshed/<ws>` remote in main, so `git fetch cowshed/<ws>` in main reads the shed's branch while it lives; without it the branch stays in the shed's own repository until `push` or `land`.                                     |
 | Locate                  | `cowshed path <ws>`                                                  | Print the live mount path.                                                                                                                                                                                                                 |
 | Run a command           | `cowshed exec <ws> -- <cmd>`                                         | Execute argv inside the workspace sandbox.                                                                                                                                                                                                 |
 | Grant host paths        | `cowshed grant <ws> --read <path...> [--write <path...>]`            | Widen filesystem access from the next exec; omit flags to list.                                                                                                                                                                            |
@@ -72,7 +81,7 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 | Retire                  | `cowshed rm <ws>`                                                    | Remove a shed whose work main holds or `push` preserved; a containment refusal names commits to fold into the batch.                                                                                                                       |
 | Reclaim                 | `cowshed gc --dry-run` / `cowshed gc`                                | Review, then reclaim orphaned storage.                                                                                                                                                                                                     |
 | Grow an image           | `cowshed resize <ws> <size>`                                         | Grow an image; resize never shrinks it.                                                                                                                                                                                                    |
-| Make clones cheap again | `cowshed defrag main`                                                | Rewrite main contiguously when doctor warns `main-extents`.                                                                                                                                                                                |
+| Make clones cheap again | `cowshed defrag main`                                                | With main idle, rewrite it contiguously after a fork warned that its source clone took over 4 s and the churn that caused it has stopped.                                                                                                  |
 | Clear Nx caches         | `cowshed cache clear [<ws>]`                                         | Delete the workspace's `.nx/cache` and `.nx/workspace-data` entries and the project's gateway Nx store, with entry counts; refuses, naming it, while a job, land or Nx request runs. `nx reset` only removes the links and clears nothing. |
 | Rename or move          | `cowshed mv <ws> <new-name>` / `cowshed mv main <new-checkout-path>` | Rename a workspace or move the adopted checkout.                                                                                                                                                                                           |
 | Hold a lock file        | `cowshed lock <path> [--state-fd <n>] [--owned-pid <pid>] -- <cmd>`  | Run a command holding a lock file's flock(2), which it inherits; on SIGUSR1 while queued, signals its inode's proven owner through an `--owned-pid` life captured at start, and then never runs the command.                               |
@@ -182,12 +191,13 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
 - Never set `CARGO_INCREMENTAL`, not even for a land check. Incremental compilation is mbx's, and a value you set
   overrides it for every unit.
 - Let `test` inherit `dev`: no `[profile.test]` overrides. `cargo test` then reuses the dependencies `cargo build`
-  compiled, and the `target/` a new workspace clones from main is warm for both.
+  compiled, as the same units.
 - Never compile `env!("CARGO_MANIFEST_DIR")` in, tests included. Cargo does not fingerprint the checkout path, so a
   workspace runs the test binaries it cloned from main and a baked path reads main's files. Read it at run time with
   `std::env::var_os("CARGO_MANIFEST_DIR")`, which cargo and nextest set for every test.
-- After a lockfile or toolchain bump, re-warm main's image with `cowshed exec main -- <canonical build>` so new clones
-  inherit the dependency graph.
+- Never re-warm main by building in it. A land adopts the landing shed's build volume, mbx's store already holds what
+  any shed compiled, and every rewrite in main fragments main's source image under its forks, which slows every later
+  fork's clone.
 - Cargo's linker must be a bare PATH program or immutable store path, never checkout-relative. Cargo keeps its default
   mtime freshness: a checkout's sources and build state stay paired (a fork clones both from one tree; a land restamps
   target sources the fast-forward left older than the landing checkout's), and a producer that restores changed input
@@ -201,13 +211,16 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
   mbx's shim; a refusal naming `mbx-host-missing` or `mbx-revision-skew` is fixed with `cowshed setup` or the project's
   mbx pin, never with a wrapper.
 - A successful managed Bun install records lockfile SHA-256 values in `node_modules/.smoo-install`. Doctor reports
-  missing receipts or lock drift and never installs dependencies.
+  missing receipts or lock drift (`node-modules-lock-drift`) and never installs dependencies. Install in main only then,
+  never wipe `node_modules` or force a reinstall there: a reinstall in main rewrites its image under every fork.
 
 ## Output and failures
 
 - stdout is the result; stderr is progress/guidance. Use `--json` for machine output; follow each `next:` command
-  literally instead of scraping stderr. Exit codes (docs/cli.md): 2 usage, 3 not-found, 4 conflict, 5
-  environment-missing, 6 sandbox-denied, 7 integrity; exec passes the child's status through (wrapper failures 100–106).
+  literally instead of scraping stderr, but run a `next:` line only when it is a command: some refusals still put a
+  prose remedy there. A fork's `cowshed: warning: cloning <src>'s source image took …` is the clone-time warning (see
+  "Use it", step 5). Exit codes (docs/cli.md): 2 usage, 3 not-found, 4 conflict, 5 environment-missing, 6
+  sandbox-denied, 7 integrity; exec passes the child's status through (wrapper failures 100–106).
 - Exit 6 is a negotiation, not a retry: surface the named `next:` grant to the operator/coordinator; filesystem grants
   apply from the next exec. A `sandbox-denied` on a lifecycle verb saying this process is "sandboxed away from cowshed's
   store" means your shell is sandboxed — no grant helps; rerun from an unsandboxed shell.

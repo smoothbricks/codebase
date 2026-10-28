@@ -41,10 +41,11 @@ the fork's own record for the workspaces cloned from it. One derivation no check
 checkout path itself, a hash of `$PWD` say, is inherited as the origin computed it, in every fork, until an input or the
 baseline environment changes.
 
-**`cowshed adopt` or `cowshed push` refused with exit 4 naming files.** The secrets gate found credential-shaped content
-(`.env*`, key files, known token prefixes, `.envrc` secret exports). For adopt: move each value into the gateway
-Keychain (see gateway.md) and delete the file, or `cowshed adopt --quarantine` to relocate findings outside the image so
-dependent tooling fails loudly. For push: the offending hunks are named — remove the secret and push again.
+**`cowshed adopt` refused with exit 4 naming files.** The secrets gate found credential-shaped content (`.env*`, key
+files, known token prefixes, `.envrc` secret exports). Move each value into the gateway Keychain (see gateway.md) and
+delete the file, or `cowshed adopt --quarantine` to relocate findings outside the image so dependent tooling fails
+loudly. Adopt is the only verb that scans: `fork`, `push` and `doctor` do not, so keep credentials out of main after
+adopt too.
 
 False positive on adopt? The refusal itself prints the exact controller-owned `waivers.json` path and a valid entry
 example. Entries form a JSON array whose `path` matches the finding's repository-relative path exactly and whose
@@ -188,8 +189,8 @@ $ cowshed gc
 44023414784
 ```
 
-A main that has taken years of writes under clones is slow to clone, not large: `cowshed doctor` reports `main-extents`
-and names `cowshed defrag main` when the next `fork` would pay for it.
+A main rewritten while clones share its blocks is slow to clone, not large: a fork whose source clone takes over 4 s
+warns and names `cowshed defrag main` ([below](#a-fork-warns-that-cloning-mains-source-image-took-over-4-s)).
 
 Attribution: `du` on the images directory tells you per-workspace cost; _inside_ a mounted workspace, normal `du` works
 — it's just APFS. Remember clones share extents: ten fresh workspaces cost ~zero until they diverge, so "sum of image
@@ -384,16 +385,16 @@ every workspace it recovers. When a command is still slow on a wait in a host pr
 `cowshed fork` prints a `cowshed: apfs canonical/<step>` or `cowshed: fork <step>` span with its elapsed time for every
 step, so the slow step is named on stderr. On a large repository two steps carry nearly all of the time:
 
-- **The mount of the fresh clone**, `apfs canonical/mount`. The clone call shares main's image extent map; the first
-  mutation of either file makes APFS copy that map, and the clone's read-write `mount_apfs` is that first mutation,
-  because APFS writes its checkpoint. `apfs canonical/attach` does not trigger the copy, and cowshed writes nothing to
-  the clone ahead of the mount. Main's image fragments when writes move blocks shared by clones into new runs, so the
-  mount's cost scales with extent count. A one-byte write into a plain `cp -c` clone reproduces that map copy without an
-  attached disk image. Deleting a written clone also incurs extent-map work; `fork <ws> <name>` incurs it for the source
-  workspace's image. `cowshed doctor` reports the extent count and predicted cost as `main-extents` and warns when it
-  reaches the cold-fork budget (08_testing.md). `cowshed defrag main` rewrites main's image file contiguously while the
-  checkout is idle; a busy volume refuses. It needs as much free space as main's image has allocated and keeps it while
-  older clones still share the old blocks.
+- **The mounts of the fresh clones**, `apfs canonical/mount`: one for the workspace's source image, one for its build
+  volume. A clone call shares its source's extent map; the first mutation of either file makes APFS copy that map, and
+  the clone's read-write `mount_apfs` is that first mutation, because APFS writes its checkpoint.
+  `apfs canonical/attach` does not trigger the copy, and cowshed writes nothing to the clone ahead of the mount. An
+  image fragments when it is rewritten while clones share its blocks, so a mount's cost grows with its source's extents.
+  A one-byte write into a plain `cp -c` clone reproduces that map copy without an attached disk image. Deleting a
+  written clone also incurs extent-map work; `fork <ws> <name>` incurs it for the source workspace's image. Main's build
+  seed is compacted on its own ([16_build_volumes.md, "Seed compaction"](../../../specs/cowshed/16_build_volumes.md));
+  keeping the source image fast is yours, and a fork whose source clone takes over 4 s says so
+  ([next section](#a-fork-warns-that-cloning-mains-source-image-took-over-4-s)).
 - **`fork links`**, the walk over the whole tree for symlinks that point outside it; its cost scales with the entries
   visited.
 
@@ -403,6 +404,37 @@ step, so the slow step is named on stderr. On a large repository two steps carry
 it asks with `cowshed: doctor <probe> waits-on=<party>`. A doctor that does not finish is in the probe it last started,
 waiting for the party that line names; the `done` lines say where a slow doctor's minute went. A gateway that accepts
 doctor's request and stays silent for a minute is reported as `gateway-unanswered` instead of holding doctor.
+
+## A fork warns that cloning main's source image took over 4 s
+
+```
+cowshed: warning: cloning main's source image took 6.3s, over 4s, and every fork of main pays it: the clone's mount, its first write, copies the extent map of main's image, which grows each time main rewrites files its forks share (a dependency reinstall, build outputs written in main)
+cowshed: find what main rewrote in the last day: cd "$(cowshed path main)" && find . -xdev -type f -ctime -1 | cut -d/ -f2-3 | sort | uniq -c | sort -rn | head -20
+cowshed: keep main still: install there only when its lockfile changed, never delete or force-reinstall its node_modules, and build in sheds; then, with main idle, cowshed defrag main rewrites its image contiguously
+```
+
+The fork measured how long its source-image clone spent attaching and mounting, lease waits excluded, and that took
+longer than 4 s. Every fork of main pays the same in its mount, on top of its build volume's, and the cost keeps growing
+while main is rewritten under its forks. The fork still succeeded. What to do, in order:
+
+1. **Find what rewrites main.** The command the warning prints counts the files in main's source image whose inode
+   changed in the last day, by top two directory levels. `-ctime` rather than `-mtime`, because an installer that clones
+   or links files keeps their old modification time; `-xdev` keeps the walk on the source image, off the build volume
+   mounted inside it. Typical answers are `node_modules/…` (a reinstall), a build's output directories (a build run in
+   main) and `.git/objects` (a repack).
+2. **Keep main still.** Install dependencies in main only when its lockfile changed: the managed install records the
+   lockfile digests in `node_modules/.smoo-install`, and `cowshed doctor` reports `node-modules-lock-drift` when main's
+   lockfile no longer matches. Never `rm -rf node_modules` or force a reinstall in main: change dependencies in a shed,
+   land the lockfile, then install once in main. Build and test in sheds (`cowshed exec <ws> -- …`), where outputs land
+   in the shed's own image, not main's. Keep each tool cache at its default path: a moved Bun cache relinks all of
+   `node_modules` ([Disk usage](#disk-usage)).
+3. **Then rewrite main once.** `cowshed defrag main` rewrites main's source image, its live build source and its seeds
+   contiguously. Main must be idle: it detaches main the way `resize` does, and a file open or a job running refuses
+   before the image is touched. It needs free space equal to main's allocated bytes, and keeps it while older clones
+   still share the old blocks. If the warning returns within days, the churn from step 1 is still running.
+
+`cowshed doctor` lists every image's extent count (`main-extents`, `source-extents`, `build-source-extents`,
+`build-seed-extents`) as information. It never warns on a count: no count predicts the clone time.
 
 ## A disk child `did not finish within 120s`
 

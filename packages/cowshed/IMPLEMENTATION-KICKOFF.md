@@ -31,10 +31,10 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 - **No workspace pools**: main-as-base; formatted blank templates serve image minting only. `cowshed adopt` turns the
   existing checkout into an image mounted at its original path; `cowshed fork` descriptor-clones main's live image after
   a flush, with main still mounted (filesystem crash-consistent). Safe because secrets never live in worktrees (gateway
-  holds them; no `.env` files). The invariant is enforced, not assumed: a built-in scanner gates `cowshed adopt`
-  (blocking, full-tree, `--quarantine` escape), gates `cowshed push`/autosave on the content delta, and audits in
-  `cowshed doctor` (filename + known-token-shape rules, no entropy heuristics; explicit reasoned waivers outside the
-  image; `--secrets-deep` via gitleaks when installed). Spec: 02_workspaces.md.
+  holds them; no `.env` files). The invariant is checked once, at adopt: a built-in scanner gates `cowshed adopt`
+  (blocking, full-tree, `--quarantine` escape; filename + known-token-shape rules, no entropy heuristics; explicit
+  reasoned waivers outside the image). No other verb scans: not `fork`, `push`, autosave or `doctor`, and none is
+  planned. Spec: 02_workspaces.md.
 - **Stable repository identity and trusted policy**: `repo_id` comes from one explicitly chosen Git remote URL,
   normalized to lowercase `owner/repo` after discarding transport, credentials, host, leading slash, optional `.git`,
   query, and fragment. Controller-owned binding metadata records both the chosen URL and `repo_id`; every open
