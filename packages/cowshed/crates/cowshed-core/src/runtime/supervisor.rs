@@ -11152,7 +11152,21 @@ mod lifecycle_commitment_tests {
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
             build_volume_released: None,
-            memory_pressure: crate::host_pressure::Source::calm(),
+            // A driven feed that reports no pressure: the host's own decides none of these admissions.
+            memory_pressure: crate::host_pressure::Source::Driven(
+                tokio::sync::watch::channel(crate::host_pressure::Reading::Known(
+                    #[cfg(target_os = "macos")]
+                    cowshed_gateway_types::host_status::MemoryPressure::Darwin {
+                        level: cowshed_gateway_types::host_status::DarwinPressureLevel::Normal,
+                    },
+                    #[cfg(not(target_os = "macos"))]
+                    cowshed_gateway_types::host_status::MemoryPressure::Psi {
+                        some_avg10: cowshed_gateway_types::host_status::CentiPercent::new(0)
+                            .expect("no stall is a share"),
+                    },
+                ))
+                .1,
+            ),
             nx_daemon_idle: defaults.nx_daemon_idle,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's

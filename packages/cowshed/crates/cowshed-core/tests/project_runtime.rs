@@ -61,6 +61,8 @@ mod refusing_gateway;
 #[path = "support/temp_parent.rs"]
 mod temp_parent;
 
+#[path = "support/calm_pressure.rs"]
+mod calm_pressure;
 #[cfg(target_os = "macos")]
 #[path = "support/publication.rs"]
 mod publication;
@@ -2430,7 +2432,7 @@ fn supervisor_config_of(
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         build_volume_released: None,
-        memory_pressure: cowshed_core::host_pressure::Source::calm(),
+        memory_pressure: calm_pressure::calm(),
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
     }
 }

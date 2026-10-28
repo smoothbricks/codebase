@@ -44,6 +44,8 @@ use cowshed_core::runtime::supervisor::{
     WorkspaceSupervisorHandle,
 };
 
+#[path = "support/calm_pressure.rs"]
+mod calm_pressure;
 #[path = "support/other_build_supervisor.rs"]
 mod other_build_supervisor;
 #[path = "support/publication.rs"]
@@ -520,7 +522,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         build_volume_released: None,
-        memory_pressure: cowshed_core::host_pressure::Source::calm(),
+        memory_pressure: calm_pressure::calm(),
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
     }
 }
