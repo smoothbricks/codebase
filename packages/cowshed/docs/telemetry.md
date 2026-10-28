@@ -54,7 +54,7 @@ cowshed has no reader verb for it: each segment is an Arrow IPC stream, readable
   <yyyy-mm-dd>/wait-*.arrow         # terminal waits: TIMEOUT, SILENT and PEER_LOST
   <yyyy-mm-dd>/wait-*.sample.txt    # retained supervisor or controller stacks on macOS SILENT
   gateway/<yyyy-mm-dd>/gateway-*.arrow   # gateway egress decisions, one event per decision
-  daemon-stderr.log, sccache-stderr.log  # launchd stderr of the two agents, for crashes before tracing starts
+  daemon-stderr.log                 # launchd stderr of the gateway agent, for crashes before tracing starts
 ```
 
 Those segments are compact continuity records, not a second copy of job stdout/stderr.

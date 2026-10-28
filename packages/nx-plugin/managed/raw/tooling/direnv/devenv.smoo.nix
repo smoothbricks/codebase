@@ -214,13 +214,12 @@ in {
   # wants the cache anyway names it in its own nix.conf.
   cachix.enable = false;
 
-  # sccache is deliberately absent from this shell. It used to export
+  # No compiler cache is exported from this shell. One shell once exported
   # RUSTC_WRAPPER=sccache as a BARE NAME, which PATH then resolved per project —
-  # which is precisely how an unpatched binary from one profile came to serve
-  # clients from another. sccache now belongs to cowshed: `cowshed setup
-  # --sccache` builds packages/cowshed/nix/sccache, pins the result with a nix GC
-  # root, and supervises that exact store path. A repository shell has no
-  # business deciding which compiler cache a host runs.
+  # which is how an unpatched binary from one profile came to serve clients from
+  # another. Cargo's cache is mbx: a repository pins it in its own devenv, and
+  # cowshed proves that pin against the mbx it installs beside itself
+  # (specs/cowshed/05_gateway.md, "Pool selection and revision").
 
   # One toolchain for every repository and every workspace, pinned by devenv.lock
   # rather than by a rust-toolchain file. devenv resolves the channel through

@@ -100,12 +100,10 @@ const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejan
 // rather than merely not required. Anchored to a package-list entry, never a
 // comment that only mentions Go.
 const unpinnedGoPackagePattern = /^\s*go\s*(#.*)?$/m;
-// No package here any more. `sccache` used to be required, which put a bare `sccache` on every
-// Rust repo's PATH for `RUSTC_WRAPPER=sccache` to resolve — the per-project resolution that let a
-// binary from one nix profile serve clients built against another. sccache is cowshed's now:
-// `cowshed setup --sccache` builds packages/cowshed/nix/sccache, pins it with a nix GC root, and
-// supervises that exact store path. Kept as an empty list rather than deleted because the shape is
-// the extension point: the next tool a Rust repo genuinely must carry belongs here.
+// No package here any more: a Rust repo carries no compiler cache on its PATH. Cargo's cache is mbx,
+// pinned in the repository's own devenv and proven against the mbx installed beside cowshed. Kept as
+// an empty list rather than deleted because the shape is the extension point: the next tool a Rust
+// repo genuinely must carry belongs here.
 const requiredRustDevenvPackages: string[] = [];
 const linuxCompilerPackage = 'pkgs.stdenv.cc';
 const ignoredNativeManifestDirectories = new Set([

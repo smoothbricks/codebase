@@ -7,7 +7,7 @@
 use super::*;
 use crate::api::call::{Arguments, Binder, Serves, decode, owned};
 use crate::api::capability::{
-    Coordinator, Host, JobHandle, Project, SccacheHost, WorkspaceHandle, WorkspaceRef,
+    Coordinator, Host, JobHandle, Project, WorkspaceHandle, WorkspaceRef,
 };
 
 impl Serves<HostListProjects> for Host {
@@ -392,54 +392,6 @@ impl Serves<HostDiskCommand> for Host {
             registry_entry,
             gateway_socket,
         })
-    }
-}
-
-impl Serves<SccacheStart> for SccacheHost {
-    const BOUND: &'static [&'static str] = &[];
-
-    fn request(
-        _authority: &<Self as Binder>::Fields<'_>,
-        arguments: Arguments,
-    ) -> Result<SccacheStartRequest> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {
-            #[serde(default)]
-            capacity: Option<String>,
-        }
-        let Caller { capacity } = decode::<SccacheStart, Caller>(arguments)?;
-        Ok(SccacheStartRequest { capacity })
-    }
-}
-
-impl Serves<SccacheStop> for SccacheHost {
-    const BOUND: &'static [&'static str] = &[];
-
-    fn request(
-        _authority: &<Self as Binder>::Fields<'_>,
-        arguments: Arguments,
-    ) -> Result<HostRequest> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {}
-        let Caller {} = decode::<SccacheStop, Caller>(arguments)?;
-        Ok(HostRequest {})
-    }
-}
-
-impl Serves<SccacheStatusRead> for SccacheHost {
-    const BOUND: &'static [&'static str] = &[];
-
-    fn request(
-        _authority: &<Self as Binder>::Fields<'_>,
-        arguments: Arguments,
-    ) -> Result<HostRequest> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {}
-        let Caller {} = decode::<SccacheStatusRead, Caller>(arguments)?;
-        Ok(HostRequest {})
     }
 }
 
@@ -1794,7 +1746,6 @@ pub(crate) trait EachServed {
 #[cfg(test)]
 pub(crate) struct Handles<'a> {
     pub(crate) host: &'a Host,
-    pub(crate) sccache_host: &'a SccacheHost,
     pub(crate) project: &'a Project,
     pub(crate) workspace_ref: &'a WorkspaceRef,
     pub(crate) coordinator: &'a Coordinator,
@@ -1825,9 +1776,6 @@ pub(crate) fn each_served(check: &mut impl EachServed, handles: &Handles<'_>) {
     check.served::<HostRetireDescendants, _>(handles.host, &[]);
     check.served::<HostCredentialAdd, _>(handles.host, &[]);
     check.served::<HostDiskCommand, _>(handles.host, &[]);
-    check.served::<SccacheStart, _>(handles.sccache_host, &[]);
-    check.served::<SccacheStop, _>(handles.sccache_host, &[]);
-    check.served::<SccacheStatusRead, _>(handles.sccache_host, &[]);
     check.served::<ProjectWorkspace, _>(handles.project, &[]);
     check.served::<ProjectWorkspaceAt, _>(handles.project, &[]);
     check.served::<ProjectList, _>(handles.project, &[]);

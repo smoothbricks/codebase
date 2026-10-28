@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn typos_suggest_the_command_that_was_meant() {
-        assert_eq!(nearest_commands("sscache"), ["sccache"]);
+        assert_eq!(nearest_commands("gatway"), ["gateway"]);
         assert_eq!(nearest_commands("statuss"), Vec::<&str>::new());
         assert_eq!(nearest_commands("remove"), ["revoke"]);
         assert_eq!(nearest_commands("revok"), ["revoke"]);

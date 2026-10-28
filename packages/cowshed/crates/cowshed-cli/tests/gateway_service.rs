@@ -808,8 +808,8 @@ fn removing_the_installed_cowshed_takes_the_stable_name_every_copy_and_every_rec
     let executable = executable.expect("installed");
     let first = executable.stored(&digest_of(b"first build\n"));
     fs::write(format!("{}.build", first.display()), b"{}").expect("a build record");
-    let neighbour = executable.directory().join("sccache");
-    fs::write(&neighbour, b"another service's binary").expect("neighbour");
+    let neighbour = executable.directory().join("mbx");
+    fs::write(&neighbour, b"another tool's link").expect("neighbour");
 
     assert_eq!(
         remove_host_stable_executable(&executable).expect("remove"),
@@ -819,7 +819,7 @@ fn removing_the_installed_cowshed_takes_the_stable_name_every_copy_and_every_rec
         .expect("directory")
         .map(|entry| entry.expect("entry").file_name())
         .collect();
-    assert_eq!(left, [OsString::from("sccache")]);
+    assert_eq!(left, [OsString::from("mbx")]);
     assert_eq!(
         remove_host_stable_executable(&executable).expect("remove again"),
         RemovalOutcome::AlreadyAbsent

@@ -22,7 +22,7 @@ use bytes::Bytes;
 use cowshed_core::{
     Coordinator as CoreCoordinator, Cowshed, CowshedError, EventStream, Host as CoreHost,
     JobAttachment as CoreJobAttachment, JobHandle as CoreJobHandle, JobStdin as CoreJobStdin,
-    Project as CoreProject, SccacheHost as CoreSccacheHost, WorkspaceHandle as CoreWorkspaceHandle,
+    Project as CoreProject, WorkspaceHandle as CoreWorkspaceHandle,
     WorkspaceRef as CoreWorkspaceRef,
     api::{
         call::{self, Arguments, NamesJob, Serves},
@@ -559,28 +559,6 @@ impl Host {
     }
 }
 
-/// The sccache daemon's control over one `cowshed sccache host` connection (07_api.md, "Host
-/// operations"), a connection and a process of its own.
-#[napi]
-pub struct SccacheHost {
-    inner: Arc<CoreSccacheHost>,
-    process: HostProcess,
-}
-
-#[napi]
-impl SccacheHost {
-    /// End the connection and wait for `cowshed sccache host` to exit, as `Host.close` does.
-    #[napi]
-    pub fn close(&self, env: Env) -> napi::Result<JsObject> {
-        let host = Arc::clone(&self.inner);
-        let process = self.process.clone();
-        spawn_promise(env, async move {
-            host.close().await.map_err(AddonFailure::from)?;
-            process.ended().await
-        })
-    }
-}
-
 /// Starts `launcher host` — the package's `bin/cowshed`, which picks the binary every verb runs
 /// (06_cli.md, "Launcher") — on one end of a fresh socketpair, with this process's stdout and
 /// stderr, and connects to it on the other. The child's stdin is the socket and nothing else;
@@ -594,24 +572,6 @@ pub fn open_host(env: Env, launcher: String) -> napi::Result<JsObject> {
             .await
             .map_err(AddonFailure::from)?;
         Ok(Host {
-            inner: Arc::new(host),
-            process,
-        })
-    })
-}
-
-/// Starts `launcher sccache host` as `openHost` starts `launcher host`: the launcher routes the
-/// `sccache` verb to the installed build, so the daemon this controls is the one `cowshed sccache`
-/// controls.
-#[napi(js_name = "openSccacheHost")]
-pub fn open_sccache_host(env: Env, launcher: String) -> napi::Result<JsObject> {
-    let started = HostProcess::start(&launcher, HostRole::Sccache);
-    spawn_promise(env, async move {
-        let (socket, process) = started?;
-        let host = CoreSccacheHost::connect(socket)
-            .await
-            .map_err(AddonFailure::from)?;
-        Ok(SccacheHost {
             inner: Arc::new(host),
             process,
         })
@@ -639,7 +599,6 @@ impl HostProcess {
         use cowshed_os::fork_lock::Spawn as _;
         let (verb, named): (&[&str], &'static str) = match role {
             HostRole::Host => (&["host"], "cowshed host"),
-            HostRole::Sccache => (&["sccache", "host"], "cowshed sccache host"),
         };
         // Darwin has no SOCK_CLOEXEC: made under the fork lock, no spawn of this process inherits
         // the pair between the socketpair and the close-on-exec that follows it

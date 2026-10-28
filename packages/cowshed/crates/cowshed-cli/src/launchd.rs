@@ -5,7 +5,6 @@
 //! tests remain entirely host-independent.
 
 use crate::agent_cycle::{self, LoadedAgent};
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_os::deadline::{self, Bound, Deadline, LatencyClass, RunError};
 use cowshed_os::namespace::HostNamespace;
 use std::error::Error;
@@ -33,7 +32,6 @@ pub const GATEWAY_HOST_NAME: &str = "cowshed-gateway-host";
 /// inside a job") — so
 /// an install removes the link an earlier one left and nothing creates it.
 pub const CARGO_LINK_NAME: &str = "cargo";
-pub const SCCACHE_BINARY_NAME: &str = "sccache";
 
 pub const LIBRARY_DIRECTORY: &str = "Library";
 pub const APPLICATION_SUPPORT: &str = "Application Support";
@@ -85,8 +83,8 @@ impl DevenvProfile {
 
 impl BunDirectory {
     /// A directory said to hold `bun`, held to the shape a plist may name: absolute, in its
-    /// canonical lexical spelling, and outside `/nix/store`. Like [`StoreBackedProgram::new`],
-    /// this states a path rather than probing it; [`Self::on_path`] is the constructor that looks.
+    /// canonical lexical spelling, and outside `/nix/store`. It states a path rather than probing
+    /// it; [`Self::on_path`] is the constructor that looks.
     pub fn new(directory: PathBuf) -> Result<Self, LaunchdError> {
         validate_canonical_absolute_path("bun-directory", &directory)?;
         if directory.starts_with(NIX_STORE) {
@@ -263,72 +261,11 @@ impl fmt::Display for ExecutableDigest {
     }
 }
 
-/// A program launchd runs straight out of the nix store, and the GC root that keeps it there.
-///
-/// Deliberately *not* a [`HostStableExecutable`]: nothing is copied. The plist names the resolved
-/// store path, which carries the build's own content hash, so a different build is a different
-/// plist — and rewriting a plist is what boots the old server out. Naming the `--out-link` symlink
-/// instead would let a later `nix build` repoint it and leave launchd starting a different binary
-/// at the next restart, under a definition nobody changed.
-///
-/// That matters because of what contends, which is the socket rather than any version string. A
-/// unix bind unlinks the path first (sccache 0.17.0, server.rs:510-514), so any client that
-/// auto-starts a server takes the LaunchAgent's socket over from it. `connect_or_start_server`
-/// (commands.rs:310-348) starts one on ConnectionRefused, TimedOut, or NotFound — never on a
-/// version disagreement, which is only ever reported. So the property worth having is not "the
-/// names match", it is "there is exactly one supervised server and every client finds it", and a
-/// plist that changes when and only when the build changes is what keeps that true.
-///
-/// The root is carried *with* the program because it is the only reason that path survives
-/// `nix store gc`. The program is derived from the rooted store path rather than passed beside it:
-/// that makes "the program the plist names lives inside the store path this root pins" true by
-/// construction, so a root pinning some other build cannot be mistaken for a pin on this one.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoreBackedProgram {
-    home: PathBuf,
-    program: PathBuf,
-    gc_root: PathBuf,
-}
-
-impl StoreBackedProgram {
-    /// `rooted_store_path` must be what `gc_root` resolves to; the caller reads the link.
-    pub fn new(
-        home: &Path,
-        gc_root: &Path,
-        rooted_store_path: &Path,
-        name: &str,
-    ) -> Result<Self, LaunchdError> {
-        validate_canonical_absolute_path("home", home)?;
-        validate_canonical_absolute_path("gc-root", gc_root)?;
-        validate_canonical_absolute_path("store-path", rooted_store_path)?;
-        validate_binary_name(name)?;
-        let program = rooted_store_path.join(STABLE_BINARY_DIRECTORY).join(name);
-        Ok(Self {
-            home: home.to_path_buf(),
-            program,
-            gc_root: gc_root.to_path_buf(),
-        })
-    }
-
-    pub fn program(&self) -> &Path {
-        &self.program
-    }
-
-    pub fn gc_root(&self) -> &Path {
-        &self.gc_root
-    }
-
-    pub fn home(&self) -> &Path {
-        &self.home
-    }
-}
-
 /// A launchctl control target: the label, and the plist path that defines it.
 ///
 /// Split out of [`LaunchAgentSpec`] because `stop` and `status` are not definitions. They have to
-/// reach the agent `start` installed even when the program it names is gone — a store-backed
-/// sccache whose GC root was deleted and collected is exactly that state, and it is a state
-/// `doctor` must be able to report rather than one that makes the control verbs unconstructible.
+/// reach the agent `start` installed even when the program it names is gone, a state `doctor` must
+/// be able to report rather than one that makes the control verbs unconstructible.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchAgentTarget {
     label: String,
@@ -378,9 +315,9 @@ pub enum ServiceLifecycle {
 /// PRIO_DARWIN_PROCESS, 0, 0)` in a child reports success and changes nothing (probed on macOS 26
 /// with a Background agent: PRI 4 before and after, in the agent and in its children).
 ///
-/// Only Interactive runs at parity with the host's own processes. sccache hashes every miss and
-/// runs rustc as its own child; the gateway's supervisor manager starts every workspace
-/// supervisor, which starts every shell host and every `cowshed exec` job. Probed with a test
+/// Only Interactive runs at parity with the host's own processes. The gateway's supervisor
+/// manager starts every workspace supervisor, which starts every shell host and every
+/// `cowshed exec` job. Probed with a test
 /// agent on macOS 26: Background runs it and its children at PRI 4, Standard at PRI 20 (the
 /// utility band, `taskpolicy -c utility`), Interactive at PRI 31 like a terminal's processes.
 /// Both clamped bands throttle IO behind the host's: under Background on a host at load 80 a
@@ -441,9 +378,8 @@ impl LaunchAgentSpec {
     }
 
     /// `home` and `program` are primitives here, but every public constructor above reaches this
-    /// through a type that has already proved its program outlives the build that installed it —
-    /// [`HostStableExecutable`] for a cowshed-owned copy, [`StoreBackedProgram`] for a GC-rooted
-    /// store path. Nothing else can name a service executable.
+    /// through a type that has already proved its program outlives the build that installed it, a
+    /// [`HostStableExecutable`] for a cowshed-owned copy. Nothing else can name a service executable.
     fn assemble(
         home: &Path,
         program: &Path,
@@ -526,73 +462,6 @@ impl LaunchAgentSpec {
         // the agent states the bound the daemon's own drain is sized within.
         spec.exit_timeout = Some(cowshed_gateway_types::GATEWAY_EXIT_TIMEOUT);
         Ok(spec)
-    }
-
-    /// The host-owned sccache server agent.
-    ///
-    /// launchd runs the sccache binary itself, straight out of the nix store path
-    /// an earlier `cowshed setup --sccache` built and rooted ([`StoreBackedProgram`] carries both, and states
-    /// why the plist names the store path rather than the out-link). Server mode is selected
-    /// entirely through the environment (`SCCACHE_START_SERVER=1` combined with any CLI
-    /// argument is a parse error in sccache), so this is the one agent with an
-    /// empty argv tail. `SCCACHE_NO_DAEMON=1` keeps the server in the
-    /// foreground under launchd's supervision, `SCCACHE_IDLE_TIMEOUT=0`
-    /// disables idle exit, and the socket and cache paths pin the shared
-    /// cowshed locations independent of the launchd session environment.
-    ///
-    /// `SCCACHE_CACHE_SIZE` and `SCCACHE_BASEDIRS` are read once, by the server, at start: neither
-    /// can be set by a client, so both belong here or nowhere. The cap has to be stated because
-    /// sccache's default is 10 GiB — smaller than one debug graph of the projects cowshed hosts, so
-    /// the default evicts the entries a second slot tenant came for. `SCCACHE_BASEDIRS` is the
-    /// *plural*, colon-separated name; sccache 0.16 has no `SCCACHE_BASEDIR` at all and ignores it
-    /// in silence, which is why a host can look configured and report "Base directories (none)".
-    /// Measured: basedirs cannot buy cross-path Rust reuse either way, because cargo's
-    /// `-C metadata` is a hash it never sees — the stable slot mount is what does that. It is set
-    /// to the store root so every path the daemon does relativize is store-relative.
-    ///
-    /// Interactive QoS (`PROCESS_TYPE`) is load-bearing here too. sccache 0.17 does not use
-    /// cargo's jobserver; it creates its own (`Client::new()` → `num_cpus()` tokens) and
-    /// `acquire()`s one per miss, so under Background (PRI 4) or Standard (PRI 20) the hasher and
-    /// those rustc children would run below every wrapped `sccache rustc` client at PRI 31, and
-    /// the host's compile fleet would wait on a niced queue instead of hitting a cache.
-    ///
-    /// The label is `namespace`'s ([`HostNamespace::launchd_label`]): production's
-    /// `dev.cowshed.sccache`, a test namespace's `dev.cowshed-test-<ns>.sccache`.
-    ///
-    /// All source-verified against sccache 0.17.
-    pub fn sccache(
-        namespace: HostNamespace,
-        program: &StoreBackedProgram,
-        server_socket: &Path,
-        cache_directory: &Path,
-        cache_capacity: ImageCapacity,
-        base_directory: &Path,
-    ) -> Result<Self, LaunchdError> {
-        validate_canonical_absolute_path("server-socket", server_socket)?;
-        validate_canonical_absolute_path("cache-directory", cache_directory)?;
-        validate_canonical_absolute_path("base-directory", base_directory)?;
-        let path_string =
-            |path: &Path| path.to_str().expect("validated paths are UTF-8").to_owned();
-        let environment = vec![
-            ("SCCACHE_START_SERVER".to_owned(), "1".to_owned()),
-            ("SCCACHE_NO_DAEMON".to_owned(), "1".to_owned()),
-            ("SCCACHE_IDLE_TIMEOUT".to_owned(), "0".to_owned()),
-            ("SCCACHE_SERVER_UDS".to_owned(), path_string(server_socket)),
-            ("SCCACHE_DIR".to_owned(), path_string(cache_directory)),
-            ("SCCACHE_CACHE_SIZE".to_owned(), cache_capacity.to_string()),
-            ("SCCACHE_BASEDIRS".to_owned(), path_string(base_directory)),
-        ];
-        Self::assemble(
-            program.home(),
-            program.program(),
-            AgentDefinition {
-                label: namespace.launchd_label("sccache"),
-                arguments: Vec::new(),
-                environment,
-                lifecycle: ServiceLifecycle::KeepAlive,
-                standard_error_file: "sccache-stderr.log",
-            },
-        )
     }
 
     pub fn label(&self) -> &str {

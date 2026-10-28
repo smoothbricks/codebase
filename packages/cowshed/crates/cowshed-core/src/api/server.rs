@@ -863,9 +863,6 @@ impl ConnectionAuthority {
 pub enum HostRole {
     /// `cowshed host`: the host's own verbs.
     Host,
-    /// `cowshed sccache host`: the sccache daemon's control, on the build the launcher routes the
-    /// `sccache` verb to.
-    Sccache,
 }
 
 impl HostRole {
@@ -873,7 +870,6 @@ impl HostRole {
     pub const fn scope(self) -> Scope {
         match self {
             Self::Host => Scope::Host,
-            Self::Sccache => Scope::Sccache,
         }
     }
 }
@@ -1728,7 +1724,7 @@ fn validate_request(
             }
         }
         ConnectionAuthority::Coordinator { .. } | ConnectionAuthority::Worker { .. }
-            if matches!(operation.scope, Scope::Host | Scope::Sccache) =>
+            if matches!(operation.scope, Scope::Host) =>
         {
             return Err(authority_error(format!(
                 "project authority cannot call host method {}",

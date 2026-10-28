@@ -2,4 +2,3 @@
 //! client configuration a host installs once, never anything a repository enables by itself.
 
 pub mod mbx;
-pub mod sccache;

@@ -1097,7 +1097,7 @@ fn running_executable() -> Result<PathBuf> {
 
 /// Boot the agent out and delete its plist, reporting whether a plist was there.
 ///
-/// Shared by `gateway stop`, `sccache stop`, and `setup --uninstall`: an agent is deactivated
+/// Shared by `gateway stop` and `setup --uninstall`: an agent is deactivated
 /// before its definition is removed, or launchd keeps running a service whose plist has gone.
 pub fn remove_launch_agent(target: &LaunchAgentTarget) -> Result<RemovalOutcome> {
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
@@ -1303,7 +1303,7 @@ pub(crate) async fn service_status(roots: &CanonicalRoots) -> Result<CliGatewayS
 /// A daemon that took a request over its socket and gave no answer within its asker's bound.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Unanswered {
-    /// Who took the request: `the gateway daemon`, `the sccache server`.
+    /// Who took the request: `the gateway daemon`.
     pub(crate) peer: &'static str,
     pub(crate) socket: PathBuf,
     pub(crate) within: Duration,
@@ -1777,7 +1777,6 @@ async fn run_daemon() -> Result<()> {
         resume_project_retirements(&storage).await;
         let inventory = NativeSessionInventory::new(storage);
         heal_recorded_projects(&heal_inventory, repositories, &heal).await;
-        heal_sccache_daemon().await;
         report_session_restore(&install_all_sessions(&inventory, &handle).await?);
         heal.restored();
         // Every session that will be restored is: a carried listener none claimed would queue
@@ -1923,25 +1922,6 @@ async fn heal_recorded_projects(
             );
             cowshed_os::eprintln!("next: cowshed doctor");
         }
-    }
-}
-
-/// Bring the compile cache up with the gateway, reporting rather than raising.
-///
-/// The daemon is part of the host's serving posture, not an opt-in: a workspace shell exports
-/// `SCCACHE_SERVER_UDS` unconditionally and a client that finds nothing there either compiles
-/// uncached or tries to bind the socket itself, which the store-wide sandbox deny refuses. Starting
-/// it here is also what re-establishes it after a reboot, since the sccache agent is only ever
-/// installed by a cowshed that could resolve the sccache binary on PATH.
-///
-/// A host without sccache installed is not a broken host, so failure is a log line: the gateway's
-/// job is to serve, and every workspace works without a compile cache.
-async fn heal_sccache_daemon() {
-    if let Err(error) = crate::capabilities::sccache::service::start_service(None).await {
-        cowshed_os::eprintln!(
-            "cowshed: could not start the sccache daemon at startup: {}",
-            error.message
-        );
     }
 }
 

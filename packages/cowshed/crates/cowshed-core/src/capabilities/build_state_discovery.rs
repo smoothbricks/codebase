@@ -1416,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_go_and_sccache_share_one_lazy_tracked_manifest_snapshot() {
+    fn cargo_and_go_share_one_lazy_tracked_manifest_snapshot() {
         let fixture = Fixture::new();
         git(&fixture, &["init", "--quiet"]);
         fixture.files(&[
@@ -1434,29 +1434,20 @@ mod tests {
                 .is_some()
         );
         assert!(tracked.inputs.is_some());
-        // A second query now sees an empty index. Go and sccache must instead use the
+        // A second query now sees an empty index. Go must instead use the
         // exact snapshot Cargo loaded, including Go's nested module.
         fs::remove_file(fixture.root.join(".git/index")).unwrap();
         let detected =
             super::super::detect_with(&fixture.context(), &BTreeMap::new(), &mut tracked).unwrap();
-        assert_eq!(
-            detected.active,
-            [CapabilityId::Cargo, CapabilityId::Go, CapabilityId::Sccache]
+        assert_eq!(detected.active, [CapabilityId::Cargo, CapabilityId::Go]);
+        let go = &super::super::go::DETECTOR;
+        assert!(
+            go.detect_with(&fixture.context(), &mut tracked)
+                .unwrap()
+                .is_some(),
+            "go re-queried the index rather than sharing the snapshot",
         );
-        for detector in [
-            &super::super::go::DETECTOR,
-            &super::super::sccache::DETECTOR,
-        ] {
-            assert!(
-                detector
-                    .detect_with(&fixture.context(), &mut tracked)
-                    .unwrap()
-                    .is_some(),
-                "{} re-queried the index rather than sharing the snapshot",
-                detector.id.name(),
-            );
-            assert!(detector.detect(&fixture.context()).unwrap().is_none());
-        }
+        assert!(go.detect(&fixture.context()).unwrap().is_none());
     }
 
     #[test]

@@ -228,8 +228,6 @@ type ReaderName =
   | 'RESIZE_RESULT'
   | 'RESIZE_VOLUME'
   | 'RE_ADOPTION'
-  | 'SCCACHE_STATS'
-  | 'SCCACHE_STATUS'
   | 'SCRIPT_COMMAND'
   | 'SCRIPT_VALUE'
   | 'SEALED_JOB_REF'
@@ -1744,26 +1742,6 @@ const READERS: Readers<ReaderName> = {
       ['retained', 'LEAF'],
     ],
   },
-  SCCACHE_STATS: {
-    kind: 'record',
-    fields: [
-      ['maxCacheSize', 'LEAF'],
-      ['baseDirectories', 'LEAF'],
-      ['compileRequests', 'LEAF'],
-      ['requestsExecuted', 'LEAF'],
-      ['hits', 'LEAF'],
-      ['misses', 'LEAF'],
-    ],
-  },
-  SCCACHE_STATUS: {
-    kind: 'record',
-    fields: [
-      ['installed', 'LEAF'],
-      ['running', 'LEAF'],
-      ['socket', 'LEAF'],
-      ['stats', 'SCCACHE_STATS'],
-    ],
-  },
   SCRIPT_COMMAND: {
     kind: 'record',
     fields: [
@@ -2260,9 +2238,6 @@ export const readRemoveReport = (json: string): Api.RemoveReport =>
 
 export const readResizeResult = (json: string): Api.ResizeResult =>
   V.assertResizeResult(project(JSON.parse(json), 'RESIZE_RESULT', READERS));
-
-export const readSccacheStatus = (json: string): Api.SccacheStatus =>
-  V.assertSccacheStatus(project(JSON.parse(json), 'SCCACHE_STATUS', READERS));
 
 export const readSealedJob = (json: string): Api.SealedJob =>
   V.assertSealedJob(project(JSON.parse(json), 'SEALED_JOB_REF', READERS));

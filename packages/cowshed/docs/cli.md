@@ -61,7 +61,7 @@ read.
 
 Usage lines are generated from the same option table the parser reads, so a flag a command accepts is a flag its usage
 line and its `--help` page name, with one line saying what it does. A mistyped verb is corrected against the command
-list: `cowshed sscache` refuses with `did you mean: sccache`.
+list: `cowshed gatway` refuses with `did you mean: gateway`.
 
 Workspace names are `[a-z0-9][a-z0-9-]*`, unique per project. Commands taking `<name>` accept `main` wherever it makes
 sense. `cowshed exec main -- ...` uses the same closed sandbox and explicit grants as every other workspace.
@@ -141,7 +141,7 @@ cowshed: the cowshed daemon is build X; this cowshed is build Y
 next: run `cowshed setup` from the cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on PATH
 ```
 
-`ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`, `controller`, `credential`, `identity`, `sccache`, `skill`,
+`ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`, `controller`, `credential`, `identity`, `skill`,
 `disk-command`, `--version` and `--help` do not ask: `doctor` diagnoses the disagreement, and `setup` ends it. No daemon
 answering is not a disagreement.
 
@@ -253,13 +253,11 @@ $ cowshed setup
 …
 cowshed: cowshed.store (store): present but not mounted -> mounted
 cowshed: /etc/fstab already pins the boot mounts
-cowshed: wrote ~/Library/Application Support/Mozilla.sccache/config: an sccache client that inherited no cowshed environment now caches in ~/Library/Caches/Mozilla.sccache
 cowshed: host storage is set up
 
 $ cowshed setup
 cowshed: cowshed.store (store): mounted at its canonical path -> already-current
 cowshed: /etc/fstab already pins the boot mounts
-cowshed: ~/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to ~/Library/Caches/Mozilla.sccache
 cowshed: everything already set up
 ```
 
@@ -289,38 +287,15 @@ path and not a failure. A build that fails, or a file there that is not cowshed'
 after every other row is printed. `setup --uninstall` removes the link and the root, never the store path, which is
 nix's to collect.
 
-`setup` also writes **sccache's own config file** — the one host-level thing that decides where a compile cache lands,
-and how large it may grow, for a client that has no cowshed environment at all. Every workspace gets `SCCACHE_DIR` from
-its supervisor, so a build inside a workspace already reaches the daemon; a `cargo` invoked anywhere else is still
-wrapped (`RUSTC_WRAPPER=sccache` survives in any shell that once loaded a project environment), and a client that finds
-no daemon starts a server of its own. The file names the daemon's own store, sccache's default
-`~/Library/Caches/Mozilla.sccache` (`~/.cache/sccache` on Linux), and the same cap the daemon uses, so that server
-neither forks a second cache nor lets sccache's 10 GiB default evict the shared store down to it.
-
-The destination is whichever config path sccache itself would load — `~/Library/Application Support/Mozilla.sccache/` on
-macOS, `$XDG_CONFIG_HOME/sccache/` elsewhere, and the legacy `~/Library/Preferences/Mozilla.sccache/` when a config
-already lives there, since writing the modern path over an existing old one would shadow rather than replace it. cowshed
-owns exactly the `[cache.disk]` table and says so in a comment at the top of the block (a comment, because sccache
-rejects unknown _keys_ and would refuse to start over one). Nothing else in that file is ever rewritten: the block is
-appended below whatever is already there, and a `cache.disk.dir` cowshed did not write is left alone and reported rather
-than overwritten —
-
-```
-cowshed: left ~/Library/Application Support/Mozilla.sccache/config alone: it already sets cache.disk.dir to /Volumes/Scratch/sccache; a store-less sccache client will not share ~/Library/Caches/Mozilla.sccache until cache.disk.dir names it
-```
-
-which is a report, not a failure: the host's storage is set up either way. A block cowshed _did_ write is refreshed on
-every run, so a cap that has drifted upward as projects were adopted is repaired by running `setup` again; a foreign
-`dir` never is, and has to be resolved by hand. Nothing is written at all when the store volume is not mounted, since
-the cap is derived from the mains it holds; the line then says the file was not written and why.
-
-`--retire-caches-volume` finishes retiring the `cowshed.caches` volume that earlier releases kept the shared tool caches
-on (`specs/cowshed/03_caches.md`, "Retiring the caches volume"). On a host that still has one, every `setup` first moves
-what it holds to its home in the host HOME — each tool's cache to the tool's own default, the gateway's mirrors to
-`~/Library/Caches/dev.cowshed`, sccache's store to `~/Library/Caches/Mozilla.sccache`, a repository's cache to the
-`[caches] home` path its main declares — merging where both sides hold a cache. That needs no authorization, and until
-the volume is deleted it stays mounted and pinned. After the storage rows, setup names every cache it moved and every
-directory it could not place, with its size:
+A host an earlier release set up with sccache has its `dev.cowshed.sccache` LaunchAgent, the `dev.cowshed/nix/sccache`
+GC root and `<store>/sccache.sock` removed by the next `setup`, one line for each that was there. sccache's own config
+file and its cache directory are the user's and are left alone. `--retire-caches-volume` finishes retiring the
+`cowshed.caches` volume that earlier releases kept the shared tool caches on (`specs/cowshed/03_caches.md`, "Retiring
+the caches volume"). On a host that still has one, every `setup` first moves what it holds to its home in the host HOME
+— each tool's cache to the tool's own default, the gateway's mirrors to `~/Library/Caches/dev.cowshed`, a repository's
+cache to the `[caches] home` path its main declares — merging where both sides hold a cache. That needs no
+authorization, and until the volume is deleted it stays mounted and pinned. After the storage rows, setup names every
+cache it moved and every directory it could not place, with its size:
 
 ```
 $ cowshed setup
@@ -360,12 +335,13 @@ cowshed: cowshed.caches (UUID 1D6F0E1A-…-BBBB) at /private/cowshed/caches hold
 `--uninstall` is the same transaction backwards, and narrower on purpose. It removes cowshed's **machine presence** —
 the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.storage` system LaunchDaemon, the `cowshed.store` item in
 `/Library/Keychains/System.keychain` (and a retired volume's `cowshed.caches` item, if one is still there) with their
-UUID-keyed discovery items, the `dev.cowshed.gateway` and `dev.cowshed.sccache` LaunchAgents, the `cowshed` links on
-your `PATH` that name the installed cowshed, the installed cowshed itself (its stable name, every stored copy and their
-build records), and sccache's nix GC root — and touches no volume, no image, and no workspace. Nothing it removes holds
-data; everything it leaves does. It therefore refuses while the volumes still hold workspaces, or while their occupancy
-cannot be established at all (an unmounted store looks empty to every cheap check), until `--force` says the caller
-means it anyway. There is no interactive prompt — the refusal is the prompt, and its hint is the completed command line:
+UUID-keyed discovery items, the `dev.cowshed.gateway` LaunchAgent, the `cowshed` links on your `PATH` that name the
+installed cowshed, the installed cowshed itself (its stable name, every stored copy and their build records), mbx's link
+and nix GC root, and an earlier release's sccache agent and GC root if they are still there — and touches no volume, no
+image, and no workspace. Nothing it removes holds data; everything it leaves does. It therefore refuses while the
+volumes still hold workspaces, or while their occupancy cannot be established at all (an unmounted store looks empty to
+every cheap check), until `--force` says the caller means it anyway. There is no interactive prompt — the refusal is the
+prompt, and its hint is the completed command line:
 
 ```
 $ cowshed setup --uninstall
@@ -376,15 +352,15 @@ next: cowshed setup --uninstall --force
 
 With `--json`, `setup` emits the frozen envelope carrying the per-volume report; `--uninstall` reports the fstab outcome
 and every service artifact it touched, in the order it touched them (system daemon, then each System.keychain item it
-removed, then both user agents, then the `cowshed` links on `PATH`, the installed cowshed and sccache's GC root). A
-teardown that found nothing installed reports an empty `services` list rather than omitting the field:
+removed, then the user agent, then the `cowshed` links on `PATH`, the installed cowshed and the GC roots). A teardown
+that found nothing installed reports an empty `services` list rather than omitting the field:
 
 ```
 $ cowshed setup --json
 {"ok":true,"result":{"volumes":[{"name":"cowshed.store","role":"store","stateBefore":"absent","action":"created"}],"fstab":"pinned","authorized":true}}
 
 $ cowshed setup --uninstall --force --json
-{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.storage system LaunchDaemon","outcome":"removed"},{"what":"cowshed.store System.keychain item","outcome":"removed"},{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"cowshed on PATH","outcome":"removed"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"sccache nix GC root","outcome":"already-absent"}]}}
+{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.storage system LaunchDaemon","outcome":"removed"},{"what":"cowshed.store System.keychain item","outcome":"removed"},{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"cowshed on PATH","outcome":"removed"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"mbx beside the installed cowshed","outcome":"removed"},{"what":"mbx nix GC root","outcome":"removed"},{"what":"retired dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"retired sccache nix GC root","outcome":"already-absent"},{"what":"retired sccache socket","outcome":"already-absent"}]}}
 ```
 
 `outcome` is `removed` or `already-absent`; the stderr rendering of the same value reads `already absent`.
@@ -578,36 +554,17 @@ A **build slot** is one stable mount path, occupied by one workspace at a time. 
 3, and that workspace mounts at `<mount-root>/<owner>/<repo>/slot@3` instead of `.../<name>`. When it is removed or
 renamed the slot is released, and the next workspace to take slot 3 mounts at exactly the same absolute path.
 
-Path identity was once the entire feature, because both halves of the compiler cache keyed on absolute paths. Neither
-does any more:
+Path identity was once the entire feature, because the compiler cache keyed on absolute paths. It no longer does:
 
 - Cargo derived `-C metadata` and `-C extra-filename` from a package id carrying the **absolute manifest directory**, so
   a local crate compiled at two paths was two different compilations. From cargo 1.97 both are path-independent for
   workspace members (measured: identical hashes for one workspace checked out at two paths).
-- sccache additionally hashes the compiler's **physical** working directory. The bundled build keys that, the blanket
-  `CARGO_*` values and the argument bytes relative to the request cwd for a client that sets `SCCACHE_BASEDIR_CWD=1` —
-  which every workspace does — and compiles such a request with the cwd remapped away, so the working directory rustc
-  records in rmeta and debuginfo is workspace-relative.
+- mbx, Cargo's cache in a project that pins it, keys a unit by its inputs rather than by the checkout it was built in,
+  and stores it once in the shared store on the `cowshed.build-cache` volume.
 
-So cross-path sharing is the default, and a slot is what is left for the cases those two do not reach. A unit whose
-output still names its checkout — an `env!("CARGO_MANIFEST_DIR")` value compiled into it, a proc macro that reads the
-manifest directory — is found by reading the outputs before they are stored, and is stored for that path alone: it hits
-again at the same path and fails closed at every other. Tooling that persists absolute paths across tenant generations
-keeps working, and an unpatched sccache or a cargo older than 1.97 still needs the path to be identical. The table below
-is that older world, measured on this hardware with sccache 0.16 over a ten-crate workspace, second checkout of
-identical sources:
-
-| build path                         | Rust units hit |
-| ---------------------------------- | -------------- |
-| same absolute path (slot)          | **22/22**      |
-| sibling paths                      | 9/22           |
-| sibling paths + `SCCACHE_BASEDIRS` | 9/22           |
-| symlink + `cargo --manifest-path`  | 12/22          |
-
-The 9 that hit without a slot are registry crates, whose package ids carry no path. Note what does _not_ work: a symlink
-is inert, because cargo resolves its working directory with `getcwd` (`cargo metadata` through a symlinked checkout
-reports the physical path), and `SCCACHE_BASEDIRS` cannot help either, because `-C metadata` is a hash sccache never
-sees. Only the mount path itself can be the stable thing.
+So cross-path sharing is the default, and a slot is what is left for the cases those two do not reach: a unit whose
+output still names its checkout (an `env!("CARGO_MANIFEST_DIR")` value compiled into it, a proc macro that reads the
+manifest directory), and tooling that persists absolute paths across tenant generations.
 
 `cowshed path --slot <n>` prints the tenant's mountpoint without you knowing which workspace holds the slot (exit 4 if
 nobody does); `cowshed path <name>` prints the same path from the other direction. **Builds must run through the slot
@@ -615,20 +572,15 @@ path to benefit** — that is where a slot-bound workspace is mounted, so `cd $(
 both land there, but a build reached through some other route to the same files (a symlink you made, a `--manifest-path`
 into one) is a different compilation.
 
-Every workspace child cowshed launches — `cowshed exec` and every supervisor-run command alike — gets `RUSTC_WRAPPER`
-naming the sccache that an earlier `cowshed setup --sccache` pinned (the program the host daemon runs, by its store
-path, so a repository shell that ships no sccache still builds), `SCCACHE_BASEDIR_CWD=1`,
-`SCCACHE_BASEDIR=<workspace root>` and the cache endpoints (`SCCACHE_SERVER_UDS`, `SCCACHE_DIR`). A host without a
-pinned sccache gets no wrapper. Name mounts are not excluded: the bundled sccache normalizes the residual path-bearing
-key inputs against the request cwd and the workspace root, so sibling paths share entries with each other. A slot buys
-the one input normalization cannot reach — cargo's `-C metadata`, a hash sccache never sees — and same-path reuse of the
-units whose output names their checkout.
+In a project whose `cargo` is mbx's shim and whose mbx is the one `cowshed setup` installed, every workspace child
+cowshed launches — `cowshed exec` and every supervisor-run command alike — gets `MBX_CACHE_DIR` naming the shared store,
+`MBX_TARGET_VIEWS=1` and mbx's scheduler settings, and loses any `RUSTC_WRAPPER` or `RUSTC_WORKSPACE_WRAPPER` a caller
+exported: no wrapper sits between Cargo and rustc. A project whose mbx differs from the installed one is refused with
+`mbx-host-missing` or `mbx-revision-skew` rather than built against a second store. A project without the shim builds
+plain Cargo into its build volume.
 
-`CARGO_INCREMENTAL` is not set, at any mount and for any command, `cowshed land --check` included. Cargo decides it per
-profile, which serves both halves of a build: workspace crates in `dev` and `test` stay incremental and local (a
-one-line edit rebuilds in ~1.7s, against ~20-32s with incremental forced off), while their dependencies are always
-non-incremental and reach the cache without anyone forcing anything. A land check therefore builds the same units an
-interactive command builds; forcing `CARGO_INCREMENTAL=0` there would compile every workspace crate a second time.
+Cowshed sets no incremental mode, at any mount and for any command, `cowshed land --check` included: incremental
+compilation is mbx's, and a land check builds the same units an interactive command builds.
 
 `main` cannot take a slot — its mount is fixed by the project's checkout layout.
 
@@ -1435,8 +1387,8 @@ out the agent and removes the plist, leaving the installed cowshed — host stat
 makes the next `start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it too — the stable
 name, every stored copy and its build record, and the `cowshed` links on your `PATH` that name the stable name — for a
 host that is done with the gateway rather than pausing it; `cowshed setup --uninstall` removes the system storage
-daemon, both user agents, the installed cowshed with its `PATH` links and sccache's nix GC root at once. All of these
-are idempotent, and a `--purge` with nothing installed says so rather than failing.
+daemon, the user agent, the installed cowshed with its `PATH` links and mbx's GC root at once. All of these are
+idempotent, and a `--purge` with nothing installed says so rather than failing.
 
 `status` and `doctor` call the gateway healthy only when the daemon runs the same bytes as the CLI asking; a daemon
 running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
@@ -1571,128 +1523,6 @@ cowshed: workspaces that can read this checkout fetch these URLs from it from th
   that was removed or now names another repository, and follows one that moved servers. Binding a remote that is already
   bound reports the binding unchanged; `--json` returns `{ repoId, added, identity, identities }`.
 
-### `cowshed sccache start [--capacity <size>]` / `stop` / `status`
-
-The gateway daemon starts this agent itself, so a healthy host already has it: `run_daemon` repairs/reattaches every
-project's mounts and then the compile cache. A host without sccache on PATH logs one line and serves normally. The verbs
-are for repair, inspection, and resizing.
-
-`start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.sccache`, then waits until the server answers on
-its unix socket at `/private/cowshed/store/sccache.sock`. The mode-0600 plist runs the _sccache binary itself_ — a copy
-at `~/Library/Application Support/dev.cowshed/bin/sccache`, installed by `start` from the sccache it resolves on the
-invoking shell's PATH, so run it from a shell with the devenv/nix sccache available — as a foreground unix-socket
-server: `SCCACHE_START_SERVER=1` selects server mode, `SCCACHE_NO_DAEMON=1` keeps it under launchd supervision,
-`SCCACHE_IDLE_TIMEOUT=0` disables idle exit, and `SCCACHE_DIR` pins the shared store at sccache's own default,
-`~/Library/Caches/Mozilla.sccache`. Stderr lands at `~/Library/Logs/cowshed/sccache-stderr.log`. `stop` boots out the
-agent and removes the plist; both operations are idempotent. The copy is what keeps the daemon alive across a devenv
-update or nix garbage collection: an sccache upgrade is picked up by rerunning `cowshed sccache start`, which recopies
-on byte drift and rewrites the plist only on drift.
-
-Cross-path reuse — every workspace hitting one cache regardless of its mount path — requires an sccache that carries
-`nix/sccache/sccache-basedir.patch`. It extends `SCCACHE_BASEDIRS` normalization to the Rust hasher and lets a client
-name base directories of its own, per request:
-
-- `SCCACHE_BASEDIR_CWD=1`, which cowshed exports in every workspace, names the request cwd. Cargo runs rustc from the
-  workspace root, so the Rust hasher keys the cwd, the blanket `CARGO_*` environment values and the argument bytes
-  relative to it. The C/C++ hasher ignores it.
-- `SCCACHE_BASEDIR=<absolute dir>` names a checkout root that is not the cwd, and both hashers honor it. Cowshed exports
-  the workspace root: cargo compiles a registry crate from its package directory, and the OUT_DIR its build script fills
-  (which serde includes from), `CARGO_HTTP_CAINFO` and a nested cargo run's other workspace paths sit outside that cwd.
-  A C/C++ build sets its own for cmake and ninja, which compile from a build directory below the root: the preprocessed
-  text (whose line markers name every source and header) and the arguments are keyed without it, and direct mode is off
-  for such a request. Named at the cwd it keys exactly as `SCCACHE_BASEDIR_CWD=1` alone.
-
-The Rust hasher strips the same directories from the values rustc records as `# env-dep:`. A normalized key is only as
-good as the claim that the output does not depend on the path it omits, so the patch makes that claim true where it can
-and then checks it:
-
-- a Rust compile runs under `--remap-path-prefix=<dir>=` for each of the request's own base directories, so the working
-  directory rustc writes into rmeta and debuginfo is relative and identical at every mount. A C/C++ compile is not
-  rewritten; the build passes `-ffile-prefix-map=<root>=.` itself, which the key strips like any argument path;
-- a proc-macro crate is never cached, but every crate the macro expands into hashes its dylib, so the client links it
-  under the same mappings and, on macOS, with an `@rpath/<file>` install name and no debug map (`-Wl,-S`): the linker
-  would otherwise record the output path and the object paths below the target directory. The dylib is then the same
-  bytes at every mount, and so is every key it feeds;
-- a Rust dep-info names the sources and env-dep values at the checkout that compiled it, and cargo reads it as such. A
-  shared entry holds it with each of the request's own base directories, where one starts a path, replaced by a
-  placeholder for its role (`SCCACHE_BASEDIR`, or the cwd), and a hit writes the requesting checkout's directories back;
-- before the entry is stored, its outputs (the dep-info in its placeholder form, rule targets aside) are searched for
-  every normalized path. An output that names one — a proc macro that read `CARGO_MANIFEST_DIR` through `std::env`,
-  which dep-info cannot see, an `env!` value compiled into a string, a C object compiled without a prefix map — is
-  stored under the verbatim per-path key, with a marker under the normalized key that sends later lookups to their own
-  per-path key. That checkout keeps reusing it; no other checkout is ever served it. A C depfile is not searched: a hit
-  keeps the one the request's own preprocessing wrote and never restores the entry's.
-
-Cargo's own `-C metadata` is path-independent for workspace members from cargo 1.97. An unpatched sccache still serves
-same-path (slot-tenant) reuse, nothing more. Prove the build with `strings sccache | grep cowshed-path-v3`; the C/C++
-half is `cowshed-path-v2:c-request-basedir`.
-
-Concurrent misses of one cache key wait for the first compile (`patches/sccache-singleflight.patch`; prove with
-`nm sccache | grep inflight_join`). Without it, parallel `cargo` processes compile the same crate N times.
-
-A C-family key also covers the files a compile reads that no preprocessor line marker names
-(`patches/sccache-embedded-inputs.patch`; prove with `strings sccache | grep cowshed-asm-inputs-v1`). Upstream keys a
-`.S` on its preprocessed text, which holds a `.incbin` file's name and none of its bytes, so a changed blob is served
-its old object; Bun's builtin-module blob is one. Assembler source keys the bytes of every `.incbin` and `.include`
-file, found as gas and LLVM both find it: as written against the cwd, then each driver `-I`, then each `-Wa,-I`. A
-directive it cannot resolve exactly (an operand built by an assembler macro, `.altmacro`, a file missing, a directory,
-`-I-` or `-I=`) and any in C inline assembly, which the compiler assembles with a search path of its own, compiles
-without a lookup or a store and counts as non-cacheable. Direct mode is off for a translation unit whose source or
-headers hold `#embed` or `__has_embed`: its line markers do not name the resource, while its preprocessed text carries
-the bytes. Directive names an assembler macro assembles from pieces are not found. Draft upstream report:
-[`sccache-upstream-assembler-inputs.md`](sccache-upstream-assembler-inputs.md).
-
-Two more variables are in that plist because sccache reads them once, at server start, and no client can supply them:
-
-- `SCCACHE_CACHE_SIZE` — the cap. sccache's own default is 10 GiB, which is smaller than one debug graph of a project
-  cowshed hosts, so the default evicts the entries a second slot tenant came for. The derived default is the summed
-  allocated size of every adopted project's `main` image, floored at **40 GiB** and rounded up to a whole gibibyte;
-  `--capacity 120g` overrides it (same size grammar as `cowshed adopt`/`resize`).
-- `SCCACHE_BASEDIRS` — **plural**; set to the store root. With the patched binary it also participates in Rust key
-  normalization; the per-request cwd from `SCCACHE_BASEDIR_CWD` is what makes workspace paths interchangeable.
-
-The agent is launchd `ProcessType` **Interactive**. Background is Darwin background QoS (PRI 4) and Standard is the
-utility band (PRI 20); both throttle the agent's IO behind the host's. sccache hashes every miss and runs rustc as its
-own child, both at the agent's priority, while every wrapped `sccache rustc` client stays interactive (PRI 31), so
-either clamp turns the shared daemon into a niced compile queue. The gateway agent is Interactive for the same reason:
-its supervisor manager starts every workspace supervisor, and so every shell host and `cowshed exec` job, and a
-descendant cannot leave its agent's QoS band.
-
-`status` reports launchd and socket health without starting anything, and surfaces the daemon's own `--show-stats`
-whenever it answers:
-
-```json
-{
-  "ok": true,
-  "result": {
-    "installed": true,
-    "running": true,
-    "socket": "/private/cowshed/store/sccache.sock",
-    "stats": {
-      "maxCacheSize": 42949672960,
-      "baseDirectories": ["/private/cowshed/store"],
-      "compileRequests": 1204,
-      "requestsExecuted": 1204,
-      "hits": { "C/C++": 39, "Rust": 22 },
-      "misses": { "Rust": 0 }
-    }
-  }
-}
-```
-
-Hits and misses are per language on purpose: cross-workspace C and C++ reuse works without any slot, so a healthy
-aggregate hit rate routinely hides a Rust hit rate of zero — which is the number a slot host is managing.
-
-Workspaces reach the daemon through `SCCACHE_SERVER_UDS` (supervisor-injected, `.cowshed/env`-exported, and carried by
-the cargo `[env]` guidance); the Seatbelt profile admits exactly that socket and keeps the sccache store
-daemon-write-only. `sccache --show-stats` works from any shell with the export set — it speaks to the same server.
-
-A client with no export set at all is `cowshed setup`'s business rather than this verb's: it reads sccache's own config
-file, which `setup` writes and owns (see [`cowshed setup`](#cowshed-setup---uninstall---force---downgrade) above).
-`sccache --show-stats` run from such a shell — no `SCCACHE_DIR`, no `SCCACHE_CONF`, outside every workspace — is the
-check that the file took effect: `Cache location` must read `Local disk: "<your home>/Library/Caches/Mozilla.sccache"`.
-It reports the resolved configuration without starting a server, so it is safe to run against a live host.
-
 ### `cowshed controller`
 
 Serves one coordinator controller connection, for the project selected by the cwd or `--project`, to the embedding
@@ -1782,14 +1612,13 @@ interleaved.
 Each probe prints `cowshed: doctor <probe> start` before it asks anything and, once it has taken 2 s,
 `done elapsed=<duration> status=ok|err`; the per-workspace checks end in one
 `cowshed: doctor workspace-checks done … workspaces=<n> slowest=<workspace> <d>` line. A probe that waits for another
-party — launchd, securityd, the gateway or sccache server at its socket, the commitment publisher — names it before it
-asks:
+party — launchd, securityd, the gateway at its socket, the commitment publisher — names it before it asks:
 `cowshed: doctor gateway-status waits-on=launchd (dev.cowshed.gateway), then the gateway daemon at /private/cowshed/store/gateway.sock`.
 The project's checks run inside the `doctor project` step, per workspace as `doctor <workspace>/<check>`. A doctor that
 seems stuck is in the probe it last started, waiting on the `waits-on=` party it named. An absent or refusing party is a
-finding; a gateway or sccache server that took doctor's request and gives no answer in 60 s is `gateway-unanswered` or
-`sccache-unanswered`. The bound is a minute, not seconds, because a saturated gateway answers late; its hint is
-`cowshed gateway status` before any restart. No probe reports an answer it did not get.
+finding; a gateway that took doctor's request and gives no answer in 60 s is `gateway-unanswered`. The bound is a
+minute, not seconds, because a saturated gateway answers late; its hint is `cowshed gateway status` before any restart.
+No probe reports an answer it did not get.
 
 Store-wide listing and diagnosis continue past an unreadable project's records: listing warns with the project name, and
 doctor records a finding for it while checking other projects.

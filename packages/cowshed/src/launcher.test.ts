@@ -188,21 +188,6 @@ describe('cowshed launcher', () => {
     expect((await stat(f.packaged(host))).mode & 0o777).toBe(0o750);
   });
 
-  hostOnly('runs sccache, even after leading flags, from the installed copy launchd runs', async () => {
-    const f = await fixture();
-    await named(f.packaged(host), 'packaged');
-    await named(f.stable, 'stable');
-
-    expect(launch(f.launcher, ['--json', 'sccache', 'start'], f).stdout).toBe('stable [--json] [sccache] [start]');
-  });
-
-  hostOnly('runs sccache from the packaged binary until something is installed', async () => {
-    const f = await fixture();
-    await named(f.packaged(host), 'packaged');
-
-    expect(launch(f.launcher, ['sccache', 'start'], f).stdout).toBe('packaged [sccache] [start]');
-  });
-
   hostOnly('runs gateway, setup, skill and every other verb from the invoking build', async () => {
     // `setup` writes the stable install and `gateway start`/`status` compare the daemon's
     // executable with the one asking: run from the installed copy, a stale gateway compared

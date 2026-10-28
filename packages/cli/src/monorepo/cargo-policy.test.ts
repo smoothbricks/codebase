@@ -127,7 +127,7 @@ describe('Cargo cache policy', () => {
   it('rejects CARGO_INCREMENTAL in a Justfile', async () => {
     const result = await check({ Justfile: 'set export CARGO_INCREMENTAL := "1"\n' });
     expect(result.failures).toBe(1);
-    expect(result.messages[0]).toContain('CARGO_INCREMENTAL=1 hard-fails');
+    expect(result.messages[0]).toContain("incremental compilation is mbx's to manage");
     expect(result.messages[0]).toContain('leave CARGO_INCREMENTAL unset');
   });
 
@@ -135,7 +135,7 @@ describe('Cargo cache policy', () => {
     const result = await check({ '.cargo/config.toml': '[env]\nCARGO_INCREMENTAL = "0"\n' });
     expect(result.failures).toBe(1);
     expect(result.messages[0]).toContain('.cargo/config.toml');
-    expect(result.messages[0]).toContain('CARGO_INCREMENTAL=0 surrenders');
+    expect(result.messages[0]).toContain('a committed value overrides it for every checkout');
   });
 
   it('flags profile tables in workspace members but not standalone package roots', async () => {

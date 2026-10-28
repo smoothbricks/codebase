@@ -149,8 +149,7 @@ hook-bearing workspace is unresolved rather than keyed without its hook-provided
 custom-hasher tasks also stay unresolved. macOS and Node 22.13+ are required; there is no unconfined fallback.
 
 Confinement permits persistent writes only in disposable scratch, plus nonpersistent `/dev/null` access (Git opens that
-device O_RDWR). Network access is denied except outbound IPC to the configured `SCCACHE_SERVER_UDS` Unix socket for
-read-only compiler metadata queries. A missing toolchain service fails rather than changing the environment. Live
+device O_RDWR). Network access is denied. A missing toolchain service fails rather than changing the environment. Live
 candidate databases are never opened by SQLite: DB/WAL/journal files are copied once to scratch, with unchanged
 device/inode/size/mtimeNs/ctimeNs required across the entire copy. Any changed/appeared/disappeared file reports busy
 and no time decision. Private SHM/recovery stays in scratch; candidate snapshot bytes and query seconds are reported.

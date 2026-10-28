@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Digest;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -4767,42 +4767,6 @@ pub struct ImageCleanup {
     pub pressure: bool,
 }
 
-/// Health of the host-owned sccache LaunchAgent.
-///
-/// `installed` is launchd's verdict (the job is loaded); `running` is the
-/// socket's (a connect on the server unix socket was accepted). Both are
-/// reported because the interesting failures are exactly the disagreements:
-/// installed-but-unresponsive (crash-looping agent) and answering-but-
-/// uninstalled (foreign server bound on the path).
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SccacheStatus {
-    pub installed: bool,
-    pub running: bool,
-    pub socket: PathBuf,
-    /// The daemon's own counters, absent unless it answered a stats request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stats: Option<SccacheStats>,
-}
-
-/// What the running sccache daemon reports about itself.
-///
-/// Hits and misses are per language rather than summed: cross-workspace C and C++ reuse works
-/// without any slot, so a healthy aggregate hit rate routinely hides a Rust hit rate of zero, which
-/// is the number a slot host is actually managing. `base_directories` is reported because it is the
-/// only observable proof that the server took `SCCACHE_BASEDIRS` — sccache 0.16 ignores the
-/// singular `SCCACHE_BASEDIR` entirely, and silently.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SccacheStats {
-    pub max_cache_size: u64,
-    pub base_directories: Vec<PathBuf>,
-    pub compile_requests: u64,
-    pub requests_executed: u64,
-    pub hits: BTreeMap<String, u64>,
-    pub misses: BTreeMap<String, u64>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuditDecision {
@@ -4945,7 +4909,6 @@ result_bodies!(
     GrantSet,
     ProjectGrants,
     GatewayStatus,
-    SccacheStatus,
     MirrorInfo,
     AuditEvent,
     SkillInstallReport,

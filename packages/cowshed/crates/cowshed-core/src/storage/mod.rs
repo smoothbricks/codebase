@@ -649,7 +649,7 @@ mod tests {
         assert!(bound.ends_with("mnt/acme/widget/slot@3"), "{bound:?}");
 
         // The whole point: the next tenant of the slot sees byte-identical bytes for its build
-        // path, which is what makes cargo's `-C metadata` and every sccache key match.
+        // path, which is what makes cargo's `-C metadata` and every path-bearing cache key match.
         let mut bindings = layout.slot_bindings().unwrap();
         assert_eq!(bindings.release(&first), Some(slot));
         bindings.bind(slot, second.clone()).unwrap();

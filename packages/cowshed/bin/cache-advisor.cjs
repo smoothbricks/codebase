@@ -43,14 +43,9 @@ function parse(argv) {
 }
 
 function sandboxProfile(scratch) {
-  // All descendants inherit this restriction, including graph plugins and runtime
-  // shells. The existing sccache socket is metadata/toolchain IPC, not a target.
-  const socket = process.env.SCCACHE_SERVER_UDS;
-  const sccache = socket
-    ? `(allow network-outbound (remote unix-socket (path-literal ${JSON.stringify(socket)})))`
-    : '';
+  // All descendants inherit this restriction, including graph plugins and runtime shells.
   return `(version 1)(allow default)(deny file-write*)(deny network*)(deny signal)
-    (allow file-write* (subpath ${JSON.stringify(scratch)}) (literal "/dev/null"))${sccache}`;
+    (allow file-write* (subpath ${JSON.stringify(scratch)}) (literal "/dev/null"))`;
 }
 
 function run(options) {
@@ -617,9 +612,8 @@ async function probe(options, scratch) {
       runtimePolicy: options.runtime,
       hooksNotExecuted: hooks,
       targetExecutions: 0,
-      sccacheSocket: process.env.SCCACHE_SERVER_UDS ?? null,
       confinement:
-        'persistent writes only to scratch; /dev/null allowed; signals denied; network only to configured sccache Unix metadata socket; Nx daemon bypassed in-process',
+        'persistent writes only to scratch; /dev/null allowed; signals denied; no network; Nx daemon bypassed in-process',
     },
     hashPassSeconds: (performance.now() - start) / 1000,
   };

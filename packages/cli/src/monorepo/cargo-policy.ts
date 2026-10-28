@@ -624,7 +624,7 @@ function configPolicy(loaded: LoadedConfig, repositoryRoot: string): number {
   if (targetDirectory !== undefined && resolvedPathIsOutsideRoot(repositoryRoot, targetDirectory)) {
     failures += report(
       path,
-      `build.target-dir resolves outside the repository root (${targetDirectory}); SCCACHE_BASEDIR_CWD normalises only paths at or below the build's working directory. Fix it by using a repository-relative target directory.`,
+      `build.target-dir resolves outside the repository root (${targetDirectory}); an absolute path outside the checkout gives every checkout its own unit identity. Fix it by using a repository-relative target directory.`,
     );
   }
 
@@ -649,7 +649,7 @@ function configPolicy(loaded: LoadedConfig, repositoryRoot: string): number {
     for (const absolutePath of absolutePathsIn(value)) {
       failures += report(
         path,
-        `rustflags contains the absolute path ${absolutePath}; SCCACHE_BASEDIR_CWD normalises only paths at or below the build's working directory, so this absolute path pins the sccache key to one machine. Fix it by using a repository-relative rustflag or removing the absolute path.`,
+        `rustflags contains the absolute path ${absolutePath}; an absolute path in a compiler flag is part of every unit's identity, so it pins the units to one checkout. Fix it by using a repository-relative rustflag or removing the absolute path.`,
       );
     }
   }
@@ -659,7 +659,7 @@ function configPolicy(loaded: LoadedConfig, repositoryRoot: string): number {
     if (text !== undefined && isAbsolute(text) && resolvedPathIsOutsideRoot(repositoryRoot, text)) {
       failures += report(
         path,
-        `[env] ${name} is an absolute path outside the repository root (${text}); SCCACHE_BASEDIR_CWD normalises only paths at or below the build's working directory. Fix it by using a repository-relative environment value.`,
+        `[env] ${name} is an absolute path outside the repository root (${text}); an absolute path outside the checkout gives every checkout its own unit identity. Fix it by using a repository-relative environment value.`,
       );
     }
   }
@@ -678,7 +678,7 @@ function packageScriptsSetCargoIncremental(path: string): boolean {
 function reportCargoIncremental(path: string): number {
   return report(
     path,
-    "sets CARGO_INCREMENTAL in committed configuration. Fix: leave CARGO_INCREMENTAL unset. CARGO_INCREMENTAL=1 hard-fails the sccache wrapper at Cargo's version probe, while CARGO_INCREMENTAL=0 surrenders dev incrementality for nothing.",
+    "sets CARGO_INCREMENTAL in committed configuration. Fix: leave CARGO_INCREMENTAL unset. incremental compilation is mbx's to manage, and a committed value overrides it for every checkout.",
   );
 }
 function cargoIncrementalPolicy(

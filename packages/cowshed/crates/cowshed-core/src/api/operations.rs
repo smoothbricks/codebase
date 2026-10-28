@@ -22,7 +22,7 @@ use super::dto::{
 use super::dto::{
     BinaryData, BuildStateListing, CredentialReport, DiskCommandEvent, DiskCommandTool,
     GatewayStatus, IdentityReport, MountResult, NxStoreClearResult, ProjectWorkspaces,
-    SccacheStatus, SeedCompactionReport, SkillInstallReport,
+    SeedCompactionReport, SkillInstallReport,
 };
 use super::fd_holder::FdHolders;
 use super::held_lock::{DecimalU64, LockObservation};
@@ -58,9 +58,6 @@ pub enum Scope {
     /// Host connections only (`cowshed host`): the host's own verbs, which no project controller
     /// serves and no project connection may call.
     Host,
-    /// `cowshed sccache host` connections only: the sccache daemon's control, served by the build
-    /// the package launcher routes the `sccache` verb to.
-    Sccache,
 }
 
 /// The single bounded raw-byte frame that may accompany an operation.
@@ -160,7 +157,6 @@ macro_rules! operations {
     (@scope worker) => { Scope::Worker };
     (@scope internal) => { Scope::Internal };
     (@scope host) => { Scope::Host };
-    (@scope sccache) => { Scope::Sccache };
     (@lane json) => { Lane::Json };
     (@lane upload) => { Lane::Upload };
     (@lane download ($offset:ident)) => { Lane::Download };
@@ -446,12 +442,6 @@ operations! {
     host upload "host.credentialAdd" HostCredentialAdd(CredentialAddRequest) -> CredentialReport;
     /// Runs one diskutil or hdiutil argv through cowshed's disk runner, its output after its end.
     host stream "host.diskCommand" HostDiskCommand(DiskCommandRequest) -> DiskCommandEvent;
-    /// Installs (or repairs) the sccache LaunchAgent and waits for its socket.
-    sccache json "sccache.start" SccacheStart(SccacheStartRequest) -> SccacheStatus;
-    /// Removes the sccache LaunchAgent; the daemon stops.
-    sccache json "sccache.stop" SccacheStop(HostRequest) -> EmptyResult;
-    /// Reports the sccache daemon's state.
-    sccache json "sccache.status" SccacheStatusRead(HostRequest) -> SccacheStatus;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1021,15 +1011,6 @@ pub enum CredentialSecretSource {
     Command { argv: Vec<String> },
     /// `--secret-stdin`: the call's upload frame.
     Upload,
-}
-
-/// `sccache start [--capacity]`: the cache cap, as `--capacity` spells it (`40g`, `1t`); absent
-/// derives it from the store.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SccacheStartRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<String>,
 }
 
 /// `gateway stop [--purge]`.

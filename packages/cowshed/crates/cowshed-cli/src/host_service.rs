@@ -262,28 +262,6 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
                 crate::disk_command::OutputEvents::new(ran),
             ))))
         }
-        Op::SccacheStart(request) => {
-            let capacity = request
-                .capacity
-                .as_deref()
-                .map(crate::capabilities::sccache::service::parse_capacity)
-                .transpose()?;
-            respond::<operations::SccacheStart>(
-                &crate::capabilities::sccache::service::start_service(capacity).await?,
-            )
-        }
-        Op::SccacheStop(_) => {
-            crate::capabilities::sccache::service::stop_service(
-                CanonicalRoots::global().namespace(),
-            )?;
-            respond::<operations::SccacheStop>(&EmptyResult {})
-        }
-        Op::SccacheStatusRead(_) => respond::<operations::SccacheStatusRead>(
-            &crate::capabilities::sccache::service::service_status(
-                CanonicalRoots::global().namespace(),
-            )
-            .await?,
-        ),
         other => Err(CowshedError::internal(format!(
             "{} reached the host router past the connection's scope check",
             other.method()

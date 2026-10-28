@@ -14,7 +14,6 @@ use cowshed_core::CowshedError;
 use cowshed_core::runtime::wait_spans::WaitRecording;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
-use crate::capabilities::sccache;
 use crate::{
     args, controller_service, credential_service, gateway_service, help, identity_service,
     install_basis, output, runtime, setup_service, skill,
@@ -418,11 +417,6 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             }
             Err(error) => Err(error),
         };
-        return Ok(finish(outcome, &mut output, json, &waits));
-    }
-    if let args::Command::Sccache(action) = &parsed.command {
-        let outcome =
-            sccache::service::dispatch(action.clone(), parsed.global.json, &mut output).await;
         return Ok(finish(outcome, &mut output, json, &waits));
     }
     // `setup` has no project and no workspace: its subject is the host, so it dispatches here

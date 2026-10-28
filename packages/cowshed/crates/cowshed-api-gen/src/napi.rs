@@ -57,14 +57,6 @@ const CLASSES: &[Class] = &[
         fence: &[],
         authority: &[],
     },
-    // The sccache daemon's control, on its own connection: `cowshed sccache host`.
-    Class {
-        rust: "SccacheHost",
-        namespaces: &["sccache"],
-        scopes: &[Scope::Sccache],
-        fence: &[],
-        authority: &[],
-    },
     Class {
         rust: "Project",
         namespaces: &["project"],
@@ -525,7 +517,7 @@ fn serves(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
          //! arguments as a record of exactly those fields.\n\n\
          use super::*;\n\
          use crate::api::call::{{Arguments, Binder, Serves, decode, owned}};\n\
-         use crate::api::capability::{{Coordinator, Host, JobHandle, Project, SccacheHost, WorkspaceHandle, WorkspaceRef}};\n"
+         use crate::api::capability::{{Coordinator, Host, JobHandle, Project, WorkspaceHandle, WorkspaceRef}};\n"
     );
     for (class, methods) in classes {
         for method in methods {
@@ -695,7 +687,7 @@ fn parameter(class: &str) -> String {
 fn rust(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
     let mut output = format!(
         "{HEADER}//! One adapter per controller operation, on each handle that serves it.\n\n\
-         use super::{{Coordinator, Host, JobHandle, Project, SccacheHost, WorkspaceHandle, WorkspaceRef}};\n\
+         use super::{{Coordinator, Host, JobHandle, Project, WorkspaceHandle, WorkspaceRef}};\n\
          use cowshed_core::api::operations;\n\
          use napi::{{Env, JsObject, bindgen_prelude::Buffer}};\n\
          use napi_derive::napi;\n\

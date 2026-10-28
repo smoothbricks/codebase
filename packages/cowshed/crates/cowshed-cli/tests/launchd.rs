@@ -6,7 +6,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_cli::agent_cycle::LoadedAgent;
 use cowshed_cli::code_signing::{CODESIGN, CertificateHash, SigningIdentity};
 use cowshed_cli::launchd::{
@@ -16,9 +15,9 @@ use cowshed_cli::launchd::{
     InstalledExecutable, LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput,
     LaunchdError, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, Mutation,
     NativeFilesystem, NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE,
-    SCCACHE_BINARY_NAME, STABLE_BINARY_MODE, ServiceLifecycle, StableLink, StoreBackedProgram,
-    plan_cargo_link_removal, plan_executable_install, plan_executable_remove,
-    plan_gateway_host_install, plan_install, plan_remove, replace_symlink,
+    STABLE_BINARY_MODE, ServiceLifecycle, StableLink, plan_cargo_link_removal,
+    plan_executable_install, plan_executable_remove, plan_gateway_host_install, plan_install,
+    plan_remove, replace_symlink,
 };
 use cowshed_os::deadline::{self, Bound, Deadline, LatencyClass, ReapError, RunError};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
@@ -41,15 +40,6 @@ const BINARY_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support/
 const GATEWAY_HOST: &str =
     "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host";
 const SUPPORT_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed";
-/// The nix GC root an earlier `cowshed setup --sccache` registered, and the store path it pins. The sccache
-/// agent names the store path, so the plist carries the build's own content hash rather than a
-/// symlink a later build could repoint under a loaded agent.
-const SCCACHE_GC_ROOT: &str =
-    "/Users/cowshed-test/Library/Application Support/dev.cowshed/nix/sccache";
-const SCCACHE_STORE_PATH: &str =
-    "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed";
-const SCCACHE_PROGRAM: &str =
-    "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed/bin/sccache";
 /// The bun a devenv shell's `PATH` provides, as the gateway agent's `PATH` names it: the profile
 /// link devenv re-points and roots, never the store path behind it.
 const BUN_DIRECTORY: &str = "/Users/cowshed-test/Dev/project/tooling/direnv/.devenv/profile/bin";
@@ -64,16 +54,6 @@ fn bun() -> BunDirectory {
 
 fn gateway() -> LaunchAgentSpec {
     LaunchAgentSpec::gateway(HostNamespace::Production, &cowshed_binary(), &bun()).unwrap()
-}
-
-fn sccache_program() -> StoreBackedProgram {
-    StoreBackedProgram::new(
-        Path::new(HOME),
-        Path::new(SCCACHE_GC_ROOT),
-        Path::new(SCCACHE_STORE_PATH),
-        SCCACHE_BINARY_NAME,
-    )
-    .unwrap()
 }
 
 #[test]
@@ -258,164 +238,29 @@ fn generic_run_at_load_definition_is_immutable_and_escapes_plist_strings() {
     assert!(plist.contains("<key>KeepAlive</key>\n  <false/>"));
 }
 
-/// The sccache agent is the one with an empty argv tail: server mode is
-/// selected entirely through the environment, and the plist carries the full
-/// foreground-server variable set with the shared cowshed paths.
-///
-/// The cap and the base directory are part of that set because sccache reads both once, at server
-/// start: no client can supply them. `SCCACHE_BASEDIRS` is asserted by its plural name — sccache
-/// 0.16 has no singular `SCCACHE_BASEDIR` and ignores it silently, so the name is the contract.
-#[test]
-fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
-    let spec = LaunchAgentSpec::sccache(
-        HostNamespace::Production,
-        &sccache_program(),
-        Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
-        Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
-        ImageCapacity::from_gibibytes(40),
-        Path::new("/Users/cowshed-test/.cowshed"),
-    )
-    .unwrap();
-
-    assert_eq!(spec.label(), "dev.cowshed.sccache");
-    assert_eq!(spec.arguments(), [] as [String; 0]);
-    assert_eq!(spec.lifecycle(), ServiceLifecycle::KeepAlive);
-    assert_eq!(
-        spec.plist_path(),
-        Path::new("/Users/cowshed-test/Library/LaunchAgents/dev.cowshed.sccache.plist")
-    );
-    assert_eq!(
-        spec.standard_error_path(),
-        Path::new("/Users/cowshed-test/Library/Logs/cowshed/sccache-stderr.log")
-    );
-    assert_eq!(
-        spec.environment(),
-        [
-            ("SCCACHE_START_SERVER".to_owned(), "1".to_owned()),
-            ("SCCACHE_NO_DAEMON".to_owned(), "1".to_owned()),
-            ("SCCACHE_IDLE_TIMEOUT".to_owned(), "0".to_owned()),
-            (
-                "SCCACHE_SERVER_UDS".to_owned(),
-                "/Users/cowshed-test/.cowshed/sccache.sock".to_owned()
-            ),
-            (
-                "SCCACHE_DIR".to_owned(),
-                "/Users/cowshed-test/Library/Caches/Mozilla.sccache".to_owned()
-            ),
-            ("SCCACHE_CACHE_SIZE".to_owned(), "40g".to_owned()),
-            (
-                "SCCACHE_BASEDIRS".to_owned(),
-                "/Users/cowshed-test/.cowshed".to_owned()
-            ),
-        ]
-    );
-
-    let expected = concat!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
-        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
-        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
-        "<plist version=\"1.0\">\n",
-        "<dict>\n",
-        "  <key>Label</key>\n",
-        "  <string>dev.cowshed.sccache</string>\n",
-        "  <key>ProgramArguments</key>\n",
-        "  <array>\n",
-        "    <string>/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed/bin/sccache</string>\n",
-        "  </array>\n",
-        "  <key>RunAtLoad</key>\n",
-        "  <true/>\n",
-        "  <key>KeepAlive</key>\n",
-        "  <true/>\n",
-        "  <key>ProcessType</key>\n",
-        "  <string>Interactive</string>\n",
-        "  <key>StandardErrorPath</key>\n",
-        "  <string>/Users/cowshed-test/Library/Logs/cowshed/sccache-stderr.log</string>\n",
-        "  <key>EnvironmentVariables</key>\n",
-        "  <dict>\n",
-        "    <key>SCCACHE_START_SERVER</key>\n",
-        "    <string>1</string>\n",
-        "    <key>SCCACHE_NO_DAEMON</key>\n",
-        "    <string>1</string>\n",
-        "    <key>SCCACHE_IDLE_TIMEOUT</key>\n",
-        "    <string>0</string>\n",
-        "    <key>SCCACHE_SERVER_UDS</key>\n",
-        "    <string>/Users/cowshed-test/.cowshed/sccache.sock</string>\n",
-        "    <key>SCCACHE_DIR</key>\n",
-        "    <string>/Users/cowshed-test/Library/Caches/Mozilla.sccache</string>\n",
-        "    <key>SCCACHE_CACHE_SIZE</key>\n",
-        "    <string>40g</string>\n",
-        "    <key>SCCACHE_BASEDIRS</key>\n",
-        "    <string>/Users/cowshed-test/.cowshed</string>\n",
-        "  </dict>\n",
-        "</dict>\n",
-        "</plist>\n",
-    );
-    assert_eq!(spec.plist_bytes(), expected.as_bytes());
-
-    // Idempotence rides on byte equality: a current plist plans no mutations.
-    let bytes = spec.plist_bytes();
-    let plan = plan_install(
-        &spec,
-        InstallState {
-            launch_agents_directory_mode: Some(PRIVATE_DIRECTORY_MODE),
-            plist: Some(ExistingPlist {
-                bytes: &bytes,
-                mode: PRIVATE_PLIST_MODE,
-            }),
-        },
-    );
-    assert!(plan.is_noop());
-
-    // Socket and cache paths are validated like every other launchd path.
-    assert!(matches!(
-        LaunchAgentSpec::sccache(
-            HostNamespace::Production,
-            &sccache_program(),
-            Path::new("relative.sock"),
-            Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
-            ImageCapacity::from_gibibytes(40),
-            Path::new("/Users/cowshed-test/.cowshed"),
-        ),
-        Err(LaunchdError::InvalidPath { .. })
-    ));
-}
-
-/// A test namespace's agents are its own: both labels, both plist paths and both plists' `Label`
-/// name the namespace, and nothing in either names production's (01_storage.md, "Host
-/// namespace").
+/// A test namespace's agent is its own: its label, its plist path and its plist's `Label` name
+/// the namespace, and nothing in it names production's (01_storage.md, "Host namespace").
 #[test]
 fn a_test_namespaces_agents_are_labelled_by_it_and_never_by_production() {
     let namespace = TestNamespace::mint().expect("a test namespace");
     let gateway =
         LaunchAgentSpec::gateway(HostNamespace::Test(namespace), &cowshed_binary(), &bun())
             .unwrap();
-    let sccache = LaunchAgentSpec::sccache(
-        HostNamespace::Test(namespace),
-        &sccache_program(),
-        Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
-        Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
-        ImageCapacity::from_gibibytes(40),
-        Path::new("/Users/cowshed-test/.cowshed"),
-    )
-    .unwrap();
-
-    for (spec, service) in [(&gateway, "gateway"), (&sccache, "sccache")] {
-        let label = format!("dev.cowshed-test-{namespace}.{service}");
-        assert_eq!(spec.label(), label);
-        assert_eq!(
-            spec.plist_path(),
-            PathBuf::from(format!("{HOME}/Library/LaunchAgents/{label}.plist"))
-        );
-        let plist = String::from_utf8(spec.plist_bytes()).unwrap();
-        assert!(
-            plist.contains(&format!("  <key>Label</key>\n  <string>{label}</string>\n")),
-            "{plist}"
-        );
-        assert!(
-            !plist.contains(&format!("dev.cowshed.{service}")),
-            "no part of a test namespace's definition names production's agent: {plist}"
-        );
-    }
+    let label = format!("dev.cowshed-test-{namespace}.gateway");
+    assert_eq!(gateway.label(), label);
+    assert_eq!(
+        gateway.plist_path(),
+        PathBuf::from(format!("{HOME}/Library/LaunchAgents/{label}.plist"))
+    );
+    let plist = String::from_utf8(gateway.plist_bytes()).unwrap();
+    assert!(
+        plist.contains(&format!("  <key>Label</key>\n  <string>{label}</string>\n")),
+        "{plist}"
+    );
+    assert!(
+        !plist.contains("dev.cowshed.gateway"),
+        "no part of a test namespace's definition names production's agent: {plist}"
+    );
 }
 
 #[test]
@@ -1194,17 +1039,9 @@ fn print_status_keeps_signal_and_spawn_failures_operationally_typed() {
     ));
 }
 
-/// The type is the guarantee, and each agent has its own.
-///
-/// The gateway plist can only be built from a path under
+/// The type is the guarantee: the gateway plist can only be built from a path under
 /// `~/Library/Application Support/dev.cowshed/bin`, so no caller can bake a checkout or a
 /// workspace image into it — the binary installing it may itself be running from anywhere.
-///
-/// The sccache plist can only be built from a [`StoreBackedProgram`], which derives the program
-/// from the store path its GC root pins. That is why the plist names
-/// `/nix/store/…/bin/sccache` and never the out-link: a store path carries the build's own hash,
-/// so a rebuild changes the plist and boots the old server out, where a repointed symlink would
-/// leave launchd starting a different binary at the next restart under an unchanged definition.
 #[test]
 fn each_agent_plist_names_only_the_program_its_type_can_prove() {
     let cowshed = cowshed_binary();
@@ -1214,37 +1051,11 @@ fn each_agent_plist_names_only_the_program_its_type_can_prove() {
     assert_eq!(cowshed.home(), Path::new(HOME));
     assert_eq!(cowshed.name(), "cowshed");
     assert_eq!(cowshed.gateway_host(), Path::new(GATEWAY_HOST));
-
-    let sccache = sccache_program();
-    assert_eq!(sccache.program(), Path::new(SCCACHE_PROGRAM));
-    assert_eq!(sccache.gc_root(), Path::new(SCCACHE_GC_ROOT));
-    assert!(
-        sccache.program().starts_with(SCCACHE_STORE_PATH),
-        "the program must live inside the store path the root pins"
-    );
-
-    let specs = [
-        LaunchAgentSpec::gateway(HostNamespace::Production, &cowshed, &bun()).unwrap(),
-        LaunchAgentSpec::sccache(
-            HostNamespace::Production,
-            &sccache,
-            Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
-            Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
-            ImageCapacity::from_gibibytes(40),
-            Path::new("/Users/cowshed-test/.cowshed"),
-        )
-        .unwrap(),
-    ];
-    for (spec, expected) in specs.iter().zip([GATEWAY_HOST, SCCACHE_PROGRAM]) {
-        assert_eq!(spec.executable(), Path::new(expected));
-        assert_eq!(spec.program_arguments().next(), Some(expected));
-        let plist = String::from_utf8(spec.plist_bytes()).unwrap();
-        assert!(plist.contains(&format!("  <array>\n    <string>{expected}</string>\n")));
-        assert!(
-            !plist.contains(SCCACHE_GC_ROOT),
-            "no plist may name the mutable out-link"
-        );
-    }
+    let spec = LaunchAgentSpec::gateway(HostNamespace::Production, &cowshed, &bun()).unwrap();
+    assert_eq!(spec.executable(), Path::new(GATEWAY_HOST));
+    assert_eq!(spec.program_arguments().next(), Some(GATEWAY_HOST));
+    let plist = String::from_utf8(spec.plist_bytes()).unwrap();
+    assert!(plist.contains(&format!("  <array>\n    <string>{GATEWAY_HOST}</string>\n")));
 }
 
 /// The digest of the build installed in the plans below: what names its stored copy.

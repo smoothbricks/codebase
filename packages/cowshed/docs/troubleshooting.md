@@ -114,7 +114,7 @@ and the gateway audit events for egress (Arrow segments under `/private/cowshed/
   System paths (`/usr`, `/System`, `/Applications`, `/nix/store`, `/opt`) stay readable; under `$HOME` a sandbox reads
   only its own workspace, the shared tool caches (`~/.cargo` registry/git, `~/.bun/install/cache`, `~/.cache/uv`), the
   Nix profile links (`~/.nix-profile`, `~/.local/state/nix/profile`) with each generation link they resolve through
-  under `~/.local/state/nix/profiles`, the sccache GC root, and what `--read`/`--write` grants name. Point the tool's
+  under `~/.local/state/nix/profiles`, cowshed's mbx link, and what `--read`/`--write` grants name. Point the tool's
   config at a path inside the workspace, or grant exactly the file it needs (`--read ~/.toolrc`, never `--read ~`).
 - **A workspace cannot read main's checkout**: by design. Main mounts at your original checkout path, and every other
   workspace denies it exactly as it denies a sibling workspace; jobs in main itself still read it. Land or fetch what
@@ -195,8 +195,7 @@ Attribution: `du` on the images directory tells you per-workspace cost; _inside_
 — it's just APFS. Remember clones share extents: ten fresh workspaces cost ~zero until they diverge, so "sum of image
 sizes" overstates real usage. `df -h /private/cowshed/store` covers the store volume. The shared tool caches are
 ordinary directories at each tool's default in your HOME, so `du -sh` on one (`~/.cargo/registry`,
-`~/.bun/install/cache`, `~/Library/Caches/Mozilla.sccache`) attributes it; both share the container's free space with
-everything else.
+`~/.bun/install/cache`) attributes it; both share the container's free space with everything else.
 
 Cargo's shared writable caches are its own `~/.cargo/{registry,git}`; gateway-owned bare repository mirrors are separate
 at `~/Library/Caches/dev.cowshed/repo-mirrors` and are never reachable from a sandbox.
@@ -265,41 +264,6 @@ process's lifetime; PID-modulo selection and file locks under different `TMPDIR`
 ownership. The gateway endpoint itself remains available for the session being tested. APFS fixtures use unique per-run
 roots and remove a root even when a corruption test replaced its directory with a regular file.
 
-## sccache reports a 0% hit rate and the shared cache never grows
-
-A misdirected cache looks exactly like a broken one. Check where the client is actually writing before believing
-anything about hit rates: from a directory outside every workspace, with `SCCACHE_DIR` and `SCCACHE_CONF` unset,
-
-```
-$ sccache --show-stats | head -3
-Cache location                  Local disk: "/Users/you/Library/Caches/Mozilla.sccache"
-Max cache size                     200 GiB
-```
-
-`Cache location` must be `~/Library/Caches/Mozilla.sccache` (`~/.cache/sccache` on Linux), sccache's own default and the
-directory the daemon serves. If it names anything else, that client is filling a cache the daemon never reads, the
-shared store is serving nothing, and the 0% is the consequence rather than the fault. `--show-stats` reports the
-resolved configuration without starting a server, so this is safe to run against a live host.
-
-The fix is `cowshed setup`, which writes and owns the `[cache.disk]` table in sccache's own config file (see
-[cli.md](cli.md#cowshed-setup---uninstall---force---downgrade)). Run it and look at the line it prints about that file.
-If it says it **left the file alone**, cowshed found a `cache.disk.dir` it did not write and refused to overwrite it;
-the line names the directory it found. Point that `dir` at `~/Library/Caches/Mozilla.sccache` yourself, or delete the
-`[cache.disk]` table and re-run `setup`. cowshed never resolves this one for you — a cache directory somebody chose
-deliberately is not cowshed's to move.
-
-Two symptoms of the same cause worth recognising. **Orphaned stores**: every directory that was ever a wrong destination
-keeps whatever it accumulated, so a host that ran misconfigured for a while has gigabytes in the directories its config
-named doing nothing. They are disposable by contract — delete them once `--show-stats` names the shared store. **A
-shrinking shared cache**: a client that finds no daemon starts a server of its own over whatever directory its config
-names, with sccache's 10 GiB default cap unless the config says otherwise, and that server will evict a larger shared
-store down to 10 GiB. This is why the file `setup` writes carries a `size` beside the `dir`, and why a hand-edited
-`[cache.disk]` should carry one too.
-
-A build _inside_ a workspace never depends on any of this: the supervisor exports `SCCACHE_DIR` and
-`SCCACHE_SERVER_UDS`, and the environment beats the config file. The config governs exactly the store-less case — which
-is also why you cannot verify it from a shell that has the project environment loaded.
-
 ## Backup and durability (read once, remember forever)
 
 **The store volume is excluded from backup** — deliberately. Multi-gigabyte images with constant internal churn would
@@ -360,12 +324,12 @@ serving until its running jobs end. Until then a command of the new build cannot
 `cowshed exec` starts a supervisor of the new build. Detaching ends that supervisor's jobs, so let a job you still need
 finish first.
 
-## A cargo build inside a workspace does not use sccache
+## A cargo build inside a workspace does not use mbx
 
-A workspace's cargo is wrapped with the sccache `cowshed setup --sccache` pinned, named by its store path. A host that
-never ran it, or whose pinned store path was collected (`cowshed doctor` reports `sccache-unpinned`), builds without a
-wrapper. Setup no longer builds sccache: cowshed's Cargo compiler cache is mbx (`cowshed setup` installs its pin), and
-`cowshed sccache stop` removes an agent whose program was collected.
+A workspace's Cargo goes through mbx only when the project's `cargo` is mbx's shim (its devenv puts the shim first on
+`PATH`) and the project's mbx is the one `cowshed setup` installed beside cowshed. A project without the shim builds
+plain Cargo into its build volume, which is not a failure. A project whose mbx is not the installed one is refused with
+`mbx-host-missing` (run `cowshed setup`) or `mbx-revision-skew` (align the project's mbx pin with cowshed's).
 
 ## `cowshed exec` fails with `cannot run direnv from PATH …`
 
@@ -386,9 +350,9 @@ wiring. There is no cache to clear and no database to reset.
 
 A corrupt shared cache is the tool's own problem, solved the tool's own way: nothing unique lives in one, so delete that
 tool's cache directory (`~/.cargo/registry`, `~/.bun/install/cache`, `~/.cache/uv`, …) and the tool refetches or
-rebuilds it. sccache's `~/Library/Caches/Mozilla.sccache` and the gateway mirror under `~/Library/Caches/dev.cowshed`
-belong to running daemons: stop the daemon first (`cowshed sccache stop`, `cowshed gateway stop`), delete, then start it
-again. (Never delete anything under `/private/cowshed/store` — that volume holds your images.)
+rebuilds it. The gateway mirror under `~/Library/Caches/dev.cowshed` belongs to a running daemon: stop it first
+(`cowshed gateway stop`), delete, then start it again. (Never delete anything under `/private/cowshed/store` — that
+volume holds your images.)
 
 ## Every verb prints `could not install gateway session …: (EndpointConflict)`
 
@@ -437,9 +401,8 @@ step, so the slow step is named on stderr. On a large repository two steps carry
 `doctor <workspace>/<check>`, and a `done elapsed=…` line for each probe that took 2 s or more, then one
 `doctor workspace-checks done` summary naming the slowest workspace. A probe that waits for another party says so before
 it asks with `cowshed: doctor <probe> waits-on=<party>`. A doctor that does not finish is in the probe it last started,
-waiting for the party that line names; the `done` lines say where a slow doctor's minute went. A gateway or sccache
-server that accepts doctor's request and stays silent for a minute is reported as `gateway-unanswered` or
-`sccache-unanswered` instead of holding doctor.
+waiting for the party that line names; the `done` lines say where a slow doctor's minute went. A gateway that accepts
+doctor's request and stays silent for a minute is reported as `gateway-unanswered` instead of holding doctor.
 
 ## A disk child `did not finish within 120s`
 

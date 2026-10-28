@@ -1364,7 +1364,7 @@ export type HostRequest = { readonly [key in string]: never };
 /**
  * Which host connection this is, fixed by its handshake: each serves exactly one scope.
  */
-export type HostRole = 'host' | 'sccache';
+export type HostRole = 'host';
 
 /**
  * What `gateway status` reads of the host's scheduling (05_gateway.md "Status"). Every number is
@@ -3062,51 +3062,6 @@ export type RunSandboxMode = 'readWrite' | 'readOnly';
  * within the bound every projection holds exactly.
  */
 export type SampleInterval = number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>;
-
-/**
- * `sccache start [--capacity]`: the cache cap, as `--capacity` spells it (`40g`, `1t`); absent
- * derives it from the store.
- */
-export type SccacheStartRequest = {
-  readonly capacity?: string;
-};
-
-/**
- * What the running sccache daemon reports about itself.
- *
- * Hits and misses are per language rather than summed: cross-workspace C and C++ reuse works
- * without any slot, so a healthy aggregate hit rate routinely hides a Rust hit rate of zero, which
- * is the number a slot host is actually managing. `base_directories` is reported because it is the
- * only observable proof that the server took `SCCACHE_BASEDIRS` — sccache 0.16 ignores the
- * singular `SCCACHE_BASEDIR` entirely, and silently.
- */
-export type SccacheStats = {
-  readonly maxCacheSize: number & tags.Type<'uint64'>;
-  readonly baseDirectories: ReadonlyArray<string>;
-  readonly compileRequests: number & tags.Type<'uint64'>;
-  readonly requestsExecuted: number & tags.Type<'uint64'>;
-  readonly hits: { readonly [key in string]: number & tags.Type<'uint64'> };
-  readonly misses: { readonly [key in string]: number & tags.Type<'uint64'> };
-};
-
-/**
- * Health of the host-owned sccache LaunchAgent.
- *
- * `installed` is launchd's verdict (the job is loaded); `running` is the
- * socket's (a connect on the server unix socket was accepted). Both are
- * reported because the interesting failures are exactly the disagreements:
- * installed-but-unresponsive (crash-looping agent) and answering-but-
- * uninstalled (foreign server bound on the path).
- */
-export type SccacheStatus = {
-  readonly installed: boolean;
-  readonly running: boolean;
-  readonly socket: string;
-  /**
-   * The daemon's own counters, absent unless it answered a stats request.
-   */
-  readonly stats?: SccacheStats;
-};
 
 /**
  * A script as a template: literal shell text `parts` interleaved with `values`, exactly one

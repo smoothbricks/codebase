@@ -451,10 +451,10 @@ smoo monorepo diff
 
 `check` fails when a managed file is missing or stale, and when a package policy fails (the devenv profile's Go against
 the Go SDK ttsc vendors, root package, Nx names and release config, public tags and metadata, test locations, workspace
-dependencies, the devenv import and release lock, the Cargo cache and toolchain policies, and, where `packages/cowshed`
-exists, the sccache patches). `check --warn` reports managed-file drift as warnings instead — CI runs it on every event
-and, on a default-branch push, dispatches the managed-files workflow to heal the drift — while a policy failure still
-fails it, because nothing heals one. `diff` reports drift without writing files.
+dependencies, the devenv import and release lock, and the Cargo cache and toolchain policies). `check --warn` reports
+managed-file drift as warnings instead — CI runs it on every event and, on a default-branch push, dispatches the
+managed-files workflow to heal the drift — while a policy failure still fails it, because nothing heals one. `diff`
+reports drift without writing files.
 
 The Cargo toolchain policy resolves each cached target's named inputs through its project definitions first, then
 workspace definitions. A cached target must reach `cargoToolchain`, the toolchain identity (the devenv pin and the Nix

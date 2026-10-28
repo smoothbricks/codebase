@@ -898,20 +898,6 @@ static RESIZE_RESULT: Reader = Reader::Record(&[
 ]);
 static RESIZE_VOLUME: Reader = Reader::External(&[("workspace", &LEAF), ("build", &LEAF)]);
 static RE_ADOPTION: Reader = Reader::Record(&[("replacement", &LEAF), ("retained", &LEAF)]);
-static SCCACHE_STATS: Reader = Reader::Record(&[
-    ("maxCacheSize", &LEAF),
-    ("baseDirectories", &LEAF),
-    ("compileRequests", &LEAF),
-    ("requestsExecuted", &LEAF),
-    ("hits", &LEAF),
-    ("misses", &LEAF),
-]);
-static SCCACHE_STATUS: Reader = Reader::Record(&[
-    ("installed", &LEAF),
-    ("running", &LEAF),
-    ("socket", &LEAF),
-    ("stats", &SCCACHE_STATS),
-]);
 static SCRIPT_COMMAND: Reader = Reader::Record(&[("parts", &LEAF), ("values", &SEQ__SCRIPT_VALUE)]);
 static SCRIPT_VALUE: Reader = Reader::External(&[("word", &LEAF), ("words", &LEAF)]);
 static SEALED_JOB_REF: Reader = Reader::Record(&[
@@ -1306,10 +1292,6 @@ impl Projected for crate::api::dto::RemoveReport {
 
 impl Projected for crate::api::dto::ResizeResult {
     const READER: &'static Reader = &RESIZE_RESULT;
-}
-
-impl Projected for crate::api::dto::SccacheStatus {
-    const READER: &'static Reader = &SCCACHE_STATUS;
 }
 
 impl Projected for crate::api::dto::SealedJob {

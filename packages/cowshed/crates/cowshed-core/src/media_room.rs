@@ -182,9 +182,8 @@ impl AttachDemand {
 
 /// What `operation` may attach. Reads, job and session traffic, detaches, removals, grants of the
 /// whole project and the project's own maintenance attach nothing, and one attach of an
-/// aggregate makes no room: detaching some sessions to attach others frees nothing. Host and
-/// sccache operations route outside the project actor, which refuses them, so they add no
-/// project attach demand. Recovering an image renames its files without attaching it.
+/// aggregate makes no room: detaching some sessions to attach others frees nothing. Host
+/// operations route outside the project actor, which refuses them, so they add no
 pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
     use OperationRequest as Op;
     let one = |workspace: &WorkspaceName| AttachDemand::of(0, [workspace.clone()]);
@@ -288,10 +287,7 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         | Op::HostFdHolders(_)
         | Op::HostRetireDescendants(_)
         | Op::HostDiskCommand(_)
-        | Op::HostCredentialAdd(_)
-        | Op::SccacheStart(_)
-        | Op::SccacheStop(_)
-        | Op::SccacheStatusRead(_) => AttachDemand::default(),
+        | Op::HostCredentialAdd(_) => AttachDemand::default(),
     }
 }
 

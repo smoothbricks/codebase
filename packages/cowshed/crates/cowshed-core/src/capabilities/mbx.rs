@@ -299,7 +299,7 @@ pub fn admit_checkout(checkout: &Path, home: &Path, build_cache: Option<&Path>) 
 }
 
 /// Host shells source the same canonical mbx environment as supervisor children (11_shell.md,
-/// "Canonical mbx environment"). `RUSTC_WRAPPER` is the compiler-cache client's name already.
+/// "Canonical mbx environment"). `RUSTC_WRAPPER` is Cargo's to withhold.
 pub const HOST_ENVIRONMENT: [&str; 14] = [
     "MBX_CACHE_DIR",
     "MBX_TARGET_VIEWS",

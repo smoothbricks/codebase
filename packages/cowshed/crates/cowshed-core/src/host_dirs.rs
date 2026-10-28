@@ -2,7 +2,7 @@
 //!
 //! The gateway's mirrors live in cowshed's user cache directory (03_caches.md, layer 1), written
 //! only by cowshed-gateway; the support directory holds the installed service binaries and the
-//! sccache GC root. Neither is ever a sandbox's to write, so no shared cache may reach into one.
+//! mbx GC root. Neither is ever a sandbox's to write, so no shared cache may reach into one.
 
 use std::path::{Path, PathBuf};
 

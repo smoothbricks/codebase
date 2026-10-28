@@ -8,9 +8,6 @@
 use async_trait::async_trait;
 use cowshed_cli::args::{Command, GatewayCommand, ProjectDiscovery, SetupArgs, parse_args};
 use cowshed_cli::capabilities::mbx::MbxInstall;
-use cowshed_cli::capabilities::sccache::client_config::{
-    ConfigChange, ConfigConflict, ConfigOutcome, ConfigReport,
-};
 use cowshed_cli::gateway_service::{CliInstall, ServiceBinaryRefresh};
 use cowshed_cli::help;
 use cowshed_cli::launchd::RemovalOutcome;
@@ -50,9 +47,8 @@ struct FakeHost {
     /// What probing each adopted checkout's git identity found, so the gap lines are provable
     /// without git or a real checkout.
     identity: GitIdentity,
-    /// What `setup` did to sccache's own config file, so the sentence it prints is provable
-    /// without a real home directory or a real store.
-    sccache: ConfigReport,
+    /// What removing an earlier cowshed's sccache found, so its lines are provable without launchd.
+    legacy: Vec<HostArtifactRemoval>,
     /// What the escalating phase fails with, so the decline path is provable without a dialog.
     execute_error: Option<CowshedError>,
     /// What reconciling the installed service binaries found, so the drift sentences are
@@ -136,13 +132,7 @@ impl Default for FakeHost {
             removals: Vec::new(),
             mains: MainMounts::Checked(Vec::new()),
             identity: GitIdentity::Checked(Vec::new()),
-            sccache: ConfigReport {
-                path: PathBuf::from(
-                    "/Users/dev/Library/Application Support/Mozilla.sccache/config",
-                ),
-                store: PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
-                outcome: ConfigOutcome::AlreadyCurrent,
-            },
+            legacy: Vec::new(),
             execute_error: None,
             services: Vec::new(),
             cli: None,
@@ -248,9 +238,9 @@ impl HostSetup for FakeHost {
             .clone()
     }
 
-    async fn configure_sccache_client(&mut self) -> Result<ConfigReport> {
-        self.events.push(String::from("configure-sccache-client"));
-        Ok(self.sccache.clone())
+    async fn retire_legacy_sccache(&mut self) -> Result<Vec<HostArtifactRemoval>> {
+        self.events.push(String::from("retire-legacy-sccache"));
+        Ok(self.legacy.clone())
     }
 
     async fn install_mbx(&mut self) -> Result<Option<MbxInstall>> {
@@ -726,7 +716,6 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
         "cowshed: cowshed.store (store): mounted at its canonical path -> already-current\n\
          cowshed: cowshed.caches (caches): mounted at its canonical path -> already-current\n\
          cowshed: /etc/fstab already pins the boot mounts\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: everything already set up\n\
          next: cowshed adopt\n"
     );
@@ -739,7 +728,7 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
             "mark-project-owners",
             "unmounted-mains",
             "git-identity",
-            "configure-sccache-client",
+            "retire-legacy-sccache",
             "refresh-services",
             "install-mbx",
             "build-state-projects",
@@ -1126,106 +1115,29 @@ async fn an_install_writes_its_skill_and_a_kept_install_leaves_the_skill() {
     );
 }
 
-/// The defect this line exists for: an sccache client that inherited no cowshed environment
-/// cached in its own private directory, the shared store served nothing, and no command said so.
-/// `setup` writes sccache's own config file and names the file it wrote, so a reader who finds
-/// that file later can tell who owns it.
+/// A host an earlier cowshed set up with sccache gets its agent, GC root and socket removed, each
+/// said once; what was already gone says nothing, so a clean host's report carries no line.
 #[tokio::test]
-async fn a_written_sccache_config_names_the_file_and_the_store_it_points_at() {
+async fn an_earlier_cowsheds_sccache_is_removed_and_each_removal_said() {
     let mut host = FakeHost {
-        sccache: ConfigReport {
-            path: PathBuf::from("/Users/dev/Library/Application Support/Mozilla.sccache/config"),
-            store: PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
-            outcome: ConfigOutcome::Written(ConfigChange::Created),
-        },
+        legacy: vec![
+            HostArtifactRemoval::new("retired dev.cowshed.sccache agent", RemovalOutcome::Removed),
+            HostArtifactRemoval::new("retired sccache nix GC root", RemovalOutcome::Removed),
+            HostArtifactRemoval::new("retired sccache socket", RemovalOutcome::AlreadyAbsent),
+        ],
         ..FakeHost::default()
     };
-
     let streams = run(&mut host, REPAIR, false, false).await;
-
     assert_eq!(streams.exit, 0);
-    let written = streams
-        .stderr
-        .find("cowshed: wrote /Users/dev/Library/Application Support/Mozilla.sccache/config: an sccache client that inherited no cowshed environment now caches in /Users/dev/Library/Caches/Mozilla.sccache\n")
-        .expect("the file and the store it now names");
-    // Before the status line, which is a claim about the whole host and is the last thing read.
-    let status = streams
-        .stderr
-        .find("cowshed: everything already set up\n")
-        .expect("status line");
-    assert!(written < status);
-}
-
-/// A config cowshed did not write is not cowshed's to overwrite. The refusal names the file, what
-/// it found there, and the store that will therefore not be shared — and it is a report rather
-/// than a failure, because the host's storage really is set up.
-#[tokio::test]
-async fn a_foreign_sccache_config_is_named_and_left_alone_without_failing_setup() {
-    let mut host = FakeHost {
-        sccache: ConfigReport {
-            path: PathBuf::from("/Users/dev/Library/Application Support/Mozilla.sccache/config"),
-            store: PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
-            outcome: ConfigOutcome::Refused(ConfigConflict::ForeignDirectory {
-                found: String::from("/Volumes/scratch/sccache"),
-            }),
-        },
-        ..FakeHost::default()
-    };
-
-    let streams = run(&mut host, REPAIR, false, false).await;
-
-    assert_eq!(
-        streams.exit, 0,
-        "a file cowshed declines to overwrite is not a failed setup"
+    assert!(
+        streams
+            .stderr
+            .contains("cowshed: removed the retired dev.cowshed.sccache agent\ncowshed: removed the retired sccache nix GC root\n"),
+        "{}",
+        streams.stderr
     );
-    assert!(streams.stderr.contains(
-        "cowshed: left /Users/dev/Library/Application Support/Mozilla.sccache/config alone: it already sets cache.disk.dir to /Volumes/scratch/sccache; a store-less sccache client will not share /Users/dev/Library/Caches/Mozilla.sccache until cache.disk.dir names it\n"
-    ));
+    assert!(!streams.stderr.contains("socket"), "{}", streams.stderr);
 }
-
-/// Appending to somebody's own config says so, because the reassurance is the point: a person with
-/// settings in that file has to know cowshed did not rewrite them.
-#[tokio::test]
-async fn an_appended_block_promises_the_rest_of_the_file_was_untouched() {
-    let mut host = FakeHost {
-        sccache: ConfigReport {
-            path: PathBuf::from("/Users/dev/Library/Application Support/Mozilla.sccache/config"),
-            store: PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
-            outcome: ConfigOutcome::Written(ConfigChange::Appended),
-        },
-        ..FakeHost::default()
-    };
-
-    let streams = run(&mut host, REPAIR, false, false).await;
-
-    assert!(streams.stderr.contains(
-        "cowshed: added cowshed's [cache.disk] block to /Users/dev/Library/Application Support/Mozilla.sccache/config, naming /Users/dev/Library/Caches/Mozilla.sccache; every other setting in that file was left exactly as it was\n"
-    ));
-}
-
-/// A host whose store cannot be validated gets no config at all: the daemon's cap derives from
-/// the store, and a config naming any other cap would let a store-less client evict the shared
-/// cache down to it.
-#[tokio::test]
-async fn no_config_is_written_when_the_daemon_cap_cannot_be_derived() {
-    let mut host = FakeHost {
-        sccache: ConfigReport {
-            path: PathBuf::from("/Users/dev/Library/Application Support/Mozilla.sccache/config"),
-            store: PathBuf::from("/Users/dev/Library/Caches/Mozilla.sccache"),
-            outcome: ConfigOutcome::NoCapacity {
-                reason: String::from("cowshed.store is not mounted"),
-            },
-        },
-        ..FakeHost::default()
-    };
-
-    let streams = run(&mut host, REPAIR, false, false).await;
-
-    assert!(streams.stderr.contains(
-        "cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config not written: the cache cap it must share with the sccache daemon derives from the store, which is not available (cowshed.store is not mounted)\n"
-    ));
-}
-
 /// 06_cli.md rule 3: the sentence naming the prompt is printed *before* the phase that raises it.
 /// The ordering is the assertion — the announcement has to precede `execute`, not accompany it.
 #[tokio::test]
@@ -1268,7 +1180,6 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
          cowshed: /etc/fstab will pin UUID 1D6F0E1A-0000-4000-8000-00000000AAAA at /private/cowshed/store so it mounts at every boot\n\
          cowshed: cowshed.store (store): absent -> created\n\
          cowshed: pinned the boot mounts in /etc/fstab\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: host storage is set up (one administrator authorization was used)\n\
          next: cowshed adopt\n"
     );
@@ -1293,7 +1204,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
             "mark-project-owners",
             "unmounted-mains",
             "git-identity",
-            "configure-sccache-client",
+            "retire-legacy-sccache",
             "refresh-services",
             "install-mbx",
             "build-state-projects",
@@ -1350,7 +1261,6 @@ async fn an_existing_volume_announces_its_identity_size_and_destination() {
          cowshed: /etc/fstab will pin UUID 1D6F0E1A-0000-4000-8000-00000000AAAA at /Users/dev/.cowshed so it mounts at every boot\n\
          cowshed: cowshed.store (store): present but not mounted -> mounted\n\
          cowshed: pinned the boot mounts in /etc/fstab\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: host storage is set up (one administrator authorization was used)\n\
          next: cowshed adopt\n"
     );
@@ -1526,7 +1436,6 @@ async fn a_run_that_cannot_escalate_never_mentions_authorization() {
          cowshed: cowshed.caches exists (UUID 1D6F0E1A-0000-4000-8000-00000000BBBB, 2.0 TB) and is mounted at /Volumes/cowshed.caches; it will be remounted at /private/cowshed/caches\n\
          cowshed: cowshed.caches (caches): mis-mounted at /Volumes/cowshed.caches -> remounted\n\
          cowshed: /etc/fstab already pins the boot mounts\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: host storage is set up\n\
          next: cowshed adopt\n"
     );
@@ -1577,7 +1486,6 @@ async fn a_volume_in_another_container_is_reported_and_left_alone() {
          cowshed: cowshed.caches (caches): found outside this host's container (container disk4, device disk4s8) -> reported\n\
          cowshed: data is safe on disk4s8; cowshed left it untouched\n\
          cowshed: /etc/fstab not pinned: no cowshed volume in the home container\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: host storage is partially set up: 2 volumes live outside this host's container and left untouched\n\
          next: cowshed adopt\n"
     );
@@ -1634,7 +1542,6 @@ async fn json_emits_one_frozen_envelope_and_no_prose_on_stdout() {
         streams.stderr,
         "cowshed: setup will request administrator authorization once, for the actions below\n\
          cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          next: cowshed adopt\n"
     );
 }
@@ -2195,7 +2102,6 @@ async fn an_unmounted_main_downgrades_both_healthy_status_lines() {
         streams.stderr,
         "cowshed: cowshed.store (store): mounted at its canonical path -> already-current\n\
          cowshed: /etc/fstab already pins the boot mounts\n\
-         cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /Users/dev/Library/Caches/Mozilla.sccache\n\
          cowshed: everything already set up, but 1 main workspace is not mounted: acme/api\n\
          next: cowshed gateway start\n"
     );
@@ -2331,7 +2237,7 @@ async fn mount_service_install_is_disclosed_before_authorization() {
             "mark-project-owners",
             "unmounted-mains",
             "git-identity",
-            "configure-sccache-client",
+            "retire-legacy-sccache",
             "refresh-services",
             "install-mbx",
             "build-state-projects",

@@ -60,7 +60,6 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &HOST,
     &CREDENTIAL,
     &IDENTITY,
-    &SCCACHE,
     &SKILL,
 ];
 
@@ -139,11 +138,10 @@ pub enum Command {
     /// One coordinator controller connection, served on standard input for an embedding process.
     Controller,
     /// One host connection of this role, served on standard input for an embedding process:
-    /// `host` the host's own verbs, `sccache host` the sccache daemon's control.
+    /// `host` the host's own verbs.
     Host(HostRole),
     Credential(CredentialCommand),
     Identity(IdentityCommand),
-    Sccache(SccacheCommand),
     Skill(SkillArgs),
     /// `--version` or `-V`: the npm package version.
     Version,
@@ -201,7 +199,6 @@ impl Command {
             | Self::Hold(_)
             | Self::TreeHolders(_)
             | Self::FdHolders(_)
-            | Self::Sccache(_)
             | Self::Skill(_)
             | Self::Host(_)
             | Self::Version
@@ -366,16 +363,6 @@ pub struct SetupArgs {
     /// Install the invoking build without judging it, even when it does not contain the installed
     /// cowshed. Without it such a build is refused, naming the binary and the commits it lacks.
     pub downgrade: bool,
-}
-
-/// `start` takes the cache cap because the cap is the one thing a host operator has to be able to
-/// override: the derived default is sized from what the store already holds, and a host that
-/// builds more graphs than it stores needs a bigger number.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SccacheCommand {
-    Start { capacity: Option<OsString> },
-    Stop,
-    Status,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1162,14 +1149,6 @@ pub fn cli_command() -> ClapCommand {
                 .subcommand(leaf("add").arg(positional("remote", 1..=1))),
         )
         .subcommand(
-            leaf("sccache")
-                .subcommand_required(true)
-                .subcommand(leaf("start").arg(value("capacity")))
-                .subcommand(leaf("stop"))
-                .subcommand(leaf("status"))
-                .subcommand(leaf("host")),
-        )
-        .subcommand(
             leaf("skill")
                 .subcommand_required(true)
                 .subcommand(leaf("install").arg(append_value("harness"))),
@@ -1292,7 +1271,6 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "gateway" => parse_gateway(leaf, &global)?,
         "credential" => parse_credential(leaf)?,
         "identity" => parse_identity(leaf)?,
-        "sccache" => parse_sccache(leaf, &global)?,
         "skill" => parse_skill(leaf, &global)?,
         other => return Err(unknown_command(other)),
     };
@@ -1346,9 +1324,7 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
                 .or_else(|| first_unrecognized(args).map(str::to_owned))
                 .unwrap_or_else(|| "unknown".to_owned());
             match spec {
-                Some(spec)
-                    if matches!(spec.name, "gateway" | "credential" | "sccache" | "skill") =>
-                {
+                Some(spec) if matches!(spec.name, "gateway" | "credential" | "skill") => {
                     UsageError::new(format!("unknown {} action `{name}`", spec.name), spec)
                 }
                 _ => unknown_command(&name),
@@ -2458,46 +2434,6 @@ fn parse_secret_command(
     Ok(argv)
 }
 
-const SCCACHE: CommandSpec = CommandSpec {
-    name: "sccache",
-    missing: "sccache action is required",
-    args: "<start|stop|status|host>",
-    trailing: "",
-    summary: "manage the host sccache daemon",
-    about: &[
-        "Runs the shared compile cache as a supervised LaunchAgent, so its configuration is pinned before any client speaks to it. sccache reads its store path, its cache cap, and its base directories once, at server start, and never again. A first client that spawned a server implicitly would therefore freeze its own environment into the daemon every later workspace shares; starting it deliberately keeps the cap and the store where the host meant them.",
-        "The gateway daemon starts this agent itself, so a healthy host already has it; these verbs are for repair, inspection, and resizing. `status` reports launchd and socket health without starting anything, and surfaces the daemon's own statistics whenever it answers. Hits are reported per language on purpose: cross-workspace C and C++ reuse needs no build slot, so a healthy aggregate hit rate routinely hides a Rust hit rate of zero.",
-        "`host` serves one sccache host connection on standard input, which must be a Unix socket, for an embedding process: `start`, `stop` and `status` as typed operations (`openSccacheHost` in N-API, which starts it through the package launcher, so the installed build answers as it answers every `sccache` verb). It serves nothing else; nothing is written to stdout, and it exits 0 when the embedding process closes its end.",
-    ],
-    options: &[Opt {
-        spelling: "--capacity <size>",
-        meaning: "`start` only: cache cap (100g, 1t). The default is the summed size of every adopted project's main image, floored at 40 GiB, because sccache's own 10 GiB default is smaller than one debug graph and evicts what the next slot tenant came for",
-    }],
-};
-
-fn parse_sccache(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &SCCACHE;
-    reject_project(global, USAGE, "--project is not valid for sccache commands")?;
-    let (action, child) = matches
-        .subcommand()
-        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
-    let command = match action {
-        "start" => SccacheCommand::Start {
-            capacity: os(child, "capacity"),
-        },
-        "stop" => SccacheCommand::Stop,
-        "status" => SccacheCommand::Status,
-        "host" => return Ok(Command::Host(HostRole::Sccache)),
-        other => {
-            return Err(UsageError::new(
-                format!("unknown sccache action `{other}`"),
-                USAGE,
-            ));
-        }
-    };
-    Ok(Command::Sccache(command))
-}
-
 const SKILL: CommandSpec = CommandSpec {
     name: "skill",
     missing: "skill action is required",
@@ -2600,7 +2536,7 @@ const SETUP: CommandSpec = CommandSpec {
     summary: "create or repair host storage",
     about: &[
         "Brings this host's store volume to its canonical state and pins it in `/etc/fstab`: an absent store is created; no volume is ever deleted unasked. A detached or mis-mounted one is remounted where it belongs, its marker is validated, and the fstab line that survives a reboot is written. It is idempotent — on a healthy host it changes nothing and says so — and it needs no repository, because its subject is the machine rather than a checkout.",
-        "On a host that still has the retired `cowshed.caches` volume, setup moves everything it holds to its home in the host HOME — each tool's cache to the tool's own default, the gateway's mirrors to cowshed's cache directory, sccache's store to sccache's default, a repository's cache to the `[caches] home` path its main declares — merging where both sides hold a cache and naming, with its size, anything it cannot place. That migration needs no authorization. Once the volume holds nothing but its marker, setup names `cowshed setup --retire-caches-volume` as the attended step that deletes it.",
+        "On a host that still has the retired `cowshed.caches` volume, setup moves everything it holds to its home in the host HOME — each tool's cache to the tool's own default, the gateway's mirrors to cowshed's cache directory, a repository's cache to the `[caches] home` path its main declares — merging where both sides hold a cache and naming, with its size, anything it cannot place. That migration needs no authorization. Once the volume holds nothing but its marker, setup names `cowshed setup --retire-caches-volume` as the attended step that deletes it.",
         "Everything that can require elevation happens inside one authorization session, and every volume's exact intent is printed before the dialog appears; a run with nothing to escalate raises no prompt at all. A volume that exists but is not this host's — a `cowshed.store` in another container — is reported with its device and left exactly as it is, never adopted and never re-created, because re-creating means deleting a volume. `cowshed doctor` explains a host; this repairs one.",
         "Setup installs the invoking build as the host's cowshed — the CLI and the daemon alike, as one artifact. The build is copied to a content-addressed file beside the plists' volume, `~/Library/Application Support/dev.cowshed/bin/cowshed-<sha256>`; the stable name `cowshed` there becomes a link to it; the gateway agent runs that name; and the first `cowshed` on your `PATH`, when it is a symbolic link — what `bun link` of the package or a link made by hand leaves — is pointed at it too. The `cowshed` you type and the daemon are then the same bytes, and only `cowshed setup` changes them: rebuilding a checkout changes nothing on `PATH` until a setup runs from that build. A setup run from the installed copy therefore installs nothing; install another build by running that build's own `cowshed setup` — a checkout's `packages/cowshed/dist/bin/<platform>/cowshed`. A gateway that answers while running other bytes than the installed copy is restarted onto it, and a stale installed copy is replaced through the same atomic plan `gateway start` uses, with the previous build put back if the agent cannot be activated. A service left running a binary from before this build is host drift a repair ends — setup never reports such a host as set up. Run setup from a release build — the platform `cli-*` target's `production` configuration (`nx run cowshed:cli-arm64-macos:production` on Apple silicon) or `cargo build --release -p cowshed-cli`; `nx run cowshed:cli-native` builds a debug one, and a debug build is refused as the supervised binary.",
         "Release builds record the commit they were made from, and the installed cowshed keeps the record of its build. One install runs at a time: setup holds the install slot, `dev.cowshed/install.lock`, for its whole run, and a second setup or `gateway start` waits for it and then judges its own build against whatever was installed meanwhile. Setup refuses to replace the installed cowshed with a build that does not contain it: the build's commit must be on an adopted project's `main`, and that main must show the build holding every installed commit, by ancestry or patch identity. The refusal names the binary, both builds and each commit the install would remove; a build that records nothing is refused too. Setup repairs everything else and exits non-zero. `--downgrade` installs the invoking build without judging it.",
@@ -2608,7 +2544,7 @@ const SETUP: CommandSpec = CommandSpec {
         "The host session workspace mount root is fixed, and setup has no option or setting to change it. On macOS it is `/private/var/folders/cowshed/<uid>/mnt` (also spelled `/var/folders/cowshed/<uid>/mnt`), using the invoking numeric uid, not HOME or a random temporary directory; on Linux it is `~/.cowshed/mnt`. Setup creates or repairs the stable macOS prefix root:wheel 0755 and its user directories uid:gid 0700 through the same single authorization, refusing symlinks, non-directories and foreign ownership. Session workspaces mount at `<root>/<owner>/<repo>/<ws>`, and build volumes also derive from that root; mains stay mounted directly at their checkout paths.",
         "To reach workspaces through a preferred path, make a symbolic link at that path pointing to the root, for example `ln -s /private/var/folders/cowshed/$(id -u)/mnt ~/workspaces` (on Linux, point it at `~/.cowshed/mnt`). The link runs from the preferred path to the root, never the other way round: the root stays a real directory, because the kernel-resolved physical mount path is what Spotlight's indexer admits. Cowshed's identity probe and workspace jobs use canonical mount paths; identity rules anchored only at an alias are not reliable.",
         "A `host.json` that still records a custom `mountRoot` is refused when read, naming that file, the recorded root and the required root. The refusal does not ignore the value, rewrite the file, move a mount or attach at the new path, and there is no automatic migration: with the previously installed build, stop workspace jobs and daemons, detach every session and build volume at the old root, resolve busy holders (Spotlight included), and audit path-bearing detached metadata and sandbox grants before reattaching. Only then remove `mountRoot` from `host.json`, keeping credential routes and mode 0600, and run this build's ordinary `cowshed setup`. A recorded root equal to the fixed root is harmless and is omitted the next time the file is saved.",
-        "`--uninstall` is the same transaction backwards, and deliberately narrower: it removes the machine presence — the cowshed-tagged `/etc/fstab` pins, the gateway and sccache LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It refuses while the volumes still hold workspaces, or while their occupancy cannot be established, until `--force` says the caller means it anyway.",
+        "`--uninstall` is the same transaction backwards, and deliberately narrower: it removes the machine presence — the cowshed-tagged `/etc/fstab` pins, the gateway LaunchAgent, the installed binary it ran and the mbx beside it — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It refuses while the volumes still hold workspaces, or while their occupancy cannot be established, until `--force` says the caller means it anyway.",
         "Setup installs cowshed's pinned mbx beside the installed cowshed (14_nix.md, \"mbx\"): it builds the flake this package ships at `nix/mbx`, registers a nix GC root for the result under cowshed's support directory, and links `mbx` in cowshed's `bin` to the rooted executable, never a copy, so its realpath is the pinned build's store path. A host without nix is told so, keeps no mbx, and schedules Cargo without it; a failed build, or a file that is not cowshed's link where `mbx` goes, fails the run after everything else is repaired. `--uninstall` removes the link and the root, never the store path.",
         "`--retire-caches-volume` deletes the retired caches volume, removes its `/etc/fstab` pin and drops it from the storage mount service, inside the same single authorization. It refuses while the volume holds anything but its marker.",
     ],
@@ -5162,19 +5098,6 @@ mod tests {
         assert!(parse_args(["path", "--slot"]).is_err());
     }
 
-    #[test]
-    fn sccache_start_takes_a_capacity_and_the_other_verbs_do_not() {
-        let cli = parse_args(["sccache", "start", "--capacity", "80g"]).unwrap();
-        assert_eq!(
-            cli.command,
-            Command::Sccache(SccacheCommand::Start {
-                capacity: Some(OsString::from("80g"))
-            })
-        );
-        assert!(parse_args(["sccache", "status", "--capacity", "80g"]).is_err());
-        assert!(parse_args(["sccache", "stop", "--capacity", "80g"]).is_err());
-    }
-
     /// `setup` is host-level repair: no positionals, no project, and the flags that pick its
     /// direction. A stranded host has no adopted checkout to name, so accepting `--project` would
     /// advertise a context the verb cannot use.
@@ -5912,17 +5835,17 @@ mod tests {
     /// the same spelling.
     #[test]
     fn an_unknown_command_names_the_command_that_was_meant() {
-        let error = parse_args(["sscache"]).unwrap_err();
+        let error = parse_args(["gatway"]).unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert_eq!(
             error.message,
-            "unknown command `sscache`; did you mean: sccache"
+            "unknown command `gatway`; did you mean: gateway"
         );
         assert_eq!(error.hint, "cowshed --help");
 
         assert_eq!(
-            parse_args(["help", "sscache"]).unwrap_err().message,
-            "unknown command `sscache`; did you mean: sccache"
+            parse_args(["help", "gatway"]).unwrap_err().message,
+            "unknown command `gatway`; did you mean: gateway"
         );
 
         // Nothing within two edits: no invented suggestion.
@@ -5961,7 +5884,6 @@ mod tests {
             (&["doctor"], Optional),
             (&["gateway", "status"], NotUsed),
             (&["controller"], Required),
-            (&["sccache", "status"], NotUsed),
             (&["skill", "install"], NotUsed),
             (&["land-turn", "repo", "--", "true"], NotUsed),
             (&["lock", "/tmp/x.lock", "--", "true"], NotUsed),
@@ -6136,7 +6058,6 @@ mod tests {
             (&["rekey"], "rekey requires a workspace"),
             (&["land"], "land requires a workspace"),
             (&["gateway"], "gateway action is required"),
-            (&["sccache"], "sccache action is required"),
             (&["skill"], "skill action is required"),
         ];
         for (arguments, message) in cases {

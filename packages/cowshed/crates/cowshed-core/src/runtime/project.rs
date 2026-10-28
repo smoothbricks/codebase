@@ -1733,10 +1733,7 @@ impl ProjectActor {
             | Op::HostFdHolders(_)
             | Op::HostRetireDescendants(_)
             | Op::HostDiskCommand(_)
-            | Op::HostCredentialAdd(_)
-            | Op::SccacheStart(_)
-            | Op::SccacheStop(_)
-            | Op::SccacheStatusRead(_) => {
+            | Op::HostCredentialAdd(_) => {
                 return Err(CowshedError::internal(format!(
                     "host operation {method} reached the project router past its scope check"
                 )));

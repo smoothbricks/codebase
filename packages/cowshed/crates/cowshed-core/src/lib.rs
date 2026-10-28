@@ -92,6 +92,5 @@ pub use workspace_credentials::GatewayWorkspaceCredentials;
 
 pub use api::{
     Adopted, Coordinator, CoordinatorToken, Cowshed, EventStream, Host, JobAttachment, JobHandle,
-    JobStdin, JobStream, Project, RawByteStream, SccacheHost, Session, WorkspaceHandle,
-    WorkspaceRef,
+    JobStdin, JobStream, Project, RawByteStream, Session, WorkspaceHandle, WorkspaceRef,
 };

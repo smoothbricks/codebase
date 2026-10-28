@@ -354,18 +354,13 @@ impl<'de> Deserialize<'de> for CheckoutRootRecord {
 
 /// A per-project build slot: one stable mount path, occupied by one workspace at a time.
 ///
-/// Slots predate path-independent cache sharing and are no longer what makes sccache hit.
-/// Cargo computes `-C metadata` / `-C extra-filename` path-independently for workspace members
-/// (measured on cargo 1.97: identical hashes for one workspace checked out at two paths), and
-/// the bundled sccache keys its residual path-bearing inputs — cwd, blanket `CARGO_*`
-/// environment values, env-dep values, argument bytes — relative to the request cwd and the
-/// workspace root (`SCCACHE_BASEDIR_CWD=1`, `SCCACHE_BASEDIR`, which every workspace now sets),
-/// and compiles such a request, proc macros included, with both remapped out of rmeta and
-/// debuginfo. Cross-path sharing is therefore the default, with one
-/// deliberate exception: a unit whose output still names its checkout (an `env!` value, a proc
-/// macro that read the manifest directory) is stored for that path alone, so it fails closed
-/// across paths. A slot's remaining value is the stable absolute path itself: same-path reuse of
-/// those units, and tooling that persists paths across tenant generations.
+/// Slots predate path-independent cache sharing and are no longer what makes the compile cache
+/// hit. Cargo computes `-C metadata` / `-C extra-filename` path-independently for workspace
+/// members (measured on cargo 1.97: identical hashes for one workspace checked out at two paths),
+/// and mbx keys a unit by its inputs rather than its checkout. A slot's remaining value is the
+/// stable absolute path itself: same-path reuse of units whose output names their checkout (an
+/// `env!` value, a proc macro that read the manifest directory), and tooling that persists paths
+/// across tenant generations.
 ///
 /// Slot numbering is shared with `coordinator.assignSlot`'s port blocks, hence the same upper
 /// bound: a slot has to be expressible as a `NEW_PORT_BLOCK_SIZE`-aligned base inside the 16-bit

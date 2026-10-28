@@ -86,13 +86,13 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   own cache directory (`~/Library/Caches/dev.cowshed/mirror`) — download dedupe; (2) clone-materializing caches — the
   cache is the reflink source (bun materializes node_modules by cloning from it; APFS clonefile is same-volume-only) —
   kept reflink-reachable INSIDE the workspace image, inherited from main via CoW; (3) read-at-build caches (cargo
-  registry, sccache, zig global, gradle) — read at build time, outputs written elsewhere, so sharing costs nothing — at
-  each tool's own default path in the host HOME, shared into the sandboxes of projects that use the tool; no relocation,
-  no symlinks. **Share only the cache subdirs** (`~/.cargo/registry`, `~/.cargo/git`, `~/.cache/zig`,
-  `~/.gradle/caches`) — NOT `~/.cargo` wholesale, which also holds `config.toml`, `credentials.toml`, and `bin/` (on
-  PATH); granting those writable to a sandbox would be a persistence-escape surface. Workspace-keyed state (target/,
-  node_modules, DerivedData, .nx) in-image. Env wiring is 0–2 vars total; everything else is in-image config files +
-  host paths. Main uses identical wiring. Spec: 03_caches.md.
+  registry, zig global, gradle) — read at build time, outputs written elsewhere, so sharing costs nothing — at each
+  tool's own default path in the host HOME, shared into the sandboxes of projects that use the tool; no relocation, no
+  symlinks. **Share only the cache subdirs** (`~/.cargo/registry`, `~/.cargo/git`, `~/.cache/zig`, `~/.gradle/caches`) —
+  NOT `~/.cargo` wholesale, which also holds `config.toml`, `credentials.toml`, and `bin/` (on PATH); granting those
+  writable to a sandbox would be a persistence-escape surface. Workspace-keyed state (target/, node_modules,
+  DerivedData, .nx) in-image. Env wiring is 0–2 vars total; everything else is in-image config files + host paths. Main
+  uses identical wiring. Spec: 03_caches.md.
 - **Go: shared caches at Go's own defaults.** `GOMODCACHE`/`GOCACHE` name the host's `~/go/pkg/mod` and the user cache
   directory's `go-build` (`~/Library/Caches/go-build`) — read-at-build, layer 3; go's sum/ziphash verification + 0444
   entries make it the strongest-postured shared cache — and the host's own `go` uses the same two directories without

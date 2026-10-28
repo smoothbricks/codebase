@@ -57,7 +57,6 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 | List this project       | `cowshed ls`                                                         | Show its workspaces.                                                                                                                                                                                                                       |
 | List every project      | `cowshed ls --all`                                                   | Show workspaces store-wide.                                                                                                                                                                                                                |
 | Inspect host            | `cowshed doctor`                                                     | Check host and workspace invariants without mutation.                                                                                                                                                                                      |
-| Inspect compile cache   | `cowshed sccache status`                                             | Check daemon health and cache hits before debugging misses.                                                                                                                                                                                |
 | Attach or detach        | `cowshed attach <ws>` / `cowshed detach <ws>`                        | Mount or park one session workspace.                                                                                                                                                                                                       |
 | Attach or detach all    | `cowshed attach --all` / `cowshed detach --all`                      | Mount or park all session workspaces.                                                                                                                                                                                                      |
 | Rebase                  | `cowshed rebase <ws> [--into <lane>]`                                | Replay the branch onto main, or with `--into` a lane base's branch, by cowshed's plan: a commit the destination holds drops, a conflict stops in progress. Never `git rebase` in a shed.                                                   |
@@ -180,9 +179,8 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
 
 - Never point agents at a shared external build directory. `target/` is inside each workspace image and already warm; an
   external shared target restores contention and serializes builds on Cargo's per-target-directory lock.
-- Never set `CARGO_INCREMENTAL`, not even for a land check. Setting it to `1` hard-fails the sccache wrapper at Cargo's
-  version probe; setting it to `0` discards incremental compilation and makes every workspace crate a second unit. Leave
-  it unset: workspace crates stay incremental while their dependencies use the shared host cache.
+- Never set `CARGO_INCREMENTAL`, not even for a land check. Incremental compilation is mbx's, and a value you set
+  overrides it for every unit.
 - Let `test` inherit `dev`: no `[profile.test]` overrides. `cargo test` then reuses the dependencies `cargo build`
   compiled, and the `target/` a new workspace clones from main is warm for both.
 - Never compile `env!("CARGO_MANIFEST_DIR")` in, tests included. Cargo does not fingerprint the checkout path, so a
@@ -199,9 +197,9 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
   read-only, not a second Nx state. The supervisor keeps the daemon in the sandbox and host shells connect to it. The
   `NX_MAX_CACHE_SIZE` default and override policy are defined in
   [03_caches.md §Wiring](../../../../specs/cowshed/03_caches.md#wiring). Repository shells leave `NX_DAEMON` to Nx.
-- The compile cache is a host daemon. Start it deliberately with `cowshed sccache start --capacity <size>`; a client
-  that spawns its own daemon silently gets sccache's 10 GiB default cap. If hits are absent, run
-  `cowshed sccache status` first.
+- The compile cache is mbx's shared store on the build-cache volume. Cargo reaches it only when the project's `cargo` is
+  mbx's shim; a refusal naming `mbx-host-missing` or `mbx-revision-skew` is fixed with `cowshed setup` or the project's
+  mbx pin, never with a wrapper.
 - A successful managed Bun install records lockfile SHA-256 values in `node_modules/.smoo-install`. Doctor reports
   missing receipts or lock drift and never installs dependencies.
 

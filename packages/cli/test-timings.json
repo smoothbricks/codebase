@@ -77,7 +77,6 @@
     "src/secrets/status.test.ts": 12,
     "src/wrangler/stage-records.test.ts": 12,
     "src/monorepo/managed-fs.test.ts": 11,
-    "src/monorepo/sccache-patches.test.ts": 11,
     "src/release/__tests__/private-npm-workflow.test.ts": 11,
     "src/monorepo/publish-manifest.test.ts": 10,
     "src/release/__tests__/core-properties.test.ts": 10,

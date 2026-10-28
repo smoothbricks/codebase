@@ -512,28 +512,19 @@ fn repository_caches_go_to_the_declared_home_path_matched_by_name() {
     assert!(planned.steps.is_empty());
 }
 
-/// Gateway mirrors move to cowshed's own cache directory and sccache's store to sccache's
-/// default, each naming the writer setup stops around the move.
+/// Gateway mirrors move to cowshed's own cache directory, naming the writer setup stops around the
+/// move.
 #[test]
-fn mirrors_and_the_sccache_store_go_to_their_own_directories() {
+fn mirrors_go_to_cowshed_s_cache_directory() {
     let fixture = Fixture::new();
     let layout = fixture.layout(&[]);
     fixture.file(&fixture.volume.join("mirror/obj-1"), 3);
-    fixture.file(&fixture.volume.join("sccache/a/b"), 4);
     let planned = plan(&layout, &observe(&layout).unwrap());
-    assert_eq!(
-        planned.owners(),
-        BTreeSet::from([Owner::Gateway, Owner::Sccache])
-    );
+    assert_eq!(planned.owners(), BTreeSet::from([Owner::Gateway]));
     execute(&layout, &planned).unwrap();
     assert!(
         crate::host_dirs::gateway_mirror(&fixture.home)
             .join("obj-1")
-            .is_file()
-    );
-    assert!(
-        sccache::cache_directory(&fixture.home)
-            .join("a/b")
             .is_file()
     );
 }

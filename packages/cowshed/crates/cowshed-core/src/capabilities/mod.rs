@@ -35,7 +35,6 @@ pub mod nix;
 pub mod npm;
 pub mod nx;
 pub mod pnpm;
-pub mod sccache;
 pub mod uv;
 pub mod zig;
 
@@ -56,7 +55,6 @@ pub enum CapabilityId {
     Gradle,
     Nix,
     Mbx,
-    Sccache,
     Codegraph,
 }
 
@@ -75,7 +73,6 @@ impl CapabilityId {
             Self::Gradle => "gradle",
             Self::Nix => "nix",
             Self::Mbx => "mbx",
-            Self::Sccache => "sccache",
             Self::Codegraph => "codegraph",
         }
     }
@@ -93,12 +90,11 @@ impl CapabilityId {
             Self::Gradle => "capabilities.gradle",
             Self::Nix => "capabilities.nix",
             Self::Mbx => "capabilities.mbx",
-            Self::Sccache => "capabilities.sccache",
             Self::Codegraph => "capabilities.codegraph",
         }
     }
 
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::Direnv,
         Self::Nx,
         Self::Cargo,
@@ -111,7 +107,6 @@ impl CapabilityId {
         Self::Gradle,
         Self::Nix,
         Self::Mbx,
-        Self::Sccache,
         Self::Codegraph,
     ];
 }
@@ -329,7 +324,7 @@ impl Detector {
     }
 }
 
-pub static DETECTORS: [&Detector; 14] = [
+pub static DETECTORS: [&Detector; 13] = [
     &direnv::DETECTOR,
     &nx::DETECTOR,
     &cargo::DETECTOR,
@@ -342,7 +337,6 @@ pub static DETECTORS: [&Detector; 14] = [
     &gradle::DETECTOR,
     &nix::DETECTOR,
     &mbx::DETECTOR,
-    &sccache::DETECTOR,
     &codegraph::DETECTOR,
 ];
 

@@ -2,8 +2,8 @@
 //!
 //! Earlier releases kept layer-3 caches on a dedicated volume and linked the host's tool paths
 //! into it. Every directory on that volume now has a home in the host HOME: a detector's tool
-//! cache at the tool's own default, the gateway's mirrors in cowshed's cache directory, sccache's
-//! store at sccache's default, and a repository-placed cache at the `[caches] home` path an
+//! cache at the tool's own default, the gateway's mirrors in cowshed's cache directory, and a
+//! repository-placed cache at the `[caches] home` path an
 //! adopted project's main declares. Retirement moves each one there.
 //!
 //! The work is split the usual way: [`observe`] reads the volume and the host paths, [`plan`] is a
@@ -23,7 +23,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::capabilities::cache::SharedToolHome;
-use crate::capabilities::{bun, cargo, go, gradle, nix, npm, pnpm, sccache, uv, zig};
+use crate::capabilities::{bun, cargo, go, gradle, nix, npm, pnpm, uv, zig};
 use crate::storage::bootstrap::VOLUME_MARKER_FILE;
 use cowshed_os::fork_lock::Run as _;
 
@@ -62,8 +62,6 @@ pub enum Owner {
     Cargo,
     /// cowshed-gateway writes its mirrors; setup stops it around the move.
     Gateway,
-    /// The sccache daemon writes its store; setup stops it around the move.
-    Sccache,
 }
 
 /// One volume directory and the host directory it moves to.
@@ -80,7 +78,6 @@ pub struct Placement {
 enum Destination {
     Tool(&'static SharedToolHome, Option<&'static str>),
     Home(&'static str),
-    Sccache,
     CowshedCache(fn(&Path) -> PathBuf),
 }
 
@@ -92,9 +89,9 @@ struct Retired {
     owner: Option<Owner>,
 }
 
-/// Every directory the volume held for a detector, the gateway or sccache, where it lived there.
-fn retired() -> [Retired; 19] {
-    use Destination::{CowshedCache, Home, Sccache, Tool};
+/// Every directory the volume held for a detector or the gateway, where it lived there.
+fn retired() -> [Retired; 18] {
+    use Destination::{CowshedCache, Home, Tool};
     use Merge::{ContentAddressed, HostWins, Preserve};
     let tool = |volume, label, home, child, owner| Retired {
         volume,
@@ -175,13 +172,6 @@ fn retired() -> [Retired; 19] {
             ..tool("nix/state", "nix state", &nix::STATE_HOME, None, None)
         },
         Retired {
-            volume: "sccache",
-            label: "sccache store",
-            destination: Sccache,
-            merge: ContentAddressed,
-            owner: Some(Owner::Sccache),
-        },
-        Retired {
             volume: "mirror",
             label: "gateway mirror",
             destination: CowshedCache(crate::host_dirs::gateway_mirror),
@@ -228,7 +218,6 @@ impl RetirementLayout {
                     Destination::Tool(tool, Some(child)) => tool.host_path(home).join(child),
                     Destination::Tool(tool, None) => tool.host_path(home),
                     Destination::Home(relative) => home.join(relative),
-                    Destination::Sccache => sccache::cache_directory(home),
                     Destination::CowshedCache(path) => path(home),
                 };
                 (

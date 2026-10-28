@@ -37,12 +37,6 @@ sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-# sccache's own config file is TOML, and `setup` has to read one it did not write without
-# reordering or dropping a key its author set. Parsing is what makes the never-clobber decision
-# honest; preservation is keys and byte-for-byte prefix — only a missing final newline is
-# inserted — and only cowshed's appended block is ever rewritten. The workspace manifest says why
-# its `serde` feature is load-bearing.
-toml.workspace = true
 
 [dev-dependencies]
 # The expired-wait boundary test (src/run.rs) reads the Arrow segment it seals.

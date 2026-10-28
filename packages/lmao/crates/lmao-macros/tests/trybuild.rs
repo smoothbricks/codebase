@@ -11,9 +11,9 @@
 //! help naming `__span` in `context.rs`.
 //!
 //! trybuild rewrites an absolute workspace path to
-//! `$WORKSPACE/.../context.rs` and keeps the expanded signature. cowshed's
-//! sccache compiles that dependency under `--remap-path-prefix=<dir>=`, so
-//! rustc emits `src/context.rs:line:col` and cannot reload the file to expand
+//! `$WORKSPACE/.../context.rs` and keeps the expanded signature. A compiler
+//! cache that compiles that dependency under `--remap-path-prefix=<dir>=` makes
+//! rustc emit `src/context.rs:line:col` and unable to reload the file to expand
 //! the signature. trybuild never rewrites that relative path, so one snapshot
 //! cannot match both. Normalize the help location and compare that.
 

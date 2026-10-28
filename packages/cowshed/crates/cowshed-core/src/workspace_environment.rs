@@ -328,9 +328,8 @@ fn nx_parallel_restore() -> String {
 /// The capability-contributed variables a host shell sources from `.cowshed/env` as its jobs get them: the
 /// compiler-cache client's, a Cargo project's recording of unit use, and Nx's cache size.
 fn host_capability_names() -> impl Iterator<Item = &'static str> {
-    crate::capabilities::sccache::HOST_ENVIRONMENT
+    crate::capabilities::cargo::HOST_ENVIRONMENT
         .into_iter()
-        .chain(crate::capabilities::cargo::HOST_ENVIRONMENT)
         .chain(crate::capabilities::mbx::HOST_ENVIRONMENT)
         .chain(["NX_MAX_CACHE_SIZE"])
 }

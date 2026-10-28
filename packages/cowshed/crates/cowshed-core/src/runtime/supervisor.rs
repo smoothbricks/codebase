@@ -10003,17 +10003,15 @@ mod workspace_toolchain_tests {
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }
 
-    /// Every cargo a workspace runs wraps rustc with the sccache the host pinned: the program
-    /// itself, not a name the repository shell's `PATH` may not resolve. A host that pinned none,
-    /// or whose pinned store path was collected, builds without a wrapper rather than failing
-    /// every cargo at its version probe. Neither the wrapper nor its cwd normalization is the
-    /// caller's, in a one-shot child or a warm shell's command, and `CARGO_INCREMENTAL` stays
-    /// cargo's to decide. Every cargo also records each unit use (`CARGO_UNSTABLE_MTIME_ON_USE`),
-    /// whatever its caller names, and the host shell's `.cowshed/env` says the same.
+    /// No cargo a workspace runs wraps rustc with anything a caller named: a wrapper a shell exported
+    /// once (an earlier compiler cache's) never reaches a one-shot child or a warm shell's command,
+    /// and the host shell's `.cowshed/env` withholds it too. `CARGO_INCREMENTAL` stays cargo's to
+    /// decide, and every cargo records each unit use (`CARGO_UNSTABLE_MTIME_ON_USE`), whatever its
+    /// caller names.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn cargo_wraps_rustc_with_the_pinned_sccache_or_with_nothing() {
-        let root = scratch("sccache-client");
+    async fn cargo_never_wraps_rustc_with_a_callers_wrapper() {
+        let root = scratch("rustc-wrapper");
         let mount = root.join("workspace");
         std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
         std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
@@ -10027,8 +10025,6 @@ mod workspace_toolchain_tests {
         std::fs::create_dir_all(&sandbox.home).expect("home");
         let caller = BTreeMap::from([
             ("RUSTC_WRAPPER".to_owned(), "/bin/false".to_owned()),
-            ("SCCACHE_BASEDIR_CWD".to_owned(), "0".to_owned()),
-            ("SCCACHE_BASEDIR".to_owned(), "/elsewhere".to_owned()),
             (
                 crate::capabilities::cargo::MTIME_ON_USE_ENV.to_owned(),
                 "false".to_owned(),
@@ -10063,10 +10059,7 @@ mod workspace_toolchain_tests {
             let output = host.output_bounded().expect("source host environment");
             assert!(output.status.success());
             let text = String::from_utf8(output.stdout).unwrap();
-            for name in crate::capabilities::sccache::HOST_ENVIRONMENT
-                .into_iter()
-                .chain(crate::capabilities::cargo::HOST_ENVIRONMENT)
-            {
+            for name in crate::capabilities::cargo::HOST_ENVIRONMENT {
                 let value = text
                     .lines()
                     .find_map(|line| line.strip_prefix(&format!("{name}=")));
@@ -10084,38 +10077,16 @@ mod workspace_toolchain_tests {
             );
             [
                 "RUSTC_WRAPPER",
-                "SCCACHE_BASEDIR_CWD",
-                "SCCACHE_BASEDIR",
                 "CARGO_INCREMENTAL",
                 crate::capabilities::cargo::MTIME_ON_USE_ENV,
             ]
             .map(|name| child.get(OsStr::new(name)).cloned())
         };
-        // A cargo project on a host with no pinned client builds without a wrapper, and the
-        // caller's wrapper and request bases never reach the child either.
-        let unwrapped = [None, None, None, None, Some(OsString::from("true"))];
-        assert_eq!(wiring().await, unwrapped, "no sccache pinned");
-
-        let store_path = root.join("store/0000-sccache-cowshed");
-        std::fs::create_dir_all(store_path.join("bin")).expect("store path");
-        std::fs::write(store_path.join("bin/sccache"), b"").expect("program");
-        let gc_root = crate::capabilities::sccache::gc_root(&sandbox.home);
-        std::fs::create_dir_all(gc_root.parent().expect("parent")).expect("support directory");
-        std::os::unix::fs::symlink(&store_path, &gc_root).expect("gc root");
         assert_eq!(
             wiring().await,
-            [
-                Some(store_path.join("bin/sccache").into_os_string()),
-                Some(OsString::from("1")),
-                Some(mount.clone().into_os_string()),
-                None,
-                Some(OsString::from("true")),
-            ],
-            "the pinned program"
+            [None, None, Some(OsString::from("true"))],
+            "the caller's wrapper never reaches the child"
         );
-
-        std::fs::remove_dir_all(&store_path).expect("collect the store path");
-        assert_eq!(wiring().await, unwrapped, "a collected store path");
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }
 

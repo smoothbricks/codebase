@@ -22,8 +22,7 @@ inputs:
   # Go for devenv.smoo.nix, pinned to the patch release ttsc vendors inside its
   # native package (0.34.1 -> go1.27.3); `smoo monorepo check` fails when the two
   # disagree. Our curated channel above cannot supply it — rolling has no Go 1.27 —
-  # so this is one leaf package from a nixpkgs that has it, the same idiom as the
-  # dedicated sccache source.
+  # so this is one leaf package from a nixpkgs that has it.
   #
   # An exact revision rather than the nixpkgs-unstable branch, deliberately: the
   # whole point of this input is to name ONE Go version, so a `devenv update` must

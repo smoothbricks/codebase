@@ -71,7 +71,11 @@ pub const CA_ENV: &str = "CARGO_HTTP_CAINFO";
 /// stable Cargo ignores it.
 pub const MTIME_ON_USE_ENV: &str = "CARGO_UNSTABLE_MTIME_ON_USE";
 /// Host shells source the same recording as supervisor children.
-pub const HOST_ENVIRONMENT: [&str; 1] = [MTIME_ON_USE_ENV];
+pub const HOST_ENVIRONMENT: [&str; 2] = [MTIME_ON_USE_ENV, RUSTC_WRAPPER_ENV];
+/// A rustc wrapper is never a caller's: one a shell exported once (an earlier compiler cache's)
+/// would wrap every compilation of every job, and under mbx it disables mbx's cache
+/// (16_build_volumes.md, "One Cargo environment on every path").
+const RUSTC_WRAPPER_ENV: &str = "RUSTC_WRAPPER";
 const RUSTUP_HOME_ENV: &str = "RUSTUP_HOME";
 
 /// rustup's proxies, which dispatch on the name they are invoked by.
@@ -90,6 +94,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     contribution
         .env
         .insert("CARGO_TARGET_DIR", EnvAction::Unset);
+    contribution.env.insert(RUSTC_WRAPPER_ENV, EnvAction::Unset);
     contribution.env.insert(
         GIT_FETCH_WITH_CLI_ENV,
         EnvAction::Own(OsString::from("true")),
@@ -238,6 +243,7 @@ mod tests {
             BTreeMap::from([
                 ("CARGO_HOME", EnvAction::Own(cargo_home.clone().into())),
                 ("CARGO_TARGET_DIR", EnvAction::Unset),
+                (RUSTC_WRAPPER_ENV, EnvAction::Unset),
                 (CA_ENV, EnvAction::Default(bundle.clone().into())),
                 (GIT_FETCH_WITH_CLI_ENV, EnvAction::Own("true".into())),
                 (MTIME_ON_USE_ENV, EnvAction::Own("true".into())),

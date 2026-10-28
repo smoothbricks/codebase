@@ -2,7 +2,7 @@
 //!
 //! `setup` is the one command a stranded host can always run. It takes no project, because a host
 //! whose volumes are absent has no adopted checkout to name, and it dispatches beside `gateway`
-//! and `sccache` at the host-service layer rather than through the project runtime bridge
+//! at the host-service layer rather than through the project runtime bridge
 //! (01a_apfs.md, "`cowshed setup` owns this transaction").
 //!
 //! The verb is two phases on purpose. The plan is gathered *before* anything is executed so the
@@ -18,12 +18,6 @@
 
 use crate::args::SetupArgs;
 use crate::capabilities::mbx::MbxInstall;
-use crate::capabilities::sccache::client_config::{
-    self, ConfigChange, ConfigOutcome, ConfigReport, SharedStore,
-};
-use crate::capabilities::sccache::service::{
-    derived_capacity, remove_stale_socket, sccache_launch_agent, start_service,
-};
 use crate::gateway_service::{
     CliInstall, Downgrade, ServiceBinaryRefresh, canonical_home, gateway_launch_agent,
     output_error, remove_host_stable_executable, remove_launch_agent, remove_path_entries,
@@ -40,7 +34,6 @@ use cowshed_core::build_volume::BuildStateRefresh;
 use cowshed_core::caches_retirement::{
     self, LeftoverReason, Merge, Owner, RetirementError, RetirementLayout, RetirementReport,
 };
-use cowshed_core::capabilities::sccache::cache_directory;
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::project::{ProjectRuntime, RecoveryScope};
@@ -207,8 +200,12 @@ pub trait HostSetup: Send {
     async fn git_identity(&mut self) -> Result<GitIdentity>;
     /// Deactivate and delete the host services and the binaries they ran.
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>>;
-    /// Point an sccache client that inherited no cowshed environment at the shared cache.
-    async fn configure_sccache_client(&mut self) -> Result<ConfigReport>;
+    /// Remove what an earlier cowshed installed for sccache, which nothing starts any more
+    /// (16_build_volumes.md, "Migration" step 4): its agent, the GC root that kept its binary and
+    /// the socket it bound. Default-empty for a test host, which must never touch a real home.
+    async fn retire_legacy_sccache(&mut self) -> Result<Vec<HostArtifactRemoval>> {
+        Ok(Vec::new())
+    }
     /// Install cowshed's pinned mbx beside the installed cowshed (14_nix.md, "mbx"): build the
     /// shipped flake, root it, link the host's `mbx` to it.
     ///
@@ -218,8 +215,8 @@ pub trait HostSetup: Send {
         Ok(None)
     }
     /// Steps 1–3 of retiring the caches volume (03_caches.md): move everything it holds to its
-    /// home in the host HOME, stopping the gateway and the sccache daemon around the moves they
-    /// own. `None` on a host that has no caches volume. Needs no authorization.
+    /// home in the host HOME, stopping the gateway around the moves it owns. `None` on a host that
+    /// has no caches volume. Needs no authorization.
     async fn retire_caches_volume(&mut self) -> Result<Option<RetirementReport>>;
     /// Migrate the store to the layout whose project owners carry a marker
     /// (`bootstrap::mark_project_owners`): the owners it marked, none once the store is current.
@@ -494,30 +491,19 @@ impl HostSetup for NativeHostSetup {
         }
     }
 
-    /// Remove both agents, then the cowshed binary copy and sccache's nix GC root.
+    /// Remove the gateway agent, then the cowshed binary copy, the mbx link and its root, and what
+    /// an earlier cowshed installed for sccache.
     ///
     /// Order is load-bearing: the gateway agent is `KeepAlive`, so deleting the binary while its
-    /// agent is still loaded leaves launchd respawning a path that no longer resolves. sccache is
-    /// the same hazard with a different mechanism — releasing its root while the agent is loaded
-    /// makes the store path it runs eligible for the next collection — so the root goes after the
-    /// agent, never before.
-    ///
-    /// Releasing the root is all teardown does about sccache's binary: the store path itself is
-    /// nix's to reclaim, and deleting anything under `/nix/store` is not cowshed's business.
+    /// agent is still loaded leaves launchd respawning a path that no longer resolves.
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>> {
         let namespace = self.roots.namespace();
         let (gateway_binary, gateway_agent) = gateway_launch_agent(namespace, &self.home)?;
-        let (sccache_agent, sccache_root, sccache_socket) =
-            sccache_launch_agent(namespace, &self.home)?;
         let [mbx_link, mbx_root] = crate::capabilities::mbx::uninstall(&self.home)?;
-        let removals = vec![
+        let mut removals = vec![
             HostArtifactRemoval::new(
                 format!("{} agent", gateway_agent.label()),
                 remove_launch_agent(&gateway_agent)?,
-            ),
-            HostArtifactRemoval::new(
-                format!("{} agent", sccache_agent.label()),
-                remove_launch_agent(&sccache_agent)?,
             ),
             HostArtifactRemoval::new(
                 "cowshed on PATH",
@@ -527,40 +513,15 @@ impl HostSetup for NativeHostSetup {
                 "installed cowshed binary",
                 remove_host_stable_executable(&gateway_binary)?,
             ),
-            HostArtifactRemoval::new("sccache nix GC root", remove_gc_root(&sccache_root)?),
             HostArtifactRemoval::new("mbx beside the installed cowshed", mbx_link),
             HostArtifactRemoval::new("mbx nix GC root", mbx_root),
         ];
-        remove_stale_socket(&sccache_socket)?;
+        removals.extend(legacy_sccache_removals(&self.home, &self.roots)?);
         Ok(removals)
     }
 
-    /// Write sccache's own config file, so a build outside every workspace still shares the cache.
-    ///
-    /// Gated on validated host storage rather than on the plan: the cap is derived from what the
-    /// store holds. The destination is the daemon's own [`cache_directory`] and the cap is the
-    /// daemon's own derivation, so the config file and the plist can never name two different
-    /// stores or two different eviction bounds.
-    async fn configure_sccache_client(&mut self) -> Result<ConfigReport> {
-        let path = client_config::client_config_path(&self.home);
-        let directory = cache_directory(&self.home);
-        let storage = match validate_existing_host_storage(&self.home).await {
-            Ok(storage) => storage,
-            Err(error) => {
-                return Ok(ConfigReport {
-                    path,
-                    store: directory,
-                    outcome: ConfigOutcome::NoCapacity {
-                        reason: error.message,
-                    },
-                });
-            }
-        };
-        fs::create_dir_all(&directory).map_err(|error| {
-            CowshedError::internal(format!("could not create {}: {error}", directory.display()))
-        })?;
-        let capacity = derived_capacity(&storage).await?;
-        client_config::apply(&path, &SharedStore::new(directory, capacity))
+    async fn retire_legacy_sccache(&mut self) -> Result<Vec<HostArtifactRemoval>> {
+        legacy_sccache_removals(&self.home, &self.roots)
     }
 
     /// Plan the moves from what the volume and the host hold, quiesce the writers they touch,
@@ -589,17 +550,9 @@ impl HostSetup for NativeHostSetup {
                 "cowshed doctor --json",
             )
         })?;
-        let owners = plan.owners();
-        let gateway = owners.contains(&Owner::Gateway);
-        let sccache_running = owners.contains(&Owner::Sccache)
-            && crate::capabilities::sccache::service::service_status(self.roots.namespace())
-                .await
-                .is_ok_and(|status| status.running);
+        let gateway = plan.owners().contains(&Owner::Gateway);
         if gateway {
             crate::gateway_service::stop_for_host_move(&self.slot, &self.roots).await?;
-        }
-        if sccache_running {
-            crate::capabilities::sccache::service::stop_for_host_move(self.roots.namespace())?;
         }
         let executed =
             tokio::task::spawn_blocking(move || caches_retirement::execute(&layout, &plan))
@@ -611,14 +564,10 @@ impl HostSetup for NativeHostSetup {
         if gateway {
             crate::gateway_service::start_after_host_move(&self.slot, self.downgrade).await?;
         }
-        if sccache_running {
-            start_service(None).await?;
-        }
         executed.map(Some).map_err(retirement_error)
     }
 
-    /// Nix's build runs on this task like the sccache build it replaces: setup's own work, which
-    /// the operator's interrupt ends.
+    /// Nix's build runs on this task: setup's own work, which the operator's interrupt ends.
     async fn install_mbx(&mut self) -> Result<Option<MbxInstall>> {
         let flake = crate::capabilities::mbx::flake_directory()?;
         crate::capabilities::mbx::install(&self.home, &flake).map(Some)
@@ -651,7 +600,36 @@ fn retirement_error(error: RetirementError) -> CowshedError {
     CowshedError::environment_missing(error.to_string(), "cowshed setup")
 }
 
-/// Release the indirect nix GC root cowshed registered for sccache.
+/// Remove what an earlier cowshed installed for sccache: its KeepAlive agent (deactivated before
+/// its definition goes), the nix GC root that kept its binary, which only lets nix collect that
+/// store path, and the socket it bound under the store. Each is named whether it was there or not.
+fn legacy_sccache_removals(
+    home: &Path,
+    roots: &CanonicalRoots,
+) -> Result<Vec<HostArtifactRemoval>> {
+    let agent =
+        crate::launchd::LaunchAgentTarget::new(home, &roots.namespace().launchd_label("sccache"))
+            .map_err(crate::gateway_service::launchd_error)?;
+    let agent_removed = remove_launch_agent(&agent)?;
+    let root = cowshed_core::host_dirs::support_directory(home).join("nix/sccache");
+    let socket = roots.store().join("sccache.sock");
+    let socket_removed = match fs::symlink_metadata(&socket) {
+        Ok(metadata) if std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()) => {
+            fs::remove_file(&socket).map_err(|error| {
+                CowshedError::internal(format!("could not remove {}: {error}", socket.display()))
+            })?;
+            RemovalOutcome::Removed
+        }
+        _ => RemovalOutcome::AlreadyAbsent,
+    };
+    Ok(vec![
+        HostArtifactRemoval::new(format!("retired {} agent", agent.label()), agent_removed),
+        HostArtifactRemoval::new("retired sccache nix GC root", remove_gc_root(&root)?),
+        HostArtifactRemoval::new("retired sccache socket", socket_removed),
+    ])
+}
+
+/// Release an indirect nix GC root cowshed registered.
 ///
 /// Unlinking the symlink is the whole of it: nix keeps indirect roots as symlinks under
 /// `/nix/var/nix/gcroots/auto` pointing back at this path, and a root whose target is gone is
@@ -812,11 +790,10 @@ where
         Some(_) => None,
         None => Some(setup.git_identity().await?),
     };
-    // Same reason, one step further: the client config carries the daemon's cap, which derives
-    // from the store, and a run that never brought the store up has no cap to write.
-    let sccache = match &failure {
-        Some(_) => None,
-        None => Some(setup.configure_sccache_client().await?),
+    // Nothing starts an earlier cowshed's sccache any more: what it installed goes.
+    let legacy = match &failure {
+        Some(_) => Vec::new(),
+        None => setup.retire_legacy_sccache().await?,
     };
     // Installed service binaries are host state exactly like the volumes: a gateway still
     // running a build from before this one is drift a repair must end (or at least name).
@@ -876,28 +853,14 @@ where
                 output.success(report).map_err(output_error)?;
                 // On stderr, so the frozen stdout envelope stays frozen and a conflict a person
                 // has to resolve still reaches them in a scripted run.
-                emit_sccache_client(sccache.as_ref(), output)?;
+                emit_legacy_sccache(&legacy, output)?;
                 emit_mbx_install(mbx.as_ref(), output)?;
                 emit_build_state(&build_state, output)?;
             }
-            _ => render_repair(
-                &plan,
-                &report,
-                &readiness,
-                sccache.as_ref(),
-                mbx.as_ref(),
-                output,
-            )?,
+            _ => render_repair(&plan, &report, &readiness, &legacy, mbx.as_ref(), output)?,
         }
     } else {
-        render_repair(
-            &plan,
-            &report,
-            &readiness,
-            sccache.as_ref(),
-            mbx.as_ref(),
-            output,
-        )?;
+        render_repair(&plan, &report, &readiness, &legacy, mbx.as_ref(), output)?;
     }
     let retirement_refused =
         emit_retirement(retirement.as_ref(), retire_requested, retire, output)?;
@@ -1416,7 +1379,7 @@ fn render_repair<W: Write, E: Write>(
     plan: &HostSetupPlan,
     report: &HostSetupReport,
     readiness: &RepairReadiness<'_>,
-    sccache: Option<&ConfigReport>,
+    legacy: &[HostArtifactRemoval],
     mbx: Option<&MbxInstall>,
     output: &mut Output<W, E>,
 ) -> Result<()> {
@@ -1450,7 +1413,7 @@ fn render_repair<W: Write, E: Write>(
         .map_err(output_error)?;
     // Before the status line, which is the last thing a reader sees and is a claim about the whole
     // host rather than about one file.
-    emit_sccache_client(sccache, output)?;
+    emit_legacy_sccache(legacy, output)?;
     emit_mbx_install(mbx, output)?;
     // An exhaustive match, not an `if let`: an outcome this module does not render is an outcome
     // the host silently kept to itself, which is the one thing a repair report must never do.
@@ -1649,14 +1612,18 @@ fn downgrade_failure(
         .map(|(reason, remedy)| CowshedError::conflict(reason.clone(), remedy.clone()))
 }
 
-fn emit_sccache_client<W: Write, E: Write>(
-    sccache: Option<&ConfigReport>,
+/// What the run removed of an earlier cowshed's sccache, one line each, and nothing on a host that
+/// had none.
+fn emit_legacy_sccache<W: Write, E: Write>(
+    legacy: &[HostArtifactRemoval],
     output: &mut Output<W, E>,
 ) -> Result<()> {
-    if let Some(report) = sccache {
-        output
-            .guidance(&sccache_client_phrase(report))
-            .map_err(output_error)?;
+    for removal in legacy {
+        if removal.outcome == RemovalOutcome::Removed {
+            output
+                .guidance(&format!("removed the {}", removal.what))
+                .map_err(output_error)?;
+        }
     }
     Ok(())
 }
@@ -1674,40 +1641,6 @@ fn emit_mbx_install<W: Write, E: Write>(
         output.guidance(&install.phrase()).map_err(output_error)?;
     }
     Ok(())
-}
-
-/// What the run did about sccache's own config file, in one line.
-///
-/// Every arm names the file, because the whole point of writing it is that a future reader can
-/// find out who did. No default branch: an outcome the module adds stops compiling here rather
-/// than being reported as something it is not.
-fn sccache_client_phrase(report: &ConfigReport) -> String {
-    let path = report.path.display();
-    let store = report.store.display();
-    match &report.outcome {
-        ConfigOutcome::AlreadyCurrent => {
-            format!("{path} already sends a store-less sccache client to {store}")
-        }
-        ConfigOutcome::Written(ConfigChange::Created) => format!(
-            "wrote {path}: an sccache client that inherited no cowshed environment now caches in {store}"
-        ),
-        // Named separately from `Created` because the reassurance is the point: a person who has
-        // settings in that file needs to know cowshed did not rewrite them.
-        ConfigOutcome::Written(ConfigChange::Appended) => format!(
-            "added cowshed's [cache.disk] block to {path}, naming {store}; every other setting in that file was left exactly as it was"
-        ),
-        ConfigOutcome::Written(ConfigChange::Refreshed) => {
-            format!("refreshed cowshed's [cache.disk] block in {path}, naming {store}")
-        }
-        // A file cowshed did not write is not cowshed's to overwrite, so this is a report and not
-        // a failure — but it is a report of a cache that will not be shared, so it says so.
-        ConfigOutcome::Refused(conflict) => format!(
-            "left {path} alone: {conflict}; a store-less sccache client will not share {store} until cache.disk.dir names it"
-        ),
-        ConfigOutcome::NoCapacity { reason } => format!(
-            "{path} not written: the cache cap it must share with the sccache daemon derives from the store, which is not available ({reason})"
-        ),
-    }
 }
 
 /// `cowshed.store exists (…) and will be mounted at …: failed — <why>`.

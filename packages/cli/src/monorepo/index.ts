@@ -44,7 +44,6 @@ import {
 } from './package-policy.js';
 import { resolvedTargetsByProject, runInitPacks, runValidatePacks } from './packs/index.js';
 import { syncRootRuntimeVersions } from './runtime.js';
-import { validateSccachePatches } from './sccache-patches.js';
 import { applyToolConfigDefaults } from './tool-validation.js';
 
 export interface InitOptions {
@@ -193,8 +192,7 @@ export async function checkPolicyFailures(root: string, projectTargets: ProjectT
     validateDevenvModuleImport(root) +
     (await validateDevenvReleaseLock(root)) +
     validateCargoCachePolicy(root) +
-    validateCargoToolchainInputs(root, projectTargets) +
-    validateSccachePatches(root)
+    validateCargoToolchainInputs(root, projectTargets)
   );
 }
 

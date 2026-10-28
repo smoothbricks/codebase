@@ -248,9 +248,6 @@
   "host.gatewayStart": {},
   "host.gatewayStop": { "purge": true },
   "host.lockHolders": { "path": "/tmp/cowshed-lock" },
-  "sccache.start": { "capacity": "40g" },
-  "sccache.stop": {},
-  "sccache.status": {},
   "host.credentialAdd": {
     "project": "/trusted/acme/widget",
     "origin": "https://registry.example.test",

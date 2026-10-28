@@ -386,11 +386,6 @@ pub const PARITY: &[Row] = &[
     row("identity add", "", field(&[("host.identityAdd", "project")], &[argument("Host.identityAdd", 0, "")])),
     row("identity add", "remote", field(&[("host.identityAdd", "remote")], &[argument("Host.identityAdd", 1, "")])),
 
-    row("sccache start", "", field(&[("sccache.start", "")], &[member("SccacheHost.start")])),
-    row("sccache start", "capacity", field(&[("sccache.start", "capacity")], &[argument("SccacheHost.start", 0, "capacity")])),
-    row("sccache stop", "", field(&[("sccache.stop", "")], &[member("SccacheHost.stop")])),
-    row("sccache status", "", field(&[("sccache.status", "")], &[member("SccacheHost.status")])),
-    row("sccache host", "", Counterpart::Composed { recipe: "an embedding process calls openSccacheHost, which starts `cowshed sccache host` through the package launcher, routed to the installed build as every sccache verb is, on a socketpair and connects to it (07_api.md, Host operations)", facade: &[member("openSccacheHost")] }),
 
     row("skill install", "", field(&[("host.skillInstall", "")], &[member("Host.skillInstall")])),
     row("skill install", "harness", field(&[("host.skillInstall", "harnesses")], &[argument("Host.skillInstall", 0, "harnesses")])),

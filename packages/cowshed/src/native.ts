@@ -12,7 +12,6 @@ import type {
   NativeJobHandleCapabilities,
   NativeJobHandleOperations,
   NativeProjectOperations,
-  NativeSccacheHostOperations,
   NativeWorkspaceHandleOperations,
   NativeWorkspaceRefOperations,
 } from './native.generated.js';
@@ -40,9 +39,6 @@ export type NativeCoordinatorHandle = NativeCoordinatorOperations;
 
 /** A host connection's adapters and the close that ends it. */
 export type NativeHostHandle = NativeHostOperations & { close(): Promise<void> };
-
-/** A sccache host connection's adapters and the close that ends it. */
-export type NativeSccacheHostHandle = NativeSccacheHostOperations & { close(): Promise<void> };
 
 export interface NativeWorkspaceHandle extends NativeWorkspaceHandleOperations {
   readonly workspaceIncarnation: string;
@@ -113,7 +109,6 @@ interface NativeModule {
   openProject(endpoint: CoordinatorEndpoint, path: string): Promise<NativeProjectHandle>;
   connectCoordinator(endpoint: CoordinatorEndpoint, path: string): Promise<NativeCoordinatorHandle>;
   openHost(launcher: string): Promise<NativeHostHandle>;
-  openSccacheHost(launcher: string): Promise<NativeSccacheHostHandle>;
 }
 
 const assertNativeModule = typia.createAssert<NativeModule>();

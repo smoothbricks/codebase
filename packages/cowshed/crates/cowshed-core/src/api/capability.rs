@@ -2274,7 +2274,7 @@ pub struct Host {
 
 impl Host {
     /// Connect over an inherited socket whose peer is `cowshed host`. A project controller's
-    /// handshake answer, and a `cowshed sccache host`'s, are refused.
+    /// handshake answer is refused.
     #[cfg(unix)]
     pub async fn connect(descriptor: OwnedFd) -> Result<Self> {
         let runtime = connect_host(descriptor, HostRole::Host).await?;
@@ -2291,35 +2291,6 @@ impl Host {
 impl fmt::Debug for Host {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Host(<host connection>)")
-    }
-}
-
-/// The sccache daemon's control (07_api.md, "Host operations"), over one `cowshed sccache host`
-/// connection, which the package launcher routes to the installed build as it routes every
-/// `sccache` verb. It binds no request field.
-pub struct SccacheHost {
-    runtime: Arc<dyn ControllerRuntime>,
-}
-
-impl SccacheHost {
-    /// Connect over an inherited socket whose peer is `cowshed sccache host`. Any other
-    /// connection's handshake answer is refused.
-    #[cfg(unix)]
-    pub async fn connect(descriptor: OwnedFd) -> Result<Self> {
-        let runtime = connect_host(descriptor, HostRole::Sccache).await?;
-        Ok(Self { runtime })
-    }
-
-    /// End the connection: `cowshed sccache host` reads end of stream and exits; every call still
-    /// pending, and every call after this, refuses.
-    pub async fn close(&self) -> Result<()> {
-        self.runtime.close().await
-    }
-}
-
-impl fmt::Debug for SccacheHost {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("SccacheHost(<sccache host connection>)")
     }
 }
 
@@ -2353,7 +2324,6 @@ async fn connect_host(descriptor: OwnedFd, role: HostRole) -> Result<Arc<dyn Con
     }
     let role_name = match role {
         HostRole::Host => "cowshed host",
-        HostRole::Sccache => "cowshed sccache host",
     };
     let controller = paired_peer(role_name, pid)?;
     let (reader, writer) = stream.into_split();
@@ -2724,17 +2694,6 @@ impl Coordinator {
 }
 
 impl Binder for Host {
-    type Fields<'a> = HostFields;
-
-    fn binding(&self) -> Binding<'_, HostFields> {
-        Binding {
-            runtime: &self.runtime,
-            authority: HostFields,
-        }
-    }
-}
-
-impl Binder for SccacheHost {
     type Fields<'a> = HostFields;
 
     fn binding(&self) -> Binding<'_, HostFields> {
@@ -5057,14 +5016,10 @@ mod tests {
         let host = Host {
             runtime: Arc::clone(&runtime),
         };
-        let sccache = SccacheHost {
-            runtime: Arc::clone(&runtime),
-        };
         operations::served::each_served(
             &mut agrees,
             &operations::served::Handles {
                 host: &host,
-                sccache_host: &sccache,
                 project: coordinator.project(),
                 workspace_ref: &workspace_ref(Arc::clone(&runtime)),
                 coordinator: &coordinator,

@@ -18,7 +18,7 @@ chooses one.
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | Main workspace                                           | dataset `<pool>/cowshed/projects/<owner>/<repo>/main`, mounted at the original path                 |
 | Session workspaces                                       | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`, mounted at `<mount-root>/<owner>/<repo>/<name>` |
-| Shared caches (Cargo, sccache, zig, Gradle, Go, Nix)     | each tool's own default in your HOME, e.g. `~/.cargo/registry`, `~/.cache/sccache`, `~/go/pkg/mod`  |
+| Shared caches (Cargo, zig, Gradle, Go, Nix)              | each tool's own default in your HOME, e.g. `~/.cargo/registry`, `~/.cache/zig`, `~/go/pkg/mod`      |
 | Gateway registry/repository mirrors                      | `$XDG_CACHE_HOME/cowshed/{mirror,repo-mirrors}` (default `~/.cache/cowshed`); gateway-only          |
 | Bindings, trusted policy, grants, waivers, gateway state | `<pool>/cowshed/store` at `/private/cowshed/store`; policy is `<owner>/<repo>/policy.json`          |
 | Telemetry + gateway audit (Arrow segments)               | `/private/cowshed/store/telemetry/` — same as macOS                                                 |

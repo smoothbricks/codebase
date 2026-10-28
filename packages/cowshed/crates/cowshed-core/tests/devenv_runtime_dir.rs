@@ -1811,7 +1811,7 @@ async fn host_controller_a_workspace_reads_neither_main_nor_home_outside_its_all
 
 /// The HOME read deny leaves a real toolchain working, against the host's real HOME: shell
 /// activation loads the workspace's own `.envrc-local`, cargo builds and runs a crate (through
-/// the host's shared cargo home and sccache when it has them), and bun runs a module graph. The
+/// the host's shared cargo home), and bun runs a module graph. The
 /// workspace is a direnv and cargo project, so its HOME reads are exactly what those detectors
 /// contribute; a tool that needed anything under HOME beyond them would fail here.
 #[tokio::test]
@@ -1883,13 +1883,12 @@ async fn host_controller_a_real_build_runs_under_the_home_read_deny() {
         .expect("detect the direnv and cargo capabilities");
     let mount = &sandbox.workspace_mount;
     // What the supervisor resolves through HOME before any shell exists — bootstrap tools
-    // through the user's Nix profile links, `RUSTC_WRAPPER` through the sccache GC root — must
+    // through the user's Nix profile links — must
     // resolve under the same deny, to what the unsandboxed host resolves. A host without one
     // of them has nothing to resolve there.
     let resolved: Vec<(PathBuf, PathBuf)> = [
         home.join(".nix-profile"),
         home.join(".local/state/nix/profile"),
-        cowshed_core::capabilities::sccache::gc_root(&home),
     ]
     .into_iter()
     .filter_map(|link| {

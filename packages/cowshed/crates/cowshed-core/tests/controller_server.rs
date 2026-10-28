@@ -289,11 +289,11 @@ fn connection_methods() -> impl Iterator<Item = &'static str> {
         .map(|operation| operation.method)
 }
 
-/// A method only a host connection of some role serves: `host`'s or `sccache`'s.
+/// A method only a host connection serves.
 fn is_host_method(method: &str) -> bool {
-    OPERATIONS.iter().any(|operation| {
-        operation.method == method && matches!(operation.scope, Scope::Host | Scope::Sccache)
-    })
+    OPERATIONS
+        .iter()
+        .any(|operation| operation.method == method && matches!(operation.scope, Scope::Host))
 }
 
 fn scope_of(method: &str) -> Scope {
@@ -425,7 +425,7 @@ async fn a_workspace_authority_cannot_reach_any_identity_verb() {
 /// with the authority error before the router sees it.
 #[tokio::test]
 async fn a_host_connection_serves_exactly_its_role() {
-    for role in [HostRole::Host, HostRole::Sccache] {
+    for role in [HostRole::Host] {
         let (router, mut records, _actor) = recording_router();
         let (mut host, server) = TestClient::connect_host(role, router).await;
         for method in connection_methods() {

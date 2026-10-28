@@ -26,8 +26,8 @@ use cowshed_core::api::{
     ProjectGrants, PublicationPolicy, PushOptions, PushReport, RebaseOptions, RebaseReport,
     RefLockPath, RekeyResult, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
     RemoveReport, ReplayedCommit, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode,
-    SccacheStatus, StdinSource as CoreStdinSource, UnlandedPaths, UnprovenWorkspace, UtcTimestamp,
-    WorkspaceInfo, WorkspacePath, WorkspaceState, validate_command_argv,
+    StdinSource as CoreStdinSource, UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo,
+    WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -268,7 +268,6 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Host(_)
         | Command::Credential(_)
         | Command::Identity(_)
-        | Command::Sccache(_)
         | Command::Skill(_)
         | Command::Version
         | Command::Help(_)
@@ -339,7 +338,6 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Host(_)
         | Command::Credential(_)
         | Command::Identity(_)
-        | Command::Sccache(_)
         | Command::Skill(_)
         | Command::Version
         | Command::Help(_)
@@ -452,7 +450,6 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::FdHolders(_)
         | Command::Controller
         | Command::Host(_)
-        | Command::Sccache(_)
         | Command::Skill(_)
         | Command::Version
         | Command::Help(_) => named([]),
@@ -2301,9 +2298,6 @@ where
         )),
         Command::Setup(_) => Err(CowshedError::internal(
             "setup must be dispatched by the host service entrypoint",
-        )),
-        Command::Sccache(_) => Err(CowshedError::internal(
-            "sccache commands must be dispatched by the host service entrypoint",
         )),
         Command::Mount(_) => Err(CowshedError::internal(
             "mount must be dispatched by the host service entrypoint",
@@ -4679,53 +4673,6 @@ fn retired_mount_layout_findings(store_root: &Path) -> Vec<Finding> {
     }
 }
 
-fn sccache_finding(status: &SccacheStatus) -> Finding {
-    let (severity, hint) = if status.running {
-        (FindingSeverity::Info, String::new())
-    } else if status.installed {
-        (
-            FindingSeverity::Warning,
-            "cowshed sccache stop && cowshed sccache start".into(),
-        )
-    } else {
-        (FindingSeverity::Info, "cowshed sccache start".into())
-    };
-    Finding {
-        code: if status.running {
-            "sccache"
-        } else {
-            "sccache-down"
-        }
-        .into(),
-        severity,
-        message: format!(
-            "sccache: launchd {}; socket {} at {}{}",
-            if status.installed {
-                "loaded"
-            } else {
-                "not loaded"
-            },
-            if status.running {
-                "answers"
-            } else {
-                "does not answer"
-            },
-            status.socket.display(),
-            status
-                .stats
-                .as_ref()
-                .map_or_else(String::new, |stats| format!(
-                    "; {} compile requests, {} executed, {} configured base directories",
-                    stats.compile_requests,
-                    stats.requests_executed,
-                    stats.base_directories.len()
-                ))
-        ),
-        hint,
-        path: Some(status.socket.clone()),
-    }
-}
-
 /// The retired caches volume, while it exists, with the command that finishes its retirement:
 /// `cowshed setup` moves what it still holds, and `cowshed setup --retire-caches-volume` deletes
 /// it once only its marker is left (03_caches.md).
@@ -5128,59 +5075,6 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
         cowshed_apfs::media_cap::read,
     )));
     findings.extend(departed);
-    let sccache = probe("sccache-status", async {
-        waits_on(
-            format_args!("sccache-status"),
-            format_args!(
-                "launchd ({}), then the sccache server at {}",
-                roots.namespace().launchd_label("sccache"),
-                cowshed_core::capabilities::sccache::server_socket().display()
-            ),
-        );
-        crate::capabilities::sccache::service::service_status_within(
-            roots.namespace(),
-            DOCTOR_PEER_ANSWER,
-        )
-        .await
-    })
-    .await;
-    match sccache {
-        Ok((status, unanswered)) => {
-            findings.push(sccache_finding(&status));
-            findings.extend(unanswered.map(|unanswered| {
-                unanswered_finding(
-                    "sccache-unanswered",
-                    FindingSeverity::Warning,
-                    &unanswered,
-                    "cowshed sccache stop && cowshed sccache start",
-                )
-            }));
-        }
-        Err(error) => findings.push(Finding {
-            code: "sccache-status".into(),
-            severity: FindingSeverity::Warning,
-            message: error.message,
-            hint: "inspect sccache; the status query failed".into(),
-            path: None,
-        }),
-    }
-    // Whether the agent still has a program to run, which the status above cannot answer: a loaded
-    // agent whose store path was collected looks identical to a healthy one until launchd next
-    // tries to exec it, which may be a reboot away.
-    let pinning = probe_sync(format_args!("sccache-agent"), || {
-        crate::capabilities::sccache::service::control_target(roots.namespace(), &home)
-            .map(|target| crate::capabilities::sccache::nix::pinning_findings(&home, &target))
-    });
-    match pinning {
-        Ok(pinning) => findings.extend(pinning),
-        Err(error) => findings.push(Finding {
-            code: "sccache-agent".into(),
-            severity: FindingSeverity::Error,
-            message: error.message,
-            hint: error.hint,
-            path: None,
-        }),
-    }
     // Inventory validates the existing store itself. A pending host setup action is a finding,
     // not permission to hide project state. One registry traversal supplies every view below.
     match probe("inventory", doctor_projects()).await {
@@ -5227,20 +5121,11 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     Ok(findings)
 }
 
-/// How long cowshed waits for the sccache server, which took its statistics request, to answer
-/// before it reports that server as unanswered (specs/cowshed/06_cli.md, "doctor"): doctor's bound,
-/// and the one `status`, `setup` and `start` read the statistics within. The gateway heartbeats
-/// its answers instead, and is unanswered at its silence bound (05_gateway.md, "Deadlines").
-/// Long rather than absent: a socket that takes a request and answers late may be a live,
-/// saturated server; a minute is still inside the 180 s a caller once gave a silent doctor before
-/// killing it.
-pub(crate) const DOCTOR_PEER_ANSWER: Duration = Duration::from_secs(60);
-
 /// What to do about a gateway that took doctor's request and did not answer: it may be saturated
 /// and answer later, so look before restarting it, which would cut off every gate it serves.
 const GATEWAY_UNANSWERED_HINT: &str = "cowshed gateway status shows whether it answers late; if it never answers: cowshed gateway stop && cowshed gateway start";
 
-/// A daemon that took doctor's request and gave no answer within [`DOCTOR_PEER_ANSWER`].
+/// A daemon that took doctor's request and gave no answer within its bound.
 fn unanswered_finding(
     code: &'static str,
     severity: FindingSeverity,
@@ -5756,7 +5641,6 @@ mod tests {
             &["gateway", "status"],
             &["gateway", "start"],
             &["build-state"],
-            &["sccache", "status"],
             &["skill", "install"],
         ] {
             assert!(!needs(argv), "{argv:?} must work while the builds disagree");
@@ -7598,21 +7482,6 @@ mod tests {
             gateway[0].hint,
             "cowshed gateway stop && cowshed gateway start"
         );
-
-        let sccache = sccache_finding(&SccacheStatus {
-            installed: true,
-            running: false,
-            socket: PathBuf::from("/private/cowshed/store/sccache.sock"),
-            stats: None,
-        });
-        assert_eq!(sccache.code, "sccache-down");
-        assert_eq!(sccache.severity, FindingSeverity::Warning);
-        assert!(sccache.message.contains("launchd loaded"));
-        assert!(sccache.message.contains("sccache.sock"));
-        assert_eq!(
-            sccache.hint,
-            "cowshed sccache stop && cowshed sccache start"
-        );
     }
 
     #[test]
@@ -7921,7 +7790,7 @@ mod tests {
         let unanswered = gateway_service::Unanswered {
             peer: "the gateway daemon",
             socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
-            within: DOCTOR_PEER_ANSWER,
+            within: Duration::from_secs(60),
         };
         let finding = unanswered_finding(
             "gateway-unanswered",

@@ -118,7 +118,6 @@ fn workspace_owned(name: &str) -> bool {
         "CI",
     ]
     .contains(&name)
-        || crate::capabilities::sccache::HOST_ENVIRONMENT.contains(&name)
         || crate::capabilities::cargo::HOST_ENVIRONMENT.contains(&name)
         || crate::capabilities::mbx::HOST_ENVIRONMENT.contains(&name)
 }

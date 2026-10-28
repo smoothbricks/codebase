@@ -1035,7 +1035,7 @@ pub fn seatbelt_profile(
     // Connecting to an allowed socket resolves its path, so every ancestor must
     // be traversable. Socket directories are not under the immutable roots
     // granted above — the nix daemon socket resolves into `/private/var/run`,
-    // while the sccache socket is itself behind the `/private/cowshed` deny — so
+    // while a socket under the store is itself behind the `/private/cowshed` deny — so
     // the literals must land here, after the store-wide deny, or last-match-wins
     // re-denies them and the connect fails on path resolution before the
     // outbound rule is ever consulted.
@@ -2205,11 +2205,11 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
     /// every carve-back — an explicit grant, the workspace's own mount, a detected capability's
     /// grant — so last-match-wins admits each of those and nothing else. The capability grants
     /// here have the detectors' shapes: Bun's still-unshared install cache, a bootstrap probe
-    /// through the Nix profile link, and the sccache GC root.
+    /// through the Nix profile link, and an installed tool's link in cowshed's support directory.
     #[test]
     fn home_reads_deny_by_default_and_every_carve_back_follows_the_deny() {
         let home = Path::new("/Users/tester");
-        let sccache_root = crate::capabilities::sccache::gc_root(home);
+        let installed = crate::capabilities::mbx::host_link(home);
         let mut config = with_contribution(
             vec![
                 grant(
@@ -2223,7 +2223,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
                     GrantAccess::Read,
                 ),
                 CapabilityGrant {
-                    path: sccache_root.clone(),
+                    path: installed.clone(),
                     scope: GrantScope::Literal,
                     access: GrantAccess::Read,
                 },
@@ -2247,7 +2247,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             "(allow file-read* (subpath \"/Users/tester/.bun/install/cache\"))",
             "(allow file-read-metadata (literal \"/Users/tester/.nix-profile\"))",
             "(allow file-read* (literal \"/Users/tester/.nix-profile/bin/direnv\"))",
-            "(allow file-read* (literal \"/Users/tester/Library/Application Support/dev.cowshed/nix/sccache\"))",
+            "(allow file-read* (literal \"/Users/tester/Library/Application Support/dev.cowshed/bin/mbx\"))",
         ] {
             let at = profile
                 .find(carve_back)
