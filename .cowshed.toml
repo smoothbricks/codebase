@@ -24,11 +24,13 @@ state = [".cache/ttsc"]
 turn = "smoothbricks"
 gate = ["sh", "tooling/land-host.sh", "--gate", "{workspace}"]
 push = "codebase"
-# First main's built products (the ordinary compiler outputs and the host's development CLI and addon), which developer
-# links in other checkouts run; Nx restores the outputs the gate cached for the same tree. Then the install of a land
-# that changed cowshed.
+# First main's built products: the ordinary compiler outputs, whose producer receipts consumers' snapshot captures read,
+# then exactly the build units developer links in other checkouts judge stale here (tooling/rebuild-linked.ts runs the
+# link judge's own rebuilds, so no unit a link reads is left out); Nx restores the outputs the gate cached for the same
+# tree, so both are cache hits. Then the install of a land that changed cowshed.
 after = [
-  ["bun", "nx", "run-many", "-t", "build", "cli-native", "napi-native", "--outputStyle=static-failures-only"],
+  ["bun", "nx", "run-many", "-t", "build", "--outputStyle=static-failures-only"],
+  ["bun", "tooling/rebuild-linked.ts"],
   ["sh", "tooling/land-install.sh", "smoothbricks", "{before}", "{head}"],
 ]
 
