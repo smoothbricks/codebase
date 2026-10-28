@@ -170,9 +170,10 @@ impl Drop for HeldLock {
 /// takes them names. It writes the held lock's record with that request beside the process onto
 /// each lock once the kernel grants it (the guard empties it before it lets go), so
 /// `lock-holders` names the holder and why, and a wait for one another holds names who holds it
-/// as `lock-holders` judges it ([`holders`]).
+/// as `lock-holders` judges it ([`holders`]), through the census of the store whose locks it takes.
 pub struct ImageLockTaker<'a> {
     pub holding: &'a LockHolding,
+    pub census: &'a crate::census::CensusScope,
 }
 
 /// An image lock's record: the held lock's process record, and the request beside it.
@@ -196,14 +197,14 @@ impl cowshed_apfs::store_lock::Taker for ImageLockTaker<'_> {
     }
 
     fn holders(&self, path: &Path) -> String {
-        holders(path)
+        holders(self.census, path)
     }
 }
 
-/// Who holds the lock file at `path`, in one line, as the kernel shows it ([`observe`]); why
-/// not, when its holders cannot be read.
-pub fn holders(path: &Path) -> String {
-    match observe(path) {
+/// Who holds the lock file at `path`, in one line, as the kernel shows it to `census`
+/// ([`observe`]); why not, when its holders cannot be read.
+pub fn holders(census: &crate::census::CensusScope, path: &Path) -> String {
+    match observe(census, path) {
         Ok(observation) => observation.to_string(),
         Err(error) => format!("its holders cannot be read: {error}"),
     }
@@ -475,9 +476,9 @@ pub(crate) fn owned_target(
     }
 }
 
-/// Read who holds the lock file at `path`: the per-OS shell reads the kernel, [`judge`] decides.
-/// A missing file is no lock.
-pub fn observe(path: &Path) -> io::Result<Observation> {
+/// Read who holds the lock file at `path`, asking the processes `census` reaches: the per-OS shell
+/// reads the kernel, [`judge`] decides. A missing file is no lock.
+pub fn observe(census: &crate::census::CensusScope, path: &Path) -> io::Result<Observation> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -498,7 +499,7 @@ pub fn observe(path: &Path) -> io::Result<Observation> {
     file.read_to_end(&mut record)?;
     let recorded = serde_json::from_slice::<lease_holder::Process>(&record).ok();
     let own = i32::try_from(std::process::id()).map_err(io::Error::other)?;
-    let (locked, seen) = kernel_view(&file, inode, recorded.as_ref())?;
+    let (locked, seen) = kernel_view(census, &file, inode, recorded.as_ref())?;
     let (owner, descriptors) = judge(seen, recorded.as_ref(), own);
     // A request is believed only as far as its owner is proven.
     let holding = owner
@@ -520,12 +521,14 @@ pub fn observe(path: &Path) -> io::Result<Observation> {
 /// holder of another user whose descriptors this user cannot read).
 #[cfg(target_os = "linux")]
 fn kernel_view(
+    census: &crate::census::CensusScope,
     _file: &File,
     inode: Inode,
     _recorded: Option<&lease_holder::Process>,
 ) -> io::Result<(bool, Vec<Seen>)> {
     let mut seen = Vec::new();
-    for (holder, fds) in crate::build_volume::nx::inode_holders((inode.dev.get(), inode.ino.get()))?
+    for (holder, fds) in
+        crate::build_volume::nx::inode_holders(census, (inode.dev.get(), inode.ino.get()))?
     {
         let view = fdinfo_custody(
             fds.iter()
@@ -618,20 +621,21 @@ fn lock_line_holds(line: &str, major: u64, minor: u64, ino: u64) -> bool {
 
 /// Darwin: each process with a descriptor on `inode` and its kernel unique id, and whether
 /// `F_GETLK` shows the inode exclusively locked: a `flock(2)` conflicts with the shared lock it
-/// asks about. The descriptor census asks no process a cowshed lifecycle operation runs in
-/// ([`crate::build_volume::nx::inode_holders`]): a fork's first mount of its new image holds its vnode
-/// for minutes. The lock's `recorded` holder, when it is such a process, is seen by its unique id
-/// alone, which the process table answers without reading a descriptor, so a fork holding
-/// `main.dmg.lock` is still its proven owner.
+/// asks about. The descriptor census asks no process a cowshed lifecycle operation of `census`'s
+/// store runs in ([`crate::build_volume::nx::inode_holders`]): a fork's first mount of its new image
+/// holds its vnode for minutes. The lock's `recorded` holder, when it is such a process, is seen by
+/// its unique id alone, which the process table answers without reading a descriptor, so a fork
+/// holding `main.dmg.lock` is still its proven owner.
 #[cfg(target_os = "macos")]
 fn kernel_view(
+    census: &crate::census::CensusScope,
     file: &File,
     inode: Inode,
     recorded: Option<&lease_holder::Process>,
 ) -> io::Result<(bool, Vec<Seen>)> {
     let mut seen = Vec::new();
     for (holder, _fds) in
-        crate::build_volume::nx::inode_holders((inode.dev.get(), inode.ino.get()))?
+        crate::build_volume::nx::inode_holders(census, (inode.dev.get(), inode.ino.get()))?
     {
         let unique_id = job_groups::process_record(holder.pid)?.map(|record| record.unique_id);
         seen.push(Seen {
@@ -643,7 +647,7 @@ fn kernel_view(
     if let Some(recorded) = recorded
         && let Ok(pid) = i32::try_from(recorded.pid)
         && !seen.iter().any(|process| process.pid == pid)
-        && lease_holder::running_lifecycle().contains(&pid)
+        && lease_holder::running_lifecycle(census.store(), |lease| fs::read(lease)).contains(&pid)
         && let Some(record) = job_groups::process_record(pid)?
     {
         seen.push(Seen {
@@ -684,16 +688,17 @@ impl OwnedLives {
     }
 
     /// Signal the proven owner of the inode `queued` the waiter opened at `path` through the life
-    /// captured for it ([`owned_target`]): the signal reaches that life or nothing, never a later
-    /// process given its pid nor the holder of a file that replaced the waiter's at `path`.
-    /// `Ok(Err(reason))` names why nothing was signalled.
+    /// captured for it ([`owned_target`]), the owner as `census` reads it: the signal reaches that
+    /// life or nothing, never a later process given its pid nor the holder of a file that replaced
+    /// the waiter's at `path`. `Ok(Err(reason))` names why nothing was signalled.
     pub fn signal_owner(
         &self,
+        census: &crate::census::CensusScope,
         path: &Path,
         queued: Inode,
         signal: libc::c_int,
     ) -> io::Result<Result<i32, String>> {
-        let observation = observe(path)?;
+        let observation = observe(census, path)?;
         let lives = self
             .0
             .iter()
@@ -1075,7 +1080,7 @@ mod tests {
                 cowshed_os::eprintln!(
                     "{} is still held after its holder let go; waiting for the kernel to grant it: {}",
                     path.display(),
-                    holders(path)
+                    holders(&crate::census::this_test(), path)
                 );
                 waiter.hold()
             }
@@ -1161,7 +1166,7 @@ mod tests {
                         drop(grant);
                         format!(
                             "the kernel granted the lock while the command it was handed to still ran; it shows: {}",
-                            holders(&path)
+                            holders(&crate::census::this_test(), &path)
                         )
                     })
                 })

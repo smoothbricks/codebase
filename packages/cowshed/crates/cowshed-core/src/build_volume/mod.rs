@@ -924,13 +924,17 @@ impl BuildVolumeLayout {
     // HOLDER_REPORT while it keeps its place; the claimant's release at its work's end, or the
     // kernel's at its exit, ends the wait.
     #[allow(clippy::disallowed_methods)]
-    pub fn hold(&self, id: &BuildVolumeId) -> io::Result<BuildVolumeHold> {
+    pub fn hold(
+        &self,
+        census: &crate::census::CensusScope,
+        id: &BuildVolumeId,
+    ) -> io::Result<BuildVolumeHold> {
         let path = self.hold_path(id);
         let file = open_hold(&path)?;
         cowshed_os::flock::queued(
             &path,
             cowshed_os::flock::HOLDER_REPORT,
-            crate::held_lock::holders,
+            |lock| crate::held_lock::holders(census, lock),
             || loop {
                 match file.lock_shared() {
                     // A signal woke the wait; the claim it waits for is unchanged.
@@ -2422,7 +2426,9 @@ mod tests {
                 // SAFETY: names this thread's own Mach port and transfers no right.
                 port.send(unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) })
                     .unwrap();
-                answer.send(layout.hold(&id)).unwrap();
+                answer
+                    .send(layout.hold(&crate::census::this_test(), &id))
+                    .unwrap();
             })
         };
         let port = ported.recv().unwrap();

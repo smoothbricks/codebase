@@ -77,6 +77,7 @@ fn store(root: &Path, config: ArtifactConfig) -> ArtifactStore {
         OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
         WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
         config,
+        census(),
     )
     .unwrap()
 }
@@ -131,6 +132,7 @@ fn invalid_configs_are_rejected_before_creating_protected_layout() {
                 OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
                 WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
                 config,
+                census(),
             ),
             Err(ArtifactError::InvalidConfig(_))
         ));
@@ -220,7 +222,8 @@ fn threshold_crossing_spills_only_the_crossing_stream_and_round_trips_arrow() {
     );
     assert_eq!(store.buffered_bytes(), 0);
 
-    let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
+    let recovered =
+        recover_records(&census(), &root.path().join(".cowshed/job/records.arrow")).unwrap();
     assert_eq!(recovered.frames.len(), 2);
     assert!(recovered.frames[1].record == sealed.record);
 }
@@ -387,8 +390,11 @@ fn combined_quota_accepts_exact_boundary_and_reports_first_crossing() {
         sealed.record.output_limit.as_ref().unwrap().crossing_bytes,
         6
     );
-    let recovered =
-        recover_records(&crossed_root.path().join(".cowshed/job/records.arrow")).unwrap();
+    let recovered = recover_records(
+        &census(),
+        &crossed_root.path().join(".cowshed/job/records.arrow"),
+    )
+    .unwrap();
     assert!(recovered.frames.last().unwrap().record.output_limit == sealed.record.output_limit);
     assert_eq!(
         crossed
@@ -463,7 +469,8 @@ fn non_utf8_argv_round_trips_through_binary_arrow_and_recovery() {
     };
     assert_eq!(item.data_type(), &DataType::Binary);
 
-    let recovery = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
+    let recovery =
+        recover_records(&census(), &root.path().join(".cowshed/job/records.arrow")).unwrap();
     let recovered = recovery
         .frames
         .iter()
@@ -512,7 +519,8 @@ fn invalid_utf8_is_tagged_base64_and_survives_json_and_arrow() {
             .unwrap(),
         bytes
     );
-    let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
+    let recovered =
+        recover_records(&census(), &root.path().join(".cowshed/job/records.arrow")).unwrap();
     assert!(recovered.frames[1].record.stdout == sealed.record.stdout);
 }
 
@@ -695,7 +703,7 @@ fn recovery_truncates_only_incomplete_tail_and_rejects_complete_corruption() {
         .unwrap()
         .write_all(b"CSBAT")
         .unwrap();
-    let recovered = recover_records(&records).unwrap();
+    let recovered = recover_records(&census(), &records).unwrap();
     assert_eq!(recovered.truncated_bytes, 5);
     assert_eq!(fs::metadata(&records).unwrap().len(), valid_len);
 
@@ -708,7 +716,7 @@ fn recovery_truncates_only_incomplete_tail_and_rejects_complete_corruption() {
     file.write_all(&[0xff]).unwrap();
     file.sync_all().unwrap();
     assert!(matches!(
-        recover_records(&records).unwrap_err(),
+        recover_records(&census(), &records).unwrap_err(),
         ArtifactError::Integrity { .. }
     ));
 }
@@ -1172,6 +1180,7 @@ fn open_rejects_missing_corrupt_and_swapped_file_backed_streams() {
             OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
             WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
             ArtifactConfig::default(),
+            census(),
         ),
         Err(ArtifactError::Io { .. })
     ));
@@ -1186,6 +1195,7 @@ fn open_rejects_missing_corrupt_and_swapped_file_backed_streams() {
             OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
             WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
             ArtifactConfig::default(),
+            census(),
         ),
         Err(ArtifactError::Integrity { .. })
     ));
@@ -1202,6 +1212,7 @@ fn open_rejects_missing_corrupt_and_swapped_file_backed_streams() {
             OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
             WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
             ArtifactConfig::default(),
+            census(),
         ),
         Err(ArtifactError::Integrity { .. })
     ));
@@ -1360,7 +1371,7 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
                     root.path(),
                     OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
                     WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
-                    ArtifactConfig::default(),
+                    ArtifactConfig::default(), census(),
                 ),
                 Err(ArtifactError::Integrity { message, .. })
                     if message.contains("sealed regular file")
@@ -1464,7 +1475,7 @@ fn streaming_recovery_enforces_retained_budget_before_payload_allocation() {
     let mut store = store(root.path(), ArtifactConfig::default());
     let _token = begin(&mut store, 1, OutputTargets::default());
     let records = root.path().join(".cowshed/job/records.arrow");
-    let error = recover_records_with_budget(&records, 1).unwrap_err();
+    let error = recover_records_with_budget(&census(), &records, 1).unwrap_err();
     assert!(matches!(
         error,
         ArtifactError::RecoveryBudgetExceeded {
@@ -1517,7 +1528,8 @@ fn completion_seals_before_independent_publication_outcomes() {
     assert_eq!(completed.sealed.record.state, JobState::Exited);
     assert!(completed.sealed.record.stdout.summary.text.is_empty());
     assert!(completed.sealed.record.stderr.summary.text.is_empty());
-    let recovery = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
+    let recovery =
+        recover_records(&census(), &root.path().join(".cowshed/job/records.arrow")).unwrap();
     assert!(recovery.frames.iter().any(|frame| {
         frame.record.job_id == completed.sealed.record.job_id
             && frame.record.state == JobState::Exited
@@ -1591,7 +1603,8 @@ fn same_length_overwrite_before_seal_refuses_the_terminal_record() {
         matches!(store.finish(token, JobState::Exited), Err(ArtifactError::Integrity { message, .. }) if message.contains("bytes and digest"))
     );
     assert!(store.sealed(id).unwrap().is_none());
-    let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
+    let recovered =
+        recover_records(&census(), &root.path().join(".cowshed/job/records.arrow")).unwrap();
     assert!(
         !recovered
             .frames
@@ -1654,7 +1667,8 @@ fn jobs_a_lost_supervisor_ran_are_sealed_failed_once_with_what_they_spilled() {
 
     let mut after = store(root.path(), config);
     assert!(after.seal_unterminated().unwrap().is_empty(), "sealed once");
-    let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
+    let recovered =
+        recover_records(&census(), &root.path().join(".cowshed/job/records.arrow")).unwrap();
     assert!(recovered.frames.iter().any(|frame| {
         frame.record.job_id == orphan.job_id()
             && frame.record.failure == Some(cowshed_core::api::JobFailure::SupervisorLost)
@@ -1700,7 +1714,7 @@ fn a_terminal_record_torn_anywhere_leaves_its_job_sealed_lost_never_succeeded() 
 
     let torn_at = |kept: usize| {
         fs::write(&records, &written[..kept]).unwrap();
-        recover_records(&records).unwrap()
+        recover_records(&census(), &records).unwrap()
     };
     let admission = torn_at(admitted).frames;
     for kept in tears {
@@ -1717,7 +1731,7 @@ fn a_terminal_record_torn_anywhere_leaves_its_job_sealed_lost_never_succeeded() 
     }
 
     let final_state = || {
-        recover_records(&records)
+        recover_records(&census(), &records)
             .unwrap()
             .frames
             .iter()
@@ -1758,4 +1772,15 @@ fn a_terminal_record_torn_anywhere_leaves_its_job_sealed_lost_never_succeeded() 
     );
     drop(next);
     assert_eq!(final_state(), Some((JobState::Exited, None)));
+}
+
+/// This test process's census, as a fixture store's census reaches it, over a store that holds no
+/// lease.
+fn census() -> cowshed_core::census::CensusScope {
+    let namespace = cowshed_os::namespace::TestNamespace::of(std::process::id(), 0)
+        .expect("this process's namespace");
+    cowshed_core::census::CensusScope::new(
+        cowshed_os::namespace::HostNamespace::Test(namespace),
+        std::sync::Arc::from(std::path::Path::new("/var/empty")),
+    )
 }

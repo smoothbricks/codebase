@@ -301,11 +301,15 @@ impl RetirementIntent {
     /// place, or in the archive after a rename that outran its phase write — still carries the
     /// recorded digest. An archived record is the completed result while no registration stands
     /// at the project path again; a project adopted there since is a new retirement.
-    pub fn authorize(store: &Path, repo: &RepoId) -> Result<Self> {
+    pub fn authorize(
+        store: &Path,
+        census: &crate::census::CensusScope,
+        repo: &RepoId,
+    ) -> Result<Self> {
         let store = Store::open(store)?;
         let names = Names::of(repo);
         let owner = store.retirement_owner(&names)?;
-        let _serialized = store.serialize(&owner, &names)?;
+        let _serialized = store.serialize(census, &owner, &names)?;
         match store.load_at(&owner, &names, repo)? {
             Some(pending) if pending.phase.blocks_open() => {
                 pending.locate_evidence(&store, &names)?;
@@ -365,7 +369,7 @@ impl RetirementIntent {
     /// Durably record this intent's phase over its own record: the same operation, staying put
     /// or advancing exactly one phase, and never to `Archived`, which only
     /// [`Self::archive_project`] may record.
-    pub fn persist(&self, store: &Path) -> Result<()> {
+    pub fn persist(&self, store: &Path, census: &crate::census::CensusScope) -> Result<()> {
         if self.phase == RetirementPhase::Archived {
             return Err(CowshedError::internal(format!(
                 "retirement {} of {} may record archived only by archiving its project",
@@ -375,7 +379,7 @@ impl RetirementIntent {
         let store = Store::open(store)?;
         let names = Names::of(&self.repo_id);
         let owner = store.recorded_owner(&names)?;
-        let _serialized = store.serialize(&owner, &names)?;
+        let _serialized = store.serialize(census, &owner, &names)?;
         let current = store.recorded(&owner, &names, &self.repo_id)?;
         self.require_same_operation(&current, &store, &names)?;
         if self.phase == current.phase {
@@ -443,7 +447,12 @@ impl RetirementIntent {
     /// its phase write is recognised by the archive carrying the recorded digest while the
     /// project path is empty, and is finished, not repeated. An already archived record answers
     /// at once.
-    pub fn archive_project(&mut self, store: &Path, collector: &CollectorLease) -> Result<()> {
+    pub fn archive_project(
+        &mut self,
+        store: &Path,
+        census: &crate::census::CensusScope,
+        collector: &CollectorLease,
+    ) -> Result<()> {
         if collector.repo_id != self.repo_id || collector.operation_id != self.operation_id {
             return Err(CowshedError::internal(format!(
                 "collector lease of {} retirement {} cannot archive {} retirement {}",
@@ -453,7 +462,7 @@ impl RetirementIntent {
         let store = Store::open(store)?;
         let names = Names::of(&self.repo_id);
         let owner = store.recorded_owner(&names)?;
-        let _serialized = store.serialize(&owner, &names)?;
+        let _serialized = store.serialize(census, &owner, &names)?;
         let current = store.recorded(&owner, &names, &self.repo_id)?;
         self.require_same_operation(&current, &store, &names)?;
         match current.phase {
@@ -1093,14 +1102,19 @@ impl<'a> Store<'a> {
     // own steps, and this one names that holder once per HOLDER_REPORT while it keeps its place;
     // the holder's release at its end, or the kernel's at its exit, ends the wait.
     #[allow(clippy::disallowed_methods)]
-    fn serialize(&self, owner: &File, names: &Names) -> Result<Fenced<File>> {
+    fn serialize(
+        &self,
+        census: &crate::census::CensusScope,
+        owner: &File,
+        names: &Names,
+    ) -> Result<Fenced<File>> {
         let path = self.retirement_path(names, &names.serialization);
         let lock = open_lock(owner, &names.serialization)
             .map_err(|error| io_failure("open retirement lock", &path, error))?;
         cowshed_os::flock::queued(
             &path,
             cowshed_os::flock::HOLDER_REPORT,
-            crate::held_lock::holders,
+            |lock| crate::held_lock::holders(census, lock),
             || loop {
                 match lock.lock() {
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -1494,14 +1508,19 @@ mod tests {
 
     /// Drive one retirement through every phase the way the orchestrator does.
     fn retire(store: &Path, repo: &RepoId) -> RetirementIntent {
-        let mut intent = RetirementIntent::authorize(store, repo).expect("authorize");
+        let mut intent = RetirementIntent::authorize(store, &crate::census::this_test(), repo)
+            .expect("authorize");
         let collector = acquire_collector(store, repo).expect("collector");
         intent.phase = RetirementPhase::Drained;
-        intent.persist(store).expect("drained");
-        intent.phase = RetirementPhase::Detached;
-        intent.persist(store).expect("detached");
         intent
-            .archive_project(store, &collector)
+            .persist(store, &crate::census::this_test())
+            .expect("drained");
+        intent.phase = RetirementPhase::Detached;
+        intent
+            .persist(store, &crate::census::this_test())
+            .expect("detached");
+        intent
+            .archive_project(store, &crate::census::this_test(), &collector)
             .expect("archive project");
         intent
     }
@@ -1531,7 +1550,7 @@ mod tests {
             ErrorCode::Conflict
         );
         assert_eq!(
-            RetirementIntent::authorize(&store, &widget)
+            RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
                 .expect_err("nothing registered to abandon")
                 .code,
             ErrorCode::NotFound
@@ -1588,7 +1607,8 @@ mod tests {
                 retirement_blocks_open(&store, &widget).map(|_| ()),
                 acquire_collector(&store, &widget).map(|_| ()),
                 acquire_project_reader(&store, &widget).map(|_| ()),
-                RetirementIntent::authorize(&store, &widget).map(|_| ()),
+                RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+                    .map(|_| ()),
             ] {
                 assert_eq!(
                     refusal.expect_err("forged record").code,
@@ -1609,7 +1629,8 @@ mod tests {
         let reader = acquire_project_reader(&store, &widget).expect("actor opens");
         assert_eq!(reader.repo_id(), &widget);
 
-        let intent = RetirementIntent::authorize(&store, &widget).expect("authorize");
+        let intent = RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+            .expect("authorize");
         assert_eq!(intent.phase, RetirementPhase::Fenced);
         assert_eq!(
             intent.authorization,
@@ -1701,7 +1722,8 @@ mod tests {
 
         // The unbinding still holds it shared: a collector waits for it too.
         drop(other);
-        RetirementIntent::authorize(&store, &widget).expect("authorize");
+        RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+            .expect("authorize");
         let refusal =
             acquire_collector(&store, &widget).expect_err("the unbinding still holds the lease");
         assert_eq!(refusal.code, ErrorCode::Conflict);
@@ -1808,7 +1830,8 @@ mod tests {
         plant_project(&store, "acme/widget", &registration("acme/widget"));
         plant_project(&store, "acme/gadget", &registration("acme/gadget"));
 
-        let intent = RetirementIntent::authorize(&store, &widget).expect("authorize");
+        let intent = RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+            .expect("authorize");
         assert!(retirement_blocks_open(&store, &widget).expect("fenced"));
         for refusal in [
             acquire_project_reader(&store, &widget).map(|_| ()),
@@ -1825,7 +1848,8 @@ mod tests {
             vec![intent.clone()]
         );
         assert_eq!(
-            RetirementIntent::authorize(&store, &widget).expect("retry resumes"),
+            RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+                .expect("retry resumes"),
             intent
         );
     }
@@ -1836,25 +1860,35 @@ mod tests {
         let store = store(&root);
         let widget = repo("acme/widget");
         let tree = plant_project(&store, "acme/widget", &registration("acme/widget"));
-        let intent = RetirementIntent::authorize(&store, &widget).expect("authorize");
+        let intent = RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+            .expect("authorize");
 
         let mut skipping = intent.clone();
         skipping.phase = RetirementPhase::Detached;
         assert_eq!(
-            skipping.persist(&store).expect_err("skip").code,
+            skipping
+                .persist(&store, &crate::census::this_test())
+                .expect_err("skip")
+                .code,
             ErrorCode::Conflict
         );
         let mut archived = intent.clone();
         archived.phase = RetirementPhase::Archived;
         assert_eq!(
-            archived.persist(&store).expect_err("archived").code,
+            archived
+                .persist(&store, &crate::census::this_test())
+                .expect_err("archived")
+                .code,
             ErrorCode::Internal
         );
         let mut foreign = intent.clone();
         foreign.operation_id = Uuid::new_v4();
         foreign.phase = RetirementPhase::Drained;
         assert_eq!(
-            foreign.persist(&store).expect_err("foreign").code,
+            foreign
+                .persist(&store, &crate::census::this_test())
+                .expect_err("foreign")
+                .code,
             ErrorCode::Conflict
         );
 
@@ -1863,7 +1897,7 @@ mod tests {
         let mut early = intent.clone();
         assert_eq!(
             early
-                .archive_project(&store, &collector)
+                .archive_project(&store, &crate::census::this_test(), &collector)
                 .expect_err("not detached")
                 .code,
             ErrorCode::Conflict
@@ -1883,7 +1917,7 @@ mod tests {
         let tree = plant_project(&store, "acme/widget", &registration("other/thing"));
         let before = snapshot(&tree);
         assert_eq!(
-            RetirementIntent::authorize(&store, &widget)
+            RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
                 .expect_err("foreign identity")
                 .code,
             ErrorCode::Integrity
@@ -1898,12 +1932,17 @@ mod tests {
         let store = store(&root);
         let widget = repo("acme/widget");
         let tree = plant_project(&store, "acme/widget", &registration("acme/widget"));
-        let mut intent = RetirementIntent::authorize(&store, &widget).expect("authorize");
+        let mut intent = RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+            .expect("authorize");
         let collector = acquire_collector(&store, &widget).expect("collector");
         intent.phase = RetirementPhase::Drained;
-        intent.persist(&store).expect("drained");
+        intent
+            .persist(&store, &crate::census::this_test())
+            .expect("drained");
         intent.phase = RetirementPhase::Detached;
-        intent.persist(&store).expect("detached");
+        intent
+            .persist(&store, &crate::census::this_test())
+            .expect("detached");
         // Same identity, other bytes: not the registration the operator abandoned.
         let mut changed = registration("acme/widget");
         changed.push(b'\n');
@@ -1922,14 +1961,14 @@ mod tests {
 
         assert_eq!(
             intent
-                .archive_project(&store, &collector)
+                .archive_project(&store, &crate::census::this_test(), &collector)
                 .expect_err("digest")
                 .code,
             ErrorCode::Integrity
         );
         drop(collector);
         assert_eq!(
-            RetirementIntent::authorize(&store, &widget)
+            RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
                 .expect_err("resume checks the digest")
                 .code,
             ErrorCode::Integrity
@@ -1952,7 +1991,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, store.join("acme/widget")).expect("plant link");
 
         assert_eq!(
-            RetirementIntent::authorize(&store, &widget)
+            RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
                 .expect_err("linked project")
                 .code,
             ErrorCode::Integrity
@@ -2021,7 +2060,8 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            RetirementIntent::authorize(&store, &widget).expect("completed result"),
+            RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+                .expect("completed result"),
             intent
         );
 
@@ -2050,23 +2090,29 @@ mod tests {
         let widget = repo("acme/widget");
         let tree = plant_project(&store, "acme/widget", &registration("acme/widget"));
         let before = snapshot(&tree);
-        let mut intent = RetirementIntent::authorize(&store, &widget).expect("authorize");
+        let mut intent = RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+            .expect("authorize");
         let collector = acquire_collector(&store, &widget).expect("collector");
         intent.phase = RetirementPhase::Drained;
-        intent.persist(&store).expect("drained");
+        intent
+            .persist(&store, &crate::census::this_test())
+            .expect("drained");
         intent.phase = RetirementPhase::Detached;
-        intent.persist(&store).expect("detached");
+        intent
+            .persist(&store, &crate::census::this_test())
+            .expect("detached");
         // The crash: the whole-tree rename landed, the phase write did not.
         fs::create_dir(store.join(RETIRED_PROJECTS_NAMESPACE)).expect("retired");
         fs::rename(&tree, intent.archive_path(&store)).expect("rename landed");
         drop(collector);
 
         assert!(retirement_blocks_open(&store, &widget).expect("still pending"));
-        let mut resumed = RetirementIntent::authorize(&store, &widget).expect("retry resumes");
+        let mut resumed = RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+            .expect("retry resumes");
         assert_eq!(resumed, intent);
         let collector = acquire_collector(&store, &widget).expect("collector again");
         resumed
-            .archive_project(&store, &collector)
+            .archive_project(&store, &crate::census::this_test(), &collector)
             .expect("finish archive");
         assert_eq!(resumed.phase, RetirementPhase::Archived);
         assert_eq!(snapshot(&resumed.archive_path(&store)), before);
@@ -2080,7 +2126,8 @@ mod tests {
         let store = store(&root);
         let widget = repo("acme/widget");
         plant_project(&store, "acme/widget", &registration("acme/widget"));
-        let intent = RetirementIntent::authorize(&store, &widget).expect("authorize");
+        let intent = RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+            .expect("authorize");
 
         let run = acquire_retirement_run(&store, &intent).expect("run");
         assert_eq!(run.operation_id(), intent.operation_id);
@@ -2093,7 +2140,9 @@ mod tests {
         );
         let mut advanced = intent.clone();
         advanced.phase = RetirementPhase::Drained;
-        advanced.persist(&store).expect("drained");
+        advanced
+            .persist(&store, &crate::census::this_test())
+            .expect("drained");
         drop(run);
 
         assert_eq!(
@@ -2125,7 +2174,8 @@ mod tests {
         let first_archive = snapshot(&first.archive_path(&store));
 
         plant_project(&store, "acme/widget", &registration("acme/widget"));
-        let second = RetirementIntent::authorize(&store, &widget).expect("new retirement");
+        let second = RetirementIntent::authorize(&store, &crate::census::this_test(), &widget)
+            .expect("new retirement");
         assert_ne!(second.operation_id, first.operation_id);
         assert_eq!(second.phase, RetirementPhase::Fenced);
         assert_eq!(snapshot(&first.archive_path(&store)), first_archive);

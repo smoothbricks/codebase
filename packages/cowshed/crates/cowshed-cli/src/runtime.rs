@@ -5295,9 +5295,9 @@ async fn repair_project_artifacts(project_root: &Path) -> Result<Vec<Finding>> {
         .into_iter()
         .filter(|workspace| workspace.state == WorkspaceState::Attached)
     {
-        let mount = workspace.mount.clone();
+        let (mount, census) = (workspace.mount.clone(), CanonicalRoots::global().census());
         tokio::task::spawn_blocking(move || {
-            repair_workspace_record_sequences(&mount, retained_budget)
+            repair_workspace_record_sequences(&census, &mount, retained_budget)
         })
         .await
         .map_err(|error| CowshedError::internal(format!("artifact repair task failed: {error}")))?

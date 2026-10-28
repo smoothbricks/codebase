@@ -4,6 +4,7 @@ pub mod api;
 pub mod build_volume;
 pub mod caches_retirement;
 pub mod capabilities;
+pub mod census;
 pub mod checkout;
 pub mod copy;
 pub mod declared_land;

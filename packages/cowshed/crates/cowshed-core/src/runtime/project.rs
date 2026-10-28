@@ -4356,9 +4356,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         + Send
         + 'static,
     ) -> Result<T> {
-        let path = self.lifecycle_intents_path.clone();
+        let (path, census) = (
+            self.lifecycle_intents_path.clone(),
+            self.descriptor.storage.census(),
+        );
         let (journal, value) = crate::storage::lifecycle::dispatch_blocking(move || {
-            crate::storage::recovery::LifecycleIntentJournal::update(&path, change)
+            crate::storage::recovery::LifecycleIntentJournal::update(&census, &path, change)
         })
         .await
         .map_err(|error| {
@@ -7792,7 +7795,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             crate::storage::lifecycle::MountState::Mounted { .. }
         ) {
             let mount = self.workspace_mount_path(&workspace)?;
-            if let Err(busy) = check_checkout_nx(&workspace, &mount, nx_check).await? {
+            if let Err(busy) = check_checkout_nx(
+                self.descriptor.storage.census(),
+                &workspace,
+                &mount,
+                nx_check,
+            )
+            .await?
+            {
                 cowshed_os::eprintln!(
                     "cowshed: {workspace}'s linked Nx state is in use: {busy}; {}",
                     nx_check.busy_action()
@@ -9984,6 +9994,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 "manager-ensure",
                 super::supervisor_manager::ensure(
                     self.descriptor.storage.store(),
+                    &self.descriptor.storage.census(),
                     &self.descriptor.git_root,
                     &needed,
                 ),
@@ -10011,6 +10022,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             build_volume_layout.grant(name, &mount)?,
         )?;
         let historical_incarnations = workspace_lineage(
+            &self.descriptor.storage.census(),
             &mount,
             current.derived.workspace.incarnation(),
             crate::storage::job_artifact::ArtifactConfig::default().retained_recovery_budget_bytes,
@@ -10028,6 +10040,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             workspace_root: mount,
             default_cwd: None,
             sandbox,
+            census: self.descriptor.storage.census(),
             build_volume_layout: Some(build_volume_layout),
             artifacts: crate::storage::job_artifact::ArtifactConfig {
                 historical_incarnations,
@@ -10292,15 +10305,22 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             );
         }
         config.inherited_groups = unresolved;
-        let (root, owned, incarnation, artifacts) = (
+        let (root, owned, incarnation, artifacts, census) = (
             config.workspace_root.clone(),
             config.owned_repo_ids.clone(),
             config.authority.workspace_incarnation.clone(),
             config.artifacts.clone(),
+            config.census.clone(),
         );
         let sealed = tokio::task::spawn_blocking(move || {
-            crate::storage::job_artifact::ArtifactStore::open(root, owned, incarnation, artifacts)?
-                .seal_unterminated()
+            crate::storage::job_artifact::ArtifactStore::open(
+                root,
+                owned,
+                incarnation,
+                artifacts,
+                census,
+            )?
+            .seal_unterminated()
         })
         .await
         .map_err(|error| CowshedError::internal(format!("sealing lost jobs failed: {error}")))?
@@ -10407,11 +10427,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         supervisor: Option<i32>,
     ) -> Result<Option<super::mount_activity::MountHeld>> {
         let ledger = self.job_group_ledger(workspace);
-        let census = mount.to_owned();
+        let (held, census) = (mount.to_owned(), self.descriptor.storage.census());
         crate::storage::lifecycle::dispatch_blocking(move || {
             super::mount_activity::unaccounted(
-                &census,
+                &held,
                 &super::mount_activity::Accounted {
+                    census: &census,
                     supervisor,
                     ledger: &ledger,
                 },
@@ -12443,6 +12464,7 @@ mod rebase_recovery_tests {
             // holding the lock, so it fails the test like any other cleanup failure.
             let released = self.open().and_then(|()| {
                 crate::build_volume::nx::hold_announced(
+                    &crate::census::everywhere(),
                     crate::held_lock::Opened::open(&self.lock)?,
                     "the maintenance this gate held back",
                 )
@@ -12567,8 +12589,11 @@ mod rebase_recovery_tests {
         else {
             panic!("without the held policy, nothing the fast-forward started kept the ref lock");
         };
-        let holders = crate::build_volume::nx::inode_holders((inode.dev.get(), inode.ino.get()))
-            .expect("the ref lock's holders");
+        let holders = crate::build_volume::nx::inode_holders(
+            &crate::census::everywhere(),
+            (inode.dev.get(), inode.ino.get()),
+        )
+        .expect("the ref lock's holders");
         assert!(
             holders
                 .iter()
@@ -12578,8 +12603,12 @@ mod rebase_recovery_tests {
         assert!(gate.untouched(), "the maintenance got through a shut gate");
         gate.open().expect("open the maintenance gate");
         drop(
-            crate::build_volume::nx::hold_announced(contender, "the detached git maintenance")
-                .expect("the ref lock is granted once the maintenance ends"),
+            crate::build_volume::nx::hold_announced(
+                &crate::census::everywhere(),
+                contender,
+                "the detached git maintenance",
+            )
+            .expect("the ref lock is granted once the maintenance ends"),
         );
         assert!(
             !gate.untouched(),
@@ -12743,8 +12772,12 @@ mod rebase_recovery_tests {
         assert_eq!(rest.len() + 1, 4 << 20, "git wrote the whole blob");
         // Git has closed its output; the contender is granted once git has exited.
         drop(
-            crate::build_volume::nx::hold_announced(contender, "the killed owner's fence git")
-                .expect("the contender takes the lock once git ends"),
+            crate::build_volume::nx::hold_announced(
+                &crate::census::everywhere(),
+                contender,
+                "the killed owner's fence git",
+            )
+            .expect("the contender takes the lock once git ends"),
         );
     }
 
@@ -15507,14 +15540,20 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if matches!(
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
-        ) && let Err(busy) =
-            check_checkout_nx(&workspace, &mount, CheckoutNxCheck::CloseRecorded).await?
+        ) && let Err(busy) = check_checkout_nx(
+            self.descriptor.storage.census(),
+            &workspace,
+            &mount,
+            CheckoutNxCheck::CloseRecorded,
+        )
+        .await?
         {
             return Err(CowshedError::conflict(
                 format!("{workspace} cannot detach while its Nx state is in use: {busy}"),
                 format!("stop those processes, then `cowshed detach {workspace}`"),
             ));
         }
+        let census = self.descriptor.storage.census();
         self.substrate
             .unmount(&current.derived.workspace)
             .await
@@ -15522,7 +15561,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 if let crate::storage::apfs::ApfsStorageError::Apfs(apfs) = &error
                     && cowshed_apfs::detach_was_dissented(apfs)
                 {
-                    detach_refused(&workspace, &mount, &error)
+                    detach_refused(&census, &workspace, &mount, &error)
                 } else {
                     native_storage_error(error)
                 }
@@ -16662,12 +16701,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // target head through the fast-forward and for nothing else: the checks before it and the
         // adoption and retirement after it run outside, so a writer queued on it waits for this
         // fence alone. The `delivery` span is the hold.
+        let census = self.descriptor.storage.census();
         let ref_lock = match options.ref_lock.as_ref() {
             Some(path) => Some(
                 timed_async(
                     "land",
                     "ref-lock-wait",
-                    super::ref_lock::RefLock::acquire(path),
+                    super::ref_lock::RefLock::acquire(&census, path),
                 )
                 .await?,
             ),
@@ -23996,6 +24036,7 @@ fn parse_capacity(value: &str) -> Result<cowshed_apfs::image::ImageCapacity> {
 /// wrote it — so the marker is rewritten with them and is strict from then on.
 #[cfg(target_os = "macos")]
 fn workspace_lineage(
+    census: &crate::census::CensusScope,
     mount: &Path,
     current: &WorkspaceIncarnation,
     retained_recovery_budget_bytes: usize,
@@ -24014,6 +24055,7 @@ fn workspace_lineage(
     }
     if marker.lineage.is_none() {
         let recorded = crate::storage::job_artifact::recorded_historical_incarnations(
+            census,
             mount,
             current,
             retained_recovery_budget_bytes,
@@ -24154,6 +24196,7 @@ impl CheckoutNxCheck {
 /// retirement reports it and retains the grace and force for its own workspace image.
 #[cfg(target_os = "macos")]
 async fn check_checkout_nx(
+    census: crate::census::CensusScope,
     workspace: &WorkspaceName,
     mount: &Path,
     check: CheckoutNxCheck,
@@ -24166,8 +24209,10 @@ async fn check_checkout_nx(
     let closed = {
         let data = data.clone();
         crate::storage::lifecycle::dispatch_blocking(move || match check {
-            CheckoutNxCheck::Held => crate::build_volume::nx::held_workspace_data(&data),
-            CheckoutNxCheck::CloseRecorded => crate::build_volume::nx::close_workspace_data(&data),
+            CheckoutNxCheck::Held => crate::build_volume::nx::held_workspace_data(&census, &data),
+            CheckoutNxCheck::CloseRecorded => {
+                crate::build_volume::nx::close_workspace_data(&census, &data)
+            }
         })
         .await
         .map_err(|error| CowshedError::internal(format!("Nx {operation} task failed: {error}")))?
@@ -24246,6 +24291,7 @@ impl<H: RuntimeStorageHost> super::supervisor::VolumeLabeller for ApfsLabeller<H
 /// what still holds it then is another user's process or the kernel, which this user cannot see.
 #[cfg(target_os = "macos")]
 fn detach_refused(
+    census: &crate::census::CensusScope,
     workspace: &WorkspaceName,
     mount: &Path,
     error: &crate::storage::apfs::ApfsStorageError,
@@ -24280,12 +24326,12 @@ fn detach_refused(
             ),
         )
     };
-    match crate::build_volume::nx::tree_holds(mount) {
+    match crate::build_volume::nx::tree_holds(census, mount) {
         Ok(holds) if !holds.is_empty() => held(
             holds.iter().map(ToString::to_string).collect(),
             holds.iter().map(|held| held.holder.pid).collect(),
         ),
-        Ok(_) => match crate::build_volume::nx::volume_holders(mount) {
+        Ok(_) => match crate::build_volume::nx::volume_holders(census, mount) {
             Ok(holders) if !holders.is_empty() => held(
                 holders
                     .iter()
@@ -28453,10 +28499,14 @@ mod port_reservation_tests {
             .carried_metadata()
             .and_then(|metadata| metadata.grants.port_block)
             .expect("the re-adoption carries main's block");
-        LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
-            journal.begin(intent);
-            Ok(())
-        })
+        LifecycleIntentJournal::update(
+            &crate::census::this_test(),
+            &fixture.journal_path(),
+            |journal| {
+                journal.begin(intent);
+                Ok(())
+            },
+        )
         .expect("journal the re-adoption");
         let home = fixture.store().with_file_name("home");
         std::fs::create_dir_all(&home).expect("home");
@@ -29174,6 +29224,7 @@ mod terminal_project_cleanup_tests {
             std::slice::from_ref(&held_image),
             cowshed_apfs::store_lock::LockMode::Try,
             &crate::held_lock::ImageLockTaker {
+                census: &crate::census::this_test(),
                 holding: &crate::api::held_lock::LockHolding::of(
                     crate::api::held_lock::LockOperation::Fork,
                     &raven,

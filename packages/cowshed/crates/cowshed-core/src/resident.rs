@@ -614,6 +614,7 @@ mod tests {
 
         fn begin_intent(&self, intent: LifecycleIntent) {
             LifecycleIntentJournal::update(
+                &crate::census::this_test(),
                 &self
                     .layout
                     .project()

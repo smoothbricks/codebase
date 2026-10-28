@@ -89,6 +89,7 @@ fn host_error(error: impl std::fmt::Display) -> ApfsStorageError {
 #[derive(Debug)]
 pub struct DirectoryExecutionHost {
     config: ApfsSubstrateConfig,
+    census: crate::census::CensusScope,
 }
 
 /// A payload directory the executor holds, and where this handle has bound it, if anywhere.
@@ -388,7 +389,12 @@ fn bind(image: &Path, mount_point: &Path) -> Result<(), ApfsStorageError> {
 
 /// Unmount `image`'s payload from `mount_point`. Not mounted is nothing to do; mounted
 /// elsewhere refuses.
-fn unbind(image: &Path, mount_point: &Path, intent: DetachIntent) -> Result<(), ApfsStorageError> {
+fn unbind(
+    census: &crate::census::CensusScope,
+    image: &Path,
+    mount_point: &Path,
+    intent: DetachIntent,
+) -> Result<(), ApfsStorageError> {
     match settle(image)? {
         Payload::Home => Ok(()),
         Payload::Mounted(current) if current != mount_point => {
@@ -399,15 +405,19 @@ fn unbind(image: &Path, mount_point: &Path, intent: DetachIntent) -> Result<(), 
                 current.display()
             )))
         }
-        Payload::Mounted(_) => move_home(image, mount_point, intent),
+        Payload::Mounted(_) => move_home(census, image, mount_point, intent),
     }
 }
 
 /// Unmount `image`'s payload from wherever it is mounted.
-fn release_mount(image: &Path, intent: DetachIntent) -> Result<(), ApfsStorageError> {
+fn release_mount(
+    census: &crate::census::CensusScope,
+    image: &Path,
+    intent: DetachIntent,
+) -> Result<(), ApfsStorageError> {
     match settle(image)? {
         Payload::Home => Ok(()),
-        Payload::Mounted(mount_point) => move_home(image, &mount_point, intent),
+        Payload::Mounted(mount_point) => move_home(census, image, &mount_point, intent),
     }
 }
 
@@ -417,17 +427,18 @@ fn release_mount(image: &Path, intent: DetachIntent) -> Result<(), ApfsStorageEr
 /// holds, not the child's — and drops them at exec, so the second census, a full scan later,
 /// no longer names it. A process that truly holds the tree is named by both.
 pub(super) fn confirmed_tree_holders(
+    census: &crate::census::CensusScope,
     root: &Path,
 ) -> Result<Vec<cowshed_os::process::Holder>, ApfsStorageError> {
-    let census = |root: &Path| {
-        crate::build_volume::nx::tree_holders(root)
+    let take = |root: &Path| {
+        crate::build_volume::nx::tree_holders(census, root)
             .map_err(|error| io_error("list the processes holding a tree", root, error))
     };
-    let first = census(root)?;
+    let first = take(root)?;
     if first.is_empty() {
         return Ok(first);
     }
-    let second = census(root)?;
+    let second = take(root)?;
     Ok(first
         .into_iter()
         .filter(|holder| second.iter().any(|confirmed| confirmed.pid == holder.pid))
@@ -439,12 +450,13 @@ pub(super) fn confirmed_tree_holders(
 /// moves with it. So `WhenIdle` refuses, naming them, while any process holds anything in the
 /// tree - the refusal an unforced unmount of a busy volume gives - and `Release` goes ahead.
 fn move_home(
+    census: &crate::census::CensusScope,
     image: &Path,
     mount_point: &Path,
     intent: DetachIntent,
 ) -> Result<(), ApfsStorageError> {
     if intent == DetachIntent::WhenIdle {
-        let open = confirmed_tree_holders(mount_point)?;
+        let open = confirmed_tree_holders(census, mount_point)?;
         if !open.is_empty() {
             return Err(ApfsStorageError::BuildVolumeHeld {
                 image: image.to_owned(),
@@ -588,7 +600,13 @@ impl DirectoryExecutionHost {
             }
             Err(error) => return Err(io_error("inspect directory store root", root, error)),
         }
-        Ok(Self { config })
+        Ok(Self {
+            census: crate::census::CensusScope::new(
+                config.namespace,
+                std::sync::Arc::from(config.store_root.as_path()),
+            ),
+            config,
+        })
     }
 
     pub fn config(&self) -> &ApfsSubstrateConfig {
@@ -1003,7 +1021,7 @@ impl DirectoryExecutionHost {
         self.require_store_image(image)?;
         match fs::symlink_metadata(image) {
             Ok(metadata) if metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
-                release_mount(image, DetachIntent::Release)?;
+                release_mount(&self.census, image, DetachIntent::Release)?;
                 let entry = self.deleting_entry(image)?;
                 let deleting = entry
                     .parent()
@@ -1077,6 +1095,10 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
     const HAS_PHYSICAL_VOLUMES: bool = false;
 
     type LockGuard = ImageLockGuard;
+
+    fn census(&self) -> &crate::census::CensusScope {
+        &self.census
+    }
     type Attachment = DirectoryAttachment;
 
     fn lock_images(
@@ -1089,7 +1111,10 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             &self.config.store_root,
             images,
             mode,
-            &crate::held_lock::ImageLockTaker { holding },
+            &crate::held_lock::ImageLockTaker {
+                holding,
+                census: &self.census,
+            },
         )
         .map_err(Into::into)
     }
@@ -1333,14 +1358,19 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
     fn discard_pending(&self, image: &Path) -> Result<(), ApfsStorageError> {
         self.require_store_image(image)?;
         if path_exists(image)? {
-            release_mount(image, DetachIntent::Release)?;
+            release_mount(&self.census, image, DetachIntent::Release)?;
         }
         self.reclaim_image(image)
     }
 
     fn unmount_attachment(&self, attachment: &Self::Attachment) -> Result<(), ApfsStorageError> {
         if let Some(mount_point) = attachment.bound() {
-            unbind(&attachment.image, &mount_point, DetachIntent::Release)?;
+            unbind(
+                &self.census,
+                &attachment.image,
+                &mount_point,
+                DetachIntent::Release,
+            )?;
             attachment.set_bound(None);
         }
         Ok(())
@@ -1590,7 +1620,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
         if let Some(mount_point) = attachment.bound() {
-            unbind(&attachment.image, &mount_point, intent)?;
+            unbind(&self.census, &attachment.image, &mount_point, intent)?;
         }
         Ok(())
     }
@@ -1709,7 +1739,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             return Ok(());
         }
         let mount_point = main_aware_mount_point(&self.config, workspace.repo(), workspace.name())?;
-        unbind(&canonical, &mount_point, intent)
+        unbind(&self.census, &canonical, &mount_point, intent)
     }
 
     fn ensure_linked_build_volume(

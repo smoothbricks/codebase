@@ -38,14 +38,17 @@ where
 /// Every holder of the tree at `path`: what `tree-holders` prints, one per line, and
 /// `host.treeHolders` answers.
 pub(crate) fn holders(path: &Path) -> Result<Vec<TreeHolder>, CowshedError> {
-    nx::tree_holds(path)
-        .map(|holds| holds.into_iter().map(TreeHolder::from).collect())
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                format!("cannot read who holds the tree {}: {error}", path.display()),
-                "name a directory this user can read",
-            )
-        })
+    nx::tree_holds(
+        &cowshed_core::storage::bootstrap::CanonicalRoots::global().census(),
+        path,
+    )
+    .map(|holds| holds.into_iter().map(TreeHolder::from).collect())
+    .map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot read who holds the tree {}: {error}", path.display()),
+            "name a directory this user can read",
+        )
+    })
 }
 
 fn write_failed(error: io::Error) -> CowshedError {

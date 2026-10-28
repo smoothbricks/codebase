@@ -117,7 +117,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         .map_err(storage_error)?;
     let previous = BuildVolumeState::read(&mount)?;
     let (state, _, _) = previous.with_discovered(paths, &[], mbx, fingerprint, &mount)?;
-    let displaced = adopt_preflighted(checkout, &mount, paths, &found)?;
+    let displaced = adopt_preflighted(host.census(), checkout, &mount, paths, &found)?;
     state.write(&mount)?;
     // Published only after every source directory has become its fixed link.
     layout.publish(&id, &registration)?;
@@ -130,6 +130,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
 /// (a pin worktree is there or it is not), so its link and volume directory appear only once a
 /// tool has made the directory, at the next refresh after.
 pub fn adopt_paths(
+    census: &crate::census::CensusScope,
     checkout: &Path,
     volume_root: &Path,
     paths: &[BuildStatePath],
@@ -138,10 +139,11 @@ pub fn adopt_paths(
     if let Some(refusal) = tracked_source(checkout, &found.real)? {
         return Ok(Err(refusal));
     }
-    adopt_preflighted(checkout, volume_root, paths, &found).map(Ok)
+    adopt_preflighted(census, checkout, volume_root, paths, &found).map(Ok)
 }
 
 fn adopt_preflighted(
+    census: &crate::census::CensusScope,
     checkout: &Path,
     volume_root: &Path,
     paths: &[BuildStatePath],
@@ -163,7 +165,7 @@ fn adopt_preflighted(
             fingerprint: None,
             mbx: None,
         };
-        if let Err(busy) = nx::close(checkout, &source_state)
+        if let Err(busy) = nx::close(census, checkout, &source_state)
             .map_err(|error| io_error("close Nx state before migration", checkout, error))?
         {
             return Err(CowshedError::conflict(

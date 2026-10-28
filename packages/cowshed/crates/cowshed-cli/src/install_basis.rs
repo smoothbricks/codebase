@@ -65,6 +65,7 @@ impl InstallSlot {
                 );
                 let waited = path.clone();
                 let slot = path.clone();
+                let census = cowshed_core::storage::bootstrap::CanonicalRoots::global().census();
                 // WHY unbounded: queued, not silent: an installer waits in line behind the install
                 // ahead, said on stderr first and its holder named again once per HOLDER_REPORT; that
                 // install's release at its end, or the kernel's at its exit, ends the wait, and the
@@ -74,7 +75,7 @@ impl InstallSlot {
                     cowshed_os::flock::queued(
                         &slot,
                         cowshed_os::flock::HOLDER_REPORT,
-                        cowshed_core::held_lock::holders,
+                        |lock| cowshed_core::held_lock::holders(&census, lock),
                         || loop {
                             match lock.lock() {
                                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -140,12 +141,15 @@ impl InstallSlot {
 pub async fn wait_for_install(support_directory: &Path) -> Result<bool> {
     let support = support_directory.to_path_buf();
     let path = support_directory.join(INSTALL_LOCK_NAME);
-    tokio::task::spawn_blocking(move || cowshed_core::host_dirs::wait_for_running_install(&support))
-        .await
-        .map_err(|error| {
-            CowshedError::internal(format!("waiting for {} failed: {error}", path.display()))
-        })?
-        .map_err(|error| slot_error(&path, "lock", &error))
+    let census = cowshed_core::storage::bootstrap::CanonicalRoots::global().census();
+    tokio::task::spawn_blocking(move || {
+        cowshed_core::host_dirs::wait_for_running_install(&census, &support)
+    })
+    .await
+    .map_err(|error| {
+        CowshedError::internal(format!("waiting for {} failed: {error}", path.display()))
+    })?
+    .map_err(|error| slot_error(&path, "lock", &error))
 }
 
 /// The command that carries a land step on as the installed cowshed, with this process's own

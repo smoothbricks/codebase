@@ -221,6 +221,7 @@ impl DirectoryExecutionHost {
                 &[lock],
                 LockMode::Try,
                 &crate::held_lock::ImageLockTaker {
+                    census: &self.census,
                     holding: &crate::api::held_lock::LockHolding {
                         operation: crate::api::held_lock::LockOperation::Recover,
                         workspace: crate::storage::image_workspace(canonical),
@@ -242,6 +243,7 @@ impl DirectoryExecutionHost {
             &[lock.to_owned()],
             LockMode::Try,
             &crate::held_lock::ImageLockTaker {
+                census: &self.census,
                 holding: &crate::api::held_lock::LockHolding::store(
                     crate::api::held_lock::LockOperation::Gc,
                 ),
@@ -1006,6 +1008,7 @@ impl DirectoryExecutionHost {
             plan.lock_paths(),
             LockMode::Try,
             &crate::held_lock::ImageLockTaker {
+                census: &self.census,
                 holding: &crate::api::held_lock::LockHolding::store(
                     crate::api::held_lock::LockOperation::Gc,
                 ),

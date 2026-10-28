@@ -1069,16 +1069,21 @@ async fn connect_manager(path: &Path) -> io::Result<UnixStream> {
 /// for the install and is made once more against the daemon it installed. Any other refusal is
 /// returned as it is (05_gateway.md, "A land step waits for an install in progress"). Measured
 /// 2026-10-20: a land step's connection made mid-restart was refused and failed the land.
-pub(crate) async fn connect_across_install(path: &Path, support: &Path) -> io::Result<UnixStream> {
+pub(crate) async fn connect_across_install(
+    census: &crate::census::CensusScope,
+    path: &Path,
+    support: &Path,
+) -> io::Result<UnixStream> {
     let refused = match connect_manager(path).await {
         Ok(stream) => return Ok(stream),
         Err(error) => error,
     };
-    let support = support.to_path_buf();
-    let waited =
-        tokio::task::spawn_blocking(move || crate::host_dirs::wait_for_running_install(&support))
-            .await
-            .map_err(io::Error::other)?;
+    let (support, census) = (support.to_path_buf(), census.clone());
+    let waited = tokio::task::spawn_blocking(move || {
+        crate::host_dirs::wait_for_running_install(&census, &support)
+    })
+    .await
+    .map_err(io::Error::other)?;
     match waited {
         Ok(true) => connect_manager(path).await,
         Ok(false) => Err(refused),
@@ -1091,12 +1096,13 @@ pub(crate) async fn connect_across_install(path: &Path, support: &Path) -> io::R
 /// Ask the host's manager for the supervisor serving `authority`'s workspace.
 pub async fn ensure(
     store_root: &Path,
+    census: &crate::census::CensusScope,
     project_root: &Path,
     authority: &WorkspaceAuthoritySnapshot,
 ) -> Result<Ensured> {
     let path = manager_socket_path(store_root);
     let support = crate::host_dirs::support_directory(&crate::gateway_sessions::canonical_home()?);
-    let mut stream = connect_across_install(&path, &support)
+    let mut stream = connect_across_install(census, &path, &support)
         .await
         .map_err(|error| {
             CowshedError::environment_missing(
@@ -1689,9 +1695,14 @@ mod tests {
             supervisors: NonZeroUsize::new(2).expect("two"),
         };
         assert_eq!(manager.recovering(), Some(two));
-        let refused = ensure(&store, Path::new("/repo"), &authority)
-            .await
-            .expect_err("raven's supervisor is still draining");
+        let refused = ensure(
+            &store,
+            &crate::census::this_test(),
+            Path::new("/repo"),
+            &authority,
+        )
+        .await
+        .expect_err("raven's supervisor is still draining");
         assert_eq!(refused.code, ErrorCode::Conflict);
         assert_eq!(refused.recovering_source(), Some(two));
         assert!(refused.message.contains("raven"), "{}", refused.message);
@@ -1699,9 +1710,14 @@ mod tests {
         peers.gate.add_permits(2);
         recovered.await.expect("the recovery ends");
         assert_eq!(manager.recovering(), None);
-        let unrecovered = ensure(&store, Path::new("/repo"), &authority)
-            .await
-            .expect_err("this manager starts no supervisor");
+        let unrecovered = ensure(
+            &store,
+            &crate::census::this_test(),
+            Path::new("/repo"),
+            &authority,
+        )
+        .await
+        .expect_err("this manager starts no supervisor");
         assert_eq!(
             unrecovered.recovering_source(),
             None,
@@ -1735,9 +1751,14 @@ mod tests {
             .expect("bind the manager");
         let served = tokio::spawn(serve(listener, manager));
 
-        let refused = ensure(&store, Path::new("/repo"), &authority)
-            .await
-            .expect_err("the startup pass is still mounting");
+        let refused = ensure(
+            &store,
+            &crate::census::this_test(),
+            Path::new("/repo"),
+            &authority,
+        )
+        .await
+        .expect_err("the startup pass is still mounting");
         assert_eq!(refused.code, ErrorCode::Conflict);
         assert_eq!(
             refused.healing_source(),
@@ -1747,9 +1768,14 @@ mod tests {
         );
 
         startup.restored();
-        let healed = ensure(&store, Path::new("/repo"), &authority)
-            .await
-            .expect_err("this manager starts no supervisor");
+        let healed = ensure(
+            &store,
+            &crate::census::this_test(),
+            Path::new("/repo"),
+            &authority,
+        )
+        .await
+        .expect_err("this manager starts no supervisor");
         assert_eq!(healed.healing_source(), None, "{}", healed.message);
         served.abort();
     }
@@ -2064,7 +2090,7 @@ mod tests {
         let support = root.join("support");
         std::fs::create_dir(&support).expect("support");
 
-        let refused = connect_across_install(&socket, &support)
+        let refused = connect_across_install(&crate::census::this_test(), &socket, &support)
             .await
             .expect_err("nothing serves and no install runs");
         assert_eq!(refused.kind(), io::ErrorKind::NotFound, "{refused}");
@@ -2074,7 +2100,7 @@ mod tests {
         install.try_lock().expect("take the free install slot");
         let connecting = tokio::spawn({
             let (socket, support) = (socket.clone(), support.clone());
-            async move { connect_across_install(&socket, &support).await }
+            async move { connect_across_install(&crate::census::this_test(), &socket, &support).await }
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(

@@ -34,6 +34,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::net::UnixStream;
 
 use crate::api::dto::LandTurnName;
+use crate::census::CensusScope;
 use crate::held_lock::{HeldLock, Opened};
 
 /// The gateway control operation that asks for a land turn: the connection that asks it is the
@@ -363,25 +364,33 @@ fn unexpected(answer: &TurnAnswer, step: &str) -> io::Error {
     )
 }
 
-/// The outside wait of the land `me`, from one census of the processes with `lock` open
-/// (05_gateway.md "Land turns"; the one holder census 02_workspaces.md admits outside a
+/// The outside wait of the land `me`, from one census of the processes with `outside`'s lock
+/// open (05_gateway.md "Land turns"; the one holder census 02_workspaces.md admits outside a
 /// destructive operation, "Holders cowshed does not run"). It reports and decides nothing.
-fn outside_wait(lock: &Path, me: i32) -> Wait {
-    let open = crate::build_volume::nx::holders(lock).map_err(|error| error.to_string());
+fn outside_wait(census: &CensusScope, lock: &Path, me: i32) -> Wait {
+    let open = crate::build_volume::nx::holders(census, lock).map_err(|error| error.to_string());
     Wait::Outside {
         lock: lock.to_path_buf(),
         holders: outside_holders(me, open),
     }
 }
 
+/// The lock file of lands that do not ask for turns, kept and never removed, and the census that
+/// names who has it open while a land waits for it: the census of the store the land serves.
+#[derive(Clone, Copy, Debug)]
+pub struct OutsideLock<'a> {
+    pub path: &'a Path,
+    pub census: &'a CensusScope,
+}
+
 /// Ask the gateway at `socket` for `ask`'s turn and wait for it, then take `outside` exclusively
-/// too when given: the lock file of lands that do not ask for turns, kept and never removed.
-/// `waiting` is told who holds the turn and how many are ahead, or which processes have the
-/// outside lock open, whenever that changes and every `report_every` while it does not.
+/// too when given. `waiting` is told who holds the turn and how many are ahead, or which
+/// processes have the outside lock open, whenever that changes and every `report_every` while it
+/// does not.
 pub async fn take(
     socket: &Path,
     ask: &TurnAsk,
-    outside: Option<&Path>,
+    outside: Option<OutsideLock<'_>>,
     report_every: Duration,
     mut waiting: impl FnMut(&Wait),
 ) -> io::Result<Turn> {
@@ -448,7 +457,7 @@ pub async fn take(
     // Its wait runs on a thread of its own before the first census, so no census delays it.
     let outside = match outside {
         None => None,
-        Some(lock) => Some(match Opened::open(lock)?.try_hold()? {
+        Some(OutsideLock { path: lock, census }) => Some(match Opened::open(lock)?.try_hold()? {
             Ok(held) => held,
             Err(opened) => {
                 let me = i32::try_from(std::process::id()).map_err(io::Error::other)?;
@@ -458,8 +467,8 @@ pub async fn take(
                     tokio::select! {
                         held = &mut holding => break held.map_err(io::Error::other)??,
                         _ = cadence.tick() => {
-                            let lock = lock.to_path_buf();
-                            let wait = tokio::task::spawn_blocking(move || outside_wait(&lock, me))
+                            let (lock, census) = (lock.to_path_buf(), census.clone());
+                            let wait = tokio::task::spawn_blocking(move || outside_wait(&census, &lock, me))
                                 .await
                                 .map_err(io::Error::other)?;
                             waiting(&wait);

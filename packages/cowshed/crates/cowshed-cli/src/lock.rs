@@ -63,7 +63,11 @@ where
 /// Who the kernel shows holding the lock at `path`: what `lock-holders` prints and
 /// `host.lockHolders` answers.
 pub(crate) fn holders(path: &Path) -> Result<LockObservation, CowshedError> {
-    held_lock::observe(path).map_err(|error| failure(path, "observe", &error))
+    held_lock::observe(
+        &cowshed_core::storage::bootstrap::CanonicalRoots::global().census(),
+        path,
+    )
+    .map_err(|error| failure(path, "observe", &error))
 }
 
 pub(crate) fn report<W: Write, E: Write>(output: &mut Output<W, E>, error: &CowshedError) -> i32 {
@@ -207,6 +211,7 @@ async fn take<W: Write, E: Write>(
     state: &mut State<LockWaiterEvent>,
     output: &mut Output<W, E>,
 ) -> Result<Taken, CowshedError> {
+    let census = cowshed_core::storage::bootstrap::CanonicalRoots::global().census();
     let opened = Opened::open(path).map_err(|error| failure(path, "open", &error))?;
     let inode = opened.inode();
     let opened = match opened
@@ -251,7 +256,7 @@ async fn take<W: Write, E: Write>(
                     .map_err(|error| failure(path, "lock", &error));
             }
             Some(()) = requests.recv() => {
-                match owned.signal_owner(path, inode, libc::SIGTERM) {
+                match owned.signal_owner(&census, path, inode, libc::SIGTERM) {
                     Ok(Ok(pid)) => {
                         state.tell(&LockWaiterEvent::Signalled { pid })?;
                         state.close();
@@ -269,7 +274,7 @@ async fn take<W: Write, E: Write>(
             _ = named.tick() => cowshed_os::eprintln!(
                 "cowshed: still waiting for lock {}, held by {}",
                 path.display(),
-                held_lock::holders(path)
+                held_lock::holders(&census, path)
             ),
         }
     }

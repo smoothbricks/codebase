@@ -1261,6 +1261,12 @@ impl CanonicalRoots {
         self.namespace
     }
 
+    /// The holder census of this store: its own leases, and every process for production's or
+    /// the namespace owner's tree for a fixture's ([`crate::census::CensusScope`]).
+    pub fn census(&self) -> crate::census::CensusScope {
+        crate::census::CensusScope::new(self.namespace, Arc::clone(&self.store))
+    }
+
     /// The store's gateway control socket, at its root: short for `sun_path` (01_storage.md).
     pub fn control_socket(&self) -> PathBuf {
         self.store.join(GATEWAY_SOCKET_NAME)
@@ -1390,6 +1396,11 @@ impl ValidatedHostStorage {
 
     pub fn roots(&self) -> &CanonicalRoots {
         &self.roots
+    }
+
+    /// The holder census of this store ([`CanonicalRoots::census`]).
+    pub fn census(&self) -> crate::census::CensusScope {
+        self.roots.census()
     }
 
     /// Where this home's land records live (02_workspaces.md "A declared land"): `land-turn` in

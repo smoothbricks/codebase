@@ -103,7 +103,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             else {
                 let mut holders = Vec::new();
                 for lock in &locks {
-                    let open = nx::holders(lock).map_err(|error| io("name seed move lock holders", lock, &error))?;
+                    let open = nx::holders(host.census(), lock).map_err(|error| io("name seed move lock holders", lock, &error))?;
                     if !open.is_empty() {
                         holders.push(format!("{} held by {}", lock.display(), named(&open)));
                     }
@@ -119,7 +119,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 BuildVolumeClaim::Claimed(claim) => claim,
                 BuildVolumeClaim::Held { open } => {
                     let hold = layout.hold_path(&plan.previous);
-                    let holders = nx::holders(&hold).map_err(|error| io("name build hold holders", &hold, &error))?;
+                    let holders = nx::holders(host.census(), &hold).map_err(|error| io("name build hold holders", &hold, &error))?;
                     return Err(CowshedError::conflict(
                         format!("cannot move {} onto its seed: build volume {} hold {} is held by {}; volume open by {}",
                             plan.workspace.owner.name, plan.previous, hold.display(), named(&holders), named(&open)),
@@ -130,7 +130,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             require_current(layout, &plan)?;
             let (old_mount, _) = host.mount_build_volume(layout, &plan.previous).map_err(storage)?;
             let state = BuildVolumeState::read(&old_mount)?;
-            if let Err(busy) = nx::close(&old_mount, &state)
+            if let Err(busy) = nx::close(host.census(), &old_mount, &state)
                 .map_err(|error| io("close the moving volume's Nx state", &old_mount, &error))?
             {
                 return Err(CowshedError::conflict(

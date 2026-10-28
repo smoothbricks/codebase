@@ -455,6 +455,9 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     /// refused with [`ApfsStorageError::Unsupported`].
     const HAS_PHYSICAL_VOLUMES: bool = true;
     type LockGuard: Send + 'static;
+    /// The holder census of this host's store ([`crate::census::CensusScope`]), built once when
+    /// the host is.
+    fn census(&self) -> &crate::census::CensusScope;
     /// Take the lifecycle locks at `images`, each recorded as held by this process for
     /// `holding`, the request the caller names (02_workspaces.md "Held locks").
     fn lock_images(
@@ -957,13 +960,13 @@ pub struct HeldImageLock {
 
 impl ApfsStorageError {
     /// `locks`, which an acquisition without waiting found held, each named with who has it open.
-    fn image_locks_held(locks: &[PathBuf]) -> Self {
+    fn image_locks_held(census: &crate::census::CensusScope, locks: &[PathBuf]) -> Self {
         Self::ImageLocksHeld {
             held: locks
                 .iter()
                 .map(|lock| HeldImageLock {
                     lock: lock.clone(),
-                    holders: crate::build_volume::nx::holders(lock)
+                    holders: crate::build_volume::nx::holders(census, lock)
                         .map_err(|error| error.to_string()),
                 })
                 .collect(),
@@ -995,7 +998,7 @@ fn lock_images_in<H: ApfsExecutionHost>(
 ) -> Result<H::LockGuard, ApfsStorageError> {
     host.lock_images(locks, mode, holding)?
         .ok_or_else(|| match mode {
-            LockMode::Try => ApfsStorageError::image_locks_held(locks),
+            LockMode::Try => ApfsStorageError::image_locks_held(host.census(), locks),
             LockMode::Wait => {
                 ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable")
             }
@@ -1966,7 +1969,7 @@ where
         self.lane
             .dispatch(move || {
                 let locks = std::slice::from_ref(&lock);
-                let holders = match crate::build_volume::nx::holders(&lock) {
+                let holders = match crate::build_volume::nx::holders(host.census(), &lock) {
                     Ok(holders) => held_by(&holders),
                     Err(error) => format!("processes that cannot be named ({error})"),
                 };

@@ -5041,7 +5041,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
     assert!(
-        nx::holders(database)
+        nx::holders(&fixture.storage.census(), database)
             .expect("query the database's holders")
             .iter()
             .any(|holder| holder.pid == pid),
@@ -5122,7 +5122,7 @@ async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substra
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
     assert!(
-        nx::holders(&index)
+        nx::holders(&fixture.storage.census(), &index)
             .expect("query the index's holders")
             .iter()
             .any(|holder| holder.pid == pid),
@@ -5545,7 +5545,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
     println!("build-volume-holder-pid={pid}");
     // `spawn` returns once the child has exec'd, so its working directory is already the mount.
     assert!(
-        nx::volume_holders(&mount)
+        nx::volume_holders(&fixture.storage.census(), &mount)
             .expect("query build volume holders")
             .iter()
             .any(|holder| holder.pid == pid),
@@ -6074,10 +6074,14 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         .expect("stop the recovered re-adoption runtime");
     host.detach_existing_image(&main_image, DetachIntent::WhenIdle)
         .expect("produce the actual post-publication empty mountpoint");
-    cowshed_core::storage::recovery::LifecycleIntentJournal::update(&journal_path, |journal| {
-        journal.begin(operation);
-        journal.mark_mutating(&WorkspaceName::main())
-    })
+    cowshed_core::storage::recovery::LifecycleIntentJournal::update(
+        &fixture.storage.census(),
+        &journal_path,
+        |journal| {
+            journal.begin(operation);
+            journal.mark_mutating(&WorkspaceName::main())
+        },
+    )
     .unwrap();
     assert!(
         !fixture.checkout.join(".git").exists(),
@@ -6872,16 +6876,20 @@ async fn prove_published_build_loss(fixture: &mut Fixture) {
                 .unwrap_or_else(|error| panic!("unwind {}: {error}", path.display()));
         }
     }
-    cowshed_core::storage::recovery::LifecycleIntentJournal::update(&journal_path, |state| {
-        let operation = state
-            .get(&main)
-            .expect("main's re-adoption is recorded")
-            .operation
-            .clone();
-        state.clear(&main);
-        state.begin(operation);
-        state.mark_mutating(&main)
-    })
+    cowshed_core::storage::recovery::LifecycleIntentJournal::update(
+        &fixture.storage.census(),
+        &journal_path,
+        |state| {
+            let operation = state
+                .get(&main)
+                .expect("main's re-adoption is recorded")
+                .operation
+                .clone();
+            state.clear(&main);
+            state.begin(operation);
+            state.mark_mutating(&main)
+        },
+    )
     .expect("reopen main's re-adoption at the crash boundary");
 
     // After publication, the retained build image is lost.

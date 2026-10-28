@@ -2391,6 +2391,7 @@ fn supervisor_config_of(
     std::fs::create_dir(&workspace_root).expect("workspace root");
     let authority = authority_of(workspace, workspace_incarnation);
     WorkspaceSupervisorConfig {
+        census: census(),
         owned_repo_ids: OwnedRepoIds::sole(authority.repo_id.clone()),
         authority,
         workspace_root: workspace_root.clone(),
@@ -2455,6 +2456,7 @@ fn supervisor_spawning(root: &Path, spawner: Box<dyn SpawnSink>) -> WorkspaceSup
         &config.owned_repo_ids,
         &config.authority,
         config.artifacts.clone(),
+        census(),
     )
     .expect("open artifact store");
     WorkspaceSupervisor::start_with_sinks(
@@ -2968,6 +2970,7 @@ async fn an_unprovable_key_preserves_its_error_over_the_controller() {
         &config.owned_repo_ids,
         &config.authority,
         config.artifacts.clone(),
+        census(),
     )
     .expect("open unprovable store");
     let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
@@ -6636,4 +6639,15 @@ async fn a_stale_collection_is_a_retryable_refusal_and_the_retry_finishes_the_re
         report.deleted_bundles.is_empty(),
         "no bundles without abandon"
     );
+}
+
+/// This test process's census, as a fixture store's census reaches it, over a store that holds no
+/// lease.
+fn census() -> cowshed_core::census::CensusScope {
+    let namespace = cowshed_os::namespace::TestNamespace::of(std::process::id(), 0)
+        .expect("this process's namespace");
+    cowshed_core::census::CensusScope::new(
+        cowshed_os::namespace::HostNamespace::Test(namespace),
+        std::sync::Arc::from(std::path::Path::new("/var/empty")),
+    )
 }

@@ -4791,6 +4791,7 @@ mod tests {
         let layout = StorageLayout::new(fixture.storage.store(), repo).unwrap();
         layout.record_checkout_root(checkout).unwrap();
         LifecycleIntentJournal::update(
+            &crate::census::this_test(),
             &layout.project().project_root.join(LIFECYCLE_INTENTS_FILE),
             |journal| {
                 journal.begin(LifecycleIntent::Retire {
@@ -4914,7 +4915,7 @@ mod tests {
             (WorkspaceName::main(), false, true),
             (WorkspaceName::new("topic").unwrap(), true, true),
         ] {
-            LifecycleIntentJournal::update(&path, |journal| {
+            LifecycleIntentJournal::update(&crate::census::this_test(), &path, |journal| {
                 journal.clear(&WorkspaceName::main());
                 journal.begin(LifecycleIntent::Retire {
                     workspace: workspace.clone(),
@@ -4939,7 +4940,7 @@ mod tests {
                 None
             );
         }
-        LifecycleIntentJournal::update(&path, |journal| {
+        LifecycleIntentJournal::update(&crate::census::this_test(), &path, |journal| {
             journal.begin(LifecycleIntent::Retire {
                 workspace: WorkspaceName::main(),
                 options: crate::api::dto::RemoveOptions {

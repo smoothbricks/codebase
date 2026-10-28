@@ -533,12 +533,16 @@ mod tests {
         assert!(!project_root.exists());
 
         layout.provision_project().expect("provision project root");
-        LifecycleIntentJournal::update(&project_root.join(LIFECYCLE_INTENTS_FILE), |journal| {
-            journal.begin(LifecycleIntent::Adopt {
-                options: AdoptOptions::default(),
-            });
-            Ok(())
-        })
+        LifecycleIntentJournal::update(
+            &crate::census::this_test(),
+            &project_root.join(LIFECYCLE_INTENTS_FILE),
+            |journal| {
+                journal.begin(LifecycleIntent::Adopt {
+                    options: AdoptOptions::default(),
+                });
+                Ok(())
+            },
+        )
         .expect("first project-local write");
 
         assert!(project_root.is_dir());

@@ -47,7 +47,10 @@ pub const INSTALL_LOCK_NAME: &str = "install.lock";
 /// holds it. The wait holds nothing afterwards, so no install ever waits on its caller
 /// (05_gateway.md, "A land step waits for an install in progress"). Blocking: call it off the
 /// async workers. An install's own process must not call it, since it would wait on itself.
-pub fn wait_for_running_install(support_directory: &Path) -> std::io::Result<bool> {
+pub fn wait_for_running_install(
+    census: &crate::census::CensusScope,
+    support_directory: &Path,
+) -> std::io::Result<bool> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let path = support_directory.join(INSTALL_LOCK_NAME);
     let lock = match std::fs::OpenOptions::new()
@@ -76,7 +79,7 @@ pub fn wait_for_running_install(support_directory: &Path) -> std::io::Result<boo
     cowshed_os::flock::queued(
         &path,
         cowshed_os::flock::HOLDER_REPORT,
-        crate::held_lock::holders,
+        |lock| crate::held_lock::holders(census, lock),
         || loop {
             match lock.lock_shared() {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -111,18 +114,18 @@ mod install_wait_tests {
             std::env::temp_dir().join(format!("cowshed-install-wait-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         assert!(
-            !wait_for_running_install(&root).unwrap(),
+            !wait_for_running_install(&crate::census::this_test(), &root).unwrap(),
             "no lock file: no install"
         );
         let install = std::fs::File::create(root.join(INSTALL_LOCK_NAME)).unwrap();
         assert!(
-            !wait_for_running_install(&root).unwrap(),
+            !wait_for_running_install(&crate::census::this_test(), &root).unwrap(),
             "a free slot: no install"
         );
         install.try_lock().expect("take the free slot");
         let waiter = std::thread::spawn({
             let root = root.clone();
-            move || wait_for_running_install(&root)
+            move || wait_for_running_install(&crate::census::this_test(), &root)
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(

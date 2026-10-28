@@ -3386,6 +3386,10 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
         &fixture.host_namespace().label_prefix(),
         capacity,
         &cowshed_core::held_lock::ImageLockTaker {
+            census: &cowshed_core::census::CensusScope::new(
+                fixture.host_namespace(),
+                Arc::from(store.as_path()),
+            ),
             holding: &cowshed_core::api::held_lock::LockHolding::store(
                 cowshed_core::api::held_lock::LockOperation::MintTemplate,
             ),

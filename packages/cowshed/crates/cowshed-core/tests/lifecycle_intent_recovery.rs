@@ -158,7 +158,7 @@ fn a_journal_an_earlier_build_wrote_reads_as_predating_and_is_written_back_as_it
         "the fixture carries a branch measurement"
     );
 
-    LifecycleIntentJournal::update(&path, |_| Ok(())).expect("write the journal back");
+    LifecycleIntentJournal::update(&census(), &path, |_| Ok(())).expect("write the journal back");
     let written: serde_json::Value =
         serde_json::from_slice(&fs::read(&path).expect("read the written journal"))
             .expect("the written journal is JSON");
@@ -269,7 +269,7 @@ fn lifecycle_intent_child() {
     let root = PathBuf::from(std::env::var_os(CHILD_ROOT).expect("child fixture root"));
     let journal_path = root.join(LIFECYCLE_INTENTS_FILE);
     let operation_intent = intent(&operation);
-    LifecycleIntentJournal::update(&journal_path, |journal| {
+    LifecycleIntentJournal::update(&census(), &journal_path, |journal| {
         journal.begin(operation_intent);
         Ok(())
     })
@@ -337,7 +337,7 @@ fn crash_then_recover(operation: &str) {
             WorkspaceIncarnation::new("a".repeat(32)).expect("fixture incarnation"),
         )
     };
-    LifecycleIntentJournal::update(&journal_path, |journal| {
+    LifecycleIntentJournal::update(&census(), &journal_path, |journal| {
         journal.complete(&target, completion.clone())
     })
     .expect("reconcile published state");
@@ -552,7 +552,7 @@ fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_author
         destination: name.clone(),
         rename: false,
     };
-    LifecycleIntentJournal::update(&path, |journal| {
+    LifecycleIntentJournal::update(&census(), &path, |journal| {
         journal.begin(clone.clone());
         journal.begin(LifecycleIntent::Retire {
             workspace: name.clone(),
@@ -564,7 +564,7 @@ fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_author
     })
     .expect("persist interrupted retirement");
 
-    LifecycleIntentJournal::update(&path, |reopened| {
+    LifecycleIntentJournal::update(&census(), &path, |reopened| {
         assert!(reopened.restore_prepared_clone_intent(&name));
         assert_eq!(reopened.get(&name).unwrap().operation, clone);
         reopened.begin(LifecycleIntent::Retire {
@@ -622,7 +622,7 @@ fn a_killed_create_keeps_its_intent_when_another_process_updates_the_journal() {
         .expect("spawn create child");
     assert!(!status.success(), "the create child is killed mid-flight");
 
-    LifecycleIntentJournal::update(&journal_path, |journal| {
+    LifecycleIntentJournal::update(&census(), &journal_path, |journal| {
         journal.begin(retire("unrelated", RemoveOptions::default()));
         Ok(())
     })
@@ -649,7 +649,7 @@ fn lifecycle_lease_child() {
     let _lease = IntentLease::try_claim(&root.join("sessions"), &name)
         .expect("claim lease")
         .expect("nobody else runs this removal");
-    LifecycleIntentJournal::update(&root.join(LIFECYCLE_INTENTS_FILE), |journal| {
+    LifecycleIntentJournal::update(&census(), &root.join(LIFECYCLE_INTENTS_FILE), |journal| {
         journal.begin(retire(
             "removed",
             RemoveOptions {
@@ -775,4 +775,15 @@ fn malformed_record_names_its_project_and_record() {
             path.display()
         )
     );
+}
+
+/// This test process's census, as a fixture store's census reaches it, over a store that holds no
+/// lease.
+fn census() -> cowshed_core::census::CensusScope {
+    let namespace = cowshed_os::namespace::TestNamespace::of(std::process::id(), 0)
+        .expect("this process's namespace");
+    cowshed_core::census::CensusScope::new(
+        cowshed_os::namespace::HostNamespace::Test(namespace),
+        std::sync::Arc::from(std::path::Path::new("/var/empty")),
+    )
 }

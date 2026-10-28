@@ -108,36 +108,40 @@ pub fn clear(file: &File, path: &Path) {
     }
 }
 
-/// Every process other than this one that a lease of the host's store names, with the unique id
+/// Every process other than this one that a lease of the store at `store` names, with the unique id
 /// it has now: the life that wrote the record, which empties it before it lets go of the lease.
 /// A record whose pid names no process, or one with another unique id, names nothing; so does
-/// one without a unique id. One directory listing per project of the store and one read per lease
-/// file, and no process-table walk. A store, project or lease this user cannot read names nothing:
-/// the census then asks those processes, as it asks any other. This process is always asked,
-/// lease or not (02_workspaces.md: genuine holders, including the controller's own pid, refuse).
+/// one without a unique id. One directory listing per project of the store and one `read` per
+/// lease file, and no process-table walk. The store is the census's own
+/// ([`crate::census::CensusScope::store`]): the host's for the host store's census, a fixture's
+/// for a fixture's, and no other store's leases are read. A store, project or lease this user
+/// cannot read names nothing: the census then asks those processes, as it asks any other. This
+/// process is always asked, lease or not (02_workspaces.md: genuine holders, including the
+/// controller's own pid, refuse).
 #[cfg(target_os = "macos")]
-pub(crate) fn running_lifecycle() -> BTreeSet<libc::pid_t> {
+pub(crate) fn running_lifecycle(
+    store: &Path,
+    mut read: impl FnMut(&Path) -> io::Result<Vec<u8>>,
+) -> BTreeSet<libc::pid_t> {
     let own = std::process::id();
     let mut running = BTreeSet::new();
-    for store in stores() {
-        for owner in directories(&store) {
-            for project in directories(&owner) {
-                for lease in leases(&project.join(crate::repository::SESSIONS_DIRECTORY)) {
-                    let Ok(bytes) = fs::read(&lease) else {
-                        continue;
-                    };
-                    let Ok(holder) = serde_json::from_slice::<Process>(&bytes) else {
-                        continue;
-                    };
-                    let Ok(pid) = libc::pid_t::try_from(holder.pid) else {
-                        continue;
-                    };
-                    if holder.pid != own
-                        && holder.unique_id.is_some()
-                        && unique_id(holder.pid).ok().flatten() == holder.unique_id
-                    {
-                        running.insert(pid);
-                    }
+    for owner in directories(store) {
+        for project in directories(&owner) {
+            for lease in leases(&project.join(crate::repository::SESSIONS_DIRECTORY)) {
+                let Ok(bytes) = read(&lease) else {
+                    continue;
+                };
+                let Ok(holder) = serde_json::from_slice::<Process>(&bytes) else {
+                    continue;
+                };
+                let Ok(pid) = libc::pid_t::try_from(holder.pid) else {
+                    continue;
+                };
+                if holder.pid != own
+                    && holder.unique_id.is_some()
+                    && unique_id(holder.pid).ok().flatten() == holder.unique_id
+                {
+                    running.insert(pid);
                 }
             }
         }
@@ -185,34 +189,6 @@ fn leases(sessions: &Path) -> Vec<PathBuf> {
                 .collect()
         },
     )
-}
-
-/// The stores whose leases a census reads: the host's. A fixture store elsewhere is not read, so a
-/// census asks a fixture's lifecycle process like any other.
-#[cfg(all(target_os = "macos", not(test)))]
-fn stores() -> Vec<PathBuf> {
-    vec![PathBuf::from(cowshed_gateway_types::STORE_ROOT)]
-}
-
-#[cfg(all(target_os = "macos", test))]
-thread_local! {
-    static STORES: std::cell::RefCell<Vec<PathBuf>> =
-        std::cell::RefCell::new(vec![PathBuf::from(cowshed_gateway_types::STORE_ROOT)]);
-}
-
-/// In this crate's tests, the stores this thread's censuses read ([`with_stores`]).
-#[cfg(all(target_os = "macos", test))]
-fn stores() -> Vec<PathBuf> {
-    STORES.with_borrow(Clone::clone)
-}
-
-/// Run `work` with this thread's censuses reading the leases of `stores` in place of the host's.
-#[cfg(all(target_os = "macos", test))]
-pub(crate) fn with_stores<T>(stores: Vec<PathBuf>, work: impl FnOnce() -> T) -> T {
-    let host = STORES.replace(stores);
-    let done = work();
-    STORES.set(host);
-    done
 }
 
 #[cfg(test)]

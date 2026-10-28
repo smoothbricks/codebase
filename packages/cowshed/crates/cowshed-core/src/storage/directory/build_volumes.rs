@@ -224,6 +224,7 @@ fn remove_if_present(path: &Path) -> Result<bool, ApfsStorageError> {
 /// holder. The path is derived from the held journal's current kernel name, and its entry must
 /// keep the fd-relative identity observed before the census. Deletion never uses this path.
 fn held_tree_holders(
+    census: &crate::census::CensusScope,
     journal: &AnchoredDirectory,
     name: &CStr,
     expected: &libc::stat,
@@ -254,7 +255,7 @@ fn held_tree_holders(
         }
     };
     require_identity()?;
-    let open = holders_of(&path).map_err(io::Error::other)?;
+    let open = holders_of(census, &path).map_err(io::Error::other)?;
     require_identity()?;
     if journal.current_path()? != directory {
         return Err(io::Error::new(
@@ -276,16 +277,20 @@ fn same_directory(observed: &fs::Metadata, expected: &libc::stat) -> bool {
 
 /// Every process holding anything inside the payload tree at `image`, confirmed by a second
 /// census (see `confirmed_tree_holders`).
-fn holders_of(image: &Path) -> Result<Vec<Holder>, ApfsStorageError> {
-    super::confirmed_tree_holders(image)
+fn holders_of(
+    census: &crate::census::CensusScope,
+    image: &Path,
+) -> Result<Vec<Holder>, ApfsStorageError> {
+    super::confirmed_tree_holders(census, image)
 }
 
 fn hold_owners(
+    census: &crate::census::CensusScope,
     layout: &BuildVolumeLayout,
     id: &BuildVolumeId,
 ) -> Result<Vec<Holder>, ApfsStorageError> {
     let hold = layout.hold_path(id);
-    crate::build_volume::nx::holders(&hold).map_err(|error| {
+    crate::build_volume::nx::holders(census, &hold).map_err(|error| {
         io_error(
             "list the processes holding a build volume's hold",
             &hold,
@@ -387,7 +392,7 @@ impl DirectoryExecutionHost {
                     return Err(ApfsStorageError::BuildVolumeHeld {
                         image: layout.image(source),
                         hold: layout.hold_path(source),
-                        holds: hold_owners(layout, source)?,
+                        holds: hold_owners(&self.census, layout, source)?,
                         open,
                     });
                 }
@@ -665,7 +670,7 @@ impl DirectoryExecutionHost {
     ) -> Result<BuildVolumeRelease, ApfsStorageError> {
         match self.claim_build_volume(layout, id)? {
             BuildVolumeClaim::Claimed(claim) => {
-                let open = holders_of(&layout.image(id))?;
+                let open = holders_of(&self.census, &layout.image(id))?;
                 if !open.is_empty() {
                     drop(claim);
                     return Ok(BuildVolumeRelease::Held { open });
@@ -693,7 +698,7 @@ impl DirectoryExecutionHost {
         {
             Some(claim) => Ok(BuildVolumeClaim::Claimed(claim)),
             None => Ok(BuildVolumeClaim::Held {
-                open: holders_of(&image)?,
+                open: holders_of(&self.census, &image)?,
             }),
         }
     }
@@ -712,7 +717,7 @@ impl DirectoryExecutionHost {
         self.require_store_image(&image)?;
         let mount = layout.mount(id);
         let was_bound = Self::build_volume_bound(layout, id)?;
-        let open = holders_of(&image)?;
+        let open = holders_of(&self.census, &image)?;
         if !open.is_empty() {
             return Err(ApfsStorageError::BuildVolumeHeld {
                 hold: layout.hold_path(id),
@@ -721,7 +726,12 @@ impl DirectoryExecutionHost {
                 open,
             });
         }
-        match unbind(&image, &mount, cowshed_apfs::DetachIntent::WhenIdle) {
+        match unbind(
+            &self.census,
+            &image,
+            &mount,
+            cowshed_apfs::DetachIntent::WhenIdle,
+        ) {
             Ok(()) => Ok(()),
             Err(primary) if was_bound => crate::storage::apfs::combine_cleanup(
                 "detach and restore claimed build volume",
@@ -759,7 +769,12 @@ impl DirectoryExecutionHost {
         // already gone has nothing to unbind: a retry confirms the commit an earlier attempt
         // made, and otherwise its record alone is retired, said as such.
         let committed = if present {
-            unbind(&image, &mount, cowshed_apfs::DetachIntent::Release)?;
+            unbind(
+                &self.census,
+                &image,
+                &mount,
+                cowshed_apfs::DetachIntent::Release,
+            )?;
             self.journal_payload_tree(layout, id)?;
             true
         } else {
@@ -903,7 +918,7 @@ impl DirectoryExecutionHost {
                 );
                 return Ok(ControlFlow::Continue(()));
             };
-            let open = held_tree_holders(held, name, &metadata)?;
+            let open = held_tree_holders(&self.census, held, name, &metadata)?;
             if !open.is_empty() {
                 cowshed_os::eprintln!(
                     "cowshed: released build volume {} stays while {} process(es) hold it; a later pass of this deleter deletes it",
@@ -1388,7 +1403,13 @@ mod detach_tests {
         assert!(layout.admit(&id).is_err());
         // Exercise the unbind's own census too: a holder arriving after the first census
         // must have the same typed refusal, without parsing a host-error string.
-        let late = unbind(&image, &mount, cowshed_apfs::DetachIntent::WhenIdle).unwrap_err();
+        let late = unbind(
+            &crate::census::this_test(),
+            &image,
+            &mount,
+            cowshed_apfs::DetachIntent::WhenIdle,
+        )
+        .unwrap_err();
         let ApfsStorageError::BuildVolumeHeld {
             image: refused_image,
             hold,

@@ -80,7 +80,7 @@ async fn clean_landed_source_is_physically_deleted_before_reply_and_crash_replay
         "clean release never prepares a trash rename"
     );
     runtime.shutdown().await.expect("stop runtime");
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Retire {
             workspace: name("landed"),
             options: RemoveOptions {
@@ -148,7 +148,7 @@ async fn an_interrupted_lane_land_retire_replays_against_the_lane_base() {
     request["workspace"] = json!("interrupted");
     let request: LifecycleIntent =
         serde_json::from_value(request).expect("the second unit's retire request");
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(request);
         journal.mark_mutating(&name("interrupted"))
     })
@@ -198,7 +198,7 @@ async fn a_named_rm_abandon_supersedes_its_targets_refused_unfinished_retire() {
         "options": { "force": false, "restore": false, "abandon": false },
     }))
     .expect("an earlier build's retire request");
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(request);
         journal.mark_mutating(&name("unit"))
     })
@@ -942,7 +942,7 @@ impl Fixture {
     /// left it: past its mutation fence, starting from a revision main does not hold, so every
     /// replay of it fails again.
     fn journal_unreplayable_create(&self, workspace: &str) {
-        LifecycleIntentJournal::update(&self.journal_path(), |journal| {
+        LifecycleIntentJournal::update(&census(), &self.journal_path(), |journal| {
             journal.begin(LifecycleIntent::Create {
                 workspace: name(workspace),
                 options: cowshed_core::storage::recovery::MintOptions {
@@ -1342,6 +1342,7 @@ fn image_lock_holder() {
         &[PathBuf::from(lock)],
         cowshed_apfs::store_lock::LockMode::Wait,
         &cowshed_core::held_lock::ImageLockTaker {
+            census: &census(),
             holding: &cowshed_core::api::held_lock::LockHolding::of(
                 cowshed_core::api::held_lock::LockOperation::Fork,
                 &cowshed_core::metadata::WorkspaceName::new("sibling").unwrap(),
@@ -2352,7 +2353,7 @@ async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
     let trash = fixture.layout().project().sessions.join(".trash");
     assert!(!trash.exists());
 
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("source"),
             destination: name("empty"),
@@ -2419,7 +2420,7 @@ async fn store_recovery_retires_an_unfinished_fork_whose_source_is_gone() {
         .remove(&runtime, "source")
         .await
         .expect("retire the clean, landed source");
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("source"),
             destination: name("empty"),
@@ -2945,7 +2946,7 @@ async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_pu
     gc.shutdown().await.expect("stop gc");
 
     // An older binary left Prepared without an artifact; a separate opening discards it.
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Create {
             workspace: name("refused"),
             options: cowshed_core::storage::recovery::MintOptions::default(),
@@ -3039,7 +3040,7 @@ async fn a_pending_rename_refuses_both_names_while_its_source_is_still_live() {
     let h2 = head(&a_mount);
     runtime.shutdown().await.expect("stop the runtime");
 
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("a"),
             destination: name("b"),
@@ -3069,7 +3070,7 @@ async fn a_prepared_rename_is_discarded_by_its_source_and_creates_nothing() {
         .await
         .expect("mint a");
     runtime.shutdown().await.expect("stop the runtime");
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("a"),
             destination: name("b"),
@@ -3094,7 +3095,7 @@ async fn a_prepared_rename_is_discarded_by_its_source_and_creates_nothing() {
 
 /// Journals a rename `a -> b` for `b`, `Prepared` or, with `mutating`, past its clone's mark.
 fn journal_rename(fixture: &Fixture, mutating: bool) {
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("a"),
             destination: name("b"),
@@ -3229,7 +3230,7 @@ async fn a_historical_create_completion_records_introduction_not_fork() {
     let forks_before = fork_commitments(&fixture, &destination);
     let introduced_before = introduced_commitments(&fixture, &destination);
 
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Create {
             workspace: name("b"),
             options: cowshed_core::storage::recovery::MintOptions::default(),
@@ -3325,7 +3326,7 @@ async fn a_replayed_rename_with_a_live_source_appends_its_fork_commitment() {
     let before = fork_commitments(&fixture, &destination);
     runtime.shutdown().await.expect("stop the runtime");
 
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("a"),
             destination: name("b"),
@@ -3368,7 +3369,7 @@ async fn a_replayed_rename_with_a_retired_source_appends_its_fork_commitment() {
         .expect("retire the source before the rename is journaled");
     runtime.shutdown().await.expect("stop the runtime");
 
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("a"),
             destination: name("b"),
@@ -3414,7 +3415,7 @@ async fn an_active_fork_with_a_gone_source_completes_its_create_intent() {
         .expect("destroy the clean, landed source");
     runtime.shutdown().await.expect("stop the runtime");
 
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Create {
             workspace: name("b"),
             options: cowshed_core::storage::recovery::MintOptions::fork(
@@ -3720,7 +3721,7 @@ async fn a_prepared_rename_with_a_published_destination_resumes_without_discard(
     let _b_mount = capture_rename(&fixture, &runtime).await;
     runtime.shutdown().await.expect("stop the runtime");
 
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("a"),
             destination: name("b"),
@@ -3763,7 +3764,7 @@ async fn a_captured_rename_keeps_later_dirty_and_untracked_bytes() {
     assert_eq!(head(&a_mount), captured_head);
     assert_eq!(porcelain(&a_mount), captured_status, "same codes and paths");
 
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("a"),
             destination: name("b"),
@@ -3803,7 +3804,7 @@ async fn a_captured_rename_keeps_new_untracked_path_without_head_change() {
 
     fs::write(a_mount.join("new.txt"), b"fresh\n").expect("new untracked path in a");
 
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("a"),
             destination: name("b"),
@@ -3839,7 +3840,7 @@ async fn a_refused_existing_destination_resume_keeps_mutating_phase() {
     git(&a_mount, &["commit", "-q", "-m", "H2"]);
     runtime.shutdown().await.expect("stop the runtime");
 
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
             source: name("a"),
             destination: name("b"),
@@ -4034,4 +4035,15 @@ async fn gc_waits_for_mains_image_lock_holding_no_intent_lease() {
             "gc finished the fork of {workspace}: {said}"
         );
     }
+}
+
+/// This test process's census, as a fixture store's census reaches it, over a store that holds no
+/// lease.
+fn census() -> cowshed_core::census::CensusScope {
+    let namespace = cowshed_os::namespace::TestNamespace::of(std::process::id(), 0)
+        .expect("this process's namespace");
+    cowshed_core::census::CensusScope::new(
+        cowshed_os::namespace::HostNamespace::Test(namespace),
+        std::sync::Arc::from(std::path::Path::new("/var/empty")),
+    )
 }

@@ -32,6 +32,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         image_lock: PathBuf,
     ) -> Result<NxStateClearResult> {
         self.blocking(move |host, layout| {
+            let census = host.census();
             let refused = |what: String| {
                 CowshedError::conflict(
                     format!("cannot clear {workspace}'s Nx state: {what}; nothing was cleared"),
@@ -49,7 +50,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 )
                 .map_err(storage)?
             else {
-                let holders = nx::holders(&image_lock)
+                let holders = nx::holders(census, &image_lock)
                     .map_err(|error| io("name image lock holders", &image_lock, &error))?;
                 return Err(refused(format!(
                     "a lifecycle operation holds its image lock {}: {}",
@@ -67,7 +68,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 BuildVolumeClaim::Claimed(claim) => claim,
                 BuildVolumeClaim::Held { open } => {
                     let hold = layout.hold_path(&volume);
-                    let holders = nx::holders(&hold)
+                    let holders = nx::holders(census, &hold)
                         .map_err(|error| io("name build hold holders", &hold, &error))?;
                     return Err(refused(format!(
                         "a job or land holds build volume {volume}: hold {} is held by {}; volume open by {}",
@@ -80,7 +81,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let (mount, _) = host.mount_build_volume(layout, &volume).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
             let closing = |error: std::io::Error| io("close the checkout's Nx state", &mount, &error);
-            if let Err(busy) = nx::close(&mount, &state).map_err(closing)? {
+            if let Err(busy) = nx::close(census, &mount, &state).map_err(closing)? {
                 return Err(refused(format!("Nx is running in it: {busy}")));
             }
             let open_locks: BTreeSet<PathBuf> = nx::task_databases(&mount, &state)
@@ -88,7 +89,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 .into_iter()
                 .map(|database| database.with_extension("lock"))
                 .collect();
-            let _opens = match nx::hold_opens(&mount, &state, &mount).map_err(closing)? {
+            let _opens = match nx::hold_opens(census, &mount, &state, &mount).map_err(closing)? {
                 Ok(opens) => opens,
                 Err(opening) => {
                     return Err(refused(format!(
@@ -98,7 +99,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     )));
                 }
             };
-            if let Err(busy) = nx::held(&mount, &state).map_err(closing)? {
+            if let Err(busy) = nx::held(census, &mount, &state).map_err(closing)? {
                 return Err(refused(format!("Nx is running in it: {busy}")));
             }
             let mut cache_entries = 0;

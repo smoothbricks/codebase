@@ -251,13 +251,14 @@ where
                 // The failed claim's own descriptor is closed, so this process is named only
                 // for a hold of its own.
                 let hold = layout.hold_path(source);
-                let holds = crate::build_volume::nx::holders(&hold).map_err(|error| {
-                    io_error(
-                        "list the processes holding a build volume's hold",
-                        &hold,
-                        error,
-                    )
-                })?;
+                let holds =
+                    crate::build_volume::nx::holders(&self.census, &hold).map_err(|error| {
+                        io_error(
+                            "list the processes holding a build volume's hold",
+                            &hold,
+                            error,
+                        )
+                    })?;
                 Err(ApfsStorageError::BuildVolumeHeld {
                     image: layout.image(source),
                     hold,
@@ -754,7 +755,7 @@ where
             None => {
                 let mount = layout.mount(id);
                 let open = match self.mounted_at(&mount)? {
-                    Some(_) => holders_of(&mount)?,
+                    Some(_) => holders_of(&self.census, &mount)?,
                     None => Vec::new(),
                 };
                 Ok(Claim::Held { open })
@@ -851,7 +852,7 @@ where
                         attachment.volume_device()
                     )));
                 }
-                let open = holders_of(&mount)?;
+                let open = holders_of(&self.census, &mount)?;
                 if !open.is_empty() {
                     return Err(held(open));
                 }
@@ -865,7 +866,9 @@ where
                     return ApfsStorageError::from(refusal);
                 }
                 let open = self.mounted_at(&mount).and_then(|mounted| match mounted {
-                    Some(device) if device == attachment.volume_device() => holders_of(&mount),
+                    Some(device) if device == attachment.volume_device() => {
+                        holders_of(&self.census, &mount)
+                    }
                     Some(_) | None => Ok(Vec::new()),
                 });
                 match open {
@@ -923,7 +926,7 @@ where
             {
                 Ok(()) => {}
                 Err(error) if cowshed_apfs::detach_was_dissented(&error) => {
-                    let open = holders_of(&mount)?;
+                    let open = holders_of(&self.census, &mount)?;
                     let unmounted = self.backend.unmount_within_grace(&attachment)?;
                     refused = Some(Refusal {
                         open,
@@ -1363,8 +1366,11 @@ where
 
 /// Every process that has the volume mounted at `mount` open, as the kernel answers for this
 /// user's processes; nothing when nothing is mounted there.
-fn holders_of(mount: &Path) -> Result<Vec<Holder>, ApfsStorageError> {
-    match crate::build_volume::nx::volume_holders(mount) {
+fn holders_of(
+    census: &crate::census::CensusScope,
+    mount: &Path,
+) -> Result<Vec<Holder>, ApfsStorageError> {
+    match crate::build_volume::nx::volume_holders(census, mount) {
         Ok(holders) => Ok(holders),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(io_error(
@@ -2662,6 +2668,7 @@ mod tests {
                 &config.owned_repo_ids,
                 &config.authority,
                 config.artifacts.clone(),
+                crate::census::this_test(),
             )
             .expect("open the artifact store")
         };

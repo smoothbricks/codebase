@@ -183,10 +183,14 @@ where
     // A report that cannot be written is kept, not returned: the turn is ended unstarted once the
     // wait is over, never left queued with nothing to report to.
     let mut written: Result<(), CowshedError> = Ok(());
+    let census = cowshed_core::storage::bootstrap::CanonicalRoots::global().census();
     let taken = queue::take(
         socket,
         &ask,
-        outside.as_deref(),
+        outside.as_deref().map(|path| queue::OutsideLock {
+            path,
+            census: &census,
+        }),
         LAND_TURN_REPORT_EVERY,
         |wait| {
             waited = true;

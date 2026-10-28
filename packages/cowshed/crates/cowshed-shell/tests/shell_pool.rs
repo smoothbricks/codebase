@@ -204,6 +204,7 @@ impl Workspace {
         prewarm: bool,
     ) -> WorkspaceSupervisorHandle {
         let config = WorkspaceSupervisorConfig {
+            census: census(),
             authority: authority(1),
             owned_repo_ids: OwnedRepoIds::sole(authority(1).repo_id),
             workspace_root: self.sandbox.workspace_mount.clone(),
@@ -234,6 +235,7 @@ impl Workspace {
             &config.owned_repo_ids,
             &config.authority,
             config.artifacts.clone(),
+            census(),
         )
         .expect("artifact store");
         let spawner = SystemSpawnSink::with_shell_host(
@@ -1244,7 +1246,15 @@ read _ < "$TMPDIR/activation-hold"
     let escaped_ended = escaped_exit
         .within(Duration::ZERO)
         .expect("read the escaped exit");
-    let holders = tree_holders(workspace.mount()).expect("list the mount's holders");
+    let holders = tree_holders(
+        // Every process: the escaped descendant left this test's tree when its parent exited.
+        &cowshed_core::census::CensusScope::new(
+            cowshed_os::namespace::HostNamespace::Production,
+            std::sync::Arc::from(std::path::Path::new("/var/empty")),
+        ),
+        workspace.mount(),
+    )
+    .expect("list the mount's holders");
     if !escaped_ended {
         // SAFETY: a plain kill of this test's own fixture process, which still runs.
         unsafe { libc::kill(escaped, libc::SIGKILL) };
@@ -2040,7 +2050,8 @@ async fn host_controller_worker_custom_environment_runs_but_is_absent_from_admis
     );
     assert_eq!(workspace.activations(), 1, "the real .envrc was evaluated");
     let records = workspace.mount().join(".cowshed/job/records.arrow");
-    let history = cowshed_core::storage::job_artifact::recover_records(&records).unwrap();
+    let history =
+        cowshed_core::storage::job_artifact::recover_records(&census(), &records).unwrap();
     assert!(!history.frames.is_empty());
     for frame in history.frames {
         let record = frame.record;
@@ -2390,4 +2401,15 @@ async fn host_controller_each_selected_envrc_has_its_own_activation() {
         2,
         "different selected shells each evaluate once"
     );
+}
+
+/// This test process's census, as a fixture store's census reaches it, over a store that holds no
+/// lease.
+fn census() -> cowshed_core::census::CensusScope {
+    let namespace = cowshed_os::namespace::TestNamespace::of(std::process::id(), 0)
+        .expect("this process's namespace");
+    cowshed_core::census::CensusScope::new(
+        cowshed_os::namespace::HostNamespace::Test(namespace),
+        std::sync::Arc::from(std::path::Path::new("/var/empty")),
+    )
 }

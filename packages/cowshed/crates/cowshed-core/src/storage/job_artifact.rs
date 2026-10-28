@@ -1002,6 +1002,9 @@ pub struct RecoveryReport {
 
 pub struct ArtifactStore {
     workspace_root: Arc<PathBuf>,
+    /// The holder census of the store this workspace belongs to, which names who holds the
+    /// records lock when a wait for it expires.
+    census: crate::census::CensusScope,
     token_namespace: Sha256Digest,
     owned_repo_ids: OwnedRepoIds,
     workspace_incarnation: WorkspaceIncarnation,
@@ -1420,11 +1423,12 @@ impl ArtifactStore {
         owned_repo_ids: OwnedRepoIds,
         workspace_incarnation: WorkspaceIncarnation,
         config: ArtifactConfig,
+        census: crate::census::CensusScope,
     ) -> Result<Self, ArtifactError> {
         config.validate()?;
         let workspace_root: Arc<PathBuf> = Arc::new(workspace_root.into());
         let records_path = records_path(&workspace_root);
-        let lock = RecordsLock::acquire(&records_path, CONTROL)?;
+        let lock = RecordsLock::acquire(&census, &records_path, CONTROL)?;
         let mut recovery =
             recover_records_with_budget_under_lock(&lock, config.retained_recovery_budget_bytes)?;
         validate_recovered_authority(&owned_repo_ids, &workspace_incarnation, &config, &recovery)?;
@@ -1471,6 +1475,7 @@ impl ArtifactStore {
         let token_namespace = Sha256Digest::compute(workspace_root.as_os_str().as_encoded_bytes());
         Ok(Self {
             workspace_root,
+            census,
             token_namespace,
             owned_repo_ids,
             workspace_incarnation,
@@ -1505,7 +1510,7 @@ impl ArtifactStore {
     pub fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJobReader>, ArtifactError> {
         if !self.committed_jobs.contains_key(&job_id) {
             let path = records_path(&self.workspace_root);
-            let lock = RecordsLock::acquire(&path, CONTROL)?;
+            let lock = RecordsLock::acquire(&self.census, &path, CONTROL)?;
             self.refresh_under_lock(&lock)?;
         }
         if let Some(record) = self.committed_jobs.get(&job_id) {
@@ -1763,7 +1768,7 @@ impl ArtifactStore {
             }
         };
         let path = records_path(&self.workspace_root);
-        let lock = RecordsLock::acquire(&path, CONTROL)?;
+        let lock = RecordsLock::acquire(&self.census, &path, CONTROL)?;
         self.refresh_under_lock(&lock)?;
         let duplicate_terminal = record.state.is_terminal()
             && record.workspace_incarnation == self.workspace_incarnation
@@ -2859,7 +2864,11 @@ struct RecordsLock<'path> {
 impl<'path> RecordsLock<'path> {
     /// Take the records lock within `bound`: production passes [`CONTROL`], since the lock is held
     /// for one sequence allocation and its append (05_gateway.md, "Deadlines").
-    fn acquire(records: &'path Path, bound: Bound) -> Result<Self, ArtifactError> {
+    fn acquire(
+        census: &crate::census::CensusScope,
+        records: &'path Path,
+        bound: Bound,
+    ) -> Result<Self, ArtifactError> {
         verify_records_layout(records)?;
         let workspace_root = records
             .parent()
@@ -2893,11 +2902,13 @@ impl<'path> RecordsLock<'path> {
         #[cfg(unix)]
         let file = {
             let deadline = cowshed_os::deadline::start("job-records-lock", bound);
-            cowshed_os::flock::exclusive(file, &path, &deadline, crate::held_lock::holders)
-                .map_err(|error| match error {
-                    LockError::Expired(expired) => ArtifactError::LockExpired(expired),
-                    LockError::Io { source, .. } => io_error(&path, source),
-                })?
+            cowshed_os::flock::exclusive(file, &path, &deadline, |lock| {
+                crate::held_lock::holders(census, lock)
+            })
+            .map_err(|error| match error {
+                LockError::Expired(expired) => ArtifactError::LockExpired(expired),
+                LockError::Io { source, .. } => io_error(&path, source),
+            })?
         };
         #[cfg(not(unix))]
         return Err(ArtifactError::InvalidConfig(
@@ -3063,11 +3074,13 @@ fn allocate_record_sequence(lock: &RecordsLock<'_>) -> Result<u64, ArtifactError
 /// controller that wrote them, so their origins are exactly the lineage such a marker would have
 /// carried. New markers never need it — the clone source's marker already names the lineage.
 pub fn recorded_historical_incarnations(
+    census: &crate::census::CensusScope,
     workspace_root: &Path,
     current: &WorkspaceIncarnation,
     retained_recovery_budget_bytes: usize,
 ) -> Result<BTreeSet<WorkspaceIncarnation>, ArtifactError> {
     let recovery = recover_records_with_budget(
+        census,
         &records_path(workspace_root),
         retained_recovery_budget_bytes,
     )?;
@@ -3233,21 +3246,23 @@ fn scan_job_directories(workspace_root: &Path) -> Result<u64, ArtifactError> {
 
 #[cfg(test)]
 fn append_framed_batch(
+    census: &crate::census::CensusScope,
     path: &Path,
     payload: &[u8],
     digest: Sha256Digest,
 ) -> Result<(), ArtifactError> {
-    append_framed_batch_impl(path, payload, digest, None)
+    append_framed_batch_impl(census, path, payload, digest, None)
 }
 
 #[cfg(test)]
 fn append_framed_batch_impl(
+    census: &crate::census::CensusScope,
     path: &Path,
     payload: &[u8],
     digest: Sha256Digest,
     fail_after_bytes: Option<usize>,
 ) -> Result<(), ArtifactError> {
-    let lock = RecordsLock::acquire(path, CONTROL)?;
+    let lock = RecordsLock::acquire(census, path, CONTROL)?;
     append_framed_batch_under_lock(
         &lock,
         payload,
@@ -3370,18 +3385,23 @@ fn rollback_append(
     }
 }
 
-pub fn recover_records(path: &Path) -> Result<RecoveryReport, ArtifactError> {
+pub fn recover_records(
+    census: &crate::census::CensusScope,
+    path: &Path,
+) -> Result<RecoveryReport, ArtifactError> {
     recover_records_with_budget(
+        census,
         path,
         ArtifactConfig::default().retained_recovery_budget_bytes,
     )
 }
 
 pub fn recover_records_with_budget(
+    census: &crate::census::CensusScope,
     path: &Path,
     retained_budget_bytes: usize,
 ) -> Result<RecoveryReport, ArtifactError> {
-    let lock = RecordsLock::acquire(path, CONTROL)?;
+    let lock = RecordsLock::acquire(census, path, CONTROL)?;
     recover_records_with_budget_under_lock(&lock, retained_budget_bytes)
 }
 
@@ -5915,11 +5935,12 @@ fn require_job_columns(batch: &RecordBatch, row: usize) -> Result<(), ArtifactEr
 }
 
 pub fn repair_workspace_record_sequences(
+    census: &crate::census::CensusScope,
     workspace_root: &Path,
     retained_budget_bytes: usize,
 ) -> Result<(), ArtifactError> {
     let path = records_path(workspace_root);
-    let lock = RecordsLock::acquire(&path, CONTROL)?;
+    let lock = RecordsLock::acquire(census, &path, CONTROL)?;
     // Each frame's digest authenticates its exact serialized bytes. Rewriting sequences changes that
     // identity, while recomputing the in-file digest would let the rewrite attest to itself.
     // Holding the append lock makes the diagnosis stable; preserving identity requires refusal.
@@ -5972,7 +5993,14 @@ mod tests {
     }
 
     fn store_at(root: &Path, config: ArtifactConfig) -> ArtifactStore {
-        ArtifactStore::open(root, OwnedRepoIds::sole(repo()), incarnation(), config).unwrap()
+        ArtifactStore::open(
+            root,
+            OwnedRepoIds::sole(repo()),
+            incarnation(),
+            config,
+            crate::census::this_test(),
+        )
+        .unwrap()
     }
 
     struct ArtifactReadWatch;
@@ -6373,11 +6401,15 @@ mod tests {
                     assert!(store.sealed(id).unwrap().is_none());
                     error
                 }
-                None => {
-                    ArtifactStore::open(&*root, OwnedRepoIds::sole(repo()), incarnation(), config)
-                        .err()
-                        .expect("mutating open cannot publish a proof")
-                }
+                None => ArtifactStore::open(
+                    &*root,
+                    OwnedRepoIds::sole(repo()),
+                    incarnation(),
+                    config,
+                    crate::census::this_test(),
+                )
+                .err()
+                .expect("mutating open cannot publish a proof"),
             };
             assert!(fired.get());
             assert!(
@@ -6424,7 +6456,7 @@ mod tests {
                     cowshed_os::test_backstop::NO_PROGRESS,
                 ),
             ),
-            crate::held_lock::holders,
+            |lock| crate::held_lock::holders(&crate::census::this_test(), lock),
         )
         .unwrap();
         println!("{LOCKED}");
@@ -6522,7 +6554,7 @@ mod tests {
             std::time::Duration::from_millis(200),
         );
         let started = std::time::Instant::now();
-        let expired = match RecordsLock::acquire(&records, bound) {
+        let expired = match RecordsLock::acquire(&crate::census::this_test(), &records, bound) {
             Err(ArtifactError::LockExpired(expired)) => expired,
             Err(error) => panic!("the wait for a held records lock failed otherwise: {error}"),
             Ok(_) => panic!("the records lock another process holds was granted"),
@@ -6555,7 +6587,7 @@ mod tests {
             cowshed_os::test_backstop::NO_PROGRESS,
         );
         drop(
-            RecordsLock::acquire(&records, backstop)
+            RecordsLock::acquire(&crate::census::this_test(), &records, backstop)
                 .expect("the abandoned wait let its late lock go"),
         );
         fs::remove_dir_all(root).unwrap();
@@ -6699,7 +6731,7 @@ mod tests {
         );
         let records = fs::read(records_path(&root)).unwrap();
         assert!(matches!(
-            recover_records(&records_path(&root)),
+            recover_records(&crate::census::this_test(), &records_path(&root)),
             Err(ArtifactError::NewerLayout { .. })
         ));
         assert_eq!(fs::read(records_path(&root)).unwrap(), records);
@@ -6737,7 +6769,7 @@ mod tests {
             append_batch(&root, &malformed);
             let before = fs::read(records_path(&root)).unwrap();
             assert!(matches!(
-                recover_records(&records_path(&root)),
+                recover_records(&crate::census::this_test(), &records_path(&root)),
                 Err(ArtifactError::Integrity { .. })
             ));
             assert_eq!(fs::read(records_path(&root)).unwrap(), before);
@@ -6762,7 +6794,7 @@ mod tests {
             drop(store_at(&root, ArtifactConfig::default()));
             append_batch(&root, &batch);
             assert!(matches!(
-                recover_records(&records_path(&root)),
+                recover_records(&crate::census::this_test(), &records_path(&root)),
                 Err(ArtifactError::Integrity { .. })
             ));
             assert!(
@@ -7417,6 +7449,7 @@ mod tests {
         let batch = job_record_to_batch(&record).unwrap();
         let payload = encode_batch(&batch).unwrap();
         append_framed_batch(
+            &crate::census::this_test(),
             &records_path(root),
             &payload,
             Sha256Digest::compute(&payload),
@@ -7463,6 +7496,7 @@ mod tests {
     fn append_batch(root: &Path, batch: &RecordBatch) {
         let payload = encode_batch(batch).unwrap();
         append_framed_batch(
+            &crate::census::this_test(),
             &records_path(root),
             &payload,
             Sha256Digest::compute(&payload),
@@ -7488,7 +7522,7 @@ mod tests {
             },
         );
 
-        let report = recover_records(&records_path(&root)).unwrap();
+        let report = recover_records(&crate::census::this_test(), &records_path(&root)).unwrap();
         assert_eq!(
             report
                 .frames
@@ -7520,7 +7554,8 @@ mod tests {
         append_batch(&root, &newer);
         let length = fs::metadata(records_path(&root)).unwrap().len();
 
-        let refused = recover_records(&records_path(&root)).unwrap_err();
+        let refused =
+            recover_records(&crate::census::this_test(), &records_path(&root)).unwrap_err();
         assert_eq!(
             refused,
             ArtifactError::NewerLayout {
@@ -7543,7 +7578,8 @@ mod tests {
                 &root,
                 OwnedRepoIds::sole(repo()),
                 incarnation(),
-                ArtifactConfig::default()
+                ArtifactConfig::default(),
+                crate::census::this_test()
             ),
             Err(ArtifactError::NewerLayout { .. })
         ));
@@ -7553,7 +7589,7 @@ mod tests {
         drop(store_at(&root, ArtifactConfig::default()));
         append_batch(&root, &current.slice(0, 0));
         assert!(matches!(
-            recover_records(&records_path(&root)),
+            recover_records(&crate::census::this_test(), &records_path(&root)),
             Err(ArtifactError::Integrity { message, .. }) if message.contains("0 rows")
         ));
         fs::remove_dir_all(&root).unwrap();
@@ -9002,6 +9038,7 @@ mod tests {
         let intact_records = fs::read(records_path(&root)).unwrap();
         let sequence = highest_record_sequence(
             &recover_records_with_budget(
+                &crate::census::this_test(),
                 &records_path(&root),
                 ArtifactConfig::default().retained_recovery_budget_bytes,
             )
@@ -9308,6 +9345,7 @@ mod tests {
                 OwnedRepoIds::sole(repo()),
                 incarnation(),
                 ArtifactConfig::default(),
+                crate::census::this_test(),
             )
             .err();
             fs::remove_dir_all(&root).unwrap();
@@ -9446,6 +9484,7 @@ mod tests {
                     historical_incarnations: lineage.clone(),
                     ..ArtifactConfig::default()
                 },
+                crate::census::this_test(),
             )
             .unwrap();
             let next = store.next_job_id().unwrap();
@@ -9463,6 +9502,7 @@ mod tests {
             lineage.insert(origin.clone());
         }
         let recorded = recorded_historical_incarnations(
+            &crate::census::this_test(),
             &root,
             &incarnation(),
             ArtifactConfig::default().retained_recovery_budget_bytes,
@@ -9470,6 +9510,7 @@ mod tests {
         .unwrap();
         assert_eq!(recorded, BTreeSet::from([ancestor.clone(), older]));
         let own = recorded_historical_incarnations(
+            &crate::census::this_test(),
             &root,
             &ancestor,
             ArtifactConfig::default().retained_recovery_budget_bytes,
@@ -9482,6 +9523,7 @@ mod tests {
         let empty_root = temp_root("recorded-origins-empty");
         assert!(
             recorded_historical_incarnations(
+                &crate::census::this_test(),
                 &empty_root,
                 &incarnation(),
                 ArtifactConfig::default().retained_recovery_budget_bytes,
@@ -9551,7 +9593,12 @@ mod tests {
             let root = temp_root(&format!("frame-size-{length}"));
             let path = records_path(&root);
             let payload = vec![0x5a; length];
-            let result = append_framed_batch(&path, &payload, Sha256Digest::compute(&payload));
+            let result = append_framed_batch(
+                &crate::census::this_test(),
+                &path,
+                &payload,
+                Sha256Digest::compute(&payload),
+            );
             assert_eq!(
                 result.is_ok(),
                 accepted,
@@ -9615,18 +9662,36 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let path = records_path(&root);
         let first = b"first complete payload";
-        append_framed_batch(&path, first, Sha256Digest::compute(first)).unwrap();
+        append_framed_batch(
+            &crate::census::this_test(),
+            &path,
+            first,
+            Sha256Digest::compute(first),
+        )
+        .unwrap();
         let before = fs::read(&path).unwrap();
 
         let failed = b"must not remain";
         assert!(matches!(
-            append_framed_batch_impl(&path, failed, Sha256Digest::compute(failed), Some(11),),
+            append_framed_batch_impl(
+                &crate::census::this_test(),
+                &path,
+                failed,
+                Sha256Digest::compute(failed),
+                Some(11),
+            ),
             Err(ArtifactError::Io { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), before);
 
         let later = b"later complete payload";
-        append_framed_batch(&path, later, Sha256Digest::compute(later)).unwrap();
+        append_framed_batch(
+            &crate::census::this_test(),
+            &path,
+            later,
+            Sha256Digest::compute(later),
+        )
+        .unwrap();
         let after = fs::read(&path).unwrap();
         assert_eq!(&after[..before.len()], before.as_slice());
         assert_eq!(
@@ -9670,7 +9735,13 @@ mod tests {
         let path = records_path(&root);
         let failed = b"failed-first-frame";
         assert!(matches!(
-            append_framed_batch_impl(&path, failed, Sha256Digest::compute(failed), Some(0)),
+            append_framed_batch_impl(
+                &crate::census::this_test(),
+                &path,
+                failed,
+                Sha256Digest::compute(failed),
+                Some(0)
+            ),
             Err(ArtifactError::Io { .. })
         ));
         assert_eq!(fs::metadata(&path).unwrap().len(), 0);
@@ -9687,7 +9758,13 @@ mod tests {
             0o600
         );
         let retry = b"retry-frame";
-        append_framed_batch(&path, retry, Sha256Digest::compute(retry)).unwrap();
+        append_framed_batch(
+            &crate::census::this_test(),
+            &path,
+            retry,
+            Sha256Digest::compute(retry),
+        )
+        .unwrap();
         let bytes = fs::read(&path).unwrap();
         assert!(bytes.starts_with(RECORD_MAGIC));
         assert_eq!(
@@ -9697,7 +9774,12 @@ mod tests {
 
         let too_large = vec![0_u8; MAX_RECORD_BATCH_BYTES as usize + 1];
         assert!(matches!(
-            append_framed_batch(&path, &too_large, Sha256Digest::compute(&too_large)),
+            append_framed_batch(
+                &crate::census::this_test(),
+                &path,
+                &too_large,
+                Sha256Digest::compute(&too_large)
+            ),
             Err(ArtifactError::Arrow(_))
         ));
         fs::remove_dir_all(root).unwrap();
@@ -9727,7 +9809,7 @@ mod tests {
         bad_complement[RECORD_MAGIC.len() + 16] ^= 1;
         fs::write(&path, &bad_complement).unwrap();
         assert!(matches!(
-            recover_records(&path),
+            recover_records(&crate::census::this_test(), &path),
             Err(ArtifactError::Integrity { .. })
         ));
 
@@ -9739,7 +9821,7 @@ mod tests {
             .copy_from_slice(&(!length).to_le_bytes());
         fs::write(&path, &excessive).unwrap();
         assert!(matches!(
-            recover_records(&path),
+            recover_records(&crate::census::this_test(), &path),
             Err(ArtifactError::Integrity { .. })
         ));
 
@@ -9750,7 +9832,7 @@ mod tests {
         incomplete.extend_from_slice(&(!declared).to_le_bytes());
         incomplete.extend_from_slice(b"abc");
         fs::write(&path, &incomplete).unwrap();
-        let recovered = recover_records(&path).unwrap();
+        let recovered = recover_records(&crate::census::this_test(), &path).unwrap();
         assert_eq!(recovered.truncated_bytes, (FRAME_HEADER_BYTES + 3) as u64);
         assert_eq!(fs::metadata(&path).unwrap().len(), valid_len as u64);
 
@@ -9758,7 +9840,7 @@ mod tests {
         invalid_tail.extend_from_slice(b"BAD");
         fs::write(&path, invalid_tail).unwrap();
         assert!(matches!(
-            recover_records(&path),
+            recover_records(&crate::census::this_test(), &path),
             Err(ArtifactError::Integrity { .. })
         ));
         fs::remove_dir_all(root).unwrap();
@@ -9835,13 +9917,14 @@ mod tests {
         let batch = job_record_to_batch(&duplicate).unwrap();
         let payload = encode_batch(&batch).unwrap();
         append_framed_batch(
+            &crate::census::this_test(),
             &records_path(&duplicate_root),
             &payload,
             Sha256Digest::compute(&payload),
         )
         .unwrap();
         assert!(matches!(
-            recover_records(&records_path(&duplicate_root)),
+            recover_records(&crate::census::this_test(), &records_path(&duplicate_root)),
             Err(ArtifactError::Integrity { message, .. })
                 if message.contains("duplicate terminal")
         ));
@@ -9874,6 +9957,7 @@ mod tests {
             owned.clone(),
             incarnation(),
             ArtifactConfig::default(),
+            crate::census::this_test(),
         );
         assert!(
             accepted.is_ok(),
@@ -9884,6 +9968,7 @@ mod tests {
             OwnedRepoIds::sole(owned.current().clone()),
             incarnation(),
             ArtifactConfig::default(),
+            crate::census::this_test(),
         );
         assert!(matches!(
             rejected,
@@ -10060,6 +10145,7 @@ mod tests {
             .unwrap();
         file.sync_data().unwrap();
         repair_workspace_record_sequences(
+            &crate::census::this_test(),
             &root,
             ArtifactConfig::default().retained_recovery_budget_bytes,
         )
@@ -10098,7 +10184,7 @@ mod tests {
         }
         let path = records_path(&root);
         let original = fs::read(&path).unwrap();
-        let ordering = recover_records(&path).unwrap_err();
+        let ordering = recover_records(&crate::census::this_test(), &path).unwrap_err();
         assert!(matches!(
             ordering,
             ArtifactError::SequenceOrdering {
@@ -10112,6 +10198,7 @@ mod tests {
         assert!(refusal.contains("cowshed doctor --repair"));
 
         let repair = repair_workspace_record_sequences(
+            &crate::census::this_test(),
             &root,
             ArtifactConfig::default().retained_recovery_budget_bytes,
         )
@@ -10152,7 +10239,7 @@ mod tests {
         fs::write(&path, &corrupted).unwrap();
 
         assert!(matches!(
-            repair_workspace_record_sequences(
+            repair_workspace_record_sequences(&crate::census::this_test(),
                 &root,
                 ArtifactConfig::default().retained_recovery_budget_bytes,
             ),

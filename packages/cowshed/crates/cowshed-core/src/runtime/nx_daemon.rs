@@ -1472,7 +1472,7 @@ mod tests {
             waited += PROBE_INTERVAL;
         }
         let walked = crate::build_volume::nx::process_table_walks() - walks;
-        let census = crate::build_volume::nx::tree_holders(&root);
+        let census = crate::build_volume::nx::tree_holders(&crate::census::this_test(), &root);
         let censused = crate::build_volume::nx::process_table_walks() - walks - walked;
         // SAFETY: kill takes plain integers and touches no memory of ours.
         unsafe { libc::kill(run, libc::SIGKILL) };
@@ -1949,7 +1949,9 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let (mut daemon, worker) = sandboxed_daemon_with_worker();
         write_record(&data.join("d/server-process.json"), daemon.id(), &socket);
-        let closed = crate::build_volume::nx::close_workspace_data(&data).unwrap();
+        let closed =
+            crate::build_volume::nx::close_workspace_data(&crate::census::this_test(), &data)
+                .unwrap();
         daemon.wait_bounded().unwrap();
         drop(listener);
         let outlived = outlived(&worker);

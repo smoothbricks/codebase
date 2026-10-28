@@ -1066,6 +1066,7 @@ pub struct MacOsApfsExecutionHost<R> {
     config: ApfsSubstrateConfig,
     image_telemetry: ImageTelemetry,
     mounted: MountedRegistry,
+    census: crate::census::CensusScope,
     mount_source: Arc<dyn KernelMountSource>,
 }
 
@@ -1095,6 +1096,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(Self {
             backend: MacOsApfsBackend::new(runner),
             image_telemetry: ImageTelemetry::new(&config.store_root),
+            census: crate::census::CensusScope::new(
+                config.namespace,
+                Arc::from(config.store_root.as_path()),
+            ),
             config,
             mounted: MountedRegistry::start()?,
             mount_source: Arc::new(mount_source),
@@ -1693,6 +1698,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 &[lock],
                 LockMode::Try,
                 &crate::held_lock::ImageLockTaker {
+                    census: &self.census,
                     holding: &crate::api::held_lock::LockHolding {
                         operation: crate::api::held_lock::LockOperation::Recover,
                         workspace: crate::storage::image_workspace(canonical),
@@ -2358,6 +2364,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             &[lock.to_owned()],
             LockMode::Try,
             &crate::held_lock::ImageLockTaker {
+                census: &self.census,
                 holding: &crate::api::held_lock::LockHolding::store(
                     crate::api::held_lock::LockOperation::Gc,
                 ),
@@ -2947,6 +2954,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             plan.lock_paths(),
             LockMode::Try,
             &crate::held_lock::ImageLockTaker {
+                census: &self.census,
                 holding: &crate::api::held_lock::LockHolding::store(
                     crate::api::held_lock::LockOperation::Gc,
                 ),
@@ -3494,7 +3502,8 @@ where
             return refusal.into();
         }
         let holders = match self.mounted_at(mount_point) {
-            Ok(Some(_)) => match crate::build_volume::nx::volume_holders(mount_point) {
+            Ok(Some(_)) => match crate::build_volume::nx::volume_holders(&self.census, mount_point)
+            {
                 Ok(holders) => holders,
                 Err(error) => {
                     return ApfsStorageError::Cleanup {
@@ -3635,6 +3644,10 @@ where
 {
     type LockGuard = ImageLockGuard;
 
+    fn census(&self) -> &crate::census::CensusScope {
+        &self.census
+    }
+
     fn lock_images(
         &self,
         paths: &[PathBuf],
@@ -3645,7 +3658,10 @@ where
             &self.config.store_root,
             paths,
             mode,
-            &crate::held_lock::ImageLockTaker { holding },
+            &crate::held_lock::ImageLockTaker {
+                census: &self.census,
+                holding,
+            },
         )
         .map_err(Into::into)
     }
@@ -5700,10 +5716,14 @@ mod tests {
             }));
         }
 
-        LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
-            journal.begin(fixture.intent(Some(fixture.build())));
-            journal.mark_mutating(&WorkspaceName::main())
-        })
+        LifecycleIntentJournal::update(
+            &crate::census::this_test(),
+            &fixture.journal_path(),
+            |journal| {
+                journal.begin(fixture.intent(Some(fixture.build())));
+                journal.mark_mutating(&WorkspaceName::main())
+            },
+        )
         .unwrap();
         assert!(matches!(
             host.execute_gc(&config, before),
@@ -5741,12 +5761,16 @@ mod tests {
         );
         assert_eq!(fs::read(retained).unwrap(), b"retained source evidence");
 
-        LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
-            journal.complete(
-                &WorkspaceName::main(),
-                LifecycleIntentCompletion::Workspace(source.replacement.clone()),
-            )
-        })
+        LifecycleIntentJournal::update(
+            &crate::census::this_test(),
+            &fixture.journal_path(),
+            |journal| {
+                journal.complete(
+                    &WorkspaceName::main(),
+                    LifecycleIntentCompletion::Workspace(source.replacement.clone()),
+                )
+            },
+        )
         .unwrap();
         let completed = host
             .preview_gc(&config, &repo, StorageGcOptions::default())

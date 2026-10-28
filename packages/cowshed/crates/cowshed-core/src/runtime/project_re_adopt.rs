@@ -70,8 +70,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     ),
                     _ => error,
                 })?;
-        if let Err(busy) =
-            check_checkout_nx(&main, &checkout, CheckoutNxCheck::CloseRecorded).await?
+        if let Err(busy) = check_checkout_nx(
+            self.descriptor.storage.census(),
+            &main,
+            &checkout,
+            CheckoutNxCheck::CloseRecorded,
+        )
+        .await?
         {
             return Err(CowshedError::conflict(
                 format!("main cannot be re-adopted while its Nx state is in use: {busy}"),
@@ -319,7 +324,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         )?;
         // Step 1: the plain checkout is the copy source, so nothing may hold it while its state
         // is recorded and copied; nothing is ended to make it so.
-        refuse_tree_held(checkout)?;
+        refuse_tree_held(&self.descriptor.storage.census(), checkout)?;
         // Main's volume root holds cowshed's runtime state and macOS's bookkeeping, which main's
         // excludes hide. The checkout takes them now, so its Git state verifies against its copy.
         git.ensure_cowshed_excludes().await?;
@@ -622,7 +627,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// writes nothing; a changed one replaces only the recorded `git_before`, under the journal's
     /// lock and only while the record is still exactly `source`.
     async fn rerecord_missing_main_git(&mut self, source: &ReAdoptSource) -> Result<ReAdoptSource> {
-        refuse_tree_held(&source.checkout)?;
+        refuse_tree_held(&self.descriptor.storage.census(), &source.checkout)?;
         let git_before = capture_git(&source.checkout).await?;
         if git_before == source.git_before {
             return Ok(source.clone());
@@ -854,8 +859,8 @@ fn refuse_held(path: &Path, holders: &[cowshed_os::process::Holder]) -> Result<(
 
 /// Refuse when anything holds a file, a working directory or an executable inside the plain
 /// checkout tree at `checkout`, a missing main's copy source.
-fn refuse_tree_held(checkout: &Path) -> Result<()> {
-    let holders = crate::build_volume::nx::tree_holders(checkout).map_err(|error| {
+fn refuse_tree_held(census: &crate::census::CensusScope, checkout: &Path) -> Result<()> {
+    let holders = crate::build_volume::nx::tree_holders(census, checkout).map_err(|error| {
         CowshedError::environment_missing(
             format!("cannot list what holds {}: {error}", checkout.display()),
             "cowshed doctor --json",

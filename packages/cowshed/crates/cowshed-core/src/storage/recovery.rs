@@ -909,6 +909,7 @@ impl LifecycleIntentJournal {
     /// unpublished clone that nothing could finish or retire. The file is re-read and rewritten
     /// under an exclusive lock on its `.lock` sibling, held for exactly that read and write.
     pub fn update<T>(
+        census: &crate::census::CensusScope,
         path: &Path,
         change: impl FnOnce(&mut Self) -> CowshedResult<T>,
     ) -> CowshedResult<(Self, T)> {
@@ -920,7 +921,7 @@ impl LifecycleIntentJournal {
             lock,
             Path::new(&lock_path),
             &cowshed_os::deadline::start("lifecycle intent journal", cowshed_os::deadline::CONTROL),
-            crate::held_lock::holders,
+            |lock| crate::held_lock::holders(census, lock),
         )
         .map_err(|error| {
             CowshedError::environment_missing(

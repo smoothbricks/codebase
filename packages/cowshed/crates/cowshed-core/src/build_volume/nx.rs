@@ -24,6 +24,8 @@ pub(crate) const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
 
 use cowshed_os::process::{DescriptorName, Holder};
 
+use crate::census::{Asked, CensusScope, Lineage, Listed};
+
 /// Processes, each as `pid <n> (<argv>)`, joined by `; `.
 pub struct Holders<'a>(pub &'a [Holder]);
 
@@ -98,8 +100,8 @@ impl std::fmt::Display for TreeHold {
 /// Every process holding anything inside the directory tree at `root` ([`tree_holds`]),
 /// without what it holds.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn tree_holders(root: &Path) -> io::Result<Vec<Holder>> {
-    Ok(tree_holds(root)?
+pub fn tree_holders(census: &CensusScope, root: &Path) -> io::Result<Vec<Holder>> {
+    Ok(tree_holds(census, root)?
         .into_iter()
         .map(|held| held.holder)
         .collect())
@@ -198,9 +200,13 @@ impl std::fmt::Display for Busy {
 /// and ask once more. Any holder then is [`Busy`]; nothing is stopped except a daemon already
 /// asked to.
 #[cfg(target_os = "macos")]
-pub fn close(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), Busy>> {
+pub fn close(
+    census: &CensusScope,
+    volume: &Path,
+    state: &BuildVolumeState,
+) -> io::Result<Result<(), Busy>> {
     for data in state.nx_workspace_data() {
-        if let Err(busy) = close_workspace_data(&volume.join(data))? {
+        if let Err(busy) = close_workspace_data(census, &volume.join(data))? {
             return Ok(Err(busy));
         }
     }
@@ -209,10 +215,10 @@ pub fn close(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), B
 
 /// [`close`] for one `workspace-data` directory, wherever it lives: in a build volume, or in a
 /// checkout that links none. A directory that does not exist holds nothing.
-pub fn close_workspace_data(data: &Path) -> io::Result<Result<(), Busy>> {
+pub fn close_workspace_data(census: &CensusScope, data: &Path) -> io::Result<Result<(), Busy>> {
     let daemon = live_daemon(data);
     let databases = task_databases_in(data)?;
-    if let Some(busy) = first_held(&databases, daemon)? {
+    if let Some(busy) = first_held(census, &databases, daemon)? {
         return Ok(Err(busy));
     }
     if let Some(pid) = daemon
@@ -220,7 +226,7 @@ pub fn close_workspace_data(data: &Path) -> io::Result<Result<(), Busy>> {
     {
         return Ok(Err(busy));
     }
-    Ok(first_held(&databases, None)?.map_or(Ok(()), Err))
+    Ok(first_held(census, &databases, None)?.map_or(Ok(()), Err))
 }
 
 /// Stop the live daemon the `workspace-data` directory `data` records, as stock `nx daemon
@@ -251,10 +257,14 @@ fn stop_live_daemon(pid: i32) -> io::Result<Result<(), Busy>> {
 
 /// The first of `databases` that a process other than `daemon` holds open, with its holders:
 /// one descriptor census for all of them ([`descriptor_holders`]).
-fn first_held(databases: &[PathBuf], daemon: Option<i32>) -> io::Result<Option<Busy>> {
+fn first_held(
+    census: &CensusScope,
+    databases: &[PathBuf],
+    daemon: Option<i32>,
+) -> io::Result<Option<Busy>> {
     Ok(databases
         .iter()
-        .zip(descriptor_holders(databases)?)
+        .zip(descriptor_holders(census, databases)?)
         .find_map(|(database, holders)| {
             let holders: Vec<Holder> = holders
                 .into_iter()
@@ -270,17 +280,24 @@ fn first_held(databases: &[PathBuf], daemon: Option<i32>) -> io::Result<Option<B
 /// Whether any process holds one `workspace-data` directory's task databases open. This never
 /// reads a daemon record, connects to its socket or signals a process.
 #[cfg(target_os = "macos")]
-pub(crate) fn held_workspace_data(data: &Path) -> io::Result<Result<(), Busy>> {
-    Ok(first_held(&task_databases_in(data)?, None)?.map_or(Ok(()), Err))
+pub(crate) fn held_workspace_data(
+    census: &CensusScope,
+    data: &Path,
+) -> io::Result<Result<(), Busy>> {
+    Ok(first_held(census, &task_databases_in(data)?, None)?.map_or(Ok(()), Err))
 }
 
 /// Whether any process holds one of the volume's task databases open, without stopping
 /// anything: the second look [`close`] takes, for a caller that has to know nothing opened one
 /// since.
 #[cfg(target_os = "macos")]
-pub fn held(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), Busy>> {
+pub fn held(
+    census: &CensusScope,
+    volume: &Path,
+    state: &BuildVolumeState,
+) -> io::Result<Result<(), Busy>> {
     for data in state.nx_workspace_data() {
-        if let Err(busy) = held_workspace_data(&volume.join(data))? {
+        if let Err(busy) = held_workspace_data(census, &volume.join(data))? {
             return Ok(Err(busy));
         }
     }
@@ -319,6 +336,7 @@ pub struct Opening {
 /// existing database holders from openers waiting until these guards are dropped.
 #[cfg(target_os = "macos")]
 pub fn hold_opens(
+    census: &CensusScope,
     volume: &Path,
     state: &BuildVolumeState,
     next: &Path,
@@ -354,7 +372,7 @@ pub fn hold_opens(
                     drop(locks);
                     return Ok(Err(Opening {
                         database,
-                        holders: holders(&lock)?,
+                        holders: holders(census, &lock)?,
                     }));
                 }
                 Err(fs::TryLockError::Error(error)) => return Err(error),
@@ -473,13 +491,13 @@ fn stop_daemon(pid: i32) -> io::Result<bool> {
 /// Every process that has `path` open, from procfs: each `/proc/<pid>/fd` link that names the
 /// file. A process of another user, or one that exited since the listing, shows none.
 #[cfg(target_os = "linux")]
-pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
+pub fn holders(census: &CensusScope, path: &Path) -> io::Result<Vec<Holder>> {
     let file = match fs::canonicalize(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let open = procfs_census(|process| {
+    let open = procfs_census(census, |process| {
         fs::read_dir(process.join("fd"))
             .is_ok_and(|descriptors| {
                 descriptors.flatten().any(|descriptor| {
@@ -493,17 +511,20 @@ pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
 
 /// [`holders`] of each of `files`, in order.
 #[cfg(target_os = "linux")]
-fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
-    files.iter().map(|file| holders(file)).collect()
+fn descriptor_holders(census: &CensusScope, files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
+    files.iter().map(|file| holders(census, file)).collect()
 }
 
 /// Every process with a descriptor on the inode `(device, inode)`, with those descriptors, from
 /// procfs: each `/proc/<pid>/fd` entry whose file (followed, so its device and inode, not its path)
 /// is that inode. A process of another user, or one that exited since the listing, shows none.
 #[cfg(target_os = "linux")]
-pub(crate) fn inode_holders(identity: (u64, u64)) -> io::Result<Vec<(Holder, Vec<i32>)>> {
+pub(crate) fn inode_holders(
+    census: &CensusScope,
+    identity: (u64, u64),
+) -> io::Result<Vec<(Holder, Vec<i32>)>> {
     use std::os::unix::fs::MetadataExt;
-    procfs_census(|process| {
+    procfs_census(census, |process| {
         let descriptors: Vec<i32> = fs::read_dir(process.join("fd"))
             .ok()?
             .flatten()
@@ -522,8 +543,8 @@ pub(crate) fn inode_holders(identity: (u64, u64)) -> io::Result<Vec<(Holder, Vec
 /// answering `EBUSY`. From procfs, so a process of another user, or one that exited since the
 /// listing, shows none.
 #[cfg(target_os = "linux")]
-pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
-    tree_holders(mount)
+pub fn volume_holders(census: &CensusScope, mount: &Path) -> io::Result<Vec<Holder>> {
+    tree_holders(census, mount)
 }
 
 /// Every process holding anything inside the directory tree at `root` -- its working directory,
@@ -533,14 +554,14 @@ pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
 /// of another user, or one that exited since the listing, shows none. `root` is canonicalized
 /// first, so a symlinked path names the tree its target does; a missing `root` has none.
 #[cfg(target_os = "linux")]
-pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
+pub fn tree_holds(census: &CensusScope, root: &Path) -> io::Result<Vec<TreeHold>> {
     let root = match fs::canonicalize(root) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
     let under = |link: PathBuf| link.starts_with(&root).then_some(link);
-    let holds = procfs_census(|process| {
+    let holds = procfs_census(census, |process| {
         let link = |name: &str| fs::read_link(process.join(name)).ok().and_then(under);
         link("cwd")
             .map(Hold::WorkingDirectory)
@@ -585,12 +606,15 @@ fn walk_begins() {
     PROCESS_TABLE_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Every process under `/proc` that `held` names something for, given its `/proc/<pid>`
-/// directory, with what it named.
+/// Every process `census` asks ([`census_pids`]) that `held` names something for, given its
+/// `/proc/<pid>` directory, with what it named.
 #[cfg(target_os = "linux")]
-fn procfs_census<T>(held: impl Fn(&Path) -> Option<T>) -> io::Result<Vec<(Holder, T)>> {
+fn procfs_census<T>(
+    census: &CensusScope,
+    held: impl Fn(&Path) -> Option<T>,
+) -> io::Result<Vec<(Holder, T)>> {
     let mut holders = Vec::new();
-    for pid in all_pids()? {
+    for pid in census_pids(census)?.pids {
         if let Some(hold) = held(Path::new(&format!("/proc/{pid}"))) {
             holders.push((
                 Holder {
@@ -646,8 +670,8 @@ fn command_line(pid: libc::pid_t) -> String {
 /// Every process with a descriptor open on the file at `path` ([`descriptor_holders`]). A missing
 /// file has none.
 #[cfg(target_os = "macos")]
-pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
-    Ok(descriptor_holders(&[path.to_owned()])?
+pub fn holders(census: &CensusScope, path: &Path) -> io::Result<Vec<Holder>> {
+    Ok(descriptor_holders(census, &[path.to_owned()])?
         .into_iter()
         .flatten()
         .collect())
@@ -659,7 +683,7 @@ pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
 /// no holder. No mapped region is walked: a database or lock is only ever held through a
 /// descriptor.
 #[cfg(target_os = "macos")]
-fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
+fn descriptor_holders(census: &CensusScope, files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
     use std::os::unix::fs::MetadataExt;
     let mut identities = Vec::with_capacity(files.len());
     for file in files {
@@ -674,7 +698,7 @@ fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
         return Ok(held);
     }
     let vinfo_size = c_size::<VnodeFdinfo>()?;
-    for pid in census_pids()? {
+    for pid in census_pids(census)?.pids {
         let mut holds = vec![false; files.len()];
         for fd in vnode_descriptors(pid)? {
             let Some(identity) = vnode_fd_identity(pid, fd, vinfo_size) else {
@@ -706,10 +730,13 @@ fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
 /// A lock's custody takes such a holder from the lock's own record instead
 /// (`held_lock::kernel_view`).
 #[cfg(target_os = "macos")]
-pub(crate) fn inode_holders(identity: (u64, u64)) -> io::Result<Vec<(Holder, Vec<i32>)>> {
+pub(crate) fn inode_holders(
+    census: &CensusScope,
+    identity: (u64, u64),
+) -> io::Result<Vec<(Holder, Vec<i32>)>> {
     let vinfo_size = c_size::<VnodeFdinfo>()?;
     let mut holders = Vec::new();
-    for pid in census_pids()? {
+    for pid in census_pids(census)?.pids {
         let descriptors: Vec<i32> = vnode_descriptors(pid)?
             .into_iter()
             .filter(|&fd| vnode_fd_identity(pid, fd, vinfo_size) == Some(identity))
@@ -751,15 +778,19 @@ pub struct ObjectCensus<K> {
 
 /// Every process with a descriptor on one of `objects`, each named as
 /// [`cowshed_os::process::descriptor_name`] names it (lsof's `d` or `i`), with the caller's key
-/// for it. One pass over every live pid the kernel lists ([`all_pids`]), reading only the names the
+/// for it. One pass over the processes `census` asks ([`census_pids`]), reading only the names the
 /// objects need ([`NameKinds`]). A process found holding one is confirmed: its life is read, its
 /// descriptors read again, then its life again, so the descriptors reported are that life's and
 /// never a later process's given the pid. A process that exits during the census holds nothing;
 /// one whose descriptors or life the kernel withholds is counted in `uninspected`, and so, on
-/// Darwin, is one a cowshed lifecycle operation runs in, whose descriptors are never read: a
-/// fork's first mount of its new image holds that vnode for minutes ([`inode_holders`]).
+/// Darwin, is one a cowshed lifecycle operation of the census's store runs in, whose descriptors
+/// are never read: a fork's first mount of its new image holds that vnode for minutes
+/// ([`inode_holders`]).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn object_holders<K: Copy>(objects: &[(DescriptorName, K)]) -> io::Result<ObjectCensus<K>> {
+pub fn object_holders<K: Copy>(
+    census: &CensusScope,
+    objects: &[(DescriptorName, K)],
+) -> io::Result<ObjectCensus<K>> {
     use crate::runtime::job_groups::life_of;
     use cowshed_os::process::{NameKinds, Unread, descriptor_names};
 
@@ -799,16 +830,8 @@ pub fn object_holders<K: Copy>(objects: &[(DescriptorName, K)]) -> io::Result<Ob
     let mut holds = Vec::new();
     let mut uninspected = 0_usize;
     let mut unread = |unread: Unread| uninspected += usize::from(unread == Unread::Withheld);
-    #[cfg(target_os = "macos")]
-    let lifecycle = crate::lease_holder::running_lifecycle();
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-    let mut unasked = 0_usize;
-    for pid in all_pids()? {
-        #[cfg(target_os = "macos")]
-        if lifecycle.contains(&pid) {
-            unasked += 1;
-            continue;
-        }
+    let asked = census_pids(census)?;
+    for pid in asked.pids {
         match on_objects(pid)? {
             Ok(held) if held.is_empty() => continue,
             Ok(_) => {}
@@ -851,7 +874,7 @@ pub fn object_holders<K: Copy>(objects: &[(DescriptorName, K)]) -> io::Result<Ob
     }
     Ok(ObjectCensus {
         holds,
-        uninspected: u32::try_from(uninspected + unasked).map_err(io::Error::other)?,
+        uninspected: u32::try_from(uninspected + asked.passed_over).map_err(io::Error::other)?,
     })
 }
 
@@ -864,7 +887,7 @@ pub fn object_holders<K: Copy>(objects: &[(DescriptorName, K)]) -> io::Result<Ob
 /// processes a census asks about ([`census_pids`]) rather than libproc's own listing, which asks
 /// every process, a lifecycle operation's included ([`on_volume`]). A missing mount has none.
 #[cfg(target_os = "macos")]
-pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
+pub fn volume_holders(census: &CensusScope, mount: &Path) -> io::Result<Vec<Holder>> {
     use std::os::unix::fs::MetadataExt;
     let device = match fs::metadata(mount) {
         Ok(metadata) => metadata.dev(),
@@ -872,7 +895,7 @@ pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
         Err(error) => return Err(error),
     };
     let mut holders = Vec::new();
-    for pid in census_pids()? {
+    for pid in census_pids(census)?.pids {
         if on_volume(pid, device)? {
             holders.push(Holder {
                 pid,
@@ -1041,14 +1064,14 @@ struct ThreadWithPath {
 /// `volume_holders` cannot name without naming its whole volume. A process the kernel withholds
 /// from this user, or that exited since the listing, shows none. A missing `root` has none.
 #[cfg(target_os = "macos")]
-pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
+pub fn tree_holds(census: &CensusScope, root: &Path) -> io::Result<Vec<TreeHold>> {
     let root = match fs::canonicalize(root) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
     let mut holds = Vec::new();
-    for pid in census_pids()? {
+    for pid in census_pids(census)?.pids {
         if let Some(hold) = hold_in_tree(pid, &root)? {
             holds.push(TreeHold {
                 holder: Holder {
@@ -1269,19 +1292,99 @@ struct VnodeFdinfoWithPath {
 #[cfg(target_os = "macos")]
 const O_EVTONLY: u32 = 0x0000_8000;
 
-/// The processes a census asks about: every live pid but those a cowshed lifecycle operation runs
-/// in, as its lease records them ([`crate::lease_holder::running_lifecycle`]). Such a process can
-/// hold one of its descriptors' vnodes in one kernel call for a minute -- a fork's read-write mount
-/// of a new clone, which pays the clone's extent-map copy -- and every per-descriptor query of it waits that long; the
+/// The processes `census` asks about ([`crate::census::asked`]): of every live pid, those its reach
+/// covers (all of them for the host store, the namespace owner's tree for a fixture's), but those a
+/// cowshed lifecycle operation of its store runs in, as their leases record them
+/// ([`crate::lease_holder::running_lifecycle`]). Such a process can hold one of its descriptors'
+/// vnodes in one kernel call for a minute -- a fork's read-write mount of a new clone, which pays
+/// the clone's extent-map copy -- and every per-descriptor query of it waits that long; the
 /// operation's own leases and image locks already refuse what a census guards. The one walker
 /// every macOS census starts from, counted once per census ([`walk_begins`]).
 #[cfg(target_os = "macos")]
-fn census_pids() -> io::Result<Vec<libc::pid_t>> {
-    let running = crate::lease_holder::running_lifecycle();
+fn census_pids(census: &CensusScope) -> io::Result<Asked> {
+    census_pids_reading(census, |lease| fs::read(lease))
+}
+
+/// [`census_pids`], reading each lease of the census's store with `read`.
+#[cfg(target_os = "macos")]
+fn census_pids_reading(
+    census: &CensusScope,
+    read: impl FnMut(&Path) -> io::Result<Vec<u8>>,
+) -> io::Result<Asked> {
+    let lifecycle = crate::lease_holder::running_lifecycle(census.store(), read);
+    Ok(crate::census::asked(
+        census.reach(),
+        &listed(census)?,
+        &lifecycle,
+    ))
+}
+
+/// The processes `census` asks about ([`crate::census::asked`]): of every live pid, those its reach
+/// covers. Linux records no unique id, so no lease passes a process over: its census asks every
+/// process in its reach. The one walker every Linux census starts from ([`walk_begins`]).
+#[cfg(target_os = "linux")]
+fn census_pids(census: &CensusScope) -> io::Result<Asked> {
+    Ok(crate::census::asked(
+        census.reach(),
+        &listed(census)?,
+        &std::collections::BTreeSet::new(),
+    ))
+}
+
+/// Every live pid ([`all_pids`]), each with its lineage when `census`'s reach needs it
+/// ([`lineage_of`]).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn listed(census: &CensusScope) -> io::Result<Vec<Listed>> {
+    let lineage = census.reach().needs_lineage();
     Ok(all_pids()?
         .into_iter()
-        .filter(|pid| !running.contains(pid))
+        .map(|pid| Listed {
+            pid,
+            lineage: if lineage { lineage_of(pid) } else { None },
+        })
         .collect())
+}
+
+/// `pid`'s parent and process group (`PROC_PIDT_SHORTBSDINFO`): one call that reads the
+/// process's own fields and never a vnode, so it never waits on a kernel call the process is in.
+/// `None` once it has exited, or when the kernel will not describe it to this user: such a process
+/// is in no fixture's reach.
+#[cfg(target_os = "macos")]
+fn lineage_of(pid: libc::pid_t) -> Option<Lineage> {
+    let size = c_size::<libc::proc_bsdshortinfo>().ok()?;
+    // SAFETY: `proc_bsdshortinfo` is plain C data, for which all zeros is a valid value; it is
+    // read only when the kernel fills all of it.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    if filled != size {
+        return None;
+    }
+    Some(Lineage {
+        parent: libc::pid_t::try_from(info.pbsi_ppid).ok()?,
+        group: libc::pid_t::try_from(info.pbsi_pgid).ok()?,
+    })
+}
+
+/// `pid`'s parent and process group, the two fields after the state in `/proc/<pid>/stat` (the
+/// command before them, in parentheses, may hold any byte but the last `)`). `None` once it has
+/// exited.
+#[cfg(target_os = "linux")]
+fn lineage_of(pid: libc::pid_t) -> Option<Lineage> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace().skip(1);
+    Some(Lineage {
+        parent: fields.next()?.parse().ok()?,
+        group: fields.next()?.parse().ok()?,
+    })
 }
 
 /// Every live pid the kernel lists (`proc_listallpids`, which answers a count of pids, not bytes),
@@ -1371,12 +1474,13 @@ fn command_line(pid: libc::pid_t) -> String {
 /// said as such, and the wait is still taken.
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn hold_announced(
+    census: &CensusScope,
     opened: crate::held_lock::Opened,
     awaited: &str,
 ) -> io::Result<crate::held_lock::HeldLock> {
     let inode = opened.inode();
     let own = std::process::id();
-    let holders = match inode_holders((inode.dev.get(), inode.ino.get())) {
+    let holders = match inode_holders(census, (inode.dev.get(), inode.ino.get())) {
         Ok(holders) => holders
             .iter()
             .map(|(holder, descriptors)| {
@@ -1979,8 +2083,11 @@ mod tests {
         fs::create_dir_all(root.join("nx/workspace-data")).unwrap();
         let database = root.join("nx/workspace-data/T-v3.db");
         fs::write(&database, b"").unwrap();
-        assert_eq!(holders(&database).unwrap(), []);
-        assert_eq!(close(&root, &state()).unwrap(), Ok(()));
+        assert_eq!(holders(&crate::census::this_test(), &database).unwrap(), []);
+        assert_eq!(
+            close(&crate::census::this_test(), &root, &state()).unwrap(),
+            Ok(())
+        );
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("exec 3<\"$0\"; echo ready; read _")
@@ -1991,19 +2098,22 @@ mod tests {
             .unwrap();
         let pid = child.id() as i32;
         holder_ready(&mut child);
-        let held = holders(&database).unwrap();
+        let held = holders(&crate::census::this_test(), &database).unwrap();
         assert_eq!(
             held.iter().map(|holder| holder.pid).collect::<Vec<_>>(),
             [pid]
         );
         assert!(held[0].command.contains("sh"), "{held:?}");
-        match close(&root, &state()).unwrap() {
+        match close(&crate::census::this_test(), &root, &state()).unwrap() {
             Err(Busy::Held { holders, .. }) => assert_eq!(holders[0].pid, pid),
             other => panic!("expected the open database to refuse: {other:?}"),
         }
         drop(child.stdin.take());
         child.wait_bounded().unwrap();
-        assert_eq!(close(&root, &state()).unwrap(), Ok(()));
+        assert_eq!(
+            close(&crate::census::this_test(), &root, &state()).unwrap(),
+            Ok(())
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2030,13 +2140,13 @@ mod tests {
         let pid = child.id() as i32;
         let databases = [idle.clone(), open.clone(), gone];
         holder_ready(&mut child);
-        let held = descriptor_holders(&databases).unwrap();
+        let held = descriptor_holders(&crate::census::this_test(), &databases).unwrap();
         let pids = |holders: &[Holder]| holders.iter().map(|holder| holder.pid).collect::<Vec<_>>();
         assert_eq!(
             held.iter().map(|holders| pids(holders)).collect::<Vec<_>>(),
             [vec![], vec![pid], vec![]]
         );
-        match held_workspace_data(&data).unwrap() {
+        match held_workspace_data(&crate::census::this_test(), &data).unwrap() {
             Err(Busy::Held { database, holders }) => {
                 assert_eq!((database, pids(&holders)), (open, vec![pid]));
             }
@@ -2044,7 +2154,10 @@ mod tests {
         }
         drop(child.stdin.take());
         child.wait_bounded().unwrap();
-        assert_eq!(held_workspace_data(&data).unwrap(), Ok(()));
+        assert_eq!(
+            held_workspace_data(&crate::census::this_test(), &data).unwrap(),
+            Ok(())
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2068,7 +2181,7 @@ mod tests {
             .unwrap();
         let pid = child.id() as i32;
         holder_ready(&mut child);
-        let held = volume_holders(&root).unwrap();
+        let held = volume_holders(&crate::census::this_test(), &root).unwrap();
         drop(child.stdin.take());
         child.wait_bounded().unwrap();
         let ours = held.iter().find(|holder| holder.pid == pid);
@@ -2102,9 +2215,9 @@ mod tests {
         let pid = i32::try_from(child.id()).unwrap();
         // Asked while the child blocks reading the stdin this test holds; it is released before
         // anything is asserted.
-        let inside = tree_holders(&root).unwrap();
-        let outside = tree_holders(&sibling).unwrap();
-        let missing = tree_holders(&root.join("missing")).unwrap();
+        let inside = tree_holders(&crate::census::this_test(), &root).unwrap();
+        let outside = tree_holders(&crate::census::this_test(), &sibling).unwrap();
+        let missing = tree_holders(&crate::census::this_test(), &root.join("missing")).unwrap();
         drop(child.stdin.take());
         child.wait_bounded().unwrap();
         assert!(
@@ -2445,9 +2558,14 @@ mod tests {
 
         let mut events = Events::new();
         events.file(&lock);
-        let opens = hold_opens(&linked.from, &linked.state, &linked.into)
-            .unwrap()
-            .expect("no Nx process is opening");
+        let opens = hold_opens(
+            &crate::census::this_test(),
+            &linked.from,
+            &linked.state,
+            &linked.into,
+        )
+        .unwrap()
+        .expect("no Nx process is opening");
         let mut opener = nx_opener(&stock);
         events.exit(opener.id());
         assert_eq!(
@@ -2460,8 +2578,8 @@ mod tests {
         opened(&mut opener);
 
         let pid = opener.id() as i32;
-        let on_moved = holders(&moved).unwrap();
-        let on_previous = holders(&database).unwrap();
+        let on_moved = holders(&crate::census::this_test(), &moved).unwrap();
+        let on_previous = holders(&crate::census::this_test(), &database).unwrap();
         assert!(
             on_moved.iter().any(|holder| holder.pid == pid)
                 && !on_previous.iter().any(|holder| holder.pid == pid),
@@ -2514,7 +2632,7 @@ mod tests {
             assert_eq!(line, "held\n");
         }
         let pid = opening.id() as i32;
-        match hold_opens(&root, &state, &next).unwrap() {
+        match hold_opens(&crate::census::this_test(), &root, &state, &next).unwrap() {
             Err(Opening {
                 database: named,
                 holders,
@@ -2533,7 +2651,7 @@ mod tests {
         drop(opening.stdin.take());
         opening.wait_bounded().unwrap();
         drop(
-            hold_opens(&root, &state, &next)
+            hold_opens(&crate::census::this_test(), &root, &state, &next)
                 .unwrap()
                 .expect("nothing is opening"),
         );
@@ -2659,7 +2777,10 @@ mod tests {
                 .unwrap(),
         );
         assert!(socket.exists());
-        assert_eq!(close(&stock.checkout, &state).unwrap(), Ok(()));
+        assert_eq!(
+            close(&crate::census::this_test(), &stock.checkout, &state).unwrap(),
+            Ok(())
+        );
         // Exited, though launchd may not have reaped it yet: a zombie, which `kill(pid, 0)`
         // still reaches.
         assert!(
@@ -2677,7 +2798,10 @@ mod tests {
         );
         let second = crate::runtime::nx_daemon::live_pid(&record).expect("a new live daemon");
         assert_ne!(first, second);
-        assert_eq!(close(&stock.checkout, &state).unwrap(), Ok(()));
+        assert_eq!(
+            close(&crate::census::this_test(), &stock.checkout, &state).unwrap(),
+            Ok(())
+        );
     }
 
     /// A real Nx client handed a held lock through the one held-command boundary
@@ -2743,7 +2867,11 @@ mod tests {
         };
         let holders = |held: &crate::held_lock::HeldLock| {
             let inode = held.inode();
-            inode_holders((inode.dev.get(), inode.ino.get())).expect("the lock's holders")
+            inode_holders(
+                &crate::census::everywhere(),
+                (inode.dev.get(), inode.ino.get()),
+            )
+            .expect("the lock's holders")
         };
 
         // Under the policy, in a checkout no daemon ever served.
@@ -2780,6 +2908,7 @@ mod tests {
         );
         drop(
             hold_announced(
+                &crate::census::everywhere(),
                 crate::held_lock::Opened::open(&lock).expect("open the lock"),
                 "the held client's descendants",
             )
@@ -2800,6 +2929,7 @@ mod tests {
         );
         drop(
             hold_announced(
+                &crate::census::everywhere(),
                 crate::held_lock::Opened::open(&lock).expect("open the lock"),
                 "the stopped daemon and its workers",
             )
@@ -2866,7 +2996,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            held(&scratch, &state).unwrap().is_ok(),
+            held(&crate::census::this_test(), &scratch, &state)
+                .unwrap()
+                .is_ok(),
             "no database is held"
         );
         let socket = scratch.join("live.sock");
@@ -2881,7 +3013,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            held(&scratch, &state).unwrap().is_ok(),
+            held(&crate::census::this_test(), &scratch, &state)
+                .unwrap()
+                .is_ok(),
             "the record is not read"
         );
         assert!(
@@ -2947,15 +3081,18 @@ mod tests {
             sessions.join("main.land.lock"),
             crate::lease_holder::Process::this().unwrap(),
         );
+        let census = crate::storage::bootstrap::CanonicalRoots::fixture(
+            cowshed_os::namespace::TestNamespace::of(std::process::id(), 0).unwrap(),
+            root.join("store"),
+        )
+        .census();
         let censuses = || {
-            crate::lease_holder::with_stores(vec![root.join("store")], || {
-                (
-                    census_pids().unwrap(),
-                    pids(&holders(&database).unwrap()),
-                    pids(&tree_holders(&root).unwrap()),
-                    pids(&volume_holders(&root).unwrap()),
-                )
-            })
+            (
+                census_pids(&census).unwrap().pids,
+                pids(&holders(&census, &database).unwrap()),
+                pids(&tree_holders(&census, &root).unwrap()),
+                pids(&volume_holders(&census, &root).unwrap()),
+            )
         };
         let (asked, held, tree, volume) = censuses();
         assert!(
@@ -2979,6 +3116,143 @@ mod tests {
             drop(child.stdin.take());
             child.wait_bounded().unwrap();
         }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A census reads the lifecycle leases of the store its roots name and no other store's: a
+    /// fixture's census opens each lease of the fixture store once, and none of another store
+    /// beside it nor of the host's (02_workspaces.md, "Holders cowshed does not run"). The lease
+    /// reader is the only injected part; the store comes from the fixture's roots.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_fixture_census_reads_its_own_stores_leases_and_no_other() {
+        let root = scratch("census-leases");
+        let lease = |store: &Path, project: &str, name: &str| {
+            let sessions = store
+                .join("acme")
+                .join(project)
+                .join(crate::repository::SESSIONS_DIRECTORY);
+            fs::create_dir_all(&sessions).unwrap();
+            let path = sessions.join(name);
+            let holder = crate::lease_holder::Process::this().unwrap();
+            fs::write(&path, serde_json::to_vec(&holder).unwrap()).unwrap();
+            path
+        };
+        let (fixture_store, other_store) = (root.join("fixture"), root.join("other"));
+        let mut expected = vec![
+            lease(&fixture_store, "widget", "main.land.lock"),
+            lease(&fixture_store, "widget", "topic.intent.lock"),
+            lease(&fixture_store, "gadget", "main.intent.lock"),
+        ];
+        lease(&other_store, "widget", "main.land.lock");
+        let census = crate::storage::bootstrap::CanonicalRoots::fixture(
+            cowshed_os::namespace::TestNamespace::of(std::process::id(), 0).unwrap(),
+            fixture_store,
+        )
+        .census();
+        let mut opened = Vec::new();
+        let asked = census_pids_reading(&census, |lease| {
+            opened.push(lease.to_owned());
+            fs::read(lease)
+        })
+        .unwrap();
+        opened.sort();
+        expected.sort();
+        assert_eq!(
+            opened, expected,
+            "the census read the fixture store's leases alone"
+        );
+        assert!(
+            asked.pids.contains(&(std::process::id() as i32)),
+            "a lease naming this process passes nothing over"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A fixture's census asks the process that minted its namespace, the processes in its process
+    /// group and their descendants, and no other. A run the fixture backgrounded from a shell that
+    /// exited, which launchd adopted, stays in the group and is named; a process launchd adopted
+    /// after it made a session of its own, as a detached daemon does, is never asked, so no
+    /// per-descriptor query of a process outside the fixture can stall it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_fixture_census_asks_its_owners_group_and_tree_alone() {
+        let root = scratch("census-reach");
+        let database = root.join("T-v3.db");
+        fs::write(&database, b"").unwrap();
+        // The shell starts both holders in the background, prints their pids and exits, so launchd
+        // adopts them. Each reads this test's pipe, kept on descriptor 4, so it ends when the pipe
+        // closes, on every exit path of this test.
+        let mut detaching = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(concat!(
+                "exec 4<&0; ",
+                "(exec 3<\"$0\"; echo ready; read _ <&4) & echo \"grouped $!\"; ",
+                "/usr/bin/perl -MPOSIX -e 'POSIX::setsid() > 0 or die \"setsid: $!\"; ",
+                "open(my $held, \"<\", $ARGV[0]) or die \"open: $!\"; $| = 1; ",
+                "print \"ready\\n\"; <STDIN>' \"$0\" <&4 & echo \"own $!\"",
+            ))
+            .arg(&database)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let mut lines =
+            std::io::BufRead::lines(std::io::BufReader::new(detaching.stdout.take().unwrap()));
+        let (mut grouped, mut own) = (None, None);
+        for _ in 0..4 {
+            let line = lines.next().unwrap().unwrap();
+            match line.split_once(' ') {
+                Some(("grouped", pid)) => grouped = Some(pid.parse::<i32>().unwrap()),
+                Some(("own", pid)) => own = Some(pid.parse::<i32>().unwrap()),
+                _ => assert_eq!(line, "ready"),
+            }
+        }
+        let (grouped, own) = (grouped.unwrap(), own.unwrap());
+        let holding = detaching.stdin.take();
+        assert!(detaching.wait_bounded().unwrap().success());
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec 3<\"$0\"; echo ready; read _")
+            .arg(&database)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        holder_ready(&mut child);
+        let child_pid = child.id() as i32;
+        let census = crate::census::this_test();
+        let asked = census_pids(&census).unwrap().pids;
+        let mut held: Vec<i32> = holders(&census, &database)
+            .unwrap()
+            .iter()
+            .map(|holder| holder.pid)
+            .collect();
+        held.sort_unstable();
+        let parents = [grouped, own].map(|pid| {
+            crate::runtime::job_groups::process_record(pid)
+                .unwrap()
+                .map(|record| record.ppid)
+        });
+        let listed = all_pids().unwrap();
+        drop(child.stdin.take());
+        child.wait_bounded().unwrap();
+        drop(holding);
+        assert_eq!(parents, [Some(1), Some(1)], "launchd adopted both holders");
+        assert!(
+            listed.contains(&own),
+            "the holder with a session of its own runs"
+        );
+        assert!(
+            asked.contains(&grouped) && asked.contains(&child_pid) && !asked.contains(&own),
+            "asked {asked:?}: grouped {grouped}, own session {own}, child {child_pid}"
+        );
+        let mut expected = vec![grouped, child_pid];
+        expected.sort_unstable();
+        assert_eq!(
+            held, expected,
+            "the group's and the tree's holders are named"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 }

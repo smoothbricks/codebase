@@ -25,6 +25,8 @@ const ANCESTRY_BOUND: usize = 1024;
 /// supervisor's tree), and the checkout's recorded Nx daemon with its plugin workers. Anything
 /// else holding the mount is work cowshed does not account for.
 pub(crate) struct Accounted<'a> {
+    /// The census of the workspace's store, which takes the walk.
+    pub census: &'a crate::census::CensusScope,
     /// The process serving the workspace's supervisor, when one is known to serve.
     pub supervisor: Option<i32>,
     /// The job-group ledger beside the workspace's supervisor socket: a job that left the
@@ -93,7 +95,7 @@ pub(crate) fn unaccounted(
     let daemon = nx::live_daemon(&mount.join(".nx/workspace-data"));
     let roots: Vec<i32> = accounted.supervisor.into_iter().chain(daemon).collect();
     let mut holders = Vec::new();
-    for held in nx::tree_holds(mount)? {
+    for held in nx::tree_holds(accounted.census, mount)? {
         if descends_from(held.holder.pid, &roots) {
             continue;
         }
@@ -207,7 +209,9 @@ mod tests {
         fs::write(&lock, b"lock").unwrap();
         let beside = scratch("beside");
         let ledger = beside.join("supervisor.groups");
+        let census = crate::census::this_test();
         let accounted = Accounted {
+            census: &census,
             supervisor: None,
             ledger: &ledger,
         };
@@ -268,6 +272,7 @@ mod tests {
         census_naming(
             &mount,
             &Accounted {
+                census: &crate::census::this_test(),
                 supervisor: None,
                 ledger: &ledger,
             },
@@ -276,6 +281,7 @@ mod tests {
         let supervised = unaccounted(
             &mount,
             &Accounted {
+                census: &crate::census::this_test(),
                 supervisor: Some(i32::try_from(std::process::id()).unwrap()),
                 ledger: &ledger,
             },

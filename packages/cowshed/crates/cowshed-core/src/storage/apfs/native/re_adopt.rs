@@ -69,7 +69,7 @@ where
         if self.mounted_at(mount)?.is_none() {
             return Ok(Vec::new());
         }
-        crate::build_volume::nx::volume_holders(mount)
+        crate::build_volume::nx::volume_holders(&self.census, mount)
             .map_err(|error| io_error("list a re-adoption source's holders", mount, error))
     }
 

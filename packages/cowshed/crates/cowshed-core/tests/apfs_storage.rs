@@ -54,6 +54,7 @@ struct FakeHost {
     fail_credentials_once: Arc<AtomicBool>,
     fail_extent_proof_once: Arc<AtomicBool>,
     mounted_paths: Arc<Mutex<BTreeSet<PathBuf>>>,
+    census: cowshed_core::census::CensusScope,
 }
 
 impl Default for FakeHost {
@@ -65,6 +66,10 @@ impl Default for FakeHost {
             fail_reclaim_once: Arc::default(),
             fail_extent_proof_once: Arc::default(),
             mounted_paths: Arc::default(),
+            census: cowshed_core::census::CensusScope::new(
+                HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+                Arc::from(Path::new("/fake/store")),
+            ),
         }
     }
 }
@@ -199,6 +204,9 @@ impl FakeHost {
 
 impl ApfsExecutionHost for FakeHost {
     type LockGuard = ();
+    fn census(&self) -> &cowshed_core::census::CensusScope {
+        &self.census
+    }
     fn lock_images(
         &self,
         paths: &[PathBuf],

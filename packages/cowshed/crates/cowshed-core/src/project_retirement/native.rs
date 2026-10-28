@@ -207,8 +207,9 @@ mod macos {
         let store = storage.store().to_owned();
         let authorize_store = store.clone();
         let authorize_repo = repo_id.clone();
+        let census = storage.census();
         let intent = dispatch_blocking(move || {
-            RetirementIntent::authorize(&authorize_store, &authorize_repo)
+            RetirementIntent::authorize(&authorize_store, &census, &authorize_repo)
         })
         .await
         .map_err(|error| {
@@ -222,6 +223,7 @@ mod macos {
         mut intent: RetirementIntent,
     ) -> Result<ProjectRetirementReport> {
         let store = storage.store().to_owned();
+        let census = storage.census();
         let repo_id = intent.repo_id.clone();
         let _run = acquire_retirement_run(&store, &intent)?;
         intent.verify_registration(&store)?;
@@ -241,7 +243,7 @@ mod macos {
             .map_err(|error| io_error("inspect recorded project", &project, error))?
         {
             let collector = acquire_collector(&store, &repo_id)?;
-            intent.archive_project(&store, &collector)?;
+            intent.archive_project(&store, &census, &collector)?;
             let archive = intent.archive_path(&store);
             let images = contents(&archive)?.images.len();
             return Ok(ProjectRetirementReport {
@@ -279,7 +281,7 @@ mod macos {
         }
         if intent.phase == RetirementPhase::Fenced {
             intent.phase = RetirementPhase::Drained;
-            intent.persist(&store)?;
+            intent.persist(&store, &census)?;
         }
         let image_count = found.images.len();
         let detached_store = store.clone();
@@ -311,9 +313,9 @@ mod macos {
         }).await.map_err(|error| CowshedError::internal(format!("detaching retired project images: {error}")))??;
         if intent.phase == RetirementPhase::Drained {
             intent.phase = RetirementPhase::Detached;
-            intent.persist(&store)?;
+            intent.persist(&store, &census)?;
         }
-        intent.archive_project(&store, &collector)?;
+        intent.archive_project(&store, &census, &collector)?;
         let archive = intent.archive_path(&store);
         // All guards outlive the archive commit: image holds, lifecycle claims and socket leases.
         drop((detached, lifecycle_leases, sockets, collector));

@@ -293,7 +293,7 @@ fn assert_refused(damaged: Value, label: &str) {
         "cowshed-readopt-refusal",
     );
     let journal = scratch.join(LIFECYCLE_INTENTS_FILE);
-    let recorded = LifecycleIntentJournal::update(&journal, |state| {
+    let recorded = LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.begin(intent);
         Ok(())
     });
@@ -302,13 +302,15 @@ fn assert_refused(damaged: Value, label: &str) {
 }
 
 fn begin_and_mark_mutating(journal: &Path, intent: LifecycleIntent) {
-    LifecycleIntentJournal::update(journal, |state| {
+    LifecycleIntentJournal::update(&crate::census::this_test(), journal, |state| {
         state.begin(intent);
         Ok(())
     })
     .expect("record ReAdopt intent before its first mutation");
-    LifecycleIntentJournal::update(journal, |state| state.mark_mutating(&WorkspaceName::main()))
-        .expect("mark ReAdopt intent mutating");
+    LifecycleIntentJournal::update(&crate::census::this_test(), journal, |state| {
+        state.mark_mutating(&WorkspaceName::main())
+    })
+    .expect("mark ReAdopt intent mutating");
 }
 
 #[test]
@@ -425,7 +427,7 @@ fn re_adopt_without_build_link_round_trips_through_journal_as_null() {
     );
 
     let journal = fixture.journal_path();
-    LifecycleIntentJournal::update(&journal, |state| {
+    LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.begin(intent.clone());
         Ok(())
     })
@@ -463,7 +465,7 @@ fn re_adopt_intent_targets_main_and_reports_the_adopt_verb() {
 fn re_adopt_mark_mutating_puts_main_in_forming_only_after_the_fence() {
     let fixture = Fixture::new();
     let journal = fixture.journal_path();
-    LifecycleIntentJournal::update(&journal, |state| {
+    LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.begin(fixture.intent(Some(fixture.build())));
         Ok(())
     })
@@ -476,7 +478,7 @@ fn re_adopt_mark_mutating_puts_main_in_forming_only_after_the_fence() {
         "a prepared re-adoption has made nothing yet"
     );
 
-    LifecycleIntentJournal::update(&journal, |state| {
+    LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.mark_mutating(&WorkspaceName::main())
     })
     .expect("mark ReAdopt mutating");
@@ -498,7 +500,7 @@ fn re_adopt_completion_with_the_exact_new_incarnation_is_accepted() {
         "the replacement is a new incarnation, not the retained one"
     );
     let completion = LifecycleIntentCompletion::Workspace(replacement);
-    LifecycleIntentJournal::update(&journal, |state| {
+    LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.complete(&WorkspaceName::main(), completion.clone())
     })
     .expect("the exact replacement incarnation completes the intent");
@@ -520,7 +522,7 @@ fn re_adopt_retire_completion_is_refused_and_never_reaches_disk() {
     begin_and_mark_mutating(&journal, fixture.intent(None));
     let before = fs::read(&journal).expect("read journal before refusal");
 
-    let error = LifecycleIntentJournal::update(&journal, |state| {
+    let error = LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.complete(
             &WorkspaceName::main(),
             LifecycleIntentCompletion::Retire(RemoveReport::default()),
@@ -762,15 +764,16 @@ fn re_adopt_completion_with_any_incarnation_but_the_recorded_replacement_is_refu
     begin_and_mark_mutating(&journal, fixture.intent(Some(fixture.build())));
     let before = fs::read(&journal).expect("read journal before refusal");
     for incarnation in [OLD_INCARNATION, "0198f2c0b7e34dc795f17b238b331c82"] {
-        let error = LifecycleIntentJournal::update(&journal, |state| {
-            state.complete(
-                &WorkspaceName::main(),
-                LifecycleIntentCompletion::Workspace(
-                    WorkspaceIncarnation::new(incarnation).expect("incarnation"),
-                ),
-            )
-        })
-        .expect_err("only the recorded replacement completes a re-adoption");
+        let error =
+            LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
+                state.complete(
+                    &WorkspaceName::main(),
+                    LifecycleIntentCompletion::Workspace(
+                        WorkspaceIncarnation::new(incarnation).expect("incarnation"),
+                    ),
+                )
+            })
+            .expect_err("only the recorded replacement completes a re-adoption");
         assert_eq!(error.code, ErrorCode::Integrity, "{incarnation}: {error:?}");
         assert_eq!(
             fs::read(&journal).expect("reread journal"),
@@ -818,7 +821,7 @@ fn re_adopt_journal_updates_never_overwrite_original_retained_or_pre_cowshed_inp
     let journal = fixture.journal_path();
     begin_and_mark_mutating(&journal, intent.clone());
     let replacement = WorkspaceIncarnation::new(NEW_INCARNATION).expect("replacement incarnation");
-    LifecycleIntentJournal::update(&journal, |state| {
+    LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.complete(
             &WorkspaceName::main(),
             LifecycleIntentCompletion::Workspace(replacement),
@@ -849,7 +852,7 @@ fn forming_re_adoptions_name_exactly_their_recorded_staging_paths() {
     let fixture = Fixture::new();
     let journal = fixture.journal_path();
     let build = fixture.build();
-    LifecycleIntentJournal::update(&journal, |state| {
+    LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.begin(fixture.intent(Some(build.clone())));
         Ok(())
     })
@@ -857,7 +860,7 @@ fn forming_re_adoptions_name_exactly_their_recorded_staging_paths() {
     let prepared = LifecycleIntentJournal::load(&journal).expect("load prepared journal");
     assert_eq!(prepared.forming_re_adoptions().count(), 0);
 
-    LifecycleIntentJournal::update(&journal, |state| {
+    LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.mark_mutating(&WorkspaceName::main())
     })
     .expect("mark ReAdopt intent mutating");
@@ -879,7 +882,7 @@ fn forming_re_adoptions_name_exactly_their_recorded_staging_paths() {
         [build.replacement_image.as_path()]
     );
 
-    LifecycleIntentJournal::update(&journal, |state| {
+    LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.complete(
             &WorkspaceName::main(),
             LifecycleIntentCompletion::Workspace(
@@ -940,10 +943,11 @@ fn a_missing_main_replay_records_the_checkouts_git_state_again_and_nothing_else(
         "the commit moved the checkout's Git state"
     );
 
-    let (_, rerecorded) = LifecycleIntentJournal::update(&journal, |state| {
-        state.rerecord_missing_main_git(&source, recaptured.clone())
-    })
-    .expect("record the checkout's Git state again");
+    let (_, rerecorded) =
+        LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
+            state.rerecord_missing_main_git(&source, recaptured.clone())
+        })
+        .expect("record the checkout's Git state again");
     let mut expected = source.clone();
     expected.git_before = recaptured.clone();
     assert_eq!(rerecorded, expected, "only git_before changes");
@@ -958,7 +962,7 @@ fn a_missing_main_replay_records_the_checkouts_git_state_again_and_nothing_else(
     };
     assert_eq!(stored.as_ref(), &expected);
 
-    let stale = LifecycleIntentJournal::update(&journal, |state| {
+    let stale = LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
         state.rerecord_missing_main_git(&source, recaptured.clone())
     });
     assert!(
@@ -969,9 +973,10 @@ fn a_missing_main_replay_records_the_checkouts_git_state_again_and_nothing_else(
     let retained = Fixture::new();
     let retained_journal = retained.journal_path();
     begin_and_mark_mutating(&retained_journal, retained.intent(None));
-    let refused = LifecycleIntentJournal::update(&retained_journal, |state| {
-        state.rerecord_missing_main_git(&retained.source(None), retained.git_before.clone())
-    });
+    let refused =
+        LifecycleIntentJournal::update(&crate::census::this_test(), &retained_journal, |state| {
+            state.rerecord_missing_main_git(&retained.source(None), retained.git_before.clone())
+        });
     assert!(
         refused.is_err(),
         "a retained main's recorded Git state is never replaced"

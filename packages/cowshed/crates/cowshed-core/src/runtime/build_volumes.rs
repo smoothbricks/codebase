@@ -1045,11 +1045,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 } => held.with_discovered(&paths, &released, mbx, fingerprint, &mount)?,
             };
             release_paths(&checkout, &mount, &released);
-            let displaced =
-                match crate::build_volume::migrate::adopt_paths(&checkout, &mount, &state.paths)? {
-                    Ok(displaced) => displaced,
-                    Err(refusal) => return Ok(Err(refusal)),
-                };
+            let displaced = match crate::build_volume::migrate::adopt_paths(
+                host.census(),
+                &checkout,
+                &mount,
+                &state.paths,
+            )? {
+                Ok(displaced) => displaced,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
             if state != held {
                 state.write(&mount)?;
             }
@@ -1383,7 +1387,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         let Some(id) = self.layout.linked(checkout)? else {
             return Ok(None);
         };
-        match self.layout.hold(&id) {
+        match self.layout.hold(self.host.census(), &id) {
             Ok(hold) => Ok(Some(Landing { id, hold })),
             Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
                 Err(CowshedError::conflict(
@@ -1419,7 +1423,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let state = BuildVolumeState::read(&mount)?;
             // Read-only: the landing's daemon was stopped by the land's ledger-proven plan before this
             // point; quiesce never rereads a record to signal anything.
-            if let Err(busy) = nx::held(&mount, &state)
+            if let Err(busy) = nx::held(host.census(), &mount, &state)
                 .map_err(|error| io("look at the landing volume's Nx state", &mount, &error))?
             {
                 return Ok(Err(skip(busy, Side::Landing)));
@@ -1610,7 +1614,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             };
             let (mount, _) = host.mount_build_volume(layout, &id).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
-            if let Err(busy) = nx::close(&mount, &state)
+            if let Err(busy) = nx::close(host.census(), &mount, &state)
                 .map_err(|error| io("close the target's Nx state", &mount, &error))?
             {
                 return Ok(Err(skip(busy, Side::Target)));
@@ -1646,7 +1650,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         let target = owner.name.clone();
         let linked = self.layout.linked(&target_checkout)?;
         let quiet = quiet.clone();
-        self.blocking(move |_, layout| {
+        self.blocking(move |host, layout| {
             let started = Instant::now();
             if linked.as_ref() != Some(&previous.id) {
                 return Err(CowshedError::internal(format!(
@@ -1654,13 +1658,18 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     previous.id
                 )));
             }
-            let opens = match nx::hold_opens(&previous.mount, &previous.state, &quiet.mount)
-                .map_err(|error| io("lock the target's Nx opens", &previous.mount, &error))?
+            let opens = match nx::hold_opens(
+                host.census(),
+                &previous.mount,
+                &previous.state,
+                &quiet.mount,
+            )
+            .map_err(|error| io("lock the target's Nx opens", &previous.mount, &error))?
             {
                 Ok(opens) => opens,
                 Err(opening) => return Ok(Err(target_opening(opening))),
             };
-            if let Err(busy) = nx::held(&previous.mount, &previous.state)
+            if let Err(busy) = nx::held(host.census(), &previous.mount, &previous.state)
                 .map_err(|error| io("look at the target's Nx state", &previous.mount, &error))?
             {
                 return Ok(Err(skip(busy, Side::Target)));
@@ -1932,7 +1941,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         self.blocking(move |host, layout| {
             let (mount, _) = host.mount_build_volume(layout, &id).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
-            if let Err(busy) = nx::close(&mount, &state)
+            if let Err(busy) = nx::close(host.census(), &mount, &state)
                 .map_err(|error| io("close the build volume's Nx state", &mount, &error))?
             {
                 return Err(CowshedError::conflict(
@@ -1988,7 +1997,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 if linked {
                     let (mount, _) = host.mount_build_volume(layout, &id).map_err(storage)?;
                     let state = BuildVolumeState::read(&mount)?;
-                    if let Err(busy) = nx::close(&mount, &state)
+                    if let Err(busy) = nx::close(host.census(), &mount, &state)
                         .map_err(|error| io("close the build volume's Nx state", &mount, &error))?
                     {
                         return Err(CowshedError::conflict(
@@ -2679,12 +2688,12 @@ fn seal(
     target: &Owner,
     registration: &Registration,
 ) -> Result<std::result::Result<Freeze, AdoptionSkip>> {
-    if let Err(busy) = nx::close(&quiet.mount, &quiet.state)
+    if let Err(busy) = nx::close(host.census(), &quiet.mount, &quiet.state)
         .map_err(|error| io("close the landing volume's Nx state", &quiet.mount, &error))?
     {
         return Ok(Err(skip(busy, Side::Landing)));
     }
-    let _opens = match nx::hold_opens(&quiet.mount, &quiet.state, &quiet.mount)
+    let _opens = match nx::hold_opens(host.census(), &quiet.mount, &quiet.state, &quiet.mount)
         .map_err(|error| io("lock the landing volume's Nx opens", &quiet.mount, &error))?
     {
         Ok(opens) => opens,
@@ -2700,7 +2709,7 @@ fn seal(
     {
         Ok(held) => held,
         Err(lock) => {
-            let holders = nx::holders(&lock)
+            let holders = nx::holders(host.census(), &lock)
                 .map_err(|error| io("list the landing Cargo build's processes", &lock, &error))?;
             return Ok(Err(AdoptionSkip::LandingBuilding {
                 lock,
@@ -2709,7 +2718,7 @@ fn seal(
         }
     };
     let previous = seeds_of(layout, target)?;
-    if let Err(busy) = nx::held(&quiet.mount, &quiet.state).map_err(|error| {
+    if let Err(busy) = nx::held(host.census(), &quiet.mount, &quiet.state).map_err(|error| {
         io(
             "look at the landing volume's Nx state",
             &quiet.mount,
@@ -3118,19 +3127,19 @@ fn capture(
         BuildVolumeClaim::Claimed(claim) => claim,
         BuildVolumeClaim::Held { open } => {
             let hold = layout.hold_path(source);
-            let claimants = nx::holders(&hold)
+            let claimants = nx::holders(host.census(), &hold)
                 .map_err(|error| io("list the build hold's holders", &hold, &error))?;
             return Ok(Err(CaptureSkip::VolumeBusy {
                 reason: build_hold_busy_reason(&layout.image(source), &hold, &claimants, &open),
             }));
         }
     };
-    if let Err(busy) = nx::close(&mount, &state)
+    if let Err(busy) = nx::close(host.census(), &mount, &state)
         .map_err(|error| io("close the volume's Nx state", &mount, &error))?
     {
         return Ok(Err(capture_skip(busy)));
     }
-    let _opens = match nx::hold_opens(&mount, &state, &mount)
+    let _opens = match nx::hold_opens(host.census(), &mount, &state, &mount)
         .map_err(|error| io("lock the volume's Nx opens", &mount, &error))?
     {
         Ok(opens) => opens,
@@ -3146,7 +3155,7 @@ fn capture(
     {
         Ok(held) => held,
         Err(lock) => {
-            let holders = nx::holders(&lock)
+            let holders = nx::holders(host.census(), &lock)
                 .map_err(|error| io("list the Cargo build's processes", &lock, &error))?;
             return Ok(Err(CaptureSkip::Building {
                 lock,
@@ -3155,7 +3164,7 @@ fn capture(
         }
     };
     let previous = seeds_of(layout, target)?;
-    if let Err(busy) = nx::held(&mount, &state)
+    if let Err(busy) = nx::held(host.census(), &mount, &state)
         .map_err(|error| io("look at the volume's Nx state", &mount, &error))?
     {
         return Ok(Err(capture_skip(busy)));
@@ -4142,7 +4151,10 @@ mod tests {
     fn a_held_volume_is_deferred_before_its_image_is_read() {
         let store = Store::new();
         let forming = store.registered(linked("lane"), Registrant::Intent);
-        let held = store.layout.hold(&forming).unwrap();
+        let held = store
+            .layout
+            .hold(&crate::census::this_test(), &forming)
+            .unwrap();
         let planned = plan(
             &store.layout,
             std::slice::from_ref(&forming),
@@ -5070,7 +5082,7 @@ mod tests {
                     .await
             });
             ready.await.unwrap();
-            RetirementIntent::authorize(&store, &repo).unwrap();
+            RetirementIntent::authorize(&store, &crate::census::this_test(), &repo).unwrap();
             caller.abort();
             assert!(caller.await.unwrap_err().is_cancelled());
             assert!(
@@ -6183,7 +6195,7 @@ fn main() {
             .spawn_locked()
             .unwrap();
         let pid = i32::try_from(holder.id()).expect("a pid fits i32");
-        while !nx::holders(&database)
+        while !nx::holders(&crate::census::this_test(), &database)
             .unwrap()
             .iter()
             .any(|held| held.pid == pid)

@@ -155,6 +155,9 @@ pub struct WorkspaceSupervisorConfig {
     /// workspace already wrote may be stamped with an identity the project has since left behind.
     pub owned_repo_ids: OwnedRepoIds,
     pub workspace_root: PathBuf,
+    /// The holder census of the workspace's store, which names who holds its job records lock
+    /// when a wait for it expires.
+    pub census: crate::census::CensusScope,
     pub default_cwd: Option<WorkspacePath>,
     pub sandbox: SandboxConfig,
     /// Controller-owned store and mount paths for resolving each Nx keeper start's current
@@ -376,6 +379,12 @@ impl Default for WorkspaceSupervisorConfig {
             term_grace: Duration::from_secs(2),
             actor_capacity: DEFAULT_ACTOR_CAPACITY,
             event_capacity: DEFAULT_EVENT_CAPACITY,
+            census: crate::census::CensusScope::new(
+                cowshed_os::namespace::HostNamespace::Test(
+                    cowshed_os::namespace::TestNamespace::mint().expect("a test namespace"),
+                ),
+                std::sync::Arc::from(std::path::Path::new("/tmp/cowshed-store")),
+            ),
             credential_env_names: BTreeSet::new(),
             shell_host: None,
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
@@ -995,12 +1004,14 @@ impl ArtifactStoreSink {
         owned_repo_ids: &OwnedRepoIds,
         authority: &WorkspaceAuthoritySnapshot,
         config: ArtifactConfig,
+        census: crate::census::CensusScope,
     ) -> Result<Self> {
         let store = ArtifactStore::open(
             workspace_root,
             owned_repo_ids.clone(),
             authority.workspace_incarnation.clone(),
             config,
+            census,
         )
         .map_err(map_artifact_error)?;
         Ok(Self {
@@ -4223,6 +4234,7 @@ impl WorkspaceSupervisor {
             &config.owned_repo_ids,
             &config.authority,
             config.artifacts.clone(),
+            config.census.clone(),
         )?;
         let spawner = match config.shell_host.clone() {
             Some(program) => SystemSpawnSink::with_shell_host(program, config.shell_pool),
@@ -11069,6 +11081,7 @@ mod lifecycle_commitment_tests {
             OwnedRepoIds::sole(repo_id.clone()),
             source.clone(),
             ArtifactConfig::default(),
+            crate::census::this_test(),
         )
         .unwrap();
         let first = artifacts
@@ -11116,6 +11129,7 @@ mod lifecycle_commitment_tests {
 
         let defaults = WorkspaceSupervisorConfig::default();
         let config = WorkspaceSupervisorConfig {
+            census: crate::census::this_test(),
             authority: WorkspaceAuthoritySnapshot {
                 repo_id: repo_id.clone(),
                 workspace: WorkspaceName::new("raven").unwrap(),
@@ -11208,6 +11222,7 @@ mod lifecycle_commitment_tests {
             OwnedRepoIds::sole(repo_id.clone()),
             foreign_only.clone(),
             ArtifactConfig::default(),
+            crate::census::this_test(),
         )
         .unwrap();
         let token = unintroduced
@@ -11231,6 +11246,7 @@ mod lifecycle_commitment_tests {
                     historical_incarnations: admitted,
                     ..ArtifactConfig::default()
                 },
+                crate::census::this_test(),
             ),
             Err(ArtifactError::Integrity { .. })
         ));

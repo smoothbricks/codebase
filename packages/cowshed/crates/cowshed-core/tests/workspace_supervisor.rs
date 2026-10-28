@@ -478,6 +478,7 @@ fn authority() -> WorkspaceAuthoritySnapshot {
 fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
     let workspace_root = root.join("workspace");
     WorkspaceSupervisorConfig {
+        census: census(),
         authority: authority(),
         owned_repo_ids: OwnedRepoIds::sole(authority().repo_id),
         workspace_root: workspace_root.clone(),
@@ -652,6 +653,7 @@ fn real_store_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
         &supervisor_config.owned_repo_ids,
         &supervisor_config.authority,
         supervisor_config.artifacts.clone(),
+        census(),
     )
     .expect("open artifact store");
     let handle = WorkspaceSupervisor::start_with_sinks(
@@ -1907,7 +1909,7 @@ async fn a_refused_terminal_record_answers_every_caller_and_stays_unterminated()
 
     std::fs::set_permissions(&job_root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (workspace_root, owned, incarnation, artifacts) = store;
-    let lost = ArtifactStore::open(workspace_root, owned, incarnation, artifacts)
+    let lost = ArtifactStore::open(workspace_root, owned, incarnation, artifacts, census())
         .unwrap()
         .seal_unterminated()
         .unwrap();
@@ -1950,6 +1952,7 @@ async fn a_refused_terminal_commitment_keeps_the_sealed_truth_and_fails_its_call
         &supervisor_config.owned_repo_ids,
         &supervisor_config.authority,
         supervisor_config.artifacts.clone(),
+        census(),
     )
     .unwrap();
     let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
@@ -3826,6 +3829,7 @@ async fn sealed_reads_preserve_unread_history_without_hiding_readable_jobs() {
         &config.owned_repo_ids,
         &config.authority,
         config.artifacts.clone(),
+        census(),
     )
     .unwrap();
     let readable = store.next_job_id().unwrap();
@@ -3979,6 +3983,7 @@ fn a_corrupt_or_unreadable_admission_history_refuses_the_supervisor_store() {
             config.owned_repo_ids.clone(),
             config.authority.workspace_incarnation.clone(),
             config.artifacts.clone(),
+            census(),
         )
         .err()
         .expect("the store cannot prove admission authority");
@@ -3992,6 +3997,7 @@ fn a_corrupt_or_unreadable_admission_history_refuses_the_supervisor_store() {
             &config.owned_repo_ids,
             &config.authority,
             config.artifacts,
+            census(),
         )
         .err()
         .expect("a supervisor cannot serve lookup from the refused store");
@@ -5223,7 +5229,7 @@ async fn a_job_s_durable_record_keeps_its_exit_and_duration() {
     complete(&spawned, b"built\n", b"", ExitStatus::Exited { code: 0 }).await;
     let info = h.handle.wait(job_id).await.unwrap();
 
-    let terminal = cowshed_core::storage::job_artifact::recover_records(&records)
+    let terminal = cowshed_core::storage::job_artifact::recover_records(&census(), &records)
         .unwrap()
         .frames
         .into_iter()
@@ -5297,6 +5303,7 @@ fn warm_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
         &supervisor_config.owned_repo_ids,
         &supervisor_config.authority,
         supervisor_config.artifacts.clone(),
+        census(),
     )
     .expect("open artifact store");
     let handle = WorkspaceSupervisor::start_with_sinks(
@@ -7292,6 +7299,7 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                 &config.owned_repo_ids,
                 &config.authority,
                 config.artifacts.clone(),
+                census(),
             )
             .expect("open the real job artifact store");
             let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
@@ -7638,7 +7646,7 @@ async fn a_shed_s_ledger_alone_says_it_is_in_use_and_its_supervisor_answers_thro
         walked, 0,
         "the supervisor began {walked} process-table walks over the interval"
     );
-    let holders = cowshed_core::build_volume::nx::holders(&database).unwrap();
+    let holders = cowshed_core::build_volume::nx::holders(&census(), &database).unwrap();
     assert!(
         cowshed_core::build_volume::nx::process_table_walks() - walks > 0,
         "a one-shot census walks the process table"
@@ -8700,7 +8708,8 @@ async fn a_host_gate_records_only_public_environment_without_restricting_executi
         );
         complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
         first.handle.wait(job).await.unwrap();
-        let history = cowshed_core::storage::job_artifact::recover_records(&records).unwrap();
+        let history =
+            cowshed_core::storage::job_artifact::recover_records(&census(), &records).unwrap();
         assert!(!history.frames.is_empty());
         for frame in history.frames {
             let record = frame.record;
@@ -9235,6 +9244,7 @@ os._exit(0)
         config.owned_repo_ids,
         config.authority.workspace_incarnation,
         config.artifacts,
+        census(),
     )
     .unwrap();
     let durable = reopened.sealed(job).unwrap().unwrap();
@@ -10396,4 +10406,15 @@ async fn host_controller_a_sealed_job_keeps_no_process_observation() {
         "{JOBS} sealed jobs of {LIVES} lives retain {retained} heap bytes"
     );
     handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+}
+
+/// This test process's census, as a fixture store's census reaches it, over a store that holds no
+/// lease.
+fn census() -> cowshed_core::census::CensusScope {
+    let namespace = cowshed_os::namespace::TestNamespace::of(std::process::id(), 0)
+        .expect("this process's namespace");
+    cowshed_core::census::CensusScope::new(
+        cowshed_os::namespace::HostNamespace::Test(namespace),
+        std::sync::Arc::from(std::path::Path::new("/var/empty")),
+    )
 }

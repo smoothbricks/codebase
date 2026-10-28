@@ -22,9 +22,9 @@ impl RefLock {
     /// Take the ref lock at `path`, creating its file if no writer has yet. An uncontended lock is
     /// taken at once; a held one is waited for on a helper thread, and the wait says every
     /// [`cowshed_os::flock::HOLDER_REPORT`] how long it has waited and who holds the file, as the
-    /// kernel shows it then ([`held_lock::holders`]). Nothing bounds the wait: the holder is a writer
-    /// moving the same branch, which a land must follow, not overtake.
-    pub async fn acquire(path: &RefLockPath) -> Result<Self> {
+    /// kernel shows it to `census` then ([`held_lock::holders`]). Nothing bounds the wait: the holder
+    /// is a writer moving the same branch, which a land must follow, not overtake.
+    pub async fn acquire(census: &crate::census::CensusScope, path: &RefLockPath) -> Result<Self> {
         let opened = Opened::open(path.as_path()).map_err(|error| failure(path, "open", &error))?;
         let opened = match opened
             .try_hold()
@@ -63,7 +63,7 @@ impl RefLock {
                     "cowshed: land has waited {}s for the ref lock {}: {}",
                     started.elapsed().as_secs(),
                     path.as_str(),
-                    held_lock::holders(path.as_path()),
+                    held_lock::holders(census, path.as_path()),
                 ),
             }
         }
@@ -106,7 +106,9 @@ mod tests {
     async fn a_land_takes_a_free_ref_lock_records_itself_and_releases_it_when_dropped() {
         let directory = crate::temp_root::TempRoot::new("ref-lock");
         let path = lock_path(&directory);
-        let held = RefLock::acquire(&path).await.unwrap();
+        let held = RefLock::acquire(&crate::census::this_test(), &path)
+            .await
+            .unwrap();
         assert!(
             matches!(try_lock(&path), Err(TryLockError::WouldBlock)),
             "a held ref lock admitted a second holder"
@@ -130,7 +132,7 @@ mod tests {
         holder.lock_bounded().unwrap();
         let waiting = tokio::spawn({
             let path = path.clone();
-            async move { RefLock::acquire(&path).await }
+            async move { RefLock::acquire(&crate::census::this_test(), &path).await }
         });
         drop(holder);
         let held = waiting

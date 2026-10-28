@@ -57,12 +57,15 @@ pub(crate) fn holders(request: &FdHoldersRequest) -> Result<FdHolders, CowshedEr
         )
         .map(|identity| (identity.name(), identity))
         .collect();
-    nx::object_holders(&objects)
-        .map(FdHolders::from)
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                format!("cannot read who holds the named descriptors: {error}"),
-                "run it where this user can list the host's processes",
-            )
-        })
+    nx::object_holders(
+        &cowshed_core::storage::bootstrap::CanonicalRoots::global().census(),
+        &objects,
+    )
+    .map(FdHolders::from)
+    .map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot read who holds the named descriptors: {error}"),
+            "run it where this user can list the host's processes",
+        )
+    })
 }

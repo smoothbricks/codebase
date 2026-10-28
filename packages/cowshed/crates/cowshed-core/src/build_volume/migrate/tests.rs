@@ -133,9 +133,14 @@ fn migration_discards_only_contributed_real_state_and_keeps_one_fixed_link_per_p
     }
     write(&scratch.volume(), "target/warm", "volume bytes stay");
     link::point(&checkout, &scratch.volume()).unwrap();
-    let findings = adopt_paths(&checkout, &scratch.volume(), &paths())
-        .unwrap()
-        .unwrap();
+    let findings = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &paths(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(findings.len(), 3);
     assert_eq!(findings[0].likely_tool, BuildStateTool::Cargo);
     assert_eq!(findings[1].likely_tool, BuildStateTool::Nx);
@@ -162,16 +167,26 @@ fn migration_discards_only_contributed_real_state_and_keeps_one_fixed_link_per_p
         "volume bytes stay"
     );
     assert!(
-        adopt_paths(&checkout, &scratch.volume(), &paths())
-            .unwrap()
-            .unwrap()
-            .is_empty()
+        adopt_paths(
+            &crate::census::this_test(),
+            &checkout,
+            &scratch.volume(),
+            &paths()
+        )
+        .unwrap()
+        .unwrap()
+        .is_empty()
     );
     fs::remove_file(checkout.join("target")).unwrap();
     write(&checkout, "target/displaced", "cargo clean rebuilt this");
-    let findings = adopt_paths(&checkout, &scratch.volume(), &paths())
-        .unwrap()
-        .unwrap();
+    let findings = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &paths(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].path, Path::new("target"));
     assert!(!checkout.join("target/displaced").exists());
@@ -187,10 +202,15 @@ fn exact_links_need_no_git_query_or_discovery() {
     link::point(&scratch.checkout(), &scratch.volume()).unwrap();
     link::link_paths(&scratch.checkout(), &scratch.volume(), &paths()).unwrap();
     assert!(
-        adopt_paths(&scratch.checkout(), &scratch.volume(), &paths())
-            .unwrap()
-            .unwrap()
-            .is_empty()
+        adopt_paths(
+            &crate::census::this_test(),
+            &scratch.checkout(),
+            &scratch.volume(),
+            &paths()
+        )
+        .unwrap()
+        .unwrap()
+        .is_empty()
     );
 }
 
@@ -205,7 +225,15 @@ fn foreign_entries_refuse_before_removing_any_real_directory() {
         } else {
             write(&scratch.checkout(), ".nx/cache", "foreign file");
         }
-        assert!(adopt_paths(&scratch.checkout(), &scratch.volume(), &paths()).is_err());
+        assert!(
+            adopt_paths(
+                &crate::census::this_test(),
+                &scratch.checkout(),
+                &scratch.volume(),
+                &paths()
+            )
+            .is_err()
+        );
         assert_eq!(
             fs::read_to_string(scratch.checkout().join("target/old")).unwrap(),
             "still here"
@@ -225,9 +253,14 @@ fn tracked_source_in_any_real_path_refuses_before_deleting_all_the_others() {
         "source, never delete",
     );
     git(&checkout, &["add", "--", ".nx/cache/tracked source"]);
-    let refusal = adopt_paths(&checkout, &scratch.volume(), &paths())
-        .unwrap()
-        .unwrap_err();
+    let refusal = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &paths(),
+    )
+    .unwrap()
+    .unwrap_err();
     assert_eq!(refusal.path, Path::new(".nx/cache"));
     assert_eq!(
         refusal.tracked_files,
@@ -251,13 +284,29 @@ fn overlapping_paths_and_symlinked_parents_refuse_without_deletion() {
         BuildStatePath::new("target", "target").unwrap(),
         BuildStatePath::new("target/nested", "nested").unwrap(),
     ];
-    assert!(adopt_paths(&scratch.checkout(), &scratch.volume(), &overlap).is_err());
+    assert!(
+        adopt_paths(
+            &crate::census::this_test(),
+            &scratch.checkout(),
+            &scratch.volume(),
+            &overlap
+        )
+        .is_err()
+    );
     assert_eq!(
         fs::read_to_string(scratch.checkout().join("target/nested/old")).unwrap(),
         "still here"
     );
     std::os::unix::fs::symlink(scratch.volume(), scratch.checkout().join(".nx")).unwrap();
-    assert!(adopt_paths(&scratch.checkout(), &scratch.volume(), &paths()).is_err());
+    assert!(
+        adopt_paths(
+            &crate::census::this_test(),
+            &scratch.checkout(),
+            &scratch.volume(),
+            &paths()
+        )
+        .is_err()
+    );
     assert_eq!(
         fs::read_to_string(scratch.checkout().join("target/nested/old")).unwrap(),
         "still here"
@@ -641,10 +690,15 @@ fn a_discard_a_crash_left_pending_is_finished_by_the_next_refresh() {
     );
 
     assert!(
-        adopt_paths(&checkout, &scratch.volume(), &target_only())
-            .unwrap()
-            .unwrap()
-            .is_empty(),
+        adopt_paths(
+            &crate::census::this_test(),
+            &checkout,
+            &scratch.volume(),
+            &target_only()
+        )
+        .unwrap()
+        .unwrap()
+        .is_empty(),
         "nothing real was at the path, so nothing new is displaced"
     );
     assert!(
@@ -693,9 +747,14 @@ fn a_refresh_returns_while_the_delete_of_what_it_moved_aside_waits() {
         "gc holds the earlier discard"
     );
 
-    let displaced = adopt_paths(&checkout, &scratch.volume(), &target_only())
-        .unwrap()
-        .unwrap();
+    let displaced = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &target_only(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(displaced.len(), 1);
     assert!(
         fs::symlink_metadata(checkout.join("target"))
@@ -728,9 +787,14 @@ fn a_declared_checkout_is_discarded_and_linked_like_any_build_state() {
     git(&checkout.join("vendor/upstream"), &["init", "--quiet"]);
     link::point(&checkout, &scratch.volume()).unwrap();
     let declared = vec![BuildStatePath::declared("vendor/upstream").unwrap()];
-    let displaced = adopt_paths(&checkout, &scratch.volume(), &declared)
-        .unwrap()
-        .unwrap();
+    let displaced = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &declared,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(
         displaced,
         [DisplacedBuildStateFinding {
@@ -767,10 +831,15 @@ fn a_declared_checkout_is_discarded_and_linked_like_any_build_state() {
         "rebuilt"
     );
     assert!(
-        adopt_paths(&checkout, &scratch.volume(), &declared)
-            .unwrap()
-            .unwrap()
-            .is_empty(),
+        adopt_paths(
+            &crate::census::this_test(),
+            &checkout,
+            &scratch.volume(),
+            &declared
+        )
+        .unwrap()
+        .unwrap()
+        .is_empty(),
         "the exact link is left alone"
     );
     discards_drain(&checkout);
@@ -793,10 +862,15 @@ fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
     ];
     for _ in 0..2 {
         assert!(
-            adopt_paths(&checkout, &scratch.volume(), &paths)
-                .unwrap()
-                .unwrap()
-                .is_empty()
+            adopt_paths(
+                &crate::census::this_test(),
+                &checkout,
+                &scratch.volume(),
+                &paths
+            )
+            .unwrap()
+            .unwrap()
+            .is_empty()
         );
         assert!(
             fs::symlink_metadata(checkout.join("target"))
@@ -811,9 +885,14 @@ fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
         "vendor/upstream/build/build.ninja",
         "made by a tool",
     );
-    let displaced = adopt_paths(&checkout, &scratch.volume(), &paths)
-        .unwrap()
-        .unwrap();
+    let displaced = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &paths,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(displaced.len(), 1);
     assert_eq!(displaced[0].likely_tool, BuildStateTool::Declared);
     assert_eq!(

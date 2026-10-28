@@ -31,6 +31,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 &self.config.namespace.label_prefix(),
                 capacity,
                 &crate::held_lock::ImageLockTaker {
+                    census: &self.census,
                     holding: &crate::api::held_lock::LockHolding::store(
                         crate::api::held_lock::LockOperation::MintTemplate,
                     ),

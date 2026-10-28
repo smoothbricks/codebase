@@ -1691,20 +1691,29 @@ A census asks nothing of a process a cowshed lifecycle operation runs in. The wo
 (`sessions/<ws>.intent.lock`, held for a create, fork, rename, adoption or retirement) and its land lease
 (`sessions/<ws>.land.lock`, held by a land or an `rm`) each record their holder's pid and kernel unique id
 (`p_uniqueid`) in the lease file, written after the holder takes the lease's `flock(2)` and emptied before it lets go
-(`lease_holder`). A pid is passed over only while a lease file of the host store names it with the unique id its process
-has now: a record that names no process, or whose pid another process has since taken, names nothing. This is positive
-evidence the holder wrote under its own lock, not a guess from the process tree. Such a process can sit in one kernel
-call for minutes holding one of its descriptors' vnodes (a fork's first mount of its clone, "`cowshed fork`" step 3),
-and it is no foreign holder: the operation's own leases and image locks already refuse the operations a census guards.
-The census's own process is always asked, whatever its leases say. A verb that retires, detaches or moves a workspace
-first moves its own working directory off that workspace's mount, to main's checkout, so the directory it was invoked
-from never refuses its own retirement; anything else of its own there, an open file, still holds the mount and is named
-like any other holder, and so is the working directory of the shell that invoked it, a process cowshed does not run.
-Every census on macOS starts from this one list of pids, the volume census included, which walks the processes itself
-rather than through libproc's `proc_listpidspath`. The leases read are the host store's
-(`/private/cowshed/store/<owner>/<repo>/sessions`) only: a lifecycle operation in a test fixture's store elsewhere
-records its lease there, which no census reads, so it is asked like any other process and can still stall a concurrent
-census. Linux records no unique id and its census asks every process.
+(`lease_holder`). A pid is passed over only while a lease file of the census's own store names it with the unique id its
+process has now: a record that names no process, or whose pid another process has since taken, names nothing. This is
+positive evidence the holder wrote under its own lock, not a guess from the process tree. Such a process can sit in one
+kernel call for minutes holding one of its descriptors' vnodes (a fork's first mount of its clone, "`cowshed fork`" step
+3), and it is no foreign holder: the operation's own leases and image locks already refuse the operations a census
+guards. The census's own process is always asked, whatever its leases say. A verb that retires, detaches or moves a
+workspace first moves its own working directory off that workspace's mount, to main's checkout, so the directory it was
+invoked from never refuses its own retirement; anything else of its own there, an open file, still holds the mount and
+is named like any other holder, and so is the working directory of the shell that invoked it, a process cowshed does not
+run. Every census on macOS starts from this one list of pids, the volume census included, which walks the processes
+itself rather than through libproc's `proc_listpidspath`. A census serves one store, the one its caller's roots name
+(`census::CensusScope`, from `CanonicalRoots::census` or the storage host's), and reads that store's leases
+(`<store>/<owner>/<repo>/sessions`) and no other store's. Which pids it asks follows the store's namespace. The host
+store's census asks every process the kernel lists: what it exists to find is a process cowshed does not run. A test
+fixture's store is reached only by the process that minted its namespace, the processes in its process group, and the
+descendants of either, by the parents and groups the kernel lists (`PROC_PIDT_SHORTBSDINFO`, one call per process that
+reads no vnode), so its census asks those alone. A fixture's stand-in for a host shell's run, which it backgrounds from
+a shell that exits, stays in the group though launchd adopts it, and is asked as that run would be; a process that made
+a session of its own and was adopted, such as a detached daemon, is outside the fixture. call that process sits in, and
+never reads the host store's leases. Measured 2026-10-28: an in-process fixture census read 740 host leases in 5 s and
+its descriptor walk waited on unrelated host processes held in APFS calls, holding `command_dispatch` substrate tests
+past their 180 s progress bound. `census::asked` makes the decision from the listing and the leases alone, with no I/O.
+Linux records no unique id: no lease passes a process over there, and its census asks every process in its reach.
 
 A record's unique id is its exact decimal string (`DecimalU64` in `api::held_lock`, the form every kernel identifier on
 the wire takes), the one form any reader parses; the switch from a JSON number was a clean cutover, with no reader of

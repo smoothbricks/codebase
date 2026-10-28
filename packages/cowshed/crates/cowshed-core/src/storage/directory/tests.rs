@@ -70,7 +70,13 @@ fn a_mounted_payload_resolves_to_its_mountpoint_not_the_store() {
     // Idempotent where it already is.
     bind(&image, &mount).unwrap();
 
-    unbind(&image, &mount, DetachIntent::Release).unwrap();
+    unbind(
+        &crate::census::this_test(),
+        &image,
+        &mount,
+        DetachIntent::Release,
+    )
+    .unwrap();
     assert_eq!(mount_point_state(&mount).unwrap(), MountPointState::Vacant);
     assert!(fs::symlink_metadata(&image).unwrap().is_dir());
     assert_eq!(fs::read(image.join("src/lib.rs")).unwrap(), SOURCE);
@@ -104,7 +110,13 @@ fn mounting_refuses_an_occupied_mountpoint_and_a_second_mountpoint() {
     let elsewhere = scratch.path().join("elsewhere");
     assert!(bind(&image, &elsewhere).is_err());
     assert!(
-        unbind(&image, &elsewhere, DetachIntent::Release).is_err(),
+        unbind(
+            &crate::census::this_test(),
+            &image,
+            &elsewhere,
+            DetachIntent::Release
+        )
+        .is_err(),
         "unmounting names its own mountpoint"
     );
     assert_eq!(settle(&image).unwrap(), Payload::Mounted(mount));
@@ -136,7 +148,13 @@ fn unmounting_nothing_mounted_changes_nothing() {
     let scratch = Scratch::new("unmounted");
     let image = scratch.payload("a.dmg");
     let tree = scratch.payload("user-checkout");
-    unbind(&image, &tree, DetachIntent::Release).unwrap();
+    unbind(
+        &crate::census::this_test(),
+        &image,
+        &tree,
+        DetachIntent::Release,
+    )
+    .unwrap();
     assert!(tree.join("src/lib.rs").exists());
     assert!(image.join("src/lib.rs").exists());
 }
@@ -283,7 +301,13 @@ fn directory_named_snapshot_and_mount_fence_ignore_broken_siblings() {
         )
         .is_err()
     );
-    unbind(&image, &mount, DetachIntent::Release).unwrap();
+    unbind(
+        &crate::census::this_test(),
+        &image,
+        &mount,
+        DetachIntent::Release,
+    )
+    .unwrap();
 }
 
 #[test]

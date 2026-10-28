@@ -734,6 +734,10 @@ fn real_apfs_adopt_resumes_a_fenced_image_killed_between_clone_and_attach() {
         &HostNamespace::Test(world.namespace).label_prefix(),
         CAPACITY,
         &cowshed_core::held_lock::ImageLockTaker {
+            census: &cowshed_core::census::CensusScope::new(
+                HostNamespace::Test(world.namespace),
+                Arc::from(world.store.as_path()),
+            ),
             holding: &cowshed_core::api::held_lock::LockHolding::store(
                 cowshed_core::api::held_lock::LockOperation::MintTemplate,
             ),
