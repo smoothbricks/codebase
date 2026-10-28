@@ -381,12 +381,14 @@ async fn a_land_retires_the_units_its_train_folded_and_keeps_live_dirty_and_unla
     let _ = unlanded;
     runtime.shutdown().await.expect("stop the landing runtime");
 }
-/// A gitignored path is disposable by the project's own declaration, so it never keeps a recovery
-/// image (02_workspaces.md, `rm` step 5): a tree whose only extra file is ignored retires with its
-/// image released. A hidden untracked file no rule ignores is still the only copy, and keeps its
-/// complete recovery image across shutdown, startup, plain gc and bundle-only gc.
+/// A gitignored path is disposable by the project's own declaration, and a hidden untracked one is
+/// junk, so neither keeps a recovery image (02_workspaces.md, `rm` step 5): a tree whose only extra
+/// files are ignored or hidden retires with its image released. A visible untracked file no rule
+/// ignores is still the only copy, and keeps its complete recovery image across shutdown, startup,
+/// plain gc and bundle-only gc.
 #[tokio::test]
-async fn ignored_content_is_released_and_hidden_only_copy_content_keeps_recovery_trash() {
+async fn ignored_and_hidden_content_is_released_and_visible_only_copy_content_keeps_recovery_trash()
+{
     let fixture = Fixture::new("only-copy-source");
     let runtime = fixture.adopt().await;
     let minted = fixture
@@ -408,6 +410,8 @@ async fn ignored_content_is_released_and_hidden_only_copy_content_keeps_recovery
         .unwrap()
         .write_all(b"\n/ignored-output\n")
         .unwrap();
+    fs::create_dir_all(scratch.join(".cache")).unwrap();
+    fs::write(scratch.join(".cache/r9-cr.log"), b"a run's log\n").unwrap();
     fixture
         .remove(&runtime, "scratch")
         .await
@@ -437,7 +441,7 @@ async fn ignored_content_is_released_and_hidden_only_copy_content_keeps_recovery
         .image()
         .to_owned();
     let metadata = DetachedWorkspaceMetadata::read_for_image(&image).unwrap();
-    fs::write(mount.join(".private-notes"), b"only hidden copy\n").unwrap();
+    fs::write(mount.join("private-notes"), b"only visible copy\n").unwrap();
     fs::write(mount.join("ignored-notes"), b"only ignored copy\n").unwrap();
     let exclude = mount.join(".git/info/exclude");
     use std::io::Write as _;
@@ -457,8 +461,8 @@ async fn ignored_content_is_released_and_hidden_only_copy_content_keeps_recovery
     ));
     assert!(!image.exists());
     assert_eq!(
-        fs::read(recovery.join(".private-notes")).unwrap(),
-        b"only hidden copy\n"
+        fs::read(recovery.join("private-notes")).unwrap(),
+        b"only visible copy\n"
     );
     assert_eq!(
         fs::read(recovery.join("ignored-notes")).unwrap(),
@@ -479,8 +483,8 @@ async fn ignored_content_is_released_and_hidden_only_copy_content_keeps_recovery
             .await
             .expect("collection preserves source recovery");
         assert_eq!(
-            fs::read(recovery.join(".private-notes")).unwrap(),
-            b"only hidden copy\n"
+            fs::read(recovery.join("private-notes")).unwrap(),
+            b"only visible copy\n"
         );
         assert_eq!(
             fs::read(recovery.join("ignored-notes")).unwrap(),
@@ -503,8 +507,8 @@ async fn ignored_content_is_released_and_hidden_only_copy_content_keeps_recovery
         .await
         .expect("missing grants do not authorize byte deletion");
     assert_eq!(
-        fs::read(recovery.join(".private-notes")).unwrap(),
-        b"only hidden copy\n"
+        fs::read(recovery.join("private-notes")).unwrap(),
+        b"only visible copy\n"
     );
     assert_eq!(
         fs::read(recovery.join("ignored-notes")).unwrap(),
