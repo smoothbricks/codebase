@@ -2232,9 +2232,13 @@ mod tests {
     /// the supervisor suite whenever another test was mid-spawn.
     ///
     /// No timer orders the race. The child is parked before the hold is dropped; the dropping
-    /// thread either answers first, having closed its descriptor without waiting (unfenced), or
+    /// thread either returns first, having closed its descriptor without waiting (unfenced), or
     /// is queued for the exclusive fork lock behind the parked spawn, which a reader then sees
     /// refused ([`cowshed_os::fork_lock::held_exclusive`]) -- only then is the child let go.
+    /// Unfenced, a probe while the child is still parked sees its copy. Fenced, the release is
+    /// proven once the child is reaped: Darwin reports a forked child's `exec` before `exec` has
+    /// closed every close-on-exec copy (cowshed-os `fork_lock`), so a probe at the spawn's return
+    /// can still find the copy, which made this test fail under gate load.
     #[test]
     fn a_dropped_hold_is_free_though_a_spawn_that_copied_it_is_in_flight() {
         let root = std::env::temp_dir().join(format!(
@@ -2255,29 +2259,35 @@ mod tests {
         assert!(layout.held(&id).unwrap());
 
         let in_flight = cowshed_os::fork_lock::in_flight::InFlight::start();
-        let (answer, answered) = std::sync::mpsc::channel();
-        let release = {
-            let (layout, id) = (layout.clone(), id.clone());
-            std::thread::spawn(move || {
-                drop(hold);
-                answer.send(layout.held(&id).unwrap()).unwrap();
-            })
-        };
-        let early = loop {
-            if let Ok(held) = answered.try_recv() {
-                break Some(held);
+        let (dropped, was_dropped) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            drop(hold);
+            dropped.send(()).unwrap();
+        });
+        let unfenced = loop {
+            if was_dropped.try_recv().is_ok() {
+                break true;
             }
             if cowshed_os::fork_lock::held_exclusive() {
-                break None;
+                break false;
             }
             std::thread::yield_now();
         };
+        // Only an unfenced drop returns while the child is parked, and its copy then keeps the hold.
+        let held_beside_the_parked_child = unfenced && layout.held(&id).unwrap();
+        // `finish` reaps the child, whose exit has closed every copy it held.
         in_flight.finish();
-        let held = early.unwrap_or_else(|| answered.recv().unwrap());
+        if !unfenced {
+            was_dropped.recv().unwrap();
+        }
         release.join().unwrap();
         assert!(
-            !held,
-            "a released hold keeps nothing held, whatever spawn copied it"
+            !held_beside_the_parked_child,
+            "a hold dropped beside a spawn in flight was not fenced: the parked child keeps it held"
+        );
+        assert!(
+            !layout.held(&id).unwrap(),
+            "a released hold keeps nothing held once the spawn that copied it is done"
         );
         fs::remove_dir_all(&root).unwrap();
     }
