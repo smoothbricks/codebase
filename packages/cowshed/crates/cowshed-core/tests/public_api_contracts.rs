@@ -1796,6 +1796,9 @@ fi
     let roots: Vec<PathBuf> = roots.lines().map(PathBuf::from).collect();
     assert_eq!(roots.len(), 2);
     assert_ne!(roots[0], roots[1]);
+    // The stand-in reports `$PWD`, which the shell takes from getcwd(3), the physical path: where the temporary directory
+    // is reached through a link (`/var` -> `/private/var` on a macOS runner), the scratch path differs from it.
+    let scratch = fs::canonicalize(&scratch).unwrap();
     for root in roots {
         assert_eq!(root.parent(), Some(scratch.as_path()));
         assert!(!root.exists(), "run-owned root {} survived", root.display());
