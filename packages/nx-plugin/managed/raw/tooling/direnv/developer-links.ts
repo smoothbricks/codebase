@@ -456,7 +456,7 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
   const trees = nodeModulesTrees(root);
   const recorded = readDeclaredRecord(root);
   const probe: ProducerProbe = (target, providerRoot) =>
-    pluginProbe(snapshotPluginRoot(root, anchor, declared))(target, providerRoot);
+    pluginProbe(snapshotPluginRoot(root, declared))(target, providerRoot);
   const changes: DeclaredLinkChange[] = [];
   const unavailable: UnavailableDeclaredLink[] = [];
   const reports: string[] = [];
@@ -588,10 +588,10 @@ function keptSnapshots(
  * a declaration: an install re-points the plugin alias at the lockfile's published version before this runs, and
  * that version cannot read a producer receipt only the declared checkout's plugin writes.
  */
-function snapshotPluginRoot(root: string, anchor: string, declared: readonly DeclaredLink[]): string {
+function snapshotPluginRoot(root: string, declared: readonly DeclaredLink[]): string {
   const plugin = declared.find(({ name }) => name === '@smoothbricks/nx-plugin');
-  if (plugin === undefined) return root;
-  const source = declaredTarget(root, anchor, plugin.directory);
+  const source = declaredDirectory(root, '@smoothbricks/nx-plugin');
+  if (plugin === undefined || source === null) return root;
   if (typeof plugin.snapshot === 'string') return pinnedSnapshot(root, plugin.name, source, plugin.snapshot).directory;
   return unavailableReason(source) === null ? source : root;
 }
