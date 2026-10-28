@@ -54,11 +54,6 @@
     "options": { "force": false, "restore": false, "abandon": false }
   },
   "coordinator.gc": { "repoId": "acme/widget", "options": { "dryRun": false, "abandoned": false } },
-  "coordinator.recoverImage": {
-    "repoId": "acme/widget",
-    "image": "/trusted/store/acme/widget/sessions/.trash/feature-0123456789abcdef0123456789abcdef.dmg",
-    "to": "/trusted/recovered"
-  },
   "coordinator.removeProject": { "repoId": "acme/widget", "options": { "force": false, "abandon": false } },
   "coordinator.repoMirror": {
     "repoId": "acme/widget",

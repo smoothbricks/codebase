@@ -3,27 +3,13 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "macos")]
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd as _, RawFd};
-
-// Darwin's sys/acl.h owns this opaque ABI; copy and its OS-level oracle share these declarations.
+use std::os::fd::AsRawFd as _;
 #[cfg(target_os = "macos")]
-#[repr(C)]
-pub(super) struct NativeAcl {
-    _private: [u8; 0],
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    pub(super) fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut NativeAcl;
-    pub(super) fn acl_free(object: *mut libc::c_void) -> libc::c_int;
-}
-#[cfg(not(target_os = "macos"))]
-use linux::{list_xattrs, read_xattr};
-#[cfg(target_os = "macos")]
-use macos::{list_xattrs, read_xattr};
+use std::os::fd::RawFd;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LeafMaterialization {
     Cloned,
@@ -41,9 +27,9 @@ pub(super) fn clone_fallback_error(error: &std::io::Error) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub use linux::{copy_leaf, copy_regular, directory_metadata};
+pub use linux::{copy_leaf, directory_metadata};
 #[cfg(target_os = "macos")]
-pub use macos::{copy_leaf, copy_regular, directory_metadata};
+pub use macos::{copy_leaf, directory_metadata};
 
 /// Observe a logical hole in a freshly opened regular file: its first data region is not the
 /// whole of `length`. Physical compression alone is not a hole: SEEK_HOLE answers in the logical
@@ -127,7 +113,8 @@ pub(crate) fn bypass_cache(_: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// Retain the native cause and descriptor context; the recovery owner adds admitted paths.
+/// Retain the native cause and descriptor context.
+#[cfg(target_os = "macos")]
 #[derive(Debug, thiserror::Error)]
 #[error("{operation} on descriptor {descriptor}, attribute {attribute:?}: {source}")]
 struct MetadataError {
@@ -138,6 +125,7 @@ struct MetadataError {
     source: io::Error,
 }
 
+#[cfg(target_os = "macos")]
 fn metadata_error(
     file: &File,
     operation: &'static str,
@@ -153,113 +141,6 @@ fn metadata_error(
             source,
         },
     )
-}
-
-fn metadata_count(count: libc::ssize_t) -> io::Result<usize> {
-    if count < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        usize::try_from(count).map_err(|_| io::Error::other("metadata length exceeds usize"))
-    }
-}
-
-fn xattr_names(file: &File) -> io::Result<Vec<u8>> {
-    let read = |buffer: &mut [u8]| {
-        list_xattrs(file, buffer)
-            .map_err(|error| metadata_error(file, "list extended attributes", None, error))
-    };
-    let length = read(&mut [])?;
-    let mut names = vec![0; length];
-    if read(&mut names)? != length {
-        return Err(metadata_error(
-            file,
-            "list extended attributes",
-            None,
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "attribute names changed while reading",
-            ),
-        ));
-    }
-    Ok(names)
-}
-
-fn ordered_xattr_names(mut bytes: &[u8]) -> io::Result<Vec<&CStr>> {
-    let mut names = Vec::new();
-    while !bytes.is_empty() {
-        let name = CStr::from_bytes_until_nul(bytes)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if name.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "empty extended attribute name",
-            ));
-        }
-        names.push(name);
-        bytes = &bytes[name.to_bytes_with_nul().len()..];
-    }
-    names.sort_unstable();
-    Ok(names)
-}
-
-fn xattr_value(file: &File, name: &CStr, buffer: &mut Vec<u8>) -> io::Result<()> {
-    let read = |buffer: &mut [u8]| {
-        read_xattr(file, name, buffer)
-            .map_err(|error| metadata_error(file, "read extended attribute", Some(name), error))
-    };
-    let length = read(&mut [])?;
-    buffer.resize(length, 0);
-    if read(buffer)? != length {
-        return Err(metadata_error(
-            file,
-            "read extended attribute",
-            Some(name),
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "attribute value changed while reading",
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Linux exposes POSIX ACLs in its kernel xattr namespace. Darwin keeps its extended ACL
-/// separately; ordinary xattrs include resource forks, but not private compression storage.
-/// Metadata changes during these reads are also fenced by the caller's ctime witnesses.
-pub(super) fn verify_metadata(source: &File, destination: &File) -> io::Result<()> {
-    let source_names = xattr_names(source)?;
-    let destination_names = xattr_names(destination)?;
-    let source_names = ordered_xattr_names(&source_names)?;
-    let destination_names = ordered_xattr_names(&destination_names)?;
-    if source_names != destination_names {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "extended attribute names differ: source descriptor {} {source_names:?}, destination descriptor {} {destination_names:?}",
-                source.as_raw_fd(),
-                destination.as_raw_fd(),
-            ),
-        ));
-    }
-    let mut source_value = Vec::new();
-    let mut destination_value = Vec::new();
-    for name in source_names {
-        xattr_value(source, name, &mut source_value)?;
-        xattr_value(destination, name, &mut destination_value)?;
-        if source_value != destination_value {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "extended attribute {name:?} differs: source descriptor {}, destination descriptor {}",
-                    source.as_raw_fd(),
-                    destination.as_raw_fd(),
-                ),
-            ));
-        }
-    }
-    #[cfg(target_os = "macos")]
-    macos::verify_acl(source, destination)?;
-    Ok(())
 }
 #[cfg(test)]
 mod tests {

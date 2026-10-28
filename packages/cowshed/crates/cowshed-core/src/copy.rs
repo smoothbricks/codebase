@@ -257,96 +257,6 @@ impl CopyFileIdentity {
             ctime: (metadata.ctime(), metadata.ctime_nsec()),
         }
     }
-    pub(crate) fn read(file: &fs::File) -> io::Result<Self> {
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cross-filesystem recovery requires a regular file",
-            ));
-        }
-        Ok(Self::from_metadata(&metadata))
-    }
-
-    pub(crate) fn same_inode(&self, other: &Self) -> bool {
-        self.device == other.device && self.inode == other.inode
-    }
-
-    /// A rename may change ctime; byte verification is still required after this comparison.
-    pub(crate) fn after_rename(&self, other: &Self) -> bool {
-        self.same_inode(other)
-            && self.size == other.size
-            && self.mode == other.mode
-            && self.mtime == other.mtime
-    }
-}
-
-/// Copy only into a newly created, held regular file. The caller owns publication and durability.
-/// Both descriptors bypass the page cache: a recovery image passes through once, and caching it
-/// evicts what the rest of the host is using. The native copy writes the source's data regions
-/// only, so a hole is neither read nor written.
-pub(crate) fn copy_held_file(source: &fs::File, destination: &fs::File) -> io::Result<()> {
-    CopyFileIdentity::read(source)?;
-    CopyFileIdentity::read(destination)?;
-    native::bypass_cache(source)?;
-    native::bypass_cache(destination)?;
-    native::copy_regular(source, destination)
-}
-
-/// Compare held bytes, ownership and applicable ACL/xattrs; retain exact mutation witnesses.
-pub(crate) fn verify_held_file(
-    source: &fs::File,
-    destination: &fs::File,
-) -> io::Result<crate::api::Sha256Digest> {
-    use std::os::unix::fs::MetadataExt as _;
-    let before = CopyFileIdentity::read(source)?;
-    let copied = CopyFileIdentity::read(destination)?;
-    if before.size != copied.size || before.mode != copied.mode || before.mtime != copied.mtime {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "copied file metadata differs",
-        ));
-    }
-    let original_metadata = source.metadata()?;
-    let copied_metadata = destination.metadata()?;
-    if original_metadata.uid() != copied_metadata.uid()
-        || original_metadata.gid() != copied_metadata.gid()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "copied ownership differs: source uid {} gid {}, destination uid {} gid {}",
-                original_metadata.uid(),
-                original_metadata.gid(),
-                copied_metadata.uid(),
-                copied_metadata.gid(),
-            ),
-        ));
-    }
-    native::verify_metadata(source, destination)?;
-    if copied_metadata.blocks().saturating_mul(512)
-        > original_metadata
-            .blocks()
-            .saturating_mul(512)
-            .saturating_add(65536)
-        && original_metadata.blocks().saturating_mul(512) < before.size
-        && native::has_holes(source, before.size)?
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "sparse holes were materialized",
-        ));
-    }
-    native::bypass_cache(source)?;
-    native::bypass_cache(destination)?;
-    let digest = compare_file_bytes(source, destination, before.size)?;
-    if CopyFileIdentity::read(source)? != before || CopyFileIdentity::read(destination)? != copied {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "source or destination changed during verification",
-        ));
-    }
-    Ok(digest)
 }
 
 /// The bytes `compare_file_bytes` reads, compares and hashes per positional transfer.
@@ -2310,9 +2220,6 @@ mod tests {
             .unwrap();
     }
 }
-
-#[cfg(test)]
-mod metadata_tests;
 
 #[cfg(test)]
 mod sparse_tests;

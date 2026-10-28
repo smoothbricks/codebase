@@ -1,12 +1,11 @@
-//! Behavioural proof that a held-file copy and its verification touch only the bytes a file holds
-//! as data (02_workspaces.md, "Recovering a recovery image": a cross-filesystem copy is sparse, and
-//! its `published` state records the SHA-256 of bytes that were compared). Fixtures are real sparse
-//! files whose data regions sit at known offsets; every expected digest is built from those regions
-//! and the zero runs between them, never by reading a file back.
+//! Behavioural proof that a file comparison touches only the bytes a file holds as data: a hole
+//! compares as zeros without a read, and the digest still covers every logical byte. Fixtures are
+//! real sparse files whose data regions sit at known offsets; every expected digest is built from
+//! those regions and the zero runs between them, never by reading a file back.
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
@@ -15,7 +14,7 @@ use crate::api::Sha256Digest;
 use crate::storage::directory::tests::Scratch;
 
 use super::native::next_data_region;
-use super::{Content, Run, Runs, ZEROS, compare_file_bytes, copy_held_file, verify_held_file};
+use super::{Content, Run, Runs, ZEROS, compare_file_bytes};
 
 const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;
@@ -59,7 +58,12 @@ fn pattern(offset: u64, length: u64) -> Vec<u8> {
 /// A sparse file of `length` holding `pattern` over exactly `regions`. It is sized first, so every
 /// positional write lands inside the file and none extends it across a gap.
 fn sparse_file(path: &Path, length: u64, regions: &[(u64, u64)]) -> fs::File {
-    let file = held_file(path);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("create a sparse file");
     file.set_len(length).expect("size the sparse file");
     for &(start, end) in regions {
         file.write_all_at(&pattern(start, end - start), start)
@@ -67,17 +71,6 @@ fn sparse_file(path: &Path, length: u64, regions: &[(u64, u64)]) -> fs::File {
     }
     file.sync_all().expect("place the data regions");
     file
-}
-
-/// A newly created, held regular file, as the recovery copy creates its partial.
-fn held_file(path: &Path) -> fs::File {
-    fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .expect("create a held file")
 }
 
 fn data_regions(file: &fs::File, length: u64) -> Vec<(u64, u64)> {
@@ -88,35 +81,6 @@ fn data_regions(file: &fs::File, length: u64) -> Vec<(u64, u64)> {
         offset = end;
     }
     regions
-}
-
-/// The runs a comparison walks between two files holding data over the same `regions`: each
-/// region read from both, each gap a hole in both and read from neither.
-fn same_region_runs(length: u64, regions: &[(u64, u64)]) -> Vec<Run> {
-    let hole = |start, end| Run {
-        start,
-        end,
-        source: Content::Hole,
-        destination: Content::Hole,
-    };
-    let mut runs = Vec::new();
-    let mut offset = 0;
-    for &(start, end) in regions {
-        if start > offset {
-            runs.push(hole(offset, start));
-        }
-        runs.push(Run {
-            start,
-            end,
-            source: Content::Data,
-            destination: Content::Data,
-        });
-        offset = end;
-    }
-    if offset < length {
-        runs.push(hole(offset, length));
-    }
-    runs
 }
 
 fn walked_runs(source: &fs::File, destination: &fs::File, length: u64) -> Vec<Run> {
@@ -144,42 +108,6 @@ fn expected_digest(length: u64, regions: &[(u64, u64)]) -> Sha256Digest {
     }
     hash_zeros(&mut digest, length - offset);
     Sha256Digest::from_bytes(digest.finalize().into())
-}
-
-/// A large sparse recovery image copies and verifies through its data regions alone: the walk the
-/// comparison consumes reads exactly the source's data, every gap is a hole in both files and is
-/// read from neither, and the recorded digest is still SHA-256 over every logical byte. The
-/// byte-at-a-time comparison this replaced read all of `LARGE_LENGTH` from both files, holes
-/// included, and had no walk to assert.
-#[test]
-fn a_large_sparse_copy_verifies_reading_only_its_data_regions() {
-    let scratch = scratch("large");
-    let source = sparse_file(&scratch.path().join("source"), LARGE_LENGTH, &LARGE_REGIONS);
-    assert_eq!(
-        data_regions(&source, LARGE_LENGTH),
-        LARGE_REGIONS,
-        "the fixture is sparse"
-    );
-    let destination = held_file(&scratch.path().join("destination"));
-
-    copy_held_file(&source, &destination).expect("copy the sparse file");
-
-    assert_eq!(
-        data_regions(&destination, LARGE_LENGTH),
-        LARGE_REGIONS,
-        "the copy kept every hole"
-    );
-    assert_eq!(
-        walked_runs(&source, &destination, LARGE_LENGTH),
-        same_region_runs(LARGE_LENGTH, &LARGE_REGIONS),
-        "the comparison reads the data regions and nothing else"
-    );
-    let digest = verify_held_file(&source, &destination).expect("the sparse copy verifies");
-    assert_eq!(
-        digest,
-        expected_digest(LARGE_LENGTH, &LARGE_REGIONS),
-        "the digest covers every logical byte, holes included"
-    );
 }
 
 /// The walker visits exactly the data regions: from the start, from a hole, from inside a region
@@ -229,7 +157,6 @@ fn a_destination_with_data_in_a_source_hole_is_refused() {
 
 /// Zeros a destination allocated where the source has a hole are the bytes the hole reads as: the
 /// comparison accepts them either way round, and the digest is the source's logical content.
-/// (Verification's allocation contract separately refuses a copy that materialized its holes.)
 #[test]
 fn a_destination_with_allocated_zeros_in_a_source_hole_is_accepted() {
     let scratch = scratch("zeros");
@@ -269,33 +196,4 @@ fn a_destination_with_allocated_zeros_in_a_source_hole_is_accepted() {
 
     assert_eq!(digest, expected_digest(SMALL_LENGTH, &SMALL_REGIONS));
     assert_eq!(reverse, digest);
-}
-
-/// A file of holes alone copies to holes alone and verifies reading neither file: its walk is one
-/// run, a hole in both, and its digest is that of its length in zeros.
-#[test]
-fn a_file_of_holes_alone_copies_and_verifies_without_a_read() {
-    let scratch = scratch("holes");
-    let source = sparse_file(&scratch.path().join("source"), SMALL_LENGTH, &[]);
-    assert!(
-        data_regions(&source, SMALL_LENGTH).is_empty(),
-        "the fixture is all hole"
-    );
-    let destination = held_file(&scratch.path().join("destination"));
-
-    copy_held_file(&source, &destination).expect("copy a file of holes");
-
-    assert!(
-        data_regions(&destination, SMALL_LENGTH).is_empty(),
-        "the copy kept the hole"
-    );
-    assert_eq!(
-        walked_runs(&source, &destination, SMALL_LENGTH),
-        same_region_runs(SMALL_LENGTH, &[]),
-        "the comparison reads neither file"
-    );
-    assert_eq!(
-        verify_held_file(&source, &destination).expect("a copy of holes verifies"),
-        expected_digest(SMALL_LENGTH, &[])
-    );
 }

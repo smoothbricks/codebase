@@ -452,10 +452,6 @@ class CoordinatorImpl implements Coordinator {
     return callNativeAsync(() => N.coordinatorGc(this.#native, { options: options ?? {} }));
   }
 
-  async recoverImage(image: string, to: string): Promise<Api.RecoveredImage> {
-    return callNativeAsync(() => N.coordinatorRecoverImage(this.#native, { image, to }));
-  }
-
   async doctor(): Promise<Api.DoctorReport> {
     return callNativeAsync(() => N.coordinatorDoctor(this.#native, {}));
   }

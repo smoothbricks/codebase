@@ -16,14 +16,15 @@ use cowshed_os::fork_lock::Fenced;
 pub const STAGING_NAMESPACE: &str = ".staging";
 pub const TRASH_NAMESPACE: &str = ".trash";
 /// Extension of the recovery bundle a removal verifies and writes into the trash before it
-/// abandons unlanded work: `sessions/.trash/<ws>-<tip>.bundle`. Its tips are also kept as refs in
-/// main's repository (02_workspaces.md, `rm` step 1), which a sweep re-asserts before it reclaims
-/// one; only a sweep explicitly authorized for them reclaims it.
+/// abandons unlanded work or uncommitted work: `sessions/.trash/<ws>-<tip>.bundle`, the only copy of
+/// what it holds (02_workspaces.md, `rm` step 1). A plain sweep drops one main holds every commit of
+/// by patch identity; only a sweep explicitly authorized for them reclaims the rest.
 pub const ABANDON_BUNDLE_EXTENSION: &str = "bundle";
 
 /// What a project's trash keeps of `rm --abandon`: its abandon bundles, recovery files for the
-/// commits each removal gave up, which only an explicit `gc --abandoned` deletes. The surfaces
-/// that never otherwise show the trash — `ls --all`, plain `gc`, `doctor` — name them with this.
+/// work each removal gave up, which only an explicit `gc --abandoned` deletes while main lacks any
+/// of it. The surfaces that never otherwise show the trash — `ls --all`, plain `gc`, `doctor` —
+/// name them with this.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeptAbandonBundles {
     pub trash: PathBuf,
@@ -37,11 +38,11 @@ impl KeptAbandonBundles {
         "cowshed gc --dry-run --abandoned lists them; cowshed gc --abandoned deletes them";
 
     /// The bundles an `--abandoned` gc preview names; `None` when it names none.
-    pub fn named_by(
-        candidates: &[crate::storage::lifecycle::StorageGcCandidate],
+    pub fn named_by<'a>(
+        candidates: impl IntoIterator<Item = &'a crate::storage::lifecycle::StorageGcCandidate>,
     ) -> CowshedResult<Option<Self>> {
         let mut kept: Option<Self> = None;
-        for candidate in candidates.iter().filter(|candidate| {
+        for candidate in candidates.into_iter().filter(|candidate| {
             candidate.reason() == crate::storage::lifecycle::StorageGcReason::AbandonedBundle
         }) {
             let summary = kept.get_or_insert_with(|| Self {
@@ -843,16 +844,18 @@ impl LifecycleIntentRecord {
     }
 }
 
-/// Lifecycle entries are bounded to one record per logical workspace. Recovery exports retain
-/// per-source custody through completion; terminal project unbinding releases this controller journal.
+/// Lifecycle entries are bounded to one record per logical workspace; terminal project unbinding
+/// releases this controller journal.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LifecycleIntentJournal {
     version: u32,
     entries: BTreeMap<WorkspaceName, LifecycleIntentRecord>,
-    /// Recovery-export proofs remain controller metadata until terminal project unbinding.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    recovery_exports: BTreeMap<PathBuf, super::recovery_image::custody::RecoveryExport>,
+    /// The custody records of `gc --recover`, which a build before recovery images went wrote
+    /// (02_workspaces.md, `rm` step 5): a storage format still read, so such a journal loads, and
+    /// never written, so its next write drops them.
+    #[serde(default, rename = "recoveryExports", skip_serializing)]
+    retired_recovery_exports: Option<serde_json::Value>,
 }
 
 impl Default for LifecycleIntentJournal {
@@ -860,7 +863,7 @@ impl Default for LifecycleIntentJournal {
         Self {
             version: LIFECYCLE_INTENT_VERSION,
             entries: BTreeMap::new(),
-            recovery_exports: BTreeMap::new(),
+            retired_recovery_exports: None,
         }
     }
 }
@@ -948,33 +951,6 @@ impl LifecycleIntentJournal {
         })
     }
 
-    pub(crate) fn recovery_export(
-        &self,
-        source: &Path,
-    ) -> Option<&super::recovery_image::custody::RecoveryExport> {
-        self.recovery_exports.get(source)
-    }
-
-    pub(crate) fn record_recovery_export(
-        &mut self,
-        source: &Path,
-        previous: Option<&super::recovery_image::custody::RecoveryExport>,
-        next: &super::recovery_image::custody::RecoveryExport,
-    ) -> CowshedResult<()> {
-        if self.recovery_exports.get(source) != previous {
-            return Err(CowshedError::integrity(
-                format!(
-                    "source-held recovery authority for {} changed",
-                    source.display()
-                ),
-                "retain both copies and retry through the existing recovery operation",
-            ));
-        }
-        next.validate(source)?;
-        self.recovery_exports
-            .insert(source.to_owned(), next.clone());
-        Ok(())
-    }
     pub fn get(&self, workspace: &WorkspaceName) -> Option<&LifecycleIntentRecord> {
         self.entries.get(workspace)
     }
@@ -1220,9 +1196,6 @@ impl LifecycleIntentJournal {
                 ),
                 "upgrade cowshed or repair the lifecycle intent journal",
             ));
-        }
-        for (source, export) in &self.recovery_exports {
-            export.validate(source)?;
         }
         for (workspace, record) in &self.entries {
             if record.operation.target() != workspace {
@@ -1631,4 +1604,28 @@ static MAIN_NAME: LazyLock<WorkspaceName> = LazyLock::new(WorkspaceName::main);
 
 fn main_name() -> &'static WorkspaceName {
     &MAIN_NAME
+}
+
+#[cfg(test)]
+mod retired_recovery_export_tests {
+    use super::{LIFECYCLE_INTENT_VERSION, LifecycleIntentJournal};
+
+    /// `gc --recover` is gone, but a journal an earlier build wrote may still hold its
+    /// `recoveryExports` records: the journal still loads, and the next write drops them.
+    #[test]
+    fn a_journal_holding_recovery_exports_loads_and_its_next_write_drops_them() {
+        let journal: LifecycleIntentJournal = serde_json::from_value(serde_json::json!({
+            "version": LIFECYCLE_INTENT_VERSION,
+            "entries": {},
+            "recoveryExports": {
+                "/store/acme/widget/sessions/.trash/raven-0123.dmg": { "admission": { "version": 2 } }
+            }
+        }))
+        .expect("an earlier build's journal loads");
+        journal.validate().expect("and validates");
+        assert_eq!(
+            serde_json::to_value(&journal).expect("serialize"),
+            serde_json::json!({ "version": LIFECYCLE_INTENT_VERSION, "entries": {} })
+        );
+    }
 }

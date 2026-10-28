@@ -215,16 +215,6 @@ type ReaderName =
   | 'REBASE_REPORT__ABORTED'
   | 'REBASE_REPORT__PLANNED'
   | 'REBASE_REPORT__REBASED'
-  | 'RECOVERED_IMAGE'
-  | 'RECOVERY_CAUSE'
-  | 'RECOVERY_CAUSE__ABANDONED'
-  | 'RECOVERY_CAUSE__DIRTY'
-  | 'RECOVERY_CAUSE__IN_PROGRESS'
-  | 'RECOVERY_CAUSE__MAIN'
-  | 'RECOVERY_CAUSE__ONLY_COPY'
-  | 'RECOVERY_RETENTION'
-  | 'RECOVERY_RETENTION__RECORDED'
-  | 'RECOVERY_RETENTION__UNRECORDED'
   | 'REKEY_RESULT'
   | 'REMOVED_WORKSPACE'
   | 'REMOVE_PROJECT_REPORT'
@@ -268,7 +258,6 @@ type ReaderName =
   | 'SEQ__PRESERVED_REF'
   | 'SEQ__PROCESS_COVERAGE_GAP'
   | 'SEQ__PROJECT_WORKSPACES'
-  | 'SEQ__RECOVERY_CAUSE'
   | 'SEQ__REMOVED_WORKSPACE'
   | 'SEQ__REPLAYED_COMMIT'
   | 'SEQ__SCRIPT_VALUE'
@@ -789,6 +778,7 @@ const READERS: Readers<ReaderName> = {
       ['orphanSessionImage', 'LEAF'],
       ['orphanMountpoint', 'LEAF'],
       ['abandonedBundle', 'LEAF'],
+      ['heldBundle', 'LEAF'],
       ['unlinkedBuildVolume', 'LEAF'],
       ['supersededSeed', 'LEAF'],
       ['interruptedBuildVolume', 'LEAF'],
@@ -1683,51 +1673,6 @@ const READERS: Readers<ReaderName> = {
       ['commits', 'SEQ__REPLAYED_COMMIT'],
     ],
   },
-  RECOVERED_IMAGE: {
-    kind: 'record',
-    fields: [
-      ['workspace', 'LEAF'],
-      ['incarnation', 'LEAF'],
-      ['source', 'LEAF'],
-      ['directory', 'LEAF'],
-      ['manifest', 'LEAF'],
-      ['moved', 'LEAF'],
-      ['grants', 'LEAF'],
-      ['retained', 'RECOVERY_RETENTION'],
-    ],
-  },
-  RECOVERY_CAUSE: {
-    kind: 'internal',
-    tag: 'kind',
-    arms: [
-      ['inProgress', 'RECOVERY_CAUSE__IN_PROGRESS'],
-      ['dirty', 'RECOVERY_CAUSE__DIRTY'],
-      ['abandoned', 'RECOVERY_CAUSE__ABANDONED'],
-      ['onlyCopy', 'RECOVERY_CAUSE__ONLY_COPY'],
-      ['main', 'RECOVERY_CAUSE__MAIN'],
-    ],
-  },
-  RECOVERY_CAUSE__ABANDONED: { kind: 'record', fields: [] },
-  RECOVERY_CAUSE__DIRTY: { kind: 'record', fields: [] },
-  RECOVERY_CAUSE__IN_PROGRESS: { kind: 'record', fields: [['operation', 'LEAF']] },
-  RECOVERY_CAUSE__MAIN: { kind: 'record', fields: [] },
-  RECOVERY_CAUSE__ONLY_COPY: { kind: 'record', fields: [['path', 'LEAF']] },
-  RECOVERY_RETENTION: {
-    kind: 'internal',
-    tag: 'kind',
-    arms: [
-      ['recorded', 'RECOVERY_RETENTION__RECORDED'],
-      ['unrecorded', 'RECOVERY_RETENTION__UNRECORDED'],
-    ],
-  },
-  RECOVERY_RETENTION__RECORDED: {
-    kind: 'record',
-    fields: [
-      ['at', 'LEAF'],
-      ['because', 'SEQ__RECOVERY_CAUSE'],
-    ],
-  },
-  RECOVERY_RETENTION__UNRECORDED: { kind: 'record', fields: [] },
   REKEY_RESULT: {
     kind: 'record',
     fields: [
@@ -1878,7 +1823,6 @@ const READERS: Readers<ReaderName> = {
   SEQ__PRESERVED_REF: { kind: 'seq', element: 'PRESERVED_REF' },
   SEQ__PROCESS_COVERAGE_GAP: { kind: 'seq', element: 'PROCESS_COVERAGE_GAP' },
   SEQ__PROJECT_WORKSPACES: { kind: 'seq', element: 'PROJECT_WORKSPACES' },
-  SEQ__RECOVERY_CAUSE: { kind: 'seq', element: 'RECOVERY_CAUSE' },
   SEQ__REMOVED_WORKSPACE: { kind: 'seq', element: 'REMOVED_WORKSPACE' },
   SEQ__REPLAYED_COMMIT: { kind: 'seq', element: 'REPLAYED_COMMIT' },
   SEQ__SCRIPT_VALUE: { kind: 'seq', element: 'SCRIPT_VALUE' },
@@ -2304,9 +2248,6 @@ export const readReAdoption = (json: string): Api.ReAdoption =>
 
 export const readRebaseReport = (json: string): Api.RebaseReport =>
   V.assertRebaseReport(project(JSON.parse(json), 'REBASE_REPORT', READERS));
-
-export const readRecoveredImage = (json: string): Api.RecoveredImage =>
-  V.assertRecoveredImage(project(JSON.parse(json), 'RECOVERED_IMAGE', READERS));
 
 export const readRekeyResult = (json: string): Api.RekeyResult =>
   V.assertRekeyResult(project(JSON.parse(json), 'REKEY_RESULT', READERS));

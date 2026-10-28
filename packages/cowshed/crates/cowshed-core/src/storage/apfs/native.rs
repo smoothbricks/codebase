@@ -2050,11 +2050,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             // The caller's own retirement names the trash path, so it still authorizes the
             // workspace-scoped cleanup the missing record would have.
             (None, Some(expected)) => expected.clone(),
+            // An image whose record is gone names no workspace's environment: only its own files,
+            // the image, its CA companion and any sidecar, are released.
             (None, None) => {
-                return Err(ApfsStorageError::Host(format!(
-                    "retaining recovery image {}: grants sidecar is missing; recover its metadata or contents before explicit retirement",
-                    trash_image.display()
-                )));
+                self.reclaim_image(trash_image)?;
+                return Ok(None);
             }
         };
         let reclaim = |owners: &super::RetiredNameOwners| {
@@ -2497,7 +2497,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         named_mountpoints.insert(WorkspaceName::main().as_str().to_owned());
         for path in trash_images {
             let Some(retired) = self.retired_authority(project, repo, &path)? else {
-                // Missing authority is not evidence that these bytes are held elsewhere.
+                // An image whose grants sidecar is gone names no workspace's environment, so only
+                // its own files go: the image, its CA companion and any sidecar.
                 let Some((name, _)) = path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
@@ -2510,10 +2511,16 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     continue;
                 };
                 named_mountpoints.insert(name.as_str().to_owned());
-                warn_session_image_issue(
+                examined = examined
+                    .checked_add(1)
+                    .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
+                lock_paths.push(super::workspace_lock_path(&self.config, repo, &name)?);
+                candidates.push(gc_candidate(
+                    StorageGcReason::RetiredWorkspace,
                     &path,
-                    "recovery image has no grants sidecar; retained, not garbage: recover it deliberately with cowshed gc --recover <image> --to <dir>",
-                );
+                    &image_gc_paths(&path),
+                    &[],
+                )?);
                 continue;
             };
             named_mountpoints.insert(retired.workspace().name().as_str().to_owned());
@@ -2525,11 +2532,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             #[cfg(target_os = "macos")]
             if let Some(RetiredMountpoint::RootHeld(held)) = &cleanup.mount_point {
                 root_held_mountpoints.push(RootHeldMountpoint::Pending(held.path.clone()));
-            }
-            if path_exists(&path)? {
-                // Recovery trash can be the only copy of dirty or ignored bytes. Even
-                // --abandoned authorizes bundles, not destruction of an image's work.
-                continue;
             }
             let artifacts = cleanup.paths;
             examined = examined
@@ -3624,36 +3626,6 @@ where
                 })
             }
         }
-    }
-}
-
-impl<R> crate::storage::recovery_image::RecoveryEnvironment for MacOsApfsExecutionHost<R>
-where
-    R: CommandRunner + Send + Sync + 'static,
-{
-    fn reclaim_recovery_environment(
-        &self,
-        repo: &RepoId,
-        image: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        let project = layout(&self.config, repo)?.project().project_root.clone();
-        let Some(authority) = self.retired_authority(&project, repo, image)? else {
-            // An already-exported image, or a legacy image missing its grants, carries no
-            // authority to delete a name's environment. Its filename cannot replace that proof.
-            return Ok(());
-        };
-        let trash = project
-            .join(SESSIONS_DIRECTORY)
-            .join(super::TRASH_NAMESPACE);
-        let owners = super::RetiredNameOwners::from_images(&self.retired_trash_images(&trash)?);
-        if self.retired_name_scope(
-            authority.workspace(),
-            owners.get(authority.workspace().name()),
-        )? == NameScope::Owned
-        {
-            self.reclaim_exec_temp(&project, &authority, image)?;
-        }
-        Ok(())
     }
 }
 
@@ -6021,8 +5993,8 @@ mod tests {
         ));
     }
 
-    /// Both successful and refused previews preserve bytes; execution rechecks unknown work and
-    /// only reclaims the authorized retirement, never a recovery image lacking authority.
+    /// Both successful and refused previews preserve bytes; execution rechecks unknown work, then
+    /// releases every trash image: the authorized retirement, and one whose record is gone.
     #[cfg(target_os = "macos")]
     #[test]
     fn retired_gc_preview_preserves_strays_until_execution() {
@@ -6057,7 +6029,7 @@ mod tests {
             .expect("retirement authority");
         let sidecar = sidecar_path(&trash);
         let authority_before = fs::read(&sidecar).expect("retirement bytes");
-        // This image-shaped sentinel is recovery data, not a mounted or fabricated APFS image.
+        // An image-shaped trash entry with no sidecar: no recovery image is kept, so it is garbage.
         let recovery =
             trash.with_file_name(format!("recovery-{}.dmg", metadata.workspace_incarnation));
         fs::write(&recovery, b"only-copy recovery bytes").expect("recovery bytes");
@@ -6130,6 +6102,9 @@ mod tests {
         assert!(plan.candidates().iter().any(|candidate| {
             candidate.reason() == StorageGcReason::RetiredWorkspace && candidate.path() == trash
         }));
+        assert!(plan.candidates().iter().any(|candidate| {
+            candidate.reason() == StorageGcReason::RetiredWorkspace && candidate.path() == recovery
+        }));
         assert_untouched();
 
         let unknown = mount.join("src/unsaved.rs");
@@ -6162,9 +6137,9 @@ mod tests {
             !sidecar.exists(),
             "completed retirement releases its authority"
         );
-        assert_eq!(
-            fs::read(&recovery).expect("recovery image retained"),
-            b"only-copy recovery bytes"
+        assert!(
+            !recovery.exists(),
+            "a trash image without its record is released too"
         );
     }
 

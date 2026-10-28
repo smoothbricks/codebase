@@ -987,7 +987,7 @@ fn a_clone_into_a_path_that_is_not_a_dmg_image_fails_before_any_command() {
 }
 
 #[test]
-fn stats_count_only_images_and_gc_preserves_recorded_recovery_trash() {
+fn stats_count_only_images_and_gc_releases_a_recorded_trash_image() {
     let fixture = Fixture::new("stats-gc");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image().expect("canonical");
@@ -1022,11 +1022,12 @@ fn stats_count_only_images_and_gc_preserves_recorded_recovery_trash() {
     create_image(&cache_image);
 
     let report = execute_gc(&host, &fixture.config()).expect("gc");
-    // Recovery trash is evidence, not a candidate, and a sidecar-backed image is not examined.
-    assert_eq!(report.examined, 0);
-    assert_eq!(report.reclaimed, 0);
-    assert!(trash.exists());
-    assert!(sidecar_path(&trash).exists());
+    // The trash image an earlier build kept is a retirement gc finishes; a sidecar-backed session
+    // image is not examined.
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.reclaimed, 1);
+    assert!(!trash.exists());
+    assert!(!sidecar_path(&trash).exists());
     assert!(active.image().exists());
     assert!(
         cache_image.exists(),
@@ -1074,10 +1075,10 @@ fn gc_sweeps_around_an_unpublished_clone_without_deleting_it() {
 
     let report = execute_gc(&host, &fixture.config()).expect("an unpublished clone cannot fail gc");
     assert_eq!(
-        report.reclaimed, 0,
-        "neither pending nor recovery work is garbage"
+        report.reclaimed, 1,
+        "the trash image is garbage, the pending clone is not"
     );
-    assert!(trash.exists());
+    assert!(!trash.exists());
     assert!(
         pending.image().exists(),
         "gc never deletes an unpublished clone"
@@ -1989,16 +1990,18 @@ fn gc_preview_and_reclaim_of_a_retired_workspace_never_read_its_sparse_trash_ima
     let plan = host
         .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("a preview over a sparse trash image reads none of it");
-    assert!(
-        plan.candidates().is_empty(),
-        "recovery images are not generic GC candidates"
+    let candidates = plan
+        .candidates()
+        .iter()
+        .map(|candidate| (candidate.reason(), candidate.path().to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        candidates,
+        [(StorageGcReason::RetiredWorkspace, trash.clone())],
+        "the trash image is garbage"
     );
     host.execute_gc(&config, plan)
-        .expect("plain gc retains recovery");
-    assert!(trash.exists());
-    let retired = RetiredRef::new(session_workspace("retired", CURRENT), Revision::new(1));
-    host.reclaim_retired(&config, &retired)
-        .expect("explicit scoped reclamation reads no image bytes");
+        .expect("gc releases the trash image reading no byte of it");
     assert!(!trash.exists(), "{} image remains", trash.display());
 }
 
@@ -2088,28 +2091,16 @@ fn gc_collects_each_stranded_retirement_while_a_live_workspace_reuses_the_name()
     let plan = host
         .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("a reused name does not block its stranded retirements");
-    let retired = plan
+    let mut retired = plan
         .candidates()
         .iter()
         .filter(|candidate| candidate.reason() == StorageGcReason::RetiredWorkspace)
         .map(|candidate| candidate.path().to_owned())
         .collect::<Vec<_>>();
-    assert!(
-        retired.is_empty(),
-        "name reuse does not make recovery images garbage"
-    );
+    retired.sort();
+    assert_eq!(retired, stranded, "name reuse keeps neither retirement");
     host.execute_gc(&config, plan)
-        .expect("plain gc preserves recovery");
-    for incarnation in [FIRST, SECOND] {
-        host.reclaim_retired(
-            &config,
-            &RetiredRef::new(
-                session_workspace("lockfree-doctrine", incarnation),
-                Revision::new(1),
-            ),
-        )
-        .expect("explicitly reclaim the selected old lifetime");
-    }
+        .expect("gc releases both stranded retirements");
 
     for image in &stranded {
         assert!(!image.exists(), "{} image remains", image.display());
@@ -2139,11 +2130,12 @@ fn gc_collects_each_stranded_retirement_while_a_live_workspace_reuses_the_name()
     );
 }
 
-/// A retired entry whose grants sidecar was deleted by hand once failed every GC preview, and so
-/// every doctor. Missing authority must neither block unrelated work nor authorize deletion
-/// of a potentially only-copy recovery image.
+/// No removal keeps a recovery image any more, so the images earlier builds kept in the trash are
+/// garbage: gc releases each into `sessions/.deleting`, one its record names with its whole
+/// retirement, one whose grants sidecar was deleted by hand by its own files alone.
 #[test]
-fn gc_preserves_recovery_images_even_when_their_sidecar_is_missing() {
+fn gc_releases_the_recovery_images_earlier_builds_kept_recorded_or_not() {
+    use cowshed_core::storage::apfs::release::DELETING_DIRECTORY;
     const RECORDED: &str = "1836ace7b0cd4b41b3ca31a9eb1d131a";
     const UNRECORDED: &str = "a5e833cf3c73476184ef904ef11846d1";
     let fixture = Fixture::new("retired-sidecar-gone");
@@ -2162,23 +2154,24 @@ fn gc_preserves_recovery_images_even_when_their_sidecar_is_missing() {
     let plan = host
         .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("a sidecarless retired image does not fail the preview");
-    let retired = plan
+    let mut retired = plan
         .candidates()
         .iter()
         .filter(|candidate| candidate.reason() == StorageGcReason::RetiredWorkspace)
         .map(|candidate| candidate.path().to_owned())
         .collect::<Vec<_>>();
-    assert!(retired.is_empty());
-    host.execute_gc(&config, plan)
-        .expect("gc preserves both recovery payloads");
-    assert!(recorded.exists());
-    assert!(sidecar_path(&recorded).exists());
-    assert!(
-        unrecorded.exists(),
-        "missing metadata is not release authority"
-    );
-    assert!(!sidecar_path(&unrecorded).exists());
-    assert!(ca_key_path(&unrecorded).exists());
+    retired.sort();
+    assert_eq!(retired, [recorded.clone(), unrecorded.clone()]);
+    host.execute_gc(&config, plan).expect("gc releases both");
+    for image in [&recorded, &unrecorded] {
+        assert!(!image.exists(), "{} stays in the trash", image.display());
+        assert!(!sidecar_path(image).exists(), "{}", image.display());
+        assert!(!ca_key_path(image).exists(), "{}", image.display());
+    }
+    let released = std::fs::read_dir(layout.project().sessions.join(DELETING_DIRECTORY))
+        .expect("the released entries wait for the gateway's cleanup")
+        .count();
+    assert_eq!(released, 2);
 }
 
 /// Retiring one name twice leaves two independently collectable entries. The paths keyed on the
@@ -2212,18 +2205,8 @@ fn gc_collects_every_stranded_retirement_of_one_name_and_its_shared_paths_once()
         path
     });
 
-    let report = execute_gc(&host, &config).expect("recovery entries remain");
-    assert_eq!(report.reclaimed, 0);
-    for incarnation in [FIRST, SECOND] {
-        host.reclaim_retired(
-            &config,
-            &RetiredRef::new(
-                session_workspace("lockfree-doctrine", incarnation),
-                Revision::new(1),
-            ),
-        )
-        .expect("explicitly reclaim the selected lifetime");
-    }
+    let report = execute_gc(&host, &config).expect("gc releases both retirements");
+    assert_eq!(report.reclaimed, 2);
     for image in &stranded {
         assert!(!image.exists(), "{} image remains", image.display());
         assert!(

@@ -97,8 +97,7 @@ Each capture observes both the source and the destination. An absent destination
 newly named clone's allocation, **not** newly allocated unique blocks. A release compares the image at its name before
 it with what is left there once it answers: a release commits the whole image to its deleting directory, so the image is
 `absent` at its name after and its delta reads as everything it held, though a rename frees no allocated bytes. The
-gateway's cleanup frees them later (05_gateway.md, "Deleting released images"). A recovery retirement compares the
-canonical file with the renamed file in trash, whose allocation is unchanged.
+gateway's cleanup frees them later (05_gateway.md, "Deleting released images").
 
 Image telemetry reads allocation alone and never walks an extent map. No operation consumed its former extent columns or
 threshold warnings, and three full map walks around a seed capture of a 1,198,506-extent image took about 85 seconds

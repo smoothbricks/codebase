@@ -629,12 +629,9 @@ impl DirectoryExecutionHost {
             }
             (Some(authority), _) => authority,
             (None, Some(expected)) => expected.clone(),
-            (None, None) => {
-                return Err(ApfsStorageError::Host(format!(
-                    "retaining recovery payload {}: grants sidecar is missing; recover its metadata or contents before explicit retirement",
-                    trash_image.display()
-                )));
-            }
+            // A payload whose record is gone names no workspace's environment: only its own
+            // files are released.
+            (None, None) => return self.reclaim_image(trash_image),
         };
         let reclaim = |owners: &crate::storage::apfs::RetiredNameOwners| {
             let scope =
@@ -813,20 +810,32 @@ impl DirectoryExecutionHost {
         let owners = crate::storage::apfs::RetiredNameOwners::from_images(&trash_images);
         for path in trash_images {
             let Some(retired) = self.retired_authority(project, repo, &path)? else {
-                warn_session_image_issue(
+                // A payload whose grants sidecar is gone names no workspace's environment, so only
+                // its own files go.
+                let Some((name, _)) = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(split_retired_stem)
+                else {
+                    warn_session_image_issue(
+                        &path,
+                        "retired payload has no grants sidecar and no <workspace>-<incarnation> name",
+                    );
+                    continue;
+                };
+                checked_increment(&mut examined)?;
+                lock_paths.push(workspace_lock_path(&self.config, repo, &name)?);
+                candidates.push(gc_candidate(
+                    StorageGcReason::RetiredWorkspace,
                     &path,
-                    "recovery payload has no grants sidecar; retained, not garbage: recover it deliberately with cowshed gc --recover <image> --to <dir>",
-                );
+                    &payload_gc_paths(&path),
+                    &[],
+                )?);
                 continue;
             };
             let scope =
                 self.retired_name_scope(&retired, owners.get(retired.workspace().name()))?;
             let cleanup = self.retired_cleanup(&retired, &path, scope)?;
-            if path_exists(&path)? {
-                // Recovery payloads are not garbage; abandon-bundle authority is not
-                // authority to destroy uncommitted or ignored source content.
-                continue;
-            }
             let mut associated = cleanup.paths;
             associated.extend(cleanup.mount_point);
             checked_increment(&mut examined)?;
@@ -1129,29 +1138,5 @@ fn names_mount(image: &Path, mount_point: &Path) -> Result<bool, ApfsStorageErro
         Ok(_) => Ok(false),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io_error("inspect payload", image, error)),
-    }
-}
-
-impl crate::storage::recovery_image::RecoveryEnvironment for DirectoryExecutionHost {
-    fn reclaim_recovery_environment(
-        &self,
-        repo: &RepoId,
-        image: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        let project = layout(&self.config, repo)?.project().project_root.clone();
-        let Some(authority) = self.retired_authority(&project, repo, image)? else {
-            // Successful-export retries and images without grants authorize no name cleanup.
-            return Ok(());
-        };
-        let trash = project.join(SESSIONS_DIRECTORY).join(TRASH_NAMESPACE);
-        let owners = crate::storage::apfs::RetiredNameOwners::from_images(
-            &Self::retired_trash_images(&trash)?,
-        );
-        if self.retired_name_scope(&authority, owners.get(authority.workspace().name()))?
-            == NameScope::Owned
-        {
-            Self::reclaim_exec_temp(&project, &authority, image)?;
-        }
-        Ok(())
     }
 }

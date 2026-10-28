@@ -96,7 +96,6 @@ export interface NativeCoordinatorOperations
     NativeCoordinatorAssignSlot,
     NativeCoordinatorDestroy,
     NativeCoordinatorGc,
-    NativeCoordinatorRecoverImage,
     NativeCoordinatorRemoveProject,
     NativeCoordinatorRepoMirror,
     NativeCoordinatorDoctor,
@@ -463,24 +462,6 @@ export async function coordinatorRebase(
   args: CoordinatorRebaseArguments,
 ): Promise<Api.RebaseReport> {
   return R.readRebaseReport(await handle.rebase(JSON.stringify(args)));
-}
-
-/** A handle that serves `coordinator.recoverImage`. */
-export interface NativeCoordinatorRecoverImage {
-  recoverImage(argumentsJson: string): Promise<string>;
-}
-
-/** The request fields a `coordinator.recoverImage` caller names; its handle binds the rest. */
-export type CoordinatorRecoverImageArguments = Pick<Api.RecoverImageRequest, 'image' | 'to'>;
-
-/**
- * Moves one recovery image, with its companions, out of the store.
- */
-export async function coordinatorRecoverImage(
-  handle: NativeCoordinatorRecoverImage,
-  args: CoordinatorRecoverImageArguments,
-): Promise<Api.RecoveredImage> {
-  return R.readRecoveredImage(await handle.recoverImage(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.rekey`. */

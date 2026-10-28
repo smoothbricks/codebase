@@ -1102,6 +1102,7 @@ export type GcReason =
   | 'orphanSessionImage'
   | 'orphanMountpoint'
   | 'abandonedBundle'
+  | 'heldBundle'
   | 'unlinkedBuildVolume'
   | 'supersededSeed'
   | 'interruptedBuildVolume';
@@ -2873,73 +2874,6 @@ export type RebaseRequest = {
  * The rebase a conflict stopped, carried on (02_workspaces.md, "`cowshed rebase`").
  */
 export type RebaseResume = 'continue' | 'abort';
-
-/**
- * `cowshed gc --recover <image> --to <dir>`: move the recovery image at `image`, one of the
- * project's `sessions/.trash/<ws>-<incarnation>.dmg`, with its companions and a manifest, into
- * `<to>/<ws>-<incarnation>/` outside the store. Both paths are absolute.
- */
-export type RecoverImageRequest = {
-  readonly repoId: RepoId;
-  readonly image: string;
-  readonly to: string;
-};
-
-/**
- * Where `cowshed gc --recover` moved one recovery image out of the store (02_workspaces.md,
- * `rm` step 5, "Recovering a recovery image").
- */
-export type RecoveredImage = {
-  readonly workspace: WorkspaceName;
-  readonly incarnation: WorkspaceIncarnation;
-  /**
-   * The trash path the image moved from.
-   */
-  readonly source: string;
-  /**
-   * `<to>/<workspace>-<incarnation>`: the image, its companions and the manifest.
-   */
-  readonly directory: string;
-  /**
-   * The manifest the recovery wrote into `directory` before anything moved.
-   */
-  readonly manifest: string;
-  /**
-   * Every file moved, at its new path: the companions, then the image.
-   */
-  readonly moved: ReadonlyArray<string>;
-  /**
-   * Whether the grants sidecar travelled with it. A recovery image can have lost it, and
-   * missing authority never made its bytes disposable.
-   */
-  readonly grants: boolean;
-  readonly retained: RecoveryRetention;
-};
-
-/**
- * Why a removal kept a workspace's complete source image as a recovery image in
- * `sessions/.trash/` instead of releasing it (02_workspaces.md, `rm` step 5, "Recovery source").
- */
-export type RecoveryCause =
-  | ({ readonly kind: 'inProgress' } & {
-      readonly operation: string;
-    })
-  | { readonly kind: 'dirty' }
-  | { readonly kind: 'abandoned' }
-  | ({ readonly kind: 'onlyCopy' } & {
-      readonly path: string;
-    })
-  | { readonly kind: 'main' };
-
-/**
- * What the project's deletion log says about why a recovery image was kept.
- */
-export type RecoveryRetention =
-  | ({ readonly kind: 'recorded' } & {
-      readonly at: string;
-      readonly because: ReadonlyArray<RecoveryCause>;
-    })
-  | { readonly kind: 'unrecorded' };
 
 /**
  * The absolute host path of the lock file that orders every move of a land target's branch: the

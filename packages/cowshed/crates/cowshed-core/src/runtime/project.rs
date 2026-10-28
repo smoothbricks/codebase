@@ -279,17 +279,6 @@ pub trait ProjectRuntimeHost: Send + 'static {
         options: RemoveOptions,
     ) -> Result<RemoveReport>;
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
-    /// Move one recovery image out of the store (`cowshed gc --recover`, 02_workspaces.md, `rm`
-    /// step 5).
-    async fn recover_image(
-        &mut self,
-        _image: PathBuf,
-        _to: PathBuf,
-    ) -> Result<crate::api::dto::RecoveredImage> {
-        Err(CowshedError::internal(
-            "recovering a recovery image is unavailable for this runtime host",
-        ))
-    }
     /// The session workspaces a listing does not show: clones whose create or fork never
     /// published them. `remove` retires them like any other.
     async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>>;
@@ -1570,12 +1559,6 @@ impl ProjectActor {
             Op::CoordinatorGc(params) => {
                 self.require_repo(&params.repo_id)?;
                 respond::<operations::CoordinatorGc>(&self.host.gc(params.options).await?)
-            }
-            Op::CoordinatorRecoverImage(params) => {
-                self.require_repo(&params.repo_id)?;
-                respond::<operations::CoordinatorRecoverImage>(
-                    &self.host.recover_image(params.image, params.to).await?,
-                )
             }
             Op::CoordinatorRemoveProject(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -3358,49 +3341,6 @@ const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 4] = [
     ),
 ];
 
-/// Refuses a main restore while a recovery image stands in `sessions/.trash`, naming it and the
-/// export that takes it out of the store (02_workspaces.md, "Recovering a recovery image"): it may
-/// hold the only copy of its workspace's work, which no gc reclaims, and it keeps that workspace's
-/// temp dir, which the terminal plan would otherwise name in its place.
-#[cfg(target_os = "macos")]
-fn require_no_recovery_image(project_root: &Path) -> Result<()> {
-    let trash = project_root
-        .join(crate::repository::SESSIONS_DIRECTORY)
-        .join(crate::storage::recovery::TRASH_NAMESPACE);
-    let failed = |error: std::io::Error| {
-        CowshedError::environment_missing(
-            format!(
-                "cannot enumerate recovery images in {}: {error}",
-                trash.display()
-            ),
-            "check controller storage permissions and retry",
-        )
-    };
-    let entries = match std::fs::read_dir(&trash) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(failed(error)),
-    };
-    for entry in entries {
-        let image = entry.map_err(failed)?.path();
-        if let Ok((workspace, _)) = crate::storage::recovery_image::classify(&trash, &image) {
-            return Err(CowshedError::conflict(
-                format!(
-                    "main cannot be restored while {workspace}'s recovery image remains: {}",
-                    image.display()
-                ),
-                format!(
-                    "it may hold the only copy of {workspace}'s work and keeps its temp dir; move it out \
-                     of the store with cowshed gc --recover {} --to <dir>, \
-                     then retry",
-                    image.display()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Refuses a main restore whose terminal storage the unbinding could not delete: a live
 /// workspace's image, grants or temp dir, an unreclaimed retired image, a staged image, an
 /// `rm --abandon` bundle kept for its owner, or anything in `build/` that is not a build
@@ -3411,7 +3351,6 @@ fn require_no_recovery_image(project_root: &Path) -> Result<()> {
 /// only a retry of the restore removes.
 #[cfg(target_os = "macos")]
 fn require_terminal_storage(project_root: &Path) -> Result<()> {
-    require_no_recovery_image(project_root)?;
     let mut plan = Vec::new();
     let planned = TERMINAL_STORAGE_TREES
         .into_iter()
@@ -3455,10 +3394,8 @@ fn require_terminal_storage(project_root: &Path) -> Result<()> {
                 "main cannot be restored while the project's storage holds more than locks: {}",
                 error.message
             ),
-            "remove every session workspace (cowshed rm <ws>) and run cowshed gc --abandoned for the \
-             rm --abandon bundles; recovery images (sessions/.trash/<ws>-<incarnation>.dmg) are \
-             excluded from every gc and may hold the only copy of work, so move each out with \
-             cowshed gc --recover <image> --to <dir>, then retry",
+            "remove every session workspace (cowshed rm <ws>), run cowshed gc to release what their \
+             retirements left, and cowshed gc --abandoned for the rm --abandon bundles, then retry",
         ),
         _ => error,
     })
@@ -3792,6 +3729,122 @@ fn plan_empty_directories_on(path: &Path, device: u64, plan: &mut Vec<PathBuf>) 
 }
 #[cfg(target_os = "macos")]
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
+    /// Drop every abandon bundle in the trash that main holds every commit of by patch identity
+    /// (02_workspaces.md, `rm` step 1): it keeps nothing main lacks
+    /// ([`crate::git::bundle_is_held`]). Each deletion is journaled as `remove-abandoned-bundle`;
+    /// with `dry_run` the bundles are only named. A bundle that cannot be measured is kept and said
+    /// on stderr, and a detached main measures none.
+    async fn drop_held_bundles(
+        &mut self,
+        dry_run: bool,
+    ) -> Result<Vec<crate::api::dto::GcCandidate>> {
+        use sha2::Digest as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let trash = self
+            .layout
+            .project()
+            .sessions
+            .join(crate::storage::recovery::TRASH_NAMESPACE);
+        let bundles =
+            crate::storage::lifecycle::dispatch_blocking(move || abandon_bundles_in(&trash))
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("abandon bundle task failed: {error}"))
+                })??;
+        if bundles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let main = self.current(&main_name()).await?;
+        if !matches!(
+            main.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            cowshed_os::eprintln!(
+                "cowshed: gc measured no abandon bundle: main is detached, and its repository is \
+                 what has to hold their commits"
+            );
+            return Ok(Vec::new());
+        }
+        let store_root = std::sync::Arc::clone(self.git.store_root());
+        let main_root = self.workspace_mount_path(&main_name())?;
+        let Some(tip) = git_optional_ref_oid(
+            &store_root,
+            &main_root,
+            &format!("refs/heads/{DEFAULT_LANDING_BRANCH}"),
+        )
+        .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let main_git = crate::git::GitRepository::from_root(&store_root, &main_root);
+        let project_root = self.layout.project().project_root.clone();
+        let mut held = Vec::new();
+        for bundle in bundles {
+            let tips = match main_git.measure_bundle(&bundle, tip.as_str()).await {
+                Ok(tips) => tips,
+                Err(error) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: kept abandon bundle {}: cannot measure it against main: {}",
+                        bundle.display(),
+                        error.message
+                    );
+                    continue;
+                }
+            };
+            if !crate::git::bundle_is_held(&tips) {
+                continue;
+            }
+            let metadata = tokio::fs::symlink_metadata(&bundle)
+                .await
+                .map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot inspect the abandon bundle {}: {error}",
+                            bundle.display()
+                        ),
+                        "check controller storage permissions, then cowshed gc",
+                    )
+                })?;
+            let bytes = metadata.blocks().saturating_mul(512);
+            let mut identity = sha2::Sha256::new();
+            identity.update(bundle.as_os_str().as_bytes());
+            identity.update(metadata.len().to_le_bytes());
+            if !dry_run {
+                tokio::fs::remove_file(&bundle).await.map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot delete the abandon bundle {}: {error}",
+                            bundle.display()
+                        ),
+                        "check controller storage permissions, then cowshed gc",
+                    )
+                })?;
+                let workspace = bundle
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.rsplit_once('-'))
+                    .map_or("", |(workspace, _)| workspace);
+                crate::storage::deletion_log::log_deletion(
+                    &project_root,
+                    crate::storage::deletion_log::DeletionOp::RemoveAbandonedBundle,
+                    crate::storage::deletion_log::DeletionKind::Other,
+                    workspace,
+                    None,
+                    &bundle,
+                );
+            }
+            held.push(crate::api::dto::GcCandidate {
+                identity: crate::api::dto::Sha256Digest::from_bytes(identity.finalize().into()),
+                path: bundle,
+                bytes,
+                reason: crate::api::dto::GcReason::HeldBundle,
+            });
+        }
+        Ok(held)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "one project open: root, bootstrap mode, repository, runtime services, validation, \
@@ -4260,8 +4313,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ROUTER_CAPACITY,
             )?
         };
-        let substrate =
-            finish_store_residue(host, config.clone(), &repo_id, retired, &recovery_scope).await?;
+        let substrate = crate::storage::apfs::ApfsSubstrate::new(config.clone(), host);
         let descriptor = ProjectDescriptor {
             repo_id,
             binding: std::sync::Arc::new(binding),
@@ -8241,7 +8293,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 caller: crate::storage::deletion_log::Caller::this_process(),
                 forced,
             },
-            None,
         );
     }
 
@@ -11071,6 +11122,40 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 }
 
+/// The abandon bundles directly in the project trash `trash`, in name order: each regular file with
+/// the bundle extension. None when the trash does not exist.
+#[cfg(target_os = "macos")]
+fn abandon_bundles_in(trash: &Path) -> Result<Vec<PathBuf>> {
+    let unreadable = |error: std::io::Error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot read the project's trash {}: {error}",
+                trash.display()
+            ),
+            "check controller storage permissions and retry",
+        )
+    };
+    let entries = match std::fs::read_dir(trash) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(unreadable(error)),
+    };
+    let mut bundles = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(unreadable)?;
+        let path = entry.path();
+        if entry.file_type().map_err(unreadable)?.is_file()
+            && path.extension().is_some_and(|extension| {
+                extension == crate::storage::recovery::ABANDON_BUNDLE_EXTENSION
+            })
+        {
+            bundles.push(path);
+        }
+    }
+    bundles.sort();
+    Ok(bundles)
+}
+
 /// The token a session open replaced, when it names another session. The supervisor answers a
 /// name it still holds with that session's own identity, so a reopen's previous token is the
 /// session just opened, and closing it would close the session the caller is about to run in.
@@ -11117,36 +11202,6 @@ fn require_vacant_move_destination(destination: &Path) -> Result<()> {
             "remove the occupant or choose another destination",
         )),
     }
-}
-
-/// Finish the store residue an opening owns before serving. Recovery trash, with or without its
-/// sidecar, is preserved; a missing record never authorizes deletion.
-#[cfg(target_os = "macos")]
-async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
-    host: H,
-    config: crate::storage::apfs::ApfsSubstrateConfig,
-    repo_id: &RepoId,
-    retired: RetiredTrash,
-    scope: &RecoveryScope,
-) -> Result<crate::storage::apfs::ApfsSubstrate<H>> {
-    if !scope.repairs() {
-        return Ok(crate::storage::apfs::ApfsSubstrate::new(config, host));
-    }
-    if !retired.recorded.is_empty() {
-        cowshed_os::eprintln!(
-            "cowshed: retaining {} recovery image(s) for {repo_id} under {}; recover their contents deliberately: cowshed gc --recover <image> --to <dir>",
-            retired.recorded.len(),
-            config.store_root.display(),
-        );
-    }
-    for image in retired.unrecorded {
-        cowshed_os::eprintln!(
-            "cowshed: retaining recovery image {} without its grants sidecar; recover it deliberately with cowshed gc --recover {} --to <dir>; missing authority is not proof of disposable bytes",
-            image.display(),
-            image.display(),
-        );
-    }
-    Ok(crate::storage::apfs::ApfsSubstrate::new(config, host))
 }
 
 #[cfg(target_os = "macos")]
@@ -15709,22 +15764,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         .await
     }
 
-    async fn recover_image(
-        &mut self,
-        image: PathBuf,
-        to: PathBuf,
-    ) -> Result<crate::api::dto::RecoveredImage> {
-        self.validate_binding().await?;
-        let layout = self.layout.clone();
-        let repo = self.descriptor.repo_id.clone();
-        let owner = self.substrate.shared_host();
-        crate::storage::lifecycle::dispatch_blocking(move || {
-            crate::storage::recovery_image::recover(&layout, &repo, &image, &to, owner.as_ref())
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("recovery image task failed: {error}")))?
-    }
-
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
         use crate::storage::lifecycle::{StorageGcOptions, StorageGcReason, Substrate};
 
@@ -15741,6 +15780,18 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         .map_err(|error| CowshedError::internal(format!("scratch reaper task failed: {error}")))?;
         self.retire_abandoned_pending_workspaces(options.dry_run)
             .await?;
+        // `--abandoned` deletes every bundle below; a plain sweep drops those main holds.
+        let held = if options.abandoned {
+            Vec::new()
+        } else {
+            self.drop_held_bundles(options.dry_run).await?
+        };
+        let held_count =
+            u64::try_from(held.len()).map_err(|_| CowshedError::internal("GC count overflow"))?;
+        let held_bytes = held
+            .iter()
+            .try_fold(0_u64, |sum, bundle| sum.checked_add(bundle.bytes))
+            .ok_or_else(|| CowshedError::internal("GC candidate byte accounting overflow"))?;
         let plan = self
             .substrate
             .preview_gc(
@@ -15764,16 +15815,18 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 )
                 .await
                 .map_err(native_storage_error)?;
-            if let Some(kept) =
-                crate::storage::recovery::KeptAbandonBundles::named_by(bundles.candidates())?
-            {
+            let kept = bundles
+                .candidates()
+                .iter()
+                .filter(|candidate| !held.iter().any(|bundle| bundle.path == candidate.path()));
+            if let Some(kept) = crate::storage::recovery::KeptAbandonBundles::named_by(kept)? {
                 cowshed_os::eprintln!(
                     "cowshed: {kept}; {}",
                     crate::storage::recovery::KeptAbandonBundles::HINT
                 );
             }
         }
-        let candidates = plan
+        let mut candidates = plan
             .candidates()
             .iter()
             .map(|candidate| crate::api::dto::GcCandidate {
@@ -15803,6 +15856,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 },
             })
             .collect::<Vec<_>>();
+
+        candidates.extend(held);
         let (images, links) = self.build_volume_links().await?;
         let build = timed_async(
             "gc",
@@ -15819,7 +15874,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             return Ok(GcReport {
                 examined: u64::try_from(plan.examined())
                     .map_err(|_| CowshedError::internal("GC count overflow"))?
-                    + build.examined,
+                    + build.examined
+                    + held_count,
                 reclaimed: 0,
                 retained_active: u64::try_from(plan.retained_active())
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
@@ -15911,13 +15967,18 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         Ok(GcReport {
             examined: u64::try_from(report.examined)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?
-                + build.examined,
+                + build.examined
+                + held_count,
             reclaimed: u64::try_from(report.reclaimed)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?
-                + build.reclaimed,
+                + build.reclaimed
+                + held_count,
             retained_active: u64::try_from(report.retained_active)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?,
-            released_bytes: report.released_bytes.saturating_add(build.released_bytes),
+            released_bytes: report
+                .released_bytes
+                .saturating_add(build.released_bytes)
+                .saturating_add(held_bytes),
             dry_run: false,
             candidates: candidates.into_iter().chain(build.candidates).collect(),
             deferred: report
@@ -15952,42 +16013,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .sessions
             .join(crate::storage::recovery::TRASH_NAMESPACE);
         let bundles =
-            crate::storage::lifecycle::dispatch_blocking(move || -> Result<Vec<PathBuf>> {
-                let unreadable = |error: std::io::Error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot read the project's trash {}: {error}",
-                            trash.display()
-                        ),
-                        "check controller storage permissions and retry",
-                    )
-                };
-                let entries = match std::fs::read_dir(&trash) {
-                    Ok(entries) => entries,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(Vec::new());
-                    }
-                    Err(error) => return Err(unreadable(error)),
-                };
-                let mut bundles = Vec::new();
-                for entry in entries {
-                    let entry = entry.map_err(unreadable)?;
-                    let path = entry.path();
-                    if entry.file_type().map_err(unreadable)?.is_file()
-                        && path
-                            .extension()
-                            .is_some_and(|extension| extension == "bundle")
-                    {
-                        bundles.push(path);
-                    }
-                }
-                bundles.sort();
-                Ok(bundles)
-            })
-            .await
-            .map_err(|error| {
-                CowshedError::internal(format!("abandon bundle task failed: {error}"))
-            })??;
+            crate::storage::lifecycle::dispatch_blocking(move || abandon_bundles_in(&trash))
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("abandon bundle task failed: {error}"))
+                })??;
         if bundles.is_empty() {
             return Ok(bundles);
         }
@@ -23529,13 +23559,12 @@ fn supervisor_sandbox(
     })
 }
 
-/// Recovery inventory, not deletion authority: a recorded retirement or a payload whose
-/// sidecar is missing. Neither category is inferred to be disposable.
+/// The retirements the trash records: each image there whose grants sidecar names it. An image
+/// without one has no record to read.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 struct RetiredTrash {
     recorded: Vec<crate::storage::lifecycle::RetiredRef>,
-    unrecorded: Vec<PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -23590,7 +23619,6 @@ fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
     retired
         .try_reserve(images.len())
         .map_err(|_| CowshedError::internal("cannot reserve retired workspace recovery facts"))?;
-    let mut unrecorded = Vec::new();
     for entry in images {
         let file_type = entry.file_type().map_err(|error| {
             CowshedError::integrity(
@@ -23621,7 +23649,6 @@ fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                unrecorded.push(entry.path());
                 continue;
             }
             Err(error) => {
@@ -23684,10 +23711,7 @@ fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
             })?;
         retired.push(RetiredRef::new(workspace, resulting_revision));
     }
-    Ok(RetiredTrash {
-        recorded: retired,
-        unrecorded,
-    })
+    Ok(RetiredTrash { recorded: retired })
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -23696,7 +23720,6 @@ mod retired_recovery_tests {
     use crate::metadata::{
         DetachedWorkspaceMetadata, GrantSet, Platform, PortBlock, PublicationState, SIDECAR_VERSION,
     };
-    use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
     #[test]
     fn retired_trash_is_a_verified_restart_baseline_fact() {
@@ -23898,200 +23921,6 @@ mod retired_recovery_tests {
         assert_eq!(
             retired[0].resulting_revision(),
             crate::storage::lifecycle::Revision::new(9)
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    /// Reclaiming a detached retired image runs no disk command; one that does is a test bug.
-    struct NoDiskCommands;
-
-    impl cowshed_apfs::CommandRunner for NoDiskCommands {
-        fn run_guarded<E>(
-            &self,
-            request: &cowshed_apfs::CommandRequest,
-            check: impl FnOnce() -> std::result::Result<bool, E>,
-        ) -> std::result::Result<Option<cowshed_apfs::CommandOutput>, E>
-        where
-            E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
-        {
-            if check()? {
-                self.run(request, "guarded disk command")
-                    .map(|run| Some(run.output))
-                    .map_err(E::from)
-            } else {
-                Ok(None)
-            }
-        }
-        fn run(
-            &self,
-            request: &cowshed_apfs::CommandRequest,
-            _: &'static str,
-        ) -> std::result::Result<cowshed_apfs::CommandRun, cowshed_apfs::CommandRunError> {
-            panic!("reclaiming a detached retired image ran a disk command: {request:?}");
-        }
-        fn image_lease(
-            &self,
-            identity: &Path,
-        ) -> std::io::Result<Option<cowshed_os::fork_lock::Fenced<std::fs::File>>> {
-            panic!("reclaiming a detached retired image took an APFS image lease: {identity:?}");
-        }
-        fn pin_raw_device(
-            &self,
-            device: &Path,
-        ) -> std::io::Result<Option<cowshed_os::fork_lock::Fenced<std::fs::File>>> {
-            panic!("reclaiming a detached retired image pinned a raw APFS device: {device:?}");
-        }
-        fn attached_disk_images(&self) -> std::io::Result<Vec<cowshed_apfs::AttachedDiskImage>> {
-            panic!("reclaiming a detached retired image read the kernel disk-image inventory");
-        }
-        fn grow_image(
-            &self,
-            image: &Path,
-            _: cowshed_apfs::image::ImageCapacity,
-        ) -> std::io::Result<()> {
-            panic!("reclaiming a detached retired image grew an image: {image:?}");
-        }
-    }
-
-    /// Both inspecting and repairing opens preserve recorded recovery trash.
-    #[tokio::test]
-    async fn inspecting_and_repairing_opens_preserve_recorded_recovery_trash() {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-open-residue-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let repo_id = RepoId::parse("acme/widget").unwrap();
-        let layout = crate::storage::StorageLayout::new(&root, &repo_id).unwrap();
-        let project_root = layout.project().project_root.clone();
-        let trash = project_root.join("sessions/.trash");
-        std::fs::create_dir_all(&trash).unwrap();
-        let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
-        let image = trash.join(format!("raven-{}.dmg", incarnation.as_str()));
-        std::fs::write(&image, b"retired image").unwrap();
-        DetachedWorkspaceMetadata {
-            version: SIDECAR_VERSION,
-            repo_id: repo_id.clone(),
-            workspace: WorkspaceName::new("raven").unwrap(),
-            workspace_incarnation: incarnation,
-            platform: Platform::Macos,
-            publication_state: PublicationState::Active,
-            updated_at: "2026-07-14T00:00:00Z".into(),
-            grants: GrantSet::closed_baseline(Some(PortBlock::new(49_136, 16).unwrap())).unwrap(),
-            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
-                project_root: PathBuf::from("/project"),
-                role: crate::metadata::WorkspaceRole::Workspace,
-                base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-                branch: None,
-                created_at: "2026-07-14T00:00:00Z".to_owned(),
-                forked_from: None,
-                captured_at: "2026-07-14T00:00:00Z".to_owned(),
-                stale: false,
-                git_worktree: false,
-            },
-        }
-        .write_for_image(&image)
-        .unwrap();
-        let namespace = TestNamespace::mint().expect("a test namespace");
-        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
-            HostNamespace::Test(namespace),
-            &root,
-            root.join("checkout"),
-        );
-        let open = async |scope: RecoveryScope| {
-            let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
-                NoDiskCommands,
-                config.clone(),
-            )
-            .unwrap();
-            let retired = retired_refs::<
-                crate::storage::apfs::native::MacOsApfsExecutionHost<
-                    cowshed_apfs::SystemCommandRunner,
-                >,
-            >(&project_root, &repo_id, None)
-            .unwrap();
-            assert_eq!(retired.recorded.len(), 1, "the retired image is found");
-            finish_store_residue(host, config.clone(), &repo_id, retired, &scope)
-                .await
-                .unwrap();
-        };
-
-        open(RecoveryScope::Inspect).await;
-        assert!(
-            image.exists(),
-            "an inspecting open reclaimed {}",
-            image.display()
-        );
-        assert!(crate::metadata::sidecar_path(&image).exists());
-
-        open(RecoveryScope::Workspaces(Default::default())).await;
-        assert!(
-            image.exists(),
-            "a repairing open destroyed recovery {}",
-            image.display()
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    /// Missing metadata cannot prove that a recovery image's bytes survive elsewhere.
-    /// Both open modes preserve the image and key without blocking unrelated project work.
-    #[tokio::test]
-    async fn a_trash_image_without_its_sidecar_is_preserved_not_an_open_failure() {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-unrecorded-trash-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let repo_id = RepoId::parse("acme/widget").unwrap();
-        let layout = crate::storage::StorageLayout::new(&root, &repo_id).unwrap();
-        let project_root = layout.project().project_root.clone();
-        let trash = project_root.join("sessions/.trash");
-        std::fs::create_dir_all(&trash).unwrap();
-        let image = trash.join("raven-0198f2c0b7e34dc795f17b238b331c80.dmg");
-        let companion = crate::metadata::append_suffix(&image, ".ca.key");
-        std::fs::write(&image, b"retired image").unwrap();
-        std::fs::write(&companion, b"retired CA key").unwrap();
-        let namespace = TestNamespace::mint().expect("a test namespace");
-        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
-            HostNamespace::Test(namespace),
-            &root,
-            root.join("checkout"),
-        );
-        let open = async |scope: RecoveryScope| {
-            let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
-                NoDiskCommands,
-                config.clone(),
-            )
-            .unwrap();
-            let retired = retired_refs::<
-                crate::storage::apfs::native::MacOsApfsExecutionHost<
-                    cowshed_apfs::SystemCommandRunner,
-                >,
-            >(&project_root, &repo_id, None)
-            .expect("a sidecarless trash image does not fail the open");
-            assert!(retired.recorded.is_empty());
-            assert_eq!(retired.unrecorded, std::slice::from_ref(&image));
-            finish_store_residue(host, config.clone(), &repo_id, retired, &scope)
-                .await
-                .unwrap();
-        };
-
-        open(RecoveryScope::Inspect).await;
-        assert!(
-            image.exists(),
-            "an inspecting open reclaimed {}",
-            image.display()
-        );
-
-        open(RecoveryScope::Workspaces(Default::default())).await;
-        assert!(
-            image.exists(),
-            "a repairing open destroyed recovery {}",
-            image.display()
-        );
-        assert_eq!(std::fs::read(&image).unwrap(), b"retired image");
-        assert_eq!(std::fs::read(&companion).unwrap(), b"retired CA key");
-        assert!(
-            !project_root.join("deletion-log.jsonl").exists(),
-            "preservation must not claim an image deletion"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -29042,7 +28871,6 @@ mod terminal_project_cleanup_tests {
         require_terminal_storage,
     };
     use crate::repository::{BoundIdentity, ProjectPaths, RepoId, RepositoryBinding};
-    use cowshed_os::test_backstop::CommandBackstop as _;
 
     fn root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -29375,40 +29203,6 @@ mod terminal_project_cleanup_tests {
 
     const VOLUME: &str = "0123456789abcdef0123456789abcdef";
 
-    /// A recovery image keeps its workspace's temp dir until it is exported, so
-    /// main's restore names the image and the export that takes it out of the store, never what
-    /// it keeps.
-    #[test]
-    fn a_recovery_image_is_named_before_the_temp_dir_it_keeps() {
-        let (root, paths) = project("recovery-image");
-        let image = paths.sessions.join(format!(".trash/raven-{VOLUME}.dmg"));
-        for kept in [
-            image.clone(),
-            crate::metadata::sidecar_path(&image),
-            paths.exec_temp.join("raven/scratch"),
-        ] {
-            std::fs::create_dir_all(kept.parent().expect("parent")).expect("parent");
-            std::fs::write(&kept, b"retained").expect("kept");
-        }
-
-        let error = require_terminal_storage(&paths.project_root)
-            .expect_err("a recovery image refuses main's restore");
-        assert_eq!(error.code.as_str(), "conflict");
-        assert!(
-            error.message.contains(&image.display().to_string()),
-            "{}",
-            error.message
-        );
-        assert!(
-            error
-                .hint
-                .contains(&format!("cowshed gc --recover {}", image.display())),
-            "{}",
-            error.hint
-        );
-        std::fs::remove_dir_all(root).expect("cleanup");
-    }
-
     /// A live session's image owns that session's temp dir: the refusal names the image.
     #[test]
     fn a_live_sessions_image_is_named_before_its_temp_dir() {
@@ -29645,294 +29439,6 @@ mod terminal_project_cleanup_tests {
             );
             std::fs::remove_dir_all(root).expect("cleanup");
         }
-    }
-
-    /// One store through the whole recovery custody chain, with the bytes a real
-    /// read-only job leaves: the environment builder publishes its trust bundle, port-0
-    /// preload, tools and XDG subtrees into the workspace's temp dir and Node and Bun
-    /// compile into its owned cache there. Retired as a recovery retention, the image
-    /// stands in the trash and the terminal guard refuses main's restore, removing
-    /// nothing. The actual recovery export then runs its scoped ephemeral cleanup
-    /// under the held name lock before any transfer: the whole temp dir goes, the
-    /// image and its companions arrive at the destination byte for byte, and the same
-    /// guard admits the restore.
-    #[tokio::test]
-    async fn mains_restore_admits_the_state_a_recovered_workspaces_export_leaves() {
-        use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
-        use crate::storage::apfs::ApfsExecutionHost as _;
-        use crate::storage::directory::tests::{
-            Scratch, published_directory, published_directory_layout, published_directory_paths,
-            published_directory_trash,
-        };
-        use crate::storage::recovery_image::recover;
-        use std::ffi::OsStr;
-
-        fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-            let mut files = Vec::new();
-            let mut pending = vec![root.to_path_buf()];
-            while let Some(directory) = pending.pop() {
-                let entries = match std::fs::read_dir(&directory) {
-                    Ok(entries) => entries,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => panic!("read {}: {error}", directory.display()),
-                };
-                for entry in entries {
-                    let entry = entry.unwrap_or_else(|error| panic!("read entry: {error}"));
-                    if entry.file_type().expect("entry type").is_dir() {
-                        pending.push(entry.path());
-                    } else {
-                        files.push(entry.path());
-                    }
-                }
-            }
-            files.sort();
-            files
-        }
-
-        fn tree_bytes(
-            root: &std::path::Path,
-        ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-            files_under(root)
-                .into_iter()
-                .map(|file| {
-                    let relative = file
-                        .strip_prefix(root)
-                        .expect("a listed file is under its root")
-                        .to_path_buf();
-                    let bytes = std::fs::read(&file)
-                        .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
-                    (relative, bytes)
-                })
-                .collect()
-        }
-
-        fn host_program(name: &str) -> std::path::PathBuf {
-            let path = std::env::var_os("PATH").expect("the gate PATH names the host toolchain");
-            std::env::split_paths(&path)
-                .map(|directory| directory.join(name))
-                .find(|candidate| candidate.is_file())
-                .unwrap_or_else(|| panic!("host {name} is required for this proof"))
-        }
-
-        // The producer's actual call, then a real module load whose bytecode the runtime
-        // flushes into the resolved cache before it exits.
-        const COMPILE: &str = r#"const m = require("node:module");
-m.enableCompileCache();
-const dir = m.getCompileCacheDir();
-if (!dir) { console.error("compile cache is not enabled"); process.exit(3); }
-console.log(dir);
-import("./compile-cache-lib.mjs").then((lib) => {
-  if (lib.answer() !== 42) { process.exit(4); }
-  if (m.flushCompileCache) { m.flushCompileCache(); }
-});
-"#;
-
-        let scratch = Scratch::new("recover-restore");
-        let (host, image, metadata) = published_directory(&scratch, "selected", 1);
-        let layout = published_directory_layout(&host, &metadata);
-        let (project_root, exec_temp) = published_directory_paths(&host, &metadata);
-        let caller_cache = scratch.path().join("caller-cache");
-        std::fs::create_dir_all(&caller_cache).expect("caller cache");
-        let caller_sentinel = caller_cache.join("sentinel");
-        std::fs::write(&caller_sentinel, b"the caller's own").expect("caller sentinel");
-        // Another workspace's temp dir, foreign to every act below.
-        let sibling = exec_temp
-            .parent()
-            .expect("temp root")
-            .join("sibling")
-            .join("keep");
-        std::fs::create_dir_all(sibling.parent().expect("sibling temp")).expect("sibling temp");
-        std::fs::write(&sibling, b"a sibling's own").expect("sibling sentinel");
-
-        std::fs::write(image.join("package.json"), "{}\n").expect("project manifest");
-        std::fs::write(image.join("bun.lock"), "").expect("project convention");
-        std::fs::write(
-            image.join("compile-cache-lib.mjs"),
-            "export function answer() { return 42; }\n",
-        )
-        .expect("compiled module");
-        let script = image.join("compile.cjs");
-        std::fs::write(&script, COMPILE).expect("compile script");
-
-        // A real read-only job's environment, built by the production builder against
-        // this store's own layout: its temp dir is the one the terminal guard reads.
-        let home = scratch.path().join("home");
-        std::fs::create_dir_all(&home).expect("home");
-        let mut sandbox = SandboxConfig {
-            program_directories: crate::capabilities::host_program_directories(&home),
-            home,
-            mount_root: scratch.path().join("mounts"),
-            workspace_mount: image.clone(),
-            exec_temp_dir: exec_temp.clone(),
-            store_root: scratch.path().join("store"),
-            port_block: metadata
-                .grants
-                .port_block
-                .expect("the fixture grants a port block"),
-            retained_port_blocks: Vec::new(),
-            mode: RunSandboxMode::ReadOnly,
-            grants: SandboxGrants::default(),
-            allowed_unix_sockets: Vec::new(),
-            cpu_pool_directory: None,
-            additional_denies: Vec::new(),
-            shed_links: Vec::new(),
-            git_worktree_repository: None,
-            build_volume_mount: None,
-            repository_caches: Vec::new(),
-            capabilities: Default::default(),
-        };
-        sandbox
-            .configure_capabilities()
-            .expect("detect capabilities");
-        let caller = std::collections::BTreeMap::from([(
-            crate::workspace_environment::NODE_COMPILE_CACHE_ENV.to_owned(),
-            caller_cache
-                .to_str()
-                .expect("utf-8 caller cache")
-                .to_owned(),
-        )]);
-        let environment = super::super::supervisor::sandbox_environment(&sandbox, &caller)
-            .await
-            .expect("environment");
-        let mut child = environment.base();
-        child.extend(environment.overlay(&caller));
-        let owned = exec_temp
-            .join("cache")
-            .join(crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY);
-        assert_eq!(
-            child.get(OsStr::new(
-                crate::workspace_environment::NODE_COMPILE_CACHE_ENV
-            )),
-            Some(&owned.clone().into_os_string()),
-            "the read-only child compiles into its exec-temp cache"
-        );
-        for program in [host_program("node"), host_program("bun")] {
-            let mut command = std::process::Command::new(&program);
-            command.arg(&script).current_dir(&image).env_clear();
-            for (name, entry) in &child {
-                command.env(name, entry);
-            }
-            let output = command.output_bounded().expect("run child runtime");
-            assert!(output.status.success(), "{}: {output:?}", program.display());
-            let stdout = String::from_utf8(output.stdout).expect("runtime output");
-            let reported = std::path::PathBuf::from(stdout.lines().next().expect("cache dir"));
-            assert!(
-                reported.starts_with(&owned),
-                "compiled into {}, not {}",
-                reported.display(),
-                owned.display()
-            );
-            assert!(
-                files_under(&reported)
-                    .iter()
-                    .any(|file| std::fs::metadata(file).expect("cache file").len() > 0),
-                "no bytecode under {}",
-                reported.display()
-            );
-        }
-        std::fs::remove_file(crate::sandbox::workspace_runtime_link(&image)).ok();
-        // The whole inventory the cleanup owes: published wiring at the temp root and
-        // job state under it, far beyond the compile cache alone.
-        for published in [
-            crate::workspace_clients::TRUST_BUNDLE_NAME
-                .to_str()
-                .expect("the bundle name is ASCII"),
-            crate::port_zero::PRELOAD_NAME
-                .to_str()
-                .expect("the preload name is ASCII"),
-        ] {
-            assert!(
-                exec_temp.join(published).is_file(),
-                "no published {published} under {}",
-                exec_temp.display()
-            );
-        }
-        assert!(
-            !exec_temp
-                .join(crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY)
-                .exists(),
-            "a loose compile cache beside the owned read-only cache"
-        );
-        let inventory = files_under(&exec_temp);
-        assert!(
-            inventory.iter().any(|file| !file.starts_with(&owned)),
-            "the inventory is only the compile cache; the whole-tree claim would be empty"
-        );
-
-        // Retire as a recovery retention does, then snapshot the exact bytes custody owes.
-        let trash = published_directory_trash(&host, &metadata);
-        std::fs::create_dir_all(trash.parent().expect("trash")).expect("trash");
-        std::fs::hard_link(
-            crate::metadata::sidecar_path(&image),
-            crate::metadata::sidecar_path(&trash),
-        )
-        .expect("stage sidecar");
-        std::fs::hard_link(
-            crate::storage::apfs::companion_path(&image),
-            crate::storage::apfs::companion_path(&trash),
-        )
-        .expect("stage companion");
-        host.retire_image(&image, &trash).expect("retire to trash");
-        let payload = tree_bytes(&trash);
-        assert!(!payload.is_empty(), "the oracle snapshot is empty");
-        let sidecar = std::fs::read(crate::metadata::sidecar_path(&trash)).expect("sidecar");
-        let companion =
-            std::fs::read(crate::storage::apfs::companion_path(&trash)).expect("companion");
-
-        // While it stands, the restore refuses and removes nothing.
-        let error = require_terminal_storage(&project_root)
-            .expect_err("a retained recovery workspace must refuse the restore");
-        assert!(
-            error.message.contains(&trash.display().to_string()),
-            "the refusal names the recovery image, not what it keeps: {}",
-            error.message
-        );
-        assert_eq!(error.code.as_str(), "conflict");
-        assert_eq!(
-            files_under(&exec_temp),
-            inventory,
-            "the refusal removed bytes"
-        );
-        assert_eq!(
-            tree_bytes(&trash),
-            payload,
-            "the refusal touched the payload"
-        );
-
-        // The actual export: scoped cleanup under the held name lock, then transfer.
-        let to = scratch.path().join("recovered");
-        let recovered = recover(&layout, &metadata.repo_id, &trash, &to, &host).expect("recover");
-        let moved = recovered
-            .directory
-            .join(trash.file_name().expect("trash name"));
-        assert_eq!(
-            tree_bytes(&moved),
-            payload,
-            "the export changed payload bytes"
-        );
-        assert_eq!(
-            std::fs::read(crate::metadata::sidecar_path(&moved)).expect("moved sidecar"),
-            sidecar
-        );
-        assert_eq!(
-            std::fs::read(crate::storage::apfs::companion_path(&moved)).expect("moved companion"),
-            companion
-        );
-        assert!(!trash.exists(), "the payload did not leave the trash");
-        assert!(
-            !exec_temp.exists(),
-            "the recovered workspace's temp dir outlived its export"
-        );
-        assert_eq!(std::fs::read(&sibling).expect("kept"), b"a sibling's own");
-        assert_eq!(
-            std::fs::read(&caller_sentinel).expect("kept"),
-            b"the caller's own"
-        );
-        // The sibling is another workspace: its own retirement, not this export, ends
-        // its temp dir. The fixture ends it here to reach the terminal state.
-        std::fs::remove_dir_all(sibling.parent().expect("sibling temp")).expect("end sibling");
-        require_terminal_storage(&project_root)
-            .expect("the export leaves terminal storage the restore admits");
     }
 }
 

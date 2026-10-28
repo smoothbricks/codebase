@@ -1046,28 +1046,6 @@ impl Serves<CoordinatorGc> for Coordinator {
     }
 }
 
-impl Serves<CoordinatorRecoverImage> for Coordinator {
-    const BOUND: &'static [&'static str] = &["repoId"];
-
-    fn request(
-        authority: &<Self as Binder>::Fields<'_>,
-        arguments: Arguments,
-    ) -> Result<RecoverImageRequest> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {
-            image: PathBuf,
-            to: PathBuf,
-        }
-        let Caller { image, to } = decode::<CoordinatorRecoverImage, Caller>(arguments)?;
-        Ok(RecoverImageRequest {
-            repo_id: owned(authority.repo_id),
-            image,
-            to,
-        })
-    }
-}
-
 impl Serves<CoordinatorRemoveProject> for Coordinator {
     const BOUND: &'static [&'static str] = &["repoId"];
 
@@ -1878,7 +1856,6 @@ pub(crate) fn each_served(check: &mut impl EachServed, handles: &Handles<'_>) {
     check.served::<CoordinatorAssignSlot, _>(handles.coordinator, &[]);
     check.served::<CoordinatorDestroy, _>(handles.coordinator, &[]);
     check.served::<CoordinatorGc, _>(handles.coordinator, &[]);
-    check.served::<CoordinatorRecoverImage, _>(handles.coordinator, &[]);
     check.served::<CoordinatorRemoveProject, _>(handles.coordinator, &[]);
     check.served::<CoordinatorRepoMirror, _>(handles.coordinator, &[]);
     check.served::<CoordinatorDoctor, _>(handles.coordinator, &[]);

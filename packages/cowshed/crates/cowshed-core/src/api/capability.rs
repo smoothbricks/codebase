@@ -2662,24 +2662,6 @@ impl Coordinator {
         invoke::<operations::CoordinatorGc>(&*self.runtime, &request).await
     }
 
-    /// Move one recovery image, `sessions/.trash/<ws>-<incarnation>.dmg`, with its grants sidecar,
-    /// CA companion and a manifest, out of the store into `<to>/<ws>-<incarnation>/`
-    /// (`cowshed gc --recover`). Same-filesystem transfers rename; cross-filesystem transfers
-    /// retain the source until every regular artifact is durably copied and verified. Terminal
-    /// project removal no longer counts the exported image.
-    pub async fn recover_image(
-        &self,
-        image: &std::path::Path,
-        to: &std::path::Path,
-    ) -> Result<super::dto::RecoveredImage> {
-        let request = operations::RecoverImageRequest {
-            repo_id: self.repo_id(),
-            image: image.to_owned(),
-            to: to.to_owned(),
-        };
-        invoke::<operations::CoordinatorRecoverImage>(&*self.runtime, &request).await
-    }
-
     /// Remove the adopted project end to end: every session workspace, the collection of their
     /// images, the abandon bundles (under `abandon`), and main's restore, which unbinds it. A
     /// refusal leaves the rest for the next call; a store that changed under the collection is

@@ -347,20 +347,20 @@ on stderr, and the unbinding keeps its shared hold. Because every holder recheck
 (`forget`, below), removing it cannot split them. The restore checks terminal storage before it retires main, exempting
 what main's retirement and this release remove (main's temp dir, every build volume's image and record, and the deleting
 directories of `build/` and `sessions/`, which the unbinding finishes first), so its refusal leaves main in place. The
-refusal names what owns the rest first: a recovery image in `sessions/.trash`, with the `gc --recover` that exports it,
-before the temp dir it keeps, then `sessions/` before `tmp/`, so a live workspace's image is named rather than its temp
-dir. Binding removal becomes completion only after its parent sync; a retry finishes controller cleanup before removing
-the lease, without recreating project directories. A fresh controller can discover an interrupted unbinding from the
-exact canonical checkout-root record and a typed, unfinished `Mutating Retire(main, restore=true)` in the source
-journal, even for a checkout with no remote. This is read-only recovery admission, never active inventory or
-registration. Live bindings retain precedence; ambiguous matching continuation records refuse rather than choosing one.
-That unfinished record is the restore's own: no startup replay or other verb completes it while the project is bound,
-and a restore is never answered from a completed record, so a retry after any failed unbinding (a stray file, a release
-that cannot move) runs the unbinding again rather than reporting success while the binding stands. A released image the
-unbinding lists but finds already unlinked by the gateway's cleanup is released, not an error. The lifecycle journal is
-released after the other controller records, so failures in their removal retain the continuation. A death after
-releasing the journal but before deleting the checkout record can leave only that unbound bookkeeping record; it holds
-no recovery authority, and a later adoption's main image outranks it.
+refusal names what owns the rest first: a trash image, which `gc` releases, then `sessions/` before `tmp/`, so a live
+workspace's image is named rather than its temp dir. Binding removal becomes completion only after its parent sync; a
+retry finishes controller cleanup before removing the lease, without recreating project directories. A fresh controller
+can discover an interrupted unbinding from the exact canonical checkout-root record and a typed, unfinished
+`Mutating Retire(main, restore=true)` in the source journal, even for a checkout with no remote. This is read-only
+recovery admission, never active inventory or registration. Live bindings retain precedence; ambiguous matching
+continuation records refuse rather than choosing one. That unfinished record is the restore's own: no startup replay or
+other verb completes it while the project is bound, and a restore is never answered from a completed record, so a retry
+after any failed unbinding (a stray file, a release that cannot move) runs the unbinding again rather than reporting
+success while the binding stands. A released image the unbinding lists but finds already unlinked by the gateway's
+cleanup is released, not an error. The lifecycle journal is released after the other controller records, so failures in
+their removal retain the continuation. A death after releasing the journal but before deleting the checkout record can
+leave only that unbound bookkeeping record; it holds no recovery authority, and a later adoption's main image outranks
+it.
 
 ## `cowshed forget <owner/repo> --abandon` — retire from store authority
 
@@ -1441,7 +1441,10 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    (step 5). The bundle is written beside that name and renamed into place once verified; a retried removal that finds a
    bundle verifying for the same range keeps it instead of writing another. The bundle is the only copy: nothing is
    written into main's repository, whose refs are the branches people check out and the ones `push` writes, never a
-   namespace per abandonment that nobody reads. It stays in the trash until `gc --abandoned` releases it (01_storage.md,
+   namespace per abandonment that nobody reads. It stays in the trash until main holds every commit it carries by patch
+   identity, when a plain `gc` drops it as `heldBundle`: each commit a tip carries beyond main is one `git cherry` marks
+   `-` (and changes something) or a merge that authors nothing, and a tip carrying nothing beyond main is held by
+   ancestry; a bundle that advertises no tip is kept. `gc --abandoned` releases every bundle (01_storage.md,
    "Retention"). The report names it (`AbandonedWork.bundle`), and `AbandonedWork.preserved` says what else keeps the
    tips: absent (`bundleOnly`) for every session abandonment; `nothingToPreserve` for main's own `--restore --abandon`
    (below), where main is what is being restored and its bundle is the copy; or `preserved` with each ref, in a record
@@ -1487,7 +1490,7 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
 4. Release the session's owned live build volume and current-incarnation seed before its source image
    (16_build_volumes.md, "Garbage collection"). A volume adopted by the target belongs to that target and stays. A held
    volume or failed release refuses while the source image and unfinished retirement journal remain.
-5. **Clean landed source: commit the release in this operation, free it in the background.** After the final
+5. **Release the source: commit the release in this operation, free it in the background.** After the final
    dirty/in-progress, HEAD-stability and all-branch containment fences, detach the exact source and remove its scoped
    temporary directory and empty mountpoint through the existing retirement checks. Then commit the release with one
    rename of the canonical source image, never replacing a file, to `sessions/.deleting/<ws>-<incarnation>.dmg` and sync
@@ -1506,116 +1509,21 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    on the bytes being freed. The removal's retry finds the workspace already gone. An open confined to other workspaces
    neither reads nor waits for it.
 
-   A gitignored path is disposable by the project's own declaration and never keeps a recovery image: one ignored by the
-   workspace's own rules (`.gitignore`, `.git/info/exclude`, the user's excludes file) or by the surviving target
-   checkout's current rules. Only uncommitted work, unlanded commits and visible untracked leaves no rule ignores keep
-   one. A hidden untracked leaf (any `.`-component) is junk, as it is to the dirty fence (8d3fc40379, "junk is junk"):
-   never the only copy, so it keeps no image (a fold's retirement once kept a whole image for one `.cache/*.log`). What
-   cowshed itself made in the checkout is not its content: `.cowshed/`, the volume's own bookkeeping (`.fseventsd`, the
-   Spotlight, trash, temporary-items and revisions directories, and the Spotlight opt-out marker volumes adopted before
-   2026-10-25 carry), and each build-state link exactly as cowshed made it for a path the record of the build volume the
-   checkout links names (16_build_volumes.md, "One link per checkout"): a symlink, under real parent directories, whose
-   target is that path's fixed relative target through `.cowshed/build`. A link at a path the record does not name, a
-   named path linked anywhere else, and a checkout whose volume record cannot be read exempt nothing. Every other
-   untracked leaf no rule ignores must be held byte-for-byte (or by the same symlink target) in the surviving target
-   checkout before direct release. Otherwise preserve the complete image as recovery. This does not weaken the ordinary
-   dirty/unlanded refusal gates or grant a new destruction override.
+   Every retirement releases its image; none keeps a recovery image. What could survive only in the image is refused by
+   step 1 unless `--abandon` bundles it: uncommitted work, by the dirt rule there, and unlanded commits. What that rule
+   reads as junk goes with the image: a path ignored by the workspace's own rules (`.gitignore`, `.git/info/exclude`,
+   the user's excludes file) or by the surviving target checkout's current rules, an untracked hidden path, and an
+   untracked path the target holds byte for byte. So do cowshed's own `.cowshed/`, the volume's bookkeeping and the
+   build-state links, which each checkout's `.git/info/exclude` ignores. An unfinished clone's retirement, a rename's
+   source once its destination holds its head and work, and `rm main --force`, which throws the warm main image away,
+   release the same way.
 
-   **Recovery source:** authorized dirty/in-progress or unlanded removal, only-copy content, and rename preservation
-   keep the existing atomic recovery transaction: durably link complete grants/CA companions at
-   `sessions/.trash/<ws>-<incarnation>.dmg`, rename the image there, sync both parents, then unlink canonical CA and
-   grants. Before rename canonical authority remains valid; after it complete recovery authority is already in trash.
-   Imageless prepared companions authorize nothing and are rebuilt on retry. Recovery images and their scoped artifacts
-   are not startup or generic-GC garbage, even when a grants sidecar was lost: missing authority never proves the bytes
-   disposable, and the diagnostic names the retained path for deliberate metadata/content recovery. `gc --abandoned`
-   still authorizes verified bundles only, never destruction of uncommitted or ignored image content. A refusal
-   preserves source/recovery authority and is reported.
-
-   **Recovering a recovery image:** `cowshed gc --recover <image> --to <dir>` (`coordinator.recoverImage`, 07_api.md) is
-   that deliberate recovery, and the only way a recovery image leaves the store. Both paths are absolute. Before any
-   source transfers it refuses a path that is not this project's `sessions/.trash/<ws>-<incarnation>.dmg` (an abandon
-   bundle is `gc --abandoned`'s), a grants sidecar recording another project, workspace or incarnation, a destination
-   inside the store, and an occupied or symlinked `<dir>/<ws>-<incarnation>` without this image's admitted manifest. It
-   holds the workspace lifecycle lock for the whole operation and refuses `conflict` while another operation holds it.
-   No filesystem alias bypasses the outside-store fence. Same-filesystem recovery keeps the no-clobber rename path,
-   including directory-backed test images. Across filesystems only regular images and regular companions are supported:
-   directories, symlinks and other nonregular artifacts refuse before creating the recovered directory or changing
-   source custody. There is no recursive directory-copy fallback.
-
-   The destination directory and `recovery.json` become durable before any source transfer. The manifest records the
-   project, workspace, incarnation, trash path, ordered file names, grants presence, recovery time and retirement reason
-   (`unrecorded` when the deletion log has none). Files are derived from the image path: grants sidecar, CA companion,
-   then the image. A foreign name, duplicate, wrong order, omitted companion present on either side, or inconsistent
-   grants flag refuses. Every component of the canonical directory chain opens without following a symlink; held
-   directory descriptors anchor file operations.
-
-   After this admission and before transferring source bytes, the backend may reclaim the whole owned exec-temp
-   environment under the same name lock. Only validated retired authority authorizes that ephemeral cleanup; a missing
-   grants sidecar authorizes no inferred-name deletion. A live canonical or newer retired incarnation keeps the name's
-   environment foreign and untouched. A mounted subtree refuses before source transfer. This cleanup deletes neither the
-   image.
-
-   A version-1 same-filesystem manifest resumes the original ordered renames: companions first, image last, no
-   replacement, both directories synced after each rename and before answering. Cross-filesystem recovery uses the
-   existing source-side `lifecycle-intents.json` journal's typed `recoveryExports` records, keyed by canonical source
-   image. The existing journal lock covers only a read/change/durable-write transaction, never image copying. Each
-   record binds the exact admitted destination, both directory identities, source witnesses, copy progress, retirement
-   progress and completion. A destination cannot authorize its own recovery: without the matching source-held record, an
-   existing version-2 destination refuses even if it claims every artifact is published and supplies plausible inode
-   identities or digests. Altered destination fields never replace source-held progress.
-
-   Source admission is journaled before publishing the destination's version-2 `recovery.json`. An interruption between
-   those steps resumes only that exact record and directory identity. This admission document is immutable: its
-   `copy.artifacts` retain the original device, inode, length, mode, mtime and ctime witnesses with `pending` states.
-   Every destination document is exclusively created and published by no-clobber rename; recovery never replaces an
-   existing document. A swapped foreign manifest or proof is retained and refused, not overwritten. The mutable states
-   below live only in the source journal:
-
-   - `pending`: no copied bytes are admitted.
-   - `copying`: an exclusively created `.<file>.recovery-<uuid>.partial` and its inode are recorded before writing. An
-     interrupted attempt is unverified evidence, not a completed copy. A retry retains it and starts a fresh UUID
-     attempt; it never overwrites unknown partial data. Unrecorded partials likewise remain untrusted and untouched.
-   - `copied`: sparse copying and file sync completed, the source still matches admission, and the staged file's
-     complete mutation witness is journaled. Publication is a descriptor-relative no-clobber rename. After a crash
-     immediately following that rename, only the recorded staged inode at the final name can resume, and it still owes
-     verification. An altered stage or foreign final name refuses without retiring a source.
-   - `published`: final file and directory are durable, bytes and copied metadata were compared, sparse allocation was
-     checked, and the SHA-256 digest plus exact final mutation witness are durable in the source journal. Normal
-     publication verifies once. An unchanged journal-owned witness reuses that proof without recopying or rehashing.
-
-   Metadata fidelity includes numeric owner/group, mode, timestamps, extended attributes and ACLs. Linux transfers the
-   exact descriptor-owned xattr set, including its POSIX ACL representation, removing inherited target-only attributes
-   before applying final times. macOS keeps native copyfile metadata transfer and verifies ordinary xattrs, resource
-   forks and canonical extended ACLs. Filesystem-private compression representation is not copied metadata. Unsupported
-   or forbidden metadata operations refuse; they are not silently dropped. Sparse verification enforces the existing
-   allocation contract, not identical physical extent topology on different filesystems. Copy and verification bypass
-   the page cache (macOS `F_NOCACHE` on both descriptors; Linux has no per-descriptor equivalent short of `O_DIRECT`)
-   and read only data regions: a hole in either file is compared and hashed as zeros without a read, so a sparse image
-   reads only its allocated bytes, while the digest still covers its whole length.
-
-   **No source artifact leaves the trash until every destination artifact is published, durable and verified.** The
-   complete journal-owned destination proof is also published create-new as `recovery-copy.json`, with the same manifest
-   shape and all copy states `published`. Its identity is then journaled. Only after both immutable documents, all
-   source/target witnesses and directory bindings agree can source retirement begin.
-
-   Retirement first creates a private held directory beneath the trash, named
-   `.<image-file-name>.recovery-retire-<uuid>.partial`, and journals its name and directory identity. For each artifact,
-   companions first and image last, the journal advances `original` → `staging` before a no-clobber rename from the
-   original name into that private directory. The moved inode is checked against the admitted source before its exact
-   new witness is journaled as `staged`. A substituted foreign entry is never unlinked: recovery attempts a no-clobber
-   restore to the original name, otherwise retains it in private custody and reports where it remains. Only a validated
-   entry in the operation-owned directory is unlinked. The directory is synced before marking that artifact `retired`. A
-   crash after the rename resumes the recorded stage; a crash after unlink but before recording `retired` is recognized
-   only from the already journaled staged identity and complete destination proof. A missing original name alone never
-   proves retirement. An occupied original or mismatched stage refuses without deleting foreign content.
-
-   After all sources retire, recovery removes only the empty owned staging directory and records completion. Completed
-   records remain in the existing controller lifecycle journal to make repeats idempotent; their release condition is
-   terminal project unbinding, whose existing controller-state removal deletes that journal. No additional root artifact
-   or surviving successful-retirement staging directory blocks terminal restore. Unfinished stages retain their source
-   bytes and remain a terminal-storage refusal. Unverified destination partials remain outside-store evidence, never
-   generic-GC input. Each retired source logs `recover-retired-image`; errors name the operation, source/destination and
-   cause, including expected and observed identities. Plain GC gains no new deletion authority.
+   A `sessions/.trash/<ws>-<incarnation>.dmg` an earlier build kept as a recovery image is garbage. A plain `gc`
+   releases it into `sessions/.deleting` as it finishes any retirement: with its workspace-scoped artifacts (temp dir,
+   empty mountpoint, grants sidecar, CA companion) when its grants sidecar names it, and as its own files alone (the
+   image, its CA companion) when that sidecar is gone, since a missing record names no workspace's environment. An
+   opening never releases one: only `gc` does, under its plan's locks. That first `gc` after the upgrade is the one-time
+   cleanup of every such image.
 
 The in-progress Git gate follows operation state (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge`, or
 `rebase-apply`), not a leftover `.git/AUTO_MERGE` tree: Git can retain that tree after an operation finishes. A stale
@@ -1626,11 +1534,10 @@ interrupted verification removes it before leaving the operation. So does the `.
 final name: the attempt renames it into place or removes it, cancellation included, since no sweep ever owns one.
 
 Removal persists its exact options before the authorized retirement mutation and records completion only after the
-release is committed or durable recovery preservation completes. If a process dies after the canonical rename or
-retirement but before acknowledging the call, startup observes the workspace absent and records completion without
-retiring it twice. A prepared request that never crossed the safety fence is discarded, not a deferred deletion; an
-authorized mutating request reruns the safety fences and retirement. Cancellation cannot discard the journal while the
-blocking release commit finishes.
+release is committed. If a process dies after the canonical rename or retirement but before acknowledging the call,
+startup observes the workspace absent and records completion without retiring it twice. A prepared request that never
+crossed the safety fence is discarded, not a deferred deletion; an authorized mutating request reruns the safety fences
+and retirement. Cancellation cannot discard the journal while the blocking release commit finishes.
 
 The request also records what the retirement measures against: nothing for main's `main`, which every `rm` measures
 against and every record from before the field means, and for a `land`'s retire the workspace and branch the unit landed
@@ -1671,15 +1578,13 @@ volume it registered, deferred behind it on every pass.
 
 `cowshed rm main --restore --purge [--force] [--abandon]` (`Coordinator::remove_project`) removes the whole project in
 one call: every session workspace, including clones a create never published, under the given `--force`/`--abandon`;
-each removal has already committed its release or completed its recovery preservation when collection begins; collects;
-with `--abandon` deletes the abandon bundles in `sessions/.trash`, the only copy of the commits they hold, which
-`--abandon` authorizes losing (01_storage.md); and restores main, whose final unbinding moves the project's released
-images into the store's `.deleting` and nudges the gateway ("Checkout layouts"). Each step is idempotent, so a refusal
-leaves the rest to the same command. A collection that still finds the store changed under it (another process) is
-refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the same command finishes the removal; callers never
-sleep and retry `gc` themselves. Recovery images can hold only-copy work even after all abandoned commits were bundled;
-they therefore refuse terminal store removal until their contents have been deliberately recovered with `gc --recover`
-(step 5), which the refusal's hint names. Bundle authorization alone never discards them.
+each removal has already committed its release when collection begins; collects; with `--abandon` deletes the abandon
+bundles in `sessions/.trash`, the only copy of the commits they hold, which `--abandon` authorizes losing
+(01_storage.md); and restores main, whose final unbinding moves the project's released images into the store's
+`.deleting` and nudges the gateway ("Checkout layouts"). Each step is idempotent, so a refusal leaves the rest to the
+same command. A collection that still finds the store changed under it (another process) is refused as retryable —
+`Conflict` with `Retry::GcPlanStale` — and the same command finishes the removal; callers never sleep and retry `gc`
+themselves.
 
 ## `cowshed attach` / `cowshed detach`
 

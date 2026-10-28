@@ -6,7 +6,7 @@
 //! opened, which `std` opens close-on-exec, through `fcopyfile(3)`. Only a clone names paths:
 //! `COPYFILE_CLONE_FORCE` is one `clonefileat(2)` on the two paths and opens no descriptor.
 
-use super::{LeafMaterialization, NativeAcl, acl_free, acl_get_fd_np};
+use super::LeafMaterialization;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -115,7 +115,7 @@ fn copy_unshared(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 /// Copy a regular file through already admitted descriptors, preserving sparse holes and metadata.
-pub fn copy_regular(input: &File, output: &File) -> io::Result<()> {
+fn copy_regular(input: &File, output: &File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     let metadata = input.metadata()?;
     let sparse = metadata.blocks().saturating_mul(512) < metadata.len()
@@ -144,105 +144,6 @@ pub fn directory_metadata(source: &Path, destination: &Path) -> io::Result<()> {
     )
 }
 
-pub(super) fn list_xattrs(file: &File, buffer: &mut [u8]) -> io::Result<usize> {
-    // Options zero matches COPYFILE_XATTR: include application metadata and resource forks,
-    // not compression implementation attributes whose encoding can change during copying.
-    // SAFETY: file remains open; the writable buffer has exactly the supplied length.
-    super::metadata_count(unsafe {
-        libc::flistxattr(
-            file.as_raw_fd(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            0,
-        )
-    })
-}
-
-pub(super) fn read_xattr(
-    file: &File,
-    name: &std::ffi::CStr,
-    buffer: &mut [u8],
-) -> io::Result<usize> {
-    // SAFETY: file, NUL-terminated name and writable buffer outlive the call.
-    super::metadata_count(unsafe {
-        libc::fgetxattr(
-            file.as_raw_fd(),
-            name.as_ptr(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            0,
-            0,
-        )
-    })
-}
-
-unsafe extern "C" {
-    fn acl_size(acl: *mut NativeAcl) -> libc::ssize_t;
-    fn acl_copy_ext(
-        buffer: *mut libc::c_void,
-        acl: *mut NativeAcl,
-        size: libc::ssize_t,
-    ) -> libc::ssize_t;
-}
-
-fn acl_bytes(file: &File) -> io::Result<Option<Vec<u8>>> {
-    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
-    let contextual = |error| super::metadata_error(file, "read extended ACL", None, error);
-    // SAFETY: file keeps its descriptor open; the type is the Darwin extended ACL constant.
-    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
-    let Some(acl) = std::ptr::NonNull::new(acl) else {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ENOENT) {
-            Ok(None)
-        } else {
-            Err(contextual(error))
-        };
-    };
-    let result = (|| {
-        // SAFETY: acl_get_fd_np returned a live, owned ACL.
-        let size = unsafe { acl_size(acl.as_ptr()) };
-        let length = super::metadata_count(size).map_err(contextual)?;
-        let mut bytes = vec![0; length];
-        // SAFETY: acl_size supplies the required capacity; both objects outlive the export.
-        let written = super::metadata_count(unsafe {
-            acl_copy_ext(bytes.as_mut_ptr().cast(), acl.as_ptr(), size)
-        })
-        .map_err(contextual)?;
-        if written != length {
-            return Err(contextual(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ACL export size differs",
-            )));
-        }
-        Ok(Some(bytes))
-    })();
-    // SAFETY: this is the single release of the ACL allocation, including every export failure.
-    if unsafe { acl_free(acl.as_ptr().cast()) } != 0 {
-        return Err(super::metadata_error(
-            file,
-            "free extended ACL",
-            None,
-            io::Error::last_os_error(),
-        ));
-    }
-    result
-}
-
-pub(super) fn verify_acl(source: &File, destination: &File) -> io::Result<()> {
-    // acl_copy_ext is the OS's canonical binary external representation, including ordered
-    // entries and ACL/entry flags. Text conversion can resolve principals through the network.
-    if acl_bytes(source)? != acl_bytes(destination)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "extended ACL differs: source descriptor {}, destination descriptor {}",
-                source.as_raw_fd(),
-                destination.as_raw_fd()
-            ),
-        ));
-    }
-    Ok(())
-}
 #[cfg(test)]
 mod tests {
     use std::fs;

@@ -273,8 +273,6 @@ pub const PARITY: &[Row] = &[
     row("gc", "", field(&[("coordinator.gc", "")], &[member("Coordinator.gc")])),
     row("gc", "dry-run", field(&[("coordinator.gc", "options.dryRun")], &[argument("Coordinator.gc", 0, "dryRun")])),
     row("gc", "abandoned", field(&[("coordinator.gc", "options.abandoned")], &[argument("Coordinator.gc", 0, "abandoned")])),
-    row("gc", "recover", field(&[("coordinator.recoverImage", "image")], &[argument("Coordinator.recoverImage", 0, "")])),
-    row("gc", "to", field(&[("coordinator.recoverImage", "to")], &[argument("Coordinator.recoverImage", 1, "")])),
 
     row("push", "", field(&[("worker.push", "")], &[member("WorkspaceHandle.push")])),
     row("push", "workspace", field(&[("coordinator.worker", "workspace")], &[argument("Coordinator.worker", 0, "")])),

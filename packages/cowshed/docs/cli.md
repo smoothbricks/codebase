@@ -1724,20 +1724,11 @@ Releases retired and orphaned images for background deletion, removes stale moun
 bytes of the images it released, not bytes freed: their deletions free the space after the command returns. Safe to run
 anytime; `rm` and `land` also run it opportunistically.
 
-A removal that could not prove every source byte held elsewhere — a forced dirty or in-progress tree, abandoned commits,
-or an untracked file no ignore rule covers and main's checkout lacks — keeps the complete image as a recovery image,
-`sessions/.trash/<ws>-<incarnation>.dmg`. No `gc` reclaims one, and removing the whole project refuses while one
-remains. Take it out of the store when you are ready to look at it:
-
-```sh
-cowshed gc --recover /private/cowshed/store/acme/api/sessions/.trash/raven-<incarnation>.dmg --to ~/recovered
-```
-
-The image, its grants sidecar and its CA companion move into `~/recovered/raven-<incarnation>/` beside `recovery.json`,
-which names the project, the workspace, its incarnation and why the removal kept it. On the store's filesystem nothing
-is copied or deleted: each file is renamed. On another filesystem each is copied, reading only its data regions and
-bypassing the page cache, verified byte for byte, and only then removed from the trash. The directory must be outside
-the store; a retry after an interruption finishes the same move.
+No removal keeps a recovery image: what could survive only in a workspace's image, uncommitted work or unlanded commits,
+is refused by `rm` until `--abandon` bundles it. Images an earlier cowshed kept as recovery images in
+`sessions/.trash/<ws>-<incarnation>.dmg` are garbage, and a plain `gc` releases them like every other retirement. It
+also drops an abandon bundle once main holds every commit it carries by patch identity (`heldBundle`); `--abandoned`
+deletes the rest.
 
 Every other image a command lets go of — a clean removal's image, the build volumes `rm`, `land` and `gc` release, the
 seeds a fork or land replaces, an orphan image `gc` collects, the staged image a failed creation leaves — is renamed

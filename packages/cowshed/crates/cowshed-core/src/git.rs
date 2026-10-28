@@ -1511,6 +1511,119 @@ impl GitRepository {
         self.count_range(&range).await
     }
 
+    /// Measure the abandon bundle at `bundle` against this repository's `target_tip`, for
+    /// [`bundle_is_held`]: each tip the bundle advertises, with the commits it carries beyond
+    /// `target_tip` and which of them this repository holds by patch identity
+    /// ([`Self::held_commits`]). The bundle is fetched into a scratch bare repository beside it
+    /// with this repository's objects attached read-only, so neither this repository nor the
+    /// bundle changes, and the scratch is removed before answering.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) async fn measure_bundle(
+        &self,
+        bundle: &Path,
+        target_tip: &str,
+    ) -> Result<Vec<BundleTip>> {
+        let parent = bundle.parent().ok_or_else(|| {
+            CowshedError::integrity(
+                format!(
+                    "abandon bundle has no parent directory: {}",
+                    bundle.display()
+                ),
+                "repair the cowshed store, then cowshed gc",
+            )
+        })?;
+        let target_objects = self.object_directory().await?;
+        let scratch = GitScratch::create(parent, ScratchUse::BundleVerification)?;
+        let measured = async {
+            let output = run_git_at(
+                #[cfg(target_os = "macos")]
+                &self.store_root,
+                &scratch.path,
+                ["init", "--bare", "."],
+            )
+            .await?;
+            if !output.status.success() {
+                return Err(bundle_artifact_error(
+                    "initialize the abandon bundle's measuring repository",
+                    &output,
+                ));
+            }
+            let listed = run_git_bundle_at(
+                &scratch.path,
+                None,
+                [
+                    OsStr::new("bundle"),
+                    OsStr::new("list-heads"),
+                    bundle.as_os_str(),
+                ],
+            )
+            .await?;
+            if !listed.status.success() {
+                return Err(bundle_artifact_error(
+                    "list the abandon bundle's tips",
+                    &listed,
+                ));
+            }
+            let tips: Vec<String> = parse_lines(&listed.stdout, "abandon bundle tip")?
+                .into_iter()
+                .filter_map(|line| line.split_once(' ').map(|(_, name)| name.to_owned()))
+                .collect();
+            if tips.is_empty() {
+                return Ok(Vec::new());
+            }
+            let fetched: Vec<String> = (0..tips.len())
+                .map(|index| format!("refs/measured/{index}"))
+                .collect();
+            let mut fetch = vec![
+                OsString::from("fetch"),
+                OsString::from("--quiet"),
+                OsString::from("--no-tags"),
+                bundle.as_os_str().to_owned(),
+            ];
+            fetch.extend(
+                tips.iter()
+                    .zip(&fetched)
+                    .map(|(tip, local)| OsString::from(format!("{tip}:{local}"))),
+            );
+            let output = run_git_bundle_at(&scratch.path, Some(&target_objects), fetch).await?;
+            if !output.status.success() {
+                return Err(bundle_artifact_error(
+                    "fetch the abandon bundle to measure it",
+                    &output,
+                ));
+            }
+            let measuring = Self::from_root(&self.store_root, &scratch.path)
+                .with_alternate_objects(target_objects.clone())?;
+            let mut measured = Vec::with_capacity(fetched.len());
+            for tip in &fetched {
+                let range = format!("{target_tip}..{tip}");
+                let listed = measuring.run(["rev-list", range.as_str()]).await?;
+                if !listed.status.success() {
+                    return Err(git_internal(
+                        "list an abandon bundle tip's commits",
+                        &listed,
+                    ));
+                }
+                measured.push(BundleTip {
+                    commits: parse_lines(&listed.stdout, "abandon bundle commit")?,
+                    held: measuring.held_commits(target_tip, tip).await?,
+                });
+            }
+            Ok(measured)
+        }
+        .await;
+        let cleanup = scratch.cleanup().await;
+        match (measured, cleanup) {
+            (Ok(measured), Ok(())) => Ok(measured),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(primary), Err(cleanup)) => Err(CowshedError::integrity(
+                format!("{primary}; measuring cleanup also failed: {cleanup}"),
+                "repair the cowshed store, then cowshed gc",
+            )),
+        }
+    }
+
     /// Write and verify a self-contained bundle of `heads` and the live target they were measured
     /// against, returning the number of commits reachable from any head and not from the target.
     ///
@@ -5609,6 +5722,28 @@ pub fn is_hidden_path(path: &[u8]) -> bool {
         .any(|component| component.first() == Some(&b'.'))
 }
 
+/// One tip an abandon bundle advertises, measured by [`GitRepository::measure_bundle`]: the
+/// commits it carries beyond the target, and those of them the target holds by patch identity.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BundleTip {
+    pub(crate) commits: Vec<String>,
+    pub(crate) held: std::collections::BTreeSet<String>,
+}
+
+/// Whether an abandon bundle holds nothing the target lacks, so `gc` may drop it
+/// (02_workspaces.md, `rm` step 1): every commit every tip it advertises carries beyond the target
+/// is patch-equivalent to one the target holds, or a merge that authors nothing. A tip that
+/// carries nothing beyond the target is held by ancestry. A bundle that advertises no tip proves
+/// nothing and is kept.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn bundle_is_held(tips: &[BundleTip]) -> bool {
+    !tips.is_empty()
+        && tips
+            .iter()
+            .all(|tip| tip.commits.iter().all(|commit| tip.held.contains(commit)))
+}
+
 /// The ref [`GitRepository::commit_uncommitted`] points at the commit of a work tree's
 /// uncommitted work, so an abandonment's bundle can carry it: a bundle advertises refs, never a
 /// bare oid. It lives in the workspace being retired and goes with it.
@@ -7095,6 +7230,88 @@ mod tests {
         assert!(asks_target(b"??", b"notes.txt"));
         assert!(!asks_target(b"??", b".cache/r9.log"));
         assert!(!asks_target(b" M", b"notes.txt"));
+    }
+
+    /// When `gc` may drop an abandon bundle, as a table: only when every commit every tip carries
+    /// beyond main is one main holds by patch identity.
+    #[test]
+    fn an_abandon_bundle_is_held_only_when_main_holds_every_commit_it_carries() {
+        use super::{BundleTip, bundle_is_held};
+        let tip = |commits: &[&str], held: &[&str]| BundleTip {
+            commits: commits.iter().map(|commit| (*commit).to_owned()).collect(),
+            held: held.iter().map(|commit| (*commit).to_owned()).collect(),
+        };
+        for (case, tips, held) in [
+            ("no tip proves nothing", vec![], false),
+            ("a tip main contains", vec![tip(&[], &[])], true),
+            (
+                "every commit picked onto main",
+                vec![tip(&["a", "b"], &["a", "b"])],
+                true,
+            ),
+            (
+                "one commit main lacks",
+                vec![tip(&["a", "b"], &["a"])],
+                false,
+            ),
+            (
+                "one tip of two carries what main lacks",
+                vec![tip(&["a"], &["a"]), tip(&["c"], &[])],
+                false,
+            ),
+            (
+                "a branch held, HEAD contained",
+                vec![tip(&[], &[]), tip(&["c"], &["c"])],
+                true,
+            ),
+        ] {
+            assert_eq!(bundle_is_held(&tips), held, "{case}");
+        }
+    }
+
+    /// An abandon bundle of a commit main later took as a cherry-pick is held by main; one more
+    /// commit main lacks keeps it. Measured against main's own repository, through a real bundle.
+    #[tokio::test]
+    async fn an_abandon_bundle_main_picked_is_held_and_one_with_more_work_is_not() {
+        use super::bundle_is_held;
+        let store = crate::temp_root::FixtureStore::new();
+        let root = repository();
+        let repo = GitRepository::from_root(store.shared(), &root);
+        git(&root, &["checkout", "-q", "-b", "work"]);
+        fs::write(root.join("picked"), "picked\n").expect("work file");
+        git(&root, &["add", "picked"]);
+        git(&root, &["commit", "-q", "-m", "work main picks"]);
+        let picked = git_stdout(&root, &["rev-parse", "HEAD"]).trim().to_owned();
+        git(&root, &["checkout", "-q", "main"]);
+        fs::write(root.join("README"), "main moved on\n").expect("main edit");
+        git(&root, &["commit", "-q", "-am", "main moves"]);
+        git(&root, &["cherry-pick", picked.as_str()]);
+        let main = git_stdout(&root, &["rev-parse", "main"]).trim().to_owned();
+        git(&root, &["checkout", "-q", "work"]);
+        let trash = root.parent().expect("scratch").join("trash");
+        fs::create_dir_all(&trash).expect("trash");
+
+        let bundle = trash.join("work-picked.bundle");
+        repo.bundle_commits(&bundle, Some(main.as_str()), &["HEAD"])
+            .await
+            .expect("bundle the picked work");
+        let tips = repo.measure_bundle(&bundle, &main).await.expect("measure");
+        assert!(bundle_is_held(&tips), "{tips:?}");
+
+        fs::write(root.join("unheld"), "unheld\n").expect("more work");
+        git(&root, &["add", "unheld"]);
+        git(&root, &["commit", "-q", "-m", "work main lacks"]);
+        let bundle = trash.join("work-unheld.bundle");
+        repo.bundle_commits(&bundle, Some(main.as_str()), &["HEAD"])
+            .await
+            .expect("bundle more work");
+        let tips = repo.measure_bundle(&bundle, &main).await.expect("measure");
+        assert!(!bundle_is_held(&tips), "{tips:?}");
+        assert_eq!(
+            fs::read_dir(&trash).expect("trash").count(),
+            2,
+            "measuring leaves no scratch behind"
+        );
     }
 
     /// An abandonment commits the work tree's dirt as one commit on top of HEAD through a private

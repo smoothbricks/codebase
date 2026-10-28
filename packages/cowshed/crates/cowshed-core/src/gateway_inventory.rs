@@ -1527,10 +1527,14 @@ impl NativeGatewayInventory {
                     let path = entry
                         .map_err(|source| io_error("reading retirement trash", &trash, source))?
                         .path();
-                    // `<ws>-<incarnation>.dmg`, read as recovery export reads it: a
-                    // session named `main-probe` retires as `main-probe-<incarnation>.dmg`.
-                    if crate::storage::recovery_image::classify(&trash, &path)
-                            .is_ok_and(|(workspace, _)| workspace.is_main())
+                    // `<ws>-<incarnation>.dmg`, split at the last `-`: a session named
+                    // `main-probe` retires as `main-probe-<incarnation>.dmg`.
+                    if cowshed_apfs::image::is_image_path(&path)
+                            && path
+                                .file_stem()
+                                .and_then(|stem| stem.to_str())
+                                .and_then(crate::storage::apfs::split_retired_stem)
+                                .is_some_and(|(workspace, _)| workspace.is_main())
                             && fs::symlink_metadata(&path)
                                 .is_ok_and(|metadata| metadata.file_type().is_file())
                             // A retired image without its sidecar has no record left to name a

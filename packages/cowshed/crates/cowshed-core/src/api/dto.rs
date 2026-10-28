@@ -1209,10 +1209,13 @@ pub enum GcReason {
     OrphanStagingMount,
     OrphanSessionImage,
     OrphanMountpoint,
-    /// The `<ws>-<tip>.bundle` recovery bundle `rm --abandon` keeps in `sessions/.trash/`, whose
-    /// tips main's repository keeps as refs before it is reclaimed. A candidate only under a sweep
-    /// that explicitly authorizes it (`GcOptions.abandoned`).
+    /// The `<ws>-<tip>.bundle` recovery bundle `rm --abandon` keeps in `sessions/.trash/`, the
+    /// only copy of the commits it holds. A candidate only under a sweep that explicitly authorizes
+    /// it (`GcOptions.abandoned`).
     AbandonedBundle,
+    /// An abandon bundle every commit of which main holds by patch identity (02_workspaces.md,
+    /// `rm` step 1): it keeps nothing main lacks, so a plain sweep drops it.
+    HeldBundle,
     /// A build volume no checkout links: a checkout's live volume its checkout no longer links,
     /// or one superseded under its owner once no job holds it (16_build_volumes.md, "Garbage
     /// collection").
@@ -4594,101 +4597,6 @@ pub struct PreservedRef {
     pub reference: String,
 }
 
-/// Why a removal kept a workspace's complete source image as a recovery image in
-/// `sessions/.trash/` instead of releasing it (02_workspaces.md, `rm` step 5, "Recovery source").
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-pub enum RecoveryCause {
-    /// A Git operation was in progress, and the removal was forced past it.
-    InProgress { operation: String },
-    /// The tree held uncommitted work, and the removal was forced past it.
-    Dirty,
-    /// The removal abandoned commits no target holds (`rm --abandon`).
-    Abandoned,
-    /// An untracked leaf the surviving target checkout does not hold, byte for byte or by the same
-    /// symlink target: the first one the check found.
-    OnlyCopy { path: PathBuf },
-    /// Main's own retirement, which always keeps its image.
-    Main,
-}
-
-impl fmt::Display for RecoveryCause {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InProgress { operation } => {
-                write!(
-                    formatter,
-                    "a forced removal went past an in-progress {operation}"
-                )
-            }
-            Self::Dirty => formatter.write_str("a forced removal went past uncommitted work"),
-            Self::Abandoned => formatter.write_str("the removal abandoned unlanded commits"),
-            Self::OnlyCopy { path } => write!(
-                formatter,
-                "{} is held by no surviving checkout",
-                path.display()
-            ),
-            Self::Main => formatter.write_str("main's own retirement keeps its image"),
-        }
-    }
-}
-
-/// What the project's deletion log says about why a recovery image was kept.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-pub enum RecoveryRetention {
-    /// The `retire-workspace` line naming this image, written `at` its retirement, with every
-    /// cause it found.
-    Recorded {
-        at: String,
-        because: Vec<RecoveryCause>,
-    },
-    /// No line names it: a build from before retirements recorded why retired it, a rename
-    /// preserved it (`cowshed mv`), or the line was lost. The log is evidence, never a lock.
-    Unrecorded,
-}
-
-impl fmt::Display for RecoveryRetention {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Recorded { at, because } => {
-                write!(formatter, "kept at {at} because ")?;
-                for (index, cause) in because.iter().enumerate() {
-                    if index > 0 {
-                        formatter.write_str("; ")?;
-                    }
-                    write!(formatter, "{cause}")?;
-                }
-                Ok(())
-            }
-            Self::Unrecorded => {
-                formatter.write_str("the project's deletion log records no reason it was kept")
-            }
-        }
-    }
-}
-
-/// Where `cowshed gc --recover` moved one recovery image out of the store (02_workspaces.md,
-/// `rm` step 5, "Recovering a recovery image").
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RecoveredImage {
-    pub workspace: WorkspaceName,
-    pub incarnation: WorkspaceIncarnation,
-    /// The trash path the image moved from.
-    pub source: PathBuf,
-    /// `<to>/<workspace>-<incarnation>`: the image, its companions and the manifest.
-    pub directory: PathBuf,
-    /// The manifest the recovery wrote into `directory` before anything moved.
-    pub manifest: PathBuf,
-    /// Every file moved, at its new path: the companions, then the image.
-    pub moved: Vec<PathBuf>,
-    /// Whether the grants sidecar travelled with it. A recovery image can have lost it, and
-    /// missing authority never made its bytes disposable.
-    pub grants: bool,
-    pub retained: RecoveryRetention,
-}
-
 /// What `cowshed rm` destroyed beyond the workspace image itself.
 ///
 /// `abandoned` is `None` for every removal whose commits the target branch already contained —
@@ -5019,7 +4927,6 @@ result_bodies!(
     MountResult,
     DoctorReport,
     GcReport,
-    RecoveredImage,
     RekeyResult,
     RebaseReport,
     ResizeResult,

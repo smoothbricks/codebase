@@ -616,14 +616,6 @@ pub struct RekeyArgs {
 pub struct GcArgs {
     pub dry_run: bool,
     pub abandoned: bool,
-    pub recover: Option<RecoverArgs>,
-}
-
-/// `gc --recover <image> --to <dir>`: the recovery image to move out of the store, and where.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoverArgs {
-    pub image: PathBuf,
-    pub to: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1031,12 +1023,7 @@ pub fn cli_command() -> ClapCommand {
                 .subcommand_required(true)
                 .subcommand(leaf("clear").arg(positional("workspace", 0..=1))),
         )
-        .subcommand(leaf("gc").args([
-            flag("dry-run"),
-            flag("abandoned"),
-            value("recover"),
-            value("to"),
-        ]))
+        .subcommand(leaf("gc").args([flag("dry-run"), flag("abandoned")]))
         .subcommand(leaf("push").arg(positional("workspace", 0..=1)).args([
             value("branch"),
             value("expected-workspace-incarnation"),
@@ -3764,15 +3751,15 @@ const GC: CommandSpec = CommandSpec {
     trailing: "",
     summary: "free storage",
     about: &[
-        "Reclaims six kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedActive` and `releasedBytes`. Five of them need no flag; the sixth, `abandonedBundle`, is only ever collected under `--abandoned`. `rm` and `land` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
-        "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars and empty mountpoint. Retirement already ran the containment gate, so these commits are in main, or an abandonment bundled them into a `<ws>-<tip>.bundle` file first. Safe. The `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are *not* this category and are never reclaimed without `--abandoned`: each is the only copy of the commits that removal gave up, so it stays until you reclaim it with `--abandoned` or delete it yourself.",
+        "Reclaims seven kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedActive` and `releasedBytes`. Six of them need no flag; the seventh, `abandonedBundle`, is only ever collected under `--abandoned`. `rm` and `land` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
+        "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars and empty mountpoint, or an image an earlier build kept there as a recovery image, with or without its grants sidecar: no removal keeps one now, so each is released into `sessions/.deleting/`, by its own files alone when its sidecar is gone. Retirement already ran the containment gate, so these commits are in main, or an abandonment bundled them into a `<ws>-<tip>.bundle` file first. Safe. The `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are *not* this category and are never reclaimed without `--abandoned`: each is the only copy of the commits that removal gave up, so it stays until you reclaim it with `--abandoned` or delete it yourself.",
+        "`heldBundle` — a `<ws>-<tip>.bundle` file in `sessions/.trash/` every commit of which main holds by patch identity (`git cherry` marks it `-`, or a merge that authors nothing): it keeps nothing main lacks, so a plain `gc` deletes it and journals it as `remove-abandoned-bundle`. Measuring fetches the bundle into a scratch repository beside it with main's objects attached; a bundle that cannot be measured, or one main lacks any commit of, stays.",
         "`orphanStagingImage` and `orphanStagingMetadata` — a staged image, with or without its grants sidecar, or a sidecar with no image, under the project's `.staging/` in the store. Each is a lifecycle transaction — create or fork — that died between writing the image and publishing it. The one sign a transaction is still running is its workspace lifecycle lock: an entry whose lock is held is retained and counted in `retainedActive`; an entry whose lock is free was never published under a workspace name, so nothing uses it. Safe.",
         "`orphanStagingMount` — a mountpoint under the mount root's `.staging/` whose image is gone or was never published: an empty directory, or a volume an interrupted operation left attached. Attached volumes are detached before the directory goes, so an orphan that held tens of gigabytes stops charging for them. Safe; the same lock rule retains a mountpoint an operation still owns.",
         "`orphanMountpoint` — a directory under the project's mount root that is no workspace's mountpoint: nothing is mounted at it and no image or retirement names it. Hidden files and files the project ignores are what late writers left after a volume went away, and go with the directory; any other file stops the removal and is named, so you move or delete it yourself.",
-        "`abandonedBundle` — under `--abandoned` only, the `<ws>-<tip>.bundle` files in `sessions/.trash/` that `rm --abandon` verified and left behind, holding commits main does not contain, which is why no plain `gc` ever deletes one. A plain `gc` still says how many the trash keeps and their allocated bytes, as `doctor` and `ls --all` do, so they are never out of sight. Each bundle is the only copy of the commits it holds, so `--abandoned` deletes them and journals each deletion in the project's deletion log as `remove-abandoned-bundle`. `--dry-run --abandoned` lists them with their real allocated bytes first.",
+        "`abandonedBundle` — under `--abandoned` only, the `<ws>-<tip>.bundle` files in `sessions/.trash/` that `rm --abandon` verified and left behind, holding work main lacks, which is why no plain `gc` deletes one that `heldBundle` does not name. A plain `gc` still says how many the trash keeps and their allocated bytes, as `doctor` and `ls --all` do, so they are never out of sight. Each bundle is the only copy of the commits it holds, so `--abandoned` deletes them and journals each deletion in the project's deletion log as `remove-abandoned-bundle`. `--dry-run --abandoned` lists them with their real allocated bytes first.",
         "A bare mountpoint whose only entry is root's `0700` `.fseventsd` is retained aside by an atomic, same-parent `.root-held-<uuid>` rename instead of deleting privileged debris. A mounted filesystem, symlink substitution, rename collision or another entry (hidden included) is never overwritten or moved. The retained log is named with a quoted privileged cleanup hint in `deferred`; it does not fail collection or make doctor unhealthy. Dry-run and doctor report it as information without renaming.",
         "Also collects build volumes no checkout links and superseded seeds. A running job's shared hold or an unfinished create/fork in the lifecycle intent journal defers release; otherwise a refused unforced unmount gets bounded grace, then is forced if needed, naming each initial holder's pid and command. Both gc and opportunistic collection in rm/land say why they skip volumes, and one failed release does not hide later candidates. Dry-run reports these reasons without changing any mount or image.",
-        "`--recover <image> --to <dir>` is the one way a recovery image leaves the store. A removal that could not prove every source byte held elsewhere — a forced dirty or in-progress tree, abandoned commits, or an untracked file the target checkout lacks — keeps the complete image as `sessions/.trash/<ws>-<incarnation>.dmg`; no gc reclaims one, and removing the whole project refuses while one remains. It moves the image, its grants sidecar and CA companion into `<dir>/<ws>-<incarnation>/` beside a `recovery.json` manifest naming the project, workspace, incarnation and why the removal kept it, and deletes nothing. The directory must be outside the store, on the store's filesystem; a retry after an interruption finishes the same move.",
     ],
     options: &[
         Opt {
@@ -3783,50 +3770,13 @@ const GC: CommandSpec = CommandSpec {
             spelling: "--abandoned",
             meaning: "also delete the `sessions/.trash/<ws>-<tip>.bundle` files `rm --abandon` wrote; each is the only copy of the commits it holds, so they are deleted only when you ask, and each deletion is journaled as `remove-abandoned-bundle`",
         },
-        Opt {
-            spelling: "--recover <image>",
-            meaning: "move this recovery image, `sessions/.trash/<ws>-<incarnation>.dmg`, with its companions and a manifest out of the store instead of collecting; requires --to",
-        },
-        Opt {
-            spelling: "--to <dir>",
-            meaning: "where --recover moves the image: `<dir>/<ws>-<incarnation>/`, outside the store on its filesystem, created if missing",
-        },
     ],
 };
 
 fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &GC;
-    let recover = match (os(matches, "recover"), os(matches, "to")) {
-        (None, None) => None,
-        (Some(_), None) => {
-            return Err(UsageError::new(
-                "--recover needs --to: name the directory outside the store to move the image into",
-                USAGE,
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(UsageError::new(
-                "--to only says where --recover moves an image",
-                USAGE,
-            ));
-        }
-        (Some(image), Some(to)) => {
-            if flagged(matches, "dry-run") || flagged(matches, "abandoned") {
-                return Err(UsageError::new(
-                    "--recover moves one recovery image and collects nothing: it takes no --dry-run or --abandoned",
-                    USAGE,
-                ));
-            }
-            Some(RecoverArgs {
-                image: PathBuf::from(image),
-                to: PathBuf::from(to),
-            })
-        }
-    };
     Ok(Command::Gc(GcArgs {
         dry_run: flagged(matches, "dry-run"),
         abandoned: flagged(matches, "abandoned"),
-        recover,
     }))
 }
 
@@ -4301,25 +4251,12 @@ mod tests {
     }
 
     #[test]
-    fn gc_recovers_one_image_only_into_a_named_directory() {
+    fn gc_takes_no_recover_or_to() {
         let image = "/store/project/sessions/.trash/raven-0123456789abcdef0123456789abcdef.dmg";
-        assert_eq!(
-            parse_args(["gc", "--recover", image, "--to", "/home/user/recovered"])
-                .unwrap()
-                .command,
-            Command::Gc(GcArgs {
-                recover: Some(RecoverArgs {
-                    image: PathBuf::from(image),
-                    to: PathBuf::from("/home/user/recovered"),
-                }),
-                ..GcArgs::default()
-            })
-        );
         for refused in [
-            &["gc", "--recover", image][..],
+            &["gc", "--recover", image, "--to", "/home/user/recovered"][..],
+            &["gc", "--recover", image],
             &["gc", "--to", "/home/user/recovered"],
-            &["gc", "--recover", image, "--to", "/r", "--dry-run"],
-            &["gc", "--recover", image, "--to", "/r", "--abandoned"],
         ] {
             assert!(parse_args(refused).is_err(), "{refused:?}");
         }

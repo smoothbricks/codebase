@@ -243,7 +243,6 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         | Op::CoordinatorAssignSlot(_)
         | Op::CoordinatorDestroy(_)
         | Op::CoordinatorGc(_)
-        | Op::CoordinatorRecoverImage(_)
         | Op::CoordinatorRemoveProject(_)
         | Op::CoordinatorRepoMirror(_)
         | Op::CoordinatorDoctor(_)

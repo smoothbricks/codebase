@@ -1103,6 +1103,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             GcReason::OrphanMountpoint,
             GcReason::OrphanSessionImage,
             GcReason::AbandonedBundle,
+            GcReason::HeldBundle,
             GcReason::UnlinkedBuildVolume,
             GcReason::SupersededSeed,
             GcReason::InterruptedBuildVolume,

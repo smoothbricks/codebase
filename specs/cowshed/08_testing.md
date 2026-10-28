@@ -158,19 +158,18 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Foreign-session isolation and atomic retirement**: directory-backed fixtures keep sibling grants missing or corrupt
   while the selected workspace remains inspectable and reconciles without evicting sibling gateway sessions. The
   controller admits and observes 100 live jobs while project enumeration refuses its foreign inventory fault. Retirement
-  fixtures prove clean landed sources are committed to `sessions/.deleting` before the removal reply, none to the
-  recovery trash and no byte of one freed by the removal, a real immutable-file refusal of that release preserves source
-  grants/CA authority, and dirty, unlanded and only-copy hidden content survives in its live or recovery image, even
-  after the recovery sidecar is removed and startup/GC runs again, while a tree whose only extra file is gitignored
-  retires with its image released. Cancellation and post-rename crash replay retain the mutating intent until the
-  release's owner metadata is removed; recovery-image rename fixtures still require complete grants/CA at commit. The
-  directory cutover runs the real controller and gateway with corrupt/missing sibling grants, named mount/marker fences
-  and held-lock recovery, plus prepared-retirement retry and post-commit recovery. Cold named and removal opens ignore
-  broken sibling sidecars, preserve session-origin validation, and still refuse selected corruption; full Store/Inspect
-  opens and project enumeration retain their malformed-inventory refusals. Ordinary worker and trusted Gate exec share
-  the core scoped preparation boundary. A fixture restarting a bare gateway explicitly restores project sessions through
-  maintenance before work; job admission never repairs port allocation. These witnesses acquire no physical disk-image
-  capability.
+  fixtures prove clean landed sources are committed to `sessions/.deleting` before the removal reply, none to the trash
+  and no byte of one freed by the removal, a real immutable-file refusal of that release preserves source grants/CA
+  authority, dirty content is refused by name until `--abandon` commits it into its bundle and keeps no image, and a
+  tree whose only extra files are gitignored or hidden retires with its image released; `gc` releases a trash image an
+  earlier build kept, with or without its sidecar. Cancellation and post-rename crash replay retain the mutating intent
+  until the release's owner metadata is removed. The directory cutover runs the real controller and gateway with
+  corrupt/missing sibling grants, named mount/marker fences and held-lock recovery, plus prepared-retirement retry and
+  post-commit recovery. Cold named and removal opens ignore broken sibling sidecars, preserve session-origin validation,
+  and still refuse selected corruption; full Store/Inspect opens and project enumeration retain their
+  malformed-inventory refusals. Ordinary worker and trusted Gate exec share the core scoped preparation boundary. A
+  fixture restarting a bare gateway explicitly restores project sessions through maintenance before work; job admission
+  never repairs port allocation. These witnesses acquire no physical disk-image capability.
 - **MCP capability/auth codecs**: coordinator authority can be read only from the designated inherited FD/socketpair and
   never argv/environment/stderr; worker descriptors are 256-bit, 30-second, one-use, memory-only, atomic-consume,
   restart-invalidated, workspace/socket/peer-bound. Missing, expired, replayed, mismatched, or insufficient authority
@@ -570,10 +569,10 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   boundary is a directory-backed project whose main image lock and served workspace's lock other processes hold, beside
   a corrupt sibling sidecar the store-wide pass refuses and an unrecorded earlier generation of the served workspace in
   the trash: the supervisor opens, serves its settled mount and answers `hello` on its socket while both holders still
-  hold; neither it nor an ordinary opening naming the workspace once the holders let go deletes the trash image, a
-  recovery image retained without its record (02_workspaces.md, `rm` step 5). A second boundary detaches the served
-  workspace and holds its lock in another process: the supervisor, a process of its own, says once on stderr that it
-  waits for that lock, naming the holder's PID, and mounts and serves only after the test releases the holder, its
+  hold; neither it nor an ordinary opening naming the workspace once the holders let go deletes the trash image, a trash
+  image without its record, which only `gc` releases (02_workspaces.md, `rm` step 5). A second boundary detaches the
+  served workspace and holds its lock in another process: the supervisor, a process of its own, says once on stderr that
+  it waits for that lock, naming the holder's PID, and mounts and serves only after the test releases the holder, its
   socket's publication waking the test.
 
 ## Integration tests (real substrate)

@@ -22,7 +22,6 @@ pub mod host_config;
 pub mod job_artifact;
 pub mod lifecycle;
 pub mod recovery;
-pub mod recovery_image;
 pub mod trace_columns;
 pub mod trace_segment;
 

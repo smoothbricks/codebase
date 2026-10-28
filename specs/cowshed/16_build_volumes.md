@@ -87,13 +87,11 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
 Module compilation uses the already-owned private environment cache, not a new build-state volume or a loose directory
 under `TMPDIR`. Its runtime-versioned bytes remain reconstructible and retain that cache root's clone and retirement
 rules. Source-read-only jobs write only their existing exec-temp cache. Clean retirement reclaims that environment
-through the owned scratch lifetime. A retained recovery image keeps its authority until deliberate export: after
-transfer preflight, under the name's lifecycle lock, the storage owner reclaims its exec-temp environment before any
-image or companion moves (02_workspaces.md, Recovering a recovery image). A live or newer namesake retains its own
-environment. A mount at exec-temp itself or beneath it refuses cleanup before any entry is removed, including a Linux
-bind mount on the same backing device; the recovery image and sidecar stay in place. Restoration's refusal of
-unexplained project contents is unchanged: no blanket temporary-tree sweep or restore exception stands in for producer
-ownership.
+through the owned scratch lifetime, and so does `gc` releasing a trash image an earlier build kept, when its grants
+sidecar names it; a live or newer namesake retains its own environment. A mount at exec-temp itself or beneath it
+refuses cleanup before any entry is removed, including a Linux bind mount on the same backing device. Restoration's
+refusal of unexplained project contents is unchanged: no blanket temporary-tree sweep or restore exception stands in for
+producer ownership.
 
 ### Substrate
 
