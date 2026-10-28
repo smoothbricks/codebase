@@ -1,3 +1,19 @@
+diff --git a/dist/bin/init-local.js b/dist/bin/init-local.js
+index 68912ab62bc8cdcc83ff599cebcb06aca501b781..ed990d930c104cdc27d5ffc135003cb55e47334c 100644
+--- a/dist/bin/init-local.js
++++ b/dist/bin/init-local.js
+@@ -30,8 +30,9 @@ async function initLocal(workspace) {
+             handleAngularCLIFallbacks(workspace);
+             return;
+         }
+-        // Skip per-TAB shell completion calls — those must not spawn the daemon.
+-        if (!process.env.NX_COMPLETE) {
++        // Skip per-TAB shell completion calls — those must not spawn the daemon. Only a client on a terminal can
++        // show the Nx Console prompt, so only it asks the daemon, whose answer runs each editor's CLI.
++        if (!process.env.NX_COMPLETE && process.stdout.isTTY && process.stdin.isTTY) {
+             try {
+                 await ensureNxConsoleInstalledViaDaemon();
+             }
 diff --git a/dist/bin/nx.js b/dist/bin/nx.js
 index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..f190d2b93cc7c1d0f59dcb1e76ef7d3efb01c3f9 100755
 --- a/dist/bin/nx.js
@@ -1884,7 +1900,7 @@ index 0000000000000000000000000000000000000000..0c065105dff1ed0847e28672661b1792
 +    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets, notice });
 +}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index b1c143e244efd435b28642ed86e999d6c86f7d94..e1edb6a44c8eaf6bf6ac09ad8cbafec0687daca3 100644
+index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966a83c3074 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -7,17 +7,13 @@ const fs_1 = require("fs");
@@ -2207,7 +2223,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..e1edb6a44c8eaf6bf6ac09ad8cbafec0
      return new Promise(async (resolve, reject) => {
          // `listen` reports a failed bind asynchronously on the server, which the
          // try below cannot catch — without this an EACCES became an uncaught
-@@ -432,11 +449,9 @@ async function startServer() {
+@@ -432,25 +449,19 @@ async function startServer() {
                              // Best effort; the 0700 socket directory is the primary control.
                          }
                      }
@@ -2222,6 +2238,24 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..e1edb6a44c8eaf6bf6ac09ad8cbafec0
                      // listen for project graph recomputation events to collect and schedule sync generators
                      (0, project_graph_incremental_recomputation_1.registerProjectGraphRecomputationListener)(sync_generators_1.collectAndScheduleSyncGenerators);
                      // register file change listener to invalidate sync generator cache
+                     (0, file_change_events_1.registerFileChangeListener)(sync_generators_1.clearSyncGeneratorsCache);
+                     // trigger an initial project graph recomputation
+                     (0, project_graph_incremental_recomputation_1.scheduleProjectGraphRecomputation)([], [], []);
+-                    // Kick off Nx Console check in background to prime the cache
+-                    (0, handle_nx_console_1.handleGetNxConsoleStatus)().catch(() => {
+-                        // Ignore errors, this is a background operation
+-                    });
+-                    // Kick off AI agents outdated check in background to prime the cache
+-                    (0, handle_configure_ai_agents_1.handleGetConfigureAiAgentsStatus)().catch(() => {
+-                        // Ignore errors, this is a background operation
+-                    });
++                    // No Nx Console or AI-agent configuration check at start: both run each editor's CLI
++                    // (`code --version`, `code --list-extensions`, ...), which outlives a daemon stopped meanwhile in
++                    // the daemon's process group. A client on a terminal, which can show what they find, asks for
++                    // them (init-local.js, run-command.js), and the checks run then.
+                     return resolve(server);
+                 }
+                 catch (err) {
 diff --git a/dist/src/daemon/server/shutdown-utils.d.ts b/dist/src/daemon/server/shutdown-utils.d.ts
 index 698fcf9e061b8e0b37057a6318614dbe6d290b9e..832d848841cb8a0f761750e24ecfb84a85fc6ff9 100644
 --- a/dist/src/daemon/server/shutdown-utils.d.ts
@@ -5362,7 +5396,7 @@ index 0000000000000000000000000000000000000000..c8d00d0f94ed40dfc27b4ffaf0018311
 +    }
 +}
 diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
-index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..b1a2a9654962067daeea7f1b2fff7a04c9ba57f1 100644
+index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..2e55ade6c0befcc6445808e6106b5b97dadc5657 100644
 --- a/dist/src/tasks-runner/run-command.js
 +++ b/dist/src/tasks-runner/run-command.js
 @@ -41,6 +41,7 @@ const task_profiling_life_cycle_1 = require("./life-cycles/task-profiling-life-c
@@ -5411,7 +5445,19 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..b1a2a9654962067daeea7f1b2fff7a04
          };
      }
      catch (e) {
-@@ -424,18 +428,22 @@ async function printConfigureAiAgentsDisclaimer() {
+@@ -411,7 +415,10 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
+ }
+ async function printConfigureAiAgentsDisclaimer() {
+     try {
+-        if (!client_1.daemonClient.enabled() || !(await client_1.daemonClient.isServerAvailable())) {
++        // The disclaimer is for a person at a terminal; the status behind it runs each editor's CLI in the daemon.
++        if (!process.stdout.isTTY ||
++            !client_1.daemonClient.enabled() ||
++            !(await client_1.daemonClient.isServerAvailable())) {
+             return;
+         }
+         const { outdatedAgents } = await client_1.daemonClient.getConfigureAiAgentsStatus();
+@@ -424,18 +431,22 @@ async function printConfigureAiAgentsDisclaimer() {
          // Silently ignore errors
      }
  }
@@ -5443,7 +5489,7 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..b1a2a9654962067daeea7f1b2fff7a04
  }
  async function ensureWorkspaceIsInSyncAndGetGraphs(projectGraph, nxJson, projectNames, nxArgs, overrides, extraTargetDependencies, extraOptions) {
      let taskGraph = createTaskGraphAndRunValidations(projectGraph, extraTargetDependencies ?? {}, projectNames, nxArgs, overrides, extraOptions);
-@@ -659,7 +667,16 @@ function setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles) {
+@@ -659,7 +670,16 @@ function setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles) {
          process.env.NX_LOAD_DOT_ENV_FILES = 'true';
      }
  }
@@ -5461,7 +5507,7 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..b1a2a9654962067daeea7f1b2fff7a04
      setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
      // this needs to be done before we start to run the tasks
      const taskDetails = (0, hash_task_1.getTaskDetails)();
-@@ -674,10 +691,11 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
+@@ -674,10 +694,11 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
          ...constructLifeCycles(lifeCycle, taskGraph, nxJson, nxArgs.skipNxCache),
          taskResultsLifecycle,
      ]);
@@ -5475,7 +5521,7 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..b1a2a9654962067daeea7f1b2fff7a04
          initiatingProject,
          initiatingTasks,
          projectGraph,
-@@ -735,12 +753,24 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
+@@ -735,12 +756,24 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
              },
          },
          daemon: client_1.daemonClient,

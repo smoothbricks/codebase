@@ -737,6 +737,21 @@ Nx instead, whatever a client sends, so it starts no package manager and asks no
 `node_modules/.bin/nx` entry against it, with every package manager on `PATH` replaced by one that records its run. The
 daemon must take the branch that pulled `nx@latest`, pull nothing, and start no package manager.
 
+## Editor probes only for a person at a terminal
+
+Stock Nx's Nx Console check and its AI-agent configuration check run each editor's CLI from the daemon
+(`code --version`, `code --list-extensions`, the same for `cursor`). The daemon starts both as it starts, every client
+asks for the Nx Console status before its command and every `nx run` for the AI-agent status after its tasks, though
+only a client on a terminal shows what either finds. So a daemon that only ever served cowshed jobs, gates or tests
+forked editors, and one outlived the daemon it came from in its process group: a land gate's test shard held
+`code --version` past its daemon's stop. The `server.js` hunk starts neither check at daemon start, and the
+`init-local.js` and `run-command.js` hunks ask the daemon for them only when stdin and stdout (Nx Console) or stdout (AI
+agents) is a terminal.
+
+`nx-daemon-idle-policy.test.ts` starts a fixture daemon with `code` and `cursor` stand-ins on `PATH` that record any
+run, serves `nx show projects` and `nx run` from non-terminal clients, stops it, and requires no `[NX-CONSOLE]` daemon
+log line and no editor run. Stock Nx logs the check and runs all four probes.
+
 ## Run information after a pre-start failure
 
 Stock Nx's discrete worker reports a hash failure through `endTasks` even when `startTasks` never ran. Its

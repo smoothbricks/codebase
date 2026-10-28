@@ -1,7 +1,7 @@
 import { expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { compileFunction } from 'node:vm';
@@ -64,6 +64,57 @@ it('serves real daemon requests with the installed five-minute inactivity policy
     expect(await readFile(join(workspace, '.nx/workspace-data/d/daemon.log'), 'utf8')).toContain(
       join(dirname(require.resolve('nx/package.json')), 'dist/src/daemon/server'),
     );
+  });
+});
+
+/**
+ * Nx's Nx Console and AI-agent configuration checks run each editor's CLI (`code`, `cursor`) from the daemon.
+ * Upstream starts both as the daemon starts, every client asks for the first and every task run for the second, so a
+ * daemon that only ever served non-interactive runs (a cowshed job, a gate, a test) still forked editors that outlived
+ * it in its process group (a gate's test shard held `code --version` past the daemon it came from). The patch starts
+ * neither at daemon start, and only a client on a terminal, which can show what they find, asks for them. Editor
+ * stand-ins on `PATH` record any run.
+ */
+it('runs no editor probe from a daemon that serves only non-interactive clients', async () => {
+  const repositoryRoot = join(import.meta.dir, '../../..');
+  const nxEntry = join(repositoryRoot, 'node_modules/.bin/nx');
+  await withNxFixture('nx-console-probe-', async ({ root, workspace, socketDirectory }) => {
+    await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+    await writeFile(join(workspace, 'nx.json'), '{}\n');
+    await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: 'console-probe', private: true }));
+    await mkdir(join(workspace, 'p'));
+    await writeFile(
+      join(workspace, 'p/project.json'),
+      JSON.stringify({ name: 'p', targets: { noop: { command: 'true' } } }),
+    );
+    const editors = join(root, 'editors');
+    const ran = join(root, 'editors-ran');
+    await mkdir(editors);
+    for (const editor of ['code', 'cursor']) {
+      await writeFile(join(editors, editor), `#!/bin/sh\necho $0 "$@" >> ${JSON.stringify(ran)}\n`);
+      await chmod(join(editors, editor), 0o755);
+    }
+    const base = fixtureNxEnv(workspace, socketDirectory);
+    const env = { ...base, NX_DAEMON: 'true', PATH: `${editors}:${base.PATH ?? ''}` };
+    const started = spawnSync('node', [nxEntry, 'daemon', '--start'], { cwd: workspace, env, encoding: 'utf8' });
+    expect(started.status, started.stdout + started.stderr).toBe(0);
+    const requested = spawnSync('node', [nxEntry, 'show', 'projects', '--json'], {
+      cwd: workspace,
+      env,
+      encoding: 'utf8',
+    });
+    expect(requested.status, requested.stdout + requested.stderr).toBe(0);
+    const task = spawnSync('node', [nxEntry, 'run', 'p:noop', '--outputStyle=static'], {
+      cwd: workspace,
+      env,
+      encoding: 'utf8',
+    });
+    expect(task.status, task.stdout + task.stderr).toBe(0);
+    const stopped = spawnSync('node', [nxEntry, 'daemon', '--stop'], { cwd: workspace, env, encoding: 'utf8' });
+    expect(stopped.status, stopped.stdout + stopped.stderr).toBe(0);
+    const log = await readFile(join(workspace, '.nx/workspace-data/d/daemon.log'), 'utf8');
+    expect(log, 'the daemon ran its Nx Console check').not.toContain('[NX-CONSOLE]');
+    expect(await readFile(ran, 'utf8').catch(() => ''), 'an editor CLI ran').toBe('');
   });
 });
 
