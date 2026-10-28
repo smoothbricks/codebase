@@ -116,15 +116,18 @@ import type { TempVolumeSpace } from './verdict.js';
  * RAM disks that are this volume's and no other (`volumeDisks`): of this user and this volume's exact size, mounting
  * nowhere but at its mountpoint or staging directory, and either carrying a volume called exactly its name, which a
  * volume is made under and keeps, or recorded by the exact registry entry its owner holds a receipt or its ledger holds
- * custody for, which covers an attach whose format never finished. A RAM disk of that size that is neither, another
- * volume's, a test's, or an unformatted one nothing recorded, is ignored, however it is mounted. The gateway holds
+ * custody for, which covers an attach whose format never finished, or records as the disk a creator kept, which covers
+ * a volume unmounted from under it. A RAM disk of that size that is neither, another volume's, a test's, or an
+ * unformatted one nothing recorded, is ignored, however it is mounted. The gateway holds
  * each disk it attaches under its creator's lease until the creator keeps it, its volume mounted and marked at the
  * mountpoint, and detaches it when the creator releases it or goes away first: a creator killed or deadlined mid-step
  * leaves no disk behind, where one did before the lease (measured 2026-10-06: a deadlined `hdiutil attach` whose
  * diskimages-helper finished the attach after `hdiutil` was killed). A gateway restart leaves an unended lease's disk
- * to the next gateway's startup scan. Before creating, a task detaches each disk of that inventory its owner holds a
- * receipt for. A disk it holds no receipt for, one with a lease directory on it, or one with something attached below
- * it stops the creation instead; its error names it.
+ * to the next gateway's startup scan. A creator records its disk's registry entry in the ledger before it keeps it: the
+ * volume's marker names the entry only while the volume is mounted, and a volume an operator's unmount took from its
+ * mountpoint leaves its disk attached, mounted nowhere, with nothing else to name it. Before creating, a task detaches
+ * each disk of that inventory its owner holds a receipt for or its ledger records as kept. Any other disk, one with a
+ * lease directory on it, or one with something attached below it stops the creation instead; its error names it.
  *
  * An image attached from a file below a lease belongs to whoever attached it:
  * cowshed's real-APFS fixtures release theirs under the production per-image
@@ -571,9 +574,14 @@ interface Ledger {
   readonly lifecycle: LifecycleClaim | null;
   readonly claims: readonly LeaseClaim[];
   readonly held: readonly HeldEntry[];
+  /**
+   * The registry entry of the disk whose volume a creator last kept, recorded before the keep. A registry entry id is
+   * never reused, so a record whose disk is gone names nothing and is replaced by the next keep.
+   */
+  readonly kept: string | null;
 }
 
-const EMPTY_LEDGER: Ledger = { lifecycle: null, claims: [], held: [] };
+const EMPTY_LEDGER: Ledger = { lifecycle: null, claims: [], held: [], kept: null };
 
 /** The volume as one locked step finds it mounted. */
 interface MountedVolume {
@@ -1825,17 +1833,32 @@ export class RamTempVolume {
     // Every path from here ends the lease: kept once the volume is mounted and marked at its mountpoint, released on
     // any failure or throw before that.
     const lease = attached.value;
-    const kept = await this.provisionAndKeep(lease).catch((error: unknown) =>
+    const kept = await this.provisionAndKeep(op, lease).catch((error: unknown) =>
       failed<void>('provision', errorText(error)),
     );
     return kept.ok ? kept : this.rollBack(op, lease, kept.error);
   }
 
-  /** Provision the leased disk, and keep it once its volume is mounted and marked at its mountpoint. */
-  private async provisionAndKeep(lease: RamDiskLease): Promise<Result<void, ProvisionFailed>> {
+  /**
+   * Provision the leased disk, record it in the ledger as the kept volume's disk, and keep it once its volume is mounted
+   * and marked at its mountpoint. A record whose keep then fails names a disk the rollback detaches.
+   */
+  private async provisionAndKeep(op: Operation, lease: RamDiskLease): Promise<Result<void, ProvisionFailed>> {
     const identity = await this.attachedIdentity(lease.device);
-    const provisioned = identity.ok ? await this.provision(lease.device, identity.value.entry) : identity;
+    if (!identity.ok) return identity;
+    const entry = identity.value.entry;
+    const provisioned = await this.provision(lease.device, entry);
     if (!provisioned.ok) return provisioned;
+    const recorded = await this.locked(op, 'ram-lease keep', async (ledger) => ({
+      ledger: { ...ledger, kept: entry },
+      value: undefined,
+    }));
+    if (!recorded.ok) {
+      return failed(
+        'ram-lease keep',
+        recorded.error.kind === 'lock-denied' ? recorded.error.detail : describeRamTempError(recorded.error),
+      );
+    }
     const kept = await lease.keep();
     return kept.ok ? kept : failed('ram-lease keep', kept.error);
   }
@@ -2014,23 +2037,36 @@ export class RamTempVolume {
     return { ok: true, value: attached };
   }
 
-  /** The registry entries the ledger keeps pending detach custody of: exact, and published before the spawn. */
+  /**
+   * The registry entries the ledger records: the one it keeps pending detach custody of, exact and published before the
+   * spawn, and the disk whose volume a creator last kept.
+   */
   private async custody(): Promise<Result<ReadonlySet<string>, RamTempError>> {
     const read = await this.readLedger();
     if (!read.ok) {
       return read;
     }
-    const entry = read.value.ledger.lifecycle?.pending?.registryEntry;
-    return { ok: true, value: new Set(entry === undefined || entry === null ? [] : [entry]) };
+    const { lifecycle, kept } = read.value.ledger;
+    const entry = lifecycle?.pending?.registryEntry;
+    return {
+      ok: true,
+      value: new Set([...(entry === undefined || entry === null ? [] : [entry]), ...(kept === null ? [] : [kept])]),
+    };
   }
 
   /**
    * Detach what earlier creators left attached: no marked volume is mounted, so every RAM disk of this volume
-   * (`attached`: by its exact name or its exact record) is debris — unformatted and recorded, staged, or mounted
-   * without its marker. One carrying a lease, or with anything attached below it, is still in use and stops the
-   * creation instead, and so does one its owner holds no receipt for: it is named, never detached.
+   * (`attached`: by its exact name or its exact record) is debris — unformatted and recorded, staged, mounted
+   * without its marker, or the kept volume's disk an operator's unmount left mounted nowhere. One carrying a lease, or
+   * with anything attached below it, is still in use and stops the creation instead, and so does one its owner holds no
+   * receipt for and its ledger does not record as kept: it is named, never detached.
    */
   private async reclaimStrays(op: Operation, holders: Holders): Promise<Result<void, RamTempError>> {
+    const read = await this.readLedger();
+    if (!read.ok) {
+      return read;
+    }
+    const { kept } = read.value.ledger;
     const strays = await this.attached();
     if (!strays.ok) {
       return strays;
@@ -2058,7 +2094,7 @@ export class RamTempVolume {
           return failed('reclaim', holdingText(point, held.value));
         }
       }
-      if (this.commands.ownsRamDisk?.(disk) !== true) {
+      if (disk.entry !== kept && this.commands.ownsRamDisk?.(disk) !== true) {
         return {
           ok: false,
           error: {
@@ -2293,6 +2329,7 @@ function prune(ledger: Ledger, volume: MountedVolume | null, isAlive: (pid: numb
         : ledger.held.filter(
             (entry) => entry.verdict.context.volumeKey === volume.key && volume.leases.includes(entry.lease),
           ),
+    kept: ledger.kept,
   };
 }
 
@@ -2311,6 +2348,7 @@ function withoutClaimsOf(ledger: Ledger, owner: ClaimOwner): Ledger {
       ledger.lifecycle?.owner.token === owner.token && ledger.lifecycle.pending === undefined ? null : ledger.lifecycle,
     claims: ledger.claims.filter((claim) => claim.owner.token !== owner.token),
     held: ledger.held,
+    kept: ledger.kept,
   };
 }
 
@@ -2334,7 +2372,7 @@ function settledLedger(
 /** The ledger's wire form, version 1. */
 function ledgerText(ledger: Ledger): string {
   // Older readers reject version 2 instead of pruning the pending authority by the caller's pid.
-  return `${JSON.stringify({ version: ledger.lifecycle?.pending === undefined ? 1 : 2, lifecycle: ledger.lifecycle, claims: ledger.claims, held: ledger.held })}\n`;
+  return `${JSON.stringify({ version: ledger.lifecycle?.pending === undefined ? 1 : 2, lifecycle: ledger.lifecycle, claims: ledger.claims, held: ledger.held, ...(ledger.kept === null ? {} : { kept: ledger.kept }) })}\n`;
 }
 
 /** Publish the ledger in one rename, so no reader, and no crash, ever leaves half of it. */
@@ -2381,6 +2419,8 @@ function parseLedger(value: unknown): Ledger | undefined {
     lifecycle = pending === undefined ? { kind, owner } : { kind, owner, pending };
   }
   if ((value.version === 2) !== (lifecycle?.pending !== undefined)) return undefined;
+  const keptWire = value.kept;
+  if (keptWire !== undefined && (typeof keptWire !== 'string' || !/^0x[0-9a-f]+$/.test(keptWire))) return undefined;
   const claims: LeaseClaim[] = [];
   for (const entry of claimsWire) {
     if (!isRecord(entry)) {
@@ -2404,7 +2444,7 @@ function parseLedger(value: unknown): Ledger | undefined {
       held.push({ lease, verdict });
     }
   }
-  return { lifecycle, claims, held };
+  return { lifecycle, claims, held, kept: keptWire ?? null };
 }
 
 function parseDetachCustody(value: unknown): DetachCustody | undefined {
@@ -2621,8 +2661,9 @@ export function ramDisksIn(registry: string, table: string): Result<RamDisk[], s
  * The RAM disks of `disks` that are this volume's, and no others. A disk is the volume's only when it has its user and
  * its exact size, mounts nowhere but at its mountpoint or staging directory, and either carries a volume called exactly
  * its name that is mounted, or is recorded: `recorded` says the disk's exact registry entry is one this volume's owner
- * holds a receipt or its ledger holds custody for, which covers an attach whose format never finished. A disk's size
- * and owner establish nothing, so an unmounted disk of the same size that nothing recorded is not the volume's.
+ * holds a receipt or its ledger holds custody for, which covers an attach whose format never finished, or records as
+ * the disk a creator kept, which covers a volume unmounted from under it. A disk's size and owner establish nothing, so
+ * an unmounted disk of the same size that nothing recorded is not the volume's.
  */
 export function volumeDisks(
   disks: readonly RamDisk[],

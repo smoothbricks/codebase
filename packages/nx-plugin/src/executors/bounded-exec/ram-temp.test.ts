@@ -1184,6 +1184,62 @@ describe('creating the RAM temp volume', () => {
       rmSync(parent, { recursive: true, force: true });
     }
   });
+
+  it('detaches the disk of a volume it kept that was unmounted from under it, by the ledger record, before it attaches another', async () => {
+    // An operator's force unmount leaves the kept volume's disk attached and mounted nowhere, its marker out of reach:
+    // the ledger's record of the disk the creator kept still names it, so the next creator detaches it, never leaving
+    // it beside a second disk (measured 2026-10-28: 8 GiB held by such a disk, mounted nowhere, owned by nothing).
+    const parent = mkdtempSync(join(tmpdir(), 'ra-kept-'));
+    const root = join(parent, 'root');
+    mkdirSync(root, { mode: 0o700 });
+    const paths = {
+      ...ramTempPaths(userInfo(), NAMESPACE),
+      root,
+      mountpoint: join(root, 'ram'),
+      leaseBytesMax: Number.MAX_SAFE_INTEGER,
+      staging: join(root, 'ram-new'),
+      lockFile: join(parent, 'v.lock'),
+    };
+    mkdirSync(paths.mountpoint);
+    writeFileSync(
+      `${paths.lockFile}.ledger`,
+      `${JSON.stringify({ version: 1, lifecycle: null, claims: [], held: [], kept: '0x100000def' })}\n`,
+      { mode: 0o600 },
+    );
+    const capacity = 64 * 1024 * 1024;
+    let registry = registryRamDisk({
+      entry: '0x100000def',
+      uid: paths.uid,
+      sectors: capacity / 512,
+      device: 'disk9',
+      volume: paths.volumeName,
+    });
+    const calls: string[] = [];
+    const commands: HostCommands = {
+      async run(file, args): Promise<CommandOutput> {
+        if (file === '/usr/sbin/ioreg') {
+          return { status: 0, stdout: args.includes('AppleDiskImageDevice') ? '' : registry, stderr: '' };
+        }
+        if (file === '/sbin/mount') return { status: 0, stdout: '', stderr: '' };
+        throw new Error(`${file} ${args.join(' ')} ran`);
+      },
+      async detachRam(device, registryEntry) {
+        calls.push(`detach ${device} ${registryEntry}`);
+        registry = '';
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      async attachRam() {
+        calls.push('attach');
+        return { ok: false, error: 'the attach is reached' };
+      },
+    };
+    try {
+      expect(await new RamTempVolume(paths, capacity, commands).acquire(noSubtrees)).toMatchObject({ ok: false });
+      expect(calls).toEqual(['detach /dev/disk9 0x100000def', 'attach']);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('observing the RAM temp volume', () => {

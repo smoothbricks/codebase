@@ -2171,23 +2171,27 @@ way never leaves an unmarked volume there. No DiskArbitration call makes either 
 task that detaches the volume, or whose provisioning step failed, removes both. Before creating, a task inventories the
 RAM disks that are this volume's and no other: of its uid and exact size, mounting nowhere but at its mountpoint or
 staging directory, and either mounted there as a volume called exactly its name, or recorded by the exact registry entry
-its owner holds a receipt or its ledger holds custody for, which covers an attach whose format never finished. Size and
-owner alone make no disk its own: another volume's, a test's or an unformatted disk nothing recorded is ignored, however
-it is mounted. Only an exact creation receipt permits debris reclamation; a disk of its name with none makes the RAM
-optimization unavailable and is left untouched. One that still carries a lease directory, or has something attached
-below it, is named in the task's error instead. The task finds these disks, and the one it detaches with the last lease,
-in the I/O Registry (an `IOHDIXHDDriveOutKernel` entry per RAM disk, with its size, its owner uid and the `FullName` of
-each of its volumes) and their mounts in the mount table, never in `hdiutil info`: measured 2026-10-22, `hdiutil info`
-left an attached RAM disk out of 2 of 10 listings while other images attached and detached, and a disk left out would
-read as absent. A registry read that does not parse whole fails the task instead. A BSD name passes to the next disk
-once its disk goes, so every RAM detach is gateway-owned and bound to an exact device and registry entry: a provisioning
-rollback releases its `ram-lease`, or, when a gateway restart lost that lease, sends the typed `ram-detach` every other
-detach is (specs/cowshed/05_gateway.md, "RAM disks"). The gateway revalidates that identity inside its own lease before
-spawning the native tool. It uses no force; a busy owned staging volume stays in place with its named refusal. A
-requester or its job ending cannot kill this protected mutation. Authoritative terminal, proven not-started and unknown
-outcomes remain distinct; only the first two or exact entry disappearance release pending authority. A gateway that
-predates `ram-lease`, or has no control listener, makes optional RAM unavailable with its typed reason, not a task
-failure. Required RAM fixtures still fail. No task ever attaches the disk itself.
+its owner holds a receipt or its ledger holds custody for, which covers an attach whose format never finished, or
+records as the disk a creator kept. A creator records its disk's registry entry in the ledger before it keeps the disk:
+the volume's marker names that entry only while the volume is mounted, and a volume an operator's unmount took from its
+mountpoint leaves its disk attached and mounted nowhere, which the record still names (measured 2026-10-28: such a disk
+held 8 GiB beside the next creator's). Size and owner alone make no disk its own: another volume's, a test's or an
+unformatted disk nothing recorded is ignored, however it is mounted. Only an exact creation receipt or the ledger's
+record of the kept disk permits debris reclamation; a disk of its name with neither makes the RAM optimization
+unavailable and is left untouched. One that still carries a lease directory, or has something attached below it, is
+named in the task's error instead. The task finds these disks, and the one it detaches with the last lease, in the I/O
+Registry (an `IOHDIXHDDriveOutKernel` entry per RAM disk, with its size, its owner uid and the `FullName` of each of its
+volumes) and their mounts in the mount table, never in `hdiutil info`: measured 2026-10-22, `hdiutil info` left an
+attached RAM disk out of 2 of 10 listings while other images attached and detached, and a disk left out would read as
+absent. A registry read that does not parse whole fails the task instead. A BSD name passes to the next disk once its
+disk goes, so every RAM detach is gateway-owned and bound to an exact device and registry entry: a provisioning rollback
+releases its `ram-lease`, or, when a gateway restart lost that lease, sends the typed `ram-detach` every other detach is
+(specs/cowshed/05_gateway.md, "RAM disks"). The gateway revalidates that identity inside its own lease before spawning
+the native tool. It uses no force; a busy owned staging volume stays in place with its named refusal. A requester or its
+job ending cannot kill this protected mutation. Authoritative terminal, proven not-started and unknown outcomes remain
+distinct; only the first two or exact entry disappearance release pending authority. A gateway that predates
+`ram-lease`, or has no control listener, makes optional RAM unavailable with its typed reason, not a task failure.
+Required RAM fixtures still fail. No task ever attaches the disk itself.
 
 RAM attach and detach go through their typed gateway operations; every other `hdiutil` and `diskutil` execution goes
 through `cowshed disk-command`, including host-test inventory. The cowshed is the installed one on `PATH`, which must

@@ -1238,8 +1238,9 @@ A kept disk's caller owns the volume on it and detaches the disk only through `r
 disk. It never detaches one through `disk-command`, and never with `-force`. The helper's own session keeps it out of
 the gateway's process group, so a gateway restart leaves a kept disk attached. A volume counts as its own only the disks
 of its uid and size that carry its exact volume name at its mountpoint or staging, or whose registry entry its ledger or
-a receipt records; it reclaims those strays and ignores every other disk, so a disk of another namespace, a test's, is
-never taken for production's.
+a receipt records, the ledger's record of the disk a creator kept included (written before the keep, so a volume
+unmounted from under its marker leaves a disk the record still names); it reclaims those strays and ignores every other
+disk, so a disk of another namespace, a test's, is never taken for production's.
 
 `ram-detach` is the gateway's other RAM disk mutation and has the kept disk's owner. The gateway forks
 `hdiutil detach <device>` through `SystemCommandRunner`'s registry-bound detach under the storage class of its own
