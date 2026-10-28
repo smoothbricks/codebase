@@ -35,6 +35,7 @@ import {
   providerReceipt,
   type ReceiptEvidence,
   receiptNode,
+  removeOrphanedOutputs,
 } from './ensure-built-receipt.js';
 import {
   type CensusRead,
@@ -442,6 +443,24 @@ export async function preTasksExecution(
       runs.set(context.id, { ok: false, detail: 'No default producer roots scheduled', rootIds });
       return;
     }
+    // Before anything runs: what the producer's previous receipt declared and this graph no longer declares goes, so a
+    // layout change leaves no orphan in a published closure (removeOrphanedOutputs).
+    for (const [target, graph] of graphs) {
+      const previous = previousTaskGraph(context.workspaceRoot, target);
+      if (previous === null) continue;
+      const removed = removeOrphanedOutputs(
+        context.workspaceRoot,
+        Object.values(previous.tasks),
+        Object.values(graph.tasks),
+        load('nx/src/native').expandOutputs,
+        (task) => projectGraph.nodes[task.target.project]?.data.targets?.[task.target.target] !== undefined,
+      );
+      if (removed.length > 0) {
+        process.stderr.write(
+          `producerReceipts: ${target}: removed outputs its previous receipt declared and no target declares now: ${removed.join(', ')}\n`,
+        );
+      }
+    }
     const outputs = new Map(
       [...graphs].map(([target, graph]) => [
         target,
@@ -635,6 +654,15 @@ function latestRefusal(root: string, target: string): string | null {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
     if (error instanceof Error) return `unreadable producer refusal record: ${error.message}`;
     throw error;
+  }
+}
+/** The task graph the producer's previous published receipt recorded, whatever its validity now, or `null` when none reads. */
+function previousTaskGraph(root: string, target: string): TaskGraph | null {
+  try {
+    const record = typia.json.isParse<PublishedReceipt>(readFileSync(recordPath(root, target, 'published'), 'utf8'));
+    return record === null || record.version !== 1 ? null : record.taskGraph;
+  } catch {
+    return null;
   }
 }
 function validatedReceipt(root: string, target: string): ReceiptEvidence<EnsureBuiltReceipt> {

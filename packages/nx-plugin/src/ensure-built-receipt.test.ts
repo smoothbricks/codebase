@@ -20,6 +20,7 @@ import {
   producerOutputPaths,
   producerSourceUnchanged,
   providerReceipt,
+  removeOrphanedOutputs,
 } from './ensure-built-receipt.js';
 import { runtimeInput } from './runtime-input.js';
 
@@ -495,3 +496,58 @@ process.stdout.write(JSON.stringify(proofs));`;
 async function repositoryReceiptProofs(): Promise<readonly RepositoryReceiptProof[]> {
   return parseReceiptProofs(await runInRepositoryNx(RECEIPT_PROOFS_SCRIPT));
 }
+
+describe('a producer layout change', () => {
+  it('removes what its previous receipt declared and nothing declares now, inside the declaring project', async () => {
+    const tool = 'packages/tool';
+    const step = (id: string, outputs: string[], projectRoot = tool): Task => ({
+      id,
+      target: { project: id.split(':')[0] ?? id, target: id.split(':')[1] ?? id },
+      overrides: {},
+      outputs,
+      cache: true,
+      projectRoot,
+    });
+    const files = [
+      `${tool}/dist/bin/smoo-tool`,
+      `${tool}/dist/bin/darwin-arm64/smoo-tool`,
+      `${tool}/dist/ts/index.js`,
+      'packages/other/dist/kept.js',
+      'shared/out/kept.txt',
+    ];
+    for (const file of files) {
+      await mkdir(join(root, file, '..'), { recursive: true });
+      await writeFile(join(root, file), file);
+    }
+    const previous = [
+      // The old layout: one executable straight in dist/bin, from a target that no longer exists.
+      step('tool:scriptc-native', [`${tool}/dist/bin`]),
+      step('tool:tsc-js', [`${tool}/dist/ts`]),
+      // Left this producer's graph, but its target still exists: not this producer's to clean.
+      step('other:build', ['packages/other/dist'], 'packages/other'),
+      // Outside its project root.
+      step('tool:shared', ['shared/out']),
+    ];
+    const current = [
+      step('tool:scriptc-arm64-macos', [`${tool}/dist/bin/darwin-arm64`]),
+      step('tool:tsc-js', [`${tool}/dist/ts`]),
+    ];
+
+    const removed = removeOrphanedOutputs(
+      root,
+      previous,
+      current,
+      expandOutputs,
+      (task) => task.id !== 'tool:scriptc-native',
+    );
+
+    expect(removed).toEqual([`${tool}/dist/bin/smoo-tool`]);
+    const present = async (file: string) =>
+      lstat(join(root, file)).then(
+        () => true,
+        () => false,
+      );
+    expect(await present(`${tool}/dist/bin/smoo-tool`)).toBe(false);
+    for (const file of files.slice(1)) expect(await present(file), file).toBe(true);
+  });
+});

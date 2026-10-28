@@ -10,6 +10,7 @@ import {
   readlinkSync,
   readSync,
   realpathSync,
+  rmSync,
 } from 'node:fs';
 import { isAbsolute, join, relative } from 'node:path';
 import type { Task } from 'nx/src/config/task-graph';
@@ -377,6 +378,46 @@ export function producerOutputPaths(root: string, tasks: readonly Task[], expand
   }
   for (const task of tasks) for (const path of expand(root, task.outputs)) visit(path);
   return [...paths].sort();
+}
+/**
+ * Remove what a producer's previous receipt declared as task outputs and its current task graph no longer declares,
+ * inside the declaring task's project root. A layout change (an output moved, a target renamed) otherwise leaves the
+ * old layout's files where a package's published `files` still packs them, so a consumer's capture hashes them as the
+ * producer's tools and ships them. A previously declared directory that holds a currently declared output loses only
+ * its other entries. A previous task that left this graph while its target still exists is not this producer's to
+ * clean: `defined` says whether a task's target still exists. Returns the removed paths, relative to `root`.
+ */
+export function removeOrphanedOutputs(
+  root: string,
+  previous: readonly Task[],
+  current: readonly Task[],
+  expand: typeof expandOutputs,
+  defined: (task: Task) => boolean,
+): string[] {
+  const declared = current.flatMap((task) => expand(root, task.outputs));
+  const currentIds = new Set(current.map((task) => task.id));
+  const removed: string[] = [];
+  function prune(path: string): void {
+    if (declared.some((output) => path === output || path.startsWith(`${output}/`))) return;
+    const stats = lstatSync(join(root, path), { throwIfNoEntry: false });
+    if (stats === undefined) return;
+    if (!declared.some((output) => output.startsWith(`${path}/`))) {
+      rmSync(join(root, path), { recursive: true, force: true });
+      removed.push(path);
+      return;
+    }
+    if (stats.isDirectory()) for (const name of readdirSync(join(root, path))) prune(join(path, name));
+  }
+  for (const task of previous) {
+    if (!currentIds.has(task.id) && defined(task)) continue;
+    const project = task.projectRoot ?? '';
+    for (const output of expand(root, task.outputs)) {
+      if (isAbsolute(output) || output.split('/').includes('..')) continue;
+      if (project !== '' && project !== '.' && output !== project && !output.startsWith(`${project}/`)) continue;
+      prune(output);
+    }
+  }
+  return removed.sort();
 }
 export function providerReceipt(
   root: string,
