@@ -102,8 +102,8 @@ const TOKEN_PREFIXES: [&str; 5] = ["ghp_", "xoxb-", "sk-", "AKIA", "-----BEGIN"]
 
 fn workspace_owned(name: &str) -> bool {
     use crate::workspace_environment::{
-        NODE_COMPILE_CACHE_ENV, NX_REMOTE_READ_ONLY_ENV, NX_REMOTE_SERVER_ENV, PORT_BASE_ENV,
-        PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV, TEMP_DIR_ENV,
+        BUILD_CACHE_ENV, NODE_COMPILE_CACHE_ENV, NX_REMOTE_READ_ONLY_ENV, NX_REMOTE_SERVER_ENV,
+        PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV, TEMP_DIR_ENV,
     };
     [
         PORT_BASE_ENV,
@@ -113,6 +113,7 @@ fn workspace_owned(name: &str) -> bool {
         TEMP_DIR_ENV,
         NODE_COMPILE_CACHE_ENV,
         RUNTIME_LINK_ENV,
+        BUILD_CACHE_ENV,
         "NX_MAX_CACHE_SIZE",
         "CI",
     ]

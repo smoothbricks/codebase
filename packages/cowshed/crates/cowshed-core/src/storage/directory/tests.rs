@@ -598,6 +598,7 @@ import("./compile-cache-lib.mjs").then((lib) => {
         },
         metadata.platform,
         metadata.grants.port_block,
+        None,
     )
     .unwrap();
     let work = scratch.path().join("work");
@@ -702,6 +703,7 @@ import("./compile-cache-lib.mjs").then((lib) => {
         },
         metadata.platform,
         metadata.grants.port_block,
+        None,
     )
     .unwrap();
     let work = scratch.path().join("work");

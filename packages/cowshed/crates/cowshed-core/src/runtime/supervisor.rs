@@ -2681,6 +2681,13 @@ pub(super) async fn sandbox_environment(
     // it, and `.cowshed/workspace.json` marks a workspace. A caller's stale value (a host shell
     // that sourced an older `.cowshed/env`) is withheld, not forwarded.
     withheld.push(WORKSPACE_TOKEN_ENV);
+    match crate::storage::bootstrap::native::provisioned_build_cache() {
+        Some(root) => own(
+            crate::workspace_environment::BUILD_CACHE_ENV,
+            root.as_os_str(),
+        ),
+        None => withheld.push(crate::workspace_environment::BUILD_CACHE_ENV),
+    }
     if sandbox
         .capabilities
         .contribution

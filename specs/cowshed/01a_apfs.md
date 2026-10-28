@@ -1313,35 +1313,40 @@ listing `diskutil apfs list -plist` read back an empty root while an unrelated i
 transient projection. A volume mounted somewhere other than its canonical path is attested by `statfs` at that path
 before it is reported as mis-mounted.
 
-Neither planning nor read-only validation spawns `diskutil`; validation uses the caller's budget for the kernel reads,
-not a separate storage-command deadline. Historical evidence: `diskutil info` is answered through Disk Arbitration,
-which congests when many images are attached. On a host with about 130 images attached, a consumer's test harness saw
-one `diskutil info -plist` of the store volume block for 279 s before the harness interrupted it. The same call answered
-in 0.43–0.64 s on that host once congestion passed. Gateways and cache services use the same read-only validation at
-startup; its latency no longer depends on Disk Arbitration at all.
+Read-only validation never spawns `diskutil`; it uses the caller's budget for the kernel reads, not a separate
+storage-command deadline. Setup's and doctor's planning spawns one bounded `diskutil info -plist` per reserved volume
+that registers `Encrypted` (below), and nothing else. Historical evidence: `diskutil info` is answered through Disk
+Arbitration, which congests when many images are attached. On a host with about 130 images attached, a consumer's test
+harness saw one `diskutil info -plist` of the store volume block for 279 s before the harness interrupted it. The same
+call answered in 0.43–0.64 s on that host once congestion passed. Gateways and cache services use the same read-only
+validation at startup; its latency no longer depends on Disk Arbitration at all.
 
-FileVault is therefore derived from the registry record. No registry property names a volume's crypto users, and
-`Encrypted` alone is not FileVault: a volume group's Data volume is encrypted at rest with a hardware-bound key and no
-user. That keyless encryption exists only inside a volume group; a role-less volume is encrypted only by adding a crypto
-user, which is exactly what setup's `diskutil apfs encryptVolume -user disk` does. This is an observed platform fact,
-measured on a FileVault-off host against `diskutil info -plist`'s `FileVault`:
+FileVault is therefore bounded by the registry record and settled, only where setup acts on it, by the volume's own
+`diskutil info -plist` `FileVault`. No registry property names a volume's crypto users, and `Encrypted` alone is not
+FileVault: a volume group's Data volume is encrypted at rest with a hardware-bound key and no user, and so, on a host
+that encrypts every volume at rest, is a role-less volume no one ever encrypted. Measured against
+`diskutil info -plist`'s `FileVault`, first on a FileVault-off host and then (2026-10-28, the bun-build-cache row) on a
+host that encrypts at rest:
 
-| Volume                            | `RoleValue` | `Encrypted` | `diskutil info` FileVault |
-| --------------------------------- | ----------- | ----------- | ------------------------- |
-| Data                              | 64          | Yes         | No                        |
-| VM                                | 8           | absent      | No                        |
-| Nix Store                         | 0           | Yes         | Yes                       |
-| `cowshed.store`, `cowshed.caches` | 0           | Yes         | Yes                       |
+| Volume                            | `RoleValue` | `Encrypted`         | `diskutil info` FileVault  |
+| --------------------------------- | ----------- | ------------------- | -------------------------- |
+| Data                              | 64          | Yes                 | No                         |
+| VM                                | 8           | absent              | No                         |
+| Nix Store                         | 0           | Yes                 | Yes (one Disk crypto user) |
+| `cowshed.store`, `cowshed.caches` | 0           | Yes                 | Yes (one Disk crypto user) |
+| bun-build-cache (a prototype)     | 0           | Yes (`ScalablePFK`) | No (no crypto user)        |
 
-All 138 volumes registered a `RoleValue`, and none registered `Encrypted = No`, so an absent `Encrypted` is an
+No registry key told the last two role-less rows apart beyond name, case sensitivity and counters. All 138 volumes of
+the first host registered a `RoleValue`, and none registered `Encrypted = No`, so an absent `Encrypted` is an
 unencrypted volume. For the selected reserved `cowshed.store` / `cowshed.build-cache` / `cowshed.caches` records, a
-role-less volume's FileVault is its `Encrypted`; a reserved volume with any role, or none registered, is refused
-(`ReservedVolumeRole`), because for it `Encrypted` can be keyless encryption. The rule protects the
-`MissingVolumeKeychain` refusal: a FileVault volume without a usable System.keychain passphrase can never be remounted
-at boot, and reading keyless encryption as FileVault, or FileVault as unencrypted, would let that refusal be skipped or
-misapplied. Setup shares the same evidence, so its encrypt-in-place decision reads the same derivation. The
-execution-time pre-create recheck inside the authorization session reads a fresh kernel snapshot the same way, and an
-unreadable or empty snapshot refuses the create.
+role-less volume without `Encrypted` is surely not FileVault, and one with it may be; a reserved volume with any role,
+or none registered, is refused (`ReservedVolumeRole`). Every command's read-only validation keeps the upper bound and
+requires a usable System.keychain passphrase for each volume that registers `Encrypted`; setup and doctor read each such
+volume's `diskutil info`, so a volume encrypted only at rest is planned for in-place encryption rather than refused. The
+rule protects the `MissingVolumeKeychain` refusal: a FileVault volume without a usable System.keychain passphrase can
+never be remounted at boot, and reading keyless encryption as FileVault, or FileVault as unencrypted, would let that
+refusal be skipped or misapplied. The execution-time pre-create recheck inside the authorization session reads a fresh
+kernel snapshot the same way, and an unreadable or empty snapshot refuses the create.
 
 **Boot mounting is owned by a root system LaunchDaemon, and the store is FileVault-encrypted.** At provision, the same
 authorization session:
@@ -1513,28 +1518,43 @@ The existing root LaunchDaemon script (`dev.cowshed.storage`, `mount-volumes.sh`
 UUID, as one more entry of the same per-UUID loop that mounts the store; no second daemon, script or keychain scheme
 exists for it. A volume that already exists at the canonical mountpoint under another label (an existing prototype
 volume is one) is **adopted by its UUID**: setup takes the UUID the kernel snapshot reports for the volume mounted
-there, encrypts it in place if it is unencrypted, pins and boot-mounts it by that UUID, and never deletes it; labels are
-mutable and identity is the UUID, here as for the store. An existing volume is never deleted by setup, and `--uninstall`
-removes its pin and keychain items with the store's, never the volume.
+there, attests it under the label it has, relabels it `cowshed.build-cache` inside the same authorization session,
+remounts it `nobrowse` if it is browsable, encrypts it in place if it is unencrypted, pins and boot-mounts it by that
+UUID, and never deletes it; labels are mutable and identity is the UUID, here as for the store, and after the relabel
+every later run finds the volume by its label as it finds the store. A second volume already labelled
+`cowshed.build-cache` beside such a prototype is refused, naming both, rather than one of them chosen. An existing
+volume is never deleted by setup, and `--uninstall` removes its pin and keychain items with the store's, never the
+volume. The `shared` parent is one of the fixed mount prefix's owned directories, provisioned and attested with the
+workspace mount root (01c_macos.md, "`/private/var/folders` is root-owned and swept"), and the volume's own provisioning
+attests it first, so a host whose store does not exist yet still gets the parent before the mountpoint.
 
-Its mountpoint is a plain directory on Data until the volume mounts, so the store's masking guard applies unchanged,
-with one addition: the marker at the volume root distinguishes the mounted volume from the bare directory, the same
-enumerated reclaimable stubs are reclaimed before remount, any other entry keeps the mountpoint **masked**, and a
-foreign top-level entry of another owner (above) is never a reclaimable stub, on the bare mountpoint or off it.
+Its mountpoint is a plain directory on Data until the volume mounts, so the store's masking guard applies with one
+addition and one narrowing: the marker at the volume root distinguishes the mounted volume from the bare directory, and
+of the store's enumerated reclaimable stubs only Finder's `.DS_Store` is one here. Any other entry, cowshed's own
+scaffolding names (`mnt`, `sccache`) and empty directories included, may be another owner's top-level tree (above), so
+it is never a reclaimable stub, on the bare mountpoint or off it, and it keeps the mountpoint **masked**.
 `cowshed doctor` reports the volume with the store's findings, each naming the observed and canonical paths and
-prescribing `cowshed setup`: **missing** (no volume by its pinned UUID or label, and none mounted at the canonical
-mountpoint), **mis-mounted** (mounted anywhere but the canonical mountpoint, `/Volumes/<name>` included),
-**unencrypted** (no FileVault by the registry derivation above), **masked mountpoint** (the marker absent, or a non-stub
-entry on the bare mountpoint), and the missing-keychain-item finding the store carries. A command that needs the mbx
-store fails before mutation with `environment-missing`, naming which of these it found, exactly as a store fault refuses
-(above); a command that does not touch Cargo through mbx does not consult the volume. Diagnosis reads the same one
-kernel snapshot the store's planning reads, so the two volumes' verdicts cannot observe different listings.
+prescribing `cowshed setup`: **missing** (no volume by its label, and none mounted at the canonical mountpoint),
+**mis-mounted** (mounted anywhere but the canonical mountpoint, `/Volumes/<name>` included), **unencrypted** (no
+FileVault by the volume's own `diskutil info`, above), **masked mountpoint** (the marker absent, or a non-stub entry on
+the bare mountpoint), and the missing-keychain-item finding the store carries. A command that needs the mbx store fails
+before mutation with `environment-missing`, naming which of these it found, exactly as a store fault refuses (above); a
+command that does not touch Cargo through mbx does not consult the volume. Diagnosis reads the same one kernel snapshot
+the store's planning reads, so the two volumes' verdicts cannot observe different listings.
 
-**Enforced by**: tests that must exist — setup provisioning and adoption cells over kernel-snapshot fixtures (absent,
-present-by-label, prototype adopted by UUID without deletion, mis-mounted, unencrypted-encrypted-in-place, masked
-mountpoint, foreign `shared` parent refused, foreign top-level entries never reclaimed or listed), doctor finding
-goldens for each state above, and a real-APFS boot-mount cell proving the installed script mounts a throwaway second
-volume by UUID at its canonical path under a user-owned parent (08_testing.md).
+**Enforced by**: the setup cells over kernel-snapshot fixtures in [`cowshed-core/src/storage/bootstrap/native/macos.rs`]
+(`an_absent_build_cache_is_created_case_sensitive_beside_the_store`,
+`a_labelled_build_cache_mounted_with_its_marker_needs_nothing_and_is_pinned`,
+`a_prototype_at_the_build_cache_mountpoint_is_adopted_by_identity_never_recreated`,
+`a_prototype_beside_a_labelled_build_cache_is_refused`, `a_mis_mounted_build_cache_is_remounted_at_its_mountpoint`,
+`an_unencrypted_build_cache_is_encrypted_in_place`, `a_masked_build_cache_mountpoint_refuses_setup_naming_it`,
+`a_foreign_shared_parent_refuses_the_plan`, `foreign_entries_on_a_bare_build_cache_mountpoint_are_never_reclaimed`,
+`only_setup_and_doctor_read_the_build_cache_volume`), the provisioning session's
+`an_adopted_prototype_is_attested_under_its_label_then_relabelled_in_the_session` and
+`the_build_cache_volume_is_created_case_sensitive`, and the doctor goldens
+`the_build_cache_volume_reports_the_store_findings_at_its_mountpoint` (`cowshed-cli/src/runtime.rs`). A test that must
+exist: a real-APFS boot-mount cell proving the installed script mounts a throwaway second volume by UUID at its
+canonical path under a user-owned parent (08_testing.md); the store has no such cell either.
 
 ## Retired mountpoint debris
 

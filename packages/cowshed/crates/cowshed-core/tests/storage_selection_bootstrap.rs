@@ -1100,6 +1100,7 @@ fn role_strategy() -> impl Strategy<Value = VolumeRole> {
         Just(VolumeRole::Store),
         Just(VolumeRole::Caches),
         Just(VolumeRole::Projects),
+        Just(VolumeRole::BuildCache),
     ]
 }
 
@@ -1129,6 +1130,7 @@ proptest! {
             VolumeRole::Store => "store",
             VolumeRole::Caches => "caches",
             VolumeRole::Projects => "projects",
+            VolumeRole::BuildCache => "build-cache",
         };
         let substrate = match substrate {
             SubstrateKind::Apfs => "apfs",

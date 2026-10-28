@@ -405,6 +405,15 @@ pub enum NativeBootstrapError {
     EvidenceLaneClosed,
     #[error("{0}")]
     CachesVolumeNotRetirable(String),
+    #[error(
+        "the build-cache mountpoint {mountpoint:?} holds {mounted} (labelled {label:?}) while {labelled} is labelled cowshed.build-cache; setup adopts one build-cache volume, never two"
+    )]
+    AmbiguousBuildCache {
+        mountpoint: PathBuf,
+        mounted: String,
+        label: String,
+        labelled: String,
+    },
     #[error(transparent)]
     Selection(#[from] SelectionError),
     #[error(transparent)]

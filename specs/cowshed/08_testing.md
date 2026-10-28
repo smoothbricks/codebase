@@ -606,15 +606,16 @@ and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool o
 same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 The Nx target `cowshed:apfs-test-root` (`packages/cowshed/scripts/apfs-test-root.ts`) gives a host `cowshed setup` has
-not run on, such as a CI runner that cannot answer setup's interactive authorization prompt, setup's own three
-directories: `/private/var/folders/cowshed` (root:wheel 0755), the user's `<uid>` directory below it and `mnt` below
-that (the user's, 0700). Every target that runs a test creating a scratch root depends on it: the cargo test shards of
-the `cowshed-*` crates, both real-APFS groups, `host-controller-test` and `integration-apfs`. It creates only what is
-missing, by `sudo -n` for the prefix and the per-user root and as the user for `mnt`, refuses a link, a non-directory or
-a foreign owner rather than writing through it, and with a directory missing and `sudo -n` refused fails naming the
-exact commands to run. It never looks at `t` or a test namespace's directory: the fixtures make them, and a
-`cowshed exec` sandbox, where the shards run too, denies it. On a host setup has been through it checks and changes
-nothing.
+not run on, such as a CI runner that cannot answer setup's interactive authorization prompt, the three directories of
+setup's workspace mount root: `/private/var/folders/cowshed` (root:wheel 0755), the user's `<uid>` directory below it
+and `mnt` below that (the user's, 0700). The build-cache volume's `shared` parent is setup's alone: no test mounts over
+the host's build-cache volume (below). Every target that runs a test creating a scratch root depends on it: the cargo
+test shards of the `cowshed-*` crates, both real-APFS groups, `host-controller-test` and `integration-apfs`. It creates
+only what is missing, by `sudo -n` for the prefix and the per-user root and as the user for `mnt`, refuses a link, a
+non-directory or a foreign owner rather than writing through it, and with a directory missing and `sudo -n` refused
+fails naming the exact commands to run. It never looks at `t` or a test namespace's directory: the fixtures make them,
+and a `cowshed exec` sandbox, where the shards run too, denies it. On a host setup has been through it checks and
+changes nothing.
 
 Build-cache volume provisioning is proved the same way, at its own boundaries: setup's and doctor's cells (absent,
 present-by-label, prototype adopted by UUID, mis-mounted, unencrypted, masked mountpoint, foreign parent, foreign

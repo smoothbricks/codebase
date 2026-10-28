@@ -89,6 +89,14 @@ recreates a volume: existing volumes are encrypted in place, and the only volume
 volume, under `--retire-caches-volume` (below). On a healthy host it changes nothing and says so. Every storage error in
 the CLI points here — a host with no volumes has no checkout to adopt.
 
+The same transaction provisions the build-cache volume, `cowshed.build-cache`, which holds the one shared mbx store:
+case-sensitive, in the store's container, mounted at `/private/var/folders/cowshed/shared/build-cache` under a `shared`
+parent setup provisions with the workspace mount root (yours, group `nixbld`, 0750), and encrypted, pinned and
+boot-mounted exactly as the store is. A volume already mounted there under another label is adopted by its UUID and
+relabelled, never recreated. On its bare mountpoint only a `.DS_Store` is reclaimed: other host tools keep their own
+trees on that volume, so any other entry masks it. Once it is provisioned, every workspace's `.cowshed/env` and every
+job export its root as `COWSHED_BUILD_CACHE` (specs/cowshed/01a_apfs.md, "Dedicated build-cache volume").
+
 Once the store is mounted, setup brings its layout current before anything else reads it. Only a directory that holds
 `.cowshed-owner` is a project owner to every command, so a directory dropped into the store root costs nothing. A store
 from before those markers (its volume marker at layout version 1) is refused by every command that enumerates projects,

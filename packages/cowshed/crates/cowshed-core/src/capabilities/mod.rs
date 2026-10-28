@@ -691,6 +691,7 @@ fn reserved(name: &str) -> bool {
             | "COWSHED_WORKSPACE_TOKEN"
             | "COWSHED_PORT_BASE"
             | "COWSHED_PORT_BLOCK_SIZE"
+            | crate::workspace_environment::BUILD_CACHE_ENV
             | "HTTP_PROXY"
             | "HTTPS_PROXY"
             | "http_proxy"

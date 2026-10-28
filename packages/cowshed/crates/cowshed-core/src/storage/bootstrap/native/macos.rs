@@ -19,14 +19,15 @@ use zeroize::Zeroizing;
 mod keychain;
 
 use super::super::{
-    APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsProvisionKind, ApfsVolumeProvision, BlockingLane,
-    BootstrapEvidence, BootstrapExecutionError, BootstrapHost, BootstrapPlan, CanonicalRoots,
+    APFS_BUILD_CACHE_VOLUME, APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsProvisionKind,
+    ApfsVolumeProvision, BUILD_CACHE_MOUNTPOINT, BlockingLane, BootstrapEvidence,
+    BootstrapExecutionError, BootstrapHost, BootstrapPlan, BuildCacheAdoption, CanonicalRoots,
     CreatedMountState, DISKUTIL, ExistingStorage, HostCommand, HostCommandFailure,
     HostCommandOutput, HostError, HostOperation, MOUNT_SERVICE_PLIST, MountpointState,
-    RETIRED_CACHES_MOUNTPOINT, StatFsEvidence, SubstrateKind, TokioBlockingLane,
+    RETIRED_CACHES_MOUNTPOINT, SelectedSubstrate, StatFsEvidence, SubstrateKind, TokioBlockingLane,
     VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeMarker, VolumeRole, attest_created_apfs_info,
-    execute_bootstrap_operation, parse_created_apfs_identifier, plan_bootstrap,
-    require_mounted_marker, select_substrate,
+    execute_bootstrap_operation, parse_created_apfs_identifier, plan_apfs_build_cache,
+    plan_bootstrap, require_mounted_marker, select_substrate,
 };
 use super::shared::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
@@ -39,7 +40,9 @@ use super::shared::{
 use crate::error::CowshedError;
 use crate::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
-use crate::storage::host_config::{HostConfig, MACOS_MOUNT_PREFIX, macos_mount_root};
+use crate::storage::host_config::{
+    BUILD_CACHE_PARENT, HostConfig, MACOS_MOUNT_PREFIX, macos_mount_root,
+};
 use cowshed_apfs::mounts::KernelMountSnapshot;
 use cowshed_apfs::{
     CommandRequest, CommandRunFailure, DISK_CHILD_DEADLINE, RegisteredApfsContainer,
@@ -71,7 +74,13 @@ const SECURITY: &str = "/usr/bin/security";
 const SYSTEM_KEYCHAIN: &str = "/Library/Keychains/System.keychain";
 const APFS_USER_AGENT: &str = "/System/Library/CoreServices/APFSUserAgent";
 const CS_USER_AGENT: &str = "/System/Library/CoreServices/CSUserAgent";
-const VOLUME_KEYCHAIN_LABELS: [&str; 2] = [APFS_STORE_VOLUME, APFS_CACHES_VOLUME];
+const VOLUME_KEYCHAIN_LABELS: [&str; 3] = [
+    APFS_STORE_VOLUME,
+    APFS_CACHES_VOLUME,
+    APFS_BUILD_CACHE_VOLUME,
+];
+/// The group of the build-cache mountpoint's `shared` parent (01c_macos.md).
+const NIX_BUILD_GROUP: &str = "nixbld";
 const MOUNT_SERVICE_LABEL: &str = "dev.cowshed.storage";
 const MOUNT_SERVICE_TARGET: &str = "system/dev.cowshed.storage";
 const MOUNT_SERVICE_DIRECTORY: &str = "/Library/Application Support/dev.cowshed";
@@ -725,7 +734,11 @@ fn add_mount_service_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBo
     Ok(())
 }
 
-fn mount_root_operations(uid: u32, gid: u32) -> [HostOperation; 3] {
+/// The owned directories of the fixed mount prefix, each after its parent: the root-owned prefix,
+/// the build-cache mountpoint's user-owned `shared` parent (group `shared_gid`, 0750), and the
+/// invoking user's `<uid>/mnt` workspace mount root (01c_macos.md, "`/private/var/folders` is
+/// root-owned and swept").
+fn mount_root_operations(uid: u32, gid: u32, shared_gid: u32) -> [HostOperation; 4] {
     let prefix = PathBuf::from(MACOS_MOUNT_PREFIX);
     [
         HostOperation::EnsureOwnedDirectory {
@@ -733,6 +746,12 @@ fn mount_root_operations(uid: u32, gid: u32) -> [HostOperation; 3] {
             uid: 0,
             gid: 0,
             mode: 0o755,
+        },
+        HostOperation::EnsureOwnedDirectory {
+            path: PathBuf::from(BUILD_CACHE_PARENT),
+            uid,
+            gid: shared_gid,
+            mode: 0o750,
         },
         HostOperation::EnsureOwnedDirectory {
             path: prefix.join(uid.to_string()),
@@ -752,11 +771,11 @@ fn mount_root_operations(uid: u32, gid: u32) -> [HostOperation; 3] {
 fn plan_mount_root_directories(
     uid: u32,
     gid: u32,
+    shared_gid: u32,
     mut inspect: impl FnMut(&Path, u32, u32, u32) -> Result<bool, HostError>,
 ) -> Result<Vec<HostOperation>, HostError> {
-    let mut needed = Vec::new();
-    let mut ancestor_needs_repair = false;
-    for operation in mount_root_operations(uid, gid) {
+    let mut needed: Vec<HostOperation> = Vec::new();
+    for operation in mount_root_operations(uid, gid, shared_gid) {
         let HostOperation::EnsureOwnedDirectory {
             path,
             uid,
@@ -766,10 +785,13 @@ fn plan_mount_root_directories(
         else {
             unreachable!("mount root operations are owned-directory attestations");
         };
-        // A missing or inaccessible parent must be provisioned first. The executor rechecks
-        // every child without following links before changing it; planning cannot read it yet.
+        // A missing or inaccessible parent must be provisioned first, and every directory below
+        // one that needs repair is planned with it: the executor rechecks each child without
+        // following links before changing it, and planning cannot read it yet.
+        let ancestor_needs_repair = needed.iter().any(|ancestor| {
+            matches!(ancestor, HostOperation::EnsureOwnedDirectory { path: parent, .. } if path.starts_with(parent))
+        });
         if ancestor_needs_repair || !inspect(path, *uid, *gid, *mode)? {
-            ancestor_needs_repair = true;
             needed.push(operation);
         }
     }
@@ -781,10 +803,11 @@ fn add_canonical_mount_root_action(
     config_missing: bool,
     uid: u32,
     gid: u32,
+    shared_gid: u32,
     inspect: impl FnMut(&Path, u32, u32, u32) -> Result<bool, HostError>,
 ) -> Result<(), HostError> {
     let root = macos_mount_root(uid);
-    let needed = plan_mount_root_directories(uid, gid, inspect)?;
+    let needed = plan_mount_root_directories(uid, gid, shared_gid, inspect)?;
     if !needed.is_empty() || config_missing {
         for operation in needed {
             snapshot.plan.push_operation(operation);
@@ -833,6 +856,7 @@ fn add_mount_root_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBoots
         config_missing,
         unsafe { libc::getuid() },
         unsafe { libc::getgid() },
+        nix_build_gid().map_err(NativeBootstrapError::Host)?,
         owned_directory_current,
     )
     .map_err(NativeBootstrapError::Host)
@@ -874,7 +898,9 @@ pub async fn execute_mount_root_provisioning(root: &Path) -> crate::Result<()> {
             "cowshed setup",
         ));
     }
-    let operations = plan_mount_root_directories(uid, gid, owned_directory_current)
+    let shared_gid = nix_build_gid()
+        .map_err(|error| existing_host_storage_error(NativeBootstrapError::Host(error)))?;
+    let operations = plan_mount_root_directories(uid, gid, shared_gid, owned_directory_current)
         .map_err(|error| existing_host_storage_error(NativeBootstrapError::Host(error)))?;
     if !operations.is_empty() {
         let session = tokio::task::spawn_blocking(MacAuthorizationSession::acquire)
@@ -912,13 +938,31 @@ fn prepare_setup_snapshot(
     existing_fstab: &str,
     caches_volume: CachesVolume,
 ) -> Result<SetupSnapshot, NativeBootstrapError> {
-    let mut gathered = gather_existing_apfs_evidence(source, home)?;
+    let mut gathered = gather_existing_apfs_evidence(EvidenceScope::Setup, source, home)?;
     let deletion = match caches_volume {
         CachesVolume::Keep => None,
         CachesVolume::Retire => retire_caches_volume(source, &mut gathered)?,
     };
     let selected = select_substrate(gathered.statfs, None)?;
     let mut plan = plan_bootstrap(selected, home, gathered.bootstrap)?;
+    if let Some(volume) = gathered
+        .volumes
+        .iter()
+        .find(|volume| volume.role == VolumeRole::BuildCache)
+    {
+        let SelectedSubstrate::Apfs { container, .. } = plan.substrate() else {
+            unreachable!("APFS evidence selects the APFS substrate")
+        };
+        let container = container.clone();
+        for operation in plan_apfs_build_cache(
+            &container,
+            &volume.mountpoint,
+            &volume.storage,
+            volume.adoption.as_ref(),
+        )? {
+            plan.push_operation(operation);
+        }
+    }
     let pins = gathered
         .volumes
         .iter()
@@ -961,7 +1005,11 @@ fn prepare_setup_snapshot(
             name: volume.name.to_owned(),
             role: volume.role,
             state_before: volume_state(&volume.storage),
-            action: volume_action(&volume.storage).to_owned(),
+            action: match volume.adoption {
+                Some(_) => "adopted",
+                None => volume_action(&volume.storage),
+            }
+            .to_owned(),
         })
         .collect();
     Ok(SetupSnapshot {
@@ -1352,7 +1400,10 @@ fn lookup_volume_password(
 }
 
 fn encrypt_volume_with(host: &dyn BootstrapHost, name: &str, uuid: &str) -> Result<(), HostError> {
-    if !matches!(name, APFS_STORE_VOLUME | APFS_CACHES_VOLUME) {
+    if !matches!(
+        name,
+        APFS_STORE_VOLUME | APFS_CACHES_VOLUME | APFS_BUILD_CACHE_VOLUME
+    ) {
         return Err(HostError::new(format!(
             "refusing to encrypt unexpected APFS volume {name:?}"
         )));
@@ -1783,10 +1834,11 @@ async fn execute_snapshot_actions(
                 let Some(name) = action_volume_name(&action) else {
                     unreachable!("non-volume actions were handled above")
                 };
-                let operations = snapshot
+                let volume = snapshot
                     .classified
                     .iter()
-                    .find(|volume| volume.name == name)
+                    .find(|volume| volume.name == name);
+                let operations = volume
                     .map(|volume| operations_for_volume(&snapshot.plan, volume))
                     .unwrap_or_default();
                 if operations.is_empty() {
@@ -1794,7 +1846,25 @@ async fn execute_snapshot_actions(
                         "setup action for {name} has no host operations"
                     )))
                 } else {
-                    execute_setup_operations(&operations, Arc::clone(&host)).await
+                    // The build-cache mountpoint's user-owned parent comes first (01a_apfs.md).
+                    match volume
+                        .filter(|volume| volume.role == VolumeRole::BuildCache)
+                        .map(|volume| mountpoint_parent_operations(&volume.mountpoint))
+                        .transpose()
+                    {
+                        Ok(parents) => {
+                            let operations = parents
+                                .unwrap_or_default()
+                                .into_iter()
+                                .chain(operations)
+                                .collect::<Vec<_>>();
+                            execute_setup_operations(&operations, Arc::clone(&host)).await
+                        }
+                        Err(error) => Err(setup_execution_error(
+                            NativeBootstrapError::Host(error),
+                            "cowshed setup",
+                        )),
+                    }
                 }
             }
         };
@@ -2215,6 +2285,9 @@ trait EvidenceSource {
         path: &Path,
     ) -> Result<MountedVolumeEvidence, NativeBootstrapError>;
     fn keychain_item_usable(&mut self, label: &'static str) -> Result<bool, NativeBootstrapError>;
+    /// Whether the exact volume `identifier` is FileVault-encrypted, as its `diskutil info`
+    /// answers: the registry's `Encrypted` cannot tell FileVault from encryption at rest.
+    fn file_vault(&mut self, identifier: &str) -> Result<bool, NativeBootstrapError>;
     /// Whether the mounted retired caches volume holds nothing but its marker and its
     /// filesystem's own bookkeeping.
     fn holds_only_marker(&mut self, mountpoint: &Path) -> Result<bool, NativeBootstrapError>;
@@ -2282,6 +2355,16 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
             .map(|output| output.succeeded())
             .map_err(NativeBootstrapError::Host)
     }
+    fn file_vault(&mut self, identifier: &str) -> Result<bool, NativeBootstrapError> {
+        let command = HostCommand::new(DISKUTIL, ["info", "-plist", identifier]);
+        let output = self.host.run_command(&command)?;
+        if !output.succeeded() {
+            return Err(NativeBootstrapError::CommandFailed(
+                HostCommandFailure::new(command, output),
+            ));
+        }
+        file_vault_from_info(&output.stdout, identifier).map_err(NativeBootstrapError::Host)
+    }
     fn holds_only_marker(&mut self, mountpoint: &Path) -> Result<bool, NativeBootstrapError> {
         crate::caches_retirement::holds_only_marker(mountpoint).map_err(|source| {
             NativeBootstrapError::StatFs {
@@ -2312,6 +2395,17 @@ struct ClassifiedVolume {
     size_bytes: Option<u64>,
     reclaimable_stubs: Vec<PathBuf>,
     file_vault: Option<bool>,
+    /// A prototype found mounted at the build-cache mountpoint under another label.
+    adoption: Option<BuildCacheAdoption>,
+}
+
+/// Which of cowshed's volumes an evidence read classifies. Every command reads the store; only
+/// setup and doctor read the build-cache volume, because a command that does not touch Cargo
+/// through mbx never consults it (01a_apfs.md, "Dedicated build-cache volume").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvidenceScope {
+    HostStorage,
+    Setup,
 }
 
 #[derive(Clone, Debug)]
@@ -2335,7 +2429,7 @@ fn plan_existing_host_storage(
     source: &mut impl EvidenceSource,
     home: &Path,
 ) -> Result<BootstrapPlan, NativeBootstrapError> {
-    let gathered = gather_existing_apfs_evidence(source, home)?;
+    let gathered = gather_existing_apfs_evidence(EvidenceScope::HostStorage, source, home)?;
     let selected = select_substrate(gathered.statfs, None)?;
     plan_bootstrap(selected, home, gathered.bootstrap).map_err(Into::into)
 }
@@ -2346,10 +2440,11 @@ fn gather_apfs_evidence(
     home: &Path,
 ) -> Result<GatheredEvidence, NativeBootstrapError> {
     require_canonical(project_root)?;
-    gather_existing_apfs_evidence(source, home)
+    gather_existing_apfs_evidence(EvidenceScope::HostStorage, source, home)
 }
 
 fn gather_existing_apfs_evidence(
+    scope: EvidenceScope,
     source: &mut impl EvidenceSource,
     home: &Path,
 ) -> Result<GatheredEvidence, NativeBootstrapError> {
@@ -2384,10 +2479,24 @@ fn gather_existing_apfs_evidence(
     )?;
     guard_absent_volume_globally(&inventory, APFS_STORE_VOLUME, &mut store)?;
     guard_absent_volume_globally(&inventory, APFS_CACHES_VOLUME, &mut caches)?;
+    let build_cache = match scope {
+        EvidenceScope::HostStorage => None,
+        EvidenceScope::Setup => {
+            let (mut build_cache, adoption) = classify_build_cache(source, container)?;
+            if adoption.is_none() {
+                guard_absent_volume_globally(
+                    &inventory,
+                    APFS_BUILD_CACHE_VOLUME,
+                    &mut build_cache,
+                )?;
+            }
+            Some((build_cache, adoption))
+        }
+    };
 
     // The retired caches volume is classified, mounted and pinned only while a host still has
     // one; a host without it never gets one (03_caches.md).
-    let classified = [
+    let mut classified = [
         (APFS_STORE_VOLUME, VolumeRole::Store, roots.store(), &store),
         (
             APFS_CACHES_VOLUME,
@@ -2400,7 +2509,17 @@ fn gather_existing_apfs_evidence(
     .filter(|(_, role, _, classified)| {
         *role == VolumeRole::Store || !matches!(classified.storage, ExistingStorage::Absent)
     })
-    .map(|(name, role, mountpoint, classified)| {
+    .map(|(name, role, mountpoint, classified)| (name, role, mountpoint, classified, None))
+    .chain(build_cache.as_ref().map(|(classified, adoption)| {
+        (
+            APFS_BUILD_CACHE_VOLUME,
+            VolumeRole::BuildCache,
+            Path::new(BUILD_CACHE_MOUNTPOINT),
+            classified,
+            adoption.clone(),
+        )
+    }))
+    .map(|(name, role, mountpoint, classified, adoption)| {
         let (container_name, volume_uuid, size_bytes) = match &classified.storage {
             ExistingStorage::FoundElsewhere {
                 container,
@@ -2414,11 +2533,15 @@ fn gather_existing_apfs_evidence(
             ),
             _ => (
                 container.reference.clone(),
-                container
-                    .volumes
-                    .iter()
-                    .find(|volume| volume.name == name)
-                    .map(|volume| volume.volume_uuid.clone()),
+                // By the exact device the classification names: an adopted volume carries
+                // another label until setup relabels it.
+                storage_device(&classified.storage).and_then(|device| {
+                    container
+                        .volumes
+                        .iter()
+                        .find(|volume| volume.identifier == device)
+                        .map(|volume| volume.volume_uuid.clone())
+                }),
                 Some(container.capacity_bytes),
             ),
         };
@@ -2432,9 +2555,22 @@ fn gather_existing_apfs_evidence(
             size_bytes,
             reclaimable_stubs: classified.reclaimable_stubs.clone(),
             file_vault: classified.file_vault,
+            adoption,
         }
     })
     .collect::<Vec<_>>();
+    // Setup and doctor settle each possibly-FileVault volume from its own record, so a volume
+    // only encrypted at rest is planned for encryption rather than refused as a FileVault volume
+    // whose passphrase is missing.
+    if scope == EvidenceScope::Setup {
+        for volume in &mut classified {
+            if volume.file_vault == Some(true)
+                && let Some(device) = storage_device(&volume.storage)
+            {
+                volume.file_vault = Some(source.file_vault(device)?);
+            }
+        }
+    }
     for volume in &classified {
         if volume.file_vault == Some(true) && !source.keychain_item_usable(volume.name)? {
             let uuid = volume.volume_uuid.clone().ok_or_else(|| {
@@ -2460,6 +2596,78 @@ fn gather_existing_apfs_evidence(
         },
         volumes: classified,
     })
+}
+
+/// Classify the build-cache volume: the one labelled `cowshed.build-cache`, or else the role-less
+/// volume the kernel snapshot shows mounted at its mountpoint under another label, which setup
+/// adopts by its identity, relabels and completes in place (01a_apfs.md, "Dedicated build-cache
+/// volume"). Both at once is refused: setup never chooses between two volumes.
+fn classify_build_cache(
+    source: &mut impl EvidenceSource,
+    container: &ApfsContainer,
+) -> Result<(ClassifiedStorage, Option<BuildCacheAdoption>), NativeBootstrapError> {
+    let mountpoint = Path::new(BUILD_CACHE_MOUNTPOINT);
+    let Some(prototype) = container.volumes.iter().find(|volume| {
+        volume.mountpoint.as_deref() == Some(mountpoint) && volume.name != APFS_BUILD_CACHE_VOLUME
+    }) else {
+        let classified = classify_volume(
+            source,
+            container,
+            APFS_BUILD_CACHE_VOLUME,
+            mountpoint,
+            VolumeRole::BuildCache,
+        )?;
+        return Ok((classified, None));
+    };
+    if let Some(labelled) = container
+        .volumes
+        .iter()
+        .find(|volume| volume.name == APFS_BUILD_CACHE_VOLUME)
+    {
+        return Err(NativeBootstrapError::AmbiguousBuildCache {
+            mountpoint: mountpoint.to_owned(),
+            mounted: prototype.identifier.clone(),
+            label: prototype.name.clone(),
+            labelled: labelled.identifier.clone(),
+        });
+    }
+    let MountpointState::Mounted { marker } = source.inspect_mountpoint(mountpoint)? else {
+        return Err(NativeBootstrapError::MountEvidenceMismatch {
+            path: mountpoint.to_owned(),
+            identifier: prototype.identifier.clone(),
+        });
+    };
+    let mounted = source.mounted_volume(mountpoint)?;
+    if mounted.exact_identifier != prototype.identifier || mounted.mountpoint != mountpoint {
+        return Err(NativeBootstrapError::MountEvidenceMismatch {
+            path: mountpoint.to_owned(),
+            identifier: mounted.exact_identifier,
+        });
+    }
+    if let Some(marker) = marker {
+        require_mounted_marker(Some(&marker), VolumeRole::BuildCache, SubstrateKind::Apfs)
+            .map_err(|error| NativeBootstrapError::InvalidMountedMarker {
+                path: mountpoint.to_owned(),
+                message: error.to_string(),
+            })?;
+    }
+    let storage = if mounted.nobrowse {
+        ExistingStorage::mounted_incomplete(&prototype.identifier)
+    } else {
+        ExistingStorage::mis_mounted_incomplete(&prototype.identifier, mountpoint)
+    };
+    Ok((
+        ClassifiedStorage {
+            storage,
+            reclaimable_stubs: Vec::new(),
+            file_vault: Some(reserved_volume_file_vault(prototype)?),
+        },
+        Some(BuildCacheAdoption {
+            exact_identifier: prototype.identifier.clone(),
+            label: prototype.name.clone(),
+            remount: !mounted.nobrowse,
+        }),
+    ))
 }
 
 fn guard_absent_volume_globally(
@@ -2698,20 +2906,43 @@ impl ApfsInventory {
     }
 }
 
+/// The `FileVault` of `diskutil info -plist <identifier>`, attested to describe that exact device.
+fn file_vault_from_info(bytes: &[u8], identifier: &str) -> Result<bool, HostError> {
+    let value = Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| HostError::new(format!("invalid diskutil info plist: {error}")))?;
+    let dictionary = value
+        .as_dictionary()
+        .ok_or_else(|| HostError::new("diskutil info plist root is not a dictionary"))?;
+    let device = dictionary
+        .get("DeviceIdentifier")
+        .and_then(Value::as_string);
+    if device != Some(identifier) {
+        return Err(HostError::new(format!(
+            "diskutil info describes {device:?}, expected {identifier:?}"
+        )));
+    }
+    dictionary
+        .get("FileVault")
+        .and_then(Value::as_boolean)
+        .ok_or_else(|| HostError::new(format!("diskutil info of {identifier} has no FileVault")))
+}
+
 fn malformed(message: impl Into<String>) -> NativeBootstrapError {
     NativeBootstrapError::MalformedApfsInventory(message.into())
 }
 
-/// FileVault of one reserved volume, from its kernel registry record alone.
+/// FileVault of one reserved volume as the kernel registry bounds it: `Encrypted = No` is surely
+/// no FileVault, and `Encrypted = Yes` may be FileVault or only encryption at rest.
 ///
-/// No registry property names a volume's crypto users. `Encrypted` alone is not FileVault: a
-/// volume group's Data volume is encrypted at rest with a hardware-bound key and no user, so it
-/// registers `Encrypted = Yes` while FileVault is off. That keyless encryption exists only for
-/// volume-group roles; a role-less volume is encrypted only by adding a crypto user, which is
-/// what `diskutil apfs encryptVolume -user disk` does at setup. So a role-less volume's
-/// `Encrypted` is its FileVault state. Measured on a FileVault-off host, registry row against
-/// `diskutil info` FileVault: Data (RoleValue 64, Encrypted) No; VM (8, unencrypted) No; Nix
-/// Store, cowshed.store, cowshed.caches (0, Encrypted) Yes.
+/// No registry property names a volume's crypto users, and `Encrypted` alone is not FileVault: a
+/// volume group's Data volume is encrypted at rest with a hardware-bound key and no user, and so
+/// is a role-less volume on a host that encrypts every volume at rest. Measured 2026-10-28 on one
+/// host, registry row against `diskutil info` FileVault: cowshed.store and Nix Store (RoleValue 0,
+/// Encrypted, ScalablePFK) Yes, each with one Disk crypto user; bun-build-cache (0, Encrypted,
+/// ScalablePFK) No, with no crypto user; no registry key differs between them but name, case
+/// sensitivity and counters. So this registry answer is an upper bound: every command's host
+/// storage validation reads it and requires a keychain item for every volume it may name, and
+/// setup and doctor settle it per volume from `diskutil info` ([`file_vault_from_info`]).
 ///
 /// The answer guards [`NativeBootstrapError::MissingVolumeKeychain`]: a FileVault volume with no
 /// System.keychain passphrase can never be remounted at boot. A reserved volume carrying any
@@ -3048,7 +3279,7 @@ where
                         "apfs",
                         "addVolume",
                         container,
-                        "APFS",
+                        apfs_personality(volume.role()),
                         volume.name(),
                         "-nomount",
                     ],
@@ -3082,6 +3313,48 @@ where
                 exact_identifier
             }
             ApfsProvisionKind::RepairMounted { exact_identifier } => exact_identifier.clone(),
+            ApfsProvisionKind::Adopt {
+                exact_identifier,
+                label,
+                remount,
+            } => {
+                // The prototype is attested under the label it has before anything changes it.
+                io.attest_mounted(volume.mountpoint(), exact_identifier, !remount)?;
+                let info =
+                    HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
+                let output = run_privileged_command(session, &info)?;
+                attest_mounted_apfs_info(
+                    &output.stdout,
+                    exact_identifier,
+                    container,
+                    label,
+                    volume.mountpoint(),
+                )?;
+                let rename = HostCommand::new(
+                    DISKUTIL,
+                    ["rename", exact_identifier.as_str(), volume.name()],
+                );
+                run_privileged_command(session, &rename)?;
+                if *remount {
+                    let unmount =
+                        HostCommand::new(DISKUTIL, ["unmount", exact_identifier.as_str()]);
+                    run_privileged_command(session, &unmount)?;
+                    io.prepare_mountpoint(volume.mountpoint())?;
+                    let mountpoint = path_argument(volume.mountpoint())?;
+                    let mount = HostCommand::new(
+                        DISKUTIL,
+                        [
+                            "mount".to_owned(),
+                            "-nobrowse".to_owned(),
+                            "-mountPoint".to_owned(),
+                            mountpoint,
+                            exact_identifier.clone(),
+                        ],
+                    );
+                    run_privileged_command(session, &mount)?;
+                }
+                exact_identifier.clone()
+            }
             ApfsProvisionKind::RecoverDetached { exact_identifier } => {
                 io.prepare_mountpoint(volume.mountpoint())?;
                 let info =
@@ -3171,6 +3444,15 @@ where
     Ok(())
 }
 
+/// The filesystem personality a new volume is created with: the build-cache volume is
+/// case-sensitive because Cargo targets live on it, the store is not (01a_apfs.md).
+fn apfs_personality(role: VolumeRole) -> &'static str {
+    match role {
+        VolumeRole::BuildCache => "APFSX",
+        VolumeRole::Store | VolumeRole::Caches | VolumeRole::Projects => "APFS",
+    }
+}
+
 fn validate_provision_batch(
     container: &str,
     volumes: &[ApfsVolumeProvision],
@@ -3191,6 +3473,7 @@ fn validate_provision_batch(
         let expected_role = match volume.name() {
             APFS_STORE_VOLUME => VolumeRole::Store,
             APFS_CACHES_VOLUME => VolumeRole::Caches,
+            APFS_BUILD_CACHE_VOLUME => VolumeRole::BuildCache,
             name => {
                 return Err(HostError::new(format!(
                     "refusing unexpected APFS volume name {name:?}"
@@ -3209,6 +3492,19 @@ fn validate_provision_batch(
         }
         let exact_identifier = match volume.kind() {
             ApfsProvisionKind::Create => continue,
+            ApfsProvisionKind::Adopt {
+                exact_identifier,
+                label,
+                ..
+            } => {
+                if volume.role() != VolumeRole::BuildCache || label.is_empty() {
+                    return Err(HostError::new(format!(
+                        "refusing to adopt {exact_identifier:?} labelled {label:?} as {:?}",
+                        volume.name()
+                    )));
+                }
+                exact_identifier
+            }
             ApfsProvisionKind::RepairMounted { exact_identifier }
             | ApfsProvisionKind::RecoverDetached { exact_identifier }
             | ApfsProvisionKind::RepairMisMounted {
@@ -3751,7 +4047,33 @@ fn inspect_system_mountpoint(path: &Path) -> Result<MountpointState, HostError> 
 /// crash-loops on exit 5 and no verb can repair it — so an idle daemon socket, the sccache compile
 /// cache (disposable by contract) and directory-only `mnt/` scaffolding are reclaimable. One
 /// foreign entry anywhere keeps the masked verdict.
+///
+/// The build-cache mountpoint is stricter: its volume has other owners, whose trees (a Bun
+/// recipe's ThinLTO and archive caches) a host tool may plant on the bare directory too, so only
+/// Finder's `.DS_Store` is cowshed's to reclaim there (01a_apfs.md, "Dedicated build-cache
+/// volume").
 fn reclaimable_stub_paths(path: &Path) -> Result<Option<Vec<PathBuf>>, HostError> {
+    let policy = if path == Path::new(BUILD_CACHE_MOUNTPOINT) {
+        StubPolicy::SharedVolume
+    } else {
+        StubPolicy::CowshedVolume
+    };
+    reclaimable_stub_paths_in(path, policy)
+}
+
+/// Which bare-mountpoint entries are cowshed's own residue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StubPolicy {
+    /// A volume only cowshed writes: its daemons' and heal's regenerable state is reclaimable.
+    CowshedVolume,
+    /// A volume other host tools keep top-level trees on: none of their entries is a stub.
+    SharedVolume,
+}
+
+fn reclaimable_stub_paths_in(
+    path: &Path,
+    policy: StubPolicy,
+) -> Result<Option<Vec<PathBuf>>, HostError> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(path)
         .map_err(|source| host_io_error("read mountpoint directory", path, source))?
@@ -3765,6 +4087,8 @@ fn reclaimable_stub_paths(path: &Path) -> Result<Option<Vec<PathBuf>>, HostError
             .map_err(|source| host_io_error("inspect mountpoint entry", &entry_path, source))?;
         let safe = if name == ".DS_Store" {
             file_type.is_file()
+        } else if policy == StubPolicy::SharedVolume {
+            false
         } else if name == "sccache.sock" {
             // The daemon rebinds on start; an existing socket file is never load-bearing.
             std::os::unix::fs::FileTypeExt::is_socket(&file_type)
@@ -3892,8 +4216,58 @@ fn owned_directory_current(path: &Path, uid: u32, gid: u32, mode: u32) -> Result
     owned_directory_state(path, &metadata, uid, gid, mode)
 }
 
+/// The group id of `nixbld`, the build users group a Nix install creates, which owns the
+/// build-cache mountpoint's parent. A host without it is refused by name, never given a guess.
+fn nix_build_gid() -> Result<u32, HostError> {
+    let name = CString::new(NIX_BUILD_GROUP).expect("the group name holds no NUL");
+    let mut entry = std::mem::MaybeUninit::<libc::group>::zeroed();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut found = std::ptr::null_mut();
+    // SAFETY: entry and buffer are live writable storage; a successful result points into them.
+    let status = unsafe {
+        libc::getgrnam_r(
+            name.as_ptr(),
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 {
+        return Err(HostError::new(format!(
+            "cannot look up group {NIX_BUILD_GROUP}, which owns {BUILD_CACHE_PARENT}: {}",
+            io::Error::from_raw_os_error(status)
+        )));
+    }
+    if found.is_null() {
+        return Err(HostError::new(format!(
+            "group {NIX_BUILD_GROUP} does not exist; {BUILD_CACHE_PARENT} belongs to the Nix build users group, so install Nix and rerun cowshed setup"
+        )));
+    }
+    // SAFETY: a successful getgrnam_r with a non-null result initialized entry.
+    Ok(unsafe { entry.assume_init() }.gr_gid)
+}
+
+/// The owned directories above `mountpoint`, ancestor first: the build-cache mountpoint needs
+/// its user-owned `shared` parent before the invoker can create it (01a_apfs.md, "Dedicated
+/// build-cache volume"). Each attests before it changes anything, so a current one is a stat.
+fn mountpoint_parent_operations(mountpoint: &Path) -> Result<Vec<HostOperation>, HostError> {
+    let operations = mount_root_operations(
+        unsafe { libc::getuid() },
+        unsafe { libc::getgid() },
+        nix_build_gid()?,
+    );
+    Ok(operations
+        .into_iter()
+        .filter(|operation| {
+            matches!(operation, HostOperation::EnsureOwnedDirectory { path, .. } if mountpoint.starts_with(path) && path != mountpoint)
+        })
+        .collect())
+}
+
 fn attest_mount_root(uid: u32, gid: u32) -> Result<(), HostError> {
-    if !plan_mount_root_directories(uid, gid, owned_directory_current)?.is_empty() {
+    if !plan_mount_root_directories(uid, gid, nix_build_gid()?, owned_directory_current)?.is_empty()
+    {
         return Err(HostError::new(format!(
             "workspace mount root {} is not provisioned with the required ownership and permissions",
             macos_mount_root(uid).display()
@@ -4075,6 +4449,21 @@ fn reclaim_authorized_mountpoint(
     }
 }
 
+/// The build-cache volume's root when this host has it provisioned: mounted at its mountpoint
+/// and carrying its build-cache marker (01a_apfs.md, "Dedicated build-cache volume"). Anything
+/// less proves nothing, and the workspace environment then names no root: a consumer falls back
+/// to its own default rather than a bare directory on Data. `doctor` names what is wrong.
+pub fn provisioned_build_cache() -> Option<PathBuf> {
+    let mountpoint = Path::new(BUILD_CACHE_MOUNTPOINT);
+    if system_statfs(mountpoint).ok()?.mountpoint != mountpoint {
+        return None;
+    }
+    let marker = read_marker_no_follow(mountpoint).ok()??;
+    require_mounted_marker(Some(&marker), VolumeRole::BuildCache, SubstrateKind::Apfs)
+        .ok()
+        .map(|_| mountpoint.to_owned())
+}
+
 fn read_marker_no_follow(root: &Path) -> Result<Option<Vec<u8>>, HostError> {
     let marker = root.join(VOLUME_MARKER_FILE);
     let marker_c = CString::new(marker.as_os_str().as_bytes())
@@ -4144,30 +4533,77 @@ mod tests {
     #[test]
     fn stable_mount_root_plan_has_fixed_ownership_and_is_idempotent() {
         let root = Path::new("/private/var/folders/cowshed/501/mnt");
-        let missing = plan_mount_root_directories(501, 20, |_, _, _, _| Ok(false)).unwrap();
+        let missing = plan_mount_root_directories(501, 20, 30, |_, _, _, _| Ok(false)).unwrap();
         assert_eq!(
             missing.as_slice(),
-            mount_root_operations(501, 20).as_slice()
+            mount_root_operations(501, 20, 30).as_slice()
         );
         assert!(
             matches!(&missing[0], HostOperation::EnsureOwnedDirectory { path, uid: 0, gid: 0, mode: 0o755 } if path == Path::new(MACOS_MOUNT_PREFIX))
         );
         assert!(
-            matches!(&missing[1], HostOperation::EnsureOwnedDirectory { path, uid: 501, gid: 20, mode: 0o700 } if path == root.parent().unwrap())
+            matches!(&missing[1], HostOperation::EnsureOwnedDirectory { path, uid: 501, gid: 30, mode: 0o750 } if path == Path::new(BUILD_CACHE_PARENT) && Path::new(BUILD_CACHE_MOUNTPOINT).parent() == Some(path.as_path()) && path.parent() == Some(Path::new(MACOS_MOUNT_PREFIX)))
         );
         assert!(
-            matches!(&missing[2], HostOperation::EnsureOwnedDirectory { path, uid: 501, gid: 20, mode: 0o700 } if path == root)
+            matches!(&missing[2], HostOperation::EnsureOwnedDirectory { path, uid: 501, gid: 20, mode: 0o700 } if path == root.parent().unwrap())
         );
         assert!(
-            plan_mount_root_directories(501, 20, |_, _, _, _| Ok(true))
+            matches!(&missing[3], HostOperation::EnsureOwnedDirectory { path, uid: 501, gid: 20, mode: 0o700 } if path == root)
+        );
+        assert!(
+            plan_mount_root_directories(501, 20, 30, |_, _, _, _| Ok(true))
                 .unwrap()
                 .is_empty()
         );
-        let repair = plan_mount_root_directories(501, 20, |path, _, _, _| {
+        let repair = plan_mount_root_directories(501, 20, 30, |path, _, _, _| {
             Ok(path == Path::new(MACOS_MOUNT_PREFIX))
         })
         .unwrap();
-        assert_eq!(repair.as_slice(), &mount_root_operations(501, 20)[1..]);
+        assert_eq!(repair.as_slice(), &mount_root_operations(501, 20, 30)[1..]);
+    }
+
+    /// Repair reaches only below what needs it: the build-cache parent is a sibling of the
+    /// user's mount root, so its mode drift plans it alone, and a drifted prefix plans all four.
+    #[test]
+    fn a_drifted_shared_parent_plans_only_itself() {
+        let shared_only = plan_mount_root_directories(501, 20, 30, |path, _, _, _| {
+            Ok(path != Path::new(BUILD_CACHE_PARENT))
+        })
+        .unwrap();
+        assert_eq!(
+            shared_only.as_slice(),
+            &mount_root_operations(501, 20, 30)[1..2]
+        );
+        let prefix = plan_mount_root_directories(501, 20, 30, |path, _, _, _| {
+            Ok(path != Path::new(MACOS_MOUNT_PREFIX))
+        })
+        .unwrap();
+        assert_eq!(
+            prefix.as_slice(),
+            mount_root_operations(501, 20, 30).as_slice()
+        );
+    }
+
+    /// A foreign `shared` parent refuses the plan before anything runs (01a_apfs.md).
+    #[test]
+    fn a_foreign_shared_parent_refuses_the_plan() {
+        let error = plan_mount_root_directories(501, 20, 30, |path, uid, gid, mode| {
+            if path == Path::new(BUILD_CACHE_PARENT) {
+                owned_directory_state(
+                    path,
+                    &directory_metadata(libc::S_IFDIR | 0o750, 502, 30),
+                    uid,
+                    gid,
+                    mode,
+                )
+            } else {
+                Ok(true)
+            }
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("foreign"), "{error}");
+        assert!(error.to_string().contains(BUILD_CACHE_PARENT), "{error}");
+        assert!(error.to_string().contains("expected 501:30"), "{error}");
     }
 
     #[test]
@@ -4251,14 +4687,16 @@ mod tests {
         assert!(snapshot.actions.is_empty());
         let root = macos_mount_root(501);
         let mut already_current = snapshot.clone();
-        add_canonical_mount_root_action(&mut already_current, false, 501, 20, |_, _, _, _| {
+        add_canonical_mount_root_action(&mut already_current, false, 501, 20, 30, |_, _, _, _| {
             Ok(true)
         })
         .unwrap();
         assert!(already_current.actions.is_empty());
         assert!(!setup_requires_authorization(&already_current));
-        add_canonical_mount_root_action(&mut already_current, true, 501, 20, |_, _, _, _| Ok(true))
-            .unwrap();
+        add_canonical_mount_root_action(&mut already_current, true, 501, 20, 30, |_, _, _, _| {
+            Ok(true)
+        })
+        .unwrap();
         assert!(matches!(
             already_current.actions.as_slice(),
             [HostAction::EnsureMountRoot { .. }]
@@ -4267,7 +4705,7 @@ mod tests {
             !setup_requires_authorization(&already_current),
             "recording an already-correct root needs no approval"
         );
-        add_canonical_mount_root_action(&mut snapshot, false, 501, 20, |_, _, _, _| Ok(false))
+        add_canonical_mount_root_action(&mut snapshot, false, 501, 20, 30, |_, _, _, _| Ok(false))
             .unwrap();
         assert_eq!(
             snapshot.actions,
@@ -4443,9 +4881,10 @@ mod tests {
                 Ok(HostCommandOutput::success(Vec::new())),
                 Ok(HostCommandOutput::success(Vec::new())),
                 Ok(HostCommandOutput::success(Vec::new())),
+                Ok(HostCommandOutput::success(Vec::new())),
             ]),
         };
-        for operation in mount_root_operations(501, 20) {
+        for operation in mount_root_operations(501, 20, 30) {
             let HostOperation::EnsureOwnedDirectory {
                 path,
                 uid,
@@ -4471,7 +4910,7 @@ mod tests {
             assert_eq!(reads, 2);
         }
         let commands = events.borrow();
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), 4);
         for event in commands.iter() {
             let ProvisionEvent::Command { program, args } = event else {
                 panic!("directory command");
@@ -4494,8 +4933,559 @@ mod tests {
         .unwrap();
         assert_eq!(
             events.borrow().len(),
-            3,
+            4,
             "correct directories execute no commands"
+        );
+    }
+
+    /// The healthy host with `build_cache` in the build-cache volume's place: the canonical
+    /// mountpoint's state and, when one is mounted there, the kernel's mount evidence.
+    fn source_with_build_cache(
+        build_cache: Option<VolumeFixture>,
+        mountpoint: MountpointState,
+        mounted: Option<MountedVolumeEvidence>,
+    ) -> FakeEvidenceSource {
+        let mut source = healthy_existing_source();
+        source.kernel = Ok(container(
+            "disk3",
+            [
+                volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+                volume(APFS_STORE_VOLUME, "disk3s8", Some("/private/cowshed/store")),
+                volume(
+                    APFS_CACHES_VOLUME,
+                    "disk3s9",
+                    Some("/private/cowshed/caches"),
+                ),
+            ]
+            .into_iter()
+            .chain(build_cache),
+        ));
+        source
+            .mountpoints
+            .insert(PathBuf::from(BUILD_CACHE_MOUNTPOINT), mountpoint);
+        source
+            .mounted_volumes
+            .remove(Path::new(BUILD_CACHE_MOUNTPOINT));
+        if let Some(mounted) = mounted {
+            source
+                .mounted_volumes
+                .insert(mounted.mountpoint.clone(), mounted);
+        }
+        source
+    }
+
+    fn mounted_at(identifier: &str, mountpoint: &str, nobrowse: bool) -> MountedVolumeEvidence {
+        MountedVolumeEvidence {
+            exact_identifier: identifier.to_owned(),
+            mountpoint: PathBuf::from(mountpoint),
+            nobrowse,
+            uid: 501,
+            gid: 20,
+        }
+    }
+
+    fn build_cache_setup(source: &mut FakeEvidenceSource) -> SetupSnapshot {
+        prepare_setup_snapshot(source, Path::new("/Users/alice"), "", CachesVolume::Keep)
+            .expect("build-cache setup evidence")
+    }
+
+    fn build_cache_outcome(snapshot: &SetupSnapshot) -> &VolumeOutcome {
+        snapshot
+            .volumes
+            .iter()
+            .find(|volume| volume.role == VolumeRole::BuildCache)
+            .expect("setup reports the build-cache volume")
+    }
+
+    fn build_cache_provisions(snapshot: &SetupSnapshot) -> Vec<&ApfsVolumeProvision> {
+        snapshot
+            .plan
+            .operations()
+            .iter()
+            .filter_map(|operation| match operation {
+                HostOperation::ProvisionApfsVolumes { container, volumes } => {
+                    assert_eq!(container, "disk3", "the store's container");
+                    Some(volumes)
+                }
+                _ => None,
+            })
+            .flatten()
+            .filter(|volume| volume.role() == VolumeRole::BuildCache)
+            .collect()
+    }
+
+    #[test]
+    fn an_absent_build_cache_is_created_case_sensitive_beside_the_store() {
+        let mut source = source_with_build_cache(None, MountpointState::Missing, None);
+        let snapshot = build_cache_setup(&mut source);
+        assert!(snapshot.actions.contains(&HostAction::CreateVolume {
+            name: APFS_BUILD_CACHE_VOLUME.to_owned(),
+            container: "disk3".to_owned(),
+            mount_at: PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+        }));
+        assert!(matches!(
+            build_cache_provisions(&snapshot).as_slice(),
+            [volume] if volume.name() == APFS_BUILD_CACHE_VOLUME
+                && volume.mountpoint() == Path::new(BUILD_CACHE_MOUNTPOINT)
+                && *volume.kind() == ApfsProvisionKind::Create
+        ));
+        let outcome = build_cache_outcome(&snapshot);
+        assert_eq!(outcome.name, APFS_BUILD_CACHE_VOLUME);
+        assert_eq!(outcome.state_before, VolumeState::Absent);
+        assert_eq!(outcome.action, "created");
+        assert!(
+            matches!(snapshot.fstab, PlannedFstab::Deferred(_)),
+            "its UUID exists only after the create"
+        );
+        assert_eq!(apfs_personality(VolumeRole::BuildCache), "APFSX");
+        assert_eq!(apfs_personality(VolumeRole::Store), "APFS");
+    }
+
+    #[test]
+    fn a_labelled_build_cache_mounted_with_its_marker_needs_nothing_and_is_pinned() {
+        let mut source = healthy_existing_source();
+        let snapshot = build_cache_setup(&mut source);
+        assert!(build_cache_provisions(&snapshot).is_empty());
+        assert!(
+            !snapshot
+                .actions
+                .iter()
+                .any(|action| action_volume_name(action) == Some(APFS_BUILD_CACHE_VOLUME))
+        );
+        let outcome = build_cache_outcome(&snapshot);
+        assert_eq!(outcome.state_before, VolumeState::MountedValid);
+        assert_eq!(outcome.action, "already-current");
+        let PlannedFstab::NeedsPin(pins) = &snapshot.fstab else {
+            panic!("pin plan: {:?}", snapshot.fstab);
+        };
+        assert!(pins.contains(&FstabPin {
+            volume_uuid: volume_uuid("disk3s10"),
+            mountpoint: PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+            label: APFS_BUILD_CACHE_VOLUME.to_owned(),
+        }));
+    }
+
+    #[test]
+    fn a_prototype_at_the_build_cache_mountpoint_is_adopted_by_identity_never_recreated() {
+        for (nobrowse, state) in [
+            (true, VolumeState::MountedIncomplete),
+            (
+                false,
+                VolumeState::MisMounted {
+                    mounted_at: PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+                },
+            ),
+        ] {
+            let mut source = source_with_build_cache(
+                Some(volume_with_filevault(
+                    "bun-build-cache",
+                    "disk3s11",
+                    Some(BUILD_CACHE_MOUNTPOINT),
+                    false,
+                )),
+                MountpointState::Mounted { marker: None },
+                Some(mounted_at("disk3s11", BUILD_CACHE_MOUNTPOINT, nobrowse)),
+            );
+            let snapshot = build_cache_setup(&mut source);
+            assert!(
+                matches!(
+                    build_cache_provisions(&snapshot).as_slice(),
+                    [volume] if *volume.kind() == ApfsProvisionKind::Adopt {
+                        exact_identifier: "disk3s11".to_owned(),
+                        label: "bun-build-cache".to_owned(),
+                        remount: !nobrowse,
+                    }
+                ),
+                "{:?}",
+                snapshot.plan.operations()
+            );
+            let outcome = build_cache_outcome(&snapshot);
+            assert_eq!(outcome.state_before, state);
+            assert_eq!(outcome.action, "adopted");
+            let uuid = volume_uuid("disk3s11");
+            assert!(snapshot.actions.contains(&HostAction::EncryptVolume {
+                name: APFS_BUILD_CACHE_VOLUME.to_owned(),
+                uuid: uuid.clone(),
+                size_bytes: 1_000_000_000_000,
+            }));
+            assert!(!snapshot.actions.iter().any(|action| matches!(
+                action,
+                HostAction::CreateVolume { .. } | HostAction::DeleteVolume { .. }
+            )));
+            let PlannedFstab::NeedsPin(pins) = &snapshot.fstab else {
+                panic!("pin plan: {:?}", snapshot.fstab);
+            };
+            assert!(pins.contains(&FstabPin {
+                volume_uuid: uuid,
+                mountpoint: PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+                label: APFS_BUILD_CACHE_VOLUME.to_owned(),
+            }));
+        }
+    }
+
+    #[test]
+    fn a_prototype_beside_a_labelled_build_cache_is_refused() {
+        let mut source = source_with_build_cache(
+            Some(volume(
+                "bun-build-cache",
+                "disk3s11",
+                Some(BUILD_CACHE_MOUNTPOINT),
+            )),
+            MountpointState::Mounted { marker: None },
+            Some(mounted_at("disk3s11", BUILD_CACHE_MOUNTPOINT, true)),
+        );
+        let Ok(kernel) = &mut source.kernel else {
+            unreachable!()
+        };
+        let labelled = volume(APFS_BUILD_CACHE_VOLUME, "disk3s12", None);
+        kernel.containers[0].volumes.push(labelled.record);
+        let error = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NativeBootstrapError::AmbiguousBuildCache { mounted, label, labelled, .. }
+                    if mounted == "disk3s11" && label == "bun-build-cache" && labelled == "disk3s12"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_mis_mounted_build_cache_is_remounted_at_its_mountpoint() {
+        let browsable = "/Volumes/cowshed.build-cache";
+        let mut source = source_with_build_cache(
+            Some(volume(APFS_BUILD_CACHE_VOLUME, "disk3s10", Some(browsable))),
+            MountpointState::Missing,
+            Some(mounted_at("disk3s10", browsable, false)),
+        );
+        let snapshot = build_cache_setup(&mut source);
+        assert_eq!(
+            build_cache_outcome(&snapshot).state_before,
+            VolumeState::MisMounted {
+                mounted_at: PathBuf::from(browsable)
+            }
+        );
+        assert!(snapshot.actions.contains(&HostAction::RepairMounted {
+            name: APFS_BUILD_CACHE_VOLUME.to_owned(),
+            uuid: volume_uuid("disk3s10"),
+            size_bytes: 1_000_000_000_000,
+            mounted_at: PathBuf::from(browsable),
+            mount_at: PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+        }));
+    }
+
+    #[test]
+    fn an_unencrypted_build_cache_is_encrypted_in_place() {
+        let mut source = source_with_build_cache(
+            Some(volume_with_filevault(
+                APFS_BUILD_CACHE_VOLUME,
+                "disk3s10",
+                Some(BUILD_CACHE_MOUNTPOINT),
+                false,
+            )),
+            MountpointState::Mounted {
+                marker: Some(
+                    VolumeMarker::new(VolumeRole::BuildCache, SubstrateKind::Apfs)
+                        .to_json()
+                        .unwrap(),
+                ),
+            },
+            Some(mounted_at("disk3s10", BUILD_CACHE_MOUNTPOINT, true)),
+        );
+        let snapshot = build_cache_setup(&mut source);
+        assert!(snapshot.actions.contains(&HostAction::EncryptVolume {
+            name: APFS_BUILD_CACHE_VOLUME.to_owned(),
+            uuid: volume_uuid("disk3s10"),
+            size_bytes: 1_000_000_000_000,
+        }));
+        assert!(build_cache_provisions(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn a_masked_build_cache_mountpoint_refuses_setup_naming_it() {
+        let mut source =
+            source_with_build_cache(None, MountpointState::NonEmptyDirectoryWithoutMount, None);
+        let error = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, NativeBootstrapError::MaskedMountpoint { path } if path == Path::new(BUILD_CACHE_MOUNTPOINT)),
+            "{error}"
+        );
+    }
+
+    /// A command that does not touch Cargo through mbx never consults the volume: the store's
+    /// evidence reads succeed with no build-cache evidence at all, and setup's read needs it.
+    #[test]
+    fn only_setup_and_doctor_read_the_build_cache_volume() {
+        let mut source = healthy_existing_source();
+        source.mountpoints.remove(Path::new(BUILD_CACHE_MOUNTPOINT));
+        let gathered = gather_existing_apfs_evidence(
+            EvidenceScope::HostStorage,
+            &mut source,
+            Path::new("/Users/alice"),
+        )
+        .expect("host storage needs no build-cache evidence");
+        assert!(
+            gathered
+                .volumes
+                .iter()
+                .all(|volume| volume.role != VolumeRole::BuildCache)
+        );
+        let mut source = healthy_existing_source();
+        source.mountpoints.remove(Path::new(BUILD_CACHE_MOUNTPOINT));
+        let error = gather_existing_apfs_evidence(
+            EvidenceScope::Setup,
+            &mut source,
+            Path::new("/Users/alice"),
+        )
+        .err()
+        .expect("setup inspects the build-cache mountpoint");
+        assert!(
+            matches!(&error, NativeBootstrapError::MountEvidenceMismatch { path, .. } if path == Path::new(BUILD_CACHE_MOUNTPOINT)),
+            "{error}"
+        );
+    }
+
+    /// A volume encrypted only at rest registers `Encrypted` like a FileVault one; setup reads its
+    /// own record, plans the in-place encryption and needs no passphrase yet, while every other
+    /// command's validation still treats the registry answer as an upper bound.
+    #[test]
+    fn a_volume_encrypted_only_at_rest_is_planned_for_filevault_not_refused() {
+        let mut source = healthy_existing_source();
+        source.file_vault.insert("disk3s10".to_owned(), false);
+        source.keychain_items.insert(APFS_BUILD_CACHE_VOLUME, false);
+        let snapshot = build_cache_setup(&mut source);
+        assert!(snapshot.actions.contains(&HostAction::EncryptVolume {
+            name: APFS_BUILD_CACHE_VOLUME.to_owned(),
+            uuid: volume_uuid("disk3s10"),
+            size_bytes: 1_000_000_000_000,
+        }));
+        let mut source = healthy_existing_source();
+        source.file_vault.insert("disk3s8".to_owned(), false);
+        source.keychain_items.insert(APFS_STORE_VOLUME, false);
+        let error = gather_existing_apfs_evidence(
+            EvidenceScope::HostStorage,
+            &mut source,
+            Path::new("/Users/alice"),
+        )
+        .err()
+        .expect("the registry's upper bound needs the passphrase");
+        assert!(
+            matches!(&error, NativeBootstrapError::MissingVolumeKeychain { name, .. } if *name == APFS_STORE_VOLUME),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn file_vault_comes_from_the_exact_device_info() {
+        let info = |device: &str, file_vault: &str| {
+            format!(
+                "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+                 <key>DeviceIdentifier</key><string>{device}</string>\
+                 <key>Encryption</key><true/><key>FileVault</key><{file_vault}/>\
+                 </dict></plist>"
+            )
+            .into_bytes()
+        };
+        assert!(!file_vault_from_info(&info("disk3s9", "false"), "disk3s9").unwrap());
+        assert!(file_vault_from_info(&info("disk3s8", "true"), "disk3s8").unwrap());
+        assert!(file_vault_from_info(&info("disk3s8", "true"), "disk3s9").is_err());
+        assert!(file_vault_from_info(b"not a plist", "disk3s9").is_err());
+    }
+
+    /// Another owner's top-level tree on the bare build-cache mountpoint keeps it masked; only
+    /// Finder's `.DS_Store` is reclaimable there. The store's policy is unchanged.
+    #[test]
+    fn foreign_entries_on_a_bare_build_cache_mountpoint_are_never_reclaimed() {
+        let scratch = std::env::temp_dir().join(format!("cowshed-bc-stubs-{}", Uuid::new_v4()));
+        fs::create_dir_all(scratch.join("thinlto")).unwrap();
+        fs::write(scratch.join(".DS_Store"), b"").unwrap();
+        assert_eq!(
+            reclaimable_stub_paths_in(&scratch, StubPolicy::SharedVolume).unwrap(),
+            None
+        );
+        assert_eq!(
+            reclaimable_stub_paths_in(&scratch, StubPolicy::CowshedVolume).unwrap(),
+            Some(vec![scratch.join(".DS_Store"), scratch.join("thinlto")])
+        );
+        fs::remove_dir(scratch.join("thinlto")).unwrap();
+        fs::create_dir_all(scratch.join("mnt/a")).unwrap();
+        assert_eq!(
+            reclaimable_stub_paths_in(&scratch, StubPolicy::SharedVolume).unwrap(),
+            None,
+            "cowshed's own scaffolding name is no stub on a shared volume either"
+        );
+        fs::remove_dir_all(scratch.join("mnt")).unwrap();
+        assert_eq!(
+            reclaimable_stub_paths_in(&scratch, StubPolicy::SharedVolume).unwrap(),
+            Some(vec![scratch.join(".DS_Store")])
+        );
+        fs::remove_dir_all(scratch).unwrap();
+    }
+
+    fn provision_events(
+        volume: ApfsVolumeProvision,
+        outputs: Vec<HostCommandOutput>,
+        kernel: KernelRead,
+    ) -> Vec<ProvisionEvent> {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outputs = outputs.into_iter().map(Ok).collect::<VecDeque<_>>();
+        let acquire_events = Rc::clone(&events);
+        provision_apfs_volumes_with(
+            "disk3",
+            &[volume],
+            501,
+            20,
+            move || {
+                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                Ok(FakePrivilegedSession {
+                    events: Rc::clone(&acquire_events),
+                    outputs,
+                })
+            },
+            &FakeProvisionIo {
+                events: Rc::clone(&events),
+                kernel,
+            },
+        )
+        .unwrap();
+        Rc::try_unwrap(events).unwrap().into_inner()
+    }
+
+    fn commands(events: &[ProvisionEvent]) -> Vec<Vec<String>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ProvisionEvent::Command { program, args } => Some(
+                    std::iter::once(program.clone())
+                        .chain(args.iter().cloned())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_adopted_prototype_is_attested_under_its_label_then_relabelled_in_the_session() {
+        let info = |name: &str| {
+            HostCommandOutput::success(provision_info(
+                "disk3s11",
+                "disk3",
+                name,
+                BUILD_CACHE_MOUNTPOINT,
+            ))
+        };
+        for remount in [false, true] {
+            let mut outputs = vec![info("bun-build-cache"), HostCommandOutput::default()];
+            if remount {
+                outputs.extend([HostCommandOutput::default(), HostCommandOutput::default()]);
+            }
+            outputs.extend([info(APFS_BUILD_CACHE_VOLUME), HostCommandOutput::default()]);
+            let events = provision_events(
+                ApfsVolumeProvision {
+                    name: APFS_BUILD_CACHE_VOLUME,
+                    mountpoint: PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+                    role: VolumeRole::BuildCache,
+                    kind: ApfsProvisionKind::Adopt {
+                        exact_identifier: "disk3s11".to_owned(),
+                        label: "bun-build-cache".to_owned(),
+                        remount,
+                    },
+                },
+                outputs,
+                KernelRead::Forbidden,
+            );
+            let info = vec![DISKUTIL, "info", "-plist", "disk3s11"];
+            let rename = vec![DISKUTIL, "rename", "disk3s11", APFS_BUILD_CACHE_VOLUME];
+            let chown = vec![CHOWN, "501:20", BUILD_CACHE_MOUNTPOINT];
+            let mut expected = vec![info.clone(), rename];
+            if remount {
+                expected.push(vec![DISKUTIL, "unmount", "disk3s11"]);
+                expected.push(vec![
+                    DISKUTIL,
+                    "mount",
+                    "-nobrowse",
+                    "-mountPoint",
+                    BUILD_CACHE_MOUNTPOINT,
+                    "disk3s11",
+                ]);
+            }
+            expected.extend([info, chown]);
+            assert_eq!(commands(&events), expected);
+            assert!(matches!(
+                events.get(1),
+                Some(ProvisionEvent::AttestMounted(path, identifier, nobrowse))
+                    if path == Path::new(BUILD_CACHE_MOUNTPOINT) && identifier == "disk3s11" && *nobrowse == !remount
+            ));
+            let marker = VolumeMarker::new(VolumeRole::BuildCache, SubstrateKind::Apfs)
+                .to_json()
+                .unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ProvisionEvent::Marker(path, bytes)
+                    if path == &Path::new(BUILD_CACHE_MOUNTPOINT).join(VOLUME_MARKER_FILE) && *bytes == marker
+            )));
+        }
+    }
+
+    #[test]
+    fn the_build_cache_volume_is_created_case_sensitive() {
+        let events = provision_events(
+            ApfsVolumeProvision {
+                name: APFS_BUILD_CACHE_VOLUME,
+                mountpoint: PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+                role: VolumeRole::BuildCache,
+                kind: ApfsProvisionKind::Create,
+            },
+            vec![
+                HostCommandOutput::success(b"Created new APFS Volume disk3s10\n".to_vec()),
+                HostCommandOutput::success(provision_info(
+                    "disk3s10",
+                    "disk3",
+                    APFS_BUILD_CACHE_VOLUME,
+                    "",
+                )),
+                HostCommandOutput::default(),
+                HostCommandOutput::success(provision_info(
+                    "disk3s10",
+                    "disk3",
+                    APFS_BUILD_CACHE_VOLUME,
+                    BUILD_CACHE_MOUNTPOINT,
+                )),
+                HostCommandOutput::default(),
+            ],
+            KernelRead::Snapshot(container(
+                "disk3",
+                [volume("Data", "disk3s5", Some("/System/Volumes/Data"))],
+            )),
+        );
+        assert_eq!(
+            commands(&events).first().map(Vec::as_slice),
+            Some(
+                [
+                    DISKUTIL,
+                    "apfs",
+                    "addVolume",
+                    "disk3",
+                    "APFSX",
+                    APFS_BUILD_CACHE_VOLUME,
+                    "-nomount"
+                ]
+                .map(str::to_owned)
+                .as_slice()
+            )
         );
     }
 
@@ -5002,6 +5992,8 @@ mod tests {
         mounted_volumes: BTreeMap<PathBuf, MountedVolumeEvidence>,
         keychain_items: BTreeMap<&'static str, bool>,
         caches_hold_only_marker: bool,
+        /// `diskutil info`'s FileVault by device; a device absent here answers as its registry.
+        file_vault: BTreeMap<String, bool>,
         invoking_identity: (u32, u32),
     }
 
@@ -5056,6 +6048,10 @@ mod tests {
             Ok(self.keychain_items.get(label).copied().unwrap_or(false))
         }
 
+        fn file_vault(&mut self, identifier: &str) -> Result<bool, NativeBootstrapError> {
+            Ok(self.file_vault.get(identifier).copied().unwrap_or(true))
+        }
+
         fn holds_only_marker(&mut self, _: &Path) -> Result<bool, NativeBootstrapError> {
             Ok(self.caches_hold_only_marker)
         }
@@ -5086,6 +6082,16 @@ mod tests {
                     PathBuf::from("/private/cowshed/caches"),
                     MountpointState::Missing,
                 ),
+                (
+                    PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+                    MountpointState::Mounted {
+                        marker: Some(
+                            VolumeMarker::new(VolumeRole::BuildCache, SubstrateKind::Apfs)
+                                .to_json()
+                                .expect("build-cache marker"),
+                        ),
+                    },
+                ),
             ]),
             mounted_volumes: BTreeMap::from([
                 (
@@ -5108,9 +6114,24 @@ mod tests {
                         gid: 20,
                     },
                 ),
+                (
+                    PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+                    MountedVolumeEvidence {
+                        exact_identifier: "disk3s10".to_owned(),
+                        mountpoint: PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+                        nobrowse: true,
+                        uid: 501,
+                        gid: 20,
+                    },
+                ),
             ]),
-            keychain_items: BTreeMap::from([(APFS_STORE_VOLUME, true), (APFS_CACHES_VOLUME, true)]),
+            keychain_items: BTreeMap::from([
+                (APFS_STORE_VOLUME, true),
+                (APFS_CACHES_VOLUME, true),
+                (APFS_BUILD_CACHE_VOLUME, true),
+            ]),
             caches_hold_only_marker: true,
+            file_vault: BTreeMap::new(),
             invoking_identity: (501, 20),
         }
     }
@@ -5126,8 +6147,23 @@ mod tests {
                     "disk3s9",
                     Some("/private/cowshed/caches"),
                 ),
+                volume(
+                    APFS_BUILD_CACHE_VOLUME,
+                    "disk3s10",
+                    Some(BUILD_CACHE_MOUNTPOINT),
+                ),
             ],
         ));
+        source.mountpoints.insert(
+            PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+            MountpointState::Mounted {
+                marker: Some(
+                    VolumeMarker::new(VolumeRole::BuildCache, SubstrateKind::Apfs)
+                        .to_json()
+                        .expect("build-cache marker"),
+                ),
+            },
+        );
         source.mountpoints.insert(
             PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted {
@@ -5161,6 +6197,11 @@ mod tests {
                 volume("Data", "disk3s5", Some("/System/Volumes/Data")),
                 volume(APFS_STORE_VOLUME, "disk3s8", Some("/private/cowshed/store")),
                 volume(APFS_CACHES_VOLUME, "disk3s9", kernel_mount),
+                volume(
+                    APFS_BUILD_CACHE_VOLUME,
+                    "disk3s10",
+                    Some(BUILD_CACHE_MOUNTPOINT),
+                ),
             ],
         ));
         source.mountpoints.insert(
@@ -5208,6 +6249,8 @@ mod tests {
                 VolumeRole::Store
             } else if path == Path::new("/private/cowshed/caches") {
                 VolumeRole::Caches
+            } else if path == Path::new(BUILD_CACHE_MOUNTPOINT) {
+                VolumeRole::BuildCache
             } else {
                 return Err(HostError::new(format!(
                     "unexpected mountpoint inspection: {}",
@@ -6032,6 +7075,11 @@ mod tests {
                 volume("Data", "disk3s5", Some("/System/Volumes/Data")),
                 volume(APFS_STORE_VOLUME, "disk3s8", None),
                 volume(APFS_CACHES_VOLUME, "disk3s9", None),
+                volume(
+                    APFS_BUILD_CACHE_VOLUME,
+                    "disk3s10",
+                    Some(BUILD_CACHE_MOUNTPOINT),
+                ),
             ],
         ));
         source.mountpoints.insert(
@@ -6987,9 +8035,12 @@ mod tests {
     #[tokio::test]
     async fn validator_reports_mis_mounted_volume_without_executing_remount() {
         let mut evidence_source = source_with_caches_kernel_mount(Some("/Volumes/cowshed.caches"));
-        let gathered =
-            gather_existing_apfs_evidence(&mut evidence_source, Path::new("/Users/alice"))
-                .expect("mis-mounted caches evidence");
+        let gathered = gather_existing_apfs_evidence(
+            EvidenceScope::HostStorage,
+            &mut evidence_source,
+            Path::new("/Users/alice"),
+        )
+        .expect("mis-mounted caches evidence");
         assert!(matches!(
             gathered.bootstrap,
             BootstrapEvidence::Apfs {
@@ -7019,9 +8070,12 @@ mod tests {
     #[test]
     fn kernel_unmounted_volume_requires_recovery() {
         let mut evidence_source = source_with_caches_kernel_mount(None);
-        let gathered =
-            gather_existing_apfs_evidence(&mut evidence_source, Path::new("/Users/alice"))
-                .expect("detached caches evidence");
+        let gathered = gather_existing_apfs_evidence(
+            EvidenceScope::HostStorage,
+            &mut evidence_source,
+            Path::new("/Users/alice"),
+        )
+        .expect("detached caches evidence");
         assert!(matches!(
             gathered.bootstrap,
             BootstrapEvidence::Apfs {
@@ -7064,8 +8118,12 @@ mod tests {
                 )],
             ),
         ]));
-        let gathered = gather_existing_apfs_evidence(&mut evidence, Path::new("/Users/alice"))
-            .expect("a foreign reserved volume is classified, never created over");
+        let gathered = gather_existing_apfs_evidence(
+            EvidenceScope::HostStorage,
+            &mut evidence,
+            Path::new("/Users/alice"),
+        )
+        .expect("a foreign reserved volume is classified, never created over");
         assert!(matches!(
             gathered.bootstrap,
             BootstrapEvidence::Apfs {
@@ -7080,7 +8138,14 @@ mod tests {
         let mut source = source(kernel([
             container(
                 "disk3",
-                [volume("Data", "disk3s5", Some("/System/Volumes/Data"))],
+                [
+                    volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+                    volume(
+                        APFS_BUILD_CACHE_VOLUME,
+                        "disk3s10",
+                        Some(BUILD_CACHE_MOUNTPOINT),
+                    ),
+                ],
             ),
             container(
                 "disk7",
@@ -7190,7 +8255,8 @@ mod tests {
         ));
         assert!(matches!(
             snapshot.volumes.as_slice(),
-            [volume] if volume.name == APFS_STORE_VOLUME && volume.role == VolumeRole::Store
+            [store, build_cache] if store.name == APFS_STORE_VOLUME && store.role == VolumeRole::Store
+                && build_cache.role == VolumeRole::BuildCache
         ));
         assert!(
             snapshot
@@ -7200,7 +8266,7 @@ mod tests {
         );
         assert!(matches!(
             snapshot.classified.as_slice(),
-            [volume] if volume.name == APFS_STORE_VOLUME
+            [volume, _] if volume.name == APFS_STORE_VOLUME
                 && volume.volume_uuid == Some(volume_uuid("disk3s8"))
                 && volume.mountpoint == Path::new("/private/cowshed/store")
         ));
@@ -7208,20 +8274,27 @@ mod tests {
             snapshot
                 .classified
                 .iter()
-                .all(|volume| volume.role == VolumeRole::Store)
+                .all(|volume| volume.role != VolumeRole::Caches)
         );
         let PlannedFstab::NeedsPin(pins) = &snapshot.fstab else {
             panic!("{:?}", snapshot.fstab);
         };
         assert_eq!(
             pins.as_slice(),
-            &[FstabPin {
-                volume_uuid: volume_uuid("disk3s8"),
-                mountpoint: PathBuf::from("/private/cowshed/store"),
-                label: APFS_STORE_VOLUME.to_owned(),
-            }]
+            &[
+                FstabPin {
+                    volume_uuid: volume_uuid("disk3s8"),
+                    mountpoint: PathBuf::from("/private/cowshed/store"),
+                    label: APFS_STORE_VOLUME.to_owned(),
+                },
+                FstabPin {
+                    volume_uuid: volume_uuid("disk3s10"),
+                    mountpoint: PathBuf::from(BUILD_CACHE_MOUNTPOINT),
+                    label: APFS_BUILD_CACHE_VOLUME.to_owned(),
+                },
+            ]
         );
-        assert!(pins.iter().all(|pin| pin.label == APFS_STORE_VOLUME));
+        assert!(pins.iter().all(|pin| pin.label != APFS_CACHES_VOLUME));
         assert!(setup_requires_authorization(&snapshot));
         let public_plan = HostSetupPlan::new(
             snapshot.actions.clone(),
@@ -7272,9 +8345,10 @@ mod tests {
         assert!(snapshot.plan.operations().iter().any(|operation| matches!(
             operation,
             HostOperation::PinVolumesInFstab { pins }
-                if pins.len() == 2
+                if pins.len() == 3
                     && pins.iter().any(|pin| pin.volume_uuid == volume_uuid("disk3s8"))
                     && pins.iter().any(|pin| pin.volume_uuid == volume_uuid("disk3s9"))
+                    && pins.iter().any(|pin| pin.volume_uuid == volume_uuid("disk3s10"))
         )));
         assert!(setup_requires_authorization(&snapshot));
         assert_eq!(
@@ -7287,6 +8361,10 @@ mod tests {
                 HostAction::PinFstab {
                     uuid: volume_uuid("disk3s9"),
                     mount_at: PathBuf::from("/private/cowshed/caches"),
+                },
+                HostAction::PinFstab {
+                    uuid: volume_uuid("disk3s10"),
+                    mount_at: PathBuf::from(BUILD_CACHE_MOUNTPOINT),
                 },
             ]
         );
@@ -7357,7 +8435,7 @@ mod tests {
             CachesVolume::Keep,
         )
         .expect("two-volume repair snapshot");
-        assert_eq!(snapshot.actions.len(), 4);
+        assert_eq!(snapshot.actions.len(), 5);
         let host: Arc<dyn BootstrapHost> = Arc::new(PartialProgressHost {
             fail_volume: APFS_CACHES_VOLUME,
         });
@@ -7373,6 +8451,7 @@ mod tests {
         ));
         assert!(matches!(outcomes[2].outcome, HostActionResult::Skipped));
         assert!(matches!(outcomes[3].outcome, HostActionResult::Skipped));
+        assert!(matches!(outcomes[4].outcome, HostActionResult::Skipped));
     }
     #[test]
     fn uninstall_plan_removes_only_tagged_pins_and_is_idempotent_when_clean() {
@@ -7750,6 +8829,11 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
                 volume("Data", "disk3s5", Some("/System/Volumes/Data")),
                 volume_with_filevault(APFS_STORE_VOLUME, "disk3s8", None, false),
                 volume_with_filevault(APFS_CACHES_VOLUME, "disk3s9", None, false),
+                volume(
+                    APFS_BUILD_CACHE_VOLUME,
+                    "disk3s10",
+                    Some(BUILD_CACHE_MOUNTPOINT),
+                ),
             ],
         ));
         for path in [
@@ -7855,7 +8939,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             .keychain_items
             .insert(APFS_STORE_VOLUME, false);
         assert!(matches!(
-            gather_existing_apfs_evidence(&mut missing_keychain, Path::new("/Users/alice")),
+            gather_existing_apfs_evidence(EvidenceScope::HostStorage, &mut missing_keychain, Path::new("/Users/alice")),
             Err(NativeBootstrapError::MissingVolumeKeychain {
                 name: APFS_STORE_VOLUME,
                 uuid,
@@ -7863,8 +8947,12 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         ));
 
         let mut source = source_with_foreign_store();
-        let gathered = gather_existing_apfs_evidence(&mut source, Path::new("/Users/alice"))
-            .expect("foreign FileVault store with its keychain item");
+        let gathered = gather_existing_apfs_evidence(
+            EvidenceScope::HostStorage,
+            &mut source,
+            Path::new("/Users/alice"),
+        )
+        .expect("foreign FileVault store with its keychain item");
         let store = &gathered.volumes[0];
         assert_eq!(store.file_vault, Some(true));
         assert_eq!(store.volume_uuid, Some(volume_uuid("disk7s2")));

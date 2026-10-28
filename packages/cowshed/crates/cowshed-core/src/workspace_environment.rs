@@ -35,6 +35,9 @@ pub(crate) const NODE_COMPILE_CACHE_DIRECTORY: &str = "node-compile-cache";
 /// exported so a host shell names the link its jobs use without re-deriving it: the Nx socket
 /// dir host shells and jobs share is `nx` below it, by that literal path.
 pub const RUNTIME_LINK_ENV: &str = "COWSHED_RUNTIME_LINK";
+/// The build-cache volume's root on a host that has it provisioned (01a_apfs.md, "Dedicated
+/// build-cache volume"): the one spelling every consumer reads, never a path it hardcodes.
+pub const BUILD_CACHE_ENV: &str = "COWSHED_BUILD_CACHE";
 
 /// Agent harnesses export `CI`; only a real runner may change local Cargo unit identities.
 pub(crate) const DEV_CI_POLICY: &str =
@@ -59,6 +62,8 @@ pub enum WorkspaceEnvironmentError {
     UnexportableNodeCompileCache(std::path::PathBuf),
     #[error("installed cowshed directory {0:?} cannot be exported as UTF-8 shell text")]
     UnexportableInstalledDirectory(std::path::PathBuf),
+    #[error("build-cache root {0:?} cannot be exported as an absolute UTF-8 shell path")]
+    UnexportableBuildCache(std::path::PathBuf),
     #[error(transparent)]
     Publication(#[from] MetadataError),
 }
@@ -95,11 +100,13 @@ impl<'a> EnvironmentMount<'a> {
 /// Atomically publish the source-able, workspace-local build environment inside an image. Its
 /// one caller is `workspace_credentials::publish_workspace_environment`. A served mount also exports
 /// its `TMPDIR`, single-quoted, and its runtime link, and binds module compilation to the
-/// receiving workspace's private cache.
+/// receiving workspace's private cache. `build_cache` is the provisioned build-cache volume's
+/// root, exported as [`BUILD_CACHE_ENV`]; a host without one gets no line.
 pub(crate) fn write_workspace_environment(
     mount: EnvironmentMount<'_>,
     platform: Platform,
     port_block: Option<PortBlock>,
+    build_cache: Option<&Path>,
 ) -> Result<(), WorkspaceEnvironmentError> {
     match (platform, port_block) {
         (Platform::Macos, Some(block)) => {
@@ -189,6 +196,7 @@ pub(crate) fn write_workspace_environment(
     };
     let mut contents = Zeroizing::new(String::with_capacity(
         384 + DEV_CI_POLICY.len()
+            + build_cache.map_or(0, |path| path.as_os_str().len() * 4 + 64)
             + capability_bytes
             + installed_directory_text.map_or(0, |path| path.len() * 4 + 96)
             + node_compile_cache_text.map_or(0, |path| path.len() * 4 + 256)
@@ -196,8 +204,21 @@ pub(crate) fn write_workspace_environment(
                 .as_ref()
                 .map_or(0, |(temp_dir, _)| temp_dir.len() * 5),
     ));
+    let build_cache_text = build_cache
+        .map(|path| {
+            path.to_str()
+                .filter(|text| path.is_absolute() && !text.contains(['\0', '\n', '\r']))
+                .ok_or_else(|| WorkspaceEnvironmentError::UnexportableBuildCache(path.to_owned()))
+        })
+        .transpose()?;
     contents.push_str(DEV_CI_POLICY);
     contents.push_str(&nx_parallel_restore());
+    if let Some(root) = build_cache_text {
+        write!(&mut *contents, "export {BUILD_CACHE_ENV}=")
+            .expect("writing to a String cannot fail");
+        write_shell_quoted(&mut contents, root);
+        contents.push('\n');
+    }
     // No bare `COWSHED_WORKSPACE_TOKEN`: every shell that sources this file would hand it to every
     // child. `.cowshed/workspace.json` is what marks a workspace.
     if let Some(block) = port_block {
@@ -329,6 +350,46 @@ mod tests {
     use super::*;
     use cowshed_os::test_backstop::CommandBackstop as _;
 
+    /// A host with a provisioned build-cache volume publishes its root, the one spelling every
+    /// consumer reads; a host without one publishes no line (02_workspaces.md).
+    #[test]
+    fn the_build_cache_root_is_exported_only_when_provisioned() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-build-cache-env-{}", uuid::Uuid::new_v4()));
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).unwrap();
+        let build_cache = root.join("shared/build-cache");
+        for (provisioned, expected) in [
+            (
+                Some(build_cache.as_path()),
+                build_cache.display().to_string(),
+            ),
+            (None, "unset".to_owned()),
+        ] {
+            write_workspace_environment(
+                EnvironmentMount::Minted(&mount),
+                Platform::Linux,
+                None,
+                provisioned,
+            )
+            .unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    ". \"$1\"; printf '%s' \"${COWSHED_BUILD_CACHE-unset}\"",
+                    "build-cache",
+                ])
+                .arg(mount.join(WORKSPACE_ENVIRONMENT_PATH))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output_bounded()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn workspace_env_var_names_are_the_sandbox_contract() {
         assert_eq!(WORKSPACE_TOKEN_ENV, "COWSHED_WORKSPACE_TOKEN");
@@ -376,18 +437,19 @@ mod tests {
             "/private/tmp/two\nlines",
         ] {
             assert!(matches!(
-                write_workspace_environment(
-                    EnvironmentMount::Served {
-                        workspace_mount: Path::new("/nonexistent-image"),
-                                                host_home: Path::new("/Users/tester"),
-                        temp_dir: Path::new(refused),
-                        capability_env: &CapabilityContribution::default(),
-                    },
-                    Platform::Linux,
-                    None,
-                ),
-                Err(WorkspaceEnvironmentError::UnexportableTempDir(path)) if path == Path::new(refused)
-            ));
+                            write_workspace_environment(
+                                EnvironmentMount::Served {
+                                    workspace_mount: Path::new("/nonexistent-image"),
+                                                            host_home: Path::new("/Users/tester"),
+                                    temp_dir: Path::new(refused),
+                                    capability_env: &CapabilityContribution::default(),
+                                },
+                                Platform::Linux,
+            None,
+            None,
+                            ),
+                            Err(WorkspaceEnvironmentError::UnexportableTempDir(path)) if path == Path::new(refused)
+                        ));
         }
     }
 
@@ -415,6 +477,7 @@ mod tests {
             },
             Platform::Linux,
             None,
+            None,
         )
         .unwrap();
         let published = std::fs::read_to_string(root.join(WORKSPACE_ENVIRONMENT_PATH)).unwrap();
@@ -430,6 +493,7 @@ mod tests {
                 capability_env: &CapabilityContribution::default(),
             },
             Platform::Linux,
+            None,
             None,
         )
         .unwrap();
@@ -506,6 +570,7 @@ mod tests {
                 },
                 Platform::Linux,
                 None,
+                None,
             )
             .unwrap();
             let output = std::process::Command::new("/bin/sh")
@@ -545,6 +610,7 @@ mod tests {
             },
             Platform::Linux,
             None,
+            None,
         )
         .unwrap();
         let output = std::process::Command::new("/bin/sh")
@@ -569,8 +635,13 @@ mod tests {
             )
             .as_bytes()
         );
-        write_workspace_environment(EnvironmentMount::Minted(&mount), Platform::Linux, None)
-            .unwrap();
+        write_workspace_environment(
+            EnvironmentMount::Minted(&mount),
+            Platform::Linux,
+            None,
+            None,
+        )
+        .unwrap();
         let output = std::process::Command::new("/bin/sh")
             .args([
                 "-c",
@@ -608,6 +679,7 @@ mod tests {
                 capability_env: &contribution,
             },
             Platform::Linux,
+            None,
             None,
         )
         .unwrap();
@@ -738,6 +810,7 @@ mod tests {
             },
             Platform::Linux,
             None,
+            None,
         )
         .unwrap();
 
@@ -837,8 +910,13 @@ mod tests {
 
         // A minted image publishes no cache identity: an inherited sibling value is unset,
         // so neither runtime starts with a compile cache enabled into it.
-        write_workspace_environment(EnvironmentMount::Minted(&mount), Platform::Linux, None)
-            .unwrap();
+        write_workspace_environment(
+            EnvironmentMount::Minted(&mount),
+            Platform::Linux,
+            None,
+            None,
+        )
+        .unwrap();
         for program in &runtimes {
             run(&caller_cache, program, &disabled);
         }

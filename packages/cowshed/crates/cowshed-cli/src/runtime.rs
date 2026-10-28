@@ -39,6 +39,8 @@ use cowshed_core::runtime::supervisor_socket::JobHold;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
+#[cfg(target_os = "macos")]
+use cowshed_core::storage::bootstrap::BUILD_CACHE_MOUNTPOINT;
 use cowshed_core::storage::bootstrap::{
     CachesVolume, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, MOUNT_SERVICE_PLIST,
     RETIRED_CACHES_MOUNTPOINT, VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeRole, VolumeState,
@@ -4374,9 +4376,9 @@ fn host_action_evidence(action: &HostAction) -> String {
 /// name the foreign container the way `setup` does). Actions are consulted only to enrich a
 /// message with the uuid and size the state does not carry.
 ///
-/// The expected roots come from [`STORE_ROOT`] and [`RETIRED_CACHES_MOUNTPOINT`] rather than from
-/// literals here: a second copy of them in the CLI is a copy that can disagree with the volume
-/// the planner actually looked at.
+/// The expected roots come from [`STORE_ROOT`], [`RETIRED_CACHES_MOUNTPOINT`] and the
+/// build-cache mountpoint rather than from literals here: a second copy of them in the CLI is a
+/// copy that can disagree with the volume the planner actually looked at.
 fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
     let mut findings = Vec::new();
     for volume in &plan.volumes {
@@ -4384,6 +4386,11 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
         let expected = match volume.role {
             VolumeRole::Store => Path::new(STORE_ROOT),
             VolumeRole::Caches => Path::new(RETIRED_CACHES_MOUNTPOINT),
+            #[cfg(target_os = "macos")]
+            VolumeRole::BuildCache => Path::new(BUILD_CACHE_MOUNTPOINT),
+            // Only macOS provisions a build-cache volume today.
+            #[cfg(not(target_os = "macos"))]
+            VolumeRole::BuildCache => continue,
             // No canonical root to compare against on this doctor surface.
             VolumeRole::Projects => continue,
         };
@@ -7436,6 +7443,68 @@ mod tests {
                     .contains(&format!("mounted at {}", expected.display())),
                 "{}",
                 finding.message
+            );
+        }
+    }
+
+    /// The build-cache volume reports with the store's findings, each naming the observed and
+    /// canonical paths and prescribing `cowshed setup` (01a_apfs.md, "Dedicated build-cache
+    /// volume").
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_build_cache_volume_reports_the_store_findings_at_its_mountpoint() {
+        let name = cowshed_core::storage::bootstrap::APFS_BUILD_CACHE_VOLUME;
+        let canonical = Path::new(BUILD_CACHE_MOUNTPOINT);
+        let observed = PathBuf::from("/Volumes/cowshed.build-cache");
+        let cells = [
+            (VolumeState::MountedValid, "host-volume", "mounted at"),
+            (VolumeState::Absent, "host-volume-absent", "absent"),
+            (VolumeState::Detached, "mount", "not mounted"),
+            (
+                VolumeState::MountedIncomplete,
+                "marker",
+                "marker missing or invalid",
+            ),
+            (
+                VolumeState::MisMounted {
+                    mounted_at: observed.clone(),
+                },
+                "mount",
+                "/Volumes/cowshed.build-cache",
+            ),
+        ];
+        for (state, code, says) in cells {
+            let findings = host_storage_findings(&HostSetupPlan {
+                actions: vec![HostAction::EncryptVolume {
+                    name: name.into(),
+                    uuid: "BC-UUID".into(),
+                    size_bytes: 4096,
+                }],
+                volumes: vec![planned_volume(name, VolumeRole::BuildCache, state.clone())],
+                requires_authorization: true,
+                non_destructive: true,
+            });
+            let volume = findings
+                .iter()
+                .find(|finding| finding.message.starts_with(&format!("{name}:")))
+                .unwrap_or_else(|| panic!("a finding for {state:?}"));
+            assert_eq!(volume.code, code, "{}", volume.message);
+            assert_eq!(volume.path.as_deref(), Some(canonical));
+            assert!(volume.message.contains(says), "{}", volume.message);
+            assert!(
+                volume.message.contains(&canonical.display().to_string()),
+                "{}",
+                volume.message
+            );
+            if state != VolumeState::MountedValid {
+                assert_eq!(volume.hint, "cowshed setup");
+            }
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.code == "host-filevault"
+                        && finding.message.contains(name)
+                        && finding.hint == "cowshed setup")
             );
         }
     }

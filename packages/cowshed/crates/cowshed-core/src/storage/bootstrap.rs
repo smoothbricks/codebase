@@ -35,6 +35,12 @@ use cowshed_gateway_types::STORE_ROOT;
 /// host that still has one. Nothing is provisioned there any more: setup moves what it holds into
 /// the host HOME and `setup --retire-caches-volume` deletes it (03_caches.md).
 pub const RETIRED_CACHES_MOUNTPOINT: &str = "/private/cowshed/caches";
+/// The dedicated build-cache volume's label (01a_apfs.md, "Dedicated build-cache volume"). Only
+/// `cowshed setup` and `doctor` plan it: a command that does not touch Cargo through mbx never
+/// consults the volume.
+pub const APFS_BUILD_CACHE_VOLUME: &str = "cowshed.build-cache";
+#[cfg(target_os = "macos")]
+pub use crate::storage::host_config::BUILD_CACHE_MOUNTPOINT;
 /// Where launchd reads the storage mount service from; owned here so the CLI's doctor names the
 /// same file the macOS planner installs.
 pub const MOUNT_SERVICE_PLIST: &str = "/Library/LaunchDaemons/dev.cowshed.storage.plist";
@@ -90,7 +96,7 @@ const STORE_LAYOUT_VERSION: u32 = 2;
 const fn marker_version(role: VolumeRole) -> u32 {
     match role {
         VolumeRole::Store => STORE_LAYOUT_VERSION,
-        VolumeRole::Caches | VolumeRole::Projects => MARKER_VERSION,
+        VolumeRole::Caches | VolumeRole::Projects | VolumeRole::BuildCache => MARKER_VERSION,
     }
 }
 
@@ -1080,6 +1086,9 @@ pub enum VolumeRole {
     Store,
     Caches,
     Projects,
+    /// The dedicated build-cache volume (01a_apfs.md, "Dedicated build-cache volume").
+    #[serde(rename = "build-cache")]
+    BuildCache,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1570,6 +1579,14 @@ pub enum ApfsProvisionKind {
         exact_identifier: String,
         current_mountpoint: PathBuf,
     },
+    /// A role-less volume found mounted at the build-cache mountpoint under another label (a
+    /// prototype): relabelled, remounted `nobrowse` when it is browsable, and completed in place
+    /// by its identity, never recreated or deleted (01a_apfs.md, "Dedicated build-cache volume").
+    Adopt {
+        exact_identifier: String,
+        label: String,
+        remount: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1775,6 +1792,68 @@ fn plan_apfs(
     Ok(operations)
 }
 
+/// A role-less volume the kernel snapshot shows mounted at the build-cache mountpoint under
+/// another label. Labels are mutable and identity is the volume's: setup adopts it rather than
+/// create a second volume beside it (01a_apfs.md, "Dedicated build-cache volume").
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildCacheAdoption {
+    pub exact_identifier: String,
+    pub label: String,
+    /// Mounted browsable: the adoption remounts it `nobrowse`.
+    pub remount: bool,
+}
+
+/// The build-cache volume's operations at `mountpoint`, for the plans of `cowshed setup` and
+/// `doctor` only, in the same container and authorization session as the store's
+/// (01a_apfs.md, "Dedicated build-cache volume"). An adoption replaces every other repair: the
+/// volume is the one already mounted there.
+pub fn plan_apfs_build_cache(
+    container: &str,
+    mountpoint: &Path,
+    state: &ExistingStorage,
+    adoption: Option<&BuildCacheAdoption>,
+) -> Result<Vec<HostOperation>, PlanError> {
+    validate_existing_marker(state, VolumeRole::BuildCache, SubstrateKind::Apfs)?;
+    let mut operations = Vec::new();
+    let mut volumes = Vec::new();
+    if let Some(adoption) = adoption {
+        volumes.push(ApfsVolumeProvision {
+            name: APFS_BUILD_CACHE_VOLUME,
+            mountpoint: mountpoint.to_owned(),
+            role: VolumeRole::BuildCache,
+            kind: ApfsProvisionKind::Adopt {
+                exact_identifier: adoption.exact_identifier.clone(),
+                label: adoption.label.clone(),
+                remount: adoption.remount,
+            },
+        });
+    } else {
+        if !mounted_but_unpublished_at(state, mountpoint)
+            && !remounting_from_elsewhere(state, mountpoint)
+        {
+            operations.push(guard(
+                mountpoint,
+                VolumeRole::BuildCache,
+                SubstrateKind::Apfs,
+            ));
+        }
+        plan_apfs_volume(
+            &mut operations,
+            &mut volumes,
+            mountpoint,
+            APFS_BUILD_CACHE_VOLUME,
+            VolumeRole::BuildCache,
+            state,
+        );
+    }
+    if !volumes.is_empty() {
+        operations.push(HostOperation::ProvisionApfsVolumes {
+            container: container.to_owned(),
+            volumes,
+        });
+    }
+    Ok(operations)
+}
 fn mounted_but_unpublished_at(state: &ExistingStorage, path: &Path) -> bool {
     matches!(state, ExistingStorage::MountedIncomplete { .. })
         || matches!(
@@ -2139,6 +2218,7 @@ impl fmt::Display for VolumeRole {
             Self::Store => "store",
             Self::Caches => "caches",
             Self::Projects => "projects",
+            Self::BuildCache => "build-cache",
         })
     }
 }

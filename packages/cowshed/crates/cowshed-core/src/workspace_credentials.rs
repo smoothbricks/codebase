@@ -167,7 +167,8 @@ pub fn publish_workspace_environment(
     platform: Platform,
     port_block: Option<PortBlock>,
 ) -> Result<(), WorkspaceCredentialError> {
-    write_workspace_environment(mount, platform, port_block)?;
+    let build_cache = crate::storage::bootstrap::native::provisioned_build_cache();
+    write_workspace_environment(mount, platform, port_block, build_cache.as_deref())?;
     Ok(())
 }
 

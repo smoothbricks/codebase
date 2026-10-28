@@ -148,13 +148,17 @@ describe('the per-user mount root the real-APFS tests need', () => {
     expect(read('cowshed-core/src/storage/host_config.rs')).toMatch(/fn macos_mount_root[^}]*\.join\("mnt"\)/);
     // The fixtures make `t` inside the per-user root this provisions, and refuse it when it is missing.
     expect(read('cowshed-os/src/scratch.rs')).toContain(`"${MOUNT_PREFIX}/{euid}/t"`);
-    // setup's own operations: the prefix is root's 0755 and the per-user root and `mnt` are the user's 0700.
+    // setup's own operations: the prefix is root's 0755, the per-user root and `mnt` are the user's 0700, and the
+    // build-cache volume's `shared` parent (the user's, 0750) is setup's alone: no test mounts over that volume.
     const operations = /fn mount_root_operations[\s\S]*?\n}\n/.exec(
       read('cowshed-core/src/storage/bootstrap/native/macos.rs'),
     )?.[0];
     expect(operations).toMatch(/uid: 0,\s+gid: 0,\s+mode: 0o755,/);
     expect(operations?.match(/mode: 0o700,/g)).toHaveLength(2);
-    expect(operations?.match(/HostOperation::EnsureOwnedDirectory/g)).toHaveLength(3);
+    expect(
+      operations?.match(/path: PathBuf::from\(BUILD_CACHE_PARENT\),\s+uid,\s+gid: shared_gid,\s+mode: 0o750,/g),
+    ).toHaveLength(1);
+    expect(operations?.match(/HostOperation::EnsureOwnedDirectory/g)).toHaveLength(4);
   });
 
   it('names the exact command for each directory, sudo only where only root can write the parent', () => {

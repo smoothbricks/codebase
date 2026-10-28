@@ -21,6 +21,18 @@ pub(crate) const RETIRED_MOUNT_DIRECTORY: &str = "mnt";
 #[cfg(target_os = "macos")]
 pub(crate) const MACOS_MOUNT_PREFIX: &str = "/private/var/folders/cowshed";
 
+/// The build-cache mountpoint's parent, directly under [`MACOS_MOUNT_PREFIX`]: a mountpoint
+/// needs a user-owned parent, so this one is the provisioning user's, group `nixbld`, 0750
+/// (01c_macos.md, "`/private/var/folders` is root-owned and swept").
+#[cfg(target_os = "macos")]
+pub(crate) const BUILD_CACHE_PARENT: &str = "/private/var/folders/cowshed/shared";
+
+/// Where the dedicated build-cache volume mounts, directly under [`BUILD_CACHE_PARENT`]
+/// (01a_apfs.md, "Dedicated build-cache volume"), published to every workspace as
+/// `COWSHED_BUILD_CACHE` (02_workspaces.md, "Workspace environment").
+#[cfg(target_os = "macos")]
+pub const BUILD_CACHE_MOUNTPOINT: &str = "/private/var/folders/cowshed/shared/build-cache";
+
 pub(crate) fn canonical_mount_root(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {

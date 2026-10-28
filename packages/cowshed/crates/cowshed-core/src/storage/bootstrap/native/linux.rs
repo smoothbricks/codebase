@@ -62,6 +62,12 @@ pub async fn bootstrap_system_storage(
     ))
 }
 
+/// No Linux host provisions a build-cache volume yet (01b_zfs.md, "The mbx store on a ZFS
+/// host"), so no workspace environment names one.
+pub fn provisioned_build_cache() -> Option<std::path::PathBuf> {
+    None
+}
+
 pub async fn validate_existing_host_storage(_home: &Path) -> crate::Result<ValidatedHostStorage> {
     Err(existing_host_storage_error(
         NativeBootstrapError::UnsupportedPlatform(std::env::consts::OS),
