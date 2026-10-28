@@ -1147,16 +1147,19 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
    touch one of them. Of those, a workspace is folded when the landed tip holds it by `rm`'s measurement (`rm` step 1,
    against the branch the unit landed on, every local branch included, and its HEAD held by the tip itself: a HEAD only
    a `push` ref keeps is work the tip lacks, so it is no fold); the others are not the land's, and are neither touched
-   nor named. A folded workspace is retired as `rm` retires it, measured again under its own land lease, with two
-   differences. The age floor does not apply: its work is already in the target. And its owner is spared, never
-   quiesced: a supervisor running a job or holding an open shell session refuses the stop rather than waiting for it,
-   and a process cowshed does not run that holds its mount refuses as it does for `rm` ("Holders cowshed does not run").
-   A folded workspace whose tree is dirty (a tracked change, or an untracked file no ignore rule covers) is kept. Each
-   folded workspace is reported in `LandedReport.folded` with its head and its outcome, `retired`, or `kept` with why
-   (`dirty` with its file count, or `refused` with the refusal's code and message), and said on stderr. A kept fold
-   never fails the land, and nothing about it is stored: it is the next `rm`'s, or the next land's that touches it.
-   Retired folds release their build volumes in one collection after the last of them, which runs in the background once
-   the land answers (16_build_volumes.md, Land 6.5). A land with `--no-retire` folds nothing.
+   nor named. A session whose head main already holds has no work of its own and is never a fold, whatever the landed
+   range touches: what it differs by from the target's previous head is main's (a shed forked from a main newer than a
+   train's base, say), and retiring it is its owner's act. A folded workspace is retired as `rm` retires it, measured
+   again under its own land lease, with two differences. The age floor does not apply: its work is already in the
+   target. And its owner is spared, never quiesced: a supervisor running a job or holding an open shell session refuses
+   the stop rather than waiting for it, and a process cowshed does not run that holds its mount refuses as it does for
+   `rm` ("Holders cowshed does not run"). A folded workspace whose tree is dirty (a tracked change, or an untracked file
+   no ignore rule covers) is kept. Each folded workspace is reported in `LandedReport.folded` with its head and its
+   outcome, `retired`, or `kept` with why (`dirty` with its file count, or `refused` with the refusal's code and
+   message), and said on stderr. A kept fold never fails the land, and nothing about it is stored: it is the next
+   `rm`'s, or the next land's that touches it. Retired folds release their build volumes in one collection after the
+   last of them, which runs in the background once the land answers (16_build_volumes.md, Land 6.5). A land with
+   `--no-retire` folds nothing.
 
 `--no-retire` keeps the workspace after a successful land (for a coordinator that wants to reuse it via
 `rebase --fresh`). `--push-only` performs steps 1–2 and installs the validated head in the workspace's durable

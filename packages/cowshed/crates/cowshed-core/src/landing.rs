@@ -609,6 +609,25 @@ pub async fn fold_facts(
     push_repository: &Path,
     workspace: &str,
 ) -> FoldFacts {
+    // A session whose head main already holds has no work of its own (a shed just forked, say), so
+    // it is no fold whatever the landed range touches: what it differs by from the target's previous
+    // head is main's work (main moved past a train's base), and retiring it is its owner's act.
+    let main = GitRepository::from_root(store_root, push_repository);
+    if let Ok(head) = GitRepository::from_root(store_root, workspace_mount)
+        .head_oid()
+        .await
+        && matches!(main.has_commit(head.as_str()).await, Ok(true))
+        && matches!(
+            main.commit_is_ancestor(head.as_str(), "HEAD").await,
+            Ok(true)
+        )
+    {
+        return FoldFacts {
+            touched: Ok(false),
+            landed: false,
+            dirty_files: Ok(0),
+        };
+    }
     let own = match GitRepository::from_root(store_root, workspace_mount)
         .with_alternate_objects(&target.objects)
     {

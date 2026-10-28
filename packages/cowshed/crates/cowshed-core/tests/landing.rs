@@ -1316,6 +1316,46 @@ async fn a_head_only_the_push_ref_keeps_is_retirable_and_not_a_fold() {
     );
 }
 
+/// A session with no work of its own is never a fold (02_workspaces.md, `land` step 5, "Folds"): a
+/// shed forked from a main newer than the target's previous head differs from it only by main's
+/// work, which the landed range may touch, and a fold that retired it destroyed a live owner's
+/// workspace on timing alone.
+#[tokio::test]
+async fn a_session_whose_head_main_holds_is_not_a_fold() {
+    let fixture = Fixture::new("fold-fresh-fork");
+    let previous = GitOid::new(
+        git(fixture.parent(), ["rev-parse", "HEAD"])
+            .trim()
+            .to_owned(),
+    )
+    .expect("the train's base");
+    fixture.land_content_separately("story.txt", "main's story\n", "main moves past the base");
+    let mount = fixture.clone_workspace("fresh");
+    let target = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("main's target");
+    let facts = fold_facts(
+        fixture.store(),
+        &target,
+        &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        &previous,
+        &mount,
+        &fixture.parent(),
+        "fresh",
+    )
+    .await;
+    assert_eq!(
+        facts.touched,
+        Ok(false),
+        "it has no change of its own: {facts:?}"
+    );
+    assert_eq!(
+        fold_step(&facts),
+        None,
+        "the land neither retires nor names it"
+    );
+}
+
 /// A ref can outlive its commit: a push ref that names a commit main's repository cannot see keeps
 /// nothing, so `rm` never retires the workspace that holds the only copy on the strength of the
 /// name alone (02_workspaces.md, `rm` step 1).
