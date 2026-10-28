@@ -371,6 +371,14 @@ receives the host's mbx settings; its lifetime owner launches the actual leaf wi
 environment, not a copy of the reservation process's environment. Host reservation settings never enable or leak mbx
 tooling into a non-Rust project.
 
+The served file follows the capabilities the jobs get, not the ones a supervisor started with. Each exec detects the
+checkout's capabilities at its root again; a set that changed since -- a dev shell that gained mbx's Cargo shim --
+becomes the supervisor's own and republishes `.cowshed/env` before the job is admitted, as an authority advance that
+changes them does. A host shell that re-sources the file then drops what the old set exported, such as a compiler
+wrapper, and gains the canonical mbx environment. A shell's Nx daemon that started under the old set keeps it until it
+restarts. Enforced by `a_capability_gained_while_the_supervisor_runs_reaches_the_host_environment` and
+`an_advance_that_changes_the_capabilities_republishes_the_host_environment`.
+
 The canonical environment carries these owned values when the capability is present:
 
 | Variable                                                                   | Value or source                                                                                                                                                     |

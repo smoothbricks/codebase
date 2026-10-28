@@ -4213,22 +4213,7 @@ impl WorkspaceSupervisor {
         // The TMPDIR it names exists before any host shell can source it.
         AnchoredDirectory::create(&config.sandbox.exec_temp_dir)
             .map_err(private_environment_error)?;
-        crate::workspace_credentials::publish_workspace_environment(
-            crate::workspace_environment::EnvironmentMount::Served {
-                workspace_mount: &config.sandbox.workspace_mount,
-                host_home: &config.sandbox.home,
-                temp_dir: &config.sandbox.exec_temp_dir,
-                capability_env: &config.sandbox.capabilities.contribution,
-            },
-            crate::metadata::Platform::Macos,
-            Some(config.sandbox.port_block),
-        )
-        .map_err(|error| {
-            CowshedError::integrity(
-                format!("cannot publish the workspace environment: {error}"),
-                "reattach the workspace to mint fresh credentials",
-            )
-        })?;
+        publish_host_environment(&config.sandbox)?;
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
             &config.owned_repo_ids,
@@ -6259,6 +6244,11 @@ impl SupervisorActor {
                 "reattach the authoritative workspace mount",
             ));
         }
+        // A host shell exports what the jobs carry: capabilities the advance changes reach its
+        // `.cowshed/env` now, not at the next supervisor start.
+        if sandbox.capabilities.contribution != self.policy.ceiling().capabilities.contribution {
+            publish_host_environment(&sandbox)?;
+        }
         // Rendered here, once for the new authority; every job admitted under it shares it.
         let policy = job_sandbox_policy(sandbox, self.membership_socket.as_deref())?;
         if authority != self.authority {
@@ -6697,6 +6687,21 @@ impl SupervisorActor {
                 build_volume_mount: build_volume,
                 ..self.policy.ceiling().clone()
             })?;
+        }
+        // The checkout's capabilities as its files hold them now, not as this supervisor started:
+        // a dev shell that gained mbx's Cargo shim, a manifest that arrived. A change becomes this
+        // supervisor's ceiling, and the host shell's `.cowshed/env` is republished from it, so a
+        // host shell and the land's host gate build in the environment the jobs do.
+        let detected = {
+            let _span = cowshed_os::timing::span("admit", "capability-detection");
+            self.policy
+                .ceiling()
+                .detect_capabilities_for(&self.workspace_root)?
+        };
+        if detected != self.policy.ceiling().capabilities {
+            let sandbox = self.policy.ceiling().with_capabilities(detected);
+            publish_host_environment(&sandbox)?;
+            self.policy = job_sandbox_policy(sandbox, self.membership_socket.as_deref())?;
         }
         let ExecRequest {
             command,
@@ -11328,6 +11333,87 @@ mod lifecycle_commitment_tests {
         tokio::task::yield_now().await;
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    /// Discovery that changes a checkout's capabilities -- its dev shell gains mbx's Cargo shim --
+    /// reaches a running supervisor as an authority advance. The host shell's `.cowshed/env` says
+    /// what the advanced sandbox's jobs carry, so a host shell and the land's host gate build
+    /// through the same canonical environment, and nothing the old contribution exported stays.
+    #[tokio::test]
+    async fn an_advance_that_changes_the_capabilities_republishes_the_host_environment() {
+        use crate::capabilities::{CapabilityContribution, DetectedCapabilities, EnvAction};
+        let root =
+            std::env::temp_dir().join(format!("cowshed-env-advance-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(workspace_root.join(".cowshed")).unwrap();
+        let env = workspace_root.join(".cowshed/env");
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let incarnation = WorkspaceIncarnation::new("5198f2c0b7e34dc795f17b238b331c81").unwrap();
+        let mut publisher = CommitmentPublisher::open(
+            root.join("telemetry"),
+            crate::storage::audit::ContinuityAudit::Arrow,
+            8,
+        )
+        .unwrap();
+        publisher
+            .record(CommitmentDraft::WorkspaceIntroduced {
+                repo_id: repo_id.clone(),
+                workspace_incarnation: incarnation.clone(),
+            })
+            .await
+            .unwrap();
+        let exporting = |name: &'static str, value: &str| DetectedCapabilities {
+            active: Vec::new(),
+            contribution: CapabilityContribution {
+                env: BTreeMap::from([(name, EnvAction::Own(value.into()))]),
+                ..CapabilityContribution::default()
+            },
+        };
+        let defaults = WorkspaceSupervisorConfig::default();
+        let sandbox = SandboxConfig {
+            workspace_mount: workspace_root.clone(),
+            exec_temp_dir: root.join("tmp"),
+            capabilities: exporting("RUSTC_WRAPPER", "/pinned/sccache"),
+            ..defaults.sandbox.clone()
+        };
+        let config = WorkspaceSupervisorConfig {
+            authority: WorkspaceAuthoritySnapshot {
+                repo_id: repo_id.clone(),
+                workspace: WorkspaceName::new("raven").unwrap(),
+                workspace_incarnation: incarnation,
+                grant_revision: 1,
+                lifecycle_revision: 1,
+            },
+            owned_repo_ids: OwnedRepoIds::sole(repo_id),
+            workspace_root: workspace_root.clone(),
+            sandbox: sandbox.clone(),
+            ..defaults
+        };
+        let supervisor = WorkspaceSupervisor::start(config, publisher.clone()).unwrap();
+        let published = std::fs::read_to_string(&env).unwrap();
+        assert!(published.contains("export RUSTC_WRAPPER="), "{published}");
+
+        let advanced = supervisor
+            .advance_authority(
+                2,
+                1,
+                SandboxConfig {
+                    capabilities: exporting("MBX_CACHE_DIR", "/bc/mbx"),
+                    ..sandbox
+                },
+            )
+            .await
+            .unwrap();
+        let published = std::fs::read_to_string(&env).unwrap();
+        assert!(published.contains("export MBX_CACHE_DIR="), "{published}");
+        assert!(!published.contains("RUSTC_WRAPPER"), "{published}");
+        drop(advanced);
+        drop(supervisor);
+        drop(publisher);
+        tokio::task::yield_now().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -12226,6 +12312,27 @@ mod install_observation_tests {
 }
 
 /// Both initial admission and grant advance add exactly the controller's narrow endpoint.
+/// Publish `sandbox`'s workspace environment, its capabilities' contribution included, as the
+/// host shell's `.cowshed/env` (11_shell.md): what a host shell sources is what the jobs carry.
+fn publish_host_environment(sandbox: &SandboxConfig) -> Result<()> {
+    crate::workspace_credentials::publish_workspace_environment(
+        crate::workspace_environment::EnvironmentMount::Served {
+            workspace_mount: &sandbox.workspace_mount,
+            host_home: &sandbox.home,
+            temp_dir: &sandbox.exec_temp_dir,
+            capability_env: &sandbox.capabilities.contribution,
+        },
+        crate::metadata::Platform::Macos,
+        Some(sandbox.port_block),
+    )
+    .map_err(|error| {
+        CowshedError::integrity(
+            format!("cannot publish the workspace environment: {error}"),
+            "reattach the workspace to mint fresh credentials",
+        )
+    })
+}
+
 fn job_sandbox_policy(
     mut sandbox: SandboxConfig,
     membership_socket: Option<&Path>,

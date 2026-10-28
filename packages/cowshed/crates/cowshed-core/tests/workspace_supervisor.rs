@@ -542,7 +542,8 @@ fn workspace_root(parent: &Path, label: &str) -> TempRoot {
     // own separate short aliases and never pass through this filesystem-only constructor.
     let parent = std::fs::canonicalize(parent).expect("canonical granted workspace fixture parent");
     let root = TempRoot::new_in(&parent, &format!("cowshed-supervisor-{label}"));
-    std::fs::create_dir(root.join("workspace")).expect("workspace root");
+    // A minted workspace holds `.cowshed`, where its supervisor publishes the host environment.
+    std::fs::create_dir_all(root.join("workspace/.cowshed")).expect("workspace root");
     root
 }
 
@@ -1403,6 +1404,37 @@ async fn a_background_start_waits_for_the_reported_drop_and_a_gate_does_not() {
             && stderr.ends_with(" status=ok\n"),
         "{stderr}"
     );
+}
+
+/// A checkout gains a capability while its supervisor runs -- its dev shell gains mbx's Cargo
+/// shim, an `nx.json` arrives -- and the next exec adopts it: the job's sandbox carries it, and the
+/// host shell's `.cowshed/env` says the same, so a host shell and the land's host gate build in the
+/// environment the jobs do.
+#[tokio::test]
+async fn a_capability_gained_while_the_supervisor_runs_reaches_the_host_environment() {
+    let (mut h, root) = harness(1, 1024, false, false);
+    let workspace = root.join("workspace");
+    let env = workspace.join(".cowshed/env");
+    assert!(
+        std::fs::read_to_string(&env).map_or(true, |text| !text.contains("NX_MAX_CACHE_SIZE")),
+        "no Nx cache size before nx.json"
+    );
+    std::fs::write(workspace.join("nx.json"), "{}").unwrap();
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+    let published = std::fs::read_to_string(&env).unwrap();
+    assert!(published.contains("NX_MAX_CACHE_SIZE"), "{published}");
 }
 
 #[tokio::test]
