@@ -103,6 +103,24 @@ impl Source {
             }
         }
     }
+
+    /// The feed a crate test's supervisor runs on: one that only ever reports no pressure (Normal
+    /// on macOS, no stall on Linux), so the host's own pressure decides none of its admissions. A
+    /// test of admission under pressure drives its own feed. The integration harnesses' copy is
+    /// `tests/support/calm_pressure.rs`, which this crate's tests cannot reach.
+    #[cfg(test)]
+    pub(crate) fn calm() -> Self {
+        #[cfg(target_os = "macos")]
+        let reading = Reading::Known(cowshed_gateway_types::host_status::MemoryPressure::Darwin {
+            level: cowshed_gateway_types::host_status::DarwinPressureLevel::Normal,
+        });
+        #[cfg(not(target_os = "macos"))]
+        let reading = Reading::Known(cowshed_gateway_types::host_status::MemoryPressure::Psi {
+            some_avg10: cowshed_gateway_types::host_status::CentiPercent::new(0)
+                .expect("no stall is a share"),
+        });
+        Self::Driven(tokio::sync::watch::channel(reading).1)
+    }
 }
 
 /// A supervisor's memory-pressure reports: one reading when it opens, then one at each change the

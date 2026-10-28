@@ -20587,7 +20587,8 @@ mod removal_supervisor_tests {
             "cowshed-rm-force-jobs-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::create_dir(&root).expect("create workspace");
+        // A minted workspace holds `.cowshed`, where its supervisor publishes the host environment.
+        std::fs::create_dir_all(root.join(".cowshed")).expect("create workspace");
         // Capability detection refuses a directory that resolves outside the workspace, and
         // `/var/folders` resolves into `/private/var`.
         let root = std::fs::canonicalize(&root).expect("canonical workspace");
@@ -20600,6 +20601,8 @@ mod removal_supervisor_tests {
                 ..defaults.sandbox
             },
             term_grace: Duration::from_millis(10),
+            // The job is a background start: the host's own memory pressure must not hold it.
+            memory_pressure: crate::host_pressure::Source::calm(),
             ..defaults
         };
         let signals = Arc::new(Mutex::new(Vec::new()));

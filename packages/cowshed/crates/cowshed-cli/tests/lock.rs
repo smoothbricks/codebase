@@ -1408,11 +1408,12 @@ fn assert_raw_lock_observation(name: &std::ffi::OsStr, path_wire: Value) {
     );
 }
 
-/// Names the image lock, the directory store it is in, and the workspace whose fork it is taken
-/// for, that this test binary takes when it runs as [`image_lock_taker`].
+/// Names the image lock, the directory store it is in, the workspace whose fork it is taken for,
+/// and the fixture namespace, that this test binary takes when it runs as [`image_lock_taker`].
 const IMAGE_LOCK_ENV: &str = "COWSHED_TEST_IMAGE_LOCK";
 const IMAGE_STORE_ENV: &str = "COWSHED_TEST_IMAGE_STORE";
 const IMAGE_WORKSPACE_ENV: &str = "COWSHED_TEST_IMAGE_WORKSPACE";
+const IMAGE_NAMESPACE_ENV: &str = "COWSHED_TEST_IMAGE_NAMESPACE";
 
 /// Not a test of its own: another process's lifecycle operation taking one image lock, as a fork
 /// takes its source's (`main.dmg.lock`) while it clones it. Run as this binary with
@@ -1430,8 +1431,15 @@ fn image_lock_taker() {
         std::env::var(IMAGE_WORKSPACE_ENV).expect("the workspace the lock is taken for"),
     )
     .expect("a workspace name");
-    // A directory store's image lock names no namespace; this process mints one for its config.
-    let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
+    // The fixture's namespace, which the test minted: a fixture store's census reaches the test's
+    // process tree, every taker of the lock included, and no other process.
+    let namespace = HostNamespace::Test(
+        std::env::var(IMAGE_NAMESPACE_ENV)
+            .ok()
+            .as_deref()
+            .and_then(TestNamespace::parse)
+            .expect("the fixture's namespace"),
+    );
     let host = DirectoryExecutionHost::new(ApfsSubstrateConfig::new(
         namespace,
         &store,
@@ -1464,13 +1472,14 @@ struct ImageLockTaker {
 }
 
 impl ImageLockTaker {
-    fn start(store: &Path, lock: &Path, workspace: &str) -> Self {
+    fn start(store: &Path, lock: &Path, workspace: &str, namespace: &TestNamespace) -> Self {
         let mut process = TestProcess::spawn(
             Command::new(std::env::current_exe().expect("this test binary"))
                 .args(["--exact", "image_lock_taker", "--nocapture"])
                 .env(IMAGE_LOCK_ENV, lock)
                 .env(IMAGE_STORE_ENV, store)
                 .env(IMAGE_WORKSPACE_ENV, workspace)
+                .env(IMAGE_NAMESPACE_ENV, namespace.as_str())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped()),
@@ -1539,7 +1548,8 @@ fn an_image_lock_names_its_holder_and_a_blocked_taker_says_whom_it_waits_for() {
     let dir = Dir::new("image-lock");
     let store = dir.path.join("store");
     let lock = store.join("acme/widget/main.dmg.lock");
-    let mut holder = ImageLockTaker::start(&store, &lock, "raven");
+    let namespace = TestNamespace::mint().expect("a test namespace");
+    let mut holder = ImageLockTaker::start(&store, &lock, "raven", &namespace);
     assert_eq!(
         holder.next(),
         "held",
@@ -1567,7 +1577,7 @@ fn an_image_lock_names_its_holder_and_a_blocked_taker_says_whom_it_waits_for() {
     assert_eq!(record["operation"], "fork", "{observation}");
     assert_eq!(record["workspace"], "raven", "{observation}");
 
-    let mut waiter = ImageLockTaker::start(&store, &lock, "wren");
+    let mut waiter = ImageLockTaker::start(&store, &lock, "wren", &namespace);
     let (step, custody) = wait_step(&lock);
     assert_eq!(waiter.next(), format!("{step} start"));
     let holders = waiter.next();
@@ -1611,9 +1621,10 @@ fn a_taker_refuses_an_image_lock_whose_path_was_replaced_while_it_waited() {
     let dir = Dir::new("image-lock-replaced");
     let store = dir.path.join("store");
     let lock = store.join("acme/widget/main.dmg.lock");
-    let mut holder = ImageLockTaker::start(&store, &lock, "raven");
+    let namespace = TestNamespace::mint().expect("a test namespace");
+    let mut holder = ImageLockTaker::start(&store, &lock, "raven", &namespace);
     assert_eq!(holder.next(), "held");
-    let mut waiter = ImageLockTaker::start(&store, &lock, "wren");
+    let mut waiter = ImageLockTaker::start(&store, &lock, "wren", &namespace);
     let (step, _) = wait_step(&lock);
     assert_eq!(waiter.next(), format!("{step} start"));
     assert!(

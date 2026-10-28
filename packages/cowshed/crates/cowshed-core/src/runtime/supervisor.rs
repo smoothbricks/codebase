@@ -11171,21 +11171,7 @@ mod lifecycle_commitment_tests {
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
             build_volume_released: None,
-            // A driven feed that reports no pressure: the host's own decides none of these admissions.
-            memory_pressure: crate::host_pressure::Source::Driven(
-                tokio::sync::watch::channel(crate::host_pressure::Reading::Known(
-                    #[cfg(target_os = "macos")]
-                    cowshed_gateway_types::host_status::MemoryPressure::Darwin {
-                        level: cowshed_gateway_types::host_status::DarwinPressureLevel::Normal,
-                    },
-                    #[cfg(not(target_os = "macos"))]
-                    cowshed_gateway_types::host_status::MemoryPressure::Psi {
-                        some_avg10: cowshed_gateway_types::host_status::CentiPercent::new(0)
-                            .expect("no stall is a share"),
-                    },
-                ))
-                .1,
-            ),
+            memory_pressure: crate::host_pressure::Source::calm(),
             nx_daemon_idle: defaults.nx_daemon_idle,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
@@ -12311,7 +12297,6 @@ mod install_observation_tests {
     }
 }
 
-/// Both initial admission and grant advance add exactly the controller's narrow endpoint.
 /// Publish `sandbox`'s workspace environment, its capabilities' contribution included, as the
 /// host shell's `.cowshed/env` (11_shell.md): what a host shell sources is what the jobs carry.
 fn publish_host_environment(sandbox: &SandboxConfig) -> Result<()> {
@@ -12333,6 +12318,7 @@ fn publish_host_environment(sandbox: &SandboxConfig) -> Result<()> {
     })
 }
 
+/// Both initial admission and grant advance add exactly the controller's narrow endpoint.
 fn job_sandbox_policy(
     mut sandbox: SandboxConfig,
     membership_socket: Option<&Path>,
