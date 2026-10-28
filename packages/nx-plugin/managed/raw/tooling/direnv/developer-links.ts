@@ -126,6 +126,7 @@ import path from 'node:path';
 import type { BuildInputProducer, KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
 import {
   linkAnchor,
+  newestSealedSnapshot,
   type ProducerProbe,
   packedFiles,
   pinnedSnapshot,
@@ -478,7 +479,17 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
     // own producer provenance instead).
     if (snapshot === undefined) {
       const stale = staleBuilds(name, source);
-      if (stale.length > 0) throw new Error(staleBuildsRefusal(stale));
+      if (stale.length > 0) {
+        // The live build is older than its sources: serve the newest sealed snapshot of the package instead, named with
+        // the revision it holds and why, so shell entry goes on with a build that describes its own sources. With none
+        // sealed, the link is refused as before.
+        const fallback = newestSealedSnapshot(root, name, source);
+        if (fallback === null) throw new Error(staleBuildsRefusal(stale));
+        binding = { kind: 'snapshot', target: fallback.directory, id: fallback.id };
+        reports.push(
+          `! smoo.developerLinks ${name}: serving sealed snapshot ${fallback.id} of ${fallback.head}, the newest this checkout holds, because the live checkout's build is stale: ${staleBuildsRefusal(stale)}`,
+        );
+      }
     }
     if (snapshot !== undefined) {
       const outcome = await snapshotBinding(root, name, source, snapshot, probe);

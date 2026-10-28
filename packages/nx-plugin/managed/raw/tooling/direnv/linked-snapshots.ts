@@ -925,6 +925,56 @@ function copySealed(from: string, to: string): void {
   }
 }
 
+/**
+ * The newest sealed snapshot of `name` this checkout's store, or else its link anchor's (the main checkout's), holds,
+ * newest by the commit time of the HEAD it captured, as `source`'s repository knows it; or null when there is none.
+ * What a live developer link serves while the live checkout's build does not describe its sources (developer-links.ts):
+ * the last revision that was built and sealed, never the stale build, and never a refusal that stops shell entry.
+ */
+export function newestSealedSnapshot(
+  root: string,
+  name: string,
+  source: string,
+): (SealedSnapshot & { readonly head: string }) | null {
+  const stores = [...new Set([path.join(root, SNAPSHOT_STORE), path.join(linkAnchor(root), SNAPSHOT_STORE)])];
+  const candidates: { readonly directory: string; readonly receipt: SnapshotReceipt; readonly time: number }[] = [];
+  for (const store of stores) {
+    let entries: string[];
+    try {
+      entries = readdirSync(store);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const directory = path.join(store, entry);
+      const receipt = readSealed(directory);
+      if (receipt === null || receipt.name !== name || !contained(receipt.packagePath)) continue;
+      const committed = spawnSync('git', ['-C', source, 'log', '-1', '--format=%ct', receipt.provenance.head], {
+        encoding: 'utf8',
+        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+      });
+      const time = Number.parseInt(committed.stdout.trim(), 10);
+      if (committed.status === 0 && Number.isFinite(time)) candidates.push({ directory, receipt, time });
+    }
+  }
+  candidates.sort((left, right) => right.time - left.time);
+  for (const { directory, receipt } of candidates) {
+    try {
+      verifySnapshot(directory);
+    } catch (error) {
+      if (error instanceof SnapshotRefusal) continue;
+      throw error;
+    }
+    return {
+      kind: 'snapshot',
+      id: receipt.id,
+      directory: path.join(directory, receipt.packagePath),
+      head: receipt.provenance.head,
+    };
+  }
+  return null;
+}
+
 /** A sealed snapshot's receipt, or null when `directory` holds none. Its census is not verified here. */
 export function readSealed(directory: string): SnapshotReceipt | null {
   let input: unknown;

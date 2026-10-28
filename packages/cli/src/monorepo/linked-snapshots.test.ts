@@ -12,6 +12,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -601,6 +602,50 @@ function reinstall(alias: string): void {
 function refuseProducer({ provider }: Fixture): void {
   write(join(provider, REFUSED_MARK), '');
 }
+
+describe('a live declaration whose build is stale', () => {
+  /** Declares `linked-api` live: the alias links the provider checkout itself. */
+  function declareLive({ consumer }: Fixture): string {
+    write(
+      join(consumer, 'package.json'),
+      JSON.stringify({
+        name: 'consumer',
+        private: true,
+        smoo: { developerLinks: { 'linked-api': join('..', 'provider/packages/api') } },
+      }),
+    );
+    const installed = join(consumer, 'node_modules/.bun/linked-api@1.0.0/node_modules/linked-api');
+    write(join(installed, 'package.json'), JSON.stringify({ name: 'linked-api', version: '1.0.0' }));
+    symlinkSync('.bun/linked-api@1.0.0/node_modules/linked-api', join(consumer, 'node_modules/linked-api'));
+    return join(consumer, 'node_modules/linked-api');
+  }
+
+  /** The provider's source moves on and its build does not: every built file predates the edit. */
+  function staleProvider({ source }: Fixture): void {
+    const past = new Date(Date.now() - 60_000);
+    for (const built of ['dist/index.js', 'dist/index.d.ts']) utimesSync(join(source, built), past, past);
+    write(join(source, 'src/index.js'), 'export const leaf = "unbuilt";\n');
+  }
+
+  it('serves the newest sealed snapshot of the package, naming the revision it holds and why', async () => {
+    const checkout = fixture();
+    const snapshot = snapshotOf(await capture(checkout));
+    const head = git(checkout.provider, 'rev-parse', 'HEAD');
+    const alias = declareLive(checkout);
+    staleProvider(checkout);
+    const { said } = await postinstall(checkout.consumer);
+    expect(said).toContain(`serving sealed snapshot ${snapshot.id} of ${head}`);
+    expect(said).toContain("because the live checkout's build is stale");
+    expect(realpathSync(alias)).toBe(snapshot.directory);
+  });
+
+  it('refuses as before when no sealed snapshot of the package exists', async () => {
+    const checkout = fixture();
+    declareLive(checkout);
+    staleProvider(checkout);
+    await expect(postinstall(checkout.consumer)).rejects.toThrow('does not describe its sources');
+  });
+});
 
 describe('snapshot declarations', () => {
   /** Declares the snapshot of `linked-api`, with any `extra` checkout declarations beside it. */
