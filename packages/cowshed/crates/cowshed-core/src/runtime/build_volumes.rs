@@ -3384,11 +3384,11 @@ mod tests {
             record.checked_out = Some(tree.clone());
             scratch.layout.write_record(&live, &record).unwrap();
             let predecessor = seed(&target, 0);
-            claims.push(scratch.layout.claim_release(&predecessor).unwrap().unwrap());
+            claims.push(scratch.layout.claim_release_granted(&predecessor).unwrap());
             let current = seed(&target, 0);
             let expected = if matches!(index, 0 | 7 | 63) {
                 let retiring = seed(&target, 1);
-                claims.push(scratch.layout.claim_release(&retiring).unwrap().unwrap());
+                claims.push(scratch.layout.claim_release_granted(&retiring).unwrap());
                 None
             } else {
                 Some(current)

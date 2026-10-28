@@ -985,6 +985,20 @@ impl BuildVolumeLayout {
         }
     }
 
+    /// [`Self::claim_release`] granted as the lock's waiter, within the test backstop. A probe
+    /// right after the last hold's close can still see a transient kernel copy of its descriptor
+    /// from another thread's spawn (cowshed-os `fork_lock`); the waiter's grant proves the release.
+    #[cfg(test)]
+    pub(crate) fn claim_release_granted(&self, id: &BuildVolumeId) -> io::Result<ReleaseClaim> {
+        use cowshed_os::test_backstop::FileBackstop as _;
+        let file = open_hold(&self.hold_path(id))?;
+        file.lock_bounded()?;
+        Ok(ReleaseClaim {
+            id: id.clone(),
+            _file: file,
+        })
+    }
+
     /// Whether a release holds its exclusive claim on volume `id` ([`Self::claim_release`]). A
     /// volume with no hold file was never claimed.
     pub fn claimed(&self, id: &BuildVolumeId) -> io::Result<bool> {
