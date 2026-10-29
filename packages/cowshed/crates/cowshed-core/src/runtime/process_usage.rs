@@ -1557,9 +1557,9 @@ mod tests {
         assert!(status.success(), "parent: {status}");
     }
 
-    /// The reaped child's independent CPU report is stable before the leader exits. Its
-    /// converted children counters agree within whole-microsecond truncation; the leader's
-    /// terminal snapshot precedes exit teardown, so its total cannot exceed the final charge.
+    /// The child's pre-exit self-report and post-reap charge bracket its converted snapshot.
+    /// Both child and leader snapshots precede their exit teardown, so neither must equal
+    /// the later getrusage charge; only component-wise microsecond truncation can cross the bounds.
     /// Exact rational conversion and once-only aggregation belong to job_accounting's pure table.
     #[cfg(target_os = "macos")]
     #[test]
@@ -1612,12 +1612,13 @@ mod tests {
         assert!(parent.wait_bounded().expect("reap the parent").success());
         let charged = rusage_us(libc::RUSAGE_CHILDREN) - before;
 
-        // The child's user and system totals are already final. Each native API truncates
-        // those two components to microseconds independently: at most two microseconds differ.
+        // The child reports its own CPU before exiting; its post-reap charge includes
+        // teardown after rusage_info's snapshot. Two independently truncated components
+        // allow at most two microseconds outside those ordered observations.
         let converted_children = cpu(last.children);
         assert!(
-            converted_children.abs_diff(reaped) <= 2,
-            "converted child CPU {converted_children} us is the independently reported {reaped} us"
+            burned <= converted_children + 2 && converted_children <= reaped + 2,
+            "converted child CPU {converted_children} us is bracketed by pre-exit {burned} us and post-reap {reaped} us"
         );
         // xnu snapshots rusage_info at proc_prepareexit, before proc_exit's teardown CPU.
         // No fixed fraction bounds that extra work. The four converted components can each

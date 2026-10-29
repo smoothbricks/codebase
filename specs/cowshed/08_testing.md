@@ -105,11 +105,12 @@ No mounts, no root, no network — pure functions with table-driven cases:
   while kernel rusage and monotonic wall time remain real. Repeated reads must keep the window; advancing one clock
   boundary opens the idle window. The child's independent CPU report pins the accounted total. Concurrent witnesses
   sharing a pipe emit each complete bounded report in one write; the reader keeps its strict record grammar rather than
-  accepting interleaved fields. The native rusage conversion witness compares the stable, already-reaped child's
-  independently reported CPU with the leader's converted children counters. The terminal leader snapshot is a lower
-  bound on its final getrusage charge: exit teardown adds CPU with no fixed percentage ceiling. Only component-wise
-  whole-microsecond truncation permits a difference. Injected-timebase tables own exact rational conversion and
-  once-only aggregation, not native timing.
+  accepting interleaved fields. The native rusage conversion witness brackets the leader's converted children counters
+  between the child's pre-exit self-reported CPU and its post-reap getrusage charge. The child's snapshot also precedes
+  exit teardown: stable counters from the two APIs need not be equal. The terminal leader snapshot is a lower bound on
+  its final getrusage charge; teardown has no fixed percentage ceiling. Only component-wise whole-microsecond truncation
+  can cross these ordered bounds. Injected-timebase tables own exact rational conversion and once-only aggregation, not
+  native timing.
 - **API capability goldens**: `Project` exposes discovery only; `WorkspaceRef` exposes inspection plus safe `attach`;
   `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/push/grant reads; only `Coordinator` exposes
   grant/revoke/destroy/rebase/land/gc/repo-mirror. Compile-fail fixtures prove forbidden methods and cross-workspace
