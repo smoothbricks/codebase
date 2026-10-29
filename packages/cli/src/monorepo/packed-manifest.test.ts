@@ -107,7 +107,7 @@ describe('packed runtime dependency freshness', () => {
         expect(packedManifest.dependencies?.['@pub.test/lib']).toBe('0.0.1-next.0');
         expect(validatePackedWorkspaceDependencies(root, source, packedManifest, { mode: 'install' })).toEqual([]);
         expect(validatePackedWorkspaceDependencies(root, source, packedManifest, { mode: 'publish' })).toEqual([
-          'packages/app: packed dependencies.@pub.test/lib would ship 0.0.1-next.0, a workspace-internal -next version no registry holds: lib has no stable release. Release lib in the same run (a first release needs --bump patch).',
+          'packages/app: packed dependencies.@pub.test/lib would ship 0.0.1-next.0, a workspace-internal -next version no registry holds: lib has no stable release. Release lib in the same run (name it in --projects).',
         ]);
       },
       {

@@ -1,4 +1,7 @@
-/** What `--bump` accepts: `auto` derives each package's bump from its commits; the rest force one. */
+/**
+ * What `--bump` accepts. `auto` has Nx derive each tagged package's bump from its commits and gives a package with no
+ * release tag the version its first release publishes (`firstReleaseVersion`); the rest force one.
+ */
 export const RELEASE_BUMPS = ['auto', 'patch', 'minor', 'major', 'prerelease'] as const;
 
 export interface ReleasePackageInfo {
@@ -61,6 +64,74 @@ export function releaseTagAliases(pkg: Pick<ReleasePackageInfo, 'name' | 'projec
 
 export function npmDistTagForVersion(version: string): string {
   return version.includes('-') ? 'next' : 'latest';
+}
+
+/** semver.org's grammar for a version: the captures are its major, minor and patch numbers. */
+const SEMVER_VERSION =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/;
+
+/**
+ * The version a package's first release publishes.
+ *
+ * `--bump auto` has Nx derive each bump from the commits since the package's last release tag. A package with no tag
+ * has no such commits, and the history Nx would read instead reaches back to the package's birth and fails on the first
+ * commit whose scope it cannot resolve, so a first release is never derived: it is what the manifest declares.
+ *
+ * - `X.Y.Z` is released as it stands.
+ * - `X.Y.Z-<prerelease>` is released as `X.Y.Z`. A prerelease version is the development version smoo leaves a package
+ *   on after each stable release (`prerelease --preid next`), and that version is neither tagged nor published (README,
+ *   "Publishing"), so it stands for the stable version it precedes. An explicit `patch` bump of it gives the same.
+ * - `0.0.0`, and a declared version that is no semver at all, name no version to release: the first release is the
+ *   patch after `0.0.0`, `0.0.1`.
+ */
+export function firstReleaseVersion(declared: string): string {
+  const stable = SEMVER_VERSION.test(declared) ? declared.replace(SEMVER_VERSION, '$1.$2.$3') : '0.0.0';
+  return stable === '0.0.0' ? '0.0.1' : stable;
+}
+
+/**
+ * The subject of the commit that versions a release. `smoo release version` writes it and every later step finds the
+ * release commit by it: the tags that would name the release are created afterwards, by the publishing job.
+ */
+export const RELEASE_COMMIT_SUBJECT = 'chore(release): publish';
+
+const RELEASE_COMMIT_PROJECT_LINE = /^- project: (\S+) (\S+)$/;
+
+/**
+ * The paragraphs of a release commit's message: the subject, then a `- project: <name> <version>` paragraph for each
+ * project the commit releases. That is the message Nx writes for an independent release, and the one smoo writes for a
+ * release with first releases in it, so one reader (`releaseCommitProjects`) serves both.
+ */
+export function releaseCommitParagraphs(
+  packages: readonly Pick<ReleasePackageInfo, 'projectName' | 'version'>[],
+): string[] {
+  return [RELEASE_COMMIT_SUBJECT, ...packages.map((pkg) => `- project: ${pkg.projectName} ${pkg.version}`)];
+}
+
+/** The versions, by project name, that a release commit's message lists. */
+export function releaseCommitProjects(message: string): Map<string, string> {
+  const listed = new Map<string, string>();
+  for (const line of message.split('\n')) {
+    const [, projectName, version] = RELEASE_COMMIT_PROJECT_LINE.exec(line.trim()) ?? [];
+    if (projectName !== undefined && version !== undefined) {
+      listed.set(projectName, version);
+    }
+  }
+  return listed;
+}
+
+/**
+ * Whether a release commit releases a package that stands at `pkg.version` in it. Changing the version is how a commit
+ * usually does, and the whole story for a package Nx versions. A first release is the exception: it publishes the
+ * version its manifest already declares, so the commit changes no manifest and the only record of it is the commit's
+ * own list.
+ */
+export function releasedByCommit(
+  pkg: Pick<ReleasePackageInfo, 'projectName' | 'version'>,
+  versionBefore: string | null,
+  listed: ReadonlyMap<string, string>,
+): boolean {
+  return pkg.version !== versionBefore || listed.get(pkg.projectName) === pkg.version;
 }
 
 export type ReleaseBranchPushAction = 'push' | 'skip' | 'diverged';

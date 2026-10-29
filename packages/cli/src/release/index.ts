@@ -72,7 +72,10 @@ import {
   type GitReleaseTagInfo,
   pendingReleaseTargets,
   RELEASE_BUMPS,
+  RELEASE_COMMIT_SUBJECT,
   type ReleasePackageInfo,
+  releaseCommitProjects,
+  releasedByCommit,
   releaseTag,
   releaseTagAliases,
 } from './core.js';
@@ -83,6 +86,7 @@ import {
   transportFailureDetail,
   undetermined,
 } from './durable-state.js';
+import { commitReleaseWithFirstReleases } from './first-release.js';
 import {
   createOrUpdateGithubRelease,
   DEPENDENCY_ONLY_RELEASE_NOTES,
@@ -96,11 +100,14 @@ import {
   bumpStableReleaseToNext,
   collectRepairPlatformOutputs,
   completeReleaseAtHead as completeReleaseAtHeadWithShell,
+  plannedReleasePackages,
+  planReleaseVersion,
   prepareReleaseCandidate,
   type ReleaseCompletionShell,
   type ReleaseRepairOutputsShell,
   type ReleaseRepairShell,
   type ReleaseSummary,
+  type ReleaseVersionPlan,
   repairPendingTargets,
   runReleaseTag,
   runReleaseVersion,
@@ -206,8 +213,7 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
         releaseCandidatePackages(await releaseCandidateShell(root), packages, selection),
       hasReleaseTag: (pkg) => hasAnyReleaseTag(root, pkg.projectName),
       gitHead: () => gitHead(root),
-      runNxReleaseVersion: (releasePackages, releaseBump, dryRun) =>
-        runNxReleaseVersion(root, releasePackageProjects(releasePackages), releaseBump, dryRun),
+      versionRelease: (plan, dryRun) => versionRelease(root, plan, dryRun),
       assertCleanGitTree: () => assertCleanGitTree(root),
     },
     { bump, dryRun: options.dryRun === true },
@@ -849,17 +855,26 @@ async function releasePlatformPackages(
     return [];
   }
   // Nx may version additional reverse dependents, so use its dry-run result rather than only the direct candidates.
-  return runNxReleaseVersionPreview(root, releasePackageProjects(candidates), bump);
+  const plan = await planReleaseVersion(
+    { hasReleaseTag: (pkg) => hasAnyReleaseTag(root, pkg.projectName) },
+    candidates,
+    bump,
+  );
+  return plannedReleasePackages(plan, await runNxReleaseVersionPreview(root, plan));
 }
 
-async function runNxReleaseVersion(
+async function versionRelease(
   root: string,
-  projects: string,
-  bump: string,
+  plan: ReleaseVersionPlan<ReleasePackage>,
   dryRun: boolean,
 ): Promise<ReleasePackage[]> {
+  for (const pkg of plan.firstReleases) {
+    console.log(
+      `First release of ${pkg.name}: no ${pkg.projectName}@* release tag exists, so --bump auto publishes it as ${pkg.version}.`,
+    );
+  }
   if (dryRun) {
-    return runNxReleaseVersionPreview(root, projects, bump);
+    return runNxReleaseVersionPreview(root, plan);
   }
 
   // Nx owns local release mutation: package versions, bun.lock updates, and the
@@ -867,13 +882,50 @@ async function runNxReleaseVersion(
   // runs in every release-candidate job before Build, Lint, and Unit Tests, so a
   // tag written here would survive a red candidate and collide on the next run.
   // `smoo release tag` creates the tags once, in the publishing job.
-  const nxArgs = ['version'];
-  if (bump !== 'auto') {
-    nxArgs.push(bump);
+  if (plan.nx.length > 0) {
+    await runNxRelease(root, nxVersionArgs(nxVersionRun(plan)));
   }
-  nxArgs.push(`--projects=${projects}`, '--git-commit=true', '--git-tag=false', '--git-push=false');
-  await runNxRelease(root, nxArgs);
+  // A first release has no commits for Nx to derive a bump from, so smoo versions it and writes the one release commit
+  // once it is in, with whatever Nx staged.
+  if (plan.firstReleases.length > 0) {
+    await commitReleaseWithFirstReleases(root, plan.firstReleases);
+  }
   return [];
+}
+
+/**
+ * The `nx release version` run a plan asks of Nx. The real run's arguments and the dry run's options both come from it,
+ * so the preview cannot report what `smoo release version` would not write. Nx versions the plan's own packages and
+ * commits them, unless the plan has first releases too: those join the one release commit, which smoo then writes, so
+ * Nx only stages.
+ */
+interface NxVersionRun {
+  specifier: string | undefined;
+  projects: string[];
+  gitCommit: boolean;
+  stageChanges: boolean;
+}
+
+function nxVersionRun(plan: ReleaseVersionPlan<ReleasePackage>): NxVersionRun {
+  const smooCommits = plan.firstReleases.length > 0;
+  return {
+    specifier: plan.bump === 'auto' ? undefined : plan.bump,
+    projects: plan.nx.map((pkg) => pkg.projectName),
+    gitCommit: !smooCommits,
+    stageChanges: smooCommits,
+  };
+}
+
+function nxVersionArgs(run: NxVersionRun): string[] {
+  return [
+    'version',
+    ...(run.specifier === undefined ? [] : [run.specifier]),
+    `--projects=${run.projects.join(',')}`,
+    `--git-commit=${run.gitCommit}`,
+    ...(run.stageChanges ? ['--stage-changes=true'] : []),
+    '--git-tag=false',
+    '--git-push=false',
+  ];
 }
 
 /**
@@ -891,20 +943,36 @@ async function runNxRelease(root: string, args: string[]): Promise<void> {
   await run('nx', ['release', ...args, '--verbose'], root, { NX_WORKSPACE_ROOT_PATH: root });
 }
 
-async function runNxReleaseVersionPreview(root: string, projects: string, bump: string): Promise<ReleasePackage[]> {
+async function runNxReleaseVersionPreview(
+  root: string,
+  plan: ReleaseVersionPlan<ReleasePackage>,
+): Promise<ReleasePackage[]> {
+  releasePreviewChangelogs.clear();
+  const versionedByNx = plan.nx.length === 0 ? [] : await previewNxVersion(root, nxVersionRun(plan));
+  // A first release is no Nx version: its notes are the ones its GitHub Release will carry.
+  for (const pkg of plan.firstReleases) {
+    releasePreviewChangelogs.set(
+      pkg.projectName,
+      await renderNxProjectChangelogContents({ root, pkg, previousTag: null, dryRun: true }),
+    );
+  }
+  return versionedByNx;
+}
+
+async function previewNxVersion(root: string, run: NxVersionRun): Promise<ReleasePackage[]> {
   return withNxWorkspaceRoot(root, async () => {
     const { createAPI } = await importWorkspaceNx(root, 'src/command-line/release/version.js');
     const { createAPI: createChangelogAPI } = await importWorkspaceNx(root, 'src/command-line/release/changelog.js');
-    const projectNames = projects.split(',').filter(Boolean);
     const result = await createAPI(
       {},
       false,
     )({
-      specifier: bump === 'auto' ? undefined : bump,
-      projects: projectNames,
-      gitCommit: true,
+      specifier: run.specifier,
+      projects: run.projects,
       // Mirror the real invocation exactly, so the preview never reports a tag
       // that `smoo release version` would not have written.
+      gitCommit: run.gitCommit,
+      stageChanges: run.stageChanges,
       gitTag: false,
       gitPush: false,
       dryRun: true,
@@ -918,7 +986,7 @@ async function runNxReleaseVersionPreview(root: string, projects: string, bump: 
       },
       false,
     )({
-      projects: projectNames,
+      projects: run.projects,
       versionData: result.projectsVersionData,
       releaseGraph: result.releaseGraph,
       gitCommit: false,
@@ -929,7 +997,6 @@ async function runNxReleaseVersionPreview(root: string, projects: string, bump: 
       forceChangelogGeneration: true,
       dryRun: true,
     });
-    releasePreviewChangelogs.clear();
     for (const [projectName, changelog] of Object.entries(changelogResult.projectChangelogs ?? {})) {
       releasePreviewChangelogs.set(projectName, changelog.contents);
     }
@@ -980,9 +1047,11 @@ async function writeReleaseGithubOutput(
  * Tags are the direct evidence, but they are no longer written by versioning:
  * `smoo release version` produces the release commit and `smoo release tag`
  * creates the tags later, in the publishing job. Between those two points a
- * validated release commit is legitimately untagged, so the fallback — Nx's
- * release commit subject plus a version that differs from the parent — is the
- * only evidence available, and it is what `smoo release tag` itself runs on.
+ * validated release commit is legitimately untagged, so the fallback -- the
+ * release commit's subject plus what the commit records of its packages (a
+ * version that differs from the parent's, or its own list of them, which a
+ * first release at its declared version needs) -- is the only evidence
+ * available, and it is what `smoo release tag` itself runs on.
  */
 export async function releasePackagesAtRef<Package extends ReleasePackageInfo>(
   root: string,
@@ -1000,10 +1069,11 @@ export async function releasePackagesAtRef<Package extends ReleasePackageInfo>(
   if (taggedPackages.length > 0) {
     return taggedPackages;
   }
-  if (!(await isNxReleaseCommit(root, ref))) {
+  const listed = await releaseCommitListing(root, ref);
+  if (listed === null) {
     return [];
   }
-  return releasePackagesChangedAtRef(root, presentPackages, ref);
+  return releasePackagesChangedAtRef(root, presentPackages, ref, listed);
 }
 
 async function releasePackageAtRef<Package extends ReleasePackageInfo>(
@@ -1027,23 +1097,28 @@ async function packageVersionAtRef(root: string, packagePath: string, ref: strin
   }
 }
 
-async function isNxReleaseCommit(root: string, ref: string): Promise<boolean> {
-  const result = await $`git show -s --format=%s ${ref}`.cwd(root).quiet().nothrow();
-  return result.exitCode === 0 && decode(result.stdout).trim() === 'chore(release): publish';
+/** What the commit at `ref` lists as released, when it is a release commit; null for any other commit. */
+async function releaseCommitListing(root: string, ref: string): Promise<Map<string, string> | null> {
+  const result = await $`git show -s --format=%B ${ref}`.cwd(root).quiet().nothrow();
+  if (result.exitCode !== 0) {
+    return null;
+  }
+  const message = decode(result.stdout);
+  return message.split('\n')[0]?.trim() === RELEASE_COMMIT_SUBJECT ? releaseCommitProjects(message) : null;
 }
 
 async function releasePackagesChangedAtRef<Package extends ReleasePackageInfo>(
   root: string,
   packages: Package[],
   ref: string,
+  listed: ReadonlyMap<string, string>,
 ): Promise<Package[]> {
   if (!(await gitRefExists(root, `${ref}^`))) {
     return packages;
   }
   const changed: Package[] = [];
   for (const pkg of packages) {
-    const previousVersion = await packageVersionAtRef(root, pkg.path, `${ref}^`);
-    if (previousVersion !== pkg.version) {
+    if (releasedByCommit(pkg, await packageVersionAtRef(root, pkg.path, `${ref}^`), listed)) {
       changed.push(pkg);
     }
   }

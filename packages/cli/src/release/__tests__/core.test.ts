@@ -2,12 +2,16 @@ import { describe, expect, it } from 'bun:test';
 import {
   classifyReleaseBranchPush,
   collectOwnedReleaseTagRecords,
+  firstReleaseVersion,
   groupReleaseTargets,
   legacyReleaseTag,
   npmDistTagForVersion,
   pendingReleaseTargets,
   type ReleasePackageInfo,
   type ReleaseTagRecord,
+  releaseCommitParagraphs,
+  releaseCommitProjects,
+  releasedByCommit,
   releasePackageForTag,
   releaseTag,
   releaseTagAliases,
@@ -140,5 +144,77 @@ describe('release core planning', () => {
     expect(
       classifyReleaseBranchPush({ remoteExists: true, headIsAncestorOfRemote: false, remoteIsAncestorOfHead: false }),
     ).toBe('diverged');
+  });
+});
+
+describe('the version a first release publishes', () => {
+  it.each([
+    ['a declared stable version stands', '2.3.0', '2.3.0'],
+    ['a version of one digit per part stands', '1.0.0', '1.0.0'],
+    ['a development prerelease stands for the version it precedes', '0.4.2-next.0', '0.4.2'],
+    ['so does a named prerelease', '1.0.0-beta.1', '1.0.0'],
+    ['build metadata is no part of a release', '1.2.3+build.5', '1.2.3'],
+    ['0.0.0 names no version to release', '0.0.0', '0.0.1'],
+    ['nor does a prerelease of it', '0.0.0-next.0', '0.0.1'],
+    ['the first patch stands for itself while in development', '0.0.1-next.0', '0.0.1'],
+    ['a declared version that is no semver names none', 'latest', '0.0.1'],
+    ['nor does a version missing a part', '1.2', '0.0.1'],
+    ['nor does one with a leading zero', '01.2.3', '0.0.1'],
+    ['nor does an empty one', '', '0.0.1'],
+  ])('%s: %s releases %s', (_case, declared, released) => {
+    expect(firstReleaseVersion(declared)).toBe(released);
+  });
+});
+
+describe('the message of a release commit', () => {
+  it('lists the projects Nx lists in the commit it writes for an independent release', () => {
+    const nxMessage = [
+      'chore(release): publish',
+      '',
+      '- project: nx-plugin 0.6.1',
+      '',
+      '- project: cowshed 0.4.1',
+      '',
+      '- project: cli 0.12.23',
+      '',
+    ].join('\n');
+
+    expect([...releaseCommitProjects(nxMessage)]).toEqual([
+      ['nx-plugin', '0.6.1'],
+      ['cowshed', '0.4.1'],
+      ['cli', '0.12.23'],
+    ]);
+  });
+
+  it('is written as the paragraphs git joins into that same message', () => {
+    const paragraphs = releaseCommitParagraphs([a, { ...b, version: '2.1.0' }]);
+
+    expect(paragraphs).toEqual(['chore(release): publish', '- project: a 1.0.0', '- project: b 2.1.0']);
+    expect([...releaseCommitProjects(paragraphs.join('\n\n'))]).toEqual([
+      ['a', '1.0.0'],
+      ['b', '2.1.0'],
+    ]);
+  });
+
+  it('lists nothing for a message that only looks like a list', () => {
+    const message = ['feat: add a project', '', 'project: a 1.0.0', '- projects: a 1.0.0', '- project: a', ''].join(
+      '\n',
+    );
+
+    expect(releaseCommitProjects(message).size).toBe(0);
+  });
+});
+
+describe('what a release commit releases', () => {
+  const listed = new Map([['a', '1.0.0']]);
+
+  it.each([
+    ['a version the commit changes', '0.9.0', new Map<string, string>(), true],
+    ['a package the commit adds', null, new Map<string, string>(), true],
+    ['a version the commit leaves alone and does not list', '1.0.0', new Map<string, string>(), false],
+    ['a version the commit leaves alone and lists, a first release at its declared version', '1.0.0', listed, true],
+    ['a version the commit leaves alone and lists at another version', '1.0.0', new Map([['a', '0.9.0']]), false],
+  ])('%s', (_case, versionBefore, commitList, released) => {
+    expect(releasedByCommit(a, versionBefore, commitList)).toBe(released);
   });
 });

@@ -778,7 +778,10 @@ function buildProgram(): Command {
 const NX_MODES = ['auto', 'affected', 'run-many'] as const;
 
 function bumpOption(): Option {
-  return new Option('--bump <bump>', 'how far to bump each released package').choices(RELEASE_BUMPS);
+  return new Option(
+    '--bump <bump>',
+    'how far to bump each released package: auto derives it from commits, and publishes a package with no release tag at the stable version its manifest declares',
+  ).choices(RELEASE_BUMPS);
 }
 
 /**

@@ -1,5 +1,5 @@
 import type { ReleaseVersionMode } from '@smoothbricks/nx-plugin/managed-files/publish-workflow';
-import type { ReleasePackageInfo, ReleaseTarget } from './core.js';
+import { firstReleaseVersion, type ReleasePackageInfo, type ReleaseTarget } from './core.js';
 import { planPublishActions } from './publish-plan.js';
 
 export interface ReleaseSummary<Package extends ReleasePackageInfo = ReleasePackageInfo> {
@@ -86,7 +86,11 @@ export interface ReleaseVersionShell<Package extends ReleasePackageInfo = Releas
   /** Whether any `<projectName>@*` release tag exists for the package. */
   hasReleaseTag(pkg: Package): Promise<boolean>;
   gitHead(): Promise<string>;
-  runNxReleaseVersion(packages: Package[], bump: string, dryRun: boolean): Promise<Package[]>;
+  /**
+   * Versions the plan, leaving one release commit: Nx versions the packages it derives, smoo the first releases. With
+   * `dryRun` it writes nothing and returns the packages Nx would version; otherwise it returns none.
+   */
+  versionRelease(plan: ReleaseVersionPlan<Package>, dryRun: boolean): Promise<Package[]>;
   assertCleanGitTree(): Promise<void>;
 }
 
@@ -105,6 +109,56 @@ export type ReleaseVersionResult<Package extends ReleasePackageInfo = ReleasePac
   | { mode: 'none'; packages: [] }
   | { mode: Exclude<ReleaseVersionMode, 'none'>; packages: Package[] };
 
+/**
+ * What a release does to the packages it selects.
+ *
+ * Under `--bump auto` Nx derives each bump from the commits since the package's last release tag, so Nx versions the
+ * tagged packages. A package with no tag has no such commits, and the history Nx would read instead reaches back to the
+ * package's birth and fails on the first commit whose scope it cannot resolve: smoo versions it itself, to the version
+ * its first release publishes (`firstReleaseVersion`). An explicit bump forces its one specifier on every selected
+ * package, tagged or not.
+ */
+export interface ReleaseVersionPlan<Package extends ReleasePackageInfo = ReleasePackageInfo> {
+  bump: string;
+  /** The packages Nx versions. */
+  nx: Package[];
+  /** The packages smoo versions: each already carries the version its first release publishes. */
+  firstReleases: Package[];
+}
+
+export async function planReleaseVersion<Package extends ReleasePackageInfo>(
+  shell: Pick<ReleaseVersionShell<Package>, 'hasReleaseTag'>,
+  packages: Package[],
+  bump: string,
+): Promise<ReleaseVersionPlan<Package>> {
+  if (bump !== 'auto') {
+    return { bump, nx: packages, firstReleases: [] };
+  }
+  const nx: Package[] = [];
+  const firstReleases: Package[] = [];
+  for (const pkg of packages) {
+    if (await shell.hasReleaseTag(pkg)) {
+      nx.push(pkg);
+    } else {
+      firstReleases.push({ ...pkg, version: firstReleaseVersion(pkg.version) });
+    }
+  }
+  return { bump, nx, firstReleases };
+}
+
+/**
+ * The packages a plan releases, each at the version the plan gives it. `versionedByNx` is what Nx versions for
+ * `plan.nx`, and it can name a first release too: Nx versions a package whose dependency it bumps, from the version on
+ * disk. The plan's version for a first release stands, never Nx's.
+ */
+export function plannedReleasePackages<Package extends ReleasePackageInfo>(
+  plan: ReleaseVersionPlan<Package>,
+  versionedByNx: Package[],
+): Package[] {
+  const firstReleases = new Set(plan.firstReleases.map((pkg) => pkg.projectName));
+  return [...versionedByNx.filter((pkg) => !firstReleases.has(pkg.projectName)), ...plan.firstReleases];
+}
+
 export async function runReleaseVersion<Package extends ReleasePackageInfo>(
   shell: ReleaseVersionShell<Package>,
   options: { bump: string; dryRun: boolean },
@@ -122,23 +176,12 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
   if (versionPackages.length === 0) {
     return { mode: 'none', packages: [] };
   }
-  if (options.bump === 'auto') {
-    // Nx derives an automatic bump from the commits since the package's last
-    // release tag; with no tag it reads the whole history and fails on the
-    // first commit whose scope it cannot resolve. A first release names its bump.
-    const first = [];
-    for (const pkg of versionPackages) if (!(await shell.hasReleaseTag(pkg))) first.push(pkg.projectName);
-    if (first.length > 0) {
-      throw new Error(
-        `First release of ${first.join(', ')}: no ${first.map((name) => `${name}@*`).join(', ')} tag exists, so --bump auto cannot derive a version. Rerun with an explicit bump (--bump patch).`,
-      );
-    }
-  }
+  const plan = await planReleaseVersion(shell, versionPackages, options.bump);
 
   const headBeforeVersioning = await shell.gitHead();
-  const dryRunPackages = await shell.runNxReleaseVersion(versionPackages, options.bump, options.dryRun);
+  const versionedByNx = await shell.versionRelease(plan, options.dryRun);
   if (options.dryRun) {
-    return { mode: 'dry-run', packages: dryRunPackages };
+    return { mode: 'dry-run', packages: plannedReleasePackages(plan, versionedByNx) };
   }
 
   await shell.assertCleanGitTree();
@@ -154,7 +197,7 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
     return { mode: 'none', packages: [] };
   }
   if (releasedPackages.length === 0) {
-    throw new Error('Nx created a release commit that versions none of the current release packages.');
+    throw new Error('The release commit versions none of the current release packages.');
   }
   return { mode: 'new', packages: releasedPackages };
 }

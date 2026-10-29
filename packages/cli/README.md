@@ -287,12 +287,14 @@ release packages exist.
 `smoo release npm-status` shows whether each owned release package's current `name@version` already exists on npm. It is
 an npm registry check, not a full release workflow status check.
 
-`smoo release version --bump auto` first selects direct release candidates, then delegates versioning to [Nx]. Direct
-candidates are owned public packages with package-local changes that can affect published users: files matched by the
-package's resolved Nx `build`/`production` inputs, packaged assets listed in `package.json` `files`, package metadata
-docs such as README/LICENSE/CHANGELOG, or user-visible `package.json` fields such as `exports`, `bin`, `types`,
-`dependencies`, `peerDependencies`, and `publishConfig`. Test-only and local automation changes such as `scripts`, `nx`,
-`devDependencies`, and `tsconfig.test.json` do not select a package by themselves.
+`smoo release version --bump auto` first selects direct release candidates, then delegates versioning to [Nx]. A
+candidate with no release tag is a first release: Nx has no commits since a release tag to derive its bump from, so smoo
+versions it itself (see [Releases](#releases)). Direct candidates are owned public packages with package-local changes
+that can affect published users: files matched by the package's resolved Nx `build`/`production` inputs, packaged assets
+listed in `package.json` `files`, package metadata docs such as README/LICENSE/CHANGELOG, or user-visible `package.json`
+fields such as `exports`, `bin`, `types`, `dependencies`, `peerDependencies`, and `publishConfig`. Test-only and local
+automation changes such as `scripts`, `nx`, `devDependencies`, and `tsconfig.test.json` do not select a package by
+themselves.
 
 Downstream dependency bumps are intentionally left to Nx release. If package A is selected and bumped, Nx may also bump
 public package B when B depends on A, even when B has no direct file changes. `smoo` should not pre-expand direct
@@ -1356,12 +1358,32 @@ Release commands wrap [Nx Release][nx-release] but keep SmoothBricks policy in o
 
 Versioning:
 
-- `--bump auto` first filters owned release packages to package-local candidates, then lets [Nx Release][nx-release]
-  derive the semver bump from [Conventional Commits]. A tagged package is an auto candidate only when files under its
-  package root changed since its current `projectName@version` release tag. An untagged package is an auto candidate
-  only when its package root has git history and its current version is stable. Root-only changes, workflow edits,
-  lockfile-only churn, untagged next-prerelease preparation commits, and other workspace-global changes may still affect
-  Nx tasks, but they do not make unrelated package artifacts releasable.
+- `--bump auto` first filters owned release packages to package-local candidates, then versions each one by whether it
+  has a release tag. A package with a `projectName@*` tag has [Nx Release][nx-release] derive the semver bump from
+  [Conventional Commits] since that tag. A tagged package is an auto candidate only when files under its package root
+  changed since its current `projectName@version` release tag. An untagged package is an auto candidate only when its
+  package root has git history and its current version is stable. Root-only changes, workflow edits, lockfile-only
+  churn, untagged next-prerelease preparation commits, and other workspace-global changes may still affect Nx tasks, but
+  they do not make unrelated package artifacts releasable.
+- A package with no `projectName@*` tag is a first release, and `--bump auto` does not derive it: there are no commits
+  since a release tag to derive a bump from, and the history Nx would read instead reaches back to the package's birth
+  and fails on the first commit whose scope it cannot resolve. It publishes the stable version its manifest declares.
+  `X.Y.Z` is released as it stands. `X.Y.Z-<prerelease>` is released as `X.Y.Z`: after each stable release smoo leaves a
+  package on a `-next` development version that is never tagged or published (see Publishing), so it stands for the
+  stable version it precedes, and an explicit `patch` bump of it gives the same. `0.0.0`, and a declared version that is
+  no semver at all, name no version to release: the first release is `0.0.1`. A package that only has a development
+  prerelease version is no auto candidate (a first release must be intentional), so it joins a release by being named in
+  `--projects`. To publish a first release as a prerelease, pass `--bump prerelease`: every explicit bump versions an
+  untagged package from its declared version like any other.
+- A release with first releases in it still ends in one release commit. Nx versions the tagged packages and, instead of
+  committing, only stages (`--git-commit=false --stage-changes=true`); smoo writes each first release's version into its
+  manifest (setting it right again when Nx versioned it as a dependent of a package it bumped), brings `bun.lock` in
+  line, and commits everything once. The commit has the message Nx writes for an independent release,
+  `chore(release): publish` and a `- project: <name> <version>` paragraph for every package it releases. The list
+  matters for a first release at the version its manifest already declares, the one release that changes no manifest:
+  until `smoo release tag` has tagged it, the commit's own list is how `smoo release tag` and `smoo release publish`
+  find it. A release of first releases alone runs no Nx, and its commit can change no file. The dry run reports the same
+  versions: Nx's for the tagged packages and, for each first release, the version it publishes.
 - `--bump patch|minor|major|prerelease` forces the release specifier only; it never widens the release set. Package
   selection comes from `--projects`: blank selects the package-local changed set (the same filter `--bump auto` uses),
   whatever the bump mode is. `--projects <a,b,...>` releases exactly those owned Nx projects without change detection,

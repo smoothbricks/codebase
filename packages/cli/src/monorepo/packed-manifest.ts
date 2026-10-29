@@ -70,7 +70,7 @@ export function validatePackedWorkspaceDependencies(
       // nx-plugin@0.6.0 shipped pinning four such packages at 0.0.1-next.0.
       if (mode === 'publish' && field !== 'devDependencies' && /-next(\.|$)/.test(expectedVersion)) {
         failures.push(
-          `${sourcePackage.path}: packed ${field}.${name} would ship ${expectedVersion}, a workspace-internal -next version no registry holds: ${dep.projectName} has no stable release. Release ${dep.projectName} in the same run (a first release needs --bump patch).`,
+          `${sourcePackage.path}: packed ${field}.${name} would ship ${expectedVersion}, a workspace-internal -next version no registry holds: ${dep.projectName} has no stable release. Release ${dep.projectName} in the same run (name it in --projects).`,
         );
       }
     }

@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'bun:test';
 import fc from 'fast-check';
-import { groupReleaseTargets, pendingReleaseTargets, type ReleasePackageInfo, type ReleaseTagRecord } from '../core.js';
+import {
+  firstReleaseVersion,
+  groupReleaseTargets,
+  pendingReleaseTargets,
+  type ReleasePackageInfo,
+  type ReleaseTagRecord,
+  releaseCommitParagraphs,
+  releaseCommitProjects,
+} from '../core.js';
 import { planPublishActions } from '../publish-plan.js';
 
 const packages: ReleasePackageInfo[] = [
@@ -86,6 +94,51 @@ describe('release core properties', () => {
           expect(action.distTag).toBe(action.pkg.version.includes('-') ? 'next' : 'latest');
         }
       }),
+      { numRuns: 300 },
+    );
+  });
+
+  it('gives a first release a stable version it keeps when released again', () => {
+    fc.assert(
+      fc.property(fc.string(), (declared) => {
+        const released = firstReleaseVersion(declared);
+
+        expect(released).toMatch(/^\d+\.\d+\.\d+$/);
+        expect(released).not.toBe('0.0.0');
+        expect(firstReleaseVersion(released)).toBe(released);
+      }),
+      { numRuns: 500 },
+    );
+  });
+
+  it('releases a declared stable version as it stands', () => {
+    fc.assert(
+      fc.property(fc.nat(), fc.nat(), fc.integer({ min: 1, max: 1000 }), (major, minor, patch) => {
+        const declared = `${major}.${minor}.${patch}`;
+
+        expect(firstReleaseVersion(declared)).toBe(declared);
+        expect(firstReleaseVersion(`${declared}-next.0`)).toBe(declared);
+      }),
+      { numRuns: 300 },
+    );
+  });
+
+  it('reads back the projects a release commit message lists', () => {
+    const project = fc.record({
+      projectName: fc.stringMatching(/^[a-z][a-z0-9-]{0,15}$/),
+      version: fc.tuple(fc.nat(), fc.nat(), fc.nat()).map(([major, minor, patch]) => `${major}.${minor}.${patch}`),
+    });
+    fc.assert(
+      fc.property(
+        fc.uniqueArray(project, { selector: (pkg) => pkg.projectName, maxLength: 12 }),
+        (releasedPackages) => {
+          const message = releaseCommitParagraphs(releasedPackages).join('\n\n');
+
+          expect([...releaseCommitProjects(message)]).toEqual(
+            releasedPackages.map((pkg) => [pkg.projectName, pkg.version]),
+          );
+        },
+      ),
       { numRuns: 300 },
     );
   });

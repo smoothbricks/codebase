@@ -8,6 +8,7 @@ import {
   type ReleaseRepairOutputsShell,
   type ReleaseRepairShell,
   type ReleaseTagShell,
+  type ReleaseVersionPlan,
   type ReleaseVersionShell,
   repairPendingTargets,
   runReleaseTag,
@@ -173,7 +174,7 @@ describe('release orchestration', () => {
     const result = await runReleaseVersion(shell, { bump: 'patch', dryRun: false });
 
     expect(result).toEqual({ mode: 'complete', packages: [stable] });
-    expect(shell.nxRuns).toEqual([]);
+    expect(shell.runs).toEqual([]);
   });
 
   it('plans a HEAD release target as complete in dry run, so the gates validate what publish ships', async () => {
@@ -184,7 +185,7 @@ describe('release orchestration', () => {
     const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: true });
 
     expect(result).toEqual({ mode: 'complete', packages: [stable] });
-    expect(shell.nxRuns).toEqual([]);
+    expect(shell.runs).toEqual([]);
   });
 
   it('reports complete when Nx leaves HEAD in place on a release target', async () => {
@@ -210,7 +211,9 @@ describe('release orchestration', () => {
     const result = await runReleaseVersion(shell, { bump: 'patch', dryRun: false });
 
     expect(result).toEqual({ mode: 'new', packages: [stable] });
-    expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable', '@scope/prerelease'], bump: 'patch', dryRun: false }]);
+    expect(shell.runs).toEqual([
+      { bump: 'patch', nx: ['@scope/stable', '@scope/prerelease'], firstReleases: [], dryRun: false },
+    ]);
     expect(shell.cleanChecks).toBe(1);
   });
 
@@ -223,18 +226,96 @@ describe('release orchestration', () => {
     const result = await runReleaseVersion(shell, { bump, dryRun: false });
 
     expect(result).toEqual({ mode: 'none', packages: [] });
-    expect(shell.nxRuns).toEqual([]);
+    expect(shell.runs).toEqual([]);
     expect(shell.cleanChecks).toBe(0);
   });
 
-  it('refuses an auto bump for a package with no release tag and names the bump to use', async () => {
-    const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [stable] });
-    shell.untagged.add(stable.projectName);
+  it('refuses a release commit that versions none of the current release packages', async () => {
+    const shell = new RecordingVersionShell({
+      releasePackagesAtHead: [[], []],
+      releaseVersionPackages: [stable],
+      heads: ['before', 'after'],
+    });
 
-    await expect(runReleaseVersion(shell, { bump: 'auto', dryRun: true })).rejects.toThrow(
-      `First release of ${stable.projectName}: no ${stable.projectName}@* tag exists, so --bump auto cannot derive a version. Rerun with an explicit bump (--bump patch).`,
+    await expect(runReleaseVersion(shell, { bump: 'auto', dryRun: false })).rejects.toThrow(
+      'The release commit versions none of the current release packages.',
     );
-    expect(shell.nxRuns).toEqual([]);
+  });
+
+  describe('a package with no release tag under auto', () => {
+    const fresh: ReleasePackageInfo = {
+      name: '@scope/fresh',
+      projectName: 'fresh',
+      path: 'packages/fresh',
+      version: '2.3.0',
+    };
+
+    it('is released at the version it declares while Nx derives the tagged package, in one run', async () => {
+      const shell = new RecordingVersionShell({
+        releasePackagesAtHead: [[], [stable, fresh]],
+        releaseVersionPackages: [stable, fresh],
+        heads: ['before', 'after'],
+      });
+      shell.untagged.add(fresh.projectName);
+
+      const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: false });
+
+      expect(shell.runs).toEqual([
+        {
+          bump: 'auto',
+          nx: ['@scope/stable'],
+          firstReleases: [{ name: '@scope/fresh', version: '2.3.0' }],
+          dryRun: false,
+        },
+      ]);
+      expect(result).toEqual({ mode: 'new', packages: [stable, fresh] });
+      expect(shell.cleanChecks).toBe(1);
+    });
+
+    it.each([
+      ['at the stable version it declares', '2.3.0', '2.3.0'],
+      ['at 0.0.1 when it declares 0.0.0', '0.0.0', '0.0.1'],
+      ['at the stable version a declared development prerelease stands for', '0.4.2-next.0', '0.4.2'],
+      ['at 0.0.1 when it declares no semver version', 'latest', '0.0.1'],
+    ])('is released %s', async (_case, declared, released) => {
+      const pkg = { ...fresh, version: declared };
+      const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [pkg] });
+      shell.untagged.add(pkg.projectName);
+
+      const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: true });
+
+      expect(shell.runs).toEqual([
+        { bump: 'auto', nx: [], firstReleases: [{ name: '@scope/fresh', version: released }], dryRun: true },
+      ]);
+      expect(result).toEqual({ mode: 'dry-run', packages: [{ ...pkg, version: released }] });
+    });
+
+    it('keeps its own version in a dry run when Nx also versions it as a dependent of a tagged package', async () => {
+      const derived = { ...stable, version: '1.1.0' };
+      const dependent = { ...fresh, version: '2.3.1' };
+      const shell = new RecordingVersionShell({
+        releasePackagesAtHead: [[]],
+        releaseVersionPackages: [stable, fresh],
+        preview: [derived, dependent],
+      });
+      shell.untagged.add(fresh.projectName);
+
+      const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: true });
+
+      expect(result).toEqual({ mode: 'dry-run', packages: [derived, fresh] });
+    });
+
+    it('is versioned by an explicit bump like any other package', async () => {
+      const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [stable, fresh] });
+      shell.untagged.add(fresh.projectName);
+
+      await runReleaseVersion(shell, { bump: 'minor', dryRun: true });
+
+      expect(shell.tagLookups).toEqual([]);
+      expect(shell.runs).toEqual([
+        { bump: 'minor', nx: ['@scope/stable', '@scope/fresh'], firstReleases: [], dryRun: true },
+      ]);
+    });
   });
 
   it('runs auto Nx versioning only for selected package-local candidates', async () => {
@@ -247,7 +328,7 @@ describe('release orchestration', () => {
     const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: false });
 
     expect(result).toEqual({ mode: 'new', packages: [stable] });
-    expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: false }]);
+    expect(shell.runs).toEqual([{ bump: 'auto', nx: ['@scope/stable'], firstReleases: [], dryRun: false }]);
   });
 
   it('reports dry-run version packages as a release candidate for validation', async () => {
@@ -257,7 +338,7 @@ describe('release orchestration', () => {
     const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: true });
 
     expect(result).toEqual({ mode: 'dry-run', packages: [preview] });
-    expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: true }]);
+    expect(shell.runs).toEqual([{ bump: 'auto', nx: ['@scope/stable'], firstReleases: [], dryRun: true }]);
   });
 
   it('tags every release package at HEAD without touching versioning', async () => {
@@ -439,7 +520,13 @@ class RecordingRepairOutputsShell implements ReleaseRepairOutputsShell<ReleasePa
 }
 
 class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
-  readonly nxRuns: Array<{ packages: string[]; bump: string; dryRun: boolean }> = [];
+  readonly runs: Array<{
+    bump: string;
+    nx: string[];
+    firstReleases: Array<{ name: string; version: string }>;
+    dryRun: boolean;
+  }> = [];
+  readonly tagLookups: string[] = [];
   cleanChecks = 0;
   private readonly releaseBatches: ReleasePackageInfo[][];
   private readonly versionPackages: ReleasePackageInfo[];
@@ -462,9 +549,10 @@ class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
     return this.releaseBatches.shift() ?? [];
   }
 
-  untagged = new Set<string>();
+  readonly untagged = new Set<string>();
 
   async hasReleaseTag(pkg: ReleasePackageInfo): Promise<boolean> {
+    this.tagLookups.push(pkg.projectName);
     return !this.untagged.has(pkg.projectName);
   }
 
@@ -476,12 +564,13 @@ class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
     return this.heads.shift() ?? 'head';
   }
 
-  async runNxReleaseVersion(
-    packages: ReleasePackageInfo[],
-    bump: string,
-    dryRun: boolean,
-  ): Promise<ReleasePackageInfo[]> {
-    this.nxRuns.push({ packages: packageNames(packages), bump, dryRun });
+  async versionRelease(plan: ReleaseVersionPlan<ReleasePackageInfo>, dryRun: boolean): Promise<ReleasePackageInfo[]> {
+    this.runs.push({
+      bump: plan.bump,
+      nx: packageNames(plan.nx),
+      firstReleases: plan.firstReleases.map((pkg) => ({ name: pkg.name, version: pkg.version })),
+      dryRun,
+    });
     return this.preview;
   }
 
