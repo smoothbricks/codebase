@@ -12,6 +12,12 @@ describe("mbx's one pool at the leaf", () => {
     });
   });
 
+  it('names no pool inside a reservation: nested work shares the grant it runs under', () => {
+    // The 2026-10-29 sb-r22 gate: a bounded-exec suite under `mbx reserve` started an executor that reserved again and
+    // waited in the pool behind its own parent's grant until the progress bound ended the suite.
+    expect(mbxPool({ MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx', MBX_SCHED_DISABLE: '1' })).toBeNull();
+  });
+
   it('lets a Cargo leaf through mbx as it is and reserves any other leaf at the job count, once', () => {
     const pool = { priority: 'low' } as const;
     for (const kind of ['cargo', 'cargo-mutants', 'nextest'] as const) {
@@ -21,7 +27,7 @@ describe("mbx's one pool at the leaf", () => {
     const leaf = mbxLeaf(pool, 'process', 4);
     expect(leaf).toEqual({ kind: 'reserve', cpus: 4, priority: 'low' });
     expect(withMbxLeaf("bun test 'a b'", leaf)).toBe(
-      "mbx reserve --cpus 4 --priority low -- /bin/sh -c 'bun test '\\''a b'\\'''",
+      "mbx reserve --cpus 4 --priority low -- /bin/sh -c 'printf granted >&5; exec 5>&-; bun test '\\''a b'\\'''",
     );
     expect(mbxLeaf(pool, 'vitest', 0)).toEqual({ kind: 'reserve', cpus: 1, priority: 'low' });
   });

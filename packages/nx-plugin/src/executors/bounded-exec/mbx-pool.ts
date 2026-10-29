@@ -11,9 +11,15 @@ export interface MbxPool {
   readonly priority: 'normal' | 'low';
 }
 
-/** The pool the environment names, or `null` where the project has no mbx and cowshed's own pools apply unchanged. */
+/**
+ * The pool the environment names, or `null` where the project has no mbx and cowshed's own pools apply unchanged, or
+ * where this run is already inside an mbx reservation: `mbx reserve` hands its command `MBX_SCHED_DISABLE=1`, and nested
+ * non-Cargo work shares the enclosing grant instead of reserving twice (specs/cowshed/05_gateway.md, "Parallelism
+ * inside a job"). A second reservation would wait in the pool while its parent holds a grant, so under a full pool the
+ * nested leaf queued behind the very work it belongs to.
+ */
 export function mbxPool(environment: Readonly<NodeJS.ProcessEnv>): MbxPool | null {
-  if (environment.MBX_SCHEDULER !== '1' || !environment.MBX_CACHE_DIR) {
+  if (environment.MBX_SCHEDULER !== '1' || !environment.MBX_CACHE_DIR || environment.MBX_SCHED_DISABLE === '1') {
     return null;
   }
   return { priority: environment.MBX_SCHEDULER_PRIORITY === 'normal' ? 'normal' : 'low' };
@@ -37,12 +43,20 @@ export function mbxLeaf(pool: MbxPool, kind: RunnerKind, want: number): MbxLeaf 
 }
 
 /**
+ * The descriptor a reserved command says its grant on: `mbx reserve` runs the command only once the pool admits it, so
+ * the command's first write is the grant. bounded-exec starts its clocks there (bounds.ts).
+ */
+export const MBX_GRANT_FD = 5;
+
+/**
  * `command` as the shell runs it under its leaf's admission. `mbx` is the canonical environment's, whose realpath
- * cowshed's admission proved to be the host's pinned mbx.
+ * cowshed's admission proved to be the host's pinned mbx. A reserved command first says its grant on
+ * {@link MBX_GRANT_FD} and closes it, so nothing it starts inherits the descriptor.
  */
 export function withMbxLeaf(command: string, leaf: MbxLeaf): string {
   if (leaf.kind === 'cargo') {
     return command;
   }
-  return `mbx reserve --cpus ${leaf.cpus} --priority ${leaf.priority} -- /bin/sh -c ${shellQuote(command)}`;
+  const granted = `printf granted >&${MBX_GRANT_FD}; exec ${MBX_GRANT_FD}>&-; ${command}`;
+  return `mbx reserve --cpus ${leaf.cpus} --priority ${leaf.priority} -- /bin/sh -c ${shellQuote(granted)}`;
 }

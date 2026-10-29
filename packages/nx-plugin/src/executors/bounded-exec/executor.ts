@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from 'node:child_process';
+import { type ChildProcess, type IOType, spawn } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { availableParallelism, userInfo } from 'node:os';
@@ -28,7 +28,7 @@ import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import type { CpuWaitRow } from './lease-wait.js';
 import type { LockWait } from './lock-wait.js';
-import { mbxLeaf, mbxPool, withMbxLeaf } from './mbx-pool.js';
+import { MBX_GRANT_FD, mbxLeaf, mbxPool, withMbxLeaf } from './mbx-pool.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -646,25 +646,34 @@ export async function runBoundedExec(
   // descriptor, and execs `/bin/sh -c command` in the same process: the command's pid, group and life are unchanged.
   const unadmitted = hooked?.command ?? (fixture === null ? command : `${fixture.command} && ${command}`);
   const shellCommand = leaf === null ? unadmitted : withMbxLeaf(unadmitted, leaf);
+  // A reserved command waits in mbx's pool before it runs, and says its grant on its own descriptor.
+  const queued = leaf?.kind === 'reserve';
+  // fd 4 is unused without a subtree admission, so the grant takes fd 5 either way.
+  const grantSlots: IOType[] = queued ? ['ignore', 'pipe'] : [];
+  const rootGrantSlot: IOType[] = queued ? ['pipe'] : [];
   const root = owner?.rootArgv(shellCommand);
   let child: ChildProcess;
   try {
     // fd 3 is the runner lifecycle's duplex socket when the command is hooked; the subtree admission takes fd 4, which
-    // `cowshed subtree-root` closes before it execs, so fd 3 reaches the shell unchanged.
+    // `cowshed subtree-root` closes before it execs, so fd 3 reaches the shell unchanged; a reserved command says its
+    // grant on MBX_GRANT_FD (5).
     child =
       root === undefined
         ? spawn(shellCommand, [], {
             cwd,
             env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
             shell: true,
-            stdio: hooked === null ? 'pipe' : ['pipe', 'pipe', 'pipe', 'pipe'],
+            stdio:
+              hooked === null && !queued
+                ? 'pipe'
+                : ['pipe', 'pipe', 'pipe', hooked === null ? 'ignore' : 'pipe', ...grantSlots],
             detached: process.platform !== 'win32',
             windowsHide: true,
           })
         : spawn(root.file, root.args, {
             cwd,
             env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
-            stdio: ['pipe', 'pipe', 'pipe', hooked === null ? 'ignore' : 'pipe', 'pipe'],
+            stdio: ['pipe', 'pipe', 'pipe', hooked === null ? 'ignore' : 'pipe', 'pipe', ...rootGrantSlot],
             detached: process.platform !== 'win32',
             windowsHide: true,
           });
@@ -1010,7 +1019,36 @@ export async function runBoundedExec(
 
   // The fixture's ceiling lives and dies with its segment: the segment's terminal clears it, so it can never
   // fire on a command the fixture already handed over to.
-  stepTo({ kind: 'spawn', at: Date.now(), testing: isTesting(), fixture: fixture !== null && lifecycle !== null });
+  stepTo({
+    kind: 'spawn',
+    at: Date.now(),
+    testing: isTesting(),
+    fixture: fixture !== null && lifecycle !== null,
+    queued,
+  });
+  // The grant is the reserved command's first byte, or its descriptor's end should every holder close it unsaid: from
+  // then on the run is the command's time. Read after the spawn's step, so a grant can never come before the queue.
+  if (leaf?.kind === 'reserve') {
+    const channel = child.stdio.at(MBX_GRANT_FD);
+    if (!(channel instanceof Readable)) throw new Error('a reserved command requires its grant descriptor');
+    let said = false;
+    const grant = (): void => {
+      if (said) return;
+      said = true;
+      tell(
+        `cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms cpus=${leaf.cpus} priority=${leaf.priority}\n`,
+      );
+      stepTo({
+        kind: 'granted',
+        at: Date.now(),
+        testing: isTesting(),
+        fixture: fixture !== null && lifecycle !== null,
+      });
+    };
+    channel.once('data', grant);
+    channel.once('end', grant);
+    channel.resume();
+  }
 
   // A grant's connection is a ledger entry, not the command's owner: the lending parent's exit ends it, and what runs
   // under it runs on over budget until it finishes. Its close, while the command runs, is said and changes nothing

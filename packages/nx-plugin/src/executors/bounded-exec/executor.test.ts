@@ -1665,6 +1665,43 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toBe('ran\n');
   });
 
+  it("hears a reserved leaf's grant on its own descriptor, through mbx reserve", async () => {
+    const workspace = await createWorkspace();
+    // mbx at its published interface: `mbx reserve … -- <command…>` runs the command once the pool admits it. This
+    // one admits at once and execs it, so the command's grant byte reaches the executor through mbx's process.
+    const bin = join(workspace.root, 'stand-in-mbx');
+    await mkdir(bin);
+    await writeFile(join(bin, 'mbx'), '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n', {
+      mode: 0o755,
+    });
+    const saved = {
+      PATH: process.env.PATH,
+      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+    };
+    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    try {
+      const result = await runBoundedExec(
+        { command: 'node -e "console.log(\'ran\')"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+      );
+
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(result.terminalOutput).toContain('ran\n');
+      expect(result.terminalOutput).toMatch(/cowshed: mbx reserve granted elapsed=\d+ms cpus=1 priority=low\n/);
+      expect(result.terminalOutput).not.toContain('Bad file descriptor');
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   it('resolves the cowshed a run uses, in full precedence order', () => {
     const root = '/workspace';
     // The executor never chdirs, so an empty PATH component names its actual spawn cwd,
