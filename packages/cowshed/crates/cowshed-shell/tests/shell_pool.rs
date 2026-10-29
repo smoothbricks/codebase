@@ -895,6 +895,11 @@ async fn host_controller_read_only_refuses_missing_and_stale_activation_by_name(
         "{}",
         cold.stderr
     );
+    assert!(
+        cold.stderr.contains("no inherited shell record"),
+        "{}",
+        cold.stderr
+    );
     assert!(cold.stdout.is_empty());
     assert_eq!(workspace.activations(), 0, "{}", cold.stderr);
     assert!(
@@ -931,21 +936,28 @@ async fn host_controller_read_only_and_read_write_never_share_a_shell() {
     let workspace = Workspace::new("shell-pool-modes", 41_184);
     workspace.envrc("");
     let handle = workspace.supervisor(false);
-    let write = "printf x > written-by-job";
+    let write = "printf command-ran; printf x >> written-by-job";
     let mode = |mode| ExecRequest { mode, ..sh(write) };
-    run(&handle, mode(RunSandboxMode::ReadWrite)).await.ok();
-    assert_eq!(workspace.activations(), 1);
-    let read_only = run(&handle, mode(RunSandboxMode::ReadOnly)).await;
-    assert_ne!(
-        read_only.info.exit,
-        Some(ExitStatus::Exited { code: 0 }),
-        "a read-only job never runs in a read-write shell"
-    );
-    assert_eq!(workspace.activations(), 1);
-    run(&handle, mode(RunSandboxMode::ReadWrite)).await.ok();
-    let read_only = run(&handle, mode(RunSandboxMode::ReadOnly)).await;
-    assert_ne!(read_only.info.exit, Some(ExitStatus::Exited { code: 0 }));
-    assert_eq!(workspace.activations(), 1, "each mode reuses its own shell");
+    for expected in ["x", "xx"] {
+        run(&handle, mode(RunSandboxMode::ReadWrite)).await.ok();
+        let read_only = run(&handle, mode(RunSandboxMode::ReadOnly)).await;
+        assert_eq!(read_only.stdout, "command-ran", "{}", read_only.stderr);
+        assert_eq!(read_only.info.failure, None, "{:?}", read_only.info);
+        assert!(
+            matches!(read_only.info.exit, Some(ExitStatus::Exited { code }) if code != 0),
+            "a launched read-only command cannot write through a read-write host: {:?}",
+            read_only.info,
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.mount().join("written-by-job")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            workspace.activations(),
+            1,
+            "each mode reuses its own host without evaluating"
+        );
+    }
 }
 
 #[tokio::test]

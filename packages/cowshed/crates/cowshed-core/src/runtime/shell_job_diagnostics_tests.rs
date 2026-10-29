@@ -193,6 +193,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                     "",
                     &std::env::temp_dir().join("cowshed-diagnostics-profiles"),
                 ),
+                read_only: false,
                 environment: BTreeMap::new(),
                 grants: Default::default(),
                 envrc_directory: None,

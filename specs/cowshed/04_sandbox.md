@@ -991,14 +991,15 @@ guarantees cowshed owns:
   alone). The rest of the user's `~/.cache` and `~/.local/state` is never granted beyond the metadata-only ancestors
   those two paths need (above): admitting them would hand every workspace the rest of what those roots contain.
 - **direnv trust is path-keyed.** Approval belongs to the workspace's private direnv configuration, never the host
-  user's trust store. Before activation, cowshed approves only the selected workspace-contained `.envrc` using that
-  private configuration. Selection walks upward from the requested cwd and stops at the workspace boundary; an unrelated
-  ancestor's `.envrc` is not authorized or evaluated. The `.envrc` is evaluated by `direnv export json` inside a warm
-  exec host, or by `direnv exec <envrc-directory> <original argv...>` in a one-shot child; either way inside the
-  executed-child sandbox, never in the supervisor. Missing direnv, failed approval, or failed activation stops the
-  command rather than silently launching an unactivated environment. Repository shell exports, including PATH additions
-  and SDK selection, reach the command unchanged; the bootstrap PATH is not reapplied after activation. Host HOME,
-  direnv configuration, and credentials are not imported.
+  user's trust store. Read-write activation approves only the selected workspace-contained `.envrc` using that private
+  configuration. Selection walks upward from the requested cwd and stops at the workspace boundary; an unrelated
+  ancestor's `.envrc` is not authorized or evaluated. Evaluation uses `direnv export json` inside a warm exec host, or
+  `direnv exec <envrc-directory> <original argv...>` in a read-write one-shot child; both run in the executed-child
+  sandbox, never in the supervisor. A read-only host only adopts a verified activation; a read-only one-shot with a
+  selected shell refuses `read-only shell entry requires an exec host`. Neither approves or evaluates. Missing direnv,
+  failed approval, or failed activation stops the command rather than silently launching an unactivated environment.
+  Repository shell exports, including PATH additions and SDK selection, reach the command unchanged; the bootstrap PATH
+  is not reapplied after activation. Host HOME, direnv configuration, and credentials are not imported.
 
 ### Evaluating an edited `devenv.nix` inside its workspace
 

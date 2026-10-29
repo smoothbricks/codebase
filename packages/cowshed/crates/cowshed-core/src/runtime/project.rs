@@ -77,12 +77,9 @@ pub const SEED_COMPACTION_VERB: &str = "__compact-seed";
 /// links (`cowshed __collect-build-volumes <project-root>`; 16_build_volumes.md, Land 6.5).
 pub const BUILD_VOLUME_COLLECTION_VERB: &str = "__collect-build-volumes";
 
-/// The sandbox the land's declared-output helper runs in (16_build_volumes.md, step 5.3): the
-/// landing workspace's read-write one, whose shell pool adopts the activation record the
-/// workspace's other jobs left, so the helper finds its `node` without evaluating anything.
-/// A read-only job keeps its environment in exec temp: its port-0 loader options name another
-/// preload, so that record misses (`BUN_OPTIONS differs`), and the devenv evaluation that
-/// follows cannot write the checkout's `.devenv`.
+/// The land's declared-output helper uses the landing workspace's read-write profile
+/// (16_build_volumes.md, step 5.3), so a missing or stale shell activation can be refreshed
+/// before enumeration. Read-only jobs adopt that activation but never refresh it themselves.
 #[cfg(target_os = "macos")]
 pub(super) const SOURCE_PATHS_MODE: RunSandboxMode = RunSandboxMode::ReadWrite;
 

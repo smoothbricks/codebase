@@ -593,7 +593,7 @@ static REGISTERED: std::sync::OnceLock<ShellHostProgram> = std::sync::OnceLock::
 
 /// Record the program that starts this process's exec hosts. Workspace supervisors this
 /// process starts run commands in warm shells only once a host program is registered; a
-/// process without one (a Node addon) runs every command through one-shot activation.
+/// process without one can activate only read-write commands through a one-shot child.
 pub fn register(program: ShellHostProgram) {
     let _ = REGISTERED.set(program);
 }

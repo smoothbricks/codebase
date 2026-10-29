@@ -13,7 +13,7 @@
 //! - the environment the export was computed against is the same up to the move ([`baseline`]),
 //! - and no value still names the origin after the move.
 //!
-//! Anything else is a miss, which evaluates as before; a miss says why ([`AdoptionMiss`]).
+//! A miss says why ([`AdoptionMiss`]): read-write evaluates; read-only requires one read-write entry.
 //!
 //! The record carries no credential and nothing the checkout owns per workspace: those values
 //! come from the checkout's own sourced files ([`TAIL_FILES`]), read through direnv exactly as an
@@ -22,6 +22,7 @@
 //! number of workspaces and the depth of their lineage. This is non-propagation, not isolation:
 //! the files the values come from are in the image either way.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{self, Read as _};
@@ -49,7 +50,7 @@ pub const GRANTS_KEY: &str = "<grants>";
 /// The selected shell directory, normalized by the baseline's existing checkout-place move.
 pub const SHELL_KEY: &str = "<shell>";
 
-const RECORD_VERSION: u32 = 1;
+const RECORD_VERSION: u32 = 2;
 
 /// A record is one export plus its watch list; a larger file is not one this code wrote.
 const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
@@ -203,15 +204,12 @@ struct ActivationRecord {
 }
 
 impl ActivationRecord {
-    /// The activating checkout's [`Placement::places`], root first.
-    fn places(&self) -> [Option<&Path>; BESIDE + 1] {
-        let [runtime, temp_dir, home] = &self.beside;
-        [
-            Some(self.root.as_path()),
-            runtime.as_deref(),
-            temp_dir.as_deref(),
-            home.as_deref(),
-        ]
+    /// The activating checkout's places, in relocation order.
+    fn places(&self) -> impl Iterator<Item = Option<Cow<'_, Path>>> {
+        places(
+            &self.root,
+            self.beside.each_ref().map(|place| place.as_deref()),
+        )
     }
 
     fn inputs(&self, root: &Path) -> Result<(Snapshot, Contents), AdoptionMiss> {
@@ -306,11 +304,9 @@ impl<'a> Placement<'a> {
         }
     }
 
-    /// The per-workspace paths a value can name, in the order a move replaces them: the root
-    /// first, so a home or runtime directory beneath it moves with it.
-    fn places(&self) -> [Option<&'a Path>; BESIDE + 1] {
-        let [runtime, temp_dir, home] = self.beside();
-        [Some(self.root), runtime, temp_dir, home]
+    /// Mode-owned private paths precede the root, which precedes the remaining places.
+    fn places(&self) -> impl Iterator<Item = Option<Cow<'a, Path>>> {
+        places(self.root, self.beside())
     }
 
     /// The per-workspace paths beside the root that a value can name, each only when the
@@ -318,6 +314,29 @@ impl<'a> Placement<'a> {
     fn beside(&self) -> [Option<&'a Path>; BESIDE] {
         [self.runtime, self.temp_dir, self.home]
     }
+}
+
+/// Only private environment entries move between exec modes, never the whole `.cowshed/`
+/// directory: its build-volume link and controller metadata still belong to the checkout.
+fn places<'a>(
+    root: &'a Path,
+    beside: [Option<&'a Path>; BESIDE],
+) -> impl Iterator<Item = Option<Cow<'a, Path>>> {
+    let [_, _, home] = beside;
+    let environment_root = home.and_then(Path::parent);
+    super::supervisor::PRIVATE_ENVIRONMENT_DIRECTORIES
+        .into_iter()
+        .chain([
+            super::supervisor::PRIVATE_TOOLS_DIRECTORY,
+            crate::workspace_clients::TRUST_BUNDLE_NAME,
+            crate::port_zero::PRELOAD_NAME,
+        ])
+        .map(move |name| {
+            environment_root
+                .map(|root| Cow::Owned(root.join(std::ffi::OsStr::from_bytes(name.to_bytes()))))
+        })
+        .chain(std::iter::once(Some(Cow::Borrowed(root))))
+        .chain(beside.map(|place| place.map(Cow::Borrowed)))
 }
 
 /// Whether `value` holds a decimal number inside `[base, base + size)` as a whole token.
@@ -463,9 +482,10 @@ impl Baseline {
 }
 
 fn baseline(placement: &Placement<'_>, environment: &BTreeMap<OsString, OsString>) -> Baseline {
-    let places = placement
+    let places: Vec<_> = placement
         .places()
-        .map(|place| place.map(Path::to_string_lossy));
+        .map(|place| place.map(|place| place.to_string_lossy().into_owned()))
+        .collect();
     let digest = |bytes: &[u8]| crate::api::dto::hex_lower(&Sha256::digest(bytes));
     let mut keyed = BTreeMap::new();
     for (name, value) in environment {
@@ -560,7 +580,7 @@ pub fn write_record(
     Ok(())
 }
 
-/// Why a host evaluates instead of adopting. Each is reported on the activating job's stderr.
+/// Why a host cannot adopt: read-write evaluates, while read-only reports the needed activation.
 #[derive(Debug, thiserror::Error)]
 pub enum AdoptionMiss {
     #[error("no inherited shell record")]
@@ -674,11 +694,9 @@ pub fn verify(
     if let Some(name) = baseline(placement, baseline_environment).differs_from(&record.baseline) {
         return Err(AdoptionMiss::BaselineMoved { name });
     }
-    // Each per-workspace place of the origin moves to this checkout's, root first, at a
-    // path-component boundary.
+    // Mode-owned private paths move first; the checkout root and the remaining places follow.
     let moves: Vec<(String, Option<String>)> = record
         .places()
-        .into_iter()
         .zip(placement.places())
         .filter_map(|(from, to)| {
             let from = from?.to_string_lossy().into_owned();

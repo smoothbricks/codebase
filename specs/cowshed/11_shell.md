@@ -25,7 +25,11 @@ a changed umask — reaches the host or a later command: every command is a fres
 environment. The host program is staged under `.cowshed/shell-host/`, which every profile denies writes to, so no job
 can replace the parent of later commands. A workspace with no `.envrc` above the command's cwd gets hosts that skip
 activation and hold the sandbox environment itself; its argv jobs keep one-shot spawns, its script jobs run in those
-hosts. Cowshed has no other shell backend: a devenv project activates through `use devenv` in its own `.envrc`.
+hosts. A devenv project activates through `use devenv` in its own `.envrc`. A caller without an exec host can activate
+read-write argv commands in a one-shot executed child (`direnv allow` then `direnv exec`); controller-owned work after
+supervisor retirement uses this path, including land's Nx socket cleanup (04_sandbox.md, lifecycle signal authority). It
+is never a read-only backend: a selected shell without an exec host refuses `EnvironmentMissing` with
+`read-only shell entry requires an exec host`, without approval or evaluation. Plain-workspace argv needs no host.
 
 **A host never spins once its mount is gone.** A host runs its program from the workspace mount, so once that mount is
 gone (a forced unmount, DiskArbitration restarting) the next page-in of code it has not yet run fails with SIGBUS. The
@@ -59,9 +63,9 @@ in needs no root relocation, but a change of exec mode still relocates its priva
   (`GIT_CONFIG_GLOBAL`) left out; and under the name `<grants>`, the workspace's grants, since what the evaluation could
   read or reach is part of what it was computed against. A baseline that differs names the first variable that does
   (`cowshed: evaluating the workspace shell: … PATH differs`). A new pool after a grant revision with the same grants
-  adopts its own checkout's export; other grants evaluate. Under the reserved name `<shell>`, the baseline also keys the
-  selected .envrc directory with the same checkout-place normalization, so different selected shells never adopt each
-  other's export while cloned paths still compare equal.
+  adopts its own checkout's export; other grants require read-write evaluation. Under the reserved name <shell>, the
+  baseline also keys the selected .envrc directory with the same checkout-place normalization, so different selected
+  shells never adopt each other's export while cloned paths still compare equal.
 
   Cowshed's mode-owned private environment paths are places too: the generic private directories, tool directory, trust
   bundle and port-0 preload under `.cowshed/` for read-write exec or exec temp for read-only exec. They are normalized
@@ -71,18 +75,19 @@ in needs no root relocation, but a change of exec mode still relocates its priva
   `BUN_OPTIONS` bytes stay in the key, and per-command caller options retain their normal overlay semantics.
 
 - **Nothing names the origin after the move.** Every value has each of the origin's per-workspace places — its root, its
-  runtime link (`XDG_RUNTIME_DIR`), its `TMPDIR` and its `HOME`, root first — replaced by the adopting checkout's
-  wherever a path starts there and ends a component (`/x/repo` moves `/x/repo/tooling`, `-I/x/repo/include` and
-  `-Wl,-rpath,/x/repo/lib`, never `/x/repo-worktrees` or `/w/x/repo`); devenv's `DEVENV_RUNTIME`, a hash of the dotfile
-  path, is recomputed as devenv computes it. The check after the move is stricter than the move: a value in which an
-  origin place still ends a component anywhere, or that holds a number inside the origin's port block, refuses adoption,
-  since a false refusal costs one evaluation and a false pass would hand the clone the origin's tree. Nothing else is
-  asked. A fork is its origin's exact clone — the same inputs, already installed — so the first clone under any parent
-  adopts, and no second checkout evaluates the same inputs to vouch for the move. What no check can see is a value
-  derived from the origin in a way the move does not name (an `.envrc` exporting a hash of `$PWD`, arithmetic on
-  anything that differs between checkouts beyond the places above): such a value is inherited as the origin computed it,
-  in every clone, until an input or the baseline changes. That is the accepted price of never evaluating a clone whose
-  inputs and baseline are already proven.
+  runtime link (`XDG_RUNTIME_DIR`), its `TMPDIR` and its `HOME` — replaced by the adopting checkout's, with private
+  environment paths first and the checkout root before the remaining places, wherever a path starts there and ends a
+  component (`/x/repo` moves `/x/repo/tooling`, `-I/x/repo/include` and `-Wl,-rpath,/x/repo/lib`, never
+  `/x/repo-worktrees` or `/w/x/repo`); devenv's `DEVENV_RUNTIME`, a hash of the dotfile path, is recomputed as devenv
+  computes it. The check after the move is stricter than the move: a value in which an origin place still ends a
+  component anywhere, or that holds a number inside the origin's port block, refuses adoption, since a false refusal
+  costs one evaluation and a false pass would hand the clone the origin's tree. Nothing else is asked. A fork is its
+  origin's exact clone — the same inputs, already installed — so the first clone under any parent adopts, and no second
+  checkout evaluates the same inputs to vouch for the move. What no check can see is a value derived from the origin in
+  a way the move does not name (an `.envrc` exporting a hash of `$PWD`, arithmetic on anything that differs between
+  checkouts beyond the places above): such a value is inherited as the origin computed it, in every clone, until an
+  input or the baseline changes. That is the accepted price of never evaluating a clone whose inputs and baseline are
+  already proven.
 
 The record has one writer: the checkout's own supervisor, when it activates, in one atomic publish. No clone writes into
 its origin's image — when the origin is main, nothing moves main's image for a clone's sake — and a missing or stale

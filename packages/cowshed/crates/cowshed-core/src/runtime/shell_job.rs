@@ -169,6 +169,7 @@ impl WorkspaceShells {
                         program: self.program.clone(),
                         workspace_mount: spawn.workspace_mount.clone(),
                         profile: spawn.profile.clone(),
+                        read_only: spawn.read_only,
                         environment: base,
                         grants: spawn.grants.clone(),
                         envrc_directory: spawn.envrc_directory.clone(),
@@ -1207,6 +1208,7 @@ pub(super) struct HostActivator {
     workspace_mount: PathBuf,
     /// Made sure of at each host start: `cowshed gc` may have removed its file since the last.
     profile: super::supervisor::ChildProfile,
+    read_only: bool,
     environment: BTreeMap<OsString, OsString>,
     /// The grants this pool's hosts run under. What an evaluation can read or reach is part of
     /// what it was computed against, so they join the inherited record's baseline key.
@@ -1319,7 +1321,7 @@ impl HostActivator {
         })
     }
 
-    /// Approve and evaluate the `.envrc` in `host`, writing activation output to `output`.
+    /// Adopt the verified activation, or approve and evaluate only for a read-write host.
     async fn activate_host(
         &self,
         host: &mut ExecHost,
@@ -1362,7 +1364,7 @@ impl HostActivator {
         };
         // A clone carries its origin's verified export (11_shell.md, "Shell activation and
         // process reuse"). Proving it for this checkout reads every recorded input once; a miss
-        // says why on the job's stderr and evaluates.
+        // says why and evaluates only for read-write hosts.
         let mount = self.workspace_mount.clone();
         let baseline = self.keyed_baseline();
         let verified = tokio::task::spawn_blocking(move || {
@@ -1381,6 +1383,15 @@ impl HostActivator {
             Ok(Err(miss)) => miss.to_string(),
             Err(error) => format!("the inheritance check failed: {error}"),
         };
+        if self.read_only {
+            return HostActivation::Broken(CowshedError::environment_missing(
+                format!(
+                    "activation needed: run one RW exec for {} before read-only exec: {miss}",
+                    self.workspace_mount.display()
+                ),
+                "run cowshed exec <workspace> -- true, then retry read-only",
+            ));
+        }
         report_on(
             &stderr,
             &format!("cowshed: evaluating the workspace shell: {miss}"),

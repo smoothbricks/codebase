@@ -1376,6 +1376,15 @@ fn one_shot_plan(
     )
     .map_err(map_exec_error)?;
     if let Some(shell) = &sandbox.capabilities.contribution.shell {
+        if sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "read-only shell entry requires an exec host: {} has no configured host",
+                    shell.directory.display()
+                ),
+                "configure shell_host or run read-only commands through the cowshed CLI",
+            ));
+        }
         wrap_one_shot(&mut plan, shell);
     }
     Ok(plan)
@@ -1446,6 +1455,10 @@ fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> Strin
     )
 }
 
+/// The generic directories owned by each exec mode's private environment.
+pub(super) const PRIVATE_ENVIRONMENT_DIRECTORIES: [&std::ffi::CStr; 6] =
+    [c"home", c"config", c"cache", c"data", c"state", c"run"];
+pub(super) const PRIVATE_TOOLS_DIRECTORY: &std::ffi::CStr = c"tools";
 /// Prepare only generic private roots and the cache/daemon paths contributed by active detectors.
 ///
 /// Every shared cache directory is created where the host keeps it before any child runs: a
@@ -1458,11 +1471,11 @@ fn prepare_private_environment(
 ) -> Result<AnchoredDirectory> {
     let environment =
         AnchoredDirectory::create(environment_root).map_err(private_environment_error)?;
-    for name in [c"home", c"config", c"cache", c"data", c"state", c"run"] {
+    for name in PRIVATE_ENVIRONMENT_DIRECTORIES {
         environment.child(name).map_err(private_environment_error)?;
     }
     let tools = environment
-        .child(c"tools")
+        .child(PRIVATE_TOOLS_DIRECTORY)
         .map_err(private_environment_error)?;
     let bin = tools.child(c"bin").map_err(private_environment_error)?;
     let manager_host = if contribution
@@ -10278,7 +10291,16 @@ mod workspace_toolchain_tests {
             &published,
             &entries,
             &contents,
-            &BTreeMap::new(),
+            &BTreeMap::from([
+                (
+                    "PRIVATE_CONFIG".to_owned(),
+                    Some(mount.join(".cowshed/config/shell").display().to_string()),
+                ),
+                (
+                    "WORKSPACE_BUILD".to_owned(),
+                    Some(mount.join(".cowshed/build/target").display().to_string()),
+                ),
+            ]),
         )
         .expect("publish the record");
 
@@ -10290,11 +10312,26 @@ mod workspace_toolchain_tests {
             panic!("the land's source-path job must adopt the workspace's shell record: {miss}");
         }
         let read_only = keyed(&policy, crate::api::dto::RunSandboxMode::ReadOnly, &mount).await;
-        super::super::shell_inherit::verify(
+        let adopted = super::super::shell_inherit::verify(
             &super::super::shell_inherit::Placement::of(&mount, &read_only),
             &read_only,
         )
         .expect("a read-only job adopts the writable activation");
+        assert_eq!(
+            adopted.environment()["PRIVATE_CONFIG"],
+            Some(
+                PathBuf::from(&read_only[OsStr::new("TMPDIR")])
+                    .join("config/shell")
+                    .display()
+                    .to_string()
+            ),
+            "derived private paths follow the exec mode",
+        );
+        assert_eq!(
+            adopted.environment()["WORKSPACE_BUILD"],
+            Some(mount.join(".cowshed/build/target").display().to_string()),
+            "the checkout's build-volume link never moves into read-only scratch",
+        );
         let mut changed_options = read_only.clone();
         changed_options
             .get_mut(OsStr::new("BUN_OPTIONS"))
