@@ -18,6 +18,11 @@
       "import": "./dist/ts/cargo-ancestor-inputs.js",
       "default": "./dist/ts/cargo-ancestor-inputs.js"
     },
+    "./launch-node": {
+      "types": "./dist/ts/launch-node.d.ts",
+      "import": "./dist/ts/launch-node.js",
+      "default": "./dist/ts/launch-node.js"
+    },
     "./locks-node": {
       "types": "./dist/ts/locks-node.d.ts",
       "import": "./dist/ts/locks-node.js",

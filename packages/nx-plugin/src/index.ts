@@ -1145,8 +1145,9 @@ function isBuildOutputPackageJson(packageJsonPath: string): boolean {
  * hint and the opt-in producer completion receipts. Each sees the same options and run context; neither reads the
  * other's output. The hint is recorded first so a producer-receipt bug cannot cost the controller its evidence. The
  * pair also serves a run that inherits no CPU pool its own, which every task inherits (`run-cpu-pool.ts`), and closes
- * it when the run ends. Last, once every task has finished, the post hook reclaims the
- * superseded Cargo unit generations of each Cargo workspace the run built into (`@smoothbricks/cargo-retain`).
+ * it when the run ends. Last, once every task has finished, the post hook starts the reclaim of the
+ * superseded Cargo unit generations of each Cargo workspace the run built into, in a process of its own, never on
+ * Nx's thread (`@smoothbricks/cargo-retain`).
  */
 export const preTasksExecution: PreTasksExecution<ProducerReceiptsOptions> = async (options, context) => {
   // Before any task is hashed: a workspace that declares the test-walk check

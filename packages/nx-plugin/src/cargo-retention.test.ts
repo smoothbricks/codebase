@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from 'bun:test';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { cp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { constants } from 'node:os';
 import { join } from 'node:path';
@@ -12,6 +12,7 @@ import {
   churnFixture,
   churnGenerations,
   denyPreload,
+  detachedPassPreload,
   exists,
   expectFresh,
   future,
@@ -106,20 +107,40 @@ describe('cargo retention after real Nx runs', () => {
           const gen = await churnGenerations(fx);
           await backdate(gen.superseded);
           const env = fixtureNxEnv(workspace, socketDirectory);
-          const runNx = async (target: string, preload?: string) => {
+          const runNx = async (target: string, preload?: string, extraEnv: Record<string, string> = {}) => {
             const nx = join(workspace, 'node_modules', '.bin', 'nx');
             // A preload is a Node `--import`: it patches the process the hook runs in, which here is Node itself.
             const argv =
               preload === undefined
                 ? [process.execPath, nx, 'run', target, '--outputStyle=static']
                 : ['node', '--import', pathToFileURL(preload).href, nx, 'run', target, '--outputStyle=static'];
-            const child = Bun.spawn(argv, { cwd: workspace, env, stdout: 'pipe', stderr: 'pipe' });
+            const child = Bun.spawn(argv, {
+              cwd: workspace,
+              env: { ...env, ...extraEnv },
+              stdout: 'pipe',
+              stderr: 'pipe',
+            });
             const [code, stdout, stderr] = await Promise.all([
               child.exited,
               new Response(child.stdout).text(),
               new Response(child.stderr).text(),
             ]);
             return { code, log: stdout + stderr };
+          };
+          // A due pass runs detached, after the run has exited; the preload, which the Node it runs in loads through
+          // NODE_OPTIONS, says that process's exit into this FIFO, so the receipt is read once the pass has written it.
+          const passExited = join(workspace, 'pass-exited.fifo');
+          execFileSync('mkfifo', [passExited]);
+          const passPreload = join(workspace, 'detached-pass.mjs');
+          await put(passPreload, detachedPassPreload(passExited));
+          const runNxAndPass = async (target: string) => {
+            const ended = readFile(passExited, 'utf8');
+            const run = await runNx(target, undefined, { NODE_OPTIONS: `--import=${pathToFileURL(passPreload).href}` });
+            if (run.log.includes('its pass runs detached in pid')) return { ...run, pass: (await ended).trim() };
+            // No pass started, so nothing will write the FIFO: this end lets the pending read go.
+            await writeFile(passExited, '');
+            await ended;
+            return { ...run, pass: 'none started' };
           };
           const receiptPath = join(fx.target, RETENTION_RECEIPT);
           const noop = await runNx('ws:noop-only');
@@ -129,8 +150,8 @@ describe('cargo retention after real Nx runs', () => {
           expect(fetched.code, fetched.log).toBe(0);
           expect(await exists(receiptPath)).toBe(false);
           for (const path of gen.superseded) expect(await exists(path)).toBe(true);
-          const built = await runNx('ws:build-cargo-fixture');
-          expect(built.code, built.log).toBe(0);
+          const built = await runNxAndPass('ws:build-cargo-fixture');
+          expect({ code: built.code, pass: built.pass }, built.log).toEqual({ code: 0, pass: 'exit 0' });
           const receipt = parseReport(await readFile(receiptPath, 'utf8'));
           expect(reclaimPaths(planned(receipt))).toEqual(gen.superseded);
           for (const path of gen.superseded) expect(await exists(path)).toBe(false);
@@ -160,8 +181,11 @@ describe('cargo retention after real Nx runs', () => {
             receiptPath,
             JSON.stringify({ ...receipt, completed: { ...receipt.completed, at: Date.now() - AUTOMATIC_INTERVAL_MS } }),
           );
-          const failed = await runNx('ws:build-fails');
-          expect(failed.code, failed.log).not.toBe(0);
+          const failed = await runNxAndPass('ws:build-fails');
+          expect({ failed: failed.code !== 0, pass: failed.pass }, failed.log).toEqual({
+            failed: true,
+            pass: 'exit 0',
+          });
           const receipt2 = parseReport(await readFile(receiptPath, 'utf8'));
           expect(reclaimPaths(planned(receipt2))).toEqual(current);
           for (const path of current) expect(await exists(path)).toBe(false);

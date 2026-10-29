@@ -1,13 +1,14 @@
 import { join, relative } from 'node:path';
 import {
-  describeRetention,
   describeRetentionError,
+  describeRetentionStart,
   type Result,
   type RetentionError,
-  type RetentionReport,
+  type RetentionStart,
   refusedAnywhere,
-  retainCargoWorkspace,
+  startRetentionPass,
 } from '@smoothbricks/cargo-retain';
+import { launchNodeCli } from '@smoothbricks/cargo-retain/launch-node';
 import { nodeLocks } from '@smoothbricks/cargo-retain/locks-node';
 import { logger, type ProjectGraph, readCachedProjectGraph } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
@@ -51,8 +52,12 @@ export function mbxManagesTargets(environment: Readonly<NodeJS.ProcessEnv>): boo
 
 /**
  * After a run that executed a Cargo producer task ({@link CARGO_PRODUCER_METADATA}), check whether
- * each Cargo workspace is due for its daily maintenance. A successful receipt schedules only;
- * every due pass reads the current graph under Cargo's locks and is awaited by this Nx process.
+ * each Cargo workspace is due for its daily maintenance, and start each due pass in a process of its own
+ * (`startRetentionPass`). Nx awaits this hook, inside its daemon when one serves the run, so the pass never runs here:
+ * its unlinks are synchronous, and one freeing a large trash on a loaded volume held a daemon, and every client waiting
+ * on it, for more than thirty minutes. Here only the gate answers (not due, busy, refused); the started pass reads the
+ * current graph under Cargo's locks and records its outcome in the target's receipt, and neither this process nor its
+ * exit waits on it. A successful receipt schedules only.
  * Maintenance never fails the run it follows: every outcome, a refused or busy pass included, is only reported. In an
  * mbx project ({@link mbxManagesTargets}) it does nothing.
  */
@@ -80,9 +85,9 @@ export async function postTasksExecution(_options: unknown, context: PostTasksEx
     if (done.some((workspaceRoot) => !relative(workspaceRoot, root).startsWith('..'))) continue;
     const started = performance.now();
     const cpu = process.cpuUsage();
-    let result: Result<RetentionReport, RetentionError>;
+    let result: Result<RetentionStart, RetentionError>;
     try {
-      result = await retainCargoWorkspace(root, { apply: true, automatic: true, now: Date.now() }, nodeLocks);
+      result = await startRetentionPass(root, Date.now(), nodeLocks, launchNodeCli);
     } catch (error) {
       // Maintenance never fails the run it follows: say what escaped, then go on to the next workspace.
       const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
@@ -97,9 +102,10 @@ export async function postTasksExecution(_options: unknown, context: PostTasksEx
       logger.warn(`Cargo retention for ${root}: ${describeRetentionError(result.error)}`);
       continue;
     }
-    done.push(result.value.workspaceRoot);
-    const line = describeRetention(result.value);
-    if (refusedAnywhere(result.value)) logger.warn(line);
+    const start = result.value;
+    done.push(start.kind === 'answered' ? start.report.workspaceRoot : start.workspaceRoot);
+    const line = describeRetentionStart(start);
+    if (start.kind === 'answered' && refusedAnywhere(start.report)) logger.warn(line);
     else logger.info(line);
   }
 }

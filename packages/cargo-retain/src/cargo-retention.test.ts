@@ -3,6 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chmod, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   AUTOMATIC_INTERVAL_MS,
   accountInodes,
@@ -36,6 +37,7 @@ import {
   clearReceipt,
   DAY3,
   declaredCli,
+  detachedPassPreload,
   emptyHash,
   exists,
   expectFresh,
@@ -48,6 +50,7 @@ import {
   incrementalReclaimPaths,
   inFixture,
   keepReason,
+  LAUNCH_NODE_MODULE_URL,
   labelled,
   lines,
   metasOf,
@@ -60,6 +63,7 @@ import {
   type PlannedOutcome,
   type ProcMacro,
   parseReport,
+  parseRetentionStart,
   planned,
   procMacroFixture,
   put,
@@ -1362,6 +1366,134 @@ async function reportsRecencyFromStampedUse(fx: Churn, stamping: boolean): Promi
   );
 }
 
+/** Each line `stream` carries, one per call; the stream ending first is a failure naming what it held. */
+function lineReader(stream: ReadableStream<Uint8Array>): () => Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffered = '';
+  return async () => {
+    for (;;) {
+      const end = buffered.indexOf('\n');
+      if (end >= 0) {
+        const line = buffered.slice(0, end);
+        buffered = buffered.slice(end + 1);
+        return line;
+      }
+      const { value, done } = await reader.read();
+      if (done) throw new Error(`the stream ended before a whole line: ${JSON.stringify(buffered)}`);
+      buffered += decoder.decode(value, { stream: true });
+    }
+  };
+}
+
+/**
+ * Case: the Nx hook's automatic pass never runs on its caller's thread (`startRetentionPass`). The pass's first removal
+ * is held at the fs boundary (`detachedPassPreload`), from its trash or in place alike; meanwhile the caller answers a
+ * line on stdin and exits, and a second start finds the retention lock held and starts nothing. Released, the pass frees
+ * the superseded generations, and its receipt accounts for what it removed.
+ */
+async function startsThePassOffTheCallersThread(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled("starts the automatic pass off its caller's thread, which answers and exits while it removes");
+  // The pass reads its own clock, as the hook's would: the superseded generations must be old at real now.
+  await backdate([...superseded]);
+  const preview = planned(await retain(fx.ws, { apply: false, now: Date.now() }));
+  check(reclaimPaths(preview), 'the generations the pass will reclaim').toEqual([...superseded]);
+  await clearReceipt(fx.target);
+  const entered = join(fx.root, 'removal-entered.fifo');
+  const release = join(fx.root, 'removal-release.fifo');
+  const exited = join(fx.root, 'pass-exited.fifo');
+  execFileSync('mkfifo', [entered, release, exited]);
+  const preload = join(fx.root, 'detached-pass.mjs');
+  await put(preload, detachedPassPreload(exited, { entered, release, under: await realpath(fx.target) }));
+  const start = lines(
+    `const { startRetentionPass } = await import(${JSON.stringify(RETENTION_MODULE_URL)});`,
+    `const { nodeLocks } = await import(${JSON.stringify(NODE_LOCKS_MODULE_URL)});`,
+    `const { launchNodeCli } = await import(${JSON.stringify(LAUNCH_NODE_MODULE_URL)});`,
+    `const started = await startRetentionPass(${JSON.stringify(fx.ws)}, Date.now(), nodeLocks, launchNodeCli);`,
+    'process.stdout.write(JSON.stringify(started) + "\\n");',
+  );
+  // As the hook's process does, the caller goes on serving once the start answers: each line it reads comes back. A
+  // start that started no pass says so into `entered` itself, which no pass would ever write.
+  const serving = lines(
+    start,
+    `if (!(started.ok && started.value.kind === "started")) (await import("node:fs")).writeFileSync(${JSON.stringify(entered)}, "not started\\n");`,
+    'process.stdin.setEncoding("utf8");',
+    'for await (const chunk of process.stdin) process.stdout.write(chunk);',
+  );
+  const caller = Bun.spawn(['node', '--input-type=module', '-e', serving], {
+    cwd: fx.ws,
+    env: { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` },
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const callerStderr = new Response(caller.stderr).text();
+  const line = lineReader(caller.stdout);
+  let released = false;
+  const releaseRemoval = async (): Promise<void> => {
+    if (released) return;
+    released = true;
+    await writeFile(release, 'go\n');
+  };
+  // Set once the started pass is seen holding its removal: from then on it says its exit into `exited`.
+  let passRunning = false;
+  const target = await realpath(fx.target);
+  try {
+    const holder = (await readFile(entered, 'utf8')).trim();
+    check(holder, 'the first removal runs in a process of its own').not.toBe(String(caller.pid));
+    const started = parseRetentionStart(await line());
+    if (!started.ok || started.value.kind !== 'started') {
+      throw new Error(`expected a started pass, got ${JSON.stringify(started)}`);
+    }
+    check(holder, 'the pass the caller started is the one removing').toBe(String(started.value.pid));
+    passRunning = true;
+    check(started.value.targetDir).toBe(target);
+    caller.stdin.write('ping\n');
+    await caller.stdin.flush();
+    check(await line(), 'the caller answers while its pass removes').toBe('ping');
+    const second = spawnSync('node', ['--input-type=module', '-e', start], {
+      cwd: fx.ws,
+      env: { ...process.env },
+      encoding: 'utf8',
+    });
+    check(second.status, second.stderr).toBe(0);
+    check(parseRetentionStart(second.stdout.trim()), 'a second start while the pass removes').toEqual({
+      ok: true,
+      value: {
+        kind: 'answered',
+        report: {
+          workspaceRoot: started.value.workspaceRoot,
+          targetDir: target,
+          nestedRoots: [],
+          outcome: { kind: 'busy', lock: join(target, RETENTION_LOCK) },
+        },
+      },
+    });
+    caller.stdin.end();
+    check(await caller.exited, await callerStderr).toBe(0);
+    check(await exists(join(fx.target, RETENTION_RECEIPT)), 'the pass is still removing: no receipt yet').toBe(false);
+    await releaseRemoval();
+    check((await readFile(exited, 'utf8')).trim(), 'the pass ends well').toBe('exit 0');
+    passRunning = false;
+    const receipt = parseReport(await readFile(join(fx.target, RETENTION_RECEIPT), 'utf8'));
+    const applied = planned(receipt);
+    check(applied.kind).toBe('reclaimed');
+    check(reclaimPaths(applied)).toEqual([...superseded]);
+    check(applied.reclaimedBytes).toBeGreaterThanOrEqual(preview.reclaimedBytes);
+    check(applied.reclaimedBytes).toBeGreaterThan(0);
+    check(receipt.completed === undefined, 'a pass that reclaimed everywhere schedules the next').toBe(false);
+    check(await exists(join(fx.target, 'debug', TRASH)), 'the pass emptied the trash').toBe(false);
+    for (const path of superseded) check(await exists(path), path).toBe(false);
+    await expectFresh(fx.ws);
+  } finally {
+    await releaseRemoval();
+    caller.kill();
+    await caller.exited;
+    // A pass seen running is waited for, so no process this case started outlives it.
+    if (passRunning) await readFile(exited, 'utf8');
+  }
+}
+
 describe('cargo retention against real Cargo target layouts', () => {
   it('runs fixture cargo without any CARGO_UNSTABLE_* switch the job environment carries', async () => {
     await withEnv(
@@ -1419,6 +1551,16 @@ describe('cargo retention against real Cargo target layouts', () => {
         await halfWrittenLibraryRecovers(fx, await toggleFeature(fx));
         // Last, because its mtime-on-use config change persists to the end of the walk.
         await automaticCadence(fx, await toggleFeature(fx));
+      });
+    });
+  });
+
+  it("starts the automatic pass off its caller's thread, which answers and exits while the pass removes", async () => {
+    await inFixture(async (root) => {
+      const fx = await churnFixture(root, false);
+      await scopedTo(fx.target, async () => {
+        const gen = await churnGenerations(fx);
+        await startsThePassOffTheCallersThread(fx, gen.superseded);
       });
     });
   });

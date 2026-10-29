@@ -40,6 +40,17 @@
  * never fails the run it follows. A profile holding a legacy layout beside the current one is read for the
  * current one alone: the legacy entries are reported retained as `legacy-layout`, and nothing is reclaimed from them.
  *
+ * A pass unlinks synchronously on purpose (one native census and recursive removal per generation, below), so it never
+ * runs on a thread that serves anyone else. The Nx hook's thread does: Nx awaits `postTasksExecution`, in its daemon when
+ * one serves the run, and a pass freeing 80 trashed generations on a loaded APFS volume, whose unlinks wait in the
+ * kernel, held a land gate's daemon, and every client waiting on it, for more than thirty minutes. So the hook calls
+ * {@link startRetentionPass}: the gate answers there (not due, the retention lock busy or unattemptable) and lets go of
+ * the retention lock, and a due pass runs in this package's Node CLI (`--apply --automatic`), started detached by
+ * `launch-node.ts`. That process goes through the gate again and takes every lock itself, as any pass does: no lock or
+ * descriptor crosses into it, so nothing the run leaves behind holds one. It records its outcome, a failure included, in
+ * {@link RETENTION_RECEIPT}. While it frees its trash it holds the retention lock, so the next run's gate answers `busy`
+ * and starts no second pass over the same trash.
+ *
  * A Cargo target root nested inside the target directory (`target/cargo-lint`, `target/cargo-lint-cross`, each
  * built with its own `--target-dir`) is a target directory of its own; units never depend across roots. The
  * target directory's scan finds it: it locks and reads the nested root's depth-two profile like
@@ -133,7 +144,11 @@ export type PassOutcome =
     }
   | { readonly kind: 'busy'; readonly lock: string }
   | { readonly kind: 'refused'; readonly profile: string; readonly reason: string };
-export type RetentionOutcome = PassOutcome | { readonly kind: 'not-due'; readonly nextDueAt: number };
+export type RetentionOutcome =
+  | PassOutcome
+  | { readonly kind: 'not-due'; readonly nextDueAt: number }
+  /** An applied pass that failed past its gate: the receipt says so, as the detached pass has nobody else to tell. */
+  | { readonly kind: 'failed'; readonly reason: string };
 /** A Cargo target root nested inside the target directory, passed under its own profiles' Cargo locks. */
 export interface NestedRoot {
   readonly root: string;
@@ -1237,15 +1252,29 @@ function nextAutomaticPass(
     return undefined;
   }
 }
+/** What a pass's gate answers: a report it settles itself (not due, busy, refused), or the pass it admits. */
+type Admission =
+  | { readonly kind: 'answered'; readonly report: RetentionReport }
+  | {
+      readonly kind: 'admitted';
+      readonly workspaceRoot: string;
+      readonly targetDir: string;
+      readonly members: ReadonlySet<string>;
+      readonly configuration: string;
+      readonly profiles: readonly string[];
+      /** The target's retention lock, which an applied pass holds and a plan never takes. */
+      readonly retention: Hold | undefined;
+    };
+
 /**
- * One retention pass over the Cargo workspace at `cargoWorkspaceRoot`, with its locks taken by `provider`: `nodeLocks` from
- * Node, `ffiLocks` in the compiled CLI.
+ * Every pass's gate, in order: the clock, Cargo's own answer for the workspace, the schedule an automatic pass keeps,
+ * the target's layout and, applied, the retention lock, with the schedule read again under it.
  */
-export async function retainCargoWorkspace(
+async function admit(
   cargoWorkspaceRoot: string,
   options: RetentionOptions,
   provider: LockProvider,
-): Promise<Result<RetentionReport, RetentionError>> {
+): Promise<Result<Admission, RetentionError>> {
   if (!Number.isFinite(options.now)) {
     return {
       ok: false,
@@ -1262,43 +1291,102 @@ export async function retainCargoWorkspace(
   performance.measure('cargoRetention:metadata', { start: metadataStarted });
   if (!workspace.ok) return workspace;
   const { workspaceRoot, targetDir, members } = workspace.value;
-  const configuration = schedulingConfiguration(workspaceRoot, targetDir, members);
-  if (!configuration.ok) return configuration;
-  if (options.apply && options.automatic) {
-    const due = nextAutomaticPass(workspaceRoot, targetDir, configuration.value, options.now);
-    if (due !== undefined)
-      return {
-        ok: true,
-        value: { workspaceRoot, targetDir, nestedRoots: [], outcome: { kind: 'not-due', nextDueAt: due } },
-      };
-  }
+  const scheduling = schedulingConfiguration(workspaceRoot, targetDir, members);
+  if (!scheduling.ok) return scheduling;
+  const configuration = scheduling.value;
+  const answer = (outcome: RetentionOutcome): Result<Admission, RetentionError> => ({
+    ok: true,
+    value: { kind: 'answered', report: { workspaceRoot, targetDir, nestedRoots: [], outcome } },
+  });
+  const nextDue = (): number | undefined =>
+    options.apply && options.automatic
+      ? nextAutomaticPass(workspaceRoot, targetDir, configuration, options.now)
+      : undefined;
+  const notYet = nextDue();
+  if (notYet !== undefined) return answer({ kind: 'not-due', nextDueAt: notYet });
   const layoutStarted = performance.now();
   const layout = await discoverLayout(targetDir);
   performance.measure('cargoRetention:layout', { start: layoutStarted });
   if (!layout.ok) return layout;
-  const report = (outcome: RetentionOutcome): RetentionReport => ({
-    workspaceRoot,
-    targetDir,
-    nestedRoots: [],
-    outcome,
-  });
   let retention: Hold | undefined;
   if (options.apply) {
     const attempt = await provider.tryHold([join(targetDir, RETENTION_LOCK)], 'create');
-    if (attempt.kind === 'busy') return { ok: true, value: report({ kind: 'busy', lock: attempt.lock }) };
-    if (attempt.kind === 'unavailable') {
-      return { ok: true, value: report(lockRefusal(targetDir, 'the retention lock', attempt.reason)) };
+    if (attempt.kind === 'busy') return answer({ kind: 'busy', lock: attempt.lock });
+    if (attempt.kind === 'unavailable') return answer(lockRefusal(targetDir, 'the retention lock', attempt.reason));
+    // Another automatic caller may have completed between the first check and our lock acquisition.
+    const completedMeanwhile = nextDue();
+    if (completedMeanwhile !== undefined) {
+      await attempt.hold.release();
+      return answer({ kind: 'not-due', nextDueAt: completedMeanwhile });
     }
     retention = attempt.hold;
   }
+  return {
+    ok: true,
+    value: {
+      kind: 'admitted',
+      workspaceRoot,
+      targetDir,
+      members,
+      configuration,
+      profiles: layout.value.profiles,
+      retention,
+    },
+  };
+}
+
+/** Publish `report` as the target's receipt: written beside it, then renamed over it, so a reader sees one whole report. */
+async function writeReceipt(targetDir: string, report: RetentionReport): Promise<Result<undefined, RetentionError>> {
+  const receipt = join(targetDir, RETENTION_RECEIPT);
+  const staging = `${receipt}.${randomUUID()}.tmp`;
   try {
-    // Another automatic caller may have completed between the first check and our lock acquisition.
-    if (options.apply && options.automatic) {
-      const due = nextAutomaticPass(workspaceRoot, targetDir, configuration.value, options.now);
-      if (due !== undefined) return { ok: true, value: report({ kind: 'not-due', nextDueAt: due }) };
+    writeNew(staging, `${JSON.stringify(report, null, 2)}\n`);
+    await rename(staging, receipt);
+    return { ok: true, value: undefined };
+  } catch (error) {
+    return { ok: false, error: ioError('write retention receipt', receipt, error) };
+  }
+}
+
+/**
+ * One retention pass over the Cargo workspace at `cargoWorkspaceRoot`, with its locks taken by `provider`: `nodeLocks` from
+ * Node, `ffiLocks` in the compiled CLI. It runs on the caller's thread, unlinks included, so only a process of its own
+ * calls it, the CLI; the Nx hook starts that process through {@link startRetentionPass}. An applied pass records what
+ * became of it in the receipt, a failure too.
+ */
+export async function retainCargoWorkspace(
+  cargoWorkspaceRoot: string,
+  options: RetentionOptions,
+  provider: LockProvider,
+): Promise<Result<RetentionReport, RetentionError>> {
+  const admission = await admit(cargoWorkspaceRoot, options, provider);
+  if (!admission.ok) return admission;
+  if (admission.value.kind === 'answered') return { ok: true, value: admission.value.report };
+  const { workspaceRoot, targetDir, members, configuration, profiles, retention } = admission.value;
+  const failed = (reason: string): Promise<Result<undefined, RetentionError>> =>
+    writeReceipt(targetDir, { workspaceRoot, targetDir, nestedRoots: [], outcome: { kind: 'failed', reason } });
+  try {
+    let result: Awaited<ReturnType<typeof passRoots>>;
+    try {
+      result = await passRoots(targetDir, profiles, members, options, provider);
+    } catch (error) {
+      // Only a bug throws here. It propagates, and an applied pass's receipt says it first.
+      if (!options.apply) throw error;
+      const recorded = await failed(
+        `unexpected failure: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+      );
+      if (recorded.ok) throw error;
+      throw new Error(`${describeCause(error)}; the receipt cannot say so: ${describeRetentionError(recorded.error)}`, {
+        cause: error,
+      });
     }
-    const result = await passRoots(targetDir, layout.value.profiles, members, options, provider);
-    if (!result.ok) return result;
+    if (!result.ok) {
+      if (!options.apply) return result;
+      const recorded = await failed(describeRetentionError(result.error));
+      if (recorded.ok) return result;
+      const detail = `${result.error.detail}; the receipt cannot say so: ${describeRetentionError(recorded.error)}`;
+      return { ok: false, error: { ...result.error, detail } };
+    }
     const done: RetentionReport = {
       workspaceRoot,
       targetDir,
@@ -1307,23 +1395,53 @@ export async function retainCargoWorkspace(
       ...(options.apply &&
       result.value.outcome.kind === 'reclaimed' &&
       result.value.nestedRoots.every((nested) => nested.outcome.kind === 'reclaimed')
-        ? { completed: { at: options.now, configuration: configuration.value } }
+        ? { completed: { at: options.now, configuration } }
         : {}),
     };
     if (options.apply) {
-      const receipt = join(targetDir, RETENTION_RECEIPT);
-      const staging = `${receipt}.${randomUUID()}.tmp`;
-      try {
-        writeNew(staging, `${JSON.stringify(done, null, 2)}\n`);
-        await rename(staging, receipt);
-      } catch (error) {
-        return { ok: false, error: ioError('write retention receipt', receipt, error) };
-      }
+      const written = await writeReceipt(targetDir, done);
+      if (!written.ok) return written;
     }
     return { ok: true, value: done };
   } finally {
     await retention?.release();
   }
+}
+
+/**
+ * Starts the process an automatic pass runs in, for the Cargo workspace at `workspaceRoot`, and answers its pid once it
+ * runs, or why it could not start. `launch-node.ts` starts this package's Node CLI.
+ */
+export type PassLauncher = (workspaceRoot: string) => Promise<Result<number, string>>;
+
+/** What starting an automatic pass did: the gate's own report (not due, busy, refused), or the pass it started. */
+export type RetentionStart =
+  | { readonly kind: 'answered'; readonly report: RetentionReport }
+  | { readonly kind: 'started'; readonly workspaceRoot: string; readonly targetDir: string; readonly pid: number };
+
+/**
+ * The Nx hook's automatic pass, kept off the caller's thread: the gate runs here, and a due pass runs in the process
+ * `launch` starts, which goes through the gate again, holds every lock itself and records its outcome in the receipt.
+ * The retention lock this gate took is let go before the launch, so no lock crosses into that process; should another
+ * pass take the lock in between, the started one answers `busy` and leaves the work to it.
+ */
+export async function startRetentionPass(
+  cargoWorkspaceRoot: string,
+  now: number,
+  provider: LockProvider,
+  launch: PassLauncher,
+): Promise<Result<RetentionStart, RetentionError>> {
+  const admission = await admit(cargoWorkspaceRoot, { apply: true, automatic: true, now }, provider);
+  if (!admission.ok) return admission;
+  if (admission.value.kind === 'answered') return { ok: true, value: admission.value };
+  const { workspaceRoot, targetDir, retention } = admission.value;
+  await retention?.release();
+  const launched = await launch(workspaceRoot);
+  if (!launched.ok) {
+    const operation = 'start the automatic retention pass';
+    return { ok: false, error: { kind: 'io', operation, path: workspaceRoot, detail: launched.error } };
+  }
+  return { ok: true, value: { kind: 'started', workspaceRoot, targetDir, pid: launched.value } };
 }
 
 /** A nested root's pass; a root whose tag or profile locks cannot be read refuses, as one of its profiles would. */
@@ -1601,6 +1719,8 @@ function describeOutcome(subject: string, outcome: RetentionOutcome): string {
       return `${subject}: skipped, ${outcome.lock} is held`;
     case 'refused':
       return `${subject}: refused, ${outcome.profile}: ${outcome.reason}; nothing was changed`;
+    case 'failed':
+      return `${subject}: failed: ${outcome.reason}`;
   }
 }
 
@@ -1610,6 +1730,19 @@ export function describeRetention(report: RetentionReport): string {
     describeOutcome(`Cargo retention ${report.targetDir}`, report.outcome),
     ...report.nestedRoots.map((nested) => describeOutcome(`nested ${nested.root}`, nested.outcome)),
   ].join('; ');
+}
+
+/** One line: the gate's own report, or the pass it started and where that pass records its outcome. */
+export function describeRetentionStart(start: RetentionStart): string {
+  switch (start.kind) {
+    case 'answered':
+      return describeRetention(start.report);
+    case 'started':
+      return (
+        `Cargo retention ${start.targetDir}: due; its pass runs detached in pid ${start.pid}, ` +
+        `which records its outcome in ${join(start.targetDir, RETENTION_RECEIPT)}`
+      );
+  }
 }
 
 export function describeRetentionError(error: RetentionError): string {

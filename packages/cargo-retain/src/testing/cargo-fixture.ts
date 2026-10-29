@@ -16,6 +16,7 @@ import {
   type RetentionOptions,
   type RetentionOutcome,
   type RetentionReport,
+  type RetentionStart,
   retainCargoWorkspace,
 } from '../cargo-retention.js';
 import { nodeLocks } from '../locks-node.js';
@@ -28,6 +29,7 @@ import { outsideTreesTmpdir } from './outside-trees.js';
  */
 export const RETENTION_MODULE_URL = import.meta.resolve('@smoothbricks/cargo-retain');
 export const NODE_LOCKS_MODULE_URL = import.meta.resolve('@smoothbricks/cargo-retain/locks-node');
+export const LAUNCH_NODE_MODULE_URL = import.meta.resolve('@smoothbricks/cargo-retain/launch-node');
 
 /** This package's root, resolved through its published `./package.json` export. */
 export const PACKAGE_DIR = dirname(fileURLToPath(import.meta.resolve('@smoothbricks/cargo-retain/package.json')));
@@ -713,4 +715,52 @@ export function denyPreload(commands: readonly string[], locks: boolean): string
     '};',
     'syncBuiltinESMExports();',
   );
+}
+
+/**
+ * A Node preload for the pass the Nx hook starts detached (`node-cli.js`, from `launch-node.ts`), which no caller
+ * awaits: as that process ends it says `exit <code>` into the FIFO `exited`. With `gate`, every process that loads it
+ * holds its first recursive removal under `gate.under`, the target directory, whichever way the pass frees a
+ * generation: from its trash, or in place on a volume under pressure. It says its pid into the FIFO `gate.entered`, then
+ * waits until the test writes `gate.release`; a pass that ends before reaching one says its exit into `gate.entered`
+ * instead, so no reader waits on a process that is gone.
+ */
+export function detachedPassPreload(
+  exited: string,
+  gate?: { readonly entered: string; readonly release: string; readonly under: string },
+): string {
+  return lines(
+    'import fs from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    `const exited = ${JSON.stringify(exited)};`,
+    `const gate = ${JSON.stringify(gate ?? null)};`,
+    'let held = false;',
+    'if (gate !== null) {',
+    '  const rmSync = fs.rmSync;',
+    '  fs.rmSync = function(path, ...args) {',
+    '    if (!held && String(path).startsWith(gate.under + "/")) {',
+    '      held = true;',
+    '      fs.writeFileSync(gate.entered, process.pid + "\\n");',
+    '      fs.readFileSync(gate.release);',
+    '    }',
+    '    return rmSync.call(this, path, ...args);',
+    '  };',
+    '  syncBuiltinESMExports();',
+    '}',
+    'if (process.argv[1]?.endsWith("/node-cli.js")) {',
+    '  process.on("exit", (code) => fs.writeFileSync(gate !== null && !held ? gate.entered : exited, "exit " + code + "\\n"));',
+    '}',
+  );
+}
+
+export type RetentionStartRun =
+  | { readonly ok: true; readonly value: RetentionStart }
+  | { readonly ok: false; readonly error: RetentionError };
+const validateRetentionStartRun = typia.createValidateEquals<RetentionStartRun>();
+
+/** What a real Node's `startRetentionPass` printed as JSON, checked against the result type with no unknown field. */
+export function parseRetentionStart(text: string): RetentionStartRun {
+  const checked = validateRetentionStartRun(JSON.parse(text));
+  if (!checked.success) throw new Error(`invalid retention start: ${JSON.stringify(checked.errors)}`);
+  return checked.data;
 }
