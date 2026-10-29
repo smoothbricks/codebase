@@ -176,7 +176,10 @@ It checks:
 - Root package policy.
 - Root Bun type version matches the Bun package manager version.
 - Tooling policy: root `package.json` owns workspace-level tools like `nx`, `tooling/package.json` owns `smoo`, and
-  `tooling/direnv/devenv.nix` owns shell-provided tools like `bun`, `git-format-staged`, and `fmt`.
+  `tooling/direnv/devenv.nix` owns shell-provided tools like `bun`, `git-format-staged`, and `fmt`. The check holds
+  `tooling/package.json`'s `@smoothbricks/cli` range to `^<the version bun.lock resolved>` and never asks the registry,
+  so a release published after a commit cannot refuse it; `smoo monorepo update` moves the pin to the latest stable
+  release and installs it.
 - Nx release policy, including project package release tags, project-level GitHub Release changelogs, and the temporary
   Bun lockfile versionActions hook.
 - `bun.lock` workspace versions match package manifests.

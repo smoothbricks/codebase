@@ -10,6 +10,7 @@ import {
   readToolContext,
   validateDevenvPackages,
   validateToolConfig,
+  validateToolingPackage,
 } from './tool-validation.js';
 
 const registryVersions: Record<string, string[]> = {
@@ -73,9 +74,9 @@ describe('tool configuration validation', () => {
       // release ever used proves the value is read rather than restated.
       await writeFile(join(root, 'bun.lock'), lockfileWithTtsc('9.9.9'));
 
-      expect(await validateToolConfig(root)).toBeGreaterThan(0);
+      expect(validateToolConfig(root)).toBeGreaterThan(0);
       await applyToolConfigDefaults(root);
-      expect(await validateToolConfig(root)).toBe(0);
+      expect(validateToolConfig(root)).toBe(0);
 
       const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
       const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
@@ -312,9 +313,9 @@ ${extra}  ];
 `,
       );
 
-      expect(await validateToolConfig(root)).toBe(1);
+      expect(validateToolConfig(root)).toBe(1);
       await applyToolConfigDefaults(root);
-      expect(await validateToolConfig(root)).toBe(0);
+      expect(validateToolConfig(root)).toBe(0);
       const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
       expect(rootPackage.patchedDependencies?.['ttsc@0.19.3']).toBeUndefined();
     } finally {
@@ -360,9 +361,9 @@ ${extra}  ];
         '{pkgs, ...}: {\n  packages = with pkgs; [\n    bun\n    git\n    git-format-staged\n    jq\n    alejandra\n    coreutils\n    gnutar\n  ];\n}\n',
       );
 
-      expect(await validateToolConfig(root)).toBe(2);
+      expect(validateToolConfig(root)).toBe(2);
       await applyToolConfigDefaults(root);
-      expect(await validateToolConfig(root)).toBe(0);
+      expect(validateToolConfig(root)).toBe(0);
       const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
       expect(rootPackage.devDependencies).toMatchObject({
         nx: 'catalog:',
@@ -396,12 +397,54 @@ ${extra}  ];
         dependencies: { '@smoothbricks/cli': configuredRange },
       });
 
-      const context = await readToolContext(root);
-      expect(context.policy.cliDependencyRange).toBe(expectedRange);
-      applyToolingPackageDefaults(root, context.policy);
+      const context = readToolContext(root);
+      await applyToolingPackageDefaults(root, context.policy);
 
       const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
       expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe(expectedRange);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('holds the tooling CLI range to what bun.lock resolved, asking no registry', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@fixture/app',
+        version: '0.0.0',
+        private: true,
+        workspaces: ['packages/*', 'tooling'],
+      });
+      await writeJson(join(root, 'tooling/package.json'), {
+        name: '@fixture/tooling',
+        private: true,
+        dependencies: { '@smoothbricks/cli': '^0.10.3' },
+      });
+      await writeFile(join(root, 'bun.lock'), lockfileWithCli('0.10.3'));
+      // The registry serves 0.10.4 as latest; a commit check must not ask it.
+      globalThis.fetch = Object.assign(
+        (): Promise<Response> => Promise.reject(new Error('a commit check asked the registry')),
+        { preconnect: realFetch.preconnect },
+      );
+
+      expect(validateToolingPackage(root, readToolContext(root).policy)).toBe(0);
+
+      await writeJson(join(root, 'tooling/package.json'), {
+        name: '@fixture/tooling',
+        private: true,
+        dependencies: { '@smoothbricks/cli': `^${registryLatestTags['@smoothbricks/cli']}` },
+      });
+      expect(validateToolingPackage(root, readToolContext(root).policy)).toBe(1);
+
+      await writeFile(join(root, 'bun.lock'), lockfileWithTtsc('0.25.0'));
+      expect(validateToolingPackage(root, readToolContext(root).policy)).toBe(0);
+      await writeJson(join(root, 'tooling/package.json'), {
+        name: '@fixture/tooling',
+        private: true,
+        dependencies: { '@smoothbricks/cli': '^0.10.5-next.0' },
+      });
+      expect(validateToolingPackage(root, readToolContext(root).policy)).toBe(1);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -416,7 +459,7 @@ ${extra}  ];
         private: true,
         workspaces: ['packages/*', 'tooling'],
       });
-      applyToolingPackageDefaults(root, (await readToolContext(root)).policy);
+      await applyToolingPackageDefaults(root, readToolContext(root).policy);
 
       const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
       expect(toolingPackage.name).toBe('@smoothbricks/tooling');
@@ -445,9 +488,9 @@ ${extra}  ];
         },
       });
 
-      const context = await readToolContext(root);
+      const context = readToolContext(root);
       await applyRootDevDependencyDefaults(root, context);
-      applyToolingPackageDefaults(root, context.policy);
+      await applyToolingPackageDefaults(root, context.policy);
 
       const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
       const toolingPackage = JSON.parse(await readFile(join(root, 'tooling/package.json'), 'utf8'));
@@ -546,6 +589,22 @@ function latestRegistryVersion(packageName: string): string {
  * A bun text lockfile carrying one resolved package entry, in the shape bun
  * writes: `"<name>": ["<name>@<version>", …]`. Deliberately includes the
  * dependency-map spelling too, so a reader that confuses the two is caught.
+ */
+function lockfileWithCli(version: string): string {
+  return `{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "tooling": { "name": "@fixture/tooling", "dependencies": { "@smoothbricks/cli": "^${version}" } }
+  },
+  "packages": {
+    "@smoothbricks/cli": ["@smoothbricks/cli@${version}", "", {}, "sha512-fixture"]
+  }
+}
+`;
+}
+
+/**
+ * A bun.lock that resolves ttsc alone.
  */
 function lockfileWithTtsc(version: string): string {
   return `{

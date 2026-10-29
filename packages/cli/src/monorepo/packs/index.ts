@@ -129,7 +129,7 @@ const packs: MonorepoPack[] = [
       return (
         runtimeFailures +
         validateRootPackagePolicy(ctx.root) +
-        (await validateToolConfig(ctx.root)) +
+        validateToolConfig(ctx.root) +
         validateNxProjectNames(ctx.root) +
         validateNxReleaseConfig(ctx.root) +
         validateBunLockfileVersions(ctx.root) +

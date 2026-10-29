@@ -37,8 +37,10 @@ interface RequiredDependency {
 export interface ToolPolicy {
   isSmoothBricksCodebase: boolean;
   toolingPackageName: string;
-  cliDependencyRange: string;
-  /** Exact versions bun.lock resolved, for `pinnedFromLockfile` dependencies. */
+  /**
+   * Exact versions bun.lock resolved, for `pinnedFromLockfile` dependencies and for the tooling package's
+   * `@smoothbricks/cli`: what the repository installed, which a commit check holds its manifests to.
+   */
   lockedToolVersions: Record<string, string>;
 }
 
@@ -123,14 +125,14 @@ function obsoleteTtscPatchKeys(patches: Record<string, string> | undefined): str
 }
 
 export async function applyToolConfigDefaults(root: string): Promise<void> {
-  const context = await readToolContext(root);
+  const context = readToolContext(root);
   await applyRootPackageToolDefaults(root, context);
-  applyToolingPackageDefaults(root, context.policy);
+  await applyToolingPackageDefaults(root, context.policy);
   applyDevenvPackageDefaults(root);
 }
 
-export async function validateToolConfig(root: string): Promise<number> {
-  const context = await readToolContext(root);
+export function validateToolConfig(root: string): number {
+  const context = readToolContext(root);
   return (
     validateRootDevDependencies(context.policy, context.rootPackage) +
     validateTtscPatch(context.rootPackage) +
@@ -206,7 +208,11 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
   );
 }
 
-export function applyToolingPackageDefaults(root: string, policy: ToolPolicy): void {
+/**
+ * The tooling package `smoo monorepo update` writes: a consumer's CLI range follows the latest published stable
+ * release ([`resolvePublishedCliDependencyRange`]), which the update then installs; the codebase uses its workspace.
+ */
+export async function applyToolingPackageDefaults(root: string, policy: ToolPolicy): Promise<void> {
   const path = join(root, 'tooling', 'package.json');
   const pkg = readJsonObject(path) ?? { name: policy.toolingPackageName, private: true, dependencies: {} };
   let changed = false;
@@ -216,7 +222,11 @@ export function applyToolingPackageDefaults(root: string, policy: ToolPolicy): v
     changed = true;
   }
   const dependencies = ensureDependencyMap(pkg, 'dependencies');
-  changed = setStringProperty(dependencies, cliPackageName, policy.cliDependencyRange) || changed;
+  const configured = dependencies[cliPackageName];
+  const cliRange = policy.isSmoothBricksCodebase
+    ? 'workspace:*'
+    : await resolvePublishedCliDependencyRange(typeof configured === 'string' ? configured : null);
+  changed = setStringProperty(dependencies, cliPackageName, cliRange) || changed;
   if (changed || !existsSync(path)) {
     mkdirSync(dirname(path), { recursive: true });
     writeJsonObject(path, pkg);
@@ -363,8 +373,25 @@ export function validateToolingPackage(root: string, policy: ToolPolicy): number
     failures++;
   }
   const actualCliRange = dependencies?.[cliPackageName];
-  if (actualCliRange !== policy.cliDependencyRange) {
-    console.error(`tooling/package.json dependencies.${cliPackageName} must be ${policy.cliDependencyRange}`);
+  const locked = policy.lockedToolVersions[cliPackageName];
+  if (policy.isSmoothBricksCodebase) {
+    if (actualCliRange !== 'workspace:*') {
+      console.error(`tooling/package.json dependencies.${cliPackageName} must be workspace:*`);
+      failures++;
+    }
+  } else if (locked !== undefined) {
+    // The commit check judges what the repository installed: a release the registry serves now, and one whose install
+    // fails, is `smoo monorepo update`'s to install, never this check's to require.
+    if (actualCliRange !== `^${locked}`) {
+      console.error(
+        `tooling/package.json dependencies.${cliPackageName} must be ^${locked}, the version bun.lock resolved — change it by installing another release (smoo monorepo update), not by editing package.json alone`,
+      );
+      failures++;
+    }
+  } else if (typeof actualCliRange !== 'string' || !/^\^\d+\.\d+\.\d+$/.test(actualCliRange)) {
+    console.error(
+      `tooling/package.json dependencies.${cliPackageName} must be a caret range of a stable release (^<major>.<minor>.<patch>); bun.lock resolves none yet, so install one with smoo monorepo update`,
+    );
     failures++;
   }
   return failures;
@@ -552,34 +579,16 @@ function formatExpectedDependency(policy: ToolPolicy, dependency: RequiredDepend
   return dependency.minimumVersion ? `>= ${dependency.minimumVersion}` : dependency.fallbackVersion;
 }
 
-export async function readToolContext(root: string): Promise<ToolContext> {
+export function readToolContext(root: string): ToolContext {
   const rootPackage = readPackageJsonObject(join(root, 'package.json'));
-  const toolingPackage = readJsonObject(join(root, 'tooling', 'package.json'));
-  const configuredCliRange = toolingPackage?.dependencies?.[cliPackageName];
-  return {
-    rootPackage,
-    policy: await toolPolicy(
-      rootPackage,
-      typeof configuredCliRange === 'string' ? configuredCliRange : null,
-      readLockedToolVersions(root),
-    ),
-  };
+  return { rootPackage, policy: toolPolicy(rootPackage, readLockedToolVersions(root)) };
 }
 
-async function toolPolicy(
-  rootPackage: PackageJson | null,
-  configuredCliRange: string | null,
-  lockedToolVersions: Record<string, string>,
-): Promise<ToolPolicy> {
+function toolPolicy(rootPackage: PackageJson | null, lockedToolVersions: Record<string, string>): ToolPolicy {
   const name = rootPackage?.name ?? null;
-  const isCodebase = isSmoothBricksCodebasePackageName(name ?? undefined);
-  const toolingName = toolingPackageName(name);
   return {
-    isSmoothBricksCodebase: isCodebase,
-    toolingPackageName: toolingName,
-    // Consumers pin the latest *published* CLI. Running a linked prerelease must not
-    // freeze tooling/package.json on an older range or rewrite it to an unpublished -next.
-    cliDependencyRange: isCodebase ? 'workspace:*' : await resolvePublishedCliDependencyRange(configuredCliRange),
+    isSmoothBricksCodebase: isSmoothBricksCodebasePackageName(name ?? undefined),
+    toolingPackageName: toolingPackageName(name),
     lockedToolVersions,
   };
 }
@@ -599,14 +608,12 @@ function readLockedToolVersions(root: string): Record<string, string> {
   }
   const lockfile = readFileSync(lockfilePath, 'utf8');
   const locked: Record<string, string> = {};
-  for (const dependency of rootDevDependencies) {
-    if (dependency.pinnedFromLockfile !== true) {
-      continue;
-    }
-    const escaped = escapeRegex(dependency.name);
+  const pinned = rootDevDependencies.filter((dependency) => dependency.pinnedFromLockfile === true);
+  for (const name of [...pinned.map((dependency) => dependency.name), cliPackageName]) {
+    const escaped = escapeRegex(name);
     const resolved = new RegExp(`"${escaped}":\\s*\\[\\s*"${escaped}@([^"]+)"`).exec(lockfile)?.[1];
     if (resolved !== undefined) {
-      locked[dependency.name] = resolved;
+      locked[name] = resolved;
     }
   }
   return locked;
@@ -641,9 +648,9 @@ async function resolveDependencyVersion(policy: ToolPolicy, dependency: Required
 }
 
 /**
- * Consumer monorepos pin `@smoothbricks/cli` to the latest stable release.
- * Prefer npm `dist-tags.latest`. Never write a running `-next` package version into
- * consumer manifests; never leave an older pin just because the running CLI is prerelease.
+ * `smoo monorepo update` pins a consumer's `@smoothbricks/cli` to the latest stable release, which it then installs.
+ * Prefer npm `dist-tags.latest`. Never write a running `-next` package version into consumer manifests; never leave an
+ * older pin just because the running CLI is prerelease. A commit check never asks this: it holds the range to bun.lock.
  */
 async function resolvePublishedCliDependencyRange(configuredCliRange: string | null): Promise<string> {
   const latest = await fetchLatestStableVersion(cliPackageName);
