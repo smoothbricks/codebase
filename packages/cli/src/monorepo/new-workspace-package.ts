@@ -1,12 +1,14 @@
+import { join } from 'node:path';
 import { printCommandOutput, runResult } from '../lib/run.js';
-import { escapeRegex, getWorkspacePatterns } from '../lib/workspace.js';
+import { escapeRegex, getWorkspacePatterns, readWorkspacePackageManifest } from '../lib/workspace.js';
 
 /**
- * Whether the index adds a package manifest directly under a workspace glob (`packages/*`): the pre-commit hook runs
- * the monorepo validator only for such a commit. It lives apart from the validator so the hook's every other commit
- * answers it without loading the validator's Nx graph.
+ * The Nx projects of the package manifests the index adds directly under a workspace glob (`packages/*`): the
+ * pre-commit hook runs the monorepo validator only for such a commit, and builds and pack-validates only these projects
+ * (Nx builds what they depend on). It lives apart from the validator so the hook's every other commit answers it
+ * without loading the validator's Nx graph.
  */
-export async function hasNewWorkspacePackage(root: string): Promise<boolean> {
+export async function newWorkspacePackageProjects(root: string): Promise<string[]> {
   const result = await runResult(
     'git',
     ['diff', '--cached', '--name-only', '--diff-filter=A', '--', '*/package.json'],
@@ -23,10 +25,18 @@ export async function hasNewWorkspacePackage(root: string): Promise<boolean> {
     .map((path) => path.trim())
     .filter(Boolean);
   if (manifests.length === 0) {
-    return false;
+    return [];
   }
   const patterns = getWorkspacePatterns(root)
     .filter((pattern) => pattern.endsWith('/*'))
     .map((pattern) => new RegExp(`^${escapeRegex(pattern.slice(0, -2))}/[^/]+/package\\.json$`));
-  return manifests.some((manifest) => patterns.some((pattern) => pattern.test(manifest)));
+  return manifests
+    .filter((manifest) => patterns.some((pattern) => pattern.test(manifest)))
+    .map((manifest) => {
+      const pkg = readWorkspacePackageManifest(join(root, manifest));
+      if (pkg === null || pkg.projectName === '') {
+        throw new Error(`${manifest} is staged as a new workspace package but names no package`);
+      }
+      return pkg.projectName;
+    });
 }

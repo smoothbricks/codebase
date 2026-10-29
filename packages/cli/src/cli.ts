@@ -103,7 +103,10 @@ function buildProgram(): Command {
     .command('validate')
     .option('--fix', 'apply safe monorepo policy fixes before validation')
     .option('--fail-fast', 'stop after the first failing validation pack')
-    .option('--only-if-new-workspace-package', 'skip validation unless a new workspace package manifest is staged')
+    .option(
+      '--only-if-new-workspace-package',
+      'skip validation unless a new workspace package manifest is staged; then build and pack-validate only the new packages',
+    )
     .option('--verbose', 'print validation progress and successful checks')
     .option(
       '--projects <names>',
@@ -127,19 +130,20 @@ function buildProgram(): Command {
         repairsPending?: boolean;
       }) => {
         const root = await findRepoRoot();
-        // The pre-commit hook asks on every commit; only a staged new package pays for the validator's Nx graph.
+        let selected = projects
+          ?.split(',')
+          .map((name) => name.trim())
+          .filter((name) => name.length > 0);
+        // The pre-commit hook asks on every commit; only a staged new package pays for the validator's Nx graph, and
+        // only for that package's projects: Nx builds what they depend on, and nothing that cannot reach them.
         if (onlyIfNewWorkspacePackage) {
-          const { hasNewWorkspacePackage } = await import('./monorepo/new-workspace-package.js');
-          if (!(await hasNewWorkspacePackage(root))) return;
+          const { newWorkspacePackageProjects } = await import('./monorepo/new-workspace-package.js');
+          const added = await newWorkspacePackageProjects(root);
+          if (added.length === 0) return;
+          selected ??= added;
         }
         const { validateMonorepo } = await import('./monorepo/index.js');
-        await validateMonorepo(root, {
-          ...options,
-          projects: projects
-            ?.split(',')
-            .map((name) => name.trim())
-            .filter((name) => name.length > 0),
-        });
+        await validateMonorepo(root, { ...options, projects: selected });
       },
     );
   monorepo.command('update').action(async () => {
