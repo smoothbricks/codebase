@@ -1,5 +1,7 @@
-import typia from 'typia';
+import { StringDecoder } from 'node:string_decoder';
+import typia, { type tags } from 'typia';
 import { invocationSpan, withInvocationFlag } from './runner-sizing.js';
+import type { NativeTestResult } from './test-results.js';
 import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
 
 /**
@@ -30,9 +32,10 @@ import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
  */
 export interface RunProgress {
   /** One chunk of one output stream; true when it reports a finished test, file or Go package. */
-  scan(stream: OutputStream, chunk: string): boolean;
+  scan(stream: OutputStream, chunk: Buffer | string): boolean;
   /** The tests the runner reported running and has not reported finished, in the order it first named them. */
   inFlight(): string[];
+  error(): string | null;
 }
 
 export type OutputStream = 'stdout' | 'stderr';
@@ -42,7 +45,6 @@ const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`, 'g');
 const FINISHED = [
   /^\s*(?:[A-Z0-9][A-Z0-9-]*\s+)+\[\s*[0-9.]+s\]\s+\(\s*\d+\/\d+\)\s+(\S.*)$/,
   /^test (\S+) \.\.\. (?:ok|FAILED|ignored)\b/,
-  /^\((?:pass|fail|skip|todo)\) (.+)$/,
   /^\s*[✓×]\s+(\S.*?)\s+\d+ms\b/,
   /^\s*❯\s+(\S.*?)\s+\(\d+ tests?(?: \| \d+ (?:failed|skipped|todo))*\)\s+\d+ms\b/,
   /^\s*↓\s+(\S.*?)\s+\(\d+ tests?(?: \| \d+ (?:skipped|todo))+\)(?:\s+\d+ms\b|$)/,
@@ -53,21 +55,43 @@ const RUNNING = [
   /^test (\S+) has been running for over \d+ seconds$/,
 ];
 const DOTS = /^\.+$/;
+const BUN_RESULT =
+  /^(?:\((?<status>pass|fail|skip|todo|pending)\)|(?<symbol>✓|✗|×|»|✎|…))\s+(?<name>.+?)(?: \[(?<duration>\d+(?:\.\d+)?)ms\])?$/;
+const UNCAPTURED_NEXTEST = /(?<![\w-])--(?:no-?capture|debugger|tracer)(?=[=\s]|$)/;
 
 type GoTestEvent =
   | { Action: 'start'; Package: string }
   | { Action: 'run' | 'pause' | 'cont'; Package: string; Test: string }
-  | { Action: 'pass' | 'fail' | 'skip' | 'bench'; Package: string; Test?: string }
+  | { Action: 'pass' | 'fail' | 'skip' | 'bench'; Package: string; Test?: string; Elapsed?: number }
   | { Action: 'output'; Package: string; Output: string; Test?: string };
-const isGoTestEvent = typia.createIs<GoTestEvent>();
+type NextestTestEvent =
+  | { type: 'test'; event: 'started' | 'ignored'; name: string }
+  | {
+      type: 'test';
+      event: 'ok' | 'failed';
+      name: string;
+      exec_time: number & tags.Minimum<0>;
+      stdout?: string;
+      reason?: string;
+    };
+type NextestSuiteEvent = { type: 'suite'; event: 'started' | 'ok' | 'failed' };
+type NativeTestEvent = GoTestEvent | NextestTestEvent | NextestSuiteEvent;
+const isNativeTestEvent = typia.createIs<NativeTestEvent>();
 
-function goTestEvent(text: string): GoTestEvent | null {
+function nativeTestEvent(text: string, invalid?: (detail: string) => void): NativeTestEvent | null {
   if (!text.startsWith('{')) return null;
   try {
     const event: unknown = JSON.parse(text);
-    return isGoTestEvent(event) ? event : null;
+    if (isNativeTestEvent(event)) return event;
+    if (typeof event === 'object' && event !== null && 'type' in event && event.type === 'test') {
+      invalid?.(`invalid native test record: ${text}`);
+    }
+    return null;
   } catch (error) {
-    if (error instanceof SyntaxError) return null;
+    if (error instanceof SyntaxError) {
+      invalid?.(`invalid native test JSON: ${error.message}`);
+      return null;
+    }
     throw error;
   }
 }
@@ -91,19 +115,43 @@ interface LineState {
   countedDots: number;
 }
 
-export function createRunProgress(command = ''): RunProgress {
+export function createRunProgress(command = '', closed?: (result: NativeTestResult) => void): RunProgress {
   const goLifecycle = onlyGoTests(command);
+  const goResults = command.search(GO_TEST) !== -1;
   const streams: Record<OutputStream, LineState> = {
     stdout: { partial: '', countedDots: 0 },
     stderr: { partial: '', countedDots: 0 },
   };
   const running = new Set<string>();
   const packages = new Map<string, Set<string>>();
+  const goOutput = new Map<string, string[]>();
+  const decoders: Record<OutputStream, StringDecoder> = {
+    stdout: new StringDecoder('utf8'),
+    stderr: new StringDecoder('utf8'),
+  };
+  const nextestStarted = new Set<string>();
+  const nextestJson =
+    /--message-format(?:=|\s+)libtest-json-plus(?=\s|$)/.test(command) && !UNCAPTURED_NEXTEST.test(command);
+  let failure: string | null = null;
+  const bunResults = command.search(BUN_TEST) !== -1 && command.search(NEXTEST_RUN) === -1;
+  let bunFile = '';
+  let bunSummary = false;
+  const bunDiagnostics: Record<OutputStream, string[]> = { stdout: [], stderr: [] };
 
   // One complete line, ANSI stripped, that is not a line of dots: true when it names a finished test.
-  const finishedLine = (text: string): boolean => {
-    const event = goTestEvent(text);
-    if (event !== null) {
+  const finishedLine = (text: string, stream: OutputStream, raw: string): boolean => {
+    const event =
+      stream === 'stdout'
+        ? nativeTestEvent(
+            text,
+            nextestJson
+              ? (detail) => {
+                  failure ??= detail;
+                }
+              : undefined,
+          )
+        : null;
+    if (event !== null && 'Action' in event) {
       switch (event.Action) {
         case 'start':
           packages.set(event.Package, new Set());
@@ -116,15 +164,84 @@ export function createRunProgress(command = ''): RunProgress {
         case 'skip':
         case 'bench':
           if (event.Test === undefined) packages.delete(event.Package);
-          else packages.get(event.Package)?.delete(event.Test);
+          else {
+            packages.get(event.Package)?.delete(event.Test);
+            const id = `${event.Package}::${event.Test}`;
+            if (event.Action !== 'bench' && goResults)
+              closed?.({
+                id,
+                status: event.Action,
+                source: 'native',
+                durationMs: event.Elapsed === undefined ? null : event.Elapsed * 1000,
+                sourceRef: null,
+                failureOutput: event.Action === 'fail' ? (goOutput.get(id)?.join('') ?? null) : null,
+              });
+            goOutput.delete(id);
+          }
           return true;
         case 'pause':
         case 'cont':
+          return false;
         case 'output':
+          if (goResults && closed !== undefined && event.Test !== undefined) {
+            const id = `${event.Package}::${event.Test}`;
+            const output = goOutput.get(id) ?? [];
+            output.push(event.Output);
+            goOutput.set(id, output);
+          }
           return false;
       }
     }
+    if (nextestJson && event !== null && 'type' in event && event.type === 'test') {
+      if (event.event === 'started') {
+        nextestStarted.add(event.name);
+        return false;
+      }
+      // nextest appends #N only after retries; a literal #N in the original name stays intact.
+      const name = nextestStarted.has(event.name) ? event.name : event.name.replace(/#\d+$/, '');
+      nextestStarted.delete(name);
+      const split = name.indexOf('$');
+      if (nextestJson && split !== -1)
+        closed?.({
+          id: `${name.slice(0, split)}::${name.slice(split + 1)}`,
+          status: event.event === 'ok' ? 'pass' : event.event === 'failed' ? 'fail' : 'skip',
+          source: 'native',
+          durationMs: 'exec_time' in event ? event.exec_time * 1000 : null,
+          sourceRef: null,
+          failureOutput: event.event === 'failed' ? (event.stdout ?? event.reason ?? null) : null,
+        });
+      return true;
+    }
     if (goLifecycle) return false;
+    const bun = BUN_RESULT.exec(text)?.groups;
+    if (
+      !bunSummary &&
+      bun !== undefined &&
+      bun.name !== undefined &&
+      ((bunResults && stream === 'stderr') || (bun.status !== undefined && bun.status !== 'pending'))
+    ) {
+      const status =
+        bun.status === 'fail' ||
+        bun.status === 'pending' ||
+        bun.symbol === '…' ||
+        bun.symbol === '✗' ||
+        bun.symbol === '×'
+          ? 'fail'
+          : bun.status === 'skip' || bun.status === 'todo' || bun.symbol === '»' || bun.symbol === '✎'
+            ? 'skip'
+            : 'pass';
+      if (bunResults && stream === 'stderr')
+        closed?.({
+          id: `${bunFile}::${bun.name}`,
+          status,
+          source: 'progress',
+          durationMs: bun.duration === undefined ? null : Number(bun.duration),
+          sourceRef: null,
+          failureOutput: status === 'fail' ? bunDiagnostics[stream].join('') : null,
+        });
+      bunDiagnostics[stream] = [];
+      return true;
+    }
     for (const pattern of FINISHED) {
       const name = pattern.exec(text)?.[1];
       if (name !== undefined) {
@@ -145,18 +262,28 @@ export function createRunProgress(command = ''): RunProgress {
   return {
     scan(stream, chunk) {
       const state = streams[stream];
-      const lines = (state.partial + chunk).split('\n');
+      const decoded = typeof chunk === 'string' ? chunk : decoders[stream].write(chunk);
+      const lines = (state.partial + decoded).split('\n');
       const rest = lines.pop() ?? '';
       let progressed = false;
       // The first complete line continues the partial one, whose dots were counted as they came.
       let counted = state.countedDots;
       for (const raw of lines) {
         const text = raw.replace(ANSI, '').trimEnd();
+        if (bunResults && stream === 'stderr' && closed !== undefined) {
+          const header = /^(?:::group::)?(\S.*\.[cm]?[jt]sx?):(?: \(run #\d+\))?$/.exec(text)?.[1];
+          if (header !== undefined) {
+            bunFile = header.replace(/^\.\//, '');
+            bunSummary = false;
+          }
+          if (/^\s*\d+ tests (?:skipped|todo|failed):$/.test(text)) bunSummary = true;
+          if (!bunSummary) bunDiagnostics[stream].push(`${raw}\n`);
+        }
         if (DOTS.test(text)) {
           if (!goLifecycle && DOTS.test(text)) {
             progressed ||= text.length > counted;
           }
-        } else if (finishedLine(text)) {
+        } else if (finishedLine(text, stream, raw)) {
           progressed = true;
         }
         counted = 0;
@@ -168,6 +295,7 @@ export function createRunProgress(command = ''): RunProgress {
       state.countedDots = dots;
       return progressed;
     },
+    error: () => failure,
     inFlight: () => [
       ...running,
       ...[...packages].flatMap(([name, tests]) =>
@@ -177,6 +305,31 @@ export function createRunProgress(command = ''): RunProgress {
   };
 }
 
+/** JSON-plus 0.1 flushes each closed result; plain libtest-json buffers a whole binary. */
+export function withTestResultReport(command: string): { command: string; env: Record<string, string> } {
+  if (
+    (command.match(NEXTEST_RUN)?.length ?? 0) !== 1 ||
+    command.search(BUN_TEST) !== -1 ||
+    command.search(GO_TEST) !== -1 ||
+    UNCAPTURED_NEXTEST.test(command)
+  )
+    return { command, env: {} };
+  let reported = withInvocationFlag(
+    command,
+    NEXTEST_RUN,
+    /(?<![\w-])--message-format(?:=|\s+)(?:"[^"]*"|'[^']*'|[^\s]+)/g,
+    '--message-format=libtest-json-plus',
+    true,
+  );
+  reported = withInvocationFlag(
+    reported,
+    NEXTEST_RUN,
+    /(?<![\w-])--message-format-version(?:=|\s+)(?:"[^"]*"|'[^']*'|[^\s]+)/g,
+    '--message-format-version=0.1',
+    true,
+  );
+  return { command: reported, env: { NEXTEST_EXPERIMENTAL_LIBTEST_JSON: '1' } };
+}
 /**
  * `command` with its one `bun test` asked for a line of dots, one per finished test: the only per-test report bun
  * prints whoever runs it. A command that runs no bun, more than one runner, or already chose bun's dots is returned

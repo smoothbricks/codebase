@@ -2384,6 +2384,85 @@ binary the target named. A script that spawns the runner itself passes
 `--reporter=junit --reporter-outfile="$BOUNDED_EXEC_JUNIT"` on; the variable is set for every task. A command with no
 runner, or with two (they would write one report), is judged by its exit alone.
 
+### Live per-test closed results
+
+A task also publishes live observations in `test-results.jsonl`, beside its `report.xml` and `verdict.json` in
+`.nx/workspace-data/bounded-exec/<encodeURIComponent(taskId)>/` (under Nx's configured workspace-data directory). The
+public `@smoothbricks/nx-plugin/test-results` entry exports `ClosedTestResult`, its generated strict
+`isClosedTestResult` guard, `TEST_RESULTS_FILE`, `TEST_FAILURES_FILE`, `taskDirectory(workspaceData, taskId)`, and
+`parseTestSourceRef`. These observations let a consumer act on a closed failure while other tests still run. They never
+replace terminal JUnit or the verdict as gate evidence.
+
+Each record is one UTF-8 JSON object followed by LF:
+
+```json
+{
+  "runId": "8b608ad0-fb8c-4d65-9a58-7dd140776235",
+  "id": "case.test.ts::outer > test",
+  "status": "fail",
+  "source": "progress",
+  "durationMs": 2.5,
+  "sourceRef": null,
+  "causeRef": { "path": "test-failures.log", "startByte": 0, "endByte": 123 },
+  "cursor": 321
+}
+```
+
+The numbers above illustrate the fields, not an encoded record's actual byte lengths. `id` is `suite::name`: Bun uses
+its reported file and outer-to-inner describe/test chain; nextest uses the native name's suite prefix before `$` and its
+test name (a final retry's appended attempt count is removed); Go uses package and test name. Status is `pass`, `fail`,
+or `skip`. `durationMs` is the native duration in milliseconds, or `null` when none is reported. `sourceRef` is `null`
+without a native location; otherwise it is the test declaration's workspace-root-relative, forward-slash `file:line`,
+with a one-based line. It is not a diagnosis of the production failure. `parseTestSourceRef` projects that location to
+`{ path, line }`; paths outside the workspace retain `../` and must not qualify local ownership.
+
+`causeRef` is `null` without failure output. Otherwise its task-directory-relative `path` is `test-failures.log` and
+`[startByte, endByte)` is the exact UTF-8 byte range of that observation's captured diagnostics. The evidence append
+completes before the referring JSONL append. Each append is unbuffered at the application boundary and visible before
+the next record; this is live visibility, not an fsync/crash-durability promise. `cursor` is the exclusive next byte
+offset in the JSONL file, including LF. Read complete lines only, validate each record, and resume at its cursor; keep
+an incomplete final line until its LF arrives. Cursor and cause offsets are nonnegative safe integers.
+
+`runId` is a fresh UUID per invocation. Previous task artifacts are removed at admission; before the command starts, the
+writer prepares new empty files and atomically replaces the cause file, then the JSONL file, with new inodes. A consumer
+must detect replacement/truncation, reopen at byte zero and admit the new `runId`, not reuse a previous run's cursor.
+The producer pins its own append descriptors until terminal/refusal, so an older overlapping invocation cannot append
+into a replacement run's files. Pin the cause file descriptor for a run if its evidence must survive replacement. The
+stream is empty for an unsupported runner; no identity or result is guessed from arbitrary output.
+
+Native channels and provenance: See the [nextest JSON channel](https://nexte.st/docs/machine-readable/libtest-json/) and
+[Bun reporter documentation](https://bun.com/docs/test/reporters); the Bun live-progress exception below is the owner's
+explicit contract, not a claim that its console output is a structured reporter API.
+
+- nextest uses `--message-format=libtest-json-plus --message-format-version=0.1` and
+  `NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1` (pinned nextest 0.9.143). JSON-plus flushes each test terminal; plain
+  `libtest-json` buffers a binary and is not a live channel. A terminal describes the final retry, with the final
+  attempt's duration; suite summaries are not test results. Failure output is the native combined output or reason.
+  These records have `source: "native"`. There is no native source location. No-capture/debugger/tracer commands are
+  left unchanged because raw test output would destroy structured-channel attribution. Ignored-test delivery follows
+  nextest's own channel: an ignored start is not evidence a test ran, and a binary with no executed test may omit its
+  ignored terminals. The human progress display remains the owner of in-flight watchdog names.
+- Go reuses the existing `go test -json` decoder: only test-level pass/fail/skip terminals produce records, never
+  package terminals or output heartbeats. Its native test output supplies failure evidence, and `Elapsed` supplies the
+  duration when present. These records have `source: "native"`; the channel supplies no declaration location.
+- Bun reuses the watchdog's existing named result-line scan, not another console parser. Per the owner's ruling of
+  2026-10-29 these records have `source: "progress"`, explicitly provisional: publish immediately when a named result
+  closes, never wait for later tests. Bun prints diagnostics before its `(fail)` line, so failure evidence is the
+  captured stderr interval since the preceding named result through this failure line. It can include unrelated output
+  and is not proof of root-cause ownership. The pinned Bun 1.4.3 inspector reporter loses events at exit and under
+  parallel/isolate execution, while its JUnit reporter writes only at the end; neither is a reliable complete live
+  channel. Dots and agent-mode output omit passing/skip names, so no identities are invented for dots. Terminal Bun
+  JUnit supplies those missing named results as `source: "junit"`. If its status contradicts a provisional record of the
+  same identity, a new `source: "junit"` record carries the authoritative status and `contradictsCursor` pointing to
+  that earlier record's cursor; matching statuses produce no duplicate. Summary reprints are not new completions.
+  Concurrent/parallel workers can interleave file headers and diagnostics, and names containing the describe separator
+  or duplicate names are ambiguous in console output. Consumers must retain the progress provenance and defer uncertain
+  attribution to terminal structured evidence; never infer a source path from the name.
+
+This contract is covered by the pure native/progress mapping and artifact tests and the real Bun/nextest smoke in
+`src/executors/bounded-exec/test-results-run.test.ts`: an early failure is visible while later work is held by IPC,
+before either terminal report exists. Test ownership and readiness follow
+[`specs/cowshed/08_testing.md`](../../specs/cowshed/08_testing.md), “Unit tests” and “Fixtures”.
 `smoo-nx-bound-failures` reads the workspace's last Nx run (`run.json` in Nx's `cacheDir`, the directory
 `StoreRunInformationLifeCycle` writes: the checkout's own `.nx/cache` under smoo's workspace policy) against those
 records and prints one line per failed task. It exits 0 only when the run failed and every failed task's record, for
