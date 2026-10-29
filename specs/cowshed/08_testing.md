@@ -223,6 +223,11 @@ socket below the fixture past Darwin's 104-byte `sun_path`. A fixture that holds
 such as a test `HOME`, takes the granted `TMPDIR`. An invalid requested alias fails loudly; it never falls through to a
 global or temp directory.
 
+Path-identity assertions compare physical paths, not literal spellings: a child shell can resolve a symlink in `TMPDIR`
+or `HOME` when it establishes its working directory. The generated Cargo-route setup fixture uses a deliberately
+symlinked home and still checks the scratch directory, published bytes, executable mode and cleanup. Its stand-in mbx
+names every refused precondition on stderr instead of exiting silently.
+
 Fixtures constructing a nested supervisor configuration and its workspace grants instead select the workspace-owned
 scratch parent for their filesystem workspace root. The existing workspace fixture constructor canonicalizes that parent
 for capability containment; separate socket fixtures still retain their short literal aliases. The exec's TMPDIR can be

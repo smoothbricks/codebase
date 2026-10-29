@@ -621,7 +621,14 @@ mod tests {
     #[test]
     fn setup_publishes_generated_cargo_bytes_and_preserves_executable_mode() {
         use std::os::unix::fs::PermissionsExt as _;
-        let home = scratch("generated-route");
+        let root = crate::temp_root::TempRoot::new_in(
+            &std::env::temp_dir(),
+            "cowshed-mbx-generated-route",
+        );
+        let physical_home = root.join("physical-home");
+        std::fs::create_dir(&physical_home).unwrap();
+        let home = root.join("home");
+        std::os::unix::fs::symlink(&physical_home, &home).unwrap();
         let executable = mbx::host_link(&home);
         std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
         let generated = b"#!/bin/sh\nprintf 'generated cargo\\n'\n";
@@ -629,10 +636,22 @@ mod tests {
             r#"#!/bin/sh
 set -eu
 export PATH='{path}'
-[ "$1" = setup ] && [ "$2" = --yes ]
-[ "$PWD" = "$TMPDIR" ]
-[ "$MBX_CACHE_DIR" = "$TMPDIR/cache/mbx" ]
-[ -z "${{MISE_CONFIG_FILE-}}" ]
+[ "$1" = setup ] && [ "$2" = --yes ] || {{
+  printf 'fake mbx: expected setup --yes, got %s %s\n' "$1" "$2" >&2
+  exit 97
+}}
+[ "$(pwd -P)" = "$(cd "$TMPDIR" && pwd -P)" ] || {{
+  printf 'fake mbx: cwd %s is not TMPDIR %s\n' "$(pwd -P)" "$TMPDIR" >&2
+  exit 97
+}}
+[ "$MBX_CACHE_DIR" = "$TMPDIR/cache/mbx" ] || {{
+  printf 'fake mbx: MBX_CACHE_DIR %s is not %s/cache/mbx\n' "$MBX_CACHE_DIR" "$TMPDIR" >&2
+  exit 97
+}}
+[ -z "${{MISE_CONFIG_FILE-}}" ] || {{
+  printf 'fake mbx: inherited MISE_CONFIG_FILE %s\n' "$MISE_CONFIG_FILE" >&2
+  exit 97
+}}
 mkdir -p "$XDG_DATA_HOME/mbx/bin"
 printf '#!/bin/sh\nprintf '\''generated cargo\\n'\''\n' > "$XDG_DATA_HOME/mbx/bin/cargo"
 chmod 755 "$XDG_DATA_HOME/mbx/bin/cargo"
@@ -662,7 +681,6 @@ printf '%s\n' "$0" > "$XDG_DATA_HOME/mbx/bin/mbx-target"
         std::fs::remove_file(&executable).unwrap();
         uninstall(&home).unwrap();
         let route_left = route.exists();
-        std::fs::remove_dir_all(&home).unwrap();
         assert_eq!(cargo, generated);
         assert_ne!(mode & 0o111, 0, "the generated launcher remains executable");
         assert_eq!(target, format!("{}\n", executable.display()));
