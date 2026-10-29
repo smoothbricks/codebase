@@ -90,6 +90,29 @@ index f6ee81fb1af41deea022b92e838a7c4665eb9778..112faf913ce38b1f4624b38db3783937
  }
  
  // forceNoEmit sets noEmit so the program type-checks without writing files.
+diff --git a/lib/internal/javascriptRuntimeCapabilities.js b/lib/internal/javascriptRuntimeCapabilities.js
+--- a/lib/internal/javascriptRuntimeCapabilities.js
++++ b/lib/internal/javascriptRuntimeCapabilities.js
+@@ -43,6 +43,19 @@
+  * @evidence contracts/performance.md#bound-retention-and-release-resources The synchronous probe owns child completion and fallback captures; finally attempts capture close/removal, whose helper suppresses cleanup failures, so native/file release is unconfirmed on failure. Capability entries retain absolute spellings and path/identity text with no eviction quota; failed identity validation can remove an entry. Returned capability copies transfer to callers.
+  */
+ function javascriptRuntimeCapabilities(runtime, env, cwd, identities) {
++    // The running process answers for itself. Under Bun, process.execPath names
++    // Bun (pluginDescriptorRuntimeBinary), and a probe of it can fail for reasons
++    // that say nothing about the executable: its 30 s timeout under load, or a
++    // spawn the host refused. Read as "not Bun", that failure handed Bun Node's
++    // `--input-type ""`, which Bun runs as an empty `bun run` script, so the
++    // plugin descriptor produced no output. This process knows what it is.
++    if (node_path_1.default.isAbsolute(runtime) && sameRuntimeExecutable(runtime, process.execPath)) {
++        return {
++            bun: typeof globalThis.Bun === "object",
++            executable: process.execPath,
++            registerHooks: typeof require("node:module").registerHooks === "function",
++        };
++    }
+     // Inside a ttsx run this is the user's NODE_OPTIONS, not ttsx's preloads,
+     // which would refuse the cache and run in the probe (#1740).
+     const effectiveEnv = TtsxNodeOptions_1.TtsxNodeOptions.forHelpers(SidecarEnvironment_1.SidecarEnvironment.merge(process.env, env));
 diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
 --- a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
 +++ b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
