@@ -99,6 +99,70 @@ describe('bounded-exec bounds', () => {
       ],
       { kind: 'idle', at: 100 },
     ],
+    [
+      'g/r pauses the idle budget until another admission, without resetting it',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: true },
+        { kind: 'granted', at: 500, testing: true, fixture: false },
+        { kind: 'released', at: 540 },
+        { kind: 'granted', at: 5_000, testing: true, fixture: false },
+      ],
+      { kind: 'idle', at: 5_060 },
+    ],
+    [
+      'the final r stops idle, not the total ceiling',
+      { idleMs: 100, totalMs: 1_000 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: true },
+        { kind: 'granted', at: 500, testing: true, fixture: false },
+        { kind: 'released', at: 540 },
+      ],
+      { kind: 'total', at: 1_500 },
+    ],
+    [
+      'one release of overlapping holds leaves idle running',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: true },
+        { kind: 'granted', at: 500, testing: true, fixture: false },
+        { kind: 'granted', at: 510, testing: true, fixture: false },
+        { kind: 'released', at: 540 },
+      ],
+      { kind: 'idle', at: 600 },
+    ],
+    [
+      'a finished test resets the paused budget even when its release arrived first',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: true },
+        { kind: 'granted', at: 500, testing: true, fixture: false },
+        { kind: 'released', at: 540 },
+        progress(550, true, true, true),
+        { kind: 'granted', at: 5_000, testing: true, fixture: false },
+      ],
+      { kind: 'idle', at: 5_100 },
+    ],
+    [
+      'an unscheduled leaf stays bounded with no hold, including after compiler g/r',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: false },
+        { kind: 'granted', at: 10, testing: true, fixture: false },
+        { kind: 'released', at: 20 },
+        progress(30, true, true, true),
+      ],
+      { kind: 'idle', at: 130 },
+    ],
+    [
+      'a holder killed without r remains bounded',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: true },
+        { kind: 'granted', at: 500, testing: true, fixture: false },
+      ],
+      { kind: 'idle', at: 600 },
+    ],
   ])('%s', (_title, limits, events, expected) => {
     expect(firstExpiry(limits, events)).toEqual(expected);
   });
