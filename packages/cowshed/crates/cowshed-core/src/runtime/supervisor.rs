@@ -10322,7 +10322,11 @@ mod workspace_toolchain_tests {
         std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
         std::fs::write(mount.join(".envrc"), "use devenv\n").expect("envrc");
         std::fs::write(mount.join("nx.json"), "{}").expect("Nx capability");
+        let program_directories: Vec<_> =
+            std::env::split_paths(&std::env::var_os("PATH").expect("test program directories"))
+                .collect();
         let mut sandbox = sandbox_at(&mount);
+        sandbox.program_directories = program_directories.clone();
         sandbox
             .configure_capabilities()
             .expect("detect capabilities");
@@ -10476,6 +10480,7 @@ mod workspace_toolchain_tests {
                 .expect("clone activation inputs and record");
         }
         let mut clone_sandbox = sandbox_at(&cloned);
+        clone_sandbox.program_directories = program_directories;
         clone_sandbox
             .configure_capabilities()
             .expect("cloned Nx capability");
