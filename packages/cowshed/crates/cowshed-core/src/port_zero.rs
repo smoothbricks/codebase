@@ -83,7 +83,8 @@ mod tests {
     }
 
     /// The block the scenarios' listeners must land in: the enclosing workspace's, whose sandbox refuses a connect
-    /// anywhere else, or else the first fixture block.
+    /// anywhere else, or else the whole fixture partition, the enclosing block outside a workspace (08_testing.md). Never
+    /// its first 64-port block alone: a concurrent fixture store's allocator binds every port of that block.
     fn block() -> (u16, u16) {
         let read = |name: &str| {
             std::env::var(name).ok().map(|value| {
@@ -95,8 +96,8 @@ mod tests {
         match (read("COWSHED_PORT_BASE"), read("COWSHED_PORT_BLOCK_SIZE")) {
             (Some(base), Some(size)) => (base, size),
             (None, None) => (
-                *crate::metadata::PortAllocation::Fixture.range().start(),
-                64,
+                cowshed_gateway_types::MACOS_FIXTURE_PORT_MIN,
+                cowshed_gateway_types::MACOS_FIXTURE_PORTS,
             ),
             half => panic!("a port block exported half: {half:?}"),
         }
