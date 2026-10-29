@@ -236,7 +236,7 @@ describe('progress report', () => {
   it('selects nextest JSON-plus version 0.1 without changing selection or no-capture commands', () => {
     expect(withTestResultReport('cargo nextest run -E "package(example)"')).toEqual({
       command:
-        'cargo nextest run --message-format=libtest-json-plus -E "package(example)" --message-format-version=0.1',
+        'cargo nextest run --message-format-version=0.1 --message-format=libtest-json-plus -E "package(example)"',
       env: { NEXTEST_EXPERIMENTAL_LIBTEST_JSON: '1' },
     });
     expect(withTestResultReport('cargo nextest run --no-capture')).toEqual({

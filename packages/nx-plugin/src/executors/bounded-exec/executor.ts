@@ -590,6 +590,7 @@ export async function runBoundedExec(
             const error = resultWriter?.reconcile(results) ?? null;
             if (error !== null) {
               resultFailure ??= error;
+              operational = true;
               appendStderr(`bounded-exec: ${error}\n`);
             }
           }
@@ -598,13 +599,13 @@ export async function runBoundedExec(
       const error = (await resultWriter?.close()) ?? null;
       if (error !== null) {
         resultFailure ??= error;
+        operational = true;
         appendStderr(`bounded-exec: ${error}\n`);
       }
     });
-    const verdict =
-      operational || resultFailure !== null
-        ? judgeOperationalFailure(exitCode, report)
-        : judgeRun({ exitCode, elapsedMs, expiry, report, noSpace, lockWaits });
+    const verdict = operational
+      ? judgeOperationalFailure(exitCode, report)
+      : judgeRun({ exitCode, elapsedMs, expiry, report, noSpace, lockWaits });
     if (verdict.outcome === 'bound' && verdict.bound === 'test') {
       appendStderr(`Every failing test failed only on its per-test timeout: ${verdict.tests.join(', ')}\n`);
     }
