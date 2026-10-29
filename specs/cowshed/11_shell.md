@@ -531,22 +531,22 @@ into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supe
   or `write`, the stat of a build volume's image at admission, the store scan behind a spawn's Git routes, or a seal's
   record append. So a turn makes no file-system call on that thread. Each step that makes one runs on the blocking pool,
   and the turn awaits its result with the thread free (`runtime::supervisor::off_actor`): an admission's build-volume
-  hold, capability detection, profile rendering, `.cowshed/env` publication and volume baseline; a spawn's host-side
-  preparation (its private environment with the store's Git routes, its process observer, start check and profile, and
-  its observation fence) and its jobserver fifo; a job's admission record, output writes, background prefix, seal and
-  sealed reads; a job's samples (every tick's, a read's and its terminal one, which read the process table and stat its
-  volumes) and its listening-ports read, its sampler lent to the pool for the observation; the release of its
-  build-volume hold, of the volume itself when the controller releases it, and of its jobserver; and the Nx keeper's
-  grant and `node` lookups. A value every use of which blocks, the artifact store, a build-volume hold or a jobserver,
-  is held so that only the blocking pool uses or drops it. The state stays the actor's own: a turn holds it across the
-  await, and no other turn starts before the result is back. A census in the crate's tests walks every function the
-  actor's turns reach by name and refuses a `std::fs`, file-system `libc` or stat-ing `Path` call among them
-  (`runtime::supervisor::actor_census`). A job's first sample stays in the turn that spawns or starts its process, which
-  yields nothing after the process is the job's, so whatever reaches the actor meanwhile, a retirement or the job's
-  first input, is ordered after that turn. That sample, the kernel reads of a spawn's fence and host load, a warm host's
-  spawn pipes and, on Linux, cgroup admission and signalling still run in the turn. Each turn is published for
-  heartbeats as it starts and ends (05_gateway.md, "Deadlines") and timed as `turn <kind>` under `COWSHED_TIMING`
-  (13_telemetry.md, "Inspection").
+  hold, capability detection, profile rendering, `.cowshed/env` publication, volume baseline and Linux cgroup admission;
+  a spawn's host-side preparation (its private environment with the store's Git routes, its process observer, start
+  check and profile, and its observation fence) and its jobserver fifo; a job's admission record, output writes,
+  background prefix, seal and sealed reads; a job's samples (its first process's, every tick's, a read's and its
+  terminal one, which read the process table and stat its volumes) and its listening-ports read, its sampler lent to the
+  pool for the observation; the release of its build-volume hold, of the volume itself when the controller releases it,
+  and of its jobserver; and the Nx keeper's grant and `node` lookups. A value every use of which blocks, the artifact
+  store, a build-volume hold or a jobserver, is held so that only the blocking pool uses or drops it. The state stays
+  the actor's own: a turn holds it across the await, and no other turn starts before the result is back. A census in the
+  crate's tests walks every function the actor's turns reach by name and refuses a `std::fs`, file-system `libc` or
+  stat-ing `Path` call among them (`runtime::supervisor::actor_census`). A job's first sample stays in the turn that
+  spawns or starts its process: the turn awaits that sample on the blocking pool before taking another command or event,
+  so whatever reaches the actor meanwhile, a retirement or the job's first input, is ordered after that turn. The kernel
+  reads of a spawn's fence and host load, a warm host's spawn pipes and, on Linux, signalling still run in the turn.
+  Each turn is published for heartbeats as it starts and ends (05_gateway.md, "Deadlines") and timed as `turn <kind>`
+  under `COWSHED_TIMING` (13_telemetry.md, "Inspection").
 
 ## Protocol
 

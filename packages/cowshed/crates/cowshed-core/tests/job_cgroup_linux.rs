@@ -262,7 +262,11 @@ fn job_cgroup_role() {
     match serde_json::from_slice(role.as_encoded_bytes()).expect("role") {
         Role::Delegate { uid, gid } => delegate(uid, gid),
         Role::Controller => {
-            control();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("controller runtime")
+                .block_on(control());
             println!("COWSHED_JOB_CGROUP_CONTROLLER_DONE");
         }
         Role::Workload(workload) => work(&workload),
@@ -538,7 +542,7 @@ fn close_inherited_stdio() {
 }
 
 /// The scenarios, run by the unprivileged controller that holds the delegated scope.
-fn control() {
+async fn control() {
     report_fixture_authority("controller");
     // This controller receives only the runner-owned mountpoint, never device authority.
     let denied = std::fs::OpenOptions::new()
@@ -576,9 +580,9 @@ fn control() {
     storage_io_outlives_its_processes(&jobs);
     retirement_waits_for_the_last_process(&jobs);
     restart_lookup_keeps_the_identity_under_its_incarnation(&authority, &jobs);
-    escapees_die_with_their_job(&authority);
+    escapees_die_with_their_job(&authority).await;
     an_unending_member_is_named_past_the_reap_bound(&authority);
-    admission_refuses_what_it_cannot_contain(&authority);
+    admission_refuses_what_it_cannot_contain(&authority).await;
 
     // Leave the scope as admission found it.
     retire_outstanding(&jobs);
@@ -1129,7 +1133,7 @@ fn retire_outstanding(jobs: &IncarnationCgroups) {
 /// escapee is only ever born of it, so its membership is inherited: once it has left the
 /// leader's session, or the leader has exited and the kernel has reparented it, nothing but the
 /// cgroup ties it to the job.
-fn escapees_die_with_their_job(authority: &CgroupAuthority) {
+async fn escapees_die_with_their_job(authority: &CgroupAuthority) {
     let incarnation = incarnation(3);
     let snapshot = authority_snapshot(&incarnation);
     let jobs = authority.incarnation(&incarnation).expect("incarnation");
@@ -1140,7 +1144,7 @@ fn escapees_die_with_their_job(authority: &CgroupAuthority) {
         (3, Detach::SessionAfterParentExit),
     ];
     for (id, detach) in escapes {
-        kill_reaches_the_escapee(&mut sink, &snapshot, &jobs, id, detach);
+        kill_reaches_the_escapee(&mut sink, &snapshot, &jobs, id, detach).await;
     }
     let left = jobs.outstanding().expect("outstanding");
     assert!(
@@ -1149,7 +1153,7 @@ fn escapees_die_with_their_job(authority: &CgroupAuthority) {
     );
 }
 
-fn kill_reaches_the_escapee(
+async fn kill_reaches_the_escapee(
     sink: &mut SystemSpawnSink,
     authority: &WorkspaceAuthoritySnapshot,
     jobs: &IncarnationCgroups,
@@ -1158,7 +1162,7 @@ fn kill_reaches_the_escapee(
 ) {
     let scenario = format!("{detach:?}");
     println!("escape fixture {scenario}: start");
-    let job = native_admission(sink, authority, job_id(id));
+    let job = native_admission(sink, authority, job_id(id)).await;
     let path = relative(job.path());
     let layout = format!(
         "/background/job-{}-{id}",
@@ -1404,19 +1408,19 @@ fn kill_reaches_the_escapee(
 /// Admission is the one moment a job's cgroup can be refused, and a refusal leaves nothing behind
 /// that a retry or a restart would trip over. Each case provokes a real kernel refusal through a
 /// real cgroup interface; no stand-in directory plays a cgroup.
-fn admission_refuses_what_it_cannot_contain(authority: &CgroupAuthority) {
-    a_name_in_use_is_refused(authority);
-    a_hierarchy_limit_refuses_creation(authority);
+async fn admission_refuses_what_it_cannot_contain(authority: &CgroupAuthority) {
+    a_name_in_use_is_refused(authority).await;
+    a_hierarchy_limit_refuses_creation(authority).await;
     a_cgroup_without_a_controller_is_removed_again(authority);
     an_unwritable_cgroup_kill_refuses_attachment(authority);
-    a_vanished_cgroup_refuses_kill_and_wait();
-    shared_finalization_removes_only_the_admitted_hierarchy(authority);
+    a_vanished_cgroup_refuses_kill_and_wait().await;
+    shared_finalization_removes_only_the_admitted_hierarchy(authority).await;
 }
 
 /// The supervisor's own sink refuses a job whose workspace incarnation already holds a cgroup of
 /// that name, and leaves the cgroup it found alone; the same job id in another incarnation is
 /// another cgroup.
-fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
+async fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
     let (first, second) = (incarnation(4), incarnation(5));
     let (here, there) = (authority_snapshot(&first), authority_snapshot(&second));
     let jobs = authority.incarnation(&first).expect("incarnation");
@@ -1427,6 +1431,7 @@ fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
     let mut sink = SystemSpawnSink::default();
     let refusal = sink
         .admit_cgroup(&here, job_id(1), ExecClass::Background)
+        .await
         .expect_err("a name in use is refused, never adopted or admitted uncontained");
     assert_eq!(
         refusal.code,
@@ -1447,12 +1452,14 @@ fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
     );
     let admitted = sink
         .admit_cgroup(&here, job_id(2), ExecClass::Background)
+        .await
         .expect("admit")
         .expect("a cgroup");
     assert_eq!(admitted.path().parent(), existing.path().parent());
     assert_eq!(admitted.identity().job_id(), job_id(2));
     let elsewhere = sink
         .admit_cgroup(&there, job_id(1), ExecClass::Background)
+        .await
         .expect("admit")
         .expect("a cgroup");
     assert_ne!(elsewhere.path(), existing.path());
@@ -1464,12 +1471,12 @@ fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
 /// The kernel's own hierarchy limit refuses a new cgroup beneath a class cgroup. The library and
 /// the supervisor's sink both report it and create nothing: the same job is admitted once the
 /// limit is lifted.
-fn a_hierarchy_limit_refuses_creation(authority: &CgroupAuthority) {
+async fn a_hierarchy_limit_refuses_creation(authority: &CgroupAuthority) {
     let incarnation = incarnation(6);
     let snapshot = authority_snapshot(&incarnation);
     let jobs = authority.incarnation(&incarnation).expect("incarnation");
     let mut sink = SystemSpawnSink::default();
-    let first = native_admission(&mut sink, &snapshot, job_id(1));
+    let first = native_admission(&mut sink, &snapshot, job_id(1)).await;
     let limit = first
         .path()
         .parent()
@@ -1477,7 +1484,9 @@ fn a_hierarchy_limit_refuses_creation(authority: &CgroupAuthority) {
         .join("cgroup.max.descendants");
     std::fs::write(&limit, "0").expect("set the descendant limit");
     let library = jobs.admit(job_id(2), ExecClass::Background);
-    let native = sink.admit_cgroup(&snapshot, job_id(2), ExecClass::Background);
+    let native = sink
+        .admit_cgroup(&snapshot, job_id(2), ExecClass::Background)
+        .await;
     let listed = jobs.outstanding();
     // Lifted before anything is judged, so a failed assertion cannot leave the scope refusing.
     std::fs::write(&limit, "max").expect("lift the descendant limit");
@@ -1498,7 +1507,7 @@ fn a_hierarchy_limit_refuses_creation(authority: &CgroupAuthority) {
         1,
         "the refused admission created no cgroup beside the first: {listed:?}"
     );
-    let retry = native_admission(&mut sink, &snapshot, job_id(2));
+    let retry = native_admission(&mut sink, &snapshot, job_id(2)).await;
     assert_eq!(retry.identity().job_id(), job_id(2));
     retire_outstanding(&jobs);
 }
@@ -1580,11 +1589,11 @@ fn an_unwritable_cgroup_kill_refuses_attachment(authority: &CgroupAuthority) {
 /// An empty cgroup can be removed under its holder: its descriptors then name nothing, and
 /// `cgroup.kill` is gone with it. Ending or awaiting such a job is an error naming the cgroup,
 /// never a silent success.
-fn a_vanished_cgroup_refuses_kill_and_wait() {
+async fn a_vanished_cgroup_refuses_kill_and_wait() {
     let incarnation = incarnation(9);
     let snapshot = authority_snapshot(&incarnation);
     let mut sink = SystemSpawnSink::default();
-    let job = native_admission(&mut sink, &snapshot, job_id(1));
+    let job = native_admission(&mut sink, &snapshot, job_id(1)).await;
     std::fs::remove_dir(job.path()).expect("remove the empty cgroup");
     let refused = [
         ("kill", job.kill()),
@@ -1692,12 +1701,12 @@ fn an_unending_member_is_named_past_the_reap_bound(authority: &CgroupAuthority) 
 
 /// The actor can finalize while a late host release still holds an Arc and a placement fd.
 /// Neither stale capability may enter or remove a replacement at the old path.
-fn shared_finalization_removes_only_the_admitted_hierarchy(authority: &CgroupAuthority) {
+async fn shared_finalization_removes_only_the_admitted_hierarchy(authority: &CgroupAuthority) {
     let incarnation = incarnation(10);
     let snapshot = authority_snapshot(&incarnation);
     let jobs = authority.incarnation(&incarnation).expect("incarnation");
     let mut sink = SystemSpawnSink::default();
-    let job = native_admission(&mut sink, &snapshot, job_id(1));
+    let job = native_admission(&mut sink, &snapshot, job_id(1)).await;
     let late_host = Arc::clone(&job);
     let placement = job.placement().expect("placement retained by a late host");
     let original = job.identity().clone();
@@ -3219,13 +3228,14 @@ fn authority_snapshot(incarnation: &WorkspaceIncarnation) -> WorkspaceAuthorityS
 }
 
 /// A job's cgroup as the supervisor's production sink admits it before the job is recorded.
-fn native_admission(
+async fn native_admission(
     sink: &mut SystemSpawnSink,
     authority: &WorkspaceAuthoritySnapshot,
     id: JobId,
 ) -> Arc<JobCgroup> {
     let admitted = sink
         .admit_cgroup(authority, id, ExecClass::Background)
+        .await
         .unwrap_or_else(|error| panic!("native admission of job {}: {error}", id.get()));
     admitted.unwrap_or_else(|| {
         panic!(
