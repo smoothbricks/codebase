@@ -23,6 +23,12 @@ const repositoryRoot = join(import.meta.dir, '../../../..');
  * NX_TASK_* identity, output capture) would reconfigure the fixture's Nx: a
  * skipped cache turns every second run into a miss.
  *
+ * Every inherited `MBX_*` variable is dropped too. A gate job of an mbx project
+ * carries cowshed's canonical mbx environment (specs/cowshed/11_shell.md,
+ * "Canonical mbx environment"), and a fixture is no such project: its Nx would
+ * join the outer job's pool (each bounded-exec leaf inside `mbx reserve`), and
+ * its Cargo retention hook would leave the fixture's targets to mbx.
+ *
  * NX_DAEMON is then `false`: a daemonless Nx leaves nothing running once it
  * exits, and only a test whose subject is the daemon overrides it with
  * `true`, inside {@link withNxFixture}, which stops that daemon. NX_USE_LOCAL
@@ -52,7 +58,7 @@ const repositoryRoot = join(import.meta.dir, '../../../..');
 export function fixtureNxEnv(workspace: string, socketDirectory: string): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && !key.startsWith('NX_')) env[key] = value;
+    if (value !== undefined && !key.startsWith('NX_') && !key.startsWith('MBX_')) env[key] = value;
   }
   return {
     ...env,

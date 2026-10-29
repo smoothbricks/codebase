@@ -55,8 +55,10 @@ const nextestWant = 8;
  * Every sizing variable a holder exports to its command (specs/cowshed/05_gateway.md, "Runners are sized to the count",
  * "Cargo reads its holder's jobserver"). This suite's own process runs under them when a gate's `bounded-exec` started
  * it, and the executor reads them as inherited ceilings and pool beside the ones its cases construct, so the suite clears
- * them
- * (specs/cowshed/08_testing.md: fixtures clear every inherited sizing variable before they set their own).
+ * them (specs/cowshed/08_testing.md: fixtures clear every inherited sizing variable before they set their own).
+ * `MBX_SCHEDULER` is the switch of mbx's one pool (mbx-pool.ts): under a gate job's canonical mbx environment it would put
+ * every leaf a case runs inside `mbx reserve`, whose process is then the leader a case observes, and no case here is
+ * about that pool.
  */
 const INHERITED_SIZING_ENV = [
   CPU_POOL_ENV,
@@ -67,6 +69,7 @@ const INHERITED_SIZING_ENV = [
   'CARGO_MAKEFLAGS',
   'MAKEFLAGS',
   'MFLAGS',
+  'MBX_SCHEDULER',
 ] as const;
 const inheritedSizing = INHERITED_SIZING_ENV.map((name) => [name, process.env[name]] as const);
 

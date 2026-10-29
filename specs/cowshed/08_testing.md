@@ -727,7 +727,10 @@ a job's command receives — `CARGO_MAKEFLAGS`/`MAKEFLAGS` naming the job's own 
 `RUST_TEST_THREADS`/`NEXTEST_TEST_THREADS` at `g` unless the caller named them, a caller's own jobserver variables never
 passed — and a fifo of `g − 1` bytes. How Cargo reads a jobserver is Cargo's own to test; an end-to-end proof with real
 Cargo belongs in a nightly, not the gate. The `bounded-exec` executor suite clears every inherited sizing variable for
-its own run, so the count of the job that runs the suite is no ceiling on the runners its cases size.
+its own run, so the count of the job that runs the suite is no ceiling on the runners its cases size; it clears mbx's
+pool switch (`MBX_SCHEDULER`) with them, so a gate job's canonical mbx environment (11_shell.md) puts none of its cases'
+leaves inside `mbx reserve`. A fixture Nx run drops every inherited `MBX_*` variable as it drops `NX_*`: a fixture
+workspace is no mbx project, so it joins no outer pool, cache or target views.
 
 **Required scheduling evidence.** The jobserver proof above is the evidence for cowshed's own ledger, which serves only
 when no mbx is present. The host-tier proofs that mbx, when present, is the one CPU/memory ledger — mbx-present
