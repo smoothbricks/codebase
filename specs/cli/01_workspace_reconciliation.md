@@ -18,6 +18,11 @@ their raw scripts, not the CLI. The existing `node_modules/.cache/smoo/dist-ver
 invalidate its daemon record and project graph; a CLI-only rebuild preserves them and every build preserves Nx task
 results and their database.
 
+For managed uv projects, install-task status joins the existing input stamps with a live environment-relocation witness
+instead of relying only on the task's file-digest cache. Normal project commands inherit `UV_NO_SYNC=1`; the managed
+installer's explicit sync is the sole writer of editable mappings and normalizes them before publication
+([Python/uv relocation](../cowshed/03_caches.md)). A fork enters installed and imports its own tree.
+
 ## Operations
 
 - `smoo monorepo sync` reconciles the installed, pinned toolset. It is deterministic and offline: it resolves nothing

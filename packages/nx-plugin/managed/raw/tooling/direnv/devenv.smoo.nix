@@ -487,6 +487,11 @@ in {
   # digest under the install lock, so two shells entering at once install once.
   # The scripts themselves are inputs: a new setup-environment.ts reruns.
   #
+  # A uv project also has live installed state: a copied environment can hold
+  # an absolute editable mapping while every input digest is unchanged. Its
+  # status joins the installer's own input stamps and relocation witness;
+  # non-Python projects retain the input-only task cache below.
+  #
   # smoo:cargo-fetch establishes what the Nx plugin's offline `cargo metadata
   # --locked` needs: every Cargo workspace's locked packages in CARGO_HOME. Its
   # stamps live in smoo's user cache and count only while CARGO_HOME names the
@@ -527,11 +532,13 @@ in {
   # setup-environment.ts is strict there.
   tasks = let
     setup = ''bun "$DEVENV_ROOT/setup-environment.ts"'';
+    install = setup + lib.optionalString uvProject " --python ${python.package.interpreter}";
   in {
     "smoo:install" = {
       description = "bun install / uv sync when what they read changed";
-      exec = setup + lib.optionalString uvProject " --python ${python.package.interpreter}";
-      execIfModified = [
+      exec = install;
+      status = lib.mkIf uvProject (install + " --check");
+      execIfModified = lib.optionals (!uvProject) [
         "../../package.json"
         "../../bun.lock"
         "../../bun.lockb"
@@ -703,6 +710,9 @@ in {
       unset GOROOT
       ${lib.optionalString uvProject ''
         if [ -f pyproject.toml ]; then
+          # The installer above owns sync and rewrites editable mappings after it.
+          # A reader's uv run must not rewrite them to this checkout's absolute path.
+          export UV_NO_SYNC=1
           export VIRTUAL_ENV="$UV_PROJECT_ENVIRONMENT"
           export PATH="$VIRTUAL_ENV/bin:$PATH"
         fi

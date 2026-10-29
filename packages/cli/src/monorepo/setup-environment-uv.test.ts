@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { chmod, cp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { edit, HEALTHY, repository, withManagedRepository } from './__tests__/helpers/shell-entry.js';
+import { edit, HEALTHY, MANAGED, repository, withManagedRepository } from './__tests__/helpers/shell-entry.js';
 
 /**
  * What shell entry does for a uv project, through the real script with a recording `uv` on PATH, and with the real
@@ -21,6 +21,21 @@ describe('what shell entry syncs for a uv project', () => {
     'uv.lock': 'version = 1\n',
   };
 
+  it('checks the live Python relocation witness even when the install inputs still match', async () => {
+    await withManagedRepository({ files: UV_PROJECT }, async (original) => {
+      const venv = join(original.state, 'venv');
+      const uv = { uvProjectEnvironment: venv, python: PYTHON };
+      expect(await original.enterShell(uv)).toEqual(HEALTHY);
+      expect(await original.enterShell({ ...uv, check: true })).toEqual(HEALTHY);
+      const before = original.uvRuns();
+      const pth = join(venv, 'lib', 'python3.14', 'site-packages', 'tool.pth');
+      await writeFile(pth, `${join(original.root, 'python/tool/src')}\n`);
+      const checked = await original.enterShell({ ...uv, check: true });
+      expect(checked.exitCode).toBe(1);
+      expect(original.uvRuns()).toEqual(before);
+      expect(readFileSync(pth, 'utf8')).toBe(`${join(original.root, 'python/tool/src')}\n`);
+    });
+  });
   it('creates a relocatable environment, syncs it once per input change, syncs nothing without uv, enters a copy installed and replaces an environment that is not relocatable', async () => {
     await withManagedRepository({ files: UV_PROJECT }, async (original) => {
       const { root, state, enterShell: enter, uvRuns } = original;
@@ -164,6 +179,42 @@ describe('what shell entry syncs for a uv project', () => {
       const cloneScript = Bun.spawnSync([join(cloneVenv, 'bin', 'tool')], { stdout: 'pipe', stderr: 'pipe' });
       expect(cloneScript.exitCode).toBe(0);
       expect(cloneScript.stdout.toString()).toBe('tool\n');
+
+      // Run an ordinary project command through the managed uv-project shell block. A run is a reader, not another
+      // installer: if it re-syncs an editable member here, its absolute clone path poisons the next warm copy.
+      const moduleText = readFileSync(join(MANAGED, 'tooling', 'direnv', 'devenv.smoo.nix'), 'utf8');
+      const uvShell = moduleText.match(/\$\{lib\.optionalString uvProject ''([\s\S]*?)''\}/)?.[1];
+      if (uvShell === undefined) throw new Error('managed shell no longer declares the uv-project activation block');
+      const environment = Object.fromEntries(
+        Object.entries(process.env).filter(([name]) => name !== 'UV_NO_SYNC' && name !== 'VIRTUAL_ENV'),
+      );
+      const command = Bun.spawnSync(
+        [
+          'bash',
+          '-c',
+          `${uvShell}\nexec "$1" run --frozen --project "$2" python -c "import tool; print(tool.__file__)"`,
+          'uv-project-command',
+          realUv,
+          join(clone, 'python', 'tool'),
+        ],
+        {
+          cwd: clone,
+          env: { ...environment, ...env, UV_PROJECT_ENVIRONMENT: cloneVenv },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        },
+      );
+      if (command.exitCode !== 0) throw new Error(`uv project command failed: ${command.stderr.toString()}`);
+      const copiedAgain = join(dirname(original.root), 'copy-after-run');
+      await cp(clone, copiedAgain, { recursive: true, verbatimSymlinks: true });
+      const copiedPython = join(copiedAgain, 'tooling', 'direnv', '.devenv', 'state', 'venv', 'bin', 'python');
+      const importedAgain = Bun.spawnSync([copiedPython, '-c', 'import tool; print(tool.__file__)'], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      if (importedAgain.exitCode !== 0)
+        throw new Error(`copied Python import failed: ${importedAgain.stderr.toString()}`);
+      expect(importedAgain.stdout.toString()).toContain(join(copiedAgain, 'python', 'tool', 'src'));
     });
   });
 });

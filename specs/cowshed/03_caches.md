@@ -441,6 +441,19 @@ there; they contain the endpoint URL, whose userinfo is the workspace token (bel
     code from its build script's `OUT_DIR`; and the job environment of an mbx-capable project carries no `RUSTC_WRAPPER`
     and no `SCCACHE_*` name, whatever the caller exported.
 
+### Python/uv relocation
+
+A managed uv project's environment travels with its checkout. The managed install task alone runs `uv sync` and rewrites
+editable workspace-member `.pth` paths relative to site-packages, so a warm copy imports the copy's source, not the
+originating checkout. Its status checks both the install input stamps and the live relocation witness; a matching digest
+never admits absolute launchers or editable mappings. The status reads only; repair runs through the same locked
+installer.
+
+The activated project shell exports uv's `UV_NO_SYNC=1`: ordinary `uv run` commands consume the installed environment
+without becoming a second installer. The managed installer clears that reader setting for its explicit sync. A member
+command must therefore leave the relative mappings intact, and a copy made after that command must still import its own
+source. External cache sharing does not authorize imports from another checkout.
+
 ### mbx
 
 mbx is the Cargo compiler cache. There is **one mbx cache directory per host, `<bc>/mbx`** on the build-cache volume

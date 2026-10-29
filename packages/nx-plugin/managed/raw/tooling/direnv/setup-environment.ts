@@ -311,10 +311,14 @@ try {
   // and package resolution/Typia transforms are not available yet.
   const bunInputs = bunInstallInputs();
   const cargoFetches = cargoMode ? cargoWorkspaces(bunInputs).map(cargoFetcher) : [];
-  if (flags.check === true) {
+  if (flags.check === true && cargoMode) {
     process.exit(cargoFetches.every((fetch) => fetch.isCurrent()) ? 0 : 1);
   }
   const uvInputs = cargoMode ? [] : uvSyncInputs();
+  if (flags.check === true) {
+    const uv = uvInstaller(uvInputs, { locked: process.env.GITHUB_ACTIONS === 'true' });
+    process.exit(bunInstaller(bunInputs).isCurrent() && (uv === null || uv.isCurrent()) ? 0 : 1);
+  }
   // A CI runner is GitHub Actions or Forgejo Actions, which mirrors every FORGEJO_*
   // variable as GITHUB_*. Not `CI`: agent harnesses set CI=true on every command
   // they run, and this branch installs unconditionally.
@@ -1072,9 +1076,11 @@ function uvInstaller(inputs: readonly string[], options: { locked: boolean }): I
       return stampOk && witnessOk;
     },
     install: async ({ quiet }) => {
-      // An inherited VIRTUAL_ENV names some other environment; uv would warn
-      // that it does not match the project environment and ignore it.
-      const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name !== 'VIRTUAL_ENV'));
+      // The managed installer is the only environment writer. An inherited VIRTUAL_ENV names another checkout;
+      // UV_NO_SYNC belongs to reader commands, not to this deliberate sync.
+      const env = Object.fromEntries(
+        Object.entries(process.env).filter(([name]) => name !== 'VIRTUAL_ENV' && name !== 'UV_NO_SYNC'),
+      );
       // Replacement is gated on the same witness currentness uses, not only on the config
       // line: a valid config beside an absolute launcher or .pth would otherwise sync over
       // the escape and stamp it. uv venv refuses a directory that already holds an
