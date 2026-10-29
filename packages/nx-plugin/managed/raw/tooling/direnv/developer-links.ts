@@ -446,6 +446,9 @@ export interface DeclaredLinksPlan {
  * binding it inherited from the main checkout, or reach through a redirected or
  * escaping path. Resolving a snapshot may capture one (linked-snapshots.ts),
  * which writes only the snapshot store.
+ * A throw is a refusal. Shell entry fails on it: once the tasks have run, the
+ * enterShell prologue plans again (setup-environment.ts, `--links --refusal`),
+ * so a refusal is read from the providers at that entry and none is kept.
  */
 export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan> {
   const declared = readDeclaredLinks(root);

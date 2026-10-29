@@ -515,10 +515,16 @@ in {
   # links its declaration does not describe runs another build than it says
   # (a live checkout whose build is stale, with no sealed snapshot to serve
   # instead), and the repair is in the provider checkout, not in this shell.
-  # The refused exec leaves node_modules/.smoo-links-refused, which the
-  # prologue below says and fails on; the next `--links` run that finds the
-  # links current removes it. CI runs both with `devenv tasks run`, which
-  # does fail; setup-environment.ts is strict there.
+  # So the prologue below asks `setup-environment.ts --links --refusal` once
+  # the tasks have run, and fails entry with the planner's reason: the answer
+  # is read from the providers at that entry, so the entry after the provider
+  # is rebuilt goes in with no step between, and nothing of a refusal outlives
+  # it. devenv also evaluates the whole enterShell script once before it runs
+  # any task, only to capture the environment (it sets DEVENV_SKIP_TASKS), and
+  # a script that fails in that pass stops the tasks that would repair: it
+  # asks nothing there, and a manifest that declares no links starts no
+  # process. CI runs both with `devenv tasks run`, which does fail;
+  # setup-environment.ts is strict there.
   tasks = let
     setup = ''bun "$DEVENV_ROOT/setup-environment.ts"'';
   in {
@@ -569,7 +575,9 @@ in {
     # Prologue, in order:
     #
     # 1. The devenv wrapper runs from tooling/direnv; every later step expects the
-    #    workspace root.
+    #    workspace root. Once the tasks have run, the planner's refusal of the
+    #    declared links (smoo:developer-links above) fails entry before any
+    #    later step.
     # 2. PATH order is most-specific → least-specific, the same list the git hooks
     #    use, so a hook and a shell resolve one binary the same way. The Rust
     #    toolchain's store bin then goes ahead of all of it (rustToolchainBin
@@ -658,12 +666,11 @@ in {
     # they run.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
-      # smoo:developer-links refused the declared links (tasks above): fail
-      # shell entry with its reason rather than run on links it refused.
-      if [ -f node_modules/.smoo-links-refused ]; then
-        echo "smoo:developer-links refused this checkout's declared links; shell entry fails until they are current:" >&2
-        cat node_modules/.smoo-links-refused >&2
-        exit 1
+      # smoo:developer-links (tasks above) refusing the declared links fails
+      # shell entry with the planner's reason, asked of the providers now. Only
+      # the entry proper asks, and only a manifest that declares links.
+      if [ -z "''${DEVENV_SKIP_TASKS:-}" ] && grep -qF developerLinks package.json; then
+        bun "$DEVENV_ROOT/setup-environment.ts" --links --refusal || exit $?
       fi
       # A bare assignment: export's status would hide repo-path's refusal of a
       # cowshed workspace it could not serve, and the shell would enter with an

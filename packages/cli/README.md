@@ -563,12 +563,13 @@ nothing when nothing changed:
   any task, only to capture the environment (it sets `DEVENV_SKIP_TASKS` for that pass), so a repository's own
   `enterShell` hook that needs what the tasks install, such as the `ttsc` in `node_modules`, must skip the pass: on a
   fresh checkout or a runner that restored another lockfile's `node_modules` the hook would abort the capture before the
-  install could run. This repository's `tooling/direnv/enter-shell.ts` does. Managed toolchain cache maintenance
-  (`toolchain-stamp.ts`) skips that capture pass too: it exports no variables, and compiler probes and invalidation
-  belong after tasks and project hooks have settled the toolchain, not once before them and again afterward. The managed
-  `.envrc` watches `package.json`, the lockfiles and the scripts shell entry runs, so a shell direnv keeps loaded
-  re-enters after a pull or a script change. Local nvfetcher overlays also watch `nixpkgs-overlay/flake.nix` and
-  `_sources/generated.nix`. Import the existing local flake outputs directly in `devenv.nix`
+  install could run. This repository's `tooling/direnv/enter-shell.ts` does, and so does the managed prologue's question
+  about the declared links (Declared Links, below). Managed toolchain cache maintenance (`toolchain-stamp.ts`) skips
+  that capture pass too: it exports no variables, and compiler probes and invalidation belong after tasks and project
+  hooks have settled the toolchain, not once before them and again afterward. The managed `.envrc` watches
+  `package.json`, the lockfiles and the scripts shell entry runs, so a shell direnv keeps loaded re-enters after a pull
+  or a script change. Local nvfetcher overlays also watch `nixpkgs-overlay/flake.nix` and `_sources/generated.nix`.
+  Import the existing local flake outputs directly in `devenv.nix`
   (`((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default`), rather than declaring the overlay as a `path:`
   flake input: the live import makes generated pins part of devenv's evaluation dependencies as well as direnv's
   watches. Ordinary activation then selects changed pins while an unchanged shell stays cached; no forced refresh or
@@ -793,8 +794,17 @@ the package's `build` may only emit TypeScript and cannot repair native artifact
 nondefault/production tasks and obsolete native receipts without provenance are not judged, nor are their surrounding
 trees. The TypeScript emit's `outDir` remains an independent boundary: its standalone bootstrap record is judged even
 without a producer, and an enclosing old `dist` record cannot hide it or its missing-record timestamp fallback. This
-runs once per shell entry, never per CLI execution; it starts no Nx graph and hand-normalizes no Nx outputs, inferred
-targets or target defaults.
+runs at shell entry, in the `smoo:developer-links` status and again in the prologue's question below, never per CLI
+execution; it starts no Nx graph and hand-normalizes no Nx outputs, inferred targets or target defaults.
+
+A refusal fails shell entry, because a shell on links its declaration does not describe runs another build than it says,
+and the repair is in the provider checkout. Once devenv's tasks have run, the managed prologue plans the declared links
+again (`setup-environment.ts --links --refusal`) and stops the entry with the planner's reason. The answer is read from
+the providers at that entry and nothing of it is kept for the next, so the entry after the provider is rebuilt succeeds
+with no step between. devenv captures the shell's environment by running the `enterShell` script once before any task,
+and that pass asks nothing: a script that fails there stops the tasks that repair. A manifest that declares no links
+starts no process for the question. Only the planner's refusal stops entry: a failed install, or a link the tasks could
+not bring current, still loads the shell so the tools to repair it stay available.
 
 Each key is a package name, scoped or not. Every directory is relative to the project checkout. For live links and
 capture, a project-contained declaration resolves within the current checkout, including a cowshed workspace, and

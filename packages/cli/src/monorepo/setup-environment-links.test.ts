@@ -1,19 +1,92 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell fixture scripts are literal shell text. */
 import { describe, expect, it } from 'bun:test';
-import { existsSync, readFileSync, readlinkSync, symlinkSync } from 'node:fs';
-import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFileSync, readlinkSync, symlinkSync } from 'node:fs';
+import { appendFile, chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
+  developerLinksTask,
   edit,
   finished,
+  git,
   HEALTHY,
   INSTALL_LOCK_WAIT,
   linkEntry,
+  type Repository,
+  type ShellEntry,
   waitForInstallLock,
   withInstallLockHeld,
   withManagedRepository,
 } from './__tests__/helpers/shell-entry.js';
 import { keepDeveloperLinks } from './developer-links.js';
+
+/** What a shell entry did as devenv runs one: whether the tasks ran, and the status of the prologue's entry proper. */
+interface DevenvEntry extends ShellEntry {
+  readonly tasks: 'ran' | 'skipped';
+}
+
+/**
+ * One shell entry as devenv runs it for direnv (`run_enter_shell_tasks` in cachix/devenv): the enterShell script once to
+ * capture the environment, before any task, where a failure stops everything after it; then the tasks, of which
+ * smoo:developer-links runs its `status` and, when that is not zero, its exec, and a failed task fails nothing; then
+ * the script again, whose status is the entry's.
+ */
+async function enterAsDevenvDoes({ prologue, enterShell }: Repository): Promise<DevenvEntry> {
+  const capture = await prologue({ capture: true });
+  if (capture.exitCode !== 0) return { ...capture, tasks: 'skipped' };
+  if ((await enterShell({ links: true, check: true })).exitCode !== 0) await enterShell({ links: true });
+  return { ...(await prologue()), tasks: 'ran' };
+}
+
+/**
+ * A provider checkout: a git workspace whose one package, `@fixture/lib`, has a TypeScript build that recorded the bytes
+ * it read (`.build-inputs.json`), as Nx's emit does. `land` is new source reaching it; `rebuild` is the build catching up.
+ */
+async function provider(at: string) {
+  const directory = join(at, 'packages', 'lib');
+  const entry = join(directory, 'src', 'index.ts');
+  const config = join(directory, 'tsconfig.lib.json');
+  const digest = (file: string) => createHash('sha256').update(readFileSync(file)).digest('hex');
+  await mkdir(join(directory, 'src'), { recursive: true });
+  await writeFile(
+    join(at, 'package.json'),
+    JSON.stringify({ name: 'provider', private: true, workspaces: ['packages/*'] }),
+  );
+  await writeFile(join(at, '.gitignore'), 'dist\nnode_modules\n');
+  await writeFile(
+    join(directory, 'package.json'),
+    JSON.stringify({ name: '@fixture/lib', version: '9.9.9', files: ['dist'] }),
+  );
+  await writeFile(config, JSON.stringify({ compilerOptions: { outDir: 'dist/js' }, include: ['src/**/*.ts'] }));
+  await writeFile(entry, 'export const value = 1;\n');
+  await git(at, ['init', '--quiet']);
+  await git(at, ['add', '-A']);
+  await git(at, [
+    '-c',
+    'user.name=fixture',
+    '-c',
+    'user.email=fixture@example.test',
+    '-c',
+    'maintenance.auto=false',
+    'commit',
+    '--quiet',
+    '-m',
+    'fixture',
+  ]);
+  const rebuild = async () => {
+    await mkdir(join(directory, 'dist', 'js'), { recursive: true });
+    await writeFile(join(directory, 'dist', 'js', 'index.js'), `// built from ${digest(entry)}\n`);
+    await writeFile(
+      join(directory, 'dist', 'js', '.build-inputs.json'),
+      JSON.stringify({
+        version: 1,
+        files: { 'packages/lib/src/index.ts': digest(entry), 'packages/lib/tsconfig.lib.json': digest(config) },
+      }),
+    );
+  };
+  await rebuild();
+  return { directory, rebuild, land: () => writeFile(entry, 'export const value = 2;\n') };
+}
 
 // What a declaration and an install do to the trees, called directly, is developer-links-declared.test.ts. These
 // entries run what only the real shell entry, the root postinstall and a real `bun install` can show.
@@ -200,16 +273,66 @@ describe('what shell entry keeps linked', () => {
             'smoo.developerLinks @fixture/lib must be a directory relative to the main checkout, not "/opt/lib"',
           );
 
-          // The refused exec leaves its reason where the enterShell prologue fails shell entry on it
-          // (devenv.smoo.nix), and the next run that finds the links current removes it.
-          const marker = join(root, 'node_modules/.smoo-links-refused');
-          expect((await enter({ links: true })).exitCode).toBe(1);
-          expect(readFileSync(marker, 'utf8')).toContain(
+          // Shell entry's own question, which the prologue asks once the tasks have run, is that same refusal and
+          // nothing kept from it: asked again after the declaration is corrected, it is answered by the planner afresh.
+          const asked = await enter({ links: true, refusal: true });
+          expect(asked.exitCode).toBe(1);
+          expect(asked.stderr).toContain(
             'smoo.developerLinks @fixture/lib must be a directory relative to the main checkout, not "/opt/lib"',
           );
+          // A CI runner links nothing, so it asks nothing; and the question is only ever asked with `--links`: alone it
+          // is refused, never taken for the install.
+          expect(await enter({ links: true, refusal: true, ciSecrets: RUNNER })).toEqual(HEALTHY);
+          const alone = await enter({ refusal: true });
+          expect(alone.exitCode).toBe(1);
+          expect(alone.stderr).toContain("--refusal is shell entry's question about the declared links");
+          expect(count('install')).toBe(1);
           await declare(root, { '@fixture/lib': '../local-lib' });
-          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
-          expect(existsSync(marker)).toBe(false);
+          expect(await enter({ links: true, refusal: true })).toEqual(HEALTHY);
+        },
+      );
+    });
+
+    it('fails shell entry only while the planner refuses the declared links, and the entry after the provider is rebuilt succeeds with no step between', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../provider/packages/lib' } },
+        async (repo) => {
+          const { root, enterShell: enter, prologue } = repo;
+          // The commands the entry below runs for the task are the ones the module declares.
+          expect(developerLinksTask()).toEqual({ exec: '${setup} --links', status: '${setup} --links --check' });
+          const live = await provider(join(dirname(root), 'provider'));
+          // The install binds the live checkout, whose build describes its sources: the whole entry is quiet.
+          expect((await enter()).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(live.directory);
+          expect(await enterAsDevenvDoes(repo)).toEqual({ exitCode: 0, stderr: '', tasks: 'ran' });
+
+          // New sources land before the provider's build catches up, and no sealed snapshot can stand in: the entry
+          // refuses with the planner's reason, after its tasks ran, and leaves the alias as it was.
+          await live.land();
+          const refused = await enterAsDevenvDoes(repo);
+          expect(refused.exitCode).toBe(1);
+          expect(refused.tasks).toBe('ran');
+          expect(refused.stderr).toContain(
+            'refusing developer link(s) to a live checkout whose build does not describe its sources',
+          );
+          expect(refused.stderr).toContain('input packages/lib/src/index.ts has other bytes than the build read');
+          expect(readlinkSync(join(root, LINKED))).toBe(live.directory);
+
+          // A file an earlier release left for its prologue is no part of the answer, and nothing removes it.
+          await appendFile(join(root, 'node_modules', '.smoo-links-refused'), 'left by an earlier release\n');
+
+          // The build catches up. The next entry succeeds: no `--links --check` by hand, no file to remove.
+          await live.rebuild();
+          expect(await enterAsDevenvDoes(repo)).toEqual({ exitCode: 0, stderr: '', tasks: 'ran' });
+
+          // The pass that captures the environment runs before the tasks that repair, so it asks nothing; and a
+          // manifest that declares no links starts no process for the question. Both beside a `bun` that fails.
+          const noBun = join(dirname(root), 'no-bun');
+          await mkdir(noBun);
+          await writeFile(join(noBun, 'bun'), '#!/bin/sh\necho "bun ran: $*" >&2\nexit 99\n', { mode: 0o755 });
+          expect(await prologue({ capture: true, ahead: noBun })).toEqual(HEALTHY);
+          await declare(root, undefined);
+          expect(await prologue({ ahead: noBun })).toEqual(HEALTHY);
         },
       );
     });

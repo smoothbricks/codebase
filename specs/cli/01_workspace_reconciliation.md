@@ -106,7 +106,16 @@ other hosts, nondefault/production records and obsolete native records without p
 their surrounding trees are not judged. The TypeScript emit's directory is an independent boundary and still accepts a
 standalone bootstrap record without producer provenance; an enclosing obsolete `dist` record cannot hide the nested
 emit's record or its missing-record timestamp fallback. Normal published units without records retain their existing
-timestamp fallback. These currentness checks run once at shell entry, never per artifact execution.
+timestamp fallback. These currentness checks run at shell entry, in the `smoo:developer-links` status and again in the
+prologue's question below, never per artifact execution.
+
+Shell entry fails closed on that refusal. Once devenv's tasks have run, the managed prologue plans the declared links
+again (`setup-environment.ts --links --refusal`) and stops the entry with the planner's reason. The question is asked of
+the providers at that entry and no verdict of an earlier entry is kept, so the entry after the provider is rebuilt
+succeeds with no step between. The environment-capture pass (`DEVENV_SKIP_TASKS`) runs before the tasks that repair and
+asks nothing, and a manifest that declares no links starts no process for the question. Only the planner's refusal stops
+entry: a failed install, or a link the tasks could not bring current, still loads the shell so the tools to repair it
+stay available.
 
 ## Acceptance
 

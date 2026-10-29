@@ -15,6 +15,9 @@ import { DECLARED_LINKS_POSTINSTALL } from '../../package-policy.js';
  * commands for declared secrets, `bun install` (through the root `prepare`
  * lifecycle it triggers), `uv sync` (through a recording `uv` on PATH) and
  * `cargo fetch` (through a recording `cargo` on PATH).
+ * The prologue's own first statements, which ask the planner whether the declared links are refused, are the text
+ * devenv.smoo.nix declares, run in bash as devenv runs them (`prologue`): once as the pass that captures the
+ * environment, once as the entry proper.
  * A shell entry runs an install that replaces developer links only for the Nx
  * bindings (`relink: ['nx']`), and the Nx cases below measure that through the
  * real script. The other replacement cases call `keepDeveloperLinks` directly,
@@ -63,6 +66,8 @@ export type EntryOptions = {
   /** devenv's smoo:developer-links task: `--links`, and its `status`, `--links --check`. */
   readonly links?: boolean;
   readonly check?: boolean;
+  /** The prologue's question about the declared links, asked after the tasks: `--links --refusal`. */
+  readonly refusal?: boolean;
 } & (
   | {
       /** The CARGO_HOME this entry runs with, instead of the repository's own. */
@@ -90,6 +95,8 @@ export interface Repository {
   readonly enterShell: (options?: EntryOptions) => Promise<ShellEntry>;
   /** The same entry, returned while it runs, for a test that races or kills it. */
   readonly startShell: (options?: EntryOptions) => ShellProcess;
+  /** The managed enterShell prologue's first statements, run as devenv runs them: its entry proper, or its capture pass. */
+  readonly prologue: (options?: PrologueOptions) => Promise<ShellEntry>;
   /** Times something recorded in the ledger: a provider command's variable, `install`, or `uv`. */
   readonly count: (name: string) => number;
   /** The argument vectors the recording `uv` received, one per run. */
@@ -304,6 +311,7 @@ export function repository(root: string, ledgers: string, bin: string): Reposito
     state,
     enterShell: async (options = {}) => finished(startShell(root, state, bin, options)),
     startShell: (options = {}) => startShell(root, state, bin, options),
+    prologue: async (options = {}) => finished(startPrologue(root, state, bin, options)),
     count: (name) => lines(name).length,
     uvRuns: () => lines('uv').map((line) => line.split(' ')),
     cargoRuns: () => lines('cargo').map((line) => line.split(' ')),
@@ -353,29 +361,88 @@ export function startShell(root: string, state: string, bin: string, options: En
       ...(options.cargo === true ? ['--cargo'] : []),
       ...(options.links === true ? ['--links'] : []),
       ...(options.check === true ? ['--check'] : []),
+      ...(options.refusal === true ? ['--refusal'] : []),
     ],
     cwd: root,
+    env: entryEnvironment(root, state, bin, options),
+    stdout: 'pipe',
+    stderr: 'pipe',
+    stdin: 'ignore',
+  });
+}
+
+/** What a developer machine's shell entry carries: only what it has, and the fixture's own roots and caches. */
+function entryEnvironment(root: string, state: string, bin: string, options: EntryOptions) {
+  return {
+    ...options.env,
+    PATH: `${bin}:${process.env.PATH ?? ''}`,
+    TMPDIR: dirname(bin),
+    ...(options.home === undefined
+      ? {
+          HOME: process.env.HOME,
+          CARGO_HOME: options.cargoHome ?? join(dirname(bin), 'cargo-home'),
+          XDG_CACHE_HOME: join(dirname(bin), 'xdg-cache'),
+        }
+      : { HOME: options.home }),
+    DEVENV_ROOT: join(root, 'tooling', 'direnv'),
+    DEVENV_STATE: state,
+    ...(options.uvProjectEnvironment === undefined ? {} : { UV_PROJECT_ENVIRONMENT: options.uvProjectEnvironment }),
+    ...(options.deadlineMs === undefined ? {} : { SMOO_CARGO_FETCH_DEADLINE_MS: String(options.deadlineMs) }),
+    ...(options.ciSecrets === undefined ? {} : { GITHUB_ACTIONS: 'true', ...options.ciSecrets }),
+  };
+}
+
+export interface PrologueOptions {
+  /** devenv's first pass over the enterShell script: it captures the environment before any task runs (DEVENV_SKIP_TASKS). */
+  readonly capture?: boolean;
+  /** A directory that goes first on PATH: a stand-in for a program the pass must not run. */
+  readonly ahead?: string;
+}
+
+/**
+ * The managed prologue's first statements (devenv.smoo.nix, `lib.mkBefore`) in bash, from the workspace root, as devenv
+ * evaluates them: whatever stands between the move to the root and the PATH writer, which is where the prologue asks
+ * about the declared links. The environment is a shell entry's, so the pass sees what the script would.
+ */
+export function startPrologue(root: string, state: string, bin: string, options: PrologueOptions): ShellProcess {
+  const environment = entryEnvironment(root, state, bin, {});
+  return Bun.spawn({
+    cmd: ['bash', '-c', prologueEntrySteps()],
+    cwd: root,
     env: {
-      ...options.env,
-      PATH: `${bin}:${process.env.PATH ?? ''}`,
-      TMPDIR: dirname(bin),
-      ...(options.home === undefined
-        ? {
-            HOME: process.env.HOME,
-            CARGO_HOME: options.cargoHome ?? join(dirname(bin), 'cargo-home'),
-            XDG_CACHE_HOME: join(dirname(bin), 'xdg-cache'),
-          }
-        : { HOME: options.home }),
-      DEVENV_ROOT: join(root, 'tooling', 'direnv'),
-      DEVENV_STATE: state,
-      ...(options.uvProjectEnvironment === undefined ? {} : { UV_PROJECT_ENVIRONMENT: options.uvProjectEnvironment }),
-      ...(options.deadlineMs === undefined ? {} : { SMOO_CARGO_FETCH_DEADLINE_MS: String(options.deadlineMs) }),
-      ...(options.ciSecrets === undefined ? {} : { GITHUB_ACTIONS: 'true', ...options.ciSecrets }),
+      ...environment,
+      PATH: `${options.ahead === undefined ? '' : `${options.ahead}:`}${environment.PATH}`,
+      ...(options.capture === true ? { DEVENV_SKIP_TASKS: '1' } : {}),
     },
     stdout: 'pipe',
     stderr: 'pipe',
     stdin: 'ignore',
   });
+}
+
+/** The shell text of those statements; a Nix indented string spells a literal `${` as `''${`. */
+function prologueEntrySteps(): string {
+  const lines = readFileSync(join(MANAGED, 'tooling', 'direnv', 'devenv.smoo.nix'), 'utf8').split('\n');
+  const first = lines.findIndex((line) => line.trim() === 'cd "$DEVENV_ROOT/../.."');
+  const last = lines.findIndex((line, index) => index > first && line.trim().startsWith('PATH="$('));
+  if (first < 0 || last < 0) {
+    throw new Error(
+      'devenv.smoo.nix no longer opens its prologue with the move to the workspace root and the PATH writer',
+    );
+  }
+  return lines.slice(first, last).join('\n').replaceAll("''${", '${');
+}
+
+/** The smoo:developer-links task as devenv.smoo.nix declares it: what devenv runs as its status and, when that is not zero, as its exec. */
+export function developerLinksTask(): { readonly exec: string; readonly status: string } {
+  const text = readFileSync(join(MANAGED, 'tooling', 'direnv', 'devenv.smoo.nix'), 'utf8');
+  const task = text.match(/"smoo:developer-links" = \{([\s\S]*?)\n {4}\};/)?.[1] ?? '';
+  const exec = task.match(/^\s*exec = "(.*)";$/m)?.[1];
+  const status = task.match(/^\s*status = "(.*)";$/m)?.[1];
+  if (exec === undefined || status === undefined) {
+    throw new Error('devenv.smoo.nix declares no smoo:developer-links task with an exec and a status');
+  }
+  return { exec, status };
 }
 
 export async function finished(proc: ShellProcess): Promise<ShellEntry> {
