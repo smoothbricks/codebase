@@ -43,20 +43,18 @@ export function mbxLeaf(pool: MbxPool, kind: RunnerKind, want: number): MbxLeaf 
 }
 
 /**
- * The descriptor a reserved command says its grant on: `mbx reserve` runs the command only once the pool admits it, so
- * the command's first write is the grant. bounded-exec starts its clocks there (bounds.ts).
+ * The descriptor `mbx reserve --grant-fd` says a reservation's grant on, the moment the pool admits it and before the
+ * command runs. bounded-exec starts its clocks there (bounds.ts).
  */
 export const MBX_GRANT_FD = 5;
 
 /**
  * `command` as the shell runs it under its leaf's admission. `mbx` is the canonical environment's, whose realpath
- * cowshed's admission proved to be the host's pinned mbx. A reserved command first says its grant on
- * {@link MBX_GRANT_FD} and closes it, so nothing it starts inherits the descriptor.
+ * cowshed's admission proved to be the host's pinned mbx; it writes the grant on {@link MBX_GRANT_FD} itself.
  */
 export function withMbxLeaf(command: string, leaf: MbxLeaf): string {
   if (leaf.kind === 'cargo') {
     return command;
   }
-  const granted = `printf granted >&${MBX_GRANT_FD}; exec ${MBX_GRANT_FD}>&-; ${command}`;
-  return `mbx reserve --cpus ${leaf.cpus} --priority ${leaf.priority} -- /bin/sh -c ${shellQuote(granted)}`;
+  return `mbx reserve --grant-fd ${MBX_GRANT_FD} --cpus ${leaf.cpus} --priority ${leaf.priority} -- /bin/sh -c ${shellQuote(command)}`;
 }

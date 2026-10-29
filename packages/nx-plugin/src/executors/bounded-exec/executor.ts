@@ -646,7 +646,7 @@ export async function runBoundedExec(
   // descriptor, and execs `/bin/sh -c command` in the same process: the command's pid, group and life are unchanged.
   const unadmitted = hooked?.command ?? (fixture === null ? command : `${fixture.command} && ${command}`);
   const shellCommand = leaf === null ? unadmitted : withMbxLeaf(unadmitted, leaf);
-  // A reserved command waits in mbx's pool before it runs, and says its grant on its own descriptor.
+  // A reserved command waits in mbx's pool before it runs, and mbx says its grant on the grant descriptor.
   const queued = leaf?.kind === 'reserve';
   // fd 4 is unused without a subtree admission, so the grant takes fd 5 either way.
   const grantSlots: IOType[] = queued ? ['ignore', 'pipe'] : [];
@@ -655,8 +655,8 @@ export async function runBoundedExec(
   let child: ChildProcess;
   try {
     // fd 3 is the runner lifecycle's duplex socket when the command is hooked; the subtree admission takes fd 4, which
-    // `cowshed subtree-root` closes before it execs, so fd 3 reaches the shell unchanged; a reserved command says its
-    // grant on MBX_GRANT_FD (5).
+    // `cowshed subtree-root` closes before it execs, so fd 3 reaches the shell unchanged; `mbx reserve --grant-fd`
+    // says a reserved command's grant on MBX_GRANT_FD (5).
     child =
       root === undefined
         ? spawn(shellCommand, [], {
@@ -1026,8 +1026,8 @@ export async function runBoundedExec(
     fixture: fixture !== null && lifecycle !== null,
     queued,
   });
-  // The grant is the reserved command's first byte, or its descriptor's end should every holder close it unsaid: from
-  // then on the run is the command's time. Read after the spawn's step, so a grant can never come before the queue.
+  // The grant is mbx's first byte on the grant descriptor, or the descriptor's end should every holder close it unsaid:
+  // from then on the run is the command's time. Read after the spawn's step, so a grant can never come before the queue.
   if (leaf?.kind === 'reserve') {
     const channel = child.stdio.at(MBX_GRANT_FD);
     if (!(channel instanceof Readable)) throw new Error('a reserved command requires its grant descriptor');

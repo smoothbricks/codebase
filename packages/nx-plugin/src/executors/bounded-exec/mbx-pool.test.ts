@@ -27,7 +27,7 @@ describe("mbx's one pool at the leaf", () => {
     const leaf = mbxLeaf(pool, 'process', 4);
     expect(leaf).toEqual({ kind: 'reserve', cpus: 4, priority: 'low' });
     expect(withMbxLeaf("bun test 'a b'", leaf)).toBe(
-      "mbx reserve --cpus 4 --priority low -- /bin/sh -c 'printf granted >&5; exec 5>&-; bun test '\\''a b'\\'''",
+      "mbx reserve --grant-fd 5 --cpus 4 --priority low -- /bin/sh -c 'bun test '\\''a b'\\'''",
     );
     expect(mbxLeaf(pool, 'vitest', 0)).toEqual({ kind: 'reserve', cpus: 1, priority: 'low' });
   });

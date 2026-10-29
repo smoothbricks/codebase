@@ -1670,13 +1670,17 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   it("hears a reserved leaf's grant on its own descriptor, through mbx reserve", async () => {
     const workspace = await createWorkspace();
-    // mbx at its published interface: `mbx reserve … -- <command…>` runs the command once the pool admits it. This
-    // one admits at once and execs it, so the command's grant byte reaches the executor through mbx's process.
+    // mbx at its published interface: `mbx reserve --grant-fd N … -- <command…>` writes the grant on fd N once the
+    // pool admits it, then runs the command. This one admits at once, so its grant reaches the executor on fd 5.
     const bin = join(workspace.root, 'stand-in-mbx');
     await mkdir(bin);
-    await writeFile(join(bin, 'mbx'), '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n', {
-      mode: 0o755,
-    });
+    await writeFile(
+      join(bin, 'mbx'),
+      '#!/bin/sh\nfd=\nwhile [ "$1" != -- ]; do if [ "$1" = --grant-fd ]; then fd=$2; fi; shift; done\nshift\neval "printf granted >&$fd; exec $fd>&-"\nexec "$@"\n',
+      {
+        mode: 0o755,
+      },
+    );
     const saved = {
       PATH: process.env.PATH,
       MBX_SCHEDULER: process.env.MBX_SCHEDULER,
