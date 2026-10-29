@@ -1,9 +1,9 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import typia from 'typia';
 import type { CpuWaitRow } from './lease-wait.js';
 import { describeHolders, type LockWait, type Opener } from './lock-wait.js';
-import type { MbxQueuedRequest } from './mbx-queue.js';
+import type { NativeTestResult } from './test-result-writer.js';
+import { TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
 
 /**
  * Why one bounded run ended, recorded per Nx task so a caller can tell a load-sensitive bound
@@ -23,14 +23,11 @@ import type { MbxQueuedRequest } from './mbx-queue.js';
  * - `no-space`: the run failed and its output said a write found no space (ENOSPC). Whatever its tests then reported,
  *   they failed on the disk, not on their own: the verdict names the line that said so and, when the task held one,
  *   its RAM temp volume as it stood when that line arrived.
- * - `queued`: the command failed before any admission after a live task PID was explicitly seen waiting in mbx.
- *   Its observed wait and public queue positions describe admission pressure, never a wedged test.
  * - `failed`: anything else that did not pass. That includes an assertion named in the report,
  *   or a non-zero exit with no report to say why.
  */
 export type BoundedExecVerdict =
   | { readonly outcome: 'passed' }
-  | ({ readonly outcome: 'queued'; readonly exitCode: number } & AdmissionQueueWait)
   | {
       readonly outcome: 'bound';
       readonly bound: 'total' | 'fixture';
@@ -48,13 +45,6 @@ export type BoundedExecVerdict =
     }
   | ({ readonly outcome: 'no-space'; readonly exitCode: number; readonly tests: readonly string[] } & NoSpaceSighting)
   | { readonly outcome: 'failed'; readonly exitCode: number; readonly tests: readonly string[] };
-
-/** Observed admission wait, supplied only while the command has never received a grant. */
-export interface AdmissionQueueWait {
-  readonly waitedMs: number;
-  readonly requests: readonly MbxQueuedRequest[];
-}
-const isQueuedVerdict = typia.createIs<Extract<BoundedExecVerdict, { outcome: 'queued' }>>();
 
 /**
  * The task's RAM temp volume, read when a line saying ENOSPC arrived: the writer's own lease and the space left on the
@@ -335,8 +325,6 @@ export interface RunEnd {
   readonly noSpace: NoSpaceSighting | null;
   /** The lock waits the expiry's snapshot named; empty when none, or when that capture did not complete. */
   readonly lockWaits: readonly LockWait[];
-  /** Explicit observed queue evidence before first admission; absent after any grant. */
-  readonly admissionQueue?: AdmissionQueueWait | null;
 }
 
 /**
@@ -351,9 +339,6 @@ export function judgeRun(run: RunEnd): BoundedExecVerdict {
   if (run.noSpace !== null && (run.exitCode !== 0 || run.expiry !== null)) {
     const tests = run.report === null ? [] : [...run.report.failed, ...run.report.timedOut, ...run.report.cancelled];
     return { outcome: 'no-space', exitCode: run.exitCode === 0 ? 1 : run.exitCode, tests, ...run.noSpace };
-  }
-  if (run.admissionQueue != null && run.exitCode !== 0) {
-    return { outcome: 'queued', exitCode: run.exitCode, ...run.admissionQueue };
   }
   if (run.expiry?.kind === 'idle') {
     const tests = [...new Set([...run.expiry.tests, ...(run.report?.cancelled ?? [])])];
@@ -509,9 +494,6 @@ function parseVerdict(value: unknown): BoundedExecVerdict {
     switch (value.outcome) {
       case 'passed':
         return { outcome: 'passed' };
-      case 'queued':
-        if (isQueuedVerdict(value)) return value;
-        break;
       case 'bound':
         if (
           (value.bound === 'total' || value.bound === 'fixture') &&
@@ -661,18 +643,10 @@ export async function failedTasksOfRun(runJson: unknown, workspaceData: string):
   return failed;
 }
 
-/** The same honest admission diagnostic in live output and a terminal verdict. */
-export function describeAdmissionQueue(wait: AdmissionQueueWait): string {
-  return `queued for admission ${(wait.waitedMs / 1_000).toFixed(1)} s; mbx ${wait.requests
-    .map((request) => `pid=${request.pid} ticket=${request.ticket} queue position=${request.queuePosition}`)
-    .join(', ')}`;
-}
 export function describeVerdict(verdict: BoundedExecVerdict): string {
   switch (verdict.outcome) {
     case 'passed':
       return 'passed';
-    case 'queued':
-      return `${describeAdmissionQueue(verdict)}; exited ${verdict.exitCode} before first admission`;
     case 'bound':
       return verdict.bound === 'test'
         ? `per-test timeout only: ${verdict.tests.join(', ')}`
