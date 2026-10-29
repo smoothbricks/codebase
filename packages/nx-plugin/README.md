@@ -2699,6 +2699,19 @@ Files with a `# smoo-local` tail or `# smoo-local-begin` / `# smoo-local-end` bl
 source symlinks are preserved; conflicting local blocks and broken or external links are reported instead of
 overwritten. The generator does not remove a repository-owned file when a capability is disabled.
 
+`tooling/devenv` is an executable wrapper, whether copied into a consumer or symlinked to the packaged script. It
+selects `tooling/direnv` beside the invocation path in that checkout, not beside the symlink's resolved source. A
+missing configuration is refused by name before any devenv process starts.
+
+The checkout root has no native devenv `allow --from` binding: `.envrc` owns activation and enters `tooling/direnv`
+before `use devenv`
+([canonical activation](../../specs/cowshed/04_sandbox.md#evaluating-an-edited-devenvnix-inside-its-workspace)). Never
+pass `tooling/devenv` to `devenv --from`: it is a program, not a configuration directory. Native auto-activation
+canonicalizes that source symlink and attempts to import `<resolved-script>/devenv.nix`. If an old root binding causes
+that error, run the installed native `devenv revoke` from the checkout root to remove the binding, then enter through
+`.envrc` or invoke `tooling/devenv` directly. Do not repoint the binding or add another wrapper: a root-scoped native
+activation would also give the managed shell the wrong `DEVENV_ROOT`.
+
 `tooling/direnv/repo-path` writes the `PATH` every managed shell entry and git hook uses. In a cowshed workspace whose
 `.cowshed/env` lacks `TMPDIR` or `COWSHED_RUNTIME_LINK`, a fork interrupted before its first supervisor start, it says
 so on stderr, runs `cowshed exec <ws> -- true` once through the installed cowshed, and continues on the file that start
