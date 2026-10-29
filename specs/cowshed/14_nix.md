@@ -86,13 +86,19 @@ only while its work holds the pool (05_gateway.md, "Parallelism inside a job"), 
 one skips every mbx Cargo shim when resolving the real Cargo, so an older project shim cannot loop with the installed
 route, and one maps the selected compiler's physical default sysroot into portable keys, so naming a Nix toolchain
 directly does not prevent action storage and restoration. Distinct installations remain distinct, and arbitrary sysroot
-overrides gain no mapping. The short session root is the canonical environment's (11_shell.md, "Canonical mbx
-environment"), not a new namespace or sandbox grant (04_sandbox.md, "Fixture roots under /tmp"; 08_testing.md,
-"Fixtures"; 01c_macos.md, "sun_path is 104 bytes"). It is `smoothbricks/mr-boxington` at rev
-`956d6c62fff5682ac9551dbae64dd87f52fb6cfb`. No project needs to pin it: the host's mbx serves every Cargo project, which
-reaches it through the Cargo shim that `cowshed setup` generates from it, below (the capability is 15_capabilities.md's,
-its route 11_shell.md's). The installed mbx is never spelled as a Nix store path or a host path where a command is
-spawned; its store path is only what the link resolves to.
+overrides gain no mapping. Reservation and compiler-admission waits block on kqueue/inotify with domain-qualified,
+rate-limited shared rescue scans for crash recovery instead of per-waiter polling. The short session root is the
+canonical environment's (11_shell.md, "Canonical mbx environment"), not a new namespace or sandbox grant (04_sandbox.md,
+"Fixture roots under /tmp"; 08_testing.md, "Fixtures"; 01c_macos.md, "sun_path is 104 bytes"). It is
+`smoothbricks/mr-boxington` at rev `9ca36475ad634c8c28b54b7d44f44d53f1d860e4`. No project needs to pin it: the host's
+mbx serves every Cargo project, which reaches it through the Cargo shim that `cowshed setup` generates from it, below
+(the capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store
+path or a host path where a command is spawned; its store path is only what the link resolves to.
+
+Managed-target seeding installs a profile's build-script shim pins before publishing a copied unit and rejects damaged
+donors, so cancellation cannot leave a fresh launcher without its executable. For unmeasured Cargo test binaries, the
+scheduler estimates at most half its CPU budget, rounded up, separately from one default memory share per binary. These
+are cold admission estimates, not a harness thread cap; observations replace them.
 
 SmoothBricks' own shell carries no mbx input, package or Cargo shim; its plain toolchain `cargo` sits behind the
 setup-owned route.
