@@ -79,7 +79,10 @@ in needs no root relocation, but a change of exec mode still relocates its priva
   paths retain their mode-owned placement. Relocation protects every matched place before inserting any destination,
   including a shared leaf that does not move, so its runtime parent cannot move it again. Such a destination leaf is not
   origin residue merely because it retains the origin's generic runtime prefix. No alias is canonicalized and no
-  environment-variable name receives a special normalization rule.
+  environment-variable name receives a special normalization rule. The record and adopter must name the same ordered
+  logical leaves relative to their own runtime aliases. A changed count, changed leaf identity or leaf outside that
+  literal alias refuses adoption before locations are paired; the baseline's environment variables are not assumed to
+  detect a changed daemon set.
 
 - **Nothing names the origin after the move.** Every value has each of the origin's per-workspace places — its root, its
   capability-contributed daemon leaves, runtime link (`XDG_RUNTIME_DIR`), `TMPDIR` and `HOME` — replaced by the adopting

@@ -615,6 +615,13 @@ pub enum AdoptionMiss {
     KeyMoved,
     #[error("the inherited shell was computed against a different environment: {name} differs")]
     BaselineMoved { name: String },
+    #[error(
+        "the inherited shell's daemon places differ: recorded {recorded:?}, current {current:?}"
+    )]
+    SharedDaemonsMoved {
+        recorded: Vec<PathBuf>,
+        current: Vec<PathBuf>,
+    },
     #[error("{name} still names the origin checkout after the move")]
     Residue { name: String },
     #[error("the inherited shell record carries {name}, which no record may")]
@@ -708,6 +715,28 @@ pub fn verify(
     baseline_environment: &BTreeMap<OsString, OsString>,
 ) -> Result<VerifiedActivation, AdoptionMiss> {
     let record = read_record(placement.root)?;
+    if record.shared_daemons.len() != placement.shared_daemons.len()
+        || (!record.shared_daemons.is_empty() && {
+            let origin_alias = crate::sandbox::workspace_runtime_link(&record.root);
+            let alias = crate::sandbox::workspace_runtime_link(placement.root);
+            record
+                .shared_daemons
+                .iter()
+                .zip(placement.shared_daemons)
+                .any(|(from, to)| {
+                    !from
+                        .strip_prefix(&origin_alias)
+                        .ok()
+                        .zip(to.strip_prefix(&alias).ok())
+                        .is_some_and(|(from, to)| from == to)
+                })
+        })
+    {
+        return Err(AdoptionMiss::SharedDaemonsMoved {
+            recorded: record.shared_daemons,
+            current: placement.shared_daemons.to_vec(),
+        });
+    }
     let (snapshot, contents) = record.inputs(placement.root)?;
     if let Some(name) = baseline(placement, baseline_environment).differs_from(&record.baseline) {
         return Err(AdoptionMiss::BaselineMoved { name });
@@ -1127,6 +1156,49 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn changed_shared_daemon_places_refuse_before_relocation() {
+        let sites = sites("daemon-places");
+        let baseline = BTreeMap::new();
+        let recorded = vec![crate::sandbox::workspace_runtime_link(&sites.origin.root).join("nx")];
+        let clone_alias = crate::sandbox::workspace_runtime_link(&sites.clone.root);
+        let unchanged = vec![clone_alias.join("nx")];
+        let changed = vec![clone_alias.join("mbx")];
+        let resolved = vec![sites.clone.root.join(".cowshed/run/nx")];
+        let (_, contents) = certify(std::iter::empty::<&Path>()).unwrap();
+        let export = BTreeMap::from([(
+            "DERIVED_DAEMON".to_owned(),
+            Some(recorded[0].join("worker.sock").display().to_string()),
+        )]);
+        write_record(
+            &Placement::of(&sites.origin.root, &baseline, &recorded),
+            &baseline,
+            &[],
+            &contents,
+            &export,
+        )
+        .unwrap();
+        std::fs::copy(
+            record_path(&sites.origin.root),
+            record_path(&sites.clone.root),
+        )
+        .unwrap();
+        let adopted = verify(
+            &Placement::of(&sites.clone.root, &baseline, &unchanged),
+            &baseline,
+        )
+        .expect("the same logical daemon leaf relocates to the clone");
+        assert_eq!(
+            adopted.environment()["DERIVED_DAEMON"],
+            Some(unchanged[0].join("worker.sock").display().to_string())
+        );
+        for daemons in [&[][..], changed.as_slice(), resolved.as_slice()] {
+            assert!(
+                matches!(verify(&Placement::of(&sites.clone.root, &baseline, daemons), &baseline), Err(AdoptionMiss::SharedDaemonsMoved { recorded: source, current }) if source == recorded && current == daemons),
+                "changed daemon places {daemons:?} refuse before positional relocation"
+            );
+        }
+    }
     fn verify_at(site: &Site) -> Result<VerifiedActivation, AdoptionMiss> {
         let baseline = site.baseline();
         verify(&Placement::of(&site.root, &baseline, &[]), &baseline)
