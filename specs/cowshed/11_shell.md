@@ -372,17 +372,18 @@ environment, not a copy of the reservation process's environment. Host reservati
 tooling into a non-Rust project.
 
 The served file follows the capabilities the jobs get, not the ones a supervisor started with. Each exec detects the
-checkout's capabilities at its root again; a set that changed since -- a dev shell that gained mbx's Cargo shim --
-becomes the supervisor's own and republishes `.cowshed/env` before the job is admitted, as an authority advance that
-changes them does. A host shell that re-sources the file then drops what the old set exported, such as a compiler
-wrapper, and gains the canonical mbx environment. A shell's Nx daemon that started under the old set keeps it until it
-restarts. Enforced by `a_capability_gained_while_the_supervisor_runs_reaches_the_host_environment` and
+checkout's capabilities at its root again; a set that changed since -- a host that gained its installed mbx -- becomes
+the supervisor's own and republishes `.cowshed/env` before the job is admitted, as an authority advance that changes
+them does. A host shell that re-sources the file then drops what the old set exported, such as a compiler wrapper, and
+gains the canonical mbx environment. A shell's Nx daemon that started under the old set keeps it until it restarts.
+Enforced by `a_capability_gained_while_the_supervisor_runs_reaches_the_host_environment` and
 `an_advance_that_changes_the_capabilities_republishes_the_host_environment`.
 
 The canonical environment carries these owned values when the capability is present:
 
 | Variable                                                                   | Value or source                                                                                                                                                     |
 | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `COWSHED_CARGO_ROUTE`                                                      | `dev.cowshed/mbx-shim/` beside the installed `bin`, where `cowshed setup` provisions mbx's Cargo shim; it leads PATH (below).                                       |
 | `MBX_CACHE_DIR`                                                            | `$COWSHED_BUILD_CACHE/mbx`, the shared store specified by 03_caches.md, "mbx"; the root comes from 02_workspaces.md, "Workspace environment", never a spelled path. |
 | `MBX_TARGET_VIEWS`                                                         | `1`, enabling mbx's managed targets.                                                                                                                                |
 | `MBX_TARGET_ROOT`                                                          | Unset, retaining mbx's default managed root on the cache filesystem.                                                                                                |
@@ -404,12 +405,17 @@ file restores them in the host shell. Per-job priority is applied at spawn, neve
 inherited activation record. A Cargo job's `--want` ceiling belongs to 05_gateway.md, "Parallelism inside a job"; it is
 not another pool-size setting.
 
-The project shell exposes mbx's upstream automatic Cargo route: the Cargo shim produced by `mbx setup`, or the
-documented mise integration. Plain `cargo` and explicit `mbx <cargo-subcommand>` reach the pinned mbx; cowshed installs
-no second Cargo wrapper and detection runs no setup. The shim and its pinned executable are supplied by project
-activation, not by borrowing an unrelated global Cargo installation. The pin proof is owned by 05_gateway.md, "Pool
-selection and revision". Direct absolute invocation of a different Cargo bypasses PATH routing and is not a canonical
-path.
+The route is mbx's own upstream automatic Cargo route, supplied by the host and never by the project. `cowshed setup`
+runs the installed mbx's `mbx setup`, which generates the Cargo shim and the one-line `mbx-target` sidecar naming the
+mbx the shim runs, into `dev.cowshed/mbx-shim/` beside the installed `bin` (14_nix.md, "mbx"), and links `mbx` there to
+the canonical installed executable, never to a wrapper. The capability owns `COWSHED_CARGO_ROUTE`, that directory, and
+leads the job's PATH with it: behind the package-manager wrapper directory (15_capabilities.md, "One contribution
+contract", Bootstrap executables) and ahead of everything the project's activation or a caller's PATH adds, none of
+which can replace, remove or invent it. Plain `cargo`, explicit `mbx <cargo-subcommand>` and build-state discovery's
+`mbx` lookup therefore reach the installed mbx ahead of any project pin, and the shim finds the project's toolchain
+`cargo` behind it on the rest of PATH; cowshed installs no second Cargo wrapper and detection runs no `mbx setup`. A
+project's own mbx pin or Cargo shim never selects, replaces or refuses it (05_gateway.md, "Pool selection and
+revision"). Direct absolute invocation of a different Cargo bypasses PATH routing and is not a canonical path.
 
 Canonical wrapper preconditions, including conflicting activation values and caller overlays, belong to
 16_build_volumes.md, "One Cargo environment on every path".
@@ -1434,14 +1440,14 @@ remain responsive. **Every exec answers at admission**, foreground, `--backgroun
 and API exec parity"): the answer is the job id while the job is `queued` with class and scope set and `nice` absent, so
 its caller reads the placement from the job's status (`running`, `nice`) and cancels it with kill while it waits. A
 foreground CLI exec therefore holds its job (05_gateway.md, "A job lives with its requester") from admission, not from
-spawn, so a requester killed while its job is queued withdraws it. A refusal after admission — an mbx pin mismatch or
-reserve failure, a jobserver fifo that cannot be made, a non-mbx memory pressure that cannot be read, or a class nice
-that cannot be placed — fails the job: `failed`, failure `cpuAdmission` or `priority`, exit the refusal's wrapper code
-and its cause on the job's stderr; the exec call itself succeeded. A Linux job cgroup the delegation cannot place is
-refused before the record, so it fails the exec call itself (07_api.md). Measured 2026-10-19 with the answer at a CPU
-grant: a `cowshed exec --background` on a loaded host answered 25 s later, so a queued job had no id to read or cancel.
-Killing a queued job withdraws it and seals Killed without a command. The non-mbx Critical-pressure policy seals an
-ended job `failed`, failure `memory` (05_gateway.md, "Memory pressure"). Detaching (`--background`, `--timeout`,
+spawn, so a requester killed while its job is queued withdraws it. A refusal after admission — an mbx reserve failure, a
+jobserver fifo that cannot be made, a non-mbx memory pressure that cannot be read, or a class nice that cannot be placed
+— fails the job: `failed`, failure `cpuAdmission` or `priority`, exit the refusal's wrapper code and its cause on the
+job's stderr; the exec call itself succeeded. A Linux job cgroup the delegation cannot place is refused before the
+record, so it fails the exec call itself (07_api.md). Measured 2026-10-19 with the answer at a CPU grant: a
+`cowshed exec --background` on a loaded host answered 25 s later, so a queued job had no id to read or cancel. Killing a
+queued job withdraws it and seals Killed without a command. The non-mbx Critical-pressure policy seals an ended job
+`failed`, failure `memory` (05_gateway.md, "Memory pressure"). Detaching (`--background`, `--timeout`,
 `JobHandle::detach`) promotes the captured prefixes to their protected files before it answers. The FIFO/grant lifecycle
 is specified once in 05_gateway.md, "Parallelism inside a job": under mbx a Cargo leaf has no enclosing reservation, and
 an external leaf's jobserver represents its reserve grant; without mbx the existing per-job FIFO remains. Caller

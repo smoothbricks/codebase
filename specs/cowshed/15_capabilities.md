@@ -46,7 +46,7 @@ path and failure.
 | Zig       | `build.zig`                                                                                 | Zig global cache                                                                                                    |
 | Gradle    | `settings.gradle`, `settings.gradle.kts`, `build.gradle` or `build.gradle.kts`              | Gradle cache, not host credentials or configuration                                                                 |
 | Nix       | `flake.nix` or `devenv.nix`, or an `.envrc` chain reaching Nix (below)                      | Nix client caches, immutable tool/store reads, canonical live daemon socket, TLS settings and bootstrap executables |
-| mbx       | Cargo convention and `mbx` resolved at the pinned revision in the canonical job environment | Shared mbx store access and canonical Cargo routing; no build-state path (below)                                    |
+| mbx       | Cargo convention, the host's installed `mbx` link resolving, and its shim directory (below) | Shared mbx store access and canonical Cargo routing; no build-state path (below)                                    |
 
 A Nix/devenv convention does not activate a shell. Projects that want devenv activation use their own `.envrc` with
 direnv's `use devenv`. There is no built-in devenv shell backend or `[devenv]` configuration. No detector recognizes a
@@ -114,11 +114,15 @@ each file once and at most 16 files in all, and never follows a path out of the 
 
 ### mbx detection
 
-mbx is a Cargo-only capability, not a host-installed-tool convention. The same activated canonical job environment that
-answers Cargo metadata resolves `mbx`; the executable-identity proof, revision-skew refusal and `mbx-host-missing`
-admission refusal are specified by 05_gateway.md, "Pool selection and revision". Discovery never borrows the
-controller's PATH or a host installation to enable the capability. A non-Rust project gets no mbx environment, grants,
-bootstrap executable or build-state change, even on a host whose scheduler uses mbx.
+mbx is a Cargo-only capability that the host enables, not the project. A Cargo project gets it when the host link
+resolves to the installed mbx and `cowshed setup` has provisioned the shim directory beside it (14_nix.md, "mbx"): no
+project file, devenv pin or shell activation opts it in or out, and a project that pins another mbx is admitted with the
+installed one winning. With no installed link, a link that does not resolve, or no provisioned shim directory, a project
+gets no mbx contribution until setup, and a broken link is reported by doctor and `cowshed setup`, never refused at
+admission. The refusals that remain (an installed mbx that cannot be executed, no build-cache volume, an unscheduled
+memory ledger) are specified by 05_gateway.md, "Pool selection and revision". Discovery never borrows the controller's
+PATH or an `mbx` a project's activation provides to enable the capability. A non-Rust project gets no mbx environment,
+grants, bootstrap executable or build-state change, even on a host whose scheduler uses mbx.
 
 With mbx detected, the Cargo capability contributes no `BuildStatePath`: mbx owns target placement. The lifecycle of its
 managed-target link, including fork and refresh, belongs to 16_build_volumes.md, "One link per checkout"; shared store
@@ -146,26 +150,29 @@ mbx's documented placement exclusions
 paths for the Cargo capability to claim alongside mbx.
 
 Detection refreshes with the canonical activation's input identity (11_shell.md, "Shell activation and process reuse")
-as well as Cargo's discovery inputs, so a changed devenv pin or resolved mbx build cannot retain an earlier capability
-answer. A resolved mbx whose pinned revision cannot be established refuses admission as the skew finding, exactly as a
-mismatched pin does (05_gateway.md, "Pool selection and revision"); detection never fails open into a successful answer.
-Detection does not run `mbx setup`, change shell configuration, create a target or start a build.
+as well as Cargo's discovery inputs, so a changed devenv cannot retain an earlier answer about an exported target
+directory or wrapper. The host link and its shim directory are read at every detection, so an install, a retarget or an
+uninstall of mbx, or a `cowshed setup` that provisions the shim, changes the capability at the next exec without a
+manifest change. A host link that does not resolve gives no capability, and doctor and `cowshed setup` report it
+(05_gateway.md, "Pool selection and revision"). Detection does not run `mbx setup` (only `cowshed setup` does,
+14_nix.md, "mbx"), change shell configuration, create a target or start a build.
 
-**Where the answer comes from.** The canonical job environment that resolves `mbx` is build-state discovery's own Cargo
-job (16_build_volumes.md, "Refresh"): after the workspace shell's activation, before its first Cargo query, the job
-names the `mbx` its PATH resolves when its `cargo` is mbx's Cargo shim (11_shell.md, "Canonical mbx environment"; an
-`mbx` beside a plain `cargo` names nothing, or plain Cargo would write a real `target/` once the volume released it),
-and discovery keeps that executable's realpath. The checkout's build volume records it beside the discovered paths
-(`cowshed-build-state.json`, `mbx`), and the discovery fingerprint covers the canonical activation's key (11_shell.md,
-"Inherited shells") as well as the tracked Cargo inputs, so a changed pin rediscovers. The mbx capability is active
-exactly where that record names an mbx; it is a cache keyed by those inputs, never a second authority. Admission is
-derived at every `exec` admission, after that refresh, from the recorded realpath and the host link's (05_gateway.md,
-"Pool selection and revision"), so discovery itself, which must run to replace a stale answer, is never refused by one.
+**Where the answer comes from.** The capability is active exactly where the host answers: the Cargo convention, the
+resolving host link and its provisioned shim directory, read at detection and never stored. No project's activation is a
+gate. Its owned `COWSHED_CARGO_ROUTE` names that shim directory, which leads the job's PATH (11_shell.md, "Canonical mbx
+environment"). Build-state discovery's own Cargo job (16_build_volumes.md, "Refresh") runs under that same route, after
+the workspace shell's activation and before its first Cargo query, so the `cargo` it asks is the injected shim. Its
+check that `cargo` is mbx's Cargo shim stays (an `mbx` beside a plain `cargo` names nothing, or plain Cargo would write
+a real `target/` once the volume released it), and when it holds, discovery records the installed mbx's realpath. The
+checkout's build volume keeps it beside the discovered paths (`cowshed-build-state.json`, `mbx`), and the discovery
+fingerprint covers the canonical activation's key (11_shell.md, "Inherited shells") as well as the tracked Cargo inputs.
+The record is a cache keyed by those inputs, never a second authority and never the gate. Admission is derived at every
+`exec` admission, after that refresh, from the host link alone (05_gateway.md, "Pool selection and revision"), so
+discovery itself, which must run to replace a stale answer, is never refused by one.
 
-**Enforced by:** `cowshed-core`'s
-`mbx_is_detected_from_the_recorded_resolution_and_contributes_the_canonical_environment`,
-`a_project_mbx_is_admitted_only_as_the_host_pin_itself`, `the_job_names_the_mbx_its_path_resolves_before_its_answers`,
-`the_job_names_mbx_only_when_its_cargo_is_mbx_s_shim`,
+**Enforced by:** `cowshed-core`'s `installed_mbx_enables_cargo_without_project_opt_in`,
+`a_project_pinning_another_mbx_is_admitted_with_the_installed_one`, `a_host_without_installed_mbx_contributes_nothing`,
+`the_job_names_the_mbx_its_path_resolves_before_its_answers`, `the_job_names_mbx_only_when_its_cargo_is_mbx_s_shim`,
 `tracked_independent_workspaces_contribute_once_and_honor_their_own_target_config` (its mbx arm) and
 `a_target_mbx_owns_leaves_the_state_and_the_mbx_is_recorded`. The content-freshness, target-override and wrapper
 refusals above, and the remaining tests listed under "Required evidence", must exist for Phase 2.
@@ -253,7 +260,8 @@ Each detector returns data through one `CapabilityContribution`:
   that same staged executable as their install wrapper, linked in the mode's private `tools/manager-bin` rather than
   `tools/bin`. Their actual capability-resolved executables stay under the reconciled `tools/real-bin`; no route is
   writable by job code. The bootstrap PATH lists `tools/manager-bin` just ahead of `tools/bin`, and after shell
-  activation `tools/manager-bin` alone leads PATH; every other bootstrap link keeps its bootstrap position behind the
+  activation `tools/manager-bin` leads PATH, followed by the mbx capability's Cargo route where the project has one
+  (11_shell.md, "Canonical mbx environment"); every other bootstrap link keeps its bootstrap position behind the
   activated shell (04_sandbox.md, "direnv trust is path-keyed"). The toolchain is not among what leads, nor among what
   is linked at all: the repository declares its toolchain through its own shell (Cargo build-state discovery above), so
   the cargo capability links no `cargo`, `rustc`, `rustdoc` or `rustup`, and the toolchain a repository's shell declares
@@ -380,10 +388,13 @@ unattended authorization prompts.
 
 For Phase 2, the following cowshed-owned tests must exist:
 
-- **`mbx_detection_uses_the_canonical_cargo_environment`** resolves the pinned mbx after the same shell activation as
-  Cargo metadata, with a conflicting host PATH unable to enable or replace it; an unprovable revision is a finding.
-- **`mbx_detection_refreshes_with_the_devenv_pin`** changes activation inputs, adds/removes the canonical mbx and
-  changes its revision without changing a manifest, and observes a new contribution rather than a stale snapshot.
+- **`installed_mbx_enables_cargo_without_project_opt_in`** gives a Cargo project on a host whose installed link resolves
+  and whose shim directory is provisioned the capability, its owned `COWSHED_CARGO_ROUTE` and the canonical environment,
+  with no project file, pin or activation, and a conflicting host PATH able neither to enable nor to replace it.
+- **`a_host_without_installed_mbx_contributes_nothing`** gives a Cargo project on a host with no installed link, a link
+  that does not resolve, or a link without its shim directory, no capability, environment, grants or target change;
+  adding the link and the shim changes the contribution at the next detection without a manifest edit, never a stale
+  snapshot.
 - **`mbx_changes_only_cargos_build_state_contribution`** checks that a Cargo project without mbx contributes its
   discovered target paths, while one with mbx contributes none; registry/git/trust contributions survive both cases.
   Independent Cargo workspace roots and directory overrides remain covered by the existing discovery boundary.
@@ -395,6 +406,6 @@ For Phase 2, the following cowshed-owned tests must exist:
 - **`mbx_uses_the_one_contribution_contract`** checks environment ownership, exact shared-store grants, conflict and
   containment refusals, and the identical host-file and child projection; it adds no separate detection or grant table.
 
-These tests prove cowshed's detection and mapping, not mbx's cache or scheduler internals. The real wiring smoke and
-revision-skew admission tests belong to 05_gateway.md, "Required scheduling evidence", and 11_shell.md, "Canonical mbx
+These tests prove cowshed's detection and mapping, not mbx's cache or scheduler internals. The real wiring smoke and the
+project-pin admission test belong to 05_gateway.md, "Required scheduling evidence", and 11_shell.md, "Canonical mbx
 environment".

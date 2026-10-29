@@ -739,12 +739,12 @@ workspace is no mbx project, so it joins no outer pool, cache or target views.
 
 **Required scheduling evidence.** The jobserver proof above is the evidence for cowshed's own ledger, which serves only
 when no mbx is present. The host-tier proofs that mbx, when present, is the one CPU/memory ledger — mbx-present
-admission, pinned-revision skew and `mbx-host-missing` refusals, `mbx reserve` for non-Cargo work, in-flight dedupe of
-identical compiles, and an Nx run mixing Cargo and non-Cargo tasks taking exactly one pool grant per leaf task — are
-named in 05_gateway.md, "Required scheduling evidence", and must exist in the host lanes there; this file does not
-restate them. Where a proof there needs a recorded memory peak, it reads the last recorded peak for the same task
-identity from the existing job/process spans (13_telemetry.md, "Job resource peaks"); no test maintains a second peak
-ledger to read from.
+admission, a project's own mbx pin admitted with the installed one, a dangling link that contributes no mbx and refuses
+nothing, `mbx reserve` for non-Cargo work, in-flight dedupe of identical compiles, and an Nx run mixing Cargo and
+non-Cargo tasks taking exactly one pool grant per leaf task — are named in 05_gateway.md, "Required scheduling
+evidence", and must exist in the host lanes there; this file does not restate them. Where a proof there needs a recorded
+memory peak, it reads the last recorded peak for the same task identity from the existing job/process spans
+(13_telemetry.md, "Job resource peaks"); no test maintains a second peak ledger to read from.
 
 Directory build-state freshness uses observed filesystem change times, not synthetic wall-clock marks. If a listed child
 or subtree disappears during a live scan, the nearest surviving ancestor records that removal; the root uses its

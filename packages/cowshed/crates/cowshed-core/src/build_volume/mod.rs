@@ -291,8 +291,8 @@ pub struct CapturedBuildVolume {
 /// The build-state paths a volume holds, as written at its root ([`STATE_FILE`]), the
 /// fingerprint of the tracked build inputs they were discovered from
 /// (`capabilities::tracked_manifest_fingerprint`): while it matches, nothing is rediscovered, and
-/// the realpath of the mbx that discovery resolved in the checkout's canonical job environment,
-/// which turns on the mbx capability (15_capabilities.md, "mbx detection").
+/// the realpath of mbx reached through the canonical Cargo route, recording target ownership
+/// rather than enabling the capability (15_capabilities.md, "mbx detection").
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BuildVolumeState {
     pub paths: Vec<BuildStatePath>,

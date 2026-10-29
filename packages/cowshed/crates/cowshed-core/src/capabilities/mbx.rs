@@ -127,8 +127,9 @@ pub enum HostMbx {
     Absent,
     /// The link resolves: the executable's realpath.
     Installed(PathBuf),
-    /// A link is there and does not resolve (a collected store path), or cannot be read: an
-    /// admission failure, never absence.
+    /// A link is there and does not resolve (a collected store path), or cannot be read: a
+    /// diagnostic for doctor and `cowshed setup`, never absence. It gives no capability and
+    /// refuses no job (15_capabilities.md, "mbx detection").
     Unresolved {
         link: PathBuf,
         cause: String,
@@ -213,13 +214,6 @@ pub fn read_host_scheduler(executable: &Path, home: &Path) -> Result<HostSchedul
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Admission {
     Admit,
-    /// No mbx is installed beside cowshed (`mbx-host-missing`).
-    HostMissing,
-    /// The installed link does not resolve (`mbx-host-missing`, naming why).
-    HostUnresolved {
-        link: PathBuf,
-        cause: String,
-    },
     /// The host's `scheduler.memory` is `"none"` (`mbx-memory-unscheduled`).
     MemoryUnscheduled,
     /// No provisioned build-cache volume holds the store (01a_apfs.md, "Dedicated build-cache
@@ -227,16 +221,11 @@ pub enum Admission {
     NoBuildCache,
 }
 
-/// The host installation and shared store determine admission, never a project's mbx pin.
-pub fn admit(host: &HostMbx, build_cache: Option<&Path>) -> Admission {
-    match host {
-        HostMbx::Absent => Admission::HostMissing,
-        HostMbx::Unresolved { link, cause } => Admission::HostUnresolved {
-            link: link.clone(),
-            cause: cause.clone(),
-        },
-        HostMbx::Installed(_) if build_cache.is_none() => Admission::NoBuildCache,
-        HostMbx::Installed(_) => Admission::Admit,
+/// The shared store decides an installed mbx's admission, never a project's mbx pin.
+pub fn admit(build_cache: Option<&Path>) -> Admission {
+    match build_cache {
+        Some(_) => Admission::Admit,
+        None => Admission::NoBuildCache,
     }
 }
 
@@ -245,7 +234,6 @@ impl Admission {
     pub fn code(&self) -> Option<&'static str> {
         match self {
             Self::Admit => None,
-            Self::HostMissing | Self::HostUnresolved { .. } => Some("mbx-host-missing"),
             Self::MemoryUnscheduled => Some("mbx-memory-unscheduled"),
             Self::NoBuildCache => Some("mbx-build-cache-missing"),
         }
@@ -256,21 +244,6 @@ impl Admission {
     pub fn refusal(&self, project: &Path) -> Option<CowshedError> {
         match self {
             Self::Admit => None,
-            Self::HostMissing => Some(CowshedError::environment_missing(
-                format!(
-                    "mbx-host-missing: this project's canonical environment resolves mbx at {}, and no mbx is installed beside cowshed",
-                    project.display()
-                ),
-                "cowshed setup",
-            )),
-            Self::HostUnresolved { link, cause } => Some(CowshedError::environment_missing(
-                format!(
-                    "mbx-host-missing: this project's canonical environment resolves mbx at {}, and the mbx installed beside cowshed, {}, does not resolve: {cause}",
-                    project.display(),
-                    link.display()
-                ),
-                "cowshed setup",
-            )),
             Self::MemoryUnscheduled => Some(CowshedError::environment_missing(
                 format!(
                     "mbx-memory-unscheduled: the mbx installed beside cowshed has scheduler.memory = \"none\", so its pool keeps no memory ledger for {}",
@@ -301,17 +274,18 @@ pub fn admit_checkout(checkout: &Path, home: &Path, build_cache: Option<&Path>) 
 }
 
 /// The installed mbx and its admission verdict for a Cargo checkout, or `None` without mbx.
-/// Doctor reports the same verdict that admission refuses (05_gateway.md, "Pool selection and revision").
+/// A link that does not resolve ([`HostMbx::Unresolved`]) is no mbx here: no job is refused for
+/// it, and doctor and `cowshed setup` report it. Doctor reports the same verdict that admission
+/// refuses (05_gateway.md, "Pool selection and revision").
 pub fn checkout_verdict(
     checkout: &Path,
     home: &Path,
     build_cache: Option<&Path>,
 ) -> Result<Option<(PathBuf, Admission)>> {
-    let host = observe_host(home);
-    let HostMbx::Installed(executable) = &host else {
+    let HostMbx::Installed(executable) = observe_host(home) else {
         return Ok(None);
     };
-    if !cargo_route_available(home, executable)? {
+    if !cargo_route_available(home, &executable)? {
         return Ok(None);
     }
     let config = super::workspace_config(checkout)?;
@@ -346,11 +320,11 @@ pub fn checkout_verdict(
     )? {
         return Ok(None);
     }
-    let mut verdict = admit(&host, build_cache);
-    if verdict == Admission::Admit && read_host_scheduler(executable, home)?.memory_unscheduled() {
+    let mut verdict = admit(build_cache);
+    if verdict == Admission::Admit && read_host_scheduler(&executable, home)?.memory_unscheduled() {
         verdict = Admission::MemoryUnscheduled;
     }
-    Ok(Some((executable.clone(), verdict)))
+    Ok(Some((executable, verdict)))
 }
 
 /// Host shells source the same canonical mbx environment as supervisor children (11_shell.md,
@@ -609,14 +583,6 @@ mod tests {
         let project = Path::new("/pinned/mbx-1.28.0/bin/mbx");
         for (verdict, code) in [
             (Admission::Admit, None),
-            (Admission::HostMissing, Some("mbx-host-missing")),
-            (
-                Admission::HostUnresolved {
-                    link: PathBuf::from("/home/dev/bin/mbx"),
-                    cause: "gone".to_owned(),
-                },
-                Some("mbx-host-missing"),
-            ),
             (Admission::MemoryUnscheduled, Some("mbx-memory-unscheduled")),
             (Admission::NoBuildCache, Some("mbx-build-cache-missing")),
         ] {

@@ -129,17 +129,19 @@ Two verbs own the host story, both runnable from any directory:
   `cowshed setup` for a gateway of a build without the op, and running doctor from a terminal for the latter. A scan is
   a cost, not a broken host, so no `first-launch-*` finding makes doctor unhealthy.
 
-  Doctor also judges the host's mbx, for every project whose canonical job environment resolves one (15_capabilities.md;
-  05_gateway.md, "Pool selection and revision" owns the rules, doctor only reports them). A canonical-environment `mbx`
-  whose realpath is not the host-installed mbx's realpath is a finding naming both paths, both `mbx --version` outputs
-  and the expected pinned revision, with the remedy: align the project's devenv pin; a matching version string alone
-  never clears it, and admission never selects another pool or falls back. A project that resolves a canonical `mbx`
-  while no host-installed mbx exists is `mbx-host-missing`, naming the project's resolved executable and the remedy
-  `cowshed setup`; job admission refuses with the same finding, and cowshed's own ledger runs only when no host mbx is
-  installed (05_gateway.md, "Pool selection and revision"). An installed mbx whose host-global `scheduler.memory` is
-  `"none"` is `mbx-memory-unscheduled`: doctor reports it and mbx-mode job admission refuses with the remedy to set a
-  memory budget; there is no CPU-only fallback. Each is derived at every detection from the two realpaths and versions,
-  never stored.
+  Doctor also judges the host's mbx, for every Cargo project, on a host that has installed one (15_capabilities.md;
+  05_gateway.md, "Pool selection and revision" owns the rules, doctor only reports them). A host link that exists and
+  does not resolve is a broken installation that doctor and `cowshed setup` report, naming the link and the cause, with
+  the remedy `cowshed setup`; no job is refused for it, because a project then gets no mbx and runs on the non-mbx
+  mechanism. An installed mbx that cannot be executed is `mbx-host-missing`, and one with no provisioned build-cache
+  volume for its store is `mbx-build-cache-missing`, each with the remedy `cowshed setup`; job admission refuses with
+  the same findings, and admission never selects another pool or falls back. A host with no installed mbx, or a link
+  whose shim directory `cowshed setup` has not yet provisioned, is no finding: its projects get no mbx and cowshed's own
+  ledger runs (05_gateway.md, "Pool selection and revision"). A project's own mbx pin is no finding either: the
+  installed mbx is the one its Cargo runs, and nothing compares the two. An installed mbx whose host-global
+  `scheduler.memory` is `"none"` is `mbx-memory-unscheduled`: doctor reports it and mbx-mode job admission refuses with
+  the remedy to set a memory budget; there is no CPU-only fallback. Each is derived at every detection from the host
+  link, never stored.
 
 - **`setup`** is idempotent host repair: provision absent volumes, repair detached or mis-mounted ones,
   FileVault-encrypt unencrypted ones in place and store passphrases in System.keychain, validate markers precisely, pin

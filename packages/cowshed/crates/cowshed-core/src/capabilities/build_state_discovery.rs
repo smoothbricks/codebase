@@ -886,8 +886,7 @@ fn discover_cargo_targets(
         &["locate-project", "--workspace", "--message-format", "plain"],
         &queries,
     )?;
-    // The job's PATH is the canonical environment's: the mbx it resolves is the project's, by
-    // realpath, the identity the host's pin is proven against at admission.
+    // Record the canonical installed mbx route alongside the target ownership discovered here.
     result.mbx = located
         .mbx
         .as_deref()

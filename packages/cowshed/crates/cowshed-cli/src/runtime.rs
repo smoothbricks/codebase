@@ -29,6 +29,7 @@ use cowshed_core::api::{
     StdinSource as CoreStdinSource, UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo,
     WorkspacePath, WorkspaceState, validate_command_argv,
 };
+use cowshed_core::capabilities::mbx::HostMbx;
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
@@ -4673,10 +4674,37 @@ fn retired_mount_layout_findings(store_root: &Path) -> Vec<Finding> {
     }
 }
 
-/// The mbx refusal each adopted main's jobs would get (05_gateway.md, "Pool selection and
-/// revision"), said by doctor before a job says it: the host's mbx missing or unresolved, a
-/// project pin of another build, an unscheduled memory ledger, or no build-cache volume.
+/// The finding for a host mbx link that exists and does not resolve (a store path since
+/// collected, or a link that cannot be read): a broken installation, named by its link and its
+/// cause, with `cowshed setup` as the remedy. It gives no project mbx and refuses no job
+/// (05_gateway.md, "Pool selection and revision"), so doctor is where it is said. A host with no
+/// link, or one that resolves, has no host finding.
+fn host_mbx_finding(host: HostMbx) -> Option<Finding> {
+    match host {
+        HostMbx::Absent | HostMbx::Installed(_) => None,
+        HostMbx::Unresolved { link, cause } => Some(Finding {
+            code: "mbx-host-missing".into(),
+            severity: FindingSeverity::Error,
+            message: format!(
+                "the mbx installed beside cowshed, {}, does not resolve: {cause}; \
+                 no Cargo project gets mbx until it does",
+                link.display()
+            ),
+            hint: "cowshed setup".into(),
+            path: Some(link),
+        }),
+    }
+}
+
+/// What doctor says of the host's mbx (05_gateway.md, "Pool selection and revision"). A link
+/// that does not resolve is one host finding, said before any project is read
+/// ([`host_mbx_finding`]). Otherwise each adopted main gets the refusal its jobs would get, said
+/// by doctor before a job says it: an unscheduled memory ledger or no build-cache volume.
 async fn mbx_findings(home: &Path) -> Vec<Finding> {
+    let host = cowshed_core::capabilities::mbx::observe_host(home);
+    if let Some(finding) = host_mbx_finding(host) {
+        return vec![finding];
+    }
     let mains = match crate::setup_service::adopted_target_paths(home).await {
         Ok((mains, _)) => mains,
         Err(error) => {
@@ -7832,6 +7860,43 @@ mod tests {
             Some(record.metadata_path.as_path())
         );
         assert!(!doctor_report(vec![finding]).healthy);
+    }
+
+    /// A host mbx link that exists and does not resolve gives no project mbx and refuses no
+    /// job, so doctor is where the broken installation is said: one Error naming the link and
+    /// the cause, with `cowshed setup` as the remedy. A host with no link, or one that
+    /// resolves, has no host finding (06_cli.md, doctor).
+    #[test]
+    fn only_an_unresolved_host_mbx_link_is_a_doctor_error_naming_link_cause_and_remedy() {
+        let link = cowshed_core::capabilities::mbx::host_link(Path::new("/Users/dev"));
+        let cause = "No such file or directory (os error 2)";
+        let unresolved = Finding {
+            code: "mbx-host-missing".into(),
+            severity: FindingSeverity::Error,
+            message: format!(
+                "the mbx installed beside cowshed, {}, does not resolve: {cause}; \
+                 no Cargo project gets mbx until it does",
+                link.display()
+            ),
+            hint: "cowshed setup".into(),
+            path: Some(link.clone()),
+        };
+        let table = [
+            (HostMbx::Absent, None),
+            (HostMbx::Installed(PathBuf::from("/opt/mbx/bin/mbx")), None),
+            (
+                HostMbx::Unresolved {
+                    link,
+                    cause: cause.to_owned(),
+                },
+                Some(unresolved),
+            ),
+        ];
+
+        for (host, expected) in table {
+            let observed = format!("{host:?}");
+            assert_eq!(host_mbx_finding(host), expected, "{observed}");
+        }
     }
 
     #[test]

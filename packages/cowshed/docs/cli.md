@@ -275,11 +275,14 @@ cowshed: host storage is partially set up: 1 volume lives outside this host's co
 
 `setup` installs **cowshed's pinned mbx** (specs/cowshed/14_nix.md, "mbx") on every run once storage is up and the
 invoking build is the installed cowshed. It builds the flake the package ships at `nix/mbx` (mbx v1.28.0 plus the
-compact-prediction, scheduler-admission and grant-descriptor changes, from `vizanto/mr-boxington` at the pinned
+compact-prediction, scheduler-admission and grant-descriptor changes, from `smoothbricks/mr-boxington` at the pinned
 revision, with mbx's own locked nixpkgs), roots the result with a nix GC root at
 `~/Library/Application Support/dev.cowshed/nix/mbx`, and links `mbx` in cowshed's `bin` beside the installed `cowshed`
-to the rooted executable: a link, never a copy, so its realpath is the pinned build's store path, the identity a
-project's own mbx is proven against. No agent, plist or socket is written for it:
+to the rooted executable: a link, never a copy, so its realpath is the pinned build's store path. It then runs that
+mbx's own `mbx setup` to generate its Cargo shim and `mbx-target` sidecar into
+`~/Library/Application Support/dev.cowshed/mbx-shim/`, beside `bin`. The link and the shim directory are all a Cargo
+project needs for mbx: projects need not pin, provide or opt in to anything, and a project that still pins its own mbx
+is built with the installed one. No agent, plist or socket is written for it:
 
 ```
 cowshed: mbx: linked ~/Library/Application Support/dev.cowshed/bin/mbx to <store path>/bin/mbx
@@ -562,8 +565,8 @@ Path identity was once the entire feature, because the compiler cache keyed on a
 - Cargo derived `-C metadata` and `-C extra-filename` from a package id carrying the **absolute manifest directory**, so
   a local crate compiled at two paths was two different compilations. From cargo 1.97 both are path-independent for
   workspace members (measured: identical hashes for one workspace checked out at two paths).
-- mbx, Cargo's cache in a project that pins it, keys a unit by its inputs rather than by the checkout it was built in,
-  and stores it once in the shared store on the `cowshed.build-cache` volume.
+- mbx, Cargo's cache on a host where `cowshed setup` installed it, keys a unit by its inputs rather than by the checkout
+  it was built in, and stores it once in the shared store on the `cowshed.build-cache` volume.
 
 So cross-path sharing is the default, and a slot is what is left for the cases those two do not reach: a unit whose
 output still names its checkout (an `env!("CARGO_MANIFEST_DIR")` value compiled into it, a proc macro that reads the
@@ -575,12 +578,14 @@ path to benefit** — that is where a slot-bound workspace is mounted, so `cd $(
 both land there, but a build reached through some other route to the same files (a symlink you made, a `--manifest-path`
 into one) is a different compilation.
 
-In a project whose `cargo` is mbx's shim and whose mbx is the one `cowshed setup` installed, every workspace child
-cowshed launches — `cowshed exec` and every supervisor-run command alike — gets `MBX_CACHE_DIR` naming the shared store,
-`MBX_TARGET_VIEWS=1` and mbx's scheduler settings, and loses any `RUSTC_WRAPPER` or `RUSTC_WORKSPACE_WRAPPER` a caller
-exported: no wrapper sits between Cargo and rustc. A project whose mbx differs from the installed one is refused with
-`mbx-host-missing` or `mbx-revision-skew` rather than built against a second store. A project without the shim builds
-plain Cargo into its build volume.
+In a Cargo project on a host where `cowshed setup` has installed mbx and provisioned its Cargo shim, every workspace
+child cowshed launches — `cowshed exec` and every supervisor-run command alike — gets `MBX_CACHE_DIR` naming the shared
+store, `MBX_TARGET_VIEWS=1` and mbx's scheduler settings, with the shim's directory leading its `PATH` so plain `cargo`
+is mbx's, and loses any `RUSTC_WRAPPER` or `RUSTC_WORKSPACE_WRAPPER` a caller exported: no wrapper sits between Cargo
+and rustc. The project opts in to nothing, and a project that pins its own mbx is built with the installed one, never
+refused or given a second store. A host without the install, with a link that no longer resolves, or with a link and no
+shim directory yet, builds plain Cargo into its build volume; `cowshed doctor` reports a broken link, and
+`cowshed setup` repairs it.
 
 Cowshed sets no incremental mode, at any mount and for any command, `cowshed land --check` included: incremental
 compilation is mbx's, and a land check builds the same units an interactive command builds.

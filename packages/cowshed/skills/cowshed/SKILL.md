@@ -201,9 +201,9 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
   read-only, not a second Nx state. The supervisor keeps the daemon in the sandbox and host shells connect to it. The
   `NX_MAX_CACHE_SIZE` default and override policy are defined in
   [03_caches.md §Wiring](../../../../specs/cowshed/03_caches.md#wiring). Repository shells leave `NX_DAEMON` to Nx.
-- The compile cache is mbx's shared store on the build-cache volume. Cargo reaches it only when the project's `cargo` is
-  mbx's shim; a refusal naming `mbx-host-missing` or `mbx-revision-skew` is fixed with `cowshed setup` or the project's
-  mbx pin, never with a wrapper.
+- The compile cache is mbx's shared store on the build-cache volume. Cargo reaches it on any host where `cowshed setup`
+  has installed mbx and provisioned its Cargo shim, with no project pin or shim of its own; a build that does not use it
+  is fixed with `cowshed setup` (`cowshed doctor` names a broken link), never with a wrapper.
 - A successful managed Bun install records lockfile SHA-256 values in `node_modules/.smoo-install`. Doctor reports
   missing receipts or lock drift (`node-modules-lock-drift`) and never installs dependencies. Install in main only then,
   never wipe `node_modules` or force a reinstall there: a reinstall in main rewrites its image under every fork.

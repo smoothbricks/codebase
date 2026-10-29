@@ -2839,6 +2839,17 @@ pub(super) async fn sandbox_environment(
             crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV,
         ]);
     }
+    // The caller may have sourced a different checkout's mbx-enabled host environment.
+    if !matches!(
+        sandbox
+            .capabilities
+            .contribution
+            .env
+            .get(crate::capabilities::mbx::CARGO_ROUTE_ENV),
+        Some(crate::capabilities::EnvAction::Own(_))
+    ) {
+        withheld.push(crate::capabilities::mbx::CARGO_ROUTE_ENV);
+    }
     for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
         own(name, OsStr::new(&gateway_http));
     }
@@ -11101,6 +11112,10 @@ mod workspace_toolchain_tests {
                 crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV.to_owned(),
                 "false".to_owned(),
             ),
+            (
+                crate::capabilities::mbx::CARGO_ROUTE_ENV.to_owned(),
+                "/another-checkout/mbx-shim".to_owned(),
+            ),
         ]);
         let sandbox = sandbox_at(&mount);
         let runtime_link = sandbox_runtime_link(&sandbox);
@@ -11118,16 +11133,23 @@ mod workspace_toolchain_tests {
         // Without an Nx project, the caller's endpoint and read-only flag are withheld.
         let mut plain = sandbox.clone();
         plain.configure_capabilities().expect("detect capabilities");
-        let without_nx = sandbox_environment(&plain, &caller)
+        let plain_environment = sandbox_environment(&plain, &caller)
             .await
-            .expect("environment")
-            .child(&caller);
+            .expect("environment");
+        let without_nx = plain_environment.child(&caller);
         assert!(!without_nx.contains_key(OsStr::new(
             crate::workspace_environment::NX_REMOTE_SERVER_ENV
         )));
         assert!(!without_nx.contains_key(OsStr::new(
             crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV
         )));
+        assert!(!without_nx.contains_key(OsStr::new(crate::capabilities::mbx::CARGO_ROUTE_ENV)));
+        assert!(
+            plain_environment.overlay(&caller).iter().all(|(name, _)| {
+                name.as_os_str() != OsStr::new(crate::capabilities::mbx::CARGO_ROUTE_ENV)
+            }),
+            "a warm command cannot import another checkout's Cargo route"
+        );
 
         // With one, the endpoint is the workspace's own and the read-only flag is set.
         std::fs::write(mount.join("nx.json"), "{}").expect("nx project");

@@ -1315,13 +1315,20 @@ whose runnable threads take precedence ("Classes"). The owner's ruling, 2026-10-
 ### Pool selection and revision
 
 **Present on the host** means the mbx installed with the running cowshed build is available at that build's pinned git
-revision (14_nix.md, "mbx"). An arbitrary `mbx` on the operator's PATH does not select the host scheduler. An installed
-mbx that cannot be executed or whose revision cannot be proven is an admission failure, not absence. With no installed
-host mbx, the non-mbx behavior below applies unchanged.
+revision (14_nix.md, "mbx"): the host link beside the installed cowshed resolves to its executable. An arbitrary `mbx`
+on the operator's PATH does not select the host scheduler. A link that does not resolve is a broken installation: it
+gives no project mbx, and doctor and `cowshed setup` report it. An installed mbx that cannot be executed is an admission
+failure, not absence. With no installed host mbx, the non-mbx behavior below applies unchanged.
 
-A Cargo project whose canonical environment resolves mbx while the host installation is absent refuses job admission as
-`mbx-host-missing`, naming that resolved executable and the remedy `cowshed setup`. Doctor reports the same finding.
-Running that Cargo pool beside the non-mbx mechanism would violate the single-ledger boundary.
+The host decides, and a project never does (15_capabilities.md, "mbx detection"). With no installed mbx, a link that
+does not resolve (a collected store path), or a resolving link whose shim directory `cowshed setup` has not provisioned,
+a Cargo project gets no mbx contribution and its Cargo runs on the non-mbx mechanism until setup; admission refuses
+nothing for it. With a resolving link and its provisioned shim directory, every Cargo project gets the mbx capability
+with no opt-in of its own: no project file, devenv pin or shell activation selects or refuses it. An installed mbx that
+cannot be executed refuses job admission as `mbx-host-missing`, naming the executable, the cause and the remedy
+`cowshed setup`; an installed mbx whose store has no provisioned build-cache volume is refused the same way as
+`mbx-build-cache-missing`. Doctor reports those findings and the broken link. Running that Cargo pool beside the non-mbx
+mechanism would violate the single-ledger boundary.
 
 The one pool is the pool of the shared store (03_caches.md, "mbx"). All Cargo sessions and external reservations use the
 same cache directory and the same host CPU/memory settings, not per-project or per-job copies. mbx owns that pool's
@@ -1334,19 +1341,16 @@ The installed mbx's host-global settings retain memory scheduling. `scheduler.me
 `mbx-memory-unscheduled`: doctor reports it and mbx-mode admission refuses with the remedy to set a memory budget. It
 never selects a CPU-only pool or cowshed fallback, because that would discard the measured-memory ledger.
 
-A Cargo project's mbx capability resolves its executable in the canonical job environment (15_capabilities.md, "mbx
-detection"). The proof of the pin is executable identity: its realpath must equal the realpath of the mbx shipped with
-the installed cowshed build. Both are derived at detection, never stored; on Nix the resolved store path identifies the
-pinned build. Equal `mbx --version` release strings alone prove nothing. A mismatch refuses admission, naming the host's
-expected revision, both executable paths, both `mbx --version` outputs and the remedy: align the project's devenv pin.
-Any actual revision established by the project's lock is reported too, never inferred from a release version. A pin
-whose revision cannot be established from that identity is the same skew finding as a mismatch, and refuses admission
-the same way: detection never fails open, so an unprovable pin yields no capability answer that external reservations
-could admit either. Admission never selects another pool or falls back to cowshed's cpu-pool for that project. A project
-without the capability does not acquire it merely because the host has mbx; its work uses external reservations under
-"Parallelism inside a job".
+The mbx a Cargo project's Cargo runs is the host's, never the project's. The capability's route leads the job's PATH
+with the shim directory (11_shell.md, "Canonical mbx environment"), and the shim there runs the installed mbx whatever
+mbx the project's devenv holds. A project that pins its own mbx, or carries its own Cargo shim, is therefore admitted
+with the installed one winning: nothing compares the two, so no release string, realpath or revision of the project's
+refuses it, and it is no finding. Admission never selects another pool or falls back to cowshed's cpu-pool for that
+project. A project without the capability (no Cargo convention, the capability disabled, or content freshness on;
+15_capabilities.md, "mbx detection") gets no mbx environment merely because the host has mbx; its work uses external
+reservations under "Parallelism inside a job".
 
-**Enforced by:** the host-selection, revision-skew and one-pool tests under "Required scheduling evidence"; those tests
+**Enforced by:** the host-selection, project-pin and one-pool tests under "Required scheduling evidence"; those tests
 must exist for Phase 2.
 
 ### Classes
@@ -1690,13 +1694,15 @@ provides no host-wide CPU reservation.
 
 For Phase 2, the following cowshed-owned tests must exist:
 
-- **`host_mbx_selection_uses_the_installed_pin`** distinguishes no host installation, the matching installed build, a
-  broken installation and an unrelated ambient PATH program; absence keeps non-mbx projects unchanged but refuses a
-  project with canonical mbx as `mbx-host-missing`, with its executable and `cowshed setup` remedy.
+- **`host_mbx_selection_uses_the_installed_pin`** distinguishes no host installation, a resolving installed link with
+  and without its provisioned shim directory, a dangling link and an unrelated ambient PATH program; absence, a dangling
+  link or a missing shim directory contributes no mbx and refuses no job, keeping every project on the non-mbx
+  mechanism, and a dangling link is left to doctor and `cowshed setup` to report.
 - **`mbx_mode_requires_a_memory_budget`** maps host-global `scheduler.memory = "none"` to `mbx-memory-unscheduled`, the
   set-memory-budget remedy and no spawned work, CPU-only pool or fallback admission.
-- **`mbx_revision_skew_refuses_admission`** checks realpath identity even when release versions match, both executable
-  paths and version outputs, the expected pin and align-devenv remedy, with no second pool, fallback or spawned command.
+- **`a_project_pinning_another_mbx_is_admitted_with_the_installed_one`** checks that a project whose own pin or recorded
+  discovery names another mbx build is admitted whatever its release string or realpath, and that the contribution still
+  names the installed route: no skew finding, no second pool, no fallback and no refused or spawned command.
 - **`mbx_priority_follows_the_job_class`** table-checks the Cargo environment and reserve priority against "Classes".
 - **`external_work_reserves_its_existing_want`** checks `--want` capping, exactly one `--cpus g` reservation, the last
   matching span's peak as `--memory` or its explicit absence, the bounded jobserver and runner count, and release only

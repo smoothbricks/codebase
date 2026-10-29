@@ -327,10 +327,11 @@ finish first.
 
 ## A cargo build inside a workspace does not use mbx
 
-A workspace's Cargo goes through mbx only when the project's `cargo` is mbx's shim (its devenv puts the shim first on
-`PATH`) and the project's mbx is the one `cowshed setup` installed beside cowshed. A project without the shim builds
-plain Cargo into its build volume, which is not a failure. A project whose mbx is not the installed one is refused with
-`mbx-host-missing` (run `cowshed setup`) or `mbx-revision-skew` (align the project's mbx pin with cowshed's).
+A workspace's Cargo goes through mbx when `cowshed setup` has installed cowshed's mbx and provisioned its Cargo shim
+(`~/Library/Application Support/dev.cowshed/mbx-shim/`): the project needs no mbx pin, shim or devenv entry. A host
+without the install, with a link that no longer resolves (nix collected its store path), or with the mbx link and no
+shim directory yet, builds plain Cargo into its build volume, which is not a failure: run `cowshed setup`, and
+`cowshed doctor` names a broken link. A project that pins another mbx is not refused: the installed one runs.
 
 ## `cowshed exec` fails with `cannot run direnv from PATH …`
 

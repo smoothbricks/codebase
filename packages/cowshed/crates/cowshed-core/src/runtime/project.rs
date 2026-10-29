@@ -7058,9 +7058,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let mount = self.workspace_mount_path(workspace)?;
         self.refresh_build_state_for(&current, &mount, super::build_volumes::Lent::Nothing)
             .await?;
-        // Work of a project whose canonical environment resolved mbx runs only beside the host's
-        // pinned mbx (05_gateway.md, "Pool selection and revision"). The refresh above ran
-        // discovery first, so a changed pin is judged at its new answer, never a stale one.
+        // Refresh target ownership before checking the installed host mbx's admission settings.
         crate::capabilities::mbx::admit_checkout(
             &mount,
             &self.home,

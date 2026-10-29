@@ -7,13 +7,13 @@
       "locked": {
         "lastModified": 1793271716,
         "narHash": "sha256-9nEX74DW3eK+ujdT07gJn19oFWD6ccYblVbxIl1Ilrk=",
-        "owner": "vizanto",
+        "owner": "smoothbricks",
         "repo": "mr-boxington",
         "rev": "9d91cf452ec59682a9a4581bdd7e39e2b247be22",
         "type": "github"
       },
       "original": {
-        "owner": "vizanto",
+        "owner": "smoothbricks",
         "repo": "mr-boxington",
         "rev": "9d91cf452ec59682a9a4581bdd7e39e2b247be22",
         "type": "github"

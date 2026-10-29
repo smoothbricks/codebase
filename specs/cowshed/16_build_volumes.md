@@ -1663,10 +1663,11 @@ volumes do not require them.
 A host moves to this model in one release, in this order:
 
 1. **The release installs mbx first.** The cowshed release that carries this model installs its pinned mbx beside the
-   cowshed binary, and `cowshed setup` provisions the build-cache volume (01a_apfs.md, "Dedicated build-cache volume"),
-   adopting an existing volume at its mountpoint by UUID. Only then does a project's devenv pin the same mbx. A project
-   that pins mbx on a host without it is refused admission as `mbx-host-missing` (05_gateway.md, "Pool selection and
-   revision").
+   cowshed binary, with mbx's own Cargo shim provisioned from it, and `cowshed setup` provisions the build-cache volume
+   (01a_apfs.md, "Dedicated build-cache volume"), adopting an existing volume at its mountpoint by UUID. Only then does
+   a Cargo project gain the mbx capability, with no opt-in of its own (15_capabilities.md, "mbx detection"): a project
+   that still pins its own mbx is admitted with the installed one winning, and a host without the install leaves every
+   project on plain Cargo into its build volume (05_gateway.md, "Pool selection and revision").
 2. **Each checkout moves at its first refresh.** For a Cargo project that gains the mbx capability, the checkout's first
    refresh removes cowshed's fixed `target` link and drops the old target directory from the build image (Refresh), so
    mbx's first build places its managed target. Build images, seeds and adoption are otherwise unchanged, and nothing is

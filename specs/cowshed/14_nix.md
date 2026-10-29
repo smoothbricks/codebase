@@ -82,19 +82,20 @@ large C++ build's task manifest is written, one admits queued work whenever the 
 reservation's included, so no request waits behind another while capacity is idle, and one says each hold on the pool on
 a descriptor the caller names (`mbx reserve --grant-fd N`, and `MBX_GRANT_FD` for every admission of a tree), so a
 runner's clocks run only while its work holds the pool (05_gateway.md, "Parallelism inside a job"). It is
-`vizanto/mr-boxington` at rev `9d91cf452ec59682a9a4581bdd7e39e2b247be22`, and each project pins the same revision in its
-devenv through mbx's flake, so a job's canonical environment also resolves `mbx` by that PATH name (the capability is
-15_capabilities.md's). Neither copy is ever spelled as a Nix store path or a host path where a command is spawned; the
-store path appears only as the identity the pin proves.
+`smoothbricks/mr-boxington` at rev `9d91cf452ec59682a9a4581bdd7e39e2b247be22`. No project needs to pin it: the host's
+mbx serves every Cargo project, which reaches it through the Cargo shim that `cowshed setup` generates from it, below
+(the capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store
+path or a host path where a command is spawned; its store path is only what the link resolves to.
 
-The host's `mbx` entry is a **symlink to the shipped pinned executable, never a copied inode**, so when the two pins
-agree, the `mbx` a job resolves and the one setup installed have the same realpath — and the Nix store path names the
-build, so that equality is what revision agreement means. On a home-manager host the same holds declaratively: the
-module puts cowshed's package, with its pinned mbx beside the cowshed binary, into the generation, and `setup` validates
-the symlink's realpath instead of writing it (Ownership detection, above). Comparing the two realpaths is derived at
-each detection and never stored, and what a mismatch refuses — with both paths and both `mbx --version` outputs named,
-semver equality alone being no proof, and no second pool or fallback behind it — is 05_gateway.md's "Pool selection and
-revision".
+The host's `mbx` entry is a **symlink to the shipped pinned executable, never a copied inode**, so its realpath is the
+pinned build's Nix store path, which names the build. Nothing proves a project's mbx against it, because no project's
+mbx runs: the capability's route leads PATH with the shim that runs the installed one, so a project that still pins
+another build is admitted with the installed one winning (05_gateway.md, "Pool selection and revision"). The host's
+answer is derived at each detection and never stored: with no link, or a dangling one, no project gets mbx, and doctor
+and `cowshed setup` report a broken link; with a resolving link and its shim directory provisioned, every Cargo project
+does (15_capabilities.md, "mbx detection"). On a home-manager host the link holds declaratively: the module puts
+cowshed's package, with its pinned mbx beside the cowshed binary, into the generation, and `setup` validates the
+symlink's realpath instead of writing it (Ownership detection, above).
 
 There is nothing else to declare for mbx. It runs no daemon and owns no socket (03_caches.md, "mbx"), so
 `programs.cowshed` has no mbx option and neither mode installs an agent for it: home-manager owns the generation that
@@ -105,21 +106,24 @@ with `mbx settings get`, and writes only `target.keep` and `target.evict_first`,
 workspace's warm-up truncated its event recording, and `mbx explain --last` then answered "no earlier recording" for the
 units it had dropped (measured 2026-10-28). for the units it had dropped (measured 2026-10-28).
 
-The imperative install is three steps of every `cowshed setup` that reaches its host services: build the flake the
+The imperative install is four steps of every `cowshed setup` that reaches its host services: build the flake the
 package ships at `nix/mbx` (its `flake.lock` locks mbx's own nixpkgs exactly as mbx's flake does, so the build is the
-store path a project's devenv pin realizes), root the result with `--out-link` at
-`~/Library/Application Support/dev.cowshed/nix/mbx`, and point `dev.cowshed/bin/mbx` at the rooted executable by an
-atomic rename of a fresh link. A link that already names it is left; one naming another build is retargeted; anything
-there that is not a link is not cowshed's and fails the run untouched. A host without `nix` keeps no mbx, which is the
-non-mbx scheduling path, not a failure (05_gateway.md, "Host scheduling"). `--uninstall` removes the link and the root
-and nothing under the nix store. Enforced by `cowshed-core`'s
+store path mbx's own flake realizes at that revision), root the result with `--out-link` at
+`~/Library/Application Support/dev.cowshed/nix/mbx`, point `dev.cowshed/bin/mbx` at the rooted executable by an atomic
+rename of a fresh link, and run that installed mbx's own `mbx setup`, which generates the Cargo shim and its one-line
+`mbx-target` sidecar into `dev.cowshed/mbx-shim/`, beside `bin`, so no project provides either. A link that already
+names it is left; one naming another build is retargeted; anything there that is not a link is not cowshed's and fails
+the run untouched. A host without `nix` keeps no mbx, which is the non-mbx scheduling path, not a failure
+(05_gateway.md, "Host scheduling"). `--uninstall` removes the link, the shim directory and the root and nothing under
+the nix store. Enforced by `cowshed-core`'s
 `the_host_link_is_made_once_retargeted_to_a_new_pin_and_never_replaces_a_foreign_file` and
 `the_link_is_observed_without_following_it`, `cowshed-cli`'s `the_host_mbx_is_one_link_to_the_rooted_executable` and the
 setup cells `a_repair_links_the_pinned_mbx_after_storage_and_names_it`,
 `a_host_without_nix_keeps_no_mbx_and_still_succeeds` and `a_failed_mbx_install_fails_the_run_after_storage_is_reported`.
 Tests that must exist beyond those: after an imperative `cowshed setup` and after a home-manager switch, `mbx` resolves
-by PATH to a symlink whose realpath is the pinned revision's executable beside the installed cowshed binary; and no
-install in either mode writes an mbx plist, socket or second copy anywhere.
+by PATH to a symlink whose realpath is the pinned revision's executable beside the installed cowshed binary; after an
+imperative `cowshed setup`, `dev.cowshed/mbx-shim/` holds mbx's generated `cargo` and `mbx-target`, which run that
+executable; and no install in either mode writes an mbx plist, socket or second copy anywhere.
 
 ## Deployment postures
 
