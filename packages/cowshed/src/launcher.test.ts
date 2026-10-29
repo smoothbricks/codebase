@@ -81,10 +81,10 @@ async function named(path: string, name: string, mode = 0o755): Promise<void> {
  * given: the launcher reaches `uname`, `readlink` and `chmod` through it, and a host keeps those
  * where it keeps them. NixOS keeps nothing but `sh` and `env` in /bin and /usr/bin.
  */
-function launch(launcher: string, argv: readonly string[], env: { home: string; path?: string }) {
+function launch(launcher: string, argv: readonly string[], env: { home: string; path?: string }, input?: string) {
   const path = [env.path, process.env.PATH].filter((entry) => entry !== undefined).join(':');
-  const result = spawnSync(launcher, [...argv], { encoding: 'utf8', env: { HOME: env.home, PATH: path } });
-  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  const result = spawnSync(launcher, [...argv], { encoding: 'utf8', env: { HOME: env.home, PATH: path }, input });
+  return { status: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr };
 }
 
 const host = HOST_DIRECTORY ?? 'darwin-arm64';
@@ -193,7 +193,18 @@ describe('cowshed launcher', () => {
     await named(f.packaged(host), 'packaged');
     await named(f.stable, 'stable');
 
-    for (const argv of [['build-state', '--json'], ['--json', 'build-state'], ['skill', 'install'], ['ls']]) {
+    for (const argv of [
+      ['build-state', '--json'],
+      ['--json', 'build-state'],
+      ['--project', 'setup', 'ls'],
+      ['--project', 'gateway', 'build-state'],
+      ['--project=setup', 'ls'],
+      ['skill', 'install'],
+      ['ls'],
+      ['exec', 'raven', '--', 'printf', 'two words', '', '*', 'setup', 'gateway'],
+      ['--version'],
+      [],
+    ]) {
       const run = launch(f.launcher, argv, f);
       expect(run.status).toBe(17);
       expect(run.stdout).toBe(`stable${argv.map((argument) => ` [${argument}]`).join('')}`);
@@ -201,6 +212,19 @@ describe('cowshed launcher', () => {
     }
   });
 
+  hostOnly("preserves the installed binary's standard streams and terminating signal", async () => {
+    const f = await fixture();
+    await named(f.packaged(host), 'packaged');
+    await binary(f.stable, 'cat; printf "installed stderr\\n" >&2; kill -TERM "$$"');
+    const input = 'two words\nsecond line\n';
+
+    const run = launch(f.launcher, ['exec', 'raven'], f, input);
+
+    expect(run.status).toBeNull();
+    expect(run.signal).toBe('SIGTERM');
+    expect(run.stdout).toBe(input);
+    expect(run.stderr).toBe('installed stderr\n');
+  });
   hostOnly('runs setup and gateway from the packaged binary even with an installed copy', async () => {
     // Setup installs the invoking build; gateway compares the daemon with that build.
     const f = await fixture();
@@ -256,7 +280,8 @@ describe('cowshed launcher', () => {
 
   hostOnly('the library runs the CLI through the launcher and resolves with its exit status', async () => {
     const f = await fixture();
-    await binary(f.packaged(host), 'exit 23');
+    await f.checkout();
+    await binary(f.development(host), 'exit 23');
 
     expect(await runLauncher(f.packageRoot, ['ls'])).toBe(23);
   });

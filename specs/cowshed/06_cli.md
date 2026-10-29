@@ -23,17 +23,22 @@ make that possible and they are absolute:
 
 ## Launcher
 
-The npm package's `cowshed` bin is `bin/cowshed`, a POSIX shell script that execs the native binary for the host: the
-package's own build, which its source authority picks (packages/nx-plugin/README.md, "Cargo profiles"). A checkout holds
-the tracked entry of the CLI's own crate, `crates/cowshed-cli/src/main.rs`, which a published package never ships, and
-runs its development build, `.cache/bin/<platform>/cowshed`; a published package runs `dist/bin/<platform>/cowshed`,
-restoring an execute bit a publish dropped. Neither falls back to the other or to a cargo `target/release/cowshed`: a
-checkout without its development build exits 5 naming the path and `nx run cowshed:cli-native`, a package without its
-binary exits 5 naming its path, and a host the package ships no binary for exits 5 naming the host. A checkout's
-launcher reached through a link from outside that checkout (another repository's `node_modules/.bin/cowshed`, which a
-developer link points at the checkout's package) is a consumer's `cowshed`: the checkout's development build cannot talk
-to the daemon the install runs, so every verb but `setup` and `gateway` runs the installed copy (05_gateway.md "The
-installed cowshed") when there is one. `setup` and `gateway` run that binary too, since they install the invoking build.
+The npm package's `cowshed` bin is `bin/cowshed`, a POSIX shell script that execs the native binary for the host. A
+published package, and a checkout's launcher reached through a link from outside that checkout (another repository's
+`node_modules/.bin/cowshed`, which a developer link points at the checkout's package), are consumers: when the host has
+an installed copy (05_gateway.md "The installed cowshed"), every verb except `setup` and `gateway` runs it. Another
+build cannot read the install's daemon and records. `setup` and `gateway` always run the invoking package's own build,
+since setup and gateway start install that build and gateway status compares it with the daemon. Global flags and the
+value of `--project` are not verbs; the original argv is passed unchanged.
+
+Without an install, or for `setup` and `gateway`, the package's source authority picks its own build
+(packages/nx-plugin/README.md, "Cargo profiles"). A checkout holds the tracked entry of the CLI's own crate,
+`crates/cowshed-cli/src/main.rs`, which a published package never ships, and runs its development build,
+`.cache/bin/<platform>/cowshed`; a published package runs its release build, `dist/bin/<platform>/cowshed`, restoring an
+execute bit a publish dropped. A launcher invoked from within its own checkout always keeps that development authority,
+even with an install present. Neither source authority substitutes the other build or a cargo `target/release/cowshed`:
+a checkout without its selected development build exits 5 naming the path and `nx run cowshed:cli-native`, a package
+without its selected binary exits 5 naming its path, and a host the package ships no binary for exits 5 naming the host.
 It is a shell script rather than Node because it runs before every command, and Node's own start (~30 ms) costs more
 than the fastest verbs take in total; `exec` hands the binary the command's signals, exit status and standard streams
 unchanged. The library's `runCli`, `openHost` and the typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`,

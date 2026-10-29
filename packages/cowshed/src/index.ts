@@ -640,7 +640,7 @@ export async function openHost(): Promise<Host> {
 /**
  * Runs any CLI verb with the exact argv, stdout/stderr, and exit-code contract of the standalone
  * binary, because it *is* the standalone binary: this runs the package's `bin/cowshed` launcher,
- * which picks the same build the `cowshed` command runs: a checkout's development build, or a published package's.
+ * which applies the same source/installed-build selection as the `cowshed` command (06_cli.md "Launcher").
  *
  * For typed calls to the host's own verbs use `openHost`; this runs a verb with the binary's exact
  * argv, stdout and exit status. It is not an in-process runtime: the addon does not link the CLI,
