@@ -7472,24 +7472,20 @@ impl SupervisorActor {
             }
             clock_observation(job);
         }
-        if let Some(owned) = process.process() {
-            own_process(job, owned.clone(), self.job_sampling.leaf_coverage).await;
+        let owned = process.process().cloned();
+        job.info.nice = process.nice();
+        job.process = Some(process);
+        if let Some(owned) = owned {
             adopt_birth(job, self.group_ledger.is_some(), owned.birth.clone());
+            own_process(job, owned, self.job_sampling.leaf_coverage).await;
             self.arm_sample_clock();
         }
         let job = self.jobs.get_mut(&job_id).expect("the job just spawned");
-        job.info.nice = process.nice();
-        job.process = Some(process);
         let started = job.birth.is_some();
+        launch_stdin_pump(job, stdin, self.workspace_root.clone(), self.events.clone());
         if started {
             self.record_groups();
         }
-        launch_stdin_pump(
-            job_id,
-            stdin,
-            self.workspace_root.clone(),
-            self.events.clone(),
-        );
         // Input a client wrote while the job waited for its grant goes to the command now.
         self.flush_stdin(job_id);
     }
@@ -8274,9 +8270,8 @@ impl SupervisorActor {
                 let coverage = self.job_sampling.leaf_coverage;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.info.nice = nice;
-                    let birth = process.birth.clone();
+                    adopt_birth(job, ledger, process.birth.clone());
                     own_process(job, process, coverage).await;
-                    adopt_birth(job, ledger, birth);
                     self.record_groups();
                     self.arm_sample_clock();
                 }
@@ -9035,18 +9030,19 @@ impl SupervisorActor {
     }
 }
 
-/// Starts delivering `stdin`'s source, then its one EOF. Open stdin has no source: its attachment
-/// writes it and ends it, so nothing starts.
+/// Starts delivering the source and its one EOF. An empty source is already drained, so the
+/// spawn turn closes it through its ordinary stdin flush; open stdin starts no pump.
 fn launch_stdin_pump(
-    job_id: JobId,
+    job: &mut JobStateRecord,
     stdin: StdinSource,
     workspace_root: PathBuf,
     events: mpsc::Sender<ProcessEvent>,
 ) {
+    let job_id = job.info.job_id;
     match stdin {
         StdinSource::Open => {}
         StdinSource::Empty => {
-            tokio::spawn(async move { finish_stdin_pump(job_id, Ok(()), &events).await });
+            job.close_stdin_when_drained = true;
         }
         StdinSource::Inline(bytes) => {
             tokio::spawn(async move {

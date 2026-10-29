@@ -555,11 +555,13 @@ into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supe
   the actor's own: a turn holds it across the await, and no other turn starts before the result is back. A census in the
   crate's tests walks every function the actor's turns reach by name and refuses a `std::fs`, file-system `libc` or
   stat-ing `Path` call among them (`runtime::supervisor::actor_census`). A job's first sample stays in the turn that
-  spawns or starts its process: the turn awaits that sample on the blocking pool before taking another command or event,
-  so whatever reaches the actor meanwhile, a retirement or the job's first input, is ordered after that turn. The kernel
-  reads of a spawn's fence and host load, a warm host's spawn pipes and, on Linux, signalling still run in the turn.
-  Each turn is published for heartbeats as it starts and ends (05_gateway.md, "Deadlines") and timed as `turn <kind>`
-  under `COWSHED_TIMING` (13_telemetry.md, "Inspection").
+  spawns or starts its process. A spawn stores any returned process handle and birth in its job before awaiting that
+  sample on the blocking pool, so runtime teardown still owns its retirement. An empty stdin source is closed in this
+  spawn turn, before any later output, cancellation or retirement is handled. The turn takes no other command or event
+  until the sample returns, so the first input is ordered after that turn. The kernel reads of a spawn's fence and host
+  load, a warm host's spawn pipes and, on Linux, signalling still run in the turn. Each turn is published for heartbeats
+  as it starts and ends (05_gateway.md, "Deadlines") and timed as `turn <kind>` under `COWSHED_TIMING` (13_telemetry.md,
+  "Inspection").
 
 ## Protocol
 
