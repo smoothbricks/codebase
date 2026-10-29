@@ -123,20 +123,37 @@ test('publishes the errors rustc located in each case, none for a case that comp
   }
 });
 
-for (const [name, messages, log, unanswered] of [
+for (const [name, messages, log, unanswered, errors] of [
   [
     'a case rustc never answered',
     [message('alpha', 'error', 'alpha/src/lib.rs:2:3: error[E0599]: no method named `attach` found\n')],
     "error: process didn't exit successfully (signal: 9, SIGKILL: kill)\n",
     'beta',
+    ['alpha/src/lib.rs:2:3: error[E0599]: no method named `attach` found'],
   ],
-  ['a cargo that never reached the compiler', [], 'error: failed to select a version for `serde`\n', 'alpha'],
+  ['a cargo that never reached the compiler', [], 'error: failed to select a version for `serde`\n', 'alpha', []],
+  [
+    'a dependency rustc could not finish',
+    [
+      message(
+        'cowshed-core',
+        'error',
+        'error: couldn\'t create a temp dir: No such file or directory (os error 2) at path "target/out/rmetassHYTQ"\n',
+        [],
+      ),
+    ],
+    'error: could not compile `cowshed-core` (lib) due to 1 previous error\n',
+    'alpha',
+    ['error: couldn\'t create a temp dir: No such file or directory (os error 2) at path "target/out/rmetassHYTQ"'],
+  ],
 ]) {
-  test(`refuses ${name}: no verdict is left, the last run's included, and no staged workspace`, () => {
+  test(`refuses ${name}: no verdict is left, the last run's included, no staged workspace, and rustc's errors are said`, () => {
     const { root, cwd, result } = probe({ messages, log, stale: true });
     try {
       assert.equal(result.status, 1);
       assert.ok(result.stderr.includes(log), result.stderr);
+      // cargo's log names the crate that failed; what rustc said of it is in the JSON messages.
+      for (const error of errors) assert.ok(result.stderr.includes(error), result.stderr);
       assert.match(result.stderr, new RegExp(`rustc gave no verdict for case ${unanswered}`));
       assert.deepEqual(fs.readdirSync(path.dirname(path.join(cwd, verdict))), []);
     } finally {

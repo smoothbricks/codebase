@@ -249,10 +249,11 @@ members of one scratch workspace inside the checkout, with the checkout's own lo
 (found by Cargo's own ancestor search, never forwarded with `--config`) and the target directory `cargo metadata`
 reports (16_build_volumes.md, "One Cargo environment on every path"). It checks them with one `cargo check --keep-going`
 and writes rustc's error diagnostics per case as its one output, and it refuses a run that gave no verdict for some
-case, so a cached answer is always an answer. `lesser_capabilities_fail_to_compile_with_coordinator_authority` reads
-that verdict, runs no Cargo and judges what each case's errors name; every cowshed-core runner runs after the target and
-keys on its output (`nx.json`, `targetDefaults`), so a cold runner's dependency build is never charged to a test's
-progress bound. Only the run's scratch workspace is removed.
+case, saying every error rustc gave (cargo's log names only the crate that failed), so a cached answer is always an
+answer. `lesser_capabilities_fail_to_compile_with_coordinator_authority` reads that verdict, runs no Cargo and judges
+what each case's errors name; every cowshed-core runner runs after the target and keys on its output (`nx.json`,
+`targetDefaults`), so a cold runner's dependency build is never charged to a test's progress bound. Only the run's
+scratch workspace is removed.
 
 Process fixtures resolve real portable tools through the selected shell's PATH, not fixed FHS executable paths. A
 version-probe fixture prepends its selected executable directory without discarding that toolchain PATH. Host API proofs

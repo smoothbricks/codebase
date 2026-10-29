@@ -92,6 +92,10 @@ if ! jq -S -s '
         else error("rustc gave no verdict for case \($case)")
         end)
   | add' --args $names <"$staging/messages.jsonl" >"$staging/verdict.json"; then
+  # cargo's log names only the crate that failed to build; what rustc said of it is in the JSON messages.
+  jq -r 'select(.reason == "compiler-message" and .message.level == "error") | .message.rendered | rtrimstr("\n")' \
+    <"$staging/messages.jsonl" >&2 ||
+    echo "capability-probe: cannot read rustc's messages in $staging/messages.jsonl" >&2
   cat "$staging/cargo.log" >&2
   echo "capability-probe: cargo check exited $status and gave no verdict for every case in $cases" >&2
   exit 1
