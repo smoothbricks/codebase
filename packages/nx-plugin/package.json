@@ -35,12 +35,6 @@
       "import": "./dist/bounded-test-policy.js",
       "default": "./dist/bounded-test-policy.js"
     },
-    "./test-results": {
-      "types": "./dist/executors/bounded-exec/test-results.d.ts",
-      "development": "./src/executors/bounded-exec/test-results.ts",
-      "import": "./dist/executors/bounded-exec/test-results.js",
-      "default": "./dist/executors/bounded-exec/test-results.js"
-    },
     "./build-state-output-policy": {
       "types": "./dist/build-state-output-policy.d.ts",
       "development": "./src/build-state-output-policy.ts",

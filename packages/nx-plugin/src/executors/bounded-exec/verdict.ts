@@ -2,7 +2,6 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { CpuWaitRow } from './lease-wait.js';
 import { describeHolders, type LockWait, type Opener } from './lock-wait.js';
-import type { NativeTestResult } from './test-results.js';
 
 /**
  * Why one bounded run ended, recorded per Nx task so a caller can tell a load-sensitive bound
@@ -179,64 +178,6 @@ export function junitFailures(xml: string): JunitFailures {
   return { timedOut, cancelled, failed };
 }
 
-/** Bun's nested suites carry the describe chain; testcase.classname is in the reverse order. */
-export function bunJunitResults(xml: string): NativeTestResult[] {
-  const results: NativeTestResult[] = [];
-  const suites: string[] = [];
-  let current: { attributes: string; body: string } | null = null;
-  const text = xml;
-  const tags =
-    /<!\[CDATA\[[\s\S]*?\]\]>|<!--[\s\S]*?-->|<(\/?)(testsuite|testcase)\b((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>/g;
-  let end = 0;
-  const close = (): void => {
-    if (current === null) return;
-    const name = attribute(current.attributes, 'name');
-    const file = attribute(current.attributes, 'file');
-    if (name !== null && file !== null) {
-      const failed = /<(?:failure|error)\b/.test(current.body);
-      const skipped = /<skipped\b/.test(current.body);
-      const line = attribute(current.attributes, 'line');
-      const time = attribute(current.attributes, 'time');
-      const seconds = time === null ? Number.NaN : Number(time);
-      const output =
-        /<(?:failure|error)\b((?:[^>"']|"[^"]*"|'[^']*')*?)(?:\/>|>((?:<!\[CDATA\[[\s\S]*?\]\]>|(?!<!\[CDATA\[|<\/(?:failure|error)>)[\s\S])*)<\/(?:failure|error)>)/.exec(
-          current.body,
-        );
-      const failureOutput =
-        output === null
-          ? null
-          : output[2] === undefined || output[2] === ''
-            ? (attribute(output[1] ?? '', 'message') ?? '')
-            : decodeJunitText(output[2]);
-      results.push({
-        id: `${file}::${[...suites.slice(1), name].join(' > ')}`,
-        status: failed ? 'fail' : skipped ? 'skip' : 'pass',
-        source: 'junit',
-        durationMs: Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : null,
-        sourceRef: line === null ? null : `${file}:${line}`,
-        failureOutput,
-      });
-    }
-    current = null;
-  };
-  for (const match of text.matchAll(tags)) {
-    if (current !== null) current.body += text.slice(end, match.index);
-    end = match.index + match[0].length;
-    const [, slash, tag, attributes = '', selfClosing] = match;
-    if (tag === undefined) {
-      if (current !== null) current.body += match[0];
-    } else if (tag === 'testsuite') {
-      if (slash === '/') suites.pop();
-      else if (selfClosing !== '/') suites.push(attribute(attributes, 'name') ?? '');
-    } else if (slash === '/') close();
-    else {
-      close();
-      current = { attributes, body: '' };
-      if (selfClosing === '/') close();
-    }
-  }
-  return results;
-}
 /** One test case of a JUnit report: nextest's binary id (its `classname`), the test's name and its seconds. */
 export interface JunitCaseTime {
   readonly binary: string;
@@ -268,16 +209,6 @@ function attribute(attributes: string, name: string): string | null {
   return decodeEntities(match[2] ?? match[3] ?? '');
 }
 
-function decodeJunitText(value: string): string {
-  let text = '';
-  let end = 0;
-  for (const match of value.matchAll(/<!\[CDATA\[([\s\S]*?)\]\]>|<!--[\s\S]*?-->/g)) {
-    text += decodeEntities(value.slice(end, match.index));
-    text += match[1] ?? '';
-    end = match.index + match[0].length;
-  }
-  return text + decodeEntities(value.slice(end));
-}
 function decodeEntities(value: string): string {
   return value.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);/g, (_, entity: string) => {
     switch (entity) {
@@ -382,8 +313,6 @@ export function taskDirectory(workspaceData: string, taskId: string): string {
 
 export const VERDICT_FILE = 'verdict.json';
 export const JUNIT_FILE = 'report.xml';
-export const TEST_RESULTS_FILE = 'test-results.jsonl';
-export const TEST_FAILURES_FILE = 'test-failures.log';
 const NEXTEST_REPORT_CONFIG_FILE = 'nextest-report.toml';
 
 /**
@@ -438,8 +367,6 @@ export async function clearTaskDirectory(directory: string): Promise<void> {
   await Promise.all([
     rm(join(directory, VERDICT_FILE), { force: true }),
     rm(join(directory, JUNIT_FILE), { force: true }),
-    rm(join(directory, TEST_RESULTS_FILE), { force: true }),
-    rm(join(directory, TEST_FAILURES_FILE), { force: true }),
   ]);
 }
 
@@ -465,16 +392,13 @@ export async function readRecord(directory: string): Promise<BoundedExecRecord |
 }
 
 /** The JUnit report a command wrote into `directory`, or `null` when it wrote none. */
-export async function readJunitReport(
-  directory: string,
-  bunClosed?: (results: readonly NativeTestResult[]) => void,
-): Promise<JunitFailures | null> {
+export async function readJunitReport(directory: string): Promise<JunitFailures | null> {
   try {
-    const xml = await readFile(join(directory, JUNIT_FILE), 'utf8');
-    bunClosed?.(bunJunitResults(xml));
-    return junitFailures(xml);
+    return junitFailures(await readFile(join(directory, JUNIT_FILE), 'utf8'));
   } catch (error) {
-    if (isNotFound(error)) return null;
+    if (isNotFound(error)) {
+      return null;
+    }
     throw error;
   }
 }

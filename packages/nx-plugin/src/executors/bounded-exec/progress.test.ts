@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { createRunProgress, withProgressReport, withTestResultReport } from './progress.js';
-import type { NativeTestResult } from './test-results.js';
+import { createRunProgress, withProgressReport } from './progress.js';
 
 describe('run progress', () => {
   it('observes Go package execution and test completions, not build output or heartbeats', () => {
@@ -150,101 +149,9 @@ describe('run progress', () => {
     expect(progress.scan('stderr', '\u001b[32m        PASS\u001b[0m [  31.000s] (1/1) nt tests::hangs\n')).toBe(true);
     expect(progress.inFlight()).toEqual([]);
   });
-  it('maps nextest final attempts once, preserves native literal names, and keeps ignored starts out of in-flight tests', () => {
-    const results: NativeTestResult[] = [];
-    const progress = createRunProgress('cargo nextest run --message-format=libtest-json-plus', (result) =>
-      results.push(result),
-    );
-    progress.scan('stdout', '{"type":"test","event":"started","name":"pkg::bin$test#2"}\n');
-    expect(progress.inFlight()).toEqual([]);
-    progress.scan(
-      'stdout',
-      '{"type":"test","event":"failed","name":"pkg::bin$test#2#3","exec_time":0.25,"stdout":"assertion é\\n"}\n',
-    );
-    progress.scan('stderr', '        FAIL [   0.250s] (1/1) pkg test#2\n');
-    expect(results).toEqual([
-      {
-        id: 'pkg::bin::test#2',
-        status: 'fail',
-        source: 'native',
-        durationMs: 250,
-        sourceRef: null,
-        failureOutput: 'assertion é\n',
-      },
-    ]);
-    expect(progress.scan('stdout', '{invalid json}\n')).toBe(false);
-    expect(progress.error()).toContain('invalid native test JSON');
-  });
-
-  it('reuses Bun terminal lines for immediate provisional results with the preceding diagnostic bytes', () => {
-    const results: NativeTestResult[] = [];
-    const progress = createRunProgress('bun test --dots', (result) => results.push(result));
-    const bytes = Buffer.from('\ncase.test.ts:\nerror: é\n(fail) outer > test [2.50');
-    const split = bytes.indexOf(Buffer.from('é')) + 1;
-    progress.scan('stderr', bytes.subarray(0, split));
-    progress.scan('stderr', bytes.subarray(split));
-    expect(results).toEqual([]);
-    progress.scan('stderr', 'ms]\n');
-    expect(results).toEqual([
-      {
-        id: 'case.test.ts::outer > test',
-        status: 'fail',
-        source: 'progress',
-        durationMs: 2.5,
-        sourceRef: null,
-        failureOutput: '\ncase.test.ts:\nerror: é\n(fail) outer > test [2.50ms]\n',
-      },
-    ]);
-    progress.scan('stderr', '..\n 21 tests failed:\n(fail) outer > test [2.50ms]\n');
-    expect(results).toHaveLength(1);
-  });
-
-  it('keeps dots in the captured Bun interval and ignores untimed symbols from other commands', () => {
-    const results: NativeTestResult[] = [];
-    const bun = createRunProgress('bun test --dots', (result) => results.push(result));
-    bun.scan('stderr', 'file.test.ts:\n(pass) a [1.00ms]\n..\nerror: failed\n(fail) b [2.00ms]\n');
-    expect(results[1]?.failureOutput).toBe('..\nerror: failed\n(fail) b [2.00ms]\n');
-    const unknown = createRunProgress('node wrapper.js');
-    for (const noise of ['… still waiting', '✓ heartbeat', '× no result']) {
-      expect(unknown.scan('stdout', `${noise}\n`)).toBe(false);
-    }
-    expect(unknown.scan('stdout', '{"type":"test","event":"ok","name":"fake$test","exec_time":0}\n')).toBe(false);
-  });
-
-  it('maps Go test terminals and captured native output, never package results or human heartbeats', () => {
-    const results: NativeTestResult[] = [];
-    const progress = createRunProgress('go test -json ./...', (result) => results.push(result));
-    progress.scan('stdout', '{"Action":"output","Package":"pkg","Test":"TestA","Output":"assertion\\n"}\n');
-    progress.scan(
-      'stdout',
-      '{"Action":"fail","Package":"pkg","Test":"TestA","Elapsed":0.5}\n{"Action":"fail","Package":"pkg"}\n',
-    );
-    expect(results).toEqual([
-      {
-        id: 'pkg::TestA',
-        status: 'fail',
-        source: 'native',
-        durationMs: 500,
-        sourceRef: null,
-        failureOutput: 'assertion\n',
-      },
-    ]);
-  });
 });
 
 describe('progress report', () => {
-  it('selects nextest JSON-plus version 0.1 without changing selection or no-capture commands', () => {
-    expect(withTestResultReport('cargo nextest run -E "package(example)"')).toEqual({
-      command:
-        'cargo nextest run --message-format-version=0.1 --message-format=libtest-json-plus -E "package(example)"',
-      env: { NEXTEST_EXPERIMENTAL_LIBTEST_JSON: '1' },
-    });
-    expect(withTestResultReport('cargo nextest run --no-capture')).toEqual({
-      command: 'cargo nextest run --no-capture',
-      env: {},
-    });
-    expect(withTestResultReport('bun test')).toEqual({ command: 'bun test', env: {} });
-  });
   it('asks Go for its package execution events without changing its test selection', () => {
     expect(withProgressReport('go test -count=1 ./hts/... ./host/...')).toBe(
       'go test -json -count=1 ./hts/... ./host/...',

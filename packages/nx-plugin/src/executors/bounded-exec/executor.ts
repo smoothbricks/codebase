@@ -39,7 +39,7 @@ import {
   type SubtreeAdmission,
   type SubtreeOwner,
 } from './owned-subtree.js';
-import { createRunProgress, withProgressReport, withTestResultReport } from './progress.js';
+import { createRunProgress, withProgressReport } from './progress.js';
 import {
   createHostCommands,
   describeCoverageGap,
@@ -56,11 +56,9 @@ import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from
 import { CPU_TOKENS_ENV, runnerDemand, sizeRunner } from './runner-sizing.js';
 import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import type { BoundedExecOptions } from './schema.js';
-import { createTestResultWriter, type TestResultWriter } from './test-results.js';
 import {
   type BoundedExecRecord,
   type BoundedExecTask,
-  BUN_TEST,
   clearTaskDirectory,
   describeNoSpace,
   type ExpiredBound,
@@ -309,8 +307,6 @@ export async function runBoundedExec(
       ? { command: options.fixtureCommand, timeoutMs: options.fixtureTimeoutMs }
       : null;
   const outputChunks: string[] = [];
-  let resultWriter: TestResultWriter | null = null;
-  let resultFailure: string | null = null;
   const state: RunState = {
     settled: false,
     expiry: null,
@@ -583,26 +579,7 @@ export async function runBoundedExec(
       return;
     }
     const { task, directory: recordDirectory } = context.record;
-    const report = await readJunitReport(
-      recordDirectory,
-      requested.search(BUN_TEST) !== -1 && resultWriter !== null
-        ? (results) => {
-            const error = resultWriter?.reconcile(results) ?? null;
-            if (error !== null) {
-              resultFailure ??= error;
-              operational = true;
-              appendStderr(`bounded-exec: ${error}\n`);
-            }
-          }
-        : undefined,
-    ).finally(async () => {
-      const error = (await resultWriter?.close()) ?? null;
-      if (error !== null) {
-        resultFailure ??= error;
-        operational = true;
-        appendStderr(`bounded-exec: ${error}\n`);
-      }
-    });
+    const report = await readJunitReport(recordDirectory);
     const verdict = operational
       ? judgeOperationalFailure(exitCode, report)
       : judgeRun({ exitCode, elapsedMs, expiry, report, noSpace, lockWaits });
@@ -639,11 +616,10 @@ export async function runBoundedExec(
     }
     pool = created.pool;
   }
-  const native = directory === null ? { command: sized.command, env: {} } : withTestResultReport(sized.command);
   const command =
     directory === null
-      ? withProgressReport(native.command)
-      : await withJunitReport(withProgressReport(native.command), directory);
+      ? withProgressReport(sized.command)
+      : await withJunitReport(withProgressReport(sized.command), directory);
   // A runner bounded-exec cannot see in the command (a script that spawns `bun test`) writes its JUnit report to this
   // path when it is set. The grant's sizing outranks the target's own environment: the runner may use what it was
   // granted, not what it was configured with. The sub-pool's environment comes last: a descendant reads only the pool
@@ -652,7 +628,6 @@ export async function runBoundedExec(
     ...(directory === null ? {} : { [JUNIT_REPORT_ENV]: join(directory, JUNIT_FILE) }),
     ...targetEnv(options.env, appendStderr),
     ...sized.env,
-    ...native.env,
     ...(pool?.environment ?? {}),
     ...(leaf?.kind === 'cargo' ? { MBX_GRANT_FD: String(MBX_GRANT_FD) } : {}),
   };
@@ -679,9 +654,6 @@ export async function runBoundedExec(
   const rootGrantSlot: IOType[] = leaf !== null ? ['pipe'] : [];
   const root = owner?.rootArgv(shellCommand);
   let child: ChildProcess;
-  const results = directory === null ? null : await createTestResultWriter(directory, { cwd, root: context.root });
-  if (results !== null && !results.ok) return refuse(`bounded-exec: ${results.error}\n`);
-  resultWriter = results?.ok ? results.writer : null;
   try {
     // fd 3 is the runner lifecycle's duplex socket when the command is hooked; the subtree admission takes fd 4, which
     // cowshed closes fd 4 before exec; fd 5 carries mbx's admission/release stream, including Cargo descendants.
@@ -725,20 +697,7 @@ export async function runBoundedExec(
   }
 
   // Progress is a finished test, not output: a runner's SLOW warnings and a hung test's heartbeat keep printing.
-  const progress = createRunProgress(
-    command,
-    resultWriter === null
-      ? undefined
-      : (result) => {
-          const error = resultWriter?.append(result) ?? null;
-          if (error !== null && resultFailure === null) {
-            resultFailure = error;
-            lifecycleFailure ??= error;
-            appendStderr(`bounded-exec: ${error}\n`);
-            termination = terminate();
-          }
-        },
-  );
+  const progress = createRunProgress(command);
   // A write that found no space is said once, in the output, by whatever made it; the volume is read when it is said,
   // since the writer usually removes what it half-wrote before it exits and the volume no longer looks full by then.
   const noSpace = createNoSpaceWatch();
@@ -836,15 +795,9 @@ export async function runBoundedExec(
   const updateIdle = (finished: boolean, wasTesting: boolean): void => {
     stepTo({ kind: 'progress', at: Date.now(), testing: isTesting(), wasTesting, finished });
   };
-  const scanProgress = (stream: 'stdout' | 'stderr', text: Buffer | string): void => {
+  const scanProgress = (stream: 'stdout' | 'stderr', text: string): void => {
     if (!fixtureDone) return;
     updateIdle(progress.scan(stream, text), isTesting());
-    const error = progress.error();
-    if (error !== null && lifecycleFailure === null) {
-      lifecycleFailure = error;
-      appendStderr(`bounded-exec: ${error}\n`);
-      termination = terminate();
-    }
   };
   if (lifecycle !== null) {
     const channel = child.stdio[3];
@@ -882,14 +835,14 @@ export async function runBoundedExec(
   }
   child.stdout?.on('data', (chunk: Buffer | string) => {
     const text = chunk.toString();
-    scanProgress('stdout', chunk);
+    scanProgress('stdout', text);
     const said = noSpace.scan('stdout', text);
     if (said !== null) state.noSpace = sight(said);
     appendStdout(text);
   });
   child.stderr?.on('data', (chunk: Buffer | string) => {
     const text = chunk.toString();
-    scanProgress('stderr', chunk);
+    scanProgress('stderr', text);
     const said = noSpace.scan('stderr', text);
     if (said !== null) state.noSpace = sight(said);
     appendStderr(text);
@@ -1164,7 +1117,7 @@ export async function runBoundedExec(
   const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null;
   await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen, state.lockWaits);
   return {
-    success: !operationalFailure && resultFailure === null && state.expiry === null && code === 0,
+    success: !operationalFailure && state.expiry === null && code === 0,
     terminalOutput: outputChunks.join(''),
   };
 }
