@@ -2,8 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { CpuWaitRow } from './lease-wait.js';
 import { describeHolders, type LockWait, type Opener } from './lock-wait.js';
-import type { NativeTestResult } from './test-result-writer.js';
-import { TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
+import type { NativeTestResult } from './test-results.js';
 
 /**
  * Why one bounded run ended, recorded per Nx task so a caller can tell a load-sensitive bound
@@ -383,6 +382,8 @@ export function taskDirectory(workspaceData: string, taskId: string): string {
 
 export const VERDICT_FILE = 'verdict.json';
 export const JUNIT_FILE = 'report.xml';
+export const TEST_RESULTS_FILE = 'test-results.jsonl';
+export const TEST_FAILURES_FILE = 'test-failures.log';
 const NEXTEST_REPORT_CONFIG_FILE = 'nextest-report.toml';
 
 /**

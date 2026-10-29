@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 
 import { createRunProgress, withProgressReport, withTestResultReport } from './progress.js';
-import type { NativeTestResult } from './test-result-writer.js';
+import type { NativeTestResult } from './test-results.js';
 
 describe('run progress', () => {
   it('observes Go package execution and test completions, not build output or heartbeats', () => {

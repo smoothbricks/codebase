@@ -2406,11 +2406,10 @@ runner, or with two (they would write one report), is judged by its exit alone.
 
 A task also publishes live observations in `test-results.jsonl`, beside its `report.xml` and `verdict.json` in
 `.nx/workspace-data/bounded-exec/<encodeURIComponent(taskId)>/` (under Nx's configured workspace-data directory). The
-public `@smoothbricks/nx-plugin/test-results` entry is pure: it exports `ClosedTestResult`, its generated strict
-`isClosedTestResult` guard, `TEST_RESULTS_FILE`, `TEST_FAILURES_FILE`, and `parseTestSourceRef`, with no host IO
-imports. The separate `@smoothbricks/nx-plugin/test-results/host` entry owns the artifact writer and
-`taskDirectory(workspaceData, taskId)`. These observations let a consumer act on a closed failure while other tests
-still run. They never replace terminal JUnit or the verdict as gate evidence.
+public `@smoothbricks/nx-plugin/test-results` entry exports `ClosedTestResult`, its generated strict
+`isClosedTestResult` guard, `TEST_RESULTS_FILE`, `TEST_FAILURES_FILE`, `taskDirectory(workspaceData, taskId)`, and
+`parseTestSourceRef`. These observations let a consumer act on a closed failure while other tests still run. They never
+replace terminal JUnit or the verdict as gate evidence.
 
 Each record is one UTF-8 JSON object followed by LF:
 
