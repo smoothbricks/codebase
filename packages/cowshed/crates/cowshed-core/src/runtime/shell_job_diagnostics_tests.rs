@@ -195,6 +195,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 ),
                 read_only: false,
                 environment: BTreeMap::new(),
+                shared_daemons: Vec::new(),
                 grants: Default::default(),
                 envrc_directory: None,
                 activation: Arc::new(tokio::sync::Mutex::new(())),

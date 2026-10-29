@@ -74,20 +74,27 @@ in needs no root relocation, but a change of exec mode still relocates its priva
   build-volume link, do not move between modes. Only those owned paths change: remaining `NODE_OPTIONS` and
   `BUN_OPTIONS` bytes stay in the key, and per-command caller options retain their normal overlay semantics.
 
+  Capability-contributed daemon leaves are separate places before the private paths and generic runtime link. Their
+  literal aliases stay shared across exec modes (04_sandbox.md, "One Nx state per checkout"), while HOME, XDG and loader
+  paths retain their mode-owned placement. Relocation protects every matched place before inserting any destination,
+  including a shared leaf that does not move, so its runtime parent cannot move it again. Such a destination leaf is not
+  origin residue merely because it retains the origin's generic runtime prefix. No alias is canonicalized and no
+  environment-variable name receives a special normalization rule.
+
 - **Nothing names the origin after the move.** Every value has each of the origin's per-workspace places — its root, its
-  runtime link (`XDG_RUNTIME_DIR`), its `TMPDIR` and its `HOME` — replaced by the adopting checkout's, with private
-  environment paths first and the checkout root before the remaining places, wherever a path starts there and ends a
-  component (`/x/repo` moves `/x/repo/tooling`, `-I/x/repo/include` and `-Wl,-rpath,/x/repo/lib`, never
-  `/x/repo-worktrees` or `/w/x/repo`); devenv's `DEVENV_RUNTIME`, a hash of the dotfile path, is recomputed as devenv
-  computes it. The check after the move is stricter than the move: a value in which an origin place still ends a
-  component anywhere, or that holds a number inside the origin's port block, refuses adoption, since a false refusal
-  costs one evaluation and a false pass would hand the clone the origin's tree. Nothing else is asked. A fork is its
-  origin's exact clone — the same inputs, already installed — so the first clone under any parent adopts, and no second
-  checkout evaluates the same inputs to vouch for the move. What no check can see is a value derived from the origin in
-  a way the move does not name (an `.envrc` exporting a hash of `$PWD`, arithmetic on anything that differs between
-  checkouts beyond the places above): such a value is inherited as the origin computed it, in every clone, until an
-  input or the baseline changes. That is the accepted price of never evaluating a clone whose inputs and baseline are
-  already proven.
+  capability-contributed daemon leaves, runtime link (`XDG_RUNTIME_DIR`), `TMPDIR` and `HOME` — replaced by the adopting
+  checkout's, with shared leaves before private environment paths, the checkout root and the remaining places, wherever
+  a path starts there and ends a component (`/x/repo` moves `/x/repo/tooling`, `-I/x/repo/include` and
+  `-Wl,-rpath,/x/repo/lib`, never `/x/repo-worktrees` or `/w/x/repo`); devenv's `DEVENV_RUNTIME`, a hash of the dotfile
+  path, is recomputed as devenv computes it. The check after the move is stricter than the move: a value in which an
+  origin place still ends a component anywhere, or that holds a number inside the origin's port block, refuses adoption,
+  since a false refusal costs one evaluation and a false pass would hand the clone the origin's tree. Nothing else is
+  asked. A fork is its origin's exact clone — the same inputs, already installed — so the first clone under any parent
+  adopts, and no second checkout evaluates the same inputs to vouch for the move. What no check can see is a value
+  derived from the origin in a way the move does not name (an `.envrc` exporting a hash of `$PWD`, arithmetic on
+  anything that differs between checkouts beyond the places above): such a value is inherited as the origin computed it,
+  in every clone, until an input or the baseline changes. That is the accepted price of never evaluating a clone whose
+  inputs and baseline are already proven.
 
 The record has one writer: the checkout's own supervisor, when it activates, in one atomic publish. No clone writes into
 its origin's image — when the origin is main, nothing moves main's image for a clone's sake — and a missing or stale

@@ -1520,7 +1520,7 @@ fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>
         .map(|(name, value)| (name.to_owned(), value))
         .collect();
         write_record(
-            &Placement::of(root, &baseline),
+            &Placement::of(root, &baseline, &[]),
             &baseline,
             &entries,
             &contents,
@@ -1536,7 +1536,7 @@ fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>
     );
     std::fs::copy(record_path(&origin), record_path(&clone)).unwrap();
     let verified =
-        verify(&Placement::of(&clone, &baseline), &baseline).expect("the record verifies");
+        verify(&Placement::of(&clone, &baseline, &[]), &baseline).expect("the record verifies");
     let inherited = serde_json::to_vec(&Inherited::of(&verified)).unwrap();
     let frame = FrameWriter::new(REQUEST_ADOPT)
         .tree_owner(cowshed_core::runtime::process_tree::TreeOwner::Job(

@@ -50,7 +50,7 @@ pub const GRANTS_KEY: &str = "<grants>";
 /// The selected shell directory, normalized by the baseline's existing checkout-place move.
 pub const SHELL_KEY: &str = "<shell>";
 
-const RECORD_VERSION: u32 = 2;
+const RECORD_VERSION: u32 = 3;
 
 /// A record is one export plus its watch list; a larger file is not one this code wrote.
 const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
@@ -191,6 +191,8 @@ struct ActivationRecord {
     root: PathBuf,
     /// The activating checkout's [`Placement::beside`], in their order.
     beside: [Option<PathBuf>; BESIDE],
+    /// Capability-owned daemon leaves, in contribution order, with their literal aliases.
+    shared_daemons: Vec<PathBuf>,
     ports: Option<(u32, u32)>,
     key: String,
     baseline: Baseline,
@@ -209,6 +211,7 @@ impl ActivationRecord {
         places(
             &self.root,
             self.beside.each_ref().map(|place| place.as_deref()),
+            &self.shared_daemons,
         )
     }
 
@@ -288,10 +291,16 @@ pub struct Placement<'a> {
     pub home: Option<&'a Path>,
     /// The workspace's port block, `[base, base + size)`.
     pub ports: Option<(u32, u32)>,
+    /// Capability-owned daemon leaves shared by every exec mode, never resolved through aliases.
+    pub shared_daemons: &'a [PathBuf],
 }
 
 impl<'a> Placement<'a> {
-    pub fn of(root: &'a Path, baseline: &'a BTreeMap<OsString, OsString>) -> Self {
+    pub fn of(
+        root: &'a Path,
+        baseline: &'a BTreeMap<OsString, OsString>,
+        shared_daemons: &'a [PathBuf],
+    ) -> Self {
         use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, TEMP_DIR_ENV};
         let get = |name: &str| baseline.get(std::ffi::OsStr::new(name));
         let number = |name: &str| get(name)?.to_str()?.parse::<u32>().ok();
@@ -301,12 +310,13 @@ impl<'a> Placement<'a> {
             temp_dir: get(TEMP_DIR_ENV).map(Path::new),
             home: get("HOME").map(Path::new),
             ports: number(PORT_BASE_ENV).zip(number(PORT_BLOCK_SIZE_ENV)),
+            shared_daemons,
         }
     }
 
-    /// Mode-owned private paths precede the root, which precedes the remaining places.
+    /// Shared leaves precede private paths, the root and the remaining places.
     fn places(&self) -> impl Iterator<Item = Option<Cow<'a, Path>>> {
-        places(self.root, self.beside())
+        places(self.root, self.beside(), self.shared_daemons)
     }
 
     /// The per-workspace paths beside the root that a value can name, each only when the
@@ -321,20 +331,27 @@ impl<'a> Placement<'a> {
 fn places<'a>(
     root: &'a Path,
     beside: [Option<&'a Path>; BESIDE],
+    shared_daemons: &'a [PathBuf],
 ) -> impl Iterator<Item = Option<Cow<'a, Path>>> {
     let [_, _, home] = beside;
     let environment_root = home.and_then(Path::parent);
-    super::supervisor::PRIVATE_ENVIRONMENT_DIRECTORIES
-        .into_iter()
-        .chain([
-            super::supervisor::PRIVATE_TOOLS_DIRECTORY,
-            crate::workspace_clients::TRUST_BUNDLE_NAME,
-            crate::port_zero::PRELOAD_NAME,
-        ])
-        .map(move |name| {
-            environment_root
-                .map(|root| Cow::Owned(root.join(std::ffi::OsStr::from_bytes(name.to_bytes()))))
-        })
+    shared_daemons
+        .iter()
+        .map(|path| Some(Cow::Borrowed(path.as_path())))
+        .chain(
+            super::supervisor::PRIVATE_ENVIRONMENT_DIRECTORIES
+                .into_iter()
+                .chain([
+                    super::supervisor::PRIVATE_TOOLS_DIRECTORY,
+                    crate::workspace_clients::TRUST_BUNDLE_NAME,
+                    crate::port_zero::PRELOAD_NAME,
+                ])
+                .map(move |name| {
+                    environment_root.map(|root| {
+                        Cow::Owned(root.join(std::ffi::OsStr::from_bytes(name.to_bytes())))
+                    })
+                }),
+        )
         .chain(std::iter::once(Some(Cow::Borrowed(root))))
         .chain(beside.map(|place| place.map(Cow::Borrowed)))
 }
@@ -566,6 +583,7 @@ pub fn write_record(
         v: RECORD_VERSION,
         root: placement.root.to_path_buf(),
         beside: placement.beside().map(|place| place.map(Path::to_path_buf)),
+        shared_daemons: placement.shared_daemons.to_vec(),
         ports: placement.ports,
         key: key(placement.root, &watches, contents),
         baseline: baseline(placement, baseline_environment),
@@ -694,23 +712,34 @@ pub fn verify(
     if let Some(name) = baseline(placement, baseline_environment).differs_from(&record.baseline) {
         return Err(AdoptionMiss::BaselineMoved { name });
     }
-    // Mode-owned private paths move first; the checkout root and the remaining places follow.
-    let moves: Vec<(String, Option<String>)> = record
+    // Tokenize every place before inserting destinations: an unchanged shared leaf must not
+    // move through its mode-owned runtime parent, nor may a destination be relocated again.
+    let moves: Vec<(String, Option<String>, String)> = record
         .places()
         .zip(placement.places())
-        .filter_map(|(from, to)| {
+        .enumerate()
+        .filter_map(|(index, (from, to))| {
             let from = from?.to_string_lossy().into_owned();
             let to = to.map(|to| to.to_string_lossy().into_owned());
-            (Some(&from) != to.as_ref()).then_some((from, to))
+            Some((from, to, format!("\0place{index}\0")))
         })
         .collect();
     let mut environment = BTreeMap::new();
     for (name, value) in &record.environment {
         let moved = value.as_ref().map(|value| {
+            let normalized = moves
+                .iter()
+                .fold(value.clone(), |value, (from, to, token)| {
+                    if to.is_some() {
+                        rebase(&value, from, token)
+                    } else {
+                        value
+                    }
+                });
             moves
                 .iter()
-                .fold(value.clone(), |value, (from, to)| match to {
-                    Some(to) => rebase(&value, from, to),
+                .fold(normalized, |value, (_, to, token)| match to {
+                    Some(to) => value.replace(token, to),
                     None => value,
                 })
         });
@@ -739,7 +768,17 @@ pub fn verify(
     let origin_ports = record.ports.filter(|ports| Some(*ports) != placement.ports);
     for (name, value) in &environment {
         let Some(value) = value else { continue };
-        if moves.iter().any(|(from, _)| contains_path(value, from))
+        // A shared leaf can legitimately retain the origin runtime parent in this mode.
+        // Protect only literal path starts; an unreachable glued spelling still refuses.
+        let private_value = placement
+            .shared_daemons
+            .iter()
+            .fold(value.clone(), |value, path| {
+                rebase(&value, &path.to_string_lossy(), "\0shared\0")
+            });
+        if moves
+            .iter()
+            .any(|(from, to, _)| Some(from) != to.as_ref() && contains_path(&private_value, from))
             || origin_ports.is_some_and(|ports| names_port(value, ports))
         {
             return Err(AdoptionMiss::Residue { name: name.clone() });
@@ -1047,7 +1086,7 @@ mod tests {
             .collect();
         let (_, contents) = certify(entries.iter().map(|entry| entry.path.as_path())).unwrap();
         write_record(
-            &Placement::of(&site.root, &baseline),
+            &Placement::of(&site.root, &baseline, &[]),
             &baseline,
             &entries,
             &contents,
@@ -1090,7 +1129,7 @@ mod tests {
 
     fn verify_at(site: &Site) -> Result<VerifiedActivation, AdoptionMiss> {
         let baseline = site.baseline();
-        verify(&Placement::of(&site.root, &baseline), &baseline)
+        verify(&Placement::of(&site.root, &baseline, &[]), &baseline)
     }
 
     /// The lineage as it happens: the origin evaluates, and the clone carries its record as
@@ -1353,7 +1392,7 @@ mod tests {
         let mut baseline = sites.clone.baseline();
         baseline.insert("EXTRA".into(), "1".into());
         assert!(matches!(
-            verify(&Placement::of(&sites.clone.root, &baseline), &baseline),
+            verify(&Placement::of(&sites.clone.root, &baseline, &[]), &baseline),
             Err(AdoptionMiss::BaselineMoved { name }) if name == "EXTRA"
         ));
     }
@@ -1419,7 +1458,7 @@ mod tests {
         let mut baseline = sites.clone.baseline();
         baseline.remove(std::ffi::OsStr::new("TMPDIR"));
         assert!(matches!(
-            verify(&Placement::of(&sites.clone.root, &baseline), &baseline),
+            verify(&Placement::of(&sites.clone.root, &baseline, &[]), &baseline),
             Err(AdoptionMiss::Residue { name }) if name == "LEFTOVER"
         ));
     }

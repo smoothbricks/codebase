@@ -1768,6 +1768,8 @@ pub(super) struct SandboxEnvironment {
     /// A clause the sandbox appends to the caller's value, or the whole value when the caller
     /// named none, so the sandbox's clause is the one that takes effect.
     appended: BTreeMap<OsString, Appended>,
+    /// Literal capability daemon leaves, shared across child modes and inherited activations.
+    pub(super) shared_daemons: Vec<PathBuf>,
 }
 
 /// What the sandbox adds after a caller's value of one variable: a configuration line after the
@@ -3021,6 +3023,12 @@ pub(super) async fn sandbox_environment(
         withheld,
         defaults,
         appended,
+        shared_daemons: sandbox
+            .capabilities
+            .contribution
+            .daemon_isolation
+            .directories
+            .clone(),
     })
 }
 
@@ -10291,27 +10299,37 @@ mod workspace_toolchain_tests {
             policy: &SandboxPolicy,
             mode: crate::api::dto::RunSandboxMode,
             shell: &Path,
-        ) -> BTreeMap<OsString, OsString> {
+        ) -> (BTreeMap<OsString, OsString>, Vec<PathBuf>) {
             let (sandbox, _) = policy.child(mode);
             let environment = sandbox_environment(sandbox, &BTreeMap::new())
                 .await
                 .expect("environment");
-            super::super::shell_job::inherited_baseline(&environment.base(), &sandbox.grants, shell)
+            let baseline = super::super::shell_job::inherited_baseline(
+                &environment.base(),
+                &sandbox.grants,
+                shell,
+            );
+            (baseline, environment.shared_daemons)
         }
-        let root = scratch("source-paths-shell");
+        let parent = std::fs::canonicalize(crate::temp_parent::scratch_parent())
+            .expect("workspace-owned fixture parent");
+        let root =
+            crate::temp_root::TempRoot::new_in(&parent, "cowshed-toolchain-source-paths-shell");
         let mount = root.join("workspace");
         std::fs::create_dir_all(mount.join(super::super::shell_host::SHELL_HOST_DIRECTORY))
             .expect("shell host directory");
         std::fs::create_dir_all(root.join("home")).expect("home");
         std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
         std::fs::write(mount.join(".envrc"), "use devenv\n").expect("envrc");
+        std::fs::write(mount.join("nx.json"), "{}").expect("Nx capability");
         let mut sandbox = sandbox_at(&mount);
         sandbox
             .configure_capabilities()
             .expect("detect capabilities");
         let policy = SandboxPolicy::render(sandbox).expect("render");
 
-        let published = keyed(&policy, crate::api::dto::RunSandboxMode::ReadWrite, &mount).await;
+        let (published, shared_daemons) =
+            keyed(&policy, crate::api::dto::RunSandboxMode::ReadWrite, &mount).await;
         let entries = [super::super::shell_watch::WatchEntry {
             path: mount.join(".envrc"),
             exists: true,
@@ -10319,34 +10337,61 @@ mod workspace_toolchain_tests {
         let (_, contents) =
             super::super::shell_watch::certify(entries.iter().map(|entry| entry.path.as_path()))
                 .expect("certify the inputs");
+        let mut export = BTreeMap::from([
+            (
+                "PRIVATE_CONFIG".to_owned(),
+                Some(mount.join(".cowshed/config/shell").display().to_string()),
+            ),
+            (
+                "WORKSPACE_BUILD".to_owned(),
+                Some(mount.join(".cowshed/build/target").display().to_string()),
+            ),
+        ]);
+        let private_names = [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "NODE_OPTIONS",
+            "BUN_OPTIONS",
+        ];
+        for name in private_names.into_iter().chain(["NX_SOCKET_DIR"]) {
+            export.insert(
+                format!("ACTIVATED_{name}"),
+                Some(published[OsStr::new(name)].to_string_lossy().into_owned()),
+            );
+        }
+        export.insert(
+            "MIXED_RUNTIME".to_owned(),
+            Some(format!(
+                "{}:{}",
+                published[OsStr::new("NX_SOCKET_DIR")].to_string_lossy(),
+                published[OsStr::new("XDG_RUNTIME_DIR")].to_string_lossy()
+            )),
+        );
         super::super::shell_inherit::write_record(
-            &super::super::shell_inherit::Placement::of(&mount, &published),
+            &super::super::shell_inherit::Placement::of(&mount, &published, &shared_daemons),
             &published,
             &entries,
             &contents,
-            &BTreeMap::from([
-                (
-                    "PRIVATE_CONFIG".to_owned(),
-                    Some(mount.join(".cowshed/config/shell").display().to_string()),
-                ),
-                (
-                    "WORKSPACE_BUILD".to_owned(),
-                    Some(mount.join(".cowshed/build/target").display().to_string()),
-                ),
-            ]),
+            &export,
         )
         .expect("publish the record");
 
-        let land = keyed(&policy, super::super::project::SOURCE_PATHS_MODE, &mount).await;
+        let (land, land_daemons) =
+            keyed(&policy, super::super::project::SOURCE_PATHS_MODE, &mount).await;
         if let Err(miss) = super::super::shell_inherit::verify(
-            &super::super::shell_inherit::Placement::of(&mount, &land),
+            &super::super::shell_inherit::Placement::of(&mount, &land, &land_daemons),
             &land,
         ) {
             panic!("the land's source-path job must adopt the workspace's shell record: {miss}");
         }
-        let read_only = keyed(&policy, crate::api::dto::RunSandboxMode::ReadOnly, &mount).await;
+        let (read_only, read_only_daemons) =
+            keyed(&policy, crate::api::dto::RunSandboxMode::ReadOnly, &mount).await;
         let adopted = super::super::shell_inherit::verify(
-            &super::super::shell_inherit::Placement::of(&mount, &read_only),
+            &super::super::shell_inherit::Placement::of(&mount, &read_only, &read_only_daemons),
             &read_only,
         )
         .expect("a read-only job adopts the writable activation");
@@ -10365,6 +10410,42 @@ mod workspace_toolchain_tests {
             Some(mount.join(".cowshed/build/target").display().to_string()),
             "the checkout's build-volume link never moves into read-only scratch",
         );
+        for name in private_names {
+            assert_ne!(
+                published[OsStr::new(name)],
+                read_only[OsStr::new(name)],
+                "{name} stays private to its exec mode"
+            );
+        }
+        assert_eq!(
+            published[OsStr::new("NX_SOCKET_DIR")],
+            read_only[OsStr::new("NX_SOCKET_DIR")],
+            "both modes share the same literal daemon leaf"
+        );
+        for name in private_names.into_iter().chain(["NX_SOCKET_DIR"]) {
+            assert_eq!(
+                adopted.environment()[&format!("ACTIVATED_{name}")].as_deref(),
+                read_only[OsStr::new(name)].to_str(),
+                "{name} follows its owning placement"
+            );
+        }
+        assert_eq!(
+            adopted.environment()["MIXED_RUNTIME"],
+            Some(format!(
+                "{}:{}",
+                read_only[OsStr::new("NX_SOCKET_DIR")].to_string_lossy(),
+                read_only[OsStr::new("XDG_RUNTIME_DIR")].to_string_lossy()
+            ))
+        );
+        let mut resolved_socket = read_only.clone();
+        resolved_socket.insert(
+            "NX_SOCKET_DIR".into(),
+            mount.join(".cowshed/run/nx").into_os_string(),
+        );
+        assert!(
+            matches!(super::super::shell_inherit::verify(&super::super::shell_inherit::Placement::of(&mount, &resolved_socket, &read_only_daemons), &resolved_socket), Err(super::super::shell_inherit::AdoptionMiss::BaselineMoved { name }) if name == "NX_SOCKET_DIR"),
+            "an equivalent resolved path is not the literal admitted socket alias"
+        );
         let mut changed_options = read_only.clone();
         changed_options
             .get_mut(OsStr::new("BUN_OPTIONS"))
@@ -10373,13 +10454,66 @@ mod workspace_toolchain_tests {
         assert!(
             matches!(
                 super::super::shell_inherit::verify(
-                    &super::super::shell_inherit::Placement::of(&mount, &changed_options),
+                    &super::super::shell_inherit::Placement::of(&mount, &changed_options, &read_only_daemons),
                     &changed_options,
                 ),
                 Err(super::super::shell_inherit::AdoptionMiss::BaselineMoved { name }) if name == "BUN_OPTIONS"
             ),
             "non-owned runtime options remain in the key"
         );
+        let cloned = root.join("cloned/workspace");
+        std::fs::create_dir_all(cloned.join(super::super::shell_host::SHELL_HOST_DIRECTORY))
+            .expect("cloned host directory");
+        std::fs::create_dir_all(cloned.parent().expect("clone parent").join("home"))
+            .expect("cloned home");
+        for path in [
+            ".envrc",
+            "nx.json",
+            ".cowshed/token",
+            ".cowshed/shell-host/activation.json",
+        ] {
+            std::fs::copy(mount.join(path), cloned.join(path))
+                .expect("clone activation inputs and record");
+        }
+        let mut clone_sandbox = sandbox_at(&cloned);
+        clone_sandbox
+            .configure_capabilities()
+            .expect("cloned Nx capability");
+        let clone_policy = SandboxPolicy::render(clone_sandbox).expect("cloned policy");
+        for mode in [
+            crate::api::dto::RunSandboxMode::ReadWrite,
+            crate::api::dto::RunSandboxMode::ReadOnly,
+        ] {
+            let (baseline, daemons) = keyed(&clone_policy, mode, &cloned).await;
+            let adopted = super::super::shell_inherit::verify(
+                &super::super::shell_inherit::Placement::of(&cloned, &baseline, &daemons),
+                &baseline,
+            )
+            .expect("the clone adopts in either mode");
+            for name in private_names.into_iter().chain(["NX_SOCKET_DIR"]) {
+                assert_eq!(
+                    adopted.environment()[&format!("ACTIVATED_{name}")].as_deref(),
+                    baseline[OsStr::new(name)].to_str(),
+                    "cloned {mode:?}: {name}"
+                );
+            }
+            assert_ne!(
+                baseline[OsStr::new("NX_SOCKET_DIR")],
+                published[OsStr::new("NX_SOCKET_DIR")]
+            );
+            assert_eq!(
+                adopted.environment()["WORKSPACE_BUILD"],
+                Some(cloned.join(".cowshed/build/target").display().to_string())
+            );
+            assert_eq!(
+                adopted.environment()["MIXED_RUNTIME"],
+                Some(format!(
+                    "{}:{}",
+                    baseline[OsStr::new("NX_SOCKET_DIR")].to_string_lossy(),
+                    baseline[OsStr::new("XDG_RUNTIME_DIR")].to_string_lossy()
+                ))
+            );
+        }
     }
 
     /// A plain repository gets the core contract, including the two exact port-0 loader options,
@@ -10756,6 +10890,7 @@ mod workspace_toolchain_tests {
                 withheld: Vec::new(),
                 defaults: BTreeMap::new(),
                 appended: BTreeMap::new(),
+                shared_daemons: Vec::new(),
             };
             let one_shot = environment.child(&caller);
             let warm: BTreeMap<_, _> = environment.overlay(&caller).into_iter().collect();

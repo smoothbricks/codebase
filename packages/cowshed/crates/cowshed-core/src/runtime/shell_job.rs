@@ -171,6 +171,7 @@ impl WorkspaceShells {
                         profile: spawn.profile.clone(),
                         read_only: spawn.read_only,
                         environment: base,
+                        shared_daemons: spawn.environment.shared_daemons.clone(),
                         grants: spawn.grants.clone(),
                         envrc_directory: spawn.envrc_directory.clone(),
                         activation: Arc::clone(&self.activation),
@@ -1210,6 +1211,7 @@ pub(super) struct HostActivator {
     profile: super::supervisor::ChildProfile,
     read_only: bool,
     environment: BTreeMap<OsString, OsString>,
+    shared_daemons: Vec<PathBuf>,
     /// The grants this pool's hosts run under. What an evaluation can read or reach is part of
     /// what it was computed against, so they join the inherited record's baseline key.
     grants: crate::sandbox::SandboxGrants,
@@ -1367,8 +1369,12 @@ impl HostActivator {
         // says why and evaluates only for read-write hosts.
         let mount = self.workspace_mount.clone();
         let baseline = self.keyed_baseline();
+        let shared_daemons = self.shared_daemons.clone();
         let verified = tokio::task::spawn_blocking(move || {
-            shell_inherit::verify(&Placement::of(&mount, &baseline), &baseline)
+            shell_inherit::verify(
+                &Placement::of(&mount, &baseline, &shared_daemons),
+                &baseline,
+            )
         })
         .await;
         let miss = match verified {
@@ -1526,13 +1532,14 @@ impl HostActivator {
     async fn record(&self, entries: Vec<WatchEntry>, contents: Contents, export: Vec<u8>) {
         let mount = self.workspace_mount.clone();
         let baseline = self.keyed_baseline();
+        let shared_daemons = self.shared_daemons.clone();
         let written = tokio::task::spawn_blocking(move || {
             let export: BTreeMap<String, Option<String>> = serde_json::from_slice(&export)
                 .map_err(|error| {
                     format!("the activation's export is not an environment diff: {error}")
                 })?;
             shell_inherit::write_record(
-                &Placement::of(&mount, &baseline),
+                &Placement::of(&mount, &baseline, &shared_daemons),
                 &baseline,
                 &entries,
                 &contents,
