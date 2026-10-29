@@ -275,11 +275,11 @@ cowshed: host storage is partially set up: 1 volume lives outside this host's co
 
 `setup` installs **cowshed's pinned mbx** (specs/cowshed/14_nix.md, "mbx") on every run once storage is up and the
 invoking build is the installed cowshed. It builds the flake the package ships at `nix/mbx` (mbx v1.28.0 plus the
-compact-prediction and scheduler-admission fixes, from `vizanto/mr-boxington` at the pinned revision, with mbx's own
-locked nixpkgs), roots the result with a nix GC root at `~/Library/Application Support/dev.cowshed/nix/mbx`, and links
-`mbx` in cowshed's `bin` beside the installed `cowshed` to the rooted executable: a link, never a copy, so its realpath
-is the pinned build's store path, the identity a project's own mbx is proven against. No agent, plist or socket is
-written for it:
+compact-prediction, scheduler-admission and grant-descriptor changes, from `vizanto/mr-boxington` at the pinned
+revision, with mbx's own locked nixpkgs), roots the result with a nix GC root at
+`~/Library/Application Support/dev.cowshed/nix/mbx`, and links `mbx` in cowshed's `bin` beside the installed `cowshed`
+to the rooted executable: a link, never a copy, so its realpath is the pinned build's store path, the identity a
+project's own mbx is proven against. No agent, plist or socket is written for it:
 
 ```
 cowshed: mbx: linked ~/Library/Application Support/dev.cowshed/bin/mbx to <store path>/bin/mbx

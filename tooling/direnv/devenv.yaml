@@ -52,11 +52,11 @@ inputs:
       true
       # mbx, the Cargo compiler cache (specs/cowshed/03_caches.md, "mbx"), at the
   # revision cowshed pins (specs/cowshed/14_nix.md, "mbx"): v1.28.0 plus the
-  # compact-prediction and scheduler-admission fixes, from vizanto/mr-boxington. An exact
+  # compact-prediction, scheduler-admission and grant-descriptor changes, from vizanto/mr-boxington. An exact
   # revision, and its own nixpkgs rather than a `follows`: the Nix store path
   # names the build, so the `mbx` a job resolves on PATH and the one cowshed
   # setup installs are the same executable only while both are built from this
   # one locked flake.
   mbx:
-    url: github:vizanto/mr-boxington/dca6f787a3029e0edbd126950e7b955701d39f4f
+    url: github:vizanto/mr-boxington/9d91cf452ec59682a9a4581bdd7e39e2b247be22
     flake: true

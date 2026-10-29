@@ -1,5 +1,6 @@
 # The mbx cowshed setup installs beside the installed cowshed (specs/cowshed/14_nix.md, "mbx"): mbx
-# v1.28.0 plus the compact-prediction fix, from vizanto/mr-boxington at the revision cowshed pins,
+# v1.28.0 plus the compact-prediction, scheduler-admission and grant-descriptor changes, from vizanto/mr-boxington at
+# the revision cowshed pins,
 # as a standalone flake that references nothing outside itself.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
@@ -14,7 +15,7 @@
   # the build, so the mbx a project's devenv resolves through mbx's flake at this revision and the
   # one this flake builds are the same executable, and that realpath equality is the pin proof
   # (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:vizanto/mr-boxington/dca6f787a3029e0edbd126950e7b955701d39f4f";
+  inputs.mbx.url = "github:vizanto/mr-boxington/9d91cf452ec59682a9a4581bdd7e39e2b247be22";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
