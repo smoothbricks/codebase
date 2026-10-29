@@ -154,17 +154,26 @@ refused, naming its format and path.
    any more. A build replacement already published at the build image path under the recorded owner record verbatim no
    longer reads its retained image: losing that image afterwards keeps the published replacement and its record. A lost
    main image refuses as before. Leave old-incarnation seed images unchanged as retained evidence; publish one fresh RAW
-   seed from the verified warm replacement for the new incarnation. A resumed copy leaves already-correct hard-link
-   topology untouched. It relinks only missing, mismatched or recopied-primary aliases and restores every changed
-   alias's ancestor metadata after the subtree is complete. Already-mirrored file payloads are not recopied merely
-   because the transaction was interrupted; full content and metadata verification still runs before publication. The
-   exclusive claim on the recorded source build image's `<image>.hold` stays held through retention, copy, seed capture
-   and publication. A seed of a volume published at that image's own path, warm or empty, captures under that same typed
-   claim rather than opening a second exclusive claim on the same resource. A published replacement or kept build
+   seed for the new incarnation: under mbx it retains only capability-marked paths from an atomic image snapshot;
+   otherwise it captures the verified warm replacement (16_build_volumes.md, "Targets and seeds"). The live build stays
+   warm in both cases. A resumed copy leaves already-correct hard-link topology untouched. It relinks only missing,
+   mismatched or recopied-primary aliases and restores every changed alias's ancestor metadata after the subtree is
+   complete. Already-mirrored file payloads are not recopied merely because the transaction was interrupted; full
+   content and metadata verification still runs before publication. The exclusive claim on the recorded source build
+   image's `<image>.hold` stays held through retention, copy, seed publication and the live volume's mount. The
+   replacement checkout's Cargo convention, installed mbx and generated Cargo shim select the mbx seed policy through
+   the existing capability authority. Canonical capability and declared-state contributions resolve legacy retention
+   metadata in the seed value only, never in the preserved live state. Under mbx, a fresh seed at the live volume's
+   capacity receives only marked directories from a protected point-in-time snapshot; each retained SQLite directory
+   travels whole, including its database, WAL and SHM. No checkpoint or lock handoff is required. Only
+   capability-declared clone-invalid entries are removed from the new seed, never from its live source. With no marked
+   paths, the seed is minted blank without a source snapshot. It records the detected mbx executable and is detached
+   before publication. The live build's metadata and contents are unchanged. Without mbx, capture borrows the same typed
+   source claim rather than opening a second exclusive claim on the same resource. A published replacement or kept build
    already detached is seeded before its first mount, not mounted merely to detach and restore it for capture. The claim
-   remains held through that mount and the new seed's captured-clone freshness mark. This immutable captured-clone clock
-   replaces live-source re-stamping after mount. A replay keeps an existing seed's mark: it never declares old captured
-   bytes current by sampling the live image again.
+   remains held through that mount and the seed's captured-clone freshness mark. This immutable captured-clone clock
+   replaces live-source re-stamping after mount. A replay keeps an existing seed's identity and mark: it never declares
+   old captured bytes current by sampling the live image again.
 4. Verify the copied content before publication, including tracked and untracked-not-ignored file checksums, the entire
    `.git` state above, `git fsck`, and the build contents and identity. Re-adoption does not normalize Git
    configuration, delete lock files, prune worktree registrations or replace user hooks. Only cowshed's own marker and
@@ -213,10 +222,11 @@ refuses with integrity. Only when none survives is main's build volume published
 recorded ID, `Linked main` owner and creation time, with its built-at tree cleared; a build image or record still
 present at that ID then refuses: this recovery never publishes over a build volume. Before the Git state is recorded,
 the checkout takes main's cowshed excludes and a build link naming main's build volume, so the copy verifies and carries
-the link. Old-incarnation seeds are retained and one fresh seed is frozen as in step 3. The journal records the copy
-mode, so a replay resumes the same recovery. While nothing is published, the checkout is the user's live tree: a replay
-before the handoff proves it unheld again and records its Git state again before it copies, so a commit or a fetch made
-after an earlier attempt refused never wedges the recovery.
+the link. Old-incarnation seeds are retained and one fresh seed is published as in step 3: filtered by capability-owned
+retention under mbx, otherwise captured from the preserved live build. The journal records the copy mode, so a replay
+resumes the same recovery. While nothing is published, the checkout is the user's live tree: a replay before the handoff
+proves it unheld again and records its Git state again before it copies, so a commit or a fetch made after an earlier
+attempt refused never wedges the recovery.
 
 Re-adoption copies filesystem entries, not allocated-but-free guest blocks. Space returns only after verification and
 explicit release of the old image and any snapshots sharing its blocks (01a_apfs.md, "Space reclamation"). Retained

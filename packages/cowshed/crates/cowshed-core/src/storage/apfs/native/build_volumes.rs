@@ -293,6 +293,29 @@ where
         )
     }
 
+    /// Snapshot retained state under existing shared custody, without claiming or stopping its
+    /// writers. The caller's lifecycle/image lock excludes adoption and the hold excludes release.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clone_shared_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        source: &crate::runtime::build_volumes::HeldVolume,
+        destination: &BuildVolumeId,
+        registration: &Registration,
+    ) -> Result<Option<Duration>, ApfsStorageError> {
+        let source = source.id();
+        self.verify_controller_path(&layout.image(source))?;
+        let mount = layout.mount(source);
+        let mounted = self.mounted_at(&mount)?.is_some();
+        self.clone_build_volume_under_hold(
+            layout,
+            source,
+            destination,
+            registration,
+            mounted.then_some(mount.as_path()),
+        )
+    }
+
     /// Clone the build volume `claim` holds to `destination`, borrowing that claim through
     /// capture, the immutable freshness mark and the destination's record. A second exclusive
     /// claim on the same hold file would conflict with it, and an upgrade would reopen admission
@@ -595,6 +618,7 @@ where
                 crate::build_volume::nx::discard_daemon_records(&mount, &state).map_err(
                     |error| io_error("discard the seed's Nx daemon record", &mount, error),
                 )?;
+                state.discard_clone_invalid(&mount).map_err(host_error)?;
                 Ok((mount, capture_elapsed.max(elapsed)))
             });
         match mounted {

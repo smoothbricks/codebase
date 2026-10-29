@@ -347,6 +347,29 @@ impl DirectoryExecutionHost {
         }
     }
 
+    /// Mint under a retained exclusive creation claim; the caller publishes or releases it.
+    pub fn create_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+        _capacity: ImageCapacity,
+        registration: &Registration,
+    ) -> Result<PathBuf, ApfsStorageError> {
+        let id = claim.id();
+        let image = layout.image(id);
+        self.require_store_image(&image)?;
+        super::ensure_parent(&image)?;
+        layout
+            .register_claimed(claim, registration)
+            .map_err(host_error)?;
+        fs::create_dir(&image)
+            .map_err(|error| io_error("create claimed build volume payload", &image, error))?;
+        sync_parent_path(&image)?;
+        let mount = layout.mount(id);
+        bind(&image, &mount)?;
+        Ok(mount)
+    }
+
     /// Release `id`, whose registered creation failed with `primary`, joining a release that
     /// cannot run to `primary`; the registered record then stays for collection.
     fn unregister(
@@ -417,6 +440,20 @@ impl DirectoryExecutionHost {
     ) -> Result<(), ApfsStorageError> {
         self.require_store_image(&layout.image(source))?;
         self.clone_build_volume_under_hold(layout, source, destination, registration)
+    }
+
+    /// Directory counterpart of shared-source custody. The runtime owns the hold and image lock;
+    /// this controlled tree copy does not claim native point-in-time atomicity.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clone_shared_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        source: &crate::runtime::build_volumes::HeldVolume,
+        destination: &BuildVolumeId,
+        registration: &Registration,
+    ) -> Result<(), ApfsStorageError> {
+        self.require_store_image(&layout.image(source.id()))?;
+        self.clone_build_volume_under_hold(layout, source.id(), destination, registration)
     }
 
     fn clone_build_volume_under_hold(
@@ -608,6 +645,7 @@ impl DirectoryExecutionHost {
             let state = crate::build_volume::BuildVolumeState::read(&mount).map_err(host_error)?;
             crate::build_volume::nx::discard_daemon_records(&mount, &state)
                 .map_err(|error| io_error("discard the seed's Nx daemon record", &mount, error))?;
+            state.discard_clone_invalid(&mount).map_err(host_error)?;
             Ok(mount)
         });
         match mounted {

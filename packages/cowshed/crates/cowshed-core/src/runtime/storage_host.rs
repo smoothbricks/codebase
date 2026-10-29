@@ -55,10 +55,27 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         capacity: ImageCapacity,
         registration: &Registration,
     ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError>;
+    /// Mint a blank image while the caller retains its exclusive claim through publication.
+    fn create_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+        capacity: ImageCapacity,
+        registration: &Registration,
+    ) -> Result<PathBuf, ApfsStorageError>;
     fn clone_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         source: &BuildVolumeId,
+        destination: &BuildVolumeId,
+        registration: &Registration,
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError>;
+    /// Capture retained state while the caller keeps the source's existing shared volume hold
+    /// and lifecycle/image lock. Ordinary jobs may keep running; release and adoption cannot.
+    fn clone_shared_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        source: &super::build_volumes::HeldVolume,
         destination: &BuildVolumeId,
         registration: &Registration,
     ) -> Result<Option<std::time::Duration>, ApfsStorageError>;
@@ -178,6 +195,8 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         layout: &BuildVolumeLayout,
         source: &ReAdoptSource,
         build_claim: Option<&ReleaseClaim>,
+        mbx: Option<&Path>,
+        retention: &[crate::capabilities::BuildStatePath],
     ) -> Result<(), ApfsStorageError>;
 
     /// Rewrite a build image under its retained exclusive admission claim.

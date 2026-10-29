@@ -543,6 +543,23 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     .await?
             }
         };
+        // The replacement checkout now exists, so use the same Cargo convention, installed mbx
+        // and generated-shim authority as job admission, not historical build-state metadata.
+        let mbx = crate::capabilities::mbx::checkout_verdict(
+            &source.checkout,
+            &self.home,
+            crate::storage::bootstrap::native::provisioned_build_cache().as_deref(),
+        )?
+        .map(|(executable, _)| executable);
+        let retention = if mbx.is_some() {
+            crate::capabilities::seed_retention_paths(
+                &source.checkout,
+                &self.home,
+                &self.program_directories,
+            )?
+        } else {
+            Vec::new()
+        };
         // The replacement's build volume takes main's build identity, under main's lock. The
         // build claim moves into that publication and is released when its closure returns,
         // still under main's image lock: until then it keeps every new job hold on the recorded
@@ -558,7 +575,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         crate::api::held_lock::LockOperation::ReAdopt,
                         &WorkspaceName::main(),
                     ),
-                    move |host| host.publish_re_adopt_build(&layout, &source, build_claim.as_ref()),
+                    move |host| {
+                        host.publish_re_adopt_build(
+                            &layout,
+                            &source,
+                            build_claim.as_ref(),
+                            mbx.as_deref(),
+                            &retention,
+                        )
+                    },
                 )
                 .await
                 .map_err(native_storage_error)?;

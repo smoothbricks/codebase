@@ -138,7 +138,8 @@ impl BuildStateDiscovery {
 /// 6: a job that holds no `cargo` is one finding per shell, not one Cargo failure per manifest.
 /// 7: the job resolves `mbx`, and the canonical activation's input identity keys the answer.
 /// 8: installed host mbx supplies the Cargo route without a project opt-in.
-const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 8";
+/// 9: capabilities mark seed-retained subtrees and clone-invalid process files.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 9";
 
 /// The manifest whose directory, once installed, holds a JavaScript package's tool caches.
 const PACKAGE_MANIFEST: &str = "package.json";
@@ -1901,7 +1902,11 @@ printf '%s:%s\n' "$index" "$PWD"
         );
         assert_eq!(
             cargo_paths(&fixture).paths,
-            [BuildStatePath::new(".codegraph", "codegraph").unwrap()]
+            [BuildStatePath::new(".codegraph", "codegraph")
+                .unwrap()
+                .retain()
+                .discard_on_clone("writer.pid")
+                .unwrap()]
         );
         write(
             &fixture,
@@ -2119,7 +2124,11 @@ printf '%s:%s\n' "$index" "$PWD"
         let undeclared = tracked_manifest_fingerprint(&fixture.root).unwrap();
         assert_eq!(
             cargo_paths(&fixture).paths,
-            [BuildStatePath::new(".codegraph", "codegraph").unwrap()]
+            [BuildStatePath::new(".codegraph", "codegraph")
+                .unwrap()
+                .retain()
+                .discard_on_clone("writer.pid")
+                .unwrap()]
         );
         write(
             &fixture,
@@ -2133,7 +2142,11 @@ printf '%s:%s\n' "$index" "$PWD"
         assert_eq!(
             state.paths,
             [
-                BuildStatePath::new(".codegraph", "codegraph").unwrap(),
+                BuildStatePath::new(".codegraph", "codegraph")
+                    .unwrap()
+                    .retain()
+                    .discard_on_clone("writer.pid")
+                    .unwrap(),
                 BuildStatePath::declared("vendor/upstream").unwrap()
             ]
         );
@@ -2150,7 +2163,11 @@ printf '%s:%s\n' "$index" "$PWD"
         assert_eq!(
             cargo_paths(&fixture).paths,
             [
-                BuildStatePath::new(".codegraph", "codegraph").unwrap(),
+                BuildStatePath::new(".codegraph", "codegraph")
+                    .unwrap()
+                    .retain()
+                    .discard_on_clone("writer.pid")
+                    .unwrap(),
                 BuildStatePath::declared("tools/.pin").unwrap(),
                 BuildStatePath::declared("vendor/upstream").unwrap(),
             ]

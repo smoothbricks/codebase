@@ -7762,7 +7762,7 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
     use cowshed_core::build_volume::{
         BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link,
     };
-    use cowshed_core::capabilities::{BuildStatePath, RelPath};
+    use cowshed_core::capabilities::BuildStatePath;
     use cowshed_core::repository::ProjectPaths;
 
     let (mut supervisor_config, root) = nx_project("raven");
@@ -7800,14 +7800,8 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
     }
     link::point(&checkout, &before).unwrap();
     let paths = [
-        BuildStatePath {
-            checkout: RelPath::new(".nx/cache").unwrap(),
-            volume: RelPath::new("nx/cache").unwrap(),
-        },
-        BuildStatePath {
-            checkout: RelPath::new(".nx/workspace-data").unwrap(),
-            volume: RelPath::new("nx/workspace-data").unwrap(),
-        },
+        BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+        BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
     ];
     link::link_paths(&checkout, &before, &paths).unwrap();
     supervisor_config.sandbox.build_volume_mount = Some(before.clone());

@@ -11,7 +11,7 @@ use crate::{CowshedError, Result};
 use cache::{SharedLayout, SharedToolHome};
 
 mod build_state;
-pub use build_state::{BuildStatePath, DeclaredState, RelPath};
+pub use build_state::{BuildStatePath, DeclaredState, RelPath, SeedRetention};
 mod build_state_discovery;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use build_state_discovery::HostCargo;
@@ -1212,6 +1212,35 @@ pub fn mint_daemon_states(
         .contribution
         .daemon_isolation
         .discard_at_mint)
+}
+
+/// Current seed policies from capability contributions and declared state, without Cargo queries or shell activation.
+pub fn seed_retention_paths(
+    workspace: &Path,
+    home: &Path,
+    program_directories: &[PathBuf],
+) -> Result<Vec<BuildStatePath>> {
+    let private = workspace.join(".cowshed");
+    let runtime = private.join("run");
+    let build_cache = crate::storage::bootstrap::native::provisioned_build_cache();
+    let context = DetectionContext {
+        workspace_root: workspace,
+        project_root: workspace,
+        command_cwd: workspace,
+        home,
+        repository_caches: &[],
+        environment_root: &private,
+        runtime_dir: &runtime,
+        trust_bundle: None,
+        program_directories,
+        build_cache: build_cache.as_deref(),
+    };
+    let mut paths = detect_for_workspace(&context)?.contribution.build_state;
+    paths.extend(build_state_discovery::expand_declared(
+        workspace,
+        workspace_config(workspace)?.build_state(),
+    )?);
+    Ok(paths)
 }
 
 #[cfg(test)]

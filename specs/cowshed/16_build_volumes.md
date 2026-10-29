@@ -5,25 +5,26 @@ dependencies, every build tool's declared outputs) and a **build volume** (the b
 task cache with its database, package caches, the code index, declared build state, and the Cargo target directories of
 a project without mbx). A Cargo project with the mbx capability keeps its compiler work out of both: mr boxington (mbx)
 holds it in one content-addressed store per host and one managed target directory per checkout, on the host's
-build-cache volume (01a_apfs.md, "Dedicated build-cache volume"). A fork clones both volumes and is warm for every task
-main built, and restores every Cargo unit any checkout stored. A land moves main to the build volume the landing
-workspace already built, by renaming one link: main builds nothing that the workspace built, and nothing is copied. This
-spec states that model, every rule that keeps it warm, why each rule exists, and how each is enforced. It is the one
-place these rules live; other specs cite it.
+build-cache volume (01a_apfs.md, "Dedicated build-cache volume"). In an mbx project a seed carries only build state
+whose capability marks it retained; other caches start empty. CodeGraph indexes and declared snapshot pins travel, Nx
+rebuilds its cache, and Cargo restores actions from mbx. Other projects clone their full warm seed. A land adopts the
+landing workspace's build volume by renaming one link; main builds nothing that the workspace built. This spec states
+that model, every rule that keeps it warm, why each rule exists, and how each is enforced. It is the one place these
+rules live; other specs cite it.
 
 ## Goal
 
-- **Fork in milliseconds, warm.** `cowshed fork` clones images (milliseconds; 01a_apfs.md "Images") and attaches them (a
-  fraction of a second each, independent of how many images the host has attached). Every Nx task main ran is a cache
-  hit in the fork: the fork reseeds main first when main's volume holds work its seed does not (Targets and seeds).
-  Every Cargo unit is restored from the mbx store instead of compiled, or, in a project without mbx, is `Fresh` in the
-  cloned volume. Only the fork's own edits invalidate anything, and exactly what the same edit would invalidate on main.
+- **CoW forks, retained warmth.** `cowshed fork` clones the source and prepared build-seed images. Without mbx, the full
+  warm seed carries Nx task hits and Cargo's incremental state, refreshed by the named writer protocol below. With mbx,
+  preparing a fresh seed selectively copies retained paths; that copy is part of fork preparation, not a promise of a
+  millisecond whole-state refresh. Retained indexes and declared pins travel, while Nx and package caches start empty.
+  Cargo restores compiled actions from mbx. Each tool's own fingerprints decide what it can reuse.
 - **Land in milliseconds.** A land runs no build on main. The landing workspace has already built and checked the exact
   tree main moves to; main takes that workspace's build volume by one `rename(2)`.
-- **Nothing copied, nothing patched, nothing extra in the environment.** No cache entries are copied between checkouts:
-  a land adopts the landing volume as it is, and what other lands ran reaches a fork through the project's Nx cache
-  (05_gateway.md, "/nx/v1/cache/{hash}") and the mbx store. Nx and Cargo run unmodified, Cargo through mbx exactly as
-  mbx documents. A process learns nothing about cowshed: it reads the same paths it always reads.
+- **No land-time cache merging or tool patching.** A land adopts the landing volume intact by moving one link. Non-mbx
+  forks clone full warm seeds; mbx seed preparation explicitly copies only capability-marked retained paths (Targets and
+  seeds), never old Cargo/Nx caches. Rebuildable task results can be restored through the project's Nx cache
+  (05_gateway.md, "/nx/v1/cache/{hash}") and mbx store. Tools keep their normal paths and protocols.
 - **Generic.** Build volumes come from capability detection (15_capabilities.md), not from a project's configuration. A
   project that uses Nx, Cargo, Go, ttsc, zig or none of them gets exactly the build state its tools have.
 - **Bounded.** Every build volume and every cache inside one has an owner that deletes it. mbx owns its store and its
@@ -43,12 +44,15 @@ each of them.
    fragments it while forks share its blocks, so main's source image stays fast to clone only while main stays still:
    dependencies installed only when the lockfile changes, never wiped or force-reinstalled, and builds run in sheds. A
    fork whose source clone takes more than 4 s says so and names the paths to look at and `cowshed defrag main`
-   (01a_apfs.md, "Clone cost follows extents, not size"). Build volumes are not replaced by anything that sheds extents:
-   a fork clones its target's seed, a land adopts the landing volume and a seed is captured from it, so every build
-   volume inherits its parent's extent map and adds its own churn. SmoothBricks' main seed went from 434,000 to 881,000
-   extents in four days, and reached 1.2 million extents and 397.7 GB allocated by 2026-10-27, when its `mount_apfs`
-   outran the 120 s deadline. Nearly all of that churn was Cargo's `target/`, which an mbx project keeps on the
-   build-cache volume instead (item 4). Seed compaction (Targets and seeds) bounds what lineage remains.
+   (01a_apfs.md, "Clone cost follows extents, not size"). Non-mbx full seeds preserve their source extent lineage: a
+   fork clones its target's seed, a land adopts the landing volume and a seed is captured from it, so every build volume
+   inherits its parent's extent map and adds its own churn. SmoothBricks' main seed went from 434,000 to 881,000 extents
+   in four days, and reached 1.2 million extents and 397.7 GB allocated by 2026-10-27, when its `mount_apfs` outran the
+   120 s deadline. Nearly all of that churn was Cargo's `target/`, which an mbx project keeps on the build-cache volume
+   instead (item 4). For non-mbx seeds, compaction (Targets and seeds) bounds the remaining lineage. In an mbx project,
+   only the temporary snapshot inherits the live source's full extent map. Retained subtrees are copied into a blank
+   seed with its own extent lineage, then the snapshot is released. This does not rewrite, compact or discard the warm
+   live build volume; its contents and extent map remain its own until ordinary adoption or release.
 2. **Without build volumes, a land rebuilds main from scratch, or main is never warm.** A workspace builds and checks
    its work, lands, and then main has to build the same tree again before the next fork can start warm. A warm step for
    main would be a background job that can fail, queue, or be skipped; while it lags, every fork starts cold, and
@@ -70,22 +74,23 @@ each of them.
 
 ### What lives where
 
-| State                                                                                                                                                                                               | Volume                                                                                  | Shared how                                                                             |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                                                                      | Source volume                                                                           | Cloned with the workspace image                                                        |
-| Cargo target directories of a project without the mbx capability; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                                                                            | Cloned at fork; adopted by main at land                                                |
-| Cargo target directory of a project with the mbx capability                                                                                                                                         | mbx's managed target for the checkout, `<build-cache>/mbx/targets/v1/<checkout digest>` | Per checkout, never travels; restored from the mbx store by content                    |
-| Cargo compiled actions, build-script runs, host links, learned incremental state                                                                                                                    | The mbx store, `<build-cache>/mbx`                                                      | One per host, written and read by every checkout (03_caches.md)                        |
-| Codegraph's per-tree `.codegraph/` index                                                                                                                                                            | Build volume                                                                            | Cloned at fork; adopted by main at land                                                |
-| Node/Bun module compile cache (`NODE_COMPILE_CACHE`)                                                                                                                                                | Workspace's private XDG cache (03_caches.md)                                            | Read-write/host cache cloned with source; read-only cache retired with owned exec-temp |
-| Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                                                              | Build volume                                                                            | Cloned at fork; adopted by main at land                                                |
-| Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                                                         | Per checkout, never travels                                                             | Deleted from a build volume before main adopts it (below)                              |
-| Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv)                                                                                                         | Shared cache paths (03_caches.md)                                                       | Written once, read by every checkout; never in any image                               |
+| State                                                                                                                                                                                               | Volume                                                                                  | Shared how                                                                                 |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                                                                      | Source volume                                                                           | Cloned with the workspace image                                                            |
+| Cargo target directories of a project without the mbx capability; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                                                                            | Non-mbx: cloned at fork; mbx: starts empty; live volume adopted at land                    |
+| Cargo target directory of a project with the mbx capability                                                                                                                                         | mbx's managed target for the checkout, `<build-cache>/mbx/targets/v1/<checkout digest>` | Per checkout, never travels; restored from the mbx store by content                        |
+| Cargo compiled actions, build-script runs, host links, learned incremental state                                                                                                                    | The mbx store, `<build-cache>/mbx`                                                      | One per host, written and read by every checkout (03_caches.md)                            |
+| Codegraph's per-tree `.codegraph/` index                                                                                                                                                            | Build volume                                                                            | Retained in selective mbx seeds; full warm seed otherwise; adopted at land                 |
+| Node/Bun module compile cache (`NODE_COMPILE_CACHE`)                                                                                                                                                | Workspace's private XDG cache (03_caches.md)                                            | Read-write/host cache cloned with source; read-only cache retired with owned exec-temp     |
+| Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                                                              | Build volume                                                                            | Retained in selective mbx seeds; full warm seed otherwise; absent declarations stay absent |
+| Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                                                         | Per checkout, never travels                                                             | Deleted from a build volume before main adopts it (below)                                  |
+| Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv)                                                                                                         | Shared cache paths (03_caches.md)                                                       | Written once, read by every checkout; never in any image                                   |
 
 The build volume holds exactly the state a build tool keeps **for one tree and keys by its own fingerprints**: state
-that is correct to reuse for any tree the tool checks against, but costly to rebuild and useless to share between two
-writers at once. Content-addressed caches, whose entries are immutable and valid for every checkout, stay shared
-(03_caches.md). Declared task outputs stay on the source volume (rule "Nx outputs never live in the build volume").
+that is correct to reuse for any tree the tool checks against, but costly to rebuild and private to one checkout. Jobs
+in that checkout share the tools' concurrency protocols; independent checkouts have separate build volumes.
+Content-addressed caches, whose entries are immutable and valid for every checkout, stay shared (03_caches.md). Declared
+task outputs stay on the source volume (rule "Nx outputs never live in the build volume").
 
 Module compilation uses the already-owned private environment cache, not a new build-state volume or a loose directory
 under `TMPDIR`. Its runtime-versioned bytes remain reconstructible and retain that cache root's clone and retirement
@@ -355,36 +360,62 @@ A **target** is any workspace that other workspaces fork from and land into: mai
 on top of it — a lane base, the base of a stack of changes (a PR stack), a merge-queue head (02_workspaces.md "Lanes").
 Everything below holds for every target alike; main is the target at the root.
 
-A **seed** is a build volume nobody writes: a target's frozen build state at one landed tree. **Each target has its own
-latest seed.** Every fork of a target clones that target's seed, never an unguarded live build volume. Capture retains
-closed supervised admission and the Nx and existing Cargo-profile protocol guards while descriptor-cloning the mounted
-image through the same block-atomic live-capture path as source images. The resulting APFS seed stays detached.
+A **seed** is a build volume nobody writes. **Each target has its own latest seed.** Every fork clones that seed, never
+an unguarded live build volume. In a project with mbx, a seed carries only build state whose capability marks it
+retained: the CodeGraph index and declared state such as sealed snapshot pins and patch-development checkouts.
+Everything else starts empty, including Cargo target output, Nx cache and task databases, and package tool caches.
+Retention belongs to the build-state contribution, not a storage-side list of tool names. The declared-state contributor
+marks its paths retained; other capabilities opt in explicitly. Legacy records without a retention mark require
+canonical rediscovery before seeding, rather than guessing from path spelling.
 
-A target's seed is made when the target is created (a clone of the seed it was forked from, or of its first build volume
-at its first touch), and **every gated land into the target refreshes it from the landing workspace's build volume** (an
-ungated fold into a lane base leaves it as it was, "Ungated folds"): `cowshed land` captures the guarded landing volume
-before the target adopts it (Land step 5.4). A named Nx or Cargo holder refuses capture without publishing a replacement
-seed. A land made outside cowshed, a plain fast-forward of the target's branch to a tree a live workspace has checked
-out (an **external land**), makes that workspace's volume the seed at the target's next fork (Which volume a seed holds,
-below). Between lands a **reseed**, the first step of every fork of the target (Fork step 2), refreezes the seed from
-the target's live volume when that volume holds a write the seed does not and is not farther from the fork's tree.
-Stopping supervised jobs alone is not writer exclusion: the named Nx and Cargo protocols must also admit capture. Each
-target keeps only its latest seed; a target's seed is deleted when the target retires.
+A retained seed starts as a blank image at the live volume's capacity. Its retained subtrees are copied whole from one
+atomic CoW image snapshot of the source. Normal mbx refresh/capture holds the existing lifecycle/image lock and takes a
+shared hold on the source volume without waiting: that hold prevents release, and the lock excludes adoption. Existing
+jobs, kept shell hosts and transactional writers do not refuse or stop for retained-only capture; the shared guard stays
+alive through the immutable snapshot. An exclusive lifecycle claim still refuses capture by holder and path, without
+falling back to an old full-cache seed. Quiet landing capture and re-adoption borrow their existing admission/claim
+authority unchanged. The named non-transactional writer exclusions below remain the protocol for non-mbx warm capture.
 
-**No manual seed refresh or warm step exists.** Apart from the explicit re-adoption rule below, every seed refresh is a
-step of a land or of a fork: there is no command that refreezes one, no background warm build in the target, and no land
-script step. A land script that fast-forwards the target's branch itself is an external land, and the next fork takes
-care of it.
+This is not a whole-image rewrite: old Cargo/Nx blocks are shared only by the temporary snapshot, not copied into the
+new seed. The source snapshot and superseded seeds go through the ordinary single released-image owner. The finished
+seed is detached before publication. Cowshed does not change the live source or its writer identity files; source jobs
+remain free to make their own writes. Clone-invalid cleanup touches only the new seed or fork.
+
+SQLite database, WAL and SHM files travel together, as the existing block-atomic snapshot contract requires. No
+checkpoint or lock handoff is introduced: recovery on first open makes that snapshot crash-consistent. Each capability
+may declare clone-invalid process-identity files relative to its own build-state path. They are removed only from the
+new seed and new fork/refork mount, never the source. CodeGraph declares only writer.pid; no CodeGraph filename is
+hardcoded in generic storage. Unrecorded retention or escaping clone-invalid paths refuse with the owner and path named.
+
+The capture and freshness rules below apply only to projects without mbx. Their seed is frozen build state at one landed
+tree. Capture retains closed supervised admission and the Nx and existing Cargo-profile protocol guards while
+descriptor-cloning the mounted image through the source-image live-capture path. The resulting seed stays detached.
+
+In a project without mbx, a target's seed is made when the target is created (a clone of the seed it was forked from, or
+of its first build volume at its first touch), and **every gated land into the target refreshes it from the landing
+workspace's build volume** (an ungated fold into a lane base leaves it as it was, "Ungated folds"): `cowshed land`
+captures the guarded landing volume before the target adopts it (Land step 5.4). A named Nx or Cargo holder refuses
+capture without publishing a replacement seed. A land made outside cowshed, a plain fast-forward of the target's branch
+to a tree a live workspace has checked out (an **external land**), makes that workspace's volume the seed at the
+target's next fork (Which volume a seed holds, below). Between lands a **reseed**, the first step of every fork of the
+target (Fork step 2), refreezes the seed from the target's live volume when that volume holds a write the seed does not
+and is not farther from the fork's tree. Stopping supervised jobs alone is not writer exclusion: the named Nx and Cargo
+protocols must also admit capture. Each target keeps only its latest seed; a target's seed is deleted when the target
+retires.
+
+**No manual warm step exists.** A land or fork refreshes a seed. No background build warms the target and no land script
+captures it. A plain Git fast-forward outside cowshed is an external land; the next fork handles it. In an mbx project
+only marked retained state travels; a live cache write never causes rebuildable state to enter the seed.
 
 Re-adoption preserves the live BuildVolumeId, its owner record, tree and creation time, and carries its warm filesystem
 into RAW at the capacity recorded from the kernel before detach (02_workspaces.md §Re-adoption). It leaves every
 old-incarnation seed unchanged as retained evidence, rather than relabeling it as a seed of the new incarnation. The new
-main receives one fresh RAW seed captured from its verified warm replacement under the same writer exclusion as every
-seed. This explicit retained evidence is not an active latest seed and is never silently collected as one. Re-adoption
-carries its existing exclusive source `ReleaseClaim` into build publication. A RAW source and its RAW replacement share
-the canonical hold resource, so registration and an empty replacement's mint borrow that claim instead of taking a
-conflicting shared creation hold. Capture borrows it through seal, restore and the immutable seed mark instead of taking
-a second exclusive claim.
+main receives one fresh RAW seed: capability-retained state only under mbx, otherwise captured from the verified warm
+replacement under the usual writer exclusion. Retained evidence is not an active latest seed and is never silently
+collected as one. Re-adoption carries its existing exclusive source `ReleaseClaim` into build publication. A RAW source
+and its RAW replacement share the canonical hold resource, so registration and an empty replacement's mint borrow that
+claim instead of taking a conflicting shared creation hold. Capture borrows it through seal, restore and the immutable
+seed mark instead of taking a second exclusive claim.
 
 **Why a reseed.** A land freezes the seed before the target runs anything on the adopted volume. Everything the target
 runs afterwards (its own builds and gates, the land's output restoration, a developer's build in main) is written to its
@@ -404,8 +435,8 @@ live volume mounts; the mount's own writes can leave it reading behind, and the 
 as any behind seed — no flush on the fork path samples a live clock to pre-pay that. Output restoration and later work
 on an adopted volume reach the seed through the next fork's reseed.
 
-**A reseed excludes the named non-transactional writers, not every open file.** It runs under the target's image lock,
-which every fork of the target holds while it clones the seed, so a reseed never deletes a seed a fork is cloning:
+**A non-mbx reseed excludes the named non-transactional writers, not every open file.** It runs under the target's image
+lock, which every fork of the target holds while it clones the seed, so a reseed never deletes a seed a fork is cloning:
 
 1. the source's build hold (`<id>.dmg.hold`, outside its mounted filesystem) is taken exclusively without waiting,
    before anything else; an admitted job holding it skips the capture before any image mutation, retaining the old seed,
@@ -415,10 +446,9 @@ which every fork of the target holds while it clones the seed, so a reseed never
 2. the target's Nx task database may have no holder but the target's daemon, which is stopped as at an adoption (Land
    step 5); any other holder, or a daemon that outlives its stop, skips the reseed. The Nx database open locks remain
    held through capture so another client cannot open a known task database between the holder check and the clone;
-3. in a project without the mbx capability, every existing Cargo profile's `.cargo-lock` is taken exclusively without
-   waiting; Cargo holds that lock shared for its whole build, so a held one skips the reseed with its lock path and
-   processes. The admitted profile locks remain held through capture. Under mbx this step is empty: no Cargo state is in
-   the build volume;
+3. every existing Cargo profile's `.cargo-lock` is taken exclusively without waiting; Cargo holds that lock shared for
+   its whole build, so a held one skips the reseed with its lock path and processes. The admitted profile locks remain
+   held through capture;
 4. the live volume and its backing image are flushed, then the existing mounted-source descriptor-clone captures the
    image atomically. Capture does not require unmount or detach; open files on exempt contributed paths do not refuse
    it. The Nx and Cargo guards remain held until the cloned bytes and immutable freshness mark are fixed;
@@ -526,6 +556,9 @@ precedence; lifecycle seed lookups remain fresh.
   names the process holding the hold.
 
 ### Seed compaction
+
+An mbx project's seed is built from retained subtrees into blank storage and is never compacted. Neither foreground
+advice nor explicit compaction rewrites it. The remainder of this section governs projects without mbx.
 
 A seed is detached and immutable, so rewriting it into contiguous space stops no live shell. Necessary main-seed capture
 or attach/mount work **strictly over 10 seconds** advises the existing background compactor, at a foreground fork of
@@ -664,13 +697,20 @@ caught up to (Catch-up); a later qualifying foreground operation can advise anot
 
 ### Source and build state arrive together
 
-A workspace keeps its own build volume through rebase and gate. A newer warm baseline arrives through a fresh fork,
-which carries the source tree and its build state together; there is no target-only build-volume replacement command and
-no land-time build-volume picker. This preserves ordinary mtime freshness without touching source metadata, with one
-exception: a land harmonizes the target checkout's source mtimes with the landing checkout's before it freezes the
-landing volume as the target's seed, the one place cowshed writes a source file's metadata (Land step 5.3). Compaction's
-internal move onto the workspace's own seed is different: it proves that the old build volume holds no write the seed
-lacks, before cloning and immediately before sealing (Seed compaction).
+A workspace keeps its own build volume through rebase and gate. In a project without mbx a newer warm baseline arrives
+through a fresh fork; there is no warm build-volume picker. In an mbx project a fork carries only capability-retained
+state, while the live volume of an existing checkout stays warm: seed replacement neither replaces that volume nor
+deletes anything in it. Retired or landed workspaces release their volumes through retirement and garbage collection,
+never a live-cache reset.
+
+A land still harmonizes source mtimes with the landing checkout's (Land step 5.3), the only place cowshed changes a
+source file's metadata. Non-mbx compaction's internal move onto the workspace's own seed proves that no write would be
+lost (Seed compaction).
+
+Declared build state may hold authority: sealed developer-link snapshots and ignored patch-development repositories
+("Declared build state"). Main keeps its live sealed pins, and the declared-state contributor retains those paths in a
+seed. A checkout missing a newly captured fixed pin imports it from main under specs/cli/01_workspace_reconciliation.md,
+"Declared developer link pins"; it never recaptures a missing ID.
 
 ### Clearing a checkout's Nx state
 
@@ -701,11 +741,12 @@ workspace. All sources use one mint path, carrying edits and untracked files war
 / `--ref` (02).
 
 1. Flush and descriptor-clone the target's live RAW source image without detaching it (02_workspaces.md). Source
-   filesystem crash consistency does not replace build-state writer exclusion. The fork holds the target's image lock
-   from here until step 3's capture.
-2. **Refresh the target's seed** (Targets and seeds, "Which volume a seed holds"): from a landed workspace's volume
-   after an external land, else by a reseed from the target's live volume when that is nearer or as near and newer and
-   has no writer.
+   filesystem crash consistency is separate from the selected build-state capture protocol. The fork holds the target's
+   image lock from here until step 3's capture.
+2. **Refresh the target's seed** (Targets and seeds): mbx projects take a fresh retained-state snapshot under shared
+   source custody, without refusing ordinary source jobs. Non-mbx projects refresh from a landed workspace after an
+   external land, else reseed from the target's live volume according to the existing tree/freshness comparison and
+   named non-transactional writer exclusions ("Which volume a seed holds").
 3. Capture **the target's** latest seed image into a new build volume owned by the new workspace: register it and
    `clonefile` the seed, nothing more, and let go of the target's image lock. Then, reading only the clone, prove it
    forkable, publish and attach it, and point the workspace's `.cowshed/build` at it. Clones preserve every file's bytes
@@ -718,10 +759,11 @@ The lock covers what reads the target: the clone of its image, its seed refresh 
 hold, so the clone's checkout and its build volume come from one state of the target that no land or reseed changes
 between them. Nothing under the lock writes a clone of the fork's own: a clone's first mutation, whatever and wherever
 it is, makes APFS copy the whole extent list it shares with its source, and only that first mutation pays; it is the
-clone's read-write mount, after the lock is let go, so the hold is the `clonefile`s'. A step 2 reseed captures, proves
-and publishes the target's new seed under the lock, which a fork does only when the target's live volume is nearer its
-tree than the seed. The hold is said as `cowshed: apfs source-lock held=<duration>`. A git-worktree fork keeps the lock
-to the end: its initializer registers it in main's repository.
+clone's read-write mount, after the lock is let go, so the hold is the `clonefile`s'. Step 2 prepares, proves and
+publishes the target's new seed under that lock. Non-mbx reseeding follows the tree/freshness comparison above; mbx
+refresh instead copies only retained state from a shared-custody snapshot while source jobs may continue. The hold is
+said as `cowshed: apfs source-lock held=<duration>`. A git-worktree fork keeps the lock to the end: its initializer
+registers it in main's repository.
 
 After the lock is let go, the build volume's attach and mount run beside the cloned image's attach and mount: every
 attach waits in the host's one `storagekitd` queue (01a_apfs.md "How the APFS host degrades"), and the two in flight
@@ -729,10 +771,11 @@ together wait in it once. The new workspace's own seed is a clone of its live vo
 it holds exactly what the target's seed held. The checkout's link is written only once its checkout is staged; a fork
 that never stages, or whose mount fails after publication, releases the volumes made for it.
 
-The fork is warm for everything the seed's volume held when it was last frozen: at the latest land, at the next fork
-after an external land, or at the latest reseed, which is this fork's own step 2 unless the target's volume had a writer
-or is farther from the fork's tree than the seed. If the fork's tree has moved past its seed's (a land skipped its
-freeze, or `--ref` names a tree no volume was built at), the fork builds the difference incrementally, as an edit would.
+Without mbx, the fork is warm for everything its full seed held when last frozen: at the latest land, after an external
+land, or at the latest admitted reseed. If its tree has moved past the seed's, it builds the difference incrementally,
+as an edit would. An mbx fork inherits only retained paths from its selective seed: rebuildable Nx/package state starts
+empty, and Cargo restores compiled actions from the host's mbx store. Existing normal source jobs do not make that
+retained-only refresh fall back to an older full-cache seed.
 
 ## Land: `cowshed land`
 

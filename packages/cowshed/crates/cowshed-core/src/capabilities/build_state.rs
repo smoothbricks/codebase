@@ -6,7 +6,7 @@
 //! detect, such as a patch-development checkout of an upstream project and its build tree, or a
 //! per-package trace store. Both are the same contract and travel the same way.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::{CowshedError, Result};
@@ -40,10 +40,24 @@ impl RelPath {
 /// `declared/<checkout path>`, apart from every tool's own volume names.
 const DECLARED: &str = "declared";
 
+/// Whether a capability's per-tree state travels into an mbx seed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SeedRetention {
+    /// A legacy state record needs canonical rediscovery before a seed can discard anything.
+    #[default]
+    Unrecorded,
+    Rebuild,
+    Retain,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildStatePath {
     pub checkout: RelPath,
     pub volume: RelPath,
+    pub retention: SeedRetention,
+    pub clone_invalid: Vec<RelPath>,
 }
 
 impl BuildStatePath {
@@ -51,6 +65,8 @@ impl BuildStatePath {
         Ok(Self {
             checkout: RelPath::new(checkout)?,
             volume: RelPath::new(volume)?,
+            retention: SeedRetention::Rebuild,
+            clone_invalid: Vec::new(),
         })
     }
 
@@ -82,7 +98,25 @@ impl BuildStatePath {
         Ok(Self {
             volume: RelPath(Path::new(DECLARED).join(&path)),
             checkout: RelPath(path),
+            retention: SeedRetention::Retain,
+            clone_invalid: Vec::new(),
         })
+    }
+
+    /// Keep this capability-owned subtree in a seed instead of rebuilding it.
+    pub fn retain(mut self) -> Self {
+        self.retention = SeedRetention::Retain;
+        self
+    }
+
+    pub fn retained(&self) -> bool {
+        self.retention == SeedRetention::Retain
+    }
+
+    /// A process-identity file relative to this path, removed only from a new clone.
+    pub fn discard_on_clone(mut self, relative: &str) -> Result<Self> {
+        self.clone_invalid.push(RelPath::new(relative)?);
+        Ok(self)
     }
 
     /// Whether this is declared build state ([`Self::declared`]) rather than a capability's.

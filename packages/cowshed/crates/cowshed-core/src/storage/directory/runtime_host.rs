@@ -15,7 +15,7 @@ use crate::build_volume::{
 };
 use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use crate::repository::RepoId;
-use crate::runtime::build_volumes::Quiet;
+use crate::runtime::build_volumes::{HeldVolume, Quiet};
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::storage::apfs::native::{BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease};
 use crate::storage::apfs::{ApfsStorageError, Labelled};
@@ -59,6 +59,21 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         DirectoryExecutionHost::create_build_volume(self, layout, id, capacity, registration)
     }
 
+    fn create_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+        capacity: ImageCapacity,
+        registration: &Registration,
+    ) -> Result<PathBuf, ApfsStorageError> {
+        DirectoryExecutionHost::create_claimed_build_volume(
+            self,
+            layout,
+            claim,
+            capacity,
+            registration,
+        )
+    }
     fn clone_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -68,6 +83,23 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
     ) -> Result<Option<std::time::Duration>, ApfsStorageError> {
         DirectoryExecutionHost::clone_build_volume(self, layout, source, destination, registration)
             .map(|()| None)
+    }
+
+    fn clone_shared_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        source: &HeldVolume,
+        destination: &BuildVolumeId,
+        registration: &Registration,
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError> {
+        DirectoryExecutionHost::clone_shared_build_volume(
+            self,
+            layout,
+            source,
+            destination,
+            registration,
+        )
+        .map(|()| None)
     }
 
     fn clone_quiet_build_volume(
@@ -233,6 +265,8 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _layout: &BuildVolumeLayout,
         _source: &ReAdoptSource,
         _build_claim: Option<&ReleaseClaim>,
+        _mbx: Option<&Path>,
+        _retention: &[crate::capabilities::BuildStatePath],
     ) -> Result<(), ApfsStorageError> {
         Err(unsupported("re-adoption"))
     }

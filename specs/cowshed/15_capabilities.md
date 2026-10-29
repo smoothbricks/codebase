@@ -213,7 +213,13 @@ Each detector returns data through one `CapabilityContribution`:
   convention a detector could read — a patch-development checkout of an upstream project and its multi-GiB incremental
   build tree is just an ignored directory, a per-package trace store just a cache directory — yet it is exactly what
   belongs on the build volume. A declaration overlapping a capability's build state, holding tracked source, or reaching
-  outside the checkout is refused with its remedy.
+  outside the checkout is refused with its remedy. Each path also carries its capability-owned seed retention policy:
+  rebuild by default, retained only when the contributor marks it. CodeGraph retains its complete index; the
+  declared-state contributor retains declarations, including sealed pins and patch-development checkouts. Cargo and Nx
+  state are rebuildable in mbx seeds. The same contribution may name normalized clone-invalid process files relative to
+  its own path. Generic seed/fork storage removes those files only on the new volume; CodeGraph declares writer.pid, not
+  its database, WAL or SHM. Legacy records missing retention require canonical rediscovery; no storage-side tool-name
+  inference supplies the policy.
 - **Daemon isolation:** private directories to create and workspace-relative inherited state to discard at mint. The
   detector owns the convention-specific paths; the clone implementation only applies the returned paths.
 - **Unix sockets:** canonical, individually admitted host service sockets. No wildcard socket grants or in-sandbox

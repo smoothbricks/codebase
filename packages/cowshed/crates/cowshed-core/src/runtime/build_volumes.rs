@@ -11,6 +11,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -27,7 +28,7 @@ use crate::build_volume::{
     BuildVolumeRole, BuildVolumeStage, BuildVolumeState, CapturedBuildVolume, Registrant,
     Registration, ReleaseClaim, SeedRecords, TrackedBuildStateRefusal, cargo, link, nx,
 };
-use crate::capabilities::BuildStatePath;
+use crate::capabilities::{BuildStatePath, SeedRetention};
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 #[cfg(test)]
 use crate::storage::apfs::ApfsExecutionHost;
@@ -84,13 +85,49 @@ pub(crate) struct Links {
     pub checkouts: BTreeMap<WorkspaceName, PathBuf>,
 }
 
-/// The landing workspace's volume, held for its land from before the landing workspace's jobs
-/// stop until the target's link and record name it (Land steps 4–6): no collection, in this
-/// process or another, releases it meanwhile, whatever links it read before the move.
+/// A volume coupled to its shared job/GC hold. The hold prevents release; the caller's
+/// lifecycle/image lock separately excludes adoption. Writer admission remains open unless
+/// another capability, such as Quiet's stopped supervisor lease, closes it.
 #[derive(Debug)]
-pub(crate) struct Landing {
+pub(crate) struct HeldVolume {
     id: BuildVolumeId,
     hold: BuildVolumeHold,
+}
+
+impl HeldVolume {
+    pub(crate) fn id(&self) -> &BuildVolumeId {
+        &self.id
+    }
+
+    /// Retained-state snapshots are transactional and need custody, not all-job exclusion.
+    /// An exclusive lifecycle claimant still refuses without waiting or reusing an old seed.
+    fn for_seed(
+        host: &impl RuntimeStorageHost,
+        layout: &BuildVolumeLayout,
+        id: BuildVolumeId,
+    ) -> Result<Self> {
+        match layout.admit(&id) {
+            Ok(hold) => Ok(Self { id, hold }),
+            Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
+                let path = layout.hold_path(&id);
+                let holders = nx::holders(host.census(), &path)
+                    .map_err(|error| io("name retained source lifecycle holders", &path, &error))?;
+                Err(CowshedError::conflict(
+                    format!(
+                        "cannot take shared seed custody of build volume {id} at {}: {error}; lifecycle holder: {}",
+                        path.display(),
+                        seed_move::named(&holders)
+                    ),
+                    "let the named lifecycle operation finish, then retry the fork; no jobs were stopped and no old seed was substituted",
+                ))
+            }
+            Err(error) => Err(io(
+                "hold a retained seed's source",
+                &layout.hold_path(&id),
+                &error,
+            )),
+        }
+    }
 }
 
 /// The landing volume after supervised jobs and Nx settle (Land step 4), held against GC and
@@ -1001,24 +1038,37 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     };
                     lent.published(&id);
                     if layout.seed_of(&owner.name, &owner.incarnation)?.is_none() {
-                        host.clone_build_volume(
-                            layout,
-                            &id,
-                            &BuildVolumeId::mint(),
-                            &Registration::new(
-                                BuildVolumeRecord::new(
-                                    None,
-                                    BuildVolumeRole::Seed {
-                                        target: owner.name,
-                                        incarnation: owner.incarnation.clone(),
+                        let state = BuildVolumeState::read(&layout.mount(&id))?;
+                        if state.mbx.is_some() {
+                            let source = HeldVolume::for_seed(host, layout, id.clone())?;
+                            let superseded = retained_seed(
+                                host,
+                                layout,
+                                &owner,
+                                SeedCapture::Shared(&source),
+                                &state,
+                            )?;
+                            retire_seeds(host, layout, superseded)?;
+                        } else {
+                            host.clone_build_volume(
+                                layout,
+                                &id,
+                                &BuildVolumeId::mint(),
+                                &Registration::new(
+                                    BuildVolumeRecord::new(
+                                        None,
+                                        BuildVolumeRole::Seed {
+                                            target: owner.name,
+                                            incarnation: owner.incarnation.clone(),
+                                        },
+                                    ),
+                                    Registrant::Workspace {
+                                        incarnation: owner.incarnation,
                                     },
                                 ),
-                                Registrant::Workspace {
-                                    incarnation: owner.incarnation,
-                                },
-                            ),
-                        )
-                        .map_err(storage)?;
+                            )
+                            .map_err(storage)?;
+                        }
                     }
                     return Ok(Ok(BuildStateRefresh {
                         volume: Some(id),
@@ -1383,12 +1433,12 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// Hold the volume `checkout` links for its land (Land step 4), or `None` when it links
     /// none. Taken before the landing workspace's jobs stop, so the volume is never without a
     /// hold between their release of it and the target's link naming it.
-    pub fn hold_landing(&self, checkout: &Path) -> Result<Option<Landing>> {
+    pub fn hold_landing(&self, checkout: &Path) -> Result<Option<HeldVolume>> {
         let Some(id) = self.layout.linked(checkout)? else {
             return Ok(None);
         };
         match self.layout.hold(self.host.census(), &id) {
-            Ok(hold) => Ok(Some(Landing { id, hold })),
+            Ok(hold) => Ok(Some(HeldVolume { id, hold })),
             Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
                 Err(CowshedError::conflict(
                     format!("cannot hold the landing build volume for the land: {error}"),
@@ -1412,13 +1462,13 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// landing hold and stopped socket lease go with the quiet volume.
     pub async fn quiesce(
         &self,
-        landing: Landing,
+        landing: HeldVolume,
         stopped: super::supervisor_socket::BoundSocket,
         target_checkout: PathBuf,
     ) -> Result<std::result::Result<Quiet, AdoptionSkip>> {
         let target = self.layout.linked(&target_checkout)?;
         self.blocking(move |host, layout| {
-            let Landing { id, hold } = landing;
+            let HeldVolume { id, hold } = landing;
             let (mount, _) = host.mount_build_volume(layout, &id).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
             // Read-only: the landing's daemon was stopped by the land's ledger-proven plan before this
@@ -1550,6 +1600,28 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     ) -> Result<Refreshed> {
         let this = self.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
+            if let Some((live, state)) = this.state_of(&checkout)?
+                && state.mbx.is_some()
+            {
+                let started = Instant::now();
+                let source = HeldVolume::for_seed(&*this.host, &this.layout, live)?;
+                let superseded = retained_seed(
+                    &*this.host,
+                    &this.layout,
+                    &target,
+                    SeedCapture::Shared(&source),
+                    &state,
+                )?;
+                return Ok(Refreshed {
+                    passed: Vec::new(),
+                    outcome: Refresh::Reseeded {
+                        behind_ms: None,
+                        elapsed_ms: millis(started.elapsed()),
+                        operation_elapsed: None,
+                    },
+                    superseded: Some(superseded),
+                });
+            }
             let Some(age) = this.age_now(&target, &checkout, &aim.tree)? else {
                 return Ok(Refreshed {
                     passed: Vec::new(),
@@ -2688,6 +2760,18 @@ fn seal(
     target: &Owner,
     registration: &Registration,
 ) -> Result<std::result::Result<Freeze, AdoptionSkip>> {
+    if quiet.state.mbx.is_some() {
+        return Ok(Ok(Freeze::Frozen {
+            superseded: retained_seed(
+                host,
+                layout,
+                target,
+                SeedCapture::Quiet(quiet),
+                &quiet.state,
+            )?,
+            operation_elapsed: None,
+        }));
+    }
     if let Err(busy) = nx::close(host.census(), &quiet.mount, &quiet.state)
         .map_err(|error| io("close the landing volume's Nx state", &quiet.mount, &error))?
     {
@@ -3101,16 +3185,304 @@ fn reseed(
     })
 }
 
+/// Source custody borrowed through the immutable snapshot: normal mbx capture keeps a shared
+/// hold, a land keeps stopped admission, and re-adoption borrows its existing exclusive claim.
+#[derive(Clone, Copy)]
+pub(crate) enum SeedCapture<'a> {
+    Shared(&'a HeldVolume),
+    Quiet(&'a Quiet),
+    Claimed(&'a ReleaseClaim),
+}
+
+impl<'a> SeedCapture<'a> {
+    fn id(self) -> &'a BuildVolumeId {
+        match self {
+            Self::Shared(source) => source.id(),
+            Self::Quiet(quiet) => quiet.id(),
+            Self::Claimed(claim) => claim.id(),
+        }
+    }
+}
+
+fn claim_seed_source(
+    host: &impl RuntimeStorageHost,
+    layout: &BuildVolumeLayout,
+    source: &BuildVolumeId,
+) -> Result<std::result::Result<ReleaseClaim, CaptureSkip>> {
+    match host.claim_build_volume(layout, source).map_err(storage)? {
+        BuildVolumeClaim::Claimed(claim) => Ok(Ok(claim)),
+        BuildVolumeClaim::Held { open } => {
+            let hold = layout.hold_path(source);
+            let claimants = nx::holders(host.census(), &hold)
+                .map_err(|error| io("list the build hold's holders", &hold, &error))?;
+            Ok(Err(CaptureSkip::VolumeBusy {
+                reason: build_hold_busy_reason(&layout.image(source), &hold, &claimants, &open),
+            }))
+        }
+    }
+}
+/// Replace only the seed; live cache and declared-state contents stay untouched.
+fn retained_seed<H: RuntimeStorageHost>(
+    host: &H,
+    layout: &BuildVolumeLayout,
+    target: &Owner,
+    source: SeedCapture<'_>,
+    state: &BuildVolumeState,
+) -> Result<SupersededSeeds> {
+    let previous = seeds_of(layout, target)?;
+    let registration = Registration::new(
+        BuildVolumeRecord::new(
+            None,
+            BuildVolumeRole::Seed {
+                target: target.name.clone(),
+                incarnation: target.incarnation.clone(),
+            },
+        ),
+        Registrant::Workspace {
+            incarnation: target.incarnation.clone(),
+        },
+    );
+    mint_retained_seed(host, layout, source, state, &registration)?;
+    claim_superseded(host, layout, target, previous)
+}
+
+/// Copy only capability-marked state from an atomic snapshot into a fresh detached seed.
+/// Whole retained directories travel together; producer-declared clone-invalid entries are
+/// discarded only from the new seed. The source's live contents and metadata are never changed.
+pub(crate) fn mint_retained_seed<H: RuntimeStorageHost>(
+    host: &H,
+    layout: &BuildVolumeLayout,
+    source: SeedCapture<'_>,
+    state: &BuildVolumeState,
+    registration: &Registration,
+) -> Result<()> {
+    let mut retains = false;
+    let mut unrecorded = Vec::new();
+    for path in &state.paths {
+        retains |= path.retained();
+        if path.retention == SeedRetention::Unrecorded {
+            unrecorded.push(path.checkout.as_path().display().to_string());
+        }
+    }
+    if !unrecorded.is_empty() {
+        let owner = layout.read_record(source.id())?.role.owner().clone();
+        return Err(CowshedError::conflict(
+            format!(
+                "cannot retain seed state from build volume {}: retention is unrecorded for {}; no snapshot or seed was created",
+                source.id(),
+                unrecorded.join(", ")
+            ),
+            format!(
+                "run `cowshed exec {owner} -- true` or `cowshed setup` to rediscover canonical build-state retention, then retry"
+            ),
+        ));
+    }
+    let (target, incarnation) = match registration.role() {
+        BuildVolumeRole::Seed {
+            target,
+            incarnation,
+        } => (target, incarnation),
+        role => {
+            return Err(CowshedError::internal(format!(
+                "retained seed registration is not a seed: {role:?}"
+            )));
+        }
+    };
+    let capacity = if H::HAS_PHYSICAL_VOLUMES {
+        host.build_volume_capacity(layout, source.id())
+            .map_err(storage)?
+    } else {
+        crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY
+    };
+    if !retains {
+        return mint_seed_image(host, layout, None, capacity, state, registration);
+    }
+    let snapshot = BuildVolumeId::mint();
+    // Hold before clone registration. The clone's own shared creation hold is compatible,
+    // and dropping it after publication must not let collection take our mounted snapshot.
+    let snapshot_hold = layout.hold_new(&snapshot).map_err(|error| {
+        io(
+            "hold the retained-state snapshot",
+            &layout.hold_path(&snapshot),
+            &error,
+        )
+    })?;
+    let snapshot_registration = Registration::new(
+        BuildVolumeRecord::new(
+            None,
+            BuildVolumeRole::Superseded {
+                owner: target.clone(),
+                incarnation: incarnation.clone(),
+            },
+        ),
+        Registrant::Workspace {
+            incarnation: incarnation.clone(),
+        },
+    );
+    let prepared = (|| {
+        match source {
+            SeedCapture::Shared(source) => {
+                host.clone_shared_build_volume(layout, source, &snapshot, &snapshot_registration)
+            }
+            SeedCapture::Quiet(quiet) => {
+                host.clone_quiet_build_volume(layout, quiet, &snapshot, &snapshot_registration)
+            }
+            SeedCapture::Claimed(claim) => {
+                host.clone_claimed_build_volume(layout, claim, &snapshot, &snapshot_registration)
+            }
+        }
+        .map_err(storage)?;
+        let (mount, _) = host
+            .mount_build_volume(layout, &snapshot)
+            .map_err(storage)?;
+        mint_seed_image(host, layout, Some(&mount), capacity, state, registration)
+    })();
+    drop(snapshot_hold);
+    let released = match host.release_build_volume(layout, &snapshot) {
+        Ok(release @ BuildVolumeRelease::Deleted { .. }) => {
+            say_release(&snapshot, "retained-state snapshot", &release);
+            Ok(())
+        }
+        Ok(BuildVolumeRelease::Held { open }) => Err(CowshedError::conflict(
+            format!(
+                "retained-state snapshot {snapshot} stays registered because its release is held: {}",
+                seed_move::named(&open)
+            ),
+            "close the named snapshot holders, then run cowshed gc",
+        )),
+        Err(error) => Err(storage(error)),
+    };
+    match (prepared, released) {
+        (result, Ok(())) => result,
+        (Ok(()), Err(error)) => Err(error),
+        (Err(mut error), Err(cleanup)) => {
+            error.message.push_str(&format!(
+                "; releasing snapshot {snapshot} failed: {cleanup}"
+            ));
+            Err(error)
+        }
+    }
+}
+
+fn mint_seed_image<H: RuntimeStorageHost>(
+    host: &H,
+    layout: &BuildVolumeLayout,
+    snapshot: Option<&Path>,
+    capacity: ImageCapacity,
+    state: &BuildVolumeState,
+    registration: &Registration,
+) -> Result<()> {
+    let snapshot = snapshot
+        .map(|root| {
+            fs::canonicalize(root)
+                .map_err(|error| io("resolve retained snapshot mount", root, &error))
+        })
+        .transpose()?;
+    let id = BuildVolumeId::mint();
+    let claim = layout
+        .claim_release(&id)
+        .map_err(|error| io("claim the retained seed", &layout.hold_path(&id), &error))?
+        .ok_or_else(|| {
+            CowshedError::internal(format!("new retained seed {id} already has a holder"))
+        })?;
+    let prepared: Result<()> = (|| {
+        let mount = host
+            .create_claimed_build_volume(layout, &claim, capacity, registration)
+            .map_err(storage)?;
+        state.write(&mount)?;
+        for path in &state.paths {
+            let directory = mount.join(path.volume.as_path());
+            if path.retained() {
+                let snapshot = snapshot
+                    .as_deref()
+                    .ok_or_else(|| CowshedError::internal("retained seed state has no snapshot"))?;
+                let retained = snapshot.join(path.volume.as_path());
+                match fs::symlink_metadata(&retained) {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => {
+                        return Err(CowshedError::integrity(
+                            format!(
+                                "retained state {} in the snapshot is not a directory",
+                                retained.display()
+                            ),
+                            "cowshed doctor --json",
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(io("inspect retained snapshot state", &retained, &error));
+                    }
+                }
+                let contained = fs::canonicalize(&retained)
+                    .map_err(|error| io("resolve retained snapshot state", &retained, &error))?;
+                if !contained.starts_with(snapshot) {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "retained seed path {} escapes snapshot {}",
+                            retained.display(),
+                            snapshot.display()
+                        ),
+                        "keep retained build-state paths inside their captured snapshot",
+                    ));
+                }
+                fs::create_dir_all(&directory)
+                    .map_err(|error| io("create retained seed state", &directory, &error))?;
+                host.copy_tree(&contained, &directory).map_err(storage)?;
+            } else if !path.is_declared() {
+                fs::create_dir_all(&directory)
+                    .map_err(|error| io("create rebuildable seed state", &directory, &error))?;
+            }
+        }
+        state.discard_clone_invalid(&mount)?;
+        host.detach_claimed_build_volume(layout, &claim)
+            .map_err(storage)?;
+        let proof = if H::HAS_PHYSICAL_VOLUMES {
+            let image = layout.image(&id);
+            Some((
+                crate::storage::apfs::extents::prove_forkable(&image).map_err(storage)?,
+                image,
+            ))
+        } else {
+            None
+        };
+        layout.publish(&id, registration)?;
+        if let Some((proof, image)) = proof
+            && let Err(mut error) = proof.revalidate(&image).map_err(storage)
+        {
+            // A changed generation must not remain a published seed if its release also fails.
+            if let Err(cleanup) = layout.write_record(&id, registration.registered()) {
+                error.message.push_str(&format!("; restoring seed {id} to registered after its generation changed failed: {cleanup}"));
+            }
+            return Err(error);
+        }
+        Ok(())
+    })();
+    if let Err(mut error) = prepared {
+        match host.release_claimed(layout, claim) {
+            Ok(None) => {}
+            Ok(Some(refusal)) => error.message.push_str(&format!(
+                "; releasing unpublished retained seed {id} was refused: {refusal:?}"
+            )),
+            Err(cleanup) => error.message.push_str(&format!(
+                "; releasing unpublished retained seed {id} failed: {cleanup}"
+            )),
+        }
+        return Err(error);
+    }
+    drop(claim);
+    Ok(())
+}
+
 type CaptureAttempt = std::result::Result<(u64, Option<Duration>, SupersededSeeds), CaptureSkip>;
 
-/// Freeze `source`, recorded at `tree`, as `target`'s seed after Nx and existing Cargo profiles
-/// admit capture, then claim every older seed of `target` ([`claim_superseded`]) for its
+/// Freeze `source` as `target`'s seed, retaining mbx state under shared custody or capturing
+/// non-mbx warm state under its Nx/Cargo guards. Claim every older seed ([`claim_superseded`]) for its
 /// retirement once the target's image lock is let go: the fork this refresh serves never waits
 /// on releasing them under it, and no step of it reads them again. Measured on build 48a8ffff,
 /// an inline free of one 300 GiB superseded seed held a provision about 12 minutes in
-/// `ftruncate`. Capture returns elapsed milliseconds, optional live work, and the claimed seeds. Their
-/// guards and the exclusive build hold stay alive through mounted capture and publication.
-/// Exempt cache/index handles may stay open. A skip leaves every seed as it was.
+/// `ftruncate`. Capture returns elapsed milliseconds, optional live work, and the claimed seeds.
+/// Source custody stays alive through snapshot and publication; non-mbx writer guards stay held.
+/// Exempt cache/index handles may stay open. A non-mbx skip leaves every seed as it was.
 fn capture(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
@@ -3121,18 +3493,15 @@ fn capture(
     let started = Instant::now();
     let (mount, mount_elapsed) = host.mount_build_volume(layout, source).map_err(storage)?;
     let state = BuildVolumeState::read(&mount)?;
-    // Claim before stopping Nx: the source's keeper must not admit a replacement job.
-    // Retain the claim through mounted capture and immutable seed publication.
-    let claim = match host.claim_build_volume(layout, source).map_err(storage)? {
-        BuildVolumeClaim::Claimed(claim) => claim,
-        BuildVolumeClaim::Held { open } => {
-            let hold = layout.hold_path(source);
-            let claimants = nx::holders(host.census(), &hold)
-                .map_err(|error| io("list the build hold's holders", &hold, &error))?;
-            return Ok(Err(CaptureSkip::VolumeBusy {
-                reason: build_hold_busy_reason(&layout.image(source), &hold, &claimants, &open),
-            }));
-        }
+    if state.mbx.is_some() {
+        let source = HeldVolume::for_seed(host, layout, source.clone())?;
+        let superseded = retained_seed(host, layout, target, SeedCapture::Shared(&source), &state)?;
+        return Ok(Ok((millis(started.elapsed()), None, superseded)));
+    }
+    // Warm non-mbx capture retains its existing exclusive writer-admission protocol.
+    let claim = match claim_seed_source(host, layout, source)? {
+        Ok(claim) => claim,
+        Err(reason) => return Ok(Err(reason)),
     };
     if let Err(busy) = nx::close(host.census(), &mount, &state)
         .map_err(|error| io("close the volume's Nx state", &mount, &error))?
@@ -4938,7 +5307,7 @@ mod tests {
         }
 
         /// The volume `checkout` links, held for a land.
-        fn landing(&self, checkout: &Path) -> Landing {
+        fn landing(&self, checkout: &Path) -> HeldVolume {
             self.volumes
                 .hold_landing(checkout)
                 .unwrap()
@@ -6385,6 +6754,591 @@ fn main() {
         assert_eq!(record.tree, Some(tree));
         still_open.expect("the cache descriptor survives reseeding");
         assert_eq!(contents, b"warm after capture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_mbx_retained_seed_keeps_absent_declarations_absent() {
+        for retention in [SeedRetention::Retain, SeedRetention::Rebuild] {
+            let scratch = Scratch::directory("mbx-retained-absent");
+            let (_, live, mount) = scratch.linked_checkout("main", 1);
+            let target = owner("main", '0');
+            let mut declared = BuildStatePath::declared("vendor/not-yet-materialized").unwrap();
+            declared.retention = retention;
+            BuildVolumeState {
+                paths: vec![declared],
+                fingerprint: Some("fixture".into()),
+                mbx: Some(PathBuf::from("/installed/mbx")),
+            }
+            .write(&mount)
+            .unwrap();
+            let (_, _, superseded) = capture(&*scratch.host, &scratch.layout, &target, &live, None)
+                .unwrap()
+                .expect("an absent retained declaration is not a capture refusal");
+            scratch.volumes.retire_superseded(superseded).await;
+            let (seed, _) = scratch
+                .layout
+                .seed_of(&target.name, &target.incarnation)
+                .unwrap()
+                .unwrap();
+            let seed_mount = scratch
+                .host
+                .mount_build_volume(&scratch.layout, &seed)
+                .unwrap();
+            let seed_created_parent = seed_mount.join("declared").exists();
+            let live_created_parent = mount.join("declared").exists();
+            scratch.release_all();
+            assert!(
+                !seed_created_parent,
+                "an absent declaration must not create seed parents under {retention:?}"
+            );
+            assert!(
+                !live_created_parent,
+                "seeding must leave the absent live declaration untouched"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_mbx_retained_seed_refuses_a_symlink_ancestor_outside_the_snapshot() {
+        let scratch = Scratch::directory("mbx-retained-escape");
+        let (_, live, mount) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        let outside = scratch.root.path().join("outside");
+        fs::create_dir_all(outside.join("pins")).unwrap();
+        fs::write(outside.join("pins/marker"), b"outside the atomic snapshot").unwrap();
+        fs::create_dir_all(mount.join("declared")).unwrap();
+        std::os::unix::fs::symlink(&outside, mount.join("declared/.cache")).unwrap();
+        BuildVolumeState {
+            paths: vec![BuildStatePath::declared(".cache/pins").unwrap()],
+            fingerprint: Some("fixture".into()),
+            mbx: Some(PathBuf::from("/installed/mbx")),
+        }
+        .write(&mount)
+        .unwrap();
+        let refusal = match capture(&*scratch.host, &scratch.layout, &target, &live, None) {
+            Err(error) => Some(error),
+            Ok(Ok((_, _, superseded))) => {
+                scratch.volumes.retire_superseded(superseded).await;
+                None
+            }
+            Ok(Err(reason)) => panic!("unexpected source capture skip: {reason}"),
+        };
+        let outside_bytes = fs::read(outside.join("pins/marker")).unwrap();
+        scratch.release_all();
+        assert!(
+            matches!(&refusal, Some(error) if error.code == crate::ErrorCode::Integrity && error.message.contains("snapshot")),
+            "a retained path outside the atomic snapshot must refuse before copying: {refusal:?}"
+        );
+        assert_eq!(outside_bytes, b"outside the atomic snapshot");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_mbx_seeds_retain_only_marked_paths_without_changing_live_state() {
+        let scratch = Scratch::directory("mbx-retained-seeds");
+        let (checkout, live, mount) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        let state = BuildVolumeState {
+            paths: vec![
+                BuildStatePath::new(".codegraph", "codegraph")
+                    .unwrap()
+                    .retain()
+                    .discard_on_clone("fixture-owner.pid")
+                    .unwrap(),
+                BuildStatePath::new(".cache/pinned", "declared/.cache/pinned")
+                    .unwrap()
+                    .retain(),
+                BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+                BuildStatePath::new(".unmarked", "unmarked").unwrap(),
+            ],
+            fingerprint: Some("mbx-fixture".into()),
+            mbx: Some(PathBuf::from("/installed/mbx")),
+        };
+        state.write(&mount).unwrap();
+        for path in &state.paths {
+            fs::create_dir_all(mount.join(path.volume.as_path())).unwrap();
+            fs::write(
+                mount.join(path.volume.as_path()).join("live-marker"),
+                b"keep live",
+            )
+            .unwrap();
+            for invalid in &path.clone_invalid {
+                fs::write(
+                    mount.join(path.volume.as_path()).join(invalid.as_path()),
+                    b"live-only custody",
+                )
+                .unwrap();
+            }
+        }
+        let tree = GitOid::new("a".repeat(40)).unwrap();
+        let (_, _, superseded) = capture(
+            &*scratch.host,
+            &scratch.layout,
+            &target,
+            &live,
+            Some(tree.clone()),
+        )
+        .unwrap()
+        .expect("retain marked paths from a protected snapshot");
+        scratch.volumes.retire_superseded(superseded).await;
+        let (seed, _) = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap();
+        let seed_mount = scratch
+            .host
+            .mount_build_volume(&scratch.layout, &seed)
+            .unwrap();
+        assert_eq!(BuildVolumeState::read(&seed_mount).unwrap(), state);
+        for path in &state.paths {
+            assert_eq!(
+                seed_mount
+                    .join(path.volume.as_path())
+                    .join("live-marker")
+                    .exists(),
+                path.retained(),
+                "retention metadata alone selects {}",
+                path.volume.as_path().display(),
+            );
+            assert_eq!(
+                fs::read(mount.join(path.volume.as_path()).join("live-marker")).unwrap(),
+                b"keep live"
+            );
+        }
+        for path in &state.paths {
+            for invalid in &path.clone_invalid {
+                assert!(
+                    !seed_mount
+                        .join(path.volume.as_path())
+                        .join(invalid.as_path())
+                        .exists()
+                );
+                assert_eq!(
+                    fs::read(mount.join(path.volume.as_path()).join(invalid.as_path())).unwrap(),
+                    b"live-only custody"
+                );
+            }
+        }
+        let locked = scratch.lock(&target).await;
+        let refreshed = scratch
+            .volumes
+            .refresh_seed(
+                target.clone(),
+                checkout,
+                Aim {
+                    tree,
+                    landed: Vec::new(),
+                },
+                LockHolding::of(LockOperation::Fork, &name("next")),
+            )
+            .await
+            .unwrap();
+        drop(locked);
+        if let Some(superseded) = refreshed.superseded {
+            scratch.volumes.retire_superseded(superseded).await;
+        }
+        let (seed, _) = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap();
+        let seed_mount = scratch
+            .host
+            .mount_build_volume(&scratch.layout, &seed)
+            .unwrap();
+        for path in &state.paths {
+            assert_eq!(
+                seed_mount
+                    .join(path.volume.as_path())
+                    .join("live-marker")
+                    .exists(),
+                path.retained()
+            );
+        }
+        assert_eq!(
+            scratch.volumes.advise_compaction(
+                &target,
+                Some(Duration::from_secs(11)),
+                &scratch.root.path().join("main")
+            ),
+            crate::api::dto::LandSeedCompaction::NotAdvised
+        );
+        scratch.release_all();
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn mbx_fork_with_live_shared_source<H: RuntimeStorageHost>(scratch: Scratch<H>) {
+        let (checkout, live, mount) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        BuildVolumeState {
+            paths: vec![
+                BuildStatePath::new(".kept", "kept")
+                    .unwrap()
+                    .retain()
+                    .discard_on_clone("fixture-owner.pid")
+                    .unwrap(),
+                BuildStatePath::new(".discarded", "discarded").unwrap(),
+            ],
+            mbx: Some(PathBuf::from("/installed/mbx")),
+            ..Default::default()
+        }
+        .write(&mount)
+        .unwrap();
+        for path in ["kept", "discarded"] {
+            fs::create_dir_all(mount.join(path)).unwrap();
+            fs::write(mount.join(path).join("marker"), b"live").unwrap();
+        }
+        use std::io::Write as _;
+        let pid = std::process::id().to_string();
+        fs::write(mount.join("kept/fixture-owner.pid"), &pid).unwrap();
+        let owner_before = fs::read(scratch.layout.record(&live)).unwrap();
+        let state_before = fs::read(mount.join(crate::build_volume::STATE_FILE)).unwrap();
+        let mut writer = fs::OpenOptions::new()
+            .append(true)
+            .open(mount.join("kept/marker"))
+            .unwrap();
+        // Arrange a pre-cutover full seed through the substrate, not the new retention owner.
+        let previous = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &live,
+                &previous,
+                &Registration::new(
+                    BuildVolumeRecord::new(
+                        None,
+                        BuildVolumeRole::Seed {
+                            target: target.name.clone(),
+                            incarnation: target.incarnation.clone(),
+                        },
+                    ),
+                    Registrant::Workspace {
+                        incarnation: target.incarnation.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        let hold = scratch.layout.admit(&live).unwrap();
+        let locked = scratch.lock(&target).await;
+        let (captured, superseded) = scratch
+            .volumes
+            .capture_fork(
+                target.clone(),
+                checkout,
+                name("next"),
+                Aim {
+                    tree: GitOid::new("a".repeat(40)).unwrap(),
+                    landed: Vec::new(),
+                },
+            )
+            .await;
+        let captured = captured
+            .expect("an existing shared source job must not block retained-only capture")
+            .expect("the source has build state");
+        let (seed, _) = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap();
+        assert_ne!(seed, previous, "never fall back to the old full-cache seed");
+        assert_eq!(captured.seed, seed);
+        let (seed_mount, _) = scratch
+            .host
+            .mount_build_volume(&scratch.layout, &seed)
+            .unwrap();
+        assert_eq!(fs::read(seed_mount.join("kept/marker")).unwrap(), b"live");
+        assert!(!seed_mount.join("discarded/marker").exists());
+        assert!(!seed_mount.join("kept/fixture-owner.pid").exists());
+        assert!(
+            scratch.layout.claim_release(&live).unwrap().is_none(),
+            "the source job's original shared hold stays admitted"
+        );
+        for path in ["kept", "discarded"] {
+            assert_eq!(fs::read(mount.join(path).join("marker")).unwrap(), b"live");
+        }
+        assert_eq!(
+            fs::read(mount.join("kept/fixture-owner.pid")).unwrap(),
+            pid.as_bytes()
+        );
+        assert_eq!(
+            fs::read(scratch.layout.record(&live)).unwrap(),
+            owner_before
+        );
+        assert_eq!(
+            fs::read(mount.join(crate::build_volume::STATE_FILE)).unwrap(),
+            state_before
+        );
+        writer.write_all(b" after snapshot").unwrap();
+        assert_eq!(
+            fs::read(mount.join("kept/marker")).unwrap(),
+            b"live after snapshot"
+        );
+        assert_eq!(
+            fs::read(seed_mount.join("kept/marker")).unwrap(),
+            b"live",
+            "the source writer remains usable without changing the immutable capture"
+        );
+        drop(locked);
+        scratch
+            .volumes
+            .abandon_captured_fork(Ok(Some(captured)))
+            .await;
+        if let Some(superseded) = superseded {
+            scratch.volumes.retire_superseded(superseded).await;
+        }
+        drop(writer);
+        drop(hold);
+        scratch.release_all();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_mbx_fork_captures_retained_state_while_source_shared_hold_stays_live() {
+        mbx_fork_with_live_shared_source(Scratch::directory("mbx-retention-shared")).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_mbx_fork_captures_retained_state_while_source_shared_hold_stays_live() {
+        mbx_fork_with_live_shared_source(Scratch::new("mbx-retention-shared-native")).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_mbx_fork_refuses_an_exclusive_lifecycle_source_claim_without_fallback() {
+        let scratch = Scratch::directory("mbx-retention-exclusive");
+        let (checkout, live, mount) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        BuildVolumeState {
+            paths: vec![BuildStatePath::new(".kept", "kept").unwrap().retain()],
+            mbx: Some(PathBuf::from("/installed/mbx")),
+            ..Default::default()
+        }
+        .write(&mount)
+        .unwrap();
+        fs::create_dir_all(mount.join("kept")).unwrap();
+        fs::write(mount.join("kept/marker"), b"previous state").unwrap();
+        let locked = scratch.lock(&target).await;
+        let (_, _, superseded) = capture(&*scratch.host, &scratch.layout, &target, &live, None)
+            .unwrap()
+            .unwrap();
+        drop(locked);
+        scratch.volumes.retire_superseded(superseded).await;
+        let (previous, _) = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap();
+        fs::write(mount.join("kept/marker"), b"newer live state").unwrap();
+        let before = scratch.layout.collection_ids().unwrap();
+        let claim = scratch.layout.claim_release(&live).unwrap().unwrap();
+        let locked = scratch.lock(&target).await;
+        let (captured, superseded) = scratch
+            .volumes
+            .capture_fork(
+                target.clone(),
+                checkout,
+                name("next"),
+                Aim {
+                    tree: GitOid::new("a".repeat(40)).unwrap(),
+                    landed: Vec::new(),
+                },
+            )
+            .await;
+        let refused = captured.unwrap_err();
+        assert_eq!(refused.code, crate::ErrorCode::Conflict, "{refused}");
+        assert!(
+            refused
+                .message
+                .contains(&scratch.layout.hold_path(&live).display().to_string()),
+            "{refused}"
+        );
+        assert!(
+            refused.message.contains(&std::process::id().to_string()),
+            "{refused}"
+        );
+        assert!(superseded.is_none());
+        assert_eq!(scratch.layout.collection_ids().unwrap(), before);
+        assert_eq!(
+            scratch
+                .layout
+                .seed_of(&target.name, &target.incarnation)
+                .unwrap()
+                .unwrap()
+                .0,
+            previous
+        );
+        assert_eq!(
+            fs::read(mount.join("kept/marker")).unwrap(),
+            b"newer live state"
+        );
+        assert_eq!(
+            fs::read(scratch.layout.image(&previous).join("kept/marker")).unwrap(),
+            b"previous state"
+        );
+        drop(locked);
+        drop(claim);
+        scratch.release_all();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_mbx_retained_seed_refuses_unrecorded_retention_before_snapshotting() {
+        let scratch = Scratch::directory("mbx-retention-legacy");
+        let (_, live, mount) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        let mut path = BuildStatePath::new(".legacy", "legacy").unwrap();
+        path.retention = SeedRetention::Unrecorded;
+        BuildVolumeState {
+            paths: vec![path],
+            mbx: Some(PathBuf::from("/installed/mbx")),
+            ..Default::default()
+        }
+        .write(&mount)
+        .unwrap();
+        fs::create_dir_all(mount.join("legacy")).unwrap();
+        fs::write(mount.join("legacy/marker"), b"must not drop").unwrap();
+        let before = scratch.layout.list().unwrap();
+        let refused = capture(&*scratch.host, &scratch.layout, &target, &live, None).unwrap_err();
+        assert_eq!(refused.code, crate::ErrorCode::Conflict, "{refused}");
+        assert!(refused.message.contains(".legacy"), "{refused}");
+        assert_eq!(scratch.layout.list().unwrap(), before);
+        assert_eq!(
+            fs::read(mount.join("legacy/marker")).unwrap(),
+            b"must not drop"
+        );
+        drop(
+            scratch
+                .layout
+                .admit(&live)
+                .expect("refusal releases its source claim"),
+        );
+        scratch.release_all();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_mbx_landing_retains_marked_state_under_its_existing_quiet_hold() {
+        let scratch = Scratch::directory("mbx-retention-quiet");
+        let (checkout, live, mount) = scratch.linked_checkout("topic", 1);
+        let (target_checkout, _, _) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        let state = BuildVolumeState {
+            paths: vec![
+                BuildStatePath::new(".kept", "kept").unwrap().retain(),
+                BuildStatePath::new(".discarded", "discarded").unwrap(),
+            ],
+            mbx: Some(PathBuf::from("/installed/mbx")),
+            ..Default::default()
+        };
+        state.write(&mount).unwrap();
+        for path in &state.paths {
+            let directory = mount.join(path.volume.as_path());
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("marker"), b"landing state").unwrap();
+        }
+        let quiet = scratch
+            .volumes
+            .quiesce(
+                scratch.landing(&checkout),
+                scratch.stopped(&checkout).await,
+                target_checkout,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let locked = scratch.lock(&target).await;
+        let frozen = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(locked);
+        let Freeze::Frozen { superseded, .. } = frozen else {
+            panic!("the landing's existing quiet authority must admit retained capture")
+        };
+        scratch.volumes.retire_superseded(superseded).await;
+        let (seed, _) = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap();
+        let seed_mount = scratch
+            .host
+            .mount_build_volume(&scratch.layout, &seed)
+            .unwrap();
+        for path in &state.paths {
+            assert_eq!(
+                seed_mount
+                    .join(path.volume.as_path())
+                    .join("marker")
+                    .exists(),
+                path.retained()
+            );
+            assert_eq!(
+                fs::read(mount.join(path.volume.as_path()).join("marker")).unwrap(),
+                b"landing state"
+            );
+        }
+        assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
+        assert!(scratch.layout.image(&live).exists());
+        drop(quiet);
+        scratch.release_all();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_mbx_seed_with_no_retained_paths_creates_no_temporary_snapshot() {
+        let scratch = Scratch::directory("mbx-retention-blank");
+        let (_, live, mount) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        BuildVolumeState {
+            paths: vec![BuildStatePath::new(".rebuild", "rebuild").unwrap()],
+            mbx: Some(PathBuf::from("/installed/mbx")),
+            ..Default::default()
+        }
+        .write(&mount)
+        .unwrap();
+        fs::create_dir_all(mount.join("rebuild")).unwrap();
+        fs::write(mount.join("rebuild/marker"), b"live cache").unwrap();
+        let releases = scratch
+            .layout
+            .project_root()
+            .join(crate::storage::deletion_log::DELETION_LOG_FILE);
+        assert!(!releases.exists(), "the fixture has released no images");
+        let (_, _, superseded) = capture(&*scratch.host, &scratch.layout, &target, &live, None)
+            .unwrap()
+            .unwrap();
+        scratch.volumes.retire_superseded(superseded).await;
+        assert!(
+            !releases.exists(),
+            "no temporary full snapshot was created and released"
+        );
+        assert_eq!(
+            scratch.layout.list().unwrap().len(),
+            2,
+            "only the source and seed exist"
+        );
+        let (seed, _) = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap();
+        let seed_mount = scratch
+            .host
+            .mount_build_volume(&scratch.layout, &seed)
+            .unwrap();
+        assert_eq!(fs::read_dir(seed_mount.join("rebuild")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read(mount.join("rebuild/marker")).unwrap(),
+            b"live cache"
+        );
+        scratch.release_all();
     }
 
     /// A fork's seed refresh never waits on freeing the seed it supersedes (16_build_volumes.md,

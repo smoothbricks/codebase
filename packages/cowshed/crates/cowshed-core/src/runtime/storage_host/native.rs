@@ -38,6 +38,21 @@ where
         MacOsApfsExecutionHost::create_build_volume(self, layout, id, capacity, registration)
     }
 
+    fn create_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+        capacity: ImageCapacity,
+        registration: &Registration,
+    ) -> Result<PathBuf, ApfsStorageError> {
+        MacOsApfsExecutionHost::create_claimed_build_volume(
+            self,
+            layout,
+            claim,
+            capacity,
+            registration,
+        )
+    }
     fn clone_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -46,6 +61,22 @@ where
         registration: &Registration,
     ) -> Result<Option<std::time::Duration>, ApfsStorageError> {
         MacOsApfsExecutionHost::clone_build_volume(self, layout, source, destination, registration)
+    }
+
+    fn clone_shared_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        source: &crate::runtime::build_volumes::HeldVolume,
+        destination: &BuildVolumeId,
+        registration: &Registration,
+    ) -> Result<Option<std::time::Duration>, ApfsStorageError> {
+        MacOsApfsExecutionHost::clone_shared_build_volume(
+            self,
+            layout,
+            source,
+            destination,
+            registration,
+        )
     }
 
     fn clone_quiet_build_volume(
@@ -225,8 +256,17 @@ where
         layout: &BuildVolumeLayout,
         source: &ReAdoptSource,
         build_claim: Option<&ReleaseClaim>,
+        mbx: Option<&Path>,
+        retention: &[crate::capabilities::BuildStatePath],
     ) -> Result<(), ApfsStorageError> {
-        MacOsApfsExecutionHost::publish_re_adopt_build(self, layout, source, build_claim)
+        MacOsApfsExecutionHost::publish_re_adopt_build(
+            self,
+            layout,
+            source,
+            build_claim,
+            mbx,
+            retention,
+        )
     }
 
     fn defragment_build_volume(

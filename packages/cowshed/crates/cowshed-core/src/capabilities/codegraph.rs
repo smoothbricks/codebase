@@ -29,10 +29,11 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
             )
         })?;
     Ok(CapabilityContribution {
-        build_state: vec![BuildStatePath::from_paths(
-            &relative.join(".codegraph"),
-            &relative.join("codegraph"),
-        )?],
+        build_state: vec![
+            BuildStatePath::from_paths(&relative.join(".codegraph"), &relative.join("codegraph"))?
+                .retain()
+                .discard_on_clone("writer.pid")?,
+        ],
         ..CapabilityContribution::default()
     })
 }
@@ -51,7 +52,11 @@ mod tests {
         let detected = DETECTOR.detect(&fixture.context()).unwrap().unwrap();
         assert_eq!(
             detected.build_state,
-            [BuildStatePath::new(".codegraph", "codegraph").unwrap()]
+            [BuildStatePath::new(".codegraph", "codegraph")
+                .unwrap()
+                .retain()
+                .discard_on_clone("writer.pid")
+                .unwrap()]
         );
         assert!(
             detected.env.is_empty()
@@ -91,7 +96,13 @@ mod tests {
         assert_eq!(detected.active, [CapabilityId::Codegraph]);
         assert_eq!(
             detected.contribution.build_state,
-            [BuildStatePath::new("packages/app/.codegraph", "packages/app/codegraph").unwrap()]
+            [
+                BuildStatePath::new("packages/app/.codegraph", "packages/app/codegraph")
+                    .unwrap()
+                    .retain()
+                    .discard_on_clone("writer.pid")
+                    .unwrap()
+            ]
         );
         std::fs::write(
             fixture.root.join(".cowshed.toml"),

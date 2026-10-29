@@ -316,6 +316,10 @@ struct StateWire {
 struct PathWire {
     checkout: String,
     volume: String,
+    #[serde(default)]
+    retention: crate::capabilities::SeedRetention,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    clone_invalid: Vec<String>,
 }
 
 impl BuildVolumeState {
@@ -360,6 +364,12 @@ impl BuildVolumeState {
                 .map(|state| PathWire {
                     checkout: state.checkout.as_path().to_string_lossy().into_owned(),
                     volume: state.volume.as_path().to_string_lossy().into_owned(),
+                    retention: state.retention,
+                    clone_invalid: state
+                        .clone_invalid
+                        .iter()
+                        .map(|path| path.as_path().to_string_lossy().into_owned())
+                        .collect(),
                 })
                 .collect(),
             fingerprint: self.fingerprint.clone(),
@@ -374,6 +384,8 @@ impl BuildVolumeState {
     /// (16_build_volumes.md, "One link per checkout"); only a discovery that found the path's owner
     /// gone off the volume releases it (a Cargo target under mbx). A new path that overlaps a held
     /// one is refused, naming both.
+    /// Complete canonical discovery resolves an unowned legacy path to rebuildable state,
+    /// without moving its fixed volume name or changing already-known retained ownership.
     pub fn with_discovered(
         &self,
         discovered: &[BuildStatePath],
@@ -408,6 +420,18 @@ impl BuildVolumeState {
             })
             .cloned()
             .collect();
+        for held in &mut paths {
+            if let Some(current) = discovered
+                .iter()
+                .find(|path| path.checkout == held.checkout)
+            {
+                held.retention = current.retention;
+                held.clone_invalid.clone_from(&current.clone_invalid);
+            } else if held.retention == crate::capabilities::SeedRetention::Unrecorded {
+                held.retention = crate::capabilities::SeedRetention::Rebuild;
+                held.clone_invalid.clear();
+            }
+        }
         paths.extend(added.iter().cloned());
         disjoint(&paths)
             .map_err(|(left, right)| overlapping(&volume_root.join(STATE_FILE), left, right))?;
@@ -420,6 +444,90 @@ impl BuildVolumeState {
             added,
             dropped,
         ))
+    }
+
+    /// Resolve legacy seed metadata from current capability contributions, without changing paths or live bytes.
+    pub fn with_seed_retention(&self, policies: &[BuildStatePath]) -> Self {
+        let mut state = self.clone();
+        for held in &mut state.paths {
+            if held.retention == crate::capabilities::SeedRetention::Unrecorded {
+                match policies
+                    .iter()
+                    .find(|policy| policy.checkout == held.checkout)
+                {
+                    Some(policy) => {
+                        held.retention = policy.retention;
+                        held.clone_invalid.clone_from(&policy.clone_invalid);
+                    }
+                    None => {
+                        held.retention = crate::capabilities::SeedRetention::Rebuild;
+                        held.clone_invalid.clear();
+                    }
+                }
+            }
+        }
+        state
+    }
+
+    /// Drop only capability-owned process files from a newly minted volume, never its source.
+    pub fn discard_clone_invalid(&self, volume_root: &Path) -> crate::Result<()> {
+        if !self.paths.iter().any(|path| !path.clone_invalid.is_empty()) {
+            return Ok(());
+        }
+        let volume = fs::canonicalize(volume_root)
+            .map_err(|error| io_error("resolve new clone volume", volume_root, &error))?;
+        for path in &self.paths {
+            if path.clone_invalid.is_empty() {
+                continue;
+            }
+            let root = volume_root.join(path.volume.as_path());
+            let canonical = match fs::canonicalize(&root) {
+                Ok(root) => root,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_error("resolve clone-invalid owner", &root, &error)),
+            };
+            if !canonical.starts_with(&volume) {
+                return Err(crate::CowshedError::integrity(
+                    format!(
+                        "clone-invalid owner {} escapes new volume {}",
+                        canonical.display(),
+                        volume.display()
+                    ),
+                    "repair the capability's clone-invalid owner path",
+                ));
+            }
+            for invalid in &path.clone_invalid {
+                let at = root.join(invalid.as_path());
+                let parent = at
+                    .parent()
+                    .expect("a validated relative clone path has a parent");
+                let resolved = match fs::canonicalize(parent) {
+                    Ok(parent) => parent,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(io_error("resolve clone-invalid parent", parent, &error));
+                    }
+                };
+                if !resolved.starts_with(&canonical) {
+                    return Err(crate::CowshedError::integrity(
+                        format!(
+                            "clone-invalid path {} escapes its owner {}",
+                            at.display(),
+                            canonical.display()
+                        ),
+                        "repair the capability's clone-invalid path",
+                    ));
+                }
+                match fs::remove_file(&at) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(io_error("discard clone-invalid process file", &at, &error));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every Nx `workspace-data` directory the volume holds, relative to its root: where Nx keeps
@@ -470,7 +578,14 @@ impl BuildVolumeState {
 }
 
 fn path_from_wire(wire: &PathWire) -> crate::Result<BuildStatePath> {
-    BuildStatePath::new(&wire.checkout, &wire.volume)
+    let mut path = BuildStatePath::new(&wire.checkout, &wire.volume)?;
+    path.retention = wire.retention;
+    path.clone_invalid = wire
+        .clone_invalid
+        .iter()
+        .map(|value| crate::capabilities::RelPath::new(value))
+        .collect::<crate::Result<_>>()?;
+    Ok(path)
 }
 
 /// The first two paths that overlap on either side, or `()` when none do: one build-state path
@@ -1550,6 +1665,140 @@ mod tests {
         )
         .unwrap();
         BuildVolumeLayout::new(&project).unwrap()
+    }
+
+    #[test]
+    fn retained_metadata_rediscovery_keeps_live_paths_and_bytes() {
+        let root =
+            crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "cs-retained-metadata");
+        fs::create_dir_all(root.join("volume/old-index")).unwrap();
+        let volume = root.join("volume");
+        let recorded = br#"{"version":1,"paths":[{"checkout":".index","volume":"old-index"},{"checkout":".removed-cache","volume":"removed-cache"}],"fingerprint":"old"}"#;
+        fs::write(volume.join(STATE_FILE), recorded).unwrap();
+        fs::write(volume.join("old-index/marker"), b"live retained bytes").unwrap();
+        let old = BuildVolumeState::read(&volume).unwrap();
+        assert_eq!(
+            old.paths[0].retention,
+            crate::capabilities::SeedRetention::Unrecorded
+        );
+        let policy = BuildStatePath::new(".index", "index")
+            .unwrap()
+            .retain()
+            .discard_on_clone("owner.pid")
+            .unwrap();
+        let (next, added, dropped) = old
+            .with_discovered(
+                std::slice::from_ref(&policy),
+                &[],
+                None,
+                "new".into(),
+                &volume,
+            )
+            .unwrap();
+        assert!(added.is_empty() && dropped.is_empty());
+        assert_eq!(
+            next.paths[0].volume, old.paths[0].volume,
+            "metadata never moves a fixed link"
+        );
+        assert!(next.paths[0].retained());
+        assert_eq!(next.paths[0].clone_invalid, policy.clone_invalid);
+        assert_eq!(
+            next.paths[1].retention,
+            crate::capabilities::SeedRetention::Rebuild,
+            "canonical discovery resolves an unowned legacy cache without another refresh loop"
+        );
+        assert_eq!(
+            old.with_seed_retention(std::slice::from_ref(&policy)).paths,
+            next.paths
+        );
+        assert_eq!(
+            fs::read(volume.join("old-index/marker")).unwrap(),
+            b"live retained bytes"
+        );
+        assert_eq!(fs::read(volume.join(STATE_FILE)).unwrap(), recorded);
+        fs::create_dir(root.join("roundtrip")).unwrap();
+        next.write(&root.join("roundtrip")).unwrap();
+        assert_eq!(
+            BuildVolumeState::read(&root.join("roundtrip")).unwrap(),
+            next
+        );
+    }
+
+    #[test]
+    fn clone_invalid_cleanup_changes_only_the_new_process_file() {
+        let root = crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "cs-clone-invalid");
+        let source = root.join("source");
+        let cloned = root.join("cloned");
+        for volume in [&source, &cloned] {
+            fs::create_dir_all(volume.join("index")).unwrap();
+            for name in ["data", "data-wal", "data-shm", "owner.pid"] {
+                fs::write(volume.join("index").join(name), name.as_bytes()).unwrap();
+            }
+        }
+        let state = BuildVolumeState {
+            paths: vec![
+                BuildStatePath::new(".index", "index")
+                    .unwrap()
+                    .retain()
+                    .discard_on_clone("owner.pid")
+                    .unwrap(),
+            ],
+            ..Default::default()
+        };
+        state.discard_clone_invalid(&cloned).unwrap();
+        assert!(!cloned.join("index/owner.pid").exists());
+        for name in ["data", "data-wal", "data-shm", "owner.pid"] {
+            assert_eq!(
+                fs::read(source.join("index").join(name)).unwrap(),
+                name.as_bytes()
+            );
+            if name != "owner.pid" {
+                assert_eq!(
+                    fs::read(cloned.join("index").join(name)).unwrap(),
+                    name.as_bytes()
+                );
+            }
+        }
+        state
+            .discard_clone_invalid(&cloned)
+            .expect("a missing process file needs no cleanup");
+    }
+
+    #[test]
+    fn clone_invalid_cleanup_refuses_symlink_escapes() {
+        let root =
+            crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "cs-clone-invalid-escape");
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("owner.pid"), b"not owned by clone").unwrap();
+        for (name, nested) in [("root-escape", false), ("parent-escape", true)] {
+            let volume = root.join(name);
+            fs::create_dir(&volume).unwrap();
+            let invalid = if nested {
+                fs::create_dir(volume.join("index")).unwrap();
+                std::os::unix::fs::symlink(&outside, volume.join("index/escape")).unwrap();
+                "escape/owner.pid"
+            } else {
+                std::os::unix::fs::symlink(&outside, volume.join("index")).unwrap();
+                "owner.pid"
+            };
+            let state = BuildVolumeState {
+                paths: vec![
+                    BuildStatePath::new(".index", "index")
+                        .unwrap()
+                        .retain()
+                        .discard_on_clone(invalid)
+                        .unwrap(),
+                ],
+                ..Default::default()
+            };
+            let refusal = state.discard_clone_invalid(&volume).unwrap_err();
+            assert!(refusal.message.contains("escapes"), "{refusal}");
+            assert_eq!(
+                fs::read(outside.join("owner.pid")).unwrap(),
+                b"not owned by clone"
+            );
+        }
     }
 
     #[test]

@@ -315,6 +315,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         if !target.name.is_main() {
             return LandSeedCompaction::NotMain;
         }
+        match self.state_of(project_root) {
+            Ok(Some((_, state))) if state.mbx.is_some() => return LandSeedCompaction::NotAdvised,
+            Ok(_) => {}
+            Err(error) => {
+                return LandSeedCompaction::Failed {
+                    error: error.message,
+                };
+            }
+        }
         if !advised(true, operation_elapsed) {
             return LandSeedCompaction::NotAdvised;
         }
@@ -480,6 +489,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     ) -> Result<Option<CompactionSource>> {
         let target = locked.target.clone();
         self.blocking(move |host, layout| {
+            for live in layout.owned_by(&target.name)? {
+                let (mount, _) = host.mount_build_volume(layout, &live).map_err(storage)?;
+                if crate::build_volume::BuildVolumeState::read(&mount)?
+                    .mbx
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+            }
             let Some((seed, _)) = layout.seed_of(&target.name, &target.incarnation)? else {
                 return Ok(None);
             };

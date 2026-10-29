@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 
 use super::{MacOsApfsExecutionHost, allocated_file_bytes, io_error, sync_parent_path};
 use crate::build_volume::{
-    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, RECORD_SUFFIX,
-    Registrant, Registration, ReleaseClaim,
+    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState,
+    RECORD_SUFFIX, Registrant, Registration, ReleaseClaim,
 };
+use crate::capabilities::BuildStatePath;
 use crate::metadata::append_suffix;
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, COMPANION_SUFFIX};
 use crate::storage::recovery::{
@@ -345,8 +346,8 @@ where
     /// build link points; 16_build_volumes.md, "Targets and seeds"); for a missing main, its
     /// surviving build volume kept as it is, or else the recorded build volume empty; for a lost
     /// build volume (its retained image gone), the recorded build volume empty
-    /// ([`Self::publish_empty_build`]). Then freeze one seed of it for the replacement
-    /// incarnation; the old incarnation's seeds stay retained. Converges from whichever step a
+    /// ([`Self::publish_empty_build`]). Publish one seed for the replacement incarnation, filtered
+    /// under mbx and otherwise captured; the old incarnation's seeds stay retained. Converges from whichever step a
     /// crash interrupted. `build_claim` is the exclusive claim on the recorded source build
     /// volume's hold, held by the caller across this whole publication: present exactly when a
     /// retained main records a build volume, and naming that volume. A missing main records no
@@ -356,6 +357,8 @@ where
         layout: &BuildVolumeLayout,
         source: &ReAdoptSource,
         build_claim: Option<&ReleaseClaim>,
+        mbx: Option<&Path>,
+        retention: &[BuildStatePath],
     ) -> Result<(), ApfsStorageError> {
         match (&source.main, &source.build, build_claim) {
             (ReAdoptMain::Missing(missing), None, None) => match &missing.build {
@@ -364,14 +367,18 @@ where
                     source,
                     build,
                     SeedSource::Unclaimed(&build.id),
+                    mbx,
+                    retention,
                 ),
-                // Main's own volume outlived main's image: seed it before mounting it where
-                // main's build link points, under its own claim.
+                // Main's own volume outlived main's image: preserve it under its own claim.
+                // Non-mbx capture still precedes the live volume's first mount.
                 Some(MissingMainBuild::Kept(build)) => self.seed_replacement(
                     layout,
                     source,
                     SeedSource::Unclaimed(&build.kept),
                     &build.record,
+                    mbx,
+                    retention,
                 ),
                 None => Ok(()),
             },
@@ -383,7 +390,14 @@ where
                 // published.
                 if retained_build(source)?.is_some() || replacement_published(layout, build)? {
                     self.publish_build_replacement(layout, build, seed.claim_of(&build.id))?;
-                    return self.seed_replacement(layout, source, seed, &build.owner_record);
+                    return self.seed_replacement(
+                        layout,
+                        source,
+                        seed,
+                        &build.owner_record,
+                        mbx,
+                        retention,
+                    );
                 }
                 // Lost before publication. Copy is not run again once main is published, so its
                 // staged copy, which nothing can verify any more, is discarded here too.
@@ -396,7 +410,7 @@ where
                     },
                     capacity_bytes: build.image.capacity_bytes,
                 };
-                self.publish_empty_build(layout, source, &lost, seed)
+                self.publish_empty_build(layout, source, &lost, seed, mbx, retention)
             }
             _ => Err(ApfsStorageError::InvalidPlan(
                 "the build claim does not hold the recorded build volume",
@@ -407,8 +421,8 @@ where
     /// A build volume published empty (02_workspaces.md, "Re-adoption" step 3 and "Missing main
     /// image"): its recorded owner record registered under the recorded id before an empty RAW
     /// volume is minted there at the recorded capacity, mounted where main's build link points,
-    /// and published, then one seed of it for the replacement incarnation, captured under
-    /// `seed`'s claim. Converges from an attempt interrupted after registration, whether or not
+    /// and published, then one seed of it for the replacement incarnation, filtered under mbx and
+    /// otherwise captured under `seed`'s claim. Converges from an attempt interrupted after registration, whether or not
     /// the image was minted. An image without an owner record, an image holding another record,
     /// or another record that names no image refuses: nothing is published over any of them.
     fn publish_empty_build(
@@ -417,6 +431,8 @@ where
         source: &ReAdoptSource,
         build: &ReAdoptEmptyBuild,
         seed: SeedSource<'_>,
+        mbx: Option<&Path>,
+        retention: &[BuildStatePath],
     ) -> Result<(), ApfsStorageError> {
         let image = layout.image(&build.id);
         self.verify_controller_path(&image)?;
@@ -468,19 +484,21 @@ where
             }
         }
         layout.publish(&build.id, &registration).map_err(host)?;
-        self.seed_replacement(layout, source, seed, &build.record)
+        self.seed_replacement(layout, source, seed, &build.record, mbx, retention)
     }
 
-    /// Freeze one seed of main's published build volume, then mount the live volume where main's
-    /// link points. An already-detached source is captured before its first mount. Admission stays
-    /// closed through capture and publication; the immutable freshness mark comes from the clone,
-    /// never a later live-source clock. A seed an earlier attempt froze keeps its original mark.
+    /// Retain capability-marked seed state under mbx without changing the live build.
+    /// Other projects capture an already-detached source before its first mount, keeping its
+    /// immutable captured-clone freshness mark. Admission stays closed through publication and
+    /// mount; a seed an earlier attempt published is kept on replay.
     fn seed_replacement(
         &self,
         layout: &BuildVolumeLayout,
         source: &ReAdoptSource,
         seed: SeedSource<'_>,
         owner: &BuildVolumeRecord,
+        mbx: Option<&Path>,
+        retention: &[BuildStatePath],
     ) -> Result<(), ApfsStorageError> {
         let acquired;
         let claim = match seed {
@@ -497,7 +515,6 @@ where
             self.mount_build_volume(layout, claim.id())?;
             return Ok(());
         }
-        let destination = BuildVolumeId::mint();
         let registration = Registration::new(
             BuildVolumeRecord::new(
                 owner.tree.clone(),
@@ -508,8 +525,25 @@ where
             ),
             Registrant::Intent,
         );
-        self.clone_claimed_build_volume(layout, claim, &destination, &registration)?;
-        self.mount_build_volume(layout, claim.id())?;
+        if let Some(mbx) = mbx {
+            let (mount, _) = self.mount_build_volume(layout, claim.id())?;
+            let mut state = BuildVolumeState::read(&mount)
+                .map_err(|error| ApfsStorageError::Host(error.to_string()))?
+                .with_seed_retention(retention);
+            state.mbx = Some(mbx.to_owned());
+            crate::runtime::build_volumes::mint_retained_seed(
+                self,
+                layout,
+                crate::runtime::build_volumes::SeedCapture::Claimed(claim),
+                &state,
+                &registration,
+            )
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        } else {
+            let destination = BuildVolumeId::mint();
+            self.clone_claimed_build_volume(layout, claim, &destination, &registration)?;
+            self.mount_build_volume(layout, claim.id())?;
+        }
         Ok(())
     }
 
@@ -1042,7 +1076,7 @@ mod tests {
 
         let publish = || {
             let error = host
-                .publish_re_adopt_build(&layout, &source, claim.as_ref())
+                .publish_re_adopt_build(&layout, &source, claim.as_ref(), None, &[])
                 .expect_err("the injected mount failure remains an error");
             assert!(
                 error.to_string().contains("injected attach refusal"),
@@ -1083,5 +1117,156 @@ mod tests {
     #[test]
     fn a_published_detached_build_is_seeded_before_mount_under_the_borrowed_claim() {
         seed_before_mount(false);
+    }
+
+    #[test]
+    fn real_apfs_re_adoption_mbx_seed_retains_marked_state_and_live_build_stays_warm() {
+        use crate::capabilities::SeedRetention;
+        use crate::repository::ProjectPaths;
+        use cowshed_apfs::SystemCommandRunner;
+        use cowshed_os::namespace::HostNamespace;
+
+        let fixture = Fixture::new();
+        let root = crate::scratch_apfs::ScratchRoot::new("readopt-mbx-seed").unwrap();
+        let store = root.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        let mut build = fixture.build();
+        let mut source = fixture.source(None);
+        let project = ProjectPaths::with_mount_root(
+            &store,
+            root.path().join("mnt"),
+            &source.metadata.repo_id,
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        let host = MacOsApfsExecutionHost::new(
+            SystemCommandRunner::new(HostNamespace::Test(root.namespace())),
+            ApfsSubstrateConfig::new(
+                HostNamespace::Test(root.namespace()),
+                &store,
+                root.path().join("checkout"),
+            ),
+        )
+        .unwrap();
+        let live = BuildVolumeId::mint();
+        let registration = Registration::new(build.owner_record.clone(), Registrant::Intent);
+        let (mount, creating) = host
+            .create_build_volume(
+                &layout,
+                &live,
+                ImageCapacity::from_gibibytes(1),
+                &registration,
+            )
+            .unwrap();
+        let retention = vec![
+            BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+            BuildStatePath::declared(".bun-pin")
+                .unwrap()
+                .discard_on_clone("fixture-owner.pid")
+                .unwrap(),
+        ];
+        let mut state = BuildVolumeState {
+            paths: retention.clone(),
+            fingerprint: Some("tracked-input-fingerprint".to_owned()),
+            mbx: None,
+        };
+        // The canonical contribution resolves legacy policy in the seed value only.
+        for path in &mut state.paths {
+            path.retention = SeedRetention::Unrecorded;
+            path.clone_invalid.clear();
+        }
+        for path in &retention {
+            let directory = mount.join(path.volume.as_path());
+            fs::create_dir_all(&directory).unwrap();
+            for invalid in &path.clone_invalid {
+                fs::write(directory.join(invalid.as_path()), b"live-only custody").unwrap();
+            }
+        }
+        for path in &state.paths {
+            let directory = mount.join(path.volume.as_path());
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("warm-marker"), b"live build state").unwrap();
+        }
+        state.write(&mount).unwrap();
+        layout.publish(&live, &registration).unwrap();
+        drop(creating);
+        let original_record = fs::read(layout.record(&live)).unwrap();
+        let original_state = fs::read(mount.join(crate::build_volume::STATE_FILE)).unwrap();
+        build.id = live.clone();
+        build.image.original = layout.image(&live);
+        build.replacement_image = root.path().join("unpublished-build.dmg");
+        build.replacement_mount = root.path().join("unpublished-build");
+        source.build = Some(build);
+        let mbx = root.path().join("installed/bin/mbx");
+        let claim = layout.claim_release(&live).unwrap().unwrap();
+        host.publish_re_adopt_build(&layout, &source, Some(&claim), Some(&mbx), &retention)
+            .unwrap();
+        let (seed, record) = layout
+            .seed_of(&WorkspaceName::main(), &source.replacement)
+            .unwrap()
+            .expect("publish the replacement incarnation's seed");
+        assert!(record.is_published());
+        assert!(
+            host.mounted_at(&layout.mount(&seed)).unwrap().is_none(),
+            "publish the seed detached"
+        );
+        let (seed_mount, _) = host.mount_build_volume(&layout, &seed).unwrap();
+        let mut expected = state.with_seed_retention(&retention);
+        expected.mbx = Some(mbx.clone());
+        assert_eq!(BuildVolumeState::read(&seed_mount).unwrap(), expected);
+        for path in &expected.paths {
+            assert_eq!(
+                seed_mount
+                    .join(path.volume.as_path())
+                    .join("warm-marker")
+                    .exists(),
+                path.retained(),
+                "canonical retention selects seed contents"
+            );
+            assert_eq!(
+                fs::read(mount.join(path.volume.as_path()).join("warm-marker")).unwrap(),
+                b"live build state"
+            );
+        }
+        for path in &retention {
+            for invalid in &path.clone_invalid {
+                assert!(
+                    !seed_mount
+                        .join(path.volume.as_path())
+                        .join(invalid.as_path())
+                        .exists()
+                );
+                assert_eq!(
+                    fs::read(mount.join(path.volume.as_path()).join(invalid.as_path())).unwrap(),
+                    b"live-only custody"
+                );
+            }
+        }
+        assert_eq!(fs::read(layout.record(&live)).unwrap(), original_record);
+        assert_eq!(
+            fs::read(mount.join(crate::build_volume::STATE_FILE)).unwrap(),
+            original_state,
+            "detected mbx changes only seed metadata"
+        );
+        host.publish_re_adopt_build(&layout, &source, Some(&claim), Some(&mbx), &retention)
+            .unwrap();
+        assert_eq!(
+            layout
+                .seed_of(&WorkspaceName::main(), &source.replacement)
+                .unwrap(),
+            Some((seed, record)),
+            "replay keeps the published seed's identity and mark"
+        );
+        drop(claim);
+        for id in layout.list().unwrap() {
+            let release = host.release_build_volume(&layout, &id).unwrap();
+            assert!(
+                matches!(
+                    release,
+                    crate::storage::apfs::native::BuildVolumeRelease::Deleted { .. }
+                ),
+                "{release:?}"
+            );
+        }
     }
 }
