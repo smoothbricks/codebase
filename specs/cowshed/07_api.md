@@ -528,19 +528,13 @@ pub struct RebaseOptions {
     pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
     pub expected_source_head: Option<GitOid>,
     pub expected_onto_head: Option<GitOid>,
-    pub plan: bool,                      // answer RebaseReport::Planned, move nothing (02: "`cowshed rebase`")
-    pub drop: Vec<GitOid>,               // commits left out; unheld ones need `drop_unheld`
-    pub drop_unheld: bool,
     pub resume: Option<RebaseResume>,    // Continue | Abort the rebase this verb stopped at a conflict
 }
 
 pub enum RebaseReport {                  // tagged `kind`
-    Rebased { oid: GitOid, onto: GitOid, commits: Vec<ReplayedCommit> },
-    Planned { oid: GitOid, onto: GitOid, commits: Vec<ReplayedCommit> },
+    Rebased { oid: GitOid, onto: GitOid },  // `git rebase` left the branch on `onto` at `oid`
     Aborted { oid: GitOid },
 }
-// ReplayedCommit { oid, subject, step }; step: Replay | ConflictExpected { paths } | Held { by } | DroppedUnheld;
-// by: PatchIdentity { holder } | Content { holder } | Emptied.
 
 pub struct LandOptions {
     pub target_branch: Option<String>,   // default: the branch the target has checked out

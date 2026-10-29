@@ -3610,17 +3610,6 @@ pub struct RebaseOptions {
     pub expected_source_head: Option<GitOid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_onto_head: Option<GitOid>,
-    /// Answer what the rebase would do and write nothing (`--plan`): [`RebaseReport::Planned`].
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub plan: bool,
-    /// Commits to leave out of the replay (`--drop`). One the destination does not hold, by content
-    /// or patch identity, is refused unless `drop_unheld` names the loss; a commit the last plan
-    /// cowshed recorded carried and the branch has since lost is named here the same way.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub drop: Vec<GitOid>,
-    /// `--drop-unheld`: drop the commits of `drop` the destination does not hold, losing them.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub drop_unheld: bool,
     /// Finish or undo the rebase this verb stopped at a conflict (`--continue`, `--abort`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume: Option<RebaseResume>,
@@ -3630,54 +3619,10 @@ pub struct RebaseOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RebaseResume {
-    /// Stage the resolved paths and replay the rest of the plan.
+    /// Stage the resolved paths and let git replay the rest.
     Continue,
     /// Put the branch back at the head the rebase started from.
     Abort,
-}
-
-/// One commit of the branch a rebase replays, and what the rebase does with it.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReplayedCommit {
-    pub oid: GitOid,
-    pub subject: String,
-    pub step: ReplayStep,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum ReplayStep {
-    /// The commit replays onto the destination.
-    Replay,
-    /// A plan's replay that conflicts when it is replayed after the commits before it: these
-    /// paths, read from an in-memory merge.
-    ConflictExpected { paths: Vec<String> },
-    /// The destination holds the commit's change, so the replay leaves it out.
-    Held { by: HeldBy },
-    /// `--drop` with `--drop-unheld`: left out though nothing else holds its change.
-    DroppedUnheld,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(
-    tag = "proof",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum HeldBy {
-    /// `holder`, a commit of the destination, is its patch-equivalent.
-    PatchIdentity { holder: GitOid },
-    /// The destination's files already carry its change; `holder` changed them last.
-    Content { holder: GitOid },
-    /// Its replay changed nothing: the destination and the commits replayed before it carry it.
-    Emptied,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -4118,127 +4063,21 @@ impl Adoption {
     deny_unknown_fields
 )]
 pub enum RebaseReport {
-    /// The branch now sits on `onto` at `oid`; `commits` is the range it replayed, oldest first,
-    /// each with what became of it.
-    Rebased {
-        oid: GitOid,
-        onto: GitOid,
-        commits: Vec<ReplayedCommit>,
-    },
-    /// `--plan`: what a rebase of `oid` onto `onto` would do. Nothing was written.
-    Planned {
-        oid: GitOid,
-        onto: GitOid,
-        commits: Vec<ReplayedCommit>,
-    },
+    /// The branch now sits on `onto` at `oid`: `git rebase` replayed each of its commits whose
+    /// patch `onto` did not already hold.
+    Rebased { oid: GitOid, onto: GitOid },
     /// `--abort`: the branch is back at `oid`, the head the stopped rebase started from.
     Aborted { oid: GitOid },
 }
 
 impl RebaseReport {
-    /// The branch head the report leaves: the rebased head, the planned one unmoved, or the
-    /// head an abort restored.
+    /// The branch head the report leaves: the rebased head, or the head an abort restored.
     pub fn oid(&self) -> &GitOid {
         match self {
-            Self::Rebased { oid, .. } | Self::Planned { oid, .. } | Self::Aborted { oid } => oid,
+            Self::Rebased { oid, .. } | Self::Aborted { oid } => oid,
         }
     }
 }
-
-impl ReplayedCommit {
-    /// What a replay did, as every rebase says it: `replayed N, dropped K held (<oid>…), dropped U
-    /// unheld (<oid>…)` (02_workspaces.md, "`cowshed rebase`"), commits abbreviated.
-    pub fn summary(commits: &[Self]) -> String {
-        let named = |pick: fn(&ReplayStep) -> bool| {
-            let oids: Vec<&str> = commits
-                .iter()
-                .filter(|commit| pick(&commit.step))
-                .map(|commit| abbreviated(&commit.oid))
-                .collect();
-            (oids.len(), oids.join(", "))
-        };
-        let replayed = commits
-            .iter()
-            .filter(|commit| {
-                matches!(
-                    commit.step,
-                    ReplayStep::Replay | ReplayStep::ConflictExpected { .. }
-                )
-            })
-            .count();
-        let dropped = |what: &str, (count, oids): (usize, String)| {
-            if count == 0 {
-                format!("dropped 0 {what}")
-            } else {
-                format!("dropped {count} {what} ({oids})")
-            }
-        };
-        format!(
-            "replayed {replayed}, {}, {}",
-            dropped(
-                "held",
-                named(|step| matches!(step, ReplayStep::Held { .. }))
-            ),
-            dropped(
-                "unheld",
-                named(|step| matches!(step, ReplayStep::DroppedUnheld))
-            ),
-        )
-    }
-
-    /// A plan as `--plan` prints it: one line per commit, oldest first, with its step and why, then
-    /// the counts.
-    pub fn plan_lines(commits: &[Self]) -> Vec<String> {
-        let mut lines: Vec<String> = commits
-            .iter()
-            .map(|commit| {
-                let (step, why) = match &commit.step {
-                    ReplayStep::Replay => ("replay", String::new()),
-                    ReplayStep::ConflictExpected { paths } => (
-                        "conflict-expected",
-                        format!(" (conflicts in {})", paths.join(", ")),
-                    ),
-                    ReplayStep::Held { by } => (
-                        "held-drop",
-                        match by {
-                            HeldBy::PatchIdentity { holder } => {
-                                format!(" (held by {}, its patch twin)", abbreviated(holder))
-                            }
-                            HeldBy::Content { holder } => {
-                                format!(
-                                    " (held by content; {} changed it last)",
-                                    abbreviated(holder)
-                                )
-                            }
-                            HeldBy::Emptied => String::from(" (its replay changed nothing)"),
-                        },
-                    ),
-                    ReplayStep::DroppedUnheld => ("drop-unheld", String::from(" (lost)")),
-                };
-                format!(
-                    "{step:<17} {} {}{why}",
-                    abbreviated(&commit.oid),
-                    commit.subject
-                )
-            })
-            .collect();
-        let conflicts = commits
-            .iter()
-            .filter(|commit| matches!(commit.step, ReplayStep::ConflictExpected { .. }))
-            .count();
-        lines.push(format!(
-            "{}; {conflicts} conflict(s) expected",
-            Self::summary(commits)
-        ));
-        lines
-    }
-}
-
-/// The first ten hex digits of a commit, as cowshed names commits to people.
-fn abbreviated(oid: &GitOid) -> &str {
-    oid.as_str().get(..10).unwrap_or(oid.as_str())
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AdoptionSkip {

@@ -287,9 +287,6 @@ pub const PARITY: &[Row] = &[
     row("rebase", "expected-workspace-incarnation", field(&[("coordinator.rebase", "options.expectedWorkspaceIncarnation")], &[argument("Coordinator.rebase", 1, "expectedWorkspaceIncarnation")])),
     row("rebase", "expected-source-head", field(&[("coordinator.rebase", "options.expectedSourceHead")], &[argument("Coordinator.rebase", 1, "expectedSourceHead")])),
     row("rebase", "expected-onto-head", field(&[("coordinator.rebase", "options.expectedOntoHead")], &[argument("Coordinator.rebase", 1, "expectedOntoHead")])),
-    row("rebase", "plan", field(&[("coordinator.rebase", "options.plan")], &[argument("Coordinator.rebase", 1, "plan")])),
-    row("rebase", "drop", field(&[("coordinator.rebase", "options.drop")], &[argument("Coordinator.rebase", 1, "drop")])),
-    row("rebase", "drop-unheld", field(&[("coordinator.rebase", "options.dropUnheld")], &[argument("Coordinator.rebase", 1, "dropUnheld")])),
     row("rebase", "continue", field(&[("coordinator.rebase", "options.resume")], &[argument("Coordinator.rebase", 1, "resume")])),
     row("rebase", "abort", field(&[("coordinator.rebase", "options.resume")], &[argument("Coordinator.rebase", 1, "resume")])),
     

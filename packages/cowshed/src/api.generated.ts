@@ -920,12 +920,6 @@ export type FenceRefusal =
   | ({ readonly reason: 'replayStopped' } & {
       readonly at: GitOid;
       readonly paths: ReadonlyArray<string>;
-    })
-  | ({ readonly reason: 'recordedWorkLost' } & {
-      readonly commits: ReadonlyArray<GitOid>;
-    })
-  | ({ readonly reason: 'dropUnheld' } & {
-      readonly commits: ReadonlyArray<GitOid>;
     });
 
 export type Finding = {
@@ -1209,15 +1203,6 @@ export type HeldBirth =
   | ({ readonly kind: 'unobserved' } & {
       readonly reason: string;
     });
-
-export type HeldBy =
-  | ({ readonly proof: 'patchIdentity' } & {
-      readonly holder: GitOid;
-    })
-  | ({ readonly proof: 'content' } & {
-      readonly holder: GitOid;
-    })
-  | { readonly proof: 'emptied' };
 
 /**
  * The kernel's name of one descriptor the leader was handed, read from the holder's own copy,
@@ -2823,20 +2808,6 @@ export type RebaseOptions = {
   readonly expectedSourceHead?: GitOid;
   readonly expectedOntoHead?: GitOid;
   /**
-   * Answer what the rebase would do and write nothing (`--plan`): [`RebaseReport::Planned`].
-   */
-  readonly plan?: boolean;
-  /**
-   * Commits to leave out of the replay (`--drop`). One the destination does not hold, by content
-   * or patch identity, is refused unless `drop_unheld` names the loss; a commit the last plan
-   * cowshed recorded carried and the branch has since lost is named here the same way.
-   */
-  readonly drop?: ReadonlyArray<GitOid>;
-  /**
-   * `--drop-unheld`: drop the commits of `drop` the destination does not hold, losing them.
-   */
-  readonly dropUnheld?: boolean;
-  /**
    * Finish or undo the rebase this verb stopped at a conflict (`--continue`, `--abort`).
    */
   readonly resume?: RebaseResume;
@@ -2849,12 +2820,6 @@ export type RebaseReport =
   | ({ readonly kind: 'rebased' } & {
       readonly oid: GitOid;
       readonly onto: GitOid;
-      readonly commits: ReadonlyArray<ReplayedCommit>;
-    })
-  | ({ readonly kind: 'planned' } & {
-      readonly oid: GitOid;
-      readonly onto: GitOid;
-      readonly commits: ReadonlyArray<ReplayedCommit>;
     })
   | ({ readonly kind: 'aborted' } & {
       readonly oid: GitOid;
@@ -2967,25 +2932,6 @@ export type RemoveReport = {
 export type RemovedWorkspace = {
   readonly workspace: WorkspaceName;
   readonly report: RemoveReport;
-};
-
-export type ReplayStep =
-  | { readonly kind: 'replay' }
-  | ({ readonly kind: 'conflictExpected' } & {
-      readonly paths: ReadonlyArray<string>;
-    })
-  | ({ readonly kind: 'held' } & {
-      readonly by: HeldBy;
-    })
-  | { readonly kind: 'droppedUnheld' };
-
-/**
- * One commit of the branch a rebase replays, and what the rebase does with it.
- */
-export type ReplayedCommit = {
-  readonly oid: GitOid;
-  readonly subject: string;
-  readonly step: ReplayStep;
 };
 
 /**

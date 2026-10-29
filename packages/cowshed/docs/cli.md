@@ -1189,7 +1189,7 @@ Stdout is the preserved ref and the commit it names. Nothing preserves a workspa
 store volume that holds the images is excluded from backup (durability = git). A pushed branch is also what lets
 `cowshed rm` retire the workspace with no flag: the ref keeps the commits main lacks, for HEAD as for any branch.
 
-### `cowshed rebase [<name>] [--onto <rev> | --into <lane>] [--plan] [--drop <commit>… [--drop-unheld]] | --continue | --abort`
+### `cowshed rebase [<name>] [--onto <rev> | --into <lane>] | --continue | --abort`
 
 Brings the workspace branch up to current main: cowshed points the workspace's `main` remote at main's checkout
 (`cowshed-main` in a workspace where something else already holds that name), fetches it, and replays the branch onto
@@ -1197,32 +1197,15 @@ Brings the workspace branch up to current main: cowshed points the workspace's `
 branch the lane base `<lane>` has checked out, fetched from its mount, so a unit catches up with what its lane-mates
 have landed there, and any shed's work moves onto a batch's branch. `--onto` and `--into` together are refused (exit 2).
 
-The replay follows a plan. A commit whose change the destination already holds, by patch identity or by content, is left
-out (held); every other commit replays, in order. `--plan` prints that plan and moves nothing:
-
-```
-$ cowshed rebase raven --into r3 --plan
-held-drop         4c1d2e3f5a fix(app): parse empty lines (held by 7a8b9c0d1e, its patch twin)
-replay            5d6e7f8a9b feat(app): stream the parser
-conflict-expected 6e7f8a9b0c docs(app): the parser's states (conflicts in docs/parser.md)
-replayed 2, dropped 1 held (4c1d2e3f5a), dropped 0 unheld; 1 conflict(s) expected
-```
-
-A dirty tree is refused before anything moves (exit 4: commit or discard the uncommitted work first). Autostash stays
-off even when the repository's config turns it on, because a stash re-apply that conflicts leaves unmerged paths behind
-and still exits 0. A conflict stops the replay in progress and exits 4 naming the commit and its conflicted paths:
-resolve them, then `cowshed rebase <name> --continue` stages them and replays the rest, or
-`cowshed rebase <name> --abort` puts the branch back where it started. Never finish it with `git rebase` by hand.
-`--drop <commit>` leaves a commit out; one the destination does not hold drops only with `--drop-unheld`, which names
-the loss.
-
-Cowshed records each rebase's plan in the workspace. A commit that plan carried, which the branch has since lost (a
-by-hand rebase or reset dropped it) and neither the branch nor the destination holds, stops the next rebase, ungated
-land, fold or `rm` (exit 4, naming it) until it is restored or named with `--drop <commit> --drop-unheld`.
-
-The rebase is Git alone: it fetches and replays, and runs no job. The new head prints on stdout and
-`cowshed: rebased <name> onto <commit>: replayed N, dropped K held (…), dropped U unheld (…)` on stderr; `--json` gives
-the `rebased` report with each commit and what became of it.
+The replay is `git rebase` onto the destination: git replays each commit whose patch the destination does not already
+hold, in order, and drops one whose replay comes out empty. Cowshed decides nothing about which commits replay. A dirty
+tree is refused before anything moves (exit 4: commit or discard the uncommitted work first). Autostash stays off even
+when the repository's config turns it on, because a stash re-apply that conflicts leaves unmerged paths behind and still
+exits 0. A conflict stops the replay in progress and exits 4 naming the commit and its conflicted paths: resolve them,
+then `cowshed rebase <name> --continue` stages them and lets git replay the rest, or `cowshed rebase <name> --abort`
+puts the branch back where it started. The rebase is Git alone: it fetches and replays, and runs no job. The new head
+prints on stdout and `cowshed: rebased <name> onto <commit>` on stderr; `--json` gives the `rebased` report with the
+head and the destination it sits on.
 
 ### `cowshed land <name> [--into <lane> [--ungated]] [--check <cmd>] [--ref-lock <file> | --ref-turn <queue>]`
 

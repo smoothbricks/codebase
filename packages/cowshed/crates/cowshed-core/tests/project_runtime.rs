@@ -1081,7 +1081,6 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(cowshed_core::api::dto::RebaseReport::Rebased {
             oid: head.clone(),
             onto: head,
-            commits: Vec::new(),
         })
     }
 
