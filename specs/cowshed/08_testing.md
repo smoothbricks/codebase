@@ -214,6 +214,12 @@ A fixture serves a test of its suite's own contract. The fixtures and helpers th
 used are deleted with it, and a fixture stands in for a dependency only at that dependency's published interface: it
 returns the results and refusals the interface can return and reproduces nothing behind it.
 
+The delayed-conclusion Nx fixture observes its live daemon and concludes the keeper maintenance start without an
+injected publication delay. Only then does it arm the delay for the developer job under test. An explicit keeper probe
+before the start concludes fixes the interleaving: setup cannot consume the idle interval being asserted. Synthetic
+spawn jobs still supply no native cgroup accounting input; their resource refusals remain visible and never become
+fabricated totals.
+
 Every test fixture stays inside the effective grants of the ordinary exec it runs in. A Rust fixture whose paths are
 used as spelled, such as a Unix-socket fixture, takes the one shared scratch parent (`scratch_parent` in
 `cowshed-core/tests/support/temp_parent.rs`, which the gateway's fixture directory reuses): `COWSHED_RUNTIME_LINK`, the

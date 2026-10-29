@@ -416,14 +416,15 @@ struct FakeCommitments {
 /// `delay`: a controller slow to publish a job's end, while the job is not yet concluded.
 struct SlowTerminal {
     inner: FakeCommitments,
-    delay: Duration,
+    delay: tokio::sync::watch::Receiver<Duration>,
 }
 
 #[async_trait]
 impl CommitmentSink for SlowTerminal {
     async fn record(&mut self, draft: CommitmentDraft) -> Result<()> {
-        if !self.delay.is_zero() && matches!(draft, CommitmentDraft::Terminal { .. }) {
-            tokio::time::sleep(self.delay).await;
+        let delay = *self.delay.borrow();
+        if !delay.is_zero() && matches!(draft, CommitmentDraft::Terminal { .. }) {
+            tokio::time::sleep(delay).await;
         }
         self.inner.record(draft).await
     }
@@ -570,7 +571,7 @@ fn harness_with_config(
         fail_next,
         backpressure,
         None,
-        Duration::ZERO,
+        tokio::sync::watch::channel(Duration::ZERO).1,
     )
 }
 
@@ -584,7 +585,7 @@ fn harness_with_sealed_stdout(sealed_stdout: Vec<u8>) -> (Harness, TempRoot) {
         false,
         false,
         Some(sealed_stdout),
-        Duration::ZERO,
+        tokio::sync::watch::channel(Duration::ZERO).1,
     );
     (h, root)
 }
@@ -596,7 +597,7 @@ fn harness_with_artifacts(
     fail_next: bool,
     backpressure: bool,
     sealed_stdout: Option<Vec<u8>>,
-    terminal_delay: Duration,
+    terminal_delay: tokio::sync::watch::Receiver<Duration>,
 ) -> Harness {
     let (spawn_tx, spawned) = mpsc::unbounded_channel();
     let (process_tx, process) = mpsc::unbounded_channel();
@@ -7502,14 +7503,15 @@ async fn shed_with_live_nx_daemon(name: &str) -> (Harness, LiveDaemon, PathBuf, 
     shed_with_live_nx_daemon_publishing_after(name, Duration::ZERO).await
 }
 
-/// [`shed_with_live_nx_daemon`], whose controller publishes each job's end `terminal_delay` after
-/// the job's conclusion began.
+/// [`shed_with_live_nx_daemon`], whose controller delays each subsequent terminal publication
+/// by `terminal_delay`, armed only once the keeper start has concluded.
 async fn shed_with_live_nx_daemon_publishing_after(
     name: &str,
     terminal_delay: Duration,
 ) -> (Harness, LiveDaemon, PathBuf, TempRoot) {
     let (supervisor_config, root) = nx_project(name);
     let project = supervisor_config.workspace_root.clone();
+    let (delay, terminal_delays) = tokio::sync::watch::channel(Duration::ZERO);
     let mut h = harness_with_artifacts(
         supervisor_config,
         1,
@@ -7517,14 +7519,23 @@ async fn shed_with_live_nx_daemon_publishing_after(
         false,
         false,
         None,
-        terminal_delay,
+        terminal_delays,
     );
     let in_use = open_named(&h.handle, "build").await;
     let start = h.spawned.recv().await.unwrap();
-    let daemon = LiveDaemon::start(&project);
+    let mut daemon = LiveDaemon::start(&project);
+    assert!(
+        running_after_probe(&h, &mut daemon).await,
+        "the fixture daemon is observed live before its start concludes"
+    );
     complete(&start, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(start.request.job_id).await.unwrap();
     h.handle.close_session(in_use).await.unwrap();
+    assert!(
+        running_after_probe(&h, &mut daemon).await,
+        "maintenance setup consumes no developer idle interval"
+    );
+    delay.send_replace(terminal_delay);
     (h, daemon, project, root)
 }
 
