@@ -139,7 +139,7 @@ export function createRunProgress(command = '', closed?: (result: NativeTestResu
   const bunDiagnostics: Record<OutputStream, string[]> = { stdout: [], stderr: [] };
 
   // One complete line, ANSI stripped, that is not a line of dots: true when it names a finished test.
-  const finishedLine = (text: string, stream: OutputStream, raw: string): boolean => {
+  const finishedLine = (text: string, stream: OutputStream): boolean => {
     const event =
       stream === 'stdout'
         ? nativeTestEvent(
@@ -283,7 +283,7 @@ export function createRunProgress(command = '', closed?: (result: NativeTestResu
           if (!goLifecycle && DOTS.test(text)) {
             progressed ||= text.length > counted;
           }
-        } else if (finishedLine(text, stream, raw)) {
+        } else if (finishedLine(text, stream)) {
           progressed = true;
         }
         counted = 0;

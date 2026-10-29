@@ -56,7 +56,7 @@ test('later_test', () => new Promise<void>((resolve, reject) => {
           join(root, 'src/lib.rs'),
           String.raw`
 #[test]
-fn early_failure() { panic!("closed failure evidence é"); }
+fn early_failure() { panic!("closed failure evidence {}", char::from_u32(0xe9).unwrap()); }
 #[test]
 fn later_test() {
     use std::io::Read;
