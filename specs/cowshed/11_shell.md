@@ -441,6 +441,19 @@ leaf, and nextest listings execute no tests; actual compiler work still uses mbx
 and nextest target runners use mbx's own pool without an external reservation. Cowshed never claims that an inherited
 jobserver alone makes an arbitrary test runner consume mbx permits.
 
+A bounded leaf's hang clock follows this boundary too. Only a supported Cargo test execution known at spawn with
+`MBX_SCHEDULER_TESTS=1`, or a reserved external leaf, may suspend its no-progress clock while mbx holds no capacity. The
+grant descriptor carries every admission (`g`) and permit drop (`r`); overlapping holds are counted, queued time spends
+no idle budget, and a finished test resets the budget. A signal-killed holder writes no release and stays counted until
+the command ends. The first admission starts total and fixture ceilings; later queue intervals do not pause those
+ceilings. EOF proves neither admission nor release.
+
+Plain `cargo test` may include doctests and keeps its lifecycle clock. Commands with unsupported overrides, direct
+binaries, other runners and archives whose target is unknown at spawn keep that same conservative hang protection, not
+an unbounded wait for a grant they never take. The plugin's native extracted-archive nextest command uses
+`--binaries-metadata` under the canonical Cargo shim and is hold-gated. The plugin's `mbx-pool.test.ts` table owns this
+spawn-time mapping; `bounds.test.ts` owns the grant/release/progress sequences without real clocks.
+
 **Enforced by:** for Phase 2, `canonical_mbx_environment_matches_host_warm_and_host_gate_paths` must compare the
 contribution's host-file and child projections, including adoption, caller overrides, non-Rust environment isolation
 through an external reservation and a class change between two commands of one warm host.

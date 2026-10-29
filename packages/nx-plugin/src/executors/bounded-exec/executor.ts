@@ -28,7 +28,7 @@ import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import type { CpuWaitRow } from './lease-wait.js';
 import type { LockWait } from './lock-wait.js';
-import { MBX_GRANT_FD, mbxLeaf, mbxPool, withMbxLeaf } from './mbx-pool.js';
+import { MBX_GRANT_FD, mbxIdleGated, mbxLeaf, mbxPool, withMbxLeaf } from './mbx-pool.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -629,6 +629,7 @@ export async function runBoundedExec(
     ...targetEnv(options.env, appendStderr),
     ...sized.env,
     ...(pool?.environment ?? {}),
+    ...(leaf?.kind === 'cargo' ? { MBX_GRANT_FD: String(MBX_GRANT_FD) } : {}),
   };
   // A fixture rides as segment 0 of the lifecycle. Without the channel (Windows) it is plain shell text ahead
   // of the command: the progress bound runs during it and its own ceiling does not.
@@ -646,17 +647,16 @@ export async function runBoundedExec(
   // descriptor, and execs `/bin/sh -c command` in the same process: the command's pid, group and life are unchanged.
   const unadmitted = hooked?.command ?? (fixture === null ? command : `${fixture.command} && ${command}`);
   const shellCommand = leaf === null ? unadmitted : withMbxLeaf(unadmitted, leaf);
-  // A reserved command waits in mbx's pool before it runs, and mbx says its grant on the grant descriptor.
-  const queued = leaf?.kind === 'reserve';
+  // Only leaves known to be scheduled can exclude zero-hold time. Others keep lifecycle hang protection.
+  const queued = mbxIdleGated(leaf, sized.command, { ...process.env, ...env });
   // fd 4 is unused without a subtree admission, so the grant takes fd 5 either way.
-  const grantSlots: IOType[] = queued ? ['ignore', 'pipe'] : [];
-  const rootGrantSlot: IOType[] = queued ? ['pipe'] : [];
+  const grantSlots: IOType[] = leaf !== null ? ['ignore', 'pipe'] : [];
+  const rootGrantSlot: IOType[] = leaf !== null ? ['pipe'] : [];
   const root = owner?.rootArgv(shellCommand);
   let child: ChildProcess;
   try {
     // fd 3 is the runner lifecycle's duplex socket when the command is hooked; the subtree admission takes fd 4, which
-    // `cowshed subtree-root` closes before it execs, so fd 3 reaches the shell unchanged; `mbx reserve --grant-fd`
-    // says a reserved command's grant on MBX_GRANT_FD (5).
+    // cowshed closes fd 4 before exec; fd 5 carries mbx's admission/release stream, including Cargo descendants.
     child =
       root === undefined
         ? spawn(shellCommand, [], {
@@ -664,7 +664,7 @@ export async function runBoundedExec(
             env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
             shell: true,
             stdio:
-              hooked === null && !queued
+              hooked === null && leaf === null
                 ? 'pipe'
                 : ['pipe', 'pipe', 'pipe', hooked === null ? 'ignore' : 'pipe', ...grantSlots],
             detached: process.platform !== 'win32',
@@ -1026,28 +1026,38 @@ export async function runBoundedExec(
     fixture: fixture !== null && lifecycle !== null,
     queued,
   });
-  // The grant is mbx's first byte on the grant descriptor, or the descriptor's end should every holder close it unsaid:
-  // from then on the run is the command's time. Read after the spawn's step, so a grant can never come before the queue.
-  if (leaf?.kind === 'reserve') {
+  // Read every byte after spawn accounting: a chunk can contain several grants and releases. EOF is neither.
+  if (leaf !== null) {
     const channel = child.stdio.at(MBX_GRANT_FD);
-    if (!(channel instanceof Readable)) throw new Error('a reserved command requires its grant descriptor');
+    if (!(channel instanceof Readable)) throw new Error('an mbx leaf requires its grant descriptor');
     let said = false;
-    const grant = (): void => {
-      if (said) return;
-      said = true;
-      tell(
-        `cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms cpus=${leaf.cpus} priority=${leaf.priority}\n`,
-      );
-      stepTo({
-        kind: 'granted',
-        at: Date.now(),
-        testing: isTesting(),
-        fixture: fixture !== null && lifecycle !== null,
-      });
+    const failGrant = (detail: string): void => {
+      if (lifecycleFailure !== null || state.expiry !== null || state.settled) return;
+      lifecycleFailure ??= `mbx grant descriptor: ${detail}`;
+      appendStderr(`bounded-exec: ${lifecycleFailure}\n`);
+      termination = terminate();
     };
-    channel.once('data', grant);
-    channel.once('end', grant);
-    channel.resume();
+    channel.on('data', (chunk: Buffer) => {
+      for (const byte of chunk) {
+        if (byte === 103) {
+          if (!said) {
+            said = true;
+            tell(
+              leaf.kind === 'reserve'
+                ? `cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms cpus=${leaf.cpus} priority=${leaf.priority}\n`
+                : `cowshed: mbx cargo granted elapsed=${Date.now() - startedAt}ms\n`,
+            );
+          }
+          stepTo({ kind: 'granted', at: Date.now(), testing: isTesting(), fixture: !fixtureDone });
+        } else if (byte === 114) {
+          stepTo({ kind: 'released', at: Date.now() });
+        } else {
+          failGrant(`unexpected byte ${byte}`);
+          return;
+        }
+      }
+    });
+    channel.on('error', (error) => failGrant(error.message));
   }
 
   // A grant's connection is a ledger entry, not the command's owner: the lending parent's exit ends it, and what runs

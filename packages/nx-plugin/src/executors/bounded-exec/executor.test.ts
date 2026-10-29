@@ -1668,30 +1668,35 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toBe('ran\n');
   });
 
-  it("hears a reserved leaf's grant on its own descriptor, through mbx reserve", async () => {
+  it.each(['reserve', 'cargo'] as const)("hears an mbx %s leaf's grant and release stream", async (kind) => {
     const workspace = await createWorkspace();
-    // mbx at its published interface: `mbx reserve --grant-fd N … -- <command…>` writes the grant on fd N once the
-    // pool admits it, then runs the command. This one admits at once, so its grant reaches the executor on fd 5.
+    // One shell mapping check; the pure table owns hold counts and clock policy.
     const bin = join(workspace.root, 'stand-in-mbx');
     await mkdir(bin);
     await writeFile(
       join(bin, 'mbx'),
-      '#!/bin/sh\nfd=\nwhile [ "$1" != -- ]; do if [ "$1" = --grant-fd ]; then fd=$2; fi; shift; done\nshift\neval "printf granted >&$fd; exec $fd>&-"\nexec "$@"\n',
-      {
-        mode: 0o755,
-      },
+      '#!/bin/sh\nshift\nwhile [ "$1" != -- ]; do\n  if [ "$1" = --grant-fd ]; then shift; fd=$1; fi\n  shift\ndone\nshift\neval "printf g >&$fd"\nexec "$@"\n',
+      { mode: 0o755 },
     );
+    await writeFile(join(bin, 'cargo'), '#!/bin/sh\neval "printf ggrr >&$MBX_GRANT_FD"\nprintf "ran\\n"\n', {
+      mode: 0o755,
+    });
     const saved = {
       PATH: process.env.PATH,
       MBX_SCHEDULER: process.env.MBX_SCHEDULER,
       MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+      MBX_SCHEDULER_TESTS: process.env.MBX_SCHEDULER_TESTS,
     };
     process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
     process.env.MBX_SCHEDULER = '1';
     process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    process.env.MBX_SCHEDULER_TESTS = '1';
     try {
       const result = await runBoundedExec(
-        { command: 'node -e "console.log(\'ran\')"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        {
+          command: kind === 'cargo' ? 'cargo nextest run' : 'node -e "console.log(\'ran\')"',
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        },
         workspace.context,
         createProcessTreeKiller(),
         null,
@@ -1699,7 +1704,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
       expect(result.success, result.terminalOutput).toBe(true);
       expect(result.terminalOutput).toContain('ran\n');
-      expect(result.terminalOutput).toMatch(/cowshed: mbx reserve granted elapsed=\d+ms cpus=1 priority=low\n/);
+      expect(result.terminalOutput).toMatch(
+        kind === 'cargo'
+          ? /cowshed: mbx cargo granted elapsed=\d+ms\n/
+          : /cowshed: mbx reserve granted elapsed=\d+ms cpus=1 priority=low\n/,
+      );
       expect(result.terminalOutput).not.toContain('Bad file descriptor');
     } finally {
       for (const [name, value] of Object.entries(saved)) {

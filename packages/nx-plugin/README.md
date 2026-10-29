@@ -1923,6 +1923,19 @@ waiting for, however long a loaded host makes the work take; one that never retu
 `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that report no tests; a target names at least one of
 the two.
 
+With mbx admission, a reserved leaf and a supported Cargo/nextest test leaf inherit a private grant pipe. mbx writes `g`
+on every admission and `r` on permit drop (`MBX_GRANT_FD=5` for Cargo, `mbx reserve --grant-fd 5` for reservations). The
+executor counts overlapping holds: while no hold exists it pauses the test idle budget, resuming the remaining budget on
+admission; a finished test still resets that budget. Total and fixture ceilings start at the first `g` and do not pause
+after it. EOF is not a grant or a release; a holder killed without `r` remains counted until command exit.
+
+The decision to pause is made before spawn, from the canonical scheduling switch and the supported command, never from
+silence on the pipe. The inferred extracted-archive `cargo --frozen nextest run --binaries-metadata …` is hold-gated.
+Plain `cargo test` can also run unscheduled doctests, so it retains its lifecycle idle clock, as do unknown runners,
+direct binaries, test listings, configuration/toolchain/directory overrides, and `--archive-file` whose target is not
+known at spawn. Explicit non-doc Cargo target selections can be hold-gated. These conservative cases remain bounded even
+when they never hold an mbx permit (specs/cowshed/11_shell.md, "Cargo test-runner boundaries").
+
 On POSIX hosts, direct Go and Cargo test commands (including chains joined by `&&`, `||`, or `;`) share one private
 runner lifecycle: `build`, `active`, and `terminal`. A per-command Node supervisor reports phases over an acknowledged
 descriptor that its actual tool child and nested fixtures do not inherit. Shell/supervisor startup is bounded; the tool

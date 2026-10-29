@@ -1,4 +1,4 @@
-import type { RunnerKind } from './runner-sizing.js';
+import { invocationSpan, type RunnerKind } from './runner-sizing.js';
 import { shellQuote } from './verdict.js';
 
 /**
@@ -43,14 +43,46 @@ export function mbxLeaf(pool: MbxPool, kind: RunnerKind, want: number): MbxLeaf 
 }
 
 /**
- * The descriptor `mbx reserve --grant-fd` says a reservation's grant on, the moment the pool admits it and before the
- * command runs. bounded-exec starts its clocks there (bounds.ts).
+ * Only a known scheduled execution may stop its idle clock at zero holds. Plain Cargo tests can run doctests;
+ * archive-file targets, direct binaries and other runners are not proven scheduled at spawn (11_shell.md,
+ * "Cargo test-runner boundaries"). The inferred extracted native nextest command is a supported Cargo invocation.
+ */
+export function mbxIdleGated(leaf: MbxLeaf | null, command: string, environment: Readonly<NodeJS.ProcessEnv>): boolean {
+  if (leaf === null) return false;
+  if (leaf.kind === 'reserve') return true;
+  if (environment.MBX_SCHEDULER_TESTS !== '1') return false;
+  if (environment.MBX_SCHEDULER === '0' || environment.MBX_SCHED_DISABLE === '1' || environment.MBX_DISABLE === '1')
+    return false;
+  const invocation = /cargo(?:\s+(?:--frozen|--locked|--offline))*\s+(nextest\s+run|test)(?=\s|$)/;
+  const found = invocation.exec(command);
+  if (found === null) return false;
+  const prefix = command.slice(0, found.index).trim();
+  if (prefix !== '' && !/^extracted="\$\([^\n]+\)"\s*&&$/.test(prefix)) return false;
+  const { argsEnd } = invocationSpan(command, invocation);
+  if (command.slice(argsEnd).trim() !== '') return false;
+  const args = command.slice(found.index, argsEnd).split(/\s--(?:\s|$)/, 1)[0] ?? '';
+  if (
+    /(?:^|\s)(?:--(?:config|directory|archive-file)(?:=|\s)|--(?:doc|no-run|list|help)(?:\s|$)|-C|-h(?:\s|$)|\+)/.test(
+      args,
+    )
+  ) {
+    return false;
+  }
+  return (
+    found[1] !== 'test' ||
+    /(?:^|\s)--(?:lib|tests|bins|examples|benches|all-targets|test|bin|example|bench)(?=\s|=|$)/.test(args)
+  );
+}
+
+/**
+ * mbx writes one byte per admission (g) and permit drop (r). Cargo descendants inherit this descriptor through
+ * MBX_GRANT_FD; reserve names it with --grant-fd and closes it on exec of the external command.
  */
 export const MBX_GRANT_FD = 5;
 
 /**
  * `command` as the shell runs it under its leaf's admission. `mbx` is the canonical environment's, whose realpath
- * cowshed's admission proved to be the host's pinned mbx; it writes the grant on {@link MBX_GRANT_FD} itself.
+ * cowshed's admission proved to be the host's pinned mbx; it writes the grant on this descriptor itself.
  */
 export function withMbxLeaf(command: string, leaf: MbxLeaf): string {
   if (leaf.kind === 'cargo') {

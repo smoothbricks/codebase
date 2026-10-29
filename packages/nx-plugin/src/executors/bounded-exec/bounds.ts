@@ -3,14 +3,10 @@
  * a pure function of the run's events and the times they happened at, so a table can test it with no clock and no
  * process (verdict.ts says why the bounds are separate).
  *
- * - A run queued in its pool (`mbx reserve` before the grant) arms nothing, and nothing it reports moves a clock:
- *   every bound below starts at the grant instead of the spawn (specs/cowshed/05_gateway.md, "Parallelism inside a
- *   job": a wait for the pool is not the command's time).
- * - The total ceiling runs from the spawn.
- * - The fixture ceiling runs from the spawn while a supervised fixture runs, and ends with the fixture's segment.
- * - The progress bound runs only while the runner is testing (runner-lifecycle.ts): from the spawn when the runner is
- *   testing then (startup is bounded until a build declares itself), restarted by a finished test or by the clock
- *   starting again after a build, and stopped while nothing tests.
+ * - A scheduled leaf arms nothing until its first grant. Later zero-hold intervals pause only the idle budget;
+ *   total and fixture ceilings keep running. Unscheduled leaves start at spawn and never wait for a grant.
+ * - The fixture ceiling ends with its segment. The idle clock also stops outside the testing lifecycle.
+ * - Finished tests reset the idle budget whether their release byte arrived before or after their output.
  */
 
 /** The limits a run was given, in milliseconds; an absent one never expires. */
@@ -29,6 +25,8 @@ export interface Bounds {
   readonly fixture: number | null;
   readonly total: number | null;
   readonly queued: boolean;
+  readonly holds: number | null;
+  readonly idleRemaining: number | null;
 }
 
 export type BoundKind = 'idle' | 'fixture' | 'total';
@@ -36,7 +34,7 @@ export type BoundKind = 'idle' | 'fixture' | 'total';
 export type BoundEvent =
   /**
    * The command started; `testing` is the lifecycle's answer then, `fixture` whether a supervised fixture leads it,
-   * `queued` whether it waits in its pool for a grant first.
+   * `queued` whether mbx schedules this leaf, as known before spawn.
    */
   | {
       readonly kind: 'spawn';
@@ -45,8 +43,9 @@ export type BoundEvent =
       readonly fixture: boolean;
       readonly queued: boolean;
     }
-  /** The pool granted a queued command: its bounds start now, as a spawn's would. */
+  /** Each admission begins a hold; the first one starts the queued leaf's ceilings. */
   | { readonly kind: 'granted'; readonly at: number; readonly testing: boolean; readonly fixture: boolean }
+  | { readonly kind: 'released'; readonly at: number }
   /**
    * The runner's state may have moved: a test finished (`finished`), a phase changed, or the lifecycle failed.
    * `wasTesting` is the answer before the event, `testing` the answer after it.
@@ -61,7 +60,14 @@ export type BoundEvent =
   /** The fixture's segment ended: its ceiling no longer applies. */
   | { readonly kind: 'fixture-done' };
 
-export const UNARMED: Bounds = { idle: null, fixture: null, total: null, queued: false };
+export const UNARMED: Bounds = {
+  idle: null,
+  fixture: null,
+  total: null,
+  queued: false,
+  holds: null,
+  idleRemaining: null,
+};
 
 /** The bounds a command that starts running at `at` arms. */
 function armed(limits: BoundLimits, at: number, testing: boolean, fixture: boolean): Bounds {
@@ -70,6 +76,8 @@ function armed(limits: BoundLimits, at: number, testing: boolean, fixture: boole
     fixture: fixture && limits.fixtureMs !== undefined ? at + limits.fixtureMs : null,
     total: limits.totalMs !== undefined ? at + limits.totalMs : null,
     queued: false,
+    holds: null,
+    idleRemaining: limits.idleMs ?? null,
   };
 }
 
@@ -77,15 +85,41 @@ function armed(limits: BoundLimits, at: number, testing: boolean, fixture: boole
 export function stepBounds(bounds: Bounds, limits: BoundLimits, event: BoundEvent): Bounds {
   switch (event.kind) {
     case 'spawn':
-      return event.queued ? { ...UNARMED, queued: true } : armed(limits, event.at, event.testing, event.fixture);
-    case 'granted':
-      return bounds.queued ? armed(limits, event.at, event.testing, event.fixture) : bounds;
+      return event.queued
+        ? { ...UNARMED, queued: true, holds: 0, idleRemaining: limits.idleMs ?? null }
+        : armed(limits, event.at, event.testing, event.fixture);
+    case 'granted': {
+      if (bounds.holds === null) return bounds;
+      if (bounds.queued) return { ...armed(limits, event.at, event.testing, event.fixture), holds: 1 };
+      return {
+        ...bounds,
+        holds: bounds.holds + 1,
+        idle:
+          bounds.holds === 0 && event.testing && bounds.idleRemaining !== null
+            ? event.at + bounds.idleRemaining
+            : bounds.idle,
+      };
+    }
+    case 'released': {
+      if (bounds.holds === null || bounds.holds === 0) return bounds;
+      if (bounds.holds > 1) return { ...bounds, holds: bounds.holds - 1 };
+      return {
+        ...bounds,
+        holds: 0,
+        idle: null,
+        idleRemaining: bounds.idle === null ? bounds.idleRemaining : Math.max(0, bounds.idle - event.at),
+      };
+    }
     case 'progress': {
       if (bounds.queued) return bounds;
-      if (!event.testing) return { ...bounds, idle: null };
+      if (!event.testing) return { ...bounds, idle: null, idleRemaining: limits.idleMs ?? null };
       const restart = event.finished || !event.wasTesting;
       if (!restart || limits.idleMs === undefined) return bounds;
-      return { ...bounds, idle: event.at + limits.idleMs };
+      return {
+        ...bounds,
+        idle: bounds.holds === 0 ? null : event.at + limits.idleMs,
+        idleRemaining: limits.idleMs,
+      };
     }
     case 'fixture-done':
       return { ...bounds, fixture: null };
