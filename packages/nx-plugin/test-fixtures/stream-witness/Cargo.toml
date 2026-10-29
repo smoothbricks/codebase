@@ -1,0 +1,27 @@
+[package]
+name = "stream-witness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.dev.build-override]
+debug = 0
+
+[profile.debugging]
+inherits = "dev"
+debug = 2
+
+[profile.debugging.package."*"]
+debug = 2
+
+[profile.debugging.build-override]
+debug = 2

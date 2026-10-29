@@ -2164,6 +2164,32 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('names the canonical toolchain for a declared-only Cargo fixture producer', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/fixture/package.json',
+        JSON.stringify({
+          name: 'fixture',
+          nx: {
+            targets: {
+              'cargo-stream-archive': {
+                executor: 'nx:run-commands',
+                cache: true,
+                inputs: [CARGO_TOOLCHAIN_NAMED_INPUT],
+                options: { command: 'cargo nextest archive --manifest-path test-fixtures/Cargo.toml' },
+              },
+            },
+          },
+        }),
+      );
+      const project = await inferProject(workspace, 'packages/fixture/package.json');
+      expect(project?.namedInputs?.[CARGO_TOOLCHAIN_NAMED_INPUT]).toEqual(cargoToolchainInputs());
+      expect(project?.targets?.['cargo-test-archive']).toBeUndefined();
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   // Without an `externalDependencies` input Nx keys a task whose executor is
   // not an `@nx/` one on every package in the lockfile, so a lockfile-only
   // commit re-ran every cargo verdict (measured in a consumer: every cargo-test-*

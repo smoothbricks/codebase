@@ -15,7 +15,7 @@ import { publishFixtureSocketDirectory, retireFixtureSocketDirectory } from '../
  */
 
 const repositoryRoot = join(import.meta.dir, '../../../..');
-const reporter = join(import.meta.dir, 'smoo-nx-bound-failures.ts');
+const reporter = join(import.meta.dir, '../../dist/bin/smoo-nx-bound-failures.js');
 const nxEntry = join(repositoryRoot, 'node_modules', '.bin', 'nx');
 const DEPENDENCY = 'lib:build';
 
@@ -100,8 +100,8 @@ it('names the failed dependency Nx recorded in cacheDir, not the checkout-local 
     expect(existsSync(join(local, 'run.json'))).toBe(false);
 
     const reported = spawnSync('bun', [reporter], { cwd: workspace, env, encoding: 'utf8' });
-    expect(reported.stdout).toContain(DEPENDENCY);
-    expect(reported.status).toBe(1);
+    expect(reported.stdout, reported.stderr).toContain(DEPENDENCY);
+    expect(reported.status, reported.stderr).toBe(1);
   } finally {
     if (published) await retireFixtureSocketDirectory(workspace);
     await rm(root, { recursive: true, force: true });

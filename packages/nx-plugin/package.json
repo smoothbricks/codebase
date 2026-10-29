@@ -35,6 +35,18 @@
       "import": "./dist/bounded-test-policy.js",
       "default": "./dist/bounded-test-policy.js"
     },
+    "./test-results": {
+      "types": "./dist/executors/bounded-exec/test-results.d.ts",
+      "development": "./src/executors/bounded-exec/test-results.ts",
+      "import": "./dist/executors/bounded-exec/test-results.js",
+      "default": "./dist/executors/bounded-exec/test-results.js"
+    },
+    "./test-results/host": {
+      "types": "./dist/executors/bounded-exec/test-result-writer.d.ts",
+      "development": "./src/executors/bounded-exec/test-result-writer.ts",
+      "import": "./dist/executors/bounded-exec/test-result-writer.js",
+      "default": "./dist/executors/bounded-exec/test-result-writer.js"
+    },
     "./build-state-output-policy": {
       "types": "./dist/build-state-output-policy.d.ts",
       "development": "./src/build-state-output-policy.ts",
@@ -350,6 +362,30 @@
           "killAfterMs": 10000
         }
       },
+      "cargo-stream-archive": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "metadata": {
+          "smooTaskKind": "test"
+        },
+        "inputs": [
+          "{projectRoot}/test-fixtures/stream-witness/**/*",
+          "!{projectRoot}/test-fixtures/stream-witness/target/**/*",
+          "{workspaceRoot}/.cargo/config",
+          "{workspaceRoot}/.cargo/config.toml",
+          "cargoToolchain",
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/.cache/test-stream/archive.tar.zst"
+        ],
+        "options": {
+          "command": "mkdir -p .cache/test-stream && cargo --frozen nextest archive --manifest-path test-fixtures/stream-witness/Cargo.toml --archive-file .cache/test-stream/archive.tar.zst --user-config-file none",
+          "cwd": "{projectRoot}"
+        }
+      },
       "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
@@ -357,7 +393,16 @@
           "default",
           "^dependencyDefault",
           "bunToolchain",
-          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs",
+          {
+            "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
+            "transitive": false
+          }
+        ],
+        "dependsOn": [
+          "^build",
+          "build",
+          "cargo-stream-archive"
         ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=1/4 --path-ignore-patterns='**/*-host.test.ts'",
@@ -373,7 +418,16 @@
           "default",
           "^dependencyDefault",
           "bunToolchain",
-          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs",
+          {
+            "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
+            "transitive": false
+          }
+        ],
+        "dependsOn": [
+          "^build",
+          "build",
+          "cargo-stream-archive"
         ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=2/4 --path-ignore-patterns='**/*-host.test.ts'",
@@ -389,7 +443,16 @@
           "default",
           "^dependencyDefault",
           "bunToolchain",
-          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs",
+          {
+            "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
+            "transitive": false
+          }
+        ],
+        "dependsOn": [
+          "^build",
+          "build",
+          "cargo-stream-archive"
         ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=3/4 --path-ignore-patterns='**/*-host.test.ts'",
@@ -405,7 +468,16 @@
           "default",
           "^dependencyDefault",
           "bunToolchain",
-          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs",
+          {
+            "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
+            "transitive": false
+          }
+        ],
+        "dependsOn": [
+          "^build",
+          "build",
+          "cargo-stream-archive"
         ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=4/4 --path-ignore-patterns='**/*-host.test.ts'",

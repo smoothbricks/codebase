@@ -2348,7 +2348,9 @@ async function createProjectTargets(
           [VERSIONLESS_PRODUCTION_INPUT]: ['production', ...versionlessProjectInputs],
           [VERSIONLESS_DEFAULT_INPUT]: ['default', ...versionlessProjectInputs],
         }),
-    ...(Object.keys(targets).some((name) => name.startsWith('cargo-') || name.startsWith('napi-'))
+    ...([...Object.keys(targets), ...Object.keys(declaredTargets)].some(
+      (name) => name.startsWith('cargo-') || name.startsWith('napi-'),
+    )
       ? { [CARGO_TOOLCHAIN_NAMED_INPUT]: cargoToolchainInputs() }
       : {}),
   };
