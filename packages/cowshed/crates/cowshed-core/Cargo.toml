@@ -64,5 +64,7 @@ security-framework-sys = "2"
 cowshed-os = { path = "../cowshed-os", features = ["test-hooks"] }
 parking_lot = "0.12"
 proptest = "1"
+# The supervisor actor's census parses this crate's own source (runtime/supervisor/actor_census.rs).
+syn = { version = "2", features = ["full", "visit"] }
 # Paused time: a supervisor test lets a minute of Nx daemon probes pass without waiting it out.
 tokio = { workspace = true, features = ["test-util"] }

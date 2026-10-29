@@ -524,6 +524,25 @@ into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supe
   operation holds the workspace's lock (a fork of it, `main`'s included, its `rm` or its defragmentation), an already
   settled mount is served as it stands, and one that needs settling waits for the lock after saying once on its stderr,
   the daemon's log, which processes hold it by PID and command. Nothing but the manager's start bound ends that wait.
+- Its actor's turns block on nothing. One actor owns the supervisor's state and takes one command or event per turn, and
+  the process runs a current-thread runtime, so every socket task, each call's heartbeat writer included, shares the
+  actor's thread: a turn that sat in a kernel call there would stop every heartbeat of the process. Measured 2026-10-28
+  and 29: five of eight stack samples of a silent supervisor found its actor pinned for the whole sample in one `stat`
+  or `write`, the stat of a build volume's image at admission, the store scan behind a spawn's Git routes, or a seal's
+  record append. So a turn makes no file-system call on that thread. Each step that makes one runs on the blocking pool,
+  and the turn awaits its result with the thread free (`runtime::supervisor::off_actor`): an admission's build-volume
+  hold, capability detection, profile rendering, `.cowshed/env` publication and volume baseline; a spawn's host-side
+  preparation (its private environment with the store's Git routes, its process observer, start check and profile, and
+  its observation fence) and its jobserver fifo; a job's admission record, output writes, background prefix, seal and
+  sealed reads; the release of its build-volume hold and its jobserver; and the Nx keeper's grant and `node` lookups. A
+  value every use of which blocks, the artifact store, a build-volume hold or a jobserver, is held so that only the
+  blocking pool uses or drops it. The state stays the actor's own: a turn holds it across the await, and no other turn
+  starts before the result is back. A census in the crate's tests walks every function the actor's turns reach by name
+  and refuses a `std::fs`, file-system `libc` or stat-ing `Path` call among them (`runtime::supervisor::actor_census`).
+  Kernel reads of the process table (a job's samples and listening ports, a spawn's fence and host load), the volume
+  usage a sample reads, the build-volume release the controller answers and, on Linux, cgroup admission and signalling
+  still run in the turn. Each turn is published for heartbeats as it starts and ends (05_gateway.md, "Deadlines") and
+  timed as `turn <kind>` under `COWSHED_TIMING` (13_telemetry.md, "Inspection").
 
 ## Protocol
 
@@ -609,27 +628,29 @@ connection. A connection that closes before either has left a running job with n
 kills it under the authority it serves then, and says so on its stderr.
 
 - **hello** — the supervisor answers with its build, the authority it serves (repository, workspace, incarnation, grant
-  and lifecycle revisions) and its pid. A client reads the build first and refuses any other by name (`Conflict`), so
-  two cowshed builds never exchange a call either cannot decode. A build is the Mach-O `LC_UUID` the linker derives from
-  the binary's contents (the SHA-256 of the executable on Linux): no number anybody has to remember to bump, so a change
-  nobody announced still counts. The manager refuses an ensure from another build the same way, and its refusal carries
-  both builds as data — `otherBuild: { daemon, caller }` on the `Conflict` — so a client tells a controller the daemon
-  will no longer serve from every other conflict without reading the sentence. Its sentence is "the cowshed daemon is
-  build X; this cowshed is build Y", and its hint "run `cowshed setup` from the cowshed you mean to use: it installs
-  that build as both the daemon and the `cowshed` on PATH" (05_gateway.md "The installed cowshed"). A refusal at the
-  first ensure comes after a verb's first step — a removal has by then stopped its workspace's supervisor and journaled
-  its intent, and the refusal comes again on the path that would put that back, "state restoration also failed" — so
-  every CLI verb that needs a supervisor first sends the manager `sameBuild`, a request carrying nothing but the
-  caller's build, before it opens the project (06_cli.md "Onboarding and repair" lists the verbs). The manager checks
-  the build before it reads the rest of any request, answers `sameBuild` before any other work, and refuses another
-  build's with the same `Conflict`, so the verb is refused before its first step and the host is left as it was. No
-  manager answering is not a disagreement: there is no other build to refuse the caller, and a verb that needs the
-  daemon says so itself. The controller client notes the first other-build refusal on its connection
-  (`Coordinator::other_build`, 07_api.md); a supervisor of the controller's own build that still drains its jobs keeps
-  answering the calls that reach it. A program that links cowshed as a library is another build whatever revision it
-  links, so it opens no project in-process: it runs its controller as `cowshed controller` (06_cli.md), a process of the
-  host's own build, and speaks the controller protocol to it over the socket it hands that process; after an install has
-  started the daemon of a new build, it starts that verb again for its new work.
+  and lifecycle revisions) and its pid. The authority is the one its actor last published (05_gateway.md, "Deadlines"),
+  read without a round trip through the actor, so a turn waiting on the blocking pool never holds a hello past its
+  handshake bound. A client reads the build first and refuses any other by name (`Conflict`), so two cowshed builds
+  never exchange a call either cannot decode. A build is the Mach-O `LC_UUID` the linker derives from the binary's
+  contents (the SHA-256 of the executable on Linux): no number anybody has to remember to bump, so a change nobody
+  announced still counts. The manager refuses an ensure from another build the same way, and its refusal carries both
+  builds as data — `otherBuild: { daemon, caller }` on the `Conflict` — so a client tells a controller the daemon will
+  no longer serve from every other conflict without reading the sentence. Its sentence is "the cowshed daemon is build
+  X; this cowshed is build Y", and its hint "run `cowshed setup` from the cowshed you mean to use: it installs that
+  build as both the daemon and the `cowshed` on PATH" (05_gateway.md "The installed cowshed"). A refusal at the first
+  ensure comes after a verb's first step — a removal has by then stopped its workspace's supervisor and journaled its
+  intent, and the refusal comes again on the path that would put that back, "state restoration also failed" — so every
+  CLI verb that needs a supervisor first sends the manager `sameBuild`, a request carrying nothing but the caller's
+  build, before it opens the project (06_cli.md "Onboarding and repair" lists the verbs). The manager checks the build
+  before it reads the rest of any request, answers `sameBuild` before any other work, and refuses another build's with
+  the same `Conflict`, so the verb is refused before its first step and the host is left as it was. No manager answering
+  is not a disagreement: there is no other build to refuse the caller, and a verb that needs the daemon says so itself.
+  The controller client notes the first other-build refusal on its connection (`Coordinator::other_build`, 07_api.md); a
+  supervisor of the controller's own build that still drains its jobs keeps answering the calls that reach it. A program
+  that links cowshed as a library is another build whatever revision it links, so it opens no project in-process: it
+  runs its controller as `cowshed controller` (06_cli.md), a process of the host's own build, and speaks the controller
+  protocol to it over the socket it hands that process; after an install has started the daemon of a new build, it
+  starts that verb again for its new work.
 
   Only a hello proving that nothing serves the socket starts a supervisor: no socket file, or one no socket is attached
   to any more, whether the connection was refused or the peer ended it unanswered (a supervisor exiting closes its

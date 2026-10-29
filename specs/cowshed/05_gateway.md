@@ -897,20 +897,28 @@ the handshake bound.
   that refuses while still attached is a live peer that is not accepting (a full queue), never `BLOCKED`.
 - **A long wait has no total ceiling; its holder heartbeats.** Some answers take as long as their work: a job's
   terminal, a log follow, a commitments read, an advance, a process event. While such an answer is not ready, the
-  workspace supervisor writes `{"progress":{"seq":n,"job":{jobId,state,members}|null}}` on the call's connection every 5
-  s. The job field is present for a call about a job. The client connects and sends within the control bound, then reads
-  past the heartbeats under a silence bound of 15 s (three heartbeats). Each heartbeat is a round trip through the
-  supervisor's actor under the authority the supervisor serves now: it reads that authority, and the job for a call
-  about one. A grant advance during the wait therefore changes nothing. A supervisor that is alive but silent, or whose
-  actor stopped answering, writes no heartbeat and fails `SILENT`, naming its socket and pid. A heartbeat about a job
-  that is running or draining with no process of its group left is not progress. Only a silence the waiter was there to
-  see is judged: a waiter whose own turn comes later than the silence bound plus one heartbeat after its last one (its
-  thread was blocked, its process stopped, as an in-process controller and its client stall together) did not run to
-  read what the holder sent meanwhile, so it gives the holder one heartbeat more from then before it judges. That is a
-  liveness rule, not a wider bound: a waiter that runs in time judges the holder at the bound, and a SILENT still names
-  the holder's whole silence since its last progress. If that state persists for the silence bound, the wait fails
-  `SILENT`, naming the job as stuck between its last process and its end. A queued job is progress: resource admission
-  has no total queue-age deadline ("Host scheduling").
+  workspace supervisor writes
+  `{"progress":{"seq":n,"job":{jobId,state,members}|null,"actor":{turns,busy:{turn,forMs}|null}}}` on the call's
+  connection every 5 s. The job field is present for a call about a job the supervisor holds and has not concluded. The
+  client connects and sends within the control bound, then reads past the heartbeats under a silence bound of 15 s
+  (three heartbeats). A heartbeat is never a round trip through the supervisor's actor: it reads what the actor last
+  published, as a controller's heartbeat reads its router's `busy` (below). The actor is the one writer of that state:
+  as each of its turns, one command or event handled, starts and ends, it swaps an immutable snapshot of the authority
+  it serves, the turns it has completed, the turn it is in and when that started, and each job it has not concluded as
+  of its last completed turn, and a heartbeat loads the latest without a lock (11_shell.md, "Supervisor"). A grant
+  advance during the wait therefore changes nothing: the advance publishes its authority before it answers. A turn
+  waiting on the blocking pool keeps the heartbeats coming and names itself in them as `busy`, its `forMs` rising while
+  `turns` stays put; as with a controller, a heartbeat proves that the process serves, not that its actor is not stuck
+  inside one turn. A supervisor that is alive but silent, its process wedged, or whose actor has stopped, writes no
+  heartbeat and fails `SILENT`, naming its socket and pid. A heartbeat about a job that is running or draining with no
+  process of its group left is not progress. Only a silence the waiter was there to see is judged: a waiter whose own
+  turn comes later than the silence bound plus one heartbeat after its last one (its thread was blocked, its process
+  stopped, as an in-process controller and its client stall together) did not run to read what the holder sent
+  meanwhile, so it gives the holder one heartbeat more from then before it judges. That is a liveness rule, not a wider
+  bound: a waiter that runs in time judges the holder at the bound, and a SILENT still names the holder's whole silence
+  since its last progress. If that state persists for the silence bound, the wait fails `SILENT`, naming the job as
+  stuck between its last process and its end, and the turn its actor is in, if any: that turn may be the one ending it.
+  A queued job is progress: resource admission has no total queue-age deadline ("Host scheduling").
 - **Cowshed CPU-pool admission has its own policy when that pool is used.** This is the existing non-mbx protocol, not a
   protocol imposed on mbx. Connecting and writing the complete request share the 5 s control bound. After the write
   completes, the client keeps its connection open and reads the queue acknowledgement and grant under the 15 s

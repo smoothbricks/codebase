@@ -20111,9 +20111,9 @@ mod removal_supervisor_tests {
         },
         error::{CowshedError, Result},
         runtime::supervisor::{
-            ArtifactSeal, ArtifactSink, ArtifactWrite, CommitmentDraft, CommitmentSink,
-            NxDaemonRetirement, ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess,
-            SpawnSink, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+            ArtifactIndex, ArtifactSeal, ArtifactSink, ArtifactWrite, CommitmentDraft,
+            CommitmentSink, NxDaemonRetirement, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
+            RunningProcess, SpawnSink, WorkspaceSupervisor, WorkspaceSupervisorConfig,
         },
         storage::job_artifact::{JobEnding, StreamKind},
     };
@@ -20136,11 +20136,20 @@ mod removal_supervisor_tests {
 
     struct TestArtifacts;
 
-    impl ArtifactSink for TestArtifacts {
+    impl ArtifactIndex for TestArtifacts {
         fn next_job_id(&self) -> Result<JobId> {
             Ok(JobId::new(1).expect("test job id"))
         }
 
+        fn admitted(
+            &self,
+            _key: &crate::api::dto::AdmissionKey,
+        ) -> crate::storage::job_artifact::AdmissionLookup<'_> {
+            crate::storage::job_artifact::AdmissionLookup::Absent
+        }
+    }
+
+    impl ArtifactSink for TestArtifacts {
         fn admit(
             &mut self,
             _job_id: JobId,
@@ -20155,13 +20164,6 @@ mod removal_supervisor_tests {
                     "this test sink keeps no admission keys",
                 )),
             }
-        }
-
-        fn admitted(
-            &self,
-            _key: &crate::api::dto::AdmissionKey,
-        ) -> crate::storage::job_artifact::AdmissionLookup<'_> {
-            crate::storage::job_artifact::AdmissionLookup::Absent
         }
 
         fn prepare_background(&mut self, _job_id: JobId) -> Result<()> {

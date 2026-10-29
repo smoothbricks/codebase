@@ -590,20 +590,47 @@ enum Response {
     Progress(ProgressWire),
 }
 
-/// What a call still being answered says each heartbeat: how many it has said, and for a call
-/// about a job, that job as the supervisor holds it now.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// What a call still being answered says each heartbeat: how many it has said, for a call about
+/// a job that job as the supervisor's actor last published it, and that actor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProgressWire {
     seq: u64,
     job: Option<JobPulse>,
+    actor: ActorPulse,
+}
+
+/// The supervisor's actor as a heartbeat reports it (05_gateway.md, "Deadlines"): the turns it
+/// has completed and the turn it is in, by what that turn handles and how long it has run. A
+/// turn that holds a call up names itself here, and one that never ends shows a `forMs` that
+/// keeps rising while the turn count stays put.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ActorPulse {
+    turns: u64,
+    busy: Option<TurnBusy>,
+}
+
+/// The turn an actor is in: the command or event it handles, and for how long so far.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TurnBusy {
+    turn: String,
+    for_ms: u64,
+}
+
+/// What one heartbeat reports besides its sequence number.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Pulse {
+    job: Option<JobPulse>,
+    actor: ActorPulse,
 }
 
 /// A job as a heartbeat reports it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct JobPulse {
-    job_id: JobId,
+pub(crate) struct JobPulse {
+    pub(crate) job_id: JobId,
     state: JobState,
     /// How many processes of the job's group its latest sample found running; absent before the
     /// job's first sample.
@@ -611,7 +638,7 @@ struct JobPulse {
 }
 
 impl JobPulse {
-    fn of(info: &JobInfo) -> Self {
+    pub(crate) fn of(info: &JobInfo) -> Self {
         Self {
             job_id: info.job_id,
             state: info.state,
@@ -687,19 +714,24 @@ pub(super) async fn write_json<T: Serialize>(
     write_frame(stream, &bytes, MAX_JSON_FRAME).await
 }
 
-/// What one heartbeat reports, read through the supervisor's actor under the authority it serves
-/// now: a call made under an authority that an advance has since replaced still gets its
-/// heartbeat. A call about no job still asks the actor for that authority, so an actor that stops
-/// answering stops every heartbeat, and the caller's silence bound reports it.
-async fn pulse(
-    supervisor: &WorkspaceSupervisorHandle,
-    job: Option<JobId>,
-) -> Result<Option<JobPulse>> {
-    let current = supervisor.with_authority(supervisor.current_authority().await?);
-    match job {
-        Some(job_id) => Ok(Some(JobPulse::of(&current.info(job_id).await?))),
-        None => Ok(None),
-    }
+/// What one heartbeat reports, read from what the supervisor's actor last published and never
+/// through the actor (05_gateway.md, "Deadlines"), so a turn that waits on the blocking pool
+/// keeps every heartbeat going and is named in each. A call about a job hears that job as of
+/// the actor's last completed turn; a job it has concluded, or never held, has no pulse. An
+/// actor that has stopped publishes nothing more: no heartbeat goes out, and the caller's
+/// silence bound reports it.
+fn pulse(supervisor: &WorkspaceSupervisorHandle, job: Option<JobId>) -> Result<Pulse> {
+    let liveness = supervisor.liveness()?;
+    Ok(Pulse {
+        job: job.and_then(|job_id| liveness.job(job_id)),
+        actor: ActorPulse {
+            turns: liveness.turns,
+            busy: liveness.turn.map(|turn| TurnBusy {
+                turn: turn.kind.to_owned(),
+                for_ms: u64::try_from(turn.since.elapsed().as_millis()).unwrap_or(u64::MAX),
+            }),
+        },
+    })
 }
 
 /// The heartbeat writer of a call or stream (05_gateway.md, "Deadlines"): every
@@ -710,10 +742,9 @@ struct Heartbeat<P> {
     seq: u64,
 }
 
-impl<P, F> Heartbeat<P>
+impl<P> Heartbeat<P>
 where
-    P: FnMut() -> F,
-    F: Future<Output = Result<Option<JobPulse>>>,
+    P: FnMut() -> Result<Pulse>,
 {
     fn new(probe: P) -> Self {
         Self {
@@ -729,10 +760,10 @@ where
 
     /// What the next heartbeat reports, or `None` when the probe failed: no heartbeat goes out,
     /// the caller's silence bound then names this supervisor, and the probe's error is said here,
-    /// where it happened. Cancelling this writes nothing.
-    async fn read(&mut self) -> Option<Option<JobPulse>> {
-        match (self.probe)().await {
-            Ok(job) => Some(job),
+    /// where it happened.
+    fn read(&mut self) -> Option<Pulse> {
+        match (self.probe)() {
+            Ok(pulse) => Some(pulse),
             Err(error) => {
                 cowshed_os::eprintln!(
                     "cowshed: a call's heartbeat could not read the supervisor: {}",
@@ -744,37 +775,37 @@ where
     }
 
     /// Write one heartbeat frame, whole. Only a failed write is an error: the caller is gone.
-    async fn write(
-        &mut self,
-        writer: &mut (impl AsyncWrite + Unpin),
-        job: Option<JobPulse>,
-    ) -> Result<()> {
+    async fn write(&mut self, writer: &mut (impl AsyncWrite + Unpin), pulse: Pulse) -> Result<()> {
         self.seq += 1;
-        let seq = self.seq;
-        write_json(writer, &Response::Progress(ProgressWire { seq, job })).await
+        let progress = ProgressWire {
+            seq: self.seq,
+            job: pulse.job,
+            actor: pulse.actor,
+        };
+        write_json(writer, &Response::Progress(progress)).await
     }
 
     /// Read and write one heartbeat.
     async fn beat(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
-        match self.read().await {
-            Some(job) => self.write(writer, job).await,
+        match self.read() {
+            Some(pulse) => self.write(writer, pulse).await,
             None => Ok(()),
         }
     }
 }
 
 /// Answer a call with `work`, heartbeating with `probe` until it is done. The work is never
-/// dropped for a heartbeat: a probe still pending runs beside it, and once a heartbeat cannot be
-/// written (the caller left) the work runs to its end unheartbeated, so an admission or a
-/// retirement it started finishes its bookkeeping as before.
-async fn heartbeating<T, P, F>(
+/// dropped for a heartbeat: one once begun is written whole, so no frame is ever left half
+/// written for the answer to follow, and once a heartbeat cannot be written (the caller left)
+/// the work runs to its end unheartbeated, so an admission or a retirement it started finishes
+/// its bookkeeping as before.
+async fn heartbeating<T, P>(
     writer: &mut (impl AsyncWrite + Unpin),
     probe: P,
     work: impl Future<Output = T>,
 ) -> T
 where
-    P: FnMut() -> F,
-    F: Future<Output = Result<Option<JobPulse>>>,
+    P: FnMut() -> Result<Pulse>,
 {
     tokio::pin!(work);
     let mut heartbeat = Heartbeat::new(probe);
@@ -784,16 +815,7 @@ where
             answer = &mut work => return answer,
             () = heartbeat.due() => {}
         }
-        // Only the probe races the answer; a heartbeat once begun is written whole, so no frame
-        // is ever left half written for the answer to follow.
-        let read = tokio::select! {
-            biased;
-            answer = &mut work => return answer,
-            read = heartbeat.read() => read,
-        };
-        if let Some(job) = read
-            && heartbeat.write(writer, job).await.is_err()
-        {
+        if heartbeat.beat(writer).await.is_err() {
             return work.await;
         }
     }
@@ -962,8 +984,16 @@ async fn answer_of(
         match pulse.job {
             Some(job) if !job.advances() => {
                 if stalled.remaining(deadline::clock()).is_none() {
+                    // The job's pulse is as of the actor's last completed turn: a turn still
+                    // running, which may be the one ending this job, is named with it.
+                    let turn = pulse.actor.busy.as_ref().map_or_else(String::new, |busy| {
+                        format!(
+                            "; the actor's {} turn has run {} ms",
+                            busy.turn, busy.for_ms
+                        )
+                    });
                     let holder = format!(
-                        "job {} ({:?} with no process of its group running) of {}",
+                        "job {} ({:?} with no process of its group running{turn}) of {}",
                         job.job_id.get(),
                         job.state,
                         stream.peer()
@@ -2461,10 +2491,12 @@ async fn serve_call(
     let request: Request = read_json(&mut stream).await?;
     let (authority, call, length) = match request {
         Request::Hello => {
-            let authority = supervisor.current_authority().await?;
+            // Read from what the actor published, never through it: a turn waiting on the
+            // blocking pool must not hold a hello past its handshake bound.
+            let liveness = supervisor.liveness()?;
             let value = to_value(&HelloWire {
                 build: BuildId::current()?.clone(),
-                authority: (&authority).into(),
+                authority: liveness.authority.as_ref().into(),
                 pid: std::process::id(),
             })?;
             write_json(&mut stream, &Response::Ok { value, bytes: 0 }).await?;
@@ -2781,14 +2813,13 @@ pub(super) async fn kill_unheld(
 
 /// Relay `events` one per demand. While a demand waits for its event, `probe` heartbeats the
 /// stream, so a subscriber can tell a job with nothing to report from a supervisor that stopped.
-async fn relay_process_events<P, F>(
+async fn relay_process_events<P>(
     stream: UnixStream,
     mut events: JobProcessStream,
     probe: P,
 ) -> Result<()>
 where
-    P: FnMut() -> F,
-    F: Future<Output = Result<Option<JobPulse>>>,
+    P: FnMut() -> Result<Pulse>,
 {
     let mut heartbeat = Heartbeat::new(probe);
     let (mut reader, mut writer) = stream.into_split();
@@ -4007,7 +4038,7 @@ mod process_demand_tests {
         let relay = tokio::spawn(relay_process_events(
             server,
             JobProcessStream::new(receive),
-            || async { Ok(None) },
+            idle_probe,
         ));
         write_json(&mut client, &Demand::Next).await.unwrap();
         let Response::Ok { value, bytes: 0 } = read_json(&mut client).await.unwrap() else {
@@ -4027,6 +4058,16 @@ mod process_demand_tests {
         relay.await.unwrap().unwrap();
     }
 
+    /// A heartbeat probe of an actor between turns: these relays answer before any is due.
+    fn idle_probe() -> Result<Pulse> {
+        Ok(Pulse {
+            job: None,
+            actor: ActorPulse {
+                turns: 0,
+                busy: None,
+            },
+        })
+    }
     #[tokio::test]
     async fn closing_an_unanswered_process_demand_drops_the_subscription() {
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -4034,7 +4075,7 @@ mod process_demand_tests {
         let relay = tokio::spawn(relay_process_events(
             server,
             JobProcessStream::new(receive),
-            || async { Ok(None) },
+            idle_probe,
         ));
         write_json(&mut client, &Demand::Next).await.unwrap();
         write_json(&mut client, &Demand::Close).await.unwrap();
@@ -4054,7 +4095,7 @@ mod process_demand_tests {
         let relay = tokio::spawn(relay_process_events(
             server,
             JobProcessStream::new(receive),
-            || async { Ok(None) },
+            idle_probe,
         ));
         write_json(&mut client, &Demand::Next).await.unwrap();
         write_json(&mut client, &Demand::Next).await.unwrap();
@@ -5202,15 +5243,32 @@ mod call_deadline_tests {
         stream
     }
 
+    /// An actor between its turns.
+    fn idle() -> ActorPulse {
+        ActorPulse {
+            turns: 1,
+            busy: None,
+        }
+    }
+
     async fn beat(
         server: &mut tokio::io::DuplexStream,
         seq: u64,
         pulse: Option<JobPulse>,
     ) -> Result<()> {
+        beat_with(server, seq, pulse, idle()).await
+    }
+
+    async fn beat_with(
+        server: &mut tokio::io::DuplexStream,
+        seq: u64,
+        job: Option<JobPulse>,
+        actor: ActorPulse,
+    ) -> Result<()> {
         tokio::time::sleep(deadline::HEARTBEAT).await;
         write_json(
             server,
-            &Response::Progress(ProgressWire { seq, job: pulse }),
+            &Response::Progress(ProgressWire { seq, job, actor }),
         )
         .await
     }
@@ -5253,35 +5311,57 @@ mod call_deadline_tests {
         drop(server);
     }
 
+    /// A job's pulse is as of its actor's last completed turn. An idle actor's pulse is the whole
+    /// story; a turn still running when the stall is judged is named with the job, since it may
+    /// be the very turn that ends it.
     #[tokio::test(start_paused = true)]
     async fn a_job_whose_processes_ended_without_its_end_is_named_stuck() {
-        let (client, mut server) = tokio::io::duplex(4096);
-        let supervisor = tokio::spawn(async move {
-            beat(&mut server, 1, Some(job(JobState::Running, Some(1))))
+        for (turn, named) in [
+            (None, ""),
+            (Some("exited"), "; the actor's exited turn has run 20000 ms"),
+        ] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let actor = move |seq: u64| ActorPulse {
+                turns: 1,
+                busy: turn.map(|turn: &str| TurnBusy {
+                    turn: turn.to_owned(),
+                    for_ms: seq * 5000,
+                }),
+            };
+            let supervisor = tokio::spawn(async move {
+                beat_with(
+                    &mut server,
+                    1,
+                    Some(job(JobState::Running, Some(1))),
+                    actor(1),
+                )
                 .await
                 .unwrap();
-            // Heartbeats go on, about a job stuck draining, until the waiter hangs up.
-            let mut seq = 2;
-            while beat(&mut server, seq, Some(job(JobState::Draining, Some(0))))
+                // Heartbeats go on, about a job stuck draining, until the waiter hangs up.
+                let mut seq = 2;
+                while beat_with(
+                    &mut server,
+                    seq,
+                    Some(job(JobState::Draining, Some(0))),
+                    actor(seq),
+                )
                 .await
                 .is_ok()
-            {
-                seq += 1;
-            }
-            seq
-        });
-        let error = answer_of(&mut waiting(client)).await.unwrap_err();
-        assert!(
-            error.message.starts_with(
-                "SILENT: wait: job 7 (Draining with no process of its group running) of \
+                {
+                    seq += 1;
+                }
+                seq
+            });
+            let error = answer_of(&mut waiting(client)).await.unwrap_err();
+            let expected = format!(
+                "SILENT: wait: job 7 (Draining with no process of its group running{named}) of \
                  workspace supervisor at /s.sock showed no progress for 15s"
-            ),
-            "{}",
-            error.message
-        );
-        // The job last advanced at heartbeat 1 (5 s); the stall is named at heartbeat 4 (20 s), 15 s
-        // later, and the waiter hangs up, so heartbeat 5 finds no one.
-        assert_eq!(supervisor.await.unwrap(), 5);
+            );
+            assert!(error.message.starts_with(&expected), "{}", error.message);
+            // The job last advanced at heartbeat 1 (5 s); the stall is named at heartbeat 4
+            // (20 s), 15 s later, and the waiter hangs up, so heartbeat 5 finds no one.
+            assert_eq!(supervisor.await.unwrap(), 5);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -5300,17 +5380,33 @@ mod call_deadline_tests {
     async fn the_server_says_a_slow_answer_is_coming_and_then_gives_it() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let answered = tokio::spawn(async move {
-            heartbeating(&mut server, || async { Ok(None) }, async {
-                tokio::time::sleep(Duration::from_secs(12)).await;
-                42
-            })
+            heartbeating(
+                &mut server,
+                || {
+                    Ok(Pulse {
+                        job: None,
+                        actor: idle(),
+                    })
+                },
+                async {
+                    tokio::time::sleep(Duration::from_secs(12)).await;
+                    42
+                },
+            )
             .await
         });
         for seq in 1..=2 {
             let Response::Progress(pulse) = read_json(&mut client).await.unwrap() else {
                 panic!("a heartbeat comes before the answer");
             };
-            assert_eq!(pulse, ProgressWire { seq, job: None });
+            assert_eq!(
+                pulse,
+                ProgressWire {
+                    seq,
+                    job: None,
+                    actor: idle()
+                }
+            );
         }
         assert_eq!(answered.await.unwrap(), 42);
     }
@@ -5319,7 +5415,7 @@ mod call_deadline_tests {
     async fn a_probe_that_fails_writes_no_heartbeat_and_never_drops_the_answer() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let answered = tokio::spawn(async move {
-            let probe = || async { Err(protocol_error("the actor stopped")) };
+            let probe = || -> Result<Pulse> { Err(protocol_error("the actor stopped")) };
             heartbeating(&mut server, probe, async {
                 tokio::time::sleep(Duration::from_secs(12)).await;
                 42
@@ -5330,5 +5426,248 @@ mod call_deadline_tests {
         let mut nothing = Vec::new();
         client.read_to_end(&mut nothing).await.unwrap();
         assert!(nothing.is_empty(), "no heartbeat frame was written");
+    }
+}
+
+#[cfg(test)]
+mod held_turn_tests {
+    use super::*;
+
+    use crate::api::dto::{
+        CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, OutputPublication,
+        RunSandboxMode, StdinSource,
+    };
+    use crate::runtime::supervisor::{
+        ArtifactIndex, ArtifactSeal, ArtifactSink, ArtifactWrite, CommitmentDraft, CommitmentSink,
+        NxDaemonRetirement, ProcessEvent, ProcessSpawnRequest, RunningProcess, SpawnSink,
+        WorkspaceSupervisor, WorkspaceSupervisorConfig,
+    };
+    use crate::storage::job_artifact::{
+        AdmissionLookup, JobAdmission, JobEnding, JobScheduling, SealedJobReader, StreamKind,
+    };
+
+    /// An artifact store whose admission holds its caller until the test lets it go, as a
+    /// stalled APFS container held the observed `stat`s and `write`s, and then records nothing.
+    struct HeldAdmission {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl ArtifactIndex for HeldAdmission {
+        fn next_job_id(&self) -> Result<JobId> {
+            Ok(JobId::new(1).expect("a job id"))
+        }
+
+        fn admitted(&self, _key: &crate::api::dto::AdmissionKey) -> AdmissionLookup<'_> {
+            AdmissionLookup::Absent
+        }
+    }
+
+    fn unrecorded() -> CowshedError {
+        CowshedError::internal("the held admission was released unrecorded")
+    }
+
+    impl ArtifactSink for HeldAdmission {
+        fn admit(
+            &mut self,
+            _job_id: JobId,
+            _grant_revision: u64,
+            _command: &ExecCommand,
+            _admission: Option<JobAdmission>,
+            _scheduling: JobScheduling,
+        ) -> Result<()> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            // Ends when the test lets it go, or when the test ends and drops its sender.
+            let _ = self.release.recv();
+            Err(unrecorded())
+        }
+
+        fn prepare_background(&mut self, _job_id: JobId) -> Result<()> {
+            Err(unrecorded())
+        }
+
+        fn write(
+            &mut self,
+            _job_id: JobId,
+            _stream: StreamKind,
+            _bytes: &[u8],
+        ) -> Result<ArtifactWrite> {
+            Err(unrecorded())
+        }
+
+        fn seal(
+            &mut self,
+            _job_id: JobId,
+            _ending: JobEnding,
+            _stdout_copy: Option<OutputPublication>,
+            _stderr_copy: Option<OutputPublication>,
+        ) -> Result<ArtifactSeal> {
+            Err(unrecorded())
+        }
+
+        fn sealed(&mut self, _job_id: JobId) -> Result<Option<SealedJobReader>> {
+            Ok(None)
+        }
+    }
+
+    struct NoSpawn;
+
+    #[async_trait::async_trait]
+    impl SpawnSink for NoSpawn {
+        async fn spawn(
+            &mut self,
+            request: ProcessSpawnRequest,
+            _events: mpsc::Sender<ProcessEvent>,
+        ) -> Result<Box<dyn RunningProcess>> {
+            Err(CowshedError::internal(format!(
+                "job {} reached a spawn this test admits none to",
+                request.job_id.get()
+            )))
+        }
+    }
+
+    struct NoCommitments;
+
+    #[async_trait::async_trait]
+    impl CommitmentSink for NoCommitments {
+        async fn record(&mut self, _draft: CommitmentDraft) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The test's workspace, removed however the test ends.
+    struct Workspace(std::path::PathBuf);
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                cowshed_os::eprintln!(
+                    "cowshed: cannot remove the test workspace {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+    /// The actor's turn, as the heartbeat `client` reads next names it.
+    async fn heartbeat(client: &mut tokio::io::DuplexStream) -> (u64, ActorPulse) {
+        let Response::Progress(progress) = read_json(client).await.expect("a heartbeat frame")
+        else {
+            panic!("a heartbeat, not an answer");
+        };
+        (progress.seq, progress.actor)
+    }
+
+    /// A turn held on the blocking pool keeps the supervisor's heartbeats going: the thread the
+    /// actor shares with every heartbeat writer is free while the turn waits, each heartbeat
+    /// reads what the actor published, names the held turn and shows no turn completed while it
+    /// is held, and the turn's end is published once it is let go.
+    #[tokio::test]
+    async fn a_turn_held_on_the_blocking_pool_is_named_in_every_heartbeat() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-held-turn-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // A minted workspace holds `.cowshed`, where its supervisor publishes the host environment.
+        std::fs::create_dir_all(root.join(".cowshed")).expect("create the workspace");
+        // Capability detection refuses a directory that resolves outside the workspace, and
+        // `/var/folders` resolves into `/private/var`.
+        let root = std::fs::canonicalize(&root).expect("the canonical workspace");
+        let _workspace = Workspace(root.clone());
+        let defaults = WorkspaceSupervisorConfig::default();
+        let config = WorkspaceSupervisorConfig {
+            workspace_root: root.clone(),
+            default_cwd: None,
+            sandbox: crate::sandbox::SandboxConfig {
+                workspace_mount: root.clone(),
+                ..defaults.sandbox
+            },
+            memory_pressure: crate::host_pressure::Source::calm(),
+            ..defaults
+        };
+        let (entered, held) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let supervisor = WorkspaceSupervisor::start_with_sinks(
+            config,
+            Box::new(NoSpawn),
+            Box::new(HeldAdmission {
+                entered: Some(entered),
+                release: released,
+            }),
+            Box::new(NoCommitments),
+        )
+        .expect("start the supervisor");
+        let exec = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move {
+                let request = ExecRequest {
+                    command: ExecCommand::Argv(vec![CommandArg::new("held")]),
+                    cwd: None,
+                    mode: RunSandboxMode::ReadWrite,
+                    env: std::collections::HashMap::new(),
+                    trace: None,
+                    stdin: StdinSource::Empty,
+                    stdout_copy: None,
+                    stderr_copy: None,
+                    admission_key: None,
+                    class: ExecClass::Background,
+                    want: Some(std::num::NonZeroUsize::MIN),
+                    scope: ExecScope::Workspace,
+                };
+                supervisor
+                    .exec(None, None, request, AdmissionSource::Worker)
+                    .await
+            }
+        });
+        held.await.expect("the admission reached the store");
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let mut beats = Heartbeat::new(|| pulse(&supervisor, None));
+        beats.beat(&mut server).await.expect("write a heartbeat");
+        beats
+            .beat(&mut server)
+            .await
+            .expect("write a second heartbeat");
+        let (first, held_at) = heartbeat(&mut client).await;
+        let (second, still) = heartbeat(&mut client).await;
+        assert_eq!((first, second), (1, 2));
+        let (Some(held_turn), Some(still_turn)) = (&held_at.busy, &still.busy) else {
+            panic!("a held turn is named: {held_at:?}, then {still:?}");
+        };
+        assert_eq!(
+            (held_turn.turn.as_str(), still_turn.turn.as_str()),
+            ("exec", "exec")
+        );
+        assert!(
+            still_turn.for_ms >= held_turn.for_ms,
+            "{held_at:?}, then {still:?}"
+        );
+        assert_eq!(
+            still.turns, held_at.turns,
+            "no turn completes while one is held"
+        );
+
+        release.send(()).expect("let the admission go");
+        let refused = exec
+            .await
+            .expect("the exec call")
+            .expect_err("the released admission recorded nothing");
+        assert_eq!(refused.message, unrecorded().message);
+        // Answered by a later turn, so the held one has ended and published its end.
+        supervisor
+            .current_authority()
+            .await
+            .expect("a later turn answers");
+        let after = pulse(&supervisor, None).expect("the actor's pulse");
+        assert!(
+            after.actor.turns > held_at.turns,
+            "{after:?} after {held_at:?}"
+        );
+
+        supervisor
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .expect("retire the supervisor");
     }
 }

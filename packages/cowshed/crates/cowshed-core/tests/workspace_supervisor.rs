@@ -37,10 +37,10 @@ use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
-    ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CommitmentDraft, CommitmentSink,
-    NxDaemonRetirement, OwnedProcess, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
-    RunningProcess, SessionToken, SpawnCommand, SpawnSink, VolumeLabeller, VolumeLabels,
-    WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+    ArtifactIndex, ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CommitmentDraft,
+    CommitmentSink, NxDaemonRetirement, OwnedProcess, ProcessEvent, ProcessSignal,
+    ProcessSpawnRequest, RunningProcess, SessionToken, SpawnCommand, SpawnSink, VolumeLabeller,
+    VolumeLabels, WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
     WorkspaceSupervisorHandle,
 };
 
@@ -210,11 +210,18 @@ struct FakeArtifactSink {
     order: mpsc::UnboundedSender<OrderObservation>,
 }
 
-impl ArtifactSink for FakeArtifactSink {
+impl ArtifactIndex for FakeArtifactSink {
     fn next_job_id(&self) -> Result<JobId> {
         Ok(self.next)
     }
 
+    /// Keyed admission is the production store's ([`real_store_harness`]).
+    fn admitted(&self, _key: &AdmissionKey) -> AdmissionLookup<'_> {
+        AdmissionLookup::Absent
+    }
+}
+
+impl ArtifactSink for FakeArtifactSink {
     fn admit(
         &mut self,
         expected_job_id: JobId,
@@ -270,11 +277,6 @@ impl ArtifactSink for FakeArtifactSink {
         );
         assert!(replaced.is_none());
         Ok(())
-    }
-
-    /// Keyed admission is the production store's ([`real_store_harness`]).
-    fn admitted(&self, _key: &AdmissionKey) -> AdmissionLookup<'_> {
-        AdmissionLookup::Absent
     }
 
     fn prepare_background(&mut self, job_id: JobId) -> Result<()> {

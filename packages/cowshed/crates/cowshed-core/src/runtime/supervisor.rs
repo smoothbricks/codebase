@@ -80,8 +80,14 @@ use crate::storage::job_artifact::{
     StreamKind,
 };
 
+#[cfg(test)]
+mod actor_census;
 mod group_ledger;
+mod liveness;
+mod off_actor;
 use group_ledger::GroupLedgerWriter;
+use liveness::{Liveness, LivenessSlot, LivenessWriter};
+use off_actor::{InMemory, OffActor};
 #[cfg(test)]
 const DEFAULT_ACTOR_CAPACITY: usize = 64;
 #[cfg(test)]
@@ -869,6 +875,31 @@ pub enum ProcessEvent {
     },
 }
 
+impl ProcessEvent {
+    /// The event's name, as the actor turn that handles it is named.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Output { .. } => "output",
+            Self::OutputEof { .. } => "output-eof",
+            Self::Exited { .. } => "exited",
+            Self::Retired { .. } => "retired",
+            Self::WaitFailed { .. } => "wait-failed",
+            Self::StdinReady { .. } => "stdin-ready",
+            Self::StdinBroken { .. } => "stdin-broken",
+            Self::StdinPumpWrite { .. } => "stdin-pump-write",
+            Self::StdinPumpClose { .. } => "stdin-pump-close",
+            Self::StdinPumpFailed { .. } => "stdin-pump-failed",
+            Self::Escalate { .. } => "escalate",
+            Self::Activating { .. } => "activating",
+            #[cfg(target_os = "macos")]
+            Self::ActivationEnded { .. } => "activation-ended",
+            Self::Started { .. } => "started",
+            Self::LaunchFailed { .. } => "launch-failed",
+            Self::ScriptSyntax { .. } => "script-syntax",
+            Self::SignalFailed { .. } => "signal-failed",
+        }
+    }
+}
 /// A process a job owns, as its parent observed it right after spawning it: the identity of the
 /// group it leads, and when it was spawned.
 #[derive(Clone, Debug)]
@@ -951,8 +982,17 @@ pub struct ArtifactSeal {
     pub publication_failure: Option<CowshedError>,
 }
 
-pub trait ArtifactSink: Send {
+/// What an artifact store answers from memory, which the actor reads in place between the
+/// turns that hand the store to the blocking pool.
+pub trait ArtifactIndex {
     fn next_job_id(&self) -> Result<JobId>;
+    /// What this workspace incarnation's admissions say of `key`.
+    fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_>;
+}
+
+/// A job's durable record and captured output. Any call may block on the file system, so the
+/// actor makes each on the blocking pool ([`OffActor`]), never on its own thread.
+pub trait ArtifactSink: ArtifactIndex + Send {
     /// Durably admit `job_id`, under `admission`'s key when it has one, with the scheduling it
     /// asked for, before it spawns.
     fn admit(
@@ -963,8 +1003,6 @@ pub trait ArtifactSink: Send {
         admission: Option<JobAdmission>,
         scheduling: JobScheduling,
     ) -> Result<()>;
-    /// What this workspace incarnation's admissions say of `key`.
-    fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_>;
     fn prepare_background(&mut self, job_id: JobId) -> Result<()>;
     fn write(&mut self, job_id: JobId, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite>;
 
@@ -978,6 +1016,14 @@ pub trait ArtifactSink: Send {
     /// One canonical terminal snapshot for facts and both stream reads. None is authoritative
     /// absence; unread or set-aside history retains its original refusal.
     fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJobReader>>;
+}
+
+impl InMemory for Box<dyn ArtifactSink> {
+    type View = dyn ArtifactIndex;
+
+    fn in_memory(&self) -> &Self::View {
+        &**self
+    }
 }
 
 pub use crate::storage::audit::CommitmentDraft;
@@ -1021,11 +1067,17 @@ impl ArtifactStoreSink {
     }
 }
 
-impl ArtifactSink for ArtifactStoreSink {
+impl ArtifactIndex for ArtifactStoreSink {
     fn next_job_id(&self) -> Result<JobId> {
         self.store.next_job_id().map_err(map_artifact_error)
     }
 
+    fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_> {
+        self.store.admitted(key)
+    }
+}
+
+impl ArtifactSink for ArtifactStoreSink {
     fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJobReader>> {
         self.store.sealed(job_id).map_err(map_artifact_error)
     }
@@ -1056,10 +1108,6 @@ impl ArtifactSink for ArtifactStoreSink {
             ));
         }
         Ok(())
-    }
-
-    fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_> {
-        self.store.admitted(key)
     }
 
     fn prepare_background(&mut self, job_id: JobId) -> Result<()> {
@@ -2995,120 +3043,206 @@ impl SpawnSink for SystemSpawnSink {
                 "delegate a writable cgroup v2 subtree and admit the job before spawning it",
             )
         })?;
-        let cwd =
-            crate::exec::contained_cwd(&request.policy.ceiling().workspace_mount, &request.cwd)
-                .map_err(map_exec_error)?;
-        if request.scope == ExecScope::HostGate {
-            let command = host_gate_command(&request, &cwd)?;
-            #[cfg(target_os = "macos")]
-            let monitor =
-                ProcessMonitor::prepare(super::process_tree::TreeOwner::Job(request.job_id))?;
-            return spawn_fenced(
+        // Everything a spawn prepares host-side reads or writes the file system, so it is made
+        // on the blocking pool ([`prepare_spawn`]); only the spawn itself is made here.
+        let prepared =
+            off_actor::drive(prepare_spawn(request.clone(), self.shells.is_some())).await?;
+        match prepared {
+            PreparedSpawn::HostGate {
                 command,
-                request.job_id,
-                #[cfg(target_os = "macos")]
-                request.cpu.nice,
-                #[cfg(target_os = "linux")]
-                cgroup,
                 #[cfg(target_os = "macos")]
                 monitor,
-                events,
-            )
-            .await;
-        }
-        let policy = request.policy.for_cwd(&cwd)?;
-        let (sandbox, profile) = policy.child(request.mode);
-        let envrc_directory = shell_directory(sandbox);
-        let environment = cowshed_os::timing::spanned(
-            "spawn",
-            "environment",
-            sandbox_environment(sandbox, &request.env),
-        )
-        .await?;
-        #[cfg(target_os = "macos")]
-        let monitor = ProcessMonitor::prepare(super::process_tree::TreeOwner::Job(request.job_id))?;
-        let pooled = |command, environment| super::shell_job::PooledSpawn {
-            job_id: request.job_id,
-            command,
-            cwd: cwd.clone(),
-            profile,
-            read_only: sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
-            workspace_mount: sandbox.workspace_mount.clone(),
-            envrc_directory: envrc_directory.clone(),
-            environment,
-            caller: &request.env,
-            grant_revision: request.authority.grant_revision,
-            grants: &sandbox.grants,
-            cpu: &request.cpu,
-            mbx: sandbox
-                .capabilities
-                .active
-                .contains(&crate::capabilities::CapabilityId::Mbx),
-            #[cfg(target_os = "linux")]
-            cgroup: Arc::clone(&cgroup),
-            #[cfg(target_os = "macos")]
-            monitor: monitor.clone(),
-        };
-        let argv = match request.command {
-            SpawnCommand::Script(script) => {
+            } => {
+                spawn_fenced(
+                    command,
+                    request.job_id,
+                    #[cfg(target_os = "macos")]
+                    request.cpu.nice,
+                    #[cfg(target_os = "linux")]
+                    cgroup,
+                    #[cfg(target_os = "macos")]
+                    monitor,
+                    events,
+                )
+                .await
+            }
+            PreparedSpawn::Warm {
+                command,
+                cwd,
+                policy,
+                environment,
+                #[cfg(target_os = "macos")]
+                monitor,
+            } => {
                 let Some(shells) = self.shells.as_mut() else {
-                    return Err(CowshedError::environment_missing(
-                        "a script job runs in the workspace's exec host, which needs the cowshed \
-                         binary",
-                        "run the script through the cowshed CLI",
+                    return Err(CowshedError::internal(
+                        "a warm spawn was prepared for a sink with no warm exec hosts",
                     ));
                 };
-                return shells.spawn(
-                    pooled(super::shell_job::HostCommand::Script(script), environment),
+                let (sandbox, profile) = policy.child(request.mode);
+                shells.spawn(
+                    super::shell_job::PooledSpawn {
+                        job_id: request.job_id,
+                        command,
+                        cwd,
+                        profile,
+                        read_only: sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
+                        workspace_mount: sandbox.workspace_mount.clone(),
+                        envrc_directory: shell_directory(sandbox),
+                        environment,
+                        caller: &request.env,
+                        grant_revision: request.authority.grant_revision,
+                        grants: &sandbox.grants,
+                        cpu: &request.cpu,
+                        mbx: sandbox
+                            .capabilities
+                            .active
+                            .contains(&crate::capabilities::CapabilityId::Mbx),
+                        #[cfg(target_os = "linux")]
+                        cgroup,
+                        #[cfg(target_os = "macos")]
+                        monitor,
+                    },
                     events,
-                );
+                )
             }
-            SpawnCommand::Argv(argv) => argv,
-        };
-        // Warm hosts serve commands under a workspace `.envrc`; a bare workspace keeps one-shot
-        // spawns for argv jobs.
-        if let (Some(_), Some(shells)) = (&envrc_directory, self.shells.as_mut()) {
-            // The activated PATH is the shell's, set inside the sandbox: unknown here.
-            if let Some(program) = argv.first() {
-                refuse_unstartable(program, &cwd, None)?;
+            PreparedSpawn::OneShot {
+                plan,
+                environment,
+                #[cfg(target_os = "macos")]
+                monitor,
+            } => {
+                spawn_fenced(
+                    tokio::process::Command::from(sandboxed_command(&plan, &environment)),
+                    request.job_id,
+                    #[cfg(target_os = "macos")]
+                    request.cpu.nice,
+                    #[cfg(target_os = "linux")]
+                    cgroup,
+                    #[cfg(target_os = "macos")]
+                    monitor,
+                    events,
+                )
+                .await
             }
-            return shells.spawn(
-                pooled(super::shell_job::HostCommand::Argv(argv), environment),
-                events,
-            );
         }
-        let mut environment = environment.child(&request.env);
-        // The job's jobserver and count are its supervisor's, laid over whatever the caller named.
-        let mbx = sandbox
-            .capabilities
-            .active
-            .contains(&crate::capabilities::CapabilityId::Mbx);
-        environment.extend(request.cpu.environment(&request.env, mbx));
-        if let Some(program) = argv.first() {
-            // Shell activation, when the profile has one, sets PATH inside the sandbox.
-            let path = sandbox
-                .capabilities
-                .contribution
-                .shell
-                .is_none()
-                .then(|| environment.get(OsStr::new("PATH")))
-                .flatten();
-            refuse_unstartable(program, &cwd, path.map(OsString::as_os_str))?;
-        }
-        let plan = one_shot_plan(sandbox, profile, cwd, argv)?;
-        spawn_fenced(
-            tokio::process::Command::from(sandboxed_command(&plan, &environment)),
-            request.job_id,
+    }
+}
+
+/// A spawn as [`prepare_spawn`] made it ready.
+enum PreparedSpawn {
+    /// A trusted coordinator's host-boundary command, exec'd outside every sandbox.
+    HostGate {
+        command: tokio::process::Command,
+        #[cfg(target_os = "macos")]
+        monitor: ProcessMonitor,
+    },
+    /// A command a warm exec host runs, in the environment the host activates.
+    Warm {
+        command: super::shell_job::HostCommand,
+        cwd: PathBuf,
+        policy: SandboxPolicy,
+        environment: SandboxEnvironment,
+        #[cfg(target_os = "macos")]
+        monitor: ProcessMonitor,
+    },
+    /// A one-shot child that enters the workspace shell itself.
+    OneShot {
+        plan: SpawnPlan,
+        environment: BTreeMap<OsString, OsString>,
+        #[cfg(target_os = "macos")]
+        monitor: ProcessMonitor,
+    },
+}
+
+/// Prepare `request`'s spawn host-side, all but the spawn itself: the contained cwd, the
+/// capability snapshot of that cwd, the private environment with the store's Git routes, the
+/// process observer, the command's start check and its profile; `warm` when warm exec hosts can
+/// take the command. Each step reads or writes the file system, and the Git routes await a
+/// sandboxed probe between them, so the supervisor drives this on the blocking pool
+/// ([`off_actor::drive`]), never on its actor.
+async fn prepare_spawn(request: ProcessSpawnRequest, warm: bool) -> Result<PreparedSpawn> {
+    let cwd = crate::exec::contained_cwd(&request.policy.ceiling().workspace_mount, &request.cwd)
+        .map_err(map_exec_error)?;
+    if request.scope == ExecScope::HostGate {
+        let command = host_gate_command(&request, &cwd)?;
+        return Ok(PreparedSpawn::HostGate {
+            command,
             #[cfg(target_os = "macos")]
-            request.cpu.nice,
-            #[cfg(target_os = "linux")]
-            cgroup,
+            monitor: ProcessMonitor::prepare(super::process_tree::TreeOwner::Job(request.job_id))?,
+        });
+    }
+    let policy = request.policy.for_cwd(&cwd)?;
+    let (sandbox, profile) = policy.child(request.mode);
+    let environment = cowshed_os::timing::spanned(
+        "spawn",
+        "environment",
+        sandbox_environment(sandbox, &request.env),
+    )
+    .await?;
+    #[cfg(target_os = "macos")]
+    let monitor = ProcessMonitor::prepare(super::process_tree::TreeOwner::Job(request.job_id))?;
+    let argv = match request.command {
+        SpawnCommand::Script(script) => {
+            if !warm {
+                return Err(CowshedError::environment_missing(
+                    "a script job runs in the workspace's exec host, which needs the cowshed \
+                     binary",
+                    "run the script through the cowshed CLI",
+                ));
+            }
+            return Ok(PreparedSpawn::Warm {
+                command: super::shell_job::HostCommand::Script(script),
+                cwd,
+                policy,
+                environment,
+                #[cfg(target_os = "macos")]
+                monitor,
+            });
+        }
+        SpawnCommand::Argv(argv) => argv,
+    };
+    // Warm hosts serve commands under a workspace `.envrc`; a bare workspace keeps one-shot
+    // spawns for argv jobs.
+    if warm && shell_directory(sandbox).is_some() {
+        // The activated PATH is the shell's, set inside the sandbox: unknown here.
+        if let Some(program) = argv.first() {
+            refuse_unstartable(program, &cwd, None)?;
+        }
+        return Ok(PreparedSpawn::Warm {
+            command: super::shell_job::HostCommand::Argv(argv),
+            cwd,
+            policy,
+            environment,
             #[cfg(target_os = "macos")]
             monitor,
-            events,
-        )
-        .await
+        });
     }
+    let mut environment = environment.child(&request.env);
+    // The job's jobserver and count are its supervisor's, laid over whatever the caller named.
+    let mbx = sandbox
+        .capabilities
+        .active
+        .contains(&crate::capabilities::CapabilityId::Mbx);
+    environment.extend(request.cpu.environment(&request.env, mbx));
+    if let Some(program) = argv.first() {
+        // Shell activation, when the profile has one, sets PATH inside the sandbox.
+        let path = sandbox
+            .capabilities
+            .contribution
+            .shell
+            .is_none()
+            .then(|| environment.get(OsStr::new("PATH")))
+            .flatten();
+        refuse_unstartable(program, &cwd, path.map(OsString::as_os_str))?;
+    }
+    let plan = one_shot_plan(sandbox, profile, cwd, argv)?;
+    Ok(PreparedSpawn::OneShot {
+        plan,
+        environment,
+        #[cfg(target_os = "macos")]
+        monitor,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -3130,12 +3264,15 @@ pub(super) fn cgroup_error(error: super::job_cgroup::CgroupError) -> CowshedErro
 }
 
 #[cfg(target_os = "linux")]
-fn refused_cgroup(
+/// `refusal`, once the unstarted job's cgroup is removed, on the blocking pool: the removal
+/// reads and writes cgroupfs and joins its members for up to the reap bound.
+async fn refused_cgroup(
     mut refusal: CowshedError,
-    cgroup: Option<&super::job_cgroup::JobCgroup>,
+    cgroup: Option<Arc<super::job_cgroup::JobCgroup>>,
 ) -> CowshedError {
     if let Some(cgroup) = cgroup
-        && let Err(cleanup) = cgroup.finish(cowshed_os::deadline::REAP)
+        && let Err(cleanup) =
+            off_actor::run(move || cgroup.finish(cowshed_os::deadline::REAP)).await
     {
         refusal.message.push_str(&format!(
             "; removing the unstarted job's cgroup also failed: {cleanup}"
@@ -3242,29 +3379,32 @@ async fn spawn_fenced(
     // Through `std`: this process alone reaps the child, inside its fence ([`ChildFence`]).
     #[cfg(target_os = "macos")]
     let (mut child, nice) = {
-        let (gate, held) = super::process_fence::leader_gate().map_err(|error| {
-            CowshedError::environment_missing(
-                format!("cannot prepare the process observation fence: {error}"),
-                "inspect descriptor availability before retrying the command",
-            )
-        })?;
-        let hold = held.in_process(&gate);
-        // SAFETY: the hold calls only close/getpid/write/read, all async-signal-safe.
-        unsafe {
-            command.pre_exec(move || hold.hold());
-        }
-        let command = command.into_std();
+        let mut command = command.into_std();
         let source = monitor.clone();
-        tokio::task::spawn_blocking(move || spawn_observed(command, held, gate, &source, nice))
-            .await
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()))
-            .map_err(|error| match error {
+        // The fence's pipes are made under the fork lock, which waits for every spawn in flight
+        // in this process: on the blocking pool, with the spawn it fences.
+        off_actor::run(move || {
+            use std::os::unix::process::CommandExt as _;
+            let (gate, held) = super::process_fence::leader_gate().map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("cannot prepare the process observation fence: {error}"),
+                    "inspect descriptor availability before retrying the command",
+                )
+            })?;
+            let hold = held.in_process(&gate);
+            // SAFETY: the hold calls only close/getpid/write/read, all async-signal-safe.
+            unsafe {
+                command.pre_exec(move || hold.hold());
+            }
+            spawn_observed(command, held, gate, &source, nice).map_err(|error| match error {
                 HeldSpawnError::Spawn(error) => {
                     map_exec_error(ExecError::from(classify_spawn_error(error)))
                 }
                 HeldSpawnError::Priority(failure) => CowshedError::priority(failure),
             })
-            .map(|(child, nice)| (child, Some(nice)))?
+        })
+        .await
+        .map(|(child, nice)| (child, Some(nice)))?
     };
     // No fence holds the child here: the job's cgroup, which it enters before exec, carries its
     // class (05_gateway.md "Classes").
@@ -3683,11 +3823,15 @@ pub(super) async fn run_system_output<R>(
         .await;
 }
 
-/// Clone is cheap: immutable authority plus a bounded actor sender.
+/// Clone is cheap: immutable authority, a bounded actor sender, and where the actor publishes
+/// its liveness.
 #[derive(Clone)]
 pub struct WorkspaceSupervisorHandle {
     authority: WorkspaceAuthoritySnapshot,
     commands: mpsc::Sender<Command>,
+    /// Where the actor publishes its liveness; `None` for a handle whose calls another process's
+    /// supervisor answers ([`super::supervisor_socket::connect`]).
+    liveness: Option<LivenessSlot>,
 }
 
 impl std::fmt::Debug for WorkspaceSupervisorHandle {
@@ -3707,6 +3851,7 @@ impl WorkspaceSupervisorHandle {
         Self {
             authority,
             commands,
+            liveness: None,
         }
     }
 
@@ -3715,11 +3860,31 @@ impl WorkspaceSupervisorHandle {
         Self {
             authority,
             commands: self.commands.clone(),
+            liveness: self.liveness.clone(),
         }
     }
 
     pub fn snapshot(&self) -> &WorkspaceAuthoritySnapshot {
         &self.authority
+    }
+
+    /// What the actor last published of itself (05_gateway.md, "Deadlines"), read without a
+    /// round trip through it, so a turn waiting on the blocking pool never delays it. Refused
+    /// for a handle to another process's supervisor, which publishes nothing here, and once the
+    /// actor has stopped, since what it last published then says nothing more.
+    pub(super) fn liveness(&self) -> Result<Arc<Liveness>> {
+        let Some(slot) = &self.liveness else {
+            return Err(CowshedError::internal(
+                "a handle to another process's supervisor reads no published liveness",
+            ));
+        };
+        if self.commands.is_closed() {
+            return Err(CowshedError::environment_missing(
+                "workspace supervisor actor is unavailable",
+                "reattach the workspace",
+            ));
+        }
+        Ok(slot.load())
     }
 
     /// How this supervisor's job-span writer has fared, once every span row queued before the
@@ -3755,6 +3920,7 @@ impl WorkspaceSupervisorHandle {
         Ok(Self {
             authority,
             commands: self.commands.clone(),
+            liveness: self.liveness.clone(),
         })
     }
 
@@ -4245,9 +4411,11 @@ impl WorkspaceSupervisor {
         let (commands, receiver) = mpsc::channel(config.actor_capacity);
         let (events, event_receiver) = mpsc::channel(config.event_capacity);
         let job_spans = config.telemetry_root.map(JobSpanPublisher::start);
+        let (liveness, published) = LivenessWriter::new(&config.authority);
         let handle = WorkspaceSupervisorHandle {
             authority: config.authority.clone(),
             commands,
+            liveness: Some(published),
         };
         let nx_daemon = NxDaemonKeeper::for_role(
             WorkspaceRole::for_name(&config.authority.workspace),
@@ -4293,7 +4461,8 @@ impl WorkspaceSupervisor {
             event_receiver,
             membership_changed: Arc::new(tokio::sync::Notify::new()),
             spawner,
-            artifacts,
+            artifacts: OffActor::new(artifacts),
+            liveness,
             commitments,
             jobs: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -4492,6 +4661,48 @@ pub(super) enum Command {
     },
 }
 
+impl Command {
+    /// The command's name, as the actor turn that handles it is named: a call's wire op where
+    /// the call is one.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::AdvanceAuthority { .. } => "advance",
+            Self::OpenSession { .. } => "open-session",
+            Self::SessionSnapshot { .. } => "session-snapshot",
+            Self::CloseSession { .. } => "close-session",
+            Self::Exec { .. } => "exec",
+            Self::Detach { .. } => "detach",
+            Self::StdinWrite { .. } => "stdin-write",
+            Self::StdinClose { .. } => "stdin-close",
+            Self::Info { .. } => "info",
+            Self::Sealed { .. } => "sealed",
+            Self::Resources { .. } => "resources",
+            Self::Processes { .. } => "processes",
+            Self::ProcessEvents { .. } => "process-events",
+            #[cfg(target_os = "macos")]
+            Self::SubtreeHandle { .. } => "subtree-handle",
+            #[cfg(target_os = "macos")]
+            Self::RetireDescendants { .. } => "retire-descendants",
+            Self::TraceHealth { .. } => "trace-health",
+            Self::ListeningPorts { .. } => "listening-ports",
+            Self::JobByKey { .. } => "job-by-key",
+            Self::Progress { .. } => "progress",
+            Self::List { .. } => "list",
+            Self::Kill { .. } => "kill",
+            Self::Wait { .. } => "wait",
+            Self::LogRead { .. } => "log-read",
+            Self::Tail { .. } => "tail",
+            Self::Quiesce { .. } => "quiesce",
+            Self::Retire { .. } => "retire",
+            Self::NameBuildVolume { .. } => "name-build-volume",
+            Self::CurrentAuthority { .. } => "current-authority",
+            #[cfg(target_os = "macos")]
+            Self::Idle { .. } => "idle",
+            Self::NxDaemonKeeper { .. } => "nx-daemon-keeper",
+            Self::StopNxKeeper { .. } => "stop-nx-keeper",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActorLifecycle {
     Running,
@@ -4944,7 +5155,7 @@ struct JobStateRecord {
     /// meanwhile (16_build_volumes.md, "Process lifetime across a swap").
     build_hold: Option<(
         crate::build_volume::BuildVolumeId,
-        crate::build_volume::BuildVolumeHold,
+        OffActor<crate::build_volume::BuildVolumeHold>,
     )>,
     /// Where the job stands with its admission.
     cpu: CpuStanding,
@@ -4991,7 +5202,7 @@ enum CpuStanding {
     /// Cancelled while queued: nothing ever spawned.
     Withdrawn,
     /// The jobserver the command runs with, held until the job concludes, whatever ends it.
-    Admitted { _jobserver: Jobserver },
+    Admitted { jobserver: OffActor<Jobserver> },
     /// Holding nothing: the admission failed, or the job concluded and let its jobserver go.
     Settled,
 }
@@ -5159,8 +5370,39 @@ impl ExecAdmission {
     }
 }
 
+/// What woke the actor: the one command or event its next turn handles.
+enum Wake {
+    Command(Option<Command>),
+    LedgerFinished(std::io::Result<()>),
+    Membership,
+    Event(Option<ProcessEvent>),
+    Pressure(super::job_admission::Reading),
+    Labelled(Option<std::result::Result<(), tokio::task::JoinError>>),
+    Sample,
+    Probed(Result<Option<(PathBuf, Probe)>>),
+}
+
+impl Wake {
+    /// The turn's name, as its heartbeats and timing span give it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Command(Some(command)) => command.kind(),
+            Self::Command(None) => "commands-closed",
+            Self::LedgerFinished(_) => "ledger-finished",
+            Self::Membership => "membership",
+            Self::Event(Some(event)) => event.kind(),
+            Self::Event(None) => "events-closed",
+            Self::Pressure(_) => "pressure",
+            Self::Labelled(_) => "labelled",
+            Self::Sample => "sample",
+            Self::Probed(_) => "nx-probe",
+        }
+    }
+}
 struct SupervisorActor {
     authority: WorkspaceAuthoritySnapshot,
+    /// What heartbeats read of this actor, published as each turn starts and ends.
+    liveness: LivenessWriter,
     group_ledger: Option<GroupLedgerWriter>,
     group_ledger_finish: GroupLedgerFinish,
     membership_socket: Option<PathBuf>,
@@ -5187,7 +5429,7 @@ struct SupervisorActor {
     event_receiver: mpsc::Receiver<ProcessEvent>,
     membership_changed: Arc<tokio::sync::Notify>,
     spawner: Box<dyn SpawnSink>,
-    artifacts: Box<dyn ArtifactSink>,
+    artifacts: OffActor<Box<dyn ArtifactSink>>,
     commitments: Box<dyn CommitmentSink>,
     jobs: BTreeMap<JobId, JobStateRecord>,
     sessions: BTreeMap<u64, SessionState>,
@@ -5487,7 +5729,14 @@ fn report_unsignalled(job: JobId, signalled: Result<()>) {
 }
 
 impl SupervisorActor {
+    /// The actor's loop. A turn starts when the actor takes the command or event that woke it
+    /// and ends when it waits again, the admission effects and job conclusions it led to
+    /// included. Each turn is published for heartbeats as it starts and ends
+    /// ([`LivenessWriter`]) and timed as `turn <kind>` under `COWSHED_TIMING`, so a slow turn
+    /// names itself (13_telemetry.md, "Inspection"). Nothing in a turn blocks the thread: what
+    /// would runs on the blocking pool ([`off_actor`]), and the turn awaits it.
     async fn run(mut self) {
+        let mut turn = self.begin_turn("start");
         let reading = self.pressure.current();
         self.admission_event(super::job_admission::Event::Pressure(reading));
         loop {
@@ -5499,51 +5748,22 @@ impl SupervisorActor {
                     break;
                 }
             }
-            tokio::select! {
-                command = self.commands.recv(), if !self.command_lane_closed => {
-                    match command {
-                        Some(command) => self.handle_command(command).await,
-                        None => {
-                            self.command_lane_closed = true;
-                            if let Some(id) = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting) {
-                                let _ = self.begin_kill(id, KillReason::Retire);
-                            }
-                        },
-                    }
-                }
+            self.end_turn(turn);
+            let wake = tokio::select! {
+                command = self.commands.recv(), if !self.command_lane_closed => Wake::Command(command),
                 finished = next_group_ledger_finish(&mut self.group_ledger_finish),
                     if matches!(self.group_ledger_finish, GroupLedgerFinish::Pending(_)) =>
                 {
-                    let outcome = finished.map_err(|error| {
-                        let path = self.group_ledger.as_ref()
-                            .expect("a pending ledger finish owns its writer").path();
-                        CowshedError::environment_missing(
-                            format!("cannot finish process-group ledger {}: {error}", path.display()),
-                            "inspect the retained group ledger before replacing this supervisor",
-                        )
-                    });
-                    self.group_ledger_finish = GroupLedgerFinish::Done(outcome);
+                    Wake::LedgerFinished(finished)
                 }
-                _ = self.membership_changed.notified() => {
-                    self.record_groups();
-                    self.rerun_refused();
-                }
-                event = self.event_receiver.recv() => {
-                    match event {
-                        Some(event) => self.handle_event(event),
-                        None => break,
-                    }
-                }
-                reading = self.pressure.changed() => {
-                    self.admission_event(super::job_admission::Event::Pressure(reading));
-                }
+                _ = self.membership_changed.notified() => Wake::Membership,
+                event = self.event_receiver.recv() => Wake::Event(event),
+                reading = self.pressure.changed() => Wake::Pressure(reading),
                 labelled = self.labelling.join_next(), if !self.labelling.is_empty() => {
-                    if let Some(Err(error)) = labelled {
-                        cowshed_os::eprintln!("cowshed: volume label task failed: {error}");
-                    }
+                    Wake::Labelled(labelled)
                 }
                 () = next_sample_tick(&mut self.sample_clock), if self.sample_clock.is_some() => {
-                    self.sample_jobs();
+                    Wake::Sample
                 }
                 probed = super::nx_daemon::next_probe(
                     &mut self.nx_daemon,
@@ -5553,21 +5773,62 @@ impl SupervisorActor {
                         && self.lifecycle == ActorLifecycle::Running
                         && !self.command_lane_closed =>
                 {
-                    match probed {
-                        Ok(probed) => {
-                            if self.keep_nx_daemon(probed).await {
-                                self.answer_nx_keeper_waiters();
-                            }
-                        }
-                        Err(error) => {
-                            cowshed_os::eprintln!("cowshed: {}", error.message);
-                            for (_, waiter) in self.nx_keeper_stops.drain(..) {
-                                let _ = waiter.send(Err(error.clone()));
-                            }
-                            for waiter in self.nx_keeper_waiters.drain(..) {
-                                let _ = waiter.send(Err(error.clone()));
-                            }
-                        }
+                    Wake::Probed(probed)
+                }
+            };
+            turn = self.begin_turn(wake.kind());
+            match wake {
+                Wake::Command(Some(command)) => self.handle_command(command).await,
+                Wake::Command(None) => {
+                    self.command_lane_closed = true;
+                    if let Some(id) = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting) {
+                        let _ = self.begin_kill(id, KillReason::Retire);
+                    }
+                }
+                Wake::LedgerFinished(finished) => {
+                    let outcome = finished.map_err(|error| {
+                        let path = self
+                            .group_ledger
+                            .as_ref()
+                            .expect("a pending ledger finish owns its writer")
+                            .path();
+                        CowshedError::environment_missing(
+                            format!(
+                                "cannot finish process-group ledger {}: {error}",
+                                path.display()
+                            ),
+                            "inspect the retained group ledger before replacing this supervisor",
+                        )
+                    });
+                    self.group_ledger_finish = GroupLedgerFinish::Done(outcome);
+                }
+                Wake::Membership => {
+                    self.record_groups();
+                    self.rerun_refused();
+                }
+                Wake::Event(Some(event)) => self.handle_event(event).await,
+                Wake::Event(None) => break,
+                Wake::Pressure(reading) => {
+                    self.admission_event(super::job_admission::Event::Pressure(reading));
+                }
+                Wake::Labelled(labelled) => {
+                    if let Some(Err(error)) = labelled {
+                        cowshed_os::eprintln!("cowshed: volume label task failed: {error}");
+                    }
+                }
+                Wake::Sample => self.sample_jobs(),
+                Wake::Probed(Ok(probed)) => {
+                    if self.keep_nx_daemon(probed).await {
+                        self.answer_nx_keeper_waiters();
+                    }
+                }
+                Wake::Probed(Err(error)) => {
+                    cowshed_os::eprintln!("cowshed: {}", error.message);
+                    for (_, waiter) in self.nx_keeper_stops.drain(..) {
+                        let _ = waiter.send(Err(error.clone()));
+                    }
+                    for waiter in self.nx_keeper_waiters.drain(..) {
+                        let _ = waiter.send(Err(error.clone()));
                     }
                 }
             }
@@ -5587,7 +5848,27 @@ impl SupervisorActor {
                 self.answer_nx_keeper_waiters();
             }
         }
+        self.end_turn(turn);
         self.labelling.abort_all();
+    }
+
+    /// A turn handling `kind` starts: published for heartbeats, and timed until
+    /// [`Self::end_turn`].
+    fn begin_turn(&mut self, kind: &'static str) -> cowshed_os::timing::Span {
+        self.liveness.begin(kind);
+        cowshed_os::timing::span("turn", kind)
+    }
+
+    /// The turn `span` times ended: published with every job it left unconcluded, as a
+    /// heartbeat about one reports it.
+    fn end_turn(&mut self, span: cowshed_os::timing::Span) {
+        self.liveness.end(
+            self.jobs
+                .values()
+                .filter(|job| !job.terminal())
+                .map(|job| super::supervisor_socket::JobPulse::of(&job.info)),
+        );
+        drop(span);
     }
 
     /// Answer every caller waiting on the keeper's decision with what it is now.
@@ -5666,13 +5947,16 @@ impl SupervisorActor {
         while let Some(effect) = self.admission_effects.pop_front() {
             match effect {
                 Effect::Admit { job } => self.spawn_admitted(job).await,
-                Effect::WaitStarted { job, pressure } => self.process_output(
-                    job,
-                    StreamKind::Stderr,
-                    Bytes::from(format!(
-                        "cowshed: jobserver wait start queue=memory pressure={pressure}\n"
-                    )),
-                ),
+                Effect::WaitStarted { job, pressure } => {
+                    self.process_output(
+                        job,
+                        StreamKind::Stderr,
+                        Bytes::from(format!(
+                            "cowshed: jobserver wait start queue=memory pressure={pressure}\n"
+                        )),
+                    )
+                    .await
+                }
                 Effect::WaitEnded { job, waited, ok } => {
                     let status = if ok { "ok" } else { "err" };
                     self.process_output(
@@ -5681,7 +5965,8 @@ impl SupervisorActor {
                         Bytes::from(format!(
                             "cowshed: jobserver wait done elapsed={waited:?} status={status}\n"
                         )),
-                    );
+                    )
+                    .await;
                 }
                 Effect::Refuse { job, error } => {
                     let Some(record) = self.jobs.get_mut(&job) else {
@@ -5700,7 +5985,7 @@ impl SupervisorActor {
                     .await;
                 }
                 #[cfg(target_os = "macos")]
-                Effect::EndForMemory { job, level } => self.end_for_memory(job, level),
+                Effect::EndForMemory { job, level } => self.end_for_memory(job, level).await,
                 // PSI has no Critical level, so a Linux report never ends a job for memory.
                 #[cfg(not(target_os = "macos"))]
                 Effect::EndForMemory { .. } => {}
@@ -5714,7 +5999,7 @@ impl SupervisorActor {
     /// acceptance runs of one repository put 5.9 of 7 GB in swap). The job fails `memory`, its
     /// stderr naming the level and its resident memory.
     #[cfg(target_os = "macos")]
-    fn end_for_memory(
+    async fn end_for_memory(
         &mut self,
         job_id: JobId,
         level: cowshed_gateway_types::host_status::DarwinPressureLevel,
@@ -5735,7 +6020,8 @@ impl SupervisorActor {
                 |sample| format!("{} bytes", u64::from(sample.rss_bytes))
             )
         );
-        self.process_output(job_id, StreamKind::Stderr, Bytes::from(line));
+        self.process_output(job_id, StreamKind::Stderr, Bytes::from(line))
+            .await;
         if let Err(error) = self.begin_kill(job_id, KillReason::Memory) {
             cowshed_os::eprintln!(
                 "cowshed: cannot end job {} for memory: {}",
@@ -5752,7 +6038,7 @@ impl SupervisorActor {
                 sandbox,
                 reply,
             } => {
-                let result = self.advance_authority(expected, authority, *sandbox);
+                let result = self.advance_authority(expected, authority, *sandbox).await;
                 let _ = reply.send(result);
             }
             Command::OpenSession {
@@ -5812,9 +6098,10 @@ impl SupervisorActor {
                 job_id,
                 reply,
             } => {
-                let result = self
-                    .validate_authority(&authority)
-                    .and_then(|()| self.detach(job_id));
+                let result = match self.validate_authority(&authority) {
+                    Ok(()) => self.detach(job_id).await,
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             Command::StdinWrite {
@@ -5844,18 +6131,23 @@ impl SupervisorActor {
                 job_id,
                 reply,
             } => {
-                let result = self.validate_authority(&authority).and_then(|()| {
-                    // A job this supervisor holds unsealed has no terminal record yet.
-                    // Its own state answers: no store refresh, no unread-history refusal.
-                    match self.jobs.get(&job_id) {
-                        Some(job) if !job.sealed() => Err(unsealed_job(job_id)),
-                        Some(_) | None => self
-                            .artifacts
-                            .sealed(job_id)?
-                            .map(|record| record.info())
-                            .ok_or_else(|| unsealed_job(job_id)),
+                let result = match self.validate_authority(&authority) {
+                    Err(error) => Err(error),
+                    // A job this supervisor holds unsealed has no terminal record yet. Its own
+                    // state answers: no store refresh, no unread-history refusal.
+                    Ok(()) if self.jobs.get(&job_id).is_some_and(|job| !job.sealed()) => {
+                        Err(unsealed_job(job_id))
                     }
-                });
+                    Ok(()) => self
+                        .artifacts
+                        .run(move |sink| sink.sealed(job_id))
+                        .await
+                        .and_then(|record| {
+                            record
+                                .map(|record| record.info())
+                                .ok_or_else(|| unsealed_job(job_id))
+                        }),
+                };
                 let _ = reply.send(result);
             }
             Command::Resources {
@@ -6001,7 +6293,7 @@ impl SupervisorActor {
                 reply,
             } => {
                 let result = self.validate_authority(&authority).and_then(|()| {
-                    match self.artifacts.admitted(&key) {
+                    match self.artifacts.in_memory().admitted(&key) {
                         AdmissionLookup::Admitted { job_id, .. } => Ok(Some(job_id)),
                         AdmissionLookup::Absent => Ok(None),
                         AdmissionLookup::Unprovable { set_aside } => Err(
@@ -6052,14 +6344,17 @@ impl SupervisorActor {
                 offset,
                 follow,
                 reply,
-            } => self.log_read(&authority, job_id, stream, offset, follow, reply),
+            } => {
+                self.log_read(&authority, job_id, stream, offset, follow, reply)
+                    .await;
+            }
             Command::Tail {
                 authority,
                 job_id,
                 cursor,
                 limits,
                 reply,
-            } => self.tail(&authority, job_id, cursor, limits, reply),
+            } => self.tail(&authority, job_id, cursor, limits, reply).await,
             Command::ListeningPorts {
                 authority,
                 job_id,
@@ -6094,22 +6389,30 @@ impl SupervisorActor {
                 build_volume,
                 reply,
             } => {
-                let named = self.validate_authority(&authority).and_then(|()| {
-                    if let Some(mount) = build_volume.as_deref()
-                        && !self.build_volume_layout.as_ref().is_some_and(|layout| {
-                            layout.volume_at(mount).is_some()
+                let named = match (self.validate_authority(&authority), build_volume.clone()) {
+                    (Err(error), _) => Err(error),
+                    (Ok(()), None) => Ok(()),
+                    (Ok(()), Some(mount)) => {
+                        // Resolving the mount canonicalizes it: on the blocking pool.
+                        let layout = self.build_volume_layout.clone();
+                        let asked = mount.clone();
+                        let known = off_actor::run(move || {
+                            layout.is_some_and(|layout| layout.volume_at(&asked).is_some())
                         })
-                    {
-                        return Err(CowshedError::integrity(
-                            format!(
-                                "build volume label request names {}, outside this project's build volumes",
-                                mount.display()
-                            ),
-                            "cowshed doctor --json",
-                        ));
+                        .await;
+                        if known {
+                            Ok(())
+                        } else {
+                            Err(CowshedError::integrity(
+                                format!(
+                                    "build volume label request names {}, outside this project's build volumes",
+                                    mount.display()
+                                ),
+                                "cowshed doctor --json",
+                            ))
+                        }
                     }
-                    Ok(())
-                });
+                };
                 if named.is_ok() {
                     self.relabel(false, build_volume.as_deref());
                 }
@@ -6220,7 +6523,7 @@ impl SupervisorActor {
         }
     }
 
-    fn advance_authority(
+    async fn advance_authority(
         &mut self,
         expected: WorkspaceAuthoritySnapshot,
         authority: WorkspaceAuthoritySnapshot,
@@ -6245,16 +6548,25 @@ impl SupervisorActor {
             ));
         }
         // A host shell exports what the jobs carry: capabilities the advance changes reach its
-        // `.cowshed/env` now, not at the next supervisor start.
-        if sandbox.capabilities.contribution != self.policy.ceiling().capabilities.contribution {
-            publish_host_environment(&sandbox)?;
-        }
-        // Rendered here, once for the new authority; every job admitted under it shares it.
-        let policy = job_sandbox_policy(sandbox, self.membership_socket.as_deref())?;
+        // `.cowshed/env` now, not at the next supervisor start. Writing it and rendering the
+        // profile read and write the file system, so both run on the blocking pool.
+        let republish =
+            sandbox.capabilities.contribution != self.policy.ceiling().capabilities.contribution;
+        let socket = self.membership_socket.clone();
+        let policy = off_actor::run(move || {
+            if republish {
+                publish_host_environment(&sandbox)?;
+            }
+            // Rendered here, once for the new authority; every job admitted under it shares it.
+            job_sandbox_policy(sandbox, socket.as_deref())
+        })
+        .await?;
         if authority != self.authority {
             self.sessions.clear();
             self.named_sessions.clear();
         }
+        // Published before the advance is answered, so a hello after it reads the new authority.
+        self.liveness.serve(&authority);
         self.authority = authority;
         self.policy = policy;
         Ok(())
@@ -6368,44 +6680,43 @@ impl SupervisorActor {
 
     /// Name the checkout's volumes in the background (see [`VolumeLabels`]): its workspace
     /// image's volume when `workspace`, and the build volume mounted at `build` unless this
-    /// supervisor already named that one. Each is named by its image, never by the path it is
-    /// mounted at; a volume is renamed, through its held mount root, only when the file system's
-    /// own name differs, and the outcome goes to stderr.
+    /// supervisor already asked to name that one. Each is named by its image, never by the path
+    /// it is mounted at; a volume is renamed, through its held mount root, only when the file
+    /// system's own name differs, and the outcome goes to stderr. Which build volume `build` is
+    /// gets resolved with the rest on the blocking pool, since resolving canonicalizes the mount.
     fn relabel(&mut self, workspace: bool, build: Option<&Path>) {
         let Some(labels) = &self.volume_labels else {
             return;
         };
-        // What each is, the build link that authorizes it, the image named, and its label.
-        let mut volumes = Vec::new();
-        if workspace {
-            volumes.push((
-                "volume",
-                None,
-                labels.workspace_image.clone(),
-                labels.workspace.clone(),
-            ));
-        }
-        if let Some(build) = build
-            && self.labelled_build.as_deref() != Some(build)
-            && let Some(layout) = &self.build_volume_layout
-            && let Some(id) = layout.volume_at(build)
-        {
-            self.labelled_build = Some(build.to_owned());
-            volumes.push((
-                "build volume",
-                Some(build.to_owned()),
-                layout.image(&id),
-                labels.build.clone(),
-            ));
-        }
-        if volumes.is_empty() {
+        let build = build
+            .filter(|build| self.labelled_build.as_deref() != Some(*build))
+            .filter(|_| self.build_volume_layout.is_some())
+            .map(Path::to_path_buf);
+        if !workspace && build.is_none() {
             return;
         }
+        if let Some(build) = &build {
+            self.labelled_build = Some(build.clone());
+        }
+        let workspace_volume =
+            workspace.then(|| (labels.workspace_image.clone(), labels.workspace.clone()));
+        let build_label = labels.build.clone();
         let labeller = Arc::clone(&labels.labeller);
         let name = self.authority.workspace.clone();
         let checkout = self.workspace_root.clone();
         let layout = self.build_volume_layout.clone();
         self.labelling.spawn_blocking(move || {
+            // What each is, the build link that authorizes it, the image named, and its label.
+            let mut volumes = Vec::new();
+            if let Some((image, label)) = workspace_volume {
+                volumes.push(("volume", None, image, label));
+            }
+            if let Some(build) = build
+                && let Some(layout) = &layout
+                && let Some(id) = layout.volume_at(&build)
+            {
+                volumes.push(("build volume", Some(build), layout.image(&id), build_label));
+            }
             for (what, linked, image, label) in volumes {
                 // Links are not authority. After a land, this checkout may still link the
                 // adopted volume, but its sidecar belongs to the target, so it cannot name it.
@@ -6609,7 +6920,7 @@ impl SupervisorActor {
         // environment it had, no build volume is held and no job id is taken.
         let admission = match &request.admission_key {
             None => None,
-            Some(key) => match self.artifacts.admitted(key) {
+            Some(key) => match self.artifacts.in_memory().admitted(key) {
                 AdmissionLookup::Absent => {
                     Some(self.job_admission(key.clone(), &request, session.as_ref())?)
                 }
@@ -6659,21 +6970,21 @@ impl SupervisorActor {
                 )
             }) {
             let exec_temp = child.exec_temp_dir.clone();
-            let observation = InstallObservation::new(&exec_temp)?;
+            let home = child.home.clone();
             let root = self.workspace_root.clone();
-            let stores = crate::developer_links::PackageStores::from_home(&child.home)?;
-            let links = tokio::task::spawn_blocking(move || {
-                crate::developer_links::DeveloperLinks::capture_job(&root, stores)
+            // The marker, the package stores and the link snapshot all touch the file system.
+            let (links, observation) = off_actor::run(move || {
+                let observation = InstallObservation::new(&exec_temp)?;
+                let stores = crate::developer_links::PackageStores::from_home(&home)?;
+                let links = crate::developer_links::DeveloperLinks::capture_job(&root, stores)?;
+                Ok::<_, CowshedError>((links, observation))
             })
-            .await
-            .map_err(|error| {
-                CowshedError::internal(format!("developer-link snapshot failed: {error}"))
-            })??;
+            .await?;
             (links, Some(observation))
         } else {
             (crate::developer_links::DeveloperLinks::default(), None)
         };
-        let build_hold = self.hold_build_volume(build_volume.as_deref())?;
+        let build_hold = self.hold_build_volume(build_volume.as_deref()).await?;
         // A volume the link moved to (a land, a refork) was another checkout's: it takes this
         // checkout's name, once.
         self.relabel(false, build_volume.as_deref());
@@ -6683,25 +6994,31 @@ impl SupervisorActor {
         // so it stays on its old volume until it exits; nothing is relaunched.
         if build_volume != self.policy.ceiling().build_volume_mount {
             let _span = cowshed_os::timing::span("admit", "build-volume-profile");
-            self.policy = SandboxPolicy::render(SandboxConfig {
+            let ceiling = SandboxConfig {
                 build_volume_mount: build_volume,
                 ..self.policy.ceiling().clone()
-            })?;
+            };
+            self.policy = off_actor::run(move || SandboxPolicy::render(ceiling)).await?;
         }
         // The checkout's capabilities as its files hold them now, not as this supervisor started:
         // a dev shell that gained mbx's Cargo shim, a manifest that arrived. A change becomes this
         // supervisor's ceiling, and the host shell's `.cowshed/env` is republished from it, so a
-        // host shell and the land's host gate build in the environment the jobs do.
+        // host shell and the land's host gate build in the environment the jobs do. Detection
+        // reads the checkout and may run its git: on the blocking pool, as is the republication.
         let detected = {
             let _span = cowshed_os::timing::span("admit", "capability-detection");
-            self.policy
-                .ceiling()
-                .detect_capabilities_for(&self.workspace_root)?
+            let ceiling = self.policy.ceiling().clone();
+            let root = self.workspace_root.clone();
+            off_actor::run(move || ceiling.detect_capabilities_for(&root)).await?
         };
         if detected != self.policy.ceiling().capabilities {
             let sandbox = self.policy.ceiling().with_capabilities(detected);
-            publish_host_environment(&sandbox)?;
-            self.policy = job_sandbox_policy(sandbox, self.membership_socket.as_deref())?;
+            let socket = self.membership_socket.clone();
+            self.policy = off_actor::run(move || {
+                publish_host_environment(&sandbox)?;
+                job_sandbox_policy(sandbox, socket.as_deref())
+            })
+            .await?;
         }
         let ExecRequest {
             command,
@@ -6800,15 +7117,19 @@ impl SupervisorActor {
             .admit_cgroup(&self.authority, job_id, scheduling.class())?;
         {
             let _span = cowshed_os::timing::span("admit", "record");
-            let admitted = self.artifacts.admit(
-                job_id,
-                self.authority.grant_revision,
-                &command,
-                admission,
-                scheduling,
-            );
+            let grant_revision = self.authority.grant_revision;
+            let recorded = command.clone();
+            let admitted = self
+                .artifacts
+                .run(move |sink| {
+                    sink.admit(job_id, grant_revision, &recorded, admission, scheduling)
+                })
+                .await;
             #[cfg(target_os = "linux")]
-            let admitted = admitted.map_err(|error| refused_cgroup(error, cgroup.as_deref()));
+            let admitted = match admitted {
+                Err(error) => Err(refused_cgroup(error, cgroup.clone()).await),
+                recorded => recorded,
+            };
             admitted?;
         }
         self.next_job_id = expected_next;
@@ -6826,9 +7147,12 @@ impl SupervisorActor {
         if let Err(error) = admission {
             let _ = self
                 .artifacts
-                .seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy);
+                .run(move |sink| {
+                    sink.seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy)
+                })
+                .await;
             #[cfg(target_os = "linux")]
-            let error = refused_cgroup(error, cgroup.as_deref());
+            let error = refused_cgroup(error, cgroup).await;
             return Err(error);
         }
 
@@ -6839,11 +7163,14 @@ impl SupervisorActor {
         let started = match utc_now() {
             Ok(started) => started,
             Err(error) => {
-                let _ =
-                    self.artifacts
-                        .seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy);
+                let _ = self
+                    .artifacts
+                    .run(move |sink| {
+                        sink.seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy)
+                    })
+                    .await;
                 #[cfg(target_os = "linux")]
-                let error = refused_cgroup(error, cgroup.as_deref());
+                let error = refused_cgroup(error, cgroup).await;
                 return Err(error);
             }
         };
@@ -6878,10 +7205,10 @@ impl SupervisorActor {
         // spawn reads them again immediately before the first process is dispatched.
         let volumes = {
             let _span = cowshed_os::timing::span("admit", "volume-baseline");
-            VolumeBaseline::admitted(
-                self.workspace_volume.as_ref(),
-                self.policy.ceiling().build_volume_mount.as_deref(),
-            )
+            let workspace = self.workspace_volume.clone();
+            let build = self.policy.ceiling().build_volume_mount.clone();
+            off_actor::run(move || VolumeBaseline::admitted(workspace.as_ref(), build.as_deref()))
+                .await
         };
         if let Some(job_spans) = &self.job_spans {
             job_spans.record(
@@ -6974,13 +7301,15 @@ impl SupervisorActor {
     /// Leave `job_id` running with nobody attached: both captured prefixes become durable in
     /// their protected files before this answers, and a session's job joins its session's
     /// background set until it ends. A job that ended is sealed, so it is durable already.
-    fn detach(&mut self, job_id: JobId) -> Result<()> {
+    async fn detach(&mut self, job_id: JobId) -> Result<()> {
         let job = self.job(job_id)?;
         if job.terminal() {
             return Ok(());
         }
         let session_identity = job.session_identity;
-        self.artifacts.prepare_background(job_id)?;
+        self.artifacts
+            .run(move |sink| sink.prepare_background(job_id))
+            .await?;
         if let Some(identity) = session_identity
             && let Some(session) = self.sessions.get_mut(&identity)
         {
@@ -7018,7 +7347,12 @@ impl SupervisorActor {
             &policy.ceiling().store_root,
             &authority.workspace_incarnation,
         );
-        let jobserver = match super::job_cpu::jobserver(want, directory, parent) {
+        // Making the fifo and writing its tokens touch the file system: on the blocking pool.
+        let made = off_actor::run(move || super::job_cpu::jobserver(want, directory, parent)).await;
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let jobserver = match made {
             Ok(jobserver) => jobserver,
             Err(error) => {
                 job.failure = Some(JobFailure::CpuAdmission);
@@ -7039,15 +7373,21 @@ impl SupervisorActor {
         };
         job.info.state = JobState::Running;
         job.cpu = CpuStanding::Admitted {
-            _jobserver: jobserver,
+            jobserver: OffActor::new(jobserver),
         };
         // Read before the job's first process is dispatched, so nothing it writes precedes its
         // baseline: a warm host may start the command before its start is reported here. Its
-        // run counts from here too: the wait for the host is not the command's time.
-        job.volumes = VolumeBaseline::admitted(
-            self.workspace_volume.as_ref(),
-            policy.ceiling().build_volume_mount.as_deref(),
-        );
+        // run counts from here too: the wait for the host is not the command's time. Each
+        // volume's usage is a stat, read on the blocking pool.
+        let workspace = self.workspace_volume.clone();
+        let build = policy.ceiling().build_volume_mount.clone();
+        let volumes =
+            off_actor::run(move || VolumeBaseline::admitted(workspace.as_ref(), build.as_deref()))
+                .await;
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        job.volumes = volumes;
         job.started_at = Instant::now();
         let spawn_span = cowshed_os::timing::span("admit", "spawn");
         let spawn = self
@@ -7141,7 +7481,8 @@ impl SupervisorActor {
             job_id,
             StreamKind::Stderr,
             Bytes::from(format!("cowshed: {}\n", error.message)),
-        );
+        )
+        .await;
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -7159,75 +7500,90 @@ impl SupervisorActor {
     /// collection"): a land that moves the checkout's link meanwhile leaves the volume unlinked,
     /// and the hold is what tells its release that this job still runs there. Refused while a
     /// release or direct seed capture claims the volume, so no job starts during deletion or
-    /// canonical restoration before the seed's freshness mark.
+    /// canonical restoration before the seed's freshness mark. Resolving the grant canonicalizes
+    /// it, and the hold stats the volume's image and creates and locks its hold file: all on the
+    /// blocking pool, where the hold is dropped too.
     fn hold_build_volume(
         &self,
         grant: Option<&Path>,
-    ) -> Result<
-        Option<(
-            crate::build_volume::BuildVolumeId,
-            crate::build_volume::BuildVolumeHold,
-        )>,
-    > {
-        let Some(grant) = grant else {
-            return Ok(None);
-        };
-        let Some(layout) = &self.build_volume_layout else {
-            return Err(CowshedError::integrity(
-                format!(
-                    "the supervisor of {} was handed build volume {} but has no controller-owned \
-                     build-volume layout to hold it by",
-                    self.authority.workspace,
-                    grant.display()
-                ),
-                "restart this workspace's supervisor with the current cowshed",
-            ));
-        };
-        let id = layout.volume_at(grant).ok_or_else(|| {
-            CowshedError::integrity(
-                format!(
-                    "build volume grant {} is not one of this project's build volumes; expected a volume under {} (root aliases are resolved)",
-                    grant.display(),
-                    layout.mounts().display(),
-                ),
-                "cowshed doctor --json",
-            )
-        })?;
-        match layout.admit(&id) {
-            Ok(hold) => Ok(Some((id, hold))),
-            Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
-                Err(CowshedError::conflict(
+    ) -> impl Future<
+        Output = Result<
+            Option<(
+                crate::build_volume::BuildVolumeId,
+                OffActor<crate::build_volume::BuildVolumeHold>,
+            )>,
+        >,
+    > + Send
+    + 'static {
+        let grant = grant.map(Path::to_path_buf);
+        let workspace = self.authority.workspace.clone();
+        let layout = self.build_volume_layout.clone();
+        async move {
+            let Some(grant) = grant else {
+                return Ok(None);
+            };
+            let Some(layout) = layout else {
+                return Err(CowshedError::integrity(
                     format!(
-                        "{}'s job cannot start on build volume {id}: {error}",
-                        self.authority.workspace
+                        "the supervisor of {workspace} was handed build volume {} but has no \
+                         controller-owned build-volume layout to hold it by",
+                        grant.display()
                     ),
-                    "retry: the next admission resolves the checkout's current build volume",
-                ))
+                    "restart this workspace's supervisor with the current cowshed",
+                ));
+            };
+            off_actor::run(move || {
+            let id = layout.volume_at(&grant).ok_or_else(|| {
+                CowshedError::integrity(
+                    format!(
+                        "build volume grant {} is not one of this project's build volumes; expected a volume under {} (root aliases are resolved)",
+                        grant.display(),
+                        layout.mounts().display(),
+                    ),
+                    "cowshed doctor --json",
+                )
+            })?;
+            match layout.admit(&id) {
+                Ok(hold) => Ok(Some((id, OffActor::new(hold)))),
+                Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
+                    Err(CowshedError::conflict(
+                        format!("{workspace}'s job cannot start on build volume {id}: {error}"),
+                        "retry: the next admission resolves the checkout's current build volume",
+                    ))
+                }
+                Err(error) => Err(CowshedError::environment_missing(
+                    format!(
+                        "cannot hold build volume {id} at {}: {error}",
+                        layout.hold_path(&id).display()
+                    ),
+                    "check the cowshed store's permissions and retry",
+                )),
             }
-            Err(error) => Err(CowshedError::environment_missing(
-                format!(
-                    "cannot hold build volume {id} at {}: {error}",
-                    layout.hold_path(&id).display()
-                ),
-                "check the cowshed store's permissions and retry",
-            )),
+            })
+            .await
         }
     }
 
-    fn current_build_volume_grant(&self) -> Result<Option<PathBuf>> {
-        match &self.build_volume_layout {
-            Some(layout) => layout.grant(&self.authority.workspace, &self.workspace_root),
-            None => match crate::build_volume::link::linked(&self.workspace_root)? {
+    /// The build volume the controller grants the checkout now. Its link and the volume's record
+    /// are read on the blocking pool.
+    fn current_build_volume_grant(
+        &self,
+    ) -> impl Future<Output = Result<Option<PathBuf>>> + Send + 'static {
+        let layout = self.build_volume_layout.clone();
+        let workspace = self.authority.workspace.clone();
+        let root = self.workspace_root.clone();
+        off_actor::run(move || match &layout {
+            Some(layout) => layout.grant(&workspace, &root),
+            None => match crate::build_volume::link::linked(&root)? {
                 None => Ok(None),
                 Some(_) => Err(CowshedError::integrity(
                     format!(
-                        "the supervisor of {} has no controller-owned build-volume layout",
-                        self.authority.workspace,
+                        "the supervisor of {workspace} has no controller-owned build-volume layout",
                     ),
                     "restart this workspace's supervisor with the current cowshed",
                 )),
             },
-        }
+        })
     }
 
     /// A job or a named session was just admitted: the shed is in use (04_sandbox.md, the kept
@@ -7301,33 +7657,42 @@ impl SupervisorActor {
         if daemon == Probe::Live || running {
             return true;
         }
-        // The job's `node` is found as its own exec would find it: on the PATH it gets.
+        // The job's `node` is found as its own exec would find it: on the PATH it gets. Building
+        // that PATH and looking along it stat the file system, so both run on the blocking pool.
         let (read_write, _) = self
             .policy
             .child(crate::api::dto::RunSandboxMode::ReadWrite);
-        let path = match read_write.capabilities.contribution.shell {
-            Some(_) => None,
-            None => match bootstrap_path(read_write) {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    keeper.refuse(format!(
-                        "the Nx daemon of {} cannot start: {}",
-                        project_root.display(),
-                        error.message
-                    ));
-                    return true;
-                }
-            },
+        let bootstrap = read_write
+            .capabilities
+            .contribution
+            .shell
+            .is_none()
+            .then(|| read_write.clone());
+        let found = off_actor::run(move || match bootstrap {
+            None => Ok(super::nx_daemon::daemon_node(
+                super::nx_daemon::NodeSource::Shell,
+            )),
+            Some(sandbox) => bootstrap_path(&sandbox).map(|path| {
+                super::nx_daemon::daemon_node(super::nx_daemon::NodeSource::Path(&path))
+            }),
+        })
+        .await;
+        let node = match found {
+            Ok(node) => node,
+            Err(error) => {
+                keeper.refuse(format!(
+                    "the Nx daemon of {} cannot start: {}",
+                    project_root.display(),
+                    error.message
+                ));
+                return true;
+            }
         };
-        let node = path.as_deref().map_or(
-            super::nx_daemon::NodeSource::Shell,
-            super::nx_daemon::NodeSource::Path,
-        );
         let Some(request) = keeper.start(&self.workspace_root, &project_root, node) else {
             return true;
         };
         let authority = self.authority.clone();
-        let started = match self.current_build_volume_grant() {
+        let started = match self.current_build_volume_grant().await {
             // The keeper is the supervisor's own coordinator-side work.
             Ok(grant) => self
                 .admit_exec(
@@ -7353,7 +7718,7 @@ impl SupervisorActor {
                     job.kept_nx_daemon = true;
                 }
                 // Nobody attaches to the keeper's job: it runs detached from its admission.
-                if let Err(error) = self.detach(job_id) {
+                if let Err(error) = self.detach(job_id).await {
                     cowshed_os::eprintln!(
                         "cowshed: the Nx daemon job {} of {} runs, but its captured output is not durable: {}",
                         job_id.get(),
@@ -7638,7 +8003,7 @@ impl SupervisorActor {
         }
     }
 
-    fn log_read(
+    async fn log_read(
         &mut self,
         authority: &WorkspaceAuthoritySnapshot,
         job_id: JobId,
@@ -7654,10 +8019,7 @@ impl SupervisorActor {
         let Ok(job) = self.job_mut(job_id) else {
             // A job an earlier supervisor of this incarnation ran and sealed: its sealed artifact
             // answers exactly as this supervisor's own terminal jobs do.
-            let reader = self
-                .artifacts
-                .sealed(job_id)
-                .and_then(|reader| reader.ok_or_else(|| not_found_job(job_id)));
+            let reader = self.sealed_reader(job_id).await;
             tokio::task::spawn_blocking(move || {
                 let _ = reply
                     .send(reader.and_then(|reader| read_sealed_chunk(&reader, stream, offset)));
@@ -7668,10 +8030,7 @@ impl SupervisorActor {
             // The sealed artifact is the authoritative copy of both streams, so the actor keeps
             // none. Off the actor thread: this may open and read a protected file, and every
             // other job's output pump waits behind this loop.
-            let reader = self
-                .artifacts
-                .sealed(job_id)
-                .and_then(|reader| reader.ok_or_else(|| not_found_job(job_id)));
+            let reader = self.sealed_reader(job_id).await;
             tokio::task::spawn_blocking(move || {
                 let _ = reply
                     .send(reader.and_then(|reader| read_sealed_chunk(&reader, stream, offset)));
@@ -7712,7 +8071,7 @@ impl SupervisorActor {
         }
     }
 
-    fn tail(
+    async fn tail(
         &mut self,
         authority: &WorkspaceAuthoritySnapshot,
         job_id: JobId,
@@ -7734,23 +8093,29 @@ impl SupervisorActor {
             }
             Ok(_) | Err(_) => {}
         }
-        let reader = self
-            .artifacts
-            .sealed(job_id)
-            .and_then(|reader| reader.ok_or_else(|| not_found_job(job_id)));
+        let reader = self.sealed_reader(job_id).await;
         // Both streams retain the same canonical record and root off the actor thread.
         tokio::task::spawn_blocking(move || {
             let _ = reply.send(reader.and_then(|reader| sealed_tail(&reader, cursor, limits)));
         });
     }
 
-    fn handle_event(&mut self, event: ProcessEvent) {
+    /// `job_id`'s sealed record, read on the blocking pool: for a job this supervisor did not
+    /// seal, the store takes its records lock and refreshes its records.
+    async fn sealed_reader(&mut self, job_id: JobId) -> Result<SealedJobReader> {
+        self.artifacts
+            .run(move |sink| sink.sealed(job_id))
+            .await
+            .and_then(|reader| reader.ok_or_else(|| not_found_job(job_id)))
+    }
+
+    async fn handle_event(&mut self, event: ProcessEvent) {
         match event {
             ProcessEvent::Output {
                 job_id,
                 stream,
                 bytes,
-            } => self.process_output(job_id, stream, bytes),
+            } => self.process_output(job_id, stream, bytes).await,
             ProcessEvent::OutputEof { job_id, stream } => {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     match stream {
@@ -7945,14 +8310,22 @@ impl SupervisorActor {
         }
     }
 
-    fn process_output(&mut self, job_id: JobId, stream: StreamKind, bytes: Bytes) {
+    async fn process_output(&mut self, job_id: JobId, stream: StreamKind, bytes: Bytes) {
         let Some(job) = self.jobs.get(&job_id) else {
             return;
         };
         if job.terminal() {
             return;
         }
-        match self.artifacts.write(job_id, stream, &bytes) {
+        // Past its first 64 KiB a stream spills to its protected file, so a write may block on
+        // the file system: on the blocking pool.
+        let written = {
+            let bytes = bytes.clone();
+            self.artifacts
+                .run(move |sink| sink.write(job_id, stream, &bytes))
+                .await
+        };
+        match written {
             Ok(admission) => {
                 let job = self
                     .jobs
@@ -8251,14 +8624,16 @@ impl SupervisorActor {
                     job_id,
                     StreamKind::Stderr,
                     Bytes::from(format!("cowshed: {finding}\n")),
-                );
+                )
+                .await;
             }
             if let Some(failure) = finish.failure {
                 self.process_output(
                     job_id,
                     StreamKind::Stderr,
                     Bytes::from(format!("cowshed: {}\n", failure.label())),
-                );
+                )
+                .await;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.terminal_cleanup_failure = Some(failure.into_error());
                 }
@@ -8354,10 +8729,13 @@ impl SupervisorActor {
             )
         });
         #[cfg(target_os = "linux")]
-        if let Some(cgroup) = &job.cgroup {
-            // Final accounting precedes removing the hierarchy. A refused finish retains all
-            // claims and remains nonterminal; only an explicit request retries retirement.
-            if let Err(error) = cgroup.finish(cowshed_os::deadline::REAP) {
+        if let Some(cgroup) = job.cgroup.clone() {
+            // Final accounting precedes removing the hierarchy, which reads cgroupfs and joins
+            // the members for up to the reap bound: on the blocking pool. A refused finish
+            // retains all claims and remains nonterminal; only an explicit request retries
+            // retirement.
+            let finished = off_actor::run(move || cgroup.finish(cowshed_os::deadline::REAP)).await;
+            if let Err(error) = finished {
                 self.refuse_membership(job_id, cgroup_error(error), RetirementRun::Requested);
                 return;
             }
@@ -8386,12 +8764,11 @@ impl SupervisorActor {
             outlived_incomplete: job.info.outlived_incomplete,
         };
         let seal_span = cowshed_os::timing::span("seal", "record");
-        let sealed = self.artifacts.seal(
-            job_id,
-            ending,
-            job.stdout_copy.take(),
-            job.stderr_copy.take(),
-        );
+        let (stdout_copy, stderr_copy) = (job.stdout_copy.take(), job.stderr_copy.take());
+        let sealed = self
+            .artifacts
+            .run(move |sink| sink.seal(job_id, ending, stdout_copy, stderr_copy))
+            .await;
         drop(seal_span);
         // The membership and direct child have ended whatever becomes of their record, so the
         // job concludes on every path below and every waiter is answered. The claim was held
@@ -8439,10 +8816,11 @@ impl SupervisorActor {
         // Nor does it run on its build volume any more: a release may take it, and the
         // controller's release is awaited before the job is told ended, so a volume superseded
         // while the job ran is gone by then, or the job's end says why it is not. Nor does it
-        // keep its jobserver: letting it go unlinks the job's own fifo.
+        // keep its jobserver: letting it go unlinks the job's own fifo. Both are let go on the
+        // blocking pool and awaited, so the release finds the hold gone.
         let mut state = state;
         if let Some((volume, hold)) = job.build_hold.take() {
-            drop(hold);
+            hold.release().await;
             if let Some(released) = &self.build_volume_released
                 && let Err(error) = released.release(volume).await
             {
@@ -8450,7 +8828,11 @@ impl SupervisorActor {
                 job.terminal_cleanup_failure.get_or_insert(error);
             }
         }
-        job.cpu = CpuStanding::Settled;
+        if let CpuStanding::Admitted { jobserver } =
+            std::mem::replace(&mut job.cpu, CpuStanding::Settled)
+        {
+            jobserver.release().await;
+        }
         self.admission_effects.extend(self.admission.step(
             Instant::now(),
             super::job_admission::Event::Concluded { job: job_id },

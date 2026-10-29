@@ -366,7 +366,8 @@ pub(crate) fn kept_project(read_write: &SandboxConfig) -> Option<&Path> {
 }
 
 /// The read-write resident job that starts the daemon of the Nx project at `project_root`: the
-/// project's own `nx`, run by [`daemon_node`] from the project root inside the workspace at
+/// project's own `nx`, run by `node` (what [`daemon_node`] found) from the project root inside
+/// the workspace at
 /// `workspace_root`. The daemon stays up to answer clients and is idle between them, and an idle
 /// process costs the host nothing (05_gateway.md "Classes"): it runs at the resident class.
 ///
@@ -375,9 +376,9 @@ pub(crate) fn kept_project(read_write: &SandboxConfig) -> Option<&Path> {
 fn start_request(
     workspace_root: &Path,
     project_root: &Path,
-    node: NodeSource<'_>,
+    node: std::result::Result<CommandArg, String>,
 ) -> Result<ExecRequest> {
-    let node = daemon_node(node).map_err(|why| {
+    let node = node.map_err(|why| {
         CowshedError::environment_missing(
             format!(
                 "the Nx daemon of {} cannot start: {why}",
@@ -621,14 +622,15 @@ impl NxDaemonKeeper {
     }
 
     /// The start job to admit for the Nx project at `project_root` in the workspace at
-    /// `workspace_root`, running the `node` from `node`; none while a pause runs, or while no
-    /// start can run. That is looked up afresh at each call -- a few `stat`s, no job -- so a
-    /// `node` that appears is started at the next probe; the refusal is said when it changes.
+    /// `workspace_root`, running `node`, which its caller looked up with [`daemon_node`] for this
+    /// call; none while a pause runs, or while no start can run. The lookup is a few `stat`s and
+    /// no job, made afresh for each call on the supervisor's blocking pool, so a `node` that
+    /// appears is started at the next probe; the refusal is said when it changes.
     pub(crate) fn start(
         &mut self,
         workspace_root: &Path,
         project_root: &Path,
-        node: NodeSource<'_>,
+        node: std::result::Result<CommandArg, String>,
     ) -> Option<ExecRequest> {
         if let Some(Hold::Paused { until, .. }) = &self.hold {
             if Instant::now() < *until {
@@ -1559,7 +1561,7 @@ mod tests {
         node: NodeSource<'_>,
     ) -> Option<ExecRequest> {
         keeper.observe(Probe::Unrecorded, root);
-        keeper.start(root, root, node)
+        keeper.start(root, root, daemon_node(node))
     }
 
     fn refused(keeper: &NxDaemonKeeper) -> String {
@@ -1611,7 +1613,7 @@ mod tests {
         plant(&root.join("a/node"), 0o644);
         plant(&root.join("b/node"), 0o755);
         let request = keeper()
-            .start(&root, &root, node)
+            .start(&root, &root, daemon_node(node))
             .expect("the executable `node` further on the PATH starts");
         assert_eq!(program(&request), root.join("b/node").as_os_str());
 
@@ -1632,7 +1634,7 @@ mod tests {
     async fn an_activated_shell_names_its_own_node() {
         let (root, _) = scratch();
         let request = keeper()
-            .start(&root, &root, NodeSource::Shell)
+            .start(&root, &root, daemon_node(NodeSource::Shell))
             .expect("an activated shed starts");
         assert_eq!(program(&request), "node");
         std::fs::remove_dir_all(&root).expect("remove scratch");
@@ -1643,7 +1645,7 @@ mod tests {
     fn one_start(keeper: &mut NxDaemonKeeper, served: bool, ending: Option<&str>, daemon: Probe) {
         let root = Path::new(NO_PROJECT);
         keeper
-            .start(root, root, NodeSource::Shell)
+            .start(root, root, daemon_node(NodeSource::Shell))
             .expect("a start is admitted");
         let job = JobId::new(1).expect("job id");
         keeper.starting = Some(job);
@@ -1697,7 +1699,9 @@ mod tests {
         for failures in START_ATTEMPTS + 1..START_ATTEMPTS + 7 {
             tokio::time::advance(pause - Duration::from_secs(1)).await;
             assert!(
-                keeper.start(root, root, NodeSource::Shell).is_none(),
+                keeper
+                    .start(root, root, daemon_node(NodeSource::Shell))
+                    .is_none(),
                 "no start while the pause runs"
             );
             tokio::time::advance(Duration::from_secs(1)).await;
