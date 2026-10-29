@@ -36,8 +36,9 @@
 //! decision-side `*_serialized` queries) and answer from the string; no read
 use crate::bitmap_ttl::{TtlAlgebraDemand, TtlAlgebraScratch, merge_expiries};
 use crate::hooks::{ByteCapture, TtlMutation, VmHooks};
+use crate::key_index::{HashIndex, KeyIndex};
 use crate::meta::SlotMetaView;
-use crate::state_init::bind_slot;
+use crate::state_init::bind_slot_in;
 use crate::ttl_plan::TtlBatchPlan;
 use bitmosaic::{
     AndNotRange, AndRange, BatchOutcome, Bitmosaic, BitmosaicView, IMAGE_ID_LEN, KeyWidth, OrRange,
@@ -851,6 +852,20 @@ pub fn batch_bitmap_algebra(
     target_meta: &SlotMetaView,
     source: BitmapSource<'_>,
 ) -> ErrorCode {
+    batch_bitmap_algebra_in::<HashIndex>(env, hooks, delta_mode, op, state, target_meta, source)
+}
+
+/// [`batch_bitmap_algebra`] over an image of key-index family `I`: a source
+/// slot is bound under that family's state header.
+pub fn batch_bitmap_algebra_in<I: KeyIndex>(
+    env: &mut BitmapEnv,
+    hooks: &mut impl VmHooks,
+    delta_mode: bool,
+    op: BitmapAlgebraOp,
+    state: &mut [u8],
+    target_meta: &SlotMetaView,
+    source: BitmapSource<'_>,
+) -> ErrorCode {
     env.ttl_mutations.clear();
     let target_storage = get_bitmap_storage(target_meta);
     let original_size = target_meta.size(state);
@@ -860,7 +875,7 @@ pub fn batch_bitmap_algebra(
     // at most both sides' live expiry rows. An unreadable operand is refused
     // below, where it is read.
     let source_slot = match source {
-        BitmapSource::Slot(slot) => bind_slot(state, slot).ok(),
+        BitmapSource::Slot(slot) => bind_slot_in::<I>(state, slot).ok(),
         BitmapSource::Scratch | BitmapSource::Bytes(_) => None,
     };
     let source_members = match source {
@@ -913,7 +928,7 @@ pub fn batch_bitmap_algebra(
     };
     let (source_meta, source_data) = match source {
         BitmapSource::Slot(slot) => {
-            let meta = match bind_slot(state, slot) {
+            let meta = match bind_slot_in::<I>(state, slot) {
                 Ok(meta) => meta,
                 Err(code) => {
                     env.last_error = 80;

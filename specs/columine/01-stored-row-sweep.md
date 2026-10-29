@@ -8,11 +8,11 @@ embedder's existing `RowExpression` semantics. The VM adds no predicate language
 synthetic batch columns.
 
 The compiler places the sweep after the writes whose resulting rows it examines. One instruction scans one unary
-struct-map slot once, in ascending physical table order. A sweep with an empty batch changes nothing: there is no new
-logical event row. With a nonempty batch, the last input row is the predicate's logical input row. A retention predicate
-reads its clock from that row's deterministic event time or the embedder's equivalent logical-time binding, never the
-wall clock. A compiler that needs expiry on every reducer wake covers every admitted event type in the predicate entry's
-match set.
+struct-map slot once, in its key index's iteration order ([key index](04-key-index.md)), evaluating every predicate
+before any row changes. A sweep with an empty batch changes nothing: there is no new logical event row. With a nonempty
+batch, the last input row is the predicate's logical input row. A retention predicate reads its clock from that row's
+deterministic event time or the embedder's equivalent logical-time binding, never the wall clock. A compiler that needs
+expiry on every reducer wake covers every admitted event type in the predicate entry's match set.
 
 ## 2. Encoding and predicate binding
 
@@ -38,14 +38,15 @@ error codes rather than silently treated as a false predicate.
 
 ## 3. Mutation and recovery
 
-Removing a row tombstones its key, decrements the map's size, and records the slot's removal change flag. It does not
-rewrite a kept row or materialize a second map. The mutation uses the same sparse `UndoState` capture authority as other
-struct-map writes. Undo restores the removed keys, size and change flags; the delta mutation lane retains physical redo
-for the same bytes. An idle sweep sets no removal flag.
+Removing a row removes its key from the slot's key index, decrements the map's size, and records the slot's removal
+change flag. It does not rewrite a kept row or a removed row's bytes, and does not materialize a second map. Each
+removal is one capture, under the same sparse `UndoState` authority as other struct-map writes, of the size and the
+bytes the index plan names. Undo restores the removed keys, size and change flags; the delta mutation lane retains
+physical redo for the same bytes. An idle sweep sets no removal flag.
 
-The instruction borrows the slot geometry once for its scan. Working memory is reserved at the VM's existing
-batch-admission boundary, not allocated per stored row. Predicate evaluation does not construct row objects or column
-arrays. State readers remain immutable borrows and introduce no lock.
+The instruction borrows the slot geometry once for its scan and holds the selected keys in VM working memory reserved at
+the VM's existing batch-admission boundary, not allocated per stored row. Predicate evaluation does not construct row
+objects or column arrays. State readers remain immutable borrows and introduce no lock.
 
 ## 4. Behavioral acceptance
 

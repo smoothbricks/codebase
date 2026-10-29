@@ -26,9 +26,9 @@
 
 use crate::bitmap_ops::{BitmapEnv, get_bitmap_storage};
 use crate::element_body::{OperandSink, envelope_body, walk_operands};
-use crate::hash_table::max_load_for_cap;
 use crate::hashmap_ops::bind_slot_map;
 use crate::hashset_ops::bind_slot_set;
+use crate::key_index::{InternBytes, KeyCx, KeyIndex};
 use crate::meta::SlotMetaView;
 use crate::scratch::ScratchDemand;
 use crate::state_init;
@@ -486,16 +486,17 @@ fn descend(
 impl CapacityScratch {
     /// Tiers 1 and 2. A program or state admission cannot read is left to a
     /// dry run, which reports whatever execution would.
-    pub(crate) fn admit(
+    pub(crate) fn admit<I: KeyIndex, S: InternBytes + ?Sized>(
         &mut self,
         state: &[u8],
         code: &[u8],
         cols: &[&[u8]],
         batch_len: u32,
         env: &BitmapEnv,
+        cx: &mut KeyCx<'_, I, S>,
     ) -> Admission {
         self.out_of_memory = false;
-        match self.admit_inner(state, code, cols, batch_len, env) {
+        match self.admit_inner(state, code, cols, batch_len, env, cx) {
             Some(admission) => admission,
             None if self.out_of_memory => Admission::OutOfMemory,
             None => Admission::DryRun,
@@ -512,13 +513,14 @@ impl CapacityScratch {
         Some(())
     }
 
-    fn admit_inner(
+    fn admit_inner<I: KeyIndex, S: InternBytes + ?Sized>(
         &mut self,
         state: &[u8],
         code: &[u8],
         cols: &[&[u8]],
         batch_len: u32,
         env: &BitmapEnv,
+        cx: &mut KeyCx<'_, I, S>,
     ) -> Option<Admission> {
         let slots = state_num_slots(state);
         for &slot in &self.touched {
@@ -553,7 +555,7 @@ impl CapacityScratch {
             scratch_card: scratch_members(env),
         };
         for &(effect, whole_batch) in &self.effects {
-            tier1.account(effect, whole_batch, &mut self.demand, &mut self.touched)?;
+            tier1.account::<I>(effect, whole_batch, &mut self.demand, &mut self.touched)?;
         }
 
         // Working memory: a TTL slot's planner storage follows its rows. A
@@ -574,8 +576,8 @@ impl CapacityScratch {
                 let rows = u64::from(meta.size(state))
                     .saturating_add(d.units)
                     .min(u64::from(meta.capacity));
-                let ranges = usize::try_from(rows).ok()?.checked_add(1)?;
-                self.scratch.sweep_ranges = self.scratch.sweep_ranges.max(ranges);
+                let rows = usize::try_from(rows).ok()?;
+                self.scratch.sweep_keys = self.scratch.sweep_keys.max(rows);
             }
             if meta.slot_type() == SlotType::Bitmap {
                 if d.rows {
@@ -610,7 +612,7 @@ impl CapacityScratch {
                     d.units.max(d.touches),
                 ));
             }
-            if d.rows || !fits(state, slot, &meta, &d)? {
+            if d.rows || !fits::<I>(state, slot, &meta, &d)? {
                 cleared = false;
             }
         }
@@ -624,11 +626,11 @@ impl CapacityScratch {
             let slot = self.touched[index];
             let d = self.demand[usize::try_from(slot).ok()?];
             let meta = slot_meta(state, slot)?;
-            if !d.rows && fits(state, slot, &meta, &d)? {
+            if !d.rows && fits::<I>(state, slot, &meta, &d)? {
                 continue;
             }
-            let probed = self.probe(state, code, cols, batch_len, slot, d)?;
-            if probed.opaque || !fits(state, slot, &meta, &probed)? {
+            let probed = self.probe(state, code, cols, batch_len, slot, d, cx)?;
+            if probed.opaque || !fits::<I>(state, slot, &meta, &probed)? {
                 return Some(Admission::DryRun);
             }
         }
@@ -669,7 +671,8 @@ impl CapacityScratch {
 
     /// Recount `target`'s demand from the rows. Algebra bounds carry over
     /// from tier 1: they read slot cardinalities, not rows.
-    fn probe(
+    #[allow(clippy::too_many_arguments)]
+    fn probe<I: KeyIndex, S: InternBytes + ?Sized>(
         &mut self,
         state: &[u8],
         code: &[u8],
@@ -677,9 +680,10 @@ impl CapacityScratch {
         batch_len: u32,
         target: u32,
         tier1: Demand,
+        cx: &mut KeyCx<'_, I, S>,
     ) -> Option<Demand> {
         let meta = slot_meta(state, target)?;
-        let lookup = Lookup::bind(state, target, &meta)?;
+        let lookup = Lookup::<I>::bind(state, target, &meta)?;
         let mut d = Demand {
             touched: true,
             ..Demand::default()
@@ -699,7 +703,7 @@ impl CapacityScratch {
                     Effect::Key { slot, col } if slot == target => {
                         for_rows(domain, cols, batch_len, &mut |row| {
                             let key = cell(cols, col, row)?;
-                            if !is_sentinel(key) && !lookup.contains(state, key) {
+                            if !is_sentinel(key) && !lookup.contains(state, key, cx)? {
                                 d.units += 1;
                                 d.touches += 1;
                             }
@@ -709,7 +713,7 @@ impl CapacityScratch {
                     Effect::Pair { slot, col1, col2 } if slot == target => {
                         for_rows(domain, cols, batch_len, &mut |row| {
                             let (k1, k2) = (cell(cols, col1, row)?, cell(cols, col2, row)?);
-                            if !lookup.contains_pair(state, k1, k2) {
+                            if !lookup.contains_pair(state, k1, k2, cx)? {
                                 d.units += 1;
                             }
                             Some(())
@@ -719,7 +723,7 @@ impl CapacityScratch {
                     // as tier 1.
                     Effect::Remove { slot, col } if slot == target => {
                         for_rows(domain, cols, batch_len, &mut |row| {
-                            if lookup.contains(state, cell(cols, col, row)?) {
+                            if lookup.contains(state, cell(cols, col, row)?, cx)? {
                                 d.touches += 1;
                             }
                             Some(())
@@ -732,7 +736,7 @@ impl CapacityScratch {
                         })
                     }
                     Effect::Arena { slot, col } if slot == target => {
-                        arena_demand(state, &lookup, o, domain, cols, batch_len, col, &mut d)
+                        arena_demand(state, &lookup, o, domain, cols, batch_len, col, &mut d, cx)
                     }
                     Effect::Routed {
                         slot,
@@ -749,7 +753,7 @@ impl CapacityScratch {
                             return Some(());
                         }
                         let key = cell(cols, col, row)?;
-                        if !is_sentinel(key) && !lookup.contains(state, key) {
+                        if !is_sentinel(key) && !lookup.contains(state, key, cx)? {
                             d.units += 1;
                             d.touches += 1;
                         }
@@ -859,7 +863,7 @@ fn slot_meta(state: &[u8], slot: u32) -> Option<SlotMetaView> {
 
 /// Whether `d` fits `slot` as the slot is now. A TTL slot's eviction index
 /// holds one entry per live key, so its new keys must fit there too.
-fn fits(state: &[u8], slot: u32, meta: &SlotMetaView, d: &Demand) -> Option<bool> {
+fn fits<I: KeyIndex>(state: &[u8], slot: u32, meta: &SlotMetaView, d: &Demand) -> Option<bool> {
     if meta.has_ttl()
         && u64::from(meta.eviction_index_size(state)) + d.units
             > u64::from(meta.eviction_index_capacity(state))
@@ -876,9 +880,8 @@ fn fits(state: &[u8], slot: u32, meta: &SlotMetaView, d: &Demand) -> Option<bool
             u64::from(table.size(state)) + d.units <= u64::from(table.max_load())
         }
         SlotType::StructMap => {
-            let map = state_init::bind_struct_map(state, slot).ok()?;
-            let rows =
-                u64::from(map.size(state)) + d.units <= u64::from(max_load_for_cap(map.capacity));
+            let map = state_init::bind_struct_map_in::<I>(state, slot).ok()?;
+            let rows = u64::from(map.size(state)) + d.units <= u64::from(I::max_rows(map.capacity));
             let arena = if d.bytes == 0 {
                 true
             } else {
@@ -888,8 +891,8 @@ fn fits(state: &[u8], slot: u32, meta: &SlotMetaView, d: &Demand) -> Option<bool
             rows && arena
         }
         SlotType::StructMap2 => {
-            let map = StructMap2Slot::bind(state, slot);
-            u64::from(map.size(state)) + d.units <= u64::from(max_load_for_cap(map.capacity))
+            let map = state_init::bind_struct_map2_in::<I>(state, slot).ok()?;
+            u64::from(map.size(state)) + d.units <= u64::from(I::max_rows(map.capacity))
         }
         SlotType::Bitmap => {
             let storage = get_bitmap_storage(meta);
@@ -906,57 +909,75 @@ fn fits(state: &[u8], slot: u32, meta: &SlotMetaView, d: &Demand) -> Option<bool
     })
 }
 
-/// Read-only membership of the slot tier 2 counts against.
-enum Lookup<'s> {
+/// Read-only membership of the slot tier 2 counts against. A struct map's
+/// membership is its key-index family's; a family read that refuses leaves
+/// the batch to the dry run, which reports what execution would.
+enum Lookup<'s, I: KeyIndex> {
     Table(crate::hash_table::FlatTable),
-    Rows(StructMapSlot),
-    Pairs(StructMap2Slot),
+    Rows(StructMapSlot<I>),
+    Pairs(StructMap2Slot<I>),
     Bitmap(Option<BitmosaicView<'s>>),
     /// Membership is irrelevant (lists count executions).
     None,
 }
 
-impl<'s> Lookup<'s> {
+impl<'s, I: KeyIndex> Lookup<'s, I> {
     fn bind(state: &'s [u8], slot: u32, meta: &SlotMetaView) -> Option<Self> {
         Some(match meta.slot_type() {
             SlotType::HashMap => Lookup::Table(bind_slot_map(meta)),
             SlotType::HashSet => Lookup::Table(bind_slot_set(meta)),
-            SlotType::StructMap => Lookup::Rows(state_init::bind_struct_map(state, slot).ok()?),
-            SlotType::StructMap2 => Lookup::Pairs(StructMap2Slot::bind(state, slot)),
+            SlotType::StructMap => {
+                Lookup::Rows(state_init::bind_struct_map_in::<I>(state, slot).ok()?)
+            }
+            SlotType::StructMap2 => {
+                Lookup::Pairs(state_init::bind_struct_map2_in::<I>(state, slot).ok()?)
+            }
             SlotType::Bitmap => Lookup::Bitmap(get_bitmap_storage(meta).view(state).ok()?),
             _ => Lookup::None,
         })
     }
 
-    fn contains(&self, state: &[u8], key: u32) -> bool {
-        match self {
+    fn contains<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        key: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Option<bool> {
+        Some(match self {
             Lookup::Table(table) => table.contains(state, key),
-            Lookup::Rows(map) => map.find(state, key).is_some(),
+            Lookup::Rows(map) => map.lookup(state, key, cx).ok()?.is_some(),
             Lookup::Bitmap(view) => view.as_ref().is_some_and(|view| view.contains(key)),
             Lookup::Pairs(_) | Lookup::None => false,
-        }
+        })
     }
 
-    fn contains_pair(&self, state: &[u8], key1: u32, key2: u32) -> bool {
-        match self {
-            Lookup::Pairs(map) => map.find(state, key1, key2).is_some(),
+    fn contains_pair<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        key1: u32,
+        key2: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Option<bool> {
+        Some(match self {
+            Lookup::Pairs(map) => map.lookup(state, key1, key2, cx).ok()?.is_some(),
             _ => false,
-        }
+        })
     }
 }
 
 /// Rows and exact array bytes of one struct-map upsert. Bytes are charged on
 /// every execution with a non-sentinel key, update or insert, unaligned.
 #[allow(clippy::too_many_arguments)]
-fn arena_demand(
+fn arena_demand<I: KeyIndex, S: InternBytes + ?Sized>(
     state: &[u8],
-    lookup: &Lookup<'_>,
+    lookup: &Lookup<'_, I>,
     o: &[u32],
     domain: &Domain<'_>,
     cols: &[&[u8]],
     batch_len: u32,
     key_col: u32,
     d: &mut Demand,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> Option<()> {
     let Lookup::Rows(map) = lookup else {
         return None;
@@ -969,7 +990,7 @@ fn arena_demand(
         if is_sentinel(key) {
             return Some(());
         }
-        if map.find(state, key).is_none() {
+        if map.lookup(state, key, cx).ok()?.is_none() {
             d.units += 1;
         }
         for array in 0..num_arrays {
@@ -1013,14 +1034,14 @@ impl Tier1<'_> {
     /// A bitmap slot's member bound so far in program order; `None` when the
     /// slot is no bitmap or an earlier instruction's adds have no row-free
     /// bound (algebra over it then needs a dry run).
-    fn card(&self, demand: &[Demand], slot: u32) -> Option<u64> {
-        let meta = state_init::bind_slot(self.state, slot).ok()?;
+    fn card<I: KeyIndex>(&self, demand: &[Demand], slot: u32) -> Option<u64> {
+        let meta = state_init::bind_slot_in::<I>(self.state, slot).ok()?;
         let d = &demand[usize::try_from(slot).ok()?];
         (meta.slot_type() == SlotType::Bitmap && !d.rows && !d.opaque)
             .then(|| u64::from(meta.size(self.state)) + d.units)
     }
 
-    fn account(
+    fn account<I: KeyIndex>(
         &self,
         effect: Effect,
         whole_batch: bool,
@@ -1039,10 +1060,10 @@ impl Tier1<'_> {
         } = effect
         {
             let source_card = match source {
-                Some(source) => self.card(demand, source),
+                Some(source) => self.card::<I>(demand, source),
                 None => self.scratch_card,
             };
-            let target_card = self.card(demand, target);
+            let target_card = self.card::<I>(demand, target);
             let d = &mut demand[usize::try_from(target).ok()?];
             mark(touched, d, target);
             let (Some(source_card), Some(target_card)) = (source_card, target_card) else {
@@ -1153,7 +1174,17 @@ mod tests {
         let mut scratch = CapacityScratch::default();
         assert_eq!(
             Admission::Fits,
-            scratch.admit(&state, code, &cols, 3, &BitmapEnv::default())
+            scratch.admit(
+                &state,
+                code,
+                &cols,
+                3,
+                &BitmapEnv::default(),
+                &mut KeyCx::<crate::key_index::HashIndex, _>::new(
+                    &crate::key_index::NoStrings,
+                    &mut crate::key_index::HashScratch::default()
+                ),
+            )
         );
         // Slot 1: three adds. Slot 0: OR adds slot 1's bound (3). Slot 1:
         // XOR adds slot 0's bound (3) and touches both bounds.

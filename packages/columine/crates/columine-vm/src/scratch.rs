@@ -17,6 +17,6 @@ pub(crate) struct ScratchDemand {
     pub(crate) nested: Option<NestedPlanDemand>,
     /// The largest bitmap patch; `None` when the batch patches no bitmap.
     pub(crate) bitmap: Option<BitmapPatchDemand>,
-    /// Sparse capture ranges of the largest stored-row sweep.
-    pub(crate) sweep_ranges: usize,
+    /// Keys the largest stored-row sweep can select.
+    pub(crate) sweep_keys: usize,
 }

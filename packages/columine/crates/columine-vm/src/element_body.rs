@@ -369,7 +369,7 @@ pub(crate) fn walk_operands<S: OperandSink>(
         Opcode::ListAppend => &[I, I],
         Opcode::StructMapSweep => &[I, I],
         Opcode::BatchStructMap2Remove => &[I, I, I],
-        Opcode::BatchStructMapRemove => &[I, I],
+        Opcode::BatchStructMapRemove | Opcode::BatchStructMap2RemovePrefix => &[I, I],
         Opcode::BatchStructMapGuardedUpsertLast => {
             // slot, companion_slot, key_col, guard_key_col, guard_field_idx,
             // then the 0x80 value/array tail.

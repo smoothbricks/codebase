@@ -65,13 +65,13 @@
 
 use columine_types::operand::Operands;
 use columine_types::types::{
-    ErrorCode, ProgramHeader, SlotMetaOffset, SlotType, StructFieldType, arena_elem_size,
-    is_arena_field_type, struct_field_size,
+    ErrorCode, ProgramHeader, SlotType, StructFieldType, is_arena_field_type, struct_field_size,
 };
 
 use crate::bytes;
 use crate::column_uses::{ColumnUse, reduce_column_uses};
-use crate::struct_map::{ArenaRegion, StructMap2Slot, StructMapSlot};
+use crate::key_index::{InternBytes, KeyCx, KeyIndex};
+use crate::struct_map::{StructMap2Slot, StructMapSlot, StructRows};
 use crate::vm::{col_at, col_u32, col_u32_exact, u32s_as_bytes};
 
 /// ASCII `R X P 1` in little-endian wire order.
@@ -80,31 +80,33 @@ pub const ROW_EXPRESSIONS_MAGIC: u32 = 0x3150_5852;
 /// Magic and entry count: the fixed part of the table header.
 const TABLE_FIXED_BYTES: usize = 4 + 2;
 
-/// The map geometry a stored row reads through: a one-key struct map, or
-/// a two-key struct map with its arena header (the slot struct carries
-/// none of its own).
-#[derive(Clone, Copy, Debug)]
-enum StoredSource {
-    Map(StructMapSlot),
-    Map2(StructMap2Slot, u32),
-}
-
-/// One live stored row, borrowing the state image. The sweep constructs
+/// One live stored row, borrowing the state image: the row geometry of its
+/// slot, the ordinal its key index named, and its keys. The sweep constructs
 /// this view for the row it visits; an embedder evaluating an expression
-/// over a frozen stored row constructs it with lookup, which validates
-/// the slot first.
+/// over a frozen stored row constructs it with lookup, which validates the
+/// slot first.
 pub struct StoredRow<'a> {
     state: &'a [u8],
-    source: StoredSource,
+    rows: StructRows,
     position: u32,
+    key: u32,
+    key2: Option<u32>,
 }
 
 impl<'a> StoredRow<'a> {
-    pub(crate) const fn new(state: &'a [u8], map: &'a StructMapSlot, position: u32) -> Self {
+    pub(crate) const fn new(
+        state: &'a [u8],
+        rows: StructRows,
+        position: u32,
+        key: u32,
+        key2: Option<u32>,
+    ) -> Self {
         Self {
             state,
-            source: StoredSource::Map(*map),
+            rows,
             position,
+            key,
+            key2,
         }
     }
 
@@ -119,60 +121,54 @@ impl<'a> StoredRow<'a> {
         key: u32,
         key2: Option<u32>,
     ) -> Result<Option<Self>, ErrorCode> {
-        let meta = crate::state_init::bind_slot(state, slot)?;
+        crate::struct_map::hash_call(|cx| Self::lookup_in(state, slot, key, key2, cx))
+    }
+
+    /// [`Self::lookup`] in an image of key-index family `I`, resolving
+    /// interned key lanes through `cx`.
+    pub fn lookup_in<I: KeyIndex, S: InternBytes + ?Sized>(
+        state: &'a [u8],
+        slot: u32,
+        key: u32,
+        key2: Option<u32>,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<Option<Self>, ErrorCode> {
+        let meta = crate::state_init::bind_slot_in::<I>(state, slot)?;
         match (meta.slot_type(), key2) {
             (SlotType::StructMap, None) => {
-                let map = StructMapSlot::bind(state, slot);
-                Ok(map.find(state, key).map(|position| Self {
-                    state,
-                    source: StoredSource::Map(map),
-                    position,
-                }))
+                let map = StructMapSlot::<I>::bind_in(state, slot);
+                Ok(map
+                    .lookup(state, key, cx)?
+                    .map(|position| Self::new(state, map.rows(), position, key, None)))
             }
             (SlotType::StructMap2, Some(key2)) => {
-                let map = StructMap2Slot::bind(state, slot);
-                let arena_header =
-                    bytes::read_u32(state, meta.meta_base + SlotMetaOffset::GRACE_SECONDS);
-                Ok(map.find(state, key, key2).map(|position| Self {
-                    state,
-                    source: StoredSource::Map2(map, arena_header),
-                    position,
-                }))
+                let map = StructMap2Slot::<I>::bind_in(state, slot);
+                Ok(map
+                    .lookup(state, key, key2, cx)?
+                    .map(|position| Self::new(state, map.rows(), position, key, Some(key2))))
             }
             _ => Err(ErrorCode::InvalidProgram),
         }
     }
 
     pub fn key(&self) -> u32 {
-        match &self.source {
-            StoredSource::Map(map) => map.key_at(self.state, self.position),
-            StoredSource::Map2(map, _) => map.key1_at(self.state, self.position),
-        }
+        self.key
     }
 
     /// The second key lane of a two-key stored row.
     pub fn key2(&self) -> Option<u32> {
-        match &self.source {
-            StoredSource::Map(_) => None,
-            StoredSource::Map2(map, _) => Some(map.key2_at(self.state, self.position)),
-        }
+        self.key2
     }
 
     pub const fn num_fields(&self) -> u8 {
-        match &self.source {
-            StoredSource::Map(map) => map.num_fields,
-            StoredSource::Map2(map, _) => map.num_fields,
-        }
+        self.rows.num_fields
     }
 
     pub fn field_type(&self, field: u8) -> Result<StructFieldType, ErrorCode> {
         if field >= self.num_fields() {
             return Err(ErrorCode::InvalidProgram);
         }
-        Ok(match &self.source {
-            StoredSource::Map(map) => map.field_type(self.state, field),
-            StoredSource::Map2(map, _) => map.field_type(self.state, field),
-        })
+        Ok(self.rows.field_type(self.state, field))
     }
 
     /// Present scalar cell bytes or an arena field's borrowed payload.
@@ -180,43 +176,13 @@ impl<'a> StoredRow<'a> {
     pub fn field(&self, field: u8) -> Result<Option<&'a [u8]>, ErrorCode> {
         let kind = self.field_type(field)?;
         if is_arena_field_type(kind) {
-            return match &self.source {
-                StoredSource::Map(map) => map.arena_field(self.state, self.position, field),
-                StoredSource::Map2(map, arena_header) => {
-                    if *arena_header == 0 {
-                        return Err(ErrorCode::InvalidState);
-                    }
-                    let row = map.row_off(self.position);
-                    if !StructMapSlot::is_field_set(self.state, row, field) {
-                        return Ok(None);
-                    }
-                    let cell = row + map.field_offset(self.state, field);
-                    let arena = ArenaRegion::bind(self.state, *arena_header)?;
-                    arena
-                        .bytes(
-                            self.state,
-                            bytes::read_u32(self.state, cell),
-                            bytes::read_u32(self.state, cell + 4),
-                            arena_elem_size(kind),
-                        )
-                        .map(Some)
-                }
-            };
+            return self.rows.arena_field(self.state, self.position, field);
         }
-        let (row, field_offset) = match &self.source {
-            StoredSource::Map(map) => (
-                map.row_off(self.position),
-                map.field_offset(self.state, field),
-            ),
-            StoredSource::Map2(map, _) => (
-                map.row_off(self.position),
-                map.field_offset(self.state, field),
-            ),
-        };
+        let row = self.rows.row_off(self.position);
         if !StructMapSlot::is_field_set(self.state, row, field) {
             return Ok(None);
         }
-        let offset = row + field_offset;
+        let offset = row + self.rows.field_offset(self.state, field);
         let end = offset + struct_field_size(kind);
         let offset = usize::try_from(offset).map_err(|_| ErrorCode::InvalidState)?;
         let end = usize::try_from(end).map_err(|_| ErrorCode::InvalidState)?;

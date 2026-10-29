@@ -18,10 +18,12 @@ use columine_types::vo::{
 
 use crate::counts_fold::CountsFoldOp;
 use crate::element_body::{InvalidSource, SourceOp, visit_source_ops};
+use crate::key_index::{HashIndex, InternBytes, KeyIndex, NoStrings};
 use crate::program_inputs::InputPlan;
 use crate::row_exprs::{LiveColumns, RowColumns, RowExpression, bind_row_columns, row_table};
 use crate::state_init;
 use crate::vm::Vm;
+use core::marker::PhantomData;
 
 pub use crate::program_inputs::{InputAdmissionError, ProgramScratch};
 
@@ -72,11 +74,12 @@ impl From<state_init::SizingRefusal> for ProgramAdmissionError {
     }
 }
 
-/// Bytecode and schema declarations certified together by a native capability.
-/// There is no public unchecked constructor and no positive boolean receipt.
-/// The registry owns this value: its immutable bytecode and metadata move into
-/// it, without a self-reference or a second copy of either declaration.
-pub struct AdmittedProgram<A: VoProgramAdmission> {
+/// Bytecode and schema declarations certified together by a native capability,
+/// for images of key-index family `I`. There is no public unchecked
+/// constructor and no positive boolean receipt. The registry owns this value:
+/// its immutable bytecode and metadata move into it, without a self-reference
+/// or a second copy of either declaration.
+pub struct AdmittedProgram<A: VoProgramAdmission, I: KeyIndex = HashIndex> {
     bytecode: Box<[u8]>,
     metadata: VoProgramMetadata,
     admission: A,
@@ -85,11 +88,55 @@ pub struct AdmittedProgram<A: VoProgramAdmission> {
     /// [`Self::execute_bound`] binds.
     binds_rows: bool,
     magic: u32,
+    /// The image size of this program under family `I`.
     state_size: u32,
+    family: PhantomData<I>,
 }
 
+/// The [`HashIndex`] program: its loader and its batch entry points, which
+/// take no resolver.
 impl<A: VoProgramAdmission> AdmittedProgram<A> {
     pub fn load(
+        bytecode: Box<[u8]>,
+        metadata: VoProgramMetadata,
+        admission: A,
+        accepted_magics: &[u32],
+    ) -> Result<Self, ProgramAdmissionError> {
+        Self::load_in(bytecode, metadata, admission, accepted_magics)
+    }
+
+    /// Admit selected VO cells and counts templates before the VM touches any
+    /// state; their schemas and counts roles were certified at load. Same-layout
+    /// cells stay borrowed, while retained-writer projections are written from
+    /// their certified reader-layout bytes.
+    pub fn execute_batch(
+        &self,
+        vm: &mut Vm,
+        state: &mut [u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        scratch: &mut ProgramScratch,
+    ) -> Result<u32, InputAdmissionError> {
+        self.execute_batch_in(vm, state, cols, batch_len, scratch, &NoStrings)
+    }
+
+    /// The same admission boundary on the paired undo/redo execution lane.
+    pub fn execute_batch_delta(
+        &self,
+        vm: &mut Vm,
+        state: &mut [u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        scratch: &mut ProgramScratch,
+    ) -> Result<u32, InputAdmissionError> {
+        self.execute_batch_delta_in(vm, state, cols, batch_len, scratch, &NoStrings)
+    }
+}
+
+impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
+    /// [`AdmittedProgram::load`] for images of key-index family `I`: the
+    /// state size it answers is that family's.
+    pub fn load_in(
         bytecode: Box<[u8]>,
         mut metadata: VoProgramMetadata,
         mut admission: A,
@@ -99,7 +146,7 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
             ProgramHeader::sections(&bytecode).ok_or(ProgramAdmissionError::InvalidProgram(
                 state_init::ProgramInvalidCause::MalformedProgram,
             ))?;
-        let state_size = state_init::calculate_state_size(&bytecode, accepted_magics)?;
+        let state_size = state_init::calculate_state_size_in::<I>(&bytecode, accepted_magics)?;
         let magic = sections.header.magic;
         let binds_rows = row_table(&bytecode)
             .map_err(|_| {
@@ -210,6 +257,7 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
             binds_rows,
             magic,
             state_size,
+            family: PhantomData,
         })
     }
 
@@ -229,9 +277,10 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
         self.state_size
     }
 
-    /// Initialize the exact admitted program, never a separately supplied one.
+    /// Initialize the exact admitted program, never a separately supplied one,
+    /// as an image of the program's key-index family.
     pub fn initialize_state(&self, state: &mut [u8]) -> Result<(), ErrorCode> {
-        state_init::init_state(state, &self.bytecode, core::slice::from_ref(&self.magic))
+        state_init::init_state_in::<I>(state, &self.bytecode, core::slice::from_ref(&self.magic))
     }
 
     /// Run an embedding dispatch loop over this certificate's own bytecode
@@ -333,34 +382,34 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
         )
     }
 
-    /// Admit selected VO cells and counts templates before the VM touches any
-    /// state; their schemas and counts roles were certified at load. Same-layout
-    /// cells stay borrowed, while retained-writer projections are written from
-    /// their certified reader-layout bytes.
-    pub fn execute_batch(
+    /// [`AdmittedProgram::execute_batch`] on a VM of the program's family,
+    /// resolving interned key lanes through `strings`.
+    pub fn execute_batch_in<S: InternBytes + ?Sized>(
         &self,
-        vm: &mut Vm,
+        vm: &mut Vm<I>,
         state: &mut [u8],
         cols: &[&[u8]],
         batch_len: u32,
         scratch: &mut ProgramScratch,
+        strings: &S,
     ) -> Result<u32, InputAdmissionError> {
         self.execute_with(cols, batch_len, scratch, |bytecode, cols| {
-            vm.execute_batch(state, bytecode, cols, batch_len)
+            vm.execute_batch_in(state, bytecode, cols, batch_len, strings)
         })
     }
 
-    /// The same admission boundary on the paired undo/redo execution lane.
-    pub fn execute_batch_delta(
+    /// [`AdmittedProgram::execute_batch_delta`] on a VM of the program's family.
+    pub fn execute_batch_delta_in<S: InternBytes + ?Sized>(
         &self,
-        vm: &mut Vm,
+        vm: &mut Vm<I>,
         state: &mut [u8],
         cols: &[&[u8]],
         batch_len: u32,
         scratch: &mut ProgramScratch,
+        strings: &S,
     ) -> Result<u32, InputAdmissionError> {
         self.execute_with(cols, batch_len, scratch, |bytecode, cols| {
-            vm.execute_batch_delta(state, bytecode, cols, batch_len)
+            vm.execute_batch_delta_in(state, bytecode, cols, batch_len, strings)
         })
     }
 }
@@ -641,6 +690,7 @@ mod tests {
             binds_rows: true,
             magic: PROGRAM_MAGIC,
             state_size: 0,
+            family: core::marker::PhantomData,
         }
     }
 

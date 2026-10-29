@@ -70,11 +70,18 @@ export enum SlotType {
  * - bit 5: has_evict_trigger
  * - bit 6: no_hashmap_timestamps (HASHMAP only; omit f64 timestamp side-array)
  * - bit 7: reserved
+ *
+ * On SLOT_STRUCT_MAP and SLOT_STRUCT_MAP2 records, which carry no TTL, bits 5
+ * and 6 declare the key lanes instead: bit 5 key lane 1 holds interned-string
+ * ids, bit 6 (SLOT_STRUCT_MAP2 only) key lane 2 does. The slot stores them in
+ * metadata byte 19 and its TYPE_FLAGS byte without them.
  */
 export enum SlotTypeFlag {
   HAS_TTL = 0x10,
   HAS_EVICT_TRIGGER = 0x20,
   NO_HASHMAP_TIMESTAMPS = 0x40,
+  STRUCT_KEY1_INTERNED = 0x20,
+  STRUCT_KEY2_INTERNED = 0x40,
 }
 
 /** Audited against `columine_types::StructFieldType`. */
@@ -485,6 +492,7 @@ export enum Opcode {
   SLOT_STRUCT_MAP2 = 0x1b, // same slot operands as SLOT_STRUCT_MAP; type flag low nibble = 10
   BATCH_STRUCT_MAP2_UPSERT_LAST = 0x83, // slot,key1_col,key2_col,num_vals,[val_col,field_idx] × N
   BATCH_STRUCT_MAP2_REMOVE = 0x86, // slot,key1_col,key2_col
+  BATCH_STRUCT_MAP2_REMOVE_PREFIX = 0x8e, // slot,key1_col; removes every row whose key1 is the element's, in key-index order
   BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2 = 0x87, // 0x83 operands + cmp1_col,cmp1_field,cmp2_col,cmp2_field; strict signed lexicographic max
   BATCH_STRUCT_MAP2_UPSERT_MIN_I64X2 = 0x89, // 0x87 operands; strict signed lexicographic min
   BATCH_STRUCT_MAP_COUNTS_FOLD = 0x88,

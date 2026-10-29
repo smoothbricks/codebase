@@ -1,27 +1,32 @@
-//! Typed accessor for multi-field hash-map rows.
+//! Typed accessors for struct-map rows.
 //!
 //! Slot data layout:
 //! `[field_type_descriptor: u8 × num_fields (padded to 8)]`
-//! `[keys: u32 × capacity]` `[rows: row_size × capacity]`
-//! `[timestamps: f64 × capacity]?`.
+//! `[key index region]` `[rows: row_size × capacity]`
+//! `[timestamps: f64 × capacity]?` (one-key maps only), then the CSR arena.
 //!
-//! Struct-map probing scans past tombstones and reuses the first tombstone
-//! only when the key is absent. Unary and exact-pair writers retain the same
-//! planned position for prior-byte capture and mutation, restoring every
-//! overwritten key, row field and arena byte physically.
+//! A row's ordinal is its identity: the key index (`crate::key_index`) names
+//! the ordinal a key owns, and the row lives at `rows_base + ordinal *
+//! row_size`. The views here reach keys only through the slot's [`KeyIndex`]
+//! family. A writer plans a key once and keeps that plan's ordinal for its
+//! prior-byte capture and its mutation, so every overwritten index, row field
+//! and arena byte is restored physically.
 //!
 //! Raw public writers are unjournaled operations on caller-owned bytes.
 //! Speculative callers use journaled VM operations or a bounded capture.
 
 use crate::bytes;
-use crate::hash_table::{
-    Probe, ProbeCell, find_key, find_key_pair, max_load_for_cap, probe_linear,
+use crate::hash_table::Probe;
+use crate::key_index::{
+    HashIndex, HashScratch, IndexRegion, InsertPlan, InternBytes, Key, KeyCx, KeyIndex, KeyLanes,
+    NoStrings, RemovePlan,
 };
 use crate::meta::slot_meta_base;
 use columine_types::types::{
     EMPTY_KEY, ErrorCode, SlotMetaOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size,
-    hash_key, hash_key_pair, is_arena_field_type, struct_field_size,
+    is_arena_field_type, struct_field_size,
 };
+use core::marker::PhantomData;
 
 /// Checked physical bounds of a per-slot CSR arena. No schema or frame decoding.
 #[derive(Clone, Copy, Debug)]
@@ -208,87 +213,94 @@ pub(crate) fn scalar_cell_order_key(
     scalar_order_key(ft, &cell[..size as usize])
 }
 
-/// Bound struct-map view carrying offsets into the state buffer.
-/// No pointers into state are formed.
+/// Whether a lane-1 key is a sentinel: `EMPTY_KEY` and `TOMBSTONE` mark dead
+/// rows, so no row holds one. The views answer a sentinel themselves (absent,
+/// or `InvalidKey` for an insert) and no key-index family ever sees one;
+/// which opcodes skip it and which refuse it is the VM's.
+const fn is_sentinel(key1: u32) -> bool {
+    key1 == EMPTY_KEY || key1 == TOMBSTONE
+}
+
+/// Run one [`HashIndex`] call for the default views' convenience methods: it
+/// resolves no text and its scratch stays empty.
+pub(crate) fn hash_call<R>(call: impl FnOnce(&mut KeyCx<'_, HashIndex, NoStrings>) -> R) -> R {
+    let mut scratch = HashScratch::default();
+    call(&mut KeyCx::new(&NoStrings, &mut scratch))
+}
+
+/// The end of an index region starting at `at`, saturating: an unchecked
+/// binder reads metadata its slot's geometry check already admitted.
+fn region_end<I: KeyIndex>(at: u32, capacity: u32, lanes: KeyLanes) -> u32 {
+    u32::try_from(u64::from(at) + I::region_bytes(capacity, lanes)).unwrap_or(u32::MAX)
+}
+
+/// The metadata both struct-map kinds bind.
+struct Bound {
+    slot_offset: u32,
+    capacity: u32,
+    size_off: u32,
+    num_fields: u8,
+    bitset_bytes: u32,
+    row_size: u32,
+    descriptor_size: u32,
+    keys_off: u32,
+    lanes: KeyLanes,
+    rows_base: u32,
+    arena_header_off: u32,
+}
+
+/// Read a struct-map slot's metadata record. Metadata byte reuse: byte 13 =
+/// num_fields, byte 15 = bitset_bytes, bytes 16–17 = row_size, byte 19 = key
+/// lane kinds, bytes 20–23 = arena header offset.
+fn bind_meta<I: KeyIndex>(state: &[u8], slot_idx: u32, pair: bool) -> Bound {
+    let meta_base = slot_meta_base(slot_idx);
+    let slot_offset = bytes::read_u32(state, meta_base + SlotMetaOffset::OFFSET);
+    let capacity = bytes::read_u32(state, meta_base + SlotMetaOffset::CAPACITY);
+    let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
+    let descriptor_size = align8(u32::from(num_fields));
+    let keys_off = slot_offset + descriptor_size;
+    let lanes = KeyLanes::bound(
+        pair,
+        state[(meta_base + SlotMetaOffset::STRUCT_KEY_LANES) as usize],
+    );
+    Bound {
+        slot_offset,
+        capacity,
+        size_off: meta_base + SlotMetaOffset::SIZE,
+        num_fields,
+        bitset_bytes: u32::from(state[(meta_base + SlotMetaOffset::STRUCT_BITSET_BYTES) as usize]),
+        row_size: u32::from(bytes::read_u16(
+            state,
+            meta_base + SlotMetaOffset::TTL_SECONDS,
+        )),
+        descriptor_size,
+        keys_off,
+        lanes,
+        rows_base: region_end::<I>(keys_off, capacity, lanes),
+        arena_header_off: bytes::read_u32(state, meta_base + SlotMetaOffset::GRACE_SECONDS),
+    }
+}
+
+/// The row geometry of one struct-map slot, whatever its key index: what a
+/// reader needs once the index has named a row's ordinal.
 #[derive(Clone, Copy, Debug)]
-pub struct StructMapSlot {
-    pub slot_offset: u32,
+pub struct StructRows {
     pub capacity: u32,
-    /// Offset of the u32 size field in slot metadata.
-    pub size_off: u32,
     pub num_fields: u8,
     pub bitset_bytes: u32,
     pub row_size: u32,
-    /// `align8(num_fields)`, the descriptor size.
-    pub descriptor_size: u32,
-    /// Offset of the field-type descriptor bytes (== `slot_offset`).
+    /// Offset of the field-type descriptor bytes.
     pub field_types_off: u32,
-    pub keys_off: u32,
     /// Absolute offset of row zero.
     pub rows_base: u32,
     /// Absolute header offset of the slot's CSR arena; zero when there is none.
     pub arena_header_off: u32,
 }
 
-impl StructMapSlot {
-    /// Bind to an existing struct-map slot via its metadata record. Metadata
-    /// byte reuse: byte 13 = num_fields, byte 15 = bitset_bytes, bytes 16–17
-    /// = row_size.
-    pub fn bind(state: &[u8], slot_idx: u32) -> Self {
-        let meta_base = slot_meta_base(slot_idx);
-        let slot_offset = bytes::read_u32(state, meta_base + SlotMetaOffset::OFFSET);
-        let capacity = bytes::read_u32(state, meta_base + SlotMetaOffset::CAPACITY);
-        let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
-        let bitset_bytes =
-            u32::from(state[(meta_base + SlotMetaOffset::STRUCT_BITSET_BYTES) as usize]);
-        let row_size = u32::from(bytes::read_u16(
-            state,
-            meta_base + SlotMetaOffset::TTL_SECONDS,
-        ));
-
-        let descriptor_size = align8(u32::from(num_fields));
-        let keys_off = slot_offset + descriptor_size;
-
-        Self {
-            slot_offset,
-            capacity,
-            size_off: meta_base + SlotMetaOffset::SIZE,
-            num_fields,
-            bitset_bytes,
-            row_size,
-            descriptor_size,
-            field_types_off: slot_offset,
-            keys_off,
-            rows_base: keys_off + capacity * 4,
-            arena_header_off: bytes::read_u32(state, meta_base + SlotMetaOffset::GRACE_SECONDS),
-        }
-    }
-
-    /// Current element count.
-    #[inline(always)]
-    pub fn size(&self, state: &[u8]) -> u32 {
-        bytes::read_u32(state, self.size_off)
-    }
-
-    #[inline(always)]
-    pub(crate) fn set_size(&self, state: &mut [u8], value: u32) {
-        bytes::write_u32(state, self.size_off, value);
-    }
-
-    /// Maximum size before growth, using a 70% integer load factor.
-    const fn max_load(&self) -> u32 {
-        max_load_for_cap(self.capacity)
-    }
-
-    #[inline(always)]
-    pub(crate) fn key_at(&self, state: &[u8], pos: u32) -> u32 {
-        bytes::read_u32(state, self.keys_off + pos * 4)
-    }
-
-    /// Raw key-cell write used by rollback to stamp a TOMBSTONE.
-    #[inline(always)]
-    pub(crate) fn set_key_at(&self, state: &mut [u8], pos: u32, key: u32) {
-        bytes::write_u32(state, self.keys_off + pos * 4, key);
+impl StructRows {
+    /// Absolute byte offset of row `pos`.
+    pub const fn row_off(&self, pos: u32) -> u32 {
+        self.rows_base + pos * self.row_size
     }
 
     /// The raw field-type byte for `field_idx` (descriptor region).
@@ -304,35 +316,6 @@ impl StructMapSlot {
         })
     }
 
-    /// Find a key, or return `None`. Sentinel keys are never present.
-    pub fn find(&self, state: &[u8], key: u32) -> Option<u32> {
-        find_key(state, self.keys_off, self.capacity, key)
-    }
-
-    /// Insert-or-update probe: find an existing key before reusing the first
-    /// tombstone.
-    pub fn find_insert(&self, state: &[u8], key: u32) -> Option<Probe> {
-        if key == EMPTY_KEY || key == TOMBSTONE {
-            return None;
-        }
-        probe_linear(
-            self.capacity,
-            hash_key(key, self.capacity),
-            true,
-            |pos| match self.key_at(state, pos) {
-                current if current == key => ProbeCell::Match,
-                EMPTY_KEY => ProbeCell::Empty,
-                TOMBSTONE => ProbeCell::Tombstone,
-                _ => ProbeCell::Occupied,
-            },
-        )
-    }
-
-    /// Absolute byte offset of row `pos`.
-    pub const fn row_off(&self, pos: u32) -> u32 {
-        self.rows_base + pos * self.row_size
-    }
-
     /// Byte offset of a field within a row (bitset first, then cumulative
     /// field sizes without padding).
     pub fn field_offset(&self, state: &[u8], field_idx: u8) -> u32 {
@@ -343,72 +326,9 @@ impl StructMapSlot {
         off
     }
 
-    /// Test whether a row field is present in its leading bitset.
-    #[inline(always)]
-    pub fn is_field_set(state: &[u8], row_off: u32, field_idx: u8) -> bool {
-        let byte = state[(row_off + u32::from(field_idx) / 8) as usize];
-        byte & (1u8 << (field_idx % 8)) != 0
-    }
-
-    /// Set a row field's presence bit without journaling.
-    #[inline(always)]
-    pub fn set_field_bit(state: &mut [u8], row_off: u32, field_idx: u8) {
-        state[(row_off + u32::from(field_idx) / 8) as usize] |= 1u8 << (field_idx % 8);
-    }
-
-    //#region reduce-typed-state.scatter-clear
-    /// Clear a single field's bit in the bitset (inverse of `set_field_bit`).
-    /// Used by BATCH_STRUCT_MAP_PROBE_SCATTER card-one retract to drop one
-    /// routed attribute field without disturbing the row's other field bits.
-    /// Unjournaled; the caller owns these bytes or already reserved their capture.
-    pub fn clear_scalar_field(state: &mut [u8], row_off: u32, field_idx: u8) {
-        state[(row_off + u32::from(field_idx) / 8) as usize] &= !(1u8 << (field_idx % 8));
-    }
-    //#endregion reduce-typed-state.scatter-clear
-
     /// Clear the row's presence bitset without journaling.
     pub fn clear_bitset(&self, state: &mut [u8], row_off: u32) {
         bytes::zero(state, row_off, self.bitset_bytes);
-    }
-
-    /// Plan one insertion without changing the table. The returned position
-    /// is reused by the writer and journal; no second probe is necessary.
-    pub(crate) fn plan_upsert(&self, state: &[u8], key: u32) -> Option<Upsert> {
-        let probe = self.find_insert(state, key)?;
-        if !probe.found && self.size(state) >= self.max_load() {
-            return None;
-        }
-        Some(Upsert {
-            pos: probe.pos,
-            is_new: !probe.found,
-        })
-    }
-
-    /// Apply a position planned against this unchanged table.
-    pub(crate) fn apply_upsert(&self, state: &mut [u8], key: u32, planned: Upsert) {
-        if planned.is_new {
-            self.set_key_at(state, planned.pos, key);
-            self.set_size(state, self.size(state) + 1);
-        }
-    }
-
-    /// Insert or find `key`, tracking size. `None` means sentinel key, probe
-    /// exhaustion, or load factor exceeded.
-    /// Unjournaled; this raw storage operation does not participate in VM undo.
-    pub fn upsert(&self, state: &mut [u8], key: u32) -> Option<Upsert> {
-        let planned = self.plan_upsert(state, key)?;
-        self.apply_upsert(state, key, planned);
-        Some(planned)
-    }
-
-    /// Stamp `key`'s cell as a TOMBSTONE and decrement size, returning the
-    /// vacated position. The row payload is left to the caller. Unjournaled;
-    /// speculative callers capture the actual bytes before invoking it.
-    pub fn remove(&self, state: &mut [u8], key: u32) -> Option<u32> {
-        let pos = self.find(state, key)?;
-        self.set_key_at(state, pos, TOMBSTONE);
-        self.set_size(state, self.size(state) - 1);
-        Some(pos)
     }
 
     /// Borrow a present arena field. The borrow cannot outlive a mutation, growth,
@@ -505,18 +425,300 @@ impl StructMapSlot {
         let row = self.row_off(pos);
         let ft = self.field_type(state, field_idx);
         let f_off = row + self.field_offset(state, field_idx);
-        Self::set_field_bit(state, row, field_idx);
+        StructMapSlot::set_field_bit(state, row, field_idx);
         write_scalar_cell(state, f_off, ft, cols[val_col as usize], element_idx);
+    }
+}
+
+/// Bound one-key struct-map view carrying offsets into the state buffer.
+/// No pointers into state are formed. `I` is the slot's key-index family.
+#[derive(Clone, Copy, Debug)]
+pub struct StructMapSlot<I: KeyIndex = HashIndex> {
+    pub slot_offset: u32,
+    pub capacity: u32,
+    /// Offset of the u32 size field in slot metadata.
+    pub size_off: u32,
+    pub num_fields: u8,
+    pub bitset_bytes: u32,
+    pub row_size: u32,
+    /// `align8(num_fields)`, the descriptor size.
+    pub descriptor_size: u32,
+    /// Offset of the field-type descriptor bytes (== `slot_offset`).
+    pub field_types_off: u32,
+    /// Absolute offset of the key index region (a [`HashIndex`]'s key lane).
+    pub keys_off: u32,
+    /// The key lane the program declared.
+    pub lanes: KeyLanes,
+    /// Absolute offset of row zero.
+    pub rows_base: u32,
+    /// Absolute header offset of the slot's CSR arena; zero when there is none.
+    pub arena_header_off: u32,
+    family: PhantomData<I>,
+}
+
+impl<I: KeyIndex> StructMapSlot<I> {
+    /// Bind a one-key slot of family `I` from its metadata record, unchecked:
+    /// the caller has validated the slot's geometry.
+    pub fn bind_in(state: &[u8], slot_idx: u32) -> Self {
+        let b = bind_meta::<I>(state, slot_idx, false);
+        Self {
+            slot_offset: b.slot_offset,
+            capacity: b.capacity,
+            size_off: b.size_off,
+            num_fields: b.num_fields,
+            bitset_bytes: b.bitset_bytes,
+            row_size: b.row_size,
+            descriptor_size: b.descriptor_size,
+            field_types_off: b.slot_offset,
+            keys_off: b.keys_off,
+            lanes: b.lanes,
+            rows_base: b.rows_base,
+            arena_header_off: b.arena_header_off,
+            family: PhantomData,
+        }
+    }
+
+    /// The slot's index region.
+    pub const fn index(&self) -> IndexRegion {
+        IndexRegion {
+            at: self.keys_off,
+            capacity: self.capacity,
+            lanes: self.lanes,
+        }
+    }
+
+    /// The slot's row geometry.
+    pub const fn rows(&self) -> StructRows {
+        StructRows {
+            capacity: self.capacity,
+            num_fields: self.num_fields,
+            bitset_bytes: self.bitset_bytes,
+            row_size: self.row_size,
+            field_types_off: self.field_types_off,
+            rows_base: self.rows_base,
+            arena_header_off: self.arena_header_off,
+        }
+    }
+
+    /// Current element count.
+    #[inline(always)]
+    pub fn size(&self, state: &[u8]) -> u32 {
+        bytes::read_u32(state, self.size_off)
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_size(&self, state: &mut [u8], value: u32) {
+        bytes::write_u32(state, self.size_off, value);
+    }
+
+    /// The key row `pos` holds, or `None` when the row is dead.
+    pub fn key_at(&self, state: &[u8], pos: u32) -> Option<u32> {
+        I::key_at(state, self.index(), pos).map(|key| key.k1)
+    }
+
+    /// The ordinal `key` owns, or `None`.
+    pub fn lookup<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        key: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<Option<u32>, ErrorCode> {
+        if is_sentinel(key) {
+            return Ok(None);
+        }
+        I::find(state, self.index(), Key::one(key), cx)
+    }
+
+    /// Plan one insert-or-update without changing the slot. The plan's
+    /// ordinal is reused by the writer and journal; no second probe runs.
+    pub fn plan_upsert<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        key: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<InsertPlan<I::InsertPlan>, ErrorCode> {
+        if is_sentinel(key) {
+            return Err(ErrorCode::InvalidKey);
+        }
+        I::plan_insert(state, self.index(), self.size(state), Key::one(key), cx)
+    }
+
+    /// Apply a plan made against this unchanged slot: a new key enters the
+    /// index and the size; a present key changes nothing.
+    pub fn apply_upsert<S: InternBytes + ?Sized>(
+        &self,
+        state: &mut [u8],
+        key: u32,
+        plan: &InsertPlan<I::InsertPlan>,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<(), ErrorCode> {
+        if plan.is_new {
+            I::apply_insert(state, self.index(), Key::one(key), plan, cx)?;
+            self.set_size(state, self.size(state) + 1);
+        }
+        Ok(())
+    }
+
+    /// Plan removing `key`; `None` when it is absent.
+    pub fn plan_remove<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        key: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<Option<RemovePlan<I::RemovePlan>>, ErrorCode> {
+        if is_sentinel(key) {
+            return Ok(None);
+        }
+        I::plan_remove(state, self.index(), Key::one(key), cx)
+    }
+
+    /// Apply a remove plan made against this unchanged slot and shrink the
+    /// size. The vacated row's bytes are left to the caller.
+    pub fn apply_remove<S: InternBytes + ?Sized>(
+        &self,
+        state: &mut [u8],
+        plan: &RemovePlan<I::RemovePlan>,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<(), ErrorCode> {
+        I::apply_remove(state, self.index(), plan, cx)?;
+        self.set_size(state, self.size(state) - 1);
+        Ok(())
+    }
+
+    /// The raw field-type byte for `field_idx` (descriptor region).
+    #[inline(always)]
+    pub fn field_type_byte(&self, state: &[u8], field_idx: u8) -> u8 {
+        self.rows().field_type_byte(state, field_idx)
+    }
+
+    #[inline(always)]
+    pub(crate) fn field_type(&self, state: &[u8], field_idx: u8) -> StructFieldType {
+        self.rows().field_type(state, field_idx)
+    }
+
+    /// Absolute byte offset of row `pos`.
+    pub const fn row_off(&self, pos: u32) -> u32 {
+        self.rows_base + pos * self.row_size
+    }
+
+    /// Byte offset of a field within a row (bitset first, then cumulative
+    /// field sizes without padding).
+    pub fn field_offset(&self, state: &[u8], field_idx: u8) -> u32 {
+        self.rows().field_offset(state, field_idx)
+    }
+
+    /// Clear the row's presence bitset without journaling.
+    pub fn clear_bitset(&self, state: &mut [u8], row_off: u32) {
+        self.rows().clear_bitset(state, row_off);
+    }
+
+    /// Borrow a present arena field; see [`StructRows::arena_field`].
+    pub fn arena_field<'a>(
+        &self,
+        state: &'a [u8],
+        pos: u32,
+        field_idx: u8,
+    ) -> Result<Option<&'a [u8]>, ErrorCode> {
+        self.rows().arena_field(state, pos, field_idx)
+    }
+
+    /// Write one scalar field and its presence bit without journaling; see
+    /// [`StructRows::write_scalar_field`].
+    pub fn write_scalar_field(
+        &self,
+        state: &mut [u8],
+        pos: u32,
+        field_idx: u8,
+        cols: &[&[u8]],
+        val_col: u32,
+        element_idx: u32,
+    ) {
+        self.rows()
+            .write_scalar_field(state, pos, field_idx, cols, val_col, element_idx);
+    }
+}
+
+/// The [`HashIndex`] instantiation's constructors and raw writers. The row
+/// bitset helpers are family-independent; they live on the default view so
+/// `StructMapSlot::is_field_set` names them.
+impl StructMapSlot {
+    /// Bind to an existing [`HashIndex`] struct-map slot via its metadata
+    /// record; see [`Self::bind_in`].
+    pub fn bind(state: &[u8], slot_idx: u32) -> Self {
+        Self::bind_in(state, slot_idx)
+    }
+
+    /// Find a key, or return `None`. Sentinel keys are never present.
+    pub fn find(&self, state: &[u8], key: u32) -> Option<u32> {
+        hash_call(|cx| self.lookup(state, key, cx)).ok().flatten()
+    }
+
+    /// Insert or find `key`, tracking size. `None` means sentinel key, probe
+    /// exhaustion, or load factor exceeded.
+    /// Unjournaled; this raw storage operation does not participate in VM undo.
+    pub fn upsert(&self, state: &mut [u8], key: u32) -> Option<Upsert> {
+        hash_call(|cx| {
+            let plan = self.plan_upsert(state, key, cx).ok()?;
+            self.apply_upsert(state, key, &plan, cx).ok()?;
+            Some(Upsert {
+                pos: plan.ordinal,
+                is_new: plan.is_new,
+            })
+        })
+    }
+
+    /// Stamp `key`'s cell as a TOMBSTONE and decrement size, returning the
+    /// vacated position. The row payload is left to the caller. Unjournaled;
+    /// speculative callers capture the actual bytes before invoking it.
+    pub fn remove(&self, state: &mut [u8], key: u32) -> Option<u32> {
+        hash_call(|cx| {
+            let plan = self.plan_remove(state, key, cx).ok()??;
+            self.apply_remove(state, &plan, cx).ok()?;
+            Some(plan.ordinal)
+        })
     }
 
     /// Return the absolute byte offset of a key's row, or `0xFFFF_FFFF` when
     /// absent.
+    /// The [`HashIndex`] insert-or-update probe: a present key's cell, else
+    /// the first tombstone or empty cell its probe meets. `None` for a
+    /// sentinel key or an exhausted probe.
+    pub fn find_insert(&self, state: &[u8], key: u32) -> Option<Probe> {
+        if is_sentinel(key) {
+            return None;
+        }
+        HashIndex::probe_insert(state, self.index(), Key::one(key))
+    }
+
     pub fn get_row_ptr_by_key(&self, state: &[u8], key: u32) -> u32 {
         match self.find(state, key) {
-            Some(pos) => self.rows_base + pos * self.row_size,
+            Some(pos) => self.row_off(pos),
             None => 0xFFFF_FFFF,
         }
     }
+
+    /// Test whether a row field is present in its leading bitset.
+    #[inline(always)]
+    pub fn is_field_set(state: &[u8], row_off: u32, field_idx: u8) -> bool {
+        let byte = state[(row_off + u32::from(field_idx) / 8) as usize];
+        byte & (1u8 << (field_idx % 8)) != 0
+    }
+
+    /// Set a row field's presence bit without journaling.
+    #[inline(always)]
+    pub fn set_field_bit(state: &mut [u8], row_off: u32, field_idx: u8) {
+        state[(row_off + u32::from(field_idx) / 8) as usize] |= 1u8 << (field_idx % 8);
+    }
+
+    //#region reduce-typed-state.scatter-clear
+    /// Clear a single field's bit in the bitset (inverse of `set_field_bit`).
+    /// Used by BATCH_STRUCT_MAP_PROBE_SCATTER card-one retract to drop one
+    /// routed attribute field without disturbing the row's other field bits.
+    /// Unjournaled; the caller owns these bytes or already reserved their capture.
+    pub fn clear_scalar_field(state: &mut [u8], row_off: u32, field_idx: u8) {
+        state[(row_off + u32::from(field_idx) / 8) as usize] &= !(1u8 << (field_idx % 8));
+    }
+    //#endregion reduce-typed-state.scatter-clear
 
     /// Read the first four bytes of a row as a u32.
     pub fn read_u32(state: &[u8], row_off: u32) -> u32 {
@@ -526,17 +728,16 @@ impl StructMapSlot {
 
 /// Bound view over an exact two-lane-key struct map.
 ///
-/// This is a separate slot kind so the unary [`StructMapSlot`] keeps its
-/// compact descriptor/keys/rows layout and unchanged probe path. Physical
-/// layout:
+/// This is a separate slot kind so the one-key [`StructMapSlot`] keeps its
+/// one-lane index. Physical layout:
 ///
-/// `[descriptor padded to 8][key1:u32 × capacity][key2:u32 × capacity][rows]`
+/// `[descriptor padded to 8][key index region][rows]`
 ///
-/// Lane 1 owns the EMPTY/TOMBSTONE sentinel state; lane 2 preserves all u32
-/// values. A hash chooses only the initial probe position. Identity always
-/// compares both lanes.
+/// Identity always compares both lanes; for a [`HashIndex`] the region is
+/// `[key1:u32 × capacity][key2:u32 × capacity]`, lane 1 owning the
+/// EMPTY/TOMBSTONE sentinel state and lane 2 preserving every u32.
 #[derive(Clone, Copy, Debug)]
-pub struct StructMap2Slot {
+pub struct StructMap2Slot<I: KeyIndex = HashIndex> {
     pub slot_offset: u32,
     pub capacity: u32,
     pub size_off: u32,
@@ -545,38 +746,57 @@ pub struct StructMap2Slot {
     pub row_size: u32,
     pub descriptor_size: u32,
     pub field_types_off: u32,
+    /// Absolute offset of the key index region (a [`HashIndex`]'s lane 1).
     pub keys1_off: u32,
-    pub keys2_off: u32,
+    /// The key lanes the program declared.
+    pub lanes: KeyLanes,
     pub rows_base: u32,
+    /// Absolute header offset of the slot's CSR arena; zero when there is none.
+    pub arena_header_off: u32,
+    family: PhantomData<I>,
 }
 
-impl StructMap2Slot {
-    pub fn bind(state: &[u8], slot_idx: u32) -> Self {
-        let meta_base = slot_meta_base(slot_idx);
-        let slot_offset = bytes::read_u32(state, meta_base + SlotMetaOffset::OFFSET);
-        let capacity = bytes::read_u32(state, meta_base + SlotMetaOffset::CAPACITY);
-        let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
-        let bitset_bytes =
-            u32::from(state[(meta_base + SlotMetaOffset::STRUCT_BITSET_BYTES) as usize]);
-        let row_size = u32::from(bytes::read_u16(
-            state,
-            meta_base + SlotMetaOffset::TTL_SECONDS,
-        ));
-        let descriptor_size = align8(u32::from(num_fields));
-        let keys1_off = slot_offset + descriptor_size;
-        let keys2_off = keys1_off + capacity * 4;
+impl<I: KeyIndex> StructMap2Slot<I> {
+    /// Bind a two-key slot of family `I` from its metadata record, unchecked:
+    /// the caller has validated the slot's geometry.
+    pub fn bind_in(state: &[u8], slot_idx: u32) -> Self {
+        let b = bind_meta::<I>(state, slot_idx, true);
         Self {
-            slot_offset,
-            capacity,
-            size_off: meta_base + SlotMetaOffset::SIZE,
-            num_fields,
-            bitset_bytes,
-            row_size,
-            descriptor_size,
-            field_types_off: slot_offset,
-            keys1_off,
-            keys2_off,
-            rows_base: keys2_off + capacity * 4,
+            slot_offset: b.slot_offset,
+            capacity: b.capacity,
+            size_off: b.size_off,
+            num_fields: b.num_fields,
+            bitset_bytes: b.bitset_bytes,
+            row_size: b.row_size,
+            descriptor_size: b.descriptor_size,
+            field_types_off: b.slot_offset,
+            keys1_off: b.keys_off,
+            lanes: b.lanes,
+            rows_base: b.rows_base,
+            arena_header_off: b.arena_header_off,
+            family: PhantomData,
+        }
+    }
+
+    /// The slot's index region.
+    pub const fn index(&self) -> IndexRegion {
+        IndexRegion {
+            at: self.keys1_off,
+            capacity: self.capacity,
+            lanes: self.lanes,
+        }
+    }
+
+    /// The slot's row geometry.
+    pub const fn rows(&self) -> StructRows {
+        StructRows {
+            capacity: self.capacity,
+            num_fields: self.num_fields,
+            bitset_bytes: self.bitset_bytes,
+            row_size: self.row_size,
+            field_types_off: self.field_types_off,
+            rows_base: self.rows_base,
+            arena_header_off: self.arena_header_off,
         }
     }
 
@@ -590,98 +810,115 @@ impl StructMap2Slot {
         bytes::write_u32(state, self.size_off, value);
     }
 
-    const fn max_load(&self) -> u32 {
-        max_load_for_cap(self.capacity)
+    /// The key pair row `pos` holds, or `None` when the row is dead.
+    pub fn key_at(&self, state: &[u8], pos: u32) -> Option<(u32, u32)> {
+        I::key_at(state, self.index(), pos).map(|key| (key.k1, key.k2))
     }
 
-    #[inline(always)]
-    pub fn key1_at(&self, state: &[u8], pos: u32) -> u32 {
-        bytes::read_u32(state, self.keys1_off + pos * 4)
+    /// The ordinal the exact pair owns, or `None`.
+    pub fn lookup<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        key1: u32,
+        key2: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<Option<u32>, ErrorCode> {
+        if is_sentinel(key1) {
+            return Ok(None);
+        }
+        I::find(state, self.index(), Key::two(key1, key2), cx)
     }
 
-    #[inline(always)]
-    pub fn key2_at(&self, state: &[u8], pos: u32) -> u32 {
-        bytes::read_u32(state, self.keys2_off + pos * 4)
-    }
-
-    #[inline(always)]
-    pub(crate) fn set_keys_at(&self, state: &mut [u8], pos: u32, key1: u32, key2: u32) {
-        bytes::write_u32(state, self.keys1_off + pos * 4, key1);
-        bytes::write_u32(state, self.keys2_off + pos * 4, key2);
-    }
-
-    #[inline(always)]
-    pub(crate) fn tombstone_at(&self, state: &mut [u8], pos: u32) {
-        bytes::write_u32(state, self.keys1_off + pos * 4, TOMBSTONE);
-    }
-
-    pub fn find(&self, state: &[u8], key1: u32, key2: u32) -> Option<u32> {
-        find_key_pair(
+    /// Plan one exact-pair insert-or-update without changing the slot.
+    pub fn plan_upsert<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        key1: u32,
+        key2: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<InsertPlan<I::InsertPlan>, ErrorCode> {
+        if is_sentinel(key1) {
+            return Err(ErrorCode::InvalidKey);
+        }
+        I::plan_insert(
             state,
-            self.keys1_off,
-            self.keys2_off,
-            self.capacity,
-            key1,
-            key2,
+            self.index(),
+            self.size(state),
+            Key::two(key1, key2),
+            cx,
         )
     }
 
-    pub fn find_insert(&self, state: &[u8], key1: u32, key2: u32) -> Option<Probe> {
-        if key1 == EMPTY_KEY || key1 == TOMBSTONE {
-            return None;
-        }
-        probe_linear(
-            self.capacity,
-            hash_key_pair(key1, key2, self.capacity),
-            true,
-            |pos| {
-                let first = self.key1_at(state, pos);
-                if first == key1 && self.key2_at(state, pos) == key2 {
-                    ProbeCell::Match
-                } else {
-                    match first {
-                        EMPTY_KEY => ProbeCell::Empty,
-                        TOMBSTONE => ProbeCell::Tombstone,
-                        _ => ProbeCell::Occupied,
-                    }
-                }
-            },
-        )
-    }
-
-    /// Plan one exact-pair insertion without changing the table.
-    pub(crate) fn plan_upsert(&self, state: &[u8], key1: u32, key2: u32) -> Option<Upsert> {
-        let probe = self.find_insert(state, key1, key2)?;
-        if !probe.found && self.size(state) >= self.max_load() {
-            return None;
-        }
-        Some(Upsert {
-            pos: probe.pos,
-            is_new: !probe.found,
-        })
-    }
-
-    /// Apply the same position used to capture the actual prior row bytes.
-    pub(crate) fn apply_upsert(&self, state: &mut [u8], key1: u32, key2: u32, planned: Upsert) {
-        if planned.is_new {
-            self.set_keys_at(state, planned.pos, key1, key2);
+    /// Apply the plan used to capture the actual prior bytes; see
+    /// [`StructMapSlot::apply_upsert`].
+    pub fn apply_upsert<S: InternBytes + ?Sized>(
+        &self,
+        state: &mut [u8],
+        key1: u32,
+        key2: u32,
+        plan: &InsertPlan<I::InsertPlan>,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<(), ErrorCode> {
+        if plan.is_new {
+            I::apply_insert(state, self.index(), Key::two(key1, key2), plan, cx)?;
             self.set_size(state, self.size(state) + 1);
         }
+        Ok(())
     }
 
-    /// Upsert an exact key pair without journaling these caller-owned bytes.
-    pub fn upsert(&self, state: &mut [u8], key1: u32, key2: u32) -> Option<Upsert> {
-        let planned = self.plan_upsert(state, key1, key2)?;
-        self.apply_upsert(state, key1, key2, planned);
-        Some(planned)
+    /// Plan removing the exact pair; `None` when it is absent.
+    pub fn plan_remove<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        key1: u32,
+        key2: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<Option<RemovePlan<I::RemovePlan>>, ErrorCode> {
+        if is_sentinel(key1) {
+            return Ok(None);
+        }
+        I::plan_remove(state, self.index(), Key::two(key1, key2), cx)
     }
 
-    /// Remove an exact key pair without journaling these caller-owned bytes.
-    pub fn remove(&self, state: &mut [u8], key1: u32, key2: u32) -> Option<u32> {
-        let pos = self.find(state, key1, key2)?;
-        self.tombstone_at(state, pos);
+    /// Apply a remove plan and shrink the size; see
+    /// [`StructMapSlot::apply_remove`].
+    pub fn apply_remove<S: InternBytes + ?Sized>(
+        &self,
+        state: &mut [u8],
+        plan: &RemovePlan<I::RemovePlan>,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<(), ErrorCode> {
+        I::apply_remove(state, self.index(), plan, cx)?;
         self.set_size(state, self.size(state) - 1);
-        Some(pos)
+        Ok(())
+    }
+
+    /// The first live ordinal, in index order, whose lane 1 is `key1`.
+    pub fn first_with_key1<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        key1: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<Option<u32>, ErrorCode> {
+        if is_sentinel(key1) {
+            return Ok(None);
+        }
+        I::first_with_key1(state, self.index(), key1, cx)
+    }
+
+    /// The live ordinal after `ordinal`, in index order, whose lane 1 is
+    /// `key1`; it stays live when `ordinal` is removed.
+    pub fn next_with_key1<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        ordinal: u32,
+        key1: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<Option<u32>, ErrorCode> {
+        if is_sentinel(key1) {
+            return Ok(None);
+        }
+        I::next_with_key1(state, self.index(), ordinal, key1, cx)
     }
 
     pub const fn row_off(&self, pos: u32) -> u32 {
@@ -689,26 +926,20 @@ impl StructMap2Slot {
     }
 
     pub fn field_type_byte(&self, state: &[u8], field_idx: u8) -> u8 {
-        state[(self.field_types_off + u32::from(field_idx)) as usize]
+        self.rows().field_type_byte(state, field_idx)
     }
 
     pub(crate) fn field_type(&self, state: &[u8], field_idx: u8) -> StructFieldType {
-        StructFieldType::from_u8(self.field_type_byte(state, field_idx)).unwrap_or_else(|| {
-            columine_types::die!("invariant: struct-map2 descriptor contains invalid field type")
-        })
+        self.rows().field_type(state, field_idx)
     }
 
     pub fn field_offset(&self, state: &[u8], field_idx: u8) -> u32 {
-        let mut off = self.bitset_bytes;
-        for i in 0..field_idx {
-            off += struct_field_size(self.field_type(state, i));
-        }
-        off
+        self.rows().field_offset(state, field_idx)
     }
 
     /// Clear the row presence bitset without journaling.
     pub fn clear_bitset(&self, state: &mut [u8], row_off: u32) {
-        bytes::zero(state, row_off, self.bitset_bytes);
+        self.rows().clear_bitset(state, row_off);
     }
 
     /// Write a scalar field and its presence bit without journaling.
@@ -721,11 +952,43 @@ impl StructMap2Slot {
         val_col: u32,
         element_idx: u32,
     ) {
-        let row = self.row_off(pos);
-        let ft = self.field_type(state, field_idx);
-        let f_off = row + self.field_offset(state, field_idx);
-        StructMapSlot::set_field_bit(state, row, field_idx);
-        write_scalar_cell(state, f_off, ft, cols[val_col as usize], element_idx);
+        self.rows()
+            .write_scalar_field(state, pos, field_idx, cols, val_col, element_idx);
+    }
+}
+
+/// The [`HashIndex`] instantiation's constructor and raw writers.
+impl StructMap2Slot {
+    /// Bind to an existing [`HashIndex`] two-key slot; see [`Self::bind_in`].
+    pub fn bind(state: &[u8], slot_idx: u32) -> Self {
+        Self::bind_in(state, slot_idx)
+    }
+
+    pub fn find(&self, state: &[u8], key1: u32, key2: u32) -> Option<u32> {
+        hash_call(|cx| self.lookup(state, key1, key2, cx))
+            .ok()
+            .flatten()
+    }
+
+    /// Upsert an exact key pair without journaling these caller-owned bytes.
+    pub fn upsert(&self, state: &mut [u8], key1: u32, key2: u32) -> Option<Upsert> {
+        hash_call(|cx| {
+            let plan = self.plan_upsert(state, key1, key2, cx).ok()?;
+            self.apply_upsert(state, key1, key2, &plan, cx).ok()?;
+            Some(Upsert {
+                pos: plan.ordinal,
+                is_new: plan.is_new,
+            })
+        })
+    }
+
+    /// Remove an exact key pair without journaling these caller-owned bytes.
+    pub fn remove(&self, state: &mut [u8], key1: u32, key2: u32) -> Option<u32> {
+        hash_call(|cx| {
+            let plan = self.plan_remove(state, key1, key2, cx).ok()??;
+            self.apply_remove(state, &plan, cx).ok()?;
+            Some(plan.ordinal)
+        })
     }
 
     pub fn get_row_ptr_by_key(&self, state: &[u8], key1: u32, key2: u32) -> u32 {
@@ -733,6 +996,7 @@ impl StructMap2Slot {
             .map_or(u32::MAX, |pos| self.row_off(pos))
     }
 
+    /// Live exact key pairs and row offsets in ascending cell order.
     pub fn iter<'a>(&self, state: &'a [u8]) -> StructMap2Iter<'a> {
         StructMap2Iter {
             state,
@@ -756,13 +1020,8 @@ impl Iterator for StructMap2Iter<'_> {
         while self.position < self.slot.capacity {
             let pos = self.position;
             self.position += 1;
-            let key1 = self.slot.key1_at(self.state, pos);
-            if key1 != EMPTY_KEY && key1 != TOMBSTONE {
-                return Some((
-                    key1,
-                    self.slot.key2_at(self.state, pos),
-                    self.slot.row_off(pos),
-                ));
+            if let Some((key1, key2)) = self.slot.key_at(self.state, pos) {
+                return Some((key1, key2, self.slot.row_off(pos)));
             }
         }
         None

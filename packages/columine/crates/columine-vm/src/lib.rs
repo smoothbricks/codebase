@@ -28,6 +28,13 @@
 //! including u32::MAX, stays distinct from absence. Bitmap views verify their
 //! complete payload once at the trust boundary before infallible membership.
 //!
+//! Struct-map keys belong to a key-index family ([`key_index::KeyIndex`]) the
+//! VM is generic over: [`key_index::HashIndex`], the open-addressed table,
+//! unless an embedder runs `Vm<I>` and the `*_in` entry points with its own.
+//! The family owns the index region of each struct-map image and its header
+//! magic; row ordinals stay row identity. [`seal::seal_state`] rebuilds every
+//! struct map canonically.
+//!
 //! Byte-order note: the VM state and program bytecode are little-endian byte
 //! contracts (wasm32 + the LE native targets). All multi-byte accesses go
 //! through explicit `to_le_bytes`/`from_le_bytes` copies, so this crate is
@@ -45,6 +52,7 @@ pub mod hash_table;
 pub mod hashmap_ops;
 pub mod hashset_ops;
 pub mod hooks;
+pub mod key_index;
 pub mod logical_export;
 pub mod meta;
 pub mod nested;
@@ -52,6 +60,7 @@ pub mod program_admission;
 mod program_inputs;
 pub mod row_exprs;
 mod scratch;
+pub mod seal;
 pub mod slot_growth;
 pub mod state_init;
 pub mod struct_map;

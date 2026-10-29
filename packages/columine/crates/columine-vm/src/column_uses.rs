@@ -362,7 +362,7 @@ fn walk_op(
         Opcode::BatchStructMap2UpsertLast => {
             struct_map2_reads(&decode_struct_map2_upsert_operands(code, pc + 1)?, visit);
         }
-        Opcode::BatchStructMapRemove => {
+        Opcode::BatchStructMapRemove | Opcode::BatchStructMap2RemovePrefix => {
             ops.index()?;
             reads(ops, 1, visit)?;
         }

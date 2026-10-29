@@ -16,7 +16,7 @@
 
 use crate::aggregates::{self, AggKind, TypeMask};
 use crate::bitmap_ops::{
-    self, BitmapAlgebraOp, BitmapEnv, BitmapSource, batch_bitmap_add, batch_bitmap_algebra,
+    self, BitmapAlgebraOp, BitmapEnv, BitmapSource, batch_bitmap_add, batch_bitmap_algebra_in,
     batch_bitmap_remove, get_bitmap_storage,
 };
 use crate::bytes;
@@ -25,6 +25,10 @@ use crate::hash_table;
 use crate::hashmap_ops::{self, CmpType, Strategy};
 use crate::hashset_ops;
 use crate::hooks::{ByteCapture, CaptureFrame, EraseScratch, VmHooks};
+use crate::key_index::{
+    HashIndex, INDEX_WRITES_MAX, IndexWrites, InsertPlan, InternBytes, KeyCx, KeyIndex, KeyScratch,
+    NoStrings, RemovePlan,
+};
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
 use crate::row_exprs::{LiveColumns, StoredRow};
@@ -45,9 +49,9 @@ use crate::element_body::{
 };
 use columine_types::types::{
     AggType, ChangeFlag, EMPTY_KEY, ErrorCode, MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES,
-    NO_PARENT_TS_COL, Opcode, ProgramHeader, SCATTER_SKIP, SLOT_META_SIZE, STATE_FORMAT_VERSION,
-    STATE_MAGIC, SlotMetaOffset, SlotType, StateFlags, StateHeaderOffset, StructFieldType,
-    TOMBSTONE, align8, arena_elem_size, is_arena_field_type, state_num_slots, struct_field_size,
+    NO_PARENT_TS_COL, Opcode, ProgramHeader, SCATTER_SKIP, SLOT_META_SIZE, SlotMetaOffset,
+    SlotType, StateFlags, StateHeaderOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size,
+    is_arena_field_type, state_num_slots, struct_field_size,
 };
 use core::sync::atomic::Ordering;
 
@@ -1016,9 +1020,11 @@ fn state_bytes_entry(offset: u32, len: u8, value: &[u8]) -> FlatUndoEntry {
     }
 }
 
-/// One long-lived reducer VM instance.
+/// One long-lived reducer VM instance over images of key-index family `I`.
+/// [`Vm::new`] and [`Vm::default`] build the [`HashIndex`] VM; [`Vm::new_in`]
+/// builds any family's.
 #[derive(Debug)]
-pub struct Vm {
+pub struct Vm<I: KeyIndex = HashIndex> {
     pub(crate) undo: UndoState,
     pub bitmap_env: BitmapEnv,
     accepted_program_magics: &'static [u32],
@@ -1040,8 +1046,10 @@ pub struct Vm {
     element_struct_map2_tuple: StructMap2TupleOperands,
     element_list_vals: ScalarOperands,
     nested_scratch: nested::NestedScratch,
-    /// Sparse key ranges selected by a stored-row sweep, retained across batches.
-    sweep_ranges: Vec<(u32, u32)>,
+    /// The keys a stored-row sweep selected, retained across batches.
+    sweep_keys: Vec<u32>,
+    /// Key-index working memory: the family's scratch and the seal space.
+    keys: KeyScratch<I>,
     /// Batch capacity admission (`capacity`), retained across batches.
     capacity: CapacityScratch,
     /// Whether the batch now running reserved and sealed its scratch: a
@@ -1054,11 +1062,19 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Construct a VM that admits exactly the supplied program magic values.
+    /// Construct a [`HashIndex`] VM that admits exactly the supplied program
+    /// magic values.
     ///
     /// The slice is `'static` so `Vm` does not carry a viral lifetime parameter;
     /// embedders with a runtime-computed set can provide a leaked boxed slice.
     pub fn new(accepted_program_magics: &'static [u32]) -> Self {
+        Self::new_in(accepted_program_magics)
+    }
+}
+
+impl<I: KeyIndex> Vm<I> {
+    /// [`Vm::new`] for images of key-index family `I`.
+    pub fn new_in(accepted_program_magics: &'static [u32]) -> Self {
         Self {
             undo: UndoState::default(),
             bitmap_env: BitmapEnv::default(),
@@ -1072,7 +1088,8 @@ impl Vm {
             element_struct_map2_tuple: StructMap2TupleOperands::EMPTY,
             element_list_vals: ScalarOperands::EMPTY,
             nested_scratch: nested::NestedScratch::default(),
-            sweep_ranges: Vec::new(),
+            sweep_keys: Vec::new(),
+            keys: KeyScratch::default(),
             capacity: CapacityScratch::default(),
             scratch_sealed: false,
             needs_growth_slot: None,
@@ -1093,7 +1110,7 @@ pub(crate) struct VmCtx<'a> {
     pub(crate) undo: &'a mut UndoState,
 }
 
-impl Vm {
+impl<I: KeyIndex> Vm<I> {
     /// Container operations capture their flags physically unless an enclosing
     /// [`Vm::change_flag_boundary`] has reserved their exclusive flag owner.
     pub(crate) fn ctx(&mut self) -> VmCtx<'_> {
@@ -1178,7 +1195,7 @@ impl Vm {
         &mut self,
         delta_mode: bool,
         state: &mut [u8],
-        mutate: impl FnOnce(&mut Vm, &mut [u8]) -> T,
+        mutate: impl FnOnce(&mut Self, &mut [u8]) -> T,
     ) -> Result<T, ErrorCode> {
         self.undo.prepare_redo(delta_mode)?;
         let owner = self.undo.open_change_flags(state)?;
@@ -1191,9 +1208,9 @@ impl Vm {
 
     /// Reserve the working memory `demand` names before any write.
     fn reserve_scratch(&mut self, demand: &ScratchDemand) -> Result<(), ErrorCode> {
-        self.sweep_ranges.clear();
-        self.sweep_ranges
-            .try_reserve(demand.sweep_ranges)
+        self.sweep_keys.clear();
+        self.sweep_keys
+            .try_reserve(demand.sweep_keys)
             .map_err(|_| ErrorCode::OutOfMemory)?;
         self.undo.ttl_batch_scratch.reserve_for(demand.ttl)?;
         if let Some(nested) = demand.nested {
@@ -1227,7 +1244,7 @@ impl Vm {
         ScratchDemand {
             ttl: crate::ttl_plan::plan_demand(state, meta, u64::try_from(rows).unwrap_or(u64::MAX)),
             nested: None,
-            sweep_ranges: 0,
+            sweep_keys: 0,
             // A slot whose image cannot be read refuses in the call itself.
             bitmap: (meta.slot_type() == SlotType::Bitmap)
                 .then(|| {
@@ -1273,7 +1290,7 @@ impl Vm {
         cmp_col: Option<&[u8]>,
         cmp_type: CmpType,
     ) -> ErrorCode {
-        let meta = match state_init::bind_slot(state, slot) {
+        let meta = match state_init::bind_slot_in::<I>(state, slot) {
             Ok(meta) => meta,
             Err(error) => return error,
         };
@@ -1319,7 +1336,7 @@ impl Vm {
         slot: u32,
         keys: &[u32],
     ) -> ErrorCode {
-        let meta = match state_init::bind_slot(state, slot) {
+        let meta = match state_init::bind_slot_in::<I>(state, slot) {
             Ok(meta) => meta,
             Err(error) => return error,
         };
@@ -1348,7 +1365,7 @@ impl Vm {
         elems: &[u32],
         ts_col: Option<&[f64]>,
     ) -> ErrorCode {
-        let meta = match state_init::bind_slot(state, slot_idx) {
+        let meta = match state_init::bind_slot_in::<I>(state, slot_idx) {
             Ok(meta) => meta,
             Err(error) => return error,
         };
@@ -1412,7 +1429,7 @@ impl Vm {
         slot_idx: u32,
         elems: &[u32],
     ) -> ErrorCode {
-        let meta = match state_init::bind_slot(state, slot_idx) {
+        let meta = match state_init::bind_slot_in::<I>(state, slot_idx) {
             Ok(meta) => meta,
             Err(error) => return error,
         };
@@ -1463,7 +1480,7 @@ impl Vm {
         target_slot: u32,
         source: BitmapSource<'_>,
     ) -> ErrorCode {
-        let target_meta = match state_init::bind_slot(state, target_slot) {
+        let target_meta = match state_init::bind_slot_in::<I>(state, target_slot) {
             Ok(meta) => meta,
             Err(error) => return error,
         };
@@ -1471,7 +1488,7 @@ impl Vm {
             return ErrorCode::InvalidSlot;
         }
         self.change_flag_boundary(delta_mode, state, |vm, state| {
-            batch_bitmap_algebra(
+            batch_bitmap_algebra_in::<I>(
                 &mut vm.bitmap_env,
                 &mut VmCtx { undo: &mut vm.undo },
                 delta_mode,
@@ -1554,69 +1571,153 @@ pub fn rollback_entry(state: &mut [u8], entry: &FlatUndoEntry) -> Result<(), Err
 // Struct-map row writes: one physical capture per row mutation
 // =============================================================================
 
+/// Most ranges one struct-map capture names besides its index plan's writes.
+const ROW_CAPTURE_FIXED: usize = 8;
+
+/// One struct-map capture frame's ranges, held inline: the writer's own
+/// ranges, with its index plan's writes in the place its key cells hold.
+#[derive(Clone, Copy)]
+struct CaptureRanges {
+    ranges: [(u32, u32); INDEX_WRITES_MAX + ROW_CAPTURE_FIXED],
+    len: usize,
+}
+
+impl CaptureRanges {
+    const fn new() -> Self {
+        Self {
+            ranges: [(0, 0); INDEX_WRITES_MAX + ROW_CAPTURE_FIXED],
+            len: 0,
+        }
+    }
+
+    /// Append one range. A writer names at most [`ROW_CAPTURE_FIXED`] of
+    /// its own; more is a VM bug.
+    fn push(mut self, range: (u32, u32)) -> Self {
+        self.ranges[self.len] = range;
+        self.len += 1;
+        self
+    }
+
+    /// Append an index plan's writes.
+    fn writes(mut self, writes: &IndexWrites) -> Self {
+        for &range in writes.as_slice() {
+            self = self.push(range);
+        }
+        self
+    }
+}
+
+impl AsRef<[(u32, u32)]> for CaptureRanges {
+    fn as_ref(&self) -> &[(u32, u32)] {
+        &self.ranges[..self.len]
+    }
+}
+
+/// The row one struct-map write lands on: a present key's ordinal, or the
+/// index plan that admits a new key.
+#[derive(Clone, Copy, Debug)]
+enum RowTarget<P> {
+    Present(u32),
+    New(InsertPlan<P>),
+}
+
+impl<P: Copy> RowTarget<P> {
+    fn of(plan: InsertPlan<P>) -> Self {
+        if plan.is_new {
+            Self::New(plan)
+        } else {
+            Self::Present(plan.ordinal)
+        }
+    }
+
+    fn pos(&self) -> u32 {
+        match self {
+            Self::Present(pos) => *pos,
+            Self::New(plan) => plan.ordinal,
+        }
+    }
+
+    fn is_new(&self) -> bool {
+        matches!(self, Self::New(_))
+    }
+
+    /// The index bytes a new key's apply changes; none for a present key.
+    fn writes(&self) -> IndexWrites {
+        match self {
+            Self::Present(_) => IndexWrites::NONE,
+            Self::New(plan) => plan.writes,
+        }
+    }
+}
+
 /// Run `write` as one physical mutation of row `target` in struct map `map`
-/// (slot `slot`, key `key`). The capture is taken before any byte moves: the key
-/// and size cells when the key is new, the slot's change-flag byte, and the whole
-/// row with its bitset and every field cell, stale bytes included. A new key is
-/// applied and its bitset cleared before `write` runs. The capture is finished
-/// even when `write` refuses partway, so the accepted prefix is journaled exactly
-/// as it now stands.
+/// (slot `slot`, key `key`). The capture is taken before any byte moves: the
+/// size cell and the index plan's writes when the key is new, the slot's
+/// change-flag byte, and the whole row with its bitset and every field cell,
+/// stale bytes included. A new key is applied and its bitset cleared before
+/// `write` runs. The capture is finished even when `write` refuses partway,
+/// so the accepted prefix is journaled exactly as it now stands.
 #[allow(clippy::too_many_arguments)]
-fn journal_row_write(
+fn journal_row_write<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    map: &StructMapSlot,
+    map: &StructMapSlot<I>,
     slot: u32,
     key: u32,
-    target: crate::struct_map::Upsert,
+    target: RowTarget<I::InsertPlan>,
+    cx: &mut KeyCx<'_, I, S>,
     write: impl FnOnce(&mut [u8]) -> ErrorCode,
 ) -> ErrorCode {
-    let capture = match undo.begin_capture(state, || row_capture_ranges(map, slot, target)) {
+    let capture = match undo.begin_capture(state, || row_capture_ranges(map, slot, &target)) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
-    apply_planned_row(map, state, key, target);
-    let result = write(&mut *state);
+    let result = match apply_planned_row(map, state, key, &target, cx) {
+        Ok(()) => write(&mut *state),
+        Err(error) => error,
+    };
     undo.finish_capture(delta_mode, state, capture);
     result
 }
 
-/// The bytes one row mutation may touch, shared by every capture of that row: the
-/// key and size cells when the key is new, the slot's change-flag byte, and the
-/// whole row with its bitset and field cells, stale bytes included.
-fn row_capture_ranges(
-    map: &StructMapSlot,
+/// The bytes one row mutation may touch, shared by every capture of that row:
+/// the size cell and the index plan's writes when the key is new, the slot's
+/// change-flag byte, and the whole row with its bitset and field cells, stale
+/// bytes included.
+fn row_capture_ranges<I: KeyIndex>(
+    map: &StructMapSlot<I>,
     slot: u32,
-    target: crate::struct_map::Upsert,
-) -> [(u32, u32); 4] {
-    let key_cells = if target.is_new { 4 } else { 0 };
-    [
-        (map.size_off, key_cells),
-        (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
-        (map.keys_off + target.pos * 4, key_cells),
-        (map.row_off(target.pos), map.row_size),
-    ]
+    target: &RowTarget<I::InsertPlan>,
+) -> CaptureRanges {
+    let size_cell = if target.is_new() { 4 } else { 0 };
+    CaptureRanges::new()
+        .push((map.size_off, size_cell))
+        .push((slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1))
+        .writes(&target.writes())
+        .push((map.row_off(target.pos()), map.row_size))
 }
 
 /// Apply a planned new key and clear its row's bitset, so stale bits never count as
 /// present. An existing row is left as it stands.
-fn apply_planned_row(
-    map: &StructMapSlot,
+fn apply_planned_row<I: KeyIndex, S: InternBytes + ?Sized>(
+    map: &StructMapSlot<I>,
     state: &mut [u8],
     key: u32,
-    target: crate::struct_map::Upsert,
-) {
-    if target.is_new {
-        map.apply_upsert(state, key, target);
-        map.clear_bitset(state, map.row_off(target.pos));
+    target: &RowTarget<I::InsertPlan>,
+    cx: &mut KeyCx<'_, I, S>,
+) -> Result<(), ErrorCode> {
+    if let RowTarget::New(plan) = target {
+        map.apply_upsert(state, key, plan, cx)?;
+        map.clear_bitset(state, map.row_off(plan.ordinal));
     }
+    Ok(())
 }
 
 /// Whether row `pos` holds `cell` as the live value of card-one `field`.
-fn card_one_held(
+fn card_one_held<I: KeyIndex>(
     state: &[u8],
-    map: &StructMapSlot,
+    map: &StructMapSlot<I>,
     pos: u32,
     field: u8,
     cell: &[u8; 8],
@@ -1628,19 +1729,19 @@ fn card_one_held(
     StructMapSlot::is_field_set(state, row, field) && state[dst..dst + size] == cell[..size]
 }
 
-/// Whether a card-one element changes `up`'s row as it stands: an assert changes
-/// a value that is not held, a retract changes one that is. A new row's bytes are
-/// stale until cleared, so they never hold the value.
-fn card_one_changes(
+/// Whether a card-one element changes `target`'s row as it stands: an assert
+/// changes a value that is not held, a retract changes one that is. A new row's
+/// bytes are stale until cleared, so they never hold the value.
+fn card_one_changes<I: KeyIndex>(
     state: &[u8],
-    map: &StructMapSlot,
-    up: crate::struct_map::Upsert,
+    map: &StructMapSlot<I>,
+    target: &RowTarget<I::InsertPlan>,
     field: u8,
     cell: &[u8; 8],
     cell_size: u32,
     is_retract: bool,
 ) -> bool {
-    let held = !up.is_new && card_one_held(state, map, up.pos, field, cell, cell_size);
+    let held = !target.is_new() && card_one_held(state, map, target.pos(), field, cell, cell_size);
     held == is_retract
 }
 
@@ -1649,9 +1750,9 @@ fn card_one_changes(
 /// it stood. A retract clears the bit and the cell only while the stored cell
 /// still equals `cell`, recording REMOVED.
 #[allow(clippy::too_many_arguments)]
-fn write_card_one(
+fn write_card_one<I: KeyIndex>(
     state: &mut [u8],
-    map: &StructMapSlot,
+    map: &StructMapSlot<I>,
     slot: u32,
     pos: u32,
     field: u8,
@@ -1690,37 +1791,41 @@ fn write_card_one(
 /// cell still equals `cell`. The key is planned once, and an element that changes
 /// nothing reserves and journals nothing.
 #[allow(clippy::too_many_arguments)]
-fn scatter_card_one(
+fn scatter_card_one<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    map: &StructMapSlot,
+    map: &StructMapSlot<I>,
     slot: u32,
     key: u32,
     field: u8,
     cell: &[u8; 8],
     cell_size: u32,
     is_retract: bool,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> ErrorCode {
     // A sentinel output key names no row: no growth could place it.
     if key == EMPTY_KEY || key == TOMBSTONE {
         return ErrorCode::InvalidKey;
     }
     let target = if is_retract {
-        map.find(state, key)
-            .map(|pos| crate::struct_map::Upsert { pos, is_new: false })
+        match map.lookup(state, key, cx) {
+            Ok(found) => found.map(RowTarget::Present),
+            Err(error) => return error,
+        }
     } else {
-        let Some(planned) = map.plan_upsert(state, key) else {
-            return ErrorCode::CapacityExceeded;
-        };
-        Some(planned)
+        match map.plan_upsert(state, key, cx) {
+            Ok(plan) => Some(RowTarget::of(plan)),
+            Err(error) => return error,
+        }
     };
-    let Some(up) = target else {
+    let Some(target) = target else {
         return ErrorCode::Ok;
     };
-    if !card_one_changes(state, map, up, field, cell, cell_size, is_retract) {
+    if !card_one_changes(state, map, &target, field, cell, cell_size, is_retract) {
         return ErrorCode::Ok;
     }
+    let pos = target.pos();
     journal_row_write(
         undo,
         delta_mode,
@@ -1728,9 +1833,10 @@ fn scatter_card_one(
         map,
         slot,
         key,
-        up,
+        target,
+        cx,
         |state: &mut [u8]| {
-            write_card_one(state, map, slot, up.pos, field, cell, cell_size, is_retract);
+            write_card_one(state, map, slot, pos, field, cell, cell_size, is_retract);
             ErrorCode::Ok
         },
     )
@@ -1783,10 +1889,10 @@ impl GuardTuple {
     /// The element's guard, imaged through the guarded row's own field
     /// types. `None` when a component names an array field, which has no
     /// column-cell form to order.
-    fn incoming(
+    fn incoming<I: KeyIndex>(
         &self,
         state: &[u8],
-        smap: &StructMapSlot,
+        smap: &StructMapSlot<I>,
         cols: &[&[u8]],
         element_idx: u32,
     ) -> Option<GuardKey> {
@@ -1801,7 +1907,12 @@ impl GuardTuple {
     /// The guard `row` remembers, or `None` when it remembers none — a row
     /// missing any component has claimed nothing and loses to every
     /// element, which is also what an absent row does.
-    fn stored(&self, state: &[u8], smap: &StructMapSlot, row: u32) -> Option<GuardKey> {
+    fn stored<I: KeyIndex>(
+        &self,
+        state: &[u8],
+        smap: &StructMapSlot<I>,
+        row: u32,
+    ) -> Option<GuardKey> {
         let mut key = [0u64; MAX_GUARD_COMPONENTS];
         for gi in 0..self.len {
             let fi = self.fields[gi];
@@ -1832,10 +1943,10 @@ impl GuardTuple {
     /// Write the element's guard into row `pos`: a pure writer under the
     /// caller's row capture (see [`journal_row_write`]). Every component's cell
     /// is encoded before the first byte moves, so a refused guard writes nothing.
-    fn stamp(
+    fn stamp<I: KeyIndex>(
         &self,
         state: &mut [u8],
-        smap: &StructMapSlot,
+        smap: &StructMapSlot<I>,
         pos: u32,
         cols: &[&[u8]],
         element_idx: u32,
@@ -2207,9 +2318,9 @@ impl StructMap2TupleOperands {
     }
 }
 
-fn validate_struct_map2_tuple(
+fn validate_struct_map2_tuple<I: KeyIndex>(
     state: &[u8],
-    smap: &StructMap2Slot,
+    smap: &StructMap2Slot<I>,
     operands: &StructMap2TupleOperands,
 ) -> bool {
     if operands.cmp1_field == operands.cmp2_field
@@ -2225,23 +2336,25 @@ fn validate_struct_map2_tuple(
     })
 }
 
-fn should_upsert_struct_map2_tuple(
+#[allow(clippy::too_many_arguments)]
+fn should_upsert_struct_map2_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
     state: &[u8],
-    smap: &StructMap2Slot,
+    smap: &StructMap2Slot<I>,
     key1: u32,
     key2: u32,
     operands: &StructMap2TupleOperands,
     cols: &[&[u8]],
     element_idx: u32,
-) -> bool {
-    let Some(pos) = smap.find(state, key1, key2) else {
-        return true;
+    cx: &mut KeyCx<'_, I, S>,
+) -> Result<bool, ErrorCode> {
+    let Some(pos) = smap.lookup(state, key1, key2, cx)? else {
+        return Ok(true);
     };
     let row = smap.row_off(pos);
     if !StructMapSlot::is_field_set(state, row, operands.cmp1_field)
         || !StructMapSlot::is_field_set(state, row, operands.cmp2_field)
     {
-        return true;
+        return Ok(true);
     }
     let existing = (
         bytes::read_i64(state, row + smap.field_offset(state, operands.cmp1_field)),
@@ -2252,10 +2365,10 @@ fn should_upsert_struct_map2_tuple(
         bytes::read_i64(col_at(cols, operands.cmp1_col as usize), comparison_offset),
         bytes::read_i64(col_at(cols, operands.cmp2_col as usize), comparison_offset),
     );
-    match operands.keep {
+    Ok(match operands.keep {
         TupleKeep::Greatest => candidate > existing,
         TupleKeep::Least => candidate < existing,
-    }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2268,9 +2381,9 @@ struct StructMapMaxComparison {
 
 /// Resolve and validate 0x82's comparison lane before processing any rows.
 /// The comparison ordinal must name a mapped scalar field.
-fn resolve_struct_map_max_comparison(
+fn resolve_struct_map_max_comparison<I: KeyIndex>(
     state: &[u8],
-    smap: &StructMapSlot,
+    smap: &StructMapSlot<I>,
     vals: &ScalarOperands,
     comparison_field_idx: u8,
 ) -> Option<StructMapMaxComparison> {
@@ -2321,9 +2434,9 @@ struct StructMapResetLane {
 
 /// Bind the instruction's pick to its mapped field lane. A comparison or reset
 /// ordinal that names no mapped field of the admitted kind is `None`.
-fn resolve_struct_map_pick(
+fn resolve_struct_map_pick<I: KeyIndex>(
     state: &[u8],
-    smap: &StructMapSlot,
+    smap: &StructMapSlot<I>,
     operands: &StructMapUpsertOperands,
 ) -> Option<ResolvedStructMapPick> {
     Some(match operands.pick {
@@ -2359,35 +2472,37 @@ fn resolve_struct_map_pick(
 /// Decide whether row `element_idx` writes its key, before bitset clearing,
 /// journaling, row or array writes, or change flags: a skipped row mutates
 /// nothing.
-fn should_write_struct_map_row(
+fn should_write_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
     state: &[u8],
-    smap: &StructMapSlot,
+    smap: &StructMapSlot<I>,
     key: u32,
     pick: ResolvedStructMapPick,
     cols: &[&[u8]],
     element_idx: u32,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> Result<bool, ErrorCode> {
     match pick {
         ResolvedStructMapPick::Last => Ok(true),
-        ResolvedStructMapPick::First => Ok(smap.find(state, key).is_none()),
+        ResolvedStructMapPick::First => Ok(smap.lookup(state, key, cx)?.is_none()),
         ResolvedStructMapPick::Max(comparison) => {
-            should_upsert_struct_map_max(state, smap, key, comparison, cols, element_idx)
+            should_upsert_struct_map_max(state, smap, key, comparison, cols, element_idx, cx)
         }
         ResolvedStructMapPick::FirstSinceReset(lane) => {
-            should_upsert_struct_map_since_reset(state, smap, key, lane, cols, element_idx)
+            should_upsert_struct_map_since_reset(state, smap, key, lane, cols, element_idx, cx)
         }
     }
 }
 
 /// 0x8b: an incoming reset, an absent key or a stored reset accepts. An absent
 /// stored reset field is false. A BOOL cell travels as a u32 lane.
-fn should_upsert_struct_map_since_reset(
+fn should_upsert_struct_map_since_reset<I: KeyIndex, S: InternBytes + ?Sized>(
     state: &[u8],
-    smap: &StructMapSlot,
+    smap: &StructMapSlot<I>,
     key: u32,
     lane: StructMapResetLane,
     cols: &[&[u8]],
     element_idx: u32,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> Result<bool, ErrorCode> {
     let start = (element_idx as usize)
         .checked_mul(4)
@@ -2400,7 +2515,7 @@ fn should_upsert_struct_map_since_reset(
     if bytes::read_u32(cell, 0) != 0 {
         return Ok(true);
     }
-    let Some(position) = smap.find(state, key) else {
+    let Some(position) = smap.lookup(state, key, cx)? else {
         return Ok(true);
     };
     let row = smap.row_off(position);
@@ -2412,9 +2527,9 @@ fn should_upsert_struct_map_since_reset(
 /// a row. Skipping execution must not make an invalid mapping valid. Each
 /// field is mapped at most once: a comparison or reset lane binds one column,
 /// and that column must be the one the row writer stores.
-fn validate_struct_map_operands(
+fn validate_struct_map_operands<I: KeyIndex>(
     state: &[u8],
-    map: &StructMapSlot,
+    map: &StructMapSlot<I>,
     operands: &StructMapUpsertOperands,
 ) -> Result<(), ErrorCode> {
     for &field in operands.vals.fields() {
@@ -2447,13 +2562,14 @@ fn validate_struct_map_operands(
 /// Decide a struct-map arg-max before bitset clearing, journaling, row writes,
 /// or change flags. Missing keys or missing stored comparison fields accept;
 /// equal and lower values are true no-ops.
-fn should_upsert_struct_map_max(
+fn should_upsert_struct_map_max<I: KeyIndex, S: InternBytes + ?Sized>(
     state: &[u8],
-    smap: &StructMapSlot,
+    smap: &StructMapSlot<I>,
     key: u32,
     comparison: StructMapMaxComparison,
     cols: &[&[u8]],
     element_idx: u32,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> Result<bool, ErrorCode> {
     let width = comparison.cmp_type.stride();
     let start = (element_idx as usize)
@@ -2465,7 +2581,7 @@ fn should_upsert_struct_map_max(
         .and_then(|col| col.get(start..end))
         .ok_or(ErrorCode::ColumnUnderrun)?;
     let incoming = hashmap_ops::read_cmp_value(cell, 0, comparison.cmp_type);
-    let Some(position) = smap.find(state, key) else {
+    let Some(position) = smap.lookup(state, key, cx)? else {
         return Ok(true);
     };
     let row = smap.row_off(position);
@@ -2490,13 +2606,13 @@ fn should_upsert_struct_map_max(
     Ok(hashmap_ops::cmp_gt(incoming, existing, comparison.cmp_type))
 }
 
-/// A checked row mutation. Probing and scalar source admission leave the
-/// position and borrowed sources the writer actually consumes.
-struct PreparedRow<'a> {
-    map: StructMapSlot,
+/// A checked row mutation. Planning and scalar source admission leave the
+/// row and borrowed sources the writer actually consumes.
+struct PreparedRow<'a, I: KeyIndex> {
+    map: StructMapSlot<I>,
     slot: u32,
     key: u32,
-    upsert: crate::struct_map::Upsert,
+    target: RowTarget<I::InsertPlan>,
     arena: Option<ArenaRegion>,
     val_cols: &'a [u32],
     field_idxs: &'a [u8],
@@ -2504,17 +2620,18 @@ struct PreparedRow<'a> {
     element_idx: u32,
 }
 
-impl<'a> PreparedRow<'a> {
+impl<'a, I: KeyIndex> PreparedRow<'a, I> {
     #[allow(clippy::too_many_arguments)]
-    fn prepare(
+    fn prepare<S: InternBytes + ?Sized>(
         state: &[u8],
-        map: StructMapSlot,
+        map: StructMapSlot<I>,
         slot: u32,
         key: u32,
         val_cols: &'a [u32],
         field_idxs: &'a [u8],
         cols: &'a [&'a [u8]],
         element_idx: u32,
+        cx: &mut KeyCx<'_, I, S>,
     ) -> Result<Self, ErrorCode> {
         if val_cols.len() != field_idxs.len() {
             return Err(ErrorCode::InvalidProgram);
@@ -2528,15 +2645,13 @@ impl<'a> PreparedRow<'a> {
             cols,
             element_idx,
         )?;
-        let upsert = map
-            .plan_upsert(state, key)
-            .ok_or(ErrorCode::CapacityExceeded)?;
+        let target = RowTarget::of(map.plan_upsert(state, key, cx)?);
         let arena = if map.arena_header_off == 0 {
             None
         } else {
             let arena = ArenaRegion::bind(state, map.arena_header_off)?;
-            if !upsert.is_new {
-                let row = map.row_off(upsert.pos);
+            if !target.is_new() {
+                let row = map.row_off(target.pos());
                 let mut offset = map.bitset_bytes;
                 for field_idx in 0..map.num_fields {
                     let kind = map.field_type(state, field_idx);
@@ -2559,7 +2674,7 @@ impl<'a> PreparedRow<'a> {
             map,
             slot,
             key,
-            upsert,
+            target,
             arena,
             val_cols,
             field_idxs,
@@ -2568,14 +2683,20 @@ impl<'a> PreparedRow<'a> {
         })
     }
 
-    fn write(&self, state: &mut [u8]) {
-        self.map.apply_upsert(state, self.key, self.upsert);
-        self.map
-            .clear_bitset(state, self.map.row_off(self.upsert.pos));
+    fn write<S: InternBytes + ?Sized>(
+        &self,
+        state: &mut [u8],
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<(), ErrorCode> {
+        if let RowTarget::New(plan) = &self.target {
+            self.map.apply_upsert(state, self.key, plan, cx)?;
+        }
+        let pos = self.target.pos();
+        self.map.clear_bitset(state, self.map.row_off(pos));
         for (&val_col, &field_idx) in self.val_cols.iter().zip(self.field_idxs) {
             self.map.write_scalar_field(
                 state,
-                self.upsert.pos,
+                pos,
                 field_idx,
                 self.cols,
                 val_col,
@@ -2583,21 +2704,23 @@ impl<'a> PreparedRow<'a> {
             );
         }
         state[(slot_meta_base(self.slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-            if self.upsert.is_new {
+            if self.target.is_new() {
                 ChangeFlag::INSERTED
             } else {
                 ChangeFlag::UPDATED
             };
+        Ok(())
     }
 
     /// One journal owner per mutation. An arena slot captures only the
-    /// affected key/row/metadata and append destination, never the whole arena.
-    fn apply(
+    /// affected index/row/metadata and append destination, never the whole arena.
+    fn apply<S: InternBytes + ?Sized>(
         &self,
         undo: &mut UndoState,
         delta_mode: bool,
         state: &mut [u8],
         arrays: Option<&ArenaWrites>,
+        cx: &mut KeyCx<'_, I, S>,
     ) -> Result<(), ErrorCode> {
         let meta = slot_meta_base(self.slot);
         let (header, append) = self.arena.map_or(((0, 0), (0, 0)), |arena| {
@@ -2609,37 +2732,40 @@ impl<'a> PreparedRow<'a> {
                 ),
             )
         });
+        let pos = self.target.pos();
         let ranges = || {
-            [
-                (
+            CaptureRanges::new()
+                .push((
                     meta + SlotMetaOffset::SIZE,
-                    if self.upsert.is_new { 4 } else { 0 },
-                ),
-                (meta + SlotMetaOffset::CHANGE_FLAGS, 1),
-                (
-                    self.map.keys_off + self.upsert.pos * 4,
-                    if self.upsert.is_new { 4 } else { 0 },
-                ),
-                (self.map.row_off(self.upsert.pos), self.map.row_size),
-                header,
-                append,
-            ]
+                    if self.target.is_new() { 4 } else { 0 },
+                ))
+                .push((meta + SlotMetaOffset::CHANGE_FLAGS, 1))
+                .writes(&self.target.writes())
+                .push((self.map.row_off(pos), self.map.row_size))
+                .push(header)
+                .push(append)
         };
         let capture = undo.begin_capture(state, ranges)?;
-        self.write(state);
-        if let Some(arrays) = arrays {
-            arrays.write(state, &self.map, self.upsert.pos, self.cols);
+        let written = self.write(state, cx);
+        if written.is_ok()
+            && let Some(arrays) = arrays
+        {
+            arrays.write(state, &self.map, pos, self.cols);
         }
         undo.finish_capture(delta_mode, state, capture);
-        Ok(())
+        written
     }
 }
 
+/// One exact-pair upsert-last row on two-key map `smap` (slot `slot`): the
+/// pair is planned once, then its index writes, size, change flag and row are
+/// captured together before any byte moves.
 #[allow(clippy::too_many_arguments)]
-fn single_struct_map2_upsert_last(
+fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
+    smap: &StructMap2Slot<I>,
     slot: u32,
     key1: u32,
     key2: u32,
@@ -2647,11 +2773,11 @@ fn single_struct_map2_upsert_last(
     field_idxs: &[u8],
     cols: &[&[u8]],
     element_idx: u32,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> ErrorCode {
     if key1 == EMPTY_KEY || key1 == TOMBSTONE {
         return ErrorCode::InvalidKey;
     }
-    let smap = StructMap2Slot::bind(state, slot);
     if let Err(err) = validate_scalar_fields(
         state,
         smap.field_types_off,
@@ -2663,43 +2789,35 @@ fn single_struct_map2_upsert_last(
     ) {
         return err;
     }
-    let Some(result) = smap.plan_upsert(state, key1, key2) else {
-        return ErrorCode::CapacityExceeded;
+    let target = match smap.plan_upsert(state, key1, key2, cx) {
+        Ok(plan) => RowTarget::of(plan),
+        Err(error) => return error,
     };
-    let row = smap.row_off(result.pos);
+    let pos = target.pos();
+    let row = smap.row_off(pos);
+    let flags = slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS;
     let ranges = || {
-        [
-            (smap.size_off, if result.is_new { 4 } else { 0 }),
-            (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
-            (
-                smap.keys1_off + result.pos * 4,
-                if result.is_new { 4 } else { 0 },
-            ),
-            (
-                smap.keys2_off + result.pos * 4,
-                if result.is_new { 4 } else { 0 },
-            ),
-            (row, smap.row_size),
-        ]
+        CaptureRanges::new()
+            .push((smap.size_off, if target.is_new() { 4 } else { 0 }))
+            .push((flags, 1))
+            .writes(&target.writes())
+            .push((row, smap.row_size))
     };
     let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
-    smap.apply_upsert(state, key1, key2, result);
+    if let RowTarget::New(plan) = &target
+        && let Err(error) = smap.apply_upsert(state, key1, key2, plan, cx)
+    {
+        undo.finish_capture(delta_mode, state, capture);
+        return error;
+    }
     smap.clear_bitset(state, row);
     for (index, &val_col) in val_cols.iter().enumerate() {
-        smap.write_scalar_field(
-            state,
-            result.pos,
-            field_idxs[index],
-            cols,
-            val_col,
-            element_idx,
-        );
+        smap.write_scalar_field(state, pos, field_idxs[index], cols, val_col, element_idx);
     }
-    let meta_base = slot_meta_base(slot);
-    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if result.is_new {
+    state[flags as usize] |= if target.is_new() {
         ChangeFlag::INSERTED
     } else {
         ChangeFlag::UPDATED
@@ -2709,22 +2827,26 @@ fn single_struct_map2_upsert_last(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn single_struct_map2_upsert_tuple(
+fn single_struct_map2_upsert_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
+    smap: &StructMap2Slot<I>,
     operands: &StructMap2TupleOperands,
     key1: u32,
     key2: u32,
     cols: &[&[u8]],
     element_idx: u32,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> ErrorCode {
     if key1 == EMPTY_KEY || key1 == TOMBSTONE {
         return ErrorCode::InvalidKey;
     }
-    let smap = StructMap2Slot::bind(state, operands.row.slot);
-    if !should_upsert_struct_map2_tuple(state, &smap, key1, key2, operands, cols, element_idx) {
-        return ErrorCode::Ok;
+    match should_upsert_struct_map2_tuple(state, smap, key1, key2, operands, cols, element_idx, cx)
+    {
+        Ok(true) => {}
+        Ok(false) => return ErrorCode::Ok,
+        Err(error) => return error,
     }
 
     // Room for the two comparison lanes was reserved at decode.
@@ -2735,6 +2857,7 @@ fn single_struct_map2_upsert_tuple(
         undo,
         delta_mode,
         state,
+        smap,
         operands.row.slot,
         key1,
         key2,
@@ -2742,42 +2865,107 @@ fn single_struct_map2_upsert_tuple(
         vals.fields(),
         cols,
         element_idx,
+        cx,
     )
 }
 
-fn single_struct_map2_remove(
+/// Remove one planned two-key row: its index entry and the size, its
+/// presence bitset and the slot's change flag, in one capture.
+fn remove_struct_map2_row<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
+    smap: &StructMap2Slot<I>,
     slot: u32,
-    key1: u32,
-    key2: u32,
+    plan: &RemovePlan<I::RemovePlan>,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> ErrorCode {
-    if key1 == EMPTY_KEY || key1 == TOMBSTONE {
-        return ErrorCode::InvalidKey;
-    }
-    let smap = StructMap2Slot::bind(state, slot);
-    let Some(pos) = smap.find(state, key1, key2) else {
-        return ErrorCode::Ok;
-    };
-    let row = smap.row_off(pos);
+    let row = smap.row_off(plan.ordinal);
+    let flags = slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS;
     let ranges = || {
-        [
-            (smap.size_off, 4),
-            (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
-            (smap.keys1_off + pos * 4, 4),
-            (row, smap.bitset_bytes),
-        ]
+        CaptureRanges::new()
+            .push((smap.size_off, 4))
+            .push((flags, 1))
+            .writes(&plan.writes)
+            .push((row, smap.bitset_bytes))
     };
     let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
-    smap.tombstone_at(state, pos);
-    smap.set_size(state, smap.size(state) - 1);
-    smap.clear_bitset(state, row);
-    state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::REMOVED;
+    let result = match smap.apply_remove(state, plan, cx) {
+        Ok(()) => {
+            smap.clear_bitset(state, row);
+            state[flags as usize] |= ChangeFlag::REMOVED;
+            ErrorCode::Ok
+        }
+        Err(error) => error,
+    };
     undo.finish_capture(delta_mode, state, capture);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn single_struct_map2_remove<I: KeyIndex, S: InternBytes + ?Sized>(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &mut [u8],
+    smap: &StructMap2Slot<I>,
+    slot: u32,
+    key1: u32,
+    key2: u32,
+    cx: &mut KeyCx<'_, I, S>,
+) -> ErrorCode {
+    if key1 == EMPTY_KEY || key1 == TOMBSTONE {
+        return ErrorCode::InvalidKey;
+    }
+    match smap.plan_remove(state, key1, key2, cx) {
+        Ok(Some(plan)) => remove_struct_map2_row(undo, delta_mode, state, smap, slot, &plan, cx),
+        Ok(None) => ErrorCode::Ok,
+        Err(error) => error,
+    }
+}
+
+/// Remove every row of two-key map `smap` whose key lane 1 holds `key1`, in
+/// the slot's index order, one capture per row. Each row's follower is found
+/// before the row goes: ordinals never move under a remove, so the walk needs
+/// no second search. A sentinel `key1` is `InvalidKey`, as for the exact-pair
+/// remove; a `key1` no row holds removes nothing.
+fn remove_struct_map2_prefix<I: KeyIndex, S: InternBytes + ?Sized>(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &mut [u8],
+    smap: &StructMap2Slot<I>,
+    slot: u32,
+    key1: u32,
+    cx: &mut KeyCx<'_, I, S>,
+) -> ErrorCode {
+    if key1 == EMPTY_KEY || key1 == TOMBSTONE {
+        return ErrorCode::InvalidKey;
+    }
+    let mut cursor = match smap.first_with_key1(state, key1, cx) {
+        Ok(cursor) => cursor,
+        Err(error) => return error,
+    };
+    while let Some(ordinal) = cursor {
+        let following = match smap.next_with_key1(state, ordinal, key1, cx) {
+            Ok(following) => following,
+            Err(error) => return error,
+        };
+        let Some((k1, k2)) = smap.key_at(state, ordinal) else {
+            return ErrorCode::InvalidState;
+        };
+        let plan = match smap.plan_remove(state, k1, k2, cx) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return ErrorCode::InvalidState,
+            Err(error) => return error,
+        };
+        let removed = remove_struct_map2_row(undo, delta_mode, state, smap, slot, &plan, cx);
+        if removed != ErrorCode::Ok {
+            return removed;
+        }
+        cursor = following;
+    }
     ErrorCode::Ok
 }
 
@@ -2785,50 +2973,57 @@ fn single_struct_map2_remove(
 /// remove. Sentinel and absent keys are no-ops: the instruction composes
 /// unconditionally after a write keyed by the same column (a companion
 /// clear), including rows whose key cell is the absent sentinel.
-fn single_struct_map_remove(
+fn single_struct_map_remove<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
     slot: u32,
     key: u32,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> ErrorCode {
     if key == EMPTY_KEY || key == TOMBSTONE {
         return ErrorCode::Ok;
     }
-    let smap = match state_init::bind_struct_map(state, slot) {
+    let smap = match state_init::bind_struct_map_in::<I>(state, slot) {
         Ok(map) => map,
         Err(error) => return error,
     };
-    let Some(pos) = smap.find(state, key) else {
-        return ErrorCode::Ok;
+    let plan = match smap.plan_remove(state, key, cx) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return ErrorCode::Ok,
+        Err(error) => return error,
     };
-    let row = smap.row_off(pos);
+    let row = smap.row_off(plan.ordinal);
+    let flags = slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS;
     let ranges = || {
-        [
-            (smap.size_off, 4),
-            (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
-            (smap.keys_off + pos * 4, 4),
-            (row, smap.bitset_bytes),
-        ]
+        CaptureRanges::new()
+            .push((smap.size_off, 4))
+            .push((flags, 1))
+            .writes(&plan.writes)
+            .push((row, smap.bitset_bytes))
     };
     let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
-    smap.set_key_at(state, pos, TOMBSTONE);
-    smap.set_size(state, smap.size(state) - 1);
-    smap.clear_bitset(state, row);
-    state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::REMOVED;
+    let result = match smap.apply_remove(state, &plan, cx) {
+        Ok(()) => {
+            smap.clear_bitset(state, row);
+            state[flags as usize] |= ChangeFlag::REMOVED;
+            ErrorCode::Ok
+        }
+        Err(error) => error,
+    };
     undo.finish_capture(delta_mode, state, capture);
-    ErrorCode::Ok
+    result
 }
 
 /// The companion field a companion guard compares must exist and hold one
 /// interned STRING or UINT32 cell: the only layouts whose 4-byte cell the
 /// guard compares against the terminal key column.
-fn validate_guard_companion(
+fn validate_guard_companion<I: KeyIndex>(
     state: &[u8],
-    companion: &StructMapSlot,
+    companion: &StructMapSlot<I>,
     guard_field_idx: u8,
 ) -> Result<(), ErrorCode> {
     if guard_field_idx >= companion.num_fields {
@@ -2843,19 +3038,21 @@ fn validate_guard_companion(
 /// Whether the companion currently holds the key with the exact guard-key
 /// cell: the revision guard. Anything else — no companion row, the field
 /// unset, a different key cell — admits nothing.
-fn guard_admits(
+fn guard_admits<I: KeyIndex, S: InternBytes + ?Sized>(
     state: &[u8],
-    companion: &StructMapSlot,
+    companion: &StructMapSlot<I>,
     guard_field_idx: u8,
     key: u32,
     guard_key: u32,
-) -> bool {
-    let Some(pos) = companion.find(state, key) else {
-        return false;
+    cx: &mut KeyCx<'_, I, S>,
+) -> Result<bool, ErrorCode> {
+    let Some(pos) = companion.lookup(state, key, cx)? else {
+        return Ok(false);
     };
     let row = companion.row_off(pos);
-    StructMapSlot::is_field_set(state, row, guard_field_idx)
-        && bytes::read_u32(state, row + companion.field_offset(state, guard_field_idx)) == guard_key
+    Ok(StructMapSlot::is_field_set(state, row, guard_field_idx)
+        && bytes::read_u32(state, row + companion.field_offset(state, guard_field_idx))
+            == guard_key)
 }
 
 /// One companion-guarded row: write through the ordinary upsert-last path only
@@ -2863,27 +3060,39 @@ fn guard_admits(
 /// admitted it. The remove runs only after a successful write, and a growth
 /// refusal leaves both slots as the batch found them for its retry.
 #[allow(clippy::too_many_arguments)]
-fn single_struct_map_guarded_upsert_last(
+fn single_struct_map_guarded_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
     operands: &StructMapGuardedUpsertOperands,
-    smap: &StructMapSlot,
-    companion: &StructMapSlot,
+    smap: &StructMapSlot<I>,
+    companion: &StructMapSlot<I>,
     key: u32,
     guard_key: u32,
     cols: &[&[u8]],
     element_idx: u32,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> u32 {
     // The destination row must still be absent: any write since the
     // companion row was seeded — guarded or not — supersedes the claim, so
     // a rewrite the producer forgot to pair with a companion clear still
     // cannot be overwritten by the later guarded write.
-    if smap.find(state, key).is_some() {
-        return OK;
+    match smap.lookup(state, key, cx) {
+        Ok(None) => {}
+        Ok(Some(_)) => return OK,
+        Err(error) => return error as u32,
     }
-    if !guard_admits(state, companion, operands.guard_field_idx, key, guard_key) {
-        return OK;
+    match guard_admits(
+        state,
+        companion,
+        operands.guard_field_idx,
+        key,
+        guard_key,
+        cx,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return OK,
+        Err(error) => return error as u32,
     }
     let result = upsert_struct_map_row(
         undo,
@@ -2897,11 +3106,12 @@ fn single_struct_map_guarded_upsert_last(
         operands.row.array_fields(),
         cols,
         element_idx,
+        cx,
     );
     if result != OK {
         return result;
     }
-    single_struct_map_remove(undo, delta_mode, state, operands.companion_slot, key) as u32
+    single_struct_map_remove(undo, delta_mode, state, operands.companion_slot, key, cx) as u32
 }
 
 /// One instruction of a sequence, as the pairing validation reads it.
@@ -3074,22 +3284,23 @@ fn validate_guard_pairing(code: &[u8]) -> Option<()> {
 //#region reduce-typed-state.probe-upsert
 /// Copy remapped fields from a probed source row into the output slot.
 #[allow(clippy::too_many_arguments)]
-fn single_struct_map_upsert_from_probe(
+fn single_struct_map_upsert_from_probe<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
     out_slot: u32,
     out_key: u32,
-    probe: &StructMapSlot,
+    probe: &StructMapSlot<I>,
     probe_row: u32,
     probe_field_idxs: &[u8],
     out_field_idxs: &[u8],
+    cx: &mut KeyCx<'_, I, S>,
 ) -> ErrorCode {
     if out_key == EMPTY_KEY || out_key == TOMBSTONE {
         return ErrorCode::Ok;
     }
 
-    let out = match state_init::bind_struct_map(state, out_slot) {
+    let out = match state_init::bind_struct_map_in::<I>(state, out_slot) {
         Ok(out) => out,
         Err(err) => return err,
     };
@@ -3102,28 +3313,31 @@ fn single_struct_map_upsert_from_probe(
             return ErrorCode::InvalidProgram;
         }
     }
-    let Some(result) = out.plan_upsert(state, out_key) else {
-        return ErrorCode::CapacityExceeded;
+    let target = match out.plan_upsert(state, out_key, cx) {
+        Ok(plan) => RowTarget::of(plan),
+        Err(error) => return error,
     };
 
-    let out_row = out.row_off(result.pos);
+    let out_row = out.row_off(target.pos());
+    let flags = slot_meta_base(out_slot) + SlotMetaOffset::CHANGE_FLAGS;
 
     let ranges = || {
-        [
-            (out.size_off, if result.is_new { 4 } else { 0 }),
-            (slot_meta_base(out_slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
-            (
-                out.keys_off + result.pos * 4,
-                if result.is_new { 4 } else { 0 },
-            ),
-            (out_row, out.row_size),
-        ]
+        CaptureRanges::new()
+            .push((out.size_off, if target.is_new() { 4 } else { 0 }))
+            .push((flags, 1))
+            .writes(&target.writes())
+            .push((out_row, out.row_size))
     };
     let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
-    out.apply_upsert(state, out_key, result);
+    if let RowTarget::New(plan) = &target
+        && let Err(error) = out.apply_upsert(state, out_key, plan, cx)
+    {
+        undo.finish_capture(delta_mode, state, capture);
+        return error;
+    }
 
     out.clear_bitset(state, out_row);
 
@@ -3138,8 +3352,7 @@ fn single_struct_map_upsert_from_probe(
         bytes::copy_within(state, src_off, dst_off, fsize);
     }
 
-    let meta_base = slot_meta_base(out_slot);
-    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if result.is_new {
+    state[flags as usize] |= if target.is_new() {
         ChangeFlag::INSERTED
     } else {
         ChangeFlag::UPDATED
@@ -3208,9 +3421,9 @@ struct ArenaWrites {
 }
 
 impl ArenaWrites {
-    fn prepare(
+    fn prepare<I: KeyIndex>(
         state: &[u8],
-        row: &PreparedRow<'_>,
+        row: &PreparedRow<'_, I>,
         fields: &[ArrayField],
     ) -> Result<Self, ErrorCode> {
         let arena = row.arena.ok_or(ErrorCode::InvalidProgram)?;
@@ -3281,7 +3494,13 @@ impl ArenaWrites {
         Ok(plan)
     }
 
-    fn write(&self, state: &mut [u8], smap: &StructMapSlot, pos: u32, cols: &[&[u8]]) {
+    fn write<I: KeyIndex>(
+        &self,
+        state: &mut [u8],
+        smap: &StructMapSlot<I>,
+        pos: u32,
+        cols: &[&[u8]],
+    ) {
         let Some(arena) = self.arena else {
             return;
         };
@@ -3305,11 +3524,11 @@ impl ArenaWrites {
 /// Both batch and nested execution apply the same row replacement and arena journal.
 /// `NEEDS_GROWTH` names `slot_idx`; the calling VM records it.
 #[allow(clippy::too_many_arguments)]
-fn upsert_struct_map_row(
+fn upsert_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    smap: &StructMapSlot,
+    smap: &StructMapSlot<I>,
     slot_idx: u32,
     key: u32,
     val_cols: &[u32],
@@ -3317,6 +3536,7 @@ fn upsert_struct_map_row(
     array_fields: &[ArrayField],
     cols: &[&[u8]],
     element_idx: u32,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> u32 {
     if key == EMPTY_KEY || key == TOMBSTONE {
         return OK;
@@ -3330,6 +3550,7 @@ fn upsert_struct_map_row(
         field_idxs,
         cols,
         element_idx,
+        cx,
     ) {
         Ok(row) => row,
         Err(ErrorCode::CapacityExceeded) => return NEEDS_GROWTH,
@@ -3344,7 +3565,7 @@ fn upsert_struct_map_row(
             Err(error) => return error as u32,
         }
     };
-    match row.apply(undo, delta_mode, state, arrays.as_ref()) {
+    match row.apply(undo, delta_mode, state, arrays.as_ref(), cx) {
         Ok(()) => OK,
         Err(error) => error as u32,
     }
@@ -3365,16 +3586,17 @@ fn counts_error(error: crate::counts_fold::CountsFoldError) -> ErrorCode {
 /// Apply one physically planned fold. Schema-role certification belongs to
 /// the admitted program; this mutation owns its exact physical journal.
 /// `NEEDS_GROWTH` names `op.slot`; the calling VM records it.
-fn fold_counts_row(
+fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
     op: &crate::counts_fold::CountsFoldOp<'_>,
     cols: &[&[u8]],
     element: u32,
+    cx: &mut KeyCx<'_, I, S>,
 ) -> u32 {
     use crate::counts_fold::{CountsFoldTarget, MAX_COUNTS_HISTOGRAMS, MAX_COUNTS_MASKS};
-    let map = match state_init::bind_struct_map(state, op.slot) {
+    let map = match state_init::bind_struct_map_in::<I>(state, op.slot) {
         Ok(map) => map,
         Err(error) => return error as u32,
     };
@@ -3393,13 +3615,15 @@ fn fold_counts_row(
         Ok(sample) => sample,
         Err(error) => return counts_error(error) as u32,
     };
-    let Some(upsert) = map.plan_upsert(state, key) else {
-        return NEEDS_GROWTH;
+    let target = match map.plan_upsert(state, key, cx) {
+        Ok(plan) => RowTarget::of(plan),
+        Err(ErrorCode::CapacityExceeded) => return NEEDS_GROWTH,
+        Err(error) => return error as u32,
     };
-    let stored = if upsert.is_new {
+    let stored = if target.is_new() {
         None
     } else {
-        match map.arena_field(state, upsert.pos, op.field_idx) {
+        match map.arena_field(state, target.pos(), op.field_idx) {
             Ok(frame) => frame,
             Err(error) => return error as u32,
         }
@@ -3412,7 +3636,7 @@ fn fold_counts_row(
         Ok(arena) => arena,
         Err(error) => return error as u32,
     };
-    let row = map.row_off(upsert.pos);
+    let row = map.row_off(target.pos());
     let cell = row + map.field_offset(state, op.field_idx);
     let (frame_offset, frame_len, next_used) = match plan.target() {
         CountsFoldTarget::Insert => {
@@ -3433,7 +3657,13 @@ fn fold_counts_row(
             arena.used,
         ),
     };
-    const MAX_RANGES: usize = 2 + MAX_COUNTS_HISTOGRAMS + MAX_COUNTS_MASKS;
+    // An insert names the size cell, its index writes, the row, the arena
+    // used word and the frame; a stored fold names its frame's ranges.
+    const MAX_RANGES: usize = {
+        let stored = 2 + MAX_COUNTS_HISTOGRAMS + MAX_COUNTS_MASKS;
+        let insert = 5 + INDEX_WRITES_MAX;
+        if stored > insert { stored } else { insert }
+    };
     let meta = slot_meta_base(op.slot);
     let capture = match undo.begin_capture(state, || {
         // Entries past the change flag stay empty; an empty range plans nothing.
@@ -3442,16 +3672,17 @@ fn fold_counts_row(
             CountsFoldTarget::Insert => {
                 ranges[0] = (
                     meta + SlotMetaOffset::SIZE,
-                    if upsert.is_new { 4 } else { 0 },
+                    if target.is_new() { 4 } else { 0 },
                 );
-                ranges[1] = (
-                    map.keys_off + upsert.pos * 4,
-                    if upsert.is_new { 4 } else { 0 },
-                );
-                ranges[2] = (row, map.row_size);
-                ranges[3] = (arena.header + 4, 4);
-                ranges[4] = (frame_offset, frame_len);
-                5
+                let mut len = 1;
+                for &range in target.writes().as_slice() {
+                    ranges[len] = range;
+                    len += 1;
+                }
+                ranges[len] = (row, map.row_size);
+                ranges[len + 1] = (arena.header + 4, 4);
+                ranges[len + 2] = (frame_offset, frame_len);
+                len + 3
             }
             CountsFoldTarget::Stored => op.journal_ranges(&plan, frame_offset, &mut ranges),
         };
@@ -3462,8 +3693,11 @@ fn fold_counts_row(
         Err(error) => return error as u32,
     };
     if plan.target() == CountsFoldTarget::Insert {
-        map.apply_upsert(state, key, upsert);
-        if upsert.is_new {
+        if let RowTarget::New(new) = &target {
+            if let Err(error) = map.apply_upsert(state, key, new, cx) {
+                undo.finish_capture(delta_mode, state, capture);
+                return error as u32;
+            }
             map.clear_bitset(state, row);
         }
         StructMapSlot::set_field_bit(state, row, op.field_idx);
@@ -3476,7 +3710,7 @@ fn fold_counts_row(
         &plan,
         &mut state[frame_offset as usize..(frame_offset + frame_len) as usize],
     );
-    state[(meta + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if upsert.is_new {
+    state[(meta + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if target.is_new() {
         ChangeFlag::INSERTED
     } else {
         ChangeFlag::UPDATED
@@ -3747,101 +3981,9 @@ const INVALID_PROGRAM: u32 = ErrorCode::InvalidProgram as u32;
 const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
 const OUT_OF_MEMORY: u32 = ErrorCode::OutOfMemory as u32;
 
+/// The [`HashIndex`] VM's batch entry points: its key lanes are `u32`s, so
+/// no resolver is passed.
 impl Vm {
-    fn sweep_stored_rows(
-        &mut self,
-        delta_mode: bool,
-        state: &mut [u8],
-        (slot, predicate_col): (u32, u32),
-        cols: &[&[u8]],
-        batch_len: u32,
-        mut live: Option<&mut LiveColumns<'_, '_>>,
-    ) -> Result<(), ErrorCode> {
-        let map = CheckedStructMap::bind(state, slot)?.view;
-        if batch_len == 0 {
-            return Ok(());
-        }
-        let predicate_col_index =
-            usize::try_from(predicate_col).map_err(|_| ErrorCode::InvalidProgram)?;
-        let bound = col_u32_exact(col_at(cols, predicate_col_index), batch_len)
-            .ok_or(ErrorCode::ColumnUnderrun)?;
-        let logical_row = batch_len - 1;
-        let logical_index = usize::try_from(logical_row).map_err(|_| ErrorCode::InvalidProgram)?;
-        self.sweep_ranges.clear();
-        let size = map.size(state);
-        let ranges = usize::try_from(size)
-            .map_err(|_| ErrorCode::OutOfMemory)?
-            .checked_add(1)
-            .ok_or(ErrorCode::OutOfMemory)?;
-        if self.scratch_sealed {
-            debug_assert!(
-                self.sweep_ranges.capacity() >= ranges,
-                "batch admission must back the stored-row sweep plan"
-            );
-        } else {
-            self.sweep_ranges
-                .try_reserve(ranges)
-                .map_err(|_| ErrorCode::OutOfMemory)?;
-        }
-        let mut removed = 0u32;
-        for position in 0..map.capacity {
-            let key = map.key_at(state, position);
-            if key == EMPTY_KEY || key == TOMBSTONE {
-                continue;
-            }
-            let predicate = match live.as_deref_mut().and_then(|live| {
-                live.stored_cell(
-                    predicate_col,
-                    logical_row,
-                    state,
-                    cols,
-                    StoredRow::new(state, &map, position),
-                )
-            }) {
-                Some(result) => result?,
-                None => bound[logical_index],
-            };
-            if predicate == 0 {
-                continue;
-            }
-            if removed == size {
-                return Err(ErrorCode::InvalidState);
-            }
-            if removed == 0 {
-                self.sweep_ranges.push((map.size_off, 4));
-            }
-            let offset = map.keys_off + position * 4;
-            if let Some((_, len)) = self
-                .sweep_ranges
-                .last_mut()
-                .filter(|(start, len)| removed != 0 && *start + *len == offset)
-            {
-                *len += 4;
-            } else {
-                self.sweep_ranges.push((offset, 4));
-            }
-            removed += 1;
-        }
-        if removed == 0 {
-            return Ok(());
-        }
-        let size = size.checked_sub(removed).ok_or(ErrorCode::InvalidState)?;
-        let flags = usize::try_from(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS)
-            .map_err(|_| ErrorCode::InvalidState)?;
-        let capture = self
-            .undo
-            .begin_capture(state, || self.sweep_ranges.as_slice())?;
-        for &(offset, len) in &self.sweep_ranges[1..] {
-            for at in (offset..offset + len).step_by(4) {
-                bytes::write_u32(state, at, TOMBSTONE);
-            }
-        }
-        map.set_size(state, size);
-        state[flags] |= ChangeFlag::REMOVED;
-        self.undo.finish_capture(delta_mode, state, capture);
-        Ok(())
-    }
-
     /// Execute one batch using the VM's normal mutation lane, over a batch
     /// with no live derived columns (`row_exprs`).
     pub fn execute_batch(
@@ -3851,7 +3993,7 @@ impl Vm {
         cols: &[&[u8]],
         batch_len: u32,
     ) -> u32 {
-        self.execute_impl(false, state, program, cols, batch_len, None)
+        self.execute_batch_in(state, program, cols, batch_len, &NoStrings)
     }
 
     /// Execute one batch using the VM's delta mutation lane, over a batch
@@ -3863,7 +4005,7 @@ impl Vm {
         cols: &[&[u8]],
         batch_len: u32,
     ) -> u32 {
-        self.execute_impl(true, state, program, cols, batch_len, None)
+        self.execute_batch_delta_in(state, program, cols, batch_len, &NoStrings)
     }
 
     /// Execute one batch using the VM's normal mutation lane; the conditional
@@ -3877,7 +4019,7 @@ impl Vm {
         batch_len: u32,
         live: &mut LiveColumns<'_, '_>,
     ) -> u32 {
-        self.execute_impl(false, state, program, cols, batch_len, Some(live))
+        self.execute_batch_live_in(state, program, cols, batch_len, live, &NoStrings)
     }
 
     /// [`Self::execute_batch_live`] on the delta mutation lane.
@@ -3889,9 +4031,144 @@ impl Vm {
         batch_len: u32,
         live: &mut LiveColumns<'_, '_>,
     ) -> u32 {
-        self.execute_impl(true, state, program, cols, batch_len, Some(live))
+        self.execute_batch_delta_live_in(state, program, cols, batch_len, live, &NoStrings)
+    }
+}
+
+impl<I: KeyIndex> Vm<I> {
+    /// Remove every stored row the sweep predicate selects. Every predicate
+    /// is evaluated, in index order, before any row changes; then each
+    /// selected row leaves the index in its own capture of the size and the
+    /// index plan's writes. The rows' bytes stay as they stand.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_stored_rows<S: InternBytes + ?Sized>(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        (slot, predicate_col): (u32, u32),
+        cols: &[&[u8]],
+        batch_len: u32,
+        mut live: Option<&mut LiveColumns<'_, '_>>,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<(), ErrorCode> {
+        let map = CheckedStructMap::<I>::bind_in(state, slot)?.view;
+        if batch_len == 0 {
+            return Ok(());
+        }
+        let predicate_col_index =
+            usize::try_from(predicate_col).map_err(|_| ErrorCode::InvalidProgram)?;
+        let bound = col_u32_exact(col_at(cols, predicate_col_index), batch_len)
+            .ok_or(ErrorCode::ColumnUnderrun)?;
+        let logical_row = batch_len - 1;
+        let logical_index = usize::try_from(logical_row).map_err(|_| ErrorCode::InvalidProgram)?;
+        self.sweep_keys.clear();
+        let rows = usize::try_from(map.size(state)).map_err(|_| ErrorCode::OutOfMemory)?;
+        if self.scratch_sealed {
+            debug_assert!(
+                self.sweep_keys.capacity() >= rows,
+                "batch admission must back the stored-row sweep plan"
+            );
+        } else {
+            self.sweep_keys
+                .try_reserve(rows)
+                .map_err(|_| ErrorCode::OutOfMemory)?;
+        }
+        let mut cursor = I::first(state, map.index(), cx)?;
+        while let Some(position) = cursor {
+            let key = map.key_at(state, position).ok_or(ErrorCode::InvalidState)?;
+            let predicate = match live.as_deref_mut().and_then(|live| {
+                live.stored_cell(
+                    predicate_col,
+                    logical_row,
+                    state,
+                    cols,
+                    StoredRow::new(state, map.rows(), position, key, None),
+                )
+            }) {
+                Some(result) => result?,
+                None => bound[logical_index],
+            };
+            if predicate != 0 {
+                if self.sweep_keys.len() == rows {
+                    return Err(ErrorCode::InvalidState);
+                }
+                self.sweep_keys.push(key);
+            }
+            cursor = I::next(state, map.index(), position, cx)?;
+        }
+        if self.sweep_keys.is_empty() {
+            return Ok(());
+        }
+        let flags = usize::try_from(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS)
+            .map_err(|_| ErrorCode::InvalidState)?;
+        for index in 0..self.sweep_keys.len() {
+            let key = self.sweep_keys[index];
+            let plan = map
+                .plan_remove(state, key, cx)?
+                .ok_or(ErrorCode::InvalidState)?;
+            let capture = self.undo.begin_capture(state, || {
+                CaptureRanges::new()
+                    .push((map.size_off, 4))
+                    .writes(&plan.writes)
+            })?;
+            let removed = map.apply_remove(state, &plan, cx);
+            self.undo.finish_capture(delta_mode, state, capture);
+            removed?;
+        }
+        state[flags] |= ChangeFlag::REMOVED;
+        Ok(())
     }
 
+    /// [`Vm::execute_batch`] for key-index family `I`, resolving interned key
+    /// lanes through `strings`.
+    pub fn execute_batch_in<S: InternBytes + ?Sized>(
+        &mut self,
+        state: &mut [u8],
+        program: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        strings: &S,
+    ) -> u32 {
+        self.execute_impl(false, state, program, cols, batch_len, None, strings)
+    }
+
+    /// [`Vm::execute_batch_delta`] for key-index family `I`.
+    pub fn execute_batch_delta_in<S: InternBytes + ?Sized>(
+        &mut self,
+        state: &mut [u8],
+        program: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        strings: &S,
+    ) -> u32 {
+        self.execute_impl(true, state, program, cols, batch_len, None, strings)
+    }
+
+    /// [`Vm::execute_batch_live`] for key-index family `I`.
+    pub fn execute_batch_live_in<S: InternBytes + ?Sized>(
+        &mut self,
+        state: &mut [u8],
+        program: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        live: &mut LiveColumns<'_, '_>,
+        strings: &S,
+    ) -> u32 {
+        self.execute_impl(false, state, program, cols, batch_len, Some(live), strings)
+    }
+
+    /// [`Vm::execute_batch_delta_live`] for key-index family `I`.
+    pub fn execute_batch_delta_live_in<S: InternBytes + ?Sized>(
+        &mut self,
+        state: &mut [u8],
+        program: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        live: &mut LiveColumns<'_, '_>,
+        strings: &S,
+    ) -> u32 {
+        self.execute_impl(true, state, program, cols, batch_len, Some(live), strings)
+    }
     /// Evict expired entries on the selected lane. A delta operation retains
     /// complete paired physical redo; an undo-only operation does not.
     pub fn evict_all_expired(
@@ -3901,14 +4178,14 @@ impl Vm {
         now: f64,
     ) -> Result<u32, ErrorCode> {
         if state.len() < columine_types::types::STATE_HEADER_SIZE as usize
-            || bytes::read_u32(state, 0) != STATE_MAGIC
-            || state[StateHeaderOffset::FORMAT_VERSION as usize] != STATE_FORMAT_VERSION
+            || bytes::read_u32(state, 0) != I::STATE_MAGIC
+            || state[StateHeaderOffset::FORMAT_VERSION as usize] != I::FORMAT_VERSION
         {
             return Err(ErrorCode::InvalidState);
         }
         // The image is the host's, as at batch entry: check its layout
         // before eviction trusts the slot metadata it reads.
-        state_init::validate_layout(state)?;
+        state_init::validate_layout::<I>(state)?;
         let slots = state_num_slots(state);
         self.change_flag_boundary(delta_mode, state, |vm, state| {
             let mut total = 0u32;
@@ -3931,8 +4208,10 @@ impl Vm {
         })?
     }
 
-    /// Execute the core batch implementation for normal or delta mode.
-    fn execute_impl(
+    /// Execute the core batch implementation for normal or delta mode, with
+    /// the family's scratch lent to the batch's key-index calls.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_impl<S: InternBytes + ?Sized>(
         &mut self,
         delta_mode: bool,
         state: &mut [u8],
@@ -3940,11 +4219,37 @@ impl Vm {
         cols: &[&[u8]],
         batch_len: u32,
         live: Option<&mut LiveColumns<'_, '_>>,
+        strings: &S,
+    ) -> u32 {
+        let mut scratch = core::mem::take(&mut self.keys.index);
+        let result = self.execute_checked(
+            delta_mode,
+            state,
+            program,
+            cols,
+            batch_len,
+            live,
+            &mut KeyCx::new(strings, &mut scratch),
+        );
+        self.keys.index = scratch;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_checked<S: InternBytes + ?Sized>(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        program: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        live: Option<&mut LiveColumns<'_, '_>>,
+        cx: &mut KeyCx<'_, I, S>,
     ) -> u32 {
         self.needs_growth_slot = None;
         if state.len() < columine_types::types::STATE_HEADER_SIZE as usize
-            || bytes::read_u32(state, 0) != STATE_MAGIC
-            || state[StateHeaderOffset::FORMAT_VERSION as usize] != STATE_FORMAT_VERSION
+            || bytes::read_u32(state, 0) != I::STATE_MAGIC
+            || state[StateHeaderOffset::FORMAT_VERSION as usize] != I::FORMAT_VERSION
         {
             return INVALID_STATE;
         }
@@ -3960,7 +4265,7 @@ impl Vm {
         // The image is the host's: check every slot's geometry before any
         // kernel trusts the metadata it reads. Nested outer pointers are
         // checked where a kernel follows one, not walked per batch.
-        if let Err(error) = state_init::validate_layout(state) {
+        if let Err(error) = state_init::validate_layout::<I>(state) {
             return error as u32;
         }
         // A FOR_EACH body's plan is drawn from the reduce section: backed
@@ -3990,7 +4295,7 @@ impl Vm {
         }
         match self
             .declarations
-            .matches(sections.init_code, sections.header.num_slots, state)
+            .matches::<I>(sections.init_code, sections.header.num_slots, state)
         {
             Ok(true) => {}
             Ok(false) => return INVALID_PROGRAM,
@@ -3998,9 +4303,14 @@ impl Vm {
         }
         self.change_flag_boundary(delta_mode, state, |vm, state| {
             let mut live = live;
-            let admission =
-                vm.capacity
-                    .admit(state, sections.reduce_code, cols, batch_len, &vm.bitmap_env);
+            let admission = vm.capacity.admit(
+                state,
+                sections.reduce_code,
+                cols,
+                batch_len,
+                &vm.bitmap_env,
+                cx,
+            );
             if admission == Admission::OutOfMemory {
                 return OUT_OF_MEMORY;
             }
@@ -4017,6 +4327,7 @@ impl Vm {
                     cols,
                     batch_len,
                     live.as_deref_mut(),
+                    cx,
                 );
                 if result != OK {
                     if result == NEEDS_GROWTH {
@@ -4036,6 +4347,7 @@ impl Vm {
                 cols,
                 batch_len,
                 live,
+                cx,
             );
             vm.unseal_scratch();
             debug_assert!(
@@ -4052,13 +4364,14 @@ impl Vm {
     /// `OutOfMemory` when the copy cannot be backed. Execution is
     /// deterministic, so a batch this run admits runs the same way for real,
     /// and one it refuses has written nothing to `state`.
-    fn dry_run(
+    fn dry_run<S: InternBytes + ?Sized>(
         &mut self,
         state: &[u8],
         code: &[u8],
         cols: &[&[u8]],
         batch_len: u32,
         live: Option<&mut LiveColumns<'_, '_>>,
+        cx: &mut KeyCx<'_, I, S>,
     ) -> u32 {
         // The image is the journal's buffer: while the window is overflowed
         // it is the shadow, so this batch's copy gets storage of its own.
@@ -4076,7 +4389,7 @@ impl Vm {
         } else {
             image.extend_from_slice(state);
             let enabled = core::mem::replace(&mut self.undo.enabled, false);
-            let result = self.execute_ops(false, &mut image, code, cols, batch_len, live);
+            let result = self.execute_ops(false, &mut image, code, cols, batch_len, live, cx);
             self.undo.enabled = enabled;
             result
         };
@@ -4091,7 +4404,8 @@ impl Vm {
         self.capacity.counts
     }
 
-    fn execute_ops(
+    #[allow(clippy::too_many_arguments)]
+    fn execute_ops<S: InternBytes + ?Sized>(
         &mut self,
         delta_mode: bool,
         state: &mut [u8],
@@ -4099,6 +4413,7 @@ impl Vm {
         cols: &[&[u8]],
         batch_len: u32,
         mut live: Option<&mut LiveColumns<'_, '_>>,
+        cx: &mut KeyCx<'_, I, S>,
     ) -> u32 {
         let mut pc = 0usize;
         while pc < code.len() {
@@ -4124,6 +4439,7 @@ impl Vm {
                         cols,
                         batch_len,
                         live.as_deref_mut(),
+                        cx,
                     ) {
                         return error as u32;
                     }
@@ -4552,7 +4868,7 @@ impl Vm {
                     };
                     pc = operands.end;
 
-                    let smap = match state_init::bind_struct_map(state, operands.slot) {
+                    let smap = match state_init::bind_struct_map_in::<I>(state, operands.slot) {
                         Ok(map) => map,
                         Err(error) => return error as u32,
                     };
@@ -4569,7 +4885,7 @@ impl Vm {
                     ));
                     for i in 0..batch_len {
                         let key = keys[i as usize];
-                        match should_write_struct_map_row(state, &smap, key, pick, cols, i) {
+                        match should_write_struct_map_row(state, &smap, key, pick, cols, i, cx) {
                             Ok(true) => {}
                             Ok(false) => continue,
                             Err(error) => return error as u32,
@@ -4587,6 +4903,7 @@ impl Vm {
                             operands.array_fields(),
                             cols,
                             i,
+                            cx,
                         );
                         if result != OK {
                             return self.growth_of(operands.slot, result);
@@ -4608,6 +4925,7 @@ impl Vm {
                             &operands,
                             cols,
                             row,
+                            cx,
                         );
                         if result != OK {
                             return self.growth_of(operands.slot, result);
@@ -4620,6 +4938,10 @@ impl Vm {
                         return INVALID_PROGRAM;
                     };
                     pc = operands.end;
+                    let smap = match state_init::bind_struct_map2_in::<I>(state, operands.slot) {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
                     let keys1 = batch_col!(col_u32_exact(
                         col_at(cols, operands.key1_col as usize),
                         batch_len
@@ -4634,6 +4956,7 @@ impl Vm {
                             &mut self.undo,
                             delta_mode,
                             state,
+                            &smap,
                             operands.slot,
                             keys1[index],
                             keys2[index],
@@ -4641,6 +4964,7 @@ impl Vm {
                             operands.vals.fields(),
                             cols,
                             i,
+                            cx,
                         );
                         if result != ErrorCode::Ok {
                             return self.signal_growth(operands.slot, result);
@@ -4653,7 +4977,11 @@ impl Vm {
                         return INVALID_PROGRAM;
                     };
                     pc = operands.end;
-                    let smap = StructMap2Slot::bind(state, operands.row.slot);
+                    let smap = match state_init::bind_struct_map2_in::<I>(state, operands.row.slot)
+                    {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
                     if !validate_struct_map2_tuple(state, &smap, &operands) {
                         return INVALID_PROGRAM;
                     }
@@ -4671,11 +4999,13 @@ impl Vm {
                             &mut self.undo,
                             delta_mode,
                             state,
+                            &smap,
                             &operands,
                             keys1[index],
                             keys2[index],
                             cols,
                             i,
+                            cx,
                         );
                         if result != ErrorCode::Ok {
                             return self.signal_growth(operands.row.slot, result);
@@ -4690,6 +5020,10 @@ impl Vm {
                         operand!(r.index()),
                     );
                     pc = r.pos();
+                    let smap = match state_init::bind_struct_map2_in::<I>(state, slot) {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
                     let keys1 =
                         batch_col!(col_u32_exact(col_at(cols, key1_col as usize), batch_len));
                     let keys2 =
@@ -4699,9 +5033,36 @@ impl Vm {
                             &mut self.undo,
                             delta_mode,
                             state,
+                            &smap,
                             slot,
                             keys1[index],
                             keys2[index],
+                            cx,
+                        );
+                        if result != ErrorCode::Ok {
+                            return result as u32;
+                        }
+                    }
+                }
+
+                Opcode::BatchStructMap2RemovePrefix => {
+                    let (slot, key1_col) = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
+                    let smap = match state_init::bind_struct_map2_in::<I>(state, slot) {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
+                    let keys1 =
+                        batch_col!(col_u32_exact(col_at(cols, key1_col as usize), batch_len));
+                    for &key1 in keys1 {
+                        let result = remove_struct_map2_prefix(
+                            &mut self.undo,
+                            delta_mode,
+                            state,
+                            &smap,
+                            slot,
+                            key1,
+                            cx,
                         );
                         if result != ErrorCode::Ok {
                             return result as u32;
@@ -4714,8 +5075,14 @@ impl Vm {
                     pc = r.pos();
                     let keys = batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len));
                     for &key in keys {
-                        let result =
-                            single_struct_map_remove(&mut self.undo, delta_mode, state, slot, key);
+                        let result = single_struct_map_remove(
+                            &mut self.undo,
+                            delta_mode,
+                            state,
+                            slot,
+                            key,
+                            cx,
+                        );
                         if result != ErrorCode::Ok {
                             return result as u32;
                         }
@@ -4727,7 +5094,7 @@ impl Vm {
                         return INVALID_PROGRAM;
                     };
                     pc = operands.end;
-                    let smap = match state_init::bind_struct_map(state, operands.row.slot) {
+                    let smap = match state_init::bind_struct_map_in::<I>(state, operands.row.slot) {
                         Ok(map) => map,
                         Err(error) => return error as u32,
                     };
@@ -4738,7 +5105,7 @@ impl Vm {
                         return INVALID_PROGRAM;
                     }
                     let companion =
-                        match state_init::bind_struct_map(state, operands.companion_slot) {
+                        match state_init::bind_struct_map_in::<I>(state, operands.companion_slot) {
                             Ok(map) => map,
                             Err(error) => return error as u32,
                         };
@@ -4767,6 +5134,7 @@ impl Vm {
                             guard_keys[i as usize],
                             cols,
                             i,
+                            cx,
                         );
                         if result != OK {
                             return self.growth_of(operands.row.slot, result);
@@ -4808,6 +5176,7 @@ impl Vm {
                             col_at(cols, col_idx as usize),
                             match_ids,
                             live.as_deref_mut(),
+                            cx,
                         )
                     };
                     self.element_plan = plan;
@@ -4830,7 +5199,7 @@ impl Vm {
     /// aggregates skips pass one, and one with nothing but aggregates widens
     /// to nothing and runs no row.
     #[allow(clippy::too_many_arguments)]
-    fn run_for_each(
+    fn run_for_each<S: InternBytes + ?Sized>(
         &mut self,
         delta_mode: bool,
         state: &mut [u8],
@@ -4841,6 +5210,7 @@ impl Vm {
         type_col: &[u8],
         match_ids: &[u8],
         mut live: Option<&mut LiveColumns<'_, '_>>,
+        cx: &mut KeyCx<'_, I, S>,
     ) -> u32 {
         // Both passes index the type column with row indices up to
         // batch_len; a short column is a malformed batch.
@@ -4887,6 +5257,7 @@ impl Vm {
                 ei,
                 NO_PARENT_TS_COL,
                 live.as_deref_mut(),
+                cx,
             );
             if result != OK {
                 return result;
@@ -5048,7 +5419,7 @@ impl Vm {
 
     /// Execute element opcodes one at a time, recursing through FLAT_MAP.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    fn execute_element_opcodes(
+    fn execute_element_opcodes<S: InternBytes + ?Sized>(
         &mut self,
         delta_mode: bool,
         state: &mut [u8],
@@ -5058,6 +5429,7 @@ impl Vm {
         parent_idx: u32,
         parent_ts_col: u32,
         mut live: Option<&mut LiveColumns<'_, '_>>,
+        cx: &mut KeyCx<'_, I, S>,
     ) -> u32 {
         // Column cell reads at an element index. Bounds are the column's own
         // length (child columns can be longer than batch_len under FLAT_MAP).
@@ -5530,7 +5902,7 @@ impl Vm {
                     }
                     bpc = operands.end;
 
-                    let smap = match state_init::bind_struct_map(state, operands.slot) {
+                    let smap = match state_init::bind_struct_map_in::<I>(state, operands.slot) {
                         Ok(map) => map,
                         Err(error) => return error as u32,
                     };
@@ -5541,12 +5913,12 @@ impl Vm {
                         return INVALID_PROGRAM;
                     };
                     let key = cell_u32(cols, operands.key_col, child_idx);
-                    let should_write =
-                        match should_write_struct_map_row(state, &smap, key, pick, cols, child_idx)
-                        {
-                            Ok(should_write) => should_write,
-                            Err(error) => return error as u32,
-                        };
+                    let should_write = match should_write_struct_map_row(
+                        state, &smap, key, pick, cols, child_idx, cx,
+                    ) {
+                        Ok(should_write) => should_write,
+                        Err(error) => return error as u32,
+                    };
                     if should_write {
                         let result = upsert_struct_map_row(
                             &mut self.undo,
@@ -5560,6 +5932,7 @@ impl Vm {
                             operands.array_fields(),
                             cols,
                             child_idx,
+                            cx,
                         );
                         if result != OK {
                             let slot = operands.slot;
@@ -5581,6 +5954,7 @@ impl Vm {
                         &operands,
                         cols,
                         child_idx,
+                        cx,
                     );
                     if result != OK {
                         return self.growth_of(operands.slot, result);
@@ -5594,10 +5968,15 @@ impl Vm {
                         return INVALID_PROGRAM;
                     }
                     bpc = operands.end;
+                    let smap = match state_init::bind_struct_map2_in::<I>(state, operands.slot) {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
                     let result = single_struct_map2_upsert_last(
                         &mut self.undo,
                         delta_mode,
                         state,
+                        &smap,
                         operands.slot,
                         cell_u32(cols, operands.key1_col, child_idx),
                         cell_u32(cols, operands.key2_col, child_idx),
@@ -5605,6 +5984,7 @@ impl Vm {
                         operands.vals.fields(),
                         cols,
                         child_idx,
+                        cx,
                     );
                     if result != ErrorCode::Ok {
                         let slot = operands.slot;
@@ -5617,7 +5997,11 @@ impl Vm {
                         return INVALID_PROGRAM;
                     }
                     bpc = operands.end;
-                    let smap = StructMap2Slot::bind(state, operands.row.slot);
+                    let smap = match state_init::bind_struct_map2_in::<I>(state, operands.row.slot)
+                    {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
                     if !validate_struct_map2_tuple(state, &smap, operands) {
                         return INVALID_PROGRAM;
                     }
@@ -5625,11 +6009,13 @@ impl Vm {
                         &mut self.undo,
                         delta_mode,
                         state,
+                        &smap,
                         operands,
                         cell_u32(cols, operands.row.key1_col, child_idx),
                         cell_u32(cols, operands.row.key2_col, child_idx),
                         cols,
                         child_idx,
+                        cx,
                     );
                     if result != ErrorCode::Ok {
                         let slot = operands.row.slot;
@@ -5643,13 +6029,39 @@ impl Vm {
                         operand!(r.index()),
                     );
                     bpc = r.pos();
+                    let smap = match state_init::bind_struct_map2_in::<I>(state, slot) {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
                     let result = single_struct_map2_remove(
                         &mut self.undo,
                         delta_mode,
                         state,
+                        &smap,
                         slot,
                         cell_u32(cols, key1_col, child_idx),
                         cell_u32(cols, key2_col, child_idx),
+                        cx,
+                    );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
+                }
+                Opcode::BatchStructMap2RemovePrefix => {
+                    let (slot, key1_col) = (operand!(r.index()), operand!(r.index()));
+                    bpc = r.pos();
+                    let smap = match state_init::bind_struct_map2_in::<I>(state, slot) {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
+                    let result = remove_struct_map2_prefix(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        &smap,
+                        slot,
+                        cell_u32(cols, key1_col, child_idx),
+                        cx,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -5665,6 +6077,7 @@ impl Vm {
                         state,
                         slot,
                         cell_u32(cols, key_col, child_idx),
+                        cx,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -5676,7 +6089,7 @@ impl Vm {
                         return INVALID_PROGRAM;
                     }
                     bpc = operands.end;
-                    let smap = match state_init::bind_struct_map(state, operands.row.slot) {
+                    let smap = match state_init::bind_struct_map_in::<I>(state, operands.row.slot) {
                         Ok(map) => map,
                         Err(error) => return error as u32,
                     };
@@ -5687,7 +6100,7 @@ impl Vm {
                         return INVALID_PROGRAM;
                     }
                     let companion =
-                        match state_init::bind_struct_map(state, operands.companion_slot) {
+                        match state_init::bind_struct_map_in::<I>(state, operands.companion_slot) {
                             Ok(map) => map,
                             Err(error) => return error as u32,
                         };
@@ -5707,6 +6120,7 @@ impl Vm {
                         cell_u32(cols, operands.guard_key_col, child_idx),
                         cols,
                         child_idx,
+                        cx,
                     );
                     if result != OK {
                         let slot = operands.row.slot;
@@ -5736,11 +6150,15 @@ impl Vm {
                     bpc = r.pos();
 
                     let key = cell_u32(cols, key_col, child_idx);
-                    let probe = match state_init::bind_struct_map(state, probe_slot) {
+                    let probe = match state_init::bind_struct_map_in::<I>(state, probe_slot) {
                         Ok(probe) => probe,
                         Err(error) => return error as u32,
                     };
-                    let Some(probe_pos) = probe.find(state, key) else {
+                    let probe_pos = match probe.lookup(state, key, cx) {
+                        Ok(found) => found,
+                        Err(error) => return error as u32,
+                    };
+                    let Some(probe_pos) = probe_pos else {
                         // Miss: skip (inner join); 'null' (left join) is
                         // compiler-rejected — treat defensively as skip.
                         continue;
@@ -5758,6 +6176,7 @@ impl Vm {
                         probe_row,
                         &probe_fis[..num_fields],
                         &out_fis[..num_fields],
+                        cx,
                     );
                     if result != ErrorCode::Ok {
                         return self.signal_growth(out_slot, result);
@@ -5793,7 +6212,7 @@ impl Vm {
                     bpc = r.pos();
 
                     let key = cell_u32(cols, key_col, child_idx);
-                    let probe = match state_init::bind_struct_map(state, probe_slot) {
+                    let probe = match state_init::bind_struct_map_in::<I>(state, probe_slot) {
                         Ok(probe) => probe,
                         Err(error) => return error as u32,
                     };
@@ -5807,7 +6226,11 @@ impl Vm {
                             return INVALID_PROGRAM;
                         }
                     }
-                    let Some(probe_pos) = probe.find(state, key) else {
+                    let probe_pos = match probe.lookup(state, key, cx) {
+                        Ok(found) => found,
+                        Err(error) => return error as u32,
+                    };
+                    let Some(probe_pos) = probe_pos else {
                         continue;
                     };
                     let probe_row = probe.row_off(probe_pos);
@@ -5844,7 +6267,7 @@ impl Vm {
                     match route_kind {
                         // kind 0: card-one struct field on the `nodes` map.
                         0 => {
-                            let out = match state_init::bind_struct_map(state, dest_slot) {
+                            let out = match state_init::bind_struct_map_in::<I>(state, dest_slot) {
                                 Ok(out) => out,
                                 Err(error) => return error as u32,
                             };
@@ -5879,6 +6302,7 @@ impl Vm {
                                 &cell,
                                 fsize,
                                 is_retract,
+                                cx,
                             );
                             if code != ErrorCode::Ok {
                                 return self.signal_growth(dest_slot, code);
@@ -5972,7 +6396,7 @@ impl Vm {
                     match route_kind {
                         // kind 0: card-one struct field on the `nodes` map.
                         0 => {
-                            let out = match state_init::bind_struct_map(state, dest_slot) {
+                            let out = match state_init::bind_struct_map_in::<I>(state, dest_slot) {
                                 Ok(out) => out,
                                 Err(error) => return error as u32,
                             };
@@ -6001,6 +6425,7 @@ impl Vm {
                                 &cell,
                                 cell_size,
                                 is_retract,
+                                cx,
                             );
                             if code != ErrorCode::Ok {
                                 return self.signal_growth(dest_slot, code);
@@ -6109,7 +6534,7 @@ impl Vm {
                     let dest_field_idx = route_dest_fields[ri];
                     let v_col = route_v_cols[ri];
 
-                    let guarded = match state_init::bind_struct_map(state, guard_slot) {
+                    let guarded = match state_init::bind_struct_map_in::<I>(state, guard_slot) {
                         Ok(guarded) => guarded,
                         Err(error) => return error as u32,
                     };
@@ -6160,18 +6585,19 @@ impl Vm {
                     // or new; a retract only looks it up, because removing a value
                     // never creates a row.
                     let target = if is_retract {
-                        guarded
-                            .find(state, key)
-                            .map(|pos| crate::struct_map::Upsert { pos, is_new: false })
+                        match guarded.lookup(state, key, cx) {
+                            Ok(found) => found.map(RowTarget::Present),
+                            Err(error) => return error as u32,
+                        }
                     } else {
-                        let Some(planned) = guarded.plan_upsert(state, key) else {
-                            return self.signal_growth(guard_slot, ErrorCode::CapacityExceeded);
-                        };
-                        Some(planned)
+                        match guarded.plan_upsert(state, key, cx) {
+                            Ok(plan) => Some(RowTarget::of(plan)),
+                            Err(error) => return self.signal_growth(guard_slot, error),
+                        }
                     };
-                    let stored = target
-                        .filter(|up| !up.is_new)
-                        .and_then(|up| guard.stored(state, &guarded, guarded.row_off(up.pos)));
+                    let stored = target.filter(|target| !target.is_new()).and_then(|target| {
+                        guard.stored(state, &guarded, guarded.row_off(target.pos()))
+                    });
                     if guard.loses(&incoming, stored) {
                         continue; // an older transaction writes nothing, by any route
                     }
@@ -6180,11 +6606,11 @@ impl Vm {
                     // asserted.
                     let stamp_needed =
                         target.is_some() && !guard.already_stamped(&incoming, stored);
-                    let card_changes = match (target, selected_cell) {
-                        (Some(up), Some((cell, cell_size))) => card_one_changes(
+                    let card_changes = match (&target, selected_cell) {
+                        (Some(target), Some((cell, cell_size))) => card_one_changes(
                             state,
                             &guarded,
-                            up,
+                            target,
                             dest_field_idx,
                             &cell,
                             cell_size,
@@ -6198,7 +6624,9 @@ impl Vm {
                     // refused set leaves the guard unstamped.
                     let guard_flags = slot_meta_base(guard_slot) + SlotMetaOffset::CHANGE_FLAGS;
                     if route_kind == 0 {
-                        if let Some(up) = target.filter(|_| stamp_needed || card_changes) {
+                        if let Some(target) = target.filter(|_| stamp_needed || card_changes) {
+                            let pos = target.pos();
+                            let is_new = target.is_new();
                             let written = journal_row_write(
                                 &mut self.undo,
                                 delta_mode,
@@ -6206,15 +6634,16 @@ impl Vm {
                                 &guarded,
                                 guard_slot,
                                 key,
-                                up,
+                                target,
+                                cx,
                                 |state: &mut [u8]| {
                                     if stamp_needed {
                                         let stamped =
-                                            guard.stamp(state, &guarded, up.pos, cols, child_idx);
+                                            guard.stamp(state, &guarded, pos, cols, child_idx);
                                         if stamped != ErrorCode::Ok {
                                             return stamped;
                                         }
-                                        state[guard_flags as usize] |= if up.is_new {
+                                        state[guard_flags as usize] |= if is_new {
                                             ChangeFlag::INSERTED
                                         } else {
                                             ChangeFlag::UPDATED
@@ -6225,7 +6654,7 @@ impl Vm {
                                             state,
                                             &guarded,
                                             dest_slot,
-                                            up.pos,
+                                            pos,
                                             dest_field_idx,
                                             &cell,
                                             cell_size,
@@ -6249,11 +6678,11 @@ impl Vm {
                         let meta = SlotMetaView::read(state, dest_slot);
                         let v = cell_u32(cols, v_col, child_idx);
                         let guard_frame = match target.filter(|_| stamp_needed) {
-                            Some(up) => {
+                            Some(target) => {
                                 match self.undo.begin_capture(state, || {
-                                    row_capture_ranges(&guarded, guard_slot, up)
+                                    row_capture_ranges(&guarded, guard_slot, &target)
                                 }) {
-                                    Ok(capture) => Some((up, capture)),
+                                    Ok(capture) => Some((target, capture)),
                                     Err(error) => return error as u32,
                                 }
                             }
@@ -6271,13 +6700,21 @@ impl Vm {
                             )
                         };
                         let mut guard_result = ErrorCode::Ok;
-                        if let Some((up, capture)) = guard_frame {
+                        if let Some((target, capture)) = guard_frame {
                             if set_result == ErrorCode::Ok {
-                                apply_planned_row(&guarded, state, key, up);
                                 guard_result =
-                                    guard.stamp(state, &guarded, up.pos, cols, child_idx);
+                                    match apply_planned_row(&guarded, state, key, &target, cx) {
+                                        Ok(()) => guard.stamp(
+                                            state,
+                                            &guarded,
+                                            target.pos(),
+                                            cols,
+                                            child_idx,
+                                        ),
+                                        Err(error) => error,
+                                    };
                                 if guard_result == ErrorCode::Ok {
-                                    state[guard_flags as usize] |= if up.is_new {
+                                    state[guard_flags as usize] |= if target.is_new() {
                                         ChangeFlag::INSERTED
                                     } else {
                                         ChangeFlag::UPDATED
@@ -6517,6 +6954,7 @@ impl Vm {
                             child_idx,
                             inner_parent_ts_col,
                             live.as_deref_mut(),
+                            cx,
                         );
                         if result != OK {
                             return result;
@@ -6627,7 +7065,22 @@ impl Vm {
         if self.undo.enabled {
             return Err(ErrorCode::NeedsGrowth);
         }
-        state_init::grow_state(old_state, new_state, slot)
+        state_init::grow_state_in::<I>(old_state, new_state, slot)
+    }
+
+    /// Seal a committed image ([`crate::seal::seal_state`]): every struct map's
+    /// bytes become a function of its keys, rows and capacity alone. Like
+    /// growth, sealing has no journal, so it is refused while a speculative
+    /// window is open.
+    pub fn seal_state<S: InternBytes + ?Sized>(
+        &mut self,
+        state: &mut [u8],
+        strings: &S,
+    ) -> Result<(), ErrorCode> {
+        if self.undo.enabled {
+            return Err(ErrorCode::SpeculationActive);
+        }
+        crate::seal::seal_state(state, strings, &mut self.keys)
     }
 
     /// Begin an inactive speculation window over an admitted image span.
@@ -6651,7 +7104,7 @@ impl Vm {
             return Err(ErrorCode::SpeculationActive);
         }
         let state_size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
-        let (slots, _) = state_init::state_geometry(state)?;
+        let (slots, _) = state_init::state_geometry::<I>(state)?;
         let u = &mut self.undo;
         debug_assert!(u.saved_change_flags.is_empty());
         let backed = u.saved_change_flags.try_reserve(slots as usize + 1).is_ok();
@@ -6868,6 +7321,60 @@ impl Vm {
         self.undo.export_count * FLAT_UNDO_ENTRY_SIZE
     }
 
+    /// Reverse-apply an undo segment only after its complete preflight.
+    pub fn delta_apply_rollback_segment(
+        &mut self,
+        state: &mut [u8],
+        undo_segment: &[u8],
+        entry_size: u32,
+    ) -> Result<u32, ErrorCode> {
+        let size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
+        Vm::delta_required_state_size(undo_segment, entry_size, size)?;
+        let count = undo_segment.len() / FLAT_UNDO_ENTRY_SIZE as usize;
+        for i in (0..count).rev() {
+            let row = &undo_segment
+                [i * FLAT_UNDO_ENTRY_SIZE as usize..(i + 1) * FLAT_UNDO_ENTRY_SIZE as usize];
+            if row.iter().all(|byte| *byte == 0) {
+                continue;
+            }
+            let entry = parse_entry(undo_segment, i)?;
+            rollback_entry(state, &entry)?;
+        }
+        Ok(size)
+    }
+
+    /// Forward-apply a redo segment; entries move the state toward the target.
+    pub fn delta_apply_rollforward_segment(
+        &mut self,
+        state: &mut [u8],
+        redo_segment: &[u8],
+        entry_size: u32,
+    ) -> Result<u32, ErrorCode> {
+        let size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
+        Vm::delta_required_state_size(redo_segment, entry_size, size)?;
+        let count = redo_segment.len() / FLAT_UNDO_ENTRY_SIZE as usize;
+        for i in 0..count {
+            let row = &redo_segment
+                [i * FLAT_UNDO_ENTRY_SIZE as usize..(i + 1) * FLAT_UNDO_ENTRY_SIZE as usize];
+            if row.iter().all(|byte| *byte == 0) {
+                continue;
+            }
+            let entry = parse_entry(redo_segment, i)?;
+            rollback_entry(state, &entry)?;
+        }
+        Ok(size)
+    }
+}
+
+/// The delta helpers that read no VM: family-independent, they live on the
+/// default `Vm` so `Vm::delta_export_entry_size` and
+/// `Vm::delta_required_state_size` name them.
+impl Vm {
+    /// Return the serialized size of one delta entry.
+    pub const fn delta_export_entry_size() -> u32 {
+        FLAT_UNDO_ENTRY_SIZE
+    }
+
     /// Validate a serialized delta before mutation. Physical entries cannot
     /// address outside the image that owns this stable-layout segment.
     pub fn delta_required_state_size(
@@ -6896,55 +7403,6 @@ impl Vm {
             }
         }
         Ok(initial_size)
-    }
-
-    /// Reverse-apply an undo segment only after its complete preflight.
-    pub fn delta_apply_rollback_segment(
-        &mut self,
-        state: &mut [u8],
-        undo_segment: &[u8],
-        entry_size: u32,
-    ) -> Result<u32, ErrorCode> {
-        let size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
-        Self::delta_required_state_size(undo_segment, entry_size, size)?;
-        let count = undo_segment.len() / FLAT_UNDO_ENTRY_SIZE as usize;
-        for i in (0..count).rev() {
-            let row = &undo_segment
-                [i * FLAT_UNDO_ENTRY_SIZE as usize..(i + 1) * FLAT_UNDO_ENTRY_SIZE as usize];
-            if row.iter().all(|byte| *byte == 0) {
-                continue;
-            }
-            let entry = parse_entry(undo_segment, i)?;
-            rollback_entry(state, &entry)?;
-        }
-        Ok(size)
-    }
-
-    /// Forward-apply a redo segment; entries move the state toward the target.
-    pub fn delta_apply_rollforward_segment(
-        &mut self,
-        state: &mut [u8],
-        redo_segment: &[u8],
-        entry_size: u32,
-    ) -> Result<u32, ErrorCode> {
-        let size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
-        Self::delta_required_state_size(redo_segment, entry_size, size)?;
-        let count = redo_segment.len() / FLAT_UNDO_ENTRY_SIZE as usize;
-        for i in 0..count {
-            let row = &redo_segment
-                [i * FLAT_UNDO_ENTRY_SIZE as usize..(i + 1) * FLAT_UNDO_ENTRY_SIZE as usize];
-            if row.iter().all(|byte| *byte == 0) {
-                continue;
-            }
-            let entry = parse_entry(redo_segment, i)?;
-            rollback_entry(state, &entry)?;
-        }
-        Ok(size)
-    }
-
-    /// Return the serialized size of one delta entry.
-    pub const fn delta_export_entry_size() -> u32 {
-        FLAT_UNDO_ENTRY_SIZE
     }
 }
 
@@ -7047,7 +7505,12 @@ impl<'a> CheckedMap<'a> {
     /// another kind, is [`ErrorCode::InvalidSlot`]. Malformed geometry is
     /// [`ErrorCode::InvalidState`]. Absence is an `Ok` answer from [`Self::get`].
     pub fn bind(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
-        let meta = state_init::bind_slot(state, slot)?;
+        Self::bind_in::<HashIndex>(state, slot)
+    }
+
+    /// [`Self::bind`] in an image of key-index family `I`.
+    pub fn bind_in<I: KeyIndex>(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
+        let meta = state_init::bind_slot_in::<I>(state, slot)?;
         if meta.slot_type() != SlotType::HashMap {
             return Err(ErrorCode::InvalidSlot);
         }
@@ -7126,7 +7589,12 @@ impl<'a> CheckedSet<'a> {
     /// cardinality above the element capacity is [`ErrorCode::InvalidState`],
     /// never an empty set.
     pub fn bind(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
-        let meta = state_init::bind_slot(state, slot)?;
+        Self::bind_in::<HashIndex>(state, slot)
+    }
+
+    /// [`Self::bind`] in an image of key-index family `I`.
+    pub fn bind_in<I: KeyIndex>(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
+        let meta = state_init::bind_slot_in::<I>(state, slot)?;
         let members = match meta.slot_type() {
             SlotType::HashSet => SetMembers::Keys { lane: meta.offset },
             SlotType::Bitmap => {
@@ -7224,129 +7692,228 @@ impl<'a> CheckedSet<'a> {
     }
 }
 
-/// A bound unary STRUCT_MAP slot. It borrows the state image immutably for its
-/// whole life.
+/// The answer of a [`HashIndex`] read, which never refuses.
+fn hash_read<T>(read: Result<T, ErrorCode>) -> T {
+    read.unwrap_or_else(|_| columine_types::die!("invariant: a HashIndex read never refuses"))
+}
+
+/// A bound unary STRUCT_MAP slot of key-index family `I`. It borrows the
+/// state image immutably for its whole life.
 ///
 /// [`CheckedStructMap::bind`] validates the slot geometry and row layout once
 /// through [`state_init::bind_slot`]. `row` and the iterators read the same keys
 /// and rows through the bound [`StructMapSlot`]. Row offsets are absolute.
+/// Iteration follows the family's order: ascending cells for [`HashIndex`].
 #[derive(Clone, Copy, Debug)]
-pub struct CheckedStructMap<'a> {
+pub struct CheckedStructMap<'a, I: KeyIndex = HashIndex> {
     state: &'a [u8],
-    view: StructMapSlot,
+    view: StructMapSlot<I>,
 }
 
-impl<'a> CheckedStructMap<'a> {
-    /// Bind STRUCT_MAP `slot`. A slot index past the slot count, or a slot of
-    /// another kind, is [`ErrorCode::InvalidSlot`]. Malformed geometry or a row
-    /// layout that disagrees with the field descriptor is [`ErrorCode::InvalidState`].
-    pub fn bind(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
-        if state_init::bind_slot(state, slot)?.slot_type() != SlotType::StructMap {
+impl<'a, I: KeyIndex> CheckedStructMap<'a, I> {
+    /// Bind STRUCT_MAP `slot` of an image of family `I`. A slot index past the
+    /// slot count, or a slot of another kind, is [`ErrorCode::InvalidSlot`].
+    /// Malformed geometry, a row layout that disagrees with the field
+    /// descriptor, or another family's header is [`ErrorCode::InvalidState`].
+    pub fn bind_in(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
+        if state_init::bind_slot_in::<I>(state, slot)?.slot_type() != SlotType::StructMap {
             return Err(ErrorCode::InvalidSlot);
         }
         Ok(Self {
             state,
-            view: StructMapSlot::bind(state, slot),
+            view: StructMapSlot::bind_in(state, slot),
         })
     }
 
-    /// The element capacity, which is also the ascending iteration end.
+    /// The element capacity, which is also the iteration end.
     pub fn capacity(&self) -> u32 {
         self.view.capacity
     }
 
     /// The absolute offset of the row stored under `key`, or `None` when absent.
-    pub fn row(&self, key: u32) -> Option<u32> {
+    pub fn row_in<S: InternBytes + ?Sized>(
+        &self,
+        key: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<Option<u32>, ErrorCode> {
+        Ok(self
+            .view
+            .lookup(self.state, key, cx)?
+            .map(|pos| self.view.row_off(pos)))
+    }
+
+    /// The first live row in the family's order, or [`Self::capacity`] when
+    /// the map is empty.
+    pub fn iter_start_in<S: InternBytes + ?Sized>(
+        &self,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<u32, ErrorCode> {
+        Ok(I::first(self.state, self.view.index(), cx)?.unwrap_or(self.view.capacity))
+    }
+
+    /// The live row after `current` in the family's order; `capacity` is the
+    /// terminal value. `current > capacity` is [`ErrorCode::InvalidState`].
+    pub fn iter_next_in<S: InternBytes + ?Sized>(
+        &self,
+        current: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<u32, ErrorCode> {
+        let capacity = self.view.capacity;
+        if current > capacity {
+            return Err(ErrorCode::InvalidState);
+        }
+        if current == capacity {
+            return Ok(capacity);
+        }
+        Ok(I::next(self.state, self.view.index(), current, cx)?.unwrap_or(capacity))
+    }
+
+    /// The key of live row `pos`. A dead row or `pos >= capacity` is
+    /// [`ErrorCode::InvalidState`].
+    pub fn iter_key(&self, pos: u32) -> Result<u32, ErrorCode> {
         self.view
-            .find(self.state, key)
-            .map(|pos| self.view.row_off(pos))
+            .key_at(self.state, pos)
+            .ok_or(ErrorCode::InvalidState)
+    }
+}
+
+/// The [`HashIndex`] reader's entry points, which take no resolver.
+impl<'a> CheckedStructMap<'a> {
+    /// Bind STRUCT_MAP `slot`; see [`Self::bind_in`].
+    pub fn bind(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
+        Self::bind_in(state, slot)
+    }
+
+    /// The absolute offset of the row stored under `key`, or `None` when absent.
+    pub fn row(&self, key: u32) -> Option<u32> {
+        hash_read(crate::struct_map::hash_call(|cx| self.row_in(key, cx)))
     }
 
     /// The first live cell, or [`Self::capacity`] when the map is empty.
     pub fn iter_start(&self) -> u32 {
-        hash_table::next_live_key(self.state, self.view.keys_off, self.view.capacity, 0)
+        hash_read(crate::struct_map::hash_call(|cx| self.iter_start_in(cx)))
     }
 
     /// The next live cell after `current`; `capacity` is the terminal value.
     /// `current > capacity` is [`ErrorCode::InvalidState`].
     pub fn iter_next(&self, current: u32) -> Result<u32, ErrorCode> {
-        cursor_step(current, self.view.capacity, |from| {
-            hash_table::next_live_key(self.state, self.view.keys_off, self.view.capacity, from)
-        })
-    }
-
-    /// The key of live cell `pos`. A dead cell or `pos >= capacity` is
-    /// [`ErrorCode::InvalidState`].
-    pub fn iter_key(&self, pos: u32) -> Result<u32, ErrorCode> {
-        live_key_at(self.state, self.view.keys_off, self.view.capacity, pos)
+        crate::struct_map::hash_call(|cx| self.iter_next_in(current, cx))
     }
 }
 
-/// A bound exact-pair STRUCT_MAP2 slot. It borrows the state image immutably for
-/// its whole life.
-///
-/// Lane one owns the EMPTY/TOMBSTONE sentinel state and lane two carries every
-/// u32 value, so the liveness of a cell is decided by lane one alone.
+/// A bound exact-pair STRUCT_MAP2 slot of key-index family `I`. It borrows
+/// the state image immutably for its whole life.
 #[derive(Clone, Copy, Debug)]
-pub struct CheckedStructMap2<'a> {
+pub struct CheckedStructMap2<'a, I: KeyIndex = HashIndex> {
     state: &'a [u8],
-    view: StructMap2Slot,
+    view: StructMap2Slot<I>,
 }
 
-impl<'a> CheckedStructMap2<'a> {
-    /// Bind STRUCT_MAP2 `slot`, with the same refusals as [`CheckedStructMap::bind`].
-    pub fn bind(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
-        if state_init::bind_slot(state, slot)?.slot_type() != SlotType::StructMap2 {
+impl<'a, I: KeyIndex> CheckedStructMap2<'a, I> {
+    /// Bind STRUCT_MAP2 `slot` of an image of family `I`, with the same
+    /// refusals as [`CheckedStructMap::bind_in`].
+    pub fn bind_in(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
+        if state_init::bind_slot_in::<I>(state, slot)?.slot_type() != SlotType::StructMap2 {
             return Err(ErrorCode::InvalidSlot);
         }
         Ok(Self {
             state,
-            view: StructMap2Slot::bind(state, slot),
+            view: StructMap2Slot::bind_in(state, slot),
         })
     }
 
-    /// The element capacity, which is also the ascending iteration end.
+    /// The element capacity, which is also the iteration end.
     pub fn capacity(&self) -> u32 {
         self.view.capacity
     }
 
     /// The absolute offset of the row stored under the exact pair, or `None`.
-    pub fn row(&self, key1: u32, key2: u32) -> Option<u32> {
+    pub fn row_in<S: InternBytes + ?Sized>(
+        &self,
+        key1: u32,
+        key2: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<Option<u32>, ErrorCode> {
+        Ok(self
+            .view
+            .lookup(self.state, key1, key2, cx)?
+            .map(|pos| self.view.row_off(pos)))
+    }
+
+    /// The first live row in the family's order, or [`Self::capacity`].
+    pub fn iter_start_in<S: InternBytes + ?Sized>(
+        &self,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<u32, ErrorCode> {
+        Ok(I::first(self.state, self.view.index(), cx)?.unwrap_or(self.view.capacity))
+    }
+
+    /// The live row after `current` in the family's order; `capacity` is the
+    /// terminal value. `current > capacity` is [`ErrorCode::InvalidState`].
+    pub fn iter_next_in<S: InternBytes + ?Sized>(
+        &self,
+        current: u32,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> Result<u32, ErrorCode> {
+        let capacity = self.view.capacity;
+        if current > capacity {
+            return Err(ErrorCode::InvalidState);
+        }
+        if current == capacity {
+            return Ok(capacity);
+        }
+        Ok(I::next(self.state, self.view.index(), current, cx)?.unwrap_or(capacity))
+    }
+
+    /// The first key of live row `pos`. A dead row or `pos >= capacity` is
+    /// [`ErrorCode::InvalidState`].
+    pub fn iter_key1(&self, pos: u32) -> Result<u32, ErrorCode> {
         self.view
-            .find(self.state, key1, key2)
-            .map(|pos| self.view.row_off(pos))
+            .key_at(self.state, pos)
+            .map(|(key1, _)| key1)
+            .ok_or(ErrorCode::InvalidState)
+    }
+
+    /// The second key of live row `pos`, with the same refusals.
+    pub fn iter_key2(&self, pos: u32) -> Result<u32, ErrorCode> {
+        self.view
+            .key_at(self.state, pos)
+            .map(|(_, key2)| key2)
+            .ok_or(ErrorCode::InvalidState)
+    }
+
+    /// The authoritative row offset for one live iterator position.
+    pub fn iter_row(&self, pos: u32) -> Result<u32, ErrorCode> {
+        self.view
+            .key_at(self.state, pos)
+            .map(|_| self.view.row_off(pos))
+            .ok_or(ErrorCode::InvalidState)
+    }
+}
+
+/// The [`HashIndex`] reader's entry points, which take no resolver.
+impl<'a> CheckedStructMap2<'a> {
+    /// Bind STRUCT_MAP2 `slot`; see [`Self::bind_in`].
+    pub fn bind(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
+        Self::bind_in(state, slot)
+    }
+
+    /// The absolute offset of the row stored under the exact pair, or `None`.
+    pub fn row(&self, key1: u32, key2: u32) -> Option<u32> {
+        hash_read(crate::struct_map::hash_call(|cx| {
+            self.row_in(key1, key2, cx)
+        }))
     }
 
     /// The first live cell, or [`Self::capacity`] when the map is empty.
     pub fn iter_start(&self) -> u32 {
-        hash_table::next_live_key(self.state, self.view.keys1_off, self.view.capacity, 0)
+        hash_read(crate::struct_map::hash_call(|cx| self.iter_start_in(cx)))
     }
 
     /// The next live cell after `current`; `capacity` is the terminal value.
     /// `current > capacity` is [`ErrorCode::InvalidState`].
     pub fn iter_next(&self, current: u32) -> Result<u32, ErrorCode> {
-        cursor_step(current, self.view.capacity, |from| {
-            hash_table::next_live_key(self.state, self.view.keys1_off, self.view.capacity, from)
-        })
-    }
-
-    /// The first key of live cell `pos`. A dead cell or `pos >= capacity` is
-    /// [`ErrorCode::InvalidState`].
-    pub fn iter_key1(&self, pos: u32) -> Result<u32, ErrorCode> {
-        live_key_at(self.state, self.view.keys1_off, self.view.capacity, pos)
-    }
-
-    /// The second key of live cell `pos`. Liveness comes from the first key, so the
-    /// same refusals apply.
-    pub fn iter_key2(&self, pos: u32) -> Result<u32, ErrorCode> {
-        live_key_at(self.state, self.view.keys1_off, self.view.capacity, pos)?;
-        Ok(self.view.key2_at(self.state, pos))
-    }
-
-    /// The authoritative row offset for one live iterator position.
-    pub fn iter_row(&self, pos: u32) -> Result<u32, ErrorCode> {
-        live_key_at(self.state, self.view.keys1_off, self.view.capacity, pos)?;
-        Ok(self.view.row_off(pos))
+        crate::struct_map::hash_call(|cx| self.iter_next_in(current, cx))
     }
 }
 

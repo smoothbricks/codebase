@@ -20,6 +20,7 @@
 //! Undersized or corrupt state images return `InvalidState` before writes.
 
 use crate::element_body::{InvalidSource, SourceOp, visit_source_ops};
+use crate::key_index::{HashIndex, IndexRegion, KeyIndex, KeyLanes};
 use crate::meta::SlotMetaView;
 use crate::struct_map::ArenaRegion;
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
@@ -28,10 +29,10 @@ pub use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::operand::{Operands, read_index};
 use columine_types::types::{
     AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode,
-    EvictionEntry, Opcode, PROGRAM_HASH_PREFIX, ProgramHeader, SLOT_META_SIZE,
-    STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags,
-    StateFlags, StateHeaderOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size,
-    has_arena_fields, is_arena_field_type, next_power_of_2, state_num_slots,
+    EvictionEntry, Opcode, PROGRAM_HASH_PREFIX, ProgramHeader, SLOT_META_SIZE, STATE_HEADER_SIZE,
+    SlotMetaOffset, SlotType, SlotTypeFlags, StateFlags, StateHeaderOffset, StructFieldType,
+    TOMBSTONE, align8, arena_elem_size, has_arena_fields, is_arena_field_type, next_power_of_2,
+    state_num_slots,
 };
 use core::mem::size_of;
 
@@ -65,6 +66,8 @@ struct OverlayMeta {
     bitset_bytes: u8,
     row_size: u16,
     kind_byte: u8,
+    /// Struct maps: the key-lane kind bits ([`SlotMetaOffset::STRUCT_KEY_LANES`]).
+    key_lanes: u8,
 }
 
 fn write_overlay_meta(state: &mut [u8], meta_base: u32, overlay: &OverlayMeta) {
@@ -88,6 +91,7 @@ fn write_overlay_meta(state: &mut [u8], meta_base: u32, overlay: &OverlayMeta) {
     let pad_from = (meta_base + STRUCT_KIND_BYTE + 1) as usize;
     let pad_to = (meta_base + SLOT_META_SIZE) as usize;
     state[pad_from..pad_to].fill(0);
+    state[(meta_base + SlotMetaOffset::STRUCT_KEY_LANES) as usize] = overlay.key_lanes;
 }
 
 fn overlay_num_fields(state: &[u8], meta_base: u32) -> u32 {
@@ -98,7 +102,7 @@ fn overlay_row_size(state: &[u8], meta_base: u32) -> u32 {
     u32::from(bytes::read_u16(state, meta_base + STRUCT_ROW_SIZE))
 }
 
-fn overlay_kind_byte(state: &[u8], meta_base: u32) -> u8 {
+pub(crate) fn overlay_kind_byte(state: &[u8], meta_base: u32) -> u8 {
     state[(meta_base + STRUCT_KIND_BYTE) as usize]
 }
 
@@ -143,22 +147,36 @@ pub fn struct_field_offset(num_fields: u8, field_types: &[u8], target_field: u8)
     columine_types::types::struct_field_offset(num_fields, field_types, target_field)
 }
 
-/// STRUCT_MAP slot data: descriptor + keys + rows + optional timestamps.
-pub const fn struct_map_slot_data_size(
+/// A struct-map slot's primary bytes under key-index family `I`: descriptor,
+/// index region, rows, and a one-key map's optional timestamp lane.
+pub fn struct_map_primary_size<I: KeyIndex>(
+    descriptor_size: u32,
+    capacity: u32,
+    row_size: u32,
+    lanes: KeyLanes,
+    has_timestamps: bool,
+) -> u64 {
+    u64::from(descriptor_size)
+        + I::region_bytes(capacity, lanes)
+        + u64::from(capacity) * (u64::from(row_size) + if has_timestamps { 8 } else { 0 })
+}
+
+/// [`HashIndex`] STRUCT_MAP slot data: descriptor + keys + rows + optional
+/// timestamps.
+pub fn struct_map_slot_data_size(
     descriptor_size: u32,
     capacity: u32,
     row_size: u32,
     has_timestamps: bool,
 ) -> u32 {
-    descriptor_size
-        + capacity * 4
-        + capacity * row_size
-        + if has_timestamps { capacity * 8 } else { 0 }
-}
-
-/// STRUCT_MAP2 primary layout: descriptor + two exact u32 key lanes + rows.
-pub const fn struct_map2_slot_data_size(descriptor_size: u32, capacity: u32, row_size: u32) -> u32 {
-    descriptor_size + capacity * 8 + capacity * row_size
+    u32::try_from(struct_map_primary_size::<HashIndex>(
+        descriptor_size,
+        capacity,
+        row_size,
+        KeyLanes::One(crate::key_index::LaneKind::Raw),
+        has_timestamps,
+    ))
+    .unwrap_or(u32::MAX)
 }
 
 /// Size of the optional TTL eviction side buffer.
@@ -435,7 +453,10 @@ fn check_init_code(
                 } else {
                     SlotType::StructMap2
                 };
-                if type_flags.has_ttl() || type_flags.slot_type() != Some(expected) {
+                if type_flags.has_ttl()
+                    || type_flags.slot_type() != Some(expected)
+                    || KeyLanes::declared(op == Opcode::SlotStructMap2, type_flags).is_none()
+                {
                     return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 let num_fields = usize::from(operands[3]);
@@ -457,7 +478,11 @@ fn check_init_code(
                     return Err(ProgramInvalidCause::MalformedProgram);
                 };
                 let type_flags = SlotTypeFlags::from_byte(operands[0]);
-                if type_flags.slot_type() != Some(SlotType::OrderedList) || type_flags.has_ttl() {
+                // Key-lane bits are a struct map's; an ordered list has no key.
+                if type_flags.slot_type() != Some(SlotType::OrderedList)
+                    || type_flags.has_ttl()
+                    || type_flags.struct_key_lanes() != 0
+                {
                     return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 let elem_type = operands[3];
@@ -577,11 +602,21 @@ pub fn calculate_state_size(
     program: &[u8],
     accepted_program_magics: &[u32],
 ) -> Result<u32, SizingRefusal> {
-    let view = validated_program(program, accepted_program_magics)?;
-    calculate_state_size_from_view(&view).map_err(SizingRefusal::Invalid)
+    calculate_state_size_in::<HashIndex>(program, accepted_program_magics)
 }
 
-fn calculate_state_size_from_view(view: &ProgramView<'_>) -> Result<u32, ProgramInvalidCause> {
+/// [`calculate_state_size`] for an image of key-index family `I`.
+pub fn calculate_state_size_in<I: KeyIndex>(
+    program: &[u8],
+    accepted_program_magics: &[u32],
+) -> Result<u32, SizingRefusal> {
+    let view = validated_program(program, accepted_program_magics)?;
+    calculate_state_size_from_view::<I>(&view).map_err(SizingRefusal::Invalid)
+}
+
+fn calculate_state_size_from_view<I: KeyIndex>(
+    view: &ProgramView<'_>,
+) -> Result<u32, ProgramInvalidCause> {
     let init_code = view.init_code;
 
     // Header + slot metadata (48 bytes per slot).
@@ -662,27 +697,33 @@ fn calculate_state_size_from_view(view: &ProgramView<'_>) -> Result<u32, Program
             size += u64::from(capacity) * 12;
             size = (size + 7) & !7;
         } else if op == Opcode::SlotStructMap as u8 || op == Opcode::SlotStructMap2 as u8 {
+            let pair = op == Opcode::SlotStructMap2 as u8;
             let type_flags = SlotTypeFlags::from_byte(init_code[pc]);
+            let Some(lanes) = KeyLanes::declared(pair, type_flags) else {
+                return Err(ProgramInvalidCause::MalformedProgram);
+            };
             let cap_lo = init_code[pc + 1];
             let cap_hi = init_code[pc + 2];
             let num_fields = init_code[pc + 3];
             pc += 4;
 
-            let mut capacity = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
-            if capacity == 0 {
-                capacity = 1024;
+            let mut declared = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
+            if declared == 0 {
+                declared = 1024;
             }
-            capacity = next_power_of_2(capacity * 2);
+            let capacity = I::capacity_for(declared);
 
             let field_types = &init_code[pc..pc + usize::from(num_fields)];
             pc += usize::from(num_fields);
 
             let layout = compute_struct_row_layout_padded(num_fields, field_types);
-            size += u64::from(if op == Opcode::SlotStructMap2 as u8 {
-                struct_map2_slot_data_size(layout.descriptor_size, capacity, layout.row_size)
-            } else {
-                struct_map_slot_data_size(layout.descriptor_size, capacity, layout.row_size, false)
-            });
+            size += struct_map_primary_size::<I>(
+                layout.descriptor_size,
+                capacity,
+                layout.row_size,
+                lanes,
+                false,
+            );
 
             if has_arena_fields(num_fields, field_types) {
                 size +=
@@ -841,15 +882,25 @@ pub fn init_state(
     program: &[u8],
     accepted_program_magics: &[u32],
 ) -> Result<(), ErrorCode> {
+    init_state_in::<HashIndex>(state, program, accepted_program_magics)
+}
+
+/// [`init_state`] for an image of key-index family `I`.
+pub fn init_state_in<I: KeyIndex>(
+    state: &mut [u8],
+    program: &[u8],
+    accepted_program_magics: &[u32],
+) -> Result<(), ErrorCode> {
     let view = validated_program(program, accepted_program_magics).map_err(SizingRefusal::code)?;
-    let required = calculate_state_size_from_view(&view).map_err(|_| ErrorCode::InvalidProgram)?;
+    let required =
+        calculate_state_size_from_view::<I>(&view).map_err(|_| ErrorCode::InvalidProgram)?;
     if state.len() < required as usize {
         return Err(ErrorCode::InvalidState);
     }
-    init_state_from_view(state, program, view)
+    init_state_from_view::<I>(state, program, view)
 }
 
-fn init_state_from_view(
+fn init_state_from_view<I: KeyIndex>(
     state: &mut [u8],
     program: &[u8],
     view: ProgramView<'_>,
@@ -864,8 +915,8 @@ fn init_state_from_view(
     // schemas(1) + derived facts change flag(1) + reserved(3) + num_slots(4)
     // + derived facts slot(4).
     state[..STATE_HEADER_SIZE as usize].fill(0);
-    bytes::write_u32(state, 0, STATE_MAGIC);
-    state[StateHeaderOffset::FORMAT_VERSION as usize] = STATE_FORMAT_VERSION;
+    bytes::write_u32(state, 0, I::STATE_MAGIC);
+    state[StateHeaderOffset::FORMAT_VERSION as usize] = I::FORMAT_VERSION;
     state[StateHeaderOffset::PROGRAM_VERSION as usize] = content[4];
     state[StateHeaderOffset::PROGRAM_VERSION as usize + 1] = content[5];
     bytes::write_u32(state, StateHeaderOffset::NUM_SLOTS, num_slots);
@@ -1064,17 +1115,19 @@ fn init_state_from_view(
                 0,
             );
         } else if op == Opcode::SlotStructMap as u8 || op == Opcode::SlotStructMap2 as u8 {
+            let pair = op == Opcode::SlotStructMap2 as u8;
             let type_flags = SlotTypeFlags::from_byte(init_code[pc]);
+            let lanes = KeyLanes::declared(pair, type_flags).ok_or(ErrorCode::InvalidProgram)?;
             let cap_lo = init_code[pc + 1];
             let cap_hi = init_code[pc + 2];
             let num_fields = init_code[pc + 3];
             pc += 4;
 
-            let mut capacity = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
-            if capacity == 0 {
-                capacity = 1024;
+            let mut declared = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
+            if declared == 0 {
+                declared = 1024;
             }
-            capacity = next_power_of_2(capacity * 2);
+            let capacity = I::capacity_for(declared);
 
             let field_types = &init_code[pc..pc + usize::from(num_fields)];
             pc += usize::from(num_fields);
@@ -1088,32 +1141,29 @@ fn init_state_from_view(
                 &OverlayMeta {
                     data_offset,
                     capacity,
-                    type_flags_byte: type_flags.to_byte(),
+                    type_flags_byte: type_flags.without_struct_key_lanes().to_byte(),
                     num_fields,
                     bitset_bytes: layout.bitset_bytes as u8,
                     row_size: layout.row_size as u16,
                     kind_byte: 0,
+                    key_lanes: lanes.byte(),
                 },
             );
 
-            // Field descriptor, exact key lane(s), then zeroed rows.
+            // Field descriptor, the family's empty index region, then zeroed rows.
             bytes::copy(state, data_offset, field_types, 0, u32::from(num_fields));
-            let keys1_offset = data_offset + layout.descriptor_size;
-            bytes::fill_u32(state, keys1_offset, capacity, EMPTY_KEY);
-            let rows_offset = if op == Opcode::SlotStructMap2 as u8 {
-                let keys2_offset = keys1_offset + capacity * 4;
-                bytes::zero(state, keys2_offset, capacity * 4);
-                keys2_offset + capacity * 4
-            } else {
-                keys1_offset + capacity * 4
+            let region = IndexRegion {
+                at: data_offset + layout.descriptor_size,
+                capacity,
+                lanes,
             };
+            I::init(state, region);
+            let rows_offset =
+                u32::try_from(u64::from(region.at) + I::region_bytes(capacity, lanes))
+                    .map_err(|_| ErrorCode::InvalidProgram)?;
             bytes::zero(state, rows_offset, capacity * layout.row_size);
 
-            data_offset += if op == Opcode::SlotStructMap2 as u8 {
-                struct_map2_slot_data_size(layout.descriptor_size, capacity, layout.row_size)
-            } else {
-                struct_map_slot_data_size(layout.descriptor_size, capacity, layout.row_size, false)
-            };
+            data_offset = rows_offset + capacity * layout.row_size;
 
             if has_arena_fields(num_fields, field_types) {
                 let arena_cap = arena_initial_capacity_64(capacity);
@@ -1159,6 +1209,7 @@ fn init_state_from_view(
                         bitset_bytes: layout.bitset_bytes as u8,
                         row_size: layout.row_size as u16,
                         kind_byte: elem_type,
+                        key_lanes: 0,
                     },
                 );
 
@@ -1186,6 +1237,7 @@ fn init_state_from_view(
                         bitset_bytes: 0,
                         row_size: elem_size as u16,
                         kind_byte: elem_type,
+                        key_lanes: 0,
                     },
                 );
 
@@ -1272,13 +1324,23 @@ pub fn reset_state(
     program: &[u8],
     accepted_program_magics: &[u32],
 ) -> Result<(), ErrorCode> {
+    reset_state_in::<HashIndex>(state, program, accepted_program_magics)
+}
+
+/// [`reset_state`] for an image of key-index family `I`.
+pub fn reset_state_in<I: KeyIndex>(
+    state: &mut [u8],
+    program: &[u8],
+    accepted_program_magics: &[u32],
+) -> Result<(), ErrorCode> {
     let view = validated_program(program, accepted_program_magics).map_err(SizingRefusal::code)?;
-    let required = calculate_state_size_from_view(&view).map_err(|_| ErrorCode::InvalidProgram)?;
+    let required =
+        calculate_state_size_from_view::<I>(&view).map_err(|_| ErrorCode::InvalidProgram)?;
     if state.len() < required as usize {
         return Err(ErrorCode::InvalidState);
     }
     state.fill(0);
-    init_state_from_view(state, program, view)
+    init_state_from_view::<I>(state, program, view)
 }
 // =============================================================================
 // Slot growth — calculate, allocate, copy, and rehash
@@ -1287,11 +1349,12 @@ pub fn reset_state(
 // When a HashMap or HashSet exceeds 70% load, the VM reports NEEDS_GROWTH so
 // the caller can allocate the larger state and retry the batch.
 
-/// Validate the actual image header before any metadata access.
-pub(crate) fn state_geometry(state: &[u8]) -> Result<(u32, u32), ErrorCode> {
+/// Validate the actual image header before any metadata access: its magic
+/// and format version are key-index family `I`'s, or the image is refused.
+pub(crate) fn state_geometry<I: KeyIndex>(state: &[u8]) -> Result<(u32, u32), ErrorCode> {
     if state.len() < STATE_HEADER_SIZE as usize
-        || bytes::read_u32(state, StateHeaderOffset::MAGIC) != STATE_MAGIC
-        || state[StateHeaderOffset::FORMAT_VERSION as usize] != STATE_FORMAT_VERSION
+        || bytes::read_u32(state, StateHeaderOffset::MAGIC) != I::STATE_MAGIC
+        || state[StateHeaderOffset::FORMAT_VERSION as usize] != I::FORMAT_VERSION
     {
         return Err(ErrorCode::InvalidState);
     }
@@ -1316,7 +1379,7 @@ fn checked_align8(size: u32) -> Result<u32, ErrorCode> {
 }
 
 /// Preserve the established minimum-16 capacity normalization without overflow.
-fn grown_capacity(capacity: u32) -> Result<u32, ErrorCode> {
+pub(crate) fn grown_capacity(capacity: u32) -> Result<u32, ErrorCode> {
     capacity
         .checked_mul(2)
         .and_then(|capacity| capacity.max(16).checked_next_power_of_two())
@@ -1380,12 +1443,17 @@ fn checked_struct_layout(
 /// Bind one slot only after validating its actual image and physical ownership.
 /// Readers derive geometry from this metadata, never caller-supplied capacities.
 pub fn bind_slot(state: &[u8], slot: u32) -> Result<SlotMetaView, ErrorCode> {
-    let (slots, metadata_end) = state_geometry(state)?;
+    bind_slot_in::<HashIndex>(state, slot)
+}
+
+/// [`bind_slot`] for an image of key-index family `I`.
+pub fn bind_slot_in<I: KeyIndex>(state: &[u8], slot: u32) -> Result<SlotMetaView, ErrorCode> {
+    let (slots, metadata_end) = state_geometry::<I>(state)?;
     if slot >= slots {
         return Err(ErrorCode::InvalidSlot);
     }
     let limit = slot_limit(state, slot, slots, metadata_end)?;
-    validate_slot_geometry(state, slot, limit, OuterPointers::Walk)?;
+    validate_slot_geometry::<I>(state, slot, limit, OuterPointers::Walk)?;
     Ok(SlotMetaView::read(state, slot))
 }
 
@@ -1396,15 +1464,21 @@ pub fn bind_slot(state: &[u8], slot: u32) -> Result<SlotMetaView, ErrorCode> {
 /// restored checkpoint or any host-supplied image, is checked here once.
 /// Refuses with `InvalidState`.
 pub fn validate_state(state: &[u8]) -> Result<(), ErrorCode> {
-    validate_slots(state, OuterPointers::Walk)
+    validate_state_in::<HashIndex>(state)
+}
+
+/// [`validate_state`] for an image of key-index family `I`: an image whose
+/// header names another family is refused.
+pub fn validate_state_in<I: KeyIndex>(state: &[u8]) -> Result<(), ErrorCode> {
+    validate_slots::<I>(state, OuterPointers::Walk)
 }
 
 /// [`validate_state`] without the walk over nested outer pointers, which
 /// costs a nested slot's capacity: what a batch checks of the image it is
 /// handed, in time proportional to the slot count. Kernels check each outer
 /// pointer they follow instead.
-pub(crate) fn validate_layout(state: &[u8]) -> Result<(), ErrorCode> {
-    validate_slots(state, OuterPointers::Skip)
+pub(crate) fn validate_layout<I: KeyIndex>(state: &[u8]) -> Result<(), ErrorCode> {
+    validate_slots::<I>(state, OuterPointers::Skip)
 }
 
 /// Whether slot validation reads every nested outer pointer.
@@ -1414,8 +1488,8 @@ enum OuterPointers {
     Skip,
 }
 
-fn validate_slots(state: &[u8], outer: OuterPointers) -> Result<(), ErrorCode> {
-    let (slots, metadata_end) = state_geometry(state)?;
+fn validate_slots<I: KeyIndex>(state: &[u8], outer: OuterPointers) -> Result<(), ErrorCode> {
+    let (slots, metadata_end) = state_geometry::<I>(state)?;
     let len = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
     if offsets_ascend(state, slots, metadata_end, len) {
         // Every offset is in range, aligned and distinct, and the next
@@ -1426,13 +1500,13 @@ fn validate_slots(state: &[u8], outer: OuterPointers) -> Result<(), ErrorCode> {
             } else {
                 len
             };
-            validate_slot_geometry(state, slot, limit, outer)?;
+            validate_slot_geometry::<I>(state, slot, limit, outer)?;
         }
         return Ok(());
     }
     for slot in 0..slots {
         let limit = slot_limit(state, slot, slots, metadata_end)?;
-        validate_slot_geometry(state, slot, limit, outer)?;
+        validate_slot_geometry::<I>(state, slot, limit, outer)?;
     }
     Ok(())
 }
@@ -1466,14 +1540,59 @@ pub fn bind_struct_map(
     state: &[u8],
     slot: u32,
 ) -> Result<crate::struct_map::StructMapSlot, ErrorCode> {
-    let meta = bind_slot(state, slot)?;
+    bind_struct_map_in::<HashIndex>(state, slot)
+}
+
+/// [`bind_struct_map`] for an image of key-index family `I`. A slot of
+/// another kind is `InvalidProgram`: the instruction naming it is wrong.
+pub fn bind_struct_map_in<I: KeyIndex>(
+    state: &[u8],
+    slot: u32,
+) -> Result<crate::struct_map::StructMapSlot<I>, ErrorCode> {
+    let meta = bind_slot_in::<I>(state, slot)?;
     if meta.slot_type() != SlotType::StructMap {
         return Err(ErrorCode::InvalidProgram);
     }
-    Ok(crate::struct_map::StructMapSlot::bind(state, slot))
+    Ok(crate::struct_map::StructMapSlot::bind_in(state, slot))
 }
 
-fn checked_primary_size(
+/// Checked two-key struct geometry, with [`bind_struct_map_in`]'s refusals.
+pub fn bind_struct_map2_in<I: KeyIndex>(
+    state: &[u8],
+    slot: u32,
+) -> Result<crate::struct_map::StructMap2Slot<I>, ErrorCode> {
+    let meta = bind_slot_in::<I>(state, slot)?;
+    if meta.slot_type() != SlotType::StructMap2 {
+        return Err(ErrorCode::InvalidProgram);
+    }
+    Ok(crate::struct_map::StructMap2Slot::bind_in(state, slot))
+}
+
+/// A struct-map slot's stored key lanes; a byte no declaration writes is
+/// `InvalidState`.
+fn struct_key_lanes(state: &[u8], meta: u32, kind: SlotType) -> Result<KeyLanes, ErrorCode> {
+    KeyLanes::stored(
+        kind == SlotType::StructMap2,
+        state[(meta + SlotMetaOffset::STRUCT_KEY_LANES) as usize],
+    )
+    .ok_or(ErrorCode::InvalidState)
+}
+
+/// The end of an index region whose slot geometry was checked.
+fn region_end<I: KeyIndex>(region: IndexRegion) -> u32 {
+    u32::try_from(u64::from(region.at) + I::region_bytes(region.capacity, region.lanes))
+        .unwrap_or_else(|_| columine_types::die!("invariant: a checked index region ends in u32"))
+}
+
+/// The capacity one slot grows to: a struct map's family decides its own.
+fn grown_slot_capacity<I: KeyIndex>(kind: SlotType, capacity: u32) -> Result<u32, ErrorCode> {
+    match kind {
+        SlotType::StructMap | SlotType::StructMap2 => I::grown_capacity(capacity),
+        _ => grown_capacity(capacity),
+    }
+}
+
+fn checked_primary_size<I: KeyIndex>(
     state: &[u8],
     meta: u32,
     m: &OldSlotMeta,
@@ -1483,21 +1602,13 @@ fn checked_primary_size(
     let size = match m.slot_type {
         SlotType::StructMap | SlotType::StructMap2 => {
             let layout = checked_struct_layout(state, meta, m.slot_type)?;
-            u64::from(layout.descriptor_size)
-                + capacity
-                    * (u64::from(layout.row_size)
-                        + if m.slot_type == SlotType::StructMap2 {
-                            8
-                        } else {
-                            4
-                        }
-                        + if m.slot_type == SlotType::StructMap
-                            && overlay_kind_byte(state, meta) != 0
-                        {
-                            8
-                        } else {
-                            0
-                        })
+            struct_map_primary_size::<I>(
+                layout.descriptor_size,
+                cap,
+                layout.row_size,
+                struct_key_lanes(state, meta, m.slot_type)?,
+                m.slot_type == SlotType::StructMap && overlay_kind_byte(state, meta) != 0,
+            )
         }
         SlotType::OrderedList => {
             let elem = overlay_kind_byte(state, meta);
@@ -1551,7 +1662,7 @@ fn checked_primary_size(
     checked_size(size)
 }
 
-fn validate_slot_geometry(
+fn validate_slot_geometry<I: KeyIndex>(
     state: &[u8],
     slot: u32,
     limit: u32,
@@ -1574,7 +1685,7 @@ fn validate_slot_geometry(
     if flags.has_ttl() && !supports_ttl(kind) {
         return Err(ErrorCode::InvalidState);
     }
-    let primary = checked_primary_size(state, meta, &m, m.capacity)?;
+    let primary = checked_primary_size::<I>(state, meta, &m, m.capacity)?;
     let mut end = m
         .offset
         .checked_add(primary)
@@ -1606,6 +1717,16 @@ fn validate_slot_geometry(
         } else if header != 0 {
             return Err(ErrorCode::InvalidState);
         }
+        let region = IndexRegion {
+            at: m.offset + align8(u32::from(nf)),
+            capacity: m.capacity,
+            lanes: struct_key_lanes(state, meta, kind)?,
+        };
+        I::validate(
+            state,
+            region,
+            bytes::read_u32(state, meta + SlotMetaOffset::SIZE),
+        )?;
     }
     if kind == SlotType::Nested {
         let header = m
@@ -1719,9 +1840,10 @@ fn read_old_slot_meta(old_state: &[u8], slot: u32) -> OldSlotMeta {
     }
 }
 
-/// Struct-map metadata-driven primary size. The slot kind determines whether
-/// one or two exact u32 key lanes precede the rows.
-fn struct_map_primary_size_from_meta(
+/// Struct-map metadata-driven primary size of a slot whose geometry was
+/// checked: the family's index region for the slot's key lanes precedes the
+/// rows.
+fn struct_map_primary_size_from_meta<I: KeyIndex>(
     old_state: &[u8],
     meta_base: u32,
     cap: u32,
@@ -1729,12 +1851,19 @@ fn struct_map_primary_size_from_meta(
 ) -> u32 {
     let nf = overlay_num_fields(old_state, meta_base);
     let rs = overlay_row_size(old_state, meta_base);
-    if slot_type == SlotType::StructMap2 {
-        struct_map2_slot_data_size(align8(nf), cap, rs)
-    } else {
-        let has_ts = overlay_kind_byte(old_state, meta_base) != 0;
-        struct_map_slot_data_size(align8(nf), cap, rs, has_ts)
-    }
+    let lanes = KeyLanes::bound(
+        slot_type == SlotType::StructMap2,
+        old_state[(meta_base + SlotMetaOffset::STRUCT_KEY_LANES) as usize],
+    );
+    let has_ts = slot_type == SlotType::StructMap && overlay_kind_byte(old_state, meta_base) != 0;
+    u32::try_from(struct_map_primary_size::<I>(
+        align8(nf),
+        cap,
+        rs,
+        lanes,
+        has_ts,
+    ))
+    .unwrap_or_else(|_| columine_types::die!("invariant: a checked struct map's size fits u32"))
 }
 
 /// ORDERED_LIST metadata-driven primary size.
@@ -1764,22 +1893,30 @@ fn nested_primary_size_from_prefix(old_state: &[u8], slot_offset: u32, outer_cap
 
 /// Calculate the checked extent after doubling one slot and its arena.
 pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> Result<u32, ErrorCode> {
-    let (num_slots, metadata_end) = state_geometry(old_state)?;
+    calculate_grown_state_size_in::<HashIndex>(old_state, grown_slot_idx)
+}
+
+/// [`calculate_grown_state_size`] for an image of key-index family `I`.
+pub fn calculate_grown_state_size_in<I: KeyIndex>(
+    old_state: &[u8],
+    grown_slot_idx: u32,
+) -> Result<u32, ErrorCode> {
+    let (num_slots, metadata_end) = state_geometry::<I>(old_state)?;
     if grown_slot_idx >= num_slots {
         return Err(ErrorCode::InvalidSlot);
     }
     let mut total_size = metadata_end;
     for slot in 0..num_slots {
         let limit = slot_limit(old_state, slot, num_slots, metadata_end)?;
-        validate_slot_geometry(old_state, slot, limit, OuterPointers::Walk)?;
+        validate_slot_geometry::<I>(old_state, slot, limit, OuterPointers::Walk)?;
         let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
         let m = read_old_slot_meta(old_state, slot);
         let cap = if slot == grown_slot_idx {
-            grown_capacity(m.capacity)?
+            grown_slot_capacity::<I>(m.slot_type, m.capacity)?
         } else {
             m.capacity
         };
-        let mut size = u64::from(checked_primary_size(old_state, meta, &m, cap)?);
+        let mut size = u64::from(checked_primary_size::<I>(old_state, meta, &m, cap)?);
         if matches!(m.slot_type, SlotType::StructMap | SlotType::StructMap2) {
             let header = overlay_arena_hdr(old_state, meta);
             if header != 0 {
@@ -1816,11 +1953,21 @@ pub fn grow_state(
     new_state: &mut [u8],
     grown_slot_idx: u32,
 ) -> Result<(), ErrorCode> {
-    let required = calculate_grown_state_size(old_state, grown_slot_idx)?;
+    grow_state_in::<HashIndex>(old_state, new_state, grown_slot_idx)
+}
+
+/// [`grow_state`] for an image of key-index family `I`: a grown struct map's
+/// family moves its keys, and every row moves with its key's ordinal.
+pub fn grow_state_in<I: KeyIndex>(
+    old_state: &[u8],
+    new_state: &mut [u8],
+    grown_slot_idx: u32,
+) -> Result<(), ErrorCode> {
+    let required = calculate_grown_state_size_in::<I>(old_state, grown_slot_idx)?;
     if new_state.len() < required as usize {
         return Err(ErrorCode::InvalidState);
     }
-    validate_struct_arenas(old_state, grown_slot_idx)?;
+    validate_struct_arenas::<I>(old_state, grown_slot_idx)?;
     let num_slots = state_num_slots(old_state);
     new_state[..required as usize].fill(0);
 
@@ -1836,7 +1983,7 @@ pub fn grow_state(
         let old_cap = m.capacity;
 
         let new_cap = if slot_i == grown_slot_idx {
-            grown_capacity(old_cap)?
+            grown_slot_capacity::<I>(m.slot_type, old_cap)?
         } else {
             old_cap
         };
@@ -1845,7 +1992,7 @@ pub fn grow_state(
         // Primary data size (STRUCT_MAP, ORDERED_LIST, NESTED are layout-driven).
         let new_primary_size = match m.slot_type {
             SlotType::StructMap | SlotType::StructMap2 => {
-                struct_map_primary_size_from_meta(old_state, meta_base, new_cap, m.slot_type)
+                struct_map_primary_size_from_meta::<I>(old_state, meta_base, new_cap, m.slot_type)
             }
             SlotType::OrderedList => {
                 ordered_list_primary_size_from_meta(old_state, meta_base, new_cap)
@@ -1948,52 +2095,50 @@ pub fn grow_state(
                     let nf = overlay_num_fields(old_state, meta_base);
                     let rs = overlay_row_size(old_state, meta_base);
                     let desc_size = align8(nf);
-                    let new_keys_off = new_offset + desc_size;
-                    let key_lane_bytes = if m.slot_type == SlotType::StructMap2 {
-                        new_cap * 8
-                    } else {
-                        new_cap * 4
+                    let lanes = KeyLanes::bound(
+                        m.slot_type == SlotType::StructMap2,
+                        old_state[(meta_base + SlotMetaOffset::STRUCT_KEY_LANES) as usize],
+                    );
+                    let from = IndexRegion {
+                        at: old_offset + desc_size,
+                        capacity: old_cap,
+                        lanes,
                     };
-                    let new_rows_base = new_keys_off + key_lane_bytes;
+                    let to = IndexRegion {
+                        at: new_offset + desc_size,
+                        capacity: new_cap,
+                        lanes,
+                    };
+                    let old_rows_base = region_end::<I>(from);
+                    let new_rows_base = region_end::<I>(to);
+                    // A one-key map's timestamp lane follows its rows, one
+                    // cell per ordinal, and moves with them.
+                    let timestamps = m.slot_type == SlotType::StructMap
+                        && overlay_kind_byte(old_state, meta_base) != 0;
+                    let old_timestamps = old_rows_base + old_cap * rs;
+                    let new_timestamps = new_rows_base + new_cap * rs;
 
-                    let table = slot_growth::StructMapTable {
-                        old_offset,
-                        new_offset,
-                        old_cap,
-                        new_cap,
-                        num_fields: nf,
-                        row_size: rs,
-                    };
-                    let rehashed = if m.slot_type == SlotType::StructMap2 {
-                        slot_growth::grow_struct_map2(old_state, new_state, &table)
-                    } else {
-                        slot_growth::grow_struct_map(old_state, new_state, &table)
-                    };
-                    bytes::write_u32(new_state, meta_base + SlotMetaOffset::SIZE, rehashed);
-
-                    if m.slot_type == SlotType::StructMap
-                        && overlay_kind_byte(old_state, meta_base) != 0
-                    {
-                        let old_keys = old_offset + desc_size;
-                        let old_timestamps = old_keys + old_cap * 4 + old_cap * rs;
-                        let new_timestamps = new_rows_base + new_cap * rs;
-                        for pos in 0..old_cap {
-                            let key = bytes::read_u32(old_state, old_keys + pos * 4);
-                            if key == EMPTY_KEY || key == TOMBSTONE {
-                                continue;
-                            }
-                            let target =
-                                hash_table::find_key(new_state, new_keys_off, new_cap, key)
-                                    .ok_or(ErrorCode::InvalidState)?;
+                    bytes::copy(new_state, new_offset, old_state, old_offset, nf);
+                    let rehashed =
+                        I::grow(old_state, from, new_state, to, |new_state, old, new| {
                             bytes::copy(
                                 new_state,
-                                new_timestamps + target * 8,
+                                new_rows_base + new * rs,
                                 old_state,
-                                old_timestamps + pos * 8,
-                                8,
+                                old_rows_base + old * rs,
+                                rs,
                             );
-                        }
-                    }
+                            if timestamps {
+                                bytes::copy(
+                                    new_state,
+                                    new_timestamps + new * 8,
+                                    old_state,
+                                    old_timestamps + old * 8,
+                                    8,
+                                );
+                            }
+                        })?;
+                    bytes::write_u32(new_state, meta_base + SlotMetaOffset::SIZE, rehashed);
                     // Arena compaction: copy live opaque payloads into the new arena.
                     let old_arena_hdr_off = overlay_arena_hdr(old_state, meta_base);
                     if old_arena_hdr_off != 0 {
@@ -2002,7 +2147,7 @@ pub fn grow_state(
                             .capacity
                             .checked_mul(2)
                             .ok_or(ErrorCode::InvalidState)?;
-                        let struct_data_size = struct_map_primary_size_from_meta(
+                        let struct_data_size = struct_map_primary_size_from_meta::<I>(
                             old_state,
                             meta_base,
                             new_cap,
@@ -2023,8 +2168,7 @@ pub fn grow_state(
                         let mut new_arena_used = 0u32;
 
                         for ki in 0..new_cap {
-                            let key = bytes::read_u32(new_state, new_keys_off + ki * 4);
-                            if key == EMPTY_KEY || key == TOMBSTONE {
+                            if I::key_at(new_state, to, ki).is_none() {
                                 continue;
                             }
                             let row_base = new_rows_base + ki * rs;
@@ -2156,7 +2300,7 @@ pub fn grow_state(
             // Non-grown slot: memcpy data as-is (incl. struct-map arena).
             let primary_size = match m.slot_type {
                 SlotType::StructMap | SlotType::StructMap2 => {
-                    let mut sz = struct_map_primary_size_from_meta(
+                    let mut sz = struct_map_primary_size_from_meta::<I>(
                         old_state,
                         meta_base,
                         old_cap,
@@ -2197,7 +2341,7 @@ pub fn grow_state(
             if matches!(m.slot_type, SlotType::StructMap | SlotType::StructMap2) {
                 let old_arena_hdr = overlay_arena_hdr(old_state, meta_base);
                 if old_arena_hdr != 0 {
-                    let struct_sz = struct_map_primary_size_from_meta(
+                    let struct_sz = struct_map_primary_size_from_meta::<I>(
                         old_state,
                         meta_base,
                         old_cap,
@@ -2315,10 +2459,10 @@ enum DeclaredShape {
     Kind,
     /// An aggregate or scalar's subtype byte.
     Subtype(u8),
-    /// A struct map's field descriptor, the `fields` span of the init
-    /// section, and the row layout it implies.
+    /// A struct map's declared key lanes, its field descriptor, the `fields`
+    /// span of the init section, and the row layout it implies.
     Struct {
-        pair: bool,
+        lanes: KeyLanes,
         fields: (usize, usize),
         layout: columine_types::types::StructRowLayout,
     },
@@ -2342,7 +2486,7 @@ impl Declarations {
     /// Whether `state` has the slots `init` declares. A different init
     /// section is decoded first; `OutOfMemory` when its storage cannot be
     /// backed, so a refusal is never a failed allocation.
-    pub(crate) fn matches(
+    pub(crate) fn matches<I: KeyIndex>(
         &mut self,
         init: &[u8],
         num_slots: u32,
@@ -2360,7 +2504,7 @@ impl Declarations {
             self.init.extend_from_slice(init);
             self.num_slots = Some(num_slots);
         }
-        Ok(self.compare(state, num_slots))
+        Ok(self.compare::<I>(state, num_slots))
     }
 
     /// Decode `init` into `slots`: every slot declared exactly once, then
@@ -2418,6 +2562,9 @@ impl Declarations {
                     if slot_type != expected || flags.has_ttl() || kind != expected as u8 {
                         return Ok(false);
                     }
+                    let Some(lanes) = KeyLanes::declared(pair, flags) else {
+                        return Ok(false);
+                    };
                     let Some(nf) = r.byte() else {
                         return Ok(false);
                     };
@@ -2432,7 +2579,7 @@ impl Declarations {
                         return Ok(false);
                     }
                     DeclaredShape::Struct {
-                        pair,
+                        lanes,
                         fields: (start, r.pos()),
                         layout: compute_struct_row_layout_padded(nf, fields),
                     }
@@ -2452,6 +2599,9 @@ impl Declarations {
                 }
                 Opcode::SlotArray => DeclaredShape::Kind,
                 Opcode::SlotOrderedList => {
+                    if flags.struct_key_lanes() != 0 {
+                        return Ok(false);
+                    }
                     let Some(elem) = r.byte() else {
                         return Ok(false);
                     };
@@ -2494,7 +2644,7 @@ impl Declarations {
 
     /// Compare the decoded declarations with `state`'s metadata and struct
     /// descriptors.
-    fn compare(&self, state: &[u8], num_slots: u32) -> bool {
+    fn compare<I: KeyIndex>(&self, state: &[u8], num_slots: u32) -> bool {
         if state.len() < STATE_HEADER_SIZE as usize
             || state_num_slots(state) != num_slots
             || u64::from(STATE_HEADER_SIZE) + u64::from(num_slots) * u64::from(SLOT_META_SIZE)
@@ -2513,7 +2663,7 @@ impl Declarations {
                     state[(meta + SlotMetaOffset::AGG_TYPE) as usize] == subtype
                 }
                 DeclaredShape::Struct {
-                    pair,
+                    lanes,
                     fields: (start, end),
                     layout,
                 } => {
@@ -2523,18 +2673,22 @@ impl Declarations {
                         .ok()
                         .and_then(|len| off.checked_add(len))
                         .and_then(|end| state.get(off as usize..end as usize));
-                    let primary = layout.row_size + if pair { 8 } else { 4 };
+                    let capacity = bytes::read_u32(state, meta + SlotMetaOffset::CAPACITY);
                     usize::from(state[(meta + STRUCT_NUM_FIELDS) as usize]) == fields.len()
                         && descriptor == Some(fields)
                         && overlay_row_size(state, meta) == layout.row_size
                         && u32::from(state[(meta + STRUCT_BITSET_BYTES) as usize])
                             == layout.bitset_bytes
-                        && bytes::read_u32(state, meta + SlotMetaOffset::CAPACITY)
-                            .checked_mul(primary)
-                            .and_then(|bytes| {
-                                off.checked_add(layout.descriptor_size)?.checked_add(bytes)
-                            })
-                            .is_some_and(|primary_end| primary_end as usize <= state.len())
+                        && state[(meta + SlotMetaOffset::STRUCT_KEY_LANES) as usize] == lanes.byte()
+                        && u64::from(off)
+                            + struct_map_primary_size::<I>(
+                                layout.descriptor_size,
+                                capacity,
+                                layout.row_size,
+                                lanes,
+                                false,
+                            )
+                            <= state.len() as u64
                 }
             }
         })
@@ -2543,7 +2697,7 @@ impl Declarations {
 
 /// Geometry was checked by sizing; validate live references and compaction span
 /// before any destination write. The descriptor and row offsets are reused.
-fn validate_struct_arenas(state: &[u8], grown_slot: u32) -> Result<(), ErrorCode> {
+fn validate_struct_arenas<I: KeyIndex>(state: &[u8], grown_slot: u32) -> Result<(), ErrorCode> {
     for slot in 0..state_num_slots(state) {
         let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
         let kind = SlotType::from_u8(state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] & 0x0f)
@@ -2560,13 +2714,16 @@ fn validate_struct_arenas(state: &[u8], grown_slot: u32) -> Result<(), ErrorCode
         let rs = overlay_row_size(state, meta);
         let off = bytes::read_u32(state, meta + SlotMetaOffset::OFFSET);
         let descriptor = &state[off as usize..off as usize + usize::from(nf)];
-        let keys = off + align8(u32::from(nf));
-        let rows = keys + cap * if kind == SlotType::StructMap2 { 8 } else { 4 };
+        let region = IndexRegion {
+            at: off + align8(u32::from(nf)),
+            capacity: cap,
+            lanes: struct_key_lanes(state, meta, kind)?,
+        };
+        let rows = region_end::<I>(region);
         let arena = ArenaRegion::bind(state, header)?;
         let mut compact_bytes = 0u64;
         for pos in 0..cap {
-            let key = bytes::read_u32(state, keys + pos * 4);
-            if key == EMPTY_KEY || key == TOMBSTONE {
+            if I::key_at(state, region, pos).is_none() {
                 continue;
             }
             let row = rows + pos * rs;

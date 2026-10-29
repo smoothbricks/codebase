@@ -47,6 +47,7 @@ use crate::aggregates;
 use crate::bitmap_ops;
 use crate::bytes;
 use crate::hash_table::{ENTRY_NONE, ENTRY_U32, FlatTable, max_load_for_cap};
+use crate::key_index::{HashIndex, InternBytes, KeyCx, KeyIndex, KeyLanes};
 use crate::meta::SlotMetaView;
 use crate::nested::{self, NestedPrefix};
 use crate::state_init;
@@ -684,13 +685,13 @@ fn descriptor_of(state: &[u8], offset: u32, num_fields: u8) -> CauseResult<Vec<S
     Ok(out)
 }
 
-fn export_slot_inner(
+fn export_slot_inner<I: KeyIndex>(
     state: &[u8],
     slot: u32,
     enc: &SlotEncoding,
     lookup: &dyn InternLookup,
 ) -> CauseResult<LogicalSlot<'static>> {
-    let meta = state_init::bind_slot(state, slot).map_err(LogicalExportCause::Vm)?;
+    let meta = state_init::bind_slot_in::<I>(state, slot).map_err(LogicalExportCause::Vm)?;
     let kind = meta.slot_type();
     let offset = meta.offset;
     let capacity = meta.capacity;
@@ -821,16 +822,15 @@ fn export_slot_inner(
             });
         }
         SlotType::StructMap => {
-            let map = StructMapSlot::bind(state, slot);
+            let map = StructMapSlot::<I>::bind_in(state, slot);
             let descriptor = descriptor_of(state, offset, map.num_fields)?;
             out.field_types = descriptor.clone();
             let has_ts = struct_kind_byte(state, &meta) != 0;
             let timestamps = map.rows_base + capacity * map.row_size;
             for pos in 0..capacity {
-                let key = map.key_at(state, pos);
-                if key == EMPTY_KEY || key == TOMBSTONE {
+                let Some(key) = map.key_at(state, pos) else {
                     continue;
-                }
+                };
                 let fields = decode_row_fields(
                     state,
                     map.row_off(pos),
@@ -853,34 +853,23 @@ fn export_slot_inner(
             sort_rows(&mut out.rows);
         }
         SlotType::StructMap2 => {
-            let map = StructMap2Slot::bind(state, slot);
+            let map = StructMap2Slot::<I>::bind_in(state, slot);
             let descriptor = descriptor_of(state, offset, map.num_fields)?;
             out.field_types = descriptor.clone();
-            let arena_header =
-                bytes::read_u32(state, meta.meta_base + SlotMetaOffset::GRACE_SECONDS);
-            for (key1, key2, row_off) in map.iter(state) {
+            for pos in 0..capacity {
+                let Some((key1, key2)) = map.key_at(state, pos) else {
+                    continue;
+                };
                 let fields = decode_row_fields(
                     state,
-                    row_off,
+                    map.row_off(pos),
                     map.bitset_bytes,
                     &descriptor,
                     lookup,
                     |field| {
-                        if arena_header == 0 {
-                            return Err(LogicalExportCause::Vm(ErrorCode::InvalidState));
-                        }
-                        let field_type = descriptor[usize::from(field)];
-                        let cell = row_off + map.field_offset(state, field);
-                        let arena = ArenaRegion::bind(state, arena_header)
-                            .map_err(LogicalExportCause::Vm)?;
-                        arena
-                            .bytes(
-                                state,
-                                bytes::read_u32(state, cell),
-                                bytes::read_u32(state, cell + 4),
-                                arena_elem_size(field_type),
-                            )
-                            .map(|payload| Some(payload.to_vec()))
+                        map.rows()
+                            .arena_field(state, pos, field)
+                            .map(|payload| payload.map(<[u8]>::to_vec))
                             .map_err(LogicalExportCause::Vm)
                     },
                 )?;
@@ -1062,10 +1051,21 @@ pub fn export_slot(
     enc: &SlotEncoding,
     lookup: &dyn InternLookup,
 ) -> Result<LogicalSlot<'static>, LogicalExportError> {
+    export_slot_in::<HashIndex>(state, slot, enc, lookup)
+}
+
+/// [`export_slot`] from an image of key-index family `I`. Keyed rows export
+/// in logical-key order whatever the family's own order.
+pub fn export_slot_in<I: KeyIndex>(
+    state: &[u8],
+    slot: u32,
+    enc: &SlotEncoding,
+    lookup: &dyn InternLookup,
+) -> Result<LogicalSlot<'static>, LogicalExportError> {
     wrap(
         "export_slot",
         slot,
-        export_slot_inner(state, slot, enc, lookup),
+        export_slot_inner::<I>(state, slot, enc, lookup),
     )
 }
 
@@ -1082,18 +1082,18 @@ fn reserve_image(size: u32) -> CauseResult<Vec<u8>> {
     Ok(image)
 }
 
-fn grow_image(image: &mut Vec<u8>, slot: u32) -> CauseResult<()> {
-    let new_size =
-        state_init::calculate_grown_state_size(image, slot).map_err(LogicalExportCause::Vm)?;
+fn grow_image<I: KeyIndex>(image: &mut Vec<u8>, slot: u32) -> CauseResult<()> {
+    let new_size = state_init::calculate_grown_state_size_in::<I>(image, slot)
+        .map_err(LogicalExportCause::Vm)?;
     let mut next = reserve_image(new_size)?;
-    state_init::grow_state(image, &mut next, slot).map_err(LogicalExportCause::Vm)?;
+    state_init::grow_state_in::<I>(image, &mut next, slot).map_err(LogicalExportCause::Vm)?;
     *image = next;
     Ok(())
 }
 
 /// Grow slot until fits accepts the image. Growth doubles, so the loop
 /// is bounded by the capacity word's range; 64 iterations is beyond it.
-fn grow_until(
+fn grow_until<I: KeyIndex>(
     image: &mut Vec<u8>,
     slot: u32,
     mut fits: impl FnMut(&[u8]) -> CauseResult<bool>,
@@ -1102,7 +1102,7 @@ fn grow_until(
         if fits(image)? {
             return Ok(());
         }
-        grow_image(image, slot)?;
+        grow_image::<I>(image, slot)?;
     }
     Err(LogicalExportCause::Capacity {
         needed: u64::MAX,
@@ -1110,8 +1110,9 @@ fn grow_until(
     })
 }
 
-fn bind_target(image: &[u8], logical: &LogicalSlot) -> CauseResult<SlotMetaView> {
-    let meta = state_init::bind_slot(image, logical.slot).map_err(LogicalExportCause::Vm)?;
+fn bind_target<I: KeyIndex>(image: &[u8], logical: &LogicalSlot) -> CauseResult<SlotMetaView> {
+    let meta =
+        state_init::bind_slot_in::<I>(image, logical.slot).map_err(LogicalExportCause::Vm)?;
     if meta.slot_type() != logical.kind {
         return Err(LogicalExportCause::KindMismatch {
             expected: logical.kind,
@@ -1444,24 +1445,24 @@ fn write_eviction(
     Ok(())
 }
 
-fn import_slot_inner(
+fn import_slot_inner<I: KeyIndex>(
     image: &mut Vec<u8>,
     logical: &LogicalSlot,
     enc: &SlotEncoding,
     interner: &mut dyn Interner,
 ) -> CauseResult<()> {
     let slot = logical.slot;
-    let meta = bind_target(image, logical)?;
+    let meta = bind_target::<I>(image, logical)?;
     require_empty(image, &meta)?;
     match logical.kind {
         SlotType::HashMap => {
             let rows = logical.rows.len() as u32;
             let eviction = logical.eviction.len() as u32;
-            grow_until(image, slot, |img| {
+            grow_until::<I>(image, slot, |img| {
                 let m = SlotMetaView::read(img, slot);
                 Ok(rows <= max_load_for_cap(m.capacity) && eviction <= m.capacity)
             })?;
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             let table = FlatTable::bind_external(
                 meta.offset,
                 meta.capacity,
@@ -1500,17 +1501,17 @@ fn import_slot_inner(
                     no_cmp_ts(row)?;
                 }
             }
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             write_eviction(image, &meta, logical, enc.key, enc.value, interner)?;
         }
         SlotType::HashSet => {
             let rows = logical.rows.len() as u32;
             let eviction = logical.eviction.len() as u32;
-            grow_until(image, slot, |img| {
+            grow_until::<I>(image, slot, |img| {
                 let m = SlotMetaView::read(img, slot);
                 Ok(rows <= max_load_for_cap(m.capacity) && eviction <= m.capacity)
             })?;
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             let table = FlatTable::bind_external(
                 meta.offset,
                 meta.capacity,
@@ -1537,7 +1538,7 @@ fn import_slot_inner(
                     }
                 }
             }
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             write_eviction(image, &meta, logical, enc.key, enc.key, interner)?;
         }
         SlotType::Aggregate => {
@@ -1547,7 +1548,7 @@ fn import_slot_inner(
                 .ok_or(LogicalExportCause::InvalidRow(
                     "aggregate slot without a value",
                 ))?;
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             let agg_byte = meta.agg_type_byte(image);
             if agg_byte != logical.agg_type && logical.agg_type != 0 {
                 return Err(LogicalExportCause::InvalidRow("aggregate subtype mismatch"));
@@ -1561,7 +1562,7 @@ fn import_slot_inner(
                 .ok_or(LogicalExportCause::InvalidRow(
                     "scalar slot without a value",
                 ))?;
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             match AggType::from_u8(meta.agg_type_byte(image)) {
                 Some(AggType::ScalarU32) => {
                     let raw = encode_u32(&scalar.value, enc.value, interner)?;
@@ -1602,11 +1603,11 @@ fn import_slot_inner(
                 max_pos = Some(max_pos.map_or(pos, |m: u32| m.max(pos)));
             }
             if let Some(max_pos) = max_pos {
-                grow_until(image, slot, |img| {
+                grow_until::<I>(image, slot, |img| {
                     Ok(SlotMetaView::read(img, slot).capacity > max_pos)
                 })?;
             }
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             let timestamps = meta.offset + meta.capacity * 4;
             let mut live = 0u32;
             for row in &logical.rows {
@@ -1640,12 +1641,12 @@ fn import_slot_inner(
             let image_bytes = Bitmosaic::from_sorted(members.iter().copied()).to_forest_bytes();
             let needed = image_bytes.len() as u32;
             let eviction = logical.eviction.len() as u32;
-            grow_until(image, slot, |img| {
+            grow_until::<I>(image, slot, |img| {
                 let m = SlotMetaView::read(img, slot);
                 Ok(bitmap_ops::bitmap_payload_capacity(m.capacity) >= needed
                     && eviction <= m.capacity)
             })?;
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             let storage = bitmap_ops::get_bitmap_storage(&meta);
             bytes::zero(image, storage.data_offset, storage.payload_capacity);
             bytes::copy(image, storage.data_offset, &image_bytes, 0, needed);
@@ -1659,7 +1660,7 @@ fn import_slot_inner(
                 .ok_or(LogicalExportCause::InvalidRow(
                     "condition slot without state",
                 ))?;
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             let identities = meta.offset + CONDITION_TREE_STATE_BYTES;
             let values = identities + meta.capacity * 8;
             bytes::write_u32(image, meta.offset, condition.lifecycle_generation);
@@ -1682,12 +1683,12 @@ fn import_slot_inner(
         }
         SlotType::StructMap => {
             let rows = logical.rows.len() as u32;
-            grow_until(image, slot, |img| {
+            grow_until::<I>(image, slot, |img| {
                 let m = SlotMetaView::read(img, slot);
-                if rows > max_load_for_cap(m.capacity) {
+                if rows > I::max_rows(m.capacity) {
                     return Ok(false);
                 }
-                let map = StructMapSlot::bind(img, slot);
+                let map = StructMapSlot::<I>::bind_in(img, slot);
                 if map.arena_header_off == 0 {
                     return Ok(true);
                 }
@@ -1695,10 +1696,10 @@ fn import_slot_inner(
                     ArenaRegion::bind(img, map.arena_header_off).map_err(LogicalExportCause::Vm)?;
                 Ok(u64::from(arena.capacity) >= arena_demand(logical))
             })?;
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             let (descriptor, _, _, _) = target_descriptor(image, &meta)?;
             require_descriptor(logical, &descriptor)?;
-            let map = StructMapSlot::bind(image, slot);
+            let map = StructMapSlot::<I>::bind_in(image, slot);
             let mut writer = if map.arena_header_off != 0 {
                 Some(ArenaWriter::bind(image, map.arena_header_off)?)
             } else {
@@ -1706,16 +1707,20 @@ fn import_slot_inner(
             };
             let has_ts = struct_kind_byte(image, &meta) != 0;
             let timestamps = map.rows_base + map.capacity * map.row_size;
+            let mut scratch = I::Scratch::default();
             for row in &logical.rows {
                 let key = key_u32(&row.key, enc.key, interner)?;
-                let upsert = map.upsert(image, key).ok_or(LogicalExportCause::Capacity {
-                    needed: u64::from(rows),
-                    capacity: u64::from(max_load_for_cap(map.capacity)),
-                })?;
-                if !upsert.is_new {
+                let strings = InternerBytes(&*interner);
+                let mut cx = KeyCx::<I, _>::new(&strings, &mut scratch);
+                let plan = map
+                    .plan_upsert(image, key, &mut cx)
+                    .map_err(|code| import_refusal(code, rows, map.capacity))?;
+                if !plan.is_new {
                     return Err(LogicalExportCause::DuplicateKey);
                 }
-                let row_off = map.row_off(upsert.pos);
+                map.apply_upsert(image, key, &plan, &mut cx)
+                    .map_err(LogicalExportCause::Vm)?;
+                let row_off = map.row_off(plan.ordinal);
                 bytes::zero(image, row_off, map.row_size);
                 write_row_fields(
                     image,
@@ -1727,7 +1732,7 @@ fn import_slot_inner(
                     interner,
                 )?;
                 if has_ts {
-                    bytes::write_f64(image, timestamps + upsert.pos * 8, required_cmp_ts(row)?);
+                    bytes::write_f64(image, timestamps + plan.ordinal * 8, required_cmp_ts(row)?);
                 } else {
                     no_cmp_ts(row)?;
                 }
@@ -1735,9 +1740,9 @@ fn import_slot_inner(
         }
         SlotType::StructMap2 => {
             let rows = logical.rows.len() as u32;
-            grow_until(image, slot, |img| {
+            grow_until::<I>(image, slot, |img| {
                 let m = SlotMetaView::read(img, slot);
-                if rows > max_load_for_cap(m.capacity) {
+                if rows > I::max_rows(m.capacity) {
                     return Ok(false);
                 }
                 let header = bytes::read_u32(img, m.meta_base + SlotMetaOffset::GRACE_SECONDS);
@@ -1747,17 +1752,16 @@ fn import_slot_inner(
                 let arena = ArenaRegion::bind(img, header).map_err(LogicalExportCause::Vm)?;
                 Ok(u64::from(arena.capacity) >= arena_demand(logical))
             })?;
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             let (descriptor, _, _, _) = target_descriptor(image, &meta)?;
             require_descriptor(logical, &descriptor)?;
-            let map = StructMap2Slot::bind(image, slot);
-            let arena_header =
-                bytes::read_u32(image, meta.meta_base + SlotMetaOffset::GRACE_SECONDS);
-            let mut writer = if arena_header != 0 {
-                Some(ArenaWriter::bind(image, arena_header)?)
+            let map = StructMap2Slot::<I>::bind_in(image, slot);
+            let mut writer = if map.arena_header_off != 0 {
+                Some(ArenaWriter::bind(image, map.arena_header_off)?)
             } else {
                 None
             };
+            let mut scratch = I::Scratch::default();
             for row in &logical.rows {
                 no_cmp_ts(row)?;
                 let key1 = key_u32(&row.key, enc.key, interner)?;
@@ -1769,16 +1773,17 @@ fn import_slot_inner(
                         ));
                     }
                 };
-                let upsert = map
-                    .upsert(image, key1, key2)
-                    .ok_or(LogicalExportCause::Capacity {
-                        needed: u64::from(rows),
-                        capacity: u64::from(max_load_for_cap(map.capacity)),
-                    })?;
-                if !upsert.is_new {
+                let strings = InternerBytes(&*interner);
+                let mut cx = KeyCx::<I, _>::new(&strings, &mut scratch);
+                let plan = map
+                    .plan_upsert(image, key1, key2, &mut cx)
+                    .map_err(|code| import_refusal(code, rows, map.capacity))?;
+                if !plan.is_new {
                     return Err(LogicalExportCause::DuplicateKey);
                 }
-                let row_off = map.row_off(upsert.pos);
+                map.apply_upsert(image, key1, key2, &plan, &mut cx)
+                    .map_err(LogicalExportCause::Vm)?;
+                let row_off = map.row_off(plan.ordinal);
                 bytes::zero(image, row_off, map.row_size);
                 write_row_fields(
                     image,
@@ -1793,10 +1798,10 @@ fn import_slot_inner(
         }
         SlotType::OrderedList => {
             let rows = logical.rows.len() as u32;
-            grow_until(image, slot, |img| {
+            grow_until::<I>(image, slot, |img| {
                 Ok(SlotMetaView::read(img, slot).capacity >= rows)
             })?;
-            let meta = bind_target(image, logical)?;
+            let meta = bind_target::<I>(image, logical)?;
             let kind_byte = struct_kind_byte(image, &meta);
             if kind_byte == 0xff {
                 let (descriptor, _, bitset_bytes, row_size) = target_descriptor(image, &meta)?;
@@ -1835,7 +1840,7 @@ fn import_slot_inner(
             meta.set_size(image, rows);
         }
         SlotType::Nested => {
-            import_nested(image, logical, enc, interner)?;
+            import_nested::<I>(image, logical, enc, interner)?;
         }
     }
     Ok(())
@@ -1941,7 +1946,7 @@ fn chosen_inner_capacity(prefix: &NestedPrefix, rows: usize) -> u32 {
     cap
 }
 
-fn import_nested(
+fn import_nested<I: KeyIndex>(
     image: &mut Vec<u8>,
     logical: &LogicalSlot,
     enc: &SlotEncoding,
@@ -1983,7 +1988,7 @@ fn import_nested(
         })
         .sum();
     let outer_rows = logical.nested.len() as u32;
-    grow_until(image, slot, |img| {
+    grow_until::<I>(image, slot, |img| {
         let m = SlotMetaView::read(img, slot);
         if outer_rows > max_load_for_cap(m.capacity) {
             return Ok(false);
@@ -1991,7 +1996,7 @@ fn import_nested(
         let arena = nested::Arena::bind(nested::arena_header_offset(m.offset, m.capacity));
         Ok(u64::from(arena.capacity(img)) >= arena_needed)
     })?;
-    let meta = bind_target(image, logical)?;
+    let meta = bind_target::<I>(image, logical)?;
     let prefix = nested::read_nested_prefix(image, meta.offset);
     let outer = FlatTable::bind_external(
         nested::outer_keys_offset(meta.offset),
@@ -2086,11 +2091,46 @@ pub fn import_slot(
     enc: &SlotEncoding,
     interner: &mut dyn Interner,
 ) -> Result<(), LogicalExportError> {
+    import_slot_in::<HashIndex>(image, logical, enc, interner)
+}
+
+/// [`import_slot`] into an image of key-index family `I`. The interner
+/// resolves the ids it hands out as the index orders them, so a family that
+/// reads interned lanes reads the text this import interned.
+pub fn import_slot_in<I: KeyIndex>(
+    image: &mut Vec<u8>,
+    logical: &LogicalSlot,
+    enc: &SlotEncoding,
+    interner: &mut dyn Interner,
+) -> Result<(), LogicalExportError> {
     wrap(
         "import_slot",
         logical.slot,
-        import_slot_inner(image, logical, enc, interner),
+        import_slot_inner::<I>(image, logical, enc, interner),
     )
+}
+
+/// An interner's text as a key index's resolver: the bytes of the text it
+/// already holds, so an id this import interned resolves for the index.
+struct InternerBytes<'a>(&'a dyn Interner);
+
+impl InternBytes for InternerBytes<'_> {
+    fn bytes(&self, id: u32) -> Option<&[u8]> {
+        self.0.text(id).map(str::as_bytes)
+    }
+}
+
+/// A struct-map insert the family refused: capacity past its row bound, or
+/// the family's own refusal.
+fn import_refusal(code: ErrorCode, rows: u32, capacity: u32) -> LogicalExportCause {
+    if code == ErrorCode::CapacityExceeded || code == ErrorCode::InvalidKey {
+        LogicalExportCause::Capacity {
+            needed: u64::from(rows),
+            capacity: u64::from(capacity),
+        }
+    } else {
+        LogicalExportCause::Vm(code)
+    }
 }
 
 // =============================================================================
@@ -2475,7 +2515,7 @@ pub struct SlotTransfer {
 
 /// Primary data size of a slot whose geometry bind_slot validated, as
 /// state_init's growth walk computes it.
-fn primary_size(state: &[u8], meta: &SlotMetaView) -> CauseResult<u32> {
+fn primary_size<I: KeyIndex>(state: &[u8], meta: &SlotMetaView) -> CauseResult<u32> {
     let capacity = meta.capacity;
     let size = match meta.slot_type() {
         SlotType::StructMap | SlotType::StructMap2 => {
@@ -2484,18 +2524,21 @@ fn primary_size(state: &[u8], meta: &SlotMetaView) -> CauseResult<u32> {
                 state[(meta.meta_base + SlotMetaOffset::TTL_SECONDS) as usize],
                 state[(meta.meta_base + SlotMetaOffset::TTL_SECONDS + 1) as usize],
             ]));
-            let key_lanes = if meta.slot_type() == SlotType::StructMap2 {
-                8
-            } else {
-                4
-            };
-            let ts =
-                if meta.slot_type() == SlotType::StructMap && struct_kind_byte(state, meta) != 0 {
-                    capacity * 8
-                } else {
-                    0
-                };
-            align8(u32::from(num_fields)) + capacity * key_lanes + capacity * row_size + ts
+            let lanes = KeyLanes::stored(
+                meta.slot_type() == SlotType::StructMap2,
+                meta_byte(state, meta, SlotMetaOffset::STRUCT_KEY_LANES),
+            )
+            .ok_or(LogicalExportCause::Vm(ErrorCode::InvalidState))?;
+            let timestamps =
+                meta.slot_type() == SlotType::StructMap && struct_kind_byte(state, meta) != 0;
+            u32::try_from(state_init::struct_map_primary_size::<I>(
+                align8(u32::from(num_fields)),
+                capacity,
+                row_size,
+                lanes,
+                timestamps,
+            ))
+            .map_err(|_| LogicalExportCause::Vm(ErrorCode::InvalidState))?
         }
         SlotType::OrderedList => {
             let num_fields = meta_byte(state, meta, SlotMetaOffset::AGG_TYPE);
@@ -2540,7 +2583,7 @@ fn arena_header_of(state: &[u8], meta: &SlotMetaView) -> u32 {
 /// kind, capacity, subtype, TTL shape, descriptor bytes, and arena
 /// capacity. Nested slots never qualify — their outer pointers are
 /// absolute and would need relocation; they take the logical path.
-fn geometry_identical(
+fn geometry_identical<I: KeyIndex>(
     old: &[u8],
     old_meta: &SlotMetaView,
     new: &[u8],
@@ -2554,19 +2597,21 @@ fn geometry_identical(
     {
         return Ok(false);
     }
-    if primary_size(old, old_meta)? != primary_size(new, new_meta)? {
+    if primary_size::<I>(old, old_meta)? != primary_size::<I>(new, new_meta)? {
         return Ok(false);
     }
     if matches!(
         old_meta.slot_type(),
         SlotType::StructMap | SlotType::StructMap2 | SlotType::OrderedList
     ) {
-        // Overlay metadata: field count, bitset width, row size, kind byte.
+        // Overlay metadata: field count, bitset width, row size, kind byte,
+        // and a struct map's key lanes, which decide its index bytes.
         for off in [
             SlotMetaOffset::STRUCT_BITSET_BYTES,
             SlotMetaOffset::TTL_SECONDS,
             SlotMetaOffset::TTL_SECONDS + 1,
             SlotMetaOffset::TTL_SECONDS + 2,
+            SlotMetaOffset::STRUCT_KEY_LANES,
         ] {
             if meta_byte(old, old_meta, off) != meta_byte(new, new_meta, off) {
                 return Ok(false);
@@ -2604,13 +2649,13 @@ fn geometry_identical(
 /// Region-copy one geometry-identical slot, the way grow_state copies a
 /// slot it is not growing: primary bytes and arena whole, TTL regions
 /// whole, sizes carried, change flags cleared.
-fn region_copy_slot(
+fn region_copy_slot<I: KeyIndex>(
     old: &[u8],
     old_meta: &SlotMetaView,
     new: &mut [u8],
     new_meta: &SlotMetaView,
 ) -> CauseResult<()> {
-    let primary = primary_size(old, old_meta)?;
+    let primary = primary_size::<I>(old, old_meta)?;
     bytes::copy(new, new_meta.offset, old, old_meta.offset, primary);
     let (old_hdr, new_hdr) = (
         arena_header_of(old, old_meta),
@@ -2666,24 +2711,42 @@ pub fn rewrite_slot_set(
     interner: &mut dyn Interner,
     evaluator: Option<&mut dyn ExprEvaluator>,
 ) -> Result<Vec<u8>, LogicalExportError> {
+    rewrite_slot_set_in::<HashIndex>(
+        old,
+        target_program,
+        accepted_program_magics,
+        plan,
+        interner,
+        evaluator,
+    )
+}
+
+/// [`rewrite_slot_set`] between images of key-index family `I`.
+pub fn rewrite_slot_set_in<I: KeyIndex>(
+    old: &[u8],
+    target_program: &[u8],
+    accepted_program_magics: &[u32],
+    plan: &[SlotTransfer],
+    interner: &mut dyn Interner,
+    evaluator: Option<&mut dyn ExprEvaluator>,
+) -> Result<Vec<u8>, LogicalExportError> {
     let mut exported: Vec<LogicalSlot> = Vec::with_capacity(plan.len());
     for rewrite in plan {
-        exported.push(export_slot(
+        exported.push(export_slot_in::<I>(
             old,
             rewrite.source,
             &rewrite.encoding,
             interner,
         )?);
     }
-    let size = state_init::calculate_state_size(target_program, accepted_program_magics).map_err(
-        |refusal| LogicalExportError {
+    let size = state_init::calculate_state_size_in::<I>(target_program, accepted_program_magics)
+        .map_err(|refusal| LogicalExportError {
             op: "rewrite_slot_set",
             slot: 0,
             cause: LogicalExportCause::Vm(refusal.code()),
-        },
-    )?;
+        })?;
     let mut image = wrap("rewrite_slot_set", 0, reserve_image(size))?;
-    state_init::init_state(&mut image, target_program, accepted_program_magics).map_err(
+    state_init::init_state_in::<I>(&mut image, target_program, accepted_program_magics).map_err(
         |code| LogicalExportError {
             op: "rewrite_slot_set",
             slot: 0,
@@ -2692,29 +2755,31 @@ pub fn rewrite_slot_set(
     )?;
     let mut evaluator = evaluator;
     for (rewrite, logical) in plan.iter().zip(exported.iter()) {
-        let old_meta =
-            state_init::bind_slot(old, rewrite.source).map_err(|code| LogicalExportError {
+        let old_meta = state_init::bind_slot_in::<I>(old, rewrite.source).map_err(|code| {
+            LogicalExportError {
                 op: "rewrite_slot_set",
                 slot: rewrite.source,
                 cause: LogicalExportCause::Vm(code),
-            })?;
-        let new_meta =
-            state_init::bind_slot(&image, rewrite.target).map_err(|code| LogicalExportError {
+            }
+        })?;
+        let new_meta = state_init::bind_slot_in::<I>(&image, rewrite.target).map_err(|code| {
+            LogicalExportError {
                 op: "rewrite_slot_set",
                 slot: rewrite.target,
                 cause: LogicalExportCause::Vm(code),
-            })?;
+            }
+        })?;
         let identical = rewrite.transform.is_none()
             && wrap(
                 "rewrite_slot_set",
                 rewrite.target,
-                geometry_identical(old, &old_meta, &image, &new_meta),
+                geometry_identical::<I>(old, &old_meta, &image, &new_meta),
             )?;
         if identical {
             wrap(
                 "rewrite_slot_set",
                 rewrite.target,
-                region_copy_slot(old, &old_meta, &mut image, &new_meta),
+                region_copy_slot::<I>(old, &old_meta, &mut image, &new_meta),
             )?;
             continue;
         }
@@ -2746,9 +2811,9 @@ pub fn rewrite_slot_set(
             logical = apply_transform(&logical, &target_types, transform, &exported, eval)?;
             logical.slot = rewrite.target;
         }
-        import_slot(&mut image, &logical, &rewrite.encoding, interner)?;
+        import_slot_in::<I>(&mut image, &logical, &rewrite.encoding, interner)?;
     }
-    state_init::validate_state(&image).map_err(|code| LogicalExportError {
+    state_init::validate_state_in::<I>(&image).map_err(|code| LogicalExportError {
         op: "rewrite_slot_set",
         slot: 0,
         cause: LogicalExportCause::Vm(code),

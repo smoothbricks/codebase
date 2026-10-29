@@ -235,6 +235,12 @@ impl SlotMetaOffset {
     pub const EVICTED_COUNT: u32 = 40;
     /// A TTL slot's timestamp input column, `u32` little-endian.
     pub const TIMESTAMP_COL: u32 = 44;
+    /// Struct-map slots: the key-lane kind bits their record declared
+    /// ([`SlotTypeFlags::STRUCT_KEY1_INTERNED`],
+    /// [`SlotTypeFlags::STRUCT_KEY2_INTERNED`]). The struct overlay leaves
+    /// byte 19 free; the slot's `TYPE_FLAGS` byte stores its flags without
+    /// these bits, so no TTL reader mistakes them for TTL flags.
+    pub const STRUCT_KEY_LANES: u32 = 19;
 }
 
 /// Bytecode encoding for duration units from the Ax expression language. The
@@ -376,6 +382,41 @@ impl SlotTypeFlags {
 
     pub const fn no_hashmap_timestamps(self) -> bool {
         self.bits & Self::NO_HASHMAP_TIMESTAMPS_MASK != 0
+    }
+
+    /// `SLOT_STRUCT_MAP` and `SLOT_STRUCT_MAP2` records only: key lane 1 holds
+    /// interned-string ids, ordered by their text. Struct maps carry no TTL,
+    /// so the bit an expiring slot reads as [`Self::has_evict_trigger`] declares
+    /// a key-lane kind on these two records and on no other.
+    pub const STRUCT_KEY1_INTERNED: u8 = 0x20;
+    /// `SLOT_STRUCT_MAP2` records only: key lane 2 holds interned-string ids.
+    /// A one-key record has no lane 2, so it refuses this bit.
+    pub const STRUCT_KEY2_INTERNED: u8 = 0x40;
+    /// Both key-lane bits.
+    pub const STRUCT_KEY_LANES: u8 = Self::STRUCT_KEY1_INTERNED | Self::STRUCT_KEY2_INTERNED;
+
+    /// Whether a struct-map record declares key lane 1 interned.
+    pub const fn struct_key1_interned(self) -> bool {
+        self.bits & Self::STRUCT_KEY1_INTERNED != 0
+    }
+
+    /// Whether a struct-map record declares key lane 2 interned.
+    pub const fn struct_key2_interned(self) -> bool {
+        self.bits & Self::STRUCT_KEY2_INTERNED != 0
+    }
+
+    /// The key-lane bits alone: what slot-metadata byte
+    /// [`SlotMetaOffset::STRUCT_KEY_LANES`] stores.
+    pub const fn struct_key_lanes(self) -> u8 {
+        self.bits & Self::STRUCT_KEY_LANES
+    }
+
+    /// These flags without the key-lane bits: what a struct-map slot's
+    /// `TYPE_FLAGS` byte stores.
+    pub const fn without_struct_key_lanes(self) -> Self {
+        Self {
+            bits: self.bits & !Self::STRUCT_KEY_LANES,
+        }
     }
 
     pub const fn reserved(self) -> bool {
@@ -792,6 +833,11 @@ pub enum Opcode {
     /// guard_field_idx:u8, num_vals:u8, [val_col:index, field_idx:u8] ×
     /// num_vals, num_arrays:u8, [(offsets_col, values_col, field_idx) × num_arrays]
     BatchStructMapGuardedUpsertLast = 0x8d,
+    /// slot:index, key1_col:index — remove every row of a two-key struct map
+    /// whose key lane 1 equals the element's key1, in the slot's key-index
+    /// order. A sentinel key1 is `InvalidKey`, as for 0x86; a key1 no row
+    /// holds removes nothing.
+    BatchStructMap2RemovePrefix = 0x8e,
     /// slot:index, val_col:index (body opcode inside FOR_EACH/FLAT_MAP blocks)
     ListAppend = 0x84,
     /// slot:index, num_vals:u8, \[(val_col:index, field_idx:u8) × N\]
@@ -888,6 +934,7 @@ impl Opcode {
             0x8b => Self::BatchStructMapUpsertFirstSinceReset,
             0x8c => Self::BatchStructMapRemove,
             0x8d => Self::BatchStructMapGuardedUpsertLast,
+            0x8e => Self::BatchStructMap2RemovePrefix,
             0x90 => Self::NestedSetInsert,
             0x92 => Self::NestedMapUpsertLast,
             0x95 => Self::NestedAggUpdate,

@@ -1,4 +1,6 @@
-//! Slot sizing and typed rehash/copy used by `vm_grow_state`.
+//! Slot sizing and typed rehash/copy used by `vm_grow_state` for the hash
+//! containers. A struct map's key-index family grows its own region
+//! (`crate::key_index::KeyIndex::grow`).
 //!
 //! The stress tests exercise `FlatTable` rehashing alongside the container
 //! family.
@@ -43,17 +45,6 @@ struct KeyLane {
     new_keys: u32,
     old_cap: u32,
     new_cap: u32,
-}
-
-/// STRUCT_MAP primary table: descriptor bases, capacities, field count, and row stride.
-#[derive(Clone, Copy, Debug)]
-pub struct StructMapTable {
-    pub old_offset: u32,
-    pub new_offset: u32,
-    pub old_cap: u32,
-    pub new_cap: u32,
-    pub num_fields: u32,
-    pub row_size: u32,
 }
 
 /// Probe live keys into a power-of-two table and invoke `on_place` at each new
@@ -142,88 +133,6 @@ pub fn grow_hash_set(
         },
         |_, _, k| hash_key(k, new_cap),
         |_, _, _| {},
-    )
-}
-
-/// Copy a STRUCT_MAP descriptor, rehash keys, and move live rows to their new
-/// probe positions. Return the number of entries rehashed.
-pub fn grow_struct_map(old_state: &[u8], new_state: &mut [u8], table: &StructMapTable) -> u32 {
-    let desc_size = columine_types::types::align8(table.num_fields);
-    bytes::copy(
-        new_state,
-        table.new_offset,
-        old_state,
-        table.old_offset,
-        table.num_fields,
-    );
-    let old_keys_offset = table.old_offset + desc_size;
-    let new_keys_offset = table.new_offset + desc_size;
-    let old_rows_base = old_keys_offset + table.old_cap * 4;
-    let new_rows_base = new_keys_offset + table.new_cap * 4;
-    rehash_occupied(
-        old_state,
-        new_state,
-        &KeyLane {
-            old_keys: old_keys_offset,
-            new_keys: new_keys_offset,
-            old_cap: table.old_cap,
-            new_cap: table.new_cap,
-        },
-        |_, _, k| hash_key(k, table.new_cap),
-        |new_state, i, pos| {
-            bytes::copy(
-                new_state,
-                new_rows_base + pos * table.row_size,
-                old_state,
-                old_rows_base + i * table.row_size,
-                table.row_size,
-            );
-        },
-    )
-}
-
-/// Rehash an exact two-lane-key struct map while preserving both key cells
-/// and each row byte-for-byte.
-pub fn grow_struct_map2(old_state: &[u8], new_state: &mut [u8], table: &StructMapTable) -> u32 {
-    let desc_size = columine_types::types::align8(table.num_fields);
-    bytes::copy(
-        new_state,
-        table.new_offset,
-        old_state,
-        table.old_offset,
-        table.num_fields,
-    );
-    let old_keys1 = table.old_offset + desc_size;
-    let old_keys2 = old_keys1 + table.old_cap * 4;
-    let old_rows = old_keys2 + table.old_cap * 4;
-    let new_keys1 = table.new_offset + desc_size;
-    let new_keys2 = new_keys1 + table.new_cap * 4;
-    let new_rows = new_keys2 + table.new_cap * 4;
-    bytes::zero(new_state, new_keys2, table.new_cap * 4);
-    rehash_occupied(
-        old_state,
-        new_state,
-        &KeyLane {
-            old_keys: old_keys1,
-            new_keys: new_keys1,
-            old_cap: table.old_cap,
-            new_cap: table.new_cap,
-        },
-        |old_state, i, key1| {
-            let key2 = bytes::read_u32(old_state, old_keys2 + i * 4);
-            columine_types::types::hash_key_pair(key1, key2, table.new_cap)
-        },
-        |new_state, i, pos| {
-            let key2 = bytes::read_u32(old_state, old_keys2 + i * 4);
-            bytes::write_u32(new_state, new_keys2 + pos * 4, key2);
-            bytes::copy(
-                new_state,
-                new_rows + pos * table.row_size,
-                old_state,
-                old_rows + i * table.row_size,
-                table.row_size,
-            );
-        },
     )
 }
 
