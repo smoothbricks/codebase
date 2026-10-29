@@ -504,6 +504,9 @@ an unbounded wait for a grant they never take. The plugin's native extracted-arc
 executions joined by `&&`, `||`, or `;`. Every leg must satisfy the boundary; a later unscheduled command, pipeline or
 background command keeps conservative idle protection for the whole command. The plugin's `mbx-pool.test.ts` table owns
 this spawn-time mapping; `bounds.test.ts` owns the grant/release/progress sequences without real clocks.
+`mbx-queue.test.ts` owns versioned activity-only reads and scoped PID membership; `verdict.test.ts` owns persistence of
+never-admitted queue failures. The executor's mbx leaf and extracted-nextest chain checks prove these observers remain
+wired alongside live closed-test result publication.
 
 **Enforced by:** for Phase 2, `canonical_mbx_environment_matches_host_warm_and_host_gate_paths` must compare the
 contribution's host-file and child projections, including adoption, caller overrides, non-Rust environment isolation

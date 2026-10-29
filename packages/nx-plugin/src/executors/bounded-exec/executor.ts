@@ -13,7 +13,17 @@ import {
   processGroupHasMembers,
   signalProcessGroup,
 } from '../../process-group.js';
-import { type BoundEvent, type BoundKind, type Bounds, earliestBound, stepBounds, UNARMED } from './bounds.js';
+import {
+  admissionWaitMs,
+  type BoundEvent,
+  type BoundKind,
+  type Bounds,
+  earliestBound,
+  NO_ADMISSION_WAIT,
+  stepAdmissionWait,
+  stepBounds,
+  UNARMED,
+} from './bounds.js';
 import {
   CPU_POOL_ENV,
   type CpuPool,
@@ -29,6 +39,7 @@ import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import type { CpuWaitRow } from './lease-wait.js';
 import type { LockWait } from './lock-wait.js';
 import { MBX_GRANT_FD, mbxIdleGated, mbxLeaf, mbxPool, withMbxLeaf } from './mbx-pool.js';
+import { MBX_QUEUE_POLL_MS, type MbxQueuedRequest, snapshotMbxQueue } from './mbx-queue.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -58,10 +69,12 @@ import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import type { BoundedExecOptions } from './schema.js';
 import { createTestResultWriter, type TestResultWriter } from './test-result-writer.js';
 import {
+  type AdmissionQueueWait,
   type BoundedExecRecord,
   type BoundedExecTask,
   BUN_TEST,
   clearTaskDirectory,
+  describeAdmissionQueue,
   describeNoSpace,
   type ExpiredBound,
   JUNIT_FILE,
@@ -293,6 +306,7 @@ export async function runBoundedExec(
   inherited: InheritedCpuPool | null = null,
   captureDiagnostics: typeof captureHangDiagnostics = captureHangDiagnostics,
   owner: SubtreeOwner | null = null,
+  queueHost?: Parameters<typeof snapshotMbxQueue>[3],
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
   const directory = context.record?.directory ?? null;
@@ -568,9 +582,27 @@ export async function runBoundedExec(
     })();
     return cpuReleased;
   };
+  let mbxAdmitted = false;
+  let admissionWait = NO_ADMISSION_WAIT;
+  let lastQueueRequests: readonly MbxQueuedRequest[] = [];
+  let queueFailure: string | null = null;
+  const queueWait = (): AdmissionQueueWait | null =>
+    mbxAdmitted || lastQueueRequests.length === 0
+      ? null
+      : {
+          waitedMs: admissionWaitMs(admissionWait, performance.now()),
+          requests: lastQueueRequests,
+        };
+  const queueAbort = new AbortController();
+  let queueTimer: NodeJS.Timeout | undefined;
+  let queueSnapshot: Promise<void> | null = null;
+  const stopQueueObservation = (): void => {
+    admissionWait = stepAdmissionWait(admissionWait, { kind: 'stop', at: performance.now() });
+    clearInterval(queueTimer);
+    queueAbort.abort();
+  };
   // Records the run's verdict when it has a task to record as. An `expiry` is set only when a bound ended the run.
-  // An `operational` run failed on its CPU pool (a sub-pool that did not close): an ordinary failure, whatever bound also
-  // fired, so it is never judged as a bound.
+  // Observation and ownership failures remain operational even after valid queue evidence; cancellation alone does not.
   const recordRun = async (
     exitCode: number,
     expiry: ExpiredBound | null,
@@ -601,10 +633,19 @@ export async function runBoundedExec(
         appendStderr(`bounded-exec: ${error}\n`);
       }
     });
+    const admissionQueue = queueWait();
     const verdict =
       operational || resultFailure !== null
         ? judgeOperationalFailure(exitCode, report)
-        : judgeRun({ exitCode, elapsedMs, expiry, report, noSpace, lockWaits });
+        : judgeRun({
+            exitCode,
+            elapsedMs,
+            expiry,
+            report,
+            noSpace,
+            lockWaits,
+            admissionQueue,
+          });
     if (verdict.outcome === 'bound' && verdict.bound === 'test') {
       appendStderr(`Every failing test failed only on its per-test timeout: ${verdict.tests.join(', ')}\n`);
     }
@@ -807,8 +848,43 @@ export async function runBoundedExec(
       : kind === 'fixture'
         ? { kind, limitMs: fixture?.timeoutMs ?? 0 }
         : { kind, limitMs: timeoutMs ?? 0 };
+  let checkingIdle = false;
+  const armBoundTimer = (): void => {
+    clearTimeout(boundTimer);
+    if (state.settled || state.expiry !== null || queueFailure !== null) return;
+    const next = earliestBound(checkingIdle ? { ...bounds, idle: null } : bounds);
+    if (next !== null) {
+      boundTimer = setTimeout(
+        () => {
+          void confirmExpiry(next.kind, next.at);
+        },
+        Math.max(0, next.at - Date.now()),
+      );
+    }
+  };
+  const confirmExpiry = async (kind: BoundKind, at: number): Promise<void> => {
+    if (state.settled || state.expiry !== null || queueFailure !== null) return;
+    const scheduled = earliestBound(checkingIdle ? { ...bounds, idle: null } : bounds);
+    if (scheduled?.kind !== kind || scheduled.at !== at) return;
+    if (kind === 'idle' && leaf !== null) {
+      if (checkingIdle) return;
+      checkingIdle = true;
+      armBoundTimer();
+      try {
+        // Drain an older poll, then take a fresh bounded snapshot before idle can end queued work. Total and fixture
+        // ceilings remain armed while this observation runs.
+        await refreshQueue(true);
+      } finally {
+        checkingIdle = false;
+      }
+    }
+    if (state.settled || state.expiry !== null || queueFailure !== null) return;
+    const next = earliestBound(bounds);
+    if (next !== null && next.at <= Date.now()) expire(expiredAs(next.kind));
+    else armBoundTimer();
+  };
   const stepTo = (event: BoundEvent): void => {
-    if (state.settled || state.expiry !== null) return;
+    if (state.settled || state.expiry !== null || queueFailure !== null) return;
     const idleBefore = bounds.idle;
     bounds = stepBounds(
       bounds,
@@ -824,9 +900,71 @@ export async function runBoundedExec(
       idleCapture = undefined;
       if (bounds.idle !== null) scheduleCapture(bounds.idle);
     }
+    armBoundTimer();
+  };
+
+  let lastQueueDiagnostic = '';
+  let lastQueueDiagnosticAt: number | null = null;
+  let lastSnapshotDiagnostics = '';
+  const failQueueObservation = (detail: string): void => {
+    if (state.settled || state.expiry !== null || queueAbort.signal.aborted || queueFailure !== null) return;
+    queueFailure = detail;
+    tell(
+      `bounded-exec: mbx admission snapshot failed: ${detail}; queue/admission state unconfirmed, not an idle wedge\n`,
+    );
     clearTimeout(boundTimer);
-    const next = earliestBound(bounds);
-    if (next !== null) boundTimer = setTimeout(() => expire(expiredAs(next.kind)), Math.max(0, next.at - Date.now()));
+    cancelCapture();
+    stopQueueObservation();
+    termination = terminate();
+  };
+  const refreshQueue = async (fresh: boolean): Promise<void> => {
+    if (fresh && queueSnapshot !== null) await queueSnapshot;
+    if (state.settled || state.expiry !== null || queueAbort.signal.aborted || child.pid === undefined) return;
+    const pid = child.pid;
+    queueSnapshot ??= (async () => {
+      const snapshot = await snapshotMbxQueue(
+        pid,
+        mergeEnv(lease?.directory ?? ordinaryTemp, env),
+        queueAbort.signal,
+        queueHost,
+      );
+      if (state.settled || state.expiry !== null || queueAbort.signal.aborted) return;
+      if (!snapshot.ok) {
+        failQueueObservation(snapshot.detail);
+        return;
+      }
+      const diagnostics = snapshot.diagnostics?.join('; ') ?? '';
+      if (diagnostics !== '' && diagnostics !== lastSnapshotDiagnostics) tell(`bounded-exec: ${diagnostics}\n`);
+      lastSnapshotDiagnostics = diagnostics;
+      const waiting = snapshot.requests.length > 0;
+      const observedAt = Date.now();
+      const observedWaitAt = performance.now();
+      admissionWait = stepAdmissionWait(admissionWait, { kind: 'snapshot', at: observedWaitAt, waiting });
+      if (waiting) {
+        lastQueueRequests = snapshot.requests;
+        const positions = JSON.stringify(snapshot.requests);
+        if (
+          positions !== lastQueueDiagnostic ||
+          lastQueueDiagnosticAt === null ||
+          Date.now() - lastQueueDiagnosticAt >= HANG_CAPTURE_MS
+        ) {
+          const waitedMs = admissionWaitMs(admissionWait, observedWaitAt);
+          tell(`cowshed: mbx ${describeAdmissionQueue({ waitedMs, requests: snapshot.requests })}\n`);
+          lastQueueDiagnostic = positions;
+          lastQueueDiagnosticAt = Date.now();
+        }
+      } else {
+        lastQueueDiagnostic = '';
+      }
+      stepTo({ kind: 'admission-queue', at: observedAt, waiting, testing: isTesting() });
+    })()
+      .catch((error: unknown) => {
+        failQueueObservation(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        queueSnapshot = null;
+      });
+    await queueSnapshot;
   };
 
   // Only the CHILD's own output is read for progress. The diagnostics below go
@@ -912,12 +1050,33 @@ export async function runBoundedExec(
   const onProcessExit = (): void => {
     void killChildTree();
   };
+  let signalCleanup: Promise<void> | null = null;
   const onTerminationSignal = (signal: NodeJS.Signals): void => {
     removeSignalHandlers();
     cancelCapture();
-    void killChildTree()
+    clearTimeout(boundTimer);
+    // Preserve explicit live membership before cancellation removes the queued process. A failed bounded observation
+    // reports an operational failure, never a manufactured queue or admission.
+    signalCleanup = (leaf === null ? Promise.resolve() : refreshQueue(false))
+      .finally(() => {
+        stopQueueObservation();
+        return killChildTree();
+      })
       .finally(releaseCpu)
       .finally(() => releaseLease(true))
+      .finally(async () =>
+        recordRun(
+          signalToExitCode(signal),
+          state.expiry,
+          Date.now() - startedAt,
+          state.poolCloseError !== null ||
+            lifecycleFailure !== null ||
+            state.retireError !== null ||
+            queueFailure !== null,
+          state.noSpace === null ? null : await state.noSpace,
+          state.lockWaits,
+        ),
+      )
       .finally(() => process.kill(process.pid, signal));
   };
   const onSigint = (): void => onTerminationSignal('SIGINT');
@@ -943,10 +1102,12 @@ export async function runBoundedExec(
     child.once('error', (error) => {
       appendStderr(`${error.message}\n`);
       state.settled = true;
+      stopQueueObservation();
       resolve({ code: 1, signal: null });
     });
     child.once(hooked === null ? 'exit' : 'close', (code: number | null, signal: NodeJS.Signals | null) => {
       state.settled = true;
+      stopQueueObservation();
       resolve({ code, signal });
     });
   });
@@ -1087,6 +1248,7 @@ export async function runBoundedExec(
       for (const byte of chunk) {
         if (byte === 103) {
           if (!said) {
+            mbxAdmitted = true;
             said = true;
             tell(
               leaf.kind === 'reserve'
@@ -1106,6 +1268,13 @@ export async function runBoundedExec(
     channel.on('error', (error) => failGrant(error.message));
   }
 
+  if (leaf !== null) {
+    queueTimer = setInterval(() => {
+      void refreshQueue(false);
+    }, MBX_QUEUE_POLL_MS);
+    void refreshQueue(false);
+  }
+
   // A grant's connection is a ledger entry, not the command's owner: the lending parent's exit ends it, and what runs
   // under it runs on over budget until it finishes. Its close, while the command runs, is said and changes nothing
   // else; only a bound or a signal stops the command. Our own release after the command settled is not a loss;
@@ -1123,6 +1292,12 @@ export async function runBoundedExec(
   }
 
   const { code: exitCode, signal: exitSignal } = await exitPromise;
+  if (signalCleanup !== null) {
+    await signalCleanup;
+    return { success: false, terminalOutput: outputChunks.join('') };
+  }
+  stopQueueObservation();
+  await queueSnapshot;
   await termination;
   clearTimeout(boundTimer);
   cancelCapture();
@@ -1156,11 +1331,18 @@ export async function runBoundedExec(
       appendStderr(`${describeRamTempError(full)}\n`);
     }
   }
-  await releaseLease(code !== 0 || state.expiry !== null || state.poolCloseError !== null || lifecycleFailure !== null);
+  await releaseLease(
+    code !== 0 ||
+      state.expiry !== null ||
+      state.poolCloseError !== null ||
+      lifecycleFailure !== null ||
+      queueFailure !== null,
+  );
 
   // Broken resource ownership, a lost native lifecycle, or leftovers that could not be retired fail even if a shell
   // branch later exited 0: its verdict is an ordinary operational failure, never a successful or silently unbounded run.
-  const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null;
+  const operationalFailure =
+    state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null || queueFailure !== null;
   await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen, state.lockWaits);
   return {
     success: !operationalFailure && resultFailure === null && state.expiry === null && code === 0,

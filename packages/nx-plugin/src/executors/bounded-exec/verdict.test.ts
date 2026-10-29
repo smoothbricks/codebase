@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -35,6 +35,19 @@ const roots: string[] = [];
 const ownedProcessGroups = new Set<number>();
 const originalStdoutWrite = process.stdout.write;
 const originalStderrWrite = process.stderr.write;
+
+// These fixtures own verdict mapping, not the installed admission protocol. The executor suite owns mbx mappings.
+const poolSwitches = ['MBX_SCHEDULER', 'MBX_SCHED_DISABLE'] as const;
+const inheritedPool = poolSwitches.map((name) => [name, process.env[name]] as const);
+beforeAll(() => {
+  for (const name of poolSwitches) delete process.env[name];
+});
+afterAll(() => {
+  for (const [name, value] of inheritedPool) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+});
 
 afterEach(async () => {
   process.stdout.write = originalStdoutWrite;

@@ -26,6 +26,7 @@ import {
 } from './executor.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS, type HangDiagnostics } from './hang-diagnostics.js';
+import { MBX_QUEUE_POLL_MS } from './mbx-queue.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { cowshedSubtreeOwner, type SubtreeOwner } from './owned-subtree.js';
 import {
@@ -1750,6 +1751,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const saved = { MBX_SCHEDULER: process.env.MBX_SCHEDULER, MBX_CACHE_DIR: process.env.MBX_CACHE_DIR };
     process.env.MBX_SCHEDULER = '1';
     process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    let snapshots = 0;
     try {
       const { result, movedMs } = await onProgressClock(
         (chunk) => {
@@ -1779,15 +1781,21 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
             undefined,
             null,
             {
-              probe: async () => ({
-                status: 'exited',
-                code: 0,
-                stdout: '{"version":2,"scheduler":{"activity":[]}}',
-                stderr: '',
-              }),
+              probe: async (file, args) => {
+                expect(file).toBe('mbx');
+                expect(args).toEqual(['stats', '--scheduler', '--json', '--activity']);
+                snapshots += 1;
+                return {
+                  status: 'exited',
+                  code: 0,
+                  stdout: '{"version":2,"scheduler":{"activity":[]}}',
+                  stderr: '',
+                };
+              },
             },
           ),
       );
+      expect(snapshots).toBeGreaterThan(0);
       expect(result.success, result.terminalOutput).toBe(true);
       expect(result.terminalOutput.match(/ran\n/g)).toHaveLength(2);
       expect(movedMs).toBe(4 * BOUNDED_TEST_IDLE_TIMEOUT_MS);
@@ -1803,6 +1811,156 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
   });
 
+  it.each(['queued', 'failed', 'admitted', 'fresh'] as const)(
+    'maps public admission observations into a %s terminal run without hiding operational failure',
+    async (mode) => {
+      const workspace = await createWorkspace();
+      const directory = await ownedSocketDirectory('admission-observer-', 'control.sock');
+      const endpoint = join(directory, 'control.sock');
+      const sockets = new Set<Socket>();
+      let release: string | null = null;
+      const send = (message: string): void => {
+        release = message;
+        for (const socket of sockets) socket.write(message);
+      };
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on('close', () => sockets.delete(socket));
+        socket.on('error', () => socket.destroy());
+        if (release !== null) socket.write(release);
+      });
+      server.listen(endpoint);
+      await once(server, 'listening');
+      const bin = join(workspace.root, 'observer-cargo');
+      await mkdir(bin);
+      await writeFile(join(bin, 'cargo'), '#!/bin/sh\nexec node observer-runner.js\n', { mode: 0o755 });
+      await workspace.write(
+        'observer-runner.js',
+        [
+          "const { connect } = require('node:net');",
+          "const { writeSync } = require('node:fs');",
+          'const socket = connect(process.env.ADMISSION_SOCKET, () => {',
+          "  if (process.env.OBSERVER_MODE === 'fresh') {",
+          "    writeSync(Number(process.env.MBX_GRANT_FD), 'g');",
+          "    console.log('advance-idle');",
+          '  }',
+          '});',
+          "socket.on('data', message => {",
+          "  if (message.toString() === 'admit') writeSync(Number(process.env.MBX_GRANT_FD), 'g');",
+          "  else if (message.toString() === 'exit') process.exit(7);",
+          "  else console.log('advance-poll');",
+          '});',
+          "socket.on('error', error => { throw error; });",
+        ].join('\n'),
+      );
+      const saved = { MBX_SCHEDULER: process.env.MBX_SCHEDULER, MBX_CACHE_DIR: process.env.MBX_CACHE_DIR };
+      process.env.MBX_SCHEDULER = '1';
+      process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+      const firstSnapshot = Promise.withResolvers<void>();
+      let snapshots = 0;
+      let running: Promise<BoundedExecResult> | null = null;
+      const recordDirectory = join(workspace.root, 'record');
+      try {
+        const { result } = await onProgressClock(
+          (chunk) => {
+            if (chunk.includes('queue position=4')) {
+              send(mode === 'failed' ? 'observe' : mode === 'admitted' ? 'admit' : 'exit');
+            }
+            if (mode === 'admitted' && chunk.includes('mbx cargo granted')) send('exit');
+            if (mode === 'fresh' && chunk.includes('advance-idle')) {
+              // Idle expires with the first poll in flight: it must drain it, then request a fresh snapshot.
+              queueMicrotask(() => queueMicrotask(() => firstSnapshot.resolve()));
+              return true;
+            }
+            return mode === 'failed' && chunk.includes('advance-poll');
+          },
+          mode === 'fresh' ? 200 : MBX_QUEUE_POLL_MS,
+          () => {
+            running = runBoundedExec(
+              {
+                command: 'cargo nextest run',
+                idleTimeoutMs: 100,
+                killAfterMs: 0,
+                env: {
+                  PATH: `${bin}:${process.env.PATH ?? ''}`,
+                  MBX_SCHEDULER_TESTS: '1',
+                  ADMISSION_SOCKET: endpoint,
+                  OBSERVER_MODE: mode,
+                },
+              },
+              { ...workspace.context, record: { task: { id: 'app:test', hash: null }, directory: recordDirectory } },
+              createProcessTreeKiller(),
+              null,
+              null,
+              undefined,
+              null,
+              {
+                probe: async (file, args) => {
+                  if (file === 'mbx') {
+                    expect(args).toEqual(['stats', '--scheduler', '--json', '--activity']);
+                    snapshots += 1;
+                    if (mode === 'fresh' && snapshots === 1) {
+                      await firstSnapshot.promise;
+                      return {
+                        status: 'exited',
+                        code: 0,
+                        stdout: '{"version":2,"scheduler":{"activity":[]}}',
+                        stderr: '',
+                      };
+                    }
+                    if (mode === 'failed' && snapshots > 1) {
+                      return { status: 'exited', code: 2, stdout: '', stderr: 'snapshot unavailable' };
+                    }
+                    return {
+                      status: 'exited',
+                      code: 0,
+                      stderr: '',
+                      stdout:
+                        '{"version":2,"scheduler":{"activity":[{"kind":"waiter","live":true,"pid":77,"ticket":31,"queue_position":4}]}}',
+                    };
+                  }
+                  expect(file).toBe('ps');
+                  const rootPid = Number(args.at(-1)?.split(',')[0]);
+                  return {
+                    status: 'exited',
+                    code: 0,
+                    stdout: `${rootPid} 1 ${rootPid} S\n77 ${rootPid} ${rootPid} S\n`,
+                    stderr: '',
+                  };
+                },
+              },
+            );
+            return running;
+          },
+        );
+        expect(result.success).toBe(false);
+        const verdict = (await readRecord(recordDirectory))?.verdict;
+        expect(verdict?.outcome).toBe(mode === 'queued' ? 'queued' : 'failed');
+        if (verdict?.outcome === 'queued') {
+          expect(verdict.requests).toEqual([{ pid: 77, ticket: 31, queuePosition: 4 }]);
+          expect(verdict.waitedMs).toBeGreaterThanOrEqual(0);
+        }
+        expect(snapshots).toBeGreaterThanOrEqual(mode === 'failed' || mode === 'fresh' ? 2 : 1);
+        expect(result.terminalOutput).not.toContain('Command made no progress');
+        if (mode === 'failed') expect(result.terminalOutput).toContain('mbx admission snapshot failed');
+        if (mode === 'admitted' || mode === 'fresh') expect(result.terminalOutput).toContain('mbx cargo granted');
+      } finally {
+        firstSnapshot.resolve();
+        send('exit');
+        try {
+          await running;
+        } finally {
+          for (const socket of sockets) socket.destroy();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+          await rm(directory, { recursive: true, force: true });
+          for (const [name, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[name];
+            else process.env[name] = value;
+          }
+        }
+      }
+    },
+  );
   it('resolves the cowshed a run uses, in full precedence order', () => {
     const root = '/workspace';
     // The executor never chdirs, so an empty PATH component names its actual spawn cwd,

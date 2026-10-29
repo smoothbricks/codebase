@@ -1,6 +1,6 @@
 # The mbx cowshed setup installs beside the installed cowshed (specs/cowshed/14_nix.md, "mbx"): mbx
 # v1.28.0 plus compact predictions, scheduler admission, grant descriptors, short session roots,
-# Cargo shim-chain selection, selected default sysroots and bounded live admission activity, from
+# Cargo shim-chain selection, selected default sysroots and version-2 activity-only admission reports, from
 # smoothbricks/mr-boxington at the pinned revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
