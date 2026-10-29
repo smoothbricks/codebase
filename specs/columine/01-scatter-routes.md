@@ -23,6 +23,22 @@ source row to resolve its ordinal. The guarded form's requirement that a kind-0 
 only to consumed routes. The guard slot itself remains a real allocated struct map; `SKIP` is not a guard-slot index. A
 skipped entry names no allocated slot and introduces no destination allocation.
 
+## Stream order
+
+Every scatter runs once per FLAT_MAP element, in arrival order: parent rows in batch order, then each row's elements in
+offset order. An element reads its destination as the elements before it left it, in the same call or an earlier one. A
+card-one assert overwrites the field, so the last assert to arrive wins whichever route wrote the earlier value. A
+retract clears the field only while the field holds the retracted value at the retract's own position. A set insert or
+remove applies to the set as it stands. The guarded form compares an element's guard with the guard its row holds at
+that position, including one an earlier row of the same batch stamped.
+
+Nothing is deduplicated, deferred or grouped by key or route, so one reduce over a batch leaves the destination slots
+byte-identical to reducing its rows one call at a time, in arrival order; only the change flags differ, because they
+record what the last call changed. The probe form reads its probe slot as it stands at each element, so it keeps this
+equivalence while no other block of the program writes the probe slot within the batch.
+`packages/columine/crates/columine-vm/tests/scatter_fold.rs` pins the equivalence for all three opcodes: a case table
+that also checks the resulting fields, and a property test per opcode over random rows.
+
 ## Admission and verification
 
 Capacity admission ignores a no-consumer destination. That entry contributes no value-column use; any consumed entry
