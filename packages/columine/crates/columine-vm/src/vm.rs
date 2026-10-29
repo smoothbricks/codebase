@@ -26,8 +26,8 @@ use crate::hashmap_ops::{self, CmpType, Strategy};
 use crate::hashset_ops;
 use crate::hooks::{ByteCapture, CaptureFrame, EraseScratch, VmHooks};
 use crate::key_index::{
-    HashIndex, INDEX_WRITES_MAX, IndexWrites, InsertPlan, InternBytes, KeyCx, KeyIndex, KeyScratch,
-    NoStrings, RemovePlan,
+    HashIndex, INDEX_WRITES_MAX, IndexWrites, InsertPlan, InternBytes, Key, KeyCx, KeyIndex,
+    KeyScratch, NoStrings, RemovePlan,
 };
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
@@ -1571,6 +1571,13 @@ pub fn rollback_entry(state: &mut [u8], entry: &FlatUndoEntry) -> Result<(), Err
 // Struct-map row writes: one physical capture per row mutation
 // =============================================================================
 
+/// One batch's input columns and its row count, as the reduce section reads
+/// them.
+#[derive(Clone, Copy)]
+struct BatchColumns<'c> {
+    cols: &'c [&'c [u8]],
+    len: u32,
+}
 /// Most ranges one struct-map capture names besides its index plan's writes.
 const ROW_CAPTURE_FIXED: usize = 8;
 
@@ -2336,18 +2343,16 @@ fn validate_struct_map2_tuple<I: KeyIndex>(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn should_upsert_struct_map2_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
     state: &[u8],
     smap: &StructMap2Slot<I>,
-    key1: u32,
-    key2: u32,
+    key: Key,
     operands: &StructMap2TupleOperands,
     cols: &[&[u8]],
     element_idx: u32,
     cx: &mut KeyCx<'_, I, S>,
 ) -> Result<bool, ErrorCode> {
-    let Some(pos) = smap.lookup(state, key1, key2, cx)? else {
+    let Some(pos) = smap.lookup(state, key.k1, key.k2, cx)? else {
         return Ok(true);
     };
     let row = smap.row_off(pos);
@@ -2842,8 +2847,15 @@ fn single_struct_map2_upsert_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
     if key1 == EMPTY_KEY || key1 == TOMBSTONE {
         return ErrorCode::InvalidKey;
     }
-    match should_upsert_struct_map2_tuple(state, smap, key1, key2, operands, cols, element_idx, cx)
-    {
+    match should_upsert_struct_map2_tuple(
+        state,
+        smap,
+        Key::two(key1, key2),
+        operands,
+        cols,
+        element_idx,
+        cx,
+    ) {
         Ok(true) => {}
         Ok(false) => return ErrorCode::Ok,
         Err(error) => return error,
@@ -2905,21 +2917,19 @@ fn remove_struct_map2_row<I: KeyIndex, S: InternBytes + ?Sized>(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn single_struct_map2_remove<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
     smap: &StructMap2Slot<I>,
     slot: u32,
-    key1: u32,
-    key2: u32,
+    key: Key,
     cx: &mut KeyCx<'_, I, S>,
 ) -> ErrorCode {
-    if key1 == EMPTY_KEY || key1 == TOMBSTONE {
+    if key.k1 == EMPTY_KEY || key.k1 == TOMBSTONE {
         return ErrorCode::InvalidKey;
     }
-    match smap.plan_remove(state, key1, key2, cx) {
+    match smap.plan_remove(state, key.k1, key.k2, cx) {
         Ok(Some(plan)) => remove_struct_map2_row(undo, delta_mode, state, smap, slot, &plan, cx),
         Ok(None) => ErrorCode::Ok,
         Err(error) => error,
@@ -4344,8 +4354,10 @@ impl<I: KeyIndex> Vm<I> {
                 delta_mode,
                 state,
                 sections.reduce_code,
-                cols,
-                batch_len,
+                BatchColumns {
+                    cols,
+                    len: batch_len,
+                },
                 live,
                 cx,
             );
@@ -4389,7 +4401,11 @@ impl<I: KeyIndex> Vm<I> {
         } else {
             image.extend_from_slice(state);
             let enabled = core::mem::replace(&mut self.undo.enabled, false);
-            let result = self.execute_ops(false, &mut image, code, cols, batch_len, live, cx);
+            let batch = BatchColumns {
+                cols,
+                len: batch_len,
+            };
+            let result = self.execute_ops(false, &mut image, code, batch, live, cx);
             self.undo.enabled = enabled;
             result
         };
@@ -4404,17 +4420,19 @@ impl<I: KeyIndex> Vm<I> {
         self.capacity.counts
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn execute_ops<S: InternBytes + ?Sized>(
         &mut self,
         delta_mode: bool,
         state: &mut [u8],
         code: &[u8],
-        cols: &[&[u8]],
-        batch_len: u32,
+        batch: BatchColumns<'_>,
         mut live: Option<&mut LiveColumns<'_, '_>>,
         cx: &mut KeyCx<'_, I, S>,
     ) -> u32 {
+        let BatchColumns {
+            cols,
+            len: batch_len,
+        } = batch;
         let mut pc = 0usize;
         while pc < code.len() {
             let Some(_) = body_op_len(code, pc) else {
@@ -5035,8 +5053,7 @@ impl<I: KeyIndex> Vm<I> {
                             state,
                             &smap,
                             slot,
-                            keys1[index],
-                            keys2[index],
+                            Key::two(keys1[index], keys2[index]),
                             cx,
                         );
                         if result != ErrorCode::Ok {
@@ -6039,8 +6056,10 @@ impl<I: KeyIndex> Vm<I> {
                         state,
                         &smap,
                         slot,
-                        cell_u32(cols, key1_col, child_idx),
-                        cell_u32(cols, key2_col, child_idx),
+                        Key::two(
+                            cell_u32(cols, key1_col, child_idx),
+                            cell_u32(cols, key2_col, child_idx),
+                        ),
                         cx,
                     );
                     if result != ErrorCode::Ok {
