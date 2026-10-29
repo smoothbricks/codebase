@@ -950,7 +950,7 @@ pub trait SpawnSink: Send {
     /// Prepare kernel membership before the actor records an admission. A non-native sink
     /// owns no OS process; the production sink must return a cgroup or refuse.
     #[cfg(target_os = "linux")]
-    async fn admit_cgroup(
+    fn admit_cgroup(
         &mut self,
         _authority: &WorkspaceAuthoritySnapshot,
         _job_id: JobId,
@@ -3003,37 +3003,32 @@ impl SystemSpawnSink {
 #[async_trait]
 impl SpawnSink for SystemSpawnSink {
     #[cfg(target_os = "linux")]
-    async fn admit_cgroup(
+    fn admit_cgroup(
         &mut self,
         authority: &WorkspaceAuthoritySnapshot,
         job_id: JobId,
         class: ExecClass,
     ) -> Result<Option<Arc<super::job_cgroup::JobCgroup>>> {
-        let mut cgroups = self.cgroups.take();
-        let incarnation = authority.workspace_incarnation.clone();
-        let (cgroups, admitted) = off_actor::run(move || {
-            let admitted = (|| {
-                if !cgroups
-                    .as_ref()
-                    .is_some_and(|jobs| jobs.incarnation() == &incarnation)
-                {
-                    let delegated =
-                        super::job_cgroup::CgroupAuthority::delegated().map_err(cgroup_error)?;
-                    cgroups = Some(delegated.incarnation(&incarnation).map_err(cgroup_error)?);
-                }
-                cgroups
-                    .as_ref()
-                    .expect("authority was established above")
-                    .admit(job_id, class)
-                    .map(Arc::new)
-                    .map(Some)
-                    .map_err(cgroup_error)
-            })();
-            (cgroups, admitted)
-        })
-        .await;
-        self.cgroups = cgroups;
-        admitted
+        if !self
+            .cgroups
+            .as_ref()
+            .is_some_and(|jobs| jobs.incarnation() == &authority.workspace_incarnation)
+        {
+            let delegated =
+                super::job_cgroup::CgroupAuthority::delegated().map_err(cgroup_error)?;
+            self.cgroups = Some(
+                delegated
+                    .incarnation(&authority.workspace_incarnation)
+                    .map_err(cgroup_error)?,
+            );
+        }
+        self.cgroups
+            .as_ref()
+            .expect("authority was established above")
+            .admit(job_id, class)
+            .map(Arc::new)
+            .map(Some)
+            .map_err(cgroup_error)
     }
     async fn spawn(
         &mut self,
@@ -7138,8 +7133,7 @@ impl SupervisorActor {
         #[cfg(target_os = "linux")]
         let cgroup = self
             .spawner
-            .admit_cgroup(&self.authority, job_id, scheduling.class())
-            .await?;
+            .admit_cgroup(&self.authority, job_id, scheduling.class())?;
         {
             let _span = cowshed_os::timing::span("admit", "record");
             let grant_revision = self.authority.grant_revision;
@@ -7473,7 +7467,7 @@ impl SupervisorActor {
             clock_observation(job);
         }
         if let Some(owned) = process.process() {
-            own_process(job, owned.clone(), self.job_sampling.leaf_coverage).await;
+            own_process(job, owned.clone(), self.job_sampling.leaf_coverage);
             adopt_birth(job, self.group_ledger.is_some(), owned.birth.clone());
             self.arm_sample_clock();
         }
@@ -8250,7 +8244,7 @@ impl SupervisorActor {
             ProcessEvent::Activating { job_id, process } => {
                 let coverage = self.job_sampling.leaf_coverage;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
-                    own_process(job, process, coverage).await;
+                    own_process(job, process, coverage);
                     self.arm_sample_clock();
                 }
             }
@@ -8275,7 +8269,7 @@ impl SupervisorActor {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.info.nice = nice;
                     let birth = process.birth.clone();
-                    own_process(job, process, coverage).await;
+                    own_process(job, process, coverage);
                     adopt_birth(job, ledger, birth);
                     self.record_groups();
                     self.arm_sample_clock();
@@ -9299,20 +9293,24 @@ fn admission_host(job_id: JobId) -> Option<HostLoadSample> {
 /// The job owns `process`: its first process starts its sampling, judging its leaf by
 /// `coverage`, and a later one -- its command, after its activation -- takes the lead. Either is
 /// a supervisor boundary, observed at once as the job's latest sample. An ended job's sampling
-/// stays as it ended, whatever arrives after. The turn that spawns or starts the process awaits
-/// this sample on the blocking pool before handling any later event, including retirement or
-/// the job's first input.
-async fn own_process(job: &mut JobStateRecord, process: OwnedProcess, coverage: LeafCoverage) {
+/// stays as it ended, whatever arrives after. This sample stays on the actor's thread: the turn
+/// that spawns or starts the job's process yields nothing after it, so whatever reaches the
+/// actor meanwhile, a retirement or the job's first input, is ordered after that turn.
+fn own_process(job: &mut JobStateRecord, process: OwnedProcess, coverage: LeafCoverage) {
     if job.terminal() {
         return;
     }
     let job_id = job.info.job_id;
-    if job.sampling.own(job_id, process, coverage).is_some() {
-        let lent =
-            LentSampler::lend(job_id, job).expect("the job just took ownership of a process");
-        let (_, sampler, sample) = off_actor::run(move || lent.observe(Boundary::Supervisor)).await;
-        job.sampling.restore(sampler);
-        match sample {
+    if let Some(sampler) = job.sampling.own(job_id, process, coverage) {
+        match observe(
+            sampler,
+            &job.volumes,
+            job.stdout_tally,
+            job.stderr_tally,
+            Boundary::Supervisor,
+            #[cfg(target_os = "macos")]
+            job.monitor.as_ref(),
+        ) {
             Ok(sample) => job.info.resources = Some(sample),
             // The latest sample stands, dated by its own `sampledAt`; a read reports the failure.
             Err(error) => cowshed_os::eprintln!(
