@@ -90,7 +90,7 @@ overrides gain no mapping. Reservation and compiler-admission waits block on kqu
 rate-limited shared rescue scans for crash recovery instead of per-waiter polling. The short session root is the
 canonical environment's (11_shell.md, "Canonical mbx environment"), not a new namespace or sandbox grant (04_sandbox.md,
 "Fixture roots under /tmp"; 08_testing.md, "Fixtures"; 01c_macos.md, "sun_path is 104 bytes"). It is
-`smoothbricks/mr-boxington` at rev `9ca36475ad634c8c28b54b7d44f44d53f1d860e4`. No project needs to pin it: the host's
+`smoothbricks/mr-boxington` at rev `5434eb066d6d141a734151d5155bec9f2ec34f0f`. No project needs to pin it: the host's
 mbx serves every Cargo project, which reaches it through the Cargo shim that `cowshed setup` generates from it, below
 (the capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store
 path or a host path where a command is spawned; its store path is only what the link resolves to.
@@ -99,6 +99,11 @@ Managed-target seeding installs a profile's build-script shim pins before publis
 donors, so cancellation cannot leave a fresh launcher without its executable. For unmeasured Cargo test binaries, the
 scheduler estimates at most half its CPU budget, rounded up, separately from one default memory share per binary. These
 are cold admission estimates, not a harness thread cap; observations replace them.
+
+The pin exposes `mbx stats --scheduler --json --activity`, a version-2 activity-only report that skips store and
+historical-summary walks. Queued records become visible only after the publisher owns their lifetime lock. This producer
+and bounded-exec's version-2 consumer cut over in one unit, so a gate never mixes the consumer with an older host schema
+(11_shell.md, "Cargo test-runner boundaries").
 
 SmoothBricks' own shell carries no mbx input, package or Cargo shim; its plain toolchain `cargo` sits behind the
 setup-owned route.

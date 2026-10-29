@@ -1675,7 +1675,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     await mkdir(bin);
     await writeFile(
       join(bin, 'mbx'),
-      '#!/bin/sh\nshift\nwhile [ "$1" != -- ]; do\n  if [ "$1" = --grant-fd ]; then shift; fd=$1; fi\n  shift\ndone\nshift\neval "printf g >&$fd"\nexec "$@"\n',
+      '#!/bin/sh\nif [ "$1" = stats ]; then printf \'{"version":2,"scheduler":{"activity":[]}}\\n\'; exit; fi\nshift\nwhile [ "$1" != -- ]; do\n  if [ "$1" = --grant-fd ]; then shift; fd=$1; fi\n  shift\ndone\nshift\neval "printf g >&$fd"\nexec "$@"\n',
       { mode: 0o755 },
     );
     await writeFile(join(bin, 'cargo'), '#!/bin/sh\neval "printf ggrr >&$MBX_GRANT_FD"\nprintf "ran\\n"\n', {
@@ -1715,6 +1715,91 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
       }
+    }
+  });
+
+  it('does not charge admission wait in either extracted nextest chain leg', async () => {
+    const workspace = await createWorkspace();
+    const directory = await ownedSocketDirectory('admission-chain-', 'control.sock');
+    const endpoint = join(directory, 'control.sock');
+    const sockets = new Set<Socket>();
+    const server = createServer((socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+      socket.on('error', () => socket.destroy());
+    });
+    server.listen(endpoint);
+    await once(server, 'listening');
+    const bin = join(workspace.root, 'stand-in-cargo');
+    await mkdir(bin);
+    await writeFile(join(bin, 'cargo'), '#!/bin/sh\nexec node queued-runner.js\n', { mode: 0o755 });
+    await workspace.write(
+      'queued-runner.js',
+      [
+        "const { connect } = require('node:net');",
+        "const { writeSync } = require('node:fs');",
+        "const socket = connect(process.env.ADMISSION_SOCKET, () => console.log('queued-for-admission'));",
+        "socket.once('data', () => {",
+        "  writeSync(Number(process.env.MBX_GRANT_FD), 'gr');",
+        "  console.log('ran');",
+        '  socket.end();',
+        '});',
+        "socket.on('error', error => { throw error; });",
+      ].join('\n'),
+    );
+    const saved = { MBX_SCHEDULER: process.env.MBX_SCHEDULER, MBX_CACHE_DIR: process.env.MBX_CACHE_DIR };
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    try {
+      const { result, movedMs } = await onProgressClock(
+        (chunk) => {
+          if (!chunk.includes('queued-for-admission')) return false;
+          // Admission is released only after the injected clock crosses the idle bound.
+          queueMicrotask(() =>
+            queueMicrotask(() => {
+              for (const socket of sockets) if (!socket.destroyed) socket.write('admit');
+            }),
+          );
+          return true;
+        },
+        2 * BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        () =>
+          runBoundedExec(
+            {
+              command:
+                'extracted="$(printf archive)" && cargo --frozen nextest run && cargo --frozen nextest run --run-ignored only',
+              idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+              killAfterMs: 0,
+              env: { PATH: `${bin}:${process.env.PATH ?? ''}`, MBX_SCHEDULER_TESTS: '1', ADMISSION_SOCKET: endpoint },
+            },
+            workspace.context,
+            createProcessTreeKiller(),
+            null,
+            null,
+            undefined,
+            null,
+            {
+              probe: async () => ({
+                status: 'exited',
+                code: 0,
+                stdout: '{"version":2,"scheduler":{"activity":[]}}',
+                stderr: '',
+              }),
+            },
+          ),
+      );
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(result.terminalOutput.match(/ran\n/g)).toHaveLength(2);
+      expect(movedMs).toBe(4 * BOUNDED_TEST_IDLE_TIMEOUT_MS);
+      expect(result.terminalOutput).not.toContain('Command made no progress');
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
     }
   });
 

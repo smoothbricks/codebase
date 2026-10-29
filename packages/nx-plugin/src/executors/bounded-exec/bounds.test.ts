@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'bun:test';
-import { type BoundEvent, type BoundKind, type BoundLimits, earliestBound, stepBounds, UNARMED } from './bounds.js';
+import {
+  type AdmissionWaitEvent,
+  admissionWaitMs,
+  type BoundEvent,
+  type BoundKind,
+  type BoundLimits,
+  earliestBound,
+  NO_ADMISSION_WAIT,
+  stepAdmissionWait,
+  stepBounds,
+  UNARMED,
+} from './bounds.js';
 
 /** The bound that would fire first after `events`, all on one injected clock. */
 function firstExpiry(limits: BoundLimits, events: readonly BoundEvent[]): { kind: BoundKind; at: number } | null {
@@ -163,7 +174,128 @@ describe('bounded-exec bounds', () => {
       ],
       { kind: 'idle', at: 600 },
     ],
+    [
+      'any pending task request pauses idle despite overlapping held grants, and resumes only after the queue empties',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: true },
+        { kind: 'granted', at: 500, testing: true, fixture: false },
+        { kind: 'granted', at: 510, testing: true, fixture: false },
+        { kind: 'admission-queue', at: 540, waiting: true, testing: true },
+        { kind: 'granted', at: 550, testing: true, fixture: false },
+        { kind: 'released', at: 560 },
+        { kind: 'admission-queue', at: 5_000, waiting: false, testing: true },
+      ],
+      { kind: 'idle', at: 5_060 },
+    ],
+    [
+      'a finished test during explicit queue wait resets the remaining budget, not the queue pause',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: false },
+        { kind: 'admission-queue', at: 40, waiting: true, testing: true },
+        progress(50, true, true, true),
+        { kind: 'admission-queue', at: 5_000, waiting: false, testing: true },
+      ],
+      { kind: 'idle', at: 5_100 },
+    ],
+    [
+      'an unsupported runner pauses only on explicit queue evidence and resumes its remaining budget',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: false },
+        { kind: 'admission-queue', at: 40, waiting: true, testing: true },
+        { kind: 'admission-queue', at: 60, waiting: true, testing: true },
+        { kind: 'granted', at: 70, testing: true, fixture: false },
+        { kind: 'admission-queue', at: 5_000, waiting: false, testing: true },
+      ],
+      { kind: 'idle', at: 5_060 },
+    ],
+    [
+      'an empty snapshot never exempts an unsupported runner',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: false },
+        { kind: 'admission-queue', at: 50, waiting: false, testing: true },
+      ],
+      { kind: 'idle', at: 100 },
+    ],
+    [
+      'explicit queue wait after first admission never pauses total or fixture ceilings',
+      { idleMs: 100, fixtureMs: 200, totalMs: 1_000 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: true, queued: true },
+        { kind: 'granted', at: 500, testing: true, fixture: true },
+        { kind: 'admission-queue', at: 540, waiting: true, testing: true },
+      ],
+      { kind: 'fixture', at: 700 },
+    ],
+    [
+      'clearing an explicit queue cannot resume a supported leaf with no held grant',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: true },
+        { kind: 'granted', at: 500, testing: true, fixture: false },
+        { kind: 'admission-queue', at: 540, waiting: true, testing: true },
+        { kind: 'released', at: 550 },
+        { kind: 'admission-queue', at: 600, waiting: false, testing: true },
+        { kind: 'granted', at: 5_000, testing: true, fixture: false },
+      ],
+      { kind: 'idle', at: 5_060 },
+    ],
+    [
+      'a pending task request stops idle even while another grant remains held',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: true },
+        { kind: 'granted', at: 500, testing: true, fixture: false },
+        { kind: 'admission-queue', at: 540, waiting: true, testing: true },
+      ],
+      null,
+    ],
+    [
+      'explicit admission wait cannot pause the total ceiling after its first grant',
+      { idleMs: 100, totalMs: 1_000 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: true },
+        { kind: 'granted', at: 500, testing: true, fixture: false },
+        { kind: 'admission-queue', at: 540, waiting: true, testing: true },
+      ],
+      { kind: 'total', at: 1_500 },
+    ],
+    [
+      'a snapshot completing after a finished test pauses only the budget left at completion, never its old poll start',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: false },
+        // Poll starts at 20. A finished test at 60 owns the new budget before its snapshot completes at 80.
+        progress(60, true, true, true),
+        { kind: 'admission-queue', at: 80, waiting: true, testing: true },
+        { kind: 'admission-queue', at: 1_000, waiting: false, testing: true },
+      ],
+      { kind: 'idle', at: 1_080 },
+    ],
   ])('%s', (_title, limits, events, expected) => {
     expect(firstExpiry(limits, events)).toEqual(expected);
   });
+});
+
+it('freezes observed admission wait at terminal/cancellation stop, excluding teardown and report reads', () => {
+  let wait = NO_ADMISSION_WAIT;
+  const walk: readonly [AdmissionWaitEvent, number][] = [
+    [{ kind: 'snapshot', at: 0, waiting: false }, 0],
+    [{ kind: 'snapshot', at: 10, waiting: true }, 0],
+    [{ kind: 'snapshot', at: 30, waiting: true }, 20],
+    [{ kind: 'snapshot', at: 50, waiting: false }, 40],
+    [{ kind: 'snapshot', at: 60, waiting: true }, 40],
+    [{ kind: 'stop', at: 80 }, 60],
+    [{ kind: 'stop', at: 1_000 }, 60],
+    [{ kind: 'snapshot', at: 2_000, waiting: true }, 60],
+  ];
+  for (const [event, expected] of walk) {
+    wait = stepAdmissionWait(wait, event);
+    expect(admissionWaitMs(wait, event.at)).toBe(expected);
+  }
+  expect(wait).toEqual({ kind: 'stopped', waitedMs: 60 });
+  expect(admissionWaitMs(wait, 10_000)).toBe(60);
 });

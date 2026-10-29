@@ -472,18 +472,38 @@ leaf, and nextest listings execute no tests; actual compiler work still uses mbx
 and nextest target runners use mbx's own pool without an external reservation. Cowshed never claims that an inherited
 jobserver alone makes an arbitrary test runner consume mbx permits.
 
-A bounded leaf's hang clock follows this boundary too. Only a supported Cargo test execution known at spawn with
+A bounded leaf's hang clock follows this boundary too. A supported Cargo test execution known at spawn with
 `MBX_SCHEDULER_TESTS=1`, or a reserved external leaf, may suspend its no-progress clock while mbx holds no capacity. The
-grant descriptor carries every admission (`g`) and permit drop (`r`); overlapping holds are counted, queued time spends
-no idle budget, and a finished test resets the budget. A signal-killed holder writes no release and stays counted until
-the command ends. The first admission starts total and fixture ceilings; later queue intervals do not pause those
+grant descriptor carries every admission (`g`) and permit drop (`r`); overlapping holds are counted, zero-hold time
+spends no idle budget, and a finished test resets the budget. A signal-killed holder writes no release and stays counted
+until the command ends. The first admission starts total and fixture ceilings; later queue intervals do not pause those
 ceilings. EOF proves neither admission nor release.
+
+Independently, any live process of the bounded task explicitly queued for mbx admission pauses the remaining idle
+budget, including alongside a held grant and for an otherwise unsupported runner. Public
+`mbx stats --scheduler --json --activity` `scheduler.activity` rows supply `kind: "waiter"`, `live: true`, PID, ticket
+and the 1-based pending `queue_position`. The consumer corroborates the live PID's process-group or descendant
+membership with bounded scoped observations, never names, private waiter files or best-effort decision logs. A
+successful snapshot without task waiters resumes the remaining budget only when its lifecycle and zero-hold rule also
+permit it. Finished tests reset that budget even while paused. Before an idle callback expires work it drains any
+existing poll and takes a fresh bounded snapshot; total and fixture ceilings remain armed. A snapshot failure is
+reported as an operational failure, not queue/admission proof or a wedge. Unidentifiable foreign legacy rows are
+diagnosed without granting them task membership. Live output names `queued for admission N s` and the public queue
+position; a failed or cancelled never-admitted command persists a distinct `queued` verdict with its observed wait and
+last public PID/ticket/position rows. This observation creates no queue deadline. Queue observations take effect at
+snapshot completion, never backdated across a finished test's budget reset. Observed wait duration freezes when the
+command settles or cancellation stops observation, before teardown or report reading. The observer consumes the
+version-2 activity-only projection. It does not load the full statistics document's cache, savings or memory histories
+and does not raise its control-plane or output limits to accommodate them. The host pin and this consumer cut over
+together (14_nix.md, "mbx").
 
 Plain `cargo test` may include doctests and keeps its lifecycle clock. Commands with unsupported overrides, direct
 binaries, other runners and archives whose target is unknown at spawn keep that same conservative hang protection, not
 an unbounded wait for a grant they never take. The plugin's native extracted-archive nextest command uses
-`--binaries-metadata` under the canonical Cargo shim and is hold-gated. The plugin's `mbx-pool.test.ts` table owns this
-spawn-time mapping; `bounds.test.ts` owns the grant/release/progress sequences without real clocks.
+`--binaries-metadata` under the canonical Cargo shim and is hold-gated, including a chain of supported Cargo test
+executions joined by `&&`, `||`, or `;`. Every leg must satisfy the boundary; a later unscheduled command, pipeline or
+background command keeps conservative idle protection for the whole command. The plugin's `mbx-pool.test.ts` table owns
+this spawn-time mapping; `bounds.test.ts` owns the grant/release/progress sequences without real clocks.
 
 **Enforced by:** for Phase 2, `canonical_mbx_environment_matches_host_warm_and_host_gate_paths` must compare the
 contribution's host-file and child projections, including adoption, caller overrides, non-Rust environment isolation

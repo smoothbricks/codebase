@@ -1,3 +1,4 @@
+import { shellTokens } from '../../runtime-input-policy.js';
 import { invocationSpan, type RunnerKind } from './runner-sizing.js';
 import { shellQuote } from './verdict.js';
 
@@ -53,25 +54,57 @@ export function mbxIdleGated(leaf: MbxLeaf | null, command: string, environment:
   if (environment.MBX_SCHEDULER_TESTS !== '1') return false;
   if (environment.MBX_SCHEDULER === '0' || environment.MBX_SCHED_DISABLE === '1' || environment.MBX_DISABLE === '1')
     return false;
+  // invocationSpan shares the lifecycle mapper's conservative shell-syntax boundary.
+  if (/[<>\n\r`\\]/.test(command)) return false;
+  if (/[^\S \t]/.test(command)) return false;
   const invocation = /cargo(?:\s+(?:--frozen|--locked|--offline))*\s+(nextest\s+run|test)(?=\s|$)/;
   const found = invocation.exec(command);
   if (found === null) return false;
   const prefix = command.slice(0, found.index).trim();
-  if (prefix !== '' && !/^extracted="\$\([^\n]+\)"\s*&&$/.test(prefix)) return false;
-  const { argsEnd } = invocationSpan(command, invocation);
-  if (command.slice(argsEnd).trim() !== '') return false;
-  const args = command.slice(found.index, argsEnd).split(/\s--(?:\s|$)/, 1)[0] ?? '';
-  if (
-    /(?:^|\s)(?:--(?:config|directory|archive-file)(?:=|\s)|--(?:doc|no-run|list|help)(?:\s|$)|-C|-h(?:\s|$)|\+)/.test(
-      args,
-    )
-  ) {
-    return false;
+  if (prefix !== '' && !/^extracted="\$\([^"\n]+\)"\s*&&$/.test(prefix)) return false;
+  let remaining = command.slice(found.index);
+  const unquoted = remaining.replace(/"[^"]*"|'[^']*'/g, '');
+  if (/[$*?{}~[\]]/.test(unquoted)) return false;
+  // Only the inferred command's path templates are known expansions; arbitrary words could supply mbx overrides.
+  const paths = remaining.replace(/\$PWD(?=\/)/g, '');
+  if ((prefix === '' ? paths : paths.replace(/\$extracted(?=\/)/g, '')).includes('$')) return false;
+  for (;;) {
+    const leg = invocation.exec(remaining);
+    if (leg === null || leg.index !== 0) return false;
+    const { argsEnd } = invocationSpan(remaining, invocation);
+    const args: string[] = [];
+    for (const token of shellTokens(remaining.slice(0, argsEnd), [])) {
+      if (token.kind !== 'word') return false;
+      if (token.text === '--') break;
+      if (
+        token.text.startsWith('$') &&
+        !(
+          token.text.startsWith('$extracted/') &&
+          ['--binaries-metadata', '--cargo-metadata', '--target-dir-remap'].includes(args.at(-1) ?? '')
+        )
+      )
+        return false;
+      args.push(token.text);
+    }
+    if (
+      args.some((arg) =>
+        /^(?:--(?:config|directory|archive-file)(?:=|$)|--(?:doc|no-run|list|help)(?:=|$)|-C|-h$|\+)/.test(arg),
+      )
+    ) {
+      return false;
+    }
+    if (
+      leg[1] === 'test' &&
+      !args.some((arg) => /^--(?:lib|tests|bins|examples|benches|all-targets|test|bin|example|bench)(?:=|$)/.test(arg))
+    ) {
+      return false;
+    }
+    const suffix = remaining.slice(argsEnd).trim();
+    if (suffix === '') return true;
+    const separator = /^(?:&&|\|\||;)\s*/.exec(suffix);
+    if (separator === null) return false;
+    remaining = suffix.slice(separator[0].length);
   }
-  return (
-    found[1] !== 'test' ||
-    /(?:^|\s)--(?:lib|tests|bins|examples|benches|all-targets|test|bin|example|bench)(?=\s|=|$)/.test(args)
-  );
 }
 
 /**

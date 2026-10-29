@@ -383,11 +383,12 @@ export function stopProbe(file: string, pid: number): boolean {
 }
 
 /** A probe owns its group and output pipes; its deadline never waits for an unresponsive child to reap. */
-function runProbe(
+export function runProbe(
   file: string,
   args: readonly string[],
   timeoutMs: number,
   signal: AbortSignal,
+  environment?: NodeJS.ProcessEnv,
 ): Promise<HangProbeResult> {
   // Keep the package's es2022-compatible event-completion convention.
   return new Promise((resolve) => {
@@ -395,7 +396,7 @@ function runProbe(
       resolve({ status: 'timed-out', detail: 'capture deadline already reached', stdout: '', stderr: '' });
       return;
     }
-    const child = spawn(file, [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(file, [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: environment });
     let stdout = '';
     let stderr = '';
     let bytes = 0;

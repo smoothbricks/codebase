@@ -198,6 +198,35 @@ describe('bounded-exec verdicts', () => {
     });
   });
 
+  it('persists never-admitted queue failures distinctly, preserving observed wait and public positions', async () => {
+    const admissionQueue = { waitedMs: 12_300, requests: [{ pid: 77, ticket: 31, queuePosition: 4 }] };
+    const end = {
+      exitCode: 143,
+      elapsedMs: 13_000,
+      expiry: null,
+      report: null,
+      noSpace: null,
+      lockWaits: [],
+      admissionQueue,
+    };
+    const verdict = judgeRun(end);
+    expect(verdict).toEqual({ outcome: 'queued', exitCode: 143, ...admissionQueue });
+    expect(describeVerdict(verdict)).toBe(
+      'queued for admission 12.3 s; mbx pid=77 ticket=31 queue position=4; exited 143 before first admission',
+    );
+    expect(judgeRun({ ...end, exitCode: 0 })).toEqual({ outcome: 'passed' });
+    expect(judgeRun({ ...end, admissionQueue: null })).toEqual({ outcome: 'failed', exitCode: 143, tests: [] });
+    const { context } = await workspace();
+    const directory = context.record?.directory ?? '';
+    await mkdir(directory, { recursive: true });
+    await writeRecord(directory, { task: 'app:test', hash: '42', verdict });
+    expect((await readRecord(directory))?.verdict).toEqual(verdict);
+    await writeFile(
+      join(directory, VERDICT_FILE),
+      JSON.stringify({ task: 'app:test', hash: '42', verdict: { ...verdict, requests: 'not rows' } }),
+    );
+    await expect(readRecord(directory)).rejects.toThrow('not a bounded-exec verdict');
+  });
   it('copies the lock waits the snapshot named into the wedged verdict', () => {
     const cache = '/Users/dev/.cargo/.package-cache';
     const lockWaits = [{ path: cache, waiters: [94769], holders: [{ pid: 51234, command: 'cargo' }] }];

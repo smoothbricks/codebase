@@ -107,7 +107,7 @@ function closingBracket(text: string, from: number, open: string, close: string)
  * The shell tokens of `script`. A command substitution is part of its word, and the programs it runs are appended to
  * `nested`; quoting is removed from the words, which are only inspected, never run.
  */
-function shellTokens(script: string, nested: string[]): Token[] {
+export function shellTokens(script: string, nested: string[]): Token[] {
   const tokens: Token[] = [];
   let word: string | undefined;
   const flush = (): void => {

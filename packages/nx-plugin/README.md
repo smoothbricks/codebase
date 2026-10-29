@@ -1947,12 +1947,32 @@ executor counts overlapping holds: while no hold exists it pauses the test idle 
 admission; a finished test still resets that budget. Total and fixture ceilings start at the first `g` and do not pause
 after it. EOF is not a grant or a release; a holder killed without `r` remains counted until command exit.
 
-The decision to pause is made before spawn, from the canonical scheduling switch and the supported command, never from
-silence on the pipe. The inferred extracted-archive `cargo --frozen nextest run --binaries-metadata …` is hold-gated.
-Plain `cargo test` can also run unscheduled doctests, so it retains its lifecycle idle clock, as do unknown runners,
-direct binaries, test listings, configuration/toolchain/directory overrides, and `--archive-file` whose target is not
-known at spawn. Explicit non-doc Cargo target selections can be hold-gated. These conservative cases remain bounded even
-when they never hold an mbx permit (specs/cowshed/11_shell.md, "Cargo test-runner boundaries").
+Independently of that spawn-time zero-hold rule, **any live task process explicitly queued for mbx admission pauses
+idle**, even while another task process holds capacity or the runner is otherwise unsupported. The executor polls public
+`mbx stats --scheduler --json --activity` activity, accepting only `kind: "waiter"`, `live: true` rows whose PID is
+corroborated by a bounded, scoped process-group/ancestor observation. Names, private waiter files and decision logs
+prove nothing. Public `queue_position` is preserved, never recomputed by the consumer. A successful snapshot with no
+task waiters resumes the remaining budget when the lifecycle and hold count permit it; a finished test resets the paused
+budget. An idle callback drains any in-flight poll and takes a fresh bounded snapshot before expiring. Snapshot failures
+are reported operational failures, never manufactured queue/admission evidence or an idle wedge; an unidentifiable
+foreign legacy row is diagnosed without claiming task membership. Live diagnostics say `queued for admission N s` with
+the mbx queue position. A command that fails or is cancelled before its first admission records a distinct `queued`
+verdict with observed wait duration and its last public PID/ticket/position rows. Queue observation adds no deadline and
+changes neither total nor fixture ceilings. Queue observations take effect at snapshot completion, never backdated
+across a finished test's budget reset. Observed wait duration freezes when the command settles or cancellation stops
+observation, before teardown or report reading. The observer requires the version-2 activity-only report; the full
+statistics document's cache, savings and memory histories are not polling input. The activity projection omits those
+walks and encodings instead of raising the observer's output or control-plane limits.
+
+The decision to use zero-hold pausing is made before spawn, from the canonical scheduling switch and the supported
+command, never from silence on the pipe. The inferred extracted-archive
+`cargo --frozen nextest run --binaries-metadata …` is hold-gated, including chains joined by `&&`, `||`, or `;` when
+every leg is a supported scheduled Cargo test execution. Each leg is checked separately; a later unscheduled command,
+pipeline or background command retains conservative idle protection. Plain `cargo test` can also run unscheduled
+doctests, so it retains its lifecycle idle clock, as do unknown runners, direct binaries, test listings,
+configuration/toolchain/directory overrides, and `--archive-file` whose target is not known at spawn. Explicit non-doc
+Cargo target selections can be hold-gated. These conservative cases remain bounded even when they never hold an mbx
+permit (specs/cowshed/11_shell.md, "Cargo test-runner boundaries").
 
 On POSIX hosts, direct Go and Cargo test commands (including chains joined by `&&`, `||`, or `;`) share one private
 runner lifecycle: `build`, `active`, and `terminal`. A per-command Node supervisor reports phases over an acknowledged
