@@ -274,9 +274,10 @@ pub trait VolumeLabeller: Send + Sync + 'static {
 /// The labels of one checkout's two volumes (16_build_volumes.md, "Substrate"): the workspace
 /// image's, and the build volume's it links. A clone carries its source's label, the blank
 /// template's `[cowshed]` or another checkout's, until its supervisor names it here: when the
-/// supervisor starts, and whenever a job is admitted on a build volume the checkout's link moved
-/// to (a land, a refork). Renaming queues on Disk Arbitration, measured at 10–28 s on a busy host,
-/// so it runs in the background and never on a command's path; the outcome goes to stderr.
+/// supervisor starts, after first touch, and when ownership or an admitted job's build volume
+/// changes. The descriptor-native rename posts the VFS update notification Disk Arbitration
+/// consumes, so its display follows the kernel name. Both run in the background, never on a
+/// command's path; naming failures and notification refusals go to stderr.
 #[derive(Clone)]
 pub struct VolumeLabels {
     /// The workspace's canonical image, whose volume `workspace` names.

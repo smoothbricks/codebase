@@ -157,8 +157,9 @@ links back to the sections here.
   from where the backing image lives and from the in-image marker; see "Ownership, identity, and the volume label"
   below. A minted image carries its template's label, its store's namespace's prefix (`[cowshed]` for production,
   `[cowshed-test-<ns>]` or the shared test template's `[cowshed-test]` for a test store, 01_storage.md "Host
-  namespace"), until its workspace's supervisor relabels it off the provisioning path; a build volume keeps it, since
-  nothing mounts one browsable.
+  namespace"), until its workspace's supervisor relabels it off the provisioning path. Every mounted live build volume
+  is named too (16_build_volumes.md, "Substrate"). A successful descriptor rename posts Disk Arbitration's VFS update
+  notification so diskutil and Finder refresh their cached display names; no Disk Arbitration rename is used.
 - **Spotlight**: neither setup nor the boot service writes Spotlight policy; session and build volumes stay unindexed
   through where they mount ([Stable workspace mount root](#stable-workspace-mount-root)). In mds **2418.6.3.9.400
   arm64e**, an admitted mounted `AppleAPFSVolume` reaches a constructor path that acquires an owned IOKit port and
@@ -1273,8 +1274,13 @@ The same descriptor supports naming and native unmount; it does not prevent anot
 The name is then set through the held descriptor. The kernel binds it to that descriptor's vnode, not to a path: a
 volume unmounted since the proof, even by force, leaves the vnode dead and the call fails (`ENOTSUP`, measured; typed
 `RenameFailed`) instead of reaching the volume beneath, and nothing is retried another way. The call is a kernel
-attribute write, not a Disk Arbitration round trip, so the image's lease is held for microseconds; Disk Arbitration
-learns the new name from the kernel and reports it.
+attribute write, not a Disk Arbitration round trip. After a successful write, the native effect posts `kNotifyVFSUpdate`
+(`com.apple.system.kernel.mountupdate`), the notification diskarbitrationd subscribes to for mount updates. It makes
+Disk Arbitration re-read its existing descriptions, including the kernel's new name, without renaming, mounting or
+attaching anything. Without it, the kernel can report the new name while diskutil and Finder still display the
+mount-time name until another disk event. Posting is best-effort: a nonzero notify status is reported with the key and
+volume device on stderr, but never turns the successful rename into a failure or retries it. No provisioning, quiescence
+or retirement waits for Disk Arbitration to consume the notification.
 
 What follows: volume labels are free to be plain, and manual renaming is harmless rather than unsupported. Cowshed still
 derives an internal per-workspace key from `repo_id` and workspace name to pair a storage fact with a kernel mount fact

@@ -2680,6 +2680,105 @@ async fn quiesce_does_not_wait_for_background_volume_labels() {
 }
 
 #[tokio::test]
+async fn build_volume_labels_follow_first_touch_startup_and_sidecar_ownership() {
+    use cowshed_core::build_volume::{
+        BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link,
+    };
+    use cowshed_core::repository::ProjectPaths;
+
+    struct RecordingLabeller(mpsc::UnboundedSender<(PathBuf, String)>);
+    impl VolumeLabeller for RecordingLabeller {
+        fn ensure_label(&self, image: &Path, label: &str) -> std::io::Result<Labelled> {
+            self.0
+                .send((image.to_owned(), label.to_owned()))
+                .map_err(std::io::Error::other)?;
+            Ok(Labelled::Renamed)
+        }
+    }
+
+    for (linked_at_start, owned) in [(false, true), (true, true), (true, false)] {
+        let root = workspace_root(&temp_parent::scratch_parent(), "build-volume-label");
+        let mut supervisor = config(&root);
+        let checkout = supervisor.workspace_root.clone();
+        let project = ProjectPaths::with_mount_root(
+            root.join("store"),
+            &supervisor.sandbox.mount_root,
+            &supervisor.authority.repo_id,
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        let id = BuildVolumeId::mint();
+        let mount = layout.mount(&id);
+        let image = layout.image(&id);
+        std::fs::create_dir_all(layout.images()).unwrap();
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::File::create(&image).unwrap();
+        layout
+            .write_record(
+                &id,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Linked {
+                        checkout: if owned {
+                            supervisor.authority.workspace.clone()
+                        } else {
+                            WorkspaceName::new("adopter").unwrap()
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        if linked_at_start {
+            link::point(&checkout, &mount).unwrap();
+            supervisor.sandbox.build_volume_mount = Some(mount.clone());
+        }
+        supervisor.build_volume_layout = Some(layout);
+        let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
+        let workspace_label = cowshed_core::storage::apfs::volume_label(
+            namespace,
+            &supervisor.authority.repo_id,
+            &supervisor.authority.workspace,
+        );
+        let build_label = cowshed_core::storage::apfs::build_volume_label(
+            namespace,
+            &supervisor.authority.repo_id,
+            &supervisor.authority.workspace,
+        );
+        let workspace_image = root.join("store/main.dmg");
+        let (named, mut labels) = mpsc::unbounded_channel();
+        supervisor.volume_labels = Some(VolumeLabels {
+            workspace_image: workspace_image.clone(),
+            workspace: workspace_label.clone(),
+            build: build_label.clone(),
+            labeller: std::sync::Arc::new(RecordingLabeller(named)),
+        });
+        let mut h = harness_with_config(supervisor, 1, 1024, false, false);
+        assert_eq!(
+            labels.recv().await.unwrap(),
+            (workspace_image, workspace_label)
+        );
+        if !linked_at_start {
+            // First touch publishes its link after the supervisor started with no build volume.
+            link::point(&checkout, &mount).unwrap();
+            h.handle.name_build_volume(Some(mount)).await.unwrap();
+        }
+        if owned {
+            assert_eq!(labels.recv().await.unwrap(), (image, build_label));
+        }
+        assert!(h.spawned.try_recv().is_err(), "naming needs no later exec");
+        h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+        drop(h);
+        // The workspace effect proves the blocking task started. Closing the executor's last
+        // sender proves it finished, including any sidecar refusal, without sleeping or polling.
+        assert_eq!(
+            labels.recv().await,
+            None,
+            "a stale owner's link authorizes no label"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_build_volume_label_request_cannot_name_a_host_mount_outside_its_layout() {
     use cowshed_core::build_volume::{BuildVolumeLayout, link};
     use cowshed_core::repository::ProjectPaths;

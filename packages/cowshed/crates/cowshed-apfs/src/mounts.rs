@@ -428,6 +428,20 @@ impl HeldMount {
             if status != 0 {
                 return Err(io::Error::last_os_error());
             }
+            unsafe extern "C" {
+                fn notify_post(name: *const libc::c_char) -> u32;
+            }
+            // kNotifyVFSUpdate from notify_keys.h is Disk Arbitration's mount-update input.
+            // The notification refreshes descriptions; it never names a volume through a path.
+            let key = c"com.apple.system.kernel.mountupdate";
+            // SAFETY: `key` is a static NUL-terminated string; notify_post retains no pointer.
+            let notified = unsafe { notify_post(key.as_ptr()) };
+            if notified != 0 {
+                cowshed_os::eprintln!(
+                    "cowshed: named APFS volume {} {name:?}, but notify_post({key:?}) returned status {notified}; Disk Arbitration may still display its previous name",
+                    self.source_device
+                );
+            }
             Ok(())
         }
         #[cfg(not(target_os = "macos"))]

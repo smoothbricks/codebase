@@ -110,12 +110,17 @@ producer ownership.
 - **Names**: every mounted live build volume is named `[cowshed] <project> — build <checkout>` (the project is displayed
   as `<owner> · <repo>`); main uses `build main`, and a session uses `build <ws>`. A mounted live volume is never left
   named only `[cowshed]`. Its supervisor queues the APFS rename off the provisioning path, checks the name again on
-  supervisor start, and queues a new name whenever land or adopt changes the checkout that owns it. Seeds are never
-  mounted and are never named: mounting one merely to rename it would write its image and advance the seed-freshness
-  clock (Targets and seeds). Resize may attach a seed without mounting it; no label operation accompanies that attach.
-  Provisioning, quiescence and retirement never wait for a rename. Before naming a build volume, the background task
-  checks its sidecar-backed checkout grant, not merely its link; an old owner cannot authorize the adopted volume.
-  Labels are cosmetic, never authority. A supervisor start reconciles a name changed in the check-to-rename window.
+  supervisor start, and queues a new name whenever land or adopt changes the checkout that owns it. First touch queues
+  its live volume's name once the checkout links it, even when no later job is admitted. Seeds are never mounted and are
+  never named: mounting one merely to rename it would write its image and advance the seed-freshness clock (Targets and
+  seeds). Resize may attach a seed without mounting it; no label operation accompanies that attach. Provisioning,
+  quiescence and retirement never wait for a rename. Before naming a build volume, the background task checks its
+  sidecar-backed checkout grant, not merely its link; an old owner cannot authorize the adopted volume. Labels are
+  cosmetic, never authority. A supervisor start reconciles a name changed in the check-to-rename window. The successful
+  descriptor-native rename posts Disk Arbitration's VFS update notification, so diskutil and Finder re-read their cached
+  name without a later disk event (01a_apfs.md, "Ownership, identity, and the volume label"). No Disk Arbitration/path
+  rename is used. A refused notification is reported with its key, volume and status, without failing or retrying the
+  successful name change.
 - **Capacity**: 100 GiB by default for a build volume created from nothing; `.cowshed.toml`
   `[build] capacity = "<size>"` overrides it per project. A sparse image costs only its written blocks, so the capacity
   is not an allocation: it is a deliberate cap on build-cache growth. A build that fills its volume fails loudly with

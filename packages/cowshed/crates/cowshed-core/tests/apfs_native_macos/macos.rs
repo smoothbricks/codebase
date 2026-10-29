@@ -2454,6 +2454,70 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
         .expect("mount");
     host.retain_mounted(&workspace(), attachment)
         .expect("retain");
+    let described_name = || {
+        let output = Command::new("diskutil")
+            .args(["info", "-plist"])
+            .arg(&mount)
+            .output_bounded()
+            .expect("read the fixture volume's Disk Arbitration description");
+        assert!(output.status.success(), "diskutil info: {:?}", output);
+        let description: plist::Value =
+            plist::from_bytes(&output.stdout).expect("disk description plist");
+        description
+            .as_dictionary()
+            .and_then(|dictionary| dictionary.get("VolumeName"))
+            .and_then(plist::Value::as_string)
+            .expect("the mounted fixture's VolumeName")
+            .to_owned()
+    };
+    let described_before = described_name();
+    assert_ne!(
+        described_before, label,
+        "the fixture starts with its inherited name"
+    );
+    struct Activity(std::process::Child);
+    impl Drop for Activity {
+        fn drop(&mut self) {
+            if let Err(error) = self.0.kill()
+                && error.kind() != std::io::ErrorKind::InvalidInput
+            {
+                eprintln!("cannot stop fixture diskutil activity: {error}");
+            }
+            if let Err(error) = self.0.wait_bounded() {
+                eprintln!("cannot reap fixture diskutil activity: {error}");
+            }
+        }
+    }
+    fn activity_until(reader: &mut impl std::io::BufRead, ready: impl Fn(&str) -> bool) -> String {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                reader.read_line(&mut line).expect("Disk Arbitration event"),
+                0,
+                "diskutil activity ended before its expected event"
+            );
+            if ready(&line) {
+                return line;
+            }
+        }
+    }
+    let mut activity = Activity(
+        Command::new("diskutil")
+            .arg("activity")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn_locked()
+            .expect("observe the fixture's Disk Arbitration events"),
+    );
+    let mut events = std::io::BufReader::new(activity.0.stdout.take().expect("activity stdout"));
+    activity_until(&mut events, |line| line.starts_with("***DAIdle "));
+    let device = kernel_mount_at(&mount)
+        .expect("the fixture's own mounted volume")
+        .source_device;
+    let device_event = format!("('{}',", device.trim_start_matches("/dev/"));
+    let name_event = format!("DAVolumeName = '{label}'");
 
     assert_eq!(
         host.label_image_volume(image.image(), label)
@@ -2469,6 +2533,14 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
             .expect("an already-named volume"),
         Labelled::Already
     );
+    // Advance on DA's description-changed callback, not on elapsed time or inventory polling.
+    let changed = activity_until(&mut events, |line| {
+        line.starts_with("***DiskDescriptionChanged ")
+            && line.contains(&device_event)
+            && line.contains(&name_event)
+    });
+    assert_eq!(described_name(), label);
+    eprintln!("Disk Arbitration observed the descriptor rename: {changed}");
     assert_eq!(
         cowshed_apfs::volume_name(Path::new("/System/Volumes/Data"))
             .expect("the host's Data volume name"),
