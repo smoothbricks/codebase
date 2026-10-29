@@ -32,21 +32,21 @@ project code during discovery. A convention that resolves outside the workspace 
 directory marker's fixed link through `.cowshed/build`. Missing markers mean absence; other filesystem errors report the
 path and failure.
 
-| Detector  | Convention                                                                                  | Contribution                                                                                                        |
-| --------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| direnv    | `.envrc`                                                                                    | Contained shell activation, private approval state, read-only host `source_url` store, bootstrap executable         |
-| Nx        | `nx.json`                                                                                   | The checkout's one `.nx` and daemon for every job; short shared socket namespace; discard inherited daemon records  |
-| Codegraph | `.codegraph/` at the selected project root                                                  | The project-relative index on the build volume, cloned and adopted behind its fixed relative link                   |
-| cargo     | Tracked `Cargo.toml` files                                                                  | Shared registry/git caches, exact cache-state files, Git and trust; target build state only without mbx (below)     |
-| Go        | `go.mod` or `go.work` at the selected root, or any tracked `go.mod` below it                | Shared module/build caches; no generated GOENV or toolchain/proxy policy                                            |
-| Bun       | `package.json` and `bun.lock` or `bun.lockb`                                                | Bun install cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`               |
-| npm       | `package.json` and `package-lock.json` or `npm-shrinkwrap.json`                             | npm content cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`               |
-| pnpm      | `package.json` and `pnpm-lock.yaml`                                                         | pnpm store and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`                      |
-| uv        | `pyproject.toml` or `uv.lock`                                                               | uv cache and platform certificate opt-in                                                                            |
-| Zig       | `build.zig`                                                                                 | Zig global cache                                                                                                    |
-| Gradle    | `settings.gradle`, `settings.gradle.kts`, `build.gradle` or `build.gradle.kts`              | Gradle cache, not host credentials or configuration                                                                 |
-| Nix       | `flake.nix` or `devenv.nix`, or an `.envrc` chain reaching Nix (below)                      | Nix client caches, immutable tool/store reads, canonical live daemon socket, TLS settings and bootstrap executables |
-| mbx       | Cargo convention, the host's installed `mbx` link resolving, and its shim directory (below) | Shared mbx store access and canonical Cargo routing; no build-state path (below)                                    |
+| Detector  | Convention                                                                                  | Contribution                                                                                                                    |
+| --------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| direnv    | `.envrc`                                                                                    | Contained shell activation, private approval state, read-only host `source_url` store, bootstrap executable                     |
+| Nx        | `nx.json`                                                                                   | The checkout's one `.nx` and daemon for every job; short shared socket namespace; discard inherited daemon records              |
+| Codegraph | `.codegraph/` at the selected project root                                                  | The project-relative index on the build volume, cloned and adopted behind its fixed relative link                               |
+| cargo     | Tracked `Cargo.toml` files                                                                  | Shared registry/git caches, exact cache-state files, Git and trust; target build state only without mbx (below)                 |
+| Go        | `go.mod` or `go.work` at the selected root, or any tracked `go.mod` below it                | Shared module/build caches; no generated GOENV or toolchain/proxy policy                                                        |
+| Bun       | `package.json` and `bun.lock` or `bun.lockb`                                                | Bun install cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`; the module compile cache |
+| npm       | `package.json` and `package-lock.json` or `npm-shrinkwrap.json`                             | npm content cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`; the module compile cache |
+| pnpm      | `package.json` and `pnpm-lock.yaml`                                                         | pnpm store and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`; the module compile cache        |
+| uv        | `pyproject.toml` or `uv.lock`                                                               | uv cache and platform certificate opt-in                                                                                        |
+| Zig       | `build.zig`                                                                                 | Zig global cache                                                                                                                |
+| Gradle    | `settings.gradle`, `settings.gradle.kts`, `build.gradle` or `build.gradle.kts`              | Gradle cache, not host credentials or configuration                                                                             |
+| Nix       | `flake.nix` or `devenv.nix`, or an `.envrc` chain reaching Nix (below)                      | Nix client caches, immutable tool/store reads, canonical live daemon socket, TLS settings and bootstrap executables             |
+| mbx       | Cargo convention, the host's installed `mbx` link resolving, and its shim directory (below) | Shared mbx store access and canonical Cargo routing; no build-state path (below)                                                |
 
 A Nix/devenv convention does not activate a shell. Projects that want devenv activation use their own `.envrc` with
 direnv's `use devenv`. There is no built-in devenv shell backend or `[devenv]` configuration. No detector recognizes a
@@ -101,9 +101,11 @@ convention for per-tree tool state (find-cache-dir: babel, webpack, ava, stryker
 convention and never a tool. A tracked manifest nothing installed, such as a fixture's, gets nothing, so discovery never
 creates a `node_modules` in a fixture. The fingerprint records each tracked `package.json` path with whether its package
 is installed, never its bytes: a dependency edit does not change where any tool writes, and must not rediscover Cargo.
-Why: such state is rewritten in place on every run, which in the source image fragments an image every session clone
-shares (measured: lmao's trace sink, a SQLite database of 716 MB in one package of a consumer repository, now in its own
-`.cache/lmao` declared as build state).
+Any of them active also contributes the checkout's module compile cache, `.cowshed/cache/node-compile-cache` at the
+volume's `node-compile-cache` (16_build_volumes.md, "What lives where"): Node and Bun rewrite it as modules change and
+rebuild it when it is missing, so it is build state, not source. Why: such state is rewritten in place on every run,
+which in the source image fragments an image every session clone shares (measured: lmao's trace sink, a SQLite database
+of 716 MB in one package of a consumer repository, now in its own `.cache/lmao` declared as build state).
 
 A project may keep its Nix files away from its root and reach them from its `.envrc`, for example with
 `cd tooling/shell` and then `. envrc.sh`. The Nix convention therefore also holds when the `.envrc` chain reaches Nix.

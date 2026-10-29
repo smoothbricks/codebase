@@ -129,9 +129,10 @@ evaluated shells obtain those values one way. This is non-propagation, not isola
 the image either way, and moving them out is the gateway vault's.
 
 `NODE_COMPILE_CACHE` is one of those workspace-owned values: an activation record never carries the origin's compile
-cache path. The receiver's `.cowshed/env` rebinds it to its own private cache, retaining its read-only exec-temp cache
-when applicable (03_caches.md, Environment variables). Reusing an activation does not authorize writes to a caller's or
-ancestor's cache, and no cache is disabled or cleared to make adoption possible.
+cache path. The receiver's `.cowshed/env` rebinds it to its own private cache (in a JavaScript checkout, the link onto
+its own build volume), retaining its read-only exec-temp cache when applicable (03_caches.md, Environment variables).
+Reusing an activation does not authorize writes to a caller's or ancestor's cache, and no cache is disabled or cleared
+to make adoption possible.
 
 Adoption runs no direnv evaluation, no devenv, no entry task and no approval; only the tail files run, and their output
 reaches the job that waited on the adoption as an activation's would. A read-write miss says why on that job's stderr

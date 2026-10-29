@@ -81,7 +81,7 @@ each of them.
 | Cargo target directory of a project with the mbx capability                                                                                                                                         | mbx's managed target for the checkout, `<build-cache>/mbx/targets/v1/<checkout digest>` | Per checkout, never travels; restored from the mbx store by content                        |
 | Cargo compiled actions, build-script runs, host links, learned incremental state                                                                                                                    | The mbx store, `<build-cache>/mbx`                                                      | One per host, written and read by every checkout (03_caches.md)                            |
 | Codegraph's per-tree `.codegraph/` index                                                                                                                                                            | Build volume                                                                            | Retained in selective mbx seeds; full warm seed otherwise; adopted at land                 |
-| Node/Bun module compile cache (`NODE_COMPILE_CACHE`)                                                                                                                                                | Workspace's private XDG cache (03_caches.md)                                            | Read-write/host cache cloned with source; read-only cache retired with owned exec-temp     |
+| Node/Bun module compile cache (`NODE_COMPILE_CACHE`) of a checkout with a detected JavaScript package manager                                                                                       | Build volume, linked at `.cowshed/cache/node-compile-cache`                             | Non-mbx: cloned at fork; mbx: starts empty; live volume adopted at land                    |
 | Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                                                              | Build volume                                                                            | Retained in selective mbx seeds; full warm seed otherwise; absent declarations stay absent |
 | Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                                                         | Per checkout, never travels                                                             | Deleted from a build volume before main adopts it (below)                                  |
 | Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv)                                                                                                         | Shared cache paths (03_caches.md)                                                       | Written once, read by every checkout; never in any image                                   |
@@ -92,11 +92,16 @@ in that checkout share the tools' concurrency protocols; independent checkouts h
 Content-addressed caches, whose entries are immutable and valid for every checkout, stay shared (03_caches.md). Declared
 task outputs stay on the source volume (rule "Nx outputs never live in the build volume").
 
-Module compilation uses the already-owned private environment cache, not a new build-state volume or a loose directory
-under `TMPDIR`. Its runtime-versioned bytes remain reconstructible and retain that cache root's clone and retirement
-rules. Source-read-only jobs write only their existing exec-temp cache. Clean retirement reclaims that environment
-through the owned scratch lifetime, and so does `gc` releasing a trash image an earlier build kept, when its grants
-sidecar names it; a live or newer namesake retains its own environment. A mount at exec-temp itself or beneath it
+Module compilation is build state: Node and Bun rewrite their compile cache as modules change and rebuild it when it is
+missing. A checkout with a detected JavaScript package manager therefore links its private cache's `node-compile-cache`
+onto the build volume (15_capabilities.md), so its source image holds only that link: main's image never carries the
+cache, no fork clones it with source, and an mbx seed starts it empty. `NODE_COMPILE_CACHE` still names
+`$XDG_CACHE_HOME/node-compile-cache` (03_caches.md), never a loose directory under `TMPDIR`. A checkout no JavaScript
+package manager was ever detected in has no such link and keeps that directory in its private cache; once linked, the
+path stays linked like every held build-state path, even after the manager is disabled (One link per checkout, "held
+ones never move"). Source-read-only jobs write only their existing exec-temp cache. Clean retirement reclaims that
+environment through the owned scratch lifetime, and so does `gc` releasing a trash image an earlier build kept, when its
+grants sidecar names it; a live or newer namesake retains its own environment. A mount at exec-temp itself or beneath it
 refuses cleanup before any entry is removed, including a Linux bind mount on the same backing device. Restoration's
 refusal of unexplained project contents is unchanged: no blanket temporary-tree sweep or restore exception stands in for
 producer ownership.
@@ -277,7 +282,8 @@ discovery scheduling, not journal identity or failure fences.
 
 Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Nx capability
 contributes `.nx/cache` and `.nx/workspace-data`, and a JavaScript package manager contributes the `node_modules/.cache`
-of every package it installed. The Codegraph capability contributes each detected project's `.codegraph/` index, held at
+of every package it installed and the checkout's module compile cache, `.cowshed/cache/node-compile-cache` at the
+volume's `node-compile-cache`. The Codegraph capability contributes each detected project's `.codegraph/` index, held at
 that project's `codegraph` path on the build volume. The Cargo capability contributes each `cargo metadata`
 `target_directory` inside the checkout only in a project without the mbx capability. With it, the target directory is
 mbx's, and the Cargo capability contributes nothing (15_capabilities.md, "mbx detection", which also refuses a tracked

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{BuildStatePath, CapabilityId, DeclaredState, DetectionContext, merge_build_state};
 use crate::runtime::supervisor::ObservedRun;
+use crate::workspace_environment::{NODE_COMPILE_CACHE_CHECKOUT, NODE_COMPILE_CACHE_DIRECTORY};
 use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Run;
 
@@ -139,7 +140,8 @@ impl BuildStateDiscovery {
 /// 7: the job resolves `mbx`, and the canonical activation's input identity keys the answer.
 /// 8: installed host mbx supplies the Cargo route without a project opt-in.
 /// 9: capabilities mark seed-retained subtrees and clone-invalid process files.
-const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 9";
+/// 10: a detected JavaScript package manager links the module compile cache onto the build volume.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 10";
 
 /// The manifest whose directory, once installed, holds a JavaScript package's tool caches.
 const PACKAGE_MANIFEST: &str = "package.json";
@@ -1039,6 +1041,10 @@ struct CargoMetadata {
 /// (16_build_volumes.md); left on the source volume, every run's writes fragment an image that
 /// clones share. A tracked `package.json` the package manager never installed, such as a
 /// fixture's, contributes nothing, and none under `node_modules` is a package of the project.
+/// Any of them active also contributes the checkout's module compile cache,
+/// [`NODE_COMPILE_CACHE_CHECKOUT`] at the volume's [`NODE_COMPILE_CACHE_DIRECTORY`]: Node and Bun
+/// rewrite it as modules change and rebuild it when it is missing, and on the source image every
+/// fork cloned main's whole cache.
 fn javascript_tool_caches(
     context: &DetectionContext<'_>,
     overrides: &BTreeMap<CapabilityId, super::CapabilityOverride>,
@@ -1050,6 +1056,11 @@ fn javascript_tool_caches(
         if !active.contains(&id) {
             continue;
         }
+        // Every active manager names the one compile cache; the dedup below keeps one.
+        caches.push(BuildStatePath::new(
+            NODE_COMPILE_CACHE_CHECKOUT,
+            NODE_COMPILE_CACHE_DIRECTORY,
+        )?);
         let selected = overrides
             .get(&id)
             .and_then(|setting| setting.directory.as_ref())
@@ -2030,6 +2041,8 @@ printf '%s:%s\n' "$index" "$PWD"
         assert_eq!(
             state.paths,
             [
+                BuildStatePath::new(".cowshed/cache/node-compile-cache", "node-compile-cache")
+                    .unwrap(),
                 BuildStatePath::new("node_modules/.cache", "node_modules/.cache").unwrap(),
                 BuildStatePath::new(
                     "packages/app/node_modules/.cache",
@@ -2040,7 +2053,8 @@ printf '%s:%s\n' "$index" "$PWD"
         );
         assert!(
             !fixture.root.join("node_modules/.cache").exists()
-                && !fixture.root.join("packages/fixture/node_modules").exists(),
+                && !fixture.root.join("packages/fixture/node_modules").exists()
+                && !fixture.root.join(".cowshed").exists(),
             "discovery creates nothing"
         );
 
@@ -2054,11 +2068,15 @@ printf '%s:%s\n' "$index" "$PWD"
         write(&fixture, "packages/app/bun.lock", "{}\n");
         assert_eq!(
             cargo_paths(&fixture).paths,
-            [BuildStatePath::new(
-                "packages/app/node_modules/.cache",
-                "packages/app/node_modules/.cache"
-            )
-            .unwrap()]
+            [
+                BuildStatePath::new(".cowshed/cache/node-compile-cache", "node-compile-cache")
+                    .unwrap(),
+                BuildStatePath::new(
+                    "packages/app/node_modules/.cache",
+                    "packages/app/node_modules/.cache"
+                )
+                .unwrap(),
+            ]
         );
         write(
             &fixture,

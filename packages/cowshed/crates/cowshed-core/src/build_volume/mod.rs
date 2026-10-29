@@ -623,21 +623,33 @@ pub enum BuildStateTool {
     Nx,
     /// `.cowshed.toml` `[build] state`: a tool no capability detects.
     Declared,
+    /// A JavaScript cache: an installed package's `node_modules/.cache`, or the module compile
+    /// cache Node and Bun keep at `NODE_COMPILE_CACHE`.
+    #[serde(rename = "javascript")]
+    JavaScript,
 }
 
 impl BuildStateTool {
     /// The tool whose state `path` is: declared state by its own volume namespace, Nx's
-    /// directories under `.nx`, and otherwise a Cargo target directory.
+    /// directories under `.nx`, a JavaScript cache (an installed package's `node_modules/.cache`
+    /// or the module compile cache), and otherwise a Cargo target directory.
     pub fn of(path: &BuildStatePath) -> Self {
         let checkout = path.checkout.as_path();
+        let parent_named = |name: &str| {
+            checkout
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|parent| parent == name)
+        };
         if path.is_declared() {
             Self::Declared
-        } else if checkout
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == ".nx")
-        {
+        } else if parent_named(".nx") {
             Self::Nx
+        } else if checkout == Path::new(crate::workspace_environment::NODE_COMPILE_CACHE_CHECKOUT)
+            || (checkout.file_name().is_some_and(|name| name == ".cache")
+                && parent_named("node_modules"))
+        {
+            Self::JavaScript
         } else {
             Self::Cargo
         }
@@ -656,6 +668,7 @@ impl std::fmt::Display for DisplacedBuildStateFinding {
         let tool = match self.likely_tool {
             BuildStateTool::Cargo => "cargo clean or another Cargo command",
             BuildStateTool::Nx => "an Nx reset or cache command",
+            BuildStateTool::JavaScript => "a Node or Bun process writing before its link existed",
             BuildStateTool::Declared => {
                 return write!(
                     formatter,
@@ -2879,5 +2892,52 @@ mod tests {
         assert_eq!(owned, expected);
         assert_eq!(layout.owned_by(&other).unwrap().len(), 1);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A JavaScript cache is its own tool: a displaced one is never reported as Cargo's, and no
+    /// Cargo lock walk reaches into it.
+    #[test]
+    fn javascript_caches_are_their_own_tool_never_cargo() {
+        use crate::workspace_environment::{
+            NODE_COMPILE_CACHE_CHECKOUT, NODE_COMPILE_CACHE_DIRECTORY,
+        };
+        let path = |checkout: &str, volume: &str| BuildStatePath::new(checkout, volume).unwrap();
+        let compile_cache = path(NODE_COMPILE_CACHE_CHECKOUT, NODE_COMPILE_CACHE_DIRECTORY);
+        for javascript in [
+            path("node_modules/.cache", "node_modules/.cache"),
+            path(
+                "packages/app/node_modules/.cache",
+                "packages/app/node_modules/.cache",
+            ),
+            compile_cache.clone(),
+        ] {
+            assert_eq!(
+                BuildStateTool::of(&javascript),
+                BuildStateTool::JavaScript,
+                "{javascript:?}"
+            );
+        }
+        assert_eq!(
+            BuildStateTool::of(&path("target", "target")),
+            BuildStateTool::Cargo
+        );
+        let state = BuildVolumeState {
+            paths: vec![path("target", "target"), compile_cache],
+            fingerprint: None,
+            mbx: None,
+        };
+        assert_eq!(
+            state.cargo_targets().collect::<Vec<_>>(),
+            [Path::new("target")]
+        );
+        let finding = DisplacedBuildStateFinding {
+            path: PathBuf::from(NODE_COMPILE_CACHE_CHECKOUT),
+            likely_tool: BuildStateTool::JavaScript,
+        };
+        assert!(finding.to_string().contains("Node or Bun"), "{finding}");
+        assert_eq!(
+            serde_json::to_value(BuildStateTool::JavaScript).unwrap(),
+            "javascript"
+        );
     }
 }

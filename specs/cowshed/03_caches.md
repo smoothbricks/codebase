@@ -370,17 +370,20 @@ there; they contain the endpoint URL, whose userinfo is the workspace token (bel
     loopback and package/proxy wiring uses `http://127.0.0.1:7644`. No workspace-identity variable is exported; anything
     that needs identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI. A served mount binds
     `NODE_COMPILE_CACHE` to `<workspace>/.cowshed/cache/node-compile-cache`, replacing any caller or parent value rather
-    than borrowing the host's `XDG_CACHE_HOME`. When sourced by a read-only job whose `XDG_CACHE_HOME` is exactly this
-    workspace's `<exec-temp>/cache`, it instead binds the cache below that directory; activation never redirects that
-    job's writes into source. A minted environment unsets the variable until its supervisor publishes the served paths,
-    so a staging clone never inherits another workspace's cache.
+    than borrowing the host's `XDG_CACHE_HOME`; in a checkout with a detected JavaScript package manager that path is
+    the build-state link onto its build volume (16_build_volumes.md, "What lives where"). When sourced by a read-only
+    job whose `XDG_CACHE_HOME` is exactly this workspace's `<exec-temp>/cache`, it instead binds the cache below that
+    directory; activation never redirects that job's writes into source. A minted environment unsets the variable until
+    its supervisor publishes the served paths, so a staging clone never inherits another workspace's cache.
   - The supervisor sets, for every job it spawns (`runtime/supervisor.rs` `sandbox_environment`):
     - the private environment: `HOME`, `XDG_{CONFIG,CACHE,DATA,STATE}_HOME`, `DIRENV_CONFIG`, `TMPDIR` (the workspace's
       temp dir in the project store, 04_sandbox.md) and `XDG_RUNTIME_DIR`; - Node and compatible runtimes' module
       compile cache: `NODE_COMPILE_CACHE=$XDG_CACHE_HOME/node-compile-cache`, owned by the supervisor, never a caller
       override or a capability's replacement. This uses the existing private cache root in either mode, not the
-      runtime's default loose `TMPDIR/node-compile-cache` directory. Caching stays enabled; no new write grant, shared
-      host cache or independent cleanup root is introduced;
+      runtime's default loose `TMPDIR/node-compile-cache` directory; for a read-write job in a checkout with a detected
+      JavaScript package manager that directory is the build-state link onto the build volume, so the source image holds
+      no compiled bytes. Caching stays enabled; no new write grant, shared host cache or independent cleanup root is
+      introduced;
     - git isolation: `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`, and the fetch-route include as
       `GIT_CONFIG_COUNT`/`KEY`/`VALUE` (02_workspaces.md);
     - each detected capability's contribution (15_capabilities.md): for an Nx project `NX_SOCKET_DIR`,

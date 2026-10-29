@@ -27,10 +27,17 @@ pub const NX_REMOTE_READ_ONLY_ENV: &str = "NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY
 /// neither shares the machine's: Bun reads every ancestor directory of its working directory
 /// whole, and a user temp directory every concurrent gate fills holds each start for seconds.
 pub const TEMP_DIR_ENV: &str = "TMPDIR";
-/// Node and compatible runtimes keep module compilation in the workspace's private cache,
-/// never the runtime's default loose directory under TMPDIR.
+/// Node and compatible runtimes keep module compilation in the private cache's own directory,
+/// never the runtime's default loose directory under TMPDIR. In a checkout with a detected
+/// JavaScript package manager, [`NODE_COMPILE_CACHE_CHECKOUT`] is a build-state link onto the
+/// build volume (16_build_volumes.md, "What lives where"): the source image holds no compiled
+/// bytes, and no fork clones them with its source.
 pub const NODE_COMPILE_CACHE_ENV: &str = "NODE_COMPILE_CACHE";
 pub(crate) const NODE_COMPILE_CACHE_DIRECTORY: &str = "node-compile-cache";
+/// The read-write module compile cache relative to the checkout: the private cache's
+/// [`NODE_COMPILE_CACHE_DIRECTORY`], which a served mount's `.cowshed/env` names and build-state
+/// discovery links onto the build volume.
+pub(crate) const NODE_COMPILE_CACHE_CHECKOUT: &str = ".cowshed/cache/node-compile-cache";
 /// The short link to the workspace's runtime dir, [`crate::sandbox::workspace_runtime_link`],
 /// exported so a host shell names the link its jobs use without re-deriving it: the Nx socket
 /// dir host shells and jobs share is `nx` below it, by that literal path.
@@ -144,12 +151,9 @@ pub(crate) fn write_workspace_environment(
             ))
         }
     };
-    let node_compile_cache = served.as_ref().map(|_| {
-        mount
-            .root()
-            .join(".cowshed/cache")
-            .join(NODE_COMPILE_CACHE_DIRECTORY)
-    });
+    let node_compile_cache = served
+        .as_ref()
+        .map(|_| mount.root().join(NODE_COMPILE_CACHE_CHECKOUT));
     let node_compile_cache_text = node_compile_cache
         .as_ref()
         .map(|path| {
