@@ -667,6 +667,13 @@ twenty minutes of gate for a one-line change).
   slow tests of both are named with their measured time in `.config/nextest-timings.json` and dealt onto their exception
   shards longest first; only the rest is hashed (nx-plugin README, cargo test targets), since a hash left cowshed-core's
   shards at 83 to 276 s of test time around a 168 s mean.
+- **A compiler run a test reads is a cached target of its own.** The cowshed-core capability probe checks crates that
+  must not compile against cowshed-core, whose dependency build takes a cold hosted runner minutes. Inside a test it
+  ended at the test's own 180 s reap bound (a hosted arm64 macOS runner, 2026-10-29), and a `bounded-exec` fixture
+  segment ahead of the exception shards only ran that same test under the same bound. `cowshed:capability-probe` keys on
+  `cargoClosure`, the toolchain (the case files are Rust sources of that closure), writes rustc's errors per case as its
+  one output and refuses a run that gave no verdict for a case. Every cowshed-core runner runs after it and keys on that
+  output (`dependentTasksOutputFiles`, `nx.json` `targetDefaults`), and the test reads a file (08_testing.md).
 - **Lint keys the files the ESLint config loads, not their directory.** Each lint target keys the workspace ESLint
   configs and every workspace file they load, read and resolved by the loader ESLint uses (jiti for a TypeScript config,
   Node otherwise); `bun.lock` and the root manifest key installed packages, and a load the walk cannot key fails graph
@@ -679,9 +686,8 @@ compiled exactly the seven cowshed crates downstream of it. For an mbx-capable p
 adopted build volume at all: the gate's Cargo hits come from the one mbx store, which the landing shed — and every
 sibling — already wrote to, so a land compiles only the units its own commits invalidated. Without mbx, Cargo warmth
 rides the adopted build volume. The targets that state `"cache": false` are `cargo-fetch` (the registry lives outside Nx
-outputs; nx-plugin README, "Cargo cache boundaries"), `shard-timings`, `tooling:lint-disk-commands`, the ttsc and
-capability-probe warmups (their caches live outside Nx outputs) and the packaging checks; they are what a re-gate
-re-runs.
+outputs; nx-plugin README, "Cargo cache boundaries"), `shard-timings`, `tooling:lint-disk-commands`, the ttsc warmup
+(its cache lives outside Nx outputs) and the packaging checks; they are what a re-gate re-runs.
 
 ## Convention table
 

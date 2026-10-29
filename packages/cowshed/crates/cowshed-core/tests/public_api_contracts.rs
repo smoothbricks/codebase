@@ -1,17 +1,12 @@
 use cowshed_core::api::*;
 use cowshed_core::{CowshedError, ErrorCode};
-use cowshed_os::test_backstop::CommandBackstop as _;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
-use std::process::Command;
-
-#[path = "support/temp_root.rs"]
-mod temp_root;
-use temp_root::TempRoot;
+use std::path::{Path, PathBuf};
 
 fn repo() -> cowshed_core::repository::RepoId {
     cowshed_core::repository::RepoId::parse("acme/widget").expect("repo id")
@@ -1497,405 +1492,80 @@ fn json_envelope_has_exact_discriminated_success_and_failure_shapes() {
     }
 }
 
-/// Each capability probe case: a crate name, a snippet that must not compile, and what its errors
-/// must name.
-const CAPABILITY_CASES: [(&str, &str, &[&str]); 9] = [
-    (
-        "project_authority",
-        "use cowshed_core::Project;\nfn deny(value: &Project) { value.attach(); value.exec(); value.grant(); value.gc(); }\n",
-        &["attach", "exec", "grant", "gc"],
-    ),
-    (
-        "worker_authority",
-        "use cowshed_core::WorkspaceHandle;\nfn deny(value: &WorkspaceHandle) { value.grant(); value.revoke(); value.destroy(); value.rebase(); value.land(); value.gc(); value.repo_mirror(); value.detach(); value.workspace(\"other\"); }\n",
-        &[
-            "grant",
-            "revoke",
-            "destroy",
-            "rebase",
-            "land",
-            "gc",
-            "repo_mirror",
-            "detach",
-            "workspace",
-        ],
-    ),
-    (
-        "token_traits",
-        "use cowshed_core::CoordinatorToken;\nfn must_clone<T: Clone>() {} fn must_serialize<T: serde::Serialize>() {}\nfn deny() { must_clone::<CoordinatorToken>(); must_serialize::<CoordinatorToken>(); }\n",
-        &["Clone", "Serialize"],
-    ),
-    (
-        "private_construction",
-        "use cowshed_core::{CoordinatorToken,Cowshed,Project,WorkspaceHandle};\nfn deny() { let _ = Cowshed {}; let _ = Project {}; let _ = WorkspaceHandle {}; let _ = CoordinatorToken {}; }\n",
-        &[
-            "Cowshed",
-            "Project",
-            "WorkspaceHandle",
-            "CoordinatorToken",
-            "private",
-        ],
-    ),
-    (
-        "port_block_construction",
-        "use cowshed_core::api::PortBlock;\nfn deny() { let _ = PortBlock { base: 40960, size: 16 }; }\n",
-        &["PortBlock", "private"],
-    ),
-    (
-        "null_success",
-        "use cowshed_core::api::JsonEnvelope;\nfn deny() { let _ = JsonEnvelope::success(()); }\n",
-        &["success", "Sealed"],
-    ),
-    (
-        "worker_operation_authority",
-        "use cowshed_core::WorkspaceHandle;\nuse cowshed_core::api::call::{Arguments, call};\nuse cowshed_core::api::operations::{CoordinatorDestroy, WorkspaceAttach};\npub async fn deny(value: &WorkspaceHandle) { let _ = call::<CoordinatorDestroy, _>(value, Arguments::new()).await; let _ = call::<WorkspaceAttach, _>(value, Arguments::new()).await; }\n",
-        &[
-            "Serves<cowshed_core::api::operations::CoordinatorDestroy>` is not implemented for `WorkspaceHandle`",
-            "Serves<cowshed_core::api::operations::WorkspaceAttach>` is not implemented for `WorkspaceHandle`",
-        ],
-    ),
-    (
-        "workspace_ref_operation_authority",
-        "use cowshed_core::WorkspaceRef;\nuse cowshed_core::api::call::{Arguments, call_upload};\nuse cowshed_core::api::operations::WorkerExec;\npub async fn deny(value: &WorkspaceRef) { let _ = call_upload::<WorkerExec, _>(value, Arguments::new(), None).await; }\n",
-        &[
-            "Serves<cowshed_core::api::operations::WorkerExec>` is not implemented for `WorkspaceRef`",
-        ],
-    ),
-    (
-        "forged_operation",
-        "use cowshed_core::JobHandle;\nuse cowshed_core::api::call::Serves;\nuse cowshed_core::api::operations::{JobRequest, Lane, Operation, OperationRequest, Scope};\npub enum Forged {}\nimpl Operation for Forged { const METHOD: &'static str = \"coordinator.destroy\"; const SCOPE: Scope = Scope::Worker; const LANE: Lane = Lane::Json; type Request = JobRequest; type Result = (); fn request(request: JobRequest) -> OperationRequest { OperationRequest::JobKill(request) } }\nimpl Serves<Forged> for JobHandle { const BOUND: &'static [&'static str] = &[]; }\n",
-        &["`Forged: operations::sealed::Sealed` is not satisfied"],
-    ),
-];
+/// The capability probe's cases, relative to this crate: one `.rs` file each. Its stem names the case, its
+/// `//! must name:` lines are what rustc's errors for it must mention, and its code is what a caller without
+/// coordinator authority must not be able to compile. `scripts/capability-probe.sh` checks the same files.
+const CAPABILITY_CASE_DIR: &str = "tests/capability_probe";
 
-/// Writes the capability probe workspace, one crate per case holding `source(name)`, and checks it
-/// with cargo in the OUTER target directory.
-///
-/// Compiled by cargo, not by a hand-assembled rustc command line.
-///
-/// This test used to run rustc itself against the newest `libcowshed_core-*.rlib` in
-/// `<target>/debug/deps`, to avoid a path-dependency `cargo check` rebuilding cowshed-core. Two
-/// toolchain changes made that technique impossible rather than merely fragile:
-///
-/// * cargo no longer writes package rlibs into `<target>/<profile>/deps`. They live in
-///   `<target>/<profile>/build/<pkg>/<hash>/out/`, and dependencies are found through one
-///   `-L dependency=` per package rather than a single shared directory.
-/// * rustc now emits rlibs carrying only a metadata *stub*, with the full metadata in a sibling
-///   `.rmeta`. `--extern name=<rlib>` fails with "only metadata stub found", and reproducing
-///   cargo's rlib/rmeta pairing by hand does not resolve either.
-///
-/// Reconstructing cargo's dependency search path here would have to be redone at every layout
-/// change, and while it was broken this gate passed nothing and proved nothing. Asking cargo
-/// cannot go stale.
-///
-/// The check shares the OUTER target directory. A probe-private one costs a full cold dependency
-/// check of cowshed-core's whole tree — measured at 48s on an idle M5 Max, ~110s of CPU, and 927MB
-/// of duplicated artifacts. Sharing reuses the build scripts and proc macros `cargo test
-/// --workspace --no-run` already built, and keeps what one probe check compiled for the next.
-///
-/// The outer cargo owning this directory is not a conflict. nextest builds through cargo and then
-/// runs the test binaries itself, releasing the build lock before execution, so a `cargo check`
-/// against the shared directory while this suite is running does not block — measured at 0.401s
-/// mid-run. Fingerprints keep the probe's artifacts distinct from the outer build's rather than
-/// evicting them, so neither invalidates the other.
-///
-/// If a stale-artifact failure ever reappears here, this is what it looks like: a poisoned rlib
-/// left in the legacy `deps` directory, written by sccache with 0640 permissions on a cache hit,
-/// compiled by a rustc that is no longer the one on PATH.
-///
-/// Every case is its own crate, so each is checked in a rustc session of its own: rustc skips its
-/// privacy pass once type checking failed, so cases sharing a crate would hide each other's
-/// later-phase errors. The crates are members of ONE probe workspace checked by ONE cargo with
-/// `--keep-going`; a cargo per case paid resolution and the fingerprint walk of cowshed-core's
-/// whole tree once per case. The outer lockfile pins the probe to the versions the outer build
-/// compiled, so resolution is a lookup.
-///
-/// The probe's manifests, lockfile and shared target are the same whatever `source` returns, so
-/// dependencies fingerprint the same for the warm-up and the test. Only the case crates live in a
-/// fresh run-owned directory: an archived test binary must never clear its producer's fixture.
-fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process::Output {
-    let probe = TempRoot::new_in(&std::env::temp_dir(), "cowshed-capability-probe");
+/// What rustc said of each case, relative to this crate: a JSON object from case name to its error
+/// diagnostics. It is the output of the cached Nx target `cowshed:capability-probe`, which every cowshed-core
+/// runner runs after and keys on, so the compiler has already run and this test only reads the answer. Checking
+/// the cases is a build of cowshed-core's whole dependency tree, which takes a cold hosted runner minutes:
+/// compiling is that target's work, never a test's, and none of it is under test.
+const CAPABILITY_VERDICT_FILE: &str = "../../.cache/capability-probe/diagnostics.json";
+
+/// The marker of a line in a case file that names something its errors must mention.
+const MUST_NAME: &str = "//! must name: ";
+
+/// Every case file in `directory`: the case's name, and each text its errors must mention.
+fn capability_cases(directory: &Path) -> BTreeMap<String, Vec<String>> {
+    fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("capability cases {}: {error}", directory.display()))
+        .map(|entry| entry.expect("a capability case entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .map(|path| {
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("a UTF-8 case name")
+                .to_owned();
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("capability case {}: {error}", path.display()));
+            let names: Vec<String> = source
+                .lines()
+                .filter_map(|line| line.strip_prefix(MUST_NAME))
+                .map(str::to_owned)
+                .collect();
+            assert!(
+                !names.is_empty(),
+                "{} names nothing its errors must mention",
+                path.display()
+            );
+            (name, names)
+        })
+        .collect()
+}
+
+/// Every case of the capability probe fails to compile, and its errors name what its file says they must: the
+/// types that hold less than coordinator authority cannot reach what only the coordinator may do.
+#[test]
+fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR")
             .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs"),
     );
-    let lockfile = manifest_dir
-        .ancestors()
-        .map(|directory| directory.join("Cargo.lock"))
-        .find(|lockfile| lockfile.is_file())
-        .expect("the workspace lockfile");
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    // Ask Cargo in the executing checkout, not the checkout that compiled this test binary.
-    // Metadata honors its runtime target configuration without building any dependencies.
-    let metadata = Command::new(&cargo)
-        .args([
-            "metadata",
-            "--no-deps",
-            "--offline",
-            "--format-version",
-            "1",
-        ])
-        .current_dir(&manifest_dir)
-        .output_bounded()
-        .unwrap_or_else(|error| panic!("cargo metadata in {}: {error}", manifest_dir.display()));
-    assert!(
-        metadata.status.success(),
-        "cargo metadata in {}: {}",
-        manifest_dir.display(),
-        String::from_utf8_lossy(&metadata.stderr)
-    );
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&metadata.stdout).expect("cargo metadata JSON");
-    let target = PathBuf::from(
-        metadata["target_directory"]
-            .as_str()
-            .expect("cargo metadata target_directory"),
-    );
-    // The owned scratch root has no repository config ancestors. Forward the files a Cargo
-    // started in cowshed-core's runtime directory reads, shallowest first: a later `--config`
-    // wins, as a deeper file does. This preserves the linker and `[env]` in the one Cargo
-    // environment (16_build_volumes.md, "One Cargo environment on every path").
-    let mut workspace_configs: Vec<PathBuf> = manifest_dir
-        .ancestors()
-        .map(|directory| directory.join(".cargo").join("config.toml"))
-        .filter(|config| config.is_file())
-        .collect();
-    workspace_configs.reverse();
-    // The probe's own `[workspace]` detaches it from the outer workspace, whose members it must
-    // not join and whose lints and profiles it must not inherit — each snippet is meant to fail on
-    // visibility, and nothing else. `serde` is here because one snippet names a serde trait to
-    // prove a sealed token does not implement it; without it that snippet would fail on an
-    // unresolved crate and prove nothing.
-    let members: Vec<String> = CAPABILITY_CASES
-        .iter()
-        .map(|(name, ..)| format!("{name:?}"))
-        .collect();
-    fs::write(
-        probe.join("Cargo.toml"),
-        format!(
-            "[workspace]\nresolver = \"3\"\nmembers = [{}]\n",
-            members.join(", ")
-        ),
-    )
-    .expect("probe workspace manifest");
-    fs::copy(&lockfile, probe.join("Cargo.lock")).expect("probe lockfile");
-    for (name, ..) in CAPABILITY_CASES {
-        let crate_dir = probe.join(name);
-        fs::create_dir_all(crate_dir.join("src")).expect("probe crate directory");
-        fs::write(
-            crate_dir.join("Cargo.toml"),
-            format!(
-                "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
-                 publish = false\n\n[lib]\npath = \"src/lib.rs\"\n\n\
-                 [dependencies]\ncowshed-core = {{ path = {manifest_dir:?} }}\n\
-                 serde = {{ version = \"1\", features = [\"derive\"] }}\n"
-            ),
+    let cases = capability_cases(&manifest_dir.join(CAPABILITY_CASE_DIR));
+    let verdict_file = manifest_dir.join(CAPABILITY_VERDICT_FILE);
+    let verdict = fs::read(&verdict_file).unwrap_or_else(|error| {
+        panic!(
+            "the capability probe's verdict {} is unreadable ({error}): `nx run cowshed:capability-probe` writes it, and every cowshed-core runner runs after that target",
+            verdict_file.display()
         )
-        .expect("probe manifest");
-        fs::write(crate_dir.join("src/lib.rs"), source(name)).expect("probe source");
-    }
-    Command::new(&cargo)
-        .args(
-            workspace_configs
-                .iter()
-                .flat_map(|config| [std::ffi::OsStr::new("--config"), config.as_os_str()]),
-        )
-        .arg("check")
-        .arg("--workspace")
-        .arg("--keep-going")
-        .arg("--offline")
-        .arg("--message-format=short")
-        .arg("--target-dir")
-        .arg(&target)
-        .current_dir(&*probe)
-        .output_bounded()
-        .unwrap_or_else(|error| panic!("cargo check: {error}"))
-}
-
-/// Exercise our Cargo CLI wiring without rebuilding Cargo's dependency tree. A child test process
-/// relocates the manifest and scratch parent at runtime, just as an archived nextest binary does.
-#[cfg(unix)]
-#[test]
-fn capability_probe_owns_runtime_scratch_and_reuses_runtime_target() {
-    const FIXTURE: &str = "COWSHED_CAPABILITY_PROBE_FIXTURE";
-    if std::env::var_os(FIXTURE).is_some() {
-        for _ in 0..2 {
-            let output = check_capability_probe(|_| "");
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        return;
-    }
-
-    use std::os::unix::fs::PermissionsExt as _;
-    let fixture = TempRoot::new_in(&std::env::temp_dir(), "cowshed-capability-relocation");
-    let consumer = fixture.join("consumer");
-    let manifest = consumer.join("crates/probe-owner");
-    let scratch = fixture.join("scratch");
-    let target = consumer.join("configured-target");
-    let producer = fixture.join("producer-target/tmp/capability-probe");
-    let configs = [
-        consumer.join(".cargo/config.toml"),
-        manifest.join(".cargo/config.toml"),
-    ];
-    for directory in [&scratch, &producer] {
-        fs::create_dir_all(directory).unwrap();
-    }
-    for config in &configs {
-        fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::write(config, "# runtime checkout config\n").unwrap();
-    }
-    fs::write(consumer.join("Cargo.lock"), "# runtime checkout lock\n").unwrap();
-    fs::write(producer.join("keep"), "producer-owned bytes").unwrap();
-    fs::write(
-        fixture.join("metadata.json"),
-        serde_json::to_vec(&json!({ "target_directory": target })).unwrap(),
-    )
-    .unwrap();
-    let cargo = fixture.join("cargo");
-    fs::write(
-        &cargo,
-        r#"#!/bin/sh
-set -eu
-fixture="$COWSHED_CAPABILITY_PROBE_FIXTURE"
-if [ "$1" = metadata ]; then
-    printf '%s\n' "$PWD" >> "$fixture/metadata-cwds"
-    cat "$fixture/metadata.json"
-else
-    printf '%s\n' "$PWD" >> "$fixture/probe-roots"
-    printf '%s\0' "$@" >> "$fixture/check-args"
-    cp Cargo.lock "$fixture/probe-lock"
-    cp private_construction/Cargo.toml "$fixture/probe-manifest"
-fi
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "capability_probe_owns_runtime_scratch_and_reuses_runtime_target",
-            "--nocapture",
-        ])
-        .env(FIXTURE, &*fixture)
-        .env("CARGO", &cargo)
-        .env("CARGO_MANIFEST_DIR", &manifest)
-        .env("CARGO_TARGET_TMPDIR", producer.parent().unwrap())
-        .env("TMPDIR", &scratch)
-        .output_bounded()
-        .expect("run relocated capability probe");
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let roots = fs::read_to_string(fixture.join("probe-roots")).unwrap();
-    let roots: Vec<PathBuf> = roots.lines().map(PathBuf::from).collect();
-    assert_eq!(roots.len(), 2);
-    assert_ne!(roots[0], roots[1]);
-    // The stand-in reports `$PWD`, which the shell takes from getcwd(3), the physical path: where the temporary directory
-    // is reached through a link (`/var` -> `/private/var` on a macOS runner), the scratch and manifest paths differ from
-    // it. The probe itself runs in exactly those directories; only the stand-in's report is physical.
-    let scratch = fs::canonicalize(&scratch).unwrap();
-    let physical_manifest = fs::canonicalize(&manifest).unwrap();
-    for root in roots {
-        assert_eq!(root.parent(), Some(scratch.as_path()));
-        assert!(!root.exists(), "run-owned root {} survived", root.display());
-    }
-    let metadata_cwds = fs::read_to_string(fixture.join("metadata-cwds")).unwrap();
-    assert_eq!(
-        metadata_cwds.lines().collect::<Vec<_>>(),
-        vec![physical_manifest.to_str().unwrap(); 2]
-    );
-    let mut expected: Vec<OsString> = configs
-        .iter()
-        .flat_map(|config| [OsString::from("--config"), config.as_os_str().to_owned()])
-        .collect();
-    expected.extend(
-        [
-            "check",
-            "--workspace",
-            "--keep-going",
-            "--offline",
-            "--message-format=short",
-            "--target-dir",
-        ]
-        .map(OsString::from),
-    );
-    expected.push(target.into_os_string());
-    let arguments = fs::read(fixture.join("check-args")).unwrap();
-    let arguments: Vec<OsString> = arguments
-        .split_inclusive(|byte| *byte == 0)
-        .map(|argument| OsString::from_vec(argument[..argument.len() - 1].to_vec()))
-        .collect();
-    assert_eq!(arguments.len(), expected.len() * 2);
-    for invocation in arguments.chunks(expected.len()) {
-        assert_eq!(invocation, expected);
-    }
-    assert_eq!(
-        fs::read(fixture.join("probe-lock")).unwrap(),
-        b"# runtime checkout lock\n"
-    );
-    assert!(
-        fs::read_to_string(fixture.join("probe-manifest"))
-            .unwrap()
-            .contains(&format!("path = {manifest:?}"))
-    );
-    assert_eq!(
-        fs::read(producer.join("keep")).unwrap(),
-        b"producer-owned bytes"
-    );
-}
-
-/// The capability probe's build step: everything the probe checks except its snippets, which is
-/// cowshed-core's whole dependency tree as the probe resolves it. On a cold CI runner that check
-/// takes longer than the bounded window of the test below (measured over 100s on a hosted arm64
-/// macOS runner, where it timed the release candidate out), and none of it is under test. So
-/// each exceptional shard runs this first as its bounded-exec fixture segment, in a build
-/// budget, and the test's window covers the case crates alone. Ignored, because it
-/// proves nothing a test should: every crate is empty and must check.
-#[test]
-#[ignore = "build step for the capability probe; the exceptional shards run it as their fixture segment"]
-fn capability_probe_dependencies_check() {
-    let output = check_capability_probe(|_| "");
-    assert!(
-        output.status.success(),
-        "the capability probe's dependencies did not check:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
-    let output = check_capability_probe(|name| {
-        CAPABILITY_CASES
-            .iter()
-            .find(|(case, ..)| *case == name)
-            .map(|(_, source, _)| *source)
-            .expect("a capability case")
     });
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "every capability probe unexpectedly compiled:\n{diagnostic}"
+    let verdict: BTreeMap<String, Vec<String>> = serde_json::from_slice(&verdict)
+        .unwrap_or_else(|error| panic!("{}: {error}", verdict_file.display()));
+    assert_eq!(
+        verdict.keys().collect::<Vec<_>>(),
+        cases.keys().collect::<Vec<_>>(),
+        "the verdict is for other cases than {CAPABILITY_CASE_DIR} holds: `nx run cowshed:capability-probe` rewrites it"
     );
-    for (name, _, expected) in CAPABILITY_CASES {
-        // `--message-format=short` puts each diagnostic on one line headed by its file, relative
-        // to the probe workspace.
-        let file = format!("{name}/src/lib.rs:");
-        let errors: Vec<&str> = diagnostic
-            .lines()
-            .filter(|line| line.starts_with(&file) && line.contains(": error"))
-            .collect();
-        assert!(!errors.is_empty(), "{name} compiled:\n{diagnostic}");
+    for (name, expected) in &cases {
+        let errors = &verdict[name];
+        assert!(!errors.is_empty(), "{name} compiled");
         let errors = errors.join("\n");
         for expected in expected {
             assert!(
-                errors.contains(expected),
+                errors.contains(expected.as_str()),
                 "{name} did not fail on {expected}:\n{errors}"
             );
         }

@@ -76,6 +76,14 @@
     "cargo-test-cowshed-*": {
       "dependsOn": ["...", { "projects": ["cowshed"], "target": "apfs-test-root" }]
     },
+    "cargo-test-cowshed-core-*": {
+      "dependsOn": [
+        "...",
+        { "projects": ["cowshed"], "target": "apfs-test-root" },
+        { "projects": ["cowshed"], "target": "capability-probe" }
+      ],
+      "inputs": ["...", { "dependentTasksOutputFiles": "**/capability-probe/diagnostics.json", "transitive": false }]
+    },
     "cargo-test-group-real-apfs": {
       "dependsOn": [
         "...",

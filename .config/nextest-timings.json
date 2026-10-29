@@ -57,7 +57,6 @@
     "git_preservation::tests::filtered_copy_verification_refuses_copy_only_paths": 6101,
     "git_preservation::tests::filtered_copy_verification_refuses_submodule_byte_and_head_drift": 7473,
     "git_preservation::tests::linked_worktree_copy_reaches_the_same_external_admin": 3336,
-    "lesser_capabilities_fail_to_compile_with_coordinator_authority": 40025,
     "macos::a_captured_rename_keeps_later_dirty_and_untracked_bytes": 15136,
     "macos::a_captured_rename_keeps_new_untracked_path_without_head_change": 6984,
     "macos::a_create_interrupted_after_its_pending_clone_exists_still_resumes": 5238,

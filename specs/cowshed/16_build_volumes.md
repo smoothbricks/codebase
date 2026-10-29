@@ -1491,9 +1491,9 @@ every mtime. A file-by-file copy that restamps files in walk order (`cp -c -R`) 
   and build state from one tree ("Source and build state arrive together"); and a land harmonizes the target's source
   mtimes with the landing checkout's under the target's image lock, before the landing volume is frozen as its seed or
   adopted as its build volume (Land step 5.3). A Cargo run whose directory has none of the checkout's
-  `.cargo/config.toml` above it reads them through `--config`, shallowest first: the cowshed-core capability probe
-  builds its workspace under `CARGO_TARGET_TMPDIR`, which resolves into the build volume, and without them it built
-  cowshed-core's tree without the workspace's linker or `[env]`.
+  `.cargo/config.toml` above it, such as a scratch workspace under `CARGO_TARGET_TMPDIR` (which resolves into the build
+  volume), builds without the workspace's linker or `[env]`; the cowshed-core capability probe therefore stages its
+  workspace inside the checkout, under `.cache/capability-probe/`, where Cargo finds those files itself (08_testing.md).
 - **Enforced by**: `source_mtimes_make_cargo_rebuild_a_unit_the_fast_forward_left_stale`
   (`crates/cowshed-core/src/runtime/build_volumes/source_mtimes.rs`), in which real Cargo in its default mtime freshness
   reuses a unit built from pre-rebase bytes beside the target's older landed source and, after harmonization, rebuilds

@@ -605,50 +605,56 @@
           "cwd": "packages/cowshed"
         }
       },
-      "cargo-test-cowshed-core-exceptions-shard1": {
+      "capability-probe": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "//": "rustc's verdict on the cowshed-core capability probe: each file of crates/cowshed-core/tests/capability_probe is a crate that must not compile, and scripts/capability-probe.sh checks them all with one cargo and writes what rustc said of each. public_api_contracts' lesser_capabilities_fail_to_compile_with_coordinator_authority reads that file and judges it, so no test compiles anything: cowshed-core's dependency build takes minutes on a cold runner, and no runner's progress bound is spent on it. Every cowshed-core runner depends on this target and keys on its output (nx.json targetDefaults), because which runner holds the test follows from the plugin's partition of the crate, not from anything declared here. Nx resolves one targetDefaults key per target, the most specific glob, so the cargo-test-cowshed-core-* key restates the apfs-test-root edge of cargo-test-cowshed-*.",
         "dependsOn": [
-          "..."
+          {
+            "target": "cargo-fetch",
+            "projects": [
+              "@smoothbricks/codebase"
+            ]
+          }
         ],
-        "//": "The exceptional shards carry the capability probe's compiler fixture as a bounded-exec fixture segment: public_api_contracts' probe cargo-checks its case crates against cowshed-core, whose dependency build exceeds the progress bound on a cold runner, so an executing shard first runs the ignored capability_probe_dependencies_check from the same archive under the 600s fixture budget, warming the shared target/. A cached shard restores its verdict and warms nothing. The fixture reuses the generated runners' content-keyed extraction under Cargo's target directory rather than --archive-file, which unpacks into a fresh $TMPDIR/nextest-archive-* that a killed run never removes.",
+        "inputs": [
+          "cargoClosure",
+          "cargoToolchain",
+          "{projectRoot}/scripts/capability-probe.sh"
+        ],
+        "outputs": [
+          "{projectRoot}/{options.verdict}"
+        ],
         "options": {
-          "fixtureCommand": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
-          "fixtureTimeoutMs": 600000
+          "verdict": ".cache/capability-probe/diagnostics.json",
+          "command": "sh scripts/capability-probe.sh {args.verdict}",
+          "cwd": "{projectRoot}"
         }
       },
-      "cargo-test-cowshed-core-exceptions-shard2": {
-        "dependsOn": [
-          "..."
+      "capability-probe-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/scripts/capability-probe.sh",
+          "{projectRoot}/scripts/capability-probe.test.cjs",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "externalDependencies": []
+          },
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node --version"
+          },
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh jq --version"
+          }
         ],
+        "outputs": [],
+        "//": "Witness that cowshed:capability-probe publishes a verdict only when rustc answered for every case, exactly the errors rustc located in each case's crate, and leaves no verdict and no staged workspace behind when it refuses. Nx caches what the script wrote and every cowshed-core runner keys on it, so a non-answer published as an answer would fail the test on every run until an input changed. Cargo is faked at its published interface; the real compiler run is the capability-probe target.",
         "options": {
-          "fixtureCommand": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
-          "fixtureTimeoutMs": 600000
-        }
-      },
-      "cargo-test-cowshed-core-exceptions-shard3": {
-        "dependsOn": [
-          "..."
-        ],
-        "options": {
-          "fixtureCommand": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
-          "fixtureTimeoutMs": 600000
-        }
-      },
-      "cargo-test-cowshed-core-exceptions-shard4": {
-        "dependsOn": [
-          "..."
-        ],
-        "options": {
-          "fixtureCommand": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
-          "fixtureTimeoutMs": 600000
-        }
-      },
-      "cargo-test-cowshed-core-exceptions-shard5": {
-        "dependsOn": [
-          "..."
-        ],
-        "options": {
-          "fixtureCommand": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
-          "fixtureTimeoutMs": 600000
+          "command": "node --test packages/cowshed/scripts/capability-probe.test.cjs",
+          "cwd": ".",
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
         }
       },
       "declaration-model-test": {
@@ -732,6 +738,7 @@
           "launcher-test",
           "cache-advisor-test",
           "wire-fixtures-test",
+          "capability-probe-test",
           "apfs-test-root-test",
           "wire-test",
           "declaration-model-test"

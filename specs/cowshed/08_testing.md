@@ -242,10 +242,17 @@ helper's exit, so startup failure reports the exited helper instead of waiting f
 and release readiness frames are newline-terminated messages; their completion does not depend on every inherited writer
 descriptor reaching EOF. Independent readiness publishers are read concurrently.
 
-The capability compile-check probe creates its scratch workspace through the shared fixture guard at runtime, never
-under a path baked into an archived test binary. Cargo metadata from the runtime manifest directory supplies its shared
-dependency target; warm-up and privacy checks use that same target and forward the checkout's ancestor Cargo configs
-(16_build_volumes.md, "One Cargo environment on every path"). Only the run-owned scratch workspace is removed.
+The capability probe is a build step a test reads, never a test that compiles. Each file of
+`crates/cowshed-core/tests/capability_probe` is a crate that must not compile, and its `//! must name:` lines say what
+rustc's errors for it must mention. `cowshed:capability-probe` (`scripts/capability-probe.sh`) stages the cases as the
+members of one scratch workspace inside the checkout, with the checkout's own lockfile, its `.cargo/config.toml` files
+(found by Cargo's own ancestor search, never forwarded with `--config`) and the target directory `cargo metadata`
+reports (16_build_volumes.md, "One Cargo environment on every path"). It checks them with one `cargo check --keep-going`
+and writes rustc's error diagnostics per case as its one output, and it refuses a run that gave no verdict for some
+case, so a cached answer is always an answer. `lesser_capabilities_fail_to_compile_with_coordinator_authority` reads
+that verdict, runs no Cargo and judges what each case's errors name; every cowshed-core runner runs after the target and
+keys on its output (`nx.json`, `targetDefaults`), so a cold runner's dependency build is never charged to a test's
+progress bound. Only the run's scratch workspace is removed.
 
 Process fixtures resolve real portable tools through the selected shell's PATH, not fixed FHS executable paths. A
 version-probe fixture prepends its selected executable directory without discarding that toolchain PATH. Host API proofs
