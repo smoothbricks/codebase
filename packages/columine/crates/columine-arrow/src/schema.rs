@@ -646,13 +646,17 @@ impl DynamicSchemaConfig {
 
 /// The largest Schema message a handle accepts, framing included.
 ///
+/// A complete event schema whose fields each carry selector metadata outgrows
+/// 64 KiB well under [`MAX_SCHEMA_FIELDS`] fields (177 such fields take
+/// 103,232 bytes); this cap admits it with room to grow.
+///
 /// Decoding goes through the arrow-ipc reader, whose allocations are
 /// infallible. This cap bounds them before the call: a message at the cap
-/// with [`MAX_SCHEMA_FIELDS`] fields decodes within a small multiple of its
-/// own size (pinned by `schema_decode_at_the_message_cap_stays_bounded`), so
-/// the one infallible decode a handle performs, once at creation, stays far
-/// below any memory ceiling a host can usefully run with.
-pub const MAX_SCHEMA_MESSAGE_BYTES: usize = 64 * 1024;
+/// with [`MAX_SCHEMA_FIELDS`] fields decodes holding at most four times the
+/// cap live (pinned by `schema_decode_at_the_message_cap_stays_bounded`), so
+/// a host creating a handle needs that much headroom above its other live
+/// memory for the one infallible decode, done once at creation.
+pub const MAX_SCHEMA_MESSAGE_BYTES: usize = 256 * 1024;
 
 fn decode_schema_message(bytes: &[u8]) -> Result<arrow_schema::Schema, SchemaError> {
     if bytes.len() > MAX_SCHEMA_MESSAGE_BYTES {

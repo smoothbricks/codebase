@@ -9,7 +9,7 @@ use arrow_array::{Array, BinaryArray, Int64Array, StringArray};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
-use columine_arrow::schema::{ArrowType, SignalSchemaField};
+use columine_arrow::schema::{ArrowType, MAX_SCHEMA_MESSAGE_BYTES, SignalSchemaField};
 use columine_ep_wasm::{
     MAX_EVENT_CAPACITY, ep_compact, ep_create_log_entry, ep_create_with_schema,
     ep_create_with_schema_and_names, ep_destroy, ep_version,
@@ -792,6 +792,18 @@ fn creation_failures_name_their_cause() {
         "the signed twin must create: {handle:#x}"
     );
     ep_destroy(handle);
+
+    // The same well-formed one-field schema, named past the message cap, is
+    // refused by its length before the reader decodes it.
+    let over_cap = ipc_schema_bytes(vec![Field::new(
+        "v".repeat(MAX_SCHEMA_MESSAGE_BYTES),
+        DataType::Int32,
+        true,
+    )]);
+    assert_eq!(
+        create(&over_cap, int32_meta.as_ptr().cast(), 1),
+        CreateFailure::SchemaTooLarge as u32
+    );
 
     let non_null_meta = [SignalSchemaField::new(ArrowType::Int32, false)];
     assert_eq!(
