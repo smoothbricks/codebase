@@ -10468,8 +10468,6 @@ mod workspace_toolchain_tests {
         let cloned = root.join("cloned/workspace");
         std::fs::create_dir_all(cloned.join(super::super::shell_host::SHELL_HOST_DIRECTORY))
             .expect("cloned host directory");
-        std::fs::create_dir_all(cloned.parent().expect("clone parent").join("home"))
-            .expect("cloned home");
         for path in [
             ".envrc",
             "nx.json",
@@ -10480,6 +10478,8 @@ mod workspace_toolchain_tests {
                 .expect("clone activation inputs and record");
         }
         let mut clone_sandbox = sandbox_at(&cloned);
+        // A clone changes checkout placement, not the controller host installation.
+        clone_sandbox.home = root.join("home");
         clone_sandbox.program_directories = program_directories;
         clone_sandbox
             .configure_capabilities()
