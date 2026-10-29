@@ -1557,18 +1557,14 @@ mod tests {
         assert!(status.success(), "parent: {status}");
     }
 
-    /// A held leader's `proc_pid_rusage`, its Mach ticks converted through the timebase, is the
-    /// CPU `getrusage` independently charges its parent for it once reaped: its own and its
-    /// reaped child's, each once. With the child counted twice it is not; read as raw
-    /// nanoseconds it is not either, wherever a tick is not one nanosecond (Apple silicon).
-    /// Intel's 1/1 timebase makes the two agree; `job_accounting`'s injected-timebase test
-    /// covers both rationals. Meanwhile its own process row -- it only waited -- holds none of the
-    /// child's CPU, which its children total holds; once reaped, nothing is read as its own.
+    /// The reaped child's independent CPU report is stable before the leader exits. Its
+    /// converted children counters agree within whole-microsecond truncation; the leader's
+    /// terminal snapshot precedes exit teardown, so its total cannot exceed the final charge.
+    /// Exact rational conversion and once-only aggregation belong to job_accounting's pure table.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_held_leader_s_converted_rusage_is_what_getrusage_charges_for_it() {
-        use super::MachTick;
-        use crate::runtime::job_accounting::{LeaderRusageError, read_leader, rusage_ticks};
+        use crate::runtime::job_accounting::{LeaderRusageError, read_leader};
         use crate::runtime::job_groups::Birth;
 
         let mut parent = Command::new(std::env::current_exe().expect("test binary"))
@@ -1587,7 +1583,9 @@ mod tests {
             .parse()
             .expect("burned");
         release.write_all(b"x").expect("release the burner");
-        next_report(&mut lines, "reaped");
+        let reaped: u64 = next_report(&mut lines, "reaped")[0]
+            .parse()
+            .expect("children");
 
         let waiting = read_leader(&leader).expect("the held, waiting leader");
         let mut fold = ProcessUsageFold::clocked(Instant::now());
@@ -1610,39 +1608,24 @@ mod tests {
         drop(release);
         wait_unreaped(&parent);
         let last = read_leader(&leader).expect("the exited, still held leader");
-        let pid = libc::pid_t::try_from(parent.id()).expect("pid");
-        let ticks = rusage_ticks(pid).expect("read").expect("still held");
         let before = rusage_us(libc::RUSAGE_CHILDREN);
         assert!(parent.wait_bounded().expect("reap the parent").success());
         let charged = rusage_us(libc::RUSAGE_CHILDREN) - before;
 
-        // xnu snapshots an exiting process's rusage_info as its exit begins (`proc_prepareexit`),
-        // and its `getrusage` times once the exit's teardown is done (`proc_exit`): the oracle
-        // is that teardown more, never less (measured: 2.2 ms of 1.03 s). Each converts to whole
-        // microseconds, so the reader may be a few microseconds above it.
-        let agrees =
-            |value: u64| value <= charged + 10 && charged.saturating_sub(value) <= charged / 100;
+        // The child's user and system totals are already final. Each native API truncates
+        // those two components to microseconds independently: at most two microseconds differ.
+        let converted_children = cpu(last.children);
+        assert!(
+            converted_children.abs_diff(reaped) <= 2,
+            "converted child CPU {converted_children} us is the independently reported {reaped} us"
+        );
+        // xnu snapshots rusage_info at proc_prepareexit, before proc_exit's teardown CPU.
+        // No fixed fraction bounds that extra work. The four converted components can each
+        // differ by less than one truncated microsecond from the final getrusage charge.
         let converted = cpu(last.total().expect("exact"));
         assert!(
-            agrees(converted),
-            "the converted rusage {converted} us is the {charged} us getrusage charged"
-        );
-        let timebase = MachTick::read().expect("the host's timebase");
-        if timebase.numerator != timebase.denominator.get() {
-            let raw_nanoseconds =
-                (ticks.user + ticks.system + ticks.child_user + ticks.child_system) / 1_000;
-            assert!(
-                !agrees(raw_nanoseconds),
-                "Mach ticks of {}/{} ns read as nanoseconds ({raw_nanoseconds} us) are not the \
-                 {charged} us",
-                timebase.numerator,
-                timebase.denominator
-            );
-        }
-        let child_twice = converted + cpu(last.children);
-        assert!(
-            !agrees(child_twice),
-            "the child counted twice ({child_twice} us) is not the {charged} us"
+            converted <= charged + 4,
+            "snapshot CPU {converted} us cannot exceed the final {charged} us charge"
         );
         assert_eq!(
             read_leader(&leader),
