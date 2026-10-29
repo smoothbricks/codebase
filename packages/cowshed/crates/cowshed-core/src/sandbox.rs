@@ -182,6 +182,9 @@ pub struct SandboxConfig {
     /// by exactly the workspaces that asked for `--git-worktree` and never implied by the
     /// baseline.
     pub git_worktree_repository: Option<PathBuf>,
+    /// Controller-selected main checkout identity for linked-snapshot imports, never a user grant.
+    /// Resolve its store at profile rendering so a build-volume adoption cannot leave a stale grant.
+    pub main_mount: Option<PathBuf>,
     /// The physical build volume selected by the controller at this job's admission.
     ///
     /// Build state stays writable even when source is read-only. Never derive this authority
@@ -243,6 +246,7 @@ impl SandboxConfig {
             allowed_unix_sockets: capabilities.contribution.unix_sockets.clone(),
             additional_denies: self.additional_denies.clone(),
             git_worktree_repository: self.git_worktree_repository.clone(),
+            main_mount: self.main_mount.clone(),
             build_volume_mount: self.build_volume_mount.clone(),
             repository_caches: self.repository_caches.clone(),
             program_directories: self.program_directories.clone(),
@@ -387,6 +391,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
     let mut deny: Vec<PathBuf> = grants.deny.iter().chain(repository_deny).cloned().collect();
     deny.sort();
     deny.dedup();
+    let import_main = mount != main_mount;
     let mut config = SandboxConfig {
         home: home.to_path_buf(),
         mount_root: mount_root.to_path_buf(),
@@ -427,6 +432,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         allowed_unix_sockets: Vec::new(),
         additional_denies,
         git_worktree_repository,
+        main_mount: import_main.then(|| main_mount.to_path_buf()),
         build_volume_mount,
         repository_caches: repository_caches.to_vec(),
         program_directories: program_directories.to_vec(),
@@ -550,6 +556,9 @@ fn validated_sandbox_paths(
     validate_path(&config.mount_root)?;
     validate_path(&config.workspace_mount)?;
     validate_path(&config.exec_temp_dir)?;
+    if let Some(main) = &config.main_mount {
+        validate_path(main)?;
+    }
     for block in held_port_blocks(config) {
         block
             .validate()
@@ -564,21 +573,7 @@ fn validated_sandbox_paths(
     }
     if let Some(volume) = &config.build_volume_mount {
         validate_path(volume)?;
-        let valid = volume
-            .strip_prefix(&config.mount_root)
-            .is_ok_and(|relative| {
-                relative.starts_with(".build")
-                    && relative.components().count() == 4
-                    && relative
-                        .file_name()
-                        .and_then(std::ffi::OsStr::to_str)
-                        .is_some_and(|id| {
-                            id.len() == 32
-                                && id.bytes().all(|byte| {
-                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-                                })
-                        })
-            });
+        let valid = is_build_volume_mount(&config.mount_root, volume);
         if !valid {
             return Err(SandboxError::InvalidPath {
                 path: volume.clone(),
@@ -1177,6 +1172,14 @@ pub fn seatbelt_profile(
         push_exact_and_subpath_rule(&mut profile, "allow file-read* file-write*", repository)?;
     }
 
+    // The consumer imports sealed pins from main, not from a live provider checkout. This is a
+    // controller-derived read exception, after main's deny and before every immutable secret deny.
+    if let Some(main) = &config.main_mount
+        && let Some(warning) = push_main_snapshot_store(&mut profile, config, main)?
+    {
+        cowshed_os::eprintln!("{warning}");
+    }
+
     // The exec temp dir is exported as TMPDIR and lives in the project's store directory, so its
     // grant must follow every deny that covers it - the store-wide one and the project root
     // above - or last-match-wins re-denies it: every `mktemp` in a child then fails on a path
@@ -1486,6 +1489,80 @@ fn push_capability_grant(
     }
 }
 
+fn is_build_volume_mount(mount_root: &Path, volume: &Path) -> bool {
+    volume.strip_prefix(mount_root).is_ok_and(|relative| {
+        relative.starts_with(".build")
+            && relative.components().count() == 4
+            && relative
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|id| {
+                    id.len() == 32
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+    })
+}
+
+/// Read the one controller-named store, including its fixed build-volume link, never main's cache.
+fn push_main_snapshot_store(
+    profile: &mut String,
+    config: &SandboxConfig,
+    main: &Path,
+) -> Result<Option<String>, SandboxError> {
+    let store = main.join(".cache/linked-snapshots");
+    let warning = |resolved: Option<&Path>, cause: String| {
+        let target = resolved.map_or_else(
+            || "<unresolved>".to_owned(),
+            |path| path.display().to_string(),
+        );
+        format!(
+            "cowshed: main linked-snapshot store {} (resolved {target}): {cause}; no snapshot read grant",
+            store.display()
+        )
+    };
+    let resolved = match std::fs::canonicalize(&store) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Ok(Some(warning(None, error.to_string()))),
+    };
+    let canonical = |path: &Path| {
+        std::fs::canonicalize(path)
+            .map_err(|error| format!("canonicalize {}: {error}", path.display()))
+    };
+    let build_link = main.join(".cowshed/build");
+    let fence = || -> Result<(), String> {
+        let canonical_main = canonical(main)?;
+        if resolved != canonical_main.join(".cache/linked-snapshots") {
+            let volume = canonical(&build_link)?;
+            let mount_root = canonical(&config.mount_root)?;
+            if !is_build_volume_mount(&mount_root, &volume)
+                || resolved != volume.join("declared/.cache/linked-snapshots")
+            {
+                return Err(
+                    "the store must be main's own directory or its declared linked-snapshot build state".to_owned(),
+                );
+            }
+        }
+        Ok(())
+    };
+    if let Err(cause) = fence() {
+        return Ok(Some(warning(Some(&resolved), cause)));
+    }
+    // A symlink in the fixed store path passes through main/.cowshed/build. Only lookup is
+    // admitted at those hops and at every ancestor, including the otherwise-denied build volume.
+    for path in [&store, &resolved, &build_link] {
+        for ancestor in path.ancestors() {
+            push_literal_rule(profile, "allow file-read-metadata", ancestor)?;
+        }
+    }
+    for path in [&store, &resolved] {
+        push_subpath_rule(profile, "allow file-read*", path)?;
+    }
+    Ok(None)
+}
+
 fn push_readable_ancestors(profile: &mut String, path: &Path) -> Result<(), SandboxError> {
     for ancestor in path.ancestors() {
         push_literal_rule(profile, "allow file-read*", ancestor)?;
@@ -1638,6 +1715,7 @@ mod tests {
             cpu_pool_directory: None,
             additional_denies: vec![],
             git_worktree_repository: None,
+            main_mount: None,
             build_volume_mount: None,
             repository_caches: Vec::new(),
             program_directories: Vec::new(),
@@ -2405,6 +2483,221 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
         assert!(profile.contains("(allow file-read* (subpath \"/Users/tester/Dev/widget\"))"));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_shed_imports_main_linked_snapshots_read_only_without_opening_main_cache() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-snapshot-import",
+        );
+        let home = root.join("home");
+        let main = home.join("project");
+        let mount_root = root.join("mounts");
+        let mount = mount_root.join("acme/widget/raven");
+        let volume = mount_root.join(".build/acme/widget/0123456789abcdef0123456789abcdef");
+        let store = main.join(".cache/linked-snapshots");
+        let physical_store = volume.join("declared/.cache/linked-snapshots");
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let physical_snapshot = physical_store.join(digest);
+        let snapshot = store.join(digest);
+        for directory in [
+            &main,
+            &mount,
+            &physical_snapshot,
+            &main.join(".cache/private"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+
+        fs::write(physical_snapshot.join("payload"), b"sealed snapshot\n").unwrap();
+        fs::write(main.join("source"), b"private source\n").unwrap();
+        fs::write(main.join(".cache/private/payload"), b"private cache\n").unwrap();
+        fs::write(volume.join("other-state"), b"private build state\n").unwrap();
+        let secret = home.join(".ssh/key");
+        fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        fs::write(&secret, b"host credential").unwrap();
+        std::os::unix::fs::symlink(&secret, physical_store.join("secret")).unwrap();
+        crate::build_volume::link::point(&main, &volume).unwrap();
+        crate::build_volume::link::link_paths(
+            &main,
+            &volume,
+            &[crate::capabilities::BuildStatePath::new(
+                ".cache/linked-snapshots",
+                "declared/.cache/linked-snapshots",
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let grants = crate::metadata::GrantSet {
+            port_block: Some(PortBlock::new(40_960, 16).unwrap()),
+            ..crate::metadata::GrantSet::default()
+        };
+        let mut sandbox = workspace_sandbox(WorkspaceSandbox {
+            home: &home,
+            mount_root: &mount_root,
+            project_root: &root.join("project-state"),
+            main_mount: &main,
+            telemetry_root: &root.join("telemetry"),
+            grants: &grants,
+            repository_deny: &[],
+            repository_caches: &[],
+            program_directories: &[],
+            git_worktree_repository: None,
+            build_volume_mount: None,
+            workspace_mount: mount.clone(),
+            exec_temp_dir: root.join("tmp"),
+            store_root: &root.join("store"),
+            workspace_incarnation: &crate::metadata::WorkspaceIncarnation::new(
+                "0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        })
+        .unwrap();
+        fs::create_dir_all(&sandbox.exec_temp_dir).unwrap();
+        let paths = serde_json::to_string(&[
+            snapshot.clone(),
+            physical_snapshot.clone(),
+            mount.join(".cache/linked-snapshots").join(digest),
+            main.join("source"),
+            main.join(".cache/private/payload"),
+            volume.join("other-state"),
+            main.join(".cache"),
+            volume.clone(),
+        ])
+        .unwrap();
+        for mode in [RunSandboxMode::ReadWrite, RunSandboxMode::ReadOnly] {
+            sandbox.mode = mode;
+            sandbox = sandbox.with_capabilities(sandbox.capabilities.clone());
+            let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+            let launch =
+                crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile).unwrap();
+            let script = format!(
+                r#"
+const fs = require("node:fs");
+const assert = require("node:assert/strict");
+const [snapshot, physical, imported, source, cache, build, cacheRoot, volume] = {paths};
+for (const path of [snapshot, physical]) {{
+  assert.ok(fs.lstatSync(path).isDirectory(), path);
+  assert.equal(fs.readFileSync(path + "/payload", "utf8"), "sealed snapshot\n");
+  assert.throws(() => fs.writeFileSync(path + "/payload", "changed"), {{code: "EPERM"}});
+  assert.throws(() => fs.writeFileSync(path + "/new", "changed"), {{code: "EPERM"}});
+  assert.throws(() => fs.readFileSync(path + "/../secret"), {{code: "EPERM"}});
+}}
+for (const path of [source, cache, build]) assert.throws(() => fs.readFileSync(path), {{code: "EPERM"}});
+for (const path of [cacheRoot, volume]) assert.throws(() => fs.readdirSync(path), {{code: "EPERM"}});
+if ({writable}) {{
+  fs.cpSync(snapshot, imported, {{recursive: true}});
+  assert.equal(fs.readFileSync(imported + "/payload", "utf8"), "sealed snapshot\n");
+}}
+"#,
+                writable = mode == RunSandboxMode::ReadWrite
+            );
+            let output = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(launch.args())
+                .arg("/usr/bin/env")
+                .args(["node", "-e", &script])
+                .current_dir(&mount)
+                .output_bounded()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        sandbox.main_mount = None;
+        let ungranted = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(!ungranted.text().contains(store.to_str().unwrap()));
+        assert!(!ungranted.text().contains(physical_store.to_str().unwrap()));
+        sandbox.main_mount = Some(main.clone());
+
+        let next_volume = mount_root.join(".build/acme/widget/abcdef0123456789abcdef0123456789");
+        let next_store = next_volume.join("declared/.cache/linked-snapshots");
+        fs::create_dir_all(&next_store).unwrap();
+        crate::build_volume::link::point(&main, &next_volume).unwrap();
+        let after_adoption = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(after_adoption.text().contains(next_store.to_str().unwrap()));
+        assert!(
+            !after_adoption
+                .text()
+                .contains(physical_store.to_str().unwrap())
+        );
+
+        fs::remove_file(&store).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        let direct = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(direct.text().contains(&format!(
+            "(allow file-read* (subpath \"{}\"))",
+            store.display()
+        )));
+        assert!(!direct.text().contains(next_store.to_str().unwrap()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_invalid_main_snapshot_store_warns_without_granting_or_refusing_exec() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-snapshot-escape",
+        );
+        let mut sandbox = config(RunSandboxMode::ReadWrite);
+        sandbox.home = root.join("home");
+        sandbox.mount_root = root.join("mounts");
+        sandbox.workspace_mount = sandbox.mount_root.join("acme/widget/raven");
+        sandbox.exec_temp_dir = root.join("tmp");
+        sandbox.store_root = root.join("store");
+        sandbox.grants = SandboxGrants::default();
+        sandbox.allowed_unix_sockets.clear();
+        let main = sandbox.home.join("project");
+        let secret = sandbox.home.join(".ssh");
+        let store = main.join(".cache/linked-snapshots");
+        let volume = sandbox
+            .mount_root
+            .join(".build/acme/widget/0123456789abcdef0123456789abcdef");
+        for directory in [
+            main.join(".cache"),
+            secret.clone(),
+            volume.clone(),
+            sandbox.workspace_mount.clone(),
+            sandbox.exec_temp_dir.clone(),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        crate::build_volume::link::point(&main, &volume).unwrap();
+        std::os::unix::fs::symlink(&secret, &store).unwrap();
+        sandbox.additional_denies.push(main.clone());
+        sandbox.main_mount = Some(main.clone());
+        let mut emitted = String::new();
+        let warning = push_main_snapshot_store(&mut emitted, &sandbox, &main)
+            .unwrap()
+            .unwrap();
+        assert!(
+            emitted.is_empty(),
+            "an escaping store contributes no authority"
+        );
+        assert_eq!(warning.lines().count(), 1);
+        for subject in [
+            store.to_str().unwrap(),
+            secret.to_str().unwrap(),
+            "the store must be",
+            "no snapshot read grant",
+        ] {
+            assert!(warning.contains(subject), "{subject}: {warning}");
+        }
+        let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(!profile.text().contains(store.to_str().unwrap()));
+        let launch =
+            crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile).unwrap();
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(launch.args())
+            .arg("/usr/bin/true")
+            .output_bounded()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "unrelated exec remains usable: {output:?}"
+        );
+    }
     /// A workspace-relative deny closes reads and writes beneath a path of the job's own mount:
     /// the read+write deny (with its file-read-data twin) and the ancestor unlink denies follow
     /// every mount allow, the same shape a write-only deny has.

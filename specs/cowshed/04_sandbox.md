@@ -331,17 +331,27 @@ Notes:
   needs none), the exec temp dir, allowed sockets' ancestors, and detected capabilities' shared caches and grants
   (above). Those come from the capability merge alone (15_capabilities.md): a detector that needs a HOME path, including
   one it only probes while the sandboxed supervisor repeats detection, contributes it as a grant or shared cache, main's
-  `[caches] home` entries join the same merge, and nothing else adds one. A workspace's sandbox `HOME`, `XDG_*`
-  directories and runtime dir are inside its own mount, so the deny takes nothing a child's private home holds. A job
-  therefore cannot read another tool's private state under HOME, such as an agent harness's session database or
-  `~/Library/Application Support/*`: the broad data allow would otherwise admit any file whose metadata was denied.
+  `[caches] home` entries join the same merge. The controller-derived main snapshot-store exception below is separate. A
+  workspace's sandbox `HOME`, `XDG_*` directories and runtime dir are inside its own mount, so the deny takes nothing a
+  child's private home holds. A job therefore cannot read another tool's private state under HOME, such as an agent
+  harness's session database or `~/Library/Application Support/*`: the broad data allow would otherwise admit any file
+  whose metadata was denied.
 - **Main's checkout is a sibling.** Main mounts at the operator's own checkout path, outside the fixed mount root, so
   the mount-root deny never covered it: a job read main's untracked files, `.cowshed/token` included. Every workspace
   but main now carries main's canonical mount among its policy denies (`file-read* file-write*`, exact and subpath, the
   shape a sibling's mount gets from the mount-root deny); main keeps its own mount. A grant into main's checkout is
   refused by validation, and project-wide grants are validated against that non-main shape as well as main's. A
   git-worktree workspace's `.git` carve-back still follows the deny, narrowed to `.git`. Explicit read grants of another
-  repository's main are unaffected.
+  repository's main are unaffected. The one read-only exception is main's `.cache/linked-snapshots` store, required by
+  [Declared developer link pins](../cli/01_workspace_reconciliation.md#declared-developer-link-pins): one capture in
+  main serves every checkout. The controller supplies main's identity; each profile resolves the current store and
+  grants only its lexical and canonical subtrees read-only, after main's deny and before secret denies. Every lookup
+  ancestor, including the fixed `.cowshed/build` link, is metadata-only. The canonical store must remain at main's own
+  store path or at exactly `declared/.cache/linked-snapshots` in the build volume main's link names. An invalid,
+  escaping or unreadable store contributes no grant and emits one `cowshed:` diagnostic naming the store, its resolved
+  target (or that it could not be resolved) and the cause; unrelated jobs still run. An actual import then fails under
+  the unchanged deny. Neither main's broader `.cache`, the rest of its build volume, nor a user-supplied grant into main
+  is admitted.
 - Gateway mirrors (layer 1) live in cowshed's own cache directory, `~/Library/Caches/dev.cowshed/{mirror,repo-mirrors}`
   (Linux `$XDG_CACHE_HOME/cowshed/…`), and only the gateway writes them (03_caches.md, 05_gateway.md). That directory
   and `~/Library/Application Support/dev.cowshed` are cowshed's controller state: their directory contents stay denied.

@@ -22522,6 +22522,7 @@ mod grant_unit_tests {
             allowed_unix_sockets: Vec::new(),
             additional_denies: vec![project_root.to_path_buf()],
             git_worktree_repository: None,
+            main_mount: None,
             build_volume_mount: None,
             repository_caches: Vec::new(),
             program_directories: Vec::new(),

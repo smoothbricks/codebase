@@ -4696,6 +4696,7 @@ fn sandboxed_git_command_with_paths(
         allowed_unix_sockets: Vec::new(),
         additional_denies: Vec::new(),
         git_worktree_repository: None,
+        main_mount: None,
         build_volume_mount: None,
         repository_caches: Vec::new(),
         // Controller Git detects no capability, so it resolves no program.

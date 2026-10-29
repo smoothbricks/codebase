@@ -116,6 +116,7 @@ fn installed_cli_fixture(label: &str) -> (Scratch, SandboxConfig, PathBuf) {
         additional_denies: Vec::new(),
         shed_links: Vec::new(),
         git_worktree_repository: None,
+        main_mount: None,
         build_volume_mount: Some(volume),
         repository_caches: Vec::new(),
         program_directories: Vec::new(),
