@@ -651,11 +651,11 @@ impl DynamicSchemaConfig {
 /// 103,232 bytes); this cap admits it with room to grow.
 ///
 /// Decoding goes through the arrow-ipc reader, whose allocations are
-/// infallible. This cap bounds them before the call: a message at the cap
-/// with [`MAX_SCHEMA_FIELDS`] fields decodes holding at most four times the
-/// cap live (pinned by `schema_decode_at_the_message_cap_stays_bounded`), so
-/// a host creating a handle needs that much headroom above its other live
-/// memory for the one infallible decode, done once at creation.
+/// infallible, so this cap bounds them before the call. For the max-field,
+/// long-name fixture of `schema_decode_at_the_message_cap_stays_bounded`, the
+/// decode's additional peak requested allocation stays within four times this
+/// cap. That fixture bound is not a worst-case memory guarantee for every
+/// schema, nor a measure of the memory a host commits.
 pub const MAX_SCHEMA_MESSAGE_BYTES: usize = 256 * 1024;
 
 fn decode_schema_message(bytes: &[u8]) -> Result<arrow_schema::Schema, SchemaError> {

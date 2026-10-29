@@ -694,6 +694,13 @@ fn schema_decode_at_the_message_cap_stays_bounded() {
         .collect();
     let (config, peak) = memory::peak_bytes(|| DynamicSchemaConfig::from_wire(&widest, &metadata));
     config.expect("the widest schema under the cap is admitted");
+    // The former 64 KiB cap refused consumer event schemas; this one admits
+    // a message past it.
+    assert!(
+        widest.len() > 64 * 1024,
+        "the widest admitted message is {} bytes",
+        widest.len()
+    );
     assert!(
         peak <= 4 * MAX_SCHEMA_MESSAGE_BYTES,
         "decoding a {}-byte schema held {peak} bytes live",
