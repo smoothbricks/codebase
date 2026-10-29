@@ -5816,7 +5816,7 @@ impl SupervisorActor {
                         cowshed_os::eprintln!("cowshed: volume label task failed: {error}");
                     }
                 }
-                Wake::Sample => self.sample_jobs(),
+                Wake::Sample => self.sample_jobs().await,
                 Wake::Probed(Ok(probed)) => {
                     if self.keep_nx_daemon(probed).await {
                         self.answer_nx_keeper_waiters();
@@ -5908,28 +5908,33 @@ impl SupervisorActor {
     /// A tick of the sampling clock: a supervisor boundary for every job that owns a process,
     /// each kept as its latest sample. With none left, the clock stops until a job owns one.
     /// A failed tick leaves the latest sample standing; every read observes again and returns
-    /// that failure itself.
-    fn sample_jobs(&mut self) {
-        let mut live = false;
-        for job in self.jobs.values_mut() {
-            let Some(sampler) = job.sampling.live() else {
+    /// that failure itself. A sample reads the kernel's process table and stats the job's
+    /// volumes, so every live sampler is lent to the blocking pool, observed there in one hop,
+    /// and back before the tick's turn ends.
+    async fn sample_jobs(&mut self) {
+        let lent: Vec<LentSampler> = self
+            .jobs
+            .iter_mut()
+            .filter_map(|(job_id, job)| LentSampler::lend(*job_id, job))
+            .collect();
+        if lent.is_empty() {
+            self.sample_clock = None;
+            return;
+        }
+        let observed = off_actor::run(move || {
+            lent.into_iter()
+                .map(|lent| lent.observe(Boundary::Supervisor))
+                .collect::<Vec<_>>()
+        })
+        .await;
+        for (job_id, sampler, sample) in observed {
+            let Some(job) = self.jobs.get_mut(&job_id) else {
                 continue;
             };
-            live = true;
-            if let Ok(sample) = observe(
-                sampler,
-                &job.volumes,
-                job.stdout_tally,
-                job.stderr_tally,
-                Boundary::Supervisor,
-                #[cfg(target_os = "macos")]
-                job.monitor.as_ref(),
-            ) {
+            job.sampling.restore(sampler);
+            if let Ok(sample) = sample {
                 job.info.resources = Some(sample);
             }
-        }
-        if !live {
-            self.sample_clock = None;
         }
     }
 
@@ -6155,10 +6160,13 @@ impl SupervisorActor {
                 job_id,
                 reply,
             } => {
-                let result = self
+                let result = match self
                     .validate_authority(&authority)
                     .and_then(|()| self.job_mut(job_id))
-                    .and_then(sample_job);
+                {
+                    Ok(job) => sample_job(job).await,
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             #[cfg(target_os = "macos")]
@@ -6310,10 +6318,13 @@ impl SupervisorActor {
                 job_id,
                 reply,
             } => {
-                let result = self
+                let result = match self
                     .validate_authority(&authority)
                     .and_then(|()| self.job_mut(job_id))
-                    .and_then(job_progress);
+                {
+                    Ok(job) => job_progress(job).await,
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             Command::List { authority, reply } => {
@@ -6360,10 +6371,16 @@ impl SupervisorActor {
                 job_id,
                 reply,
             } => {
-                let result = self
+                // The group's sockets are read from the kernel's process table, on the blocking
+                // pool.
+                let group = self
                     .validate_authority(&authority)
                     .and_then(|()| self.job(job_id))
-                    .and_then(listening_ports);
+                    .and_then(listening_group);
+                let result = match group {
+                    Ok(leader) => off_actor::run(move || listening_ports(job_id, &leader)).await,
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             Command::Quiesce { authority, reply } => {
@@ -8716,17 +8733,19 @@ impl SupervisorActor {
             }
         }
         // The terminal sample, frozen into the job's record; none for a job that never owned a
-        // process, or whose last observation failed -- a read says which.
-        job.info.resources = job.sampling.freeze(|sampler| {
-            observe(
-                sampler,
-                &job.volumes,
-                job.stdout_tally,
-                job.stderr_tally,
-                Boundary::Supervisor,
-                #[cfg(target_os = "macos")]
-                job.monitor.as_ref(),
-            )
+        // process, or whose last observation failed -- a read says which. It reads the process
+        // table and stats the volumes, on the blocking pool.
+        let observed = match LentSampler::lend(job_id, job) {
+            Some(lent) => {
+                let (_, sampler, sample) =
+                    off_actor::run(move || lent.observe(Boundary::Supervisor)).await;
+                job.sampling.restore(sampler);
+                Some(sample)
+            }
+            None => None,
+        };
+        job.info.resources = job.sampling.freeze(|_| {
+            observed.expect("a sampling is frozen through its sampler only while one was lent")
         });
         #[cfg(target_os = "linux")]
         if let Some(cgroup) = job.cgroup.clone() {
@@ -9272,7 +9291,9 @@ fn admission_host(job_id: JobId) -> Option<HostLoadSample> {
 /// The job owns `process`: its first process starts its sampling, judging its leaf by
 /// `coverage`, and a later one -- its command, after its activation -- takes the lead. Either is
 /// a supervisor boundary, observed at once as the job's latest sample. An ended job's sampling
-/// stays as it ended, whatever arrives after.
+/// stays as it ended, whatever arrives after. This sample stays on the actor's thread: the turn
+/// that spawns or starts the job's process yields nothing after it, so whatever reaches the
+/// actor meanwhile, a retirement or the job's first input, is ordered after that turn.
 fn own_process(job: &mut JobStateRecord, process: OwnedProcess, coverage: LeafCoverage) {
     if job.terminal() {
         return;
@@ -9316,6 +9337,50 @@ fn clock_observation(job: &JobStateRecord) {
     }
 }
 
+/// A job's live sampler, lent to the blocking pool for one observation, with what that
+/// observation reads beside it ([`Sampling::lend`]).
+struct LentSampler {
+    job_id: JobId,
+    sampler: Box<JobSampler>,
+    volumes: VolumeBaseline<HostVolume>,
+    stdout: StreamTally,
+    stderr: StreamTally,
+    #[cfg(target_os = "macos")]
+    monitor: Option<ProcessMonitor>,
+}
+
+impl LentSampler {
+    /// `job`'s sampler, lent until its turn restores it, or `None` while it owns no process.
+    fn lend(job_id: JobId, job: &mut JobStateRecord) -> Option<Self> {
+        let sampler = job.sampling.lend()?;
+        Some(Self {
+            job_id,
+            sampler,
+            volumes: job.volumes.clone(),
+            stdout: job.stdout_tally,
+            stderr: job.stderr_tally,
+            #[cfg(target_os = "macos")]
+            monitor: job.monitor.clone(),
+        })
+    }
+
+    /// Observe at `boundary`, on the blocking pool: the sampler comes back with its sample.
+    fn observe(
+        mut self,
+        boundary: Boundary,
+    ) -> (JobId, Box<JobSampler>, Result<JobResourceSample>) {
+        let sample = observe(
+            &mut self.sampler,
+            &self.volumes,
+            self.stdout,
+            self.stderr,
+            boundary,
+            #[cfg(target_os = "macos")]
+            self.monitor.as_ref(),
+        );
+        (self.job_id, self.sampler, sample)
+    }
+}
 /// Observe the job's processes and volumes now, with its streams as admitted so far, at
 /// `boundary`: the one imperative step of a sample. Each member's resident memory is read right
 /// after the membership; a member that exited in between holds nothing and is no member any
@@ -9473,18 +9538,19 @@ fn unaccounted(leader: u32, error: super::job_accounting::AccountingError) -> Co
 }
 
 /// A resources read: a running job observed now and kept as its latest sample, an ended job's
-/// terminal sample or why it has none.
-fn sample_job(job: &mut JobStateRecord) -> Result<JobResourceSample> {
-    let sample = job.sampling.read(job.info.job_id, |sampler| {
-        observe(
-            sampler,
-            &job.volumes,
-            job.stdout_tally,
-            job.stderr_tally,
-            Boundary::Read,
-            #[cfg(target_os = "macos")]
-            job.monitor.as_ref(),
-        )
+/// terminal sample or why it has none. A running job is observed on the blocking pool.
+async fn sample_job(job: &mut JobStateRecord) -> Result<JobResourceSample> {
+    let job_id = job.info.job_id;
+    let observed = match LentSampler::lend(job_id, job) {
+        Some(lent) => {
+            let (_, sampler, sample) = off_actor::run(move || lent.observe(Boundary::Read)).await;
+            job.sampling.restore(sampler);
+            Some(sample)
+        }
+        None => None,
+    };
+    let sample = job.sampling.read(job_id, |_| {
+        observed.expect("a sampling is read through its sampler only while one was lent")
     })?;
     if !job.terminal() {
         job.info.resources = Some(sample.clone());
@@ -9492,20 +9558,23 @@ fn sample_job(job: &mut JobStateRecord) -> Result<JobResourceSample> {
     Ok(sample)
 }
 
-/// A listening-ports read: the group the job's sampling follows while it runs -- its shell
-/// activation's, then its command's -- and the group that last led once it ended. A job that
-/// never owned a process has no group to read, and says so.
-fn listening_ports(job: &JobStateRecord) -> Result<JobListeningPorts> {
-    let job_id = job.info.job_id;
-    let leader = job.sampling.leader().ok_or_else(|| {
+/// The group a listening-ports read reads: the one the job's sampling follows while it runs --
+/// its shell activation's, then its command's -- and the group that last led once it ended. A
+/// job that never owned a process has no group to read, and says so.
+fn listening_group(job: &JobStateRecord) -> Result<Birth> {
+    job.sampling.leader().cloned().ok_or_else(|| {
         CowshedError::conflict(
             format!(
                 "job {} owns no process: it has not started one, or ended before it did",
-                job_id.get()
+                job.info.job_id.get()
             ),
             "read its listening ports once the job has started; its status says how it ended",
         )
-    })?;
+    })
+}
+
+/// A listening-ports read of `job_id`'s group, led by `leader`, from the kernel's process table.
+fn listening_ports(job_id: JobId, leader: &Birth) -> Result<JobListeningPorts> {
     let sampled_at = utc_now()?;
     let ports = super::job_groups::job_listening_ports(leader).map_err(|error| {
         CowshedError::environment_missing(
@@ -9526,11 +9595,11 @@ fn listening_ports(job: &JobStateRecord) -> Result<JobListeningPorts> {
 
 /// A progress read: an ended job's terminal sample, a running job observed now, or nothing yet
 /// for one that owns no process. A read never answers a running job with a frozen sample.
-fn job_progress(job: &mut JobStateRecord) -> Result<ProgressRead> {
+async fn job_progress(job: &mut JobStateRecord) -> Result<ProgressRead> {
     if job.terminal() {
-        sample_job(job).map(ProgressRead::Ended)
+        sample_job(job).await.map(ProgressRead::Ended)
     } else if job.sampling.owns() {
-        sample_job(job).map(ProgressRead::Running)
+        sample_job(job).await.map(ProgressRead::Running)
     } else {
         Ok(ProgressRead::Unowned)
     }

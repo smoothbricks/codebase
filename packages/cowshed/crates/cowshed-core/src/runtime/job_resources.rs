@@ -113,11 +113,30 @@ impl Sampling {
     }
 
     /// The sampler of a job that owns processes and has not ended.
+    #[cfg(target_os = "macos")]
     pub(super) fn live(&mut self) -> Option<&mut JobSampler> {
         match self {
             Self::Live(sampler) => Some(sampler.as_mut()),
             Self::Unowned | Self::Frozen { .. } => None,
         }
+    }
+
+    /// The live sampler, lent out whole so that one observation runs on the supervisor's
+    /// blocking pool. The job reads as owning nothing until [`Self::restore`] puts it back, which
+    /// the turn that lent it does before any other turn runs.
+    pub(super) fn lend(&mut self) -> Option<Box<JobSampler>> {
+        match std::mem::replace(self, Self::Unowned) {
+            Self::Live(sampler) => Some(sampler),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    /// Put back the sampler [`Self::lend`] lent.
+    pub(super) fn restore(&mut self, sampler: Box<JobSampler>) {
+        *self = Self::Live(sampler);
     }
 
     /// When the job's clock started, the instant its first owned process spawned, while the job
