@@ -1,7 +1,7 @@
 import { StringDecoder } from 'node:string_decoder';
 import typia, { type tags } from 'typia';
 import { invocationSpan, withInvocationFlag } from './runner-sizing.js';
-import type { NativeTestResult } from './test-results.js';
+import type { NativeTestResult } from './test-result-writer.js';
 import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
 
 /**

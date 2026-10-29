@@ -41,6 +41,12 @@
       "import": "./dist/executors/bounded-exec/test-results.js",
       "default": "./dist/executors/bounded-exec/test-results.js"
     },
+    "./test-results/host": {
+      "types": "./dist/executors/bounded-exec/test-result-writer.d.ts",
+      "development": "./src/executors/bounded-exec/test-result-writer.ts",
+      "import": "./dist/executors/bounded-exec/test-result-writer.js",
+      "default": "./dist/executors/bounded-exec/test-result-writer.js"
+    },
     "./build-state-output-policy": {
       "types": "./dist/build-state-output-policy.d.ts",
       "development": "./src/build-state-output-policy.ts",

@@ -56,7 +56,7 @@ import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from
 import { CPU_TOKENS_ENV, runnerDemand, sizeRunner } from './runner-sizing.js';
 import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import type { BoundedExecOptions } from './schema.js';
-import { createTestResultWriter, type TestResultWriter } from './test-results.js';
+import { createTestResultWriter, type TestResultWriter } from './test-result-writer.js';
 import {
   type BoundedExecRecord,
   type BoundedExecTask,

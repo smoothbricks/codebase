@@ -2,14 +2,8 @@ import { expect, it } from 'bun:test';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { TestResultWriter } from './test-results.js';
-import {
-  createTestResultWriter,
-  isClosedTestResult,
-  parseTestSourceRef,
-  TEST_FAILURES_FILE,
-  TEST_RESULTS_FILE,
-} from './test-results.js';
+import { createTestResultWriter, type TestResultWriter } from './test-result-writer.js';
+import { isClosedTestResult, parseTestSourceRef, TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
 import { bunJunitResults } from './verdict.js';
 
 it('publishes UTF-8 cause ranges and resumable cursors, and gives a replacement run a new identity', async () => {
