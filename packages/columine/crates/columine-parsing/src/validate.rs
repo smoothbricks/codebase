@@ -20,6 +20,12 @@
 //! tokens and canonical int64 values exactly against them, never through a
 //! rounded double. An `array` node may demand an exact length.
 //!
+//! A `key` node admits an `S.key` value: a non-empty string whose routing key
+//! component encodes to at most `maxEncodedLength` characters. Only that length
+//! is computed here, never the encoding: the routing encoder owns both, and the
+//! node's producer derives the bound. A value that is not a string is refused as
+//! `string` refuses it.
+//!
 //! A `vo` node carries canonical value-object metadata — a qualified root, a
 //! frame table, and the manifest rows it depends on — decoded once from
 //! lowercase hex. Decoding judges only that envelope's syntax; this crate has
@@ -330,6 +336,8 @@ enum Expected<'s> {
     Text(&'static str),
     Enum(&'s [String]),
     Range(NumericRange),
+    /// An `S.key` value: its routing key component encodes to at most this many characters.
+    Key(u32),
     Length(u32),
     /// An undeclared key below a closed object, with the declared members.
     Declared(&'s [(String, SemanticSchema)]),
@@ -353,6 +361,7 @@ impl fmt::Display for Expected<'_> {
                 };
                 write!(output, "{kind} in [{}, {}]", range.min, range.max)
             }
+            Self::Key(bound) => write!(output, "key: encodes to at most {bound} characters"),
             Self::Length(length) => write!(output, "array of length {length}"),
             Self::Declared(fields) => {
                 output.write_str("not declared (declared: ")?;
@@ -638,6 +647,13 @@ impl ExactInteger {
 pub enum SemanticSchema {
     Unknown,
     String,
+    /// An `S.key` value: a non-empty string whose routing key component encodes to at most
+    /// `max_encoded_length` characters. Only that length is computed, never the encoding: the
+    /// routing encoder owns both, and the node's producer derives the bound. The decoder
+    /// refuses a node whose bound is not positive.
+    Key {
+        max_encoded_length: u32,
+    },
     Number,
     Boolean,
     Binary,
@@ -730,6 +746,7 @@ impl SemanticSchema {
         match self {
             Self::Unknown => "unknown",
             Self::String => "string",
+            Self::Key { .. } => "key",
             Self::Number => "number",
             Self::Boolean => "boolean",
             Self::Binary => "binary",
@@ -819,6 +836,7 @@ pub(crate) fn collect_open_paths(
         }
         SemanticSchema::Unknown
         | SemanticSchema::String
+        | SemanticSchema::Key { .. }
         | SemanticSchema::Number
         | SemanticSchema::Boolean
         | SemanticSchema::Binary
@@ -856,6 +874,7 @@ fn collect_vo_metadata<'a>(schema: &'a SemanticSchema, output: &mut Vec<&'a VoMe
         }
         SemanticSchema::Unknown
         | SemanticSchema::String
+        | SemanticSchema::Key { .. }
         | SemanticSchema::Number
         | SemanticSchema::Boolean
         | SemanticSchema::Binary
@@ -1058,6 +1077,9 @@ impl SemanticSchema {
         Ok(match self {
             Self::Unknown => Self::Unknown,
             Self::String => Self::String,
+            Self::Key { max_encoded_length } => Self::Key {
+                max_encoded_length: *max_encoded_length,
+            },
             Self::Number => Self::Number,
             Self::Boolean => Self::Boolean,
             Self::Binary => Self::Binary,
@@ -1247,6 +1269,7 @@ fn count_vo_metadata(schema: &SemanticSchema) -> usize {
         SemanticSchema::Union(variants) => variants.iter().map(count_vo_metadata).sum(),
         SemanticSchema::Unknown
         | SemanticSchema::String
+        | SemanticSchema::Key { .. }
         | SemanticSchema::Number
         | SemanticSchema::Boolean
         | SemanticSchema::Binary
@@ -1473,6 +1496,7 @@ fn validate_at<'s>(
     match schema {
         SemanticSchema::Unknown => Ok(()),
         SemanticSchema::String => require_kind(value, ValueKind::String),
+        SemanticSchema::Key { max_encoded_length } => validate_key(*max_encoded_length, value),
         SemanticSchema::Boolean => require_kind(value, ValueKind::Boolean),
         SemanticSchema::Binary => require_kind(value, ValueKind::Binary),
         SemanticSchema::BigInt => validate_bigint(value),
@@ -1703,6 +1727,33 @@ fn require_kind<'s>(value: &dyn ValueView, expected: ValueKind) -> Result<(), St
     }
 }
 
+/// An `S.key` value: a non-empty string whose [`encoded_key_len`] is at most
+/// `max_encoded_length`. A value that is not a string is refused as `string` refuses it.
+fn validate_key<'s>(max_encoded_length: u32, value: &dyn ValueView) -> Result<(), Stop<'s>> {
+    require_kind(value, ValueKind::String)?;
+    let admitted = value.as_str().is_some_and(|key| {
+        !key.is_empty() && encoded_key_len(key) <= u64::from(max_encoded_length)
+    });
+    if admitted {
+        Ok(())
+    } else {
+        Err(Fault::seen(Expected::Key(max_encoded_length), ValueKind::String).into())
+    }
+}
+
+/// The length of the routing key component `key` encodes to: each UTF-16 code unit spells
+/// itself when it is an ASCII letter, digit or `-`, and is otherwise the escape `.` and four hex
+/// digits, so it counts one or five. Only the length is computed, never the encoding: the
+/// routing encoder owns that.
+fn encoded_key_len(key: &str) -> u64 {
+    key.encode_utf16()
+        .map(|unit| match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() || byte == b'-' => 1,
+            _ => 5,
+        })
+        .sum()
+}
+
 /// A bigint is a native bigint where the wire has one, and otherwise its
 /// decimal string: canonical JSON cannot spell a bigint, so the JSON lane
 /// carries `"5000000000"`, the bigint-as-string form both extractors accept
@@ -1866,6 +1917,14 @@ fn parse_schema(value: &JsonValue, depth: usize) -> Result<SemanticSchema, Schem
     match kind {
         "unknown" => Ok(SemanticSchema::Unknown),
         "string" => Ok(SemanticSchema::String),
+        "key" => {
+            const MEMBERS: &[&str] = &["kind", "maxEncodedLength"];
+            let members = exact_members(value, MEMBERS, MEMBERS)?;
+            match unsigned::<u32>(field(members, "maxEncodedLength"))? {
+                0 => Err(SchemaParseError::InvalidOperand),
+                max_encoded_length => Ok(SemanticSchema::Key { max_encoded_length }),
+            }
+        }
         "number" => Ok(SemanticSchema::Number),
         "boolean" => Ok(SemanticSchema::Boolean),
         "binary" => Ok(SemanticSchema::Binary),
@@ -3312,6 +3371,187 @@ mod tests {
                 SemanticSchema::from_tree_bytes(tree.as_bytes()),
                 Err(SchemaParseError::InvalidOperand),
                 "{tree}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_tree_carries_its_positive_u32_bound() {
+        assert_eq!(
+            schema(r#"{"kind":"key","maxEncodedLength":256}"#),
+            SemanticSchema::Key {
+                max_encoded_length: 256
+            }
+        );
+        assert_eq!(
+            schema(r#"{"kind":"key","maxEncodedLength":4294967295}"#),
+            SemanticSchema::Key {
+                max_encoded_length: u32::MAX
+            }
+        );
+        assert_eq!(
+            SemanticSchema::Key {
+                max_encoded_length: 256
+            }
+            .kind(),
+            "key"
+        );
+
+        assert_eq!(
+            SemanticSchema::from_tree_bytes(br#"{"kind":"key"}"#),
+            Err(SchemaParseError::MissingOperand)
+        );
+        for bound in ["0", "-1", "1.5", "4294967296", "\"256\"", "null"] {
+            let tree = format!(r#"{{"kind":"key","maxEncodedLength":{bound}}}"#);
+            assert_eq!(
+                SemanticSchema::from_tree_bytes(tree.as_bytes()),
+                Err(SchemaParseError::InvalidOperand),
+                "{tree}"
+            );
+        }
+        // A member the node does not define is refused, not ignored.
+        assert_eq!(
+            SemanticSchema::from_tree_bytes(
+                br#"{"kind":"key","maxEncodedLength":256,"minLength":1}"#
+            ),
+            Err(SchemaParseError::InvalidOperand)
+        );
+        // So is the bound's earlier spelling.
+        assert_eq!(
+            SemanticSchema::from_tree_bytes(br#"{"kind":"key","maxLength":256}"#),
+            Err(SchemaParseError::InvalidOperand)
+        );
+    }
+
+    #[test]
+    fn encoded_key_len_counts_one_per_safe_unit_and_five_per_escaped_unit() {
+        let longest = "k".repeat(256);
+        let accents = "\u{e9}".repeat(51);
+        for (key, length) in [
+            // An ASCII letter, digit or `-` spells itself: one character.
+            ("a", 1),
+            ("-lead", 5),
+            ("inv-period-1730000000000", 24),
+            (longest.as_str(), 256),
+            // Any other UTF-16 code unit, `.` included, is `.` and four hex digits: five.
+            ("us-west.2", 13),
+            ("k.x", 7),
+            ("a_b", 7),
+            ("github:424242", 17),
+            // A code unit is neither a byte nor a character.
+            ("\u{e9}", 5),
+            ("\u{6771}\u{4eac}", 10),
+            ("\u{1f600}", 10),
+            (accents.as_str(), 255),
+            ("", 0),
+        ] {
+            assert_eq!(encoded_key_len(key), length, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn only_ascii_letters_digits_and_dash_spell_themselves() {
+        let spelled = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-";
+        // Every ASCII character and the Latin letters beyond it.
+        for character in '\0'..='\u{24f}' {
+            let expected = if spelled.contains(character) { 1 } else { 5 };
+            assert_eq!(
+                encoded_key_len(&character.to_string()),
+                expected,
+                "{character:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_admits_a_non_empty_string_whose_encoding_fits_its_bound() {
+        let key = schema(r#"{"kind":"key","maxEncodedLength":256}"#);
+        let longest_safe = "k".repeat(256);
+        let longest_escaped = "\u{e9}".repeat(51);
+        for admitted in [
+            "a",
+            "us-west.2",
+            "github:424242",
+            longest_safe.as_str(),
+            longest_escaped.as_str(),
+        ] {
+            assert_eq!(
+                validate_value(&key, &JsonValue::String(admitted.into())),
+                Ok(()),
+                "{admitted}"
+            );
+        }
+
+        let too_long_safe = "k".repeat(257);
+        let too_long_escaped = "\u{e9}".repeat(52);
+        for refused in ["", too_long_safe.as_str(), too_long_escaped.as_str()] {
+            assert_eq!(
+                validate_value(&key, &JsonValue::String(refused.into())),
+                Err(ValueRefusal::Violation(PayloadViolation {
+                    path: "value".into(),
+                    expected: "key: encodes to at most 256 characters".into(),
+                    observed: "string".into(),
+                    vo: None,
+                })),
+                "{refused:?}"
+            );
+        }
+
+        // The bound is exact: `a.b` is 1 + 5 + 1 = 7 characters.
+        for (bound, admitted) in [(6, false), (7, true)] {
+            let key = schema(&format!(r#"{{"kind":"key","maxEncodedLength":{bound}}}"#));
+            assert_eq!(
+                validate_value(&key, &JsonValue::String("a.b".into())).is_ok(),
+                admitted,
+                "a.b within {bound}"
+            );
+        }
+
+        // A value that is not a string is refused exactly as `string` refuses it.
+        let plain_string = schema(r#"{"kind":"string"}"#);
+        for other in ["42", "true", "null", "[]", "{}"] {
+            let refusal = validate_value(&key, &json(other));
+            assert!(refusal.is_err(), "{other}");
+            assert_eq!(
+                refusal,
+                validate_value(&plain_string, &json(other)),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_is_judged_where_it_sits() {
+        let ids = schema(
+            r#"{"kind":"object","fields":{"id":{"kind":"key","maxEncodedLength":10},"by":{"kind":"map","key":{"kind":"key","maxEncodedLength":10},"value":{"kind":"i32"}}}}"#,
+        );
+        // `a_` is 1 + 5 = 6 characters; `a.b` is 7.
+        assert_eq!(
+            validate_value(&ids, &json(r#"{"id":"a_","by":{"a.b":1}}"#)),
+            Ok(())
+        );
+        let key_text = "key: encodes to at most 10 characters";
+        for (value, path, expected, observed) in [
+            (r#"{"id":"","by":{}}"#, "value.id", key_text, "string"),
+            (r#"{"id":7,"by":{}}"#, "value.id", "string", "number"),
+            (r#"{"by":{}}"#, "value.id", "key", "absent"),
+            // `a_b_c` is 1 + 5 + 1 + 5 + 1 = 13 characters, though five are written.
+            (
+                r#"{"id":"ok","by":{"a_b_c":1}}"#,
+                "value.by",
+                key_text,
+                "string",
+            ),
+        ] {
+            let violation = violation_of(validate_value(&ids, &json(value)));
+            assert_eq!(
+                (
+                    violation.path.as_str(),
+                    violation.expected.as_str(),
+                    violation.observed.as_str()
+                ),
+                (path, expected, observed),
+                "{value}"
             );
         }
     }
