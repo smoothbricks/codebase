@@ -19,8 +19,8 @@ state = [".cache/ttsc"]
 [land]
 # The declared land (specs/cowshed/02_workspaces.md "A declared land"): `cowshed land <ws>` takes this land turn,
 # rebases <ws> onto main, runs the gate below on the host in main's pure environment, fast-forwards main under the ref
-# turn smoothbricks.ref (rebasing and gating again when main moved) and retires <ws>, then pushes main to codebase and
-# runs the after commands, detached.
+# turn smoothbricks.ref (rebasing and gating again when main moved) and retires <ws>, then runs the after commands and
+# pushes main to codebase, detached.
 turn = "smoothbricks"
 gate = ["sh", "tooling/land-host.sh", "--gate", "{workspace}"]
 push = "codebase"

@@ -8403,7 +8403,7 @@ async fn directory_a_declared_land_regates_over_a_racing_doc_commit_lands_and_pu
     use cowshed_core::declared_land::LandEvent;
     assert_eq!(
         events,
-        [LandEvent::Landed, LandEvent::Pushed, LandEvent::AfterExited],
+        [LandEvent::Landed, LandEvent::AfterExited, LandEvent::Pushed],
         "{lands:?}"
     );
     assert!(lands.iter().all(|record| record.head.as_str() == head));
@@ -8619,7 +8619,7 @@ async fn directory_a_declared_land_whose_retire_is_refused_still_pushes_substrat
     use cowshed_core::declared_land::LandEvent;
     assert_eq!(
         lands.iter().map(|record| record.event).collect::<Vec<_>>(),
-        [LandEvent::Landed, LandEvent::Pushed, LandEvent::AfterExited],
+        [LandEvent::Landed, LandEvent::AfterExited, LandEvent::Pushed],
         "{lands:?}"
     );
     assert!(lands.iter().all(|record| record.head.as_str() == head));

@@ -1,6 +1,6 @@
 //! What a declared land does after its turn (02_workspaces.md "A declared land" step 6):
-//! `<cowshed> __land-after <request>` pushes main and runs the repository's after-land commands
-//! in order, each outcome one more `lands.log` line. The land submits it to main's workspace
+//! `<cowshed> __land-after <request>` runs the repository's after-land commands in order and then
+//! pushes main, each outcome one more `lands.log` line. The land submits it to main's workspace
 //! supervisor as a background job and returns ([`argv`]): a remote is never needed to land, and
 //! nothing it runs holds up this land or the next.
 
@@ -72,10 +72,27 @@ pub fn dispatch() -> Option<i32> {
     Some(0)
 }
 
-/// Push, then each after command, in order; every outcome is recorded and none stops the next.
+/// Each after command in order, then the push; every outcome is recorded and none stops the next.
+/// The after commands rebuild main's outputs for the sources the land just checked out, and until
+/// they end main's sources are newer than the builds its developer links serve, so they go first:
+/// a remote is never needed by a local consumer, and the push waits for nothing else.
 fn run(request: &AfterRequest) {
     let directory = crate::declared_land::after_directory(&request.turn);
     let head = request.head.as_str();
+    for (index, argv) in request.after.iter().enumerate() {
+        let log = directory.join(format!("{head}.after{}.log", index + 1));
+        let Executed { ran, unretired } = execute("after-land command", request, argv, &log);
+        let detail = match ran {
+            Ok(status) => format!(
+                "{} {}; output in {}",
+                argv.join(" "),
+                crate::declared_land::describe(status),
+                log.display()
+            ),
+            Err(error) => format!("{}: {error}", argv.join(" ")),
+        };
+        note(request, LandEvent::AfterExited, beside(unretired, detail));
+    }
     if let Some(remote) = &request.push {
         let argv = [
             "git".to_owned(),
@@ -105,20 +122,6 @@ fn run(request: &AfterRequest) {
             Err(error) => (LandEvent::PushFailed, error),
         };
         note(request, event, beside(unretired, detail));
-    }
-    for (index, argv) in request.after.iter().enumerate() {
-        let log = directory.join(format!("{head}.after{}.log", index + 1));
-        let Executed { ran, unretired } = execute("after-land command", request, argv, &log);
-        let detail = match ran {
-            Ok(status) => format!(
-                "{} {}; output in {}",
-                argv.join(" "),
-                crate::declared_land::describe(status),
-                log.display()
-            ),
-            Err(error) => format!("{}: {error}", argv.join(" ")),
-        };
-        note(request, LandEvent::AfterExited, beside(unretired, detail));
     }
 }
 
