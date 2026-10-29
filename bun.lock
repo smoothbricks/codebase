@@ -51,7 +51,7 @@
     },
     "packages/build-inputs": {
       "name": "@smoothbricks/build-inputs",
-      "version": "0.0.1-next.0",
+      "version": "0.0.1",
       "bin": {
         "smoo-nx-build-inputs": "./dist/ts/bin/smoo-nx-build-inputs.js",
       },
@@ -69,7 +69,7 @@
     },
     "packages/cargo-retain": {
       "name": "@smoothbricks/cargo-retain",
-      "version": "0.0.1-next.0",
+      "version": "0.0.1",
       "bin": {
         "smoo-nx-cargo-retain": "./dist/ts/bin/smoo-nx-cargo-retain.js",
       },
@@ -88,7 +88,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.12.24-next.0",
+      "version": "0.12.24",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -124,7 +124,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.4.2-next.0",
+      "version": "0.4.2",
       "bin": {
         "cowshed": "./bin/cowshed",
       },
@@ -166,7 +166,7 @@
     },
     "packages/failure-summary": {
       "name": "@smoothbricks/failure-summary",
-      "version": "0.0.1-next.0",
+      "version": "0.0.1",
       "bin": {
         "smoo-nx-failures": "./dist/ts/bin/smoo-nx-failures.js",
       },
@@ -268,7 +268,7 @@
     },
     "packages/nextest-extract": {
       "name": "@smoothbricks/nextest-extract",
-      "version": "0.0.1-next.0",
+      "version": "0.0.1",
       "bin": {
         "smoo-nx-nextest-extract": "./dist/ts/bin/smoo-nx-nextest-extract.js",
       },
@@ -285,7 +285,7 @@
     },
     "packages/nx-cache-server": {
       "name": "@smoothbricks/nx-cache-server",
-      "version": "0.1.3",
+      "version": "0.1.4",
       "bin": {
         "nx-cache-server": "./dist/ts/main.js",
       },
@@ -299,7 +299,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.6.2-next.0",
+      "version": "0.6.2",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",

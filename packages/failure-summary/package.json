@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/failure-summary",
-  "version": "0.0.1-next.0",
+  "version": "0.0.1",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/ts/failure-summary.js",
