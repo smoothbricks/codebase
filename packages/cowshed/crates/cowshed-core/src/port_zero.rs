@@ -45,6 +45,8 @@ pub fn loader_options(preload: &Path) -> Result<[(&'static str, String); 2], Uns
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::{PortAllocation, PortBlock};
+    use crate::storage::bootstrap::FixturePortClaims;
     use cowshed_os::test_backstop::CommandBackstop as _;
     use std::process::Command;
 
@@ -82,9 +84,18 @@ mod tests {
         assert!(loader_options(Path::new(non_utf8)).is_err());
     }
 
+    /// The block a scenario run is handed, and what keeps it this test's while the run lasts.
+    struct Block {
+        base: u16,
+        size: u16,
+        /// The block's gateway port, bound for as long as this value lives; none for a workspace's block, which its
+        /// own gateway holds.
+        _gateway: Option<FixturePortClaims>,
+    }
+
     /// The block the scenarios' listeners must land in: the enclosing workspace's, whose sandbox refuses a connect
-    /// anywhere else, or else the first fixture block.
-    fn block() -> (u16, u16) {
+    /// anywhere else, or else one of the fixture partition that this test claims.
+    fn block() -> Block {
         let read = |name: &str| {
             std::env::var(name).ok().map(|value| {
                 value
@@ -93,13 +104,50 @@ mod tests {
             })
         };
         match (read("COWSHED_PORT_BASE"), read("COWSHED_PORT_BLOCK_SIZE")) {
-            (Some(base), Some(size)) => (base, size),
-            (None, None) => (
-                *crate::metadata::PortAllocation::Fixture.range().start(),
-                64,
-            ),
+            (Some(base), Some(size)) => Block {
+                base,
+                size,
+                _gateway: None,
+            },
+            (None, None) => {
+                let (claimed, gateway) = claim_fixture_block();
+                Block {
+                    base: claimed.base(),
+                    size: claimed.size(),
+                    _gateway: Some(gateway),
+                }
+            }
             half => panic!("a port block exported half: {half:?}"),
         }
+    }
+
+    /// A block of the fixture partition that no other process holds a port of, and the claim that keeps it this
+    /// test's for as long as the claim lives. A fixture store claims its workspace's block the same way
+    /// (`bind_port_block`, `runtime::project`): every port of a candidate is bound, and a port another process holds
+    /// refuses that candidate whole. The kernel arbitrates concurrent claimants and nothing is retried. The scenarios'
+    /// children bind the service ports, so every port but the gateway's is then let go, as a workspace's gateway
+    /// leaves them to its jobs; the gateway port stays bound, which keeps off the block every allocator that binds a
+    /// block whole. Every other allocator of the partition tries its first block first (a concurrent fixture store
+    /// binds all of it, a gateway fixture claims a port of it), which this test once assumed free, so the scan here
+    /// comes down from the last block.
+    fn claim_fixture_block() -> (PortBlock, FixturePortClaims) {
+        let candidates: Vec<PortBlock> =
+            PortBlock::macos_candidates(PortAllocation::Fixture).collect();
+        for block in candidates.into_iter().rev() {
+            let claims = FixturePortClaims::default();
+            let ports = block.ports().expect("a candidate is a port block");
+            match ports.clone().try_for_each(|port| claims.claim(port)) {
+                Ok(()) => {
+                    for port in ports.filter(|port| *port != block.base()) {
+                        claims.release(port);
+                    }
+                    return (block, claims);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) => panic!("claim fixture port block {block}: {error}"),
+            }
+        }
+        panic!("every block of the fixture partition has a port another process holds")
     }
 
     /// `runtime` run on `script` with the preload loaded the way a job loads it, under `block`.
@@ -147,22 +195,58 @@ mod tests {
         let (root, preload) = fixture();
         let script = root.join("scenarios.cjs");
         std::fs::write(&script, SCENARIOS).expect("write the scenarios");
-        let (base, size) = block();
-        let (base, size) = (base.to_string(), size.to_string());
+        let block = block();
+        let (base, size) = (block.base.to_string(), block.size.to_string());
         for (runtime, scenarios) in [("node", 16), ("bun", 17)] {
             let output = run(runtime, &preload, &script, Some((&base, &size)));
             let stdout = String::from_utf8_lossy(&output.stdout);
             let report = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
-            assert!(output.status.success(), "{runtime}: {report}");
+            assert!(
+                output.status.success(),
+                "{runtime} in port block {base}+{size}: {report}"
+            );
             assert_eq!(
                 stdout
                     .lines()
                     .filter(|line| line.ends_with(" PASS"))
                     .count(),
                 scenarios,
-                "{runtime}: {report}"
+                "{runtime} in port block {base}+{size}: {report}"
             );
         }
+    }
+
+    /// A claim is the kernel's word, not a guess: a block that holds a port another listener has is passed over
+    /// whole, and a block whose claim lives is refused to the next claimant.
+    #[test]
+    fn a_claimed_fixture_block_is_one_no_other_holder_has_a_port_of() {
+        use std::io::ErrorKind;
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let (first, _first_claim) = claim_fixture_block();
+        let gateway = TcpListener::bind((Ipv4Addr::LOCALHOST, first.base()))
+            .expect_err("the claim keeps the block's gateway port");
+        assert_eq!(gateway.kind(), ErrorKind::AddrInUse, "{first}");
+        // The scan comes down from the last block, so the block below `first` is the next it tries: one port of it
+        // held by a listener the claim knows nothing of makes the whole block unclaimable.
+        let below = PortBlock::new(first.base() - first.size(), first.size())
+            .expect("the block below a block of the partition is a port block");
+        assert!(
+            PortAllocation::Fixture.contains(below),
+            "{first} is the partition's first block"
+        );
+        let port = below.base() + 5;
+        let _held = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == ErrorKind::AddrInUse => None,
+            Err(error) => panic!("hold port {port}: {error}"),
+        };
+        let (second, _second_claim) = claim_fixture_block();
+        assert_ne!(second, first, "a claimed block was claimed twice");
+        assert!(
+            !second.ports().expect("a claimed block").contains(&port),
+            "{second} holds port {port}, which another listener has"
+        );
     }
 
     /// A block exported half, unaligned or of a size that is no power of two is a broken environment: the preload

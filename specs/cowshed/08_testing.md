@@ -338,6 +338,14 @@ and the other tests remain parallel. Both claims use the existing fork-lock `Fen
 creation and release wait only for concurrent spawns in flight, so another fixture's pre-exec descriptor copy cannot
 outlive the release/rebind handoff. No process-local installer mutex is needed.
 
+A fixture that hands child processes a block of their own, the port-0 preload's scenarios (04_sandbox.md, "A sandboxed
+job binds its listeners in its block"), takes one of the partition's aligned 64-port blocks whole instead of a two-port
+sub-block, and claims it as a fixture store claims its workspace's: it binds every port of a candidate, and a port
+another process holds refuses that candidate, so the kernel decides between concurrent claimants and nothing retries. It
+then lets go of every port but the block's first, the gateway's, so its children bind the service ports while the
+gateway port keeps off the block every allocator that binds a block whole. The scan comes down from the partition's last
+block, because every other allocator tries its first block first and a concurrent fixture store binds all of that one.
+
 An exact-count network fixture, including single-shot HTTP and TLS backends, keeps its listener owned until the test
 releases its fixture handle or its joined result, even after its accept loop finishes (including a zero-count loop). A
 completed task retains the listener as its result. Finishing the expected requests must not make a still-used fixture
