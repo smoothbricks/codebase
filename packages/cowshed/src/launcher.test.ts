@@ -188,17 +188,42 @@ describe('cowshed launcher', () => {
     expect((await stat(f.packaged(host))).mode & 0o777).toBe(0o750);
   });
 
-  hostOnly('runs gateway, setup, skill and every other verb from the invoking build', async () => {
-    // `setup` writes the stable install and `gateway start`/`status` compare the daemon's
-    // executable with the one asking: run from the installed copy, a stale gateway compared
-    // with itself, looked current, and was never replaced.
+  hostOnly('runs published-package consumer verbs from the installed copy', async () => {
     const f = await fixture();
     await named(f.packaged(host), 'packaged');
     await named(f.stable, 'stable');
 
-    for (const argv of [['gateway', 'start'], ['gateway', 'status'], ['setup'], ['skill', 'install'], ['ls']]) {
-      expect(launch(f.launcher, argv, f).stdout).toStartWith('packaged ');
+    for (const argv of [['build-state', '--json'], ['--json', 'build-state'], ['skill', 'install'], ['ls']]) {
+      const run = launch(f.launcher, argv, f);
+      expect(run.status).toBe(17);
+      expect(run.stdout).toBe(`stable${argv.map((argument) => ` [${argument}]`).join('')}`);
+      expect(run.stderr).toBe('');
     }
+  });
+
+  hostOnly('runs setup and gateway from the packaged binary even with an installed copy', async () => {
+    // Setup installs the invoking build; gateway compares the daemon with that build.
+    const f = await fixture();
+    await named(f.packaged(host), 'packaged');
+    await named(f.stable, 'stable');
+
+    for (const argv of [['setup'], ['--json', 'setup'], ['gateway', 'start'], ['gateway', 'status']]) {
+      const run = launch(f.launcher, argv, f);
+      expect(run.status).toBe(17);
+      expect(run.stdout).toBe(`packaged${argv.map((argument) => ` [${argument}]`).join('')}`);
+      expect(run.stderr).toBe('');
+    }
+  });
+
+  hostOnly('runs published-package consumer verbs from the packaged binary with no install', async () => {
+    const f = await fixture();
+    await named(f.packaged(host), 'packaged');
+
+    const run = launch(f.launcher, ['build-state', '--json'], f);
+
+    expect(run.status).toBe(17);
+    expect(run.stdout).toBe('packaged [build-state] [--json]');
+    expect(run.stderr).toBe('');
   });
 
   hostOnly(
