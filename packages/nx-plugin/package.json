@@ -171,6 +171,12 @@
       "import": "./dist/deploy-policy.js",
       "default": "./dist/deploy-policy.js"
     },
+    "./nx-publish": {
+      "types": "./dist/nx-publish.d.ts",
+      "development": "./src/nx-publish.ts",
+      "import": "./dist/nx-publish.js",
+      "default": "./dist/nx-publish.js"
+    },
     "./managed-assets": {
       "types": "./dist/managed-assets.d.ts",
       "development": "./src/managed-assets.ts",
@@ -258,6 +264,7 @@
     "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
     "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
     "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
+    "smoo-nx-publish": "./dist/bin/smoo-nx-publish.js",
     "smoo-nx-forbidden-spellings": "./dist/bin/smoo-nx-forbidden-spellings.js"
   },
   "generators": "./generators.json",
@@ -267,6 +274,65 @@
   },
   "nx": {
     "targets": {
+      "build": {
+        "dependsOn": [
+          "...",
+          "copy-nx-publish-assets"
+        ]
+      },
+      "copy-nx-publish-assets": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/build_volume/cache_adapter.js",
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/build_volume/nx_publish.js",
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/runtime/nx-publish/"
+        ],
+        "options": {
+          "command": "asset_source=../cowshed/crates/cowshed-core/src/build_volume; if [ -e runtime/nx-publish ]; then rm -r runtime/nx-publish; fi && mkdir -p runtime/nx-publish && cp \"$asset_source/cache_adapter.js\" \"$asset_source/nx_publish.js\" runtime/nx-publish/",
+          "cwd": "{projectRoot}"
+        }
+      },
+      "test-nx-publish": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^dependencyDefault",
+          "bunToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node --version"
+          },
+          {
+            "dependentTasksOutputFiles": "**/dist/bin/smoo-nx-publish.js",
+            "transitive": true
+          },
+          {
+            "dependentTasksOutputFiles": "**/dist/nx-publish.js",
+            "transitive": true
+          },
+          {
+            "dependentTasksOutputFiles": "**/runtime/nx-publish/*.js",
+            "transitive": true
+          }
+        ],
+        "dependsOn": [
+          "tsc-js",
+          "copy-nx-publish-assets",
+          "typecheck-tests"
+        ],
+        "options": {
+          "command": "bun test --timeout=0 ./src/__tests__/nx-publish.cases.ts ./src/__tests__/nx-publish-bin.cases.ts",
+          "cwd": "{projectRoot}",
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
+        }
+      },
       "lint": {},
       "test": {
         "executor": "nx:noop",
@@ -276,7 +342,8 @@
           "test-shard3",
           "test-shard4",
           "test-host",
-          "test-pool-silence"
+          "test-pool-silence",
+          "test-nx-publish"
         ]
       },
       "test-pool-silence": {
@@ -417,7 +484,8 @@
     "!**/*.tsbuildinfo",
     "!src/**/*.test.ts",
     "!src/**/__tests__",
-    "managed"
+    "managed",
+    "runtime/nx-publish"
   ],
   "license": "MIT",
   "publishConfig": {

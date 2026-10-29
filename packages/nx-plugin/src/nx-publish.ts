@@ -1,25 +1,19 @@
-// The land's publish of the gate's Nx results. A land publishes only after its gate passed, so the localhost Nx cache
-// holds only task results a verified tree produced. Sheds read that cache and never write it (05_gateway.md,
-// "/nx/v1/cache/{hash}", accepted-project Nx artifacts; the owner's ruling, 2026-10-10: every shed reads the local remote
-// cache, and only a land publishes). land-host.sh runs 'hashes' right after the gate passes, while the Nx
-// run summary still belongs to the gate, and again once the Linux cross check has written one of its own; 'publish' runs
-// for each list once the cross check passes.
-//
-//   land-publish.ts hashes RUN_JSON SINCE     print the distinct task hashes of the run's succeeded tasks, refusing a
-//                                             summary whose run began before SINCE (epoch seconds): an earlier run's
-//   land-publish.ts publish CHECKOUT HASHES   store those tasks' results with the build volume's nx_publish.js
+// Accepted-task publication for declared gates (specs/cowshed/05_gateway.md, "Publication").
+// Capture each successful Nx invocation before another overwrites run.json; publish the captured lists only after
+// the entire gate passes. Ordinary shed clients remain read-only.
 
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { dirname, isAbsolute, join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const USAGE = 'usage: land-publish.ts hashes RUN_JSON SINCE_EPOCH | publish CHECKOUT HASHES_JSON\n';
+const USAGE = 'usage: smoo-nx-publish hashes RUN_JSON SINCE_EPOCH | publish CHECKOUT HASHES_JSON\n';
 
 /** A task hash as the gateway's cache route takes it (05_gateway.md). */
 const TASK_HASH = /^[A-Za-z0-9_-]{1,128}$/;
 
-/** The build volume that holds the one publisher. The land runs it; it never reimplements it. */
-const BUILD_VOLUME = join(dirname(import.meta.dir), 'packages/cowshed/crates/cowshed-core/src/build_volume');
+// One cached producer copies the unchanged canonical cowshed scripts outside the TypeScript output tree.
+const PUBLISH_ASSETS = fileURLToPath(new URL('../runtime/nx-publish/', import.meta.url));
 
 /** A refusal says why: a malformed summary or hash list is never guessed at. */
 export type HashList =
@@ -99,8 +93,8 @@ export function hashList(text: string): HashList {
 
 /** cache_adapter.js first: it defines the cache nx_publish.js calls. Both go to 'node -' as one program. */
 function bridgeProgram(): string {
-  const adapter = readFileSync(join(BUILD_VOLUME, 'cache_adapter.js'), 'utf8');
-  const publisher = readFileSync(join(BUILD_VOLUME, 'nx_publish.js'), 'utf8');
+  const adapter = readFileSync(join(PUBLISH_ASSETS, 'cache_adapter.js'), 'utf8');
+  const publisher = readFileSync(join(PUBLISH_ASSETS, 'nx_publish.js'), 'utf8');
   return `${adapter}\n${publisher}`;
 }
 
@@ -108,6 +102,7 @@ function bridgeProgram(): string {
 function runBridge(args: readonly string[]): Promise<{ readonly status: number; readonly stdout: string }> {
   // Read before spawning: a read that threw after the spawn would leave node waiting on a stdin that never closes.
   const program = bridgeProgram();
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the accepted-result archive command lasts as long as its work; node close/error settles this wait, and the operator's interrupt or the enclosing cowshed job or test-runner lifecycle ends a hung one (05_gateway.md, "Deadlines", "Enforcement")
   return new Promise((resolve, reject) => {
     const child = spawn('node', ['-', ...args], { stdio: ['pipe', 'pipe', 'inherit'] });
     let stdout = '';
@@ -126,7 +121,7 @@ function runBridge(args: readonly string[]): Promise<{ readonly status: number; 
 }
 
 function fail(why: string): number {
-  process.stderr.write(`land-publish: ${why}\n`);
+  process.stderr.write(`smoo-nx-publish: ${why}\n`);
   return 1;
 }
 
@@ -152,10 +147,11 @@ async function main(argv: readonly string[]): Promise<number> {
   return 64;
 }
 
-if (import.meta.main) {
+/** Run the packaged publisher, returning a failure status and diagnostic for operational refusals. */
+export async function runNxPublish(argv: readonly string[]): Promise<number> {
   try {
-    process.exitCode = await main(process.argv.slice(2));
+    return await main(argv);
   } catch (error) {
-    process.exitCode = fail(errorMessage(error));
+    return fail(errorMessage(error));
   }
 }

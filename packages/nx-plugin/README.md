@@ -902,6 +902,24 @@ installed. Every fallback costs cache hits and never trades away invalidation, b
 reporting a failing one — a fileset that excluded a manifest with no digest replacing it would serve stale results
 silently.
 
+## Accepted task cache publication
+
+Declared gates use the emitted `smoo-nx-publish` executable from this package; they do not carry a publisher copy.
+`hashes <run.json> <since-epoch-seconds>` prints the distinct succeeded task hashes as JSON, refusing a summary begun
+before that invocation. Capture each list immediately, before another Nx call overwrites the summary.
+`publish <absolute-checkout> <hashes.json>` sends existing local cache entries to that checkout's accepted-store route.
+Call it only after every gate check passes. Red gates publish nothing, and ordinary shed clients stay read-only.
+Publication prints stored/existing/skipped counts; an operational refusal exits nonzero with its cause. The gate reports
+that cache finding distinctly without changing the checks' verdict (cowshed specs 03, "Nx accepted-task artifact
+service", and 05, "Publication"). No task is rebuilt and no shell is evaluated by the publisher.
+
+The canonical cache adapter and native publisher remain in
+`packages/cowshed/crates/cowshed-core/src/build_volume/{cache_adapter.js,nx_publish.js}`. The cached
+`copy-nx-publish-assets` target declares those source inputs and owns `runtime/nx-publish/`, disjoint from the entire
+TypeScript `dist/` output. It copies their unchanged bytes; there is one implementation, not two maintained sources.
+`build` depends on that producer and the emitted executable. `test-nx-publish` depends on the concrete JavaScript and
+runtime-asset producers and loads their bytes; tests never build the publisher or its runtime assets inline.
+
 ## Build/Test Graph Boundary
 
 The final-graph `createMetadata` hook also calls `refuseBuildTestDependencies(graph, workspaceRoot)` from

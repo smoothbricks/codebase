@@ -309,6 +309,7 @@
         "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
         "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
         "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
+        "smoo-nx-publish": "./dist/bin/smoo-nx-publish.js",
         "smoo-nx-forbidden-spellings": "./dist/bin/smoo-nx-forbidden-spellings.js",
       },
       "dependencies": {
@@ -495,6 +496,7 @@
       "dependencies": {
         "@smoothbricks/cli": "workspace:*",
         "@smoothbricks/failure-summary": "workspace:*",
+        "@smoothbricks/nx-plugin": "workspace:*",
         "@smoothbricks/validation": "workspace:*",
         "typia": "15.2.1",
       },

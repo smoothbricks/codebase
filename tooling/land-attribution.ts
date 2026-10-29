@@ -19,8 +19,8 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { isRecord, staleSummary } from '@smoothbricks/nx-plugin/nx-publish';
 import { cacheDir } from 'nx/src/utils/cache-directory.js';
-import { isRecord, staleSummary } from './land-publish.ts';
 
 /** A file read as what it claims to be, or the reason it is not. Nothing malformed is read as empty. */
 export type Reading<T> =

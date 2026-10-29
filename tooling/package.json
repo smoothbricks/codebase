@@ -51,8 +51,43 @@
       },
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "...",
+          {
+            "projects": [
+              "nx-plugin"
+            ],
+            "target": "tsc-js"
+          },
+          {
+            "projects": [
+              "nx-plugin"
+            ],
+            "target": "copy-nx-publish-assets"
+          }
+        ],
+        "inputs": [
+          "default",
+          "^dependencyDefault",
+          "bunToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node --version"
+          },
+          {
+            "dependentTasksOutputFiles": "**/dist/bin/smoo-nx-publish.js",
+            "transitive": true
+          },
+          {
+            "dependentTasksOutputFiles": "**/dist/nx-publish.js",
+            "transitive": true
+          },
+          {
+            "dependentTasksOutputFiles": "**/runtime/nx-publish/*.js",
+            "transitive": true
+          }
+        ],
         "options": {
-          "command": "bun test --timeout=0 direnv land-attribution.test land-decide.test land-host.test land-install.test land-publish.test && python3 -B -m unittest test_nx_patch.py",
+          "command": "bun test --timeout=0 direnv land-attribution.test land-decide.test land-host.test land-install.test && python3 -B -m unittest test_nx_patch.py",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -101,6 +136,7 @@
   },
   "dependencies": {
     "@smoothbricks/cli": "workspace:*",
+    "@smoothbricks/nx-plugin": "workspace:*",
     "@smoothbricks/failure-summary": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "typia": "15.2.1"

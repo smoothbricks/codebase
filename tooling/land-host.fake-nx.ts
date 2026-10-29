@@ -47,7 +47,7 @@ if (call.requireFileOutput) {
 
 if (call.run !== undefined) {
   // The run summary Nx writes into its cache directory, the one the gate job names in NX_CACHE_DIRECTORY (the cowshed
-  // stand-in names one, as the workspace supervisor does): what land-publish.ts and land-attribution.ts read.
+  // stand-in names one, as the workspace supervisor does): what the packaged publisher and land-attribution.ts read.
   const cache = process.env.NX_CACHE_DIRECTORY;
   if (cache === undefined) {
     process.stderr.write('fake nx: a call that writes a run summary needs NX_CACHE_DIRECTORY\n');

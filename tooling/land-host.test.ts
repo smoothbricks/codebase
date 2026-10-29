@@ -25,14 +25,17 @@ import type { Call } from './land-host.plan.ts';
 // names Nx's cache directory in NX_CACHE_DIRECTORY), `direnv` (runs the command it is given) and `bun nx`
 // (land-host.fake-nx.ts plays back the calls a scenario scripts: its exact output, exit status and run summary rows). A
 // scenario names every nx call the gate may make, in order: a call it did not script fails the gate. node runs the
-// publisher, recording what land-publish.ts gave it and refusing when FIX_PUBLISH says so, and the workspace's
+// publisher, recording what the packaged publisher gave it and refusing when FIX_PUBLISH says so, and the workspace's
 // tooling/land-inputs.mts, recording the tasks it was asked about and printing the inputs the fixture keeps in
 // inputs.json.
 
 const tooling = import.meta.dir;
 const repo = dirname(tooling);
-// The cowshed bridge that publishes the gate's Nx results: land-publish.ts reads it from the checkout it lands.
+// The plugin packages a derived copy of the canonical cowshed bridge; fixtures load the built payload.
 const BRIDGE = 'packages/cowshed/crates/cowshed-core/src/build_volume';
+const PUBLISHER = 'packages/nx-plugin/dist/bin/smoo-nx-publish.js';
+const PUBLISHER_MODULE = 'packages/nx-plugin/dist/nx-publish.js';
+const RUNTIME_ASSETS = 'packages/nx-plugin/runtime/nx-publish';
 const bun = process.execPath;
 
 const TASK = 'cowshed:cargo-test-cowshed-core-shard1';
@@ -104,6 +107,7 @@ function failedRun(message: string, exit = 1): Call {
 const stubs: Record<string, string> = {
   node: `#!/bin/sh
 case $1 in
+*/smoo-nx-publish.js) exec "$FIX_BUN" "$@" ;;
 */land-inputs.mts)
   # The workspace's tooling/land-inputs.mts: the input files of the failed tasks it names.
   printf '%s\\n' "$@" >"$FIX_STATE/inputs.args"
@@ -240,20 +244,18 @@ function fixture({
   mkdirSync(bin);
   mkdirSync(join(state, 'tmp'));
   writeFileSync(join(state, 'inputs.json'), JSON.stringify(INPUTS));
-  for (const file of [
-    'land-host.sh',
-    'land-attribution.ts',
-    'land-decide.ts',
-    'land-publish.ts',
-    'land-cargo-env.ts',
-  ]) {
+  for (const file of ['land-host.sh', 'land-attribution.ts', 'land-decide.ts', 'land-cargo-env.ts']) {
     cpSync(join(tooling, file), join(main, 'tooling', file));
   }
   symlinkSync(join(repo, 'node_modules'), join(main, 'node_modules'));
-  // The publisher reads the real bridge from the checkout it lands, at the path BRIDGE names.
-  mkdirSync(join(main, BRIDGE), { recursive: true });
+  // Copy only already-built runtime assets; the expected bytes below still come from the canonical sources.
+  mkdirSync(join(main, RUNTIME_ASSETS), { recursive: true });
   for (const file of ['cache_adapter.js', 'nx_publish.js']) {
-    cpSync(join(repo, BRIDGE, file), join(main, BRIDGE, file));
+    cpSync(join(repo, RUNTIME_ASSETS, file), join(main, RUNTIME_ASSETS, file));
+  }
+  for (const file of [PUBLISHER, PUBLISHER_MODULE]) {
+    mkdirSync(dirname(join(main, file)), { recursive: true });
+    cpSync(join(repo, file), join(main, file));
   }
   // The failure reporter is main's native build of the failure-summary package (tooling:test depends on its build).
   mkdirSync(join(main, 'packages'), { recursive: true });
@@ -491,15 +493,25 @@ describe('land-host.sh --gate', () => {
     expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
   });
 
-  it('publishes the gate task results once the Linux cross check passes', () => {
+  it('publishes gate and shipping results only after every check passes', () => {
     const gate = fixture();
-    const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, ...SHIPPING]);
+    const run = gate.gate([
+      DAEMON_STOP,
+      {
+        ...passingRun(WIRING('*')),
+        run: [{ taskId: '@smoothbricks/codebase:wiring', hash: 'wiring-hash', status: 0 }],
+      },
+      GATE_PASSED,
+      ...SHIPPING,
+    ]);
     expect(run.status, run.log).toBe(0);
     // The publisher gets the cowshed bridge as one program, then the checkout and the gate's succeeded task hashes.
     const bridge = join(repo, BRIDGE);
     const program = `${readFileSync(join(bridge, 'cache_adapter.js'), 'utf8')}\n${readFileSync(join(bridge, 'nx_publish.js'), 'utf8')}`;
     expect(readFileSync(join(gate.state, 'publish.program'), 'utf8')).toBe(program);
-    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(`-\n${gate.ws}\n["gate-hash"]\n`);
+    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
+      `-\n${gate.ws}\n["wiring-hash"]\n-\n${gate.ws}\n["gate-hash"]\n-\n${gate.ws}\n["shipping-producer-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
+    );
   });
 
   it("publishes the Linux cross check's own task results beside the gate's, so main finds cargo-lint-cross cached", () => {
@@ -507,9 +519,9 @@ describe('land-host.sh --gate', () => {
     const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, CROSS_PASSED, ...SHIPPING]);
     expect(run.status, run.log).toBe(0);
     expect(run.nx.slice(-3)).toEqual([CROSS.join(' '), ...SHIPPING_NX]);
-    // One publisher run per list: the gate's hashes, then the cross check's.
+    // Each invocation keeps its own list: gate, cross check, shipping producer and shipping guard.
     expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["gate-hash"]\n-\n${gate.ws}\n["cross-hash"]\n`,
+      `-\n${gate.ws}\n["gate-hash"]\n-\n${gate.ws}\n["cross-hash"]\n-\n${gate.ws}\n["shipping-producer-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
     );
   });
 
@@ -521,13 +533,15 @@ describe('land-host.sh --gate', () => {
     expect(run.log).toContain('failed (status 1); the land goes on');
   });
 
-  it('passes without publishing when the gate passes without a readable run summary, and leaves no temporary file', () => {
+  it('omits an unreadable gate summary but publishes known shipping lists and leaves no temporary file', () => {
     const gate = fixture();
     const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), passingRun(GATE), ...SHIPPING]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain("could not read the gate's task hashes");
     expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
-    expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
+    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
+      `-\n${gate.ws}\n["shipping-producer-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
+    );
     expect(readdirSync(join(gate.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
   });
 
@@ -579,7 +593,9 @@ describe('land-host.sh --gate', () => {
       'the run summary is of an invocation that began at 2026-01-01T00:00:00.000Z, before this gate',
     );
     expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
-    expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
+    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
+      `-\n${gate.ws}\n["shipping-producer-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
+    );
   });
 
   it('names no commit from a run summary an earlier invocation wrote', () => {

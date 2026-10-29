@@ -1,8 +1,8 @@
-// Tests for land-publish.ts: which gate task results a land publishes. Each case is a plain call, so the branch is
+// Tests for the shared publisher: which gate task results a land publishes. Each case is a plain call, so the branch is
 // proven without a process.
 
 import { describe, expect, it } from 'bun:test';
-import { hashList, succeededHashes } from './land-publish.ts';
+import { hashList, succeededHashes } from '../nx-publish.js';
 
 const task = (hash: unknown, status: unknown = 0) => ({
   taskId: 'app:build',

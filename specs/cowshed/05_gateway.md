@@ -620,9 +620,13 @@ task result from that checkout's own Nx cache through the workspace's own route,
 `HttpRemoteCache` itself, which the read-only flag the job also carries does not wrap: local hits as well as executed
 tasks, since stock Nx stores only what it executed. A task Nx does not cache, or one that failed, is skipped; a key
 already stored is counted, never replaced. The cache never blocks a land: a failed publish is said on stderr with its
-cause, and the land goes on. A declared land's gate (02_workspaces.md "A declared land") publishes its run with the same
-script (SmoothBricks: `tooling/land-host.sh --gate` through `tooling/land-publish.ts`, after its host gate and Linux
-cross check pass).
+cause, and the land goes on. A declared land's gate (02_workspaces.md, "A declared land") uses
+`@smoothbricks/nx-plugin`'s emitted `smoo-nx-publish` executable, not a repository-local publisher. It captures each
+invocation's succeeded hashes before another can overwrite the summary, and publishes those lists only after the whole
+gate passes. The plugin's cached asset producer packages unchanged bytes from the canonical
+`build_volume/{cache_adapter.js,nx_publish.js}` sources in its own disjoint runtime output. Sheds remain read-only. A
+red gate publishes nothing; a failed publication is a distinct diagnostic with the cause, never a claim that results
+were stored.
 
 The existing artifact server is a controller-owned foreground child. The gateway passes `--exit-on-stdin-eof` and
 retains the write end of its stdin pipe; EOF drains the server and releases its store lock. A gateway SIGKILL closes

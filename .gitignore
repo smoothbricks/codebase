@@ -20,6 +20,7 @@ dist-node
 dist-ts-plugin
 tmp
 out-tsc
+/packages/nx-plugin/runtime/nx-publish/
 
 # dependencies
 node_modules

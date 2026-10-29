@@ -27,11 +27,10 @@
 #    tree whose Linux cross check is not cached, so a land that skipped it would leave main unpushable.
 #    The shipping seam then builds this host's production CLI and runs cowshed:release-check on those dist bytes.
 #    The guard remains uncached and dependency-free; both phases report their wall time and refuse a red land.
-#    After the gate, the Linux cross check and the shipping seam pass, the gate run's task results, and the cross
-#    check's own when it wrote a run summary, are published to the project's localhost Nx cache, the only writer to
-#    it (sheds only read it): the pre-push hook asks Nx for cargo-lint-cross, which main finds cached only by
-#    adopting this workspace's build volume, and a held target refuses that adoption. The cache never blocks a land:
-#    task hashes that cannot be read from a run summary, or a publish that fails, are said and the land goes on.
+#    Once the wiring preflight, gate, Linux cross check and shipping seam all pass, each captured invocation's
+#    succeeded results are published through smoo-nx-publish to the accepted Nx store. Sheds stay read-only.
+#    Hashes are captured before the next invocation overwrites its summary; a red publishes nothing.
+#    The cache never blocks a land: unreadable task hashes or a failed publish are said, and the land goes on.
 #
 # The gate builds on the workspace's own build volume. Choosing between it and a clone of main's latest seed
 # (16_build_volumes.md, "Picking a land's build volume") is to move into `cowshed land`; until it does, a land whose
@@ -65,6 +64,7 @@ head=$(git -C "$checkout" rev-parse HEAD)
 # after the rebase, so main's objects are read beside its own (an alternate, never a fetch: this script moves neither).
 base=$(GIT_ALTERNATE_OBJECT_DIRECTORIES="$(git -C "$main" rev-parse --absolute-git-dir)/objects" git -C "$checkout" merge-base HEAD "$(git -C "$main" rev-parse HEAD)")
 started=$(date +%s)
+publisher="$here/../packages/nx-plugin/dist/bin/smoo-nx-publish.js"
 
 
 say() {
@@ -140,6 +140,20 @@ attribute_failures() {
   return 0
 }
 
+# Retain only validated invocation lists in one gate-owned temporary namespace.
+capture_hashes() {
+  [ -n "$hashes_dir" ] || return 0
+  capture_file=$hashes_dir/$1
+  capture_since=$2
+  capture_subject=$3
+  "$publisher" hashes "$checkout/.nx/cache/run.json" "$capture_since" >"$capture_file" || {
+    capture_status=$?
+    say "could not read $capture_subject task hashes from $checkout/.nx/cache/run.json (status $capture_status); the land goes on without publishing: the cache never blocks a land"
+    if [ -f "$capture_file" ]; then
+      rm "$capture_file" || say "could not release failed hash capture $capture_file"
+    fi
+  }
+}
 # Gates exactly the rebased tree. Reporting never changes Nx's status or grants permission to land.
 gate_workspace() {
   say "gating $head (rebased onto $base) on the host"
@@ -156,12 +170,21 @@ gate_workspace() {
   # Done means the production path calls what the change adds (AGENTS.md rule 7): the wiring check refuses each item
   # the rebased tree adds since $base that no production code reaches, by name and file:line. It runs before the gate
   # it would otherwise wait behind, as a gate job like the gate; a tree it already judged is a cache hit.
+  hashes_dir=$(mktemp -d "${TMPDIR:-/tmp}/land-hashes.XXXXXX") || {
+    say "could not allocate Nx publication lists (status $?); the land goes on without publishing: the cache never blocks a land"
+    hashes_dir=
+  }
+  if [ -n "$hashes_dir" ]; then
+    trap 'if ! rm -r "$hashes_dir"; then say "could not release Nx publication lists in $hashes_dir"; fi' EXIT
+  fi
   say "checking that $head wires what it adds since $base"
+  wiring_began=$(date +%s)
   gate_job bun nx run @smoothbricks/codebase:wiring "--args=--base $base" --outputStyle=static-failures-only >&2 || {
     wiring_status=$?
     say "the wiring check exited $wiring_status; the land stops: wire or delete each item it names"
     exit "$wiring_status"
   }
+  capture_hashes 00-wiring.json "$wiring_began" "the wiring check's"
   output=$(mktemp "${TMPDIR:-/tmp}/land-gate.XXXXXX")
   gate_status=0
   began=$(date +%s)
@@ -183,18 +206,12 @@ gate_workspace() {
   # The gate's task hashes are read now, straight after the gate, from the run summary the gate's own Nx began (one an
   # earlier invocation began is refused). The cache never blocks a land (05_gateway.md, "Publication"): hashes that
   # cannot be read are said, and the land goes on unpublished.
-  hashes=$(mktemp "${TMPDIR:-/tmp}/land-hashes.XXXXXX")
-  bun "$here/land-publish.ts" hashes "$checkout/.nx/cache/run.json" "$began" >"$hashes" || {
-    say "could not read the gate's task hashes from $checkout/.nx/cache/run.json (status $?); the land goes on without publishing: the cache never blocks a land"
-    rm "$hashes"
-    hashes=
-  }
+  capture_hashes 01-gate.json "$began" "the gate's"
   gate_summary=$(cksum <"$checkout/.nx/cache/run.json" 2>/dev/null || :)
   cross_began=$(date +%s)
   say "cross-linting $head for Linux"
   gate_job bun run check:linux >"$output" 2>&1 || {
     linux_status=$?
-    [ -z "$hashes" ] || rm "$hashes"
     replay_gate_output "$output"
     say "Linux cross check exited $linux_status; the land stops; complete output: $output"
     exit "$linux_status"
@@ -203,42 +220,35 @@ gate_workspace() {
   # The pre-push hook asks Nx for cargo-lint-cross, the cross check's own run and not the gate's: main finds it cached
   # by adopting this workspace's build volume, which a held target refuses, and a green land is then unpushable. When
   # the cross check wrote a run summary of its own, its task hashes are read the way the gate's were and published too.
-  cross_hashes=
   if [ "$(cksum <"$checkout/.nx/cache/run.json" 2>/dev/null || :)" != "$gate_summary" ]; then
-    cross_hashes=$(mktemp "${TMPDIR:-/tmp}/land-hashes.XXXXXX")
-    bun "$here/land-publish.ts" hashes "$checkout/.nx/cache/run.json" "$cross_began" >"$cross_hashes" || {
-      say "could not read the Linux cross check's task hashes (status $?); the land goes on without publishing them: the cache never blocks a land"
-      rm "$cross_hashes"
-      cross_hashes=
-    }
+    capture_hashes 02-cross.json "$cross_began" "the Linux cross check's"
   fi
   shipping_started=$(date +%s)
   say "building the host production CLI for shipping verification"
   gate_job bun nx run cowshed:cli-native:production --outputStyle=static-failures-only >&2 || {
     shipping_status=$?
     say "host production CLI exited $shipping_status after $(($(date +%s) - shipping_started))s; the land stops"
-    [ -z "$hashes" ] || rm "$hashes"
-    [ -z "$cross_hashes" ] || rm "$cross_hashes"
     exit "$shipping_status"
   }
   shipping_built=$(date +%s)
+  capture_hashes 03-shipping-producer.json "$shipping_started" "the shipping producer's"
+  shipping_check_began=$(date +%s)
   say "checking the shipping CLI bytes with cowshed:release-check"
   gate_job bun nx run cowshed:release-check --outputStyle=static-failures-only >&2 || {
     shipping_status=$?
-    say "shipping release-check exited $shipping_status after $(($(date +%s) - shipping_built))s; the land stops"
-    [ -z "$hashes" ] || rm "$hashes"
-    [ -z "$cross_hashes" ] || rm "$cross_hashes"
+    say "shipping release-check exited $shipping_status after $(($(date +%s) - shipping_check_began))s; the land stops"
     exit "$shipping_status"
   }
   shipping_checked=$(date +%s)
-  say "shipping verification: producer $((shipping_built - shipping_started))s, release-check $((shipping_checked - shipping_built))s, total $((shipping_checked - shipping_started))s"
-  # The gate and the Linux cross check passed, so their task results are the land's to publish. The cache never blocks
-  # a land: a failed publish is said, and the land goes on.
-  for list in "$hashes" "$cross_hashes"; do
-    [ -n "$list" ] || continue
-    gate_job bun "$here/land-publish.ts" publish "$checkout" "$list" >&2 || say "publishing Nx results failed (status $?); the land goes on: the cache never blocks a land"
-    rm "$list"
-  done
+  capture_hashes 04-shipping-check.json "$shipping_check_began" "the shipping guard's"
+  say "shipping verification: producer $((shipping_built - shipping_started))s, release-check $((shipping_checked - shipping_check_began))s, total $((shipping_checked - shipping_started))s"
+  # All checks passed; publication is a loud, nonblocking cache optimization.
+  if [ -n "$hashes_dir" ]; then
+    for list in "$hashes_dir"/*.json; do
+      [ -f "$list" ] || continue
+      gate_job "$publisher" publish "$checkout" "$list" >&2 || say "publishing Nx results failed (status $?); the land goes on: the cache never blocks a land"
+    done
+  fi
 }
 
 allow_envrc
