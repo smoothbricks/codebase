@@ -2501,10 +2501,13 @@ explicit contract, not a claim that its console output is a structured reporter 
 
 This contract is covered by the pure native/progress mapping and artifact tests and the real Bun/nextest smoke in
 `src/executors/bounded-exec/test-results-run.test.ts`: an early failure is visible while later work is held by IPC,
-before either terminal report exists. `nx-plugin:cargo-stream-archive` produces the smoke's nextest archive before any
-Bun shard starts; the smoke executes that archive and never compiles inside the test progress interval. The reporter
-smoke likewise executes the transformed `dist/bin/smoo-nx-bound-failures.js` supplied by the shards' `build` dependency,
-not raw TypeScript whose imports may require schema generation. Test ownership and readiness follow
+before either terminal report exists. Readiness comes from complete LF-terminated records checked by the public schema
+and the held test's IPC connection, never from console text, ANSI escapes or result symbols. The smoke runs with colored
+output, reads the referenced UTF-8 cause before releasing the held test, then checks the same run's terminal stream,
+JUnit and verdict. `nx-plugin:cargo-stream-archive` produces the smoke's nextest archive before any Bun shard starts;
+the smoke executes that archive and never compiles inside the test progress interval. The reporter smoke likewise
+executes the transformed `dist/bin/smoo-nx-bound-failures.js` supplied by the shards' `build` dependency, not raw
+TypeScript whose imports may require schema generation. Test ownership and readiness follow
 [`specs/cowshed/08_testing.md`](../../specs/cowshed/08_testing.md), “Unit tests” and “Fixtures”.
 `smoo-nx-bound-failures` reads the workspace's last Nx run (`run.json` in Nx's `cacheDir`, the directory
 `StoreRunInformationLifeCycle` writes: the checkout's own `.nx/cache` under smoo's workspace policy) against those

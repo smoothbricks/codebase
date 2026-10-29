@@ -5,9 +5,10 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { whenFound } from '../../__tests__/path-change.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { createProcessTreeKiller, runBoundedExec } from './executor.js';
-import { isClosedTestResult, TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
+import { isClosedTestResult, TEST_RESULTS_FILE } from './test-results.js';
 import { readRecord } from './verdict.js';
 
 const streamArchive = join(import.meta.dir, '../../../.cache/test-stream/archive.tar.zst');
@@ -19,14 +20,13 @@ it.each(['bun', 'nextest'] as const)(
     const directory = join(root, 'artifacts');
     const sockets = new Set<Socket>();
     const held = Promise.withResolvers<void>();
-    const failed = Promise.withResolvers<void>();
+    const readiness = new AbortController();
     const server = createServer((socket) => {
       sockets.add(socket);
       socket.once('close', () => sockets.delete(socket));
       socket.on('error', held.reject);
       held.resolve();
     });
-    const stderr = process.stderr.write;
     let running: ReturnType<typeof runBoundedExec> | null = null;
     const inherited = ['MBX_SCHEDULER', 'MBX_SCHED_DISABLE', 'BOUNDED_EXEC_CPU_POOL', 'BOUNDED_EXEC_CPU_TOKENS'].map(
       (key) => [key, process.env[key]] as const,
@@ -53,71 +53,70 @@ test('later_test', () => new Promise<void>((resolve, reject) => {
       await once(server, 'listening');
       const address = server.address();
       if (address === null || typeof address === 'string') throw new Error('fixture needs a TCP address');
-      let output = '';
       let settled = false;
-      process.stderr.write = (chunk) => {
-        output += chunk.toString();
-        if (output.includes('(fail) early_failure')) failed.resolve();
-        return stderr.call(process.stderr, chunk);
-      };
       running = runBoundedExec(
         {
           command:
             runner === 'bun'
               ? 'bun test --timeout=0 ./stream.test.ts'
               : `cargo nextest run --archive-file '${streamArchive}' --workspace-remap '${streamFixture}' --no-fail-fast --user-config-file none`,
-          env: { STREAM_GATE: `127.0.0.1:${address.port}` },
+          // Exercise the symbol/ANSI output used by Nx too; readiness must not depend on its spelling.
+          env: { STREAM_GATE: `127.0.0.1:${address.port}`, FORCE_COLOR: '1' },
           idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         },
         {
           root,
           record: { task: { id: 'fixture:test', hash: null }, directory },
-          stdout: (text) => {
-            output += text;
-            if (output.includes('"event":"failed"') || output.includes('"event": "failed"')) failed.resolve();
-          },
         },
         createProcessTreeKiller(),
         null,
       );
-      void running.then(() => {
-        settled = true;
-        failed.resolve();
-        held.resolve();
-      }, failed.reject);
-      await Promise.all([held.promise, failed.promise]);
+      void running.then(
+        () => {
+          settled = true;
+          held.resolve();
+          readiness.abort(new Error('runner ended before the live failure was observed'));
+        },
+        (error) => {
+          held.reject(error);
+          readiness.abort(error);
+        },
+      );
+      await held.promise;
+      // The held test started after the writer opened its artifacts. Watch the file, not console output.
+      const failure = await whenFound(
+        join(directory, TEST_RESULTS_FILE),
+        async () => (await readClosedResults(directory)).find((record) => record.status === 'fail') ?? null,
+        readiness.signal,
+      );
       expect(settled).toBe(false);
       expect(existsSync(join(directory, 'report.xml'))).toBe(false);
       expect(await readRecord(directory)).toBeNull();
-      expect(existsSync(join(directory, 'test-results.jsonl'))).toBe(true);
-      const lines = await readFile(join(directory, 'test-results.jsonl'), 'utf8');
-      expect(lines).toContain('"status":"fail"');
-      expect(lines).toContain('::early_failure');
+      expect(failure.id).toEndWith('::early_failure');
+      expect(failure.source).toBe(runner === 'bun' ? 'progress' : 'native');
+      expect(failure.sourceRef).toBeNull();
+      expect(failure.contradictsCursor).toBeUndefined();
+      expect(failure.cursor).toBe((await readFile(join(directory, TEST_RESULTS_FILE))).length);
+      if (failure.causeRef === null) throw new Error('missing early failure evidence');
+      const causes = await readFile(join(directory, failure.causeRef.path));
+      expect(causes.subarray(failure.causeRef.startByte, failure.causeRef.endByte).toString('utf8')).toContain(
+        'closed failure evidence é',
+      );
       for (const socket of sockets) socket.end(Buffer.from([1]));
       const result = await running;
       expect(result.success).toBe(false);
       expect((await readRecord(directory))?.verdict.outcome).toBe('failed');
       expect(await readFile(join(directory, 'report.xml'), 'utf8')).toContain('early_failure');
-      const records = (await readFile(join(directory, TEST_RESULTS_FILE), 'utf8'))
-        .trimEnd()
-        .split('\n')
-        .map((line) => {
-          const record: unknown = JSON.parse(line);
-          if (!isClosedTestResult(record)) throw new Error('invalid closed result');
-          return record;
-        });
+      const records = await readClosedResults(directory);
       expect(records).toHaveLength(2);
-      const failure = records.find((record) => record.status === 'fail');
-      expect(failure?.source).toBe(runner === 'bun' ? 'progress' : 'native');
-      expect(records.some((record) => record.status === 'pass' && record.id.endsWith('::later_test'))).toBe(true);
-      if (failure?.causeRef === null || failure?.causeRef === undefined)
-        throw new Error('missing early failure evidence');
-      const causes = await readFile(join(directory, TEST_FAILURES_FILE));
-      expect(causes.subarray(failure.causeRef.startByte, failure.causeRef.endByte).toString('utf8')).toContain(
-        'closed failure evidence é',
-      );
+      expect(records.find((record) => record.status === 'fail')).toEqual(failure);
+      expect(records.every((record) => record.runId === failure.runId)).toBe(true);
+      expect(records.at(-1)?.cursor).toBe((await readFile(join(directory, TEST_RESULTS_FILE))).length);
+      expect(records.find((record) => record.id.endsWith('::later_test'))).toMatchObject({
+        status: 'pass',
+        source: runner === 'bun' ? 'junit' : 'native',
+      });
     } finally {
-      process.stderr.write = stderr;
       try {
         for (const socket of sockets) socket.end(Buffer.from([1]));
         await running;
@@ -140,3 +139,14 @@ test('later_test', () => new Promise<void>((resolve, reject) => {
     }
   },
 );
+
+/** Read complete protocol records only, using the public schema rather than runner-console spellings. */
+async function readClosedResults(directory: string) {
+  const lines = (await readFile(join(directory, TEST_RESULTS_FILE), 'utf8')).split('\n');
+  lines.pop(); // Reread an incomplete final line on the next file event, as the live protocol requires.
+  return lines.map((line) => {
+    const record: unknown = JSON.parse(line);
+    if (!isClosedTestResult(record)) throw new Error('invalid closed result');
+    return record;
+  });
+}
