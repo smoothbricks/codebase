@@ -58,7 +58,9 @@ const nextestWant = 8;
  * them (specs/cowshed/08_testing.md: fixtures clear every inherited sizing variable before they set their own).
  * `MBX_SCHEDULER` is the switch of mbx's one pool (mbx-pool.ts): under a gate job's canonical mbx environment it would put
  * every leaf a case runs inside `mbx reserve`, whose process is then the leader a case observes, and no case here is
- * about that pool.
+ * about that pool. `MBX_SCHED_DISABLE` is what `mbx reserve` hands its command: a gate's leaf that runs this suite
+ * reserved, so the suite would read itself as nested inside a grant (mbxPool), and the case about mbx's pool builds its
+ * own.
  */
 const INHERITED_SIZING_ENV = [
   CPU_POOL_ENV,
@@ -70,6 +72,7 @@ const INHERITED_SIZING_ENV = [
   'MAKEFLAGS',
   'MFLAGS',
   'MBX_SCHEDULER',
+  'MBX_SCHED_DISABLE',
 ] as const;
 const inheritedSizing = INHERITED_SIZING_ENV.map((name) => [name, process.env[name]] as const);
 
