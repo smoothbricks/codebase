@@ -44,17 +44,17 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1793220548,
-        "narHash": "sha256-0wma/UVASSCKK5eyarN6ggKzZuZtog2U8WJ3RQpEbIU=",
+        "lastModified": 1793244912,
+        "narHash": "sha256-H5wXO0+DenU1Jytt7VgCo4oZ318aU6Do2G4LFs/VmeY=",
         "owner": "vizanto",
         "repo": "mr-boxington",
-        "rev": "72b0d2c535212e70422f37757008ff7c8cde3ac5",
+        "rev": "dca6f787a3029e0edbd126950e7b955701d39f4f",
         "type": "github"
       },
       "original": {
         "owner": "vizanto",
         "repo": "mr-boxington",
-        "rev": "72b0d2c535212e70422f37757008ff7c8cde3ac5",
+        "rev": "dca6f787a3029e0edbd126950e7b955701d39f4f",
         "type": "github"
       }
     },

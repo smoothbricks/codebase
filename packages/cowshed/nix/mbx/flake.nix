@@ -14,7 +14,7 @@
   # the build, so the mbx a project's devenv resolves through mbx's flake at this revision and the
   # one this flake builds are the same executable, and that realpath equality is the pin proof
   # (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:vizanto/mr-boxington/72b0d2c535212e70422f37757008ff7c8cde3ac5";
+  inputs.mbx.url = "github:vizanto/mr-boxington/dca6f787a3029e0edbd126950e7b955701d39f4f";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;

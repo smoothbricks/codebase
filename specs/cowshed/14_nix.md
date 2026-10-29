@@ -77,11 +77,13 @@ Cowshed's package pins mbx by git revision as a flake input; `cowshed setup` ins
 cowshed binary, and cowshed invokes it through that link for its own reads and for external-work reservations
 (05_gateway.md, "Host scheduling"), never by a PATH lookup: a launchd agent's PATH is whatever shell set it up, and on
 this host it led with a project's devenv profile, whose `mbx` is exactly the arbitrary one 05_gateway.md says selects
-nothing. The pin is mbx v1.28.0 plus the fix that front-codes C and C++ predictions so a large C++ build's task manifest
-is written (it is not upstream yet), from `vizanto/mr-boxington` at rev `72b0d2c535212e70422f37757008ff7c8cde3ac5`, and
-each project pins the same revision in its devenv through mbx's flake, so a job's canonical environment also resolves
-`mbx` by that PATH name (the capability is 15_capabilities.md's). Neither copy is ever spelled as a Nix store path or a
-host path where a command is spawned; the store path appears only as the identity the pin proves.
+nothing. The pin is mbx v1.28.0 plus two fixes that are not upstream yet: one front-codes C and C++ predictions so a
+large C++ build's task manifest is written, and one admits queued work whenever the pool has free capacity, a nested
+reservation's included, so no request waits behind another while capacity is idle. It is `vizanto/mr-boxington` at rev
+`dca6f787a3029e0edbd126950e7b955701d39f4f`, and each project pins the same revision in its devenv through mbx's flake,
+so a job's canonical environment also resolves `mbx` by that PATH name (the capability is 15_capabilities.md's). Neither
+copy is ever spelled as a Nix store path or a host path where a command is spawned; the store path appears only as the
+identity the pin proves.
 
 The host's `mbx` entry is a **symlink to the shipped pinned executable, never a copied inode**, so when the two pins
 agree, the `mbx` a job resolves and the one setup installed have the same realpath — and the Nix store path names the
