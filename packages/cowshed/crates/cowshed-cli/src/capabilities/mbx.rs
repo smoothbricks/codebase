@@ -1,8 +1,8 @@
 //! The mbx cowshed ships (14_nix.md, "mbx"): `cowshed setup` builds the pinned flake this package
 //! carries at `nix/mbx`, roots the build with an out-link under cowshed's support directory, and
-//! links `mbx` beside the installed cowshed to the rooted executable. No agent, no socket and no
-//! copy: the link's realpath is the pinned build's store path, the identity a project's own mbx is
-//! proven against (05_gateway.md, "Pool selection and revision").
+//! links mbx beside the installed cowshed to the rooted executable. Its own setup command
+//! generates the Cargo route in a private scratch home; only the generated cargo launcher and
+//! mbx-target sidecar are published in cowshed's support directory.
 //!
 //! The out-link is the GC root: without it the freshly built store path is garbage the next
 //! `nix store gc` may delete from under the link. A host without nix installs no mbx, and the
@@ -162,7 +162,108 @@ pub fn install(home: &Path, flake: &Path) -> Result<MbxInstall> {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    link(home, &rooted_program(&root)?)
+    let installed = link(home, &rooted_program(&root)?)?;
+    if matches!(installed, MbxInstall::Installed { .. }) {
+        install_cargo_route(home)?;
+    }
+    Ok(installed)
+}
+
+/// Generate the upstream route without touching the operator's shell, editor or mbx settings.
+fn install_cargo_route(home: &Path) -> Result<()> {
+    let route = mbx::cargo_route(home);
+    let support = route
+        .parent()
+        .expect("the Cargo route has a support directory");
+    let scratch = support.join(format!(".mbx-setup-{}", std::process::id()));
+    std::fs::create_dir(&scratch).map_err(|error| {
+        CowshedError::internal(format!("could not create {}: {error}", scratch.display()))
+    })?;
+    let result = (|| {
+        let private_home = scratch.join("home");
+        // dirs uses this location on Darwin; XDG_DATA_HOME selects the same path on Linux.
+        let data = private_home.join("Library/Application Support");
+        std::fs::create_dir_all(&data).map_err(|error| {
+            CowshedError::internal(format!("could not create {}: {error}", data.display()))
+        })?;
+        let executable = mbx::host_link(home);
+        // WHY unbounded: setup writes its own local configuration and shim; the operator's
+        // interrupt ends the enclosing setup command.
+        #[allow(clippy::disallowed_methods)]
+        let output = Command::new(&executable)
+            .args(["setup", "--yes"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("HOME", &private_home)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", scratch.join("config"))
+            .env("XDG_CACHE_HOME", scratch.join("cache"))
+            .env("XDG_STATE_HOME", scratch.join("state"))
+            .env("MBX_CACHE_DIR", scratch.join("cache/mbx"))
+            .env("TMPDIR", &scratch)
+            .current_dir(&scratch)
+            .output_locked()
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("could not run {} setup: {error}", executable.display()),
+                    "rerun cowshed setup",
+                )
+            })?;
+        if !output.status.success() {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "{} setup failed ({}): {}{}",
+                    executable.display(),
+                    exit_phrase(output.status.code()),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                ),
+                "repair the installed mbx and rerun cowshed setup",
+            ));
+        }
+        std::fs::create_dir_all(&route).map_err(|error| {
+            CowshedError::internal(format!("could not create {}: {error}", route.display()))
+        })?;
+        let installed = std::fs::canonicalize(&executable).map_err(|error| {
+            CowshedError::internal(format!(
+                "could not resolve installed mbx {}: {error}",
+                executable.display()
+            ))
+        })?;
+        let generated = data.join("mbx/bin");
+        let staged_mbx = generated.join(mbx::BINARY_NAME);
+        std::os::unix::fs::symlink(&installed, &staged_mbx).map_err(|error| {
+            CowshedError::internal(format!(
+                "could not link {} to installed mbx {}: {error}",
+                staged_mbx.display(),
+                installed.display()
+            ))
+        })?;
+        // Scratch and route share a filesystem. Never truncate a launcher a job may execute;
+        // the executable-identity sidecar is published after both executable routes.
+        for name in ["cargo", mbx::BINARY_NAME, "mbx-target"] {
+            let source = generated.join(name);
+            let destination = route.join(name);
+            std::fs::rename(&source, &destination).map_err(|error| {
+                CowshedError::internal(format!(
+                    "could not install generated mbx route {} at {}: {error}",
+                    source.display(),
+                    destination.display(),
+                ))
+            })?;
+        }
+        Ok(())
+    })();
+    match (result, std::fs::remove_dir_all(&scratch)) {
+        (result, Ok(())) => result,
+        (result, Err(error)) => Err(CowshedError::internal(format!(
+            "{}could not remove mbx setup scratch {}: {error}",
+            result
+                .err()
+                .map_or_else(String::new, |cause| format!("{cause}; ")),
+            scratch.display(),
+        ))),
+    }
 }
 
 /// The executable the GC root pins, read through the root rather than from nix's stdout, so the
@@ -411,6 +512,17 @@ pub fn uninstall(home: &Path) -> Result<[crate::launchd::RemovalOutcome; 2]> {
         })?;
         crate::launchd::RemovalOutcome::Removed
     };
+    let route = mbx::cargo_route(home);
+    match std::fs::remove_dir_all(&route) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(CowshedError::internal(format!(
+                "could not remove mbx Cargo route {}: {error}",
+                route.display()
+            )));
+        }
+    }
     Ok([link_outcome, root_outcome])
 }
 
@@ -504,5 +616,85 @@ mod tests {
             assert_eq!(flake_directory_from(&executable).unwrap(), flake);
         }
         let _ = std::fs::remove_dir_all(&package);
+    }
+
+    #[test]
+    fn setup_publishes_generated_cargo_bytes_and_preserves_executable_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = scratch("generated-route");
+        let executable = mbx::host_link(&home);
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        let generated = b"#!/bin/sh\nprintf 'generated cargo\\n'\n";
+        let script = r#"#!/bin/sh
+set -eu
+[ "$1" = setup ] && [ "$2" = --yes ]
+[ "$PWD" = "$TMPDIR" ]
+[ "$MBX_CACHE_DIR" = "$TMPDIR/cache/mbx" ]
+[ -z "${MISE_CONFIG_FILE-}" ]
+mkdir -p "$XDG_DATA_HOME/mbx/bin"
+printf '#!/bin/sh\nprintf '\''generated cargo\\n'\''\n' > "$XDG_DATA_HOME/mbx/bin/cargo"
+chmod 755 "$XDG_DATA_HOME/mbx/bin/cargo"
+printf '%s\n' "$0" > "$XDG_DATA_HOME/mbx/bin/mbx-target"
+"#;
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install_cargo_route(&home).unwrap();
+        let route = mbx::cargo_route(&home);
+        let cargo = std::fs::read(route.join("cargo")).unwrap();
+        let mode = std::fs::metadata(route.join("cargo"))
+            .unwrap()
+            .permissions()
+            .mode();
+        let target = std::fs::read_to_string(route.join("mbx-target")).unwrap();
+        let routed_mbx = std::fs::read_link(route.join(mbx::BINARY_NAME)).unwrap();
+        let installed_mbx = std::fs::canonicalize(&executable).unwrap();
+        let scratch_left = route
+            .parent()
+            .unwrap()
+            .join(format!(".mbx-setup-{}", std::process::id()))
+            .exists();
+        std::fs::remove_file(&executable).unwrap();
+        uninstall(&home).unwrap();
+        let route_left = route.exists();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(cargo, generated);
+        assert_ne!(mode & 0o111, 0, "the generated launcher remains executable");
+        assert_eq!(target, format!("{}\n", executable.display()));
+        assert_eq!(
+            routed_mbx, installed_mbx,
+            "explicit mbx uses the installed executable"
+        );
+        assert!(
+            !scratch_left,
+            "setup's home and configuration are disposable"
+        );
+        assert!(!route_left, "uninstall removes the generated route");
+    }
+
+    #[test]
+    fn failed_mbx_setup_reports_status_and_diagnostics_without_publishing_a_route() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = scratch("failed-route");
+        let executable = mbx::host_link(&home);
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho 'setup fixture refused' >&2\nexit 23\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = install_cargo_route(&home).unwrap_err().to_string();
+        let route = mbx::cargo_route(&home);
+        let route_left = route.exists();
+        let scratch_left = route
+            .parent()
+            .unwrap()
+            .join(format!(".mbx-setup-{}", std::process::id()))
+            .exists();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(error.contains("exit 23"), "{error}");
+        assert!(error.contains("setup fixture refused"), "{error}");
+        assert!(!route_left, "failed setup publishes nothing");
+        assert!(!scratch_left, "failed setup still removes its private home");
     }
 }

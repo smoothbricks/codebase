@@ -91,8 +91,7 @@ impl std::fmt::Display for BuildStateFinding {
 pub struct BuildStateDiscovery {
     pub paths: Vec<BuildStatePath>,
     pub findings: Vec<BuildStateFinding>,
-    /// The realpath of the `mbx` the canonical job environment resolves, which gives the project
-    /// the mbx capability (15_capabilities.md, "mbx detection").
+    /// The realpath of the mbx reached through the canonical Cargo route, recorded with target ownership.
     pub mbx: Option<PathBuf>,
     /// The Cargo target directories mbx owns now, which the build volume holds no longer.
     pub released: Vec<BuildStatePath>,
@@ -138,7 +137,8 @@ impl BuildStateDiscovery {
 /// JavaScript packages contribute their `node_modules/.cache`. 5: Codegraph indexes are build-volume state.
 /// 6: a job that holds no `cargo` is one finding per shell, not one Cargo failure per manifest.
 /// 7: the job resolves `mbx`, and the canonical activation's input identity keys the answer.
-const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 7";
+/// 8: installed host mbx supplies the Cargo route without a project opt-in.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 8";
 
 /// The manifest whose directory, once installed, holds a JavaScript package's tool caches.
 const PACKAGE_MANIFEST: &str = "package.json";

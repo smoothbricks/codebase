@@ -422,8 +422,20 @@ fn detect_with(
         if override_.is_some_and(|override_| override_.disabled) {
             continue;
         }
+        if detector.id == CapabilityId::Mbx && !result.active.contains(&CapabilityId::Cargo) {
+            continue;
+        }
         let project = override_
             .and_then(|override_| override_.directory.as_ref())
+            .or_else(|| {
+                (detector.id == CapabilityId::Mbx)
+                    .then(|| {
+                        overrides
+                            .get(&CapabilityId::Cargo)
+                            .and_then(|setting| setting.directory.as_ref())
+                    })
+                    .flatten()
+            })
             .map(|directory| context.workspace_root.join(directory));
         if let Some(project) = &project {
             validate_project_directory(context.workspace_root, project)?;

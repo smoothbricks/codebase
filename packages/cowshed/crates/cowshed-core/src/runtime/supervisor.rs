@@ -1380,11 +1380,9 @@ fn one_shot_plan(
     Ok(plan)
 }
 
-/// The installed cowshed's directory leads exact private-bin tool links; no host tool profile
-/// joins PATH. Nothing there answers to `cargo`: the toolchain's own Cargo reads the job's grant
-/// from its environment ([`CpuPlacement`]).
-/// The package-manager wrapper route sits just ahead of the other bootstrap links: it is the one
-/// directory the exec host re-leads after shell activation, so it leads before activation too.
+/// The installed launcher leads private tool links, never a host toolchain profile.
+/// Manager wrappers and the capability's installed Cargo route precede bootstrap tools;
+/// the exec host re-leads those two routes after project shell activation.
 fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
     let tools = match sandbox.mode {
         crate::sandbox::RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.join("tools"),
@@ -1393,8 +1391,16 @@ fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
     let mut paths = vec![
         crate::host_dirs::installed_binary_directory(&sandbox.home),
         tools.join("manager-bin"),
-        tools.join("bin"),
     ];
+    if let Some(crate::capabilities::EnvAction::Own(route)) = sandbox
+        .capabilities
+        .contribution
+        .env
+        .get(crate::capabilities::mbx::CARGO_ROUTE_ENV)
+    {
+        paths.push(PathBuf::from(route));
+    }
+    paths.push(tools.join("bin"));
     paths.push(sandbox.workspace_mount.join(".cowshed/bin"));
     if let Some(path) = developer_directory().map(|directory| directory.join("usr/bin"))
         && !paths.contains(&path)

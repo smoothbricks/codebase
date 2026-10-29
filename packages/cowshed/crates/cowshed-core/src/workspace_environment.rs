@@ -308,6 +308,20 @@ pub(crate) fn write_workspace_environment(
                 }
             }
         }
+        if matches!(
+            capability_env
+                .env
+                .get(crate::capabilities::mbx::CARGO_ROUTE_ENV),
+            Some(EnvAction::Own(_))
+        ) {
+            writeln!(
+                &mut *contents,
+                "export PATH=\"${{{manager}:+${{{manager}}}:}}${{{cargo}}}${{PATH:+:}}${{PATH-}}\"",
+                manager = crate::developer_links::MANAGER_BIN_ENV,
+                cargo = crate::capabilities::mbx::CARGO_ROUTE_ENV,
+            )
+            .expect("writing to a String cannot fail");
+        }
     }
 
     write_atomic_bytes(
@@ -655,6 +669,76 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
         assert_eq!(output.stdout, b"unset");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn served_cargo_route_leads_project_tools_after_manager_wrappers() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-cargo-route-{}", uuid::Uuid::new_v4()));
+        let mount = root.join("workspace");
+        let home = root.join("home");
+        let cargo = root.join("installed mbx's $literal/bin");
+        let wrappers = mount.join(".cowshed/tools/manager-bin");
+        std::fs::create_dir_all(mount.join(".cowshed")).unwrap();
+        let mut contribution = CapabilityContribution::default();
+        contribution.env.insert(
+            "COWSHED_CARGO_ROUTE",
+            EnvAction::Own(cargo.clone().into_os_string()),
+        );
+        write_workspace_environment(
+            EnvironmentMount::Served {
+                workspace_mount: &mount,
+                host_home: &home,
+                temp_dir: &root,
+                capability_env: &contribution,
+            },
+            Platform::Linux,
+            None,
+            None,
+        )
+        .unwrap();
+        let outputs = [false, true].map(|manager| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    ". \"$1\"; printf '%s\\0' \"$COWSHED_CARGO_ROUTE\" \"$PATH\"",
+                    "served-route",
+                ])
+                .arg(mount.join(WORKSPACE_ENVIRONMENT_PATH))
+                .env_clear()
+                .env("COWSHED_CARGO_ROUTE", "/caller/mbx/bin")
+                .env("PATH", "/project/bin:/usr/bin:/bin");
+            if manager {
+                command.env(crate::developer_links::MANAGER_BIN_ENV, &wrappers);
+            }
+            (manager, command.output_bounded().unwrap())
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+        for (manager, output) in outputs {
+            assert!(output.status.success(), "{output:?}");
+            let mut paths = Vec::new();
+            if manager {
+                paths.push(wrappers.clone());
+            }
+            paths.extend([
+                cargo.clone(),
+                crate::host_dirs::installed_binary_directory(&home),
+                std::path::PathBuf::from("/project/bin"),
+                std::path::PathBuf::from("/usr/bin"),
+                std::path::PathBuf::from("/bin"),
+            ]);
+            let expected = format!(
+                "{}\0{}\0",
+                cargo.display(),
+                std::env::join_paths(paths).unwrap().to_str().unwrap()
+            );
+            assert_eq!(
+                output.stdout,
+                expected.as_bytes(),
+                "manager route present: {manager}"
+            );
+        }
     }
 
     #[test]

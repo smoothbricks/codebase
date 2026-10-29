@@ -209,6 +209,10 @@ fn apply_to(
     diff: &BTreeMap<String, Option<String>>,
 ) {
     for (name, value) in diff {
+        // Activation cannot replace, remove or invent the capability-owned Cargo route.
+        if name == cowshed_core::capabilities::mbx::CARGO_ROUTE_ENV {
+            continue;
+        }
         match value {
             Some(value) => {
                 environment.insert(name.into(), value.into());
@@ -710,28 +714,37 @@ impl Host {
             ));
         }
         let mut environment = self.environment.clone();
-        // Only the package-manager wrapper route leads the activated PATH; every other entry,
-        // the shell's declared toolchain included, reaches the command as activation left it.
-        if let Some(wrappers) = self
-            .environment
-            .get(OsStr::new(cowshed_core::developer_links::MANAGER_BIN_ENV))
-        {
-            let mut paths = vec![PathBuf::from(wrappers)];
-            if let Some(path) = environment.get(OsStr::new("PATH")) {
-                paths.extend(
-                    std::env::split_paths(path).filter(|entry| entry.as_os_str() != wrappers),
-                );
-            }
-            environment.insert(
-                "PATH".into(),
-                std::env::join_paths(paths).map_err(io::Error::other)?,
-            );
-        }
         for [name, value] in pairs {
             environment.insert(
                 OsString::from_vec(name.to_vec()),
                 OsString::from_vec(value.to_vec()),
             );
+        }
+        // The manager wrappers lead mbx's own Cargo shim, then the activated toolchain.
+        let routes = [
+            environment.get(OsStr::new(cowshed_core::developer_links::MANAGER_BIN_ENV)),
+            environment.get(OsStr::new(cowshed_core::capabilities::mbx::CARGO_ROUTE_ENV)),
+        ];
+        if routes.iter().any(Option::is_some) {
+            let paths = routes
+                .iter()
+                .flatten()
+                .map(|route| std::borrow::Cow::Borrowed(route.as_os_str()))
+                .chain(
+                    environment
+                        .get(OsStr::new("PATH"))
+                        .into_iter()
+                        .flat_map(std::env::split_paths)
+                        .filter(|entry| {
+                            !routes
+                                .iter()
+                                .flatten()
+                                .any(|route| entry.as_os_str() == *route)
+                        })
+                        .map(|entry| std::borrow::Cow::Owned(entry.into_os_string())),
+                );
+            let path = std::env::join_paths(paths).map_err(io::Error::other)?;
+            environment.insert("PATH".into(), path);
         }
         environment.insert("PWD".into(), cwd.as_os_str().to_owned());
         Ok(environment)
@@ -1402,5 +1415,62 @@ mod tests {
             (Some(devenv.join("cargo")), Some(wrappers.join("bun"))),
             "{path:?}"
         );
+    }
+
+    #[test]
+    fn installed_cargo_route_leads_the_activated_path_after_manager_wrappers() {
+        let wrappers = "/workspace/tools/manager-bin";
+        let cargo = "/installed/mbx/bin";
+        let activated = format!("/project/bin:{cargo}:{wrappers}:/usr/bin:/bin");
+        let host = Host {
+            environment: BTreeMap::from([
+                ("PATH".into(), activated.clone().into()),
+                (
+                    cowshed_core::developer_links::MANAGER_BIN_ENV.into(),
+                    wrappers.into(),
+                ),
+                ("COWSHED_CARGO_ROUTE".into(), cargo.into()),
+            ]),
+        };
+        for overlay in [
+            Vec::new(),
+            vec![
+                b"PATH".as_slice(),
+                activated.as_bytes(),
+                b"COWSHED_CARGO_ROUTE".as_slice(),
+                cargo.as_bytes(),
+            ],
+        ] {
+            let environment = host
+                .command_environment(Path::new("/workspace"), &overlay)
+                .unwrap();
+            let paths: Vec<_> = std::env::split_paths(&environment[OsStr::new("PATH")]).collect();
+            assert_eq!(
+                paths,
+                [wrappers, cargo, "/project/bin", "/usr/bin", "/bin"].map(PathBuf::from),
+                "canonical routes must precede activation and command overlays"
+            );
+        }
+    }
+
+    #[test]
+    fn activation_cannot_replace_remove_or_invent_the_cargo_route() {
+        for route in [None, Some("/installed/mbx/bin")] {
+            for exported in [None, Some("/project/mbx/bin")] {
+                let mut environment = BTreeMap::new();
+                if let Some(route) = route {
+                    environment.insert("COWSHED_CARGO_ROUTE".into(), OsString::from(route));
+                }
+                apply_to(
+                    &mut environment,
+                    &BTreeMap::from([("COWSHED_CARGO_ROUTE".into(), exported.map(str::to_owned))]),
+                );
+                assert_eq!(
+                    environment.get(OsStr::new("COWSHED_CARGO_ROUTE")),
+                    route.map(OsString::from).as_ref(),
+                    "capability route {route:?}, activation export {exported:?}"
+                );
+            }
+        }
     }
 }
