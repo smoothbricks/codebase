@@ -11,7 +11,7 @@ repo_root="$(cd "$script_dir/../.." && pwd)"
 # A separate name on purpose: assigning to TTSC_CACHE_DIR itself would mutate
 # the (possibly exported) environment that persist_devenv_environment later
 # fingerprints as the pre-shell baseline.
-ttsc_cache_dir_default="${TTSC_CACHE_DIR:-$repo_root/.cache/ttsc}"
+ttsc_cache_dir_default="${TTSC_CACHE_DIR:-$repo_root/.cache/ttsc-plugins}"
 
 add_repo_paths() {
   "$repo_root/tooling/direnv/repo-path" --github-path

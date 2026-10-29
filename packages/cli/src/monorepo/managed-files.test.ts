@@ -489,7 +489,7 @@ describe('managed raw files', () => {
       const cases = [
         // No host value: the shell computes the checkout's default and the
         // capture persists it for the workflow steps that follow.
-        { input: '', expected: `TTSC_CACHE_DIR=${join(checkout, '.cache', 'ttsc')}\n` },
+        { input: '', expected: `TTSC_CACHE_DIR=${join(checkout, '.cache', 'ttsc-plugins')}\n` },
         // Host-provided value: the shell keeps it, so nothing changed and
         // nothing is rewritten — the override stays live in the step env.
         { input: join(temp, 'host-ttsc'), expected: undefined },

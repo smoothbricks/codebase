@@ -3,18 +3,19 @@
 [build]
 # Build state no capability detects, kept on the build volume instead of the source image
 # (specs/cowshed/16_build_volumes.md "Declared build state"): cloned at fork, adopted by main at
-# land. `.cache/ttsc` is the shell's TTSC_CACHE_DIR (devenv.smoo.nix): ttsc's native plugin
-# binaries and the Go build cache that compiles them. A plugin's key hashes its sources by
-# relative path plus the ttsc/tsgo versions, platform and Go environment, never the checkout, and
-# GOFLAGS=-trimpath keeps paths out of the Go cache, so an entry built in any checkout is valid in
-# every fork. On the source image a fork gets only main's copy, which no land writes, so its first
-# compile rebuilds every plugin main never built.
+# land. `.cache/ttsc-plugins` is the shell's TTSC_CACHE_DIR (ttsc-env.sh): ttsc's native plugin
+# binaries; `.cache/ttsc` holds its TTSC_GO_CACHE_DIR (go-build), the Go build cache that
+# compiles them. A plugin's key hashes its sources by relative path plus the ttsc/tsgo versions,
+# platform and Go environment, never the checkout, and GOFLAGS=-trimpath keeps paths out of the
+# Go cache, so an entry built in any checkout is valid in every fork. On the source image a fork
+# gets only main's copy, which no land writes, so its first compile rebuilds every plugin main
+# never built.
 #
 # Not declared: `.cache/nextest` and `.cache/lmao-thread-ffi` are Nx task outputs, which never
 # live on the build volume (16_build_volumes.md "Nx outputs never live in the build volume"); the
 # Nx cache restores them. `.cache/statebus-packages` is the packed-consumer verification's declared
 # Nx output on the same footing; its consumer lockfiles name tarballs workspace-relatively.
-state = [".cache/ttsc"]
+state = [".cache/ttsc-plugins", ".cache/ttsc"]
 
 [land]
 # The declared land (specs/cowshed/02_workspaces.md "A declared land"): `cowshed land <ws>` takes this land turn,

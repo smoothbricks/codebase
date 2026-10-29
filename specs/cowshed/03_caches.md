@@ -296,15 +296,15 @@ there; they contain the endpoint URL, whose userinfo is the workspace token (bel
 
      A legacy toolchain cache whose current owner instead declares checkout build state is placed with that existing
      build volume, never made into a new shared HOME cache merely to retire this volume. For `ttsc/`, the managed shell
-     writes `TTSC_CACHE_DIR=<checkout>/.cache/ttsc` and `TTSC_GO_CACHE_DIR` beneath it; main already declares
-     `.cache/ttsc` in `[build] state` (16_build_volumes.md, "Declared build state"). The operator explicitly selects
-     that main and witnesses its existing fixed link before moving the legacy tree with the retirement executor. If
-     several mains declare the same toolchain path, this is a deliberate choice of the main whose build volume will
-     retain the old state, not a global name match: the other mains keep their independently declared caches. No
-     detector, HOME-sharing declaration or configuration knob is added. A legacy tree with divergent mutable lock or
-     usage bookkeeping is preserved whole at `<checkout>/.cache/ttsc/cowshed-retired/ttsc`, within that existing
-     declared build state, rather than merged with the current cache; the retained bytes are reported. Writers of the
-     source and destination must be quiet; bytes are preserved, never discarded as a substitute for placement.
+     writes `TTSC_CACHE_DIR=<checkout>/.cache/ttsc-plugins` and `TTSC_GO_CACHE_DIR=<checkout>/.cache/ttsc/go-build`;
+     main already declares `.cache/ttsc` in `[build] state` (16_build_volumes.md, "Declared build state"). The operator
+     explicitly selects that main and witnesses its existing fixed link before moving the legacy tree with the
+     retirement executor. If several mains declare the same toolchain path, this is a deliberate choice of the main
+     whose build volume will retain the old state, not a global name match: the other mains keep their independently
+     declared caches. No detector, HOME-sharing declaration or configuration knob is added. A legacy tree with divergent
+     mutable lock or usage bookkeeping is preserved whole at `<checkout>/.cache/ttsc/cowshed-retired/ttsc`, within that
+     existing declared build state, rather than merged with the current cache; the retained bytes are reported. Writers
+     of the source and destination must be quiet; bytes are preserved, never discarded as a substitute for placement.
 
   4. Under `--retire-caches-volume`, and only once steps 1–3 left the volume holding nothing but its marker, setup
      deletes the volume (or destroys the dataset), removes its `/etc/fstab` pin and drops it from the storage mount

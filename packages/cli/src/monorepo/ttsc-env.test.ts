@@ -62,7 +62,7 @@ function boundFor(other: string): Record<string, string> {
   return {
     NX_WORKSPACE_ROOT_PATH: other,
     TTSC_TSGO_BINARY: join(other, 'node_modules/@typescript/native/bin/tsc'),
-    TTSC_CACHE_DIR: join(other, '.cache/ttsc'),
+    TTSC_CACHE_DIR: join(other, '.cache/ttsc-plugins'),
     TTSC_GO_CACHE_DIR: join(other, '.cache/ttsc/go-build'),
   };
 }
@@ -75,7 +75,7 @@ it('selects this checkout profile when the repository declares its native produc
     symlinkSync(process.execPath, join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'));
     expect(enter(checkout, boundFor(other))).toEqual({
       TTSC_TSGO_BINARY: join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'),
-      TTSC_CACHE_DIR: join(checkout, '.cache/ttsc'),
+      TTSC_CACHE_DIR: join(checkout, '.cache/ttsc-plugins'),
       TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
     });
   });
@@ -115,7 +115,7 @@ describe('ttsc-env.sh', () => {
     withCheckouts((checkout) => {
       expect(enter(checkout, {})).toEqual({
         TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
-        TTSC_CACHE_DIR: join(checkout, '.cache/ttsc'),
+        TTSC_CACHE_DIR: join(checkout, '.cache/ttsc-plugins'),
         TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
       });
     });
@@ -125,7 +125,7 @@ describe('ttsc-env.sh', () => {
     withCheckouts((checkout, other) => {
       expect(enter(checkout, boundFor(other))).toEqual({
         TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
-        TTSC_CACHE_DIR: join(checkout, '.cache/ttsc'),
+        TTSC_CACHE_DIR: join(checkout, '.cache/ttsc-plugins'),
         TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
       });
     });
@@ -137,7 +137,7 @@ describe('ttsc-env.sh', () => {
       const expected = {
         TTSC_TSGO_BINARY: join(checkout, 'node_modules/@typescript/native/bin/tsc'),
         TTSC_CACHE_DIR: shared,
-        TTSC_GO_CACHE_DIR: join(shared, 'go-build'),
+        TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
       };
       expect(enter(checkout, { TTSC_CACHE_DIR: shared })).toEqual(expected);
       expect(enter(checkout, { NX_WORKSPACE_ROOT_PATH: checkout, TTSC_CACHE_DIR: shared })).toEqual(expected);

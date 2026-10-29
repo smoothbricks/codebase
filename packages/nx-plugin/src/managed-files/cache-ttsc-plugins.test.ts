@@ -63,7 +63,7 @@ function runScript(step: ActionStep, env: Record<string, string>) {
 /** A checkout whose plugin cache holds entries stamped the way ttsc stamps a hit or a build (null: never stamped). */
 function checkoutWithPlugins(entries: Record<string, number | null>) {
   const workspace = mkdtempSync(join(tmpdir(), 'ttsc-plugin-cache-'));
-  const plugins = join(workspace, '.cache', 'ttsc', 'plugins');
+  const plugins = join(workspace, '.cache', 'ttsc-plugins', 'plugins');
   mkdirSync(plugins, { recursive: true });
   writeFileSync(join(plugins, '.gc-last-run'), `${RESTORED_AT_MS}\n`);
   for (const [name, stamp] of Object.entries(entries)) {

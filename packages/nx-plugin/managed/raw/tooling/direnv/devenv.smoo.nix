@@ -585,8 +585,10 @@ in {
     #    owns.
     # 3. ttsc drives the native TypeScript 7 binary while Nx imports the TypeScript
     #    6 API, so the two must be named separately.
-    # 4. ttsc caches in the checkout's .cache/ttsc (the path the CI ttsc-plugin
-    #    cache restores), its Go build cache in a directory of its own so
+    # 4. ttsc caches its plugin binaries in the checkout's .cache/ttsc-plugins (the
+    #    path the CI ttsc-plugin cache restores, and the output a repository's
+    #    plugin build target declares), its Go build cache in .cache/ttsc/go-build,
+    #    a directory of its own outside that output, so
     #    `ttsc clean` can reclaim it: ttsc never deletes a GOCACHE it did not
     #    resolve itself, and sharing GOCACHE once left 35G nothing could empty.
     #    GOFLAGS carries -trimpath, Go's stable way to keep absolute build paths
