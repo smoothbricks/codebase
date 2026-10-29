@@ -20,6 +20,12 @@
 //! [`UnavailableVoAdmission`] refusal, so a value-object schema never yields
 //! a processor that would accept frames unchecked.
 //!
+//! An `axId` payload field is judged by an [`AddressGrammar`], which the host
+//! owns and names as the processor's second type parameter: a caller picks it
+//! with `EventProcessor::<A, G>::new_with_vo_admission`. The default,
+//! [`NoAddressGrammar`], refuses every address, so a processor built by
+//! [`EventProcessor::new`] never admits one unchecked.
+//!
 //! The `ep_*` wasm exports of `columine-ep-wasm` are thin bindings around
 //! this library core.
 
@@ -39,9 +45,9 @@ use columine_parsing::{
     ExtractionConfig, FrameProjections, json_extractor, json_scanner, msgpack_extractor,
     msgpack_scanner,
     validate::{
-        BatchValidationError, PayloadViolation, PrepareRefusal, PreparedSchemas,
-        UnavailableVoAdmission, VoAdmission, VoFrameProof, VoPreparationError, VoPresence,
-        VoRefusal, parse_schema_envelope,
+        AddressGrammar, BatchValidationError, NoAddressGrammar, PayloadViolation, PrepareRefusal,
+        PreparedSchemas, UnavailableVoAdmission, VoAdmission, VoFrameProof, VoPreparationError,
+        VoPresence, VoRefusal, parse_schema_envelope,
     },
 };
 
@@ -301,13 +307,14 @@ impl PayloadValidationDiagnostic {
 }
 
 /// The public event-processor parse plane, generic over its value-object
-/// admission capability.
+/// admission capability and the [`AddressGrammar`] its `axId` nodes are judged
+/// by.
 ///
 /// The prepared envelope is read-only after construction and the plane is
 /// the only mutable state, so a validated input can borrow the envelope's
 /// admission proofs while it extracts into the plane.
-pub struct EventProcessor<A = UnavailableVoAdmission> {
-    semantic: Option<PreparedSchemas<A>>,
+pub struct EventProcessor<A = UnavailableVoAdmission, G: AddressGrammar = NoAddressGrammar> {
+    semantic: Option<PreparedSchemas<A, G>>,
     last_validation_diagnostic: Option<PayloadValidationDiagnostic>,
     plane: Plane,
 }
@@ -338,6 +345,8 @@ impl EventProcessor {
     /// `column_capacity` sizes the batch columns; the wasm exports build every
     /// handle at [`WASM_EVENT_CAPACITY`]. `options` selects the base scanner
     /// path, MessagePack workspace growth, and header diagnostics.
+    /// It has no address grammar either ([`NoAddressGrammar`]): an `axId` field
+    /// is accepted at init and refuses every address at validation.
     pub fn new(
         options: ParseOptions,
         column_capacity: u32,
@@ -352,12 +361,14 @@ impl EventProcessor {
     }
 }
 
-impl<A: VoAdmission> EventProcessor<A> {
+impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
     /// [`EventProcessor::new`] with a value-object capability. The semantic
     /// envelope is decoded once and `admission` is prepared once for every
     /// distinct value-object schema it declares, before any metadata,
     /// extraction configuration, or column plane is allocated; a refusal
     /// leaves no processor behind.
+    /// Every `axId` node of the envelope is judged by the grammar `G`, which the
+    /// caller names with `EventProcessor::<A, G>::new_with_vo_admission`.
     pub fn new_with_vo_admission(
         options: ParseOptions,
         column_capacity: u32,
@@ -369,12 +380,14 @@ impl<A: VoAdmission> EventProcessor<A> {
             Some(envelope) => {
                 let schemas =
                     parse_schema_envelope(envelope).map_err(EpInitError::SemanticSchema)?;
-                Some(PreparedSchemas::prepare(schemas, admission).map_err(
-                    |refusal| match refusal {
-                        PrepareRefusal::Refused(error) => EpInitError::VoAdmission(error),
-                        PrepareRefusal::OutOfMemory => EpInitError::MemoryExhausted,
-                    },
-                )?)
+                Some(
+                    PreparedSchemas::<A, G>::prepare(schemas, admission).map_err(|refusal| {
+                        match refusal {
+                            PrepareRefusal::Refused(error) => EpInitError::VoAdmission(error),
+                            PrepareRefusal::OutOfMemory => EpInitError::MemoryExhausted,
+                        }
+                    })?,
+                )
             }
         };
 
@@ -473,7 +486,7 @@ impl<A: VoAdmission> EventProcessor<A> {
             plane,
         } = self;
         // The envelope stays shared for `'a`: the projected frames borrow it.
-        let semantic: &'a Option<PreparedSchemas<A>> = semantic;
+        let semantic: &'a Option<PreparedSchemas<A, G>> = semantic;
         *last_validation_diagnostic = None;
         let mut projected = Vec::new();
         if let Some(prepared) = semantic {
@@ -695,7 +708,7 @@ impl ParsedBatch<'_> {
         }
     }
 }
-impl<A: VoAdmission> EventProcessor<A> {
+impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
     /// Encode one validated CPB1 column batch into `[ResultHeader][Arrow IPC]`.
     ///
     /// Validation and exact-size preflight finish before any Arrow output byte
@@ -1549,7 +1562,7 @@ mod tests {
             refused
         );
         assert_eq!(
-            EventProcessor::new_with_vo_admission(
+            EventProcessor::<UnavailableVoAdmission, NoAddressGrammar>::new_with_vo_admission(
                 admission_options(),
                 8,
                 semantic_schema(&line_envelope()),
@@ -1734,5 +1747,61 @@ mod tests {
                 "the refused batch left no row"
             );
         }
+    }
+
+    /// The one address the test grammar admits: a host's grammar, named by type.
+    struct TestGrammar;
+
+    impl AddressGrammar for TestGrammar {
+        fn violation(value: &str) -> Option<&'static str> {
+            (value != "d~g~t").then_some("not the test address")
+        }
+    }
+
+    #[test]
+    fn an_ax_id_is_judged_by_the_grammar_the_processor_is_typed_with() {
+        let envelope = r#"{"owned":{"kind":"object","fields":{"owner":{"kind":"axId"}}}}"#;
+        let mut ep = EventProcessor::<UnavailableVoAdmission, TestGrammar>::new_with_vo_admission(
+            admission_options(),
+            8,
+            semantic_schema(envelope),
+            UnavailableVoAdmission,
+        )
+        .unwrap();
+        let mut output = vec![0u8; 64 * 1024];
+        assert_eq!(
+            ep.create_log_entry(
+                br#"[{"id":"a","type":"owned","timestamp":1,"value":{"owner":"d~g~t"}}]"#,
+                InputFormat::Json,
+                &mut output
+            ),
+            ResultCode::Ok
+        );
+        assert_eq!(ep.plane.dynamic_columns.count, 1);
+
+        let mut refused = vec![0xa5; 4096];
+        assert_eq!(
+            ep.create_log_entry(
+                br#"[{"id":"b","type":"owned","timestamp":2,"value":{"owner":"other"}}]"#,
+                InputFormat::Json,
+                &mut refused
+            ),
+            ResultCode::ParseError
+        );
+        let diagnostic = ep.payload_validation_diagnostic().unwrap();
+        assert_eq!(
+            (
+                diagnostic.path.as_str(),
+                diagnostic.expected.as_str(),
+                diagnostic.observed.as_str(),
+                diagnostic.vo,
+            ),
+            ("value.owner", "axId: not the test address", "string", None)
+        );
+        assert!(refused[32..].iter().all(|byte| *byte == 0xa5));
+        assert_eq!(
+            ep.plane.dynamic_columns.count, 1,
+            "the refused batch left no row"
+        );
     }
 }

@@ -26,6 +26,13 @@
 //! node's producer derives the bound. A value that is not a string is refused as
 //! `string` refuses it.
 //!
+//! An `axId` node admits an address the host's grammar admits. This crate
+//! parses the node and never knows the grammar: an [`AddressGrammar`], named by
+//! the type a [`Judge`] or [`PreparedSchemas`] is given, judges each string, as
+//! a `vo` frame is judged by an injected [`VoAdmission`]. [`NoAddressGrammar`],
+//! the default, refuses every string, so no address is admitted unchecked. A
+//! value that is not a string is refused as `string` refuses it.
+//!
 //! A `vo` node carries canonical value-object metadata — a qualified root, a
 //! frame table, and the manifest rows it depends on — decoded once from
 //! lowercase hex. Decoding judges only that envelope's syntax; this crate has
@@ -37,7 +44,7 @@
 //! [`UnavailableVoAdmission`] is the explicit refusal capability the ordinary
 //! entry points use, so a `vo` schema is refused there rather than accepted
 //! unchecked.
-use std::{cmp::Ordering, fmt};
+use std::{cmp::Ordering, fmt, marker::PhantomData};
 
 pub use columine_types::vo::{
     UnavailableVoAdmission, VoAdmission, VoAdmissionError, VoCountsRole, VoDefinition, VoFieldLink,
@@ -338,6 +345,8 @@ enum Expected<'s> {
     Range(NumericRange),
     /// An `S.key` value: its routing key component encodes to at most this many characters.
     Key(u32),
+    /// An `axId` value the host's grammar refused, with the grammar's reason.
+    AxId(&'static str),
     Length(u32),
     /// An undeclared key below a closed object, with the declared members.
     Declared(&'s [(String, SemanticSchema)]),
@@ -362,6 +371,7 @@ impl fmt::Display for Expected<'_> {
                 write!(output, "{kind} in [{}, {}]", range.min, range.max)
             }
             Self::Key(bound) => write!(output, "key: encodes to at most {bound} characters"),
+            Self::AxId(reason) => write!(output, "axId: {reason}"),
             Self::Length(length) => write!(output, "array of length {length}"),
             Self::Declared(fields) => {
                 output.write_str("not declared (declared: ")?;
@@ -654,6 +664,10 @@ pub enum SemanticSchema {
     Key {
         max_encoded_length: u32,
     },
+    /// An address the host's [`AddressGrammar`] admits, which this crate never judges itself.
+    /// The tree spells it `{"kind":"axId"}` and carries no operand: the grammar is the type a
+    /// judge is given, not part of the schema.
+    AxId,
     Number,
     Boolean,
     Binary,
@@ -747,6 +761,7 @@ impl SemanticSchema {
             Self::Unknown => "unknown",
             Self::String => "string",
             Self::Key { .. } => "key",
+            Self::AxId => "axId",
             Self::Number => "number",
             Self::Boolean => "boolean",
             Self::Binary => "binary",
@@ -837,6 +852,7 @@ pub(crate) fn collect_open_paths(
         SemanticSchema::Unknown
         | SemanticSchema::String
         | SemanticSchema::Key { .. }
+        | SemanticSchema::AxId
         | SemanticSchema::Number
         | SemanticSchema::Boolean
         | SemanticSchema::Binary
@@ -875,6 +891,7 @@ fn collect_vo_metadata<'a>(schema: &'a SemanticSchema, output: &mut Vec<&'a VoMe
         SemanticSchema::Unknown
         | SemanticSchema::String
         | SemanticSchema::Key { .. }
+        | SemanticSchema::AxId
         | SemanticSchema::Number
         | SemanticSchema::Boolean
         | SemanticSchema::Binary
@@ -886,19 +903,51 @@ fn collect_vo_metadata<'a>(schema: &'a SemanticSchema, output: &mut Vec<&'a VoMe
     }
 }
 
+/// The grammar of an `axId` value, which only the host that installs it knows. This crate
+/// parses an `axId` node and never judges its string itself, as it never judges a value-object
+/// frame itself: [`VoAdmission`] is the capability for frames and `AddressGrammar` the one for
+/// addresses. The grammar is pure, a function of the value alone, so a [`Judge`] or a
+/// [`PreparedSchemas`] names it by type and holds no instance of it.
+pub trait AddressGrammar {
+    /// Why `value` is not an address, or `None` when it is one.
+    fn violation(value: &str) -> Option<&'static str>;
+}
+
+/// The grammar of a judge with none installed: it refuses every string, so an `axId` node is
+/// never admitted unchecked, as [`UnavailableVoAdmission`] refuses every value-object frame.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NoAddressGrammar;
+
+impl AddressGrammar for NoAddressGrammar {
+    fn violation(_value: &str) -> Option<&'static str> {
+        Some("no address grammar is installed")
+    }
+}
+
 /// Judges values one after another, keeping the storage of the path it
 /// walks: once that storage has held the deepest path judged, admitting a
 /// value allocates nothing. Unknown members below an open object are not
 /// traversed: the extractor owns bounded carrier capture, a judge only the
-/// admission judgment. A refusal spells its diagnostic, fallibly.
-#[derive(Default)]
-pub struct Judge {
+/// admission judgment. A refusal spells its diagnostic, fallibly. An `axId`
+/// node is judged by `G`, [`NoAddressGrammar`] unless the host names its own.
+pub struct Judge<G: AddressGrammar = NoAddressGrammar> {
     path: JudgedPath,
+    grammar: PhantomData<G>,
 }
 
-impl Judge {
+impl<G: AddressGrammar> Default for Judge<G> {
+    fn default() -> Self {
+        Self {
+            path: JudgedPath::default(),
+            grammar: PhantomData,
+        }
+    }
+}
+
+impl<G: AddressGrammar> Judge<G> {
     /// Judge `value` against `schema` with no value-object capability: any
-    /// `vo` node is refused as [`VoAdmissionError::Unavailable`].
+    /// `vo` node is refused as [`VoAdmissionError::Unavailable`]. An `axId`
+    /// node is judged by `G`.
     pub fn validate<V: ValueView>(
         &mut self,
         schema: &SemanticSchema,
@@ -917,22 +966,25 @@ impl Judge {
     ) -> Result<(), ValueRefusal> {
         let path = &mut self.path;
         path.at("value").map_err(|_| ValueRefusal::OutOfMemory)?;
-        validate_at(schema, value, path, 0, &mut JudgeOnly(admission)).map_err(|stop| match stop {
-            Stop::Fault(fault) => fault
-                .spell(path.as_str())
-                .map_or(ValueRefusal::OutOfMemory, ValueRefusal::Violation),
-            Stop::OutOfMemory => ValueRefusal::OutOfMemory,
+        validate_at::<G>(schema, value, path, 0, &mut JudgeOnly(admission)).map_err(|stop| {
+            match stop {
+                Stop::Fault(fault) => fault
+                    .spell(path.as_str())
+                    .map_or(ValueRefusal::OutOfMemory, ValueRefusal::Violation),
+                Stop::OutOfMemory => ValueRefusal::OutOfMemory,
+            }
         })
     }
 }
 
-/// Judge one value with a fresh [`Judge`]; a caller judging many values
-/// keeps one judge instead.
+/// Judge one value with a fresh [`Judge`] that has no address grammar, so an
+/// `axId` node refuses every string. A caller judging many values, or with a
+/// grammar to install, keeps its own judge instead.
 pub fn validate_value<V: ValueView>(
     schema: &SemanticSchema,
     value: &V,
 ) -> Result<(), ValueRefusal> {
-    Judge::default().validate(schema, value)
+    Judge::<NoAddressGrammar>::default().validate(schema, value)
 }
 
 /// [`validate_value`] with a value-object capability already prepared for
@@ -942,7 +994,7 @@ pub fn validate_value_with_admission<V: ValueView, A: VoAdmission>(
     value: &V,
     admission: &A,
 ) -> Result<(), ValueRefusal> {
-    Judge::default().validate_with_admission(schema, value, admission)
+    Judge::<NoAddressGrammar>::default().validate_with_admission(schema, value, admission)
 }
 
 /// Where the judgment sends each value-object frame it reaches. A judgment
@@ -1080,6 +1132,7 @@ impl SemanticSchema {
             Self::Key { max_encoded_length } => Self::Key {
                 max_encoded_length: *max_encoded_length,
             },
+            Self::AxId => Self::AxId,
             Self::Number => Self::Number,
             Self::Boolean => Self::Boolean,
             Self::Binary => Self::Binary,
@@ -1238,10 +1291,15 @@ pub fn parse_schema_envelope(bytes: &[u8]) -> Result<SemanticSchemaSet, SchemaPa
 /// post-admission rows, which are never judged here.
 /// A key spelled twice in one judged object is refused for the same reason:
 /// the judgment reads one spelling and the extractor stores another.
-pub struct PreparedSchemas<A> {
+///
+/// `G` is the [`AddressGrammar`] every `axId` node of its schemas is judged by,
+/// named by type because the grammar is pure; [`NoAddressGrammar`] unless the
+/// host names its own.
+pub struct PreparedSchemas<A, G: AddressGrammar = NoAddressGrammar> {
     schemas: SemanticSchemaSet,
     admission: A,
     presence: VoPresence,
+    grammar: PhantomData<G>,
 }
 
 /// Why a semantic envelope could not be prepared.
@@ -1270,6 +1328,7 @@ fn count_vo_metadata(schema: &SemanticSchema) -> usize {
         SemanticSchema::Unknown
         | SemanticSchema::String
         | SemanticSchema::Key { .. }
+        | SemanticSchema::AxId
         | SemanticSchema::Number
         | SemanticSchema::Boolean
         | SemanticSchema::Binary
@@ -1281,7 +1340,7 @@ fn count_vo_metadata(schema: &SemanticSchema) -> usize {
     }
 }
 
-impl<A: VoAdmission> PreparedSchemas<A> {
+impl<A: VoAdmission, G: AddressGrammar> PreparedSchemas<A, G> {
     /// Prepare `admission` once for every distinct `vo` metadata declared
     /// anywhere in `schemas`. The first refusal stops preparation and names
     /// its root; a set with no `vo` node never consults the capability.
@@ -1315,6 +1374,7 @@ impl<A: VoAdmission> PreparedSchemas<A> {
             schemas,
             admission,
             presence,
+            grammar: PhantomData,
         })
     }
 
@@ -1436,7 +1496,7 @@ impl<A: VoAdmission> PreparedSchemas<A> {
                 .map_err(|stop| stopped(event_index, event_type, stop, &path))?;
             path.at("value")?;
             let value = event.object_field("value").unwrap_or(&AbsentValue);
-            validate_at(schema, value, &mut path, 0, frames)
+            validate_at::<G>(schema, value, &mut path, 0, frames)
                 .map_err(|stop| stopped(event_index, event_type, stop, &path))?;
         }
         Ok(())
@@ -1483,7 +1543,7 @@ impl ValueView for AbsentValue {
 
 /// Judge `value` at `path` against `schema`. An admitted value leaves `path`
 /// as it found it; a refused one leaves it naming the refused value.
-fn validate_at<'s>(
+fn validate_at<'s, G: AddressGrammar>(
     schema: &'s SemanticSchema,
     value: &dyn ValueView,
     path: &mut JudgedPath,
@@ -1497,6 +1557,7 @@ fn validate_at<'s>(
         SemanticSchema::Unknown => Ok(()),
         SemanticSchema::String => require_kind(value, ValueKind::String),
         SemanticSchema::Key { max_encoded_length } => validate_key(*max_encoded_length, value),
+        SemanticSchema::AxId => validate_ax_id::<G>(value),
         SemanticSchema::Boolean => require_kind(value, ValueKind::Boolean),
         SemanticSchema::Binary => require_kind(value, ValueKind::Binary),
         SemanticSchema::BigInt => validate_bigint(value),
@@ -1529,7 +1590,7 @@ fn validate_at<'s>(
                     return;
                 }
                 let judged = path.index(index).map_err(Stop::from).and_then(|mark| {
-                    validate_at(item, item_value, path, depth + 1, frames)?;
+                    validate_at::<G>(item, item_value, path, depth + 1, frames)?;
                     path.cut(mark);
                     Ok(())
                 });
@@ -1567,7 +1628,7 @@ fn validate_at<'s>(
                 if key_count(value, name) > 1 {
                     return Err(Fault::repeated_key().into());
                 }
-                validate_at(field_schema, field_value, path, depth + 1, frames)?;
+                validate_at::<G>(field_schema, field_value, path, depth + 1, frames)?;
                 path.cut(mark);
             }
             if !open {
@@ -1598,7 +1659,7 @@ fn validate_at<'s>(
             let mut vo = None;
             for variant in variants {
                 let mark = frames.mark();
-                match validate_at(variant, value, path, depth + 1, frames) {
+                match validate_at::<G>(variant, value, path, depth + 1, frames) {
                     Ok(()) => matches += 1,
                     Err(Stop::Fault(fault)) => {
                         frames.rollback(mark);
@@ -1628,12 +1689,13 @@ fn validate_at<'s>(
                     return;
                 }
                 let key_value = StringValue(name);
-                let judged = validate_at(key, &key_value, path, depth + 1, frames).and_then(|()| {
-                    let mark = path.field(name)?;
-                    validate_at(item, item_value, path, depth + 1, frames)?;
-                    path.cut(mark);
-                    Ok(())
-                });
+                let judged =
+                    validate_at::<G>(key, &key_value, path, depth + 1, frames).and_then(|()| {
+                        let mark = path.field(name)?;
+                        validate_at::<G>(item, item_value, path, depth + 1, frames)?;
+                        path.cut(mark);
+                        Ok(())
+                    });
                 stop = judged.err();
             });
             stop.map_or(Ok(()), Err)
@@ -1648,7 +1710,7 @@ fn validate_at<'s>(
                     return;
                 }
                 let judged = path.field(name).map_err(Stop::from).and_then(|mark| {
-                    validate_at(item, item_value, path, depth + 1, frames)?;
+                    validate_at::<G>(item, item_value, path, depth + 1, frames)?;
                     path.cut(mark);
                     Ok(())
                 });
@@ -1656,12 +1718,12 @@ fn validate_at<'s>(
             });
             stop.map_or(Ok(()), Err)
         }
-        SemanticSchema::Optional(item) => validate_at(item, value, path, depth + 1, frames),
+        SemanticSchema::Optional(item) => validate_at::<G>(item, value, path, depth + 1, frames),
         SemanticSchema::Nullable(item) => {
             if value.kind() == ValueKind::Null {
                 Ok(())
             } else {
-                validate_at(item, value, path, depth + 1, frames)
+                validate_at::<G>(item, value, path, depth + 1, frames)
             }
         }
     }
@@ -1752,6 +1814,20 @@ fn encoded_key_len(key: &str) -> u64 {
             _ => 5,
         })
         .sum()
+}
+
+/// An `axId` value: a string the grammar `G` admits. A value that is not a string is refused as
+/// `string` refuses it; a string the grammar refuses is refused with the grammar's reason, which
+/// the violation carries in what it expected, as a refused key names its rule.
+fn validate_ax_id<'s, G: AddressGrammar>(value: &dyn ValueView) -> Result<(), Stop<'s>> {
+    let address = match (value.kind(), value.as_str()) {
+        (ValueKind::String, Some(address)) => address,
+        _ => return Err(Fault::shape(ValueKind::String.as_str(), value).into()),
+    };
+    match G::violation(address) {
+        None => Ok(()),
+        Some(reason) => Err(Fault::seen(Expected::AxId(reason), ValueKind::String).into()),
+    }
 }
 
 /// A bigint is a native bigint where the wire has one, and otherwise its
@@ -1924,6 +2000,11 @@ fn parse_schema(value: &JsonValue, depth: usize) -> Result<SemanticSchema, Schem
                 0 => Err(SchemaParseError::InvalidOperand),
                 max_encoded_length => Ok(SemanticSchema::Key { max_encoded_length }),
             }
+        }
+        "axId" => {
+            const MEMBERS: &[&str] = &["kind"];
+            exact_members(value, MEMBERS, MEMBERS)?;
+            Ok(SemanticSchema::AxId)
         }
         "number" => Ok(SemanticSchema::Number),
         "boolean" => Ok(SemanticSchema::Boolean),
@@ -2823,7 +2904,7 @@ mod tests {
         assert_eq!(admitted(1), admitted(64));
         // A judge kept across values allocates nothing once warm: its path
         // storage is reused, for admitted values and refused ones alike.
-        let mut judge = Judge::default();
+        let mut judge = Judge::<NoAddressGrammar>::default();
         let wide = json(&format!("[{}]", vec![r#"{"name":"ok"}"#; 64].join(",")));
         assert_eq!(judge.validate(&items, &wide), Ok(()));
         assert_eq!(
@@ -3556,6 +3637,208 @@ mod tests {
         }
     }
 
+    /// The one address the test grammar admits: a host's grammar, named by type.
+    struct TestGrammar;
+
+    impl AddressGrammar for TestGrammar {
+        fn violation(value: &str) -> Option<&'static str> {
+            (value != "d~g~t").then_some("not the test address")
+        }
+    }
+
+    /// The violation of an address the test grammar refuses, at `path`.
+    fn refused_address(path: &str) -> PayloadViolation {
+        PayloadViolation {
+            path: path.into(),
+            expected: "axId: not the test address".into(),
+            observed: "string".into(),
+            vo: None,
+        }
+    }
+
+    #[test]
+    fn ax_id_tree_has_no_operands() {
+        assert_eq!(schema(r#"{"kind":"axId"}"#), SemanticSchema::AxId);
+        assert_eq!(SemanticSchema::AxId.kind(), "axId");
+        for tree in [
+            r#"{"kind":"axId","maxEncodedLength":256}"#,
+            r#"{"kind":"axId","open":true}"#,
+        ] {
+            assert_eq!(
+                SemanticSchema::from_tree_bytes(tree.as_bytes()),
+                Err(SchemaParseError::InvalidOperand),
+                "{tree}"
+            );
+        }
+        // The kind is spelled exactly.
+        assert_eq!(
+            SemanticSchema::from_tree_bytes(br#"{"kind":"axid"}"#),
+            Err(SchemaParseError::UnknownKind)
+        );
+    }
+
+    #[test]
+    fn a_deep_copy_keeps_the_key_bound_and_the_ax_id_leaf() {
+        let tree = schema(
+            r#"{"kind":"object","fields":{"id":{"kind":"key","maxEncodedLength":256},"owner":{"kind":"axId"}}}"#,
+        );
+        assert_eq!(tree.try_clone().unwrap(), tree);
+    }
+
+    #[test]
+    fn no_address_grammar_refuses_every_string() {
+        assert_eq!(
+            NoAddressGrammar::violation("d~g~t"),
+            Some("no address grammar is installed")
+        );
+        let ax_id = schema(r#"{"kind":"axId"}"#);
+        for text in ["", "a", "d~g~t"] {
+            assert_eq!(
+                validate_value(&ax_id, &JsonValue::String(text.into())),
+                Err(ValueRefusal::Violation(PayloadViolation {
+                    path: "value".into(),
+                    expected: "axId: no address grammar is installed".into(),
+                    observed: "string".into(),
+                    vo: None,
+                })),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_installed_grammar_judges_an_ax_id() {
+        let ax_id = schema(r#"{"kind":"axId"}"#);
+        let mut judge = Judge::<TestGrammar>::default();
+        assert_eq!(
+            judge.validate(&ax_id, &JsonValue::String("d~g~t".into())),
+            Ok(())
+        );
+        for text in ["", "d~g", "D~G~T", "d~g~t "] {
+            assert_eq!(
+                judge.validate(&ax_id, &JsonValue::String(text.into())),
+                Err(ValueRefusal::Violation(refused_address("value"))),
+                "{text:?}"
+            );
+        }
+
+        // A value that is not a string is refused exactly as `string` refuses it, whatever
+        // the grammar.
+        let plain_string = schema(r#"{"kind":"string"}"#);
+        for other in ["42", "true", "null", "[]", "{}"] {
+            let refusal = judge.validate(&ax_id, &json(other));
+            assert!(refusal.is_err(), "{other}");
+            assert_eq!(
+                refusal,
+                validate_value(&plain_string, &json(other)),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ax_id_is_judged_where_it_sits() {
+        let mut judge = Judge::<TestGrammar>::default();
+        let owned = schema(
+            r#"{"kind":"object","fields":{"owner":{"kind":"axId"},"count":{"kind":"i32"}}}"#,
+        );
+        assert_eq!(
+            judge.validate(&owned, &json(r#"{"owner":"d~g~t","count":1}"#)),
+            Ok(())
+        );
+        assert_eq!(
+            judge.validate(&owned, &json(r#"{"owner":"other","count":1}"#)),
+            Err(ValueRefusal::Violation(refused_address("value.owner")))
+        );
+        // A required axId that is absent names the kind, as every required member does.
+        let absent = violation_of(judge.validate(&owned, &json(r#"{"count":1}"#)));
+        assert_eq!(
+            (
+                absent.path.as_str(),
+                absent.expected.as_str(),
+                absent.observed.as_str()
+            ),
+            ("value.owner", "axId", "absent")
+        );
+
+        // In a union only a string the grammar admits selects the axId variant: a string it
+        // refuses selects none, and a number selects the other variant.
+        let either = schema(r#"{"kind":"union","variants":[{"kind":"axId"},{"kind":"i32"}]}"#);
+        for admitted in [r#""d~g~t""#, "7"] {
+            assert_eq!(
+                judge.validate(&either, &json(admitted)),
+                Ok(()),
+                "{admitted}"
+            );
+        }
+        for (refused, observed) in [(r#""other""#, "string"), ("true", "boolean")] {
+            assert_eq!(
+                judge.validate(&either, &json(refused)),
+                Err(ValueRefusal::Violation(PayloadViolation {
+                    path: "value".into(),
+                    expected: "exactly one union variant".into(),
+                    observed: observed.into(),
+                    vo: None,
+                })),
+                "{refused}"
+            );
+        }
+        // With no grammar installed the same union admits only the number.
+        assert_eq!(validate_value(&either, &json("7")), Ok(()));
+        assert!(validate_value(&either, &json(r#""d~g~t""#)).is_err());
+    }
+
+    #[test]
+    fn a_prepared_batch_judges_an_ax_id_with_the_grammar_it_is_typed_with() {
+        let envelope = br#"{"owned":{"kind":"object","fields":{"owner":{"kind":"axId"}}}}"#;
+        let batch = |owner: &str| format!(r#"[{{"type":"owned","value":{{"owner":"{owner}"}}}}]"#);
+
+        let installed = PreparedSchemas::<_, TestGrammar>::prepare(
+            parse_schema_envelope(envelope).unwrap(),
+            UnavailableVoAdmission,
+        )
+        .unwrap();
+        assert_eq!(
+            installed.validate_json_batch(batch("d~g~t").as_bytes()),
+            Ok(())
+        );
+        let Err(BatchValidationError::Violation {
+            event_index,
+            event_type,
+            violation,
+        }) = installed.validate_json_batch(batch("other").as_bytes())
+        else {
+            panic!("an address the grammar refuses must refuse");
+        };
+        assert_eq!(event_index, 0);
+        assert_eq!(event_type.as_deref(), Some("owned"));
+        assert_eq!(violation.into_inner(), refused_address("value.owner"));
+
+        // With no grammar installed the batch refuses the address the grammar admits.
+        let none = PreparedSchemas::<_, NoAddressGrammar>::prepare(
+            parse_schema_envelope(envelope).unwrap(),
+            UnavailableVoAdmission,
+        )
+        .unwrap();
+        let Err(BatchValidationError::Violation { violation, .. }) =
+            none.validate_json_batch(batch("d~g~t").as_bytes())
+        else {
+            panic!("no installed grammar must refuse every address");
+        };
+        assert_eq!(
+            (
+                violation.path.as_str(),
+                violation.expected.as_str(),
+                violation.observed.as_str()
+            ),
+            (
+                "value.owner",
+                "axId: no address grammar is installed",
+                "string"
+            )
+        );
+    }
+
     fn vo_tree(root: &str, frame: &str, rows: &str) -> String {
         format!(r#"{{"kind":"vo","root":"{root}","frame":"{frame}","rows":{rows}}}"#)
     }
@@ -3797,7 +4080,7 @@ mod tests {
         );
         let schemas = parse_schema_envelope(envelope.as_bytes()).unwrap();
         assert_eq!(
-            PreparedSchemas::prepare(schemas, UnavailableVoAdmission).err(),
+            PreparedSchemas::<_, NoAddressGrammar>::prepare(schemas, UnavailableVoAdmission).err(),
             Some(PrepareRefusal::Refused(VoPreparationError {
                 root: "orders.Line".into(),
                 error: VoAdmissionError::Unavailable,
@@ -3805,7 +4088,7 @@ mod tests {
         );
         let plain = parse_schema_envelope(br#"{"plain":{"kind":"string"}}"#).unwrap();
         assert_eq!(
-            PreparedSchemas::prepare(plain, UnavailableVoAdmission)
+            PreparedSchemas::<_, NoAddressGrammar>::prepare(plain, UnavailableVoAdmission)
                 .map(|prepared| prepared.presence())
                 .ok(),
             Some(VoPresence::Absent)
@@ -3818,7 +4101,9 @@ mod tests {
             br#"{"hi":{"kind":"object","fields":{"greeting":{"kind":"string"}}}}"#,
         )
         .unwrap();
-        let prepared = PreparedSchemas::prepare(schemas, UnavailableVoAdmission).unwrap();
+        let prepared =
+            PreparedSchemas::<_, NoAddressGrammar>::prepare(schemas, UnavailableVoAdmission)
+                .unwrap();
         // {"type":"hi","value":{"greeting":42}}
         let judged = [
             0x82, 0xa4, b't', b'y', b'p', b'e', 0xa2, b'h', b'i', 0xa5, b'v', b'a', b'l', b'u',
@@ -3905,8 +4190,11 @@ mod tests {
             |()| {
                 let schemas =
                     parse_schema_envelope(envelope.as_bytes()).map_err(Refusal::Schema)?;
-                let prepared = PreparedSchemas::prepare(schemas, Projecting([0x0a, 0x1b]))
-                    .map_err(Refusal::Prepare)?;
+                let prepared = PreparedSchemas::<_, NoAddressGrammar>::prepare(
+                    schemas,
+                    Projecting([0x0a, 0x1b]),
+                )
+                .map_err(Refusal::Prepare)?;
                 crate::build_extraction_config_with_semantic_schemas(
                     &[],
                     &[],
@@ -4201,7 +4489,9 @@ mod tests {
             br#"{"hi":{"kind":"object","fields":{"greeting":{"kind":"optional","value":{"kind":"string"}}}}}"#,
         )
         .unwrap();
-        let prepared = PreparedSchemas::prepare(schemas, UnavailableVoAdmission).unwrap();
+        let prepared =
+            PreparedSchemas::<_, NoAddressGrammar>::prepare(schemas, UnavailableVoAdmission)
+                .unwrap();
         assert_eq!(
             prepared.validate_json_batch(br#"[{"type":"hi","value":{"greeting":"ok"}}]"#),
             Ok(())
@@ -4228,7 +4518,9 @@ mod tests {
             br#"{"hi":{"kind":"object","fields":{"greeting":{"kind":"string"}}}}"#,
         )
         .unwrap();
-        let prepared = PreparedSchemas::prepare(schemas, UnavailableVoAdmission).unwrap();
+        let prepared =
+            PreparedSchemas::<_, NoAddressGrammar>::prepare(schemas, UnavailableVoAdmission)
+                .unwrap();
         let Err(BatchValidationError::Violation {
             event_index,
             violation,
