@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,14 +20,27 @@ interface Finished {
   readonly signal: NodeJS.Signals | null;
 }
 
-/** The executor in a process of its own, as Nx runs it: how it ended, and a wait for text it prints. */
-function startExecutor(root: string, commands: readonly string[], cwd = '.') {
+/**
+ * The executor in a process of its own, as Nx runs it: how it ended, and a wait for text it prints. Its Nx state is
+ * the fixture's, never the runner's: a file index the executor reads must not rewrite the archive of a workspace the
+ * runner is part of.
+ */
+function startExecutor(
+  root: string,
+  commands: readonly string[],
+  cwd = '.',
+  options: { readonly eslintProjectRoot?: string } = {},
+) {
   const script = [
     `const { default: run } = await import(${JSON.stringify(executorModule)});`,
-    `const { success } = await run(${JSON.stringify({ commands, cwd })}, { root: ${JSON.stringify(root)} });`,
+    `const { success } = await run(${JSON.stringify({ commands, cwd, ...options })}, { root: ${JSON.stringify(root)} });`,
     'process.exitCode = success ? 0 : 1;',
   ].join('\n');
-  const child = spawn(process.execPath, ['--eval', script], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, ['--eval', script], {
+    cwd: root,
+    env: { ...process.env, NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data') },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   let stdout = '';
   let stderr = '';
   const waits: { readonly text: string; readonly printed: () => void }[] = [];
@@ -58,6 +71,11 @@ async function withRoot(body: (root: string) => Promise<void>): Promise<void> {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+async function put(root: string, path: string, text = 'export const value = 1;\n'): Promise<void> {
+  await mkdir(dirname(join(root, path)), { recursive: true });
+  await writeFile(join(root, path), text);
 }
 
 describe('all-verdicts executor', () => {
@@ -129,6 +147,49 @@ describe('all-verdicts executor', () => {
           },
         ]),
       );
+    }));
+
+  it('hands a command the ESLint sources that exist when it runs, whatever the graph that named it knew', () =>
+    withRoot(async (root) => {
+      const project = 'packages/example';
+      const listing = "printf '%s\\n' {eslintSources}";
+      await put(root, `${project}/src/a.ts`);
+      await put(root, `${project}/src/b.ts`);
+      const before = await startExecutor(root, [listing], '.', { eslintProjectRoot: project }).finished;
+      expect(before.stdout, before.stderr).toContain(
+        `\n> printf '%s\\n' ${project}/src/a.ts ${project}/src/b.ts\n\n${project}/src/a.ts\n${project}/src/b.ts\n`,
+      );
+
+      // What the graph that named the files a moment ago never learns: one is deleted, one is added.
+      await rm(join(root, project, 'src/b.ts'));
+      await put(root, `${project}/src/c.ts`);
+      const after = await startExecutor(root, [listing], '.', { eslintProjectRoot: project }).finished;
+      expect(after.stdout, after.stderr).toContain(
+        `\n> printf '%s\\n' ${project}/src/a.ts ${project}/src/c.ts\n\n${project}/src/a.ts\n${project}/src/c.ts\n`,
+      );
+      expect(after.stdout).not.toContain('b.ts');
+      expect(after.code).toBe(0);
+    }));
+
+  it('passes a project with no ESLint sources without starting the command', () =>
+    withRoot(async (root) => {
+      const command = '{eslintSources}; exit 7';
+      await put(root, 'packages/example/package.json', '{"name":"example"}\n');
+      const { stdout, stderr, code } = await startExecutor(root, [command], '.', {
+        eslintProjectRoot: 'packages/example',
+      }).finished;
+      expect(stdout, stderr).toContain(`\n> ${command}\n\nno ESLint sources under packages/example: nothing to lint\n`);
+      expect(stdout, stderr).toEndWith(verdictReport([{ command, verdict: { kind: 'pass' } }]));
+      expect(code).toBe(0);
+    }));
+
+  it('refuses a command that names the ESLint sources when the target names no project to resolve them for', () =>
+    withRoot(async (root) => {
+      const { stdout, stderr, code } = await startExecutor(root, ['eslint {eslintSources}']).finished;
+      expect(stderr).toContain('all-verdicts: cannot resolve the commands to run: a command names {eslintSources}');
+      expect(stderr).toContain('names no eslintProjectRoot');
+      expect(stdout).toBe('');
+      expect(code).toBe(1);
     }));
 
   it('refuses an empty command list, which could never fail', async () => {

@@ -2,7 +2,7 @@ import { type ChildProcessByStdio, spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 
-import type { AllVerdictsOptions } from './schema.js';
+import { type AllVerdictsOptions, ESLINT_SOURCES_TOKEN } from './schema.js';
 
 /**
  * A command's verdict. Only a command that exited reached one. A command a signal ended, one that never started and
@@ -113,12 +113,44 @@ function judge(run: Run, cwd: string): Promise<Verdict> {
   });
 }
 
+/** A command as it will run: the text the shell gets, or why it needs no run. */
+interface Planned {
+  readonly command: string;
+  readonly noRun?: string;
+}
+
+/**
+ * The commands as they run now. A command that names {@link ESLINT_SOURCES_TOKEN} gets the files ESLint is handed for
+ * `eslintProjectRoot` as the filesystem holds them at this moment, read through a fresh workspace file index: a graph the
+ * daemon serves past a deletion or an addition its watcher never reported still lints the files that exist. A project
+ * with none has nothing to lint, and no ESLint process starts for it.
+ */
+async function planCommands(options: AllVerdictsOptions, root: string): Promise<readonly Planned[]> {
+  if (!options.commands.some((command) => command.includes(ESLINT_SOURCES_TOKEN))) {
+    return options.commands.map((command) => ({ command }));
+  }
+  const projectRoot = options.eslintProjectRoot;
+  if (projectRoot === undefined) {
+    throw new Error(
+      `a command names ${ESLINT_SOURCES_TOKEN}, and the target names no eslintProjectRoot to resolve it for`,
+    );
+  }
+  const { expandEslintSources, freshEslintSources } = await import('../../eslint-sources.js');
+  const { files } = freshEslintSources(root, projectRoot);
+  return options.commands.map((command): Planned => {
+    if (!command.includes(ESLINT_SOURCES_TOKEN)) return { command };
+    if (files.length === 0) return { command, noRun: `no ESLint sources under ${projectRoot}: nothing to lint` };
+    return { command: expandEslintSources(command, files) };
+  });
+}
+
 /**
  * Starts every command at once and lets each reach its own verdict. Nx's run-commands cannot: in parallel it terminates
  * the other commands once one fails, and serially it never starts the ones after a failure, so one tool's errors hide
  * another's until a later run. Here no command ends another. Each command's output prints as one block when it closes,
  * then every command's verdict. A signal to the run ends every command's process group, reports each command still
  * running UNJUDGED, and ends the run by the same signal. The run succeeds only when every command passed.
+ * A command that names the ESLint sources placeholder is resolved first, and the verdicts name it as it ran.
  */
 export default async function allVerdictsExecutor(
   options: AllVerdictsOptions,
@@ -129,7 +161,23 @@ export default async function allVerdictsExecutor(
     return { success: false };
   }
   const cwd = resolve(context.root, options.cwd);
-  const runs: Run[] = options.commands.map((command) => ({ command, output: [], pid: undefined, verdict: null }));
+  let planned: readonly Planned[];
+  try {
+    planned = await planCommands(options, context.root);
+  } catch (error) {
+    process.stderr.write(
+      `all-verdicts: cannot resolve the commands to run: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return { success: false };
+  }
+  const runs = planned.map(
+    ({ command, noRun }): Run => ({
+      command,
+      output: noRun === undefined ? [] : [`${noRun}\n`],
+      pid: undefined,
+      verdict: noRun === undefined ? null : { kind: 'pass' },
+    }),
+  );
   const onExit = (): void => {
     for (const run of runs) {
       if (run.verdict === null && run.pid !== undefined) signalCommand(run.pid, 'SIGTERM');
@@ -154,9 +202,16 @@ export default async function allVerdictsExecutor(
   };
   process.on('exit', onExit);
   for (const [signal, listener] of listeners) process.on(signal, listener);
+  // A command that needs no run is already judged: its block prints now, the others' as they close.
+  for (const run of runs) if (run.verdict !== null) process.stdout.write(block(run));
 
   const verdicts = await Promise.all(
-    runs.map(async (run): Promise<CommandVerdict> => ({ command: run.command, verdict: await judge(run, cwd) })),
+    runs.map(
+      async (run): Promise<CommandVerdict> => ({
+        command: run.command,
+        verdict: run.verdict ?? (await judge(run, cwd)),
+      }),
+    ),
   );
   detach();
   process.stdout.write(verdictReport(verdicts));

@@ -23,7 +23,6 @@ import {
 } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
-import { type ParsedCommandLine, parseJsonConfigFileContent, readConfigFile, sys as typescriptSys } from 'typescript';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { refuseOverlappingOutputs } from './build-state-output-policy.js';
 import { bunLockDependencies, bunLockInput, bunLockNode } from './bun-lock-scope.js';
@@ -78,7 +77,12 @@ import {
 } from './cross-check-policy.js';
 import { eslintConfigClosure } from './eslint-config-closure.js';
 import type { EslintFileSet } from './eslint-file-set.js';
-import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
+import { ESLINT_SOURCES_GLOB, eslintSources } from './eslint-sources.js';
+import {
+  ALL_VERDICTS_EXECUTOR,
+  type AllVerdictsOptions,
+  ESLINT_SOURCES_TOKEN,
+} from './executors/all-verdicts/schema.js';
 import { closeRunCpuPool, serveRunCpuPool } from './executors/bounded-exec/run-cpu-pool.js';
 import { ffiPathProblem } from './executors/scriptc-native/ffi-paths.js';
 import type { ScriptcNativeFfi } from './executors/scriptc-native/schema.js';
@@ -90,7 +94,6 @@ import {
   preTasksExecution as preProducerReceipts,
 } from './producer-receipts.js';
 import { runtimeInput, shellWord } from './runtime-input.js';
-import { isNonSourceDirectory } from './source-directories.js';
 import { inferredTaskKind, refuseBuildTestDependencies } from './task-graph-policy.js';
 import { postTasksExecution as postTaskResults, preTasksExecution as preTaskResults } from './task-results.js';
 import { SHARD_TIMINGS_EXECUTOR, SHARD_TIMINGS_TARGET, timingsShardedSuite } from './test-timings.js';
@@ -371,9 +374,6 @@ const ESLINT_CONFIG_FILES = [
   'eslint.config.cts',
 ];
 
-/** Every JavaScript and TypeScript module kind ESLint is handed. */
-const ESLINT_SOURCES_GLOB = '**/*.{js,jsx,cjs,mjs,ts,tsx,cts,mts}';
-
 /** What ESLint lints in this workspace and what its configuration loads. */
 interface EslintWorkspace {
   /** The JavaScript and TypeScript files of Nx's workspace file index. */
@@ -386,14 +386,15 @@ interface EslintWorkspace {
  * The ESLint sources and config closure of Nx's workspace file index, listed
  * once per graph computation; `null` when no workspace ESLint config enables ESLint.
  *
- * The ESLint file list is part of the lint target's command, metadata and
- * inputs, and Nx hashes the whole target configuration into every task that
- * reaches the project. A walk of the tree also listed gitignored generated
- * modules a build had left on disk, so every such task's key depended on
- * whether a build had run in that checkout: one workspace's graph listed them
- * and a fresh fork's did not, which alone re-keyed 197 of 510 gate tasks.
- * Drawing the list from the index makes the plugin and the hasher agree on one
- * file set.
+ * The lists the graph records for a project (its lint target's metadata, and
+ * the inputs that name its program files) are drawn from the index, not from a
+ * walk of the tree. A walk also listed gitignored generated modules a build had
+ * left on disk, so every such task's key depended on whether a build had run in
+ * that checkout: one workspace's graph listed them and a fresh fork's did not,
+ * which alone re-keyed 197 of 510 gate tasks. Drawing them from the index makes
+ * the plugin and the hasher agree on one file set. What the lint command runs
+ * on is in no graph: the executor reads it when the command runs
+ * (eslint-sources.ts).
  *
  * The configs key every lint target with exactly the workspace files they
  * load (eslint-config-closure.ts): a glob over the directory holding a
@@ -410,18 +411,6 @@ async function eslintWorkspace(workspaceRoot: string): Promise<EslintWorkspace |
   };
 }
 
-/**
- * Read a tsconfig with this plugin's own TypeScript. `@nx/js`'s readTsConfig does an
- * undeclared `require('typescript')` resolved from its own location: where that lands on the
- * TypeScript 7 native package (whose entry exports only its version), `sys` is undefined and
- * graph construction dies reading `sys.readFile`. The plugin declares TypeScript 6, whose
- * `sys` this uses, so the resolution is the one this package's manifest promises.
- */
-function readTestTsConfig(testConfig: string): ParsedCommandLine {
-  const readResult = readConfigFile(testConfig, typescriptSys.readFile);
-  return parseJsonConfigFileContent(readResult.config, typescriptSys, dirname(testConfig));
-}
-
 function projectLintCommands(
   projectRoot: string,
   workspaceRoot: string,
@@ -430,54 +419,22 @@ function projectLintCommands(
   const commands: string[] = [];
   const inputs: string[] = [];
   let eslintFileSet: EslintFileSet | null = null;
-  const absoluteProjectRoot = join(workspaceRoot, projectRoot);
   const quote = (path: string) => `'${path.replaceAll("'", "'\"'\"'")}'`;
   if (BIOME_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) {
     commands.push(`biome check --files-ignore-unknown=true ${quote(projectRoot)}`);
   }
   if (eslint !== null) {
-    const sourcePrefix = projectRoot === '.' ? 'src/' : `${posix.normalize(projectRoot)}/src/`;
-    const sourceFiles = new Set<string>();
-    for (const path of eslint.sources) {
-      if (
-        path.startsWith(sourcePrefix) &&
-        !path.slice(sourcePrefix.length).split('/').slice(0, -1).some(isNonSourceDirectory)
-      ) {
-        sourceFiles.add(path);
-      }
-    }
-    const testConfig = join(absoluteProjectRoot, 'tsconfig.test.json');
-    if (existsSync(testConfig)) {
-      // A test program can live anywhere the declaration selects, not just src.
-      // Use the compiler's file set and the existing declaration-chain hasher,
-      // so inherited includes and files outside this project keep their keys.
-      const program: ParsedCommandLine = readTestTsConfig(testConfig);
-      const errors = program.errors.filter(({ code }) => code !== 18003);
-      if (errors.length > 0) {
-        throw new Error(
-          `${testConfig}: ${errors.map(({ code, messageText }) => `TS${code}: ${JSON.stringify(messageText)}`).join('; ')}`,
-        );
-      }
-      inputs.push('{projectRoot}/tsconfig.test.json');
-      for (const file of program.fileNames) {
-        const path = relative(workspaceRoot, file).split(sep).join('/');
-        if (path === '..' || path.startsWith('../') || isAbsolute(path)) {
-          throw new Error(`${testConfig}: test source ${file} is outside the workspace and cannot be hashed`);
-        }
-        // Only a module Nx indexes is linted and keyed. An ignored one is build
-        // output that a fresh checkout lacks; a JSON file is not ESLint's.
-        if (!eslint.sources.has(path) || path.split('/').some(isNonSourceDirectory)) continue;
-        sourceFiles.add(path);
-        inputs.push(`{workspaceRoot}/${path}`);
-      }
-    }
-    if (sourceFiles.size > 0) {
-      const files = [...sourceFiles].sort();
-      eslintFileSet = { command: `eslint ${files.map(quote).join(' ')}`, files };
+    const sources = eslintSources(workspaceRoot, projectRoot, eslint.sources);
+    inputs.push(...sources.inputs);
+    // The command names no file: a graph the daemon serves past a deletion or an addition would hand ESLint a pattern
+    // no file matches, or leave a new file unlinted. The all-verdicts executor resolves the token when it runs, and the
+    // list beside the command is the file set this graph resolved, for the inspectors that read it.
+    if (sources.files.length > 0) {
+      eslintFileSet = { command: `eslint ${ESLINT_SOURCES_TOKEN}`, files: sources.files };
       commands.push(eslintFileSet.command);
     }
   }
-  return { commands, inputs: [...new Set(inputs)], eslintFileSet };
+  return { commands, inputs, eslintFileSet };
 }
 
 type NapiArchitecture = 'arm64' | 'x64';
@@ -2354,7 +2311,11 @@ async function createProjectTargets(
       ],
       ...(lintCommands.length > 0
         ? {
-            options: { commands: lintCommands, cwd: '.' },
+            options: {
+              commands: lintCommands,
+              cwd: '.',
+              ...(eslintFileSet === null ? {} : { eslintProjectRoot: projectRoot }),
+            } satisfies AllVerdictsOptions,
           }
         : {}),
     };

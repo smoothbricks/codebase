@@ -69,8 +69,8 @@ for (const isolate of ['false', 'true']) {
         encoding: 'utf8',
       });
       expect(ran.status, `${ran.stdout}${ran.stderr}`).toBe(0);
-      // Lint keys the test program's sources, which only reading tsconfig.test.json yields.
-      expect(ran.stdout).toContain('{workspaceRoot}/packages/example/src/a.test.ts');
+      // Lint keys the directories the test program walks, which only reading tsconfig.test.json yields.
+      expect(ran.stdout).toContain('{workspaceRoot}/packages/example/src/**/*.{js,jsx,cjs,mjs,ts,tsx,cts,mts}');
     });
   });
 }

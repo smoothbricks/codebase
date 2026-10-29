@@ -43,7 +43,7 @@
     "all-verdicts": {
       "implementation": "./dist/executors/all-verdicts/executor.js",
       "schema": "./src/executors/all-verdicts/schema.json",
-      "description": "Run every command at once to its own verdict and report each one a signal ended or that never ran as UNJUDGED"
+      "description": "Run every command at once to its own verdict and report each one a signal ended or that never ran as UNJUDGED; resolve an ESLint sources placeholder against the files that exist when the command runs"
     }
   }
 }

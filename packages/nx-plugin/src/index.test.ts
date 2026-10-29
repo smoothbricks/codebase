@@ -1457,12 +1457,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(rustLint.dependsOn).toEqual(['cargo-lint']);
       expect(rustLint.options?.commands).toEqual([biome]);
 
-      // A JavaScript source joins ESLint's file list the moment it appears, with no tsconfig to announce it.
+      // A JavaScript source gives a project its ESLint command the moment the graph sees it, with no tsconfig to
+      // announce it.
       await workspace.write(`${root}/src/check.js`, 'debugger;\n');
-      const withJavaScript = resolveLint(await inferProjectTargets(workspace, `${root}/package.json`));
+      const javaScript = await inferProjectTargets(workspace, `${root}/package.json`);
+      const withJavaScript = resolveLint(javaScript);
       expect(withJavaScript.executor).toBe(ALL_VERDICTS_EXECUTOR);
       expect(withJavaScript.dependsOn).toEqual(['cargo-lint']);
-      expect(withJavaScript.options?.commands).toEqual([biome, `eslint '${root}/src/check.js'`]);
+      expect(withJavaScript.options?.commands).toEqual([biome, 'eslint {eslintSources}']);
+      expect(withJavaScript.options?.eslintProjectRoot).toBe(root);
+      expect(javaScript.lint?.metadata?.eslintFileSet.files).toEqual([`${root}/src/check.js`]);
 
       const custom = { executor: 'nx:run-commands', options: { command: 'custom-linter package.json' } };
       await workspace.write(
@@ -1476,10 +1480,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write(`${root}/tsconfig.lib.json`, '{"compilerOptions":{"outDir":"dist"}}\n');
       await workspace.write(`${root}/src/index.ts`, 'export const value = 1;\n');
       const mixed = await inferProjectTargets(workspace, `${root}/package.json`);
-      expect(resolveLint(mixed).options?.commands).toEqual([
-        biome,
-        `eslint '${root}/src/check.js' '${root}/src/index.ts'`,
-      ]);
+      expect(resolveLint(mixed).options?.commands).toEqual([biome, 'eslint {eslintSources}']);
+      expect(mixed.lint?.metadata?.eslintFileSet.files).toEqual([`${root}/src/check.js`, `${root}/src/index.ts`]);
       expectNoSchedulerThrottle(mixed);
     } finally {
       await workspace.cleanup();
@@ -1508,9 +1510,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('packages/contract/schema.d.ts', 'export interface Contract { value: number }\n');
 
       const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
-      expect(lint?.options?.commands).toEqual([
-        "eslint 'packages/contract/schema.d.ts' 'packages/example/src/index.ts' 'packages/example/tests/check.test.ts' 'packages/example/tests/helper.ts'",
-      ]);
+      expect(lint?.options?.commands).toEqual(['eslint {eslintSources}']);
+      expect(lint?.options?.eslintProjectRoot).toBe('packages/example');
       expect(lint?.metadata?.eslintFileSet).toEqual({
         command: lint?.options?.commands?.[0],
         files: [
@@ -1522,23 +1523,24 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(isEslintFileSet(lint?.metadata?.eslintFileSet)).toBe(true);
       expect(isEslintFileSet({ command: 'eslint invalid', files: [null] })).toBe(false);
+      // The directory its include pattern walks is keyed as a glob, so a program file added later is keyed with no
+      // graph naming it; the file its declaration names is keyed by name. Nothing the declaration does not select is.
       expect(lint?.inputs).toEqual(
         expect.arrayContaining([
           '{projectRoot}/tsconfig.test.json',
           '{workspaceRoot}/packages/test-base.json',
           '{workspaceRoot}/packages/contract/schema.d.ts',
-          '{workspaceRoot}/packages/example/tests/check.test.ts',
-          '{workspaceRoot}/packages/example/tests/helper.ts',
+          '{workspaceRoot}/packages/example/tests/**/*.{js,jsx,cjs,mjs,ts,tsx,cts,mts}',
         ]),
       );
-      expect(lint?.inputs).not.toContain('{workspaceRoot}/packages/example/tests/excluded.ts');
-      expect(lint?.inputs).not.toContain('{workspaceRoot}/packages/example/other/stray.test.ts');
+      expect(hashes(lint, 'packages/example/tests/added.test.ts')).toBe(true);
+      expect(hashes(lint, 'packages/example/other/stray.test.ts')).toBe(false);
     } finally {
       await workspace.cleanup();
     }
   });
 
-  it('lints and keys only the sources Nx indexes, never ignored files a build left on disk', async () => {
+  it('records and keys only the sources Nx indexes, never ignored files a build left on disk', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('eslint.config.mjs', 'export default [{ files: ["**/*.ts"] }];\n');
@@ -1558,20 +1560,48 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
       const files = ['packages/example/src/index.ts', 'packages/example/tests/check.test.ts'];
-      expect(lint?.metadata?.eslintFileSet).toEqual({
-        command: `eslint ${files.map((file) => `'${file}'`).join(' ')}`,
-        files,
-      });
+      expect(lint?.metadata?.eslintFileSet).toEqual({ command: 'eslint {eslintSources}', files });
       expect(lint?.options?.commands).toEqual([lint?.metadata?.eslintFileSet.command]);
+      // The tests directory is keyed as a glob; the index, which holds no ignored file, decides what it hashes.
       const programInputs = (lint?.inputs ?? []).filter(
         (input): input is string => typeof input === 'string' && input.startsWith('{workspaceRoot}/packages/example/'),
       );
-      expect(programInputs).toEqual(['{workspaceRoot}/packages/example/tests/check.test.ts']);
+      expect(programInputs).toEqual(['{workspaceRoot}/packages/example/tests/**/*.{js,jsx,cjs,mjs,ts,tsx,cts,mts}']);
     } finally {
       await workspace.cleanup();
     }
   });
 
+  it('names no source in the lint command, so a file deleted or added after the graph is computed leaves it correct', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('eslint.config.mjs', 'export default [{ files: ["**/*.ts"] }];\n');
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/src/index.ts', 'export const value = 1;\n');
+      await workspace.write('packages/example/src/probe.test.ts', 'export const probe = 1;\n');
+      const computed = await inferProjectTargets(workspace, 'packages/example/package.json');
+
+      // A graph the daemon goes on serving after a deletion and an addition its watcher never reported: what its
+      // lint target holds must still be what a graph computed now holds.
+      await rm(join(workspace.context.workspaceRoot, 'packages/example/src/probe.test.ts'));
+      await workspace.write('packages/example/src/added.ts', 'export const added = 1;\n');
+      const current = await inferProjectTargets(workspace, 'packages/example/package.json');
+
+      expect(JSON.stringify(computed.lint?.options)).not.toContain('probe.test.ts');
+      expect(current.lint?.options).toEqual(computed.lint?.options);
+      // The metadata inspectors read is the file set of the graph that wrote it, and it is not part of the command.
+      expect(computed.lint?.metadata?.eslintFileSet.files).toEqual([
+        'packages/example/src/index.ts',
+        'packages/example/src/probe.test.ts',
+      ]);
+      expect(current.lint?.metadata?.eslintFileSet.files).toEqual([
+        'packages/example/src/added.ts',
+        'packages/example/src/index.ts',
+      ]);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   it('keys exactly the workspace files jiti loads for a TypeScript ESLint config', async () => {
     const workspace = await createWorkspace();
     try {

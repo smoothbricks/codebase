@@ -1,3 +1,5 @@
+import native from 'nx/src/native/index.js';
+import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import { globWithWorkspaceContext, globWithWorkspaceContextSync } from 'nx/src/utils/workspace-context.js';
 import { workspaceRoot as daemonWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
 
@@ -15,4 +17,14 @@ export async function globIndexedFiles(workspaceRoot: string, globs: string[]): 
   return workspaceRoot === daemonWorkspaceRoot
     ? globWithWorkspaceContext(workspaceRoot, globs)
     : globWithWorkspaceContextSync(workspaceRoot, globs);
+}
+
+/**
+ * Like {@link globIndexedFiles}, read from the filesystem now: a new native context, the same walk and the same ignore
+ * rules, never the table of this process or of the daemon. A table only learns of a write when a watcher event reaches
+ * it, so one the watcher missed leaves a deleted file listed and an added one unlisted until that process ends. What
+ * runs on the files as they are asks here; what describes a graph asks {@link globIndexedFiles}.
+ */
+export function freshIndexedFiles(workspaceRoot: string, globs: string[]): string[] {
+  return new native.WorkspaceContext(workspaceRoot, workspaceDataDirectoryForWorkspace(workspaceRoot)).glob(globs);
 }

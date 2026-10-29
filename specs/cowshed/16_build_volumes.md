@@ -1562,7 +1562,10 @@ An Nx task hash must not change between checkouts of the same tree.
 - A file list that inference writes into a target (a command, its metadata or its inputs) names only files in Nx's
   workspace file index: .gitignore and .nxignore applied. A walk of the tree also finds ignored generated modules that a
   build left on disk and that a fresh checkout lacks. Through the project configuration, such a list re-keys every task
-  that reaches the project, depending on whether a build ran in that checkout.
+  that reaches the project, depending on whether a build ran in that checkout. The inferred ESLint command carries no
+  such list: the files of one moment outlive it in a graph the daemon serves past an event its watcher missed, so the
+  command names a placeholder that its executor resolves against a fresh index when it runs
+  (`packages/nx-plugin/README.md`, lint inference).
 - A target that runs no package from `node_modules` declares `externalDependencies: []`; otherwise a lockfile edit
   re-keys it.
 - **Enforced by**: step 2b of every land (100% hits on main) and the fork test (100% hits in a fresh fork).

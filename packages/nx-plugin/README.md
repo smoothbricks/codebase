@@ -77,15 +77,28 @@ question, answered only by the deploy tags the CLI reads (`stage-deploy-target` 
 
 Lint commands are inferred per project. A workspace Biome configuration enables the project-wide Biome check; an ESLint
 flat configuration enables ESLint for existing JavaScript/TypeScript files under that project's `src` and the files its
-`tsconfig.test.json` declares, wherever they live. TypeScript resolves inherited `include`, `files` and `exclude`; the
-same sources, the test declaration and its existing `extends` chain are explicit lint cache inputs. Both lists hold only
-files in Nx's workspace file index (.gitignore and .nxignore applied), so a gitignored generated module that a build
-left on disk is neither linted nor keyed, and the lint target is the same in every checkout of one tree. Rust-only
+`tsconfig.test.json` declares, wherever they live. TypeScript resolves inherited `include`, `files` and `exclude`. Only
+files in Nx's workspace file index (.gitignore and .nxignore applied) count, so a gitignored generated module that a
+build left on disk is neither linted nor keyed, and the lint target is the same in every checkout of one tree. Rust-only
 source trees keep their Cargo validation and manifest checks without invoking ESLint on nonexistent JavaScript inputs.
 Test-config diagnostics retain TypeScript's parsed-command-line types through bootstrap emit; invalid declarations fail
-with their diagnostic code and message, while an empty test program (TS18003) contributes no test files. Adding
-JavaScript/TypeScript sources or changing the declared test program updates lint coverage automatically. The target's
-`metadata.eslintFileSet` retains that exact command and workspace-relative file list for cache inspectors.
+with their diagnostic code and message, while an empty test program (TS18003) contributes no test files.
+
+The ESLint command names no file. It is `eslint {eslintSources}`, and the target's `eslintProjectRoot` option names the
+project whose sources the placeholder stands for. A graph holds the files of the moment it was computed, and the daemon
+serves it past a deletion or an addition its watcher never reported: a list in the command made ESLint refuse a pattern
+no file matches, and left a new file unlinted, until the graph recomputed. The `all-verdicts` executor replaces the
+placeholder when the command runs, with the files the rules above select out of a fresh workspace file index: a new
+native context over the filesystem, never the table of the process or of the daemon, which learn of a write only when a
+watcher event reaches them. A project with none passes without starting ESLint. Adding JavaScript/TypeScript sources or
+changing the declared test program changes what the next run lints, with no graph computation in between.
+
+The lint inputs key the same program without naming each file: the test declaration and its existing `extends` chain,
+one glob over the JavaScript and TypeScript kinds for each directory the declaration's include patterns walk (none for a
+directory outside the workspace or inside a build output directory), and every other program file by name. A file the
+program gains is keyed the moment it exists. A glob also covers what `exclude` removes from the program: keyed, never
+linted. The target's `metadata.eslintFileSet` retains the command and the workspace-relative file list the graph
+resolved, for cache inspectors: the list describes that graph, and what runs is read when it runs.
 `@smoothbricks/nx-plugin/eslint-file-set` owns its type and generated validator; an inspector can resolve each file's
 actual ESLint parser program instead of guessing from the project or target name.
 
@@ -95,8 +108,8 @@ errors would hide another's until a later run. `all-verdicts` starts every comma
 command's output prints as one block when it closes, then every command's verdict: `PASS`, `FAIL (exit n)`, or
 `UNJUDGED` with its cause when a signal ended it, it never started, or the run itself was signalled. A signal to the run
 ends each command's process group, and the run then ends by the same signal. The target passes only when every command
-passed; an empty command list is refused, since it could never fail. The options keep `commands` and `cwd`, so each
-tool's command, the inputs that key it and `metadata.eslintFileSet` are what they were.
+passed; an empty command list is refused, since it could never fail. The options are `commands`, `cwd` and, for a
+project with an ESLint command, `eslintProjectRoot`; a command's block and verdict name it as it ran.
 
 Lint inputs include dependency production inputs because type-aware ESLint reads dependencies' declarations. This uses
 `^production` unless the workspace opts into the versionless production input described below. Keep

@@ -16,6 +16,10 @@
     "cwd": {
       "type": "string",
       "description": "Where every command runs, relative to the workspace root."
+    },
+    "eslintProjectRoot": {
+      "type": "string",
+      "description": "The project, by workspace-relative root, whose ESLint sources replace {eslintSources} in a command when it runs."
     }
   },
   "additionalProperties": false
