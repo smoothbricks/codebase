@@ -48,12 +48,4 @@ inputs:
         follows: nixpkgs
   rust-overlay:
     url: github:oxalica/rust-overlay
-    flake:
-      true
-      # mbx, the Cargo compiler cache (specs/cowshed/03_caches.md, "mbx"), at the
-  # revision cowshed pins (specs/cowshed/14_nix.md, "mbx"): v1.28.0 plus the
-  # compact-prediction, scheduler-admission and grant-descriptor changes, from smoothbricks/mr-boxington.
-  # This pins mbx and nixpkgs for the dev shell; cowshed jobs use the installed host route.
-  mbx:
-    url: github:smoothbricks/mr-boxington/9d91cf452ec59682a9a4581bdd7e39e2b247be22
     flake: true

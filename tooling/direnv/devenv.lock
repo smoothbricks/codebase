@@ -39,41 +39,6 @@
         "type": "github"
       }
     },
-    "mbx": {
-      "inputs": {
-        "nixpkgs": "nixpkgs"
-      },
-      "locked": {
-        "lastModified": 1793271716,
-        "narHash": "sha256-9nEX74DW3eK+ujdT07gJn19oFWD6ccYblVbxIl1Ilrk=",
-        "owner": "smoothbricks",
-        "repo": "mr-boxington",
-        "rev": "9d91cf452ec59682a9a4581bdd7e39e2b247be22",
-        "type": "github"
-      },
-      "original": {
-        "owner": "smoothbricks",
-        "repo": "mr-boxington",
-        "rev": "9d91cf452ec59682a9a4581bdd7e39e2b247be22",
-        "type": "github"
-      }
-    },
-    "nixpkgs": {
-      "locked": {
-        "lastModified": 1791031588,
-        "narHash": "sha256-/FGDr01siZ8txrVzkOz6CYjiz0XR27JuVJP+aWchi4s=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "825e2028c29b702a4a5f085f08095d12099784f2",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "ref": "nixos-26.05",
-        "repo": "nixpkgs",
-        "type": "github"
-      }
-    },
     "nixpkgs-go": {
       "locked": {
         "lastModified": 1792812153,
@@ -146,7 +111,6 @@
       "inputs": {
         "devenv": "devenv",
         "git-format-staged": "git-format-staged",
-        "mbx": "mbx",
         "nixpkgs": "nixpkgs_2",
         "nixpkgs-go": "nixpkgs-go",
         "rust-overlay": "rust-overlay"
