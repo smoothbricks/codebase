@@ -106,7 +106,7 @@ describe('cargo retention after real Nx runs', () => {
           await put(join(fx.ws, 'marker.txt'), 'one\n');
           const gen = await churnGenerations(fx);
           await backdate(gen.superseded);
-          const env = fixtureNxEnv(workspace, socketDirectory);
+          const env = { ...fixtureNxEnv(workspace, socketDirectory), PATH: cargoEnv().PATH ?? '' };
           const runNx = async (target: string, preload?: string, extraEnv: Record<string, string> = {}) => {
             const nx = join(workspace, 'node_modules', '.bin', 'nx');
             // A preload is a Node `--import`: it patches the process the hook runs in, which here is Node itself.

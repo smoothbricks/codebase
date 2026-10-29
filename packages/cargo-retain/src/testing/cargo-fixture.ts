@@ -6,7 +6,7 @@
 import { expect } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, utimes, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import typia from 'typia';
 import {
@@ -114,13 +114,35 @@ export function scopedTo(targetDir: string, run: () => Promise<void>): Promise<v
  * Nor `CI`: Cargo turns incremental compilation off for workspace crates whenever it is set
  * (03_caches.md, "No CI in a dev environment"), and a CI runner sets it, so the incremental
  * cases would find no incremental directories to keep or supersede.
+ * Nor mbx: the fixtures are plain Cargo layouts, and in an mbx project's shell `cargo` is
+ * mbx's Cargo shim and the canonical mbx environment (`MBX_*`, specs/cowshed/11_shell.md)
+ * would put their units in mbx's managed target views and incremental state. So no `MBX_*`
+ * variable passes, and the toolchain's own `cargo` ({@link PLAIN_CARGO}) leads PATH.
  */
 export function cargoEnv(): NodeJS.ProcessEnv {
   const env = Object.fromEntries(
-    Object.entries(process.env).filter(([name]) => !name.startsWith('CARGO_UNSTABLE_') && name !== 'CI'),
+    Object.entries(process.env).filter(
+      ([name]) => !name.startsWith('CARGO_UNSTABLE_') && !name.startsWith('MBX_') && name !== 'CI',
+    ),
   );
-  return { ...env, RUSTC_WRAPPER: '', RUSTC_WORKSPACE_WRAPPER: '', CARGO_NET_OFFLINE: 'true' };
+  return {
+    ...env,
+    PATH: `${dirname(PLAIN_CARGO)}${delimiter}${process.env.PATH ?? ''}`,
+    RUSTC_WRAPPER: '',
+    RUSTC_WORKSPACE_WRAPPER: '',
+    CARGO_NET_OFFLINE: 'true',
+  };
 }
+
+/**
+ * The toolchain's own `cargo`, beside the `rustc` that names its sysroot: never an mbx project's Cargo shim, which
+ * stands first on its shell's PATH as `cargo`.
+ */
+export const PLAIN_CARGO = join(
+  execFileSync('rustc', ['--print', 'sysroot'], { encoding: 'utf8' }).trim(),
+  'bin',
+  'cargo',
+);
 
 export interface CargoRun {
   readonly code: number;
@@ -129,7 +151,7 @@ export interface CargoRun {
 }
 
 async function cargo(cwd: string, args: string[], env: NodeJS.ProcessEnv = cargoEnv()): Promise<CargoRun> {
-  const child = Bun.spawn(['cargo', ...args], { cwd, env, stdout: 'pipe', stderr: 'pipe' });
+  const child = Bun.spawn([PLAIN_CARGO, ...args], { cwd, env, stdout: 'pipe', stderr: 'pipe' });
   const [code, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
@@ -145,7 +167,7 @@ export async function cargoOk(cwd: string, args: string[], env?: NodeJS.ProcessE
 }
 
 export function relock(workspace: string): void {
-  execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', join(workspace, 'Cargo.toml')], {
+  execFileSync(PLAIN_CARGO, ['generate-lockfile', '--offline', '--manifest-path', join(workspace, 'Cargo.toml')], {
     stdio: 'pipe',
     env: cargoEnv(),
   });

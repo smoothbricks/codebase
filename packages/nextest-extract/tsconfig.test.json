@@ -18,6 +18,7 @@
   "references": [
     {
       "path": "./tsconfig.lib.json"
-    }
+    },
+    { "path": "../cargo-retain/tsconfig.lib.json" }
   ]
 }

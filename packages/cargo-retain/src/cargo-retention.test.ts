@@ -330,7 +330,7 @@ async function refusesWithoutPerl(fx: Churn): Promise<void> {
   const bin = join(fx.root, 'bin');
   await mkdir(bin);
   for (const tool of ['cargo', 'rustc']) {
-    const real = Bun.which(tool);
+    const real = Bun.which(tool, { PATH: cargoEnv().PATH ?? '' });
     if (real === null) throw new Error(`${tool} is not on PATH`);
     await symlink(real, join(bin, tool));
   }

@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { cargoEnv } from '@smoothbricks/cargo-retain/testing/cargo-fixture';
 import {
   EXTRACTED_BINARIES_METADATA,
   EXTRACTED_CARGO_METADATA,
@@ -154,7 +155,7 @@ describe('nextestExtractionRoot', () => {
       );
       await mkdir(join(root, 'src'));
       await writeFile(join(root, 'src/lib.rs'), '');
-      expect(spawnSync('cargo', ['generate-lockfile', '--offline'], { cwd: root }).status).toBe(0);
+      expect(spawnSync('cargo', ['generate-lockfile', '--offline'], { cwd: root, env: cargoEnv() }).status).toBe(0);
       expect(await nextestExtractionRoot(root)).toBe(join(root, 'target', NEXTEST_EXTRACTION_DIRECTORY));
 
       // A repository that moves Cargo's build tree moves its extractions with it.
@@ -177,7 +178,7 @@ describe('smoo-nx-nextest-extract', () => {
       [join(import.meta.dir, 'bin/smoo-nx-nextest-extract.ts'), 'archive.tar.zst'],
       {
         cwd: root,
-        env: { ...process.env, TMPDIR: tmp },
+        env: { ...cargoEnv(), TMPDIR: tmp },
         stdio: ['ignore', 'pipe', 'pipe'],
       },
     );
@@ -204,11 +205,11 @@ describe('smoo-nx-nextest-extract', () => {
       );
       await mkdir(join(root, 'src'));
       await writeFile(join(root, 'src/lib.rs'), '#[test]\nfn adds() {\n    assert_eq!(1 + 1, 2);\n}\n');
-      expect(spawnSync('cargo', ['generate-lockfile', '--offline'], { cwd: root }).status).toBe(0);
+      expect(spawnSync('cargo', ['generate-lockfile', '--offline'], { cwd: root, env: cargoEnv() }).status).toBe(0);
       const archived = spawnSync(
         'cargo',
         ['--frozen', 'nextest', 'archive', '--archive-file', 'archive.tar.zst', '--user-config-file', 'none'],
-        { cwd: root, encoding: 'utf8' },
+        { cwd: root, env: cargoEnv(), encoding: 'utf8' },
       );
       expect({ status: archived.status, stderr: archived.status === 0 ? '' : archived.stderr }).toEqual({
         status: 0,
