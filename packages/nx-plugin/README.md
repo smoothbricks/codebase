@@ -2583,6 +2583,13 @@ so on stderr, runs `cowshed exec <ws> -- true` once through the installed cowshe
 served. It refuses, naming the workspace and the start's exit status and error, only when that start fails or leaves the
 file unserved (cowshed `specs/cowshed/02_workspaces.md`, "Workspace environment").
 
+CI's shared `github-actions-bootstrap.sh build-shell` captures that activated shell once. It persists its complete
+`PATH` through `GITHUB_PATH` in the same search order, alongside the changed exported values in `GITHUB_ENV`; workflow
+steps do not enter a second shell or reconstruct a tool list. The combined profile is not sufficient: mbx excludes the
+profile directory containing its Cargo shim before launching real Cargo, so the shell's individual package bins must
+remain available for declared tools such as the macOS linker (`specs/cowshed/16_build_volumes.md`, "One Cargo
+environment on every path").
+
 ### Workflow security and bounded execution
 
 Managed action references use full commit SHAs with their release tags in comments. Read-only jobs explicitly set

@@ -21,6 +21,7 @@ shift
 # Real enterShell hooks print progress to stdout; the capture must survive it.
 echo "Installing dependencies..."
 echo "enterShell noise on stdout"
+export PATH="/nix/store/test-linker/bin:/nix/store/test-rust/bin:$PATH"
 export LD_LIBRARY_PATH="/nix/store/test-gcc-lib/lib"
 export TTSC_TSGO_BINARY="/repo/node_modules/@typescript/native/bin/tsc"
 export TTSC_CACHE_DIR="/home/runner/.cowshed/caches/ttsc"
@@ -114,8 +115,12 @@ describe('github-actions-bootstrap build-shell environment persistence', () => {
     expect(run.stdout).toContain('devenv environment persisted for later steps:');
     expect(run.stdout).toContain('LD_LIBRARY_PATH');
 
-    // add_repo_paths still runs after persistence.
-    expect(run.githubPath).toContain('tooling/direnv/.devenv/profile/bin');
+    // The combined profile is not the whole shell: Cargo shims may remove their
+    // own profile directory before launching the compiler and linker.
+    expect(run.githubPath.trimEnd().split('\n').reverse().slice(0, 2)).toEqual([
+      '/nix/store/test-linker/bin',
+      '/nix/store/test-rust/bin',
+    ]);
   });
 });
 
