@@ -644,9 +644,9 @@ pub fn reap(
     collect_exited(role, pid, deadline, last, || child.try_wait())
 }
 
-/// Hand `child`, whose wait expired, to a thread that collects its exit whenever it comes and
-/// says so, so a child that leaves an uninterruptible kernel call late is reaped, never left a
-/// zombie for the life of this process. Nothing waits for that thread.
+/// Hand an owned child to a thread that collects its exit whenever it comes and says so. A
+/// cancelled caller or an expired wait can give up custody without leaving a zombie for the
+/// life of this process. Nothing waits for that thread.
 // WHY unbounded: nothing waits on this thread; it only collects the exit when it comes.
 #[allow(clippy::disallowed_methods)]
 pub fn collect_later(role: &'static str, mut child: std::process::Child) {
@@ -654,10 +654,12 @@ pub fn collect_later(role: &'static str, mut child: std::process::Child) {
         let pid = child.id();
         match child.wait() {
             Ok(status) => {
-                crate::eprintln!("cowshed: {role} pid {pid} ended after its wait expired: {status}")
+                crate::eprintln!(
+                    "cowshed: {role} pid {pid} ended during deferred collection: {status}"
+                )
             }
             Err(error) => crate::eprintln!(
-                "cowshed: {role} pid {pid} could not be collected after its wait expired: {error}"
+                "cowshed: {role} pid {pid} could not be reaped during deferred collection: {error}"
             ),
         }
     });

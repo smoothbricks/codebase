@@ -9,6 +9,11 @@
 //! system calls from returning to the actor.
 
 use std::future::Future;
+use std::sync::Arc;
+use std::time::Instant;
+
+use super::super::child_fence::ChildFence;
+use crate::error::Result;
 
 /// Run `work` on the blocking pool and answer what it returns. A panic in `work` is the
 /// caller's, resumed here.
@@ -97,5 +102,197 @@ impl<T: Send + 'static> Drop for OffActor<T> {
             }
             Err(_) => drop(value),
         }
+    }
+}
+
+/// A spawn awaiting adoption: its owned child and observed fence travel together across the
+/// blocking-pool await. Cancellation or refused pipes end the unadopted group and reap it away
+/// from the actor; only adoption hands reaping to the ordinary process watcher.
+pub(super) struct Spawned {
+    child: Option<std::process::Child>,
+    fence: Option<Arc<ChildFence>>,
+    pub(super) at: Instant,
+    pub(super) nice: Option<i32>,
+}
+
+impl Spawned {
+    /// Observe the owned, unreaped group leader before returning it to the actor.
+    pub(super) fn new(child: std::process::Child, nice: Option<i32>) -> Result<Self> {
+        let mut spawned = Self {
+            child: Some(child),
+            fence: None,
+            at: Instant::now(),
+            nice,
+        };
+        spawned.fence = Some(Arc::new(ChildFence::new(spawned.child().id())?));
+        Ok(spawned)
+    }
+
+    pub(super) fn child(&mut self) -> &mut std::process::Child {
+        self.child
+            .as_mut()
+            .expect("an unadopted spawn owns its child")
+    }
+
+    pub(super) fn fence(&self) -> &Arc<ChildFence> {
+        self.fence
+            .as_ref()
+            .expect("a returned spawn has observed its child's fence")
+    }
+
+    /// All fallible pipe setup is over. The watcher alone may now reap this leader.
+    pub(super) fn adopt(mut self) -> Arc<ChildFence> {
+        self.child.take();
+        self.fence.take().expect("an adopted spawn has its fence")
+    }
+}
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let pid = i32::try_from(child.id()).expect("an owned child pid fits the kernel pid type");
+        // SAFETY: this is our own unreaped child, made a group leader before exec. No watcher
+        // can reap it before adoption, so neither its pid nor its group id can be reused.
+        if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
+            cowshed_os::eprintln!(
+                "cowshed: cannot end unadopted job group {pid}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // SIGKILL is not synchronous; no actor thread waits for the actual exit. This child
+        // and its fence are no longer published, so the detached collector owns reaping alone.
+        cowshed_os::deadline::collect_later("unadopted job", child);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+
+    use cowshed_os::fork_lock::Spawn as _;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+    use crate::api::dto::ExitStatus;
+    use crate::runtime::job_groups::{Birth, Process};
+
+    /// The fixture exits on stdin EOF even if its spawn guard is broken. Its last line is the
+    /// negative control: abandoning a child must kill it, not merely drop its pipes.
+    fn child() -> Spawned {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", r#"exec 3<&0; /bin/sh -c "printf 'ready\n'; read line; printf 'stdin closed\n'; exit 17" <&3 & wait $!"#])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        Spawned::new(command.spawn_locked().expect("spawn the fixture"), None)
+            .expect("observe its unreaped birth")
+    }
+
+    /// Identity-held cleanup remains safe if the guard already reaped the fixture.
+    struct End(Process);
+
+    impl Drop for End {
+        fn drop(&mut self) {
+            self.0.signal(libc::SIGKILL).expect("end the fixture");
+        }
+    }
+
+    fn output(spawned: &mut Spawned) -> (End, tokio::process::ChildStdout) {
+        let pid = spawned.fence().pid();
+        assert!(matches!(spawned.fence().birth(), Birth::Observed(_)));
+        let end = End(Process::observe(pid)
+            .expect("read the fixture's life")
+            .expect("it runs"));
+        let stdout = tokio::process::ChildStdout::from_std(
+            spawned.child().stdout.take().expect("fixture stdout"),
+        )
+        .expect("watch fixture stdout");
+        (end, stdout)
+    }
+
+    async fn ready(
+        stdout: tokio::process::ChildStdout,
+    ) -> tokio::io::BufReader<tokio::process::ChildStdout> {
+        let mut stdout = tokio::io::BufReader::new(stdout);
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .await
+            .expect("fixture readiness");
+        assert_eq!(line, "ready\n");
+        stdout
+    }
+
+    #[tokio::test]
+    async fn an_adopted_spawn_retains_its_birth_and_transfers_reaping() {
+        let mut spawned = run(child).await;
+        let birth = spawned.fence().birth().clone();
+        let (_end, stdout) = output(&mut spawned);
+        let mut stdout = ready(stdout).await;
+        let mut stdin = tokio::process::ChildStdin::from_std(
+            spawned.child().stdin.take().expect("fixture stdin"),
+        )
+        .expect("watch fixture stdin");
+        let fence = spawned.adopt();
+        assert_eq!(
+            fence.birth(),
+            &birth,
+            "adoption carries the observed identity"
+        );
+        stdin.write_all(b"line\n").await.expect("first input");
+        drop(stdin);
+        let mut output = String::new();
+        stdout
+            .read_to_string(&mut output)
+            .await
+            .expect("fixture output");
+        assert_eq!(output, "stdin closed\n");
+        assert_eq!(
+            fence.exited().await.expect("the leader stays unreaped"),
+            ExitStatus::Exited { code: 17 }
+        );
+        fence.release().expect("the adopter reaps it");
+        assert!(fence.reaped());
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_off_actor_spawn_ends_the_unadopted_group() {
+        let (published, received) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let pending = tokio::spawn(run(move || {
+            let mut spawned = child();
+            published
+                .send(output(&mut spawned))
+                .unwrap_or_else(|_| panic!("the test awaits its spawn"));
+            released.recv().expect("release the blocking work");
+            spawned
+        }));
+        let (_end, stdout) = received.await.expect("blocking work published its spawn");
+        let mut stdout = ready(stdout).await;
+        pending.abort();
+        assert!(
+            pending
+                .await
+                .err()
+                .expect("the actor was cancelled")
+                .is_cancelled()
+        );
+        release
+            .send(())
+            .expect("finish the cancelled blocking work");
+        let mut output = String::new();
+        stdout
+            .read_to_string(&mut output)
+            .await
+            .expect("the unadopted group exited");
+        assert!(
+            output.is_empty(),
+            "the abandoned child ran after its stdin closed: {output:?}"
+        );
     }
 }

@@ -111,6 +111,12 @@ No mounts, no root, no network — pure functions with table-driven cases:
   its final getrusage charge; teardown has no fixed percentage ceiling. Only component-wise whole-microsecond truncation
   can cross these ordered bounds. Injected-timebase tables own exact rational conversion and once-only aggregation, not
   native timing.
+- **Actor census**: the supervisor source walk follows the compiled platform's actor and production sink calls and
+  refuses file-system calls outside the existing blocking-pool boundary (11_shell.md, "Supervisor"). Linux one-shot
+  spawns observe the owned, unreaped leader's birth through procfs on that pool before adoption or first input. A
+  cancelled blocking-pool result or failed pipe setup ends the unadopted group and reaps it off the actor. Focused
+  ownership, stdin ordering, cancellation and failed-start witnesses retain the spawn-turn first-sample contract. The
+  census executes for the native target: the Linux cross-check compiles it but only Linux CI executes that branch.
 - **API capability goldens**: `Project` exposes discovery only; `WorkspaceRef` exposes inspection plus safe `attach`;
   `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/push/grant reads; only `Coordinator` exposes
   grant/revoke/destroy/rebase/land/gc/repo-mirror. Compile-fail fixtures prove forbidden methods and cross-workspace

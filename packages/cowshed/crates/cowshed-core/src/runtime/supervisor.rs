@@ -3435,13 +3435,14 @@ async fn spawn_fenced(
         });
     }
     // Through `std`: this process alone reaps the child, inside its fence ([`ChildFence`]).
+    // Spawning takes the fork lock; observing the birth reads procfs on Linux. Both stay on
+    // the blocking pool, with the owned child retained until its pipes are ready for adoption.
     #[cfg(target_os = "macos")]
-    let (mut child, nice) = {
+    let source = monitor.clone();
+    let mut spawned = off_actor::run(move || {
         let mut command = command.into_std();
-        let source = monitor.clone();
-        // The fence's pipes are made under the fork lock, which waits for every spawn in flight
-        // in this process: on the blocking pool, with the spawn it fences.
-        off_actor::run(move || {
+        #[cfg(target_os = "macos")]
+        let (child, nice) = {
             use std::os::unix::process::CommandExt as _;
             let (gate, held) = super::process_fence::leader_gate().map_err(|error| {
                 CowshedError::environment_missing(
@@ -3454,51 +3455,54 @@ async fn spawn_fenced(
             unsafe {
                 command.pre_exec(move || hold.hold());
             }
-            spawn_observed(command, held, gate, &source, nice).map_err(|error| match error {
-                HeldSpawnError::Spawn(error) => {
-                    map_exec_error(ExecError::from(classify_spawn_error(error)))
-                }
-                HeldSpawnError::Priority(failure) => CowshedError::priority(failure),
-            })
-        })
-        .await
-        .map(|(child, nice)| (child, Some(nice)))?
-    };
-    // No fence holds the child here: the job's cgroup, which it enters before exec, carries its
-    // class (05_gateway.md "Classes").
-    #[cfg(not(target_os = "macos"))]
-    let (mut child, nice) = (
-        command
-            .into_std()
-            .spawn_locked()
-            .map_err(|error| map_exec_error(ExecError::from(classify_spawn_error(error))))?,
-        None,
-    );
-    let spawned = Instant::now();
-    let fence = std::sync::Arc::new(ChildFence::new(child.id())?);
+            spawn_observed(command, held, gate, &source, nice)
+                .map(|(child, nice)| (child, Some(nice)))
+                .map_err(|error| match error {
+                    HeldSpawnError::Spawn(error) => {
+                        map_exec_error(ExecError::from(classify_spawn_error(error)))
+                    }
+                    HeldSpawnError::Priority(failure) => CowshedError::priority(failure),
+                })?
+        };
+        // The cgroup, entered before exec, carries the child's class on Linux.
+        #[cfg(not(target_os = "macos"))]
+        let (child, nice) = (
+            command
+                .spawn_locked()
+                .map_err(|error| map_exec_error(ExecError::from(classify_spawn_error(error))))?,
+            None,
+        );
+        off_actor::Spawned::new(child, nice)
+    })
+    .await?;
     let process = OwnedProcess {
-        birth: fence.birth().clone(),
-        spawned,
+        birth: spawned.fence().birth().clone(),
+        spawned: spawned.at,
         host: crate::host_load::read_host_load(),
     };
+    let nice = spawned.nice;
     let pipe = |error: io::Error| {
         CowshedError::internal(format!("cannot watch the spawned process's pipes: {error}"))
     };
-    let stdin = child
+    let stdin = spawned
+        .child()
         .stdin
         .take()
         .ok_or_else(|| CowshedError::internal("spawned process has no stdin pipe"))
         .and_then(|stdin| tokio::process::ChildStdin::from_std(stdin).map_err(pipe))?;
-    let stdout = child
+    let stdout = spawned
+        .child()
         .stdout
         .take()
         .ok_or_else(|| CowshedError::internal("spawned process has no stdout pipe"))
         .and_then(|stdout| tokio::process::ChildStdout::from_std(stdout).map_err(pipe))?;
-    let stderr = child
+    let stderr = spawned
+        .child()
         .stderr
         .take()
         .ok_or_else(|| CowshedError::internal("spawned process has no stderr pipe"))
         .and_then(|stderr| tokio::process::ChildStderr::from_std(stderr).map_err(pipe))?;
+    let fence = spawned.adopt();
     let (stdin_sender, stdin_receiver) = mpsc::channel(1);
     tokio::spawn(run_system_stdin(
         job_id,
