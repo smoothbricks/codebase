@@ -141,8 +141,10 @@ impl BuildVolumeReleased {
         Self(Arc::new(move |volume| Box::pin(released(volume))))
     }
 
+    /// The release of `volume`, driven to its end on the blocking pool: the controller opens the
+    /// project's store and reads the volume's record before its first await.
     async fn release(&self, volume: crate::build_volume::BuildVolumeId) -> Result<()> {
-        (self.0)(volume).await
+        off_actor::drive((self.0)(volume)).await
     }
 }
 
