@@ -1401,7 +1401,9 @@ if root == 0:
     os.write(1, b"root %d %d\n" % (os.getpid(), child))
     command = os.read(root_read, 1)
     if command == b"e":
-        os.execv(sys.executable, [sys.executable, "-c", "import os, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); os.write(1, b'exec\\n'); signal.pause()"])
+        # Pause in a loop, as the sibling does: stopping the child posts this parent a
+        # CLD_STOPPED SIGCHLD, which ends a single pause() before the parent's own SIGSTOP.
+        os.execv(sys.executable, [sys.executable, "-c", "import os, signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nos.write(1, b'exec\\n')\nwhile True:\n    signal.pause()"])
     if command == b"n":
         os.write(child_write, b"x")
         os.waitpid(child, 0)
@@ -1519,12 +1521,10 @@ for line in sys.stdin:
             assert_eq!(self.lines.next().unwrap().unwrap(), expected);
         }
 
+        /// No grace: every fixture life ignores TERM and waits out every other signal, so the
+        /// receipt is decided by the exits the retirement joins, never by a timer.
         fn retired(&self, handle: JobSubtreeHandle) -> JobProcessRetirement {
-            match self
-                .monitor
-                .retire_subtree(handle, Duration::from_millis(20))
-                .unwrap()
-            {
+            match self.monitor.retire_subtree(handle, Duration::ZERO).unwrap() {
                 JobSubtreeRetirement::Retired { retirement } => retirement,
                 refused => panic!("an issued subtree was refused: {refused:?}"),
             }
