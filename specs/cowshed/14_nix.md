@@ -87,9 +87,8 @@ mbx serves every Cargo project, which reaches it through the Cargo shim that `co
 (the capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store
 path or a host path where a command is spawned; its store path is only what the link resolves to.
 
-Project shells expose the toolchain's plain `cargo` behind this owned route, never another mbx-generated Cargo shim.
-Neither a project input nor a project package selects the host's mbx route. One shim lets mbx resolve real Cargo without
-re-entering a project shim and cycling back into the installed route.
+SmoothBricks' own shell carries no mbx input, package or Cargo shim; its plain toolchain `cargo` sits behind the
+setup-owned route.
 
 The host's `mbx` entry is a **symlink to the shipped pinned executable, never a copied inode**, so its realpath is the
 pinned build's Nix store path, which names the build. Nothing proves a project's mbx against it, because no project's
