@@ -841,6 +841,92 @@ async fn host_controller_an_exited_leaders_descendants_are_retired_before_the_jo
 
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_read_only_reuses_a_writable_activation_without_evaluating() {
+    let workspace = Workspace::new("shell-pool-ro-adopt", 41_184);
+    workspace.envrc("mkdir -p .devenv\nprintf evaluated > .devenv/imports.txt\nexport ACTIVATED_CONFIG=\"$XDG_CONFIG_HOME/from-shell\"\n");
+    let handle = workspace.supervisor(false);
+    run(&handle, sh("true")).await.ok();
+    let record = std::fs::read(inherited_record(&workspace)).expect("writable activation record");
+    let mut probe = sh(
+        "test \"$ACTIVATED_CONFIG\" = \"$XDG_CONFIG_HOME/from-shell\" && test \"$BUN_OPTIONS\" = \"--preload=$TMPDIR/port-zero.cjs\" && test \"$NODE_OPTIONS\" = \"--trace-warnings --require=$TMPDIR/port-zero.cjs\" && printf command-ran",
+    );
+    probe.mode = RunSandboxMode::ReadOnly;
+    probe
+        .env
+        .insert("NODE_OPTIONS".into(), "--trace-warnings".into());
+    let ran = run(&handle, probe).await.ok();
+    assert_eq!(ran.stdout, "command-ran");
+    assert_eq!(workspace.activations(), 1, "{}", ran.stderr);
+    assert_eq!(
+        std::fs::read(inherited_record(&workspace)).unwrap(),
+        record,
+        "read-only adoption never republishes an activation"
+    );
+    assert!(
+        !workspace
+            .sandbox
+            .exec_temp_dir
+            .join("data/direnv/allow")
+            .exists(),
+        "read-only adoption never approves .envrc"
+    );
+}
+
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_read_only_refuses_missing_and_stale_activation_by_name() {
+    let workspace = Workspace::new("shell-pool-ro-cold", 41_184);
+    workspace.envrc("watch_file shell-input\n");
+    std::fs::write(workspace.mount().join("shell-input"), "one").unwrap();
+    let handle = workspace.supervisor(false);
+    let probe = || ExecRequest {
+        mode: RunSandboxMode::ReadOnly,
+        ..sh("printf command-ran")
+    };
+    let cold = run(&handle, probe()).await;
+    assert_eq!(
+        cold.info.failure,
+        Some(JobFailure::Unlaunched),
+        "{:?}",
+        cold.info
+    );
+    assert!(
+        cold.stderr.contains("activation needed: run one RW exec"),
+        "{}",
+        cold.stderr
+    );
+    assert!(cold.stdout.is_empty());
+    assert_eq!(workspace.activations(), 0, "{}", cold.stderr);
+    assert!(
+        !workspace
+            .sandbox
+            .exec_temp_dir
+            .join("data/direnv/allow")
+            .exists()
+    );
+    run(&handle, sh("true")).await.ok();
+    std::fs::write(workspace.mount().join("shell-input"), "two").unwrap();
+    let stale = run(&handle, probe()).await;
+    assert_eq!(
+        stale.info.failure,
+        Some(JobFailure::Unlaunched),
+        "{:?}",
+        stale.info
+    );
+    assert!(
+        stale.stderr.contains("activation needed: run one RW exec"),
+        "{}",
+        stale.stderr
+    );
+    assert!(stale.stderr.contains("inputs differ"), "{}", stale.stderr);
+    assert!(stale.stdout.is_empty());
+    assert_eq!(workspace.activations(), 1, "{}", stale.stderr);
+    run(&handle, sh("true")).await.ok();
+    assert_eq!(run(&handle, probe()).await.ok().stdout, "command-ran");
+    assert_eq!(workspace.activations(), 2);
+}
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_read_only_and_read_write_never_share_a_shell() {
     let workspace = Workspace::new("shell-pool-modes", 41_184);
     workspace.envrc("");
@@ -855,11 +941,11 @@ async fn host_controller_read_only_and_read_write_never_share_a_shell() {
         Some(ExitStatus::Exited { code: 0 }),
         "a read-only job never runs in a read-write shell"
     );
-    assert_eq!(workspace.activations(), 2);
+    assert_eq!(workspace.activations(), 1);
     run(&handle, mode(RunSandboxMode::ReadWrite)).await.ok();
     let read_only = run(&handle, mode(RunSandboxMode::ReadOnly)).await;
     assert_ne!(read_only.info.exit, Some(ExitStatus::Exited { code: 0 }));
-    assert_eq!(workspace.activations(), 2, "each mode reuses its own shell");
+    assert_eq!(workspace.activations(), 1, "each mode reuses its own shell");
 }
 
 #[tokio::test]

@@ -42,8 +42,9 @@ when it cannot collect the host at all.
 **Inherited shells.** Every activation whose inputs stayed put while it ran (below) leaves its export in
 `.cowshed/shell-host/activation.json`, written by the supervisor, so the APFS clone carries it to every workspace forked
 from this one, and a fork of a fork carries it again. A host that starts with no live generation adopts that export
-instead of evaluating when three checks pass, and evaluates otherwise (the checkout the record was written in needs only
-the first two: nothing moves):
+instead of evaluating when three checks pass. A read-write host evaluates otherwise; a read-only host never evaluates or
+approves an `.envrc`, and refuses a missing or invalid activation by name (below). The checkout the record was written
+in needs no root relocation, but a change of exec mode still relocates its private environment:
 
 - **The inputs are the same bytes.** The record keeps the activation's watch list, each input relative to the checkout
   root, and its key: SHA-256 over every input, ordered by relative path, as (path, whether it exists, its bytes). The
@@ -61,6 +62,14 @@ the first two: nothing moves):
   adopts its own checkout's export; other grants evaluate. Under the reserved name `<shell>`, the baseline also keys the
   selected .envrc directory with the same checkout-place normalization, so different selected shells never adopt each
   other's export while cloned paths still compare equal.
+
+  Cowshed's mode-owned private environment paths are places too: the generic private directories, tool directory, trust
+  bundle and port-0 preload under `.cowshed/` for read-write exec or exec temp for read-only exec. They are normalized
+  before the checkout root, and relocated before the root in adopted exports, so both modes reuse one activation while
+  each retains its own HOME, XDG state, tools, trust and loader paths. Other `.cowshed/` paths, including the
+  build-volume link, do not move between modes. Only those owned paths change: remaining `NODE_OPTIONS` and
+  `BUN_OPTIONS` bytes stay in the key, and per-command caller options retain their normal overlay semantics.
+
 - **Nothing names the origin after the move.** Every value has each of the origin's per-workspace places — its root, its
   runtime link (`XDG_RUNTIME_DIR`), its `TMPDIR` and its `HOME`, root first — replaced by the adopting checkout's
   wherever a path starts there and ends a component (`/x/repo` moves `/x/repo/tooling`, `-I/x/repo/include` and
@@ -110,9 +119,12 @@ when applicable (03_caches.md, Environment variables). Reusing an activation doe
 ancestor's cache, and no cache is disabled or cleared to make adoption possible.
 
 Adoption runs no direnv evaluation, no devenv, no entry task and no approval; only the tail files run, and their output
-reaches the job that waited on the adoption as an activation's would. A miss says why on that job's stderr
-(`cowshed: evaluating the workspace shell: …`) and evaluates as before. A lost or unreadable record is a miss, never an
-error, and a record that cannot be written is reported on the supervisor's stderr and only means clones evaluate. The
+reaches the job that waited on the adoption as an activation's would. A read-write miss says why on that job's stderr
+(`cowshed: evaluating the workspace shell: …`) and evaluates as before. A read-only miss instead fails the unlaunched
+job with `activation needed: run one RW exec`, naming the checkout and the reason; one read-write
+`cowshed exec <ws> -- true` refreshes it before retrying read-only. This applies to absent, unreadable, invalid, stale
+and tail-refused records alike; read-only never falls through to approval or devenv writes. A record that cannot be
+written is reported on the supervisor's stderr: clones must activate read-write before a read-only entry can use it. The
 tail interpreter is an activation root of that same job or spare: on macOS it is observed before it runs and control EOF
 retires its retained subtree before the host ends, exactly as for direnv export.
 

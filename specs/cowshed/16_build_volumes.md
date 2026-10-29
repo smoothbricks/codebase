@@ -800,21 +800,21 @@ unit's export.
       says so, while any other failure to enumerate them, a plugin present but throwing or missing a module of its own
       included, refuses the land before the fast-forward, with the target unmoved. The enumeration runs as a read-write
       job of the landing workspace, in the shell its other jobs activated (`11_shell.md`, "Shell activation and process
-      reuse"): a read-only job keeps its environment in exec temp, so its port-0 loader options name another preload and
-      that activation misses, and the devenv evaluation that follows cannot write the checkout's `.devenv`. A generated
-      build input that no task declares as an output and the index does not track is outside this contract: nothing
-      enumerates it and nothing reconciles it. Both checkouts are read through held directories and no-follow opens, so
-      a planted link redirects neither a read nor a timestamp write outside either checkout; a path that is not plainly
-      relative is refused, and one that is not a regular file in both checkouts — absent, a link, a directory or beneath
-      a link in either — is skipped. Files whose mtimes are already equal are skipped without reading a byte. Where they
-      differ, a tracked file, whose bytes the fast-forward made equal, takes the newer of the two mtimes. A declared
-      output — generated and ignored, so its bytes can differ, and reconciled as an output even when the index also
-      tracks it — has its bytes compared: equal bytes take the newer mtime in the same way; different bytes give the
-      target file the time of this pass, one time taken when the pass starts, unless it is already newer, so those bytes
-      are newer than every unit the landing volume built from the landing checkout's bytes. No byte of either checkout
-      changes, only a target file's mtime, and no mtime ever moves back. The pass is reported on stderr with the tracked
-      and output path counts, the regular files examined, the files advanced to the landing checkout's newer mtime, the
-      outputs whose bytes were compared, the outputs republished at the pass's time, and the time the pass took;
+      reuse"). Read-only jobs can reuse that same verified activation with their private environment paths rebound, but
+      never evaluate on a miss: they require one read-write entry first. A generated build input that no task declares
+      as an output and the index does not track is outside this contract: nothing enumerates it and nothing reconciles
+      it. Both checkouts are read through held directories and no-follow opens, so a planted link redirects neither a
+      read nor a timestamp write outside either checkout; a path that is not plainly relative is refused, and one that
+      is not a regular file in both checkouts — absent, a link, a directory or beneath a link in either — is skipped.
+      Files whose mtimes are already equal are skipped without reading a byte. Where they differ, a tracked file, whose
+      bytes the fast-forward made equal, takes the newer of the two mtimes. A declared output — generated and ignored,
+      so its bytes can differ, and reconciled as an output even when the index also tracks it — has its bytes compared:
+      equal bytes take the newer mtime in the same way; different bytes give the target file the time of this pass, one
+      time taken when the pass starts, unless it is already newer, so those bytes are newer than every unit the landing
+      volume built from the landing checkout's bytes. No byte of either checkout changes, only a target file's mtime,
+      and no mtime ever moves back. The pass is reported on stderr with the tracked and output path counts, the regular
+      files examined, the files advanced to the landing checkout's newer mtime, the outputs whose bytes were compared,
+      the outputs republished at the pass's time, and the time the pass took;
    4. admit the landing volume's Nx state and, in a project without the mbx capability, existing Cargo profile locks
       immediately before capture. A live task-database holder is `landingHeld`, a process opening that database is
       `landingOpening`, a daemon that outlives its stop is `landingDaemonStayed`, and a held Cargo profile is

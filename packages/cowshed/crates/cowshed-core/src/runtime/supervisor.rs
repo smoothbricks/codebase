@@ -10289,6 +10289,27 @@ mod workspace_toolchain_tests {
         ) {
             panic!("the land's source-path job must adopt the workspace's shell record: {miss}");
         }
+        let read_only = keyed(&policy, crate::api::dto::RunSandboxMode::ReadOnly, &mount).await;
+        super::super::shell_inherit::verify(
+            &super::super::shell_inherit::Placement::of(&mount, &read_only),
+            &read_only,
+        )
+        .expect("a read-only job adopts the writable activation");
+        let mut changed_options = read_only.clone();
+        changed_options
+            .get_mut(OsStr::new("BUN_OPTIONS"))
+            .unwrap()
+            .push(" --smol");
+        assert!(
+            matches!(
+                super::super::shell_inherit::verify(
+                    &super::super::shell_inherit::Placement::of(&mount, &changed_options),
+                    &changed_options,
+                ),
+                Err(super::super::shell_inherit::AdoptionMiss::BaselineMoved { name }) if name == "BUN_OPTIONS"
+            ),
+            "non-owned runtime options remain in the key"
+        );
     }
 
     /// A plain repository gets the core contract, including the two exact port-0 loader options,

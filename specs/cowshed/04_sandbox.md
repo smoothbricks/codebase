@@ -913,17 +913,21 @@ These anchors are trust configuration, not secrets, so they are exported/written
    build-configuration variables, then sets the private HOME/XDG directories, proxy credentials, runtime directory, and
    bootstrap PATH. Inside that restriction, canonical shell activation owns the environment the command sees. A command
    under the nearest workspace-contained `.envrc` runs in a warm exec host (11_shell.md): a process started under the
-   same child profile that approved and evaluated that `.envrc` once and forks the command into the job's own process
-   group, with the job's own pipes, the requested cwd, the literal argv, and the caller env laid over the activated
-   environment. A host that activates for a job belongs to that job until its command starts, so the activation's
-   output, failure and kill are the job's. Without a contained `.envrc` the command runs in the plain sandbox
-   environment. The supervisor neither evaluates repository shell code nor parses and reconstructs its exported
-   environment; it reads only the watch list direnv recorded, to decide when a host is stale. Failed activation prevents
-   command execution. The child profile's final rule denies every mutation beneath `.cowshed/job/**`; no startup hook,
-   exec host, one-shot, or descendant receives supervisor artifact-write authority. Request-specific `--ro` narrows only
-   that job's child profile, never the supervisor's artifact-write authority or later jobs, and a read-only job runs
-   only in a host started under the read-only profile. The effective mode is read-only whenever either the request or
-   the configured workspace ceiling is read-only; a read-write request cannot widen a read-only ceiling.
+   same child profile, holding a verified activation or, for read-write only, approving and evaluating that .envrc once.
+   It forks the command into the job's own process group, with the job's own pipes, the requested cwd, the literal argv,
+   and the caller env laid over the activated environment. A host that activates for a job belongs to that job until its
+   command starts, so the activation's output, failure and kill are the job's. Without a contained `.envrc` the command
+   runs in the plain sandbox environment. The supervisor neither evaluates repository shell code nor parses and
+   reconstructs its exported environment; it reads only the watch list direnv recorded, to decide when a host is stale.
+   Failed activation prevents command execution. The child profile's final rule denies every mutation beneath
+   `.cowshed/job/**`; no startup hook, exec host, one-shot, or descendant receives supervisor artifact-write authority.
+   Request-specific `--ro` narrows only that job's child profile, never the supervisor's artifact-write authority or
+   later jobs, and a read-only job runs only in a host started under the read-only profile. The effective mode is
+   read-only whenever either the request or the configured workspace ceiling is read-only; a read-write request cannot
+   widen a read-only ceiling. Read-only hosts adopt the verified read-write activation with mode-owned environment paths
+   rebound (11_shell.md, "Inherited shells"). They never approve or evaluate: a miss refuses as
+   `activation needed: run one RW exec`, naming its cause before any devenv attempt; no .devenv write grant is added to
+   make shell entry work.
 5. Read stdout and stderr as separate opaque byte streams, incrementally hash and quota-account them, and begin in
    bounded memory. Terminal streams at or below the inline limit are stored as Arrow Binary in a complete protected
    batch. A stream creates `.cowshed/job/<numeric-id>/out` or `err` only when it crosses that limit or a live replay
