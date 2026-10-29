@@ -18,6 +18,8 @@ namespaces is a later platform goal; [zfs.md](zfs.md) records that contract but 
 The workspace and test targets must still compile on Linux. Pure retained-input path witnesses are available across
 crate boundaries on every platform; disk-image attachment, native port allocation, and Darwin process-argument
 diagnostics remain macOS-only. From the repository root, `bun run check:linux` checks the full Linux target surface.
+Shell fixtures running under cleared child environments supply their tool PATH from the test environment rather than
+assuming coreutils live under `/bin` or `/usr/bin`.
 
 ```sh
 $ cd ~/src/api

@@ -625,17 +625,23 @@ mod tests {
         let executable = mbx::host_link(&home);
         std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
         let generated = b"#!/bin/sh\nprintf 'generated cargo\\n'\n";
-        let script = r#"#!/bin/sh
+        let script = format!(
+            r#"#!/bin/sh
 set -eu
+export PATH='{path}'
 [ "$1" = setup ] && [ "$2" = --yes ]
 [ "$PWD" = "$TMPDIR" ]
 [ "$MBX_CACHE_DIR" = "$TMPDIR/cache/mbx" ]
-[ -z "${MISE_CONFIG_FILE-}" ]
+[ -z "${{MISE_CONFIG_FILE-}}" ]
 mkdir -p "$XDG_DATA_HOME/mbx/bin"
 printf '#!/bin/sh\nprintf '\''generated cargo\\n'\''\n' > "$XDG_DATA_HOME/mbx/bin/cargo"
 chmod 755 "$XDG_DATA_HOME/mbx/bin/cargo"
 printf '%s\n' "$0" > "$XDG_DATA_HOME/mbx/bin/mbx-target"
-"#;
+"#,
+            path = std::env::var("PATH")
+                .expect("the test PATH supplies mkdir and chmod")
+                .replace('\'', "'\\''"),
+        );
         std::fs::write(&executable, script).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         install_cargo_route(&home).unwrap();
