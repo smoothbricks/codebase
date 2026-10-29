@@ -329,9 +329,10 @@ pub fn checkout_verdict(
 
 /// Host shells source the same canonical mbx environment as supervisor children (11_shell.md,
 /// "Canonical mbx environment"). `RUSTC_WRAPPER` is Cargo's to withhold.
-pub const HOST_ENVIRONMENT: [&str; 15] = [
+pub const HOST_ENVIRONMENT: [&str; 16] = [
     CARGO_ROUTE_ENV,
     "MBX_CACHE_DIR",
+    "MBX_SESSION_ROOT",
     "MBX_TARGET_VIEWS",
     "MBX_TARGET_ROOT",
     "MBX_DISABLE",
@@ -461,6 +462,16 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     ] {
         contribution.env.insert(unset, EnvAction::Unset);
     }
+    let sessions = context.runtime_dir.join("mbx");
+    contribution.env.insert(
+        "MBX_SESSION_ROOT",
+        EnvAction::Own(sessions.clone().into_os_string()),
+    );
+    contribution.daemon_isolation.directories.push(sessions);
+    contribution
+        .daemon_isolation
+        .discard_at_mint
+        .push(PathBuf::from(".cowshed/run/mbx"));
     let project = context
         .project_root
         .strip_prefix(context.workspace_root)
@@ -834,6 +845,19 @@ mod tests {
             contribution.env.get("MBX_CACHE_DIR"),
             Some(&EnvAction::Own(build_cache.join("mbx").into_os_string()))
         );
+        assert_eq!(
+            contribution.env.get("MBX_SESSION_ROOT"),
+            Some(&EnvAction::Own(
+                context.runtime_dir.join("mbx").into_os_string()
+            ))
+        );
+        assert!(HOST_ENVIRONMENT.contains(&"MBX_SESSION_ROOT"));
+        assert!(
+            contribution
+                .daemon_isolation
+                .directories
+                .contains(&context.runtime_dir.join("mbx"))
+        );
         for unset in [
             "RUSTC_WRAPPER",
             "RUSTC_WORKSPACE_WRAPPER",
@@ -868,7 +892,7 @@ mod tests {
         );
         assert_eq!(
             contribution.daemon_isolation.discard_at_mint,
-            [PathBuf::from("target")]
+            [PathBuf::from(".cowshed/run/mbx"), PathBuf::from("target")]
         );
     }
 
@@ -917,7 +941,7 @@ mod tests {
     fn the_pin_is_the_revision_the_shipped_lock_names() {
         assert_eq!(
             pinned_revision().as_deref(),
-            Some("9d91cf452ec59682a9a4581bdd7e39e2b247be22")
+            Some("956d6c62fff5682ac9551dbae64dd87f52fb6cfb")
         );
     }
 

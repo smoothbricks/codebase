@@ -385,6 +385,7 @@ The canonical environment carries these owned values when the capability is pres
 | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `COWSHED_CARGO_ROUTE`                                                      | `dev.cowshed/mbx-shim/` beside the installed `bin`, where `cowshed setup` provisions mbx's Cargo shim; it leads PATH (below).                                       |
 | `MBX_CACHE_DIR`                                                            | `$COWSHED_BUILD_CACHE/mbx`, the shared store specified by 03_caches.md, "mbx"; the root comes from 02_workspaces.md, "Workspace environment", never a spelled path. |
+| `MBX_SESSION_ROOT`                                                         | The `mbx` leaf under the workspace's existing short runtime link, without canonicalizing the alias.                                                                 |
 | `MBX_TARGET_VIEWS`                                                         | `1`, enabling mbx's managed targets.                                                                                                                                |
 | `MBX_TARGET_ROOT`                                                          | Unset, retaining mbx's default managed root on the cache filesystem.                                                                                                |
 | `MBX_DISABLE`                                                              | Unset; the canonical route does not bypass mbx.                                                                                                                     |
@@ -396,6 +397,13 @@ The canonical environment carries these owned values when the capability is pres
 | `MBX_SCHEDULER_SUSPEND`                                                    | `0`; scheduling never freezes processes (AGENTS.md, rule 6).                                                                                                        |
 | `MBX_SCHEDULER_TESTS`                                                      | `1`, enabling mbx's supported Cargo-test and nextest target runners.                                                                                                |
 | `MBX_SCHEDULER_PRIORITY`                                                   | The class mapping owned by 05_gateway.md, "Classes"; outside a job, the non-gate value.                                                                             |
+
+The session root is a capability-owned writable runtime leaf in every job mode, prepared before the host shell's
+`.cowshed/env` is published, initially and after a capability change. Host shells receive it too: their served `TMPDIR`
+is the same long workspace directory. The socket suffix is 36 bytes below the 24-byte short root, so the pathname is 60
+bytes, within macOS's 103-byte limit (01c_macos.md, "sun_path is 104 bytes"). Session shims and staging keep their
+existing private-directory lifecycle there. Mint discards the `mbx` runtime leaf through the capability's existing
+daemon-state cleanup, so a clone never inherits a running or crashed session's scratch.
 
 Host-global settings are read through the installed mbx's settings interface, not copied into a cowshed configuration or
 peak-memory ledger. The same resolved CPU/memory settings reach every pool participant, including the host's

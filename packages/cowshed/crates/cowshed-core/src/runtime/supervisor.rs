@@ -1557,15 +1557,36 @@ fn prepare_private_environment(
             }
         }
     }
+    prepare_daemon_directories(environment_root, &environment, runtime, contribution)?;
+    Ok(environment)
+}
+
+/// Makes every directory the active detectors contributed for their daemons, before any process
+/// can need one. A directory inside the private environment is made through that environment's
+/// held anchor. One named through the short runtime alias is made in the runtime directory the
+/// alias leads to (`runtime` is the alias and that directory), never through the alias itself:
+/// the directory is walked to once and every such leaf is made under that one anchor. A path in
+/// neither is a detector's defect: it is refused, and nothing is made for it.
+fn prepare_daemon_directories(
+    environment_root: &Path,
+    environment: &AnchoredDirectory,
+    runtime: Option<(&Path, &Path)>,
+    contribution: &crate::capabilities::CapabilityContribution,
+) -> Result<()> {
+    let mut shared: Option<AnchoredDirectory> = None;
     for path in &contribution.daemon_isolation.directories {
         if let Ok(relative) = path.strip_prefix(environment_root) {
-            private_directory(&environment, relative).map_err(private_environment_error)?;
+            private_directory(environment, relative).map_err(private_environment_error)?;
         } else if let Some((alias, directory)) = runtime
             && let Ok(relative) = path.strip_prefix(alias)
         {
-            let runtime =
-                AnchoredDirectory::create(directory).map_err(private_environment_error)?;
-            private_directory(&runtime, relative).map_err(private_environment_error)?;
+            let held = match &mut shared {
+                Some(held) => held,
+                empty => empty.insert(
+                    AnchoredDirectory::create(directory).map_err(private_environment_error)?,
+                ),
+            };
+            private_directory(held, relative).map_err(private_environment_error)?;
         } else {
             return Err(CowshedError::integrity(
                 "capability daemon directory escapes the private environment and shared runtime",
@@ -1573,7 +1594,21 @@ fn prepare_private_environment(
             ));
         }
     }
-    Ok(environment)
+    Ok(())
+}
+
+/// Whether `contribution` names a daemon directory through `alias`, the short name of the shared
+/// runtime directory: the one reason to take the alias for that directory, which a plain
+/// checkout never needs.
+fn names_runtime_alias(
+    contribution: &crate::capabilities::CapabilityContribution,
+    alias: &Path,
+) -> bool {
+    contribution
+        .daemon_isolation
+        .directories
+        .iter()
+        .any(|path| path.starts_with(alias))
 }
 
 fn private_directory(root: &AnchoredDirectory, relative: &Path) -> io::Result<AnchoredDirectory> {
@@ -1613,31 +1648,37 @@ async fn link_runtime_dir(sandbox: &SandboxConfig, runtime_dir: &Path) -> Result
     point_runtime_link(&sandbox_runtime_link(sandbox), runtime_dir).await
 }
 
+/// [`point_runtime_link_blocking`] on the blocking pool, so the actor awaits it with its thread
+/// free (`off_actor`).
+async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
+    let (link, runtime_dir) = (link.to_owned(), runtime_dir.to_owned());
+    off_actor::run(move || point_runtime_link_blocking(&link, &runtime_dir)).await
+}
+
 /// Points `link` at `runtime_dir`. A link that already points there is the whole answer: every
 /// spawn of a live workspace takes that path, so it reads one link and nothing else. Creating or
 /// retargeting the link also sweeps every `cs-*` link beside it whose target is gone - a retired
 /// workspace takes its mount with it and leaves the link dangling - so the scan of the shared
 /// directory is paid once per link a workspace takes, never once per command.
-async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
+///
+/// Blocking: [`point_runtime_link`] runs it on the blocking pool, and publishing the host
+/// environment calls it where it already runs there.
+fn point_runtime_link_blocking(link: &Path, runtime_dir: &Path) -> Result<()> {
     let io = |what: &str, path: &Path, error: std::io::Error| {
         CowshedError::environment_missing(
             format!("cannot {what} {}: {error}", path.display()),
             "reattach the workspace and retry",
         )
     };
-    match tokio::fs::read_link(link).await {
+    match std::fs::read_link(link) {
         Ok(target) if target == runtime_dir => return Ok(()),
         Ok(_) => {
-            tokio::fs::remove_file(link)
-                .await
-                .map_err(|error| io("replace runtime link", link, error))?;
-            tokio::fs::symlink(runtime_dir, link)
-                .await
+            std::fs::remove_file(link).map_err(|error| io("replace runtime link", link, error))?;
+            std::os::unix::fs::symlink(runtime_dir, link)
                 .map_err(|error| io("create runtime link", link, error))?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tokio::fs::symlink(runtime_dir, link)
-                .await
+            std::os::unix::fs::symlink(runtime_dir, link)
                 .map_err(|error| io("create runtime link", link, error))?;
         }
         Err(error) => return Err(io("inspect runtime link", link, error)),
@@ -1645,22 +1686,21 @@ async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
     let Some(directory) = link.parent() else {
         return Ok(());
     };
-    let mut entries = match tokio::fs::read_dir(directory).await {
-        Ok(entries) => entries,
-        Err(_) => return Ok(()),
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Ok(());
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    for entry in entries.map_while(std::result::Result::ok) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !name.starts_with("cs-") {
             continue;
         }
         let path = entry.path();
-        let Ok(target) = tokio::fs::read_link(&path).await else {
+        let Ok(target) = std::fs::read_link(&path) else {
             continue;
         };
-        if tokio::fs::metadata(&target).await.is_err() {
-            let _ = tokio::fs::remove_file(&path).await;
+        if std::fs::metadata(&target).is_err() {
+            let _ = std::fs::remove_file(&path);
         }
     }
     Ok(())
@@ -2745,14 +2785,7 @@ pub(super) async fn sandbox_environment(
         )
     })?;
     link_runtime_dir(sandbox, &private_runtime).await?;
-    if sandbox
-        .capabilities
-        .contribution
-        .daemon_isolation
-        .directories
-        .iter()
-        .any(|path| path.starts_with(&shared_alias))
-    {
+    if names_runtime_alias(&sandbox.capabilities.contribution, &shared_alias) {
         point_runtime_link(&shared_alias, &shared_runtime).await?;
     }
     // Host-side preparation: adopted bindings are controller metadata, not child-readable
@@ -11741,6 +11774,29 @@ mod lifecycle_commitment_tests {
         let workspace_root = root.join("workspace");
         std::fs::create_dir_all(workspace_root.join(".cowshed")).unwrap();
         std::fs::write(workspace_root.join("nx.json"), "{}").unwrap();
+        let runtime_link = crate::sandbox::workspace_runtime_link(&workspace_root);
+        struct RuntimeLinkCleanup(PathBuf);
+        impl Drop for RuntimeLinkCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _runtime_link_cleanup = RuntimeLinkCleanup(runtime_link.clone());
+        let sessions = runtime_link.join("mbx");
+        assert!(!sessions.exists());
+        let mut capabilities = crate::capabilities::DetectedCapabilities {
+            active: Vec::new(),
+            contribution: Default::default(),
+        };
+        capabilities.contribution.env.insert(
+            "MBX_SESSION_ROOT",
+            crate::capabilities::EnvAction::Own(sessions.clone().into_os_string()),
+        );
+        capabilities
+            .contribution
+            .daemon_isolation
+            .directories
+            .push(sessions.clone());
         let env = workspace_root.join(".cowshed/env");
         std::fs::write(
             &env,
@@ -11776,12 +11832,26 @@ mod lifecycle_commitment_tests {
             sandbox: SandboxConfig {
                 workspace_mount: workspace_root.clone(),
                 exec_temp_dir: root.join("tmp"),
+                capabilities,
                 ..defaults.sandbox.clone()
             },
             ..defaults
         };
         let supervisor = WorkspaceSupervisor::start(config, publisher.clone()).unwrap();
         let published = std::fs::read_to_string(&env).unwrap();
+        assert!(
+            sessions.is_dir(),
+            "published session root does not exist before the first job: {}",
+            sessions.display()
+        );
+        assert!(
+            published.contains("export MBX_SESSION_ROOT="),
+            "{published}"
+        );
+        assert!(
+            published.contains(sessions.to_str().unwrap()),
+            "{published}"
+        );
         assert!(
             published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true\n"),
             "{published}"
@@ -12778,9 +12848,44 @@ mod install_observation_tests {
     }
 }
 
+/// Makes what `.cowshed/env` names for the daemons exist before a host shell can source it: the
+/// directories the capabilities contributed (mbx's session root) and, when one is named through
+/// the short runtime alias, the alias that leads to the runtime directory. A shell that makes a
+/// leaf below an alias nothing has taken makes the alias itself a real directory, which
+/// [`point_runtime_link_blocking`] never replaces. Made as a spawn makes them
+/// ([`prepare_daemon_directories`] over the shared runtime, in either mode), anchored from the
+/// root without following a link: a symlinked `.cowshed` is refused, never written through. A
+/// checkout whose capabilities contribute no daemon directory takes nothing.
+fn prepare_host_daemon_runtime(sandbox: &SandboxConfig) -> Result<()> {
+    let contribution = &sandbox.capabilities.contribution;
+    if contribution.daemon_isolation.directories.is_empty() {
+        return Ok(());
+    }
+    let environment_root = match sandbox.mode {
+        crate::sandbox::RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.clone(),
+        crate::sandbox::RunSandboxMode::ReadWrite => sandbox.workspace_mount.join(".cowshed"),
+    };
+    let environment =
+        AnchoredDirectory::create(&environment_root).map_err(private_environment_error)?;
+    let alias = shared_daemon_runtime_link(sandbox);
+    let runtime = shared_daemon_runtime_dir(sandbox);
+    prepare_daemon_directories(
+        &environment_root,
+        &environment,
+        Some((&alias, &runtime)),
+        contribution,
+    )?;
+    if names_runtime_alias(contribution, &alias) {
+        point_runtime_link_blocking(&alias, &runtime)?;
+    }
+    Ok(())
+}
+
 /// Publish `sandbox`'s workspace environment, its capabilities' contribution included, as the
 /// host shell's `.cowshed/env` (11_shell.md): what a host shell sources is what the jobs carry.
+/// Everything the file names for a daemon exists first ([`prepare_host_daemon_runtime`]).
 fn publish_host_environment(sandbox: &SandboxConfig) -> Result<()> {
+    prepare_host_daemon_runtime(sandbox)?;
     crate::workspace_credentials::publish_workspace_environment(
         crate::workspace_environment::EnvironmentMount::Served {
             workspace_mount: &sandbox.workspace_mount,
