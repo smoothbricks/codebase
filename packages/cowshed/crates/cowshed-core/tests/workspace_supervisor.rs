@@ -7092,9 +7092,30 @@ async fn idle_named_handles_and_maintenance_do_not_keep_the_nx_daemon_resident()
         .recv()
         .await
         .expect("a new session opening is one use");
-    complete(&restart, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(restart.request.job_id).await.unwrap();
-    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+    // Retirement stops the keeper's start as it stops every admitted job, and the start ends only
+    // then. Ended before, it would be a start that left no daemon live, which the keeper follows
+    // with another at its next probe (04_sandbox.md, the kept daemon). That probe finishes on the
+    // blocking pool, in real time, so whether it is judged before the retirement is a race, and a
+    // successor nothing ends would hold the retirement forever.
+    let handle = h.handle.clone();
+    let retiring = tokio::spawn(async move { handle.retire(NxDaemonRetirement::Recorded).await });
+    let stopped = loop {
+        if let ProcessObservation::Signal(job, signal) = h.process.recv().await.unwrap() {
+            break (job, signal);
+        }
+    };
+    assert_eq!(stopped, (restart.request.job_id, ProcessSignal::Term));
+    complete(
+        &restart,
+        b"",
+        b"",
+        ExitStatus::Signaled {
+            signal: 15,
+            core_dumped: false,
+        },
+    )
+    .await;
+    retiring.await.unwrap().unwrap();
 }
 
 /// How long a shed must go unused before its keeper stops the daemon it keeps.
