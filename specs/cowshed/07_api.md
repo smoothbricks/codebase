@@ -577,7 +577,7 @@ pub struct LandedReport {
     pub target_was_checked_out: bool,
     pub retired: bool,
     pub build_volume: LandBuildVolume,
-    pub folded: Vec<FoldedWorkspace>,    // the sessions the land folded (02: `land` step 5, "Folds")
+    pub folded: Vec<FoldedWorkspace>,    // non-empty own work since the recorded fork base; retire idle peers only (02, land step 5)
 }
 
 pub struct FoldedWorkspace {

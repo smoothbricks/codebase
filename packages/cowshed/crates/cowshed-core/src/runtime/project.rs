@@ -7741,14 +7741,39 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 crate::storage::lifecycle::MountState::Mounted { .. }
             )
         };
-        if mounted(&self.current(workspace).await?) {
+        if when == RetireWhen::IfUnowned {
+            self.leave_mount(workspace, &mount)?;
+        } else if mounted(&self.current(workspace).await?) {
             self.require_mount_unheld_before_stop(workspace, &mount)
                 .await?;
         }
         let stopped = self
             .stop_supervisor_with_mode(workspace, when, nx_check.supervisor_retirement())
             .await?;
-        require_lost_groups_released(workspace, &stopped, "remove").await?;
+        if when == RetireWhen::IfUnowned {
+            let ledger = self.job_group_ledger(workspace);
+            let live = tokio::task::spawn_blocking(move || super::job_groups::live_job(&ledger))
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("peer job census failed: {error}"))
+                })?
+                .map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!("cannot inspect workspace {workspace}'s recorded jobs: {error}"),
+                        "cowshed doctor --json",
+                    )
+                })?;
+            if let Some(job) = live {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "workspace {workspace} has a running recorded job {job}; its peer fold stops nothing"
+                    ),
+                    "let the owner finish the job, then explicitly land or remove the workspace",
+                ));
+            }
+        } else {
+            require_lost_groups_released(workspace, &stopped, "remove").await?;
+        }
         let current = self.current(workspace).await?;
         Self::require_exact_incarnation(&current, &initial.incarnation)?;
         if mounted(&current) {
@@ -8390,9 +8415,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 
     /// A land's fold step (02_workspaces.md, `land` step 5, "Folds"): retire every published,
-    /// mounted session other than `unit`, the target and main whose own change since its merge base
-    /// with the target's previous head touches a path `previous..landed` changes and that the
-    /// target holds as `rm` measures it, as `rm` retires it, sparing a live owner. A session that
+    /// mounted peer with non-empty own commits since its recorded fork base that touch a path
+    /// `previous..landed` changes and that the target holds as `rm` measures it, sparing every
+    /// live supervisor. A session that
     /// is not the land's is neither touched nor named; a kept one says why. Collects nothing: the
     /// caller collects once after it.
     async fn retire_folds_into(
@@ -8416,7 +8441,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         };
         let target = crate::landing::resolve_target(&store_root, &into.mount, target_branch)
             .await
-            .map_err(unreadable)?;
+            .map_err(unreadable)?
+            .at(landed_head.clone());
         let paths = crate::landing::landed_paths(&store_root, &target, previous, landed_head)
             .await
             .map_err(unreadable)?;
@@ -8439,27 +8465,41 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
             let mount = self.workspace_mount_path(&name)?;
             let main = self.descriptor.git_root.to_path_buf();
-            let (store_root, target, paths, previous) = (
+            let incarnation = candidate.derived.workspace.incarnation().clone();
+            let fork_base = candidate.metadata.info_snapshot.base_commit;
+            let (store_root, target, paths) = (
                 std::sync::Arc::clone(&store_root),
                 target.clone(),
                 std::sync::Arc::clone(&paths),
-                previous.clone(),
             );
             measuring.spawn(async move {
                 let head = crate::git::GitRepository::from_root(&store_root, &mount)
                     .head_oid()
                     .await;
-                let facts = crate::landing::fold_facts(
-                    &store_root,
-                    &target,
-                    &paths,
-                    &previous,
-                    &mount,
-                    &main,
-                    name.as_str(),
-                )
-                .await;
-                (name, head, facts)
+                let unreadable = |reason| crate::landing::FoldFacts {
+                    touched: Err(reason),
+                    landed: false,
+                    dirty_files: Ok(0),
+                };
+                let facts = match head.as_ref() {
+                    Ok(head) => match GitOid::new(fork_base) {
+                        Ok(base) => {
+                            crate::landing::fold_facts(
+                                &store_root,
+                                &target,
+                                &paths,
+                                crate::landing::FoldProvenance { base: &base, head },
+                                &mount,
+                                &main,
+                                name.as_str(),
+                            )
+                            .await
+                        }
+                        Err(error) => unreadable(format!("recorded fork base is invalid: {error}")),
+                    },
+                    Err(error) => unreadable(error.message.clone()),
+                };
+                (name, incarnation, head, facts)
             });
         }
         let mut measured = Vec::new();
@@ -8471,7 +8511,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         measured.sort_by(|(left, ..), (right, ..)| left.cmp(right));
         let containment = into.containment(target_branch.to_owned());
         let mut folded = Vec::new();
-        for (name, head, facts) in measured {
+        for (name, incarnation, head, facts) in measured {
             let Some(step) = crate::landing::fold_step(&facts) else {
                 continue;
             };
@@ -8491,7 +8531,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             let outcome = match step {
                 crate::landing::FoldStep::Keep(reason) => FoldOutcome::Kept { reason },
                 crate::landing::FoldStep::Retire => {
-                    match self.retire_fold(&name, &containment).await {
+                    match self
+                        .retire_fold(&name, &incarnation, &head, &containment)
+                        .await
+                    {
                         Ok(()) => FoldOutcome::Retired,
                         // Gone after a failure late in its retirement (its journal, say) is
                         // retired: the replay finishes the rest. Still there is kept, saying why.
@@ -8546,6 +8589,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn retire_fold(
         &mut self,
         workspace: &WorkspaceName,
+        expected_incarnation: &WorkspaceIncarnation,
+        expected_head: &GitOid,
         containment: &NativeContainment,
     ) -> Result<()> {
         let _lease = super::land_lease::take(
@@ -8559,7 +8604,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             containment,
             CheckoutNxCheck::CloseRecorded,
             YoungPolicy::Authorized,
-            LiveOwner::Spare,
+            LiveOwner::Spare {
+                expected_incarnation,
+                expected_head,
+            },
         )
         .await
         .map(|_| ())
@@ -8572,7 +8620,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         containment: &NativeContainment,
         nx_check: CheckoutNxCheck,
         young: YoungPolicy,
-        owner: LiveOwner,
+        owner: LiveOwner<'_>,
     ) -> Result<RemoveReport> {
         use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
 
@@ -9018,6 +9066,20 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let removal = async {
             let current = self.current(&workspace).await?;
             let initial_fence = self.removal_git_fence(&current).await?;
+            if let LiveOwner::Spare {
+                expected_incarnation,
+                expected_head,
+            } = owner
+            {
+                Self::require_exact_incarnation(&current, expected_incarnation)?;
+                if initial_fence.head != *expected_head {
+                    return Err(removal_head_moved_refusal(
+                        &workspace,
+                        expected_head,
+                        &initial_fence.head,
+                    ));
+                }
+            }
             self.require_removal_safe(
                 &workspace,
                 options,
@@ -9106,7 +9168,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         .unmount(&current.derived.workspace)
                         .await
                         .map_err(native_storage_error),
-                    Ok(_) => self.ensure_supervisor(&workspace).await.map(|_| ()),
+                    Ok(_) if matches!(owner, LiveOwner::Quiesce) => {
+                        self.ensure_supervisor(&workspace).await.map(|_| ())
+                    }
+                    Ok(_) => Ok(()),
                     Err(_) => Ok(()),
                 };
                 return match cleanup {
@@ -10520,6 +10585,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         );
         // An unknown hello or retirement outcome is never proof a supervisor stopped. The
         // returned socket lease closes replacement admission until the caller's mutation ends.
+        if when == RetireWhen::IfUnowned {
+            // Binding refuses a live supervisor without stopping it and fences new admission
+            // through the caller's retirement, including queued jobs and attached shells.
+            return super::supervisor_socket::bind(&socket).await;
+        }
         let handle = match self.supervisors.remove(name) {
             Some(handle) => Some(handle),
             None => match super::supervisor_socket::hello_if_present(&socket).await {
@@ -10529,11 +10599,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 )),
                 Ok(None) => None,
                 Err(error) if error.code == ErrorCode::Conflict => {
-                    // A fold spares a live owner; a supervisor of another build cannot be asked
-                    // whether it has one, so it is never drained or signalled for a fold.
-                    if when == RetireWhen::IfUnowned {
-                        return Err(error);
-                    }
                     if nx_daemon == NxDaemonRetirement::ControllerOwned {
                         // Preserve the typed build refusal. A generic drain could let that
                         // older actor signal a mutable record nominee before the controller.
@@ -23842,21 +23907,24 @@ const YOUNG_WORKSPACE: std::time::Duration = std::time::Duration::from_secs(10 *
 /// session it holds (02_workspaces.md, `rm` step 2; `land` step 5, "Folds").
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LiveOwner {
+enum LiveOwner<'a> {
     /// Let the running jobs finish first, as `rm` does; `--force` stops them.
     Quiesce,
-    /// Refuse while a job runs or a shell is open: a land retiring what it folded never waits for
-    /// an owner, nor stops one.
-    Spare,
+    /// Refuse every live supervisor, including one with a queued job or attached shell.
+    /// Only an idle peer's age floor is bypassed by a land's fold cleanup.
+    Spare {
+        expected_incarnation: &'a WorkspaceIncarnation,
+        expected_head: &'a GitOid,
+    },
 }
 
 #[cfg(target_os = "macos")]
-impl LiveOwner {
+impl LiveOwner<'_> {
     const fn retire_when(self, force: bool) -> RetireWhen {
         match (self, force) {
             (_, true) => RetireWhen::Now,
             (Self::Quiesce, false) => RetireWhen::AfterJobs,
-            (Self::Spare, false) => RetireWhen::IfUnowned,
+            (Self::Spare { .. }, false) => RetireWhen::IfUnowned,
         }
     }
 }

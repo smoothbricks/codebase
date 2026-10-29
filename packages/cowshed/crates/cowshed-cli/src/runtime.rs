@@ -3719,7 +3719,7 @@ fn fold_line(folded: &FoldedWorkspace) -> String {
         } => format!("kept (refused: {message})"),
     };
     format!(
-        "folded {} {}: {outcome}",
+        "folded peer {} {}: {outcome}",
         folded.workspace.as_str(),
         folded.head
     )

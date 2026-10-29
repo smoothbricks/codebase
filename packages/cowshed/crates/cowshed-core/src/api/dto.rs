@@ -3826,13 +3826,13 @@ pub struct LandedReport {
     /// What the land did with build volumes (16_build_volumes.md, Land steps 4–7).
     pub build_volume: LandBuildVolume,
 
-    /// The sessions the land folded (02_workspaces.md, `land` step 5, "Folds"), each retired or
-    /// kept; empty when it retired nothing of its own.
+    /// Peers with non-empty own commits since their recorded fork base held by this land
+    /// (02_workspaces.md, land step 5): each retired if idle, or kept with why.
     pub folded: Vec<FoldedWorkspace>,
 }
 
-/// A session a land folded: its own change touched a path the landed range changed, and the
-/// target now holds it by `rm`'s measurement (02_workspaces.md, `land` step 5, "Folds").
+/// A peer whose non-empty own commits since its recorded fork base touch the landed range
+/// and are held by its result (02_workspaces.md, land step 5, "Folds").
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FoldedWorkspace {
@@ -3856,8 +3856,8 @@ pub enum FoldKept {
     /// Its tree carries `files` uncommitted changes: tracked ones, and untracked files no ignore
     /// rule covers.
     Dirty { files: u64 },
-    /// Its retirement refused, word for word: a supervisor running a job or holding an open shell,
-    /// a process holding its checkout, a land or `rm` holding it, or anything else `rm` refuses.
+    /// Its retirement refused, word for word: a live supervisor, running or queued job, attached
+    /// shell, checkout holder, land or `rm` lease, or anything else `rm` refuses.
     Refused {
         code: crate::error::ErrorCode,
         message: String,

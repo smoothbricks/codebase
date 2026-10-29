@@ -235,6 +235,168 @@ async fn a_named_rm_abandon_supersedes_its_targets_refused_unfinished_retire() {
     assert_eq!(fixture.listed(&rm).await, ["lane", "main"]);
     rm.shutdown().await.expect("stop the removing runtime");
 }
+/// An empty sibling inherits the landed tip, not its source's work (02_workspaces.md, land step 5).
+#[tokio::test]
+async fn an_ungated_land_keeps_a_fresh_sibling_forked_at_its_source_tip() {
+    let fixture = Fixture::new("land-fresh-sibling");
+    let runtime = fixture.adopt().await;
+    let lane = fixture
+        .mint(&runtime, "lane", ForkOptions::default())
+        .await
+        .expect("lane");
+    fixture.lane_unit(&runtime, &lane, "unit").await;
+    let sibling = fixture
+        .fork(&runtime, "unit", "fresh")
+        .await
+        .expect("fresh sibling");
+    let mount = PathBuf::from(sibling["info"]["mount"].as_str().expect("fresh mount"));
+    let image = fixture
+        .layout()
+        .session_image(&name("fresh"))
+        .expect("fresh image")
+        .image()
+        .to_owned();
+    let metadata = DetachedWorkspaceMetadata::read_for_image(&image).expect("fresh provenance");
+    let head = cowshed_core::git::GitRepository::from_root(
+        &std::sync::Arc::from(fixture.storage.store()),
+        &mount,
+    )
+    .head_oid()
+    .await
+    .expect("fresh head");
+    assert_eq!(metadata.info_snapshot.base_commit, head.as_str());
+    // No supervisor can hide the provenance defect by keeping an otherwise retirable peer busy.
+    runtime.shutdown().await.expect("stop supervisors");
+    let runtime = fixture.open_naming("unit").await.expect("landing runtime");
+    let landed = fixture
+        .land_into(&runtime, "unit", &lane, true)
+        .await
+        .expect("ungated fold");
+    assert_eq!(
+        landed["retired"], true,
+        "the named source still retires: {landed}"
+    );
+    assert_eq!(
+        fixture.listed(&runtime).await,
+        ["fresh", "lane", "main"],
+        "{landed}"
+    );
+    assert!(mount.join("unit").exists(), "fresh sibling remains mounted");
+    assert!(image.exists(), "fresh sibling retains its backing payload");
+    assert!(
+        landed["folded"]
+            .as_array()
+            .expect("fold report")
+            .iter()
+            .all(|fold| fold["workspace"] != "fresh"),
+        "an empty sibling folded nothing: {landed}"
+    );
+    runtime.shutdown().await.expect("stop landing runtime");
+}
+/// Fold cleanup never stops another workspace's live supervisor (02_workspaces.md, land step 5).
+#[tokio::test]
+async fn an_ungated_land_keeps_a_folded_peer_with_a_live_supervisor_or_running_job() {
+    use cowshed_core::api::dto::{
+        CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobState, RunSandboxMode,
+        StdinSource,
+    };
+    use cowshed_core::storage::job_artifact::StreamKind;
+    for running in [false, true] {
+        let fixture = Fixture::new("land-live-peer");
+        let runtime = fixture.adopt().await;
+        let lane = fixture
+            .mint(&runtime, "lane", ForkOptions::default())
+            .await
+            .expect("lane");
+        fixture.lane_unit(&runtime, &lane, "peer").await;
+        fixture
+            .fork(&runtime, "peer", "unit")
+            .await
+            .expect("landing source");
+        let socket =
+            supervisor_socket::socket_path(fixture.storage.store(), &fixture.repo, &name("peer"));
+        let hello = supervisor_socket::hello(&socket)
+            .await
+            .expect("live peer supervisor");
+        let peer = supervisor_socket::connect(socket.clone(), hello.authority);
+        let job = if running {
+            // This fixture owns lifecycle, not gateway admission; use the real supervisor's API.
+            let job = peer
+                .exec(
+                    None,
+                    None,
+                    ExecRequest {
+                        command: ExecCommand::Argv(
+                            ["sh", "-c", "printf ready; read line"]
+                                .into_iter()
+                                .map(CommandArg::new)
+                                .collect(),
+                        ),
+                        cwd: None,
+                        mode: RunSandboxMode::ReadWrite,
+                        env: Default::default(),
+                        trace: None,
+                        stdin: StdinSource::Open,
+                        stdout_copy: None,
+                        stderr_copy: None,
+                        admission_key: None,
+                        class: ExecClass::Background,
+                        want: None,
+                        scope: ExecScope::HostGate,
+                    },
+                    supervisor_socket::AdmissionSource::Coordinator,
+                )
+                .await
+                .expect("run a peer job with open stdin");
+            let output = peer
+                .log_read(job, StreamKind::Stdout, 0, true)
+                .await
+                .expect("job readiness");
+            assert_eq!(output.bytes.as_ref(), b"ready");
+            Some(job)
+        } else {
+            None
+        };
+        let landed = fixture
+            .land_into(&runtime, "unit", &lane, true)
+            .await
+            .expect("fold source");
+        assert_eq!(
+            landed["retired"], true,
+            "the named source retires: {landed}"
+        );
+        assert_eq!(
+            fixture.listed(&runtime).await,
+            ["lane", "main", "peer"],
+            "running={running}: {landed}"
+        );
+        let outcome = &landed["folded"]
+            .as_array()
+            .expect("fold report")
+            .iter()
+            .find(|fold| fold["workspace"] == "peer")
+            .expect("peer owns work in the result")["outcome"];
+        assert_eq!(outcome["kind"], "kept", "{landed}");
+        assert_eq!(outcome["reason"]["kind"], "refused", "{landed}");
+        assert!(
+            outcome["reason"]["message"]
+                .as_str()
+                .expect("refusal reason")
+                .contains("supervisor"),
+            "the report names the live owner: {landed}"
+        );
+        supervisor_socket::hello(&socket)
+            .await
+            .expect("the peer supervisor still serves");
+        if let Some(job) = job {
+            let status = peer.info(job).await.expect("peer job survives");
+            assert_eq!(status.state, JobState::Running, "{status:?}");
+            peer.stdin_close(job).await.expect("release peer stdin");
+            peer.wait(job).await.expect("reap peer job");
+        }
+        runtime.shutdown().await.expect("stop fixture supervisors");
+    }
+}
 /// A train folds units by cherry-pick, one through a conflict its lander resolved, then lands into
 /// its lane base. The land retires every session it folded — whose own change its range touched and
 /// whose content the landed tip holds — keeps a fold a host process holds or whose tree is dirty,
@@ -309,6 +471,14 @@ async fn a_land_retires_the_units_its_train_folded_and_keeps_live_dirty_and_unla
             );
         }
     }
+    runtime
+        .shutdown()
+        .await
+        .expect("stop peer supervisors before their idle fold");
+    let runtime = fixture
+        .open_naming("train")
+        .await
+        .expect("open the landing runtime");
     // A host shell sitting in a folded unit's checkout is a live owner.
     let mut holder = Command::new("sleep")
         .arg("600")

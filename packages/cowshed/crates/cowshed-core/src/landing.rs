@@ -67,6 +67,12 @@ impl LandingTarget {
     pub const fn tip(&self) -> &GitOid {
         &self.tip
     }
+
+    /// Pin containment to the immutable result of one land, not a later branch advance.
+    pub fn at(mut self, tip: GitOid) -> Self {
+        self.tip = tip;
+        self
+    }
 }
 
 /// Resolve `branch` from the target's own repository, or say why it could not be resolved.
@@ -534,8 +540,8 @@ pub fn merge_changes_nothing(target_tree: &GitOid, merged: &MergedTree) -> bool 
 /// What a land's fold step read of one session (02_workspaces.md, `land` step 5, "Folds").
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FoldFacts {
-    /// Whether its own change since its merge base with the target's previous head touches a path
-    /// the landed range changes, or why that could not be read.
+    /// Whether its non-empty own commits since its recorded fork base touch a path the landed
+    /// range changes, or why that could not be read.
     pub touched: std::result::Result<bool, String>,
     /// Whether the landed tip holds its head, and every other local branch passes as `rm` measures
     /// them. A head only a ref `cowshed push` keeps is not held: a fold is work the target carries
@@ -597,47 +603,40 @@ pub async fn landed_paths(
         .map_err(|error| error.message)
 }
 
-/// Read what [`fold_step`] decides from for the session at `workspace_mount`: whether its own
-/// change since its merge base with `previous` touches `landed_paths`, and only then whether the
-/// target holds it, measured as `rm` measures it ([`measure`]), and how dirty its tree is.
+/// Immutable endpoints of a peer's own commits, rooted at its recorded fork base.
+#[derive(Clone, Copy, Debug)]
+pub struct FoldProvenance<'a> {
+    pub base: &'a GitOid,
+    pub head: &'a GitOid,
+}
+/// Read the fold decision facts: non-empty own commits in the captured provenance
+/// touching `landed_paths`, then whether the target holds them as `rm` measures them
+/// ([`measure`]), and how dirty the peer's tree is.
 pub async fn fold_facts(
     store_root: &std::sync::Arc<Path>,
     target: &LandingTarget,
     landed_paths: &std::collections::BTreeSet<Vec<u8>>,
-    previous: &GitOid,
+    provenance: FoldProvenance<'_>,
     workspace_mount: &Path,
     push_repository: &Path,
     workspace: &str,
 ) -> FoldFacts {
-    // A session whose head main already holds has no work of its own (a shed just forked, say), so
-    // it is no fold whatever the landed range touches: what it differs by from the target's previous
-    // head is main's work (main moved past a train's base), and retiring it is its owner's act.
-    let main = GitRepository::from_root(store_root, push_repository);
-    if let Ok(head) = GitRepository::from_root(store_root, workspace_mount)
-        .head_oid()
-        .await
-        && matches!(main.has_commit(head.as_str()).await, Ok(true))
-        && matches!(
-            main.commit_is_ancestor(head.as_str(), "HEAD").await,
-            Ok(true)
-        )
-    {
-        return FoldFacts {
-            touched: Ok(false),
-            landed: false,
-            dirty_files: Ok(0),
-        };
-    }
-    let own = match GitRepository::from_root(store_root, workspace_mount)
+    let fork_base = provenance.base.as_str();
+    let head = provenance.head.as_str();
+    let touched = match GitRepository::from_root(store_root, workspace_mount)
         .with_alternate_objects(&target.objects)
     {
-        Ok(repository) => repository
-            .changed_paths(&format!("{previous}...HEAD"))
-            .await
-            .map_err(|error| error.message),
+        Ok(repository) => match repository.divergence(fork_base, head).await {
+            Ok(commits) if commits.ahead == 0 => Ok(false),
+            Ok(_) => repository
+                .changed_paths(&format!("{fork_base}...{head}"))
+                .await
+                .map(|own| !own.is_disjoint(landed_paths))
+                .map_err(|error| error.message),
+            Err(error) => Err(error.message),
+        },
         Err(error) => Err(error.message),
     };
-    let touched = own.map(|own| !own.is_disjoint(landed_paths));
     if touched != Ok(true) {
         return FoldFacts {
             touched,
@@ -651,7 +650,7 @@ pub async fn fold_facts(
         workspace_mount,
         push_repository,
         workspace,
-        "HEAD",
+        head,
     )
     .await;
     FoldFacts {

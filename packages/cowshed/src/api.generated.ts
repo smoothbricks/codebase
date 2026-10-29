@@ -954,8 +954,8 @@ export type FoldOutcome =
     });
 
 /**
- * A session a land folded: its own change touched a path the landed range changed, and the
- * target now holds it by `rm`'s measurement (02_workspaces.md, `land` step 5, "Folds").
+ * A peer whose non-empty own commits since its recorded fork base touch the landed range
+ * and are held by its result (02_workspaces.md, land step 5, "Folds").
  */
 export type FoldedWorkspace = {
   readonly workspace: WorkspaceName;
@@ -2033,8 +2033,8 @@ export type LandedReport = {
    */
   readonly buildVolume: LandBuildVolume;
   /**
-   * The sessions the land folded (02_workspaces.md, `land` step 5, "Folds"), each retired or
-   * kept; empty when it retired nothing of its own.
+   * Peers with non-empty own commits since their recorded fork base held by this land
+   * (02_workspaces.md, land step 5): each retired if idle, or kept with why.
    */
   readonly folded: ReadonlyArray<FoldedWorkspace>;
 };

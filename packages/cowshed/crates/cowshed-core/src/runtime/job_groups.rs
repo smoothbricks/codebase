@@ -519,6 +519,27 @@ pub fn take_lost(path: &Path, grace: Duration) -> io::Result<Vec<UnresolvedGroup
     Ok(unresolved)
 }
 
+/// The first recorded job that may still run, without signalling or rewriting its ledger.
+pub fn live_job(path: &Path) -> io::Result<Option<u64>> {
+    let Some(ledger) = read(path)? else {
+        return Ok(None);
+    };
+    for group in ledger
+        .groups
+        .iter()
+        .chain(ledger.unresolved.iter().map(|held| &held.group))
+    {
+        let held = match ownership(group)? {
+            Ownership::Owned(members) => !members.is_empty(),
+            Ownership::Unidentified => true,
+            Ownership::NotOwned => false,
+        };
+        if held || recorded_members_alive(group)? {
+            return Ok(Some(group.job_id));
+        }
+    }
+    Ok(None)
+}
 /// The unresolved groups the ledger at `path` carries that processes still hold, observed now.
 /// Reads only: the ledger's writer drops released ones.
 pub fn unresolved(path: &Path) -> io::Result<Vec<UnresolvedGroup>> {
@@ -3199,6 +3220,60 @@ os._exit(0)
         let _ = job.wait_bounded();
     }
 
+    #[test]
+    fn an_idle_census_observes_live_jobs_without_signalling_or_rewriting() {
+        use std::io::{BufRead as _, Write as _};
+        let (_scratch, path) = scratch();
+        assert_eq!(super::live_job(&path).unwrap(), None);
+        let mut job = OwnedGroup(
+            Command::new("sh")
+                .args(["-c", "while read line; do printf '%s\\n' \"$line\"; done"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .process_group(0)
+                .spawn_locked()
+                .expect("pipe-held job"),
+        );
+        let mut output = std::io::BufReader::new(job.0.stdout.take().unwrap());
+        super::Recorder::new(path.clone())
+            .record(
+                [super::JobGroupClaim::group(4, leader(job.0.id()))].into_iter(),
+                &[],
+            )
+            .unwrap();
+        for inherited in [false, true] {
+            if inherited {
+                let mut ledger = super::read(&path).unwrap().unwrap();
+                let group = ledger.groups.pop().unwrap();
+                ledger.unresolved.push(super::UnresolvedGroup {
+                    lost_supervisor: ledger.supervisor,
+                    group,
+                });
+                super::replace(&path, &ledger).unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(super::live_job(&path).unwrap(), Some(4));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "inspection rewrites nothing"
+            );
+            job.0
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"still alive\n")
+                .unwrap();
+            let mut response = String::new();
+            output.read_line(&mut response).unwrap();
+            assert_eq!(
+                response, "still alive\n",
+                "the census stopped no recorded job"
+            );
+        }
+        drop(job);
+        assert_eq!(super::live_job(&path).unwrap(), None);
+    }
     /// A supervisor that retired in order left a ledger naming no group: its watcher has nothing
     /// to recover. One that left a group does, and only its own watcher, or a holder of the
     /// workspace's socket, may act on it.

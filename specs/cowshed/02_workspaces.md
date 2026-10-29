@@ -1113,27 +1113,28 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
    at this point (the check left work behind, say) keeps the workspace and exits with the refusal, but its message
    starts with the landed head and target: the target has moved, so the next step is `cowshed rm`, not another land.
 
-   **Folds.** A land whose unit retired then retires every session workspace it folded: one whose own work the landed
-   range carried into the target. Trains fold units by cherry-pick, resolving conflicts and adding review fixes, so no
-   folded unit is an ancestor of what lands and none retires by a land of its own. The fold list is the land's own: the
-   paths the range from the target's previous head to the landed head changes, and every published, mounted session
-   other than the unit, the target workspace and main whose own changes since its merge base with that previous head
-   touch one of them. Of those, a workspace is folded when the landed tip holds it by `rm`'s measurement (`rm` step 1,
-   against the branch the unit landed on, every local branch included, and its HEAD held by the tip itself: a HEAD only
-   a `push` ref keeps is work the tip lacks, so it is no fold); the others are not the land's, and are neither touched
-   nor named. A session whose head main already holds has no work of its own and is never a fold, whatever the landed
-   range touches: what it differs by from the target's previous head is main's (a shed forked from a main newer than a
-   train's base, say), and retiring it is its owner's act. A folded workspace is retired as `rm` retires it, measured
-   again under its own land lease, with two differences. The age floor does not apply: its work is already in the
-   target. And its owner is spared, never quiesced: a supervisor running a job or holding an open shell session refuses
-   the stop rather than waiting for it, and a process cowshed does not run that holds its mount refuses as it does for
-   `rm` ("Holders cowshed does not run"). A folded workspace whose tree is dirty (a tracked change, or an untracked file
-   no ignore rule covers) is kept. Each folded workspace is reported in `LandedReport.folded` with its head and its
-   outcome, `retired`, or `kept` with why (`dirty` with its file count, or `refused` with the refusal's code and
-   message), and said on stderr. A kept fold never fails the land, and nothing about it is stored: it is the next
-   `rm`'s, or the next land's that touches it. Retired folds release their build volumes in one collection after the
-   last of them, which runs in the background once the land answers (16_build_volumes.md, Land 6.5). A land with
-   `--no-retire` folds nothing.
+   **Folds.** A land whose named source retired then retires the idle session workspaces whose own work it folded. The
+   fold list is the land's own: the paths the range from the target's previous head to the landed head changes, and
+   every published, mounted session other than the source, the target workspace and main whose own commits since its
+   recorded fork base are non-empty and touch one of those paths. The recorded `baseCommit` is the provenance boundary,
+   never the merge base with the target's previous head. A fresh sibling forked at the landed tip has no commits of its
+   own and is never a fold, even when its inherited history overlaps the landed range. Missing or unreadable provenance
+   is a named refusal, never permission to retire.
+
+   Of those peers, a workspace is folded only when all its own work is held by the landed result, measured by `rm` step
+   1 against the branch the source landed on, every local branch included, and its HEAD held by the tip itself: a HEAD
+   only a `push` ref keeps is work the tip lacks, so it is no fold. The others are neither touched nor named. A folded
+   peer is measured again under its own land lease. The age floor is bypassed only for an idle peer: any live
+   supervisor, running or queued job, or attached shell keeps it, without quiescing, draining or stopping its owner. The
+   supervisor socket's exclusive lease fences new admission through retirement. A process cowshed does not run that
+   holds its mount refuses as for `rm` ("Holders cowshed does not run"). A dirty peer is kept too. The named source
+   workspace still retires by the ordinary land path, however young.
+
+   Each folded peer is reported in `LandedReport.folded` with its head and outcome, `retired`, or `kept` with why
+   (`dirty` with its file count, or `refused` with the refusal's code and message), and said on stderr. A kept peer
+   never fails the land, and nothing about it is stored: its owner can explicitly `rm` or land it later. Retired peers
+   release their build volumes in one collection after the last of them, which runs in the background once the land
+   answers (16_build_volumes.md, Land 6.5). A land with `--no-retire` folds nothing.
 
 `--no-retire` keeps the workspace after a successful land (for a coordinator that wants to reuse it via
 `rebase --fresh`). `--push-only` performs steps 1–2 and installs the validated head in the workspace's durable
@@ -1405,28 +1406,28 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    The refusal names the age and the floor, and its hint the remedies that keep the work; a creation time that cannot be
    read refuses the same way. It alone carries `removal: {reason: "young", createdAt, removableAt}`: `removableAt` is
    the first second the floor lets the workspace go, absent when the creation cannot be read, so a caller that owns the
-   workspace waits for that second instead of copying the floor. `--force` overrides it. A `land` retiring the unit it
-   landed or a workspace it folded (`land` step 5), and the replay of a removal already authorized, are not asked.
-   Explicit `--abandon` authorizes losing all three. It requires a verified recovery bundle,
-   `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and every branch that did not pass as refs, and, when the tree
-   holds uncommitted work, one more commit on top of HEAD holding the work tree as it stands, under
-   `refs/cowshed/uncommitted` (`AbandonedWork.uncommitted`): each dirty path taken as the tree holds it and one the tree
-   lost as its deletion, staged through a private index so the workspace's own index, HEAD and branches are untouched.
-   An in-progress operation's own state (`MERGE_HEAD`, a rebase's plan) is not kept; its work tree is. No image is kept
-   (step 5). The bundle is written beside that name and renamed into place once verified; a retried removal that finds a
-   bundle verifying for the same range keeps it instead of writing another. The bundle is the only copy: nothing is
-   written into main's repository, whose refs are the branches people check out and the ones `push` writes, never a
-   namespace per abandonment that nobody reads. It stays in the trash until main holds every commit it carries by patch
-   identity, when a plain `gc` drops it as `heldBundle`: each commit a tip carries beyond main is one `git cherry` marks
-   `-` (and changes something) or a merge that authors nothing, and a tip carrying nothing beyond main is held by
-   ancestry; a bundle that advertises no tip is kept. `gc --abandoned` releases every bundle (01_storage.md,
-   "Retention"). The report names it (`AbandonedWork.bundle`), and `AbandonedWork.preserved` says what else keeps the
-   tips: absent (`bundleOnly`) for every session abandonment; `nothingToPreserve` for main's own `--restore --abandon`
-   (below), where main is what is being restored and its bundle is the copy; or `preserved` with each ref, in a record
-   an earlier build wrote when abandonments also wrote refs into main's repository, which no build writes or reads now.
-   A measurement's files (`unlandedPaths`) are `named`, or `predatesPaths` for a record from a build that counted
-   commits by patch identity and named no file. A command reporting a predating record warns once on stderr, naming what
-   it does not record (00_overview.md).
+   workspace waits for that second instead of copying the floor. `--force` overrides it. A `land` retiring its named
+   source, an idle peer whose own non-empty work it folded (`land` step 5), and the replay of a removal already
+   authorized, are not asked. A live peer owner is never bypassed by a land's fold cleanup. Explicit `--abandon`
+   authorizes losing all three. It requires a verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding
+   HEAD and every branch that did not pass as refs, and, when the tree holds uncommitted work, one more commit on top of
+   HEAD holding the work tree as it stands, under `refs/cowshed/uncommitted` (`AbandonedWork.uncommitted`): each dirty
+   path taken as the tree holds it and one the tree lost as its deletion, staged through a private index so the
+   workspace's own index, HEAD and branches are untouched. An in-progress operation's own state (`MERGE_HEAD`, a
+   rebase's plan) is not kept; its work tree is. No image is kept (step 5). The bundle is written beside that name and
+   renamed into place once verified; a retried removal that finds a bundle verifying for the same range keeps it instead
+   of writing another. The bundle is the only copy: nothing is written into main's repository, whose refs are the
+   branches people check out and the ones `push` writes, never a namespace per abandonment that nobody reads. It stays
+   in the trash until main holds every commit it carries by patch identity, when a plain `gc` drops it as `heldBundle`:
+   each commit a tip carries beyond main is one `git cherry` marks `-` (and changes something) or a merge that authors
+   nothing, and a tip carrying nothing beyond main is held by ancestry; a bundle that advertises no tip is kept.
+   `gc --abandoned` releases every bundle (01_storage.md, "Retention"). The report names it (`AbandonedWork.bundle`),
+   and `AbandonedWork.preserved` says what else keeps the tips: absent (`bundleOnly`) for every session abandonment;
+   `nothingToPreserve` for main's own `--restore --abandon` (below), where main is what is being restored and its bundle
+   is the copy; or `preserved` with each ref, in a record an earlier build wrote when abandonments also wrote refs into
+   main's repository, which no build writes or reads now. A measurement's files (`unlandedPaths`) are `named`, or
+   `predatesPaths` for a record from a build that counted commits by patch identity and named no file. A command
+   reporting a predating record warns once on stderr, naming what it does not record (00_overview.md).
 
    Every retirement, abandoned or not, appends a `retire-workspace` line to the project's `deletion-log.jsonl`
    (01_storage.md) once the source release is committed: the head and every local branch tip read before the image went,

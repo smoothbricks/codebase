@@ -1297,11 +1297,16 @@ async fn a_head_only_the_push_ref_keeps_is_retirable_and_not_a_fold() {
     let target = resolve_target(fixture.store(), &fixture.parent(), TARGET)
         .await
         .expect("main's target");
+    let head =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("peer head");
     let facts = fold_facts(
         fixture.store(),
         &target,
         &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
-        &previous,
+        cowshed_core::landing::FoldProvenance {
+            base: &previous,
+            head: &head,
+        },
         &mount,
         &fixture.parent(),
         "topic",
@@ -1316,21 +1321,65 @@ async fn a_head_only_the_push_ref_keeps_is_retirable_and_not_a_fold() {
     );
 }
 
-/// A session with no work of its own is never a fold (02_workspaces.md, `land` step 5, "Folds"): a
-/// shed forked from a main newer than the target's previous head differs from it only by main's
-/// work, which the landed range may touch, and a fold that retired it destroyed a live owner's
-/// workspace on timing alone.
+/// Later target work cannot make a peer part of an earlier land (02_workspaces.md, land step 5).
 #[tokio::test]
-async fn a_session_whose_head_main_holds_is_not_a_fold() {
-    let fixture = Fixture::new("fold-fresh-fork");
-    let previous = GitOid::new(
-        git(fixture.parent(), ["rev-parse", "HEAD"])
-            .trim()
-            .to_owned(),
+async fn a_fold_uses_the_captured_peer_head_and_landed_result_not_later_refs() {
+    let fixture = Fixture::new("fold-pinned-result");
+    let mount = fixture.clone_workspace("topic");
+    let base =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("fork base");
+    workspace_commit(&mount, "story.txt", "peer's story\n", "peer work");
+    let head =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("captured head");
+    fixture.land_content_separately("story.txt", "landed story\n", "land result");
+    let landed = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("land result")
+        .tip()
+        .clone();
+    fixture.land_content_separately("story.txt", "peer's story\n", "later target work");
+    let target = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("advanced target")
+        .at(landed);
+    git(&mount, ["checkout", "-q", "--detach", base.as_str()]);
+    let facts = fold_facts(
+        fixture.store(),
+        &target,
+        &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        cowshed_core::landing::FoldProvenance {
+            base: &base,
+            head: &head,
+        },
+        &mount,
+        &fixture.parent(),
+        "topic",
     )
-    .expect("the train's base");
+    .await;
+    assert_eq!(
+        facts.touched,
+        Ok(true),
+        "the captured peer owns overlapping work, regardless of its later HEAD: {facts:?}"
+    );
+    assert!(
+        !facts.landed,
+        "only the later target, not this land, holds the peer: {facts:?}"
+    );
+    assert_eq!(
+        fold_step(&facts),
+        None,
+        "an unrelated later commit never authorizes peer retirement"
+    );
+}
+/// A peer with no commits after its recorded fork base never folded work (02_workspaces.md,
+/// land step 5), even when the land changed paths in the history it inherited.
+#[tokio::test]
+async fn a_session_without_commits_after_its_fork_base_is_not_a_fold() {
+    let fixture = Fixture::new("fold-fresh-fork");
     fixture.land_content_separately("story.txt", "main's story\n", "main moves past the base");
     let mount = fixture.clone_workspace("fresh");
+    let fork_base =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("recorded base");
     let target = resolve_target(fixture.store(), &fixture.parent(), TARGET)
         .await
         .expect("main's target");
@@ -1338,7 +1387,10 @@ async fn a_session_whose_head_main_holds_is_not_a_fold() {
         fixture.store(),
         &target,
         &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
-        &previous,
+        cowshed_core::landing::FoldProvenance {
+            base: &fork_base,
+            head: &fork_base,
+        },
         &mount,
         &fixture.parent(),
         "fresh",

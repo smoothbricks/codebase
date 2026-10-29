@@ -1235,14 +1235,14 @@ Every target-changing land refreshes the target's shell once through its own sup
 requiring a current activation record. It runs no check again and never copies the unit's export. A failed refresh names
 the head and target already landed, reports the shell failure and keeps the unit.
 
-A land that retires its workspace then retires every workspace it folded: a train that cherry-picked units, resolving
-conflicts and fixing review findings on the way, lands work none of whose commits are a unit's own, so no unit could
-retire by its own land. A workspace is folded when its own changes touch a path the landed range changes and the target
-now holds it, measured as `rm` measures it. Each is retired as `rm` would retire it, except that its age is not asked
-and a live owner is spared instead of waited for: a job its supervisor runs, an open shell session, or a process holding
-its checkout keeps it. A dirty folded workspace is kept too. The report's `folded` names each with its outcome
-(`retired`, or `kept` with why), and stderr says the same; a kept fold never fails the land, and a later `rm` retires
-it. Work the target does not hold is never folded. `--no-retire` folds nothing.
+A land that retires its named source also retires idle peers whose own work it folded. A peer must have non-empty
+commits since its recorded fork base, touching a path the landed range changed, with all its work held by the result as
+`rm` measures it. A fresh sibling forked at the source's tip folded nothing and is never retired. Missing or unreadable
+fork provenance is a named refusal. A live supervisor, running or queued job, attached shell, process holding the
+checkout, or dirty tree keeps a folded peer; cleanup never quiesces, drains or stops its owner. Only idle peers bypass
+the age floor. The report's `folded` names each folded peer with its outcome (`retired`, or `kept` with why), and stderr
+says the same; a kept peer never fails the land. Its owner can explicitly `rm` or land it later. The named source still
+retires as usual. `--no-retire` folds nothing.
 
 `--ungated`, with `--into <lane>`, folds a unit into its lane base without a gate: no check, seed freeze or build-volume
 adoption. First it rebases the unit onto the lane base's checked-out branch, as `rebase --into <lane>` does; a unit
