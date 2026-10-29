@@ -181,9 +181,9 @@ pub struct WorkspaceSupervisorConfig {
     /// holds a registry credential for an origin, an ambient copy of the same token in the
     /// operator's shell has no business reaching a sandbox. Empty unless a route was enrolled.
     pub credential_env_names: BTreeSet<String>,
-    /// The program that starts this workspace's warm exec hosts. `None` runs every command
-    /// through one-shot activation, which is what a host process that cannot start exec hosts
-    /// (it never called [`super::shell_host::dispatch`]) is left with.
+    /// The program that starts this workspace's warm exec hosts. Without one, only read-write
+    /// argv jobs can activate a selected shell in a one-shot child. Read-only shell entry
+    /// requires an exec host; bare-workspace argv jobs need no activation.
     pub shell_host: Option<super::shell_host::ShellHostProgram>,
     pub shell_pool: super::shell_pool::ShellPoolConfig,
     /// Where the supervisor keeps the process groups of its running jobs for whoever finds it
@@ -1369,6 +1369,17 @@ fn one_shot_plan(
     cwd: PathBuf,
     argv: Vec<OsString>,
 ) -> Result<SpawnPlan> {
+    if sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly
+        && let Some(shell) = &sandbox.capabilities.contribution.shell
+    {
+        return Err(CowshedError::environment_missing(
+            format!(
+                "read-only shell entry requires an exec host: {} has no configured host",
+                shell.directory.display()
+            ),
+            "configure shell_host or run read-only commands through the cowshed CLI",
+        ));
+    }
     let mut plan = plan_exec_under(
         SandboxExecRequest { argv, cwd },
         sandbox,
@@ -1376,15 +1387,6 @@ fn one_shot_plan(
     )
     .map_err(map_exec_error)?;
     if let Some(shell) = &sandbox.capabilities.contribution.shell {
-        if sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly {
-            return Err(CowshedError::environment_missing(
-                format!(
-                    "read-only shell entry requires an exec host: {} has no configured host",
-                    shell.directory.display()
-                ),
-                "configure shell_host or run read-only commands through the cowshed CLI",
-            ));
-        }
         wrap_one_shot(&mut plan, shell);
     }
     Ok(plan)
@@ -10246,6 +10248,36 @@ mod workspace_toolchain_tests {
             !private.join("home/.netrc").exists(),
             "the netrc a previous wiring left, token and all, is gone"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_read_only_one_shot_shell_refuses_before_any_launch_preparation() {
+        let mount = Path::new("/workspace");
+        let mut sandbox = sandbox_at(mount);
+        sandbox.mode = crate::sandbox::RunSandboxMode::ReadOnly;
+        sandbox.capabilities.contribution.shell = Some(crate::capabilities::ShellActivation {
+            directory: mount.to_owned(),
+            script: "exit 99",
+            label: "unlaunched",
+        });
+        let profile = ChildProfile::unbound("", Path::new("/unprepared-profile"));
+        let Err(error) = one_shot_plan(&sandbox, &profile, mount.to_owned(), vec!["true".into()])
+        else {
+            panic!("read-only shell entry produced a launch plan without an exec host")
+        };
+        assert_eq!(
+            error.code,
+            crate::ErrorCode::EnvironmentMissing,
+            "{error:?}"
+        );
+        assert!(
+            error
+                .message
+                .contains("read-only shell entry requires an exec host"),
+            "{error:?}"
+        );
+        assert!(error.message.contains("/workspace"), "{error:?}");
     }
 
     /// The land enumerates declared outputs in a job of the landing workspace's own shell

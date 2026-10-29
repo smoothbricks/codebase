@@ -70,50 +70,6 @@ export COWSHED_TMP_DENIED="$tmp_denied"
 export COWSHED_TMPDIR_DENIED="$tmpdir_denied"
 "#;
 
-#[tokio::test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-async fn host_controller_read_only_one_shot_shell_refuses_before_approval_or_evaluation() {
-    let root = scratch("readonly-host-required");
-    let sandbox = workspace(&root, 41_072);
-    std::fs::write(
-        sandbox.workspace_mount.join(".envrc"),
-        "printf activated > activation-ran\n",
-    )
-    .unwrap();
-    let mut request = spawn_request(
-        &sandbox,
-        &sandbox.workspace_mount,
-        vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "printf command > command-ran".into(),
-        ],
-    );
-    request.mode = cowshed_core::api::RunSandboxMode::ReadOnly;
-    let (events, _receiver) = mpsc::channel(16);
-    let result = SystemSpawnSink::default().spawn(request, events).await;
-    let Err(error) = result else {
-        panic!("read-only shell entry ran without an exec host")
-    };
-    assert_eq!(
-        error.code,
-        cowshed_core::ErrorCode::EnvironmentMissing,
-        "{error:?}"
-    );
-    assert!(
-        error
-            .message
-            .contains("read-only shell entry requires an exec host"),
-        "{error:?}"
-    );
-    assert!(!sandbox.workspace_mount.join("activation-ran").exists());
-    assert!(!sandbox.workspace_mount.join("command-ran").exists());
-    assert!(
-        !sandbox.exec_temp_dir.join("data/direnv/allow").exists(),
-        "the refused one-shot never approves direnv"
-    );
-    std::fs::remove_dir_all(root).expect("remove read-only missing-host fixture");
-}
 fn scratch(label: &str) -> PathBuf {
     let alias = std::env::temp_dir().join(format!(
         "cowshed-{label}-{}-{}",
