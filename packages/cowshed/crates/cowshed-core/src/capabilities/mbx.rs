@@ -970,10 +970,13 @@ mod tests {
         std::fs::write(&settings, "8").unwrap();
         let calls = root.join("calls");
         let mbx = root.join("mbx");
+        // mbx runs with a cleared environment, so the stand-in uses only shell builtins: with no
+        // PATH a shell searches its compiled default, which on a NixOS runner holds no `cat`, and
+        // the stand-in answered nothing there.
         std::fs::write(
             &mbx,
             format!(
-                "#!/bin/sh\necho \"$3\" >> '{}'\n[ \"$3\" = scheduler.cpus ] && cat '{}'\nexit 0\n",
+                "#!/bin/sh\necho \"$3\" >> '{}'\nif [ \"$3\" = scheduler.cpus ]; then read -r value < '{}'; printf '%s\\n' \"$value\"; fi\nexit 0\n",
                 calls.display(),
                 settings.display()
             ),
