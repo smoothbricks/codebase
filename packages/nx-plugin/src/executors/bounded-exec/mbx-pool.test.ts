@@ -30,7 +30,8 @@ describe("mbx's one pool at the leaf", () => {
     expect(withMbxLeaf("bun test 'a b'", leaf)).toBe(
       "mbx reserve --grant-fd 5 --cpus 4 --priority low -- /bin/sh -c 'bun test '\\''a b'\\'''",
     );
-    expect(mbxLeaf(pool, 'vitest', 0, 'bun vitest run')).toEqual({ kind: 'reserve', cpus: 1, priority: 'low' });
+    // A Vitest leaf enters no pool and runs its own default workers (owner's ruling, 2026-10-31).
+    expect(mbxLeaf(pool, 'vitest', 17, 'bun vitest run')).toBeNull();
   });
 
   it('admits a nextest run of prebuilt binaries once for its whole grant, never a ticket per test process', () => {

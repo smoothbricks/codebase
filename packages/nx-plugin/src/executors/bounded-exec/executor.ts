@@ -564,8 +564,8 @@ export async function runBoundedExec(
   let cpu: BoundedExecRecord['cpu'];
   let sized: { command: string; env: Record<string, string> } = { command: requested, env: {} };
   // With mbx the leaf's admission is mbx's one pool, not a parent's tokens: its runner is sized to the job's count,
-  // and a non-Cargo leaf holds that much of the pool for its run (specs/cowshed/05_gateway.md, "Parallelism inside a
-  // job"). No grant and no sub-pool beside it.
+  // and a non-Cargo leaf but a Vitest one holds that much of the pool for its run (specs/cowshed/05_gateway.md,
+  // "Parallelism inside a job"). No grant and no sub-pool beside it.
   const leaf = mbx === null ? null : mbxLeaf(mbx, demand.kind, demand.want, requested);
   if (grant !== null) {
     sized = sizeRunner(demand, requested, grant.tokens);
@@ -730,7 +730,7 @@ export async function runBoundedExec(
   // With a supervisor, `cowshed subtree-root` asks it for a handle on itself, writes the answer to the handle
   // descriptor, and execs `/bin/sh -c command` in the same process: the command's pid, group and life are unchanged.
   const unadmitted = hooked?.command ?? (fixture === null ? command : `${fixture.command} && ${command}`);
-  const shellCommand = leaf === null ? unadmitted : withMbxLeaf(unadmitted, leaf);
+  const shellCommand = withMbxLeaf(unadmitted, leaf);
   // Only leaves known to be scheduled can exclude zero-hold time. Others keep lifecycle hang protection.
   const queued = mbxIdleGated(leaf, sized.command, { ...process.env, ...env });
   // fd 4 is unused without a subtree admission, so the grant takes fd 5 either way.
