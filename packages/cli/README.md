@@ -388,9 +388,12 @@ required: TypeScript 7 under the unscoped name breaks Nx API calls such as `read
 For `ttsc@0.34.1`, smoo temporarily distributes `patches/ttsc@0.34.1.patch` and registers it in the root
 `patchedDependencies` before `smoo monorepo update` runs Bun installation; it removes every other `ttsc@` registration.
 The patch repairs import-extension handling during the compiler's internal forced-emission diagnostic pass; user
-`--noEmit` still writes no output. The packaged managed asset is the source, so clean managed installs receive the same
-repair without a compiler fork or edits to the dependency cache. The registration applies only to that exact compiler
-version; the repository's lockfile continues to own its compiler pin.
+`--noEmit` still writes no output. It also makes a source-plugin build lock waiter inspect the holder before it reports
+a published binary: a process that finds the binary still takes the cache key's lock to register as its reader, so a
+holder killed while it held that lock is proven gone and retired instead of outwaited for ttsc's 600 s admission budget,
+and a live or unprovable holder is never retired. The packaged managed asset is the source, so clean managed installs
+receive the same repairs without a compiler fork or edits to the dependency cache. The registration applies only to that
+exact compiler version; the repository's lockfile continues to own its compiler pin.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases

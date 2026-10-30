@@ -140,3 +140,55 @@ diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/
          worker = created;
          const retire = () => {
              if (worker === created)
+diff --git a/lib/plugin/internal/source/waitForPluginBinary.js b/lib/plugin/internal/source/waitForPluginBinary.js
+--- a/lib/plugin/internal/source/waitForPluginBinary.js
++++ b/lib/plugin/internal/source/waitForPluginBinary.js
+@@ -25,6 +25,12 @@
+  * run. An opted-in synchronous owner can cancel observation or interrupt a
+  * polling sleep; cancellation never retires the holder's generation.
+  *
++ * A published binary is not admission: the caller registers as its reader
++ * under the key, which only release or retirement frees. Each poll therefore
++ * inspects the lock before it reports publication, so a holder that died
++ * holding the key after its binary was published is reported abandoned
++ * instead of outwaiting the admission budget.
++ *
+  * @evidence contracts/common.md#principled-implementation Polling first refuses unknown/malformed native guards, suppresses publication while pending and rechecks after observed release; actual abandoned-owner observations retain their exact generation, while budget expiry fails without revoking a possibly active payload task.
+  * @evidence contracts/common.md#clear-and-simple-design The loop separates publication, release, retirement and periodic status reporting; generation interpretation belongs to inspectPluginBuildLock.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts Budget expiry throws instead of retiring a live-looking generation and compensating for concurrent callbacks; status output never substitutes for ownership evidence.
+@@ -43,22 +49,9 @@
+         OwnedSynchronousProcess_1.OwnedSynchronousProcess.checkpoint();
+         SourceNativeRetirement_1.SourceNativeRetirement.assertAvailable(protocolDir);
+         const protectedNativeInputs = SourceNativeRetirement_1.SourceNativeRetirement.isProtected(protocolDir);
+-        if (!protectedNativeInputs && node_fs_1.default.existsSync(opts.binaryPath)) {
+-            OwnedSynchronousProcess_1.OwnedSynchronousProcess.checkpoint();
+-            return { outcome: "published" };
+-        }
+         const clock = performance.now();
+         const lock = (0, inspectPluginBuildLock_1.inspectPluginBuildLock)(opts.lockDir);
+         OwnedSynchronousProcess_1.OwnedSynchronousProcess.checkpoint();
+-        if (lock.state === "released") {
+-            // The holder retired its generation between the binary check above and
+-            // this observation. That is a normal release, not abandonment: prefer the
+-            // binary when it landed inside that window, otherwise hand the free key
+-            // back to the caller.
+-            return !protectedNativeInputs && node_fs_1.default.existsSync(opts.binaryPath)
+-                ? { outcome: "published" }
+-                : { outcome: "released" };
+-        }
+         if (lock.state === "abandoned") {
+             return {
+                 outcome: "abandoned",
+@@ -66,6 +59,12 @@
+                 fence: lock.fence,
+             };
+         }
++        if (!protectedNativeInputs && node_fs_1.default.existsSync(opts.binaryPath)) {
++            return { outcome: "published" };
++        }
++        if (lock.state === "released") {
++            return { outcome: "released" };
++        }
+         if (clock - startedAt >= opts.timeoutMs) {
+             throw new Error(`ttsc: timed out after ${(0, formatDuration_1.formatDuration)(clock - startedAt)} waiting for ` +
+                 `${opts.lockInfo.label} "${opts.lockInfo.pluginName}" at ${opts.lockDir}; ` +
