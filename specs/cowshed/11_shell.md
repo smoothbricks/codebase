@@ -880,13 +880,13 @@ attached workspace. Admission appends a complete `JobArtifactRecord` batch and p
 `ControllerCommitment::Admission(AdmissionCommitment)` before process creation, so spawn failure retains durable
 identity. A record's sequence comes from the `records.sequence` counter, published by atomic rename before the record is
 appended under the same lock, so a crash may leave a gap but never hands a sequence out twice. At startup the supervisor
-takes the maximum canonical `job_id` across valid complete in-volume allocation batches, controller commitments for the
-active lineage, canonical spill directories and the checked `records.job-floor` counter, then chooses `max + 1` (or `1`
-when none exist). Any disagreement or duplicate durable key is `Integrity`, not a reason to reuse a number.
-Open/recovery requires every record's `repo_id` to equal the workspace's bound repository. A record incarnation may
-differ from the current marker only when the marker's fork lineage names it as an ancestor or controller fork lineage
-and commitments admit it as inherited history; an unknown historical incarnation, or any new allocation under a
-non-current incarnation, is `Integrity`. Thus copied histories are intentional but cannot smuggle a foreign
+takes the maximum canonical `job_id` across valid complete in-volume allocation batches, canonical spill directories and
+the checked `records.job-floor` counter (never the controller commitments, which nothing reads for a decision), then
+chooses `max + 1` (or `1` when none exist). Any disagreement or duplicate durable key is `Integrity`, not a reason to
+reuse a number. Open/recovery requires every record's `repo_id` to equal the workspace's bound repository. A record
+incarnation may differ from the current marker only when the marker's fork lineage names it as an ancestor or controller
+fork lineage and commitments admit it as inherited history; an unknown historical incarnation, or any new allocation
+under a non-current incarnation, is `Integrity`. Thus copied histories are intentional but cannot smuggle a foreign
 repository/timeline. Supervisor replacement and attach otherwise discard only an incomplete trailing Arrow batch and
 never rewrite a complete batch or sealed artifact. Fork copies start above every inherited allocation, including the
 maximum id retained by `records.job-floor` for a store set aside unread. That floor record never decodes or retrofits

@@ -305,7 +305,7 @@ Find the symptom in the left column and follow the link.
   `<sys/fcntl.h>`: “fsync + issue barrier to drive”).
 - **Rule.** A job's own records take no sync: they must survive the death of their writer, which the page cache gives,
   not power loss, while `F_FULLFSYNC` (through `sync_all`) is spent on lifecycle and authority state and on sealed
-  telemetry segments, one per writer interval.
+  telemetry segments (job and process spans one per writer interval).
 - **Owners.** [11_shell.md §Job control](./11_shell.md#job-control), “Durability of a job's own records”;
   [13_telemetry.md §Storage: one authority tier, one audit trail, one Arrow substrate](./13_telemetry.md#storage-one-authority-tier-one-audit-trail-one-arrow-substrate);
   [13_telemetry.md §Process-tree spans](./13_telemetry.md#process-tree-spans) (sealed segments). Code:

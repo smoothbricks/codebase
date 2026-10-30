@@ -9855,6 +9855,7 @@ mod tests {
         fs::create_dir(root.join("published")).unwrap();
         let mut store = store_at(&root, ArtifactConfig::default());
         let job_id = JobId::new(1).unwrap();
+        cowshed_os::fsio::take_syncs();
         let token = store
             .begin_job(
                 job_id,
@@ -9865,6 +9866,11 @@ mod tests {
                 OutputTargets::default(),
             )
             .unwrap();
+        assert_eq!(
+            cowshed_os::fsio::take_syncs(),
+            cowshed_os::fsio::Syncs::default(),
+            "the first record of a store syncs nothing, its directory entry included"
+        );
         store.append(&token, StreamKind::Stdout, b"built").unwrap();
         cowshed_os::fsio::take_syncs();
         store.prepare_background(&token).unwrap();

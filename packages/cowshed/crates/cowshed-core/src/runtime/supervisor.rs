@@ -6800,10 +6800,11 @@ impl SupervisorActor {
 
     /// Stop publication admission only once no job can add another owned life. Completion is
     /// a selectable event, never an actor-side wait on filesystem IO or a worker join.
-    /// Begin the retiring supervisor's last writes: the span writer seals what it gathered (a
-    /// retired supervisor's process exits waiting for nothing else, 13_telemetry.md, "Job span
-    /// segments"), then the group ledger records its last cut. Retirement is answered once both
-    /// are done.
+    ///
+    /// These are the retiring supervisor's last writes: the group ledger's last cut and, beside
+    /// it, the span writer's seal of what it gathered (a retired supervisor's process exits
+    /// waiting for nothing else, 13_telemetry.md, "Job span segments"). Retirement is answered
+    /// once both are done.
     fn begin_group_ledger_finish(&mut self) {
         if !matches!(self.group_ledger_finish, GroupLedgerFinish::Idle) {
             return;
@@ -6829,6 +6830,8 @@ impl SupervisorActor {
                 }),
                 None => Ok(()),
             };
+            // A task the runtime dropped before this reply reads as the ledger writer's end: the
+            // span seal itself never fails retirement.
             let _ = reply.send(recorded);
         });
         self.group_ledger_finish = GroupLedgerFinish::Pending(finished);

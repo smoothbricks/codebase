@@ -30,7 +30,10 @@ mod accounting_fixture;
 use accounting_fixture::terminal_sample;
 #[path = "support/span_schema.rs"]
 mod span_schema;
-use span_schema::{Column, exact_schema, fields, number_cell, sealed_segments, text_cell};
+use span_schema::{
+    Column, exact_schema, fields, number_cell, sealed_segments, sealed_segments_among_kinds,
+    text_cell,
+};
 #[path = "support/temp_root.rs"]
 mod temp_root;
 use temp_root::TempRoot;
@@ -311,7 +314,10 @@ async fn job_rows_seal_when_their_interval_ends_with_no_reader_asking() {
     // and drive the writer; the paused clock moves only by these short steps, never another
     // whole interval. Real time bounds the wait.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while sealed_segments(&telemetry, "job-").is_empty() && std::time::Instant::now() < deadline {
+    // The seal's temporary may stand in the partition while it runs: poll for sealed names only.
+    while sealed_segments_among_kinds(&telemetry, "job-").is_empty()
+        && std::time::Instant::now() < deadline
+    {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let segments = sealed_segments(&telemetry, "job-");

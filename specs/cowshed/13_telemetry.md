@@ -270,27 +270,29 @@ events the fold emits are projected and gathered by the job's writer, which seal
 `process-<order:020>-<writer>.arrow` beside the job's segments, by the same order and sealing, once 10 seconds
 (`SEAL_INTERVAL`) have passed since the first row of either kind it gathered, each time just after the job rows it
 gathered ("Job span segments"); it also seals what it gathered, job rows first, before answering a trace-health read,
-and when it stops. No count of rows seals early: the interval is the seal rate and the gathered rows are the buffer, and
-the two are not interchangeable. Rows past 16,384 gathered in one interval are refused and counted in the trace health,
-so a burst loses rows rather than flushing the drive more often because a lot happened. A process fold batch is not a
-durability event: each seal is a full-drive flush of the segment and of its directory, and one seal per batch made 26
-seals and about 52 `F_FULLFSYNC`s a second host-wide, 5-8 s of flushing per wall second at 0.10-0.16 s each, saturating
-the drive under every other process on it (measured 2026-10-21; the same 0.7 s p99 metadata-read latency then showed on
-the store disk and on a build-volume image alike). Each seal keeps its durability; rows still gathered when the writer's
-process dies are lost, as the gateway's one-batch audit window is ("Batched audit flush accepted"). An event the
-projection cannot place is counted in the trace health and adds no row. A row's kind is its lmao entry type and a fixed
-message: `span-start` and `span-ok`/`span-err` named `process.run` at the observed birth and exit (`span-ok` only for a
-clean exit with status 0; an exit whose status the kernel withheld ends `span-err` with both exit columns null), and
-`info` rows `process.exec`, `process.busy`, `process.idle`, `process.usage` (a first read or an RSS step),
-`process.heartbeat`, `process.blocked` and `process.blocker-cleared`. A `process.blocked` row is a SET that states
-`blocked_on`, `blocked_path` and `blocked_holder_pid` whole, so a null path or holder there is absent, never unchanged;
-`process.blocker-cleared` is a CLEAR. A span starts idle and only busy/idle rows change that; a flip with no counter
-moved is a row with every column null. The end row states every counter of the final usage. `exit_signal` names the
-signal from one dictionary on every host: the macOS and Linux signal names, then Linux's real-time signals by kernel
-number as `SIG32`…`SIG64`. The argv display writes an argument of only `[A-Za-z0-9_@%+=:,./-]` bare and any other in
-`$'…'` quotes, with `\\`, `\'`, and `\xHH` for each byte of a control character or of an invalid UTF-8 sequence. The
-enum columns (`exit_signal`, `blocked_on`) are dictionaries of every declared name keyed by `u16`, as lmao encodes
-`S.enum`; `S.category` and `S.text` are `u32`-keyed dictionaries.
+and a retiring supervisor has it sealed before it is answered. Process rows a monitor still watching outlived lives
+sends after that seal are lost with the process, as a dying writer's are. No count of rows seals early: the interval is
+the seal rate and the gathered rows are the buffer, and the two are not interchangeable. Rows past 16,384 gathered in
+one interval are refused and counted in the trace health, so a burst loses rows rather than flushing the drive more
+often because a lot happened. A process fold batch is not a durability event: each seal is a full-drive flush of the
+segment and of its directory, and one seal per batch made 26 seals and about 52 `F_FULLFSYNC`s a second host-wide, 5-8 s
+of flushing per wall second at 0.10-0.16 s each, saturating the drive under every other process on it (measured
+2026-10-21; the same 0.7 s p99 metadata-read latency then showed on the store disk and on a build-volume image alike).
+Each seal keeps its durability; rows still gathered when the writer's process dies are lost, as the gateway's one-batch
+audit window is ("Batched audit flush accepted"). An event the projection cannot place is counted in the trace health
+and adds no row. A row's kind is its lmao entry type and a fixed message: `span-start` and `span-ok`/`span-err` named
+`process.run` at the observed birth and exit (`span-ok` only for a clean exit with status 0; an exit whose status the
+kernel withheld ends `span-err` with both exit columns null), and `info` rows `process.exec`, `process.busy`,
+`process.idle`, `process.usage` (a first read or an RSS step), `process.heartbeat`, `process.blocked` and
+`process.blocker-cleared`. A `process.blocked` row is a SET that states `blocked_on`, `blocked_path` and
+`blocked_holder_pid` whole, so a null path or holder there is absent, never unchanged; `process.blocker-cleared` is a
+CLEAR. A span starts idle and only busy/idle rows change that; a flip with no counter moved is a row with every column
+null. The end row states every counter of the final usage. `exit_signal` names the signal from one dictionary on every
+host: the macOS and Linux signal names, then Linux's real-time signals by kernel number as `SIG32`…`SIG64`. The argv
+display writes an argument of only `[A-Za-z0-9_@%+=:,./-]` bare and any other in `$'…'` quotes, with `\\`, `\'`, and
+`\xHH` for each byte of a control character or of an invalid UTF-8 sequence. The enum columns (`exit_signal`,
+`blocked_on`) are dictionaries of every declared name keyed by `u16`, as lmao encodes `S.enum`; `S.category` and
+`S.text` are `u32`-keyed dictionaries.
 
 The job span, not each process span, carries signed `disk_ws_delta_bytes` and optional `disk_build_delta_bytes`,
 `load1_milli: u32` at start and end, and `cores: u16` at those same boundaries. The start row states the host as the
@@ -543,7 +545,9 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   changes when queued records are written, not which a crash can take. A lost record stays lost, while the inventory and
   the protected records still hold the facts, and nothing reads commitments for a decision. A job's terminal record is
   written before its commitment, but neither is synced, so a host crash may keep the commitment and lose the record; the
-  next supervisor then seals that job lost and commits that too, and its last commitment says lost, never success.
+  next supervisor then seals that job lost and commits that too, and its last commitment says lost, never success. A
+  crash may likewise keep an admission commitment whose record it took; that id is allocated again, so the trail can
+  hold two admissions under one key, and nothing reads them for a decision.
 - **Controller producer capability delivery** — each controller telemetry producer receives a dedicated IPC channel or
   inherited write-only capability/FD. It is close-on-exec/non-inheritable before any workspace child starts and is never
   named by a workspace-readable path or token. Audit records are recorded in the order the controller performed the

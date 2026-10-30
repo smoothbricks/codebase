@@ -84,8 +84,8 @@ const QUEUE_CAPACITY: usize = 256;
 /// flushing per wall second at 0.10-0.16 s each, which saturated the drive under every other
 /// process on it (measured 2026-10-21). One seal per job row, each a full flush of the segment
 /// and of its directory, cost 22.9 ms of flushing per exec in a supervisor sample of 203
-/// back-to-back execs on 2026-10-30 (load about 10), competing with the job's own record writes. So the writer seals on this interval, and the durability of each seal is
-/// unchanged. Rows still gathered when the process dies are lost, as the gateway's one-batch audit
+/// back-to-back execs on 2026-10-30 (load about 10), competing with the job's own record writes.
+/// So the writer seals on this interval, and the durability of each seal is unchanged. Rows still gathered when the process dies are lost, as the gateway's one-batch audit
 /// window is (13_telemetry.md, "Job span segments", "Process segments").
 pub const SEAL_INTERVAL: Duration = Duration::from_secs(10);
 
