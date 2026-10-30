@@ -38,7 +38,7 @@ use super::shell_host::{
     SHELL_HOST_DIRECTORY, ShellHostProgram, dropped_host_end, send_with_descriptors,
 };
 use super::shell_inherit::{self, Placement, VerifiedActivation};
-use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
+use super::shell_pool::{Acquired, Activation, Activator, PoolCounts, ShellPool, ShellPoolConfig};
 use super::shell_watch::{
     ActivationEvidence, Contents, EvaluationClock, FsInstant, FsSeparation, Snapshot, WatchEntry,
     decode_direnv_watches,
@@ -101,6 +101,8 @@ pub(super) struct WorkspaceShells {
     /// Keyed by (read-only, `.envrc` directory or none); a changed identity replaces the pool,
     /// whose idle hosts end with it and whose executing hosts are not returned.
     pools: BTreeMap<(bool, Option<PathBuf>), (Sha256Digest, ShellPool<HostActivator>)>,
+    /// What the pools a changed identity replaced had counted.
+    retired: PoolCounts,
 }
 
 /// What a warm host runs for one job.
@@ -143,7 +145,15 @@ impl WorkspaceShells {
             config,
             activation: Arc::new(tokio::sync::Mutex::new(())),
             pools: BTreeMap::new(),
+            retired: PoolCounts::default(),
         }
+    }
+
+    /// How every command of this supervisor got its warm host, across every pool it started.
+    pub(super) fn counts(&self) -> PoolCounts {
+        self.pools
+            .values()
+            .fold(self.retired, |sum, (_, pool)| sum + pool.counts())
     }
 
     pub(super) fn spawn(
@@ -152,9 +162,8 @@ impl WorkspaceShells {
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
         let base = spawn.environment.base();
-        let launch = spawn.profile.launch()?;
         let key = pool_key(
-            &launch,
+            spawn.profile.planned(),
             &base,
             spawn.envrc_directory.as_deref(),
             spawn.grant_revision,
@@ -178,7 +187,10 @@ impl WorkspaceShells {
                     }),
                     self.config,
                 );
-                self.pools.insert(family, (key, pool.clone()));
+                cowshed_os::timing::event("pool", || "start: a new shell identity".to_owned());
+                if let Some((_, replaced)) = self.pools.insert(family, (key, pool.clone())) {
+                    self.retired = self.retired + replaced.counts();
+                }
                 pool
             }
         };
@@ -1991,6 +2003,72 @@ mod tests {
             "the activation record survives staging"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// One spawn's shell identity, drawn from small alphabets so equal and unequal pairs both occur.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct Identity {
+        profile: u8,
+        environment: BTreeMap<OsString, OsString>,
+        envrc: Option<u8>,
+        grant_revision: u64,
+        program: u8,
+    }
+
+    fn identity() -> impl Strategy<Value = Identity> {
+        (
+            0_u8..3,
+            proptest::collection::btree_map(0_u8..3, 0_u8..3, 0..3),
+            proptest::option::of(0_u8..2),
+            0_u64..3,
+            0_u8..2,
+        )
+            .prop_map(
+                |(profile, environment, envrc, grant_revision, program)| Identity {
+                    profile,
+                    environment: environment
+                        .into_iter()
+                        .map(|(name, value)| (format!("V{name}").into(), format!("{value}").into()))
+                        .collect(),
+                    envrc,
+                    grant_revision,
+                    program,
+                },
+            )
+    }
+
+    fn key(identity: &Identity) -> Sha256Digest {
+        let profile = crate::sandbox::SeatbeltProfile::unparameterized(&format!(
+            "(version 1) ; profile {}",
+            identity.profile
+        ));
+        let envrc = identity
+            .envrc
+            .map(|directory| PathBuf::from(format!("/w/{directory}")));
+        pool_key(
+            &ProfileLaunch::planned(Path::new("/store/run/profiles"), &profile),
+            &identity.environment,
+            envrc.as_deref(),
+            identity.grant_revision,
+            &ShellHostProgram::dedicated(format!("/bin/host-{}", identity.program)),
+        )
+    }
+
+    proptest! {
+        /// Two spawns share a pool exactly when their whole shell identity is equal: a host
+        /// activated under one grant revision, environment, profile, `.envrc` or host program
+        /// never serves a command of another (11_shell.md, "One spare and a SIEVE cache";
+        /// "Grant-change propagation").
+        #[test]
+        fn no_host_serves_another_shell_identity(a in identity(), b in identity()) {
+            prop_assert_eq!(key(&a) == key(&b), a == b);
+        }
     }
 }
 

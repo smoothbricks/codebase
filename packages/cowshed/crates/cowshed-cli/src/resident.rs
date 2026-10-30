@@ -2,12 +2,14 @@
 //!
 //! A named workspace that is mounted, and whose records agree with its mount, is answered here
 //! for `path` without opening the project controller and without asking its supervisor anything
-//! ([`cowshed_core::resident::mounted`]): `path` runs no work there. `exec` also needs the
-//! workspace's daemon-owned supervisor to serve its current authority, its gateway session to be
-//! current and its build state to be what the controller's refresh would leave as it is
-//! ([`cowshed_core::resident::resolve`]), and the job runs through the supervisor's socket.
-//! Everything else — and every workspace the resolution declines — falls through to the
-//! controller untouched, so this path never answers what the controller would answer differently.
+//! ([`cowshed_core::resident::mounted`]): `path` runs no work there. `exec` is the core's resident
+//! exec client, which the controller's exec runs too: the workspace's daemon-owned supervisor
+//! serves its current authority ([`cowshed_core::resident::resolve`]), its gateway session is
+//! current and its build state is what the controller's refresh would leave as it is
+//! ([`Resident::admissible`]), and the job runs through the supervisor's socket on a
+//! [`JobLink`]. This module only relays it. Everything else — and every workspace the resolution
+//! declines — falls through to the controller untouched, so this path never answers what the
+//! controller would answer differently.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,17 +18,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cowshed_core::api::{ExecRequest, JobId, JobInfo};
 use cowshed_core::metadata::WorkspaceName;
-use cowshed_core::resident::{Decline, HostProbe, Mounted, Resident, mounted, resolve};
-use cowshed_core::runtime::supervisor::WorkspaceSupervisorHandle;
+use cowshed_core::resident::{Decline, HostProbe, JobLink, Mounted, Resident, mounted, resolve};
 use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_core::storage::job_artifact::StreamKind;
-use cowshed_core::{CowshedError, ErrorCode, JobStream, Result};
+use cowshed_core::{CowshedError, JobStream, Result};
 use cowshed_gateway_types::STORE_ROOT;
 use cowshed_os::timing::{event, span, spanned};
 use tokio::io::AsyncRead;
 
 use crate::args::{Cli, Command};
-use crate::gateway_service::{ControlSocket, stable_workspace_id};
+use crate::gateway_service::ControlSocket;
 use crate::output::Output;
 use crate::runtime::{
     DispatchExit, ExecEnd, ExecPresentation, ExecResult, ForegroundJob, emit_mount_path,
@@ -41,67 +42,80 @@ pub enum Answer<R> {
     Declined(R),
 }
 
-/// Answer `cli` from a resident workspace when it names one; otherwise hand `stdin` back.
-pub async fn answer<R, W, E>(cli: &Cli, stdin: R, output: &mut Output<W, E>) -> Result<Answer<R>>
+/// Answer `path` from a resident workspace when it names one; `None` when the controller has to.
+pub fn answer_path<W, E>(cli: &Cli, output: &mut Output<W, E>) -> Result<Option<DispatchExit>>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    let Command::Path(args) = &cli.command else {
+        return Ok(None);
+    };
+    let (Some(workspace), None) = (args.workspace.as_deref(), args.slot) else {
+        return Ok(None);
+    };
+    let Some(mounted) = mounted_workspace(cli, workspace)? else {
+        return Ok(None);
+    };
+    emit_mount_path(
+        output,
+        cli.global.json,
+        &mounted.workspace,
+        &mounted.mount,
+        mounted.base_commit.as_ref(),
+    )?;
+    Ok(Some(success()))
+}
+
+/// Answer an `exec` from a resident workspace when it names one; otherwise hand `stdin` back.
+pub async fn answer_exec<R, W, E>(
+    cli: &Cli,
+    stdin: R,
+    output: &mut Output<W, E>,
+) -> Result<Answer<R>>
 where
     R: AsyncRead + Send + 'static,
     W: Write + Send,
     E: Write + Send,
 {
     let json = cli.global.json;
-    match &cli.command {
-        Command::Path(args) if args.slot.is_none() => {
-            let Some(workspace) = args.workspace.as_deref() else {
-                return Ok(Answer::Declined(stdin));
-            };
-            let Some(mounted) = mounted_workspace(cli, workspace)? else {
-                return Ok(Answer::Declined(stdin));
-            };
-            emit_mount_path(
-                output,
-                json,
-                &mounted.workspace,
-                &mounted.mount,
-                mounted.base_commit.as_ref(),
-            )?;
-            Ok(Answer::Answered(success()))
-        }
-        Command::Exec(args) if args.session.is_none() => {
-            let Some(resident) = resident(cli, &args.workspace).await? else {
-                return Ok(Answer::Declined(stdin));
-            };
-            if !gateway_current(&resident).await {
-                return Ok(Answer::Declined(stdin));
-            }
-            let build_state = {
-                let _span = span("resident", "build-state");
-                resident.build_state_current()
-            };
-            if let Err(decline) = build_state {
-                declined(decline);
-                return Ok(Answer::Declined(stdin));
-            }
-            let command = exec_command(args.clone(), stdin)?;
-            let (stdout, stderr) = output.writers_mut();
-            let result = run(
-                resident,
-                command.request,
-                command.background,
-                command.timeout,
-                exec_presentation(json),
-                stdout,
-                stderr,
-            )
-            .await?;
-            Ok(Answer::Answered(report_exec(
-                output,
-                json,
-                &args.workspace,
-                result,
-            )?))
-        }
-        _ => Ok(Answer::Declined(stdin)),
+    let Command::Exec(args) = &cli.command else {
+        return Ok(Answer::Declined(stdin));
+    };
+    if args.session.is_some() {
+        return Ok(Answer::Declined(stdin));
     }
+    let Some(resident) = resident(cli, &args.workspace).await? else {
+        return Ok(Answer::Declined(stdin));
+    };
+    // The resident path reads the host's own store (`STORE_ROOT`), so the gateway it asks is the
+    // host's.
+    let admissible = match ControlSocket::at(CanonicalRoots::global().control_socket()) {
+        Ok(gateway) => resident.admissible(&gateway).await,
+        Err(_) => Err(Decline::GatewayUnanswered),
+    };
+    if let Err(decline) = admissible {
+        declined(decline);
+        return Ok(Answer::Declined(stdin));
+    }
+    let command = exec_command(args.clone(), stdin)?;
+    let (stdout, stderr) = output.writers_mut();
+    let result = run(
+        resident,
+        command.request,
+        command.background,
+        command.timeout,
+        exec_presentation(json),
+        stdout,
+        stderr,
+    )
+    .await?;
+    Ok(Answer::Answered(report_exec(
+        output,
+        json,
+        &args.workspace,
+        result,
+    )?))
 }
 
 /// The mounted workspace `name` of the invocation's project, as `path` answers it, or `None`
@@ -165,35 +179,6 @@ fn invocation_start(project: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// Whether the gateway holds this workspace's session at the revision its supervisor serves —
-/// exactly the case in which the controller's pre-exec reconcile would install nothing for it.
-async fn gateway_current(resident: &Resident) -> bool {
-    let _span = span("resident", "gateway");
-    // The resident path reads the host's own store (`STORE_ROOT`), so the gateway it asks is the
-    // host's.
-    let Ok(control) = ControlSocket::at(CanonicalRoots::global().control_socket()) else {
-        return false;
-    };
-    let authority = resident.authority();
-    let identity = stable_workspace_id(
-        &resident.repo_id,
-        resident.workspace.as_str(),
-        &authority.workspace_incarnation,
-    );
-    let Ok(current) = control
-        .session_current(&identity, authority.grant_revision)
-        .await
-    else {
-        return false;
-    };
-    if !current {
-        event("resident", || {
-            "declined: the gateway session is not current".to_owned()
-        });
-    }
-    current
-}
-
 /// Run one job in the resident workspace and relay it as the controller path does.
 async fn run(
     resident: Resident,
@@ -205,8 +190,7 @@ async fn run(
     stderr: &mut (dyn Write + Send),
 ) -> Result<ExecResult> {
     let build_volume = resident.build_volume.clone();
-    let incarnation = resident.authority().workspace_incarnation.clone();
-    let link = JobLink::new(resident);
+    let mut link = JobLink::new(&resident);
     // The CLI is the coordinator route (07_api.md, "CLI and API exec parity"), on this path as
     // through the controller: the route is who asks, never the class asked for.
     let source = cowshed_core::runtime::supervisor_socket::AdmissionSource::Coordinator;
@@ -216,11 +200,11 @@ async fn run(
     let job = spanned(
         "resident",
         "submit",
-        link.handle.exec(None, build_volume, request, source),
+        link.handle().exec(None, build_volume, request, source),
     )
     .await?;
     if background {
-        let info = link.clone().info(job).await?;
+        let info = link.info(job).await?;
         link.detach(job).await?;
         return Ok(ExecResult {
             info,
@@ -230,7 +214,12 @@ async fn run(
     let job = ResidentJob { link, job };
     // Held for as long as this process lives, as through the controller (05_gateway.md, "A job
     // lives with its requester").
-    let hold = hold_foreground(&job, &job.link.socket, &incarnation, job.job).await?;
+    let held = cowshed_core::runtime::supervisor_socket::hold_under(
+        job.link.socket(),
+        job.link.handle().snapshot(),
+        job.job,
+    );
+    let hold = hold_foreground(&job, held).await?;
     let _relay = span("resident", "relay");
     relay_foreground(&job, Some(hold), timeout, presentation, stdout, stderr).await
 }
@@ -261,103 +250,16 @@ impl ForegroundJob for ResidentJob {
         self.link.clone().kill(self.job).await
     }
 
+    /// Copy one stream to `writer` as it is produced, to its end.
     async fn relay(&self, stream: JobStream, writer: &mut (dyn Write + Send)) -> Result<()> {
         let stream = match stream {
             JobStream::Stdout => StreamKind::Stdout,
             JobStream::Stderr => StreamKind::Stderr,
         };
-        self.link.clone().pump(self.job, stream, writer).await
-    }
-}
-
-/// One lane to the job's supervisor. A grant change while the job runs advances the supervisor
-/// in place, and it then refuses calls that name the authority it served before; the lane follows
-/// it to the new one, which still holds the job.
-#[derive(Clone)]
-struct JobLink {
-    socket: PathBuf,
-    handle: WorkspaceSupervisorHandle,
-}
-
-impl JobLink {
-    fn new(resident: Resident) -> Self {
-        Self {
-            socket: resident.socket().to_path_buf(),
-            handle: resident.supervisor,
-        }
-    }
-
-    async fn followed(&mut self, error: CowshedError) -> Result<()> {
-        if error.code != ErrorCode::Conflict {
-            return Err(error);
-        }
-        match cowshed_core::resident::follow(&self.socket, self.handle.snapshot(), &HostProbe)
-            .await?
-        {
-            Some(handle) => {
-                self.handle = handle;
-                Ok(())
-            }
-            None => Err(error),
-        }
-    }
-
-    async fn info(mut self, job: JobId) -> Result<JobInfo> {
-        match self.handle.info(job).await {
-            Err(error) => {
-                self.followed(error).await?;
-                self.handle.info(job).await
-            }
-            done => done,
-        }
-    }
-
-    async fn wait(mut self, job: JobId) -> Result<JobInfo> {
-        match self.handle.wait(job).await {
-            Err(error) => {
-                self.followed(error).await?;
-                self.handle.wait(job).await
-            }
-            done => done,
-        }
-    }
-
-    async fn kill(mut self, job: JobId) -> Result<()> {
-        match self.handle.kill(job).await {
-            Err(error) => {
-                self.followed(error).await?;
-                self.handle.kill(job).await
-            }
-            done => done,
-        }
-    }
-
-    async fn detach(mut self, job: JobId) -> Result<()> {
-        match self.handle.detach(job).await {
-            Err(error) => {
-                self.followed(error).await?;
-                self.handle.detach(job).await
-            }
-            done => done,
-        }
-    }
-
-    /// Copy one stream to `writer` as it is produced, to its end.
-    async fn pump(
-        mut self,
-        job: JobId,
-        stream: StreamKind,
-        writer: &mut (dyn Write + Send),
-    ) -> Result<()> {
+        let mut link = self.link.clone();
         let mut offset = 0_u64;
         loop {
-            let chunk = match self.handle.log_read(job, stream, offset, true).await {
-                Err(error) => {
-                    self.followed(error).await?;
-                    continue;
-                }
-                Ok(chunk) => chunk,
-            };
+            let chunk = link.log_read(self.job, stream, offset, true).await?;
             if !chunk.bytes.is_empty() {
                 writer.write_all(&chunk.bytes).map_err(output_error)?;
                 writer.flush().map_err(output_error)?;

@@ -495,23 +495,36 @@ struct RenderedPolicy {
 pub struct ChildProfile {
     profile: SeatbeltProfile,
     directory: PathBuf,
+    /// The launch this profile makes, digested once when it is rendered: a warm command is
+    /// keyed by it and launches nothing, so it writes no file (11_shell.md, "One spare and a
+    /// SIEVE cache").
+    planned: ProfileLaunch,
 }
 
 impl ChildProfile {
     fn new(profile: SeatbeltProfile, sandbox: &SandboxConfig) -> Self {
+        let directory = sandbox.profile_directory();
         Self {
+            planned: ProfileLaunch::planned(&directory, &profile),
             profile,
-            directory: sandbox.profile_directory(),
+            directory,
         }
     }
 
     /// `text`, kept in `directory`, bound to no build volume: a test's host profile.
     #[cfg(test)]
     pub(super) fn unbound(text: &str, directory: &Path) -> Self {
+        let profile = SeatbeltProfile::unparameterized(text);
         Self {
-            profile: SeatbeltProfile::unparameterized(text),
+            planned: ProfileLaunch::planned(directory, &profile),
+            profile,
             directory: directory.to_owned(),
         }
+    }
+
+    /// The launch [`Self::launch`] makes, without making sure of its file.
+    pub fn planned(&self) -> &ProfileLaunch {
+        &self.planned
     }
 
     /// The rendered profile.
@@ -966,6 +979,11 @@ pub trait SpawnSink: Send {
         request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>>;
+
+    /// How the warm-shell pools answered this sink's spawns, or `None` for a sink without them.
+    fn shell_pool(&self) -> Option<super::shell_pool::PoolCounts> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3077,6 +3095,11 @@ impl SystemSpawnSink {
 
 #[async_trait]
 impl SpawnSink for SystemSpawnSink {
+    fn shell_pool(&self) -> Option<super::shell_pool::PoolCounts> {
+        self.shells
+            .as_ref()
+            .map(super::shell_job::WorkspaceShells::counts)
+    }
     #[cfg(target_os = "linux")]
     async fn admit_cgroup(
         &mut self,
@@ -3983,6 +4006,30 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// Whether a job may be admitted onto the checkout's build state as it is, with the build
+    /// volume the caller resolved (`crate::resident::build_state_current`): `None`, or why not.
+    pub async fn build_state(
+        &self,
+        build_volume: Option<PathBuf>,
+    ) -> Result<Option<crate::resident::Decline>> {
+        self.call(|reply| Command::BuildState {
+            authority: self.authority.clone(),
+            build_volume,
+            reply,
+        })
+        .await
+    }
+
+    /// How this supervisor's commands got their warm hosts (11_shell.md, "One spare and a SIEVE
+    /// cache"). Refused by a supervisor that runs no warm shells.
+    pub async fn shell_pool(&self) -> Result<super::shell_pool::PoolCounts> {
+        self.call(|reply| Command::ShellPool {
+            authority: self.authority.clone(),
+            reply,
+        })
+        .await
+    }
+
     pub async fn advance_authority(
         &self,
         grant_revision: u64,
@@ -4664,6 +4711,15 @@ pub(super) enum Command {
         grace: Duration,
         reply: oneshot::Sender<Result<JobSubtreeRetirement>>,
     },
+    BuildState {
+        authority: WorkspaceAuthoritySnapshot,
+        build_volume: Option<PathBuf>,
+        reply: oneshot::Sender<Result<Option<crate::resident::Decline>>>,
+    },
+    ShellPool {
+        authority: WorkspaceAuthoritySnapshot,
+        reply: oneshot::Sender<Result<super::shell_pool::PoolCounts>>,
+    },
     TraceHealth {
         authority: WorkspaceAuthoritySnapshot,
         reply: oneshot::Sender<Result<TraceHealth>>,
@@ -4769,6 +4825,8 @@ impl Command {
             Self::SubtreeHandle { .. } => "subtree-handle",
             #[cfg(target_os = "macos")]
             Self::RetireDescendants { .. } => "retire-descendants",
+            Self::BuildState { .. } => "build-state",
+            Self::ShellPool { .. } => "shell-pool",
             Self::TraceHealth { .. } => "trace-health",
             Self::ListeningPorts { .. } => "listening-ports",
             Self::JobByKey { .. } => "job-by-key",
@@ -5132,7 +5190,7 @@ impl JobFinish {
 /// finding, and a marker that cannot be removed is reported after the restore, never before it.
 fn finish_terminal_restore(
     root: &Path,
-    links: crate::developer_links::DeveloperLinks,
+    links: Arc<crate::developer_links::DeveloperLinks>,
     observation: Option<InstallObservation>,
 ) -> JobFinish {
     let mut findings = Vec::new();
@@ -5206,7 +5264,7 @@ struct JobStateRecord {
     /// Set when `wait(2)` could not name the child's termination. Keeps the job's terminal
     /// record free of a fabricated exit and hands the failure to everyone awaiting the job.
     wait_failure: Option<CowshedError>,
-    developer_links: crate::developer_links::DeveloperLinks,
+    developer_links: Arc<crate::developer_links::DeveloperLinks>,
     install_observation: Option<InstallObservation>,
     /// The terminal cleanup failure of this job, kept as its one error for waiters and the record.
     terminal_cleanup_failure: Option<CowshedError>,
@@ -6359,6 +6417,39 @@ impl SupervisorActor {
                     }
                 }
             }
+            Command::BuildState {
+                authority,
+                build_volume,
+                reply,
+            } => match self.validate_authority(&authority) {
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+                Ok(()) => {
+                    // The fingerprint reads the checkout and may run its Git: on the blocking
+                    // pool, and no turn waits for it.
+                    let root = self.workspace_root.clone();
+                    tokio::spawn(async move {
+                        let judged = off_actor::run(move || {
+                            crate::resident::build_state_current(&root, build_volume.as_deref())
+                                .err()
+                        })
+                        .await;
+                        let _ = reply.send(Ok(judged));
+                    });
+                }
+            },
+            Command::ShellPool { authority, reply } => {
+                let counts = self.validate_authority(&authority).and_then(|()| {
+                    self.spawner.shell_pool().ok_or_else(|| {
+                        CowshedError::environment_missing(
+                            "this workspace's supervisor runs no warm shells",
+                            "start the supervisor with a shell host program",
+                        )
+                    })
+                });
+                let _ = reply.send(counts);
+            }
             Command::TraceHealth { authority, reply } => {
                 let writer = self.validate_authority(&authority).and_then(|()| {
                     self.job_spans.clone().ok_or_else(|| {
@@ -7079,13 +7170,13 @@ impl SupervisorActor {
             let (links, observation) = off_actor::run(move || {
                 let observation = InstallObservation::new(&exec_temp)?;
                 let stores = crate::developer_links::PackageStores::from_home(&home)?;
-                let links = crate::developer_links::DeveloperLinks::capture_job(&root, stores)?;
+                let links = crate::developer_links::DeveloperLinks::capture_kept(&root, stores)?;
                 Ok::<_, CowshedError>((links, observation))
             })
             .await?;
             (links, Some(observation))
         } else {
-            (crate::developer_links::DeveloperLinks::default(), None)
+            (Arc::default(), None)
         };
         let build_hold = self.hold_build_volume(build_volume.as_deref()).await?;
         // A volume the link moved to (a land, a refork) was another checkout's: it takes this
@@ -12853,7 +12944,11 @@ mod install_observation_tests {
     /// A tracked checkout with one scoped package link to a live sibling, captured as a job would.
     fn captured_checkout(
         scratch: &Path,
-    ) -> (PathBuf, PathBuf, crate::developer_links::DeveloperLinks) {
+    ) -> (
+        PathBuf,
+        PathBuf,
+        Arc<crate::developer_links::DeveloperLinks>,
+    ) {
         let root = scratch.join("checkout");
         fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
         fs::write(root.join("package.json"), "{}\n").unwrap();
@@ -12878,7 +12973,8 @@ mod install_observation_tests {
         symlink(&sibling, root.join("node_modules/@scope/dev")).unwrap();
         let stores =
             crate::developer_links::PackageStores::from_home(&scratch.join("home")).unwrap();
-        let links = crate::developer_links::DeveloperLinks::capture_job(&root, stores).unwrap();
+        let links =
+            Arc::new(crate::developer_links::DeveloperLinks::capture_job(&root, stores).unwrap());
         (root, sibling, links)
     }
 

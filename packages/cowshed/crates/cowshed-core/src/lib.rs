@@ -26,6 +26,7 @@ mod inherited_daemons;
 #[cfg(target_os = "macos")]
 mod inherited_git_locks;
 pub mod inherited_links;
+mod input_memo;
 pub mod land_turn;
 pub mod landing;
 pub mod lease_holder;

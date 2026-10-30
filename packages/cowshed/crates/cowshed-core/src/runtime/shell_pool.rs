@@ -25,8 +25,10 @@ use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use super::shell_watch::{ActivationEvidence, Contents, Snapshot, WatchEntry, Watcher, certify};
@@ -164,8 +166,9 @@ impl<H> Sieve<H> {
     }
 }
 
+/// The inputs the current generation was activated from, and their subscription: the pool core
+/// knows the generation by its number alone.
 struct Generation {
-    id: u64,
     baseline: Snapshot,
     /// The inputs' bytes certified with `baseline`; `None` when they are not known, and then
     /// any signal makes the generation stale.
@@ -225,10 +228,57 @@ pub(crate) struct PoolInspection {
     pub generation: Option<u64>,
 }
 
+/// How a supervisor's commands got their warm hosts (11_shell.md, "One spare and a SIEVE
+/// cache"): an idle host of the current generation, the spare, or a host the command activated
+/// for itself. A caller proves which path its commands took from these, not from their timing.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PoolCounts {
+    /// Acquires an idle host of the current generation answered.
+    pub idle: u64,
+    /// Acquires the spare answered.
+    pub spare: u64,
+    /// Acquires that found no warm host and activated one of their own.
+    pub activated: u64,
+    /// Shell identities a pool was started for. Past one per identity, a changed identity (a
+    /// profile, environment, grant revision or host program) replaced a pool and its hosts.
+    pub pools: u64,
+}
+
+impl std::ops::Add for PoolCounts {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            idle: self.idle + other.idle,
+            spare: self.spare + other.spare,
+            activated: self.activated + other.activated,
+            pools: self.pools + other.pools,
+        }
+    }
+}
+
+/// The pool actor's tallies, which only it writes.
+#[derive(Default)]
+struct Tallies {
+    idle: AtomicU64,
+    spare: AtomicU64,
+    activated: AtomicU64,
+}
+
+impl Tallies {
+    /// Count one acquire answered `how`, and say so on the latency waterfall.
+    fn count(&self, tally: &AtomicU64, how: &'static str) {
+        tally.fetch_add(1, Ordering::Relaxed);
+        cowshed_os::timing::event("pool", || format!("acquire: {how}"));
+    }
+}
+
 /// Cheap to clone: one sender to the actor.
 pub struct ShellPool<A: Activator> {
     requests: mpsc::UnboundedSender<Request<A::Host>>,
     activator: Arc<A>,
+    tallies: Arc<Tallies>,
 }
 
 impl<A: Activator> Clone for ShellPool<A> {
@@ -236,6 +286,7 @@ impl<A: Activator> Clone for ShellPool<A> {
         Self {
             requests: self.requests.clone(),
             activator: Arc::clone(&self.activator),
+            tallies: Arc::clone(&self.tallies),
         }
     }
 }
@@ -247,27 +298,29 @@ fn pool_stopped() -> CowshedError {
 impl<A: Activator> ShellPool<A> {
     pub fn start(activator: Arc<A>, config: ShellPoolConfig) -> Self {
         let (requests, receiver) = mpsc::unbounded_channel();
+        let tallies = Arc::new(Tallies::default());
         let actor = PoolActor {
             activator: Arc::clone(&activator),
             requests: requests.downgrade(),
-            config,
-            sieve: Sieve {
-                slots: VecDeque::new(),
-                hand: 0,
-                capacity: config.capacity.get(),
-            },
+            core: PoolCore::new(config),
             generation: None,
-            next_generation: 1,
-            next_slot: 1,
-            dirty: false,
-            epoch: 0,
-            spare: None,
-            warming: false,
+            tallies: Arc::clone(&tallies),
         };
         tokio::spawn(actor.run(receiver));
         Self {
             requests,
             activator,
+            tallies,
+        }
+    }
+
+    /// How this pool's acquires were answered so far.
+    pub fn counts(&self) -> PoolCounts {
+        PoolCounts {
+            idle: self.tallies.idle.load(Ordering::Relaxed),
+            spare: self.tallies.spare.load(Ordering::Relaxed),
+            activated: self.tallies.activated.load(Ordering::Relaxed),
+            pools: 1,
         }
     }
 
@@ -414,20 +467,233 @@ struct Spare<H> {
     generation: u64,
 }
 
-struct PoolActor<A: Activator> {
-    activator: Arc<A>,
-    /// Weak, so the actor ends when the last handle, ticket and checkout are gone.
-    requests: mpsc::WeakUnboundedSender<Request<A::Host>>,
-    config: ShellPoolConfig,
-    sieve: Sieve<A::Host>,
-    generation: Option<Generation>,
+/// What an acquire is granted ([`PoolCore::acquire`]).
+enum Grant<H> {
+    /// An idle host of the current generation.
+    Idle { slot: SlotId, host: H },
+    /// The spare; `warm` is the epoch its replacement activates under, when one must start.
+    Spare {
+        slot: SlotId,
+        host: H,
+        warm: Option<u64>,
+    },
+    /// No warm host: the caller activates one into `slot`. `stale` when no generation was current
+    /// and every idle host and the spare were retired for it.
+    Activate {
+        slot: SlotId,
+        epoch: u64,
+        stale: bool,
+    },
+}
+
+/// What installing an activation's evidence takes ([`PoolCore::install`]).
+enum Install {
+    /// The evidence is the current generation's: its host returns to it.
+    Current(u64),
+    /// A generation of its own, once its inputs are subscribed ([`PoolCore::generation`]).
+    Subscribe { stable: bool },
+}
+
+/// The pool's decisions over its own state (11_shell.md, "One spare and a SIEVE cache"). Every
+/// fact the actor observes arrives as an argument and every effect leaves as a return value: a
+/// grant, a spare to start, a host dropped (a host ends when it drops). It reads no file, starts
+/// no task and reads no clock, so random event sequences check it against a model (`tests`).
+struct PoolCore<H> {
+    prewarm: bool,
+    sieve: Sieve<H>,
+    /// The generation of the inputs hosts were last activated from.
+    generation: Option<u64>,
     next_generation: u64,
     next_slot: SlotId,
     dirty: bool,
     /// Counts observed input changes; an activation compares it across its own run.
     epoch: u64,
-    spare: Option<Spare<A::Host>>,
+    spare: Option<Spare<H>>,
     warming: bool,
+}
+
+impl<H> PoolCore<H> {
+    fn new(config: ShellPoolConfig) -> Self {
+        Self {
+            prewarm: config.prewarm,
+            sieve: Sieve {
+                slots: VecDeque::new(),
+                hand: 0,
+                capacity: config.capacity.get(),
+            },
+            generation: None,
+            next_generation: 1,
+            next_slot: 1,
+            dirty: false,
+            epoch: 0,
+            spare: None,
+            warming: false,
+        }
+    }
+
+    /// The inputs moved: their bytes differ from the generation's, or cannot be certified.
+    fn changed(&mut self) {
+        self.epoch += 1;
+        self.dirty = true;
+    }
+
+    fn current(&self) -> Option<u64> {
+        if self.dirty {
+            return None;
+        }
+        self.generation
+    }
+
+    fn new_slot(&mut self, generation: Option<u64>) -> SlotId {
+        let id = self.next_slot;
+        self.next_slot += 1;
+        self.sieve.insert(Slot {
+            id,
+            generation,
+            host: None,
+            visited: false,
+        });
+        id
+    }
+
+    /// The most recently returned idle host of the current generation, else the spare, else a
+    /// slot to activate into. With no generation current, every idle host and the spare retire.
+    fn acquire(&mut self) -> Grant<H> {
+        let Some(current) = self.current() else {
+            self.sieve.retire_except(None);
+            self.spare = None;
+            return Grant::Activate {
+                slot: self.new_slot(None),
+                epoch: self.epoch,
+                stale: true,
+            };
+        };
+        if let Some((slot, host)) = self.sieve.take_idle(current) {
+            return Grant::Idle { slot, host };
+        }
+        if let Some(spare) = self.spare.take_if(|spare| spare.generation == current) {
+            let slot = self.new_slot(Some(current));
+            return Grant::Spare {
+                slot,
+                host: spare.host,
+                warm: self.warm(),
+            };
+        }
+        Grant::Activate {
+            slot: self.new_slot(None),
+            epoch: self.epoch,
+            stale: false,
+        }
+    }
+
+    /// What [`Self::acquire`] would grant warm, deciding nothing.
+    fn ready(&self) -> bool {
+        let Some(current) = self.current() else {
+            return false;
+        };
+        self.sieve
+            .slots
+            .iter()
+            .any(|slot| slot.generation == Some(current) && slot.host.is_some())
+            || self
+                .spare
+                .as_ref()
+                .is_some_and(|spare| spare.generation == current)
+    }
+
+    /// How an activation that started at `epoch` installs: `stable` that its inputs held still
+    /// while it ran, `same` that they are the current generation's.
+    fn install(&self, epoch: u64, stable: bool, same: bool) -> Install {
+        let stable = stable && epoch == self.epoch;
+        match self.current() {
+            Some(current) if stable && same => Install::Current(current),
+            _ => Install::Subscribe { stable },
+        }
+    }
+
+    /// A new generation of an activation's inputs, `subscribed` or not; the generation its host
+    /// may return to. An unstable activation still names the inputs to predict next time, and
+    /// its flag makes the next acquire activate again; inputs that cannot be subscribed leave
+    /// every shell to serve one command.
+    fn generation(&mut self, stable: bool, subscribed: bool) -> Option<u64> {
+        if !subscribed {
+            self.dirty = true;
+            return None;
+        }
+        let id = self.next_generation;
+        self.next_generation += 1;
+        self.generation = Some(id);
+        self.dirty = !stable;
+        self.sieve.retire_except(stable.then_some(id));
+        self.spare = None;
+        stable.then_some(id)
+    }
+
+    /// The host activated into `slot` belongs to `generation`: whether it may return, and the
+    /// epoch a spare starts under when one must.
+    fn activated(&mut self, slot: SlotId, generation: Option<u64>) -> (bool, Option<u64>) {
+        let Some(position) = self.sieve.position(slot) else {
+            return (false, None);
+        };
+        self.sieve.slots[position].generation = generation;
+        match generation {
+            Some(_) => (true, self.warm()),
+            None => (false, None),
+        }
+    }
+
+    /// A host back from its command: kept idle when healthy and of the current generation,
+    /// dropped otherwise.
+    fn release(&mut self, slot: SlotId, host: Option<H>, healthy: bool) {
+        let current = self.current();
+        let Some(position) = self.sieve.position(slot) else {
+            return;
+        };
+        let entry = &mut self.sieve.slots[position];
+        match host {
+            Some(host) if healthy && entry.generation.is_some() && entry.generation == current => {
+                entry.host = Some(host);
+            }
+            _ => self.sieve.remove(slot),
+        }
+    }
+
+    /// The epoch a spare starts activating under, when none exists or is on its way.
+    fn warm(&mut self) -> Option<u64> {
+        if !self.prewarm || self.spare.is_some() || self.warming || self.current().is_none() {
+            return None;
+        }
+        self.warming = true;
+        Some(self.epoch)
+    }
+
+    /// The spare's activation produced `host` of `generation`: it is the spare while that
+    /// generation is current and no other spare came first.
+    fn warmed(&mut self, host: H, generation: Option<u64>) {
+        self.warming = false;
+        if let Some(generation) = generation
+            && self.current() == Some(generation)
+            && self.spare.is_none()
+        {
+            self.spare = Some(Spare { host, generation });
+        }
+    }
+
+    /// The spare's activation produced no usable host: there is no spare.
+    fn warm_failed(&mut self) {
+        self.warming = false;
+    }
+}
+
+/// The pool's I/O: it reads the inputs' kernel events and identities, subscribes and certifies
+/// them, starts spare activations and publishes tallies; [`PoolCore`] decides.
+struct PoolActor<A: Activator> {
+    activator: Arc<A>,
+    /// Weak, so the actor ends when the last handle, ticket and checkout are gone.
+    requests: mpsc::WeakUnboundedSender<Request<A::Host>>,
+    core: PoolCore<A::Host>,
+    generation: Option<Generation>,
+    tallies: Arc<Tallies>,
 }
 
 impl<A: Activator> PoolActor<A> {
@@ -457,39 +723,30 @@ impl<A: Activator> PoolActor<A> {
                 } => self.release(slot, host, healthy),
                 Request::Warmed { epoch, activation } => self.warmed(epoch, activation),
                 Request::Ready { reply } => {
-                    let ready = self.ready();
-                    let _ = reply.send(ready);
+                    self.refresh(true);
+                    let _ = reply.send(self.core.ready());
                 }
                 #[cfg(test)]
                 Request::Inspect { reply } => {
+                    let slots = &self.core.sieve.slots;
                     let _ = reply.send(PoolInspection {
-                        idle: self
-                            .sieve
-                            .slots
-                            .iter()
-                            .filter(|slot| slot.host.is_some())
-                            .count(),
-                        executing: self
-                            .sieve
-                            .slots
-                            .iter()
-                            .filter(|slot| slot.host.is_none())
-                            .count(),
-                        spare: self.spare.is_some(),
-                        warming: self.warming,
-                        dirty: self.dirty,
-                        generation: self.generation.as_ref().map(|generation| generation.id),
+                        idle: slots.iter().filter(|slot| slot.host.is_some()).count(),
+                        executing: slots.iter().filter(|slot| slot.host.is_none()).count(),
+                        spare: self.core.spare.is_some(),
+                        warming: self.core.warming,
+                        dirty: self.core.dirty,
+                        generation: self.core.generation,
                     });
                 }
             }
         }
     }
 
-    /// Fold kernel events, and at acquire the stat backstop, into the dirty flag. Either only
-    /// says an input may have changed; its bytes decide (11_shell.md, "Freshness is direnv's
-    /// own"). Bytes equal to the ones the generation certified mean the rewrite changed nothing
-    /// the shell read: the generation takes the new identities, resubscribes (a replaced file
-    /// is a new vnode) and stays warm.
+    /// Fold kernel events, and at acquire the stat backstop, into the core. Either only says an
+    /// input may have changed; its bytes decide (11_shell.md, "Freshness is direnv's own"). Bytes
+    /// equal to the ones the generation certified mean the rewrite changed nothing the shell
+    /// read: the generation takes the new identities, resubscribes (a replaced file is a new
+    /// vnode) and stays warm.
     fn refresh(&mut self, backstop: bool) {
         let Some(generation) = &mut self.generation else {
             return;
@@ -517,119 +774,75 @@ impl<A: Activator> PoolActor<A> {
             generation.watcher = watcher;
             return;
         }
-        self.epoch += 1;
-        self.dirty = true;
+        self.core.changed();
     }
 
-    fn current(&self) -> Option<u64> {
-        if self.dirty {
-            return None;
-        }
-        self.generation.as_ref().map(|generation| generation.id)
-    }
-
-    fn new_slot(&mut self, generation: Option<u64>) -> SlotId {
-        let id = self.next_slot;
-        self.next_slot += 1;
-        self.sieve.insert(Slot {
-            id,
-            generation,
-            host: None,
-            visited: false,
-        });
-        id
+    /// The current generation's inputs, which an activation snapshots just before evaluating.
+    fn predicted(&self) -> Vec<PathBuf> {
+        self.generation
+            .as_ref()
+            .map(|generation| generation.baseline.paths().map(PathBuf::from).collect())
+            .unwrap_or_default()
     }
 
     fn acquire(&mut self) -> Lease<A::Host> {
         self.refresh(true);
-        let Some(current) = self.current() else {
-            self.sieve.retire_except(None);
-            self.spare = None;
-            return self.ticket();
-        };
-        if let Some((slot, host)) = self.sieve.take_idle(current) {
-            return Lease::Warm { slot, host };
-        }
-        if let Some(spare) = self.spare.take_if(|spare| spare.generation == current) {
-            let slot = self.new_slot(Some(current));
-            self.warm();
-            return Lease::Warm {
-                slot,
-                host: spare.host,
-            };
-        }
-        self.ticket()
-    }
-
-    /// What [`Self::acquire`] would decide, deciding nothing: the same input checks fold into
-    /// the dirty flag, and no host is taken.
-    fn ready(&mut self) -> bool {
-        self.refresh(true);
-        let Some(current) = self.current() else {
-            return false;
-        };
-        self.sieve
-            .slots
-            .iter()
-            .any(|slot| slot.generation == Some(current) && slot.host.is_some())
-            || self
-                .spare
-                .as_ref()
-                .is_some_and(|spare| spare.generation == current)
-    }
-
-    fn ticket(&mut self) -> Lease<A::Host> {
-        let predicted = self
-            .generation
-            .as_ref()
-            .map(|generation| generation.baseline.paths().map(PathBuf::from).collect())
-            .unwrap_or_default();
-        Lease::Activate {
-            slot: self.new_slot(None),
-            predicted,
-            epoch: self.epoch,
+        match self.core.acquire() {
+            Grant::Idle { slot, host } => {
+                self.tallies.count(&self.tallies.idle, "idle host");
+                Lease::Warm { slot, host }
+            }
+            Grant::Spare { slot, host, warm } => {
+                self.tallies.count(&self.tallies.spare, "spare");
+                self.warm(warm);
+                Lease::Warm { slot, host }
+            }
+            Grant::Activate { slot, epoch, stale } => {
+                let why = if stale {
+                    "activate (no current generation)"
+                } else {
+                    "activate (no idle host or spare)"
+                };
+                self.tallies.count(&self.tallies.activated, why);
+                Lease::Activate {
+                    slot,
+                    predicted: self.predicted(),
+                    epoch,
+                }
+            }
         }
     }
 
     /// Install what an activation observed; returns the generation its host may return to.
     fn install(&mut self, epoch: u64, evidence: ActivationEvidence) -> Option<u64> {
         self.refresh(false);
-        let stable = evidence.stable() && epoch == self.epoch;
-        if stable
-            && let Some(current) = self.current()
-            && self
-                .generation
-                .as_ref()
-                .is_some_and(|generation| generation.baseline.same_as(&evidence.after))
-        {
-            return Some(current);
-        }
-        let watcher = match Watcher::subscribe(&evidence.entries) {
-            Ok(watcher) => watcher,
+        let same = self
+            .generation
+            .as_ref()
+            .is_some_and(|generation| generation.baseline.same_as(&evidence.after));
+        let stable = match self.core.install(epoch, evidence.stable(), same) {
+            Install::Current(current) => return Some(current),
+            Install::Subscribe { stable } => stable,
+        };
+        match Watcher::subscribe(&evidence.entries) {
+            Ok(watcher) => {
+                let generation = self.core.generation(stable, true);
+                self.generation = Some(Generation {
+                    baseline: evidence.after,
+                    contents: evidence.contents,
+                    entries: evidence.entries,
+                    watcher,
+                });
+                generation
+            }
             Err(error) => {
                 cowshed_os::eprintln!(
                     "cowshed: cannot subscribe the workspace shell's inputs ({error}); its \
                  shells serve one command each"
                 );
-                self.dirty = true;
-                return None;
+                self.core.generation(stable, false)
             }
-        };
-        let id = self.next_generation;
-        self.next_generation += 1;
-        self.generation = Some(Generation {
-            id,
-            baseline: evidence.after,
-            contents: evidence.contents,
-            entries: evidence.entries,
-            watcher,
-        });
-        // An unstable activation still names the inputs to predict next time; its flag makes
-        // the next acquire activate again.
-        self.dirty = !stable;
-        self.sieve.retire_except(stable.then_some(id));
-        self.spare = None;
-        stable.then_some(id)
+        }
     }
 
     fn activated(
@@ -648,47 +861,23 @@ impl<A: Activator> PoolActor<A> {
                 None
             }
         };
-        let Some(position) = self.sieve.position(slot) else {
-            return false;
-        };
-        self.sieve.slots[position].generation = generation;
-        if generation.is_some() {
-            self.warm();
-        }
-        generation.is_some()
+        let (reusable, warm) = self.core.activated(slot, generation);
+        self.warm(warm);
+        reusable
     }
 
     fn release(&mut self, slot: SlotId, host: Option<A::Host>, healthy: bool) {
         self.refresh(false);
-        let current = self.current();
-        let Some(position) = self.sieve.position(slot) else {
-            return;
-        };
-        let entry = &mut self.sieve.slots[position];
-        match host {
-            Some(host) if healthy && entry.generation.is_some() && entry.generation == current => {
-                entry.host = Some(host);
-            }
-            _ => self.sieve.remove(slot),
-        }
+        self.core.release(slot, host, healthy);
     }
 
-    /// Start activating a spare when none exists or is on its way.
-    fn warm(&mut self) {
-        if !self.config.prewarm || self.spare.is_some() || self.warming {
-            return;
-        }
-        let (Some(_), Some(requests)) = (self.current(), self.requests.upgrade()) else {
+    /// Start the spare activation the core asked for, under its epoch.
+    fn warm(&mut self, epoch: Option<u64>) {
+        let (Some(epoch), Some(requests)) = (epoch, self.requests.upgrade()) else {
             return;
         };
-        let predicted = self
-            .generation
-            .as_ref()
-            .map(|generation| generation.baseline.paths().map(PathBuf::from).collect())
-            .unwrap_or_default();
+        let predicted = self.predicted();
         let activator = Arc::clone(&self.activator);
-        let epoch = self.epoch;
-        self.warming = true;
         tokio::spawn(async move {
             let activation = activator.activate(predicted, None).await;
             let _ = requests.send(Request::Warmed { epoch, activation });
@@ -696,20 +885,16 @@ impl<A: Activator> PoolActor<A> {
     }
 
     fn warmed(&mut self, epoch: u64, activation: Activation<A::Host>) {
-        self.warming = false;
         let Activation::Ready {
             host,
             evidence: Ok(evidence),
         } = activation
         else {
+            self.core.warm_failed();
             return;
         };
-        if let Some(generation) = self.install(epoch, evidence)
-            && self.current() == Some(generation)
-            && self.spare.is_none()
-        {
-            self.spare = Some(Spare { host, generation });
-        }
+        let generation = self.install(epoch, evidence);
+        self.core.warmed(host, generation);
     }
 }
 
@@ -826,6 +1011,16 @@ mod tests {
         assert_eq!(command(&pool).await, (1, false));
         assert_eq!(command(&pool).await, (1, false));
         assert_eq!(fixture.activations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            pool.counts(),
+            PoolCounts {
+                idle: 2,
+                spare: 0,
+                activated: 1,
+                pools: 1,
+            },
+            "two of three commands reached an idle host"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -955,6 +1150,16 @@ mod tests {
             (4, true),
             "idle hosts and the spare retired"
         );
+        assert_eq!(
+            pool.counts(),
+            PoolCounts {
+                idle: 0,
+                spare: 1,
+                activated: 2,
+                pools: 1,
+            },
+            "the cold start and the stale generation activated; the spare answered once"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -989,5 +1194,198 @@ mod tests {
         assert_eq!(inspection.idle, 2, "the evicted host was not returned");
         assert_eq!(command(&pool).await, (3, false), "newest idle host first");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One event of the pool core's world, as its actor feeds them.
+    #[derive(Clone, Debug)]
+    enum Event {
+        /// An input changed and its bytes did not hold.
+        Changed,
+        Acquire,
+        /// The `n`th checked-out host comes back, healthy or not.
+        Return {
+            n: usize,
+            healthy: bool,
+        },
+        /// The `n`th activation in flight ends: its inputs held still while it ran (`stable`),
+        /// they are the current generation's (`same`), their subscription is made or refused.
+        Activated {
+            n: usize,
+            stable: bool,
+            same: bool,
+            subscribed: bool,
+        },
+        /// The `n`th activation ticket is dropped unused.
+        Abandoned {
+            n: usize,
+        },
+        /// The spare activation in flight ends, with a usable host or none.
+        Warmed {
+            usable: bool,
+            stable: bool,
+            same: bool,
+            subscribed: bool,
+        },
+    }
+
+    fn event() -> impl proptest::strategy::Strategy<Value = Event> {
+        use proptest::prelude::*;
+        prop_oneof![
+            1 => Just(Event::Changed),
+            3 => Just(Event::Acquire),
+            3 => (any::<usize>(), any::<bool>()).prop_map(|(n, healthy)| Event::Return { n, healthy }),
+            3 => (any::<usize>(), any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
+                |(n, stable, same, subscribed)| Event::Activated { n, stable, same, subscribed }
+            ),
+            1 => any::<usize>().prop_map(|n| Event::Abandoned { n }),
+            2 => (any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
+                |(usable, stable, same, subscribed)| Event::Warmed { usable, stable, same, subscribed }
+            ),
+        ]
+    }
+
+    /// The generations as the specification states them (11_shell.md, "Freshness is direnv's
+    /// own"): one is current from the stable activation that installed it until any change.
+    #[derive(Default)]
+    struct Generations {
+        current: Option<u64>,
+        epoch: u64,
+        next: u64,
+    }
+
+    impl Generations {
+        /// The generation an activation that started at `epoch` gives its host.
+        fn install(
+            &mut self,
+            epoch: u64,
+            stable: bool,
+            same: bool,
+            subscribed: bool,
+        ) -> Option<u64> {
+            let stable = stable && epoch == self.epoch;
+            if let Some(current) = self.current
+                && stable
+                && same
+            {
+                return Some(current);
+            }
+            if !subscribed {
+                self.current = None;
+                return None;
+            }
+            self.next += 1;
+            self.current = stable.then_some(self.next);
+            self.current
+        }
+    }
+
+    fn install(
+        core: &mut PoolCore<u64>,
+        epoch: u64,
+        stable: bool,
+        same: bool,
+        subscribed: bool,
+    ) -> Option<u64> {
+        match core.install(epoch, stable, same) {
+            Install::Current(current) => Some(current),
+            Install::Subscribe { stable } => core.generation(stable, subscribed),
+        }
+    }
+
+    proptest::proptest! {
+        /// Whatever arrives in whatever order, the core grants only a host of the generation
+        /// current at the grant, never one it holds out already; it replaces a spare it hands
+        /// out; and it keeps no more hosts than its capacity.
+        #[test]
+        fn the_pool_core_grants_only_current_hosts_and_replaces_its_spare(
+            prewarm in proptest::prelude::any::<bool>(),
+            capacity in 1_usize..5,
+            events in proptest::collection::vec(event(), 1..150),
+        ) {
+            let mut core = PoolCore::<u64>::new(ShellPoolConfig {
+                capacity: NonZeroUsize::new(capacity).unwrap(),
+                prewarm,
+            });
+            let mut model = Generations::default();
+            let mut generation_of = std::collections::HashMap::<u64, Option<u64>>::new();
+            let mut next_host = 0_u64;
+            // Checked out: (slot, host, whether it may return).
+            let mut out = Vec::<(SlotId, u64, bool)>::new();
+            // Activation tickets: (slot, epoch).
+            let mut tickets = Vec::<(SlotId, u64)>::new();
+            let mut warming: Option<u64> = None;
+            for event in events {
+                match event {
+                    Event::Changed => {
+                        core.changed();
+                        model.epoch += 1;
+                        model.current = None;
+                    }
+                    Event::Acquire => match core.acquire() {
+                        Grant::Spare { warm: None, .. } if prewarm => {
+                            proptest::prop_assert!(false, "a spare was handed out and not replaced");
+                        }
+                        Grant::Idle { slot, host } | Grant::Spare { slot, host, warm: None } => {
+                            proptest::prop_assert!(model.current.is_some());
+                            proptest::prop_assert_eq!(generation_of[&host], model.current);
+                            proptest::prop_assert!(out.iter().all(|&(_, held, _)| held != host));
+                            out.push((slot, host, true));
+                        }
+                        Grant::Spare { slot, host, warm: Some(epoch) } => {
+                            proptest::prop_assert!(prewarm);
+                            proptest::prop_assert_eq!(generation_of[&host], model.current);
+                            proptest::prop_assert_eq!(epoch, model.epoch);
+                            proptest::prop_assert!(warming.is_none());
+                            warming = Some(epoch);
+                            out.push((slot, host, true));
+                        }
+                        Grant::Activate { slot, epoch, stale } => {
+                            proptest::prop_assert_eq!(stale, model.current.is_none());
+                            proptest::prop_assert_eq!(epoch, model.epoch);
+                            tickets.push((slot, epoch));
+                        }
+                    },
+                    Event::Return { n, healthy } if !out.is_empty() => {
+                        let (slot, host, reusable) = out.remove(n % out.len());
+                        core.release(slot, Some(host), healthy && reusable);
+                    }
+                    Event::Activated { n, stable, same, subscribed } if !tickets.is_empty() => {
+                        let (slot, epoch) = tickets.remove(n % tickets.len());
+                        let expected = model.install(epoch, stable, same, subscribed);
+                        let generation = install(&mut core, epoch, stable, same, subscribed);
+                        proptest::prop_assert_eq!(generation, expected);
+                        let (reusable, warm) = core.activated(slot, generation);
+                        if let Some(epoch) = warm {
+                            proptest::prop_assert!(prewarm && warming.is_none());
+                            warming = Some(epoch);
+                        }
+                        next_host += 1;
+                        generation_of.insert(next_host, generation);
+                        out.push((slot, next_host, reusable));
+                    }
+                    Event::Abandoned { n } if !tickets.is_empty() => {
+                        let (slot, _) = tickets.remove(n % tickets.len());
+                        core.release(slot, None, false);
+                    }
+                    Event::Warmed { usable, stable, same, subscribed } => {
+                        let Some(epoch) = warming.take() else { continue };
+                        if !usable {
+                            core.warm_failed();
+                            continue;
+                        }
+                        let expected = model.install(epoch, stable, same, subscribed);
+                        let generation = install(&mut core, epoch, stable, same, subscribed);
+                        proptest::prop_assert_eq!(generation, expected);
+                        next_host += 1;
+                        generation_of.insert(next_host, generation);
+                        core.warmed(next_host, generation);
+                    }
+                    Event::Return { .. } | Event::Activated { .. } | Event::Abandoned { .. } => {}
+                }
+                proptest::prop_assert_eq!(core.current(), model.current);
+                proptest::prop_assert_eq!(core.warming, warming.is_some());
+                proptest::prop_assert!(core.sieve.slots.len() <= capacity);
+            }
+        }
     }
 }

@@ -336,6 +336,26 @@ directory a devenv module reads, such as a package's build recipe a source filte
 repository with direnv's `watch_dir`, which records every file beneath it. An input missing from the list is the one way
 a warm or inherited shell can serve stale: neither the identity check nor the content key can see it.
 
+**Kept readings.** Admission asks some answers of files on every exec: the checkout's tracked build inputs (one
+`git ls-files`, and one per declared pattern; 15_capabilities.md, "Detection inputs"), the installed mbx's scheduler
+settings (`mbx settings get`, 15_capabilities.md, "mbx detection"), the build-state fingerprint a resident exec is
+admitted on (06_cli.md, "Resident workspaces"), and the developer-link snapshot (15_capabilities.md, "Bootstrap
+executables"). The supervisor keeps each answer beside the identity — inode, size, mtime and ctime, as above — that
+every file the reading depended on had, and answers from it while each still has that identity; any other identity reads
+again. Bytes are never compared: the reading stays the authority, and identities only ask whether to run it. An answer
+is kept only when every file it read was last changed at least three seconds before the reading started, past any
+timestamp's tick, so a change made while it ran, or a second one inside the tick of the first, moves an identity. A Git
+listing reads the checkout's own `.git/index` and `.git/config` and nothing else; a linked worktree's listing, or a Git
+this process's `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` or `GIT_COMMON_DIR` redirects, is listed every time. mbx
+resolves `settings get` from its environment, which the reading clears to `HOME`, and its global settings file, so the
+executable and that file are its inputs. A developer-link capture names its own inputs as it reads: every directory it
+lists, every tracked package's directory, the build link, and every directory a link's resolution passes through. The
+decisions are pure functions of identities and the time they were read, and a model of coarse filesystem clocks (a Linux
+tick, an HFS+ second, stamps behind the clock by up to a tick, writes in place and by rename, between asks and during a
+reading) checks that a kept answer is never served after a change (`input_memo::tests`). Measured 2026-10-30: before
+they were kept, these readings cost every warm exec six `mbx` processes, three `git ls-files` and a canonicalization of
+every package link, about 90 of its 100–400 ms.
+
 **One spare and a SIEVE cache.** Hosts are pooled per shell identity: effective sandbox mode, `.envrc` directory, grant
 revision, the exact sandbox environment, and the host program. A read-only command never runs in a read-write host, and
 no host activated under one grant revision serves another. Each pool keeps one activated spare ahead of demand and a
@@ -345,6 +365,21 @@ else activates a host of its own. Commands never queue for a host. One actor own
 supervisor that lives only as long as a short-lived controller process keeps no spare, which would end unused with it. A
 spare's activation asks for nothing and runs at the supervisor's own nice, as every warm host does; a failed activation
 is like any other: there is no spare, and the next command activates for itself.
+
+Each pool counts how its acquires were answered — an idle host of the current generation, the spare, or an activation of
+the command's own — and the supervisor serves the sums over every pool it started, with the number of pools, as
+`shellPool` (Protocol). `COWSHED_TIMING` prints each answer as `pool acquire: …` and each new identity's pool as
+`pool start` (13_telemetry.md). A caller proves its commands reached a warm host from these counts, not from their
+timing: until 2026-10-30 nothing counted, and a 300 ms warm exec could not say whether it had found a host. The pool's
+decisions are a pure core over explicit events (inputs changed, acquire, release, activation installed, spare warmed or
+not); its actor only reads the inputs' kernel events and identities, certifies and subscribes them, starts activations
+and publishes the counts. A model-based property test drives the core with random event sequences and checks that only a
+host of the generation current at the grant is granted, never one already out, that a spare handed out under prewarm
+starts its replacement, and that no more hosts are kept than the capacity (`shell_pool::tests`); another checks that two
+spawns share a pool exactly when their whole shell identity is equal, so no host activated under one grant revision
+serves another (`shell_job::identity_tests`). A warm command keys its pool by the profile launch it would make, digested
+once when the profile is rendered, and writes no profile file: only a host's own launch makes sure of its file
+(04_sandbox.md, "Exec pipeline").
 
 Cold activation is single-flight per workspace, across demand hosts, spares and controller tools. A host waiting on
 another host's evaluation reports that wait and can be cancelled without ending the producer. Once the producer
@@ -766,18 +801,23 @@ kills it under the authority it serves then, and says so on its stderr.
   into it, and acknowledges them. The supervisor keeps up to 65,536 unacknowledged commitments and then drops the
   oldest, which the next read reports.
 - **calls** — `openSession`, `sessionSnapshot`, `closeSession`, `exec`, `stdinWrite`, `stdinClose`, `streamChunk`,
-  `streamEnd`, `info`, `sealed`, `jobByKey`, `list`, `kill`, `wait`, `logRead`, `retire`: one per supervisor operation,
-  each naming the authority the caller holds. The supervisor fences every call by it exactly as it fences an in-process
-  one, so a caller holding a stale incarnation or grant revision is refused, not served under the wrong profile. A first
-  `exec` allocates its numeric `jobId` before process creation; a keyed repeat answers the durable existing id and
-  spawns nothing. A spawn failure is therefore a terminal job, not a response with no identity. `jobByKey` reads the
-  exact incarnation's admission records after a lost reply or supervisor restart; only proven absence in that current
-  authority returns `None` (wire `null`). Missing workspace/job, stale authority, transport, storage and observation
-  failures remain errors; unreadable keyed history is an explicit unprovable refusal, never absence. `info`, `list`,
-  `kill` and `wait` answer the supervisor's own jobs; `sealed` answers a job's terminal record from the workspace's
-  records — state, exit, failure, duration, output limit and both streams — for any job of the incarnation that has one,
-  including a job an earlier supervisor ran and sealed, and `logRead` reads such a job's sealed streams from any offset
-  as it reads its own terminal jobs'.
+  `streamEnd`, `info`, `sealed`, `jobByKey`, `list`, `kill`, `wait`, `logRead`, `retire`, `buildState`, `shellPool`: one
+  per supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it exactly
+  as it fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under
+  the wrong profile. A first `exec` allocates its numeric `jobId` before process creation; a keyed repeat answers the
+  durable existing id and spawns nothing. A spawn failure is therefore a terminal job, not a response with no identity.
+  `jobByKey` reads the exact incarnation's admission records after a lost reply or supervisor restart; only proven
+  absence in that current authority returns `None` (wire `null`). Missing workspace/job, stale authority, transport,
+  storage and observation failures remain errors; unreadable keyed history is an explicit unprovable refusal, never
+  absence. `info`, `list`, `kill` and `wait` answer the supervisor's own jobs; `sealed` answers a job's terminal record
+  from the workspace's records — state, exit, failure, duration, output limit and both streams — for any job of the
+  incarnation that has one, including a job an earlier supervisor ran and sealed, and `logRead` reads such a job's
+  sealed streams from any offset as it reads its own terminal jobs'. `buildState` judges, with the build volume the
+  caller resolved, whether a job may be admitted onto the checkout's build state as it is (06_cli.md, "Resident
+  workspaces"), on the blocking pool from the supervisor's kept readings, and answers `null` or the reason it may not;
+  no turn waits for it. `shellPool` answers the pool counts above. A client that has read the served authority holds its
+  job under it without another `hello`; a grant change since then refuses that authority as stale, and the client then
+  holds under the authority a `hello` reads.
 - **stdin** — empty, inline bytes (the request's raw frame), a workspace-relative regular file opened inside the
   sandbox, a reader-backed stream, or explicit `open` with no reader or automatic EOF. A reader's `streamChunk` calls
   enter its bounded source channel in order and `streamEnd` names clean EOF or the source error. Attachment `stdinWrite`

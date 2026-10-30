@@ -1083,9 +1083,11 @@ impl CliService for ActorBridge {
         );
         let hold = hold_foreground(
             &job,
-            &socket,
-            &worker.info().workspace_incarnation,
-            job.id(),
+            cowshed_core::runtime::supervisor_socket::hold(
+                &socket,
+                &worker.info().workspace_incarnation,
+                job.id(),
+            ),
         )
         .await?;
         let _relay = cowshed_os::timing::span("exec", "relay");
@@ -1173,14 +1175,13 @@ impl ForegroundJob for JobHandle {
 
 /// Hold a foreground job for as long as this process lives (05_gateway.md, "A job lives with its
 /// requester"): a job nobody waits for any more would run on for nobody, and a gate would keep
-/// its repository's land waiting. A job that cannot be held is killed rather than left running.
+/// its repository's land waiting. A job that `held` cannot hold is killed rather than left
+/// running.
 pub(crate) async fn hold_foreground(
     job: &impl ForegroundJob,
-    socket: &Path,
-    incarnation: &cowshed_core::metadata::WorkspaceIncarnation,
-    id: cowshed_core::api::JobId,
+    held: impl Future<Output = Result<JobHold>>,
 ) -> Result<JobHold> {
-    match cowshed_core::runtime::supervisor_socket::hold(socket, incarnation, id).await {
+    match held.await {
         Ok(hold) => Ok(hold),
         Err(error) => Err(merge_primary(error, job.kill().await.err())),
     }
@@ -5456,15 +5457,11 @@ where
             ActorBridge::open_existing(&root, runtime_recovery_scope(&cli.command)?).await?;
         return dispatch_and_shutdown(bridge, cli, stdin, output).await;
     }
-    let stdin = match &prepared {
-        // Host scope is a coordinator route. Its store-authorized root is already known,
-        // so neither a resident probe nor another discovery belongs before dispatch.
-        PreparedProject::Resolved(_) => stdin,
-        PreparedProject::Deferred => match crate::resident::answer(&cli, stdin, output).await? {
-            crate::resident::Answer::Answered(exit) => return Ok(exit),
-            crate::resident::Answer::Declined(stdin) => stdin,
-        },
-    };
+    if let PreparedProject::Deferred = &prepared
+        && let Some(exit) = crate::resident::answer_path(&cli, output)?
+    {
+        return Ok(exit);
+    }
     let discovery = cli.command.project_discovery();
     if discovery == ProjectDiscovery::NotUsed {
         return dispatch_host_command(cli, output, false).await;

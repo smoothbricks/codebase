@@ -23,22 +23,30 @@
 //! next verb that opens the controller.
 //!
 //! A job is admitted only onto build state the controller's refresh would leave as it is
-//! (16_build_volumes.md, "Refresh"; [`Resident::build_state_current`]): the tracked build inputs
-//! still have the fingerprint the checkout's build volume records, and every fixed link that
-//! volume's state names is in place. Anything else — inputs that moved, a volume that records
-//! none or no volume at all, a link a tool displaced — declines, and the controller's refresh
-//! rediscovers or relinks before it admits the job. `path` admits no job and checks none of it.
+//! (16_build_volumes.md, "Refresh"; [`build_state_current`]): the tracked build inputs still have
+//! the fingerprint the checkout's build volume records, and every fixed link that volume's state
+//! names is in place. Anything else — inputs that moved, a volume that records none or no volume
+//! at all, a link a tool displaced — declines, and the controller's refresh rediscovers or relinks
+//! before it admits the job. The workspace's supervisor judges it
+//! ([`Resident::build_state_current`]): its process keeps the Git listings the fingerprint reads
+//! while the index keeps its identity, where a CLI process would list them again for every exec.
+//! `path` admits no job and checks none of it.
 
 use std::path::{Path, PathBuf};
 
 use crate::api::dto::GitOid;
+use crate::api::{JobId, JobInfo};
+use crate::gateway_sessions::GatewayControl;
 use crate::metadata::{
     DetachedWorkspaceMetadata, PublicationState, WorkspaceMarker, WorkspaceName, sidecar_path,
 };
 use crate::repository::RepoId;
+use crate::runtime::supervisor::LogChunk;
 use crate::runtime::supervisor::{WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle};
 use crate::runtime::supervisor_socket::{self, Hello};
+use crate::storage::job_artifact::StreamKind;
 use crate::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
+use serde::{Deserialize, Serialize};
 
 /// Git's own discovery honours these; a caller that sets one is answered by Git, through the
 /// controller, rather than by a walk that would not.
@@ -51,7 +59,8 @@ const GIT_DISCOVERY_ENVIRONMENT: [&str; 5] = [
 ];
 
 /// Why a verb opens the controller instead of answering from live state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Decline {
     /// The caller steers Git's repository discovery through its environment.
     GitEnvironment,
@@ -87,6 +96,16 @@ pub enum Decline {
     BuildInputsUnreadable,
     /// A build-state link is missing, displaced, or reaches no directory in the volume.
     BuildLinkDisplaced,
+    /// The supervisor drains: the daemon is of another build, which the controller's build
+    /// check names (11_shell.md, "Draining a supervisor of another build").
+    Draining,
+    /// The supervisor did not judge the build state.
+    BuildStateUnanswered,
+    /// The gateway does not hold the workspace's session at the revision its supervisor serves:
+    /// the controller's pre-exec reconcile installs it.
+    GatewaySession,
+    /// The gateway did not say whether it holds the workspace's session.
+    GatewayUnanswered,
 }
 
 impl Decline {
@@ -107,6 +126,10 @@ impl Decline {
             Self::BuildInputsMoved => "the build inputs moved off the recorded fingerprint",
             Self::BuildInputsUnreadable => "the build inputs cannot be fingerprinted",
             Self::BuildLinkDisplaced => "a build-state link is displaced or missing",
+            Self::Draining => "the supervisor drains for a daemon of another build",
+            Self::BuildStateUnanswered => "the supervisor did not judge the build state",
+            Self::GatewaySession => "the gateway session is not current",
+            Self::GatewayUnanswered => "the gateway did not answer for the workspace's session",
         }
     }
 }
@@ -190,32 +213,166 @@ impl Resident {
         &self.socket
     }
 
-    /// Whether a job may be admitted onto the checkout's build state as it is, which is exactly
-    /// when the controller's refresh (16_build_volumes.md, "Refresh") would change nothing: every
-    /// link the volume's state names is in place, and the tracked build inputs still have the
-    /// fingerprint it records. Reads only; the fingerprint costs one `git ls-files` (and one per
-    /// declared pattern) plus a hash of the tracked manifests. A pending discard is left to the
-    /// next controller refresh and `cowshed gc`.
-    pub fn build_state_current(&self) -> Result<(), Decline> {
-        use crate::build_volume::{BuildVolumeState, link};
-        let volume = self
-            .build_volume
-            .as_deref()
-            .ok_or(Decline::BuildStateUnrecorded)?;
-        let state = BuildVolumeState::read(volume).map_err(|_| Decline::Records)?;
-        let recorded = state
-            .fingerprint
-            .as_deref()
-            .ok_or(Decline::BuildStateUnrecorded)?;
-        if !link::settled(&self.mount, volume, &state.paths) {
-            return Err(Decline::BuildLinkDisplaced);
+    /// Whether a job may be admitted onto the checkout's build state as it is
+    /// ([`build_state_current`]), as the workspace's supervisor judges it.
+    /// Whether an exec may be admitted here as it is, which is exactly when the controller's
+    /// preparation would do nothing for it (06_cli.md, "Resident workspaces"): `gateway` holds
+    /// the workspace's session at the revision its supervisor serves, so the pre-exec reconcile
+    /// installs nothing, and the build state is current. Every front end's resident exec asks
+    /// this, the CLI's and the controller's that Node-API callers reach.
+    pub async fn admissible(&self, gateway: &dyn GatewayControl) -> Result<(), Decline> {
+        let authority = self.authority();
+        let session = crate::gateway_sessions::stable_workspace_id(
+            &self.repo_id,
+            self.workspace.as_str(),
+            &authority.workspace_incarnation,
+        );
+        match cowshed_os::timing::spanned(
+            "resident",
+            "gateway",
+            gateway.session_current(&session, authority.grant_revision),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(Decline::GatewaySession),
+            Err(_) => return Err(Decline::GatewayUnanswered),
         }
-        let fingerprint = crate::capabilities::tracked_manifest_fingerprint(&self.mount)
-            .map_err(|_| Decline::BuildInputsUnreadable)?;
-        if fingerprint != recorded {
-            return Err(Decline::BuildInputsMoved);
+        cowshed_os::timing::spanned("resident", "build-state", self.build_state_current()).await
+    }
+
+    pub async fn build_state_current(&self) -> Result<(), Decline> {
+        match self.supervisor.build_state(self.build_volume.clone()).await {
+            Ok(None) => Ok(()),
+            Ok(Some(decline)) => Err(decline),
+            Err(_) => Err(Decline::BuildStateUnanswered),
         }
-        Ok(())
+    }
+}
+
+/// Whether a job may be admitted onto the build state of the checkout mounted at `mount`, whose
+/// build volume is `volume`, as it is: exactly when the controller's refresh (16_build_volumes.md,
+/// "Refresh") would change nothing. Every link the volume's state names is in place, and the
+/// tracked build inputs still have the fingerprint it records. Reads only; the fingerprint costs
+/// the checkout's Git listings (one `git ls-files`, one more per declared pattern, kept while the
+/// index keeps its identity) plus a hash of the tracked manifests. A pending discard is left to
+/// the next controller refresh and `cowshed gc`.
+pub fn build_state_current(mount: &Path, volume: Option<&Path>) -> Result<(), Decline> {
+    use crate::build_volume::{BuildVolumeState, link};
+    let volume = volume.ok_or(Decline::BuildStateUnrecorded)?;
+    let state = BuildVolumeState::read(volume).map_err(|_| Decline::Records)?;
+    let recorded = state
+        .fingerprint
+        .as_deref()
+        .ok_or(Decline::BuildStateUnrecorded)?;
+    if !link::settled(mount, volume, &state.paths) {
+        return Err(Decline::BuildLinkDisplaced);
+    }
+    let fingerprint = crate::capabilities::tracked_manifest_fingerprint(mount)
+        .map_err(|_| Decline::BuildInputsUnreadable)?;
+    if fingerprint != recorded {
+        return Err(Decline::BuildInputsMoved);
+    }
+    Ok(())
+}
+
+/// One lane to a resident job's supervisor, for every front end that runs a job through a
+/// resident workspace. A grant change while the job runs advances the supervisor in place, and
+/// it then refuses calls that name the authority it served before; the lane follows it to the
+/// new one, which still holds the job.
+#[derive(Clone)]
+pub struct JobLink {
+    socket: PathBuf,
+    handle: WorkspaceSupervisorHandle,
+}
+
+impl JobLink {
+    pub fn new(resident: &Resident) -> Self {
+        Self {
+            socket: resident.socket.clone(),
+            handle: resident.supervisor.clone(),
+        }
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// The supervisor handle, under the authority the lane last followed.
+    pub fn handle(&self) -> &WorkspaceSupervisorHandle {
+        &self.handle
+    }
+
+    /// Follow the supervisor to the authority it serves now after it refused `error`: only a
+    /// stale-authority `Conflict` is followed, and only to a newer authority of the same
+    /// incarnation.
+    async fn followed(&mut self, error: crate::CowshedError) -> crate::Result<()> {
+        if error.code != crate::ErrorCode::Conflict {
+            return Err(error);
+        }
+        match follow(&self.socket, self.handle.snapshot(), &HostProbe).await? {
+            Some(handle) => {
+                self.handle = handle;
+                Ok(())
+            }
+            None => Err(error),
+        }
+    }
+
+    pub async fn info(&mut self, job: JobId) -> crate::Result<JobInfo> {
+        match self.handle.info(job).await {
+            Err(error) => {
+                self.followed(error).await?;
+                self.handle.info(job).await
+            }
+            done => done,
+        }
+    }
+
+    pub async fn wait(&mut self, job: JobId) -> crate::Result<JobInfo> {
+        match self.handle.wait(job).await {
+            Err(error) => {
+                self.followed(error).await?;
+                self.handle.wait(job).await
+            }
+            done => done,
+        }
+    }
+
+    pub async fn kill(&mut self, job: JobId) -> crate::Result<()> {
+        match self.handle.kill(job).await {
+            Err(error) => {
+                self.followed(error).await?;
+                self.handle.kill(job).await
+            }
+            done => done,
+        }
+    }
+
+    pub async fn detach(&mut self, job: JobId) -> crate::Result<()> {
+        match self.handle.detach(job).await {
+            Err(error) => {
+                self.followed(error).await?;
+                self.handle.detach(job).await
+            }
+            done => done,
+        }
+    }
+
+    pub async fn log_read(
+        &mut self,
+        job: JobId,
+        stream: StreamKind,
+        offset: u64,
+        follow: bool,
+    ) -> crate::Result<LogChunk> {
+        match self.handle.log_read(job, stream, offset, follow).await {
+            Err(error) => {
+                self.followed(error).await?;
+                self.handle.log_read(job, stream, offset, follow).await
+            }
+            done => done,
+        }
     }
 }
 
@@ -366,6 +523,10 @@ pub async fn resolve(
     let build_volume = build_volume_grant(project, workspace, &mount, probe)?;
     drop(grants_span);
     let socket = supervisor_socket::socket_path(store_root, &repo, workspace);
+    // A draining supervisor admits nothing; the controller's build check says why.
+    if socket.with_extension("drain").symlink_metadata().is_ok() {
+        return Err(Decline::Draining);
+    }
     let hello = cowshed_os::timing::spanned("resident", "hello", probe.hello(&socket))
         .await
         .map_err(|_| Decline::Unserved)?;
@@ -876,10 +1037,10 @@ mod tests {
     async fn admission(store: &Store, volume: Option<&Path>) -> Result<(), Decline> {
         let mut probe = probe(store, store.current());
         probe.mounted.extend(volume.map(Path::to_path_buf));
-        resolve(&store.store, &store.checkout, &raven(), &probe)
+        let resident = resolve(&store.store, &store.checkout, &raven(), &probe)
             .await
-            .expect("resident")
-            .build_state_current()
+            .expect("resident");
+        build_state_current(&resident.mount, resident.build_volume.as_deref())
     }
 
     /// A resident `exec` admits a job only onto build state the controller's refresh would

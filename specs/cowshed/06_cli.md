@@ -195,11 +195,17 @@ not a disagreement. `ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`, 
 `gateway status` and `doctor` (`gateway-stale-binary`) name `cowshed setup` as the remedy for a daemon running other
 bytes than the CLI.
 
-For exec in host scope, project discovery first establishes the caller's store authority through the controller Git
-profile it already writes. A sandboxed CLI therefore gets the store's sandbox-denied refusal (exit 6, naming that path)
-before an install-slot wait, a manager build check or a resident connection can replace it with a control-plane failure.
-The discovered root is carried into coordinator dispatch and is not discovered twice. The build check still precedes
-opening the project or replaying lifecycle work; other commands keep their existing preflight order.
+An `exec` a resident workspace answers (below) asks nothing first: it opens no project and changes nothing before its
+supervisor admits the job, and that supervisor's `hello` refuses another build by itself (11_shell.md, "hello"). An
+`exec` the resident answer declines asks `sameBuild` as above, before anything else.
+
+For exec in host scope, the resident answer comes first as for any `exec`: a sandboxed CLI reaches neither the store's
+records nor the supervisor's socket, so it declines without a word. Project discovery then establishes the caller's
+store authority through the controller Git profile it already writes, so that CLI gets the store's sandbox-denied
+refusal (exit 6, naming that path) before an install-slot wait or a manager build check can replace it with a
+control-plane failure. The discovered root is carried into coordinator dispatch and is not discovered twice. The build
+check still precedes opening the project or replaying lifecycle work; other commands keep their existing preflight
+order. Measured 2026-10-30: a warm `exec --host` through the controller cost 490–750 ms, against 100–340 ms resident.
 
 The stranded-user journey this contract exists for: after a reboot with locked or unmounted volumes, `cowshed doctor`
 explains the exact divergence (volume present but locked, or at macOS's default `/Volumes/<name>` instead of its
@@ -718,20 +724,24 @@ installed at that revision — exactly the case in which the controller's pre-ex
 And `exec` admits a job only onto build state the controller's refresh (16_build_volumes.md, "One link per checkout")
 would leave as it is: every fixed link the checkout's build volume records is in place and reaches its volume directory
 (a declared path nothing occupies needs none), and the tracked build inputs still have the fingerprint that volume
-records, computed as the refresh computes it (one `git ls-files`, one more per declared pattern, and a hash of the
-tracked manifests). The job then runs through the supervisor's socket, relayed as the controller path relays it.
+records, computed as the refresh computes it (its Git listings and a hash of the tracked manifests). The workspace's
+supervisor judges it (`buildState`, 11_shell.md, "Protocol") from listings its process keeps while the checkout's index
+keeps its identity (11_shell.md, "Kept readings"), where a CLI process would list them again for every exec. The job
+then runs through the supervisor's socket, held under the authority the `hello` read, and is relayed as the controller
+path relays it. `exec --host` is answered the same way, as a host-scope job of the coordinator route.
 
 Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached; for
 `exec`, one unserved, served under an older grant or another incarnation, a gateway session not yet at the served
 revision, build inputs whose fingerprint moved (a `.cowshed.toml` `[build] state` edit, a new manifest), a checkout that
 links no build volume or whose volume records no fingerprint (only discovery says what build state it has), a
-build-state link a tool displaced or removed, a linked worktree, or unfinished lifecycle work on the workspace, on
-`main`, or on the project identity. Git discovery steered by `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`,
-`GIT_CEILING_DIRECTORIES` or `GIT_DISCOVERY_ACROSS_FILESYSTEM`, an omitted `<ws>`, `path --slot`, and `exec --session`
-always go through the controller. No directory is listed: a project with a thousand retired sessions answers as fast as
-one with a single workspace. Once the supervisor admits the job, every later failure is that job's and is reported,
-never retried through the controller. A discard an earlier refresh left pending is resumed by the next refresh that
-opens the controller, or by `cowshed gc`.
+build-state link a tool displaced or removed, a linked worktree, a supervisor that drains (its drain report stands
+beside its socket: the daemon is of another build, which the controller's build check names), or unfinished lifecycle
+work on the workspace, on `main`, or on the project identity. Git discovery steered by `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_COMMON_DIR`, `GIT_CEILING_DIRECTORIES` or `GIT_DISCOVERY_ACROSS_FILESYSTEM`, an omitted `<ws>`, `path --slot`, and
+`exec --session` always go through the controller. No directory is listed: a project with a thousand retired sessions
+answers as fast as one with a single workspace. Once the supervisor admits the job, every later failure is that job's
+and is reported, never retried through the controller. A discard an earlier refresh left pending is resumed by the next
+refresh that opens the controller, or by `cowshed gc`.
 
 What a resident answer does not re-check is what the serving supervisor proved when it opened: the project binding
 against Git's remotes. The recorded binding changes only through cowshed verbs, which change the records read above; a

@@ -2607,6 +2607,10 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
         std::collections::BTreeMap<WorkspaceName, super::supervisor::WorkspaceSupervisorHandle>,
     /// The supervisors this process serves: only in a `cowshed __workspace-supervisor` process.
     served: std::collections::BTreeMap<WorkspaceName, ServedSupervisor>,
+    /// The lane of each workspace whose exec this controller admitted through the resident exec
+    /// client (06_cli.md, "Resident workspaces"); that workspace's job calls take it while it
+    /// names the incarnation they ask about.
+    residents: std::collections::BTreeMap<WorkspaceName, crate::resident::JobLink>,
     /// Who runs the workspace supervisors this host's commands reach.
     supervisors_run_in: SupervisorHome,
     /// Set by a land step (`exec --class gate`, `rebase`, `land`) when it starts: until this
@@ -4326,6 +4330,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             commitments,
             supervisors: std::collections::BTreeMap::new(),
             served: std::collections::BTreeMap::new(),
+            residents: std::collections::BTreeMap::new(),
             supervisors_run_in,
             other_build_wait_until: None,
             forwarders: if forwards_commitments {
@@ -9866,6 +9871,51 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .await
             .map_err(|error| CowshedError::internal(error.to_string()))?
             .map_err(native_integrity_error)
+    }
+
+    /// `workspace` as the resident exec client every front end shares finds it (06_cli.md,
+    /// "Resident workspaces"): serving `incarnation`, with nothing an exec's preparation here
+    /// would change. Its lane is kept for the job calls that follow.
+    async fn resident(
+        &mut self,
+        workspace: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
+    ) -> Option<crate::resident::Resident> {
+        let resident = cowshed_os::timing::spanned(
+            "resident",
+            "resolve",
+            crate::resident::resolve(
+                self.descriptor.storage.store(),
+                &self.descriptor.git_root,
+                workspace,
+                &crate::resident::HostProbe,
+            ),
+        )
+        .await
+        .ok()?;
+        if resident.authority().workspace_incarnation != *incarnation {
+            return None;
+        }
+        resident
+            .admissible(self.gateway_control.as_ref())
+            .await
+            .ok()?;
+        self.residents
+            .insert(workspace.clone(), crate::resident::JobLink::new(&resident));
+        Some(resident)
+    }
+
+    /// The resident lane of `workspace`, when an exec of this controller took one at
+    /// `incarnation`.
+    fn resident_link(
+        &self,
+        workspace: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
+    ) -> Option<crate::resident::JobLink> {
+        self.residents
+            .get(workspace)
+            .filter(|link| link.handle().snapshot().workspace_incarnation == *incarnation)
+            .cloned()
     }
 
     async fn ensure_supervisor(
@@ -17789,6 +17839,23 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if request.class == crate::api::dto::ExecClass::Gate {
             self.wait_for_other_builds_as_a_land_step();
         }
+        // An exec its workspace's supervisor can admit as it is takes the resident path every
+        // front end shares (06_cli.md, "Resident workspaces"): nothing of the preparation below
+        // would change, so none of it runs.
+        if session.is_none()
+            && let Some(resident) = self.resident(&workspace, &incarnation).await
+        {
+            return resident
+                .supervisor
+                .exec_from(
+                    None,
+                    resident.build_volume.clone(),
+                    request,
+                    source,
+                    super::job_cpu::requester_jobserver(),
+                )
+                .await;
+        }
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         let token = self.session(&workspace, &session).cloned();
@@ -17853,6 +17920,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<JobInfo> {
+        if let Some(mut link) = self.resident_link(&workspace, &incarnation) {
+            return link.info(job).await;
+        }
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         self.ensure_supervisor(&workspace).await?.info(job).await
@@ -17889,6 +17959,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<JobAnswer<JobInfo>> {
+        if let Some(mut link) = self.resident_link(&workspace, &incarnation) {
+            return Ok(Box::pin(async move { link.wait(job).await }));
+        }
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         let supervisor = self.ensure_supervisor(&workspace).await?;
@@ -17901,6 +17974,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<JobAnswer<()>> {
+        if let Some(mut link) = self.resident_link(&workspace, &incarnation) {
+            return Ok(Box::pin(async move { link.kill(job).await }));
+        }
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         let supervisor = self.ensure_supervisor(&workspace).await?;
@@ -17913,6 +17989,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<()> {
+        if let Some(mut link) = self.resident_link(&workspace, &incarnation) {
+            return link.detach(job).await;
+        }
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         self.ensure_supervisor(&workspace).await?.detach(job).await
@@ -17927,6 +18006,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         offset: u64,
         follow: bool,
     ) -> Result<JobAnswer<RuntimeLogChunk>> {
+        if let Some(mut link) = self.resident_link(&workspace, &incarnation) {
+            let stream = crate::storage::job_artifact::StreamKind::from(stream);
+            return Ok(Box::pin(async move {
+                let chunk = link.log_read(job, stream, offset, follow).await?;
+                Ok(RuntimeLogChunk {
+                    bytes: chunk.bytes,
+                    next_offset: chunk.next_offset,
+                    eof: chunk.eof,
+                })
+            }));
+        }
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         let stream = crate::storage::job_artifact::StreamKind::from(stream);

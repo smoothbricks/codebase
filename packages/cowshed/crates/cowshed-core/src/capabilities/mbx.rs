@@ -6,11 +6,13 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use super::{
     CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, DetectionScope,
     Detector, EnvAction, GrantAccess, GrantScope, MarkerKind, ReachedConvention,
 };
+use crate::input_memo::InputMemo;
 use crate::{CowshedError, Result};
 
 /// The lock of the flake cowshed's package ships at `nix/mbx`: the one record of the pinned
@@ -170,8 +172,21 @@ impl HostScheduler {
 
 /// Ask the installed mbx at `executable` for its host-global scheduler settings, with nothing of
 /// this process's environment but `home`: a job's or a caller's `MBX_*` must not stand in for
-/// the host's file.
+/// the host's file. mbx resolves `settings get` from its environment and its global file alone,
+/// so with the environment cleared its answer moves only with the executable or that file, and
+/// it is kept while both keep their identity ([`InputMemo`]): every detection asks it, at every
+/// exec admission and spawn (15_capabilities.md, "mbx detection").
 pub fn read_host_scheduler(executable: &Path, home: &Path) -> Result<HostScheduler> {
+    static READ: LazyLock<InputMemo<(PathBuf, PathBuf), HostScheduler>> =
+        LazyLock::new(InputMemo::new);
+    READ.read(
+        &(executable.to_owned(), home.to_owned()),
+        &[executable.to_owned(), host_settings_file(home)],
+        || read_host_scheduler_now(executable, home),
+    )
+}
+
+fn read_host_scheduler_now(executable: &Path, home: &Path) -> Result<HostScheduler> {
     use cowshed_os::fork_lock::Run as _;
     let get = |key: &str| -> Result<Option<String>> {
         // WHY unbounded: `mbx settings get` reads one TOML file and prints; it waits on nothing.
@@ -934,6 +949,59 @@ mod tests {
             "{}",
             refusal.message
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The scheduler settings are read through mbx once and kept while mbx and its settings
+    /// file keep their identity; a changed settings file is read through mbx again.
+    #[test]
+    fn a_changed_settings_file_is_read_through_mbx_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-mbx-kept-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings = host_settings_file(&root);
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "8").unwrap();
+        let calls = root.join("calls");
+        let mbx = root.join("mbx");
+        std::fs::write(
+            &mbx,
+            format!(
+                "#!/bin/sh\necho \"$3\" >> '{}'\n[ \"$3\" = scheduler.cpus ] && cat '{}'\nexit 0\n",
+                calls.display(),
+                settings.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&mbx, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::input_memo::settle(&mbx);
+        crate::input_memo::settle(&settings);
+        let reads = || std::fs::read_to_string(&calls).unwrap().lines().count();
+        assert_eq!(
+            read_host_scheduler(&mbx, &root).unwrap().cpus.as_deref(),
+            Some("8")
+        );
+        assert_eq!(
+            read_host_scheduler(&mbx, &root).unwrap().cpus.as_deref(),
+            Some("8")
+        );
+        assert_eq!(
+            reads(),
+            3,
+            "one reading of three settings, then the kept one"
+        );
+        std::fs::write(&settings, "4").unwrap();
+        assert_eq!(
+            read_host_scheduler(&mbx, &root).unwrap().cpus.as_deref(),
+            Some("4")
+        );
+        assert_eq!(reads(), 6);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

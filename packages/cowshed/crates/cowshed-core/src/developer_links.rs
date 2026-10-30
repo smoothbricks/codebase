@@ -13,11 +13,14 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::{Arc, LazyLock};
 
 use crate::capabilities::bun::BUN_HOME;
 use crate::capabilities::cache::SharedToolHome;
 use crate::capabilities::pnpm::PNPM_HOME;
+use crate::input_memo::InputMemo;
 use crate::runtime::shell_host::SHELL_HOST_DIRECTORY;
+use crate::runtime::shell_watch::FileState;
 use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Run as _;
 use cowshed_os::fsio::AnchoredDirectory;
@@ -37,7 +40,7 @@ const DECLARED_RECORD: &str = "node_modules/.smoo-declared-links";
 
 /// The shared package-store roots a checkout's installers write to. A link into one is the
 /// installer's own entry, never a developer binding. Classification only: a root grants no read.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct PackageStores {
     bun: Option<StoreRoot>,
     pnpm: Option<StoreRoot>,
@@ -49,7 +52,7 @@ pub struct PackageStores {
 /// matches a link that spells the physical directory, which is how a symlinked home's store is
 /// reached. Both come from the configured root alone, never from a link found in the tree being
 /// captured.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct StoreRoot {
     raw: PathBuf,
     canonical: Option<PathBuf>,
@@ -141,6 +144,9 @@ pub struct DeveloperLinks {
     /// Links `smoo.developerLinks` made and no longer names: never restored, only said.
     released: Vec<ReleasedLink>,
     stores: PackageStores,
+    /// The directories holding every captured and released link, each with the identity it had
+    /// when the snapshot was taken, when all of them were settled then ([`Self::holders`]).
+    holders: Option<Box<[(PathBuf, FileState)]>>,
 }
 
 #[derive(Debug)]
@@ -201,17 +207,51 @@ impl DeveloperLinks {
         Self::capture(root, CaptureMode::Job, stores)
     }
 
+    /// The supervisor's job-time snapshot ([`Self::capture_job`]), kept in its process while every
+    /// directory and path its capture read keeps its identity ([`InputMemo::read_recorded`]): an
+    /// admission whose package trees are as the last capture found them takes that snapshot
+    /// instead of listing every tree again (15_capabilities.md, "Bootstrap executables"). A
+    /// checkout whose tracked listing is not its own `.git` index is captured afresh every time.
+    pub fn capture_kept(root: &Path, stores: PackageStores) -> Result<Arc<Self>> {
+        static KEPT: LazyLock<InputMemo<(PathBuf, PackageStores), Arc<DeveloperLinks>>> =
+            LazyLock::new(InputMemo::new);
+        if crate::capabilities::kept_listing_inputs(root).is_none() {
+            return Self::capture_job(root, stores).map(Arc::new);
+        }
+        KEPT.read_recorded(&(root.to_owned(), stores.clone()), || {
+            let mut reads = Reads::recording();
+            let snapshot = Self::capture_reading(root, CaptureMode::Job, stores, &mut reads)?;
+            Ok((Arc::new(snapshot), reads.into_paths()))
+        })
+    }
+
     pub fn capture(root: &Path, mode: CaptureMode, stores: PackageStores) -> Result<Self> {
+        Self::capture_reading(root, mode, stores, &mut Reads::ignoring())
+    }
+
+    fn capture_reading(
+        root: &Path,
+        mode: CaptureMode,
+        stores: PackageStores,
+        reads: &mut Reads,
+    ) -> Result<Self> {
+        let asked = crate::input_memo::now_ns();
         let root = fs::canonicalize(root).map_err(|error| link_error(root, error))?;
+        reads.resolution(&root, &root.join(crate::build_volume::BUILD_LINK));
         let volume = build_volume(&root)?;
+        reads.path(&root.join(DECLARED_RECORD));
+        reads.path(&root.join("package.json"));
         let released = released_links(&root)?;
+        reads.packages(&root)?;
         let mut snapshot = Self {
             links: Vec::new(),
             released: Vec::new(),
             stores,
+            holders: None,
         };
         crate::capabilities::installed_javascript_trees(&root, |tree| {
             let directory = root.join(tree);
+            reads.within(&root, &directory);
             crate::storage::verify_no_symlinks(&root, &directory)
                 .map_err(|error| link_error(&directory, error))?;
             for entry in fs::read_dir(&directory).map_err(|error| link_error(&directory, error))? {
@@ -224,6 +264,7 @@ impl DeveloperLinks {
                     .map_err(|error| link_error(&entry.path(), error))?;
                 if entry.file_name().as_encoded_bytes().starts_with(b"@") && kind.is_dir() {
                     let scope = entry.path();
+                    reads.path(&scope);
                     for package in
                         fs::read_dir(&scope).map_err(|error| link_error(&scope, error))?
                     {
@@ -234,19 +275,52 @@ impl DeveloperLinks {
                             &released,
                             package,
                             mode,
+                            reads,
                         )?;
                     }
                 } else if kind.is_symlink() {
-                    snapshot.capture_entry(&root, volume.as_deref(), &released, entry, mode)?;
+                    snapshot.capture_entry(
+                        &root,
+                        volume.as_deref(),
+                        &released,
+                        entry,
+                        mode,
+                        reads,
+                    )?;
                 }
             }
-            snapshot.capture_executables(&root, tree, mode)?;
+            snapshot.capture_executables(&root, tree, mode, reads)?;
             Ok(())
         })?;
         snapshot
             .links
             .sort_unstable_by(|left, right| left.at.cmp(&right.at));
+        snapshot.holders = asked.and_then(|asked| snapshot.holders(&root, asked));
         Ok(snapshot)
+    }
+
+    /// The directories holding every captured and released link, with their identities now,
+    /// when each was last changed [`crate::input_memo::SETTLED`] before `asked`: a link is
+    /// removed, replaced or retargeted only by changing the directory that holds it, so a job
+    /// that leaves each of these as it is changed no link.
+    fn holders(&self, root: &Path, asked: i128) -> Option<Box<[(PathBuf, FileState)]>> {
+        let directories: BTreeSet<&Path> = self
+            .links
+            .iter()
+            .map(|link| link.at.as_path())
+            .chain(self.released.iter().map(|link| link.at.as_path()))
+            .filter_map(Path::parent)
+            .collect();
+        let holders: Box<[(PathBuf, FileState)]> = directories
+            .into_iter()
+            .map(|directory| {
+                let directory = root.join(directory);
+                let identity = FileState::of(&directory);
+                (directory, identity)
+            })
+            .collect();
+        let identities: Vec<FileState> = holders.iter().map(|(_, identity)| *identity).collect();
+        crate::input_memo::keeps(&identities, asked).then_some(holders)
     }
 
     /// `volume` is the physical build volume `root` reaches through its build link: the checkout's
@@ -261,6 +335,7 @@ impl DeveloperLinks {
         released: &BTreeMap<PathBuf, PathBuf>,
         entry: fs::DirEntry,
         mode: CaptureMode,
+        reads: &mut Reads,
     ) -> Result<()> {
         let at = entry.path();
         if !entry
@@ -285,8 +360,12 @@ impl DeveloperLinks {
         if registry_store(root, &self.stores, &resolved) {
             return Ok(());
         }
+        reads.resolution(root, &at);
         let canonical = match fs::canonicalize(&at) {
-            Ok(target) => target,
+            Ok(target) => {
+                reads.path(&target);
+                target
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) if unreadable(&error, mode) => {
                 return self.push_unclassified(relative, target);
@@ -340,8 +419,15 @@ impl DeveloperLinks {
         Ok(())
     }
 
-    fn capture_executables(&mut self, root: &Path, tree: &Path, mode: CaptureMode) -> Result<()> {
+    fn capture_executables(
+        &mut self,
+        root: &Path,
+        tree: &Path,
+        mode: CaptureMode,
+        reads: &mut Reads,
+    ) -> Result<()> {
         let directory = root.join(tree).join(".bin");
+        reads.within(root, &directory);
         crate::storage::verify_no_symlinks(root, &directory)
             .map_err(|error| link_error(&directory, error))?;
         let entries = match fs::read_dir(&directory) {
@@ -359,8 +445,12 @@ impl DeveloperLinks {
             {
                 continue;
             }
+            reads.resolution(root, &at);
             let canonical = match fs::canonicalize(&at) {
-                Ok(canonical) => canonical,
+                Ok(canonical) => {
+                    reads.path(&canonical);
+                    canonical
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) if unreadable(&error, mode) => {
                     self.links.push(DeveloperLink {
@@ -412,6 +502,19 @@ impl DeveloperLinks {
     }
 
     pub fn restore(&self, root: &Path, mode: RestoreMode) -> Result<Vec<String>> {
+        // Every captured and released link sits in a directory whose entries are as the capture
+        // found them: none was removed, replaced or retargeted, so there is nothing to say or
+        // restore.
+        if self.holders.as_ref().is_some_and(|holders| {
+            holders
+                .iter()
+                .all(|(directory, identity)| identity.same_as(FileState::of(directory)))
+        }) {
+            if !self.is_empty() {
+                crate::build_volume::discard::reap(root);
+            }
+            return Ok(Vec::new());
+        }
         self.say_released(root)?;
         if self.is_empty() {
             return Ok(Vec::new());
@@ -468,6 +571,116 @@ fn build_volume(root: &Path) -> Result<Option<PathBuf>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(link_error(&link, error)),
     }
+}
+
+/// What a capture to be kept read: every path whose identity decides the snapshot
+/// ([`DeveloperLinks::capture_kept`]). A capture that keeps nothing records nothing.
+struct Reads(Option<BTreeSet<PathBuf>>);
+
+impl Reads {
+    fn ignoring() -> Self {
+        Self(None)
+    }
+
+    fn recording() -> Self {
+        Self(Some(BTreeSet::new()))
+    }
+
+    fn path(&mut self, path: &Path) {
+        if let Some(paths) = &mut self.0 {
+            paths.insert(path.to_owned());
+        }
+    }
+
+    /// `path` and every directory above it up to `root`: the entries that decide what it names.
+    fn within(&mut self, root: &Path, path: &Path) {
+        if self.0.is_none() {
+            return;
+        }
+        for directory in path.ancestors() {
+            self.path(directory);
+            if directory == root {
+                return;
+            }
+        }
+    }
+
+    /// What decides where `path` resolves: beneath `root`, every directory above each path the
+    /// resolution passes through; elsewhere, each such path and the directory holding it. A
+    /// replaced link changes the directory that holds it, and a resolution that comes to name
+    /// another directory changes the identity at its end.
+    fn resolution(&mut self, root: &Path, path: &Path) {
+        if self.0.is_none() {
+            return;
+        }
+        let mut pending = path.to_owned();
+        for _ in 0..MAX_RESOLUTION_LINKS {
+            if pending.starts_with(root) {
+                self.within(root, &pending);
+            } else {
+                self.path(&pending);
+                if let Some(parent) = pending.parent() {
+                    self.path(parent);
+                }
+            }
+            match first_link(root, &pending) {
+                Some(next) => pending = next,
+                None => return,
+            }
+        }
+    }
+
+    /// The checkout's tracked listing and every tracked package's directory: where an install
+    /// makes or removes a package tree.
+    fn packages(&mut self, root: &Path) -> Result<()> {
+        if self.0.is_none() {
+            return Ok(());
+        }
+        if let Some(listing) = crate::capabilities::kept_listing_inputs(root) {
+            for input in &listing {
+                self.path(input);
+            }
+        }
+        for directory in crate::capabilities::tracked_package_directories(root)? {
+            self.path(&directory);
+        }
+        Ok(())
+    }
+
+    fn into_paths(self) -> Vec<PathBuf> {
+        self.0
+            .map(|paths| paths.into_iter().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// The links one recorded resolution follows; past it, the capture's own resolution names the
+/// cycle.
+const MAX_RESOLUTION_LINKS: usize = 40;
+
+/// `path` with its first link replaced by that link's text, or `None` when no component is a
+/// link, or one cannot be read (the capture's own resolution reports it). Beneath `root` only the
+/// components below it are examined.
+fn first_link(root: &Path, path: &Path) -> Option<PathBuf> {
+    let (mut prefix, rest) = match path.strip_prefix(root) {
+        Ok(rest) => (root.to_path_buf(), rest),
+        Err(_) => (PathBuf::new(), path),
+    };
+    let mut components = rest.components();
+    while let Some(component) = components.next() {
+        prefix.push(component);
+        if fs::symlink_metadata(&prefix).ok()?.file_type().is_symlink() {
+            let target = fs::read_link(&prefix).ok()?;
+            let mut next = prefix.parent().map(Path::to_path_buf).unwrap_or_default();
+            next.push(target);
+            let rest = components.as_path();
+            if !rest.as_os_str().is_empty() {
+                next.push(rest);
+            }
+            return Some(next);
+        }
+    }
+    None
 }
 
 /// One row of `DECLARED_RECORD`; its `declaration` field is the managed script's own.
@@ -1715,6 +1928,7 @@ mod tests {
             }],
             released: Vec::new(),
             stores: PackageStores::default(),
+            holders: None,
         };
         assert_eq!(links.sibling_targets().count(), 0);
         links.restore(&root, RestoreMode::CoveredInstall).unwrap();
@@ -1935,6 +2149,7 @@ mod tests {
                 .collect(),
             released: Vec::new(),
             stores: PackageStores::default(),
+            holders: None,
         };
         take_syncs();
         links.restore(&root, RestoreMode::CoveredInstall).unwrap();
@@ -2690,5 +2905,95 @@ mod tests {
         let root = fs::canonicalize(&*scratch).unwrap();
         let snapshot = planning_fixture(&root, 64, true);
         measure_planning("distinct-parents", &root, &snapshot);
+    }
+
+    /// A checkout with a tracked root package, one scoped developer link to `original` and its
+    /// executable alias, every directory settled behind the clock.
+    fn settled_checkout(scratch: &Path) -> (PathBuf, PathBuf) {
+        let root = scratch.join("checkout");
+        fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
+        fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        for args in [&["init", "--quiet"][..], &["add", "package.json"]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status_bounded()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let original = scratch.join("original");
+        fs::create_dir_all(original.join("bin")).unwrap();
+        fs::write(original.join("bin/dev"), "#!/bin/sh\necho original\n").unwrap();
+        symlink(&original, root.join("node_modules/@scope/dev")).unwrap();
+        symlink("../@scope/dev/bin/dev", root.join("node_modules/.bin/dev")).unwrap();
+        for settled in [
+            root.clone(),
+            root.join(".git"),
+            root.join(".git/index"),
+            root.join(".git/config"),
+            root.join("package.json"),
+            root.join("node_modules"),
+            root.join("node_modules/@scope"),
+            root.join("node_modules/.bin"),
+            original.clone(),
+            original.join("bin"),
+            original.join("bin/dev"),
+            scratch.to_path_buf(),
+        ] {
+            crate::input_memo::settle(&settled);
+        }
+        (fs::canonicalize(root).unwrap(), original)
+    }
+
+    /// A snapshot taken over settled directories restores nothing while they stay as they were,
+    /// and still restores a link a job replaced with an installed payload: replacing it changed
+    /// the directory that holds it.
+    #[test]
+    fn a_settled_snapshot_restores_exactly_what_a_job_changed() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-settled");
+        let (root, original) = settled_checkout(&scratch);
+        let links = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap();
+        assert_eq!(links.links.len(), 2);
+        assert!(
+            links.holders.is_some(),
+            "settled holders let a restore see nothing changed"
+        );
+        assert!(
+            links
+                .restore(&root, RestoreMode::JobTerminal)
+                .unwrap()
+                .is_empty()
+        );
+        let dev = root.join("node_modules/@scope/dev");
+        fs::remove_file(&dev).unwrap();
+        fs::create_dir(&dev).unwrap();
+        fs::write(dev.join("registry-payload"), "installed\n").unwrap();
+        assert!(
+            links
+                .restore(&root, RestoreMode::JobTerminal)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read_link(&dev).unwrap(), original);
+    }
+
+    /// The supervisor's snapshot is kept while what its capture read keeps its identity, and a
+    /// developer link added under a package tree is in the next one.
+    #[test]
+    fn a_kept_snapshot_takes_a_new_link_into_the_next_admission() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-kept");
+        let (root, _) = settled_checkout(&scratch);
+        let first = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        let again = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "the kept snapshot");
+        let added = scratch.join("added");
+        fs::create_dir_all(&added).unwrap();
+        symlink(&added, root.join("node_modules/@scope/added")).unwrap();
+        let next = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert_eq!(next.links.len(), 3);
     }
 }

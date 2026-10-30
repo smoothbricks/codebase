@@ -426,6 +426,30 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             setup_service::dispatch_native(setup_args, parsed.global.json, &mut output).await;
         return Ok(finish(outcome, &mut output, json, &waits));
     }
+    // A resident exec opens no project and changes nothing until its supervisor admits the job,
+    // and that supervisor's hello refuses another build by itself, so it answers before the
+    // host-scope preflight and the daemon's build check. A sandboxed caller reaches neither the
+    // store's records nor the supervisor's socket, so it declines without a word and meets the
+    // preflight's refusal below; whatever declines takes the path below unchanged (06_cli.md,
+    // "Resident workspaces"). Its relay is interruptible, and stays armed for the rest.
+    let mut armed = None;
+    let stdin = if let args::Command::Exec(_) = &parsed.command {
+        let mut interrupts = interrupts.arm();
+        let answered = tokio::select! {
+            answered = crate::resident::answer_exec(&parsed, tokio::io::stdin(), &mut output) => answered,
+            signal = interrupts.received() => return Err(signal),
+        };
+        armed = Some(interrupts);
+        match answered {
+            Ok(crate::resident::Answer::Answered(exit)) => {
+                return Ok(finish(Ok(exit.code), &mut output, json, &waits));
+            }
+            Ok(crate::resident::Answer::Declined(stdin)) => stdin,
+            Err(error) => return Ok(finish(Err(error), &mut output, json, &waits)),
+        }
+    } else {
+        tokio::io::stdin()
+    };
     let prepared = match runtime::prepare_project_before_control(&parsed).await {
         Ok(prepared) => prepared,
         Err(error) => return Ok(finish(Err(error), &mut output, json, &waits)),
@@ -464,14 +488,13 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     // Project and host commands run the controller in this process, and its workspace supervisors
     // run jobs as children in their own process groups, out of reach of the terminal's signals.
     // The long-running services above own their signals, so only this section is interruptible.
-    let mut interrupts = interrupts.arm();
+    let mut interrupts = armed.unwrap_or_else(|| interrupts.arm());
     let outcome = {
         let command = async {
             match runtime_dispatch(&parsed.command) {
                 RuntimeDispatch::Host => runtime::run_host_command(parsed, &mut output).await,
                 RuntimeDispatch::Project => {
-                    runtime::run_bridge_command(parsed, prepared, tokio::io::stdin(), &mut output)
-                        .await
+                    runtime::run_bridge_command(parsed, prepared, stdin, &mut output).await
                 }
             }
             .map(|exit| exit.code)

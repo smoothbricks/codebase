@@ -24,8 +24,9 @@ Project-scoped detectors inspect the workspace root, or the contained relative d
 override. A tool invoked through a task runner gets the same cache and daemon authority as one invoked directly. There
 is no recursive walk through dependencies or build trees. Direnv alone inspects command ancestors inside the workspace
 and selects the nearest `.envrc`; an explicit directory override selects only that directory. Spawn admission refreshes
-the convention snapshot, so adding or removing a convention takes effect without restarting the supervisor. An unchanged
-snapshot reuses its rendered policy; a changed snapshot renders a matched sandbox/profile pair before applying job-mode
+the convention snapshot, so adding or removing a convention takes effect without restarting the supervisor. Its Git
+listing and the host mbx's scheduler settings are kept readings (11_shell.md, "Kept readings"). An unchanged snapshot
+reuses its rendered policy; a changed snapshot renders a matched sandbox/profile pair before applying job-mode
 narrowing. Warm-host identity includes the resulting profile, environment and shell directory. At mint the same
 detectors inspect the minted tree. A detector may examine file contents to disambiguate a convention; it never executes
 project code during discovery. A convention that resolves outside the workspace is rejected, except for a provisioned
@@ -156,11 +157,13 @@ paths for the Cargo capability to claim alongside mbx.
 
 Detection refreshes with the canonical activation's input identity (11_shell.md, "Shell activation and process reuse")
 as well as Cargo's discovery inputs, so a changed devenv cannot retain an earlier answer about an exported target
-directory or wrapper. The host link and its shim directory are read at every detection, so an install, a retarget or an
-uninstall of mbx, or a `cowshed setup` that provisions the shim, changes the capability at the next exec without a
-manifest change. A host link that does not resolve gives no capability, and doctor and `cowshed setup` report it
-(05_gateway.md, "Pool selection and revision"). Detection does not run `mbx setup` (only `cowshed setup` does,
-14_nix.md, "mbx"), change shell configuration, create a target or start a build.
+directory or wrapper. The host link and its shim directory are read at every detection; the scheduler settings are read
+through mbx's settings interface at the first detection and again whenever the installed mbx or its settings file
+changes identity (11_shell.md, "Kept readings"). So an install, a retarget or an uninstall of mbx, a `cowshed setup`
+that provisions the shim, or a changed setting changes the capability at the next exec without a manifest change. A host
+link that does not resolve gives no capability, and doctor and `cowshed setup` report it (05_gateway.md, "Pool selection
+and revision"). Detection does not run `mbx setup` (only `cowshed setup` does, 14_nix.md, "mbx"), change shell
+configuration, create a target or start a build.
 
 **Where the answer comes from.** The capability is active exactly where the host answers: the Cargo convention, the
 resolving host link and its provisioned shim directory, read at detection and never stored. No project's activation is a
@@ -319,12 +322,17 @@ Each detector returns data through one `CapabilityContribution`:
   restores it, the install leaves the version it installs, and the wrapper names it on stderr.
 
   The supervisor uses the same snapshot/restore implementation at job admission and terminal cleanup, including failed
-  or killed installs. Terminal cleanup has two distinct failures, each labelled in the sealed job's stderr: a link
-  restoration that fails is `developer-link restoration failed`, and a marker that cannot be removed is
-  `install observation cleanup failed`. Either one, or both together, leaves the job in the failed state, and the
-  waiters receive one error that names every cause that occurred. A blocking cleanup task failure is instead labelled
-  `terminal cleanup task failed`: it proves neither filesystem cause. These failures are not findings: only a link
-  absent with no observed install is one. Explicit absolute host/devenv executable paths, invocations whose first
+  or killed installs. Its admission snapshot is a kept reading (11_shell.md, "Kept readings"): an admission whose
+  package trees, links and their resolutions are as the last capture found them takes that snapshot. A snapshot whose
+  link-holding directories were all settled when it was taken records their identities, and a terminal cleanup that
+  finds each as it was knows no link was removed, replaced or retargeted, and restores and says nothing; any change
+  plans every link as below. Measured 2026-10-30: capturing and restoring cost a warm exec of a 29-tree checkout about
+  19 ms. The remaining rules hold for every snapshot. Terminal cleanup has two distinct failures, each labelled in the
+  sealed job's stderr: a link restoration that fails is `developer-link restoration failed`, and a marker that cannot be
+  removed is `install observation cleanup failed`. Either one, or both together, leaves the job in the failed state, and
+  the waiters receive one error that names every cause that occurred. A blocking cleanup task failure is instead
+  labelled `terminal cleanup task failed`: it proves neither filesystem cause. These failures are not findings: only a
+  link absent with no observed install is one. Explicit absolute host/devenv executable paths, invocations whose first
   argument is not one of those verbs, and unregistered library-only one-shot hosts bypass immediate wrapping and get
   terminal cleanup only; chained-command preservation is not promised for those bypasses. No snapshot taken by a job or
   wrapper grants a new target. Only the mint captures canonical sibling read grants from its source. Terminal cleanup

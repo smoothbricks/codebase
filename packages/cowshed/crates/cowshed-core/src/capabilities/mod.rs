@@ -15,11 +15,13 @@ pub use build_state::{BuildStatePath, DeclaredState, RelPath, SeedRetention};
 mod build_state_discovery;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use build_state_discovery::HostCargo;
-pub(crate) use build_state_discovery::installed_javascript_trees;
 pub use build_state_discovery::{
     BuildStateDiscovery, BuildStateFinding, CargoAnswer, CargoDiscoveryPhase, CargoQuery,
     CargoRunner, CargoUnanswered, JobCargo, discover_build_state, may_name_build_state,
     tracked_manifest_fingerprint,
+};
+pub(crate) use build_state_discovery::{
+    installed_javascript_trees, kept_listing_inputs, tracked_package_directories,
 };
 pub mod bun;
 pub mod cache;

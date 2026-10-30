@@ -3,15 +3,17 @@
 //! workspace resolver, decides membership and the configured target directory of each one.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 
 use serde::{Deserialize, Serialize};
 
 use super::{BuildStatePath, CapabilityId, DeclaredState, DetectionContext, merge_build_state};
+use crate::input_memo::InputMemo;
 use crate::runtime::supervisor::ObservedRun;
 use crate::workspace_environment::{NODE_COMPILE_CACHE_CHECKOUT, NODE_COMPILE_CACHE_DIRECTORY};
 use crate::{CowshedError, Result};
@@ -826,26 +828,18 @@ pub(super) fn expand_declared(
         let depth = selector.components().count();
         let mut pathspec = OsString::from(":(glob)");
         pathspec.push(selector.join("**"));
-        // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager, editors
-        // and prompts off (`git_command_at`): it waits on no other process.
-        #[allow(clippy::disallowed_methods)]
-        let output = crate::git::git_command_at(workspace)
-            .args(["ls-files", "-z", "--"])
-            .arg(&pathspec)
-            .output_locked()
-            .map_err(|error| crate::git::git_spawn_error(&error))?;
-        if !output.status.success() {
-            return Err(CowshedError::environment_missing(
+        let listed = ls_files(workspace, &[pathspec.as_os_str()], |output| {
+            CowshedError::environment_missing(
                 format!(
                     "cannot expand [build] state {}: {}",
                     entry.spelling().display(),
-                    crate::git::git_ended(&output)
+                    crate::git::git_ended(output)
                 ),
                 "repair the checkout's Git index and retry",
-            ));
-        }
+            )
+        })?;
         let mut selected = BTreeSet::new();
-        for name in output.stdout.split(|byte| *byte == 0) {
+        for name in listed.split(|byte| *byte == 0) {
             let tracked = Path::new(std::ffi::OsStr::from_bytes(name));
             if tracked.components().count() > depth {
                 selected.insert(tracked.components().take(depth).collect::<PathBuf>());
@@ -1252,7 +1246,7 @@ fn installed_package(workspace: &Path, manifest: &Path) -> Result<bool> {
 
 #[derive(Default)]
 pub(super) struct TrackedManifests {
-    inputs: Option<Vec<u8>>,
+    inputs: Option<Arc<[u8]>>,
 }
 
 impl TrackedManifests {
@@ -1304,37 +1298,104 @@ fn tracked_manifest(path: &Path, prefix: &Path, manifest: &str) -> bool {
         })
 }
 
-fn tracked_build_inputs(workspace: &Path) -> Result<Vec<u8>> {
+fn tracked_build_inputs(workspace: &Path) -> Result<Arc<[u8]>> {
     match fs::symlink_metadata(workspace.join(".git")) {
         Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Arc::from(&[][..])),
         Err(error) => return Err(super::detection_error(&workspace.join(".git"), error)),
     }
-    // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager, editors and
-    // prompts off (`git_command_at`): it waits on no other process.
-    #[allow(clippy::disallowed_methods)]
-    let output = crate::git::git_command_at(workspace)
-        .args([
-            "ls-files",
-            "-z",
-            "--",
-            ":(glob)**/Cargo.toml",
-            ":(glob)**/.cargo/config*",
-            ":(glob)**/go.mod",
-            ":(glob)**/package.json",
-        ])
-        .output_locked()
-        .map_err(|error| crate::git::git_spawn_error(&error))?;
-    if !output.status.success() {
-        return Err(CowshedError::environment_missing(
+    let pathspecs = [
+        ":(glob)**/Cargo.toml",
+        ":(glob)**/.cargo/config*",
+        ":(glob)**/go.mod",
+        ":(glob)**/package.json",
+    ]
+    .map(OsStr::new);
+    ls_files(workspace, &pathspecs, |output| {
+        CowshedError::environment_missing(
             format!(
                 "cannot enumerate tracked tool manifests: {}",
-                crate::git::git_ended(&output)
+                crate::git::git_ended(output)
             ),
             "repair the checkout's Git index and retry",
-        ));
+        )
+    })
+}
+
+/// The tracked paths of the checkout at `workspace` that `pathspecs` select, NUL-separated, as
+/// `git ls-files -z` lists them; `refused` names a listing Git refused. The listing reads the
+/// index, and the local config for how to read it, and nothing else, so its answer is kept while
+/// both keep their identity ([`InputMemo`]): every exec admission asks it twice and a resident
+/// exec once more (15_capabilities.md, "Detection inputs").
+fn ls_files(
+    workspace: &Path,
+    pathspecs: &[&OsStr],
+    refused: impl FnOnce(&std::process::Output) -> CowshedError,
+) -> Result<Arc<[u8]>> {
+    static LISTINGS: LazyLock<InputMemo<(PathBuf, Vec<OsString>), Arc<[u8]>>> =
+        LazyLock::new(InputMemo::new);
+    let list = || {
+        // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager,
+        // editors and prompts off (`git_command_at`): it waits on no other process.
+        #[allow(clippy::disallowed_methods)]
+        let output = crate::git::git_command_at(workspace)
+            .args(["ls-files", "-z", "--"])
+            .args(pathspecs)
+            .output_locked()
+            .map_err(|error| crate::git::git_spawn_error(&error))?;
+        if !output.status.success() {
+            return Err(refused(&output));
+        }
+        Ok(Arc::from(output.stdout))
+    };
+    match kept_listing_inputs(workspace) {
+        Some(inputs) => {
+            let key = (
+                workspace.to_owned(),
+                pathspecs.iter().map(|spec| spec.to_os_string()).collect(),
+            );
+            LISTINGS.read(&key, &inputs, list)
+        }
+        None => list(),
     }
-    Ok(output.stdout)
+}
+
+/// What a listing at `workspace` reads, when that is the checkout's own `.git/index` and
+/// `.git/config` alone: `.git` is a directory, and no variable of this process points Git at
+/// another repository, index or tree. A linked worktree's `.git` file, or a redirected Git, is
+/// listed afresh every time.
+pub(crate) fn kept_listing_inputs(workspace: &Path) -> Option<[PathBuf; 2]> {
+    const REDIRECTS: [&str; 4] = [
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+    ];
+    if REDIRECTS
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return None;
+    }
+    let git = workspace.join(".git");
+    fs::symlink_metadata(&git)
+        .ok()?
+        .is_dir()
+        .then(|| [git.join("index"), git.join("config")])
+}
+
+/// The directory of every tracked package manifest of the checkout at `workspace` outside any
+/// `node_modules`: where an install makes or removes a package tree.
+pub(crate) fn tracked_package_directories(workspace: &Path) -> Result<Vec<PathBuf>> {
+    let mut tracked = TrackedManifests::default();
+    Ok(tracked
+        .inputs(workspace)?
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| Path::new(std::ffi::OsStr::from_bytes(name)))
+        .filter(|manifest| tracked_manifest(manifest, Path::new(""), PACKAGE_MANIFEST))
+        .map(|manifest| workspace.join(manifest.parent().expect("a manifest names a file")))
+        .collect())
 }
 
 fn tracked_manifests(
@@ -1638,6 +1699,46 @@ mod tests {
                 "a report must not name a cause it did not observe: {report}"
             );
         }
+    }
+
+    /// A supervisor keeps the tracked listing while the index keeps its identity, so a manifest
+    /// staged after a kept listing is listed and moves the fingerprint: a resident exec is never
+    /// admitted onto build state a refresh would change (06_cli.md, "Resident workspaces").
+    #[test]
+    fn a_manifest_staged_after_a_kept_listing_is_listed() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-kept-listing-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let output = crate::git::git_command_at(&root)
+                .args(args)
+                .output_bounded()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        };
+        git(&["init", "--quiet"]);
+        write("Cargo.toml", "[workspace]\n");
+        git(&["add", "Cargo.toml"]);
+        for input in ["index", "config"] {
+            crate::input_memo::settle(&root.join(".git").join(input));
+        }
+        let listed = || TrackedManifests::default().inputs(&root).unwrap().to_vec();
+        let before = tracked_manifest_fingerprint(&root).unwrap();
+        assert_eq!(listed(), b"Cargo.toml\0");
+        assert_eq!(listed(), b"Cargo.toml\0", "the kept listing");
+        write("member/Cargo.toml", "[package]\nname = \"member\"\n");
+        git(&["add", "member/Cargo.toml"]);
+        assert_eq!(listed(), b"Cargo.toml\0member/Cargo.toml\0");
+        assert_ne!(tracked_manifest_fingerprint(&root).unwrap(), before);
+        fs::remove_dir_all(&root).unwrap();
     }
     fn git(fixture: &Fixture, args: &[&str]) {
         let output = crate::git::git_command_at(&fixture.root)

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6302625c3d64951d63da457bf5200f6d54f7a37f3ed9300a01c04cc17421004a # shrinks to prewarm = true, capacity = 1, events = [Acquire, Acquire, Acquire, Activated { n: 0, stable: false, same: false, subscribed: false }, Activated { n: 0, stable: false, same: false, subscribed: false }, Acquire, Activated { n: 963942389533291490, stable: false, same: false, subscribed: false }, Activated { n: 0, stable: true, same: false, subscribed: true }, Warmed { usable: true, stable: true, same: true, subscribed: false }, Acquire]

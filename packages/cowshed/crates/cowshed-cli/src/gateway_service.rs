@@ -84,21 +84,6 @@ impl ControlSocket {
             .map_err(control_error)
     }
 
-    /// Observe only the installed revision the resident admission path needs.
-    pub async fn session_current(&self, workspace_id: &str, revision: u64) -> Result<bool> {
-        self.0
-            .session_current(workspace_id, revision)
-            .await
-            .map_err(|error| match expired(&error) {
-                Some(failure) => CowshedError::environment_missing(
-                    error.to_string(),
-                    "cowshed doctor --json names the gateway and its socket",
-                )
-                .with_wait(Some(failure)),
-                None => control_error(error),
-            })
-    }
-
     /// Clear the project's Nx accepted-task store. A refusal while the project's Nx work is in
     /// flight is a conflict naming that work; a gateway that is not running, or one of an earlier
     /// build that does not serve `nx-cache-clear`, is said as the setup it needs.
@@ -139,6 +124,19 @@ impl ControlSocket {
 
 #[async_trait]
 impl GatewayControl for ControlSocket {
+    async fn session_current(&self, workspace_id: &str, revision: u64) -> Result<bool> {
+        self.0
+            .session_current(workspace_id, revision)
+            .await
+            .map_err(|error| match expired(&error) {
+                Some(failure) => CowshedError::environment_missing(
+                    error.to_string(),
+                    "cowshed doctor --json names the gateway and its socket",
+                )
+                .with_wait(Some(failure)),
+                None => control_error(error),
+            })
+    }
     async fn land_turns(
         &self,
     ) -> std::result::Result<Vec<cowshed_core::api::dto::LandTurnQueue>, GatewayStatusError> {

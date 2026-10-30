@@ -46,13 +46,21 @@ pub struct ProfileFile {
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 impl ProfileFile {
+    /// Where the file of `profile` in `directory` is, named by its SHA-256; nothing is read or
+    /// written.
+    pub fn at(directory: &Path, profile: &str) -> Self {
+        let digest = Sha256Digest::compute(profile.as_bytes()).to_hex();
+        Self {
+            path: directory.join(format!("{digest}.sb")),
+        }
+    }
+
     /// The file of `profile` in `directory`, made sure of for a launch now: its mtime bumped
     /// when present, written when absent. The content is staged beside it and renamed into
     /// place, so a reader finds the whole profile or none; a concurrent writer of the same
     /// profile renames identical bytes over it.
     pub fn write(directory: &Path, profile: &str) -> io::Result<Self> {
-        let digest = Sha256Digest::compute(profile.as_bytes()).to_hex();
-        let path = directory.join(format!("{digest}.sb"));
+        let Self { path } = Self::at(directory, profile);
         match touch(&path) {
             Ok(()) => return Ok(Self { path }),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -63,8 +71,8 @@ impl ProfileFile {
             .mode(0o700)
             .create(directory)
             .map_err(|error| denied_as_present(directory, error))?;
-        let staged = directory.join(format!(
-            "{digest}.{}.{}.staged",
+        let staged = path.with_extension(format!(
+            "{}.{}.staged",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -195,6 +203,15 @@ impl ProfileLaunch {
             file: ProfileFile::write(directory, profile.text())?,
             build_volume: profile.build_volume().map(Path::to_path_buf),
         })
+    }
+
+    /// The launch [`Self::write`] would make, with nothing read or written: what tells it from
+    /// another launch ([`Self::identity`]) without making sure of its file.
+    pub fn planned(directory: &Path, profile: &SeatbeltProfile) -> Self {
+        Self {
+            file: ProfileFile::at(directory, profile.text()),
+            build_volume: profile.build_volume().map(Path::to_path_buf),
+        }
     }
 
     pub fn file(&self) -> &ProfileFile {

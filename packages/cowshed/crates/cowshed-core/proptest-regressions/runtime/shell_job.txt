@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3e59baed8bde019fdf6a6aeab01da35eea179f7835fc5b4db922636323f67c48 # shrinks to a = Identity { profile: 2, environment: {}, envrc: Some(0), grant_revision: 0, program: 0 }, b = Identity { profile: 2, environment: {}, envrc: Some(0), grant_revision: 1, program: 0 }

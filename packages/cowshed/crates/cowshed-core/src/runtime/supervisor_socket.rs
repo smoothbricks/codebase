@@ -349,6 +349,13 @@ enum Call {
         job_id: JobId,
         every: SampleInterval,
     },
+    /// Whether a job may be admitted onto the checkout's build state as it is, judged with the
+    /// build volume the caller resolved: `null`, or why not (`crate::resident::build_state_current`).
+    #[serde(rename_all = "camelCase")]
+    BuildState {
+        build_volume: Option<PathBuf>,
+    },
+    ShellPool,
     TraceHealth,
     #[serde(rename_all = "camelCase")]
     ListeningPorts {
@@ -428,6 +435,8 @@ impl Call {
             Self::Resources { .. } => "resources",
             Self::Processes { .. } => "processes",
             Self::ProcessEvents { .. } => "process-events",
+            Self::BuildState { .. } => "build-state",
+            Self::ShellPool => "shell-pool",
             Self::TraceHealth => "trace-health",
             Self::ListeningPorts { .. } => "listening-ports",
             Self::JobByKey { .. } => "job-by-key",
@@ -3151,6 +3160,11 @@ async fn answer(
         Call::Hold { .. } => {
             return Err(protocol_error("a hold requires its connection"));
         }
+        Call::BuildState { build_volume } => (
+            to_value(&supervisor.build_state(build_volume).await?)?,
+            Bytes::new(),
+        ),
+        Call::ShellPool => (to_value(&supervisor.shell_pool().await?)?, Bytes::new()),
         Call::TraceHealth => (to_value(&supervisor.trace_health().await?)?, Bytes::new()),
         Call::ListeningPorts { job_id } => (
             to_value(&supervisor.listening_ports(job_id).await?)?,
@@ -3698,10 +3712,35 @@ pub async fn hold(
             "run the command again against the current workspace",
         ));
     }
+    hold_as(path, &serving.authority, job_id).await
+}
+
+/// [`hold`] under `authority`, the one the caller already read from the supervisor at `path`,
+/// without asking for it again. A grant change since then makes the supervisor refuse that
+/// authority as stale, and that refusal is answered by [`hold`], which reads the authority
+/// served now: a grant change between the job's admission and its hold still changes nothing.
+pub async fn hold_under(
+    path: &Path,
+    authority: &WorkspaceAuthoritySnapshot,
+    job_id: JobId,
+) -> Result<JobHold> {
+    match hold_as(path, authority, job_id).await {
+        Err(error) if error.code == crate::ErrorCode::Conflict => {
+            hold(path, &authority.workspace_incarnation, job_id).await
+        }
+        held => held,
+    }
+}
+
+async fn hold_as(
+    path: &Path,
+    authority: &WorkspaceAuthoritySnapshot,
+    job_id: JobId,
+) -> Result<JobHold> {
     // The hold is in place once the supervisor answers, which it does at once.
     let mut stream = open(path, "hold", deadline::CONTROL).await?;
     let request = Request::Call {
-        authority: (&serving.authority).into(),
+        authority: authority.into(),
         call: Box::new(Call::Hold { job_id }),
         bytes: 0,
     };
@@ -3870,6 +3909,24 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             reply,
         } => {
             let _ = reply.send(open_process_events(path, &authority, job_id, every).await);
+        }
+        Command::BuildState {
+            authority,
+            build_volume,
+            reply,
+        } => {
+            let _ = reply.send(
+                call(
+                    path,
+                    &authority,
+                    Call::BuildState { build_volume },
+                    Bytes::new(),
+                )
+                .await,
+            );
+        }
+        Command::ShellPool { authority, reply } => {
+            let _ = reply.send(call(path, &authority, Call::ShellPool, Bytes::new()).await);
         }
         Command::TraceHealth { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::TraceHealth, Bytes::new()).await);
