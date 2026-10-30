@@ -767,13 +767,17 @@ impl GitRepository {
 
     /// The checkout's remotes, as `git config --local` lists them. That reads the checkout's own
     /// `.git/config` alone (includes are off for one named file), so it is a kept reading while
-    /// that file keeps its identity (11_shell.md, "Kept readings"): the binding gate every verb
-    /// and every controller call runs asks it.
+    /// the checkout's configuration keeps its identity (11_shell.md, "Kept readings"): the
+    /// binding gate every verb and every controller call runs asks it. It is kept against all of
+    /// [`crate::capabilities::local_config_inputs`], a superset of what it reads, and read every
+    /// time where those refuse (a `commondir`, which `--local` follows; or a configuration they
+    /// cannot vouch for).
     pub async fn remotes(&self) -> Result<Vec<RemoteUrl>> {
         static KEPT: std::sync::LazyLock<crate::input_memo::InputMemo<PathBuf, Vec<RemoteUrl>>> =
             std::sync::LazyLock::new(crate::input_memo::InputMemo::new);
         match crate::capabilities::kept_listing_inputs(&self.root) {
-            // The index is no input: `config --local` reads the configuration alone.
+            // The index, which `kept_listing_inputs` names first, is no input: `config --local`
+            // reads the configuration alone.
             Some(inputs) => {
                 KEPT.read_async(&self.root, &inputs[1..], || self.listed_remotes())
                     .await

@@ -1403,7 +1403,8 @@ pub(crate) fn local_config_inputs(git: &Path) -> Option<Vec<PathBuf>> {
     let includes = config_includes(&fs::read(&config).ok()?)?;
     let mut inputs = vec![config];
     for include in includes {
-        if include.starts_with('~') {
+        // A home or install prefix Git expands is no path this reads.
+        if include.starts_with('~') || include.starts_with("%(") {
             return None;
         }
         // Relative to the directory of the file that includes it; an absolute path stands.
@@ -1422,9 +1423,10 @@ pub(crate) fn local_config_inputs(git: &Path) -> Option<Vec<PathBuf>> {
 /// The `path` of every `[include]` section of the Git configuration `text`, as written. `None`
 /// when this does not read the text as Git does: not UTF-8, a continued line, a variable on a
 /// section's header line, a quoted or escaped include path, an `includeIf`, or
-/// `extensions.worktreeConfig`.
+/// `extensions.worktreeConfig`. A leading byte-order mark is skipped, as Git skips it.
 fn config_includes(text: &[u8]) -> Option<Vec<String>> {
     let text = std::str::from_utf8(text).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut section = String::new();
     let mut paths = Vec::new();
     for line in text.lines() {

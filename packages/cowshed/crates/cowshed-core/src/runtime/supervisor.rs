@@ -4583,17 +4583,27 @@ impl WorkspaceSupervisor {
                     "inspect the supervisor's thread resources and retained group ledger",
                 )
             })?;
-        let lifecycle_journal = crate::storage::StorageLayout::new(
+        // Said once here: without it every `asIs` answers `records`, and every resident exec of
+        // this workspace takes the controller path for this supervisor's life.
+        let lifecycle_journal = match crate::storage::StorageLayout::new(
             &policy.ceiling().store_root,
             &config.authority.repo_id,
-        )
-        .ok()
-        .map(|layout| {
-            layout
-                .project()
-                .project_root
-                .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE)
-        });
+        ) {
+            Ok(layout) => Some(
+                layout
+                    .project()
+                    .project_root
+                    .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE),
+            ),
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: workspace {} cannot place its project's lifecycle journal, so its \
+                     execs take the controller path: {error}",
+                    config.authority.workspace
+                );
+                None
+            }
+        };
         let mut actor = SupervisorActor {
             lifecycle_journal,
             authority: config.authority,

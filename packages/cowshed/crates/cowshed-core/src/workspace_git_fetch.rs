@@ -1106,6 +1106,14 @@ mod tests {
         assert_eq!(probed_inputs(&root), None, "a nested include");
         for (config, case) in [
             (
+                "\u{feff}[extensions]\n\tworktreeConfig = true\n",
+                "a per-worktree configuration behind a byte-order mark",
+            ),
+            (
+                "[include]\n\tpath = %(prefix)/etc/gitconfig\n",
+                "an install-prefix include",
+            ),
+            (
                 "[includeIf \"gitdir:/x/\"]\n\tpath = other\n",
                 "a conditional include",
             ),

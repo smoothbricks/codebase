@@ -100,7 +100,7 @@ pub enum Decline {
     /// The supervisor drains: the daemon is of another build, which the controller's build
     /// check names (11_shell.md, "Draining a supervisor of another build").
     Draining,
-    /// The supervisor did not judge the build state.
+    /// The supervisor did not judge the workspace as it is (`asIs`).
     AsIsUnanswered,
     /// The gateway does not hold the workspace's session at the revision its supervisor serves:
     /// the controller's pre-exec reconcile installs it.
