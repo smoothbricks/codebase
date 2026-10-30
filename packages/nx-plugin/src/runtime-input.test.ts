@@ -40,8 +40,14 @@ interface Ran {
 }
 
 function wrapped(workspace: string, ...command: string[]): Ran {
-  const ran = spawnSync('sh', [script, ...command], { cwd: workspace, encoding: 'buffer' });
-  return { status: ran.status, stdout: ran.stdout, stderr: ran.stderr.toString('utf8') };
+  // No controlling terminal, as under Nx's daemon: `detached` starts a new session (setsid), which has none.
+  const ran = Bun.spawnSync(['sh', script, ...command], {
+    cwd: workspace,
+    detached: true,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  return { status: ran.exitCode, stdout: ran.stdout, stderr: ran.stderr.toString('utf8') };
 }
 
 async function withWrapperWorkspace(run: (workspace: string) => Promise<void>): Promise<void> {
@@ -86,7 +92,7 @@ describe('runtime-input.sh', () => {
     });
   });
 
-  it('poisons a failure and durably retains exact argv, stderr and exit status', async () => {
+  it('poisons a failure and durably retains only its exact argv, stdout, stderr and exit status', async () => {
     await withWrapperWorkspace(async (workspace) => {
       const command = [
         'sh',
@@ -105,6 +111,8 @@ describe('runtime-input.sh', () => {
       expect(ran.stdout).toEqual(Buffer.from([0xff]));
       const record = await failureRecord(workspace);
       expect((await stat(record)).mode & 0o777).toBe(0o700);
+      // No terminal to show the report on is no failure of the input: the record holds its evidence alone.
+      expect((await readdir(record)).sort()).toEqual(['argv', 'exit-status', 'report', 'stderr', 'stdout']);
       expect(await readFile(join(record, 'argv'))).toEqual(Buffer.from(`${command.join('\0')}\0`));
       expect(await readFile(join(record, 'stderr'))).toEqual(Buffer.from('the-cause\0raw\n\n'));
       expect(await readFile(join(record, 'stdout'))).toEqual(Buffer.from('partial\n'));
@@ -117,6 +125,8 @@ describe('runtime-input.sh', () => {
       expect(ran.stderr).toContain('the-cause');
       expect(ran.stderr).toContain('runtime input exited 3: sh -c');
       expect(ran.stderr).toContain(join(record, 'report'));
+      // The shell's refusal to open /dev/tty is a diagnostic beside that notice, not evidence.
+      expect(ran.stderr).toContain('/dev/tty');
     });
   });
 

@@ -78,9 +78,18 @@ if record=$(umask 077; mkdir -p "$PWD/.runtime-input-failures" &&
       cat "$record/stdout"
     } >"$record/report"; then
     printf '\nruntime input exited %s: %s; evidence: %s/report\n' "$status" "$*" "$record" >&2
-    # A detached daemon may have no terminal. Preserve that error too, rather
-    # than sending it into Nx's discarded stderr or swallowing it.
-    (exec 4>/dev/tty && cat "$record/report" >&4) 2>"$record/terminal-error"
+    # Nx discards this stderr, so a controlling terminal is the one live display
+    # of the report. Nx's daemon has none (ENXIO) and cowshed's sandbox denies
+    # it (EPERM). Having no terminal is no failure of the input: the shell's
+    # refusal of the open joins the notice above on stderr, and the record
+    # gains nothing. `command` keeps that refusal from exiting the shell. A
+    # write that fails on a terminal that did open is retained in the record.
+    if command exec 4>/dev/tty; then
+      if ! failure=$(cat "$record/report" 2>&1 >&4); then
+        printf '%s\n' "$failure" >"$record/terminal-error"
+      fi
+      exec 4>&-
+    fi
   else
     printf '\nruntime input exited %s: %s; evidence incomplete: %s; stderr capture: %s\n' \
       "$status" "$*" "$record" "$diagnostic" >&2

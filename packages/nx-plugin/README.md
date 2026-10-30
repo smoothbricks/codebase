@@ -562,11 +562,13 @@ command and its cause beside Nx's decoder error, which names neither.
 Each readable `report` names the command, its indexed arguments, working directory, exit status and original stderr.
 `argv` retains the exact NUL-delimited argument vector (including empty arguments), `stderr` retains the original bytes
 (including trailing newlines), and `exit-status` retains the decimal status. The wrapper also attempts a stderr summary
-naming the command and report path, and displays the report on `/dev/tty` when it can open a controlling terminal.
-Neither display is guaranteed through Nx's daemon or a headless harness: rely on the retained report, not on Nx
-forwarding stderr. A failed terminal write is retained in the record's `terminal-error`. Records can contain arguments
-or stderr with credentials; keep them private and inspect before sharing. Evidence-storage errors name the problem and
-the surviving stderr capture on stderr; they never remove the refusal byte or replace the command's status.
+naming the command and report path, and displays the report on `/dev/tty` when it can open a controlling terminal. Nx's
+daemon has none (`ENXIO`) and cowshed's sandbox denies it (`EPERM`); having no terminal is no failure of the input, so
+the shell's refusal of the open joins the stderr summary and the record gains nothing. Neither display is guaranteed
+through Nx's daemon or a headless harness: rely on the retained report, not on Nx forwarding stderr. A write that fails
+on a terminal that did open is retained in the record's `terminal-error`. Records can contain arguments or stderr with
+credentials; keep them private and inspect before sharing. Evidence-storage errors name the problem and the surviving
+stderr capture on stderr; they never remove the refusal byte or replace the command's status.
 
 Successful commands still emit only their original stdout bytes, discard stderr and retain no failure record: no
 evidence path, timestamp or diagnostic enters a successful key. `runtime-input.test.ts` compares that byte stream and
