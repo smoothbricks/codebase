@@ -457,6 +457,17 @@ expectAdded(
   [{ kind: 'pub', name: 'widened' }],
 );
 
+expectFindings(
+  "a test-only crate's modules, #![cfg(test)] at its root, are test code down to their own submodules",
+  {
+    'crates/sim/Cargo.toml': CRATE('sim'),
+    'crates/sim/src/lib.rs': '//! A simulator only tests run.\n#![cfg(test)]\n\nmod pool;\n',
+    'crates/sim/src/pool.rs':
+      'mod deep;\n\npub(crate) fn convoy() {}\n\n#[cfg(test)]\nmod tests {\n    fn t() {\n        super::convoy();\n        super::deep::deeper();\n    }\n}\n',
+    'crates/sim/src/pool/deep.rs': 'pub(crate) fn deeper() {}\n',
+  },
+  [],
+);
 // --- The root lint's scope ------------------------------------------------------------------------------------------
 
 {

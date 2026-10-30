@@ -861,23 +861,45 @@ function withoutTests(blanked: string): string {
   return out.join('');
 }
 
-/** The files of the out-of-line modules a Rust file declares under `#[cfg(test)]` (`#[cfg(test)] mod tests;`). */
-function testModuleFiles(path: string, text: string): string[] {
-  const blanked = blankRust(text);
+/** An out-of-line module declaration (`mod name;`) at the start of a text, its outer attributes and visibility included. */
+const MOD_DECL = /^(?:\s*#\[[^\]]*\])*\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/;
+
+/** The files `mod name;` in `path` may name, or the one file its `#[path]` attribute (in `declared`) names. */
+function moduleFiles(path: string, name: string, declared: string): string[] {
+  const pathAttr = /#\[path\s*=\s*"([^"]+)"\]/.exec(declared)?.[1];
+  if (pathAttr !== undefined) return [posix.join(posix.dirname(path), pathAttr)];
   const base = posix.basename(path);
   const dir = /^(lib|main|mod)\.rs$/.test(base) ? posix.dirname(path) : path.replace(/\.rs$/, '');
+  return [`${dir}/${name}.rs`, `${dir}/${name}/mod.rs`];
+}
+
+/** The files of every out-of-line module a Rust file declares (`mod x;`, whatever its attributes). */
+function declaredModuleFiles(path: string, text: string): string[] {
+  const blanked = blankRust(text);
+  return [...blanked.matchAll(/(?<![A-Za-z0-9_])(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/g)].flatMap(
+    (m) => {
+      const name = m[1];
+      if (name === undefined) return [];
+      const declared = attributesBefore(text, blanked, m.index) + text.slice(m.index, m.index + m[0].length);
+      return moduleFiles(path, name, declared);
+    },
+  );
+}
+
+/**
+ * The files of the out-of-line modules a Rust file declares under `#[cfg(test)]` (`#[cfg(test)] mod tests;`), or of
+ * every module it declares when the file itself is `#![cfg(test)]`: such a file, a test-only crate's root for one,
+ * compiles nothing outside tests.
+ */
+function testModuleFiles(path: string, text: string): string[] {
+  const blanked = blankRust(text);
   const out: string[] = [];
   for (const m of blanked.matchAll(CFG_TEST)) {
-    if (m[1] === '!') continue;
-    const decl = /^(?:\s*#\[[^\]]*\])*\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/.exec(
-      blanked.slice(m.index + m[0].length),
-    );
+    if (m[1] === '!') return declaredModuleFiles(path, text);
+    const decl = MOD_DECL.exec(blanked.slice(m.index + m[0].length));
     const name = decl?.[1];
     if (decl === null || name === undefined) continue;
-    const declared = text.slice(m.index, m.index + m[0].length + decl[0].length);
-    const pathAttr = /#\[path\s*=\s*"([^"]+)"\]/.exec(declared)?.[1];
-    if (pathAttr !== undefined) out.push(posix.join(posix.dirname(path), pathAttr));
-    else out.push(`${dir}/${name}.rs`, `${dir}/${name}/mod.rs`);
+    out.push(...moduleFiles(path, name, text.slice(m.index, m.index + m[0].length + decl[0].length)));
   }
   return out;
 }
@@ -1337,20 +1359,36 @@ class Judge {
     return parsed;
   }
 
-  /** Rust files only `#[cfg(test)] mod x;` declarations compile: test code under a non-test path. */
+  /**
+   * Rust files only test builds compile, under non-test paths: out-of-line `#[cfg(test)]` modules, every module of a
+   * `#![cfg(test)]` file, and every module those declare in turn.
+   */
   #testRust: ReadonlySet<string> | undefined;
 
-  /** Whether `path` is test code: by its path, or as an out-of-line `#[cfg(test)]` module. */
+  /** Whether `path` is test code: by its path, or as a module only test builds compile. */
   isTest(path: string): boolean {
     if (!isSourcePath(path)) return true;
     if (!path.endsWith('.rs')) return false;
-    this.#testRust ??= new Set(
+    this.#testRust ??= this.#withDeclaredModules(
       this.#tree
         .filesHolding('cfg', true)
         .filter((file) => file.endsWith('.rs') && isSourcePath(file))
         .flatMap((file) => testModuleFiles(file, this.#tree.textOf(file) ?? '')),
     );
     return this.#testRust.has(path);
+  }
+
+  /** `roots` and every module file they declare, transitively: a test module's own modules are test code too. */
+  #withDeclaredModules(roots: readonly string[]): ReadonlySet<string> {
+    const found = new Set<string>();
+    const pending = [...roots];
+    for (let file = pending.pop(); file !== undefined; file = pending.pop()) {
+      if (found.has(file)) continue;
+      found.add(file);
+      const text = this.#tree.textOf(file);
+      if (text !== undefined) pending.push(...declaredModuleFiles(file, text));
+    }
+    return found;
   }
 
   #production(paths: readonly string[]): string[] {
