@@ -35,8 +35,9 @@
 //! `BitmosaicView` over the slot bytes (or over caller-supplied bytes for the
 //! decision-side `*_serialized` queries) and answer from the string; no read
 use crate::bitmap_ttl::{TtlAlgebraDemand, TtlAlgebraScratch, merge_expiries};
+use crate::change_feed::Change;
 use crate::hooks::{ByteCapture, TtlMutation, VmHooks};
-use crate::key_index::{HashIndex, KeyIndex};
+use crate::key_index::{HashIndex, Key, KeyIndex};
 use crate::meta::SlotMetaView;
 use crate::state_init::bind_slot_in;
 use crate::ttl_plan::TtlBatchPlan;
@@ -643,6 +644,9 @@ pub fn batch_bitmap_add(
             meta.set_change_flag(state, ChangeFlag::INSERTED);
         }
         finish_bitmap_mutations(env, hooks, delta_mode, state, meta, capture, ttl_plan);
+        if report.added > 0 && hooks.feed_records(meta.slot()) {
+            feed_members(hooks, meta.slot(), elem_col, Change::Inserted);
+        }
         return ErrorCode::Ok;
     }
 
@@ -734,6 +738,9 @@ pub fn batch_bitmap_add(
         meta.set_change_flag(state, ChangeFlag::INSERTED);
     }
     finish_bitmap_mutations(env, hooks, delta_mode, state, meta, capture, ttl_plan);
+    if report.added > 0 && hooks.feed_records(meta.slot()) {
+        feed_members(hooks, meta.slot(), &env.adds, Change::Inserted);
+    }
     if overflow {
         ErrorCode::CapacityExceeded
     } else {
@@ -804,7 +811,24 @@ pub fn batch_bitmap_remove(
         meta.set_change_flag(state, ChangeFlag::REMOVED);
     }
     finish_bitmap_mutations(env, hooks, delta_mode, state, meta, capture, ttl_plan);
+    if report.removed > 0 && hooks.feed_records(meta.slot()) {
+        let requested: &[u32] = if is_batch(elem_col) {
+            elem_col
+        } else {
+            &env.removes
+        };
+        feed_members(hooks, meta.slot(), requested, Change::Removed(None));
+    }
     ErrorCode::Ok
+}
+
+/// Record every requested member of a landed membership patch in the change
+/// feed. The patch reports how many members changed, not which, so each
+/// requested member may have.
+fn feed_members(hooks: &mut impl VmHooks, slot: u32, members: &[u32], change: Change) {
+    for &member in members {
+        hooks.feed_record(slot, Key::one(member), change);
+    }
 }
 
 /// Set-algebra operation applied to a target bitmap.
@@ -1091,6 +1115,9 @@ pub fn batch_bitmap_algebra_in<I: KeyIndex>(
         capture,
         ttl_plan,
     );
+    if hooks.feed_records(target_meta.slot()) {
+        hooks.feed_changed_whole(target_meta.slot());
+    }
     ErrorCode::Ok
 }
 

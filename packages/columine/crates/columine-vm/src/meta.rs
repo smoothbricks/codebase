@@ -47,6 +47,12 @@ impl SlotMetaView {
         }
     }
 
+    /// The slot this metadata record belongs to.
+    #[inline(always)]
+    pub const fn slot(&self) -> u32 {
+        (self.meta_base - STATE_HEADER_SIZE) / SLOT_META_SIZE
+    }
+
     #[inline(always)]
     pub fn slot_type(&self) -> SlotType {
         // Validated in `read`; this keeps the accessor infallible.

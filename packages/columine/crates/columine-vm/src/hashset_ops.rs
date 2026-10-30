@@ -5,8 +5,10 @@
 //! Each accepted primitive owns one bounded prior-byte capture, including its
 //! TTL index. An enclosing VM boundary owns flag bytes instead of this capture.
 
+use crate::change_feed::Change;
 use crate::hash_table::{ENTRY_NONE, EraseRanges, FlatTable};
 use crate::hooks::{ByteCapture, TtlMutation, VmHooks, batch_rows};
+use crate::key_index::Key;
 use crate::meta::{BatchFlags, SlotMetaView};
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset, SlotType};
 
@@ -26,7 +28,7 @@ pub fn batch_set_insert(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    _slot_idx: u32,
+    slot_idx: u32,
     elems: &[u32],
     ts_col: Option<&[f64]>,
     hooks: &mut impl VmHooks,
@@ -37,7 +39,7 @@ pub fn batch_set_insert(
     batch_rows!(
         hooks.undo_enabled(),
         meta.has_ttl(),
-        insert_rows(delta_mode, state, meta, elems, ts_col, hooks)
+        insert_rows(delta_mode, state, meta, slot_idx, elems, ts_col, hooks)
     )
 }
 
@@ -48,6 +50,7 @@ fn insert_rows<const RECORDING: bool, const TTL: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
+    slot: u32,
     elems: &[u32],
     ts_col: Option<&[f64]>,
     hooks: &mut impl VmHooks,
@@ -56,6 +59,7 @@ fn insert_rows<const RECORDING: bool, const TTL: bool>(
     let mut local_size = tbl.size(state);
     let max_load = tbl.max_load();
     let mut flags = BatchFlags::default();
+    let feeds = hooks.feed_records(slot);
 
     for (i, &elem) in elems.iter().enumerate() {
         let ts = if TTL {
@@ -126,6 +130,10 @@ fn insert_rows<const RECORDING: bool, const TTL: bool>(
             hooks.consume_ttl_batch_plan(state, meta, plan);
         }
         hooks.finish_capture(delta_mode, state, capture);
+        // A TTL refresh of a held member changes nothing a rule binds.
+        if feeds && !probe.found {
+            hooks.feed_record(slot, Key::one(elem), Change::Inserted);
+        }
     }
     ErrorCode::Ok
 }
@@ -135,7 +143,7 @@ pub fn batch_set_remove(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    _slot_idx: u32,
+    slot_idx: u32,
     elems: &[u32],
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
@@ -165,6 +173,7 @@ pub fn batch_set_remove(
             delta_mode,
             state,
             meta,
+            slot_idx,
             &tbl,
             elems,
             &mut scratch.ranges,
@@ -177,17 +186,20 @@ pub fn batch_set_remove(
 
 /// [`batch_set_remove`]'s row loop over a checked table; `RECORDING` is the
 /// journal's state and `TTL` the slot's.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn remove_rows<const RECORDING: bool, const TTL: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
+    slot: u32,
     tbl: &FlatTable,
     elems: &[u32],
     ranges: &mut EraseRanges,
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
     let mut flags = BatchFlags::default();
+    let feeds = hooks.feed_records(slot);
     for &elem in elems {
         let Some(pos) = tbl.find(state, elem) else {
             continue;
@@ -233,6 +245,9 @@ fn remove_rows<const RECORDING: bool, const TTL: bool>(
             hooks.consume_ttl_batch_plan(state, meta, plan);
         }
         hooks.finish_capture(delta_mode, state, capture);
+        if feeds {
+            hooks.feed_record(slot, Key::one(elem), Change::Removed(None));
+        }
     }
     ErrorCode::Ok
 }

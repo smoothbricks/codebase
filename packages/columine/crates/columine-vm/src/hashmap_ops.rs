@@ -13,8 +13,10 @@
 //! bytes instead. TTL helpers never append a second logical journal.
 
 use crate::bytes;
+use crate::change_feed::Change;
 use crate::hash_table::{ENTRY_U32, ErasePlan, EraseRanges, FlatTable};
 use crate::hooks::{ByteCapture, TtlMutation, VmHooks, batch_rows};
+use crate::key_index::Key;
 use crate::meta::{BatchFlags, SlotMetaView};
 use crate::removal_cut::{CutKey, SlotCuts};
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset};
@@ -130,7 +132,7 @@ pub fn batch_map_upsert(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    _slot_idx: u32,
+    slot_idx: u32,
     cuts: SlotCuts<'_>,
     keys: &[u32],
     vals: &[u32],
@@ -150,7 +152,8 @@ pub fn batch_map_upsert(
         hooks.undo_enabled(),
         meta.has_ttl(),
         upsert_rows(
-            strategy, delta_mode, state, meta, cuts, keys, vals, cmp_col, cmp_type, hooks,
+            strategy, delta_mode, state, meta, slot_idx, cuts, keys, vals, cmp_col, cmp_type,
+            hooks,
         )
     )
 }
@@ -164,6 +167,7 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
+    slot: u32,
     cuts: SlotCuts<'_>,
     keys: &[u32],
     vals: &[u32],
@@ -177,6 +181,7 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool>(
     let mut local_size = tbl.size(state);
     let max_load = tbl.max_load();
     let mut flags = BatchFlags::default();
+    let feeds = hooks.feed_records(slot);
 
     for (i, (&key, &val)) in keys.iter().zip(vals).enumerate() {
         let i = i as u32;
@@ -258,6 +263,9 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool>(
                 Err(error) => return error,
             }
         };
+        // The prior value the change feed names; an equal rewrite changes
+        // nothing a rule binds, so it records nothing.
+        let prior = (feeds && probe.found).then(|| tbl.entry_u32_at(state, probe.pos));
         if !probe.found {
             tbl.set_key_at(state, probe.pos, key);
             local_size += 1;
@@ -280,6 +288,13 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool>(
             hooks.consume_ttl_batch_plan(state, meta, plan);
         }
         hooks.finish_capture(delta_mode, state, capture);
+        if feeds && prior != Some(val) {
+            let change = match prior {
+                Some(old) => Change::Updated(Some(u64::from(old))),
+                None => Change::Inserted,
+            };
+            hooks.feed_record(slot, Key::one(key), change);
+        }
     }
     ErrorCode::Ok
 }
@@ -309,7 +324,7 @@ pub fn batch_map_remove(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    _slot_idx: u32,
+    slot_idx: u32,
     keys: &[u32],
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
@@ -342,6 +357,7 @@ pub fn batch_map_remove(
             delta_mode,
             state,
             meta,
+            slot_idx,
             &tbl,
             has_ts,
             keys,
@@ -361,6 +377,7 @@ fn remove_rows<const RECORDING: bool, const TTL: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
+    slot: u32,
     tbl: &FlatTable,
     has_ts: bool,
     keys: &[u32],
@@ -368,6 +385,7 @@ fn remove_rows<const RECORDING: bool, const TTL: bool>(
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
     let mut flags = BatchFlags::default();
+    let feeds = hooks.feed_records(slot);
     for &key in keys {
         let Some(pos) = tbl.find(state, key) else {
             continue;
@@ -406,6 +424,7 @@ fn remove_rows<const RECORDING: bool, const TTL: bool>(
                 Err(error) => return error,
             }
         };
+        let prior = feeds.then(|| tbl.entry_u32_at(state, pos));
         erase_slot_map_planned(state, meta, tbl, &erase);
         let size = tbl.size(state);
         tbl.set_size(state, size - 1);
@@ -414,6 +433,9 @@ fn remove_rows<const RECORDING: bool, const TTL: bool>(
             hooks.consume_ttl_batch_plan(state, meta, plan);
         }
         hooks.finish_capture(delta_mode, state, capture);
+        if let Some(old) = prior {
+            hooks.feed_record(slot, Key::one(key), Change::Removed(Some(u64::from(old))));
+        }
     }
     ErrorCode::Ok
 }

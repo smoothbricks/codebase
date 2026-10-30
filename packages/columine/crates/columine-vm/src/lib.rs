@@ -21,6 +21,10 @@
 //! Layout growth has no journal: roll back and end the complete speculative
 //! window, grow its committed image, reenable undo, and retry the full window.
 //!
+//! The change feed ([`change_feed`]) is the logical counterpart of the
+//! journal: while a RETE pass is armed, each key-scoped kernel write records
+//! its slot, key and prior bindable value in storage bound once per program.
+//!
 //! [`vm::CheckedMap`], [`vm::CheckedSet`], [`vm::CheckedStructMap`] and
 //! [`vm::CheckedStructMap2`] bind authoritative slot geometry once and borrow
 //! the original image for their whole lifetime. Malformed images are typed
@@ -45,6 +49,7 @@ pub mod bitmap_ops;
 mod bitmap_ttl;
 pub mod bytes;
 pub mod capacity;
+pub mod change_feed;
 pub mod column_uses;
 pub mod counts_fold;
 mod element_body;

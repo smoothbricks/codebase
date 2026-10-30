@@ -1,11 +1,13 @@
 //! Service boundary between container operations and VM-owned state.
 //!
-//! HashMap, HashSet and BITMAP operations use this trait for undo logging and
-//! TTL eviction-index maintenance. The VM supplies the implementation;
+//! HashMap, HashSet and BITMAP operations use this trait for undo logging,
+//! TTL eviction-index maintenance and the change feed. The VM supplies the implementation;
 //! [`NoVm`] is the deliberately minimal environment used when those services
 //! are not wired. BITMAP work itself is not a hook: the VM routes a set
 //! opcode on a BITMAP-typed slot to `bitmap_ops` with its own `BitmapEnv`.
 
+use crate::change_feed::Change;
+use crate::key_index::Key;
 use crate::meta::SlotMetaView;
 use columine_types::types::ErrorCode;
 
@@ -149,6 +151,18 @@ pub trait VmHooks {
         meta: &SlotMetaView,
         plan: crate::ttl_plan::TtlBatchPlan,
     );
+
+    /// Whether a write to `slot` records in the change feed now. A kernel
+    /// reads it once per call, before its row loop, and reads a prior value
+    /// only when it is set.
+    fn feed_records(&self, slot: u32) -> bool;
+
+    /// Record one landed change of `slot`'s `key` in the change feed.
+    fn feed_record(&mut self, slot: u32, key: Key, change: Change);
+
+    /// A landed write changed `slot` in a way no key names: the change feed
+    /// treats the whole slot as changed.
+    fn feed_changed_whole(&mut self, slot: u32);
 }
 
 /// Minimal environment with undo and TTL services disabled. Calling an
@@ -162,6 +176,20 @@ pub struct NoVm {
 impl VmHooks for NoVm {
     fn undo_enabled(&self) -> bool {
         false
+    }
+
+    /// No feed is wired: nothing records, so the record services are never
+    /// reached.
+    fn feed_records(&self, _slot: u32) -> bool {
+        false
+    }
+
+    fn feed_record(&mut self, _slot: u32, _key: Key, _change: Change) {
+        unreachable!("the change feed requires the VM")
+    }
+
+    fn feed_changed_whole(&mut self, _slot: u32) {
+        unreachable!("the change feed requires the VM")
     }
 
     fn take_erase_scratch(&mut self) -> EraseScratch {
