@@ -151,6 +151,7 @@ pub fn batch_map_upsert(
     batch_rows!(
         hooks.undo_enabled(),
         meta.has_ttl(),
+        hooks.feed_records(slot_idx),
         upsert_rows(
             strategy, delta_mode, state, meta, slot_idx, cuts, keys, vals, cmp_col, cmp_type,
             hooks,
@@ -158,11 +159,11 @@ pub fn batch_map_upsert(
     )
 }
 
-/// [`batch_map_upsert`]'s row loop; `RECORDING` is the journal's state
-/// and `TTL` the slot's.
+/// [`batch_map_upsert`]'s row loop; `RECORDING` is the journal's state,
+/// `TTL` the slot's and `FEED` whether the change feed records the slot.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn upsert_rows<const RECORDING: bool, const TTL: bool>(
+fn upsert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
     strategy: Strategy,
     delta_mode: bool,
     state: &mut [u8],
@@ -181,7 +182,6 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool>(
     let mut local_size = tbl.size(state);
     let max_load = tbl.max_load();
     let mut flags = BatchFlags::default();
-    let feeds = hooks.feed_records(slot);
 
     for (i, (&key, &val)) in keys.iter().zip(vals).enumerate() {
         let i = i as u32;
@@ -265,7 +265,7 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool>(
         };
         // The prior value the change feed names; an equal rewrite changes
         // nothing a rule binds, so it records nothing.
-        let prior = (feeds && probe.found).then(|| tbl.entry_u32_at(state, probe.pos));
+        let prior = (FEED && probe.found).then(|| tbl.entry_u32_at(state, probe.pos));
         if !probe.found {
             tbl.set_key_at(state, probe.pos, key);
             local_size += 1;
@@ -288,7 +288,7 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool>(
             hooks.consume_ttl_batch_plan(state, meta, plan);
         }
         hooks.finish_capture(delta_mode, state, capture);
-        if feeds && prior != Some(val) {
+        if FEED && prior != Some(val) {
             let change = match prior {
                 Some(old) => Change::Updated(Some(u64::from(old))),
                 None => Change::Inserted,
@@ -353,6 +353,7 @@ pub fn batch_map_remove(
     let result = batch_rows!(
         hooks.undo_enabled(),
         meta.has_ttl(),
+        hooks.feed_records(slot_idx),
         remove_rows(
             delta_mode,
             state,
@@ -370,10 +371,11 @@ pub fn batch_map_remove(
 }
 
 /// [`batch_map_remove`]'s row loop over a checked table; `RECORDING` is the
-/// journal's state and `TTL` the slot's.
+/// journal's state, `TTL` the slot's and `FEED` whether the change feed
+/// records the slot.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn remove_rows<const RECORDING: bool, const TTL: bool>(
+fn remove_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -385,7 +387,6 @@ fn remove_rows<const RECORDING: bool, const TTL: bool>(
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
     let mut flags = BatchFlags::default();
-    let feeds = hooks.feed_records(slot);
     for &key in keys {
         let Some(pos) = tbl.find(state, key) else {
             continue;
@@ -424,7 +425,7 @@ fn remove_rows<const RECORDING: bool, const TTL: bool>(
                 Err(error) => return error,
             }
         };
-        let prior = feeds.then(|| tbl.entry_u32_at(state, pos));
+        let prior = FEED.then(|| tbl.entry_u32_at(state, pos));
         erase_slot_map_planned(state, meta, tbl, &erase);
         let size = tbl.size(state);
         tbl.set_size(state, size - 1);

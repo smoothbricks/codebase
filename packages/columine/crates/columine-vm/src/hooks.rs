@@ -99,18 +99,24 @@ pub enum TtlMutation {
     },
 }
 
-/// Run a batch kernel's row loop `$rows::<RECORDING, TTL>` specialized on
-/// the journal's recording state and the slot's TTL flag, both fixed for
-/// the whole batch: an unrecorded loop carries no capture code, and a loop
-/// over a slot without TTL no planner calls, so neither pays for them per
-/// row in branches or in registers saved around a call.
+/// Run a batch kernel's row loop `$rows::<RECORDING, TTL, FEED>` specialized
+/// on the journal's recording state, the slot's TTL flag and whether the
+/// change feed records the slot, all fixed for the whole batch: an
+/// unrecorded loop carries no capture code, a loop over a slot without TTL
+/// no planner calls, and a loop the feed does not record no prior-value read
+/// or record call, so none pays for them per row in branches or in registers
+/// saved around a call.
 macro_rules! batch_rows {
-    ($recording:expr, $ttl:expr, $rows:ident($($arg:expr),* $(,)?)) => {
-        match ($recording, $ttl) {
-            (true, true) => $rows::<true, true>($($arg),*),
-            (true, false) => $rows::<true, false>($($arg),*),
-            (false, true) => $rows::<false, true>($($arg),*),
-            (false, false) => $rows::<false, false>($($arg),*),
+    ($recording:expr, $ttl:expr, $feed:expr, $rows:ident($($arg:expr),* $(,)?)) => {
+        match ($recording, $ttl, $feed) {
+            (true, true, true) => $rows::<true, true, true>($($arg),*),
+            (true, true, false) => $rows::<true, true, false>($($arg),*),
+            (true, false, true) => $rows::<true, false, true>($($arg),*),
+            (true, false, false) => $rows::<true, false, false>($($arg),*),
+            (false, true, true) => $rows::<false, true, true>($($arg),*),
+            (false, true, false) => $rows::<false, true, false>($($arg),*),
+            (false, false, true) => $rows::<false, false, true>($($arg),*),
+            (false, false, false) => $rows::<false, false, false>($($arg),*),
         }
     };
 }

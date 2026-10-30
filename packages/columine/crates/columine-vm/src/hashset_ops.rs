@@ -39,14 +39,15 @@ pub fn batch_set_insert(
     batch_rows!(
         hooks.undo_enabled(),
         meta.has_ttl(),
+        hooks.feed_records(slot_idx),
         insert_rows(delta_mode, state, meta, slot_idx, elems, ts_col, hooks)
     )
 }
 
-/// [`batch_set_insert`]'s row loop; `RECORDING` is the journal's state
-/// and `TTL` the slot's.
+/// [`batch_set_insert`]'s row loop; `RECORDING` is the journal's state,
+/// `TTL` the slot's and `FEED` whether the change feed records the slot.
 #[inline(always)]
-fn insert_rows<const RECORDING: bool, const TTL: bool>(
+fn insert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -59,7 +60,6 @@ fn insert_rows<const RECORDING: bool, const TTL: bool>(
     let mut local_size = tbl.size(state);
     let max_load = tbl.max_load();
     let mut flags = BatchFlags::default();
-    let feeds = hooks.feed_records(slot);
 
     for (i, &elem) in elems.iter().enumerate() {
         let ts = if TTL {
@@ -131,7 +131,7 @@ fn insert_rows<const RECORDING: bool, const TTL: bool>(
         }
         hooks.finish_capture(delta_mode, state, capture);
         // A TTL refresh of a held member changes nothing a rule binds.
-        if feeds && !probe.found {
+        if FEED && !probe.found {
             hooks.feed_record(slot, Key::one(elem), Change::Inserted);
         }
     }
@@ -169,6 +169,7 @@ pub fn batch_set_remove(
     let result = batch_rows!(
         hooks.undo_enabled(),
         meta.has_ttl(),
+        hooks.feed_records(slot_idx),
         remove_rows(
             delta_mode,
             state,
@@ -185,10 +186,11 @@ pub fn batch_set_remove(
 }
 
 /// [`batch_set_remove`]'s row loop over a checked table; `RECORDING` is the
-/// journal's state and `TTL` the slot's.
+/// journal's state, `TTL` the slot's and `FEED` whether the change feed
+/// records the slot.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn remove_rows<const RECORDING: bool, const TTL: bool>(
+fn remove_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -199,7 +201,6 @@ fn remove_rows<const RECORDING: bool, const TTL: bool>(
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
     let mut flags = BatchFlags::default();
-    let feeds = hooks.feed_records(slot);
     for &elem in elems {
         let Some(pos) = tbl.find(state, elem) else {
             continue;
@@ -245,7 +246,7 @@ fn remove_rows<const RECORDING: bool, const TTL: bool>(
             hooks.consume_ttl_batch_plan(state, meta, plan);
         }
         hooks.finish_capture(delta_mode, state, capture);
-        if feeds {
+        if FEED {
             hooks.feed_record(slot, Key::one(elem), Change::Removed(None));
         }
     }
