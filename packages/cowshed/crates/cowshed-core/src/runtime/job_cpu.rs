@@ -89,18 +89,25 @@ pub fn granted_jobserver_fifo(environment: &BTreeMap<OsString, OsString>) -> Opt
 pub struct InheritedJobserver {
     pub fifo: PathBuf,
     pub tokens: NonZeroUsize,
+    /// Whether the requester runs under a hold on mbx's pool (`MBX_SCHED_DISABLE=1`, what a held
+    /// job and `mbx reserve`'s own command see): the new job's work is covered by that hold, so it
+    /// takes no place in the pool of its own (05_gateway.md "Held jobs").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
 }
 
 /// The jobserver this process inherited from the job that started it, if any: the fifo its
-/// `CARGO_MAKEFLAGS` names beside the count its [`CPU_TOKENS_ENV`] names. The controller runs in
-/// the requester's process (in-process for the CLI and every embedder; `cowshed controller`
-/// inherits its embedder's environment), so a `cowshed exec` from inside a job names its parent's
-/// jobserver, which the new job reads too when its sandbox can open it. A fifo beside no count, or
-/// a count that is no positive count, names nothing.
+/// `CARGO_MAKEFLAGS` names beside the count its [`CPU_TOKENS_ENV`] names, and whether that job runs
+/// under a hold on mbx's pool. The controller runs in the requester's process (in-process for the
+/// CLI and every embedder; `cowshed controller` inherits its embedder's environment), so a
+/// `cowshed exec` from inside a job names its parent's jobserver, which the new job reads too when
+/// its sandbox can open it. A fifo beside no count, or a count that is no positive count, names
+/// nothing.
 pub fn requester_jobserver() -> Option<InheritedJobserver> {
     let fifo = fifo_in_flags(&std::env::var_os("CARGO_MAKEFLAGS")?)?.to_path_buf();
     let tokens = std::env::var(CPU_TOKENS_ENV).ok()?.parse().ok()?;
-    Some(InheritedJobserver { fifo, tokens })
+    let held = std::env::var_os("MBX_SCHED_DISABLE").is_some_and(|value| value == "1");
+    Some(InheritedJobserver { fifo, tokens, held })
 }
 
 /// A job's jobserver: the fifo its command reads, and the count its command and test threads
@@ -184,7 +191,10 @@ impl Drop for Jobserver {
 
 /// The jobserver of an admitted job (05_gateway.md "Parallelism inside a job"): `parent`, the
 /// requester's, when its fifo lies in `directory`, the job's own pool directory that its sandbox
-/// opens, at the lesser of the two counts; or else a fifo of its own there holding `tokens`.
+/// opens, at the lesser of the two counts; or else a fifo of its own there. A fifo of its own holds
+/// `tokens`, or, when the requester runs under a hold on mbx's pool, no more than that hold's
+/// count: the job's work is the hold's, as mbx's own enclosed reservation's is (05_gateway.md
+/// "Held jobs").
 pub(super) fn jobserver(
     tokens: NonZeroUsize,
     directory: PathBuf,
@@ -196,12 +206,18 @@ pub(super) fn jobserver(
             tokens: tokens.min(parent.tokens),
             own: None,
         }),
-        Some(_) | None => Jobserver::make(&directory, tokens).map_err(|error| {
-            CowshedError::cpu_admission(CpuAdmissionRefusal::Jobserver {
-                directory,
-                error: error.to_string(),
+        parent => {
+            let tokens = match parent {
+                Some(parent) if parent.held => tokens.min(parent.tokens),
+                Some(_) | None => tokens,
+            };
+            Jobserver::make(&directory, tokens).map_err(|error| {
+                CowshedError::cpu_admission(CpuAdmissionRefusal::Jobserver {
+                    directory,
+                    error: error.to_string(),
+                })
             })
-        }),
+        }
     }
 }
 
@@ -242,7 +258,13 @@ mod tests {
         assert_eq!(reader.read(&mut bytes).expect("read its tokens"), 3);
 
         let two = NonZeroUsize::new(2).expect("two");
-        let parent = |fifo: PathBuf| Some(InheritedJobserver { fifo, tokens: two });
+        let parent = |fifo: PathBuf| {
+            Some(InheritedJobserver {
+                fifo,
+                tokens: two,
+                held: false,
+            })
+        };
         let shared =
             jobserver(FOUR, directory.clone(), parent(fifo.clone())).expect("the requester's fifo");
         assert_eq!((shared.fifo(), shared.tokens()), (fifo.as_path(), two));
@@ -259,5 +281,29 @@ mod tests {
             !fifo.exists(),
             "a job's own fifo is unlinked when it lets it go"
         );
+    }
+
+    /// A requester under a hold on mbx's pool, its fifo in a pool this job's sandbox cannot open,
+    /// still bounds the job: a fifo of its own holds no more than the hold's count, and one whose
+    /// requester holds nothing holds the job's own count.
+    #[test]
+    fn a_fifo_of_its_own_holds_no_more_than_its_requesters_hold() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "cowshed-jobserver-held",
+        );
+        let two = NonZeroUsize::new(2).expect("two");
+        let requester = |held: bool| {
+            Some(InheritedJobserver {
+                fifo: root.join("other-pool").join("1-0.fifo"),
+                tokens: two,
+                held,
+            })
+        };
+        let enclosed = jobserver(FOUR, root.join("pool"), requester(true)).expect("a fifo");
+        assert_eq!(enclosed.tokens(), two);
+        assert_ne!(enclosed.fifo(), root.join("other-pool").join("1-0.fifo"));
+        let unheld = jobserver(FOUR, root.join("pool"), requester(false)).expect("a fifo");
+        assert_eq!(unheld.tokens(), FOUR);
     }
 }

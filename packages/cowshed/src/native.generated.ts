@@ -300,6 +300,7 @@ export type CoordinatorExecArguments = Pick<
   | 'admissionKey'
   | 'class'
   | 'want'
+  | 'hold'
   | 'scope'
   | 'record'
 >;
@@ -1328,6 +1329,7 @@ export type WorkerExecArguments = Pick<
   | 'admissionKey'
   | 'class'
   | 'want'
+  | 'hold'
   | 'scope'
   | 'record'
 >;

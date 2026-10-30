@@ -274,7 +274,7 @@ fn pipe_error(error: io::Error) -> CowshedError {
 /// A pipe whose ends are both close-on-exec from birth: only an explicit `dup2` or `SCM_RIGHTS`
 /// hands an end to a process. A spawn that inherited an end would hold the job's input or output
 /// open for its own lifetime, and the job's end of stream with it.
-fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+pub(super) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     pipe_with(|| ())
 }
 

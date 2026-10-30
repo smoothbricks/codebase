@@ -374,6 +374,7 @@ impl ControllerRuntime for ActorRuntime {
             admission_key,
             class,
             want,
+            hold,
             scope,
             record,
         } = request;
@@ -407,6 +408,7 @@ impl ControllerRuntime for ActorRuntime {
             admission_key,
             class,
             want,
+            hold,
             scope,
             record,
         };
@@ -4057,6 +4059,7 @@ mod tests {
             admission_key: None,
             class: ExecClass::Background,
             want: None,
+            hold: false,
             scope: ExecScope::Workspace,
             record: JobRecord::Cowshed,
         }

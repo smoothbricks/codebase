@@ -609,11 +609,14 @@ ends — a caller's timeout killing it included — leaves a job nobody waits fo
 `--background` takes none. A `--class resident` command — a daemon or worker that stays up and is idle between requests
 — starts at once and costs nothing while idle (05_gateway.md, "Classes"). Every exec gets a make jobserver of its own,
 `min(--want, cores)` tokens and `cores` when it names no `--want`, which bounds how many compiler and test threads its
-command starts (05_gateway.md, "Parallelism inside a job"); `--want <n>` asks fewer. A `--class interactive` command is
-one its caller waits on: it runs at nice 0, above a gate at +5 and background at +10 (05_gateway.md, "Classes"); a
-workspace may ask for it. A background exec waits to start while the host reports memory pressure (05_gateway.md,
-"Memory pressure"). Every `exec` flag that asks the scheduler for something is a typed field of the API's exec request
-(07_api.md, "CLI and API exec parity"), so an embedding process can ask for everything this command can.
+command starts (05_gateway.md, "Parallelism inside a job"); `--want <n>` asks fewer. In a project with mbx, `--want <n>`
+also declares the job heavy: it stays queued, saying so on its stderr, until the host's pool grants it as many of
+`min(n, cores)` cores as are free, at least one, and holds them for its life (05_gateway.md, "Held jobs"). Name `--want`
+on every build, test suite, Nx run or gate task; a brief command names none. A `--class interactive` command is one its
+caller waits on: it runs at nice 0, above a gate at +5 and background at +10 (05_gateway.md, "Classes"); a workspace may
+ask for it. A background exec waits to start while the host reports memory pressure (05_gateway.md, "Memory pressure").
+Every `exec` flag that asks the scheduler for something is a typed field of the API's exec request (07_api.md, "CLI and
+API exec parity"), so an embedding process can ask for everything this command can.
 
 `--host` names where the command runs, not how it is scheduled. The argv runs once at the host boundary, outside the
 workspace sandbox and without shell activation, from an empty environment filled with the operator's own (07_api.md,

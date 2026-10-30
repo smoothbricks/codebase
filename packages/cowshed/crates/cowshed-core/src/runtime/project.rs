@@ -2571,6 +2571,7 @@ fn exec_request(
             admission_key: params.admission_key,
             class: params.class,
             want: params.want,
+            hold: params.hold,
             scope: params.scope,
             record: params.record,
         },
@@ -6729,6 +6730,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     admission_key: None,
                     class: crate::api::dto::ExecClass::Background,
                     want: Some(std::num::NonZeroUsize::MIN),
+                    hold: false,
                     scope: crate::api::dto::ExecScope::Workspace,
                     record: crate::api::dto::JobRecord::Cowshed,
                 };
@@ -6837,6 +6839,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 admission_key: None,
                 class: crate::api::dto::ExecClass::Background,
                 want: Some(std::num::NonZeroUsize::MIN),
+                hold: false,
                 scope: crate::api::dto::ExecScope::Workspace,
                 record: crate::api::dto::JobRecord::Cowshed,
             };
@@ -20736,6 +20739,7 @@ mod removal_supervisor_tests {
                     admission_key: None,
                     class: crate::api::dto::ExecClass::Background,
                     want: Some(std::num::NonZeroUsize::MIN),
+                    hold: false,
                     scope: crate::api::dto::ExecScope::Workspace,
                     record: crate::api::dto::JobRecord::Cowshed,
                 },
@@ -22279,6 +22283,7 @@ fn land_check_request(check: &str) -> ExecRequest {
         admission_key: None,
         class: crate::api::dto::ExecClass::Gate,
         want: Some(NonZeroUsize::MIN),
+        hold: false,
         scope: crate::api::dto::ExecScope::Workspace,
         record: crate::api::dto::JobRecord::Cowshed,
     }
@@ -22483,6 +22488,7 @@ fn nx_probe_request(
         admission_key: None,
         class,
         want: Some(NonZeroUsize::MIN),
+        hold: false,
         scope: crate::api::dto::ExecScope::Workspace,
         record: crate::api::dto::JobRecord::Cowshed,
     })

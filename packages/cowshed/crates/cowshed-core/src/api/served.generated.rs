@@ -1108,6 +1108,8 @@ impl Serves<CoordinatorExec> for Coordinator {
             #[serde(default)]
             want: Option<NonZeroUsize>,
             #[serde(default)]
+            hold: bool,
+            #[serde(default)]
             scope: ExecScope,
             #[serde(default)]
             record: JobRecord,
@@ -1128,6 +1130,7 @@ impl Serves<CoordinatorExec> for Coordinator {
             admission_key,
             class,
             want,
+            hold,
             scope,
             record,
         } = decode::<CoordinatorExec, Caller>(arguments)?;
@@ -1148,6 +1151,7 @@ impl Serves<CoordinatorExec> for Coordinator {
             admission_key,
             class,
             want,
+            hold,
             scope,
             record,
         })
@@ -1202,6 +1206,8 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             #[serde(default)]
             want: Option<NonZeroUsize>,
             #[serde(default)]
+            hold: bool,
+            #[serde(default)]
             scope: ExecScope,
             #[serde(default)]
             record: JobRecord,
@@ -1220,6 +1226,7 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             admission_key,
             class,
             want,
+            hold,
             scope,
             record,
         } = decode::<WorkerExec, Caller>(arguments)?;
@@ -1240,6 +1247,7 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             admission_key,
             class,
             want,
+            hold,
             scope,
             record,
         })

@@ -287,6 +287,7 @@ fn request(argv: &[&str]) -> ExecRequest {
         admission_key: None,
         class: ExecClass::Background,
         want: None,
+        hold: false,
         scope: ExecScope::Workspace,
         record: JobRecord::Cowshed,
     }

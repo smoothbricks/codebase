@@ -25,8 +25,11 @@ is the host-installed CLI of `packages/cowshed`.
   `gc` to its lead.
 - **cowshed exec**: `cowshed exec <ws> -- <cmd>` runs a build, test or bench as a cowshed job: its class sets the
   priority the kernel schedules it at, and its own jobserver (`--want`, at most one token per core) bounds the compiler
-  and test threads it starts. Work started outside it has neither, so it competes with every job unweighted and
-  unbounded. Host targets that a sandbox can't run (`host-e2e`) use `cowshed exec <ws> --host -- direnv exec . <cmd>`.
+  and test threads it starts. Name `--want <n>` on every build, test suite or Nx run you start: the job then waits its
+  turn in the host's pool and holds what it is granted, up to `n` cores, for its life (specs/cowshed/05_gateway.md,
+  "Held jobs"), so nobody checks the host's load before starting work. Work started outside it has neither, so it
+  competes with every job unweighted and unbounded. Host targets that a sandbox can't run (`host-e2e`) use
+  `cowshed exec <ws> --host -- direnv exec . <cmd>`.
 - **Land**: the land command (see Commands). Under the repository's **land turn** (a FIFO queue per repo, holder named),
   it rebases the shed onto `main`, runs the gate main's `.cowshed.toml` declares (`tooling/land-host.sh --gate`: it
   refuses what the rebased tree adds that no production code reaches (`@smoothbricks/codebase:wiring`), then runs

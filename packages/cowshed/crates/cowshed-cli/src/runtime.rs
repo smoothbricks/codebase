@@ -2550,6 +2550,8 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
             admission_key: None,
             class: args.class,
             want: args.want,
+            // Naming a count declares the job heavy (05_gateway.md "Held jobs").
+            hold: args.want.is_some(),
             scope: args.scope,
             record: cowshed_core::api::JobRecord::Cowshed,
         },
@@ -6099,6 +6101,7 @@ mod tests {
                     admission_key: None,
                     class: cowshed_core::api::ExecClass::Background,
                     want: None,
+                    hold: false,
                     scope: cowshed_core::api::ExecScope::Workspace,
                     record: cowshed_core::api::JobRecord::Cowshed,
                 })

@@ -8223,6 +8223,7 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
             admission_key: None,
             class: cowshed_core::api::ExecClass::Background,
             want: None,
+            hold: false,
             scope: cowshed_core::api::ExecScope::Workspace,
             record: cowshed_core::api::JobRecord::Cowshed,
         })

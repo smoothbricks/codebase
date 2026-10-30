@@ -111,7 +111,7 @@ pub(crate) const TODAY: Policy = Policy {
     rule: Rule::Mbx,
     cpus: CpuLedger::Counted,
     memory: MemoryCharge::Mbx,
-    jobs: JobLedger::Mbx,
+    jobs: JobLedger::Mbx { hold: None },
     gate: Priority::Low,
     grant_latency: MBX_GRANT,
     estimate_spread: 0.0,

@@ -519,6 +519,10 @@ struct ExecWire {
     admission_key: Option<AdmissionKey>,
     class: ExecClass,
     want: Option<NonZeroUsize>,
+    /// Whether the job is held (05_gateway.md "Held jobs"), omitted when it is not, so a supervisor
+    /// built before the field still decodes the call.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    hold: bool,
     scope: ExecScope,
     /// Who keeps the job's record, omitted when cowshed does, so a supervisor built before the
     /// field still decodes the call (11_shell.md, "Caller-owned jobs").
@@ -3109,6 +3113,7 @@ async fn answer(
                 admission_key: request.admission_key,
                 class: request.class,
                 want: request.want,
+                hold: request.hold,
                 scope: request.scope,
                 record: request.record,
             };
@@ -4154,6 +4159,7 @@ async fn forward_exec(
             admission_key: request.admission_key,
             class: request.class,
             want: request.want,
+            hold: request.hold,
             scope: request.scope,
             record: request.record,
             parent_jobserver,
@@ -5865,6 +5871,7 @@ mod held_turn_tests {
                     admission_key: None,
                     class: ExecClass::Background,
                     want: Some(std::num::NonZeroUsize::MIN),
+                    hold: false,
                     scope: ExecScope::Workspace,
                     record: JobRecord::Cowshed,
                 };

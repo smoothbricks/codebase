@@ -1685,10 +1685,10 @@ is a typed operational error and does not change the already-established process
 
 ### Job classes and host scheduling
 
-Every job starts at once at the nice of its class, and the kernel schedules it beside everything else on the host
-(05_gateway.md, "Host scheduling", "Classes"): cowshed never decides whether runnable work runs. On macOS the supervisor
-places the job's first process at its class's nice with `setpriority` and reads it back; on Linux the class's nice
-weighs the job's own cgroup. No job runs under a QoS clamp, `PRIO_DARWIN_BG` or a disk policy below the default: a
+Every job starts at the nice of its class, and the kernel schedules it beside everything else on the host
+(05_gateway.md, "Host scheduling", "Classes"). A job that holds nothing of mbx's pool starts at once. On macOS the
+supervisor places the job's first process at its class's nice with `setpriority` and reads it back; on Linux the class's
+nice weighs the job's own cgroup. No job runs under a QoS clamp, `PRIO_DARWIN_BG` or a disk policy below the default: a
 throttled process that holds the store's filesystem work stalls every process behind it. An ordinary command is
 `background` and runs at nice +10. `--class interactive` names a command someone is waiting on: it runs at its
 supervisor's own nice, ahead of a gate at +5 and background at +10 on a contended core, and a workspace's own capability
@@ -1698,12 +1698,22 @@ with a typed class-not-permitted error before anything runs, and no environment 
 repository take its land turn one at a time, so one gate runs per repository. `--host` runs the command once at the host
 boundary, outside the workspace sandbox, at the class it names; only the trusted route may name `--host`, at any class.
 `--class resident` and `--class interactive-resident` admit a process that stays up between requests, at +10 and at 0;
-an idle resident costs the host nothing.
+an idle resident costs the host nothing and is never held in mbx's pool.
 
 Every job has its own jobserver (05_gateway.md, "Parallelism inside a job"): a fifo with as many slots as the host has
 cores, or `--want <n>` if that is fewer, served by its supervisor and handed to its make, Cargo and test runners through
 `MAKEFLAGS` and `CARGO_MAKEFLAGS`. It bounds how many compiler and test threads one build starts and never waits on
 another job. A `cowshed exec` a job starts in its own workspace shares that job's fifo.
+
+In a project with mbx, `--want <n>` also declares a held job (05_gateway.md, "Held jobs"): it stays `queued` until mbx's
+pool grants it as many of `min(n, cores)` cores as are free, at least one, and holds that grant until it ends. Its
+jobserver, `NX_PARALLEL`, `CARGO_BUILD_JOBS` and test threads hold the granted count, and its own mbx work runs under
+the hold. Its stderr says `cowshed: host admission wait start cpus=<g> priority=<p> ahead=<k>`, once it has waited a
+second `cowshed: host admission queued position=<i> waiters=<w> held_cpus=<c> leases=<l>`, and
+`cowshed: host admission wait done elapsed=<waited> status=ok cpus=<granted>` (or `status=err`). A hold mbx does not
+grant fails the job with `cpuAdmission`. One hold per pool priority of a checkout waits in the pool at a time, so a gate
+never waits behind its own checkout's background job. Name `--want` on every build, test suite or Nx run; a brief
+command names none. A resident, and an exec a held job starts, are never held.
 
 A background job without mbx waits to start while the host reports memory pressure (05_gateway.md, "Memory pressure",
 "Admission"): macOS `kern.memorystatus_vm_pressure_level` at warning or above, Linux `/proc/pressure/memory`

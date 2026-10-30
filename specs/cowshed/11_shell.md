@@ -1599,17 +1599,18 @@ protected terminal record, and its controller commitment.
 ## Job admission and class placement
 
 The supervisor's exec admission records Queued durably before resource admission (05_gateway.md, "Host scheduling"). The
-active mechanism alone decides when a leaf may start: mbx's Cargo admission or external reservation when selected, the
-existing jobserver and background pressure policy otherwise. Resource waits run off the actor path; status and cancel
-remain responsive. **Every exec answers at admission**, foreground, `--background` and API caller alike (07_api.md, "CLI
-and API exec parity"): the answer is the job id while the job is `queued` with class and scope set and `nice` absent, so
-its caller reads the placement from the job's status (`running`, `nice`) and cancels it with kill while it waits. A
-foreground CLI exec therefore holds its job (05_gateway.md, "A job lives with its requester") from admission, not from
-spawn, so a requester killed while its job is queued withdraws it. A refusal after admission — an mbx reserve failure, a
-jobserver fifo that cannot be made, a non-mbx memory pressure that cannot be read, or a class nice that cannot be placed
-— fails the job: `failed`, failure `cpuAdmission` or `priority`, exit the refusal's wrapper code and its cause on the
-job's stderr; the exec call itself succeeded. A Linux job cgroup the delegation cannot place is refused before the
-record, so it fails the exec call itself (07_api.md). Measured 2026-10-19 with the answer at a CPU grant: a
+active mechanism alone decides when a leaf may start: a held job's hold for the whole job when it declared one
+(05_gateway.md, "Held jobs"), mbx's Cargo admission or external reservation when selected, the existing jobserver and
+background pressure policy otherwise. Resource waits run off the actor path; status and cancel remain responsive.
+**Every exec answers at admission**, foreground, `--background` and API caller alike (07_api.md, "CLI and API exec
+parity"): the answer is the job id while the job is `queued` with class and scope set and `nice` absent, so its caller
+reads the placement from the job's status (`running`, `nice`) and cancels it with kill while it waits. A foreground CLI
+exec therefore holds its job (05_gateway.md, "A job lives with its requester") from admission, not from spawn, so a
+requester killed while its job is queued withdraws it. A refusal after admission — an mbx reserve failure, a jobserver
+fifo that cannot be made, a non-mbx memory pressure that cannot be read, or a class nice that cannot be placed — fails
+the job: `failed`, failure `cpuAdmission` or `priority`, exit the refusal's wrapper code and its cause on the job's
+stderr; the exec call itself succeeded. A Linux job cgroup the delegation cannot place is refused before the record, so
+it fails the exec call itself (07_api.md). Measured 2026-10-19 with the answer at a CPU grant: a
 `cowshed exec --background` on a loaded host answered 25 s later, so a queued job had no id to read or cancel. Killing a
 queued job withdraws it and seals Killed without a command. The non-mbx Critical-pressure policy seals an ended job
 `failed`, failure `memory` (05_gateway.md, "Memory pressure"). Detaching (`--background`, `--timeout`,

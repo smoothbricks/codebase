@@ -162,7 +162,8 @@ const SAMPLE_COLUMNS: [&str; 5] = [
 /// The first of [`SAMPLE_COLUMNS`].
 const SAMPLE_COLUMN: usize = ADMISSION_COLUMN + ADMISSION_COLUMNS;
 /// The job's host CPU admission and its owned child's placement, which layout 10 appended after
-/// [`SAMPLE_COLUMNS`] (05_gateway.md "Classes"): the class and the count its jobserver holds, in
+/// [`SAMPLE_COLUMNS`] (05_gateway.md "Classes"): the class and the count it was admitted with,
+/// `min(want, cores)` (a held job's grant from mbx's pool, which may be fewer, is on its stderr), in
 /// every job record; `cpu_wait_ms`, retired; `cpu_tokens`, retired; then the nice its command was
 /// observed at, present only in the terminal record of a job whose command was observed; then the
 /// scope it ran in, present in every job record. Nothing here is inferred for a job that never got

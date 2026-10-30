@@ -201,6 +201,8 @@ pub struct ExecRequest {
                                           // Gate requires trusted coordinator (05_gateway.md "Classes")
     pub want: Option<NonZeroUsize>,       // the job's jobserver count, min(want, cores); None: cores
                                           // (05_gateway.md "Parallelism inside a job")
+    pub hold: bool,                       // with mbx, the job holds up to its count of the host's pool for its
+                                          // life (05_gateway.md "Held jobs"); the CLI's --want sets it
     pub scope: ExecScope,                 // Workspace default; HostGate: coordinator route only, any class
     pub record: JobRecord,                // Cowshed default; Caller: no disk records (11_shell.md "Caller-owned jobs")
 }
@@ -226,7 +228,8 @@ pub enum JobFailure {
     ScriptSyntax,                        // the script did not parse; nothing ran
     SupervisorLost,                      // its supervisor ended without seeing it end (11_shell.md)
     CpuAdmission,                        // its admission failed before its command ran: jobserver fifo not made,
-                                         // memory pressure unreadable; the stderr names the cause
+                                         // memory pressure unreadable, a hold mbx did not grant; the stderr names
+                                         // the cause
     Priority,                            // its class nice could not be placed; its command never ran
     Memory,                              // ended at macOS Critical memory pressure (05_gateway.md "Memory pressure")
     Unlaunched,                          // anything else kept its command from launching
@@ -1510,14 +1513,14 @@ supervisor that ran the job retires.
   `{kind:"exited",code:2}`, diagnostic on stderr), `"supervisorLost"` in the terminal record the next supervisor seals
   for a job its lost predecessor never saw end (11_shell.md), `"memory"` for a background or resident job ended at macOS
   Critical memory pressure (05_gateway.md "Memory pressure"), and, for a job whose command never ran, `"cpuAdmission"`
-  or `"priority"` (its jobserver fifo or memory-pressure read, or its class nice, failed) or `"unlaunched"` (anything
-  else kept the command from launching: a program, `#!` interpreter or `env` name proven absent, a held child refused
-  before its exec, a host that could not start it). A never-launched job's exit is the refusal's wrapper code; a host
-  process it owned meanwhile does not make its command one that ran, so `failure`, never a `pid` or a sample, says it
-  never ran. The one exception keeps its own shape: a cold activation that itself fails ends the job with the
-  activation's status and no `failure` (11_shell.md, "Activation belongs to the job that waited on it"). Protected Arrow
-  stores a script in the `argv` column as the two arguments `\0script` and the script's JSON, a pair no argv can
-  produce. Every element of `argv` is the exact tagged `CommandArg` object
+  or `"priority"` (its jobserver fifo, memory-pressure read or held job's grant, or its class nice, failed) or
+  `"unlaunched"` (anything else kept the command from launching: a program, `#!` interpreter or `env` name proven
+  absent, a held child refused before its exec, a host that could not start it). A never-launched job's exit is the
+  refusal's wrapper code; a host process it owned meanwhile does not make its command one that ran, so `failure`, never
+  a `pid` or a sample, says it never ran. The one exception keeps its own shape: a cold activation that itself fails
+  ends the job with the activation's status and no `failure` (11_shell.md, "Activation belongs to the job that waited on
+  it"). Protected Arrow stores a script in the `argv` column as the two arguments `\0script` and the script's JSON, a
+  pair no argv can produce. Every element of `argv` is the exact tagged `CommandArg` object
   `{encoding:"utf8",data:String} | {encoding:"base64",data:String}`. Serialization selects `utf8` if and only if the
   Unix argument bytes are valid UTF-8; otherwise it emits canonical standard base64. The controller's request decoder
   denies unknown fields; a result reader projects them (Reader projection). Every decoder denies unknown encodings and
@@ -2105,9 +2108,9 @@ identity because it cannot reach the command. The existing Arrow record proof co
 unrecorded private map is retained to make a repeat work.
 
 JobInfo and SealedJob expose admitted class/scope and observed nice (absent before placement, and always on Linux, where
-the class cgroup places the job). CowshedError carries typed cpuAdmission (a jobserver fifo not made or a memory
-pressure not read) and priority (actual pid, requested/observed nice and errno). A failed or absent observation is never
-fabricated.
+the class cgroup places the job). CowshedError carries typed cpuAdmission (a jobserver fifo not made, a memory pressure
+not read, or a hold mbx's pool did not grant) and priority (actual pid, requested/observed nice and errno). A failed or
+absent observation is never fabricated.
 
 Records now use layout14: layout13's columns remain an exact prefix, followed by the nullable boolean
 retirement_outlived_incomplete marker. Layout13 appended the nullable retirement_containment and retirement_outlived
@@ -2137,7 +2140,7 @@ is one typed field of the same request, decoded by the same validation (`JobSche
 | `--session <name>`                                                        | `WorkspaceHandle::shell(Some(name))`, then `Session::run`         | `shell(name)`, then `session.exec`                        |
 | `--stdout-copy`, `--stderr-copy`                                          | `stdout_copy`, `stderr_copy`                                      | `stdoutCopy`, `stderrCopy`                                |
 | `--replace-output`                                                        | `PublicationPolicy::Replace`                                      | `policy: 'replace'`                                       |
-| `--want <n>`                                                              | `want: Option<NonZeroUsize>`                                      | `want`                                                    |
+| `--want <n>`                                                              | `want: Option<NonZeroUsize>` and `hold: true`                     | `want` and `hold: true`                                   |
 | `--class <background\|interactive\|gate\|resident\|interactive-resident>` | `class: ExecClass`                                                | `class`                                                   |
 | `--host`                                                                  | `scope: ExecScope::HostGate`                                      | `scope: 'hostGate'`                                       |
 | `--background`                                                            | every exec answers its `JobHandle` at admission                   | the same                                                  |

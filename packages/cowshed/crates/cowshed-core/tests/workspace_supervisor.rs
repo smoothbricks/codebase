@@ -743,6 +743,7 @@ fn request(stdin: StdinSource) -> ExecRequest {
         admission_key: None,
         class: ExecClass::Background,
         want: None,
+        hold: false,
         scope: ExecScope::Workspace,
         record: JobRecord::Cowshed,
     }
@@ -1709,6 +1710,660 @@ async fn a_background_start_waits_for_the_reported_drop_and_a_gate_does_not() {
             && stderr.contains("cowshed: jobserver wait done elapsed=")
             && stderr.ends_with(" status=ok\n"),
         "{stderr}"
+    );
+}
+
+/// The program `TestMbx` installs as the host's `mbx`, answering the verbs a supervisor runs. It
+/// starts with no `PATH`, so it runs shell builtins alone. A `reserve` appends what it does to
+/// `$HOME/mbx.log` and says it on `$HOME/events`, naming its own pid when it starts; it takes the
+/// pool's answer from `$HOME/answers`, a count of cores to grant or `refuse`, and once granted
+/// runs its command with the count in `MBX_RESERVE_CPUS`, as `mbx reserve` does (05_gateway.md,
+/// "Held jobs"). Every refusal it makes is named on its stderr, never a silent exit
+/// (08_testing.md, "Fixtures").
+const TEST_MBX: &str = r#"#!/bin/sh
+say() {
+  printf '%s\n' "$*" >> "$HOME/mbx.log"
+  printf '%s\n' "$*" 1<>"$HOME/events"
+}
+case "$1" in
+settings) exit 0 ;;
+stats)
+  printf '{"version":2,"scheduler":{"activity":[]}}\n'
+  exit 0
+  ;;
+reserve) shift ;;
+*)
+  printf 'mbx test double: no verb %s\n' "$1" >&2
+  exit 64
+  ;;
+esac
+cpus=
+priority=
+while :; do
+  case "$1" in
+  --cpus) cpus=$2; shift 2 ;;
+  --priority) priority=$2; shift 2 ;;
+  --) shift; break ;;
+  *)
+    printf 'mbx test double: no option %s\n' "$1" >&2
+    exit 64
+    ;;
+  esac
+done
+say "reserve cpus=$cpus priority=$priority scheduler=$MBX_SCHEDULER pid=$$"
+read -r answer < "$HOME/answers" || {
+  printf 'mbx test double: no answer arrived on %s/answers\n' "$HOME" >&2
+  exit 70
+}
+if [ "$answer" = refuse ]; then
+  printf 'mbx: pool refused the hold\n' >&2
+  say refused
+  exit 3
+fi
+say "granted $answer of $cpus"
+MBX_RESERVE_CPUS=$answer "$@"
+say "released $answer"
+"#;
+
+/// A FIFO of the held-exec test whose two ends the test holds: what it reads never ends with a
+/// writer's close, and what it writes is never lost to a reader that has not opened yet. Its reads
+/// are nonblocking and asynchronous, so a wait the test drops leaves no blocking thread behind
+/// (08_testing.md, "Fixtures").
+struct Fifo {
+    reader: tokio::io::BufReader<tokio::net::unix::pipe::Receiver>,
+    writer: tokio::net::unix::pipe::Sender,
+}
+
+impl Fifo {
+    fn make(path: &Path) -> Self {
+        use tokio::net::unix::pipe::OpenOptions;
+
+        let name =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a FIFO path without NUL");
+        // SAFETY: `name` is a NUL-terminated path that outlives the call.
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        let reader = OpenOptions::new()
+            .open_receiver(path)
+            .expect("open the FIFO to read");
+        // A reader is open, so the writer's open cannot fail for want of one.
+        let writer = OpenOptions::new()
+            .open_sender(path)
+            .expect("open the FIFO to write");
+        Self {
+            reader: tokio::io::BufReader::new(reader),
+            writer,
+        }
+    }
+
+    /// Writes `line`, newline-terminated.
+    async fn write_line(&mut self, line: impl std::fmt::Display) {
+        use tokio::io::AsyncWriteExt as _;
+
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write the FIFO");
+    }
+
+    /// The next line, without its newline.
+    async fn read_line(&mut self) -> String {
+        use tokio::io::AsyncBufReadExt as _;
+
+        let mut line = String::new();
+        self.reader
+            .read_line(&mut line)
+            .await
+            .expect("read the FIFO");
+        assert!(line.ends_with('\n'), "the FIFO ended inside {line:?}");
+        line.pop();
+        line
+    }
+}
+
+/// The mbx of a held-exec test: `TEST_MBX` installed as the host's, with the Cargo route that makes
+/// a Cargo checkout an mbx project, so that capability detection finds mbx active and an exec that
+/// names `want` is a held job (05_gateway.md, "Held jobs"). The test gives the program its
+/// `answers` and hears what it does as `events`; the program's own log is its record.
+struct TestMbx {
+    home: PathBuf,
+    answers: Fifo,
+    events: Fifo,
+    /// What the test has heard, in order.
+    heard: Vec<String>,
+}
+
+impl TestMbx {
+    /// Installs the program under `config`'s HOME and gives its workspace the `Cargo.toml` that
+    /// makes detection find mbx there. Detection reads these files at every admission, so the
+    /// capabilities a test sets by hand would not outlast the first exec.
+    fn install(config: &mut WorkspaceSupervisorConfig) -> Self {
+        use cowshed_core::capabilities::{CapabilityId, mbx};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = config.sandbox.home.clone();
+        let program = mbx::host_link(&home);
+        let route = mbx::cargo_route(&home);
+        let shim = route.join("cargo");
+        std::fs::create_dir_all(program.parent().expect("the host link has a directory"))
+            .expect("the host's bin directory");
+        std::fs::create_dir_all(&route).expect("the Cargo route's directory");
+        for (path, text) in [(&program, TEST_MBX), (&shim, "#!/bin/sh\nexit 0\n")] {
+            std::fs::write(path, text).expect("an installed program");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("an executable program");
+        }
+        // The route names the executable it was generated for: the installed mbx, as it resolves.
+        std::fs::write(
+            route.join("mbx-target"),
+            std::fs::canonicalize(&program)
+                .expect("the installed mbx resolves")
+                .as_os_str()
+                .as_bytes(),
+        )
+        .expect("the route's sidecar");
+        std::fs::write(
+            config.workspace_root.join("Cargo.toml"),
+            "[package]\nname = \"held\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("the checkout's manifest");
+        config
+            .sandbox
+            .configure_capabilities()
+            .expect("detect capabilities");
+        assert!(
+            config
+                .sandbox
+                .capabilities
+                .active
+                .contains(&CapabilityId::Mbx),
+            "the fixture makes the checkout an mbx project: {:?}",
+            config.sandbox.capabilities.active
+        );
+        Self {
+            answers: Fifo::make(&home.join("answers")),
+            events: Fifo::make(&home.join("events")),
+            home,
+            heard: Vec::new(),
+        }
+    }
+
+    /// Answers the `reserve` that waits for the pool: a count of cores to grant, or `refuse`.
+    async fn answer(&mut self, answer: impl std::fmt::Display) {
+        self.answers.write_line(answer).await;
+    }
+
+    /// The program's next event, unless `job` ends first. A hold that cannot run fails its job, so
+    /// the wait also watches `job` and reports that failure instead of waiting on a program that
+    /// never speaks (08_testing.md, "Fixtures"); `waiting_for` names the event for that report.
+    async fn next_unless_ended(&mut self, h: &Harness, job: JobId, waiting_for: &str) -> String {
+        tokio::select! {
+            said = self.events.read_line() => said,
+            ended = h.handle.ended(job) => {
+                let state = ended.expect("the job's outcome").state;
+                let stderr = stderr_of(&h.handle, job).await;
+                panic!("job {job:?} ended {state:?} before mbx said {waiting_for:?}: {stderr}")
+            }
+        }
+    }
+
+    /// Waits for the program's next event, which must be `expected`, unless `job` ends first.
+    async fn hear_unless_ended(&mut self, h: &Harness, job: JobId, expected: &str) {
+        let said = self.next_unless_ended(h, job, expected).await;
+        self.record(said, expected);
+    }
+
+    /// Waits for the program's `reserve` of `cpus` cores at the background priority, unless `job`
+    /// ends first, and answers the pid it names: the `mbx` the supervisor started for the hold.
+    async fn hear_reserve(&mut self, h: &Harness, job: JobId, cpus: usize) -> i32 {
+        let prefix = format!("reserve cpus={cpus} priority=low scheduler=1 pid=");
+        let said = self
+            .next_unless_ended(h, job, &format!("{prefix}<pid>"))
+            .await;
+        let pid = said
+            .strip_prefix(&prefix)
+            .and_then(|pid| pid.parse::<i32>().ok())
+            .unwrap_or_else(|| panic!("the test mbx's next event is {said:?}, not {prefix}<pid>"));
+        self.heard.push(said);
+        pid
+    }
+
+    /// Waits for the program's next event, which must be `expected`: one that comes with or after
+    /// its job's end, which a watch on the job would take for a failure.
+    async fn hear(&mut self, expected: &str) {
+        let said = self.events.read_line().await;
+        self.record(said, expected);
+    }
+
+    fn record(&mut self, said: String, expected: &str) {
+        assert_eq!(said, expected, "the test mbx's next event");
+        self.heard.push(said);
+    }
+
+    /// Every line the program logged, in order.
+    fn log(&self) -> Vec<String> {
+        std::fs::read_to_string(self.home.join("mbx.log"))
+            .expect("the test mbx's log")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// What `job`, which has ended, wrote on its stderr.
+async fn stderr_of(handle: &WorkspaceSupervisorHandle, job: JobId) -> String {
+    String::from_utf8_lossy(&read_all(handle, job, StreamKind::Stderr).await).into_owned()
+}
+
+/// Every job of `jobs` is `queued` and nothing has spawned. Each status is a round trip through
+/// the supervisor's actor, so whatever was asked before it has been carried out.
+async fn queued_without_spawn(h: &mut Harness, jobs: &[JobId]) {
+    for &job in jobs {
+        let state = h.handle.info(job).await.unwrap().state;
+        assert_eq!(state, JobState::Queued, "job {job:?} waits for its grant");
+    }
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "nothing spawns before its grant"
+    );
+}
+
+/// An exec that declares a hold of `want` cores in a project with mbx: a held job (05_gateway.md
+/// "Held jobs", "Declaration"). A `want` alone declares none.
+fn held(want: usize) -> ExecRequest {
+    ExecRequest {
+        want: NonZeroUsize::new(want),
+        hold: true,
+        ..request(StdinSource::Empty)
+    }
+}
+
+/// The cores a hold of `want` asks mbx for: its count, held to the host's (05_gateway.md,
+/// "Parallelism inside a job").
+fn asked(want: usize) -> usize {
+    want.min(cowshed_core::runtime::job_cpu::host_cores().get())
+}
+
+/// Waits for the process `pid` to exit, on the kernel's report of its exit (the supervisor's own
+/// exit watch: kqueue `NOTE_EXIT`, a pidfd) rather than a poll of the process table. A process the
+/// kernel already reports gone (`ESRCH`) has exited: the wait is over at once (08_testing.md,
+/// "Fixtures").
+async fn exited(pid: i32) {
+    use cowshed_core::runtime::job_groups::Process;
+
+    let Some(process) = Process::observe(pid).expect("observe the process") else {
+        return;
+    };
+    process
+        .exit()
+        .expect("watch the process's exit")
+        .observed()
+        .await
+        .expect("the process's exit");
+}
+
+/// The spawn of `job`, which an exec that declares no hold gets at once: by the time a round trip
+/// behind its admission answers, its status is no longer `queued`.
+async fn spawned_at_once(h: &mut Harness, job: JobId) -> Spawned {
+    let state = h.handle.info(job).await.unwrap().state;
+    assert_ne!(
+        state,
+        JobState::Queued,
+        "job {job:?} waits for a grant it never declared"
+    );
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(spawned.request.job_id, job, "the spawn is the job's own");
+    spawned
+}
+
+/// `spawned` exits with status 0 and its job concludes `exited`.
+async fn finish(h: &Harness, spawned: &Spawned) {
+    complete(spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let ended = h.handle.wait(spawned.request.job_id).await.unwrap();
+    assert_eq!(ended.state, JobState::Exited);
+}
+
+/// A held job waits in mbx's pool for its grant and runs on the cores it is granted (05_gateway.md
+/// "Held jobs"; 11_shell.md "Job admission and class placement"), driven through a workspace
+/// supervisor whose installed mbx is a test's program ("Required scheduling evidence"): an exec
+/// that declares a hold stays `queued` and spawns nothing until its hold prints a count, then
+/// spawns on that count; a second held exec of the same checkout and priority starts its
+/// `mbx reserve` only once the first is granted; a job's end closes its hold; and a hold that
+/// ends without a count fails its job `cpuAdmission`. An unheld exec of the same checkout reserves
+/// nothing and starts at once, even while a hold of its checkout waits in the pool.
+#[tokio::test]
+async fn a_held_exec_waits_for_its_grant() {
+    let (mut supervisor_config, _root) =
+        isolated_config(&temp_parent::scratch_parent(), "held-exec");
+    let mut mbx = TestMbx::install(&mut supervisor_config);
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    // A hold asks for `min(want, cores)` and mbx grants as many as are free, so on any host the
+    // first job is granted about half of what it asked and the second all of it.
+    let (asked_a, asked_b, asked_c) = (asked(4), asked(3), asked(2));
+    let (granted_a, granted_b) = (asked_a.div_ceil(2), asked_b);
+
+    // A held exec's hold waits in the pool, and until mbx grants it the job is queued.
+    let a = h
+        .handle
+        .exec(None, None, held(4), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    mbx.hear_reserve(&h, a, asked_a).await;
+    queued_without_spawn(&mut h, &[a]).await;
+
+    // A second held exec of the same checkout and priority, asked before the first is granted,
+    // waits behind it: its `mbx reserve` has not started.
+    let b = h
+        .handle
+        .exec(None, None, held(3), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    queued_without_spawn(&mut h, &[a, b]).await;
+
+    // The grant spawns the job on the count granted, not the count asked, under its hold.
+    mbx.answer(granted_a).await;
+    mbx.hear_unless_ended(&h, a, &format!("granted {granted_a} of {asked_a}"))
+        .await;
+    let first = h.spawned.recv().await.unwrap();
+    assert_eq!(first.request.job_id, a, "the first hold's job spawns first");
+    assert_eq!(
+        first.request.cpu.tokens.get(),
+        granted_a,
+        "the job runs on the count granted"
+    );
+    assert!(first.request.cpu.held, "its tree runs under its hold");
+
+    // Only now does the second hold reach the pool, and it is granted as the first was.
+    mbx.hear_reserve(&h, b, asked_b).await;
+    queued_without_spawn(&mut h, &[b]).await;
+    mbx.answer(granted_b).await;
+    mbx.hear_unless_ended(&h, b, &format!("granted {granted_b} of {asked_b}"))
+        .await;
+    let second = h.spawned.recv().await.unwrap();
+    assert_eq!(second.request.job_id, b);
+    assert_eq!(second.request.cpu.tokens.get(), granted_b);
+    assert!(second.request.cpu.held);
+
+    // A job's end closes its hold: the held command ends and mbx releases.
+    complete(&first, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(h.handle.wait(a).await.unwrap().state, JobState::Exited);
+    mbx.hear(&format!("released {granted_a}")).await;
+    let stderr = stderr_of(&h.handle, a).await;
+    assert!(
+        stderr.contains(&format!(
+            "cowshed: host admission wait start cpus={asked_a} priority=low ahead=0\n"
+        )) && stderr.contains("cowshed: host admission wait done elapsed=")
+            && stderr.contains(&format!(" status=ok cpus={granted_a}\n")),
+        "{stderr}"
+    );
+
+    // A hold that ends without a count fails its job before its command. An exec that declares no
+    // hold is unheld: it reserves nothing and spawns at once, though a hold of its checkout waits
+    // in the pool.
+    let c = h
+        .handle
+        .exec(None, None, held(2), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    mbx.hear_reserve(&h, c, asked_c).await;
+    queued_without_spawn(&mut h, &[c]).await;
+    let u = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let unheld = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        unheld.request.job_id, u,
+        "an unheld exec starts beside a hold"
+    );
+    assert!(!unheld.request.cpu.held, "an unheld job runs under no hold");
+    mbx.answer("refuse").await;
+    mbx.hear("refused").await;
+    let refused = h.handle.wait(c).await.unwrap();
+    assert_eq!(
+        (refused.state, refused.failure),
+        (JobState::Failed, Some(JobFailure::CpuAdmission))
+    );
+    let stderr = stderr_of(&h.handle, c).await;
+    assert!(
+        stderr.contains("mbx: pool refused the hold") && stderr.contains(" status=err"),
+        "{stderr}"
+    );
+    complete(&unheld, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(h.handle.wait(u).await.unwrap().state, JobState::Exited);
+
+    // The second job ends too, and the program logged nothing the test did not wait for: no
+    // reserve for the unheld exec.
+    complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(h.handle.wait(b).await.unwrap().state, JobState::Exited);
+    mbx.hear(&format!("released {granted_b}")).await;
+    let stderr = stderr_of(&h.handle, b).await;
+    assert!(
+        stderr.contains(&format!(
+            "cowshed: host admission wait start cpus={asked_b} priority=low ahead=1\n"
+        )) && stderr.contains(&format!(" status=ok cpus={granted_b}\n")),
+        "{stderr}"
+    );
+    assert_eq!(
+        mbx.log(),
+        mbx.heard,
+        "the program logged exactly what the test heard"
+    );
+}
+
+/// Only an exec that declares a hold waits for a grant (05_gateway.md "Held jobs", "Declaration"):
+/// while a held job's hold waits in the pool, an internal job that names a count for its jobserver
+/// alone, a resident that declares a hold and a nested exec of a held requester each spawn at once
+/// and reserve nothing. The nested exec runs under its requester's hold, on the requester's
+/// jobserver when that lies in the checkout's pool directory, and on one of its own, held to the
+/// requester's count, when it does not.
+#[tokio::test]
+async fn an_exec_that_is_not_a_held_job_starts_at_once_and_reserves_nothing() {
+    use cowshed_core::runtime::job_cpu::{InheritedJobserver, cpu_pool_directory};
+
+    let (mut supervisor_config, _root) =
+        isolated_config(&temp_parent::scratch_parent(), "held-declaration");
+    let mut mbx = TestMbx::install(&mut supervisor_config);
+    let pool = cpu_pool_directory(
+        &supervisor_config.sandbox.store_root,
+        &supervisor_config.authority.workspace_incarnation,
+    );
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let asked_hold = asked(2);
+
+    // A held job's hold waits in the pool while the others start.
+    let waiting = h
+        .handle
+        .exec(None, None, held(2), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    mbx.hear_reserve(&h, waiting, asked_hold).await;
+    queued_without_spawn(&mut h, &[waiting]).await;
+
+    // An internal job names a count for its jobserver alone and declares no hold: it starts on that
+    // count, beside the waiting hold.
+    let internal = h
+        .handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                want: NonZeroUsize::new(1),
+                ..request(StdinSource::Empty)
+            },
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let brief = spawned_at_once(&mut h, internal).await;
+    assert_eq!(brief.request.cpu.tokens.get(), 1);
+    assert!(
+        !brief.request.cpu.held,
+        "an internal job runs under no hold"
+    );
+
+    // A resident idles between requests, so a hold would keep its cores while it does: it is never
+    // held, whatever it declares.
+    let resident = h
+        .handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                class: ExecClass::Resident,
+                ..held(2)
+            },
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let idle = spawned_at_once(&mut h, resident).await;
+    assert!(!idle.request.cpu.held, "a resident runs under no hold");
+
+    // A nested exec is covered by its requester's hold: it reads its requester's jobserver, runs
+    // under that hold, and takes no place in the pool of its own.
+    let requester = InheritedJobserver {
+        fifo: pool.join("requester.fifo"),
+        tokens: NonZeroUsize::new(4).unwrap(),
+        held: true,
+    };
+    let nested = h
+        .handle
+        .exec_from(
+            None,
+            None,
+            held(2),
+            AdmissionSource::Worker,
+            Some(requester.clone()),
+        )
+        .await
+        .unwrap();
+    let covered = spawned_at_once(&mut h, nested).await;
+    assert_eq!(covered.request.cpu.fifo, requester.fifo);
+    assert_eq!(
+        covered.request.cpu.tokens.get(),
+        asked(2).min(requester.tokens.get())
+    );
+    assert!(
+        covered.request.cpu.held,
+        "a nested exec runs under its requester's hold"
+    );
+
+    // A requester whose jobserver lies outside the pool directory is none the job's sandbox opens:
+    // the job makes a fifo of its own, held to the count of the hold it runs under.
+    let outside = InheritedJobserver {
+        fifo: pool
+            .with_file_name("another-workspace")
+            .join("requester.fifo"),
+        tokens: NonZeroUsize::new(2).unwrap(),
+        held: true,
+    };
+    let outsider = h
+        .handle
+        .exec_from(
+            None,
+            None,
+            held(4),
+            AdmissionSource::Worker,
+            Some(outside.clone()),
+        )
+        .await
+        .unwrap();
+    let sized = spawned_at_once(&mut h, outsider).await;
+    assert_ne!(sized.request.cpu.fifo, outside.fifo);
+    assert_eq!(
+        sized.request.cpu.tokens.get(),
+        asked(4).min(outside.tokens.get())
+    );
+    assert!(
+        sized.request.cpu.held,
+        "a nested exec runs under its requester's hold"
+    );
+
+    // The hold that waited waits still, and is answered as it asks: nothing else reserved.
+    queued_without_spawn(&mut h, &[waiting]).await;
+    mbx.answer(1).await;
+    mbx.hear_unless_ended(&h, waiting, &format!("granted 1 of {asked_hold}"))
+        .await;
+    let held_job = h.spawned.recv().await.unwrap();
+    assert_eq!(held_job.request.job_id, waiting);
+    assert_eq!(held_job.request.cpu.tokens.get(), 1);
+    assert!(held_job.request.cpu.held);
+    for spawned in [&brief, &idle, &covered, &sized, &held_job] {
+        finish(&h, spawned).await;
+    }
+    mbx.hear("released 1").await;
+    assert_eq!(
+        mbx.log(),
+        mbx.heard,
+        "the program logged exactly what the test heard"
+    );
+}
+
+/// A job withdrawn while its hold waits in the pool ends `killed` without a command, and its hold's
+/// process group is killed, which gives back its place in the pool's queue (05_gateway.md "Held
+/// jobs"): the next held exec of the checkout reserves in its place and is answered once the killed
+/// reserve is gone, on the kernel's report of its exit, so the answer can only be that job's own.
+#[tokio::test]
+async fn a_held_exec_killed_while_its_hold_waits_gives_back_its_place() {
+    let (mut supervisor_config, _root) =
+        isolated_config(&temp_parent::scratch_parent(), "held-withdrawal");
+    let mut mbx = TestMbx::install(&mut supervisor_config);
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    // The two holds ask for different counts, so the program's line also names whose reserve took
+    // the answer.
+    let (asked_killed, asked_next) = (asked(3), asked(1));
+
+    let killed = h
+        .handle
+        .exec(None, None, held(3), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    let killed_pid = mbx.hear_reserve(&h, killed, asked_killed).await;
+    let next = h
+        .handle
+        .exec(None, None, held(1), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    queued_without_spawn(&mut h, &[killed, next]).await;
+
+    // Withdrawn while its hold waits, the first job ends without a command.
+    h.handle.kill(killed).await.unwrap();
+    assert_eq!(h.handle.wait(killed).await.unwrap().state, JobState::Killed);
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "a withdrawn job spawns nothing"
+    );
+
+    // The second hold enters the pool in its place. The answer is written only once the killed
+    // reserve is gone, on the kernel's report of its exit, so it can only be the second's own.
+    mbx.hear_reserve(&h, next, asked_next).await;
+    exited(killed_pid).await;
+    mbx.answer(1).await;
+    mbx.hear_unless_ended(&h, next, &format!("granted 1 of {asked_next}"))
+        .await;
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(spawned.request.job_id, next);
+    assert_eq!(spawned.request.cpu.tokens.get(), 1);
+    assert!(spawned.request.cpu.held);
+    finish(&h, &spawned).await;
+    mbx.hear("released 1").await;
+    assert_eq!(
+        mbx.log(),
+        mbx.heard,
+        "the program logged exactly what the test heard"
     );
 }
 

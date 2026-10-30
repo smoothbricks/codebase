@@ -1314,7 +1314,9 @@ detaches it.
 The kernel schedules runnable threads and their I/O. Resource admission has one authority: with mbx present on the host,
 mbx's machine-wide pool is the CPU and measured-memory ledger; without it, cowshed's existing mechanism is unchanged:
 per-job jobservers and the Nx/bounded-exec cpu-pool, not a host token ledger. Class placement still tells the kernel
-whose runnable threads take precedence ("Classes"). The owner's ruling, 2026-10-27, selects this boundary.
+whose runnable threads take precedence ("Classes"). The owner's ruling, 2026-10-27, selects this boundary. A job that
+declares its parallelism is admitted against that same pool as one hold for its life ("Held jobs"); that is no second
+ledger.
 
 ### Pool selection and revision
 
@@ -1478,23 +1480,30 @@ A workspace supervisor's admission is one state machine, `cowshed-core`'s `runti
 file or kernel of its own. The supervisor feeds it events, each stamped with the instant it observed, and carries out
 the effects it answers, in order.
 
-- **States.** A job is `queued` until the host's pressure is known, `waiting` while memory pressure holds it, `admitted`
-  once it may start, `running` from its first process's dispatch, `ending for memory` once Critical pressure chose it,
-  and concluded when it ends, which takes it out of the ledger.
-- **Events.** A start request (job, class, and whether the project has the mbx capability), a pressure report, a spawn,
-  a cancel and a job's end. A cancel removes a `queued` or `waiting` job at once; an admitted one leaves at its end.
-- **Effects.** Admit (make the jobserver and spawn), the wait's start and end lines, refuse (`cpuAdmission`, an
-  unreadable host) and end for memory.
+- **States.** A job is `queued` until the host's pressure is known, `waiting` while memory pressure holds it, `pending`
+  while a held job of its own checkout and pool priority waits in mbx's pool ahead of it, `holding` while its own hold
+  waits there ("Held jobs"), `admitted` once it may start, `running` from its first process's dispatch,
+  `ending for memory` once Critical pressure chose it, and concluded when it ends, which takes it out of the ledger.
+- **Events.** A start request (job, class, and its ledger: the jobservers, or mbx with the job's hold, its declared
+  count or none), a pressure report, a hold's grant, a hold's refusal, a spawn, a cancel and a job's end. A cancel
+  removes a `queued`, `waiting`, `pending` or `holding` job at once; an admitted one leaves at its end.
+- **Effects.** Admit (make the jobserver and spawn), reserve (start the job's hold in mbx's pool), release (end it), the
+  memory wait's and the host-admission wait's start and end lines, refuse (`cpuAdmission`: an unreadable host, or a hold
+  mbx did not grant) and end for memory. A job that reserved is released exactly once, when it leaves the ledger.
 
 The policy it holds:
 
 - **Gate before background.** A gate, interactive work and residents are admitted at once whatever the host reports, and
-  are never ended for memory; only a background start waits. With mbx every class is admitted at once, and mbx's pool
-  orders the work by priority: `normal` for a gate, `low` for everything else ("Classes").
-- **Fairness between checkouts.** Each supervisor's ledger holds its own checkout's jobs; no job waits on another job's
-  tokens, so there is no cross-checkout queue to order. A drop in pressure releases every waiter of every supervisor
-  that hears it, oldest first within each. Contended CPU is shared by the kernel's class weights; with mbx, across
-  checkouts, by mbx's one pool, which admits each compile and test.
+  are never ended for memory; only a background start waits. With mbx an unheld job of every class is admitted at once,
+  and mbx's pool orders its leaves by priority: `normal` for a gate, `low` for everything else ("Classes"). A held job's
+  hold carries the same priority, so a gate's hold passes every waiting background hold, and a checkout's gate never
+  queues behind its own background holds: each pool priority is a lane of its own.
+- **Fairness between checkouts.** An unheld job waits on no other job's tokens, so cowshed has no cross-checkout queue
+  to order for it. A drop in pressure releases every waiter of every supervisor that hears it, oldest first within each.
+  Contended CPU is shared by the kernel's class weights; with mbx, across checkouts, by mbx's one pool, which admits
+  each compile and test. Held jobs queue in that pool: each supervisor keeps its held jobs in request order per lane and
+  lets one per lane wait there at a time, so a checkout that submits twenty jobs holds one place in mbx's queue and
+  checkouts take turns in ticket order.
 - **Long holders.** A job's jobserver holds its own constant count `g`, never a share of a host ledger, so a grant made
   on an idle host cannot hold a later start, however long its holder runs. This closes the 2026-10-19 hole, in which a
   grant made while the host was idle never shrank, for cowshed's ledger in both modes (enforced by
@@ -1504,7 +1513,8 @@ The policy it holds:
   inside a job"), holds its grant, at most `--cpus g`, until the leaf concludes ("Tradeoff" under "Status"). Such a
   holder no longer convoys the pool: mbx starts a waiting reservation on whatever cores are free, and lets later
   requests pass one that cannot start until it has waited 30 s (mbx's pool rule,
-  [Machine-wide compile scheduling](https://mr-boxington.jdx.dev/scheduling#machine-wide-compile-scheduling)).
+  [Machine-wide compile scheduling](https://mr-boxington.jdx.dev/scheduling#machine-wide-compile-scheduling)). A held
+  job keeps its grant for its life on purpose, bounded by its own declared `g` ("Held jobs", Tradeoff).
 
 **The kernel tells the supervisor the pressure.** Each supervisor opens one feed (`host_pressure::Feed`) when it starts:
 one reading, then a new reading each time the kernel notifies a change. On macOS the notification is libdispatch's
@@ -1515,9 +1525,87 @@ last reading holds a start the feed reads again at each window's end, the first 
 host is read again only when the trigger fires. A kernel that refuses the subscription leaves a feed whose one reading
 names why, which refuses every waiting start. Nothing samples the pressure on a timer.
 
-Enforced by the table tests in `runtime::job_admission`, one per rule above, and
+Enforced by the table tests in `runtime::job_admission`, one per rule above; the admission simulator's property test
+`held::held_jobs_across_checkouts_keep_the_pool_contract` (`cowshed-admission-sim`), which drives several checkouts'
+admissions against mbx's pool as it admits, the simulator's `POOL_RULE`, through random requests, pool passes, refusals,
+cancels, spawns and ends, and holds after each of them that the grants never exceed the pool, every admitted held job
+holds a grant of at least one and at most its `g` cores, a checkout waits in the pool at most once per priority, no
+background hold starts while a gate's hold waits, every hold is granted once the holds ahead of it end, and a released
+pool grants a later hold of the whole pool whole; and
 `a_background_start_waits_for_the_reported_drop_and_a_gate_does_not`, which drives a supervisor through a test's
 pressure feed.
+
+### Held jobs
+
+Agents' heavy jobs overshot the host together: each agent checked that `uptime` read below 30 before it started one,
+several started in the same minute, and the host reached load 40 to 60 (four load alerts on 2026-10-30, between 21:02
+and 22:26), while the checks themselves cost the agents turns. Leaf admission ("Parallelism inside a job") charges only
+the leaves mbx sees: Nx itself, `nx:run-commands` targets, `tsgo` and every runner sized at one run uncharged or above
+their charge. So a job that declares its parallelism is admitted whole, against the same pool, and nobody reads the
+host's load.
+
+- **Declaration.** In a project with the mbx capability, an exec that declares a hold (the API's `hold`, which the CLI's
+  `--want n` sets beside `want`) is a held job: it holds up to `g = min(n, cores)` cores of mbx's pool from its grant to
+  its conclusion. An exec that declares none is not held, whatever count it names for its jobserver: its leaves are
+  admitted one at a time exactly as "Parallelism inside a job" says, so cowshed's own brief jobs, which name a count of
+  one for their jobserver, never wait in the pool. A nested exec, one that names its requester's jobserver, is never
+  held: its tokens are its requester's, and a held requester's hold covers it, so it runs with what the hold gives its
+  own job ("Inside the hold"). A resident is never held: it idles between requests, and a hold would keep its cores
+  while it does. Without mbx a hold declares nothing, and a named want keeps its meaning, the jobserver count alone.
+- **What an agent declares.** Every build, test suite, Nx run or gate task an agent starts names `--want n`, `n` being
+  the cores it should hold: 4 for a focused suite or one project's targets, up to the host's cores for a run across the
+  repository. A brief command (a git query, one file's lint, a status read) names none. Agents do not read the host's
+  load, wait for a quiet host, or hold work back for a gate: admission does that.
+- **The budget.** The pool's own budget, CPU cores and memory bytes, never a load average: mbx's `scheduler.cpus` less
+  `scheduler.reserve_cpus`, and `scheduler.memory`. A hold asks `--cpus g` and is charged the cores it is granted. Its
+  memory charge is the job identity's last recorded terminal peak (13_telemetry.md, "Job resource peaks") once
+  "External-work peak identity" below names that identity; until then `--memory` is omitted, mbx's zero-byte charge, and
+  never estimated. mbx's live pressure control holds a hold's admission while the host's memory is short, as it holds
+  every admission.
+- **The hold.** The supervisor runs the installed mbx through its host link (14_nix.md, "mbx") as
+  `mbx reserve --cpus g --priority <priority> -- /bin/sh -c 'printf "%s\n" "$MBX_RESERVE_CPUS"; read -r _; exit 0'`, in
+  a process group of its own, its stdin a pipe whose write end only the supervisor holds, its stdout a pipe the
+  supervisor reads, its environment `HOME` and the canonical mbx environment's `MBX_*` values alone, so the hold enters
+  the one shared pool. mbx grants as many of the `g` cores as are free, at least one, and starts the held command with
+  that count `k` in `MBX_RESERVE_CPUS`; the command's one line is the grant. The job stays `queued` until that line;
+  then the supervisor makes the job's jobserver of `k` tokens and spawns it. At the job's conclusion the supervisor
+  closes the pipe: the held command ends, and mbx releases the hold. A job withdrawn while its hold waits has the hold's
+  process group killed, which gives back its place in the queue. A supervisor that ends closes the pipe with its
+  process, so no grant outlives its supervisor: a hold still waiting then is released as soon as mbx grants it, and a
+  job that outlives its supervisor runs on unheld.
+- **Inside the hold.** The job's command receives `MBX_SCHED_DISABLE=1`, an empty `MBX_SCHED_DIR` and
+  `MBX_RESERVE_CPUS=k`, what `mbx reserve` gives its own command: its Cargo compiles and tests take no permits of their
+  own, a nested `mbx reserve` runs under the hold on at most `k` cores, and its Nx run serves a run pool of its own,
+  since bounded-exec sees no mbx pool. The job's granted count bounds its tree as its count does without mbx: the
+  jobserver fifo, `NX_PARALLEL`, `CARGO_BUILD_JOBS` and the run pool all hold `k`, the cores the hold is charged. Its
+  compiles still restore from and store to the shared store, but they leave mbx's in-flight registry, so an identical
+  compilation another checkout runs at the same moment is compiled twice.
+- **Order.** mbx's pool rule orders the holds as it orders every request ("Admission", "Long holders"): normal priority
+  before low ("Classes": a gate's hold `normal`, every other `low`), then by ticket. It starts a waiting hold on
+  whatever cores are free, at least one, rather than holding it until all `g` are, and lets later requests pass a hold
+  that cannot start until that hold has waited 30 s. Each supervisor keeps its own held jobs in request order, one lane
+  per pool priority, and lets one hold per lane wait in the pool at a time; the next enters when that one is granted,
+  refused or withdrawn. A checkout that submits twenty jobs holds one place in the queue, so checkouts take turns, and a
+  gate never waits behind its own checkout's background job. An admitted hold is never preempted, and its count never
+  grows: a job granted fewer cores than it asked runs on those to its end.
+- **The fence is admission.** A gate's priority in the pool replaces the fence. The land gate itself is unheld and its
+  leaves are admitted at `normal` ("A land is a gate job"); a held gate, such as a train's proof that names `--want`,
+  holds at `normal`. Either passes every waiting background hold, and nothing waits for a gate to finish ("Nothing else
+  yields to gates"): background work keeps running on what the gate leaves free.
+- **What the caller sees.** A held job's status is `queued` until its grant (11_shell.md, "Job admission and class
+  placement"). Its stderr says `cowshed: host admission wait start cpus=<g> priority=<p> ahead=<k>`, `k` being its own
+  checkout's held jobs ahead of it in its lane; once its hold has waited a second in the pool,
+  `cowshed: host admission queued position=<i> waiters=<w> held_cpus=<c> leases=<l>`, read once from mbx's activity
+  report (`mbx stats --scheduler --json --activity`); and
+  `cowshed: host admission wait done elapsed=<waited> status=ok cpus=<granted>`, or `status=err`, when it is granted or
+  refused. `cowshed gateway status` reads the pool's leases and waiters from the same report ("Status").
+- **Failures.** A hold that ends without a grant, because mbx refused the request or could not run, fails the job before
+  its command: `failed`, failure `cpuAdmission` (`hostPool`), its stderr naming mbx's exit and its last stderr line. A
+  held command's line that is no count from one to `g` fails it the same way, naming the line, and ends the hold. A hold
+  that ends while its job runs is said on the job's stderr; the job runs on unheld.
+- **Tradeoff.** A hold lasts its job's life however much of it the job uses, so a job that idles keeps its cores. That
+  reopens the long-holder hole ("Admission") for declared jobs, bounded by each one's own `g` and life, which its
+  requester chose. Leaf admission alone left most of a job's work uncharged; this is what admitting the whole job costs.
 
 ### Parallelism inside a job
 
@@ -1564,13 +1652,14 @@ one runs on fewer cores than it could use. A count that fails fails the leaf bef
 units command, such as a cross-target archive run, asks for its runner's own count `g`, its fixture inside the
 reservation.
 
-The boundary is the actual leaf runner (`bounded-exec` and equivalent direct runners), not an enclosing orchestration
-command. An Nx run mixing Cargo and non-Cargo leaves holds no reservation of its own: Cargo leaves use mbx, non-Cargo
-leaves reserve, and local fan-out consumes only the admitted leaf's grant. `mbx reserve` does not discover Cargo
-children. Reserving around an orchestrator and then letting its Cargo children acquire again would double-charge and can
-deadlock, so that path is not used. Nested non-Cargo work shares its enclosing grant instead of reserving twice. The
-seven unscheduled Cargo test-runner cases are an explicit exception with job-local bounds, not another hidden pool
-(11_shell.md, "Cargo test-runner boundaries" and "Open questions"). The external-work interface belongs to
+The boundary of an unheld job is the actual leaf runner (`bounded-exec` and equivalent direct runners), not an enclosing
+orchestration command; a held job's boundary is the job itself ("Held jobs"). An Nx run mixing Cargo and non-Cargo
+leaves outside a hold holds no reservation of its own: Cargo leaves use mbx, non-Cargo leaves reserve, and local fan-out
+consumes only the admitted leaf's grant. `mbx reserve` does not discover Cargo children. Reserving around an
+orchestrator and then letting its Cargo children acquire again would double-charge and can deadlock, so that path is not
+used. Nested non-Cargo work shares its enclosing grant instead of reserving twice. The seven unscheduled Cargo
+test-runner cases are an explicit exception with job-local bounds, not another hidden pool (11_shell.md, "Cargo
+test-runner boundaries" and "Open questions"). The external-work interface belongs to
 [mbx reserve](https://mr-boxington.jdx.dev/scheduling#reserve-capacity-for-external-work).
 
 **Without mbx, every job receives its own GNU make jobserver fifo**, served by its supervisor at the constant count `g`.
@@ -1687,9 +1776,11 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   route that alone grants the class. It takes no land turn, since nothing of it moves main. Ordinary unit work of a shed
   that is no train stays background.
 - **Nothing else yields to gates.** No fork, attach, rebase, removal, release cleanup or other job waits for a gate to
-  finish. With mbx, low-priority work continues through the same pool while normal-priority gate work waits or runs; the
-  admission policy belongs to mbx and never preempts an admitted reservation. Without mbx, the existing class placement
-  applies. A gate has no quiet window and creates no additional hold.
+  finish, and no agent holds work back, reads the host's load or keeps a quiet window for one. With mbx, low-priority
+  work, unheld leaves and held jobs alike, continues through the same pool while normal-priority gate work waits or
+  runs: mbx's pool rule starts a waiting gate request before every waiting low-priority one ("Held jobs", Order). The
+  admission policy belongs to mbx and never preempts an admitted reservation or hold. Without mbx, the existing class
+  placement applies. A gate has no quiet window and creates no additional hold.
 - **A job lives with its requester.** A foreground job's only consumer is the process that asked for it, so when that
   process is gone the job stops. A gate job's verdict moves main only through the `cowshed land` its lander runs next,
   so a gate whose lander is gone authorizes nothing and only loads the host. Measured 2026-10-18: a land of another
@@ -1751,6 +1842,14 @@ For Phase 2, the following cowshed-owned tests must exist:
   existing pure pressure decisions: threshold crossings and youngest eligible Critical-pressure victim.
 - **`gate_priority_never_holds_other_lifecycle_work`** interleaves a gate with fork, attach and release cleanup and sees
   no gate-induced admission hold.
+- **`a_held_exec_waits_for_its_grant`** drives a workspace supervisor whose installed mbx is a test's program: a held
+  exec stays `queued` and spawns nothing until its hold prints its granted count, then runs on that count; a second held
+  exec of the same checkout and priority waits one ahead in its lane and enters the pool after the first is granted; the
+  first job's end closes its hold; and a hold that ends without a count fails its job `cpuAdmission`. Its siblings
+  `an_exec_that_is_not_a_held_job_starts_at_once_and_reserves_nothing` (a count named with no hold, as cowshed's own
+  brief jobs name one, a resident, and a nested exec under a held requester, which runs enclosed in that hold) and
+  `a_held_exec_killed_while_its_hold_waits_gives_back_its_place` cover the rest. The lane's order itself is proven by
+  the admission's table tests and the simulator's pool contract ("Admission").
 
 Exactly one real mbx wiring smoke, **`canonical_cargo_route_reaches_the_pinned_mbx`**, uses two shed roots, the upstream
 Cargo shim and the one shared cache directory: it records both sessions' pool identity, priority and published evidence
@@ -1760,8 +1859,9 @@ Kernel nice/cgroup behavior and mbx's internal scheduling policy remain their ow
 ### Open questions
 
 - **External-work peak identity.** The inference under "Parallelism inside a job" is whether existing job/process spans
-  identify the same Nx task across runs. Inspect that correlation before enabling the span-derived memory request;
-  absent or unprovable identity uses the specified zero-byte charge, never a shadow table.
+  identify the same Nx task across runs, and, for a held job ("Held jobs"), which job identity (command, working
+  directory, repository) names the same work across checkouts. Inspect that correlation before enabling the span-derived
+  memory request; absent or unprovable identity uses the specified zero-byte charge, never a shadow table.
 - The known unscheduled Cargo test-runner gap and its closing measurement belong to 11_shell.md, "Open questions".
 
 ## The task server schedules work units

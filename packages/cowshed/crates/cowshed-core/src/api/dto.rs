@@ -3151,6 +3151,10 @@ pub struct ExecRequest {
     /// cores, and a larger want is held to them (`JobScheduling::requested`, 05_gateway.md
     /// "Parallelism inside a job").
     pub want: Option<NonZeroUsize>,
+    /// Whether the job holds its count of mbx's pool for its life, in a project with mbx: a held
+    /// job (05_gateway.md "Held jobs"). The CLI's `--want` declares one; cowshed's own brief jobs,
+    /// which name a count only for their jobserver, never do.
+    pub hold: bool,
     /// Where the command runs: the workspace sandbox, or a coordinator's host boundary outside it.
     pub scope: ExecScope,
     /// Who keeps the job's record: cowshed, in the workspace's protected records, or the caller,

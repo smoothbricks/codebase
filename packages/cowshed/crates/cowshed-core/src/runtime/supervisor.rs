@@ -649,6 +649,9 @@ pub struct CpuPlacement {
     pub tokens: std::num::NonZeroUsize,
     /// The job's class, which sets its priority in mbx's pool when the project has mbx.
     pub class: ExecClass,
+    /// A held job (05_gateway.md "Held jobs"): its tree runs under the hold its supervisor took,
+    /// so its own mbx work takes no permits of its own.
+    pub held: bool,
     #[cfg(target_os = "macos")]
     pub nice: i32,
 }
@@ -690,16 +693,21 @@ impl CpuPlacement {
             tasks,
         ));
         if mbx {
-            let priority = OsString::from(match self.class {
-                ExecClass::Gate => "normal",
-                _ => "low",
-            });
+            let priority =
+                OsString::from(super::job_admission::PoolPriority::of(self.class).as_str());
             environment.push((
                 OsString::from(crate::workspace_environment::MBX_PRIORITY_RESTORE_ENV),
                 priority.clone(),
             ));
             environment.push((OsString::from("MBX_SCHEDULER_PRIORITY"), priority));
-            environment.push((OsString::from("CARGO_BUILD_JOBS"), tokens));
+            environment.push((OsString::from("CARGO_BUILD_JOBS"), tokens.clone()));
+            if self.held {
+                // What `mbx reserve` gives its own command: nested mbx work runs under the hold,
+                // never queueing behind it in the pool it fills, and reads the count it holds.
+                environment.push((OsString::from("MBX_SCHED_DISABLE"), OsString::from("1")));
+                environment.push((OsString::from("MBX_SCHED_DIR"), OsString::new()));
+                environment.push((OsString::from("MBX_RESERVE_CPUS"), tokens));
+            }
         }
         environment
     }
@@ -727,17 +735,19 @@ mod cpu_placement_tests {
     /// none of that environment appears (05_gateway.md, "Classes", "Parallelism inside a job").
     #[test]
     fn an_mbx_job_names_its_pool_priority_and_cargo_ceiling_and_a_plain_job_neither() {
-        for (class, mbx, priority) in [
-            (ExecClass::Gate, true, Some("normal")),
-            (ExecClass::Interactive, true, Some("low")),
-            (ExecClass::Background, true, Some("low")),
-            (ExecClass::Resident, true, Some("low")),
-            (ExecClass::Gate, false, None),
+        for (class, mbx, held, priority) in [
+            (ExecClass::Gate, true, false, Some("normal")),
+            (ExecClass::Interactive, true, false, Some("low")),
+            (ExecClass::Background, true, false, Some("low")),
+            (ExecClass::Resident, true, false, Some("low")),
+            (ExecClass::Background, true, true, Some("low")),
+            (ExecClass::Gate, false, false, None),
         ] {
             let placement = CpuPlacement {
                 fifo: PathBuf::from("/pool/j"),
                 tokens: std::num::NonZeroUsize::new(4).expect("four"),
                 class,
+                held,
                 #[cfg(target_os = "macos")]
                 nice: 10,
             };
@@ -760,6 +770,24 @@ mod cpu_placement_tests {
                 mbx.then_some("4"),
                 "{class:?}"
             );
+            let inside_the_hold = (
+                read("MBX_SCHED_DISABLE"),
+                read("MBX_SCHED_DIR"),
+                read("MBX_RESERVE_CPUS"),
+            );
+            assert_eq!(
+                inside_the_hold,
+                if held {
+                    (
+                        Some("1".to_owned()),
+                        Some(String::new()),
+                        Some("4".to_owned()),
+                    )
+                } else {
+                    (None, None, None)
+                },
+                "{class:?} held={held}"
+            );
         }
     }
 
@@ -771,6 +799,7 @@ mod cpu_placement_tests {
             fifo: PathBuf::from("/pool/j"),
             tokens: std::num::NonZeroUsize::new(4).expect("four"),
             class: ExecClass::Background,
+            held: false,
             #[cfg(target_os = "macos")]
             nice: 10,
         };
@@ -840,6 +869,7 @@ mod cpu_placement_tests {
                 fifo: PathBuf::from("/pool/j"),
                 tokens: std::num::NonZeroUsize::new(4).expect("four"),
                 class,
+                held: false,
                 #[cfg(target_os = "macos")]
                 nice: 10,
             };
@@ -916,6 +946,22 @@ pub enum ProcessEvent {
         job_id: JobId,
         error: CowshedError,
     },
+    /// mbx's pool granted a held job's hold: `cpus` of the cores it asked for, at least one
+    /// (05_gateway.md "Held jobs").
+    HoldGranted {
+        job_id: JobId,
+        cpus: std::num::NonZeroUsize,
+    },
+    /// A held job's hold ended without a grant; `error` says why.
+    HoldRefused {
+        job_id: JobId,
+        error: String,
+    },
+    /// A granted hold ended before its job was done with it; `cause` says how.
+    HoldLost {
+        job_id: JobId,
+        cause: String,
+    },
     Escalate {
         job_id: JobId,
     },
@@ -983,6 +1029,9 @@ impl ProcessEvent {
             Self::LaunchFailed { .. } => "launch-failed",
             Self::ScriptSyntax { .. } => "script-syntax",
             Self::SignalFailed { .. } => "signal-failed",
+            Self::HoldGranted { .. } => "hold-granted",
+            Self::HoldRefused { .. } => "hold-refused",
+            Self::HoldLost { .. } => "hold-lost",
         }
     }
 }
@@ -2659,6 +2708,7 @@ pub fn project_tool_request(mount: &Path, cwd: &Path, argv: Vec<OsString>) -> Re
         admission_key: None,
         class: ExecClass::Background,
         want: Some(std::num::NonZeroUsize::MIN),
+        hold: false,
         scope: ExecScope::Workspace,
         record: JobRecord::Cowshed,
     })
@@ -4787,6 +4837,7 @@ impl WorkspaceSupervisor {
             turns: 0,
             caller_keys: std::collections::HashMap::new(),
             output_quota: config.artifacts.combined_output_quota_bytes,
+            holds: BTreeMap::new(),
         };
         // Whatever the checkout's volumes were cloned from, they are named for it from here.
         let build = actor.policy.ceiling().build_volume_mount.clone();
@@ -5575,6 +5626,8 @@ enum CpuStanding {
 struct PendingSpawn {
     /// The job's count, and the requester's jobserver it may share.
     want: std::num::NonZeroUsize,
+    /// Whether the job runs under a hold on mbx's pool (05_gateway.md "Held jobs").
+    held: bool,
     parent: Option<super::job_cpu::InheritedJobserver>,
     authority: WorkspaceAuthoritySnapshot,
     policy: SandboxPolicy,
@@ -5914,6 +5967,9 @@ struct SupervisorActor {
     caller_keys: std::collections::HashMap<AdmissionKey, CallerKey>,
     /// The combined output quota of one job, which the actor counts for a caller-owned job.
     output_quota: u64,
+    /// Each held job's hold on mbx's pool, from its reserve to its release; dropping one ends it
+    /// (05_gateway.md "Held jobs").
+    holds: BTreeMap<JobId, super::host_hold::Hold>,
 }
 
 /// Runtime teardown transfers the same jobs to one retirement worker. The actor joins for a
@@ -6425,18 +6481,52 @@ impl SupervisorActor {
                     .await;
                 }
                 Effect::Refuse { job, error } => {
-                    let Some(record) = self.jobs.get_mut(&job) else {
-                        continue;
-                    };
-                    if record.terminal() || !matches!(record.cpu, CpuStanding::Queued(_)) {
-                        continue;
-                    }
-                    record.cpu = CpuStanding::Settled;
-                    record.failure = Some(JobFailure::CpuAdmission);
-                    self.fail_before_command(
+                    self.refuse_before_command(job, CpuAdmissionRefusal::MemoryPressure { error })
+                        .await;
+                }
+                Effect::RefuseHold { job, error } => {
+                    self.refuse_before_command(job, CpuAdmissionRefusal::HostPool { error })
+                        .await;
+                }
+                Effect::Reserve {
+                    job,
+                    cpus,
+                    priority,
+                } => self.reserve_hold(job, cpus, priority),
+                Effect::Release { job } => {
+                    self.holds.remove(&job);
+                }
+                Effect::HoldWaitStarted {
+                    job,
+                    cpus,
+                    priority,
+                    ahead,
+                } => {
+                    self.process_output(
                         job,
-                        KillReason::CpuAdmission,
-                        CowshedError::cpu_admission(CpuAdmissionRefusal::MemoryPressure { error }),
+                        StreamKind::Stderr,
+                        Bytes::from(format!(
+                            "cowshed: host admission wait start cpus={cpus} priority={} ahead={ahead}\n",
+                            priority.as_str()
+                        )),
+                    )
+                    .await;
+                }
+                Effect::HoldWaitEnded { job, waited, ok } => {
+                    // A granted job's count is now what mbx granted it.
+                    let status = match self.jobs.get(&job).map(|record| &record.cpu) {
+                        Some(CpuStanding::Queued(pending)) if ok => {
+                            format!("ok cpus={}", pending.want)
+                        }
+                        _ if ok => "ok".to_owned(),
+                        _ => "err".to_owned(),
+                    };
+                    self.process_output(
+                        job,
+                        StreamKind::Stderr,
+                        Bytes::from(format!(
+                            "cowshed: host admission wait done elapsed={waited:?} status={status}\n"
+                        )),
                     )
                     .await;
                 }
@@ -6446,6 +6536,54 @@ impl SupervisorActor {
                 #[cfg(not(target_os = "macos"))]
                 Effect::EndForMemory { .. } => {}
             }
+        }
+    }
+
+    /// Fail `job_id`, still queued, before its command, `cpuAdmission`: its admission was refused.
+    /// A job that already ended or started is left as it is.
+    async fn refuse_before_command(&mut self, job_id: JobId, refusal: CpuAdmissionRefusal) {
+        let Some(record) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if record.terminal() || !matches!(record.cpu, CpuStanding::Queued(_)) {
+            return;
+        }
+        record.cpu = CpuStanding::Settled;
+        record.failure = Some(JobFailure::CpuAdmission);
+        self.fail_before_command(
+            job_id,
+            KillReason::CpuAdmission,
+            CowshedError::cpu_admission(refusal),
+        )
+        .await;
+    }
+
+    /// Start `job_id`'s hold of `cpus` at `priority` in the pool its own work enters
+    /// (05_gateway.md "Held jobs"): the installed mbx under the job's sandbox home, with the
+    /// canonical mbx environment of the sandbox it was admitted under. A hold that cannot start is
+    /// refused at once.
+    fn reserve_hold(
+        &mut self,
+        job_id: JobId,
+        cpus: std::num::NonZeroUsize,
+        priority: super::job_admission::PoolPriority,
+    ) {
+        let Some(CpuStanding::Queued(pending)) = self.jobs.get(&job_id).map(|job| &job.cpu) else {
+            return;
+        };
+        let (sandbox, _) = pending.policy.child(pending.mode);
+        let pool = super::host_hold::Pool::installed(
+            &sandbox.home,
+            &sandbox.capabilities.contribution.env,
+        );
+        match pool.reserve(job_id, cpus, priority, self.events.clone()) {
+            Ok(hold) => {
+                self.holds.insert(job_id, hold);
+            }
+            Err(error) => self.admission_event(super::job_admission::Event::HoldRefused {
+                job: job_id,
+                error: format!("cannot start {} reserve: {error}", pool.mbx().display()),
+            }),
         }
     }
 
@@ -7462,6 +7600,8 @@ impl SupervisorActor {
                 "drop stdoutCopy and stderrCopy, or let cowshed keep the job's record",
             ));
         }
+        // Whether the request named its count: in an mbx project, the declaration of a held job.
+        let declared = request.hold;
         let scheduling = JobScheduling::requested(
             request.scope,
             request.class,
@@ -7620,6 +7760,7 @@ impl SupervisorActor {
             admission_key: _,
             class: _,
             want: _,
+            hold: _,
             scope: _,
             record,
         } = request;
@@ -7839,6 +7980,14 @@ impl SupervisorActor {
             .map(WorkspacePath::as_path)
             .map(Path::to_path_buf)
             .unwrap_or_default();
+        // A held job (05_gateway.md "Held jobs") declares its hold in an mbx project. A nested exec,
+        // one that names its requester's jobserver, is never held: its tokens are its requester's,
+        // and a held requester's hold covers it. A resident is never held: it idles between
+        // requests, and a hold would keep its cores while it does.
+        let resident = matches!(
+            scheduling.class(),
+            ExecClass::Resident | ExecClass::InteractiveResident
+        );
         let ledger = if self
             .policy
             .child(mode)
@@ -7847,10 +7996,16 @@ impl SupervisorActor {
             .active
             .contains(&crate::capabilities::CapabilityId::Mbx)
         {
-            super::job_admission::Ledger::Mbx
+            super::job_admission::Ledger::Mbx {
+                hold: (declared && parent_jobserver.is_none() && !resident)
+                    .then(|| scheduling.want()),
+            }
         } else {
             super::job_admission::Ledger::Jobservers
         };
+        // The job's tree runs under a hold: its own, or the one its requester runs under.
+        let held = matches!(ledger, super::job_admission::Ledger::Mbx { hold: Some(_) })
+            || parent_jobserver.as_ref().is_some_and(|parent| parent.held);
         let job = JobStateRecord {
             info,
             started_at: Instant::now(),
@@ -7892,6 +8047,7 @@ impl SupervisorActor {
             build_hold,
             cpu: CpuStanding::Queued(Box::new(PendingSpawn {
                 want: scheduling.want(),
+                held,
                 parent: parent_jobserver,
                 authority: self.authority.clone(),
                 // Rendered when this authority was taken. The request may narrow the ceiling,
@@ -7965,6 +8121,7 @@ impl SupervisorActor {
         };
         let PendingSpawn {
             want,
+            held,
             parent,
             authority,
             policy,
@@ -7998,6 +8155,7 @@ impl SupervisorActor {
             fifo: jobserver.fifo().to_path_buf(),
             tokens: jobserver.tokens(),
             class: job.info.class,
+            held,
             #[cfg(target_os = "macos")]
             nice: super::placement::macos::nice_from(
                 super::placement::macos::own_nice(),
@@ -8955,6 +9113,35 @@ impl SupervisorActor {
                 job.exit = Some(ExitStatus::Exited { code: 2 });
                 job.kill_reason = Some(KillReason::ScriptSyntax);
                 end_job_stdin(job);
+            }
+            ProcessEvent::HoldGranted { job_id, cpus } => {
+                // The job runs on what mbx granted: as many of its cores as were free, at least
+                // one (05_gateway.md "Held jobs"). Its jobserver, Nx and Cargo counts follow.
+                if let Some(CpuStanding::Queued(pending)) =
+                    self.jobs.get_mut(&job_id).map(|job| &mut job.cpu)
+                {
+                    pending.want = cpus.min(pending.want);
+                }
+                self.admission_event(super::job_admission::Event::Granted { job: job_id });
+            }
+            ProcessEvent::HoldRefused { job_id, error } => {
+                self.admission_event(super::job_admission::Event::HoldRefused {
+                    job: job_id,
+                    error,
+                });
+            }
+            ProcessEvent::HoldLost { job_id, cause } => {
+                // Only a hold the supervisor still keeps was lost; a released one ended as asked.
+                if self.holds.contains_key(&job_id) {
+                    self.process_output(
+                        job_id,
+                        StreamKind::Stderr,
+                        Bytes::from(format!(
+                            "cowshed: the job's host hold ended before the job ({cause}); it runs on unheld\n"
+                        )),
+                    )
+                    .await;
+                }
             }
             ProcessEvent::Escalate { job_id } => {
                 if let Some(job) = self.jobs.get_mut(&job_id)
@@ -11443,6 +11630,7 @@ mod workspace_toolchain_tests {
                 fifo: PathBuf::from("/pool/j"),
                 tokens: std::num::NonZeroUsize::MIN,
                 class: ExecClass::Background,
+                held: false,
                 #[cfg(target_os = "macos")]
                 nice: 0,
             },
@@ -13362,6 +13550,7 @@ mod sandbox_environment_tests {
                 fifo: PathBuf::from("/pool/j"),
                 tokens: std::num::NonZeroUsize::MIN,
                 class: ExecClass::Background,
+                held: false,
                 #[cfg(target_os = "macos")]
                 nice: 0,
             },

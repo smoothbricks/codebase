@@ -204,6 +204,8 @@ pub enum CpuAdmissionRefusal {
     /// The host's memory pressure, which a background start waits on, could not be read
     /// (05_gateway.md "Memory pressure").
     MemoryPressure { error: String },
+    /// mbx's pool ended a held job's hold without granting it (05_gateway.md "Held jobs").
+    HostPool { error: String },
 }
 
 /// What placing nice on the owned child observed; absent values were not observed, never guessed.
@@ -462,6 +464,10 @@ impl CowshedError {
             CpuAdmissionRefusal::MemoryPressure { error } => Self::environment_missing(
                 format!("cannot read the host's memory pressure for a background start: {error}"),
                 "run the job as interactive, or fix the host's pressure reading",
+            ),
+            CpuAdmissionRefusal::HostPool { error } => Self::environment_missing(
+                format!("the host's pool did not grant the job's hold: {error}"),
+                "check the installed mbx with cowshed doctor, and the pool with mbx stats --scheduler",
             ),
         };
         Self {

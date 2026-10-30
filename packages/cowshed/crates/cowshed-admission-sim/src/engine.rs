@@ -406,6 +406,13 @@ impl<'a> Sim<'a> {
                 Effect::WaitStarted { .. } => self.log.job_waits += 1,
                 Effect::WaitEnded { .. } => {}
                 Effect::Refuse { job, .. } => self.fail(job_index(job)),
+                Effect::Reserve { .. }
+                | Effect::Release { .. }
+                | Effect::HoldWaitStarted { .. }
+                | Effect::HoldWaitEnded { .. }
+                | Effect::RefuseHold { .. } => {
+                    unreachable!("the engine's jobs declare no hold: {effect:?}")
+                }
                 Effect::EndForMemory { job, .. } => {
                     self.log.ended_for_memory += 1;
                     self.fail(job_index(job));

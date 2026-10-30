@@ -785,6 +785,10 @@ pub struct ExecParams {
     /// (05_gateway.md "Parallelism inside a job").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub want: Option<NonZeroUsize>,
+    /// Whether the job holds its count of mbx's pool for its life (05_gateway.md "Held jobs");
+    /// omitted when it does not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
     /// Where the command runs; omitted for the workspace sandbox.
     #[serde(default, skip_serializing_if = "is_workspace")]
     pub scope: ExecScope,

@@ -14,6 +14,7 @@
 mod admit;
 mod engine;
 mod fixture;
+mod held;
 mod model;
 mod policy;
 mod pool;

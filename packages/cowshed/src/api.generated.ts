@@ -490,6 +490,9 @@ export type CpuAdmissionRefusal =
     })
   | ({ readonly reason: 'memoryPressure' } & {
       readonly error: string;
+    })
+  | ({ readonly reason: 'hostPool' } & {
+      readonly error: string;
     });
 
 /**
@@ -746,6 +749,11 @@ export type ExecParams = {
    * (05_gateway.md "Parallelism inside a job").
    */
   readonly want?: number & tags.Type<'uint64'> & tags.Minimum<1>;
+  /**
+   * Whether the job holds its count of mbx's pool for its life (05_gateway.md "Held jobs");
+   * omitted when it does not.
+   */
+  readonly hold?: boolean;
   /**
    * Where the command runs; omitted for the workspace sandbox.
    */
