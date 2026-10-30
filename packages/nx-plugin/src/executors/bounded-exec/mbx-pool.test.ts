@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { mbxIdleGated, mbxLeaf, mbxPool, withMbxLeaf } from './mbx-pool.js';
+import { mbxIdleGated, mbxLeaf, mbxPool, nxTaskCores, runsPrebuiltNextest, withMbxLeaf } from './mbx-pool.js';
+import { runnerDemand, sizeRunner } from './runner-sizing.js';
 
 describe("mbx's one pool at the leaf", () => {
   it('is named only by the canonical mbx environment, at the priority of the job', () => {
@@ -50,6 +51,37 @@ describe("mbx's one pool at the leaf", () => {
     });
     // A nextest run that builds its tests first still lets mbx admit its compilers.
     expect(mbxLeaf(pool, 'nextest', 8, 'cargo nextest run -p x')).toEqual({ kind: 'cargo' });
+  });
+
+  it("sizes a prebuilt nextest leaf to its task's share, so the run's cargo-test leaves hold the pool side by side", () => {
+    // A gate on 2026-10-30: every cargo-test leaf reserved `--cpus 18` of an 18-core pool, so they ran one at a time
+    // and the host sat 70% idle.
+    const pool = { priority: 'low' } as const;
+    const command =
+      'cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json --workspace-remap .';
+    expect(runsPrebuiltNextest(command)).toBe(true);
+    expect(runsPrebuiltNextest('cargo nextest run -p x')).toBe(false);
+    const leaf = (environment: NodeJS.ProcessEnv, declared?: number, ran = command) =>
+      mbxLeaf(pool, 'nextest', runnerDemand(ran, declared, nxTaskCores(18, environment), {}).want, ran);
+    // Nx runs every task at once under 100%: each leaf counts one core, and two of them fit beside each other.
+    const reserved = [leaf({ NX_PARALLEL: '100%' }), leaf({ NX_PARALLEL: '100%' })];
+    expect(reserved).toEqual([
+      { kind: 'reserve', cpus: 1, priority: 'low' },
+      { kind: 'reserve', cpus: 1, priority: 'low' },
+    ]);
+    expect(nxTaskCores(18, { NX_PARALLEL: '6' })).toBe(3);
+    expect(nxTaskCores(18, { NX_PARALLEL: '50%' })).toBe(2);
+    // Nx's own default of three tasks at once.
+    expect(nxTaskCores(18, {})).toBe(6);
+    expect(nxTaskCores(2, { NX_PARALLEL: '8' })).toBe(1);
+    // A declared or named count is the target's own word and still wins.
+    expect(leaf({ NX_PARALLEL: '100%' }, 4)).toEqual({ kind: 'reserve', cpus: 4, priority: 'low' });
+    expect(leaf({ NX_PARALLEL: '100%' }, undefined, `${command} --test-threads=2`)).toEqual({
+      kind: 'reserve',
+      cpus: 2,
+      priority: 'low',
+    });
+    expect(sizeRunner({ kind: 'nextest', want: 1 }, command, 1).env.NEXTEST_TEST_THREADS).toBe('1');
   });
 
   it.each<[string, string, boolean]>([

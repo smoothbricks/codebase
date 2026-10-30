@@ -43,11 +43,37 @@ export type MbxLeaf =
 const CARGO_LEAVES: ReadonlySet<RunnerKind> = new Set<RunnerKind>(['cargo', 'cargo-mutants', 'nextest']);
 
 /** A nextest invocation that runs test binaries already built, from extracted archive metadata or an archive file. */
+/** A nextest invocation that runs test binaries already built, from extracted archive metadata or an archive file. */
 const PREBUILT_NEXTEST = /(?<![\w-])--(?:binaries-metadata|archive-file)(?=[=\s]|$)/;
 
+/** Whether `command` runs nextest over test binaries already built, which compiles nothing. */
+export function runsPrebuiltNextest(command: string): boolean {
+  return PREBUILT_NEXTEST.test(command);
+}
+
 export function mbxLeaf(pool: MbxPool, kind: RunnerKind, want: number, command: string): MbxLeaf {
-  const builds = CARGO_LEAVES.has(kind) && !(kind === 'nextest' && PREBUILT_NEXTEST.test(command));
+  const builds = CARGO_LEAVES.has(kind) && !(kind === 'nextest' && runsPrebuiltNextest(command));
   return builds ? { kind: 'cargo' } : { kind: 'reserve', cpus: Math.max(1, want), priority: pool.priority };
+}
+
+/** Nx's own default count of tasks at once, when nothing names one. */
+const NX_DEFAULT_PARALLEL = 3;
+
+/**
+ * The cores one task of an Nx run counts as its own: the host's cores divided among the tasks Nx runs at once, at
+ * least one. Nx reads that count from `NX_PARALLEL`, a number or a share of the cores (`100%`), else runs three.
+ *
+ * A prebuilt nextest leaf reserves its runner's count for its whole run, and nextest asks for every core by default,
+ * so each cargo-test leaf of a gate reserved the whole pool and they ran one at a time behind each other: on
+ * 2026-10-30 a gate's 18-core host ran 4.2 cores busy, its leaves each holding `mbx reserve --cpus 18`. Sized to its
+ * share, a leaf leaves the rest of the pool to the tasks Nx starts beside it.
+ */
+export function nxTaskCores(cores: number, environment: Readonly<NodeJS.ProcessEnv>): number {
+  const named = environment.NX_PARALLEL?.trim() ?? '';
+  const share = /^(\d+)%$/.exec(named);
+  const count = share?.[1] !== undefined ? (cores * Number(share[1])) / 100 : /^\d+$/.test(named) ? Number(named) : 0;
+  const parallel = count >= 1 ? Math.floor(count) : NX_DEFAULT_PARALLEL;
+  return Math.max(1, Math.floor(cores / parallel));
 }
 
 /**

@@ -38,7 +38,15 @@ import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import type { CpuWaitRow } from './lease-wait.js';
 import type { LockWait } from './lock-wait.js';
-import { MBX_GRANT_FD, mbxIdleGated, mbxLeaf, mbxPool, withMbxLeaf } from './mbx-pool.js';
+import {
+  MBX_GRANT_FD,
+  mbxIdleGated,
+  mbxLeaf,
+  mbxPool,
+  nxTaskCores,
+  runsPrebuiltNextest,
+  withMbxLeaf,
+} from './mbx-pool.js';
 import { MBX_QUEUE_POLL_MS, type MbxQueuedRequest, snapshotMbxQueue } from './mbx-queue.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
@@ -529,7 +537,12 @@ export async function runBoundedExec(
   // (`run-cpu-pool.ts`), so a task takes its tokens from a parent's pool; a command that inherits none runs exactly as
   // asked and nothing is said.
   const cores = availableParallelism();
-  const demand = runnerDemand(requested, options.parallelism, cores, process.env, options.env);
+  // A prebuilt nextest leaf under mbx reserves what its runner asks for, all of it for its whole run: its runner's
+  // default is the task's share of the host, never every core (`nxTaskCores`). A declared or named count still wins.
+  const mbx = mbxPool(process.env);
+  const leafCores =
+    mbx !== null && runsPrebuiltNextest(requested) ? nxTaskCores(cores, { ...process.env, ...options.env }) : cores;
+  const demand = runnerDemand(requested, options.parallelism, leafCores, process.env, options.env);
   const asked = Date.now();
   // A pool that answered and refused is a live budget, and running beside it would count the run twice: the run fails
   // instead. A pool whose endpoint is gone (its holder exited) lends nothing, and the run goes on as asked.
@@ -553,7 +566,6 @@ export async function runBoundedExec(
   // With mbx the leaf's admission is mbx's one pool, not a parent's tokens: its runner is sized to the job's count,
   // and a non-Cargo leaf holds that much of the pool for its run (specs/cowshed/05_gateway.md, "Parallelism inside a
   // job"). No grant and no sub-pool beside it.
-  const mbx = mbxPool(process.env);
   const leaf = mbx === null ? null : mbxLeaf(mbx, demand.kind, demand.want, requested);
   if (grant !== null) {
     sized = sizeRunner(demand, requested, grant.tokens);
