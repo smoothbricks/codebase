@@ -554,7 +554,7 @@ export async function runBoundedExec(
   // and a non-Cargo leaf holds that much of the pool for its run (specs/cowshed/05_gateway.md, "Parallelism inside a
   // job"). No grant and no sub-pool beside it.
   const mbx = mbxPool(process.env);
-  const leaf = mbx === null ? null : mbxLeaf(mbx, demand.kind, demand.want);
+  const leaf = mbx === null ? null : mbxLeaf(mbx, demand.kind, demand.want, requested);
   if (grant !== null) {
     sized = sizeRunner(demand, requested, grant.tokens);
     cpu = { tokens: grant.tokens, want: demand.want, waitedMs };

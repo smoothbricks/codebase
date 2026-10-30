@@ -1496,9 +1496,10 @@ The policy it holds:
   on an idle host cannot hold a later start, however long its holder runs. This closes the 2026-10-19 hole, in which a
   grant made while the host was idle never shrank, for cowshed's ledger in both modes (enforced by
   `a_long_holder_admitted_on_an_idle_host_never_holds_a_later_start`). Inside an mbx project, mbx admits each rustc and,
-  with `MBX_SCHEDULER_TESTS=1`, each test process, so a long `cargo nextest` gives its grant back as each one exits. A
-  non-Cargo leaf's `mbx reserve` holds its `--cpus g` until the leaf concludes ("Tradeoff" under "Status"): the hole
-  stays open there, bounded by one leaf and its own `g`.
+  with `MBX_SCHEDULER_TESTS=1`, each test process of a Cargo run that builds, so a long `cargo nextest` gives its grant
+  back as each one exits. A non-Cargo leaf's `mbx reserve`, and so a nextest run of prebuilt test binaries ("Parallelism
+  inside a job"), holds its `--cpus g` until the leaf concludes ("Tradeoff" under "Status"): the hole stays open there,
+  bounded by one leaf and its own `g`.
 
 **The kernel tells the supervisor the pressure.** Each supervisor opens one feed (`host_pressure::Feed`) when it starts:
 one reading, then a new reading each time the kernel notifies a change. On macOS the notification is libdispatch's
@@ -1518,11 +1519,11 @@ pressure feed.
 `g = min(want, cores)`, with `cores` from `std::thread::available_parallelism`, remains cowshed's sizing rule. `want` is
 the job's `--want`, or `cores` when absent; every class uses the same rule and a brief command may request fewer.
 
-**With mbx, Cargo and non-Cargo leaves enter the same pool once.** A Cargo leaf runs through mbx under its job's
-priority, with `CARGO_BUILD_JOBS=g` as that build's CPU ceiling, not an enclosing resource reservation. It takes no
-cowshed host grant; mbx admits the actual compiler and supported test work. It keeps its job's jobserver fifo: the fifo
-bounds one build tree's own fan-out at the same `g`, never host capacity, so it is no second ledger, and Cargo reads
-`MAKEFLAGS` as well as `CARGO_MAKEFLAGS`, so withholding one would bound nothing. A non-Cargo leaf runs under
+**With mbx, Cargo and non-Cargo leaves enter the same pool once.** A Cargo leaf that builds runs through mbx under its
+job's priority, with `CARGO_BUILD_JOBS=g` as that build's CPU ceiling, not an enclosing resource reservation. It takes
+no cowshed host grant; mbx admits the actual compiler and supported test work. It keeps its job's jobserver fifo: the
+fifo bounds one build tree's own fan-out at the same `g`, never host capacity, so it is no second ledger, and Cargo
+reads `MAKEFLAGS` as well as `CARGO_MAKEFLAGS`, so withholding one would bound nothing. A non-Cargo leaf runs under
 `mbx reserve --cpus g --priority <job-priority> -- <command>`, the host's installed mbx invoked through its link beside
 the installed cowshed (14_nix.md, "mbx"), `g` being the job's own count from its `--want`, never a host figure. The
 grant is the job's admission: its command stays queued until mbx grants it, then its existing jobserver, runner flags
@@ -1532,6 +1533,13 @@ cowshed peak ledger or prediction table exists. [INFERENCE] The task-identity ke
 verified for Nx leaves; until the span carries it, or when no prior peak exists, `--memory` is omitted. mbx defines an
 omitted memory request as a zero-byte charge, not a measurement or a memory guarantee. This open keying question does
 not authorize a second store (AGENTS.md, rule 8).
+
+**A nextest run of prebuilt test binaries is a reserved leaf.** The inferred extracted-archive run
+(`--binaries-metadata`), or one from `--archive-file`, builds nothing, so it enters the pool as a non-Cargo leaf does:
+`mbx reserve --cpus g` admits it once for its whole grant, and its test processes run inside that grant, mbx scheduling
+none of them beneath the reservation. Admitted one test process at a time under `MBX_SCHEDULER_TESTS=1`, each queued for
+a ticket of its own: a downstream gate on 2026-10-30 measured 73.5 s apiece for codec tests of at most 0.25 s, whose 121
+tests run in 1.18 s unqueued (owner's ruling, 2026-10-30).
 
 The boundary is the actual leaf runner (`bounded-exec` and equivalent direct runners), not an enclosing orchestration
 command. An Nx run mixing Cargo and non-Cargo leaves holds no reservation of its own: Cargo leaves use mbx, non-Cargo

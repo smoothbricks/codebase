@@ -27,9 +27,14 @@ export function mbxPool(environment: Readonly<NodeJS.ProcessEnv>): MbxPool | nul
 }
 
 /**
- * How a leaf enters the pool once: a Cargo leaf runs through mbx, which admits its compiler and supported test work
- * itself, so wrapping it would charge it twice; any other leaf holds `cpus` of the pool for its whole run through
- * `mbx reserve`, `cpus` being the job's own count.
+ * How a leaf enters the pool once. A Cargo leaf that builds runs through mbx, which admits its compilers and supported
+ * test work itself, so wrapping it would charge it twice. Any other leaf holds `cpus` of the pool for its whole run
+ * through `mbx reserve`, `cpus` being the job's own count. That includes a nextest run of test binaries already built
+ * (the inferred extracted-archive run, or one from `--archive-file`): it compiles nothing, and beneath a reservation
+ * mbx schedules none of its test processes, so they run inside the one grant. Admitted one by one under
+ * `MBX_SCHEDULER_TESTS=1`, each queued for a ticket of its own: in a downstream gate on 2026-10-30, codec tests of at
+ * most 0.25 s took 73.5 s apiece, and their 121 tests run in 1.18 s unqueued (specs/cowshed/05_gateway.md,
+ * "Parallelism inside a job").
  */
 export type MbxLeaf =
   | { readonly kind: 'cargo' }
@@ -37,10 +42,12 @@ export type MbxLeaf =
 
 const CARGO_LEAVES: ReadonlySet<RunnerKind> = new Set<RunnerKind>(['cargo', 'cargo-mutants', 'nextest']);
 
-export function mbxLeaf(pool: MbxPool, kind: RunnerKind, want: number): MbxLeaf {
-  return CARGO_LEAVES.has(kind)
-    ? { kind: 'cargo' }
-    : { kind: 'reserve', cpus: Math.max(1, want), priority: pool.priority };
+/** A nextest invocation that runs test binaries already built, from extracted archive metadata or an archive file. */
+const PREBUILT_NEXTEST = /(?<![\w-])--(?:binaries-metadata|archive-file)(?=[=\s]|$)/;
+
+export function mbxLeaf(pool: MbxPool, kind: RunnerKind, want: number, command: string): MbxLeaf {
+  const builds = CARGO_LEAVES.has(kind) && !(kind === 'nextest' && PREBUILT_NEXTEST.test(command));
+  return builds ? { kind: 'cargo' } : { kind: 'reserve', cpus: Math.max(1, want), priority: pool.priority };
 }
 
 /**

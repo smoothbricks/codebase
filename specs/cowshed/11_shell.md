@@ -480,8 +480,9 @@ These leaves retain the job's own `g` jobserver and runner/thread bounds (05_gat
 take no mbx grant. This is a known scheduling gap, not grounds to refuse an ordinary gate. No enclosing reservation is
 added around a Cargo session, so its compiler work is not charged twice. `cargo test --no-run` has no test-execution
 leaf, and nextest listings execute no tests; actual compiler work still uses mbx's compiler pool. Supported Cargo test
-and nextest target runners use mbx's own pool without an external reservation. Cowshed never claims that an inherited
-jobserver alone makes an arbitrary test runner consume mbx permits.
+and nextest target runners of a Cargo run that builds use mbx's own pool without an external reservation; a nextest run
+of prebuilt test binaries is reserved once instead (05_gateway.md, "Parallelism inside a job"). Cowshed never claims
+that an inherited jobserver alone makes an arbitrary test runner consume mbx permits.
 
 A bounded leaf's hang clock follows this boundary too. A supported Cargo test execution known at spawn with
 `MBX_SCHEDULER_TESTS=1`, or a reserved external leaf, may suspend its no-progress clock while mbx holds no capacity. The

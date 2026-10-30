@@ -18,18 +18,38 @@ describe("mbx's one pool at the leaf", () => {
     expect(mbxPool({ MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx', MBX_SCHED_DISABLE: '1' })).toBeNull();
   });
 
-  it('lets a Cargo leaf through mbx as it is and reserves any other leaf at the job count, once', () => {
+  it('lets a building Cargo leaf through mbx as it is and reserves any other leaf at the job count, once', () => {
     const pool = { priority: 'low' } as const;
     for (const kind of ['cargo', 'cargo-mutants', 'nextest'] as const) {
-      expect(mbxLeaf(pool, kind, 8)).toEqual({ kind: 'cargo' });
-      expect(withMbxLeaf('cargo test -p x', mbxLeaf(pool, kind, 8))).toBe('cargo test -p x');
+      expect(mbxLeaf(pool, kind, 8, 'cargo test -p x')).toEqual({ kind: 'cargo' });
+      expect(withMbxLeaf('cargo test -p x', mbxLeaf(pool, kind, 8, 'cargo test -p x'))).toBe('cargo test -p x');
     }
-    const leaf = mbxLeaf(pool, 'process', 4);
+    const leaf = mbxLeaf(pool, 'process', 4, "bun test 'a b'");
     expect(leaf).toEqual({ kind: 'reserve', cpus: 4, priority: 'low' });
     expect(withMbxLeaf("bun test 'a b'", leaf)).toBe(
       "mbx reserve --grant-fd 5 --cpus 4 --priority low -- /bin/sh -c 'bun test '\\''a b'\\'''",
     );
-    expect(mbxLeaf(pool, 'vitest', 0)).toEqual({ kind: 'reserve', cpus: 1, priority: 'low' });
+    expect(mbxLeaf(pool, 'vitest', 0, 'bun vitest run')).toEqual({ kind: 'reserve', cpus: 1, priority: 'low' });
+  });
+
+  it('admits a nextest run of prebuilt binaries once for its whole grant, never a ticket per test process', () => {
+    // A downstream gate on 2026-10-30: under MBX_SCHEDULER_TESTS=1 each test process of an extracted-archive run
+    // queued for its own mbx ticket, and codec tests of at most 0.25 s took 73.5 s apiece.
+    const pool = { priority: 'low' } as const;
+    const extracted =
+      'extracted="$(smoo-nx-nextest-extract target/nextest/archive.tar.zst)" && cargo --frozen nextest run ' +
+      '--binaries-metadata "$extracted/target/nextest/binaries-metadata.json" --workspace-remap .';
+    expect(mbxLeaf(pool, 'nextest', 6, extracted)).toEqual({ kind: 'reserve', cpus: 6, priority: 'low' });
+    expect(withMbxLeaf(extracted, mbxLeaf(pool, 'nextest', 6, extracted))).toStartWith(
+      'mbx reserve --grant-fd 5 --cpus 6 --priority low -- /bin/sh -c ',
+    );
+    expect(mbxLeaf(pool, 'nextest', 4, 'cargo nextest run --archive-file a.tar.zst')).toEqual({
+      kind: 'reserve',
+      cpus: 4,
+      priority: 'low',
+    });
+    // A nextest run that builds its tests first still lets mbx admit its compilers.
+    expect(mbxLeaf(pool, 'nextest', 8, 'cargo nextest run -p x')).toEqual({ kind: 'cargo' });
   });
 
   it.each<[string, string, boolean]>([
