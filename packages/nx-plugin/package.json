@@ -37,13 +37,11 @@
     },
     "./test-results": {
       "types": "./dist/executors/bounded-exec/test-results.d.ts",
-      "development": "./src/executors/bounded-exec/test-results.ts",
       "import": "./dist/executors/bounded-exec/test-results.js",
       "default": "./dist/executors/bounded-exec/test-results.js"
     },
     "./test-results/host": {
       "types": "./dist/executors/bounded-exec/test-result-writer.d.ts",
-      "development": "./src/executors/bounded-exec/test-result-writer.ts",
       "import": "./dist/executors/bounded-exec/test-result-writer.js",
       "default": "./dist/executors/bounded-exec/test-result-writer.js"
     },
@@ -345,8 +343,70 @@
           "test-shard4",
           "test-host",
           "test-pool-silence",
-          "test-nx-publish"
+          "test-nx-publish",
+          "test-results-runtime"
         ]
+      },
+      "test-results-runtime-bundle": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "metadata": {
+          "smooTaskKind": "test"
+        },
+        "dependsOn": [
+          "tsc-js",
+          "typecheck-tests"
+        ],
+        "inputs": [
+          "{projectRoot}/src/__tests__/test-results-runtime.entry.ts",
+          "{projectRoot}/package.json",
+          "{projectRoot}/tsconfig.json",
+          "{workspaceRoot}/tsconfig.base.json",
+          "bunToolchain",
+          {
+            "externalDependencies": [
+              "bun-lock:packages/nx-plugin"
+            ]
+          },
+          {
+            "dependentTasksOutputFiles": "**/dist/**/*.js",
+            "transitive": false
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/.cache/test-results-runtime/"
+        ],
+        "options": {
+          "command": "bun build src/__tests__/test-results-runtime.entry.ts --target=bun --conditions=production --outfile=.cache/test-results-runtime/bundle.mjs",
+          "cwd": "{projectRoot}"
+        }
+      },
+      "test-results-runtime": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "dependsOn": [
+          "...",
+          "test-results-runtime-bundle"
+        ],
+        "inputs": [
+          "...",
+          "bunToolchain",
+          {
+            "externalDependencies": [
+              "bun-lock:packages/nx-plugin"
+            ]
+          },
+          {
+            "dependentTasksOutputFiles": "**/test-results-runtime/bundle.mjs",
+            "transitive": false
+          }
+        ],
+        "options": {
+          "command": "bun .cache/test-results-runtime/bundle.mjs",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
       },
       "test-pool-silence": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",

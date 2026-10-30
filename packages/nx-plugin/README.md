@@ -2450,6 +2450,12 @@ imports. The separate `@smoothbricks/nx-plugin/test-results/host` entry owns the
 `taskDirectory(workspaceData, taskId)`. These observations let a consumer act on a closed failure while other tests
 still run. They never replace terminal JUnit or the verdict as gate evidence.
 
+Both runtime entries always resolve to the declared `dist` products, with no raw-source development condition. A
+consumer's production bundler may also inherit a development condition from its TypeScript configuration; it must never
+embed an untransformed Typia macro. The cached `test-results-runtime-bundle` producer builds a public-entry fixture
+under those production conditions after declaration emission, and `test-results-runtime` executes only that prebuilt
+bundle. The test compiles no toolchain or fixture inline, and package tests reach it through their aggregate.
+
 Each record is one UTF-8 JSON object followed by LF:
 
 ```json
