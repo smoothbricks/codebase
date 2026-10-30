@@ -76,11 +76,14 @@ case $verb in
 setup | gateway) ;;
 *)
   if [ -n "$development" ]; then
-    # Where the link chain started: a directory outside this checkout is another repository's.
-    checkout=$(cd "$package/../.." && pwd -P)
+    # Where the link chain started: a directory outside this checkout is another repository's. Both are
+    # judged physically: a developer link reaches this package through a directory link, and `..` read
+    # lexically from there names the consumer's own node_modules, which holds its .bin. A bare name, which
+    # keeps no directory, says nothing about the link that was found, so its working directory decides.
+    checkout=$(cd -P "$package/../.." && pwd -P)
     case $invoked in
-    */*) from=$(cd "${invoked%/*}" 2>/dev/null && pwd -P) || from=$checkout ;;
-    *) from=$checkout ;;
+    */*) from=$(cd -P "${invoked%/*}" 2>/dev/null && pwd -P) || from=$checkout ;;
+    *) from=$(pwd -P) ;;
     esac
     case $from/ in
     "$checkout"/*) stable= ;;

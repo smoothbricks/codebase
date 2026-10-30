@@ -36,13 +36,16 @@ Without an install, or for `setup` and `gateway`, the package's source authority
 `crates/cowshed-cli/src/main.rs`, which a published package never ships, and runs its development build,
 `.cache/bin/<platform>/cowshed`; a published package runs its release build, `dist/bin/<platform>/cowshed`, restoring an
 execute bit a publish dropped. A launcher invoked from within its own checkout always keeps that development authority,
-even with an install present. Neither source authority substitutes the other build or a cargo `target/release/cowshed`:
-a checkout without its selected development build exits 5 naming the path and `nx run cowshed:cli-native`, a package
-without its selected binary exits 5 naming its path, and a host the package ships no binary for exits 5 naming the host.
-It is a shell script rather than Node because it runs before every command, and Node's own start (~30 ms) costs more
-than the fastest verbs take in total; `exec` hands the binary the command's signals, exit status and standard streams
-unchanged. The library's `runCli`, `openHost` and the typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`,
-`spawnLandTurn`; 07_api.md, "Launchers") run the CLI through the same script, so one rule picks the binary.
+even with an install present. "Within" is judged physically on both sides: a developer link reaches the package through
+a directory link, and the checkout read lexically through it would be the consumer's own `node_modules`, which holds the
+consumer's `.bin`. An invocation by a bare name, which keeps no directory, is judged by its working directory. Neither
+source authority substitutes the other build or a cargo `target/release/cowshed`: a checkout without its selected
+development build exits 5 naming the path and `nx run cowshed:cli-native`, a package without its selected binary exits 5
+naming its path, and a host the package ships no binary for exits 5 naming the host. It is a shell script rather than
+Node because it runs before every command, and Node's own start (~30 ms) costs more than the fastest verbs take in
+total; `exec` hands the binary the command's signals, exit status and standard streams unchanged. The library's
+`runCli`, `openHost` and the typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`, `spawnLandTurn`; 07_api.md,
+"Launchers") run the CLI through the same script, so one rule picks the binary.
 
 The launcher is how a build that is not installed yet is run, and not the `cowshed` on `PATH`. After `setup`, the
 `cowshed` on `PATH` is the installed copy (05_gateway.md "The installed cowshed"): setup repoints the first `cowshed` on

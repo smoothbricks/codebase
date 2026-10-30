@@ -278,6 +278,40 @@ describe('cowshed launcher', () => {
     },
   );
 
+  hostOnly(
+    "runs the installed copy for a consumer that links the checkout's package directory, as a developer link does",
+    async () => {
+      // A developer link makes node_modules/@smoothbricks/cowshed a link to this checkout's package directory, and
+      // node_modules/.bin/cowshed a relative link into it. Read lexically, `<package>/../..` through that link is the
+      // consumer's own node_modules, which holds its .bin: the consumer then passed for this checkout and ran a
+      // development build the installed daemon refuses ("the cowshed daemon is build …; this cowshed is build …").
+      const f = await fixture();
+      await f.checkout();
+      await named(f.development(host), 'development');
+      await named(f.stable, 'stable');
+      const consumerRoot = `${f.root}-consumer`;
+      fixtureRoots.push(consumerRoot);
+      const linked = join(consumerRoot, 'node_modules', '@smoothbricks', 'cowshed');
+      await mkdir(dirname(linked), { recursive: true });
+      await symlink(f.packageRoot, linked);
+      const bin = join(consumerRoot, 'node_modules', '.bin');
+      await mkdir(bin, { recursive: true });
+      await symlink(join('..', '@smoothbricks', 'cowshed', 'bin', 'cowshed'), join(bin, 'cowshed'));
+
+      // Found on PATH, as a test spawning a bare `cowshed` finds it, from the consumer's own directory.
+      const found = spawnSync('sh', ['-c', 'cowshed "$@"', 'sh', 'fork', 'raven'], {
+        cwd: consumerRoot,
+        encoding: 'utf8',
+        env: { HOME: f.home, PATH: `${bin}:${process.env.PATH}` },
+      });
+      expect(found.stdout).toBe('stable [fork] [raven]');
+      expect(launch(join(bin, 'cowshed'), ['fork', 'raven'], f).stdout).toBe('stable [fork] [raven]');
+      expect(launch(join(bin, 'cowshed'), ['setup'], f).stdout).toBe('development [setup]');
+      // The checkout's own launcher still runs its development build.
+      expect(launch(f.launcher, ['fork', 'raven'], f).stdout).toBe('development [fork] [raven]');
+    },
+  );
+
   hostOnly('the library runs the CLI through the launcher and resolves with its exit status', async () => {
     const f = await fixture();
     await f.checkout();
