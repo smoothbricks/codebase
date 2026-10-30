@@ -113,6 +113,26 @@ diff --git a/lib/internal/javascriptRuntimeCapabilities.js b/lib/internal/javasc
      // Inside a ttsx run this is the user's NODE_OPTIONS, not ttsx's preloads,
      // which would refuse the cache and run in the probe (#1740).
      const effectiveEnv = TtsxNodeOptions_1.TtsxNodeOptions.forHelpers(SidecarEnvironment_1.SidecarEnvironment.merge(process.env, env));
+diff --git a/lib/plugin/internal/source/GoSourceInputs.js b/lib/plugin/internal/source/GoSourceInputs.js
+--- a/lib/plugin/internal/source/GoSourceInputs.js
++++ b/lib/plugin/internal/source/GoSourceInputs.js
+@@ -73,6 +73,16 @@
+     function goBuildEnv(goBinary, goBuildCacheRoot, effectiveEnv = process.env) {
+         const env = { ...effectiveEnv };
+         env.GOWORK = "auto";
++        // GOWORK=auto puts go in workspace mode wherever a go.work lies (typia's
++        // native plugin ships one), where go accepts only -mod=readonly or
++        // -mod=vendor. A caller's GOFLAGS -mod=mod, a host shell's say, failed
++        // every invocation; ttsc owns the workspace, so it drops that flag and
++        // keeps the caller's others.
++        if (env.GOFLAGS) {
++            env.GOFLAGS = env.GOFLAGS.split(/\s+/)
++                .filter((flag) => flag !== "" && !/^--?mod=/.test(flag))
++                .join(" ");
++        }
+         // Only the actual `go build` needs ttsc's GOCACHE; read-only metadata spawns
+         // (`go mod edit`, `go env`, `go version`) call goBuildEnv with no cache root
+         // and inherit ambient GOCACHE rather than receiving the managed build
 diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
 --- a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
 +++ b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js

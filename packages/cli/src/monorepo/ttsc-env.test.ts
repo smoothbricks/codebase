@@ -10,8 +10,9 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import { printCommandOutput } from '../lib/run.js';
 
@@ -142,5 +143,49 @@ describe('ttsc-env.sh', () => {
       expect(enter(checkout, { TTSC_CACHE_DIR: shared })).toEqual(expected);
       expect(enter(checkout, { NX_WORKSPACE_ROOT_PATH: checkout, TTSC_CACHE_DIR: shared })).toEqual(expected);
     });
+  });
+});
+
+/**
+ * A `go list` in the cwd under the environment ttsc builds for each of its go invocations (GoSourceInputs.goBuildEnv,
+ * the module TTSC_GO_SOURCE_INPUTS names), printing that environment's GOFLAGS.
+ */
+const LIST_UNDER_TTSC_ENV = `const { GoSourceInputs } = require(process.env.TTSC_GO_SOURCE_INPUTS);
+const env = GoSourceInputs.goBuildEnv('go', undefined, process.env);
+const listed = require('node:child_process').spawnSync('go', ['list', '.'], { env, encoding: 'utf8' });
+process.stderr.write(listed.stderr);
+process.stdout.write(env.GOFLAGS);
+process.exit(listed.status ?? 1);`;
+
+describe("ttsc's go invocations", () => {
+  it("list a plugin's packages under a caller's GOFLAGS -mod=mod, keeping its other flags", () => {
+    // ttsc runs go with GOWORK=auto, so go works in workspace mode wherever a go.work lies (typia's native plugin ships
+    // one), and go refuses -mod=mod there: a host shell exporting GOFLAGS=-mod=mod failed its entry rebuilding a tool,
+    // 'selecting Go packages for plugin "typia" failed: go: -mod may only be set to readonly or vendor when in
+    // workspace mode'.
+    const root = mkdtempSync(join(tmpdir(), 'ttsc-goflags-'));
+    try {
+      writeFileSync(join(root, 'go.work'), 'go 1.21\n\nuse ./plugin\n');
+      mkdirSync(join(root, 'plugin'));
+      writeFileSync(join(root, 'plugin', 'go.mod'), 'module example.com/plugin\n\ngo 1.21\n');
+      writeFileSync(join(root, 'plugin', 'plugin.go'), 'package plugin\n');
+      const ttsc = dirname(createRequire(import.meta.url).resolve('ttsc/package.json'));
+      const listed = spawnSync(process.execPath, ['-e', LIST_UNDER_TTSC_ENV], {
+        cwd: join(root, 'plugin'),
+        env: {
+          ...process.env,
+          GOFLAGS: '-mod=mod -trimpath',
+          GOWORK: '',
+          GOCACHE: join(root, 'go-build'),
+          TTSC_GO_SOURCE_INPUTS: join(ttsc, 'lib/plugin/internal/source/GoSourceInputs.js'),
+        },
+        encoding: 'utf8',
+      });
+      expect(listed.stderr).toBe('');
+      expect(listed.status).toBe(0);
+      expect(listed.stdout).toBe('-trimpath');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
