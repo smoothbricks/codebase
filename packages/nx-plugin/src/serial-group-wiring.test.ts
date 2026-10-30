@@ -29,8 +29,6 @@ const CHECKOUT_COWSHED_BUILD = { projects: ['cowshed'], target: 'cli-native' };
 /** The target that provisions the per-user mount root the real-image fixtures keep their scratch trees below. */
 const APFS_TEST_ROOT = { projects: ['cowshed'], target: 'apfs-test-root' };
 const APFS_TEST_ROOT_TASK = 'cowshed:apfs-test-root';
-const APFS_TEST_SWEEP = { projects: ['cowshed'], target: 'apfs-test-sweep' };
-const APFS_TEST_SWEEP_TASK = 'cowshed:apfs-test-sweep';
 
 describe('the real-APFS serial groups of this repository', () => {
   it('are exactly the device group and the host group, each scoped to the packages it holds', () => {
@@ -94,7 +92,7 @@ describe('the real-APFS serial groups of this repository', () => {
     const nx = await readRecord('nx.json', JSON.parse);
     const host = child(child(nx, 'targetDefaults'), HOST_GROUP);
     // `...` keeps the inferred archive and fetch edges ahead of the explicit ones.
-    expect(host.dependsOn).toEqual(['...', CHECKOUT_COWSHED_BUILD, APFS_TEST_ROOT, APFS_TEST_SWEEP, DEVICE_GROUP]);
+    expect(host.dependsOn).toEqual(['...', CHECKOUT_COWSHED_BUILD, APFS_TEST_ROOT, DEVICE_GROUP]);
   });
 
   it("run this checkout's cowshed, built first, for every disk command the code under test makes", async () => {
@@ -179,7 +177,8 @@ describe('the real-APFS serial groups of this repository', () => {
     const config = await readRecord(NEXTEST_REPO_CONFIG_PATH, parseToml);
     const profile = child(child(config, 'profile'), 'default');
     const overrides = records(profile.overrides);
-    const scripts = records(profile.scripts);
+    // The run-wrapper rules alone: the setup rule beside them is the lanes' sweep (below).
+    const scripts = records(profile.scripts).filter((script) => script['run-wrapper'] !== undefined);
     const grouped = overrides.filter(
       (override) => override['test-group'] === 'real-apfs' || override['test-group'] === 'real-apfs-host',
     );
@@ -234,25 +233,47 @@ describe('the real-APFS serial groups of this repository', () => {
 });
 
 describe('the per-user mount root the real-image fixtures keep their scratch trees below', () => {
-  it('is provisioned by a target that runs every time, because its directories are host state, not an Nx output', async () => {
+  it('is provisioned by a target cached on its probe of the host, so no fresh runner replays a skip', async () => {
     const graph = await projectGraph();
     const setup = graph.nodes.cowshed?.data.targets?.[APFS_TEST_ROOT.target];
     expect(setup?.executor).toBe('nx:run-commands');
     expect(setup?.options?.command).toBe('bun scripts/apfs-test-root.ts');
-    // A cached skip on a fresh runner would leave the directories missing.
-    expect(setup?.cache).toBe(false);
+    // The directories are host state, not an Nx output: the key is the probe, `provisioned` only on a host needing nothing.
+    expect(setup?.cache).toBe(true);
+    expect(setup?.inputs).toContainEqual({
+      runtime:
+        'sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun packages/cowshed/scripts/apfs-test-root.ts --probe',
+    });
   });
 
-  it('owns predecessor cleanup once before the lanes, not as a test or a cached result', async () => {
+  it('sweeps dead runs first in each real-image lane that runs, and in none replayed from cache', async () => {
     const graph = await projectGraph();
-    const setup = graph.nodes.cowshed?.data.targets?.[APFS_TEST_SWEEP.target];
-    expect(setup?.executor).toBe('nx:run-commands');
-    expect(setup?.cache).toBe(false);
-    expect(setup?.options?.command).toBe('bun packages/cowshed/scripts/apfs-test-sweep.ts');
-    expect(setup?.dependsOn).toContain('apfs-test-root');
-    expect(setup?.dependsOn).toContain('cli-native');
-    expect(setup?.dependsOn).toContainEqual({ projects: [ROOT_PROJECT], target: 'cargo-test-archive' });
-    expect(setup?.dependsOn).toContainEqual({ projects: ['nextest-extract'], target: 'scriptc-native' });
+    // No sweep target: a lane replayed from cache starts no fixture, so nothing sweeps for it.
+    expect(graph.nodes.cowshed?.data.targets?.['apfs-test-sweep']).toBeUndefined();
+    const config = await readRecord(NEXTEST_REPO_CONFIG_PATH, parseToml);
+    expect(config.experimental).toContain('setup-scripts');
+    expect(child(child(child(config, 'scripts'), 'setup'), 'apfs-sweep').command).toEqual({
+      'command-line': 'bun packages/cowshed/scripts/apfs-test-sweep.ts',
+      'relative-to': 'none',
+    });
+    // nextest runs it before the first selected test of either group or of the host-controller lane, on macOS.
+    const profile = child(child(config, 'profile'), 'default');
+    const grouped = records(profile.overrides).filter(
+      (override) => override['test-group'] === 'real-apfs' || override['test-group'] === 'real-apfs-host',
+    );
+    const setups = records(profile.scripts).filter((rule) => rule.setup !== undefined);
+    expect(setups.map(({ setup, platform, filter }) => ({ setup, platform, filter }))).toEqual([
+      {
+        setup: 'apfs-sweep',
+        platform: SERIAL_TEST_GROUP_PLATFORM,
+        filter: [...grouped.map((override) => `(${String(override.filter)})`), 'test(/host_controller_/)'].join(' or '),
+      },
+    ]);
+    // integration-apfs runs under cargo test, so the sweep is its own first step, from the workspace root.
+    const integration = graph.nodes.cowshed?.data.targets?.['integration-apfs'];
+    expect(integration?.options?.cwd).toBe('.');
+    expect(String(integration?.options?.command)).toStartWith('bun packages/cowshed/scripts/apfs-test-sweep.ts && ');
+    // The script extracts the root's archive with the native extractor, so every lane builds both before it runs.
     const tasks = createTaskGraph(
       graph,
       {},
@@ -263,24 +284,26 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
     );
     const extractor = 'nextest-extract:scriptc-native';
     const producer = `scriptc-${process.arch}-${process.platform === 'darwin' ? 'macos' : 'linux'}`;
-    expect(tasks.dependencies[APFS_TEST_SWEEP_TASK]).toContain(extractor);
     expect(tasks.dependencies[extractor]).toEqual([`nextest-extract:${producer}`]);
     expect(graph.nodes['nextest-extract']?.data.targets?.[producer]?.options?.outputDirectory).toBe(
       `dist/bin/${process.platform}-${process.arch}`,
     );
-    expect(Object.keys(tasks.tasks).filter((id) => id === APFS_TEST_SWEEP_TASK)).toHaveLength(1);
+    for (const lane of [
+      `${ROOT_PROJECT}:${DEVICE_GROUP}`,
+      `${ROOT_PROJECT}:${HOST_GROUP}`,
+      'cowshed:host-controller-test',
+      'cowshed:integration-apfs',
+    ]) {
+      const reached = (tasks.dependencies[lane] ?? []).flatMap((id) => [id, ...(tasks.dependencies[id] ?? [])]);
+      expect(reached, lane).toContain(`nextest-extract:${producer}`);
+      expect(tasks.dependencies[lane], lane).toContain(`${ROOT_PROJECT}:cargo-test-archive`);
+    }
     for (const group of [DEVICE_GROUP, HOST_GROUP]) {
-      expect(tasks.dependencies[`${ROOT_PROJECT}:${group}`]).toContain(APFS_TEST_SWEEP_TASK);
       // A serial group is inferred only where its declared cfg holds, macOS: there it runs bounded by progress, and
       // elsewhere its root entry only orders its dependencies and runs no command.
       const runner = graph.nodes[ROOT_PROJECT]?.data.targets?.[group];
       if (process.platform === 'darwin') expect(runner?.options?.idleTimeoutMs).toBe(180000);
       else expect(runner?.options?.command).toBeUndefined();
-    }
-    for (const target of ['host-controller-test', 'integration-apfs']) {
-      const declared = graph.nodes.cowshed?.data.targets?.[target];
-      expect(declared?.dependsOn, target).toContain(APFS_TEST_SWEEP.target);
-      expect(tasks.dependencies[`cowshed:${target}`]).toContain(APFS_TEST_SWEEP_TASK);
     }
     const nx = await readRecord('nx.json', JSON.parse);
     expect(child(child(nx, 'targetDefaults'), 'cargo-test-cowshed-*').dependsOn).toEqual(['...', APFS_TEST_ROOT]);

@@ -38,7 +38,7 @@
 # warns of a test whose wall time less their union exceeds its class. No rule
 # here kills a test: the plugin's slow-timeout only warns, and the group's run
 # ends a test that never returns at its no-progress bound, naming it.
-experimental = ["wrapper-scripts"]
+experimental = ["setup-scripts", "wrapper-scripts"]
 
 [test-groups.real-apfs]
 max-threads = 1
@@ -102,3 +102,17 @@ run-wrapper = 'real-apfs-code-30s'
 filter = 'package(cowshed-cli) and test(/real_apfs_/)'
 platform = 'cfg(target_os="macos")'
 run-wrapper = 'real-apfs-code-30s'
+
+
+# The real-image lanes' setup. Before the first fixture of a run that selects any real-image test (the two groups'
+# filters, verbatim) or host-controller test, the archive's sweep reclaims what dead runs left: their directory
+# fixtures, roots, processes and attachments (specs/cowshed/08_testing.md, "Integration tests"). A lane replayed from
+# Nx's cache runs no nextest, so it starts no fixture and sweeps nothing. The script runs from the workspace root,
+# where the lane's archive is.
+[scripts.setup.apfs-sweep]
+command = { command-line = "bun packages/cowshed/scripts/apfs-test-sweep.ts", relative-to = "none" }
+
+[[profile.default.scripts]]
+filter = '(package(cowshed-apfs-tests) and test(/real_apfs_/)) or (package(cowshed-core) and test(/real_apfs_/)) or (package(cowshed-cli) and test(/real_apfs_/)) or test(/host_controller_/)'
+platform = 'cfg(target_os="macos")'
+setup = 'apfs-sweep'

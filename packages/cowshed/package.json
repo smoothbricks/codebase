@@ -836,49 +836,6 @@
           "cwd": "{projectRoot}"
         }
       },
-      "apfs-test-sweep": {
-        "executor": "nx:run-commands",
-        "cache": true,
-        "dependsOn": [
-          "apfs-test-root",
-          "cli-native",
-          {
-            "projects": [
-              "nextest-extract"
-            ],
-            "target": "scriptc-native"
-          },
-          {
-            "projects": [
-              "@smoothbricks/codebase"
-            ],
-            "target": "cargo-test-archive"
-          }
-        ],
-        "//": "One setup owner per Nx run, shared by every fixture runner. Executes the existing dead-namespace sweep from the built archive to completion before nextest starts; no fixture teardown inherits the backlog. Cached on the archive and on the --census runtime input: clean when no dead run left a directory fixture, a root, a process or an attachment, and a value of its own run while one did, so the sweep runs exactly when there is something to reclaim. No test completion is emitted for cleanup.",
-        "inputs": [
-          "{projectRoot}/scripts/apfs-test-sweep.ts",
-          {
-            "dependentTasksOutputFiles": "**/archive.tar.zst",
-            "transitive": false
-          },
-          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun packages/cowshed/scripts/apfs-test-sweep.ts --census"
-          },
-          {
-            "externalDependencies": []
-          }
-        ],
-        "outputs": [],
-        "options": {
-          "command": "bun packages/cowshed/scripts/apfs-test-sweep.ts",
-          "cwd": ".",
-          "env": {
-            "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed"
-          }
-        }
-      },
       "apfs-test-root-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
@@ -914,7 +871,12 @@
           "napi-native",
           "tsc-js",
           "apfs-test-root",
-          "apfs-test-sweep",
+          {
+            "projects": [
+              "nextest-extract"
+            ],
+            "target": "scriptc-native"
+          },
           {
             "target": "cargo-test-archive",
             "projects": [
@@ -952,7 +914,7 @@
       "integration-apfs": {
         "executor": "nx:run-commands",
         "cache": true,
-        "//": "Cached on the crate closure, the toolchain and the host kernel it exercises.",
+        "//": "Cached on the crate closure, the toolchain and the host kernel it exercises. It runs from the workspace root so its first step can sweep dead runs (scripts/apfs-test-sweep.ts, from the root's archive) before its fixtures start; replayed from cache it starts none and sweeps nothing.",
         "inputs": [
           "cargoClosure",
           "cargoToolchain",
@@ -967,11 +929,22 @@
         "outputs": [],
         "dependsOn": [
           "apfs-test-root",
-          "apfs-test-sweep"
+          {
+            "projects": [
+              "nextest-extract"
+            ],
+            "target": "scriptc-native"
+          },
+          {
+            "projects": [
+              "@smoothbricks/codebase"
+            ],
+            "target": "cargo-test-archive"
+          }
         ],
         "options": {
-          "cwd": "packages/cowshed",
-          "command": "cargo test -p cowshed-core --test apfs_integration -- --nocapture"
+          "cwd": ".",
+          "command": "bun packages/cowshed/scripts/apfs-test-sweep.ts && cargo test -p cowshed-core --test apfs_integration -- --nocapture"
         }
       },
       "benchmark-apfs": {

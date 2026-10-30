@@ -1077,26 +1077,27 @@ input must be released too. Ordinary runtime enumeration and attachment remain R
 images concurrently, one holder per image: each release is an unmount under the host's namespace lease and then a detach
 under its storage lease, and those classes exclude each other (05_gateway.md, "Disk-lifecycle lease"), so releasing a
 CLI fixture's main, build and workspace images one after another waited for a phase change at every step on a loaded
-host. A run sweeps its dead predecessors once in its real-substrate lane setup, before any fixture starts. The Nx
-prerequisite `cowshed:apfs-test-sweep` first builds the native extractor through its host `scriptc-native` producer,
-then runs the existing sweep from the built archive synchronously under `t/sweep.lock` and writes `sweep.run` only after
-the full pass completes. The real-substrate lanes of one Nx run share that prerequisite. It is cached on the archive and
-on a read-only census, `cowshed-test-sweep --census`: the same selections the sweep acts on (dead directory fixtures,
-per-user-root entries whose owner is gone, processes working in a dead run's tree, the kernel's attachments of a dead
-run's images), counted. `clean` keys a cached run; any residue gives a value of that run alone, so the sweep runs
-exactly when a dead run left something to reclaim. The setup owns cleanup through completion; a failed or killed setup
-starts no tests and leaves uncompleted work for the next setup. A fixture owns and tears down only its own root: no
-constructor starts a predecessor sweep and no Drop retains or joins one. A real-substrate regression holds the actual
-`t/sweep.lock` while both the first and later fixtures construct and finish Drop; it never forges a completed run record
-or starts a backlog sweep inside the test. Separate pure controls require all N selected roots to be attempted before
-recording completion, no record after failure, and no second sweep of a completed run. An individual image-release
-refusal retains only the dead root containing that image; the sweep reports every refusal and still removes other dead
-roots after releasing their images. An inventory failure retains every root, since no root's image-release safety can
-then be proved. Root-local refusal and continued reclamation have a pure, platform-independent regression; one
-unreleased image must not leave another run's already-detached files behind. No sweep selects a live pid's root. Child
-fixtures create only their own roots and never force a host-wide scan. The test lanes retain their unchanged 180-second
-no-finish guard; setup emits no synthetic test completions or progress. Ordinary sandboxed shards keep their existing
-root provisioning and do not acquire host-wide cleanup authority.
+host. Each real-substrate lane that runs sweeps its dead predecessors first, before any of its fixtures starts:
+`packages/cowshed/scripts/apfs-test-sweep.ts` extracts the root's archive with the native extractor (both built first,
+through the lane's own dependencies) and runs the existing sweep from it synchronously under `t/sweep.lock`, writing
+`sweep.run` only after the full pass completes. The lanes nextest runs (both serial groups and `host-controller-test`)
+run it as nextest's `apfs-sweep` setup script, scoped by the groups' filters and the host-controller filter
+(`.config/nextest.toml`); `integration-apfs`, which runs under `cargo test`, runs it as its own first step. A lane
+replayed from Nx's cache runs nothing, starts no fixture and so sweeps nothing; that is why no separate sweep target
+exists to run, or be cached, for it. A second lane of the same run takes the lock after the first and finds nothing
+left. The setup owns cleanup through completion; a failed or killed setup starts no tests and leaves uncompleted work
+for the next setup. A fixture owns and tears down only its own root: no constructor starts a predecessor sweep and no
+Drop retains or joins one. A real-substrate regression holds the actual `t/sweep.lock` while both the first and later
+fixtures construct and finish Drop; it never forges a completed run record or starts a backlog sweep inside the test.
+Separate pure controls require all N selected roots to be attempted before recording completion, no record after
+failure, and no second sweep of a completed run. An individual image-release refusal retains only the dead root
+containing that image; the sweep reports every refusal and still removes other dead roots after releasing their images.
+An inventory failure retains every root, since no root's image-release safety can then be proved. Root-local refusal and
+continued reclamation have a pure, platform-independent regression; one unreleased image must not leave another run's
+already-detached files behind. No sweep selects a live pid's root. Child fixtures create only their own roots and never
+force a host-wide scan. The test lanes retain their unchanged 180-second no-finish guard; setup emits no synthetic test
+completions or progress. Ordinary sandboxed shards keep their existing root provisioning and do not acquire host-wide
+cleanup authority.
 
 Pure regressions recycle a device to a RAM image during the storage-lease wait, recycle it between dissent attempts and
 before force, and repeat an image's whole-device view. They prove the guard runs after the grant, no child detaches a

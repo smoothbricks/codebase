@@ -84,8 +84,7 @@
       "dependsOn": [
         "...",
         { "projects": ["cowshed"], "target": "cli-native" },
-        { "projects": ["cowshed"], "target": "apfs-test-root" },
-        { "projects": ["cowshed"], "target": "apfs-test-sweep" }
+        { "projects": ["cowshed"], "target": "apfs-test-root" }
       ],
       "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
     },
@@ -94,7 +93,6 @@
         "...",
         { "projects": ["cowshed"], "target": "cli-native" },
         { "projects": ["cowshed"], "target": "apfs-test-root" },
-        { "projects": ["cowshed"], "target": "apfs-test-sweep" },
         "cargo-test-group-real-apfs"
       ],
       "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
