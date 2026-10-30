@@ -1,9 +1,8 @@
 /// <reference types="node" />
 
-import { existsSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import typia from 'typia';
+import { loadAddon } from './addon.js';
 import type {
   NativeCoordinatorOperations,
   NativeEvents,
@@ -15,7 +14,6 @@ import type {
   NativeWorkspaceHandleOperations,
   NativeWorkspaceRefOperations,
 } from './native.generated.js';
-import { addonDirectory, addonSearch } from './platform.js';
 import type { CoordinatorEndpoint } from './types.js';
 
 // Every controller operation's method is declared in `native.generated.ts`, from the operation
@@ -113,44 +111,6 @@ interface NativeModule {
 
 const assertNativeModule = typia.createAssert<NativeModule>();
 
-interface NativeBinary {
-  directory: string;
-  fileName: string;
-}
-
-function nativeBinary(): NativeBinary {
-  const directory = addonDirectory(process.platform, process.arch);
-  if (directory === null) {
-    throw new Error(`Unsupported Cowshed native target: ${process.platform}-${process.arch}`);
-  }
-  return { directory, fileName: `cowshed.${directory}.node` };
-}
-
 export function loadNativeModule(): NativeModule {
-  const { directory, fileName } = nativeBinary();
-  const { paths, producer } = addonSearch({
-    modulePath: fileURLToPath(import.meta.url),
-    exists: existsSync,
-    directory,
-    fileName,
-    // napi-rs loaders honour NAPI_RS_NATIVE_LIBRARY_PATH first; this is that same hook, not a
-    // bespoke cowshed name. The override stays — only the spelling is the ecosystem one.
-    override: process.env.NAPI_RS_NATIVE_LIBRARY_PATH,
-    // NAPI_DEBUG_ADDON is set only by the napi-test targets: the test suite loads the dev-profile
-    // addon of its own graph from .cache/native-debug (never packaged) instead of the dev build.
-    debug: process.env.NAPI_DEBUG_ADDON === '1',
-  });
-  const require = createRequire(import.meta.url);
-  let lastError: unknown;
-
-  for (const path of paths) {
-    try {
-      return assertNativeModule(require(path));
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  const remedy = producer === null ? '' : ` Run "nx run ${producer}" for this platform.`;
-  throw new Error(`Could not load ${fileName} from ${paths.join(', ')}.${remedy}`, { cause: lastError });
+  return loadAddon(fileURLToPath(import.meta.url), assertNativeModule);
 }

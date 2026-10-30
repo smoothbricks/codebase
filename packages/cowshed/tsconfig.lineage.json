@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist/lineage",
+    "tsBuildInfoFile": "dist/lineage/tsconfig.lineage.tsbuildinfo",
+    "emitDeclarationOnly": false,
+    "forceConsistentCasingInFileNames": true,
+    "lib": ["es2024"],
+    "types": []
+  },
+  "files": ["src/process-lineage.ts", "src/addon.ts", "src/platform.ts"]
+}

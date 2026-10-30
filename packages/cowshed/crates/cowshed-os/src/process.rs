@@ -428,6 +428,112 @@ pub fn run_state(pid: libc::pid_t) -> RunState {
     }
 }
 
+/// Where a process descends from, as the kernel's own record of it says: its parent, its group,
+/// and whether it has exited unreaped (07_api.md, "Process lineage").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessLineage {
+    pub pid: libc::pid_t,
+    pub ppid: libc::pid_t,
+    pub pgid: libc::pid_t,
+    /// Exited, not yet reaped by its parent.
+    pub zombie: bool,
+}
+
+/// [`ProcessLineage`] of `pid`, or `None` when no process holds it. One system call for this pid
+/// alone: nothing walks the process table, spawns a process or waits on the process's task, so a
+/// process stalled in the kernel cannot stall the reader, as it stalls `ps`.
+#[cfg(target_os = "macos")]
+pub fn lineage(pid: libc::pid_t) -> io::Result<Option<ProcessLineage>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .map_err(io::Error::other)?;
+    // Argument 1 answers for a zombie too (xnu `proc_pidinfo`: `findzomb`), which argument 0
+    // reports as `ESRCH` like a reaped pid.
+    // SAFETY: `info` is writable storage of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        if written > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("proc_pidinfo of pid {pid} returned {written} bytes, expected {size}"),
+            ));
+        }
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(None),
+            _ => Err(io::Error::new(
+                error.kind(),
+                format!("proc_pidinfo of pid {pid}: {error}"),
+            )),
+        };
+    }
+    // SAFETY: proc_pidinfo filled all `size` bytes.
+    let info = unsafe { info.assume_init() };
+    Ok(Some(ProcessLineage {
+        pid,
+        ppid: libc::pid_t::try_from(info.pbi_ppid).map_err(io::Error::other)?,
+        pgid: libc::pid_t::try_from(info.pbi_pgid).map_err(io::Error::other)?,
+        zombie: info.pbi_status == libc::SZOMB,
+    }))
+}
+
+/// [`lineage`] from procfs: the state, parent and group fields after the command name's closing
+/// parenthesis in `/proc/<pid>/stat`. The name is the process's own bytes, any bytes, emitted
+/// unescaped, so the line is read as bytes and only the ASCII fields after its last `)` are decoded.
+#[cfg(target_os = "linux")]
+pub fn lineage(pid: libc::pid_t) -> io::Result<Option<ProcessLineage>> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = match std::fs::read(&path) {
+        Ok(stat) => stat,
+        // procfs answers ESRCH for a task that exited after its stat file was opened.
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(io::Error::new(error.kind(), format!("{path}: {error}"))),
+    };
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{path} is not a process stat line: {:?}",
+                String::from_utf8_lossy(&stat)
+            ),
+        )
+    };
+    let mut fields = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .and_then(|closing| std::str::from_utf8(&stat[closing + 1..]).ok())
+        .map(str::split_ascii_whitespace)
+        .ok_or_else(invalid)?;
+    let state = fields.next().ok_or_else(invalid)?;
+    let ppid = fields
+        .next()
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(invalid)?;
+    let pgid = fields
+        .next()
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(invalid)?;
+    Ok(Some(ProcessLineage {
+        pid,
+        ppid,
+        pgid,
+        zombie: matches!(state, "Z" | "X"),
+    }))
+}
+
 /// One process of a group, named as a run that went silent names it: its pid, its command and
 /// what the kernel shows it doing.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1956,6 +2062,49 @@ mod tests {
         );
         assert_eq!(exited, RunState::Zombie);
         assert_eq!(reaped, RunState::Gone);
+    }
+
+    /// A process's lineage is the kernel's own record of it: a child names this process as its
+    /// parent and leads the group it was started in; exited and unreaped it is a zombie that
+    /// still names its parent; reaped, no process holds its pid.
+    #[test]
+    fn a_childs_lineage_follows_its_life() {
+        use crate::fork_lock::Spawn as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("600")
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn sleep");
+        let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+        let exit = ExitWatch::of(child.id())
+            .expect("watch sleep")
+            .expect("sleep runs");
+        // Every read happens before any assertion, so a failed assertion leaves no sleeper.
+        let started = lineage(pid);
+        child.kill().expect("kill sleep");
+        exit.wait().expect("sleep exits");
+        let exited = lineage(pid);
+        child.wait_bounded().expect("reap sleep");
+        let reaped = lineage(pid);
+        // SAFETY: getpid has no preconditions.
+        let parent = unsafe { libc::getpid() };
+        assert_eq!(
+            started.expect("read the live child"),
+            Some(ProcessLineage {
+                pid,
+                ppid: parent,
+                pgid: pid,
+                zombie: false
+            })
+        );
+        let exited = exited
+            .expect("read the exited child")
+            .expect("an unreaped child still holds its pid");
+        assert!(exited.zombie, "{exited:?}");
+        assert_eq!(exited.ppid, parent, "{exited:?}");
+        assert_eq!(reaped.expect("read the reaped pid"), None);
     }
 
     /// A cgroup's CPU is its `usage_usec` line's count, and a `cpu.stat` without one names none.

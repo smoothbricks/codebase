@@ -27,6 +27,11 @@
       "types": "./dist/ts/validators.generated.d.ts",
       "import": "./dist/ts/validators.generated.js",
       "default": "./dist/ts/validators.generated.js"
+    },
+    "./process-lineage": {
+      "types": "./dist/lineage/process-lineage.d.ts",
+      "import": "./dist/lineage/process-lineage.js",
+      "default": "./dist/lineage/process-lineage.js"
     }
   },
   "files": [
@@ -51,6 +56,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "{projectRoot}/bin/cache-advisor.cjs",
           "{projectRoot}/scripts/cache-advisor.test.cjs",
           "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
@@ -77,6 +83,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "{projectRoot}/scripts/wire-fixtures.sh",
           "{projectRoot}/scripts/wire-fixtures.test.cjs",
           "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
@@ -201,9 +208,11 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "dependsOn": [
+          "...",
           "api-generator"
         ],
         "inputs": [
+          "...",
           "{workspaceRoot}/Cargo.toml",
           {
             "externalDependencies": [
@@ -484,6 +493,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           {
             "externalDependencies": [
               "bun-lock:packages/cowshed"
@@ -495,6 +505,7 @@
           "!{workspaceRoot}/patches/**/*.md"
         ],
         "dependsOn": [
+          "...",
           "napi-debug",
           "tsc-js",
           "cli-native",
@@ -515,6 +526,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           {
             "externalDependencies": [
               "bun-lock:packages/cowshed"
@@ -526,6 +538,7 @@
           "!{workspaceRoot}/patches/**/*.md"
         ],
         "dependsOn": [
+          "...",
           "cargo-test",
           "napi-debug",
           "tsc-js",
@@ -545,6 +558,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           {
             "externalDependencies": [
               "bun-lock:packages/cowshed"
@@ -557,6 +571,7 @@
         ],
         "//": "dependsOn ^build so lmao/dist exists: bunfig.napi-test.toml preloads ../../lmao/dist/ts/bun/trace-preload.js, and without the edge a cold cache runs this target before lmao:build.",
         "dependsOn": [
+          "...",
           "^build",
           "typecheck-tests"
         ],
@@ -635,6 +650,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "{projectRoot}/scripts/capability-probe.sh",
           "{projectRoot}/scripts/capability-probe.test.cjs",
           "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
@@ -661,9 +677,11 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "dependsOn": [
+          "...",
           "typecheck-tests"
         ],
         "inputs": [
+          "...",
           {
             "externalDependencies": [
               "bun-lock:packages/cowshed"
@@ -695,6 +713,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           {
             "externalDependencies": [
               "bun-lock:packages/cowshed"
@@ -706,6 +725,7 @@
           "!{workspaceRoot}/patches/**/*.md"
         ],
         "dependsOn": [
+          "...",
           "typecheck-tests",
           "wire-fixtures"
         ],
@@ -717,6 +737,31 @@
           "fixtureTimeoutMs": 600000,
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
+        }
+      },
+      "lineage-js": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "//": "The process-lineage entry (specs/cowshed/07_api.md, \"Process lineage\") compiled on its own into dist/lineage, apart from tsc-js's dist/ts: its closure is src/process-lineage.ts, src/addon.ts and src/platform.ts, with no generated or typia module, so it depends on no other target and nx-plugin compiles against it without cowshed's whole build.",
+        "inputs": [
+          "{projectRoot}/src/process-lineage.ts",
+          "{projectRoot}/src/addon.ts",
+          "{projectRoot}/src/platform.ts",
+          "{projectRoot}/tsconfig.lineage.json",
+          "{workspaceRoot}/tsconfig.base.json",
+          {
+            "externalDependencies": [
+              "@types/node",
+              "typescript"
+            ]
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/dist/lineage"
+        ],
+        "options": {
+          "command": "tsc -p tsconfig.lineage.json",
+          "cwd": "{projectRoot}"
         }
       },
       "release-check": {
@@ -785,6 +830,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "{projectRoot}/scripts/apfs-test-root.ts",
           "{projectRoot}/scripts/apfs-test-sweep.ts",
           "{workspaceRoot}/packages/nx-plugin/src/tool-bins.ts",
@@ -810,6 +856,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
         "dependsOn": [
+          "...",
           "cli-native",
           "napi-native",
           "tsc-js",
@@ -829,6 +876,7 @@
           }
         ],
         "inputs": [
+          "...",
           "default",
           "{workspaceRoot}/packages/nx-plugin/nextest.toml",
           {

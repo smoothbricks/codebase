@@ -1,5 +1,6 @@
 /**
- * Fail when any packaged CLI binary under `dist/bin/` lost its execute bit.
+ * Fail when any packaged CLI binary under `dist/bin/` lost its execute bit, when this host's N-API
+ * addon is not under `dist/native/`, or when any family's addon there is empty or unreadable.
  *
  * The bits survive the build itself (cargo emits 0755 and napi copies it
  * through), but they do not survive the release pipeline's GitHub Actions
@@ -18,11 +19,21 @@
  * this runs, the publishing job has put the directory there. The development builds under
  * `.cache/bin/` are not shipped, and this never reads them.
  *
+ * The addon of this host's family must be in the tree too, and every other family's addon that is
+ * there is judged the same way, at `dist/native/<directory>/` for each row of `NATIVE_TARGETS`
+ * (src/platform.ts `shippedAddonProblems`): an installed package loads only that tree, so a family
+ * packed with a broken addon fails at a user's first import, and a consumer such as bounded-exec's
+ * admission observer (`processLineages`) has nothing to call. The publishing job has every family's
+ * addon there; the land seam builds this host's. An empty file, or one this process cannot open for
+ * reading, is a problem; nothing is loaded. The development addons under `.cache/native-dev/` are
+ * not shipped, and this never reads them.
+ *
  * Run with: `nx run cowshed:release-check`
  */
 
-import { readdirSync, type Stats, statSync } from 'node:fs';
+import { closeSync, openSync, readdirSync, type Stats, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { addonDirectory, shippedAddonProblems } from '../src/platform.js';
 
 const BIN_ROOT = new URL('../dist/bin', import.meta.url).pathname;
 const EXECUTABLE_OWNER_BIT = 0o100;
@@ -59,14 +70,48 @@ if (files.length === 0) {
 }
 
 const notExecutable = files.filter((path) => (statSync(path).mode & EXECUTABLE_OWNER_BIT) === 0);
+const PACKAGE_ROOT = new URL('..', import.meta.url).pathname;
+const host = addonDirectory(process.platform, process.arch);
+if (host === null) {
+  console.error(`this package ships no N-API addon for ${process.platform}-${process.arch}, so none was checked`);
+  process.exit(1);
+}
+const addonProblems = shippedAddonProblems(host, (relative) => {
+  const path = join(PACKAGE_ROOT, relative);
+  try {
+    const entry = statSync(path);
+    if (!entry.isFile()) {
+      return { kind: 'other' };
+    }
+    // Readable means opened for reading: permission bits alone can lie (ACLs, flags, ownership).
+    closeSync(openSync(path, 'r'));
+    return { kind: 'file', bytes: entry.size };
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return { kind: 'absent' };
+    }
+    return { kind: 'unread', error: error instanceof Error ? error.message : String(error) };
+  }
+});
 
 if (notExecutable.length > 0) {
   console.error('packaged binaries without the execute bit:');
   for (const path of notExecutable) {
     console.error(`  ${path}`);
   }
+}
+if (addonProblems.length > 0) {
+  console.error(`N-API addon problems under ${PACKAGE_ROOT}:`);
+  for (const problem of addonProblems) {
+    console.error(`  ${problem}`);
+  }
+}
+if (notExecutable.length > 0 || addonProblems.length > 0) {
   process.exit(1);
 }
 
 const count = files.length;
-console.log(`${count} packaged ${count === 1 ? 'binary' : 'binaries'} executable in ${BIN_ROOT}`);
+console.log(
+  `${count} packaged ${count === 1 ? 'binary' : 'binaries'} executable in ${BIN_ROOT}; ` +
+    `the ${host} N-API addon and every other family's present addon are readable`,
+);

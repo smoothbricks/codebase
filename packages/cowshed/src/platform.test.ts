@@ -3,7 +3,15 @@
 
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { addonDirectory, addonSearch, cliDirectory, NATIVE_TARGETS } from './platform.js';
+import {
+  addonDirectory,
+  addonFileName,
+  addonSearch,
+  cliDirectory,
+  NATIVE_TARGETS,
+  type ShippedEntry,
+  shippedAddonProblems,
+} from './platform.js';
 
 /**
  * `NATIVE_TARGETS` is the runtime owner of the platform → `dist` directory mapping, for the addon
@@ -127,6 +135,42 @@ describe('platform target table', () => {
       expect(directory('win32', 'x64')).toBeNull();
       expect(directory('freebsd', 'arm64')).toBeNull();
     }
+  });
+
+  it("requires the host family's addon in a packed tree and judges every other one present", () => {
+    const shipped = NATIVE_TARGETS.map(
+      ({ addon }) => `dist/native/${addon.directory}/${addonFileName(addon.directory)}`,
+    );
+    expect(shipped).toEqual([
+      'dist/native/darwin-arm64/cowshed.darwin-arm64.node',
+      'dist/native/darwin-x64/cowshed.darwin-x64.node',
+      'dist/native/linux-arm64-gnu/cowshed.linux-arm64-gnu.node',
+      'dist/native/linux-x64-gnu/cowshed.linux-x64-gnu.node',
+    ]);
+    const asked: string[] = [];
+    const present = (relative: string): ShippedEntry => {
+      asked.push(relative);
+      return { kind: 'file', bytes: 1 };
+    };
+    expect(shippedAddonProblems('darwin-arm64', present)).toEqual([]);
+    expect(asked).toEqual(shipped);
+    // The land seam builds only this host's family: the others are simply not in its tree.
+    const hostOnly = (relative: string): ShippedEntry =>
+      relative === shipped[0] ? { kind: 'file', bytes: 4096 } : { kind: 'absent' };
+    expect(shippedAddonProblems('darwin-arm64', hostOnly)).toEqual([]);
+    expect(shippedAddonProblems('linux-x64-gnu', hostOnly)).toEqual([`${shipped[3]}: missing for this host's family`]);
+    const tree: Readonly<Record<string, ShippedEntry>> = {
+      [shipped[0] ?? '']: { kind: 'file', bytes: 0 },
+      [shipped[1] ?? '']: { kind: 'other' },
+      [shipped[2] ?? '']: { kind: 'unread', error: 'EACCES: permission denied' },
+      [shipped[3] ?? '']: { kind: 'absent' },
+    };
+    expect(shippedAddonProblems('linux-x64-gnu', (relative) => tree[relative] ?? { kind: 'absent' })).toEqual([
+      `${shipped[0]}: empty`,
+      `${shipped[1]}: not a regular file`,
+      `${shipped[2]}: EACCES: permission denied`,
+      `${shipped[3]}: missing for this host's family`,
+    ]);
   });
 });
 

@@ -59,10 +59,13 @@ currentness check: building is the target's job, and the builds of a developer-l
 entry, by the receipt beside each binary (specs/cli/01_workspace_reconciliation.md, "Declared developer link pins").
 
 The shipped trees are judged where they are assembled. The package's `release-check` target
-(`scripts/verify-packaged-bin-bits.ts`) fails on a missing or empty `dist/bin` and on any binary in it without its
-execute bit, and never reads `.cache/bin`. `smoo release pack` runs it in the publishing job, after every platform's
-prebuilt outputs are applied and before the tarball is packed, and refuses a gate that declares dependencies or a cache,
-so the gate judges the bytes that get packed, never a rebuild or a replay.
+(`scripts/verify-packaged-bin-bits.ts`) fails on a missing or empty `dist/bin`, on any binary in it without its execute
+bit, on this host's N-API addon missing at `dist/native/<directory>/cowshed.<directory>.node`, and on any family's addon
+there that is empty or unreadable (one directory per `NATIVE_TARGETS` row in `src/platform.ts`, the only tree an
+installed package loads; the publishing job has every family's, the land's shipping seam this host's). It never reads
+`.cache/bin` or `.cache/native-dev`. `smoo release pack` runs it in the publishing job, after every platform's prebuilt
+outputs are applied and before the tarball is packed, and refuses a gate that declares dependencies or a cache, so the
+gate judges the bytes that get packed, never a rebuild or a replay.
 
 ### Linux artifacts
 

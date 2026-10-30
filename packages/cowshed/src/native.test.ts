@@ -2,6 +2,8 @@
 /// <reference types="node" />
 
 import { describe, expect, it } from 'bun:test';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { openSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -14,6 +16,7 @@ import {
   type ErrorCode,
   openProject,
 } from '../dist/ts/index.js';
+import { processLineages } from './process-lineage.js';
 
 /**
  * The oracle is the `ErrorCode` plus a non-empty hint, not the rendered English. `code` is core's
@@ -819,5 +822,41 @@ describe('Node fixture environment', () => {
     expect(
       nodeFixtureEnvironment({ FORCE_COLOR: 'true', NO_COLOR: '1', PATH: '/usr/bin', CARGO_HOME: '/cargo' }),
     ).toEqual({ NO_COLOR: '1', PATH: '/usr/bin', CARGO_HOME: '/cargo' });
+  });
+});
+
+describe('processLineages', () => {
+  it("reads each live pid's parent and group, and leaves out a reaped one", async () => {
+    // A child in a session of its own leads its own group, so its group is known without a probe.
+    const child = spawn('sleep', ['600'], { detached: true, stdio: 'ignore' });
+    try {
+      await once(child, 'spawn');
+      const pid = child.pid;
+      if (pid === undefined) {
+        // invariant throw: a child that emitted 'spawn' has a pid.
+        throw new Error('a spawned child has a pid');
+      }
+      // No kernel assigns pid 2^31 - 1, so it is left out.
+      expect(processLineages([pid, 2 ** 31 - 1])).toEqual([{ pid, ppid: process.pid, pgid: pid, zombie: false }]);
+      child.kill('SIGKILL');
+      await once(child, 'exit');
+      expect(processLineages([pid])).toEqual([]);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+      }
+    }
+  });
+
+  it('refuses what is not a process id with the addon’s own usage error', () => {
+    let refused: unknown;
+    try {
+      processLineages([0]);
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeInstanceOf(Error);
+    expect(refused).toMatchObject({ code: 'usage', hint: expect.any(String) });
+    expect(() => processLineages([1.5])).toThrow(RangeError);
   });
 });

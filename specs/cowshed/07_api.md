@@ -1932,6 +1932,25 @@ are optional strings, while `expectedDestinationHead` is the discriminated union
 `PushReport` returns `sourceHead`, `destinationRef`, and optional `previousDestinationHead`. A conflict rejects the
 Promise with `code: "conflict"`; it never silently retries with newer values.
 
+### Process lineage
+
+`@smoothbricks/cowshed/process-lineage` exports `processLineages(pids: readonly number[]): ProcessLineage[]`, a direct
+addon export, not an operation: it asks no controller and no `cowshed host`, so the installed CLI's build never decides
+whether it answers. `ProcessLineage` is `{ pid, ppid, pgid, zombie }`, the kernel's own record of one process:
+`proc_pidinfo(PROC_PIDTBSDINFO)` on Darwin, which answers for an exited, unreaped process too, and `/proc/<pid>/stat` on
+Linux (cowshed-os `process::lineage`). Each listed pid is read for itself, in the order asked; a pid no process holds is
+left out, as `ps -p` leaves it out. Nothing walks the process table, spawns a process or waits on another process's
+task, so a process stalled in the kernel cannot stall the reader. A number that is no 32-bit integer is a `RangeError`;
+a pid that is not positive throws the addon's own error with `code: "usage"`, and any other record that cannot be read
+one with `code: "environment-missing"`, each with its message, naming the pid and the system error, and hint.
+
+The entry is the source module `src/process-lineage.ts`, the type's one owner, compiled on its own by
+`cowshed:lineage-js` into `dist/lineage` from `src/process-lineage.ts`, `src/addon.ts` and `src/platform.ts` alone: no
+generated or typia module, and no other target first. It loads the addon at its first call, never at import, through the
+same `loadAddon` search (`src/addon.ts`) the root entry's eager `loadNativeModule` uses. bounded-exec's admission
+observer imports its type and loads it lazily, so nx-plugin compiles against `dist/lineage` without the package's whole
+build (11_shell.md, "Cargo test-runner boundaries").
+
 ### NAPI streaming (frozen)
 
 One boundary answer, no ambiguity:

@@ -494,19 +494,22 @@ Independently, any live process of the bounded task explicitly queued for mbx ad
 budget, including alongside a held grant and for an otherwise unsupported runner. Public
 `mbx stats --scheduler --json --activity` `scheduler.activity` rows supply `kind: "waiter"`, `live: true`, PID, ticket
 and the 1-based pending `queue_position`. The consumer corroborates the live PID's process-group or descendant
-membership with bounded scoped observations, never names, private waiter files or best-effort decision logs. A
-successful snapshot without task waiters resumes the remaining budget only when its lifecycle and zero-hold rule also
-permit it. Finished tests reset that budget even while paused. Before an idle callback expires work it drains any
-existing poll and takes a fresh bounded snapshot; total and fixture ceilings remain armed. A snapshot failure is
-reported as an operational failure, not queue/admission proof or a wedge. Unidentifiable foreign legacy rows are
-diagnosed without granting them task membership. Live output names `queued for admission N s` and the public queue
-position; a failed or cancelled never-admitted command persists a distinct `queued` verdict with its observed wait and
-last public PID/ticket/position rows. This observation creates no queue deadline. Queue observations take effect at
-snapshot completion, never backdated across a finished test's budget reset. Observed wait duration freezes when the
-command settles or cancellation stops observation, before teardown or report reading. The observer consumes the
-version-2 activity-only projection. It does not load the full statistics document's cache, savings or memory histories
-and does not raise its control-plane or output limits to accommodate them. The host pin and this consumer cut over
-together (14_nix.md, "mbx").
+membership with bounded scoped reads of each PID's lineage through cowshed's native `processLineages`
+(`@smoothbricks/cowshed/process-lineage`, 07_api.md, "Process lineage"), loaded at the first read: one kernel record per
+PID, never a spawned `ps`, a process-table census, names, private waiter files or best-effort decision logs. The whole
+snapshot, the stats read and every lineage read, shares one control-plane budget measured on the monotonic clock, never
+the wall clock the idle and total bounds read. A successful snapshot without task waiters resumes the remaining budget
+only when its lifecycle and zero-hold rule also permit it. Finished tests reset that budget even while paused. Before an
+idle callback expires work it drains any existing poll and takes a fresh bounded snapshot; total and fixture ceilings
+remain armed. A snapshot failure is reported as an operational failure, not queue/admission proof or a wedge.
+Unidentifiable foreign legacy rows are diagnosed without granting them task membership. Live output names
+`queued for admission N s` and the public queue position; a failed or cancelled never-admitted command persists a
+distinct `queued` verdict with its observed wait and last public PID/ticket/position rows. This observation creates no
+queue deadline. Queue observations take effect at snapshot completion, never backdated across a finished test's budget
+reset. Observed wait duration freezes when the command settles or cancellation stops observation, before teardown or
+report reading. The observer consumes the version-2 activity-only projection. It does not load the full statistics
+document's cache, savings or memory histories and does not raise its control-plane or output limits to accommodate them.
+The host pin and this consumer cut over together (14_nix.md, "mbx").
 
 Plain `cargo test` may include doctests and keeps its lifecycle clock. Commands with unsupported overrides, direct
 binaries, other runners and archives whose target is unknown at spawn keep that same conservative hang protection, not

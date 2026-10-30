@@ -44,6 +44,44 @@ export function addonDirectory(platform: NodeJS.Platform, arch: string): string 
   return row?.addon.directory ?? null;
 }
 
+/** The addon's file name in a family's directory, as `napi build` writes it and the loader reads it. */
+export function addonFileName(directory: string): string {
+  return `cowshed.${directory}.node`;
+}
+
+/** What the release guard reads at one path of a packed tree. */
+export type ShippedEntry =
+  | { readonly kind: 'file'; readonly bytes: number }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'other' }
+  | { readonly kind: 'unread'; readonly error: string };
+
+/**
+ * What a packed tree gets wrong about its N-API addons, each problem with its path: the addon of the
+ * `host` family (an {@link addonDirectory}) must be there, and every other family's that is there
+ * must be the same, a non-empty regular file that can be read, at
+ * `dist/native/<directory>/<addonFileName>` for each {@link NATIVE_TARGETS} row, the only tree an
+ * installed package loads ({@link addonSearch}). A family whose addon is absent is not this tree's
+ * unless it is the host's, as the CLI binaries under `dist/bin` are judged for what is there. `read`
+ * answers for a path relative to the package root.
+ */
+export function shippedAddonProblems(host: string, read: (relative: string) => ShippedEntry): string[] {
+  return NATIVE_TARGETS.flatMap(({ addon }) => {
+    const relative = join('dist/native', addon.directory, addonFileName(addon.directory));
+    const entry = read(relative);
+    switch (entry.kind) {
+      case 'file':
+        return entry.bytes > 0 ? [] : [`${relative}: empty`];
+      case 'absent':
+        return addon.directory === host ? [`${relative}: missing for this host's family`] : [];
+      case 'other':
+        return [`${relative}: not a regular file`];
+      case 'unread':
+        return [`${relative}: ${entry.error}`];
+    }
+  });
+}
+
 export function cliDirectory(platform: NodeJS.Platform, arch: string): string | null {
   const row = NATIVE_TARGETS.find((target) => target.platform === platform && target.arch === arch);
   return row?.cli.directory ?? null;
