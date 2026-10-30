@@ -8295,6 +8295,9 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
 #[path = "workspace_isolation.rs"]
 mod workspace_isolation;
 
+#[path = "node_api_pool.rs"]
+mod node_api_pool;
+
 /// A fixture whose store has this test's own built cowshed installed, as a host has its installed
 /// one: a declared land's after-land job runs as it.
 impl Fixture {

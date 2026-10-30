@@ -197,14 +197,17 @@ bytes than the CLI.
 
 An `exec` a resident workspace answers (below) asks nothing first: it opens no project and changes nothing before its
 supervisor admits the job, and that supervisor's `hello` refuses another build by itself (11_shell.md, "hello"). An
-`exec` the resident answer declines asks `sameBuild` as above, before anything else.
+`exec` the resident answer declines asks `sameBuild` as above, before anything else. A land step's `exec --class gate`
+is not answered first: it waits for an install that holds the slot and asks `sameBuild` (05_gateway.md, "A land step
+waits for an install in progress"), and only then does the controller's exec take the same resident client, so no step
+runs on a supervisor an install is about to replace.
 
-For exec in host scope, the resident answer comes first as for any `exec`: a sandboxed CLI reaches neither the store's
-records nor the supervisor's socket, so it declines without a word. Project discovery then establishes the caller's
-store authority through the controller Git profile it already writes, so that CLI gets the store's sandbox-denied
-refusal (exit 6, naming that path) before an install-slot wait or a manager build check can replace it with a
-control-plane failure. The discovered root is carried into coordinator dispatch and is not discovered twice. The build
-check still precedes opening the project or replaying lifecycle work; other commands keep their existing preflight
+For exec in host scope, the resident answer comes first as for any other `exec`: a sandboxed CLI reaches neither the
+store's records nor the supervisor's socket, so it declines without a word. Project discovery then establishes the
+caller's store authority through the controller Git profile it already writes, so that CLI gets the store's
+sandbox-denied refusal (exit 6, naming that path) before an install-slot wait or a manager build check can replace it
+with a control-plane failure. The discovered root is carried into coordinator dispatch and is not discovered twice. The
+build check still precedes opening the project or replaying lifecycle work; other commands keep their existing preflight
 order. Measured 2026-10-30: a warm `exec --host` through the controller cost 490–750 ms, against 100–340 ms resident.
 
 The stranded-user journey this contract exists for: after a reboot with locked or unmounted volumes, `cowshed doctor`
@@ -728,7 +731,10 @@ records, computed as the refresh computes it (its Git listings and a hash of the
 supervisor judges it (`buildState`, 11_shell.md, "Protocol") from listings its process keeps while the checkout's index
 keeps its identity (11_shell.md, "Kept readings"), where a CLI process would list them again for every exec. The job
 then runs through the supervisor's socket, held under the authority the `hello` read, and is relayed as the controller
-path relays it. `exec --host` is answered the same way, as a host-scope job of the coordinator route.
+path relays it. The controller that Node-API callers reach keeps the lane for that job's later calls (`info`, `wait`,
+`kill`, `detach`, `logRead`) and proves it with one `hello` per call: a supervisor that retired or now serves another
+incarnation drops the lane, and the call takes the controller path, which answers from the sealed records. `exec --host`
+is answered the same way, as a host-scope job of the coordinator route.
 
 Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached; for
 `exec`, one unserved, served under an older grant or another incarnation, a gateway session not yet at the served

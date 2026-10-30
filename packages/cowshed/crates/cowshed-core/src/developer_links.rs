@@ -299,23 +299,30 @@ impl DeveloperLinks {
         Ok(snapshot)
     }
 
-    /// The directories holding every captured and released link, with their identities now,
-    /// when each was last changed [`crate::input_memo::SETTLED`] before `asked`: a link is
-    /// removed, replaced or retargeted only by changing the directory that holds it, so a job
-    /// that leaves each of these as it is changed no link.
+    /// The directories holding every captured and released link, and every directory above them
+    /// up to `root`, each with its identity now, links not followed, when each was last changed
+    /// [`crate::input_memo::SETTLED`] before `asked`. A link is removed, replaced or retargeted
+    /// only by changing the directory that holds it, and that directory is moved or replaced by a
+    /// link only by changing the one above it, so a job that leaves each of these as it is changed
+    /// no link and left no path a restore would refuse.
     fn holders(&self, root: &Path, asked: i128) -> Option<Box<[(PathBuf, FileState)]>> {
-        let directories: BTreeSet<&Path> = self
+        let mut directories = BTreeSet::new();
+        for at in self
             .links
             .iter()
             .map(|link| link.at.as_path())
             .chain(self.released.iter().map(|link| link.at.as_path()))
-            .filter_map(Path::parent)
-            .collect();
+        {
+            for directory in root.join(at).ancestors().skip(1) {
+                if !directories.insert(directory.to_path_buf()) || directory == root {
+                    break;
+                }
+            }
+        }
         let holders: Box<[(PathBuf, FileState)]> = directories
             .into_iter()
             .map(|directory| {
-                let directory = root.join(directory);
-                let identity = FileState::of(&directory);
+                let identity = FileState::of_entry(&directory);
                 (directory, identity)
             })
             .collect();
@@ -508,7 +515,7 @@ impl DeveloperLinks {
         if self.holders.as_ref().is_some_and(|holders| {
             holders
                 .iter()
-                .all(|(directory, identity)| identity.same_as(FileState::of(directory)))
+                .all(|(directory, identity)| identity.same_as(FileState::of_entry(directory)))
         }) {
             if !self.is_empty() {
                 crate::build_volume::discard::reap(root);

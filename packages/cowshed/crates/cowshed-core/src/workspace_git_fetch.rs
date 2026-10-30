@@ -352,7 +352,17 @@ async fn collect_probe_output(
     }
 }
 
+/// The object store of the checkout at `root`, when every directory its Git reaches is granted
+/// to the sandbox. Every spawn of a workspace that holds read or write grants asks it of every
+/// project's checkout (04_sandbox.md, "Exec pipeline" step 4), so its probes are a kept reading
+/// (11_shell.md, "Kept readings"): with a `.git` directory, no alternates and no included config,
+/// they read the checkout's `.git/config`, `.git/commondir` and alternates file and nothing that
+/// can change while this process runs. Measured 2026-10-30: in a workspace whose grants name two
+/// other projects' checkouts, every warm exec paid two sandboxed `git rev-parse` processes.
 async fn repository_object_store(root: &Path, sandbox: &SandboxConfig) -> Result<Option<PathBuf>> {
+    type Key = (PathBuf, Vec<PathBuf>, Vec<PathBuf>, Option<PathBuf>);
+    static KEPT: std::sync::LazyLock<crate::input_memo::InputMemo<Key, Option<PathBuf>>> =
+        std::sync::LazyLock::new(crate::input_memo::InputMemo::new);
     let Some(root) = authorized_path(root, sandbox) else {
         return Ok(None);
     };
@@ -363,6 +373,50 @@ async fn repository_object_store(root: &Path, sandbox: &SandboxConfig) -> Result
     {
         return Ok(None);
     }
+    let Some(inputs) = probed_inputs(&root) else {
+        return probed_object_store(root, sandbox).await;
+    };
+    let key = (
+        root.clone(),
+        sandbox.grants.read.clone(),
+        sandbox.grants.write.clone(),
+        sandbox.git_worktree_repository.clone(),
+    );
+    KEPT.read_async(&key, &inputs, || probed_object_store(root, sandbox))
+        .await
+}
+
+/// What [`probed_object_store`] reads of the checkout at `root` beyond the grants, when that is
+/// its own `.git` directory's config, worktree pointer, object directory and alternates alone:
+/// `None` for a `.git` file (a linked worktree), an alternates file (whose stores may name more),
+/// or a config that includes another file, each probed every time.
+fn probed_inputs(root: &Path) -> Option<[PathBuf; 4]> {
+    let git = root.join(".git");
+    if !std::fs::symlink_metadata(&git).ok()?.is_dir() {
+        return None;
+    }
+    let alternates = git.join("objects/info/alternates");
+    if alternates.symlink_metadata().is_ok() {
+        return None;
+    }
+    let config = git.join("config");
+    let included = std::fs::read(&config)
+        .ok()?
+        .windows(b"[include".len())
+        .any(|window| window.eq_ignore_ascii_case(b"[include"));
+    (!included).then(|| {
+        [
+            config,
+            git.join("commondir"),
+            git.join("objects"),
+            alternates,
+        ]
+    })
+}
+
+/// [`repository_object_store`] asked of Git: its own paths, each granted, and every alternate
+/// store it traverses granted too.
+async fn probed_object_store(root: PathBuf, sandbox: &SandboxConfig) -> Result<Option<PathBuf>> {
     let output = probe_git(
         &root,
         &[
@@ -1008,5 +1062,37 @@ mod tests {
             Some(checkout)
         );
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A checkout's object-store probes are kept only while what they read is its own `.git`
+    /// directory's config, worktree pointer and alternates file: a linked worktree's `.git`
+    /// file, an alternates file, or a config that includes another file is probed every time.
+    #[test]
+    fn only_a_plain_git_directory_keeps_its_probe() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-git-probe-inputs-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("objects/info")).unwrap();
+        std::fs::write(git.join("config"), "[core]\n\tbare = false\n").unwrap();
+        assert_eq!(
+            probed_inputs(&root),
+            Some([
+                git.join("config"),
+                git.join("commondir"),
+                git.join("objects"),
+                git.join("objects/info/alternates")
+            ])
+        );
+        std::fs::write(git.join("config"), "[core]\n[Include]\n\tpath = other\n").unwrap();
+        assert_eq!(probed_inputs(&root), None, "an included config");
+        std::fs::write(git.join("config"), "[core]\n").unwrap();
+        std::fs::write(git.join("objects/info/alternates"), "/elsewhere/objects\n").unwrap();
+        assert_eq!(probed_inputs(&root), None, "alternates");
+        std::fs::remove_dir_all(&git).unwrap();
+        std::fs::write(&git, "gitdir: /elsewhere/.git/worktrees/w\n").unwrap();
+        assert_eq!(probed_inputs(&root), None, "a linked worktree");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

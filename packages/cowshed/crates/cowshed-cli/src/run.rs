@@ -431,9 +431,13 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     // host-scope preflight and the daemon's build check. A sandboxed caller reaches neither the
     // store's records nor the supervisor's socket, so it declines without a word and meets the
     // preflight's refusal below; whatever declines takes the path below unchanged (06_cli.md,
-    // "Resident workspaces"). Its relay is interruptible, and stays armed for the rest.
+    // "Resident workspaces"). A land step first waits for an install that holds the slot and
+    // asks the daemon's build (05_gateway.md, "The install slot"), so its exec takes the same
+    // resident client in the controller, after both.
     let mut armed = None;
-    let stdin = if let args::Command::Exec(_) = &parsed.command {
+    let resident =
+        matches!(&parsed.command, args::Command::Exec(_)) && !is_land_step(&parsed.command);
+    let stdin = if resident {
         let mut interrupts = interrupts.arm();
         let answered = tokio::select! {
             answered = crate::resident::answer_exec(&parsed, tokio::io::stdin(), &mut output) => answered,
@@ -450,44 +454,47 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     } else {
         tokio::io::stdin()
     };
-    let prepared = match runtime::prepare_project_before_control(&parsed).await {
+    let preflight = async {
+        let prepared = runtime::prepare_project_before_control(&parsed).await?;
+        // A land step that starts while an install holds the slot waits for that install, and
+        // then holds nothing (`install_basis::wait_for_install`): no install ever waits on a land
+        // step. Waited for before the build check, so the step judges the daemon the install left.
+        let mut waited_in = None;
+        if is_land_step(&parsed.command) {
+            let home = cowshed_core::gateway_sessions::canonical_home()?;
+            let support = cowshed_core::host_dirs::support_directory(&home);
+            if install_basis::wait_for_install(&support).await? {
+                waited_in = Some(support);
+            }
+        }
+        // The daemon refuses another build's cowshed at the first supervisor a verb asks for,
+        // which is after the verb's first step. Ask it now, before anything is changed.
+        if let Err(error) = runtime::require_daemon_of_this_build(&parsed.command).await {
+            // A step the install it waited for replaced goes on as the installed build, in place.
+            if let (Some(support), Some(_)) = (&waited_in, error.other_build_source()) {
+                return Err(continue_as_installed(support));
+            }
+            return Err(error);
+        }
+        Ok::<_, CowshedError>(prepared)
+    };
+    // Handlers armed for a resident answer stay installed, so a signal during the preflight ends
+    // the command as it would during the relay, never waits for the preflight to finish.
+    let prepared = match &mut armed {
+        Some(interrupts) => tokio::select! {
+            prepared = preflight => prepared,
+            signal = interrupts.received() => return Err(signal),
+        },
+        None => preflight.await,
+    };
+    let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return Ok(finish(Err(error), &mut output, json, &waits)),
     };
-    // A land step that starts while an install holds the slot waits for that install, and then
-    // holds nothing (`install_basis::wait_for_install`): no install ever waits on a land step.
-    // Waited for before the build check, so the step judges the daemon the install left.
-    let mut waited_in = None;
-    if is_land_step(&parsed.command) {
-        let waited = async {
-            let home = cowshed_core::gateway_sessions::canonical_home()?;
-            let support = cowshed_core::host_dirs::support_directory(&home);
-            let waited = install_basis::wait_for_install(&support).await?;
-            Ok::<_, CowshedError>(waited.then_some(support))
-        }
-        .await;
-        match waited {
-            Ok(support) => waited_in = support,
-            Err(error) => return Ok(finish(Err(error), &mut output, json, &waits)),
-        }
-    }
-    // The daemon refuses another build's cowshed at the first supervisor a verb asks for, which
-    // is after the verb's first step. Ask it now, before anything is changed.
-    if let Err(error) = runtime::require_daemon_of_this_build(&parsed.command).await {
-        // A step the install it waited for replaced goes on as the installed build, in place.
-        if let (Some(support), Some(_)) = (&waited_in, error.other_build_source()) {
-            return Ok(finish(
-                Err(continue_as_installed(support)),
-                &mut output,
-                json,
-                &waits,
-            ));
-        }
-        return Ok(finish(Err(error), &mut output, json, &waits));
-    }
     // Project and host commands run the controller in this process, and its workspace supervisors
     // run jobs as children in their own process groups, out of reach of the terminal's signals.
-    // The long-running services above own their signals, so only this section is interruptible.
+    // The long-running services above own their signals, and a resident answer's handlers stay
+    // armed from it, so from here on the command is interruptible.
     let mut interrupts = armed.unwrap_or_else(|| interrupts.arm());
     let outcome = {
         let command = async {

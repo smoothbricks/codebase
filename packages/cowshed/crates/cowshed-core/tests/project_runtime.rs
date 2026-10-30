@@ -64,6 +64,9 @@ mod temp_parent;
 #[path = "support/calm_pressure.rs"]
 mod calm_pressure;
 #[cfg(target_os = "macos")]
+#[path = "support/napi_client.rs"]
+mod napi_client;
+#[cfg(target_os = "macos")]
 #[path = "support/publication.rs"]
 mod publication;
 #[path = "support/temp_root.rs"]
@@ -3491,65 +3494,17 @@ async fn napi_job_read<T: serde::de::DeserializeOwned>(
     job: JobId,
     expression: &str,
 ) -> T {
-    use cowshed_os::fork_lock::Spawn as _;
-    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
-        .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
-    let package = Path::new(&manifest).join("../..");
-    let module = Url::from_file_path(package.join("dist/ts/index.js").canonicalize().expect(
-        "the built TypeScript package (nx run cowshed:tsc-js) under packages/cowshed/dist/ts",
-    ))
-    .expect("a module URL");
-    let client = format!(
-        "import {{ connectCoordinator, coordinatorEndpoint }} from {module};\n\
-         const coordinator = await connectCoordinator(coordinatorEndpoint(3), {checkout});\n\
-         const worker = await coordinator.worker('main');\n\
-         const job = await worker.job({job});\n\
-         const document = JSON.stringify({expression});\n\
-         await new Promise((resolve, reject) => process.stdout.write(document + '\\n', error => error ? reject(error) : resolve()));\n\
-         process.exit(0);\n",
-        module = json!(module.as_str()),
-        checkout = json!(root.join("checkout")),
-        job = job.get(),
-        expression = expression,
-    );
-    let node = std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join("node"))
-                .find(|node| node.is_file())
-        })
-        .expect("node on the test's PATH");
-    let endpoint = std::os::fd::OwnedFd::from(jobs.controller.endpoint());
-    let output = tokio::task::spawn_blocking(move || {
-        // The endpoint arrives as stdin; the shell hands it to Node as descriptor 3, the way a
-        // trusted spawner hands an embedder its controller endpoint.
-        std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                r#"exec "$0" --input-type=module --eval "$1" 3<&0 </dev/null"#,
-            ])
-            .arg(node)
-            .arg(client)
-            .env_remove("NAPI_DEBUG_ADDON")
-            .env_remove("FORCE_COLOR")
-            .current_dir(&package)
-            .stdin(std::process::Stdio::from(endpoint))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn_locked()?
-            .wait_with_output_bounded()
-    })
+    napi_client::answer(
+        jobs.controller.endpoint().into(),
+        &root.join("checkout"),
+        &format!(
+            "const worker = await coordinator.worker('main');\n\
+             const job = await worker.job({job});\n\
+             return {expression};",
+            job = job.get(),
+        ),
+    )
     .await
-    .expect("node task")
-    .expect("run node");
-    assert!(
-        output.status.success(),
-        "node: {}\nstdout: {}\nstderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("the SDK answers the canonical job value")
 }
 
 /// The complete native path: held workload, served supervisor, worker stream, trusted N-API

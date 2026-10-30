@@ -59,8 +59,7 @@ const GIT_DISCOVERY_ENVIRONMENT: [&str; 5] = [
 ];
 
 /// Why a verb opens the controller instead of answering from live state.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Decline {
     /// The caller steers Git's repository discovery through its environment.
     GitEnvironment,
@@ -213,8 +212,6 @@ impl Resident {
         &self.socket
     }
 
-    /// Whether a job may be admitted onto the checkout's build state as it is
-    /// ([`build_state_current`]), as the workspace's supervisor judges it.
     /// Whether an exec may be admitted here as it is, which is exactly when the controller's
     /// preparation would do nothing for it (06_cli.md, "Resident workspaces"): `gateway` holds
     /// the workspace's session at the revision its supervisor serves, so the pre-exec reconcile
@@ -241,11 +238,37 @@ impl Resident {
         cowshed_os::timing::spanned("resident", "build-state", self.build_state_current()).await
     }
 
+    /// Whether a job may be admitted onto the checkout's build state as it is
+    /// ([`build_state_current`]), as the workspace's supervisor judges it.
     pub async fn build_state_current(&self) -> Result<(), Decline> {
         match self.supervisor.build_state(self.build_volume.clone()).await {
             Ok(None) => Ok(()),
-            Ok(Some(decline)) => Err(decline),
+            Ok(Some(decline)) => Err(decline.into()),
             Err(_) => Err(Decline::BuildStateUnanswered),
+        }
+    }
+}
+
+/// Why a job may not be admitted onto a checkout's build state as it is ([`build_state_current`]),
+/// as the workspace's supervisor answers it (`buildState`, 11_shell.md, "Protocol").
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BuildStateDecline {
+    Unrecorded,
+    Records,
+    InputsMoved,
+    InputsUnreadable,
+    LinkDisplaced,
+}
+
+impl From<BuildStateDecline> for Decline {
+    fn from(decline: BuildStateDecline) -> Self {
+        match decline {
+            BuildStateDecline::Unrecorded => Self::BuildStateUnrecorded,
+            BuildStateDecline::Records => Self::Records,
+            BuildStateDecline::InputsMoved => Self::BuildInputsMoved,
+            BuildStateDecline::InputsUnreadable => Self::BuildInputsUnreadable,
+            BuildStateDecline::LinkDisplaced => Self::BuildLinkDisplaced,
         }
     }
 }
@@ -257,21 +280,21 @@ impl Resident {
 /// the checkout's Git listings (one `git ls-files`, one more per declared pattern, kept while the
 /// index keeps its identity) plus a hash of the tracked manifests. A pending discard is left to
 /// the next controller refresh and `cowshed gc`.
-pub fn build_state_current(mount: &Path, volume: Option<&Path>) -> Result<(), Decline> {
+pub fn build_state_current(mount: &Path, volume: Option<&Path>) -> Result<(), BuildStateDecline> {
     use crate::build_volume::{BuildVolumeState, link};
-    let volume = volume.ok_or(Decline::BuildStateUnrecorded)?;
-    let state = BuildVolumeState::read(volume).map_err(|_| Decline::Records)?;
+    let volume = volume.ok_or(BuildStateDecline::Unrecorded)?;
+    let state = BuildVolumeState::read(volume).map_err(|_| BuildStateDecline::Records)?;
     let recorded = state
         .fingerprint
         .as_deref()
-        .ok_or(Decline::BuildStateUnrecorded)?;
+        .ok_or(BuildStateDecline::Unrecorded)?;
     if !link::settled(mount, volume, &state.paths) {
-        return Err(Decline::BuildLinkDisplaced);
+        return Err(BuildStateDecline::LinkDisplaced);
     }
     let fingerprint = crate::capabilities::tracked_manifest_fingerprint(mount)
-        .map_err(|_| Decline::BuildInputsUnreadable)?;
+        .map_err(|_| BuildStateDecline::InputsUnreadable)?;
     if fingerprint != recorded {
-        return Err(Decline::BuildInputsMoved);
+        return Err(BuildStateDecline::InputsMoved);
     }
     Ok(())
 }
@@ -296,6 +319,27 @@ impl JobLink {
 
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// Prove the lane still reaches a supervisor serving its job's incarnation, with one `hello`,
+    /// and take a grant advance it served since; an error when nothing serves that incarnation
+    /// any more (the supervisor retired, or another incarnation stands there).
+    pub async fn current(&mut self) -> crate::Result<()> {
+        let hello = HostProbe.hello(&self.socket).await?;
+        let lane = self.handle.snapshot();
+        if hello.authority.repo_id != lane.repo_id
+            || hello.authority.workspace != lane.workspace
+            || hello.authority.workspace_incarnation != lane.workspace_incarnation
+        {
+            return Err(crate::CowshedError::conflict(
+                "the workspace's supervisor serves another incarnation than the job's",
+                "read the job through its workspace again",
+            ));
+        }
+        if hello.authority != *lane {
+            self.handle = supervisor_socket::connect(self.socket.clone(), hello.authority);
+        }
+        Ok(())
     }
 
     /// The supervisor handle, under the authority the lane last followed.
@@ -1041,6 +1085,7 @@ mod tests {
             .await
             .expect("resident");
         build_state_current(&resident.mount, resident.build_volume.as_deref())
+            .map_err(Decline::from)
     }
 
     /// A resident `exec` admits a job only onto build state the controller's refresh would

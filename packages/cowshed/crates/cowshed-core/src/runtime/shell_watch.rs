@@ -218,6 +218,29 @@ impl FileState {
         }
     }
 
+    /// [`Self::of`] of the entry at `path` itself, a link not followed: a directory moved away
+    /// and replaced by a link to it keeps the identity [`Self::of`] reads, not this one.
+    pub fn of_entry(path: &Path) -> Self {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Self::Present {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                size: metadata.size(),
+                mtime_ns: nanoseconds(metadata.mtime(), metadata.mtime_nsec()),
+                ctime_ns: nanoseconds(metadata.ctime(), metadata.ctime_nsec()),
+            },
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Self::Missing
+            }
+            Err(error) => Self::Unreadable(error.raw_os_error().unwrap_or(0)),
+        }
+    }
+
     fn exists(self) -> bool {
         !matches!(self, Self::Missing)
     }

@@ -148,6 +148,11 @@ struct FakeControl {
 
 #[async_trait]
 impl GatewayControl for FakeControl {
+    /// A test gateway never says a session is current: no exec it serves is resident.
+    async fn session_current(&self, _: &str, _: u64) -> cowshed_core::Result<bool> {
+        Ok(false)
+    }
+
     async fn land_turns(
         &self,
     ) -> std::result::Result<Vec<cowshed_core::api::dto::LandTurnQueue>, GatewayStatusError> {
@@ -965,6 +970,11 @@ impl FencedGateway {
 
 #[async_trait]
 impl GatewayControl for FencedGateway {
+    /// A test gateway never says a session is current: no exec it serves is resident.
+    async fn session_current(&self, _: &str, _: u64) -> cowshed_core::Result<bool> {
+        Ok(false)
+    }
+
     async fn land_turns(
         &self,
     ) -> std::result::Result<Vec<cowshed_core::api::dto::LandTurnQueue>, GatewayStatusError> {

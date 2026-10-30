@@ -4011,7 +4011,7 @@ impl WorkspaceSupervisorHandle {
     pub async fn build_state(
         &self,
         build_volume: Option<PathBuf>,
-    ) -> Result<Option<crate::resident::Decline>> {
+    ) -> Result<Option<crate::resident::BuildStateDecline>> {
         self.call(|reply| Command::BuildState {
             authority: self.authority.clone(),
             build_volume,
@@ -4714,7 +4714,7 @@ pub(super) enum Command {
     BuildState {
         authority: WorkspaceAuthoritySnapshot,
         build_volume: Option<PathBuf>,
-        reply: oneshot::Sender<Result<Option<crate::resident::Decline>>>,
+        reply: oneshot::Sender<Result<Option<crate::resident::BuildStateDecline>>>,
     },
     ShellPool {
         authority: WorkspaceAuthoritySnapshot,

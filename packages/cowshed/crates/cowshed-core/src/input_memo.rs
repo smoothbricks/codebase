@@ -4,18 +4,19 @@
 //! for the host scheduler. Admission asks them again for every exec (15_capabilities.md,
 //! "Detection inputs"), and their answer moves only when a file the reading depends on moves. An
 //! [`InputMemo`] keeps the last answer beside the identity ([`FileState`]: inode, size, mtime,
-//! ctime) each of those files had before that reading started, and answers from it while every
-//! one of them still has that identity. Identities are taken before the reading, so a change made
-//! while it runs moves one and the next ask reads again. A file whose last change is not yet
-//! [`SETTLED`] behind the clock could be rewritten again within its timestamp's tick without
-//! moving its identity (a coarse Linux tick, an HFS+ second), so an answer that read it is used
-//! once and not kept. Bytes are never compared: the reading is the authority, and a moved identity
-//! only means it runs again (11_shell.md, "Freshness is direnv's own").
+//! ctime) each of those files had, and answers from it while every one of them still has that
+//! identity. An absent input is watched through the directory that would hold it, whose entries
+//! change when it is created, even when it is removed again before the next ask. A file whose last
+//! change is not yet [`SETTLED`] behind the clock when the reading starts could be rewritten
+//! again within its timestamp's tick without moving its identity (a coarse Linux tick, an HFS+
+//! second), so an answer that read it is used once and not kept. Bytes are never compared: the
+//! reading is the authority, and a moved identity only means it runs again (11_shell.md,
+//! "Kept readings").
 //!
-//! The decisions are pure ([`stands`], [`keeps`]): an ask's identities and the time it read them
-//! are their inputs, so a model of coarse filesystem clocks checks them (`tests`); [`InputMemo`]
-//! only reads identities and the clock, runs the reading, and publishes. An ask loads one
-//! published map; keeping an answer publishes a new one. Nothing locks.
+//! The decisions are pure ([`watched`], [`stands`], [`keeps`]): an ask's identities and the time
+//! it started are their inputs, so a model of coarse filesystem clocks checks them (`tests`);
+//! [`InputMemo`] only reads identities and the clock, runs the reading, and publishes. An ask
+//! loads one published map; keeping an answer publishes a new one. Nothing locks.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -38,7 +39,10 @@ pub(crate) struct InputMemo<K, V> {
 }
 
 struct Kept<V> {
+    /// The inputs the answer was asked for.
     inputs: Box<[PathBuf]>,
+    /// What decides it ([`watched`]) and the identity each had.
+    watched: Box<[PathBuf]>,
     identities: Box<[FileState]>,
     value: V,
 }
@@ -59,12 +63,12 @@ impl<K: Clone + Eq + Hash, V: Clone> InputMemo<K, V> {
         inputs: &[PathBuf],
         read: impl FnOnce() -> Result<V, E>,
     ) -> Result<V, E> {
-        let (identities, asked) = match self.ask(key, inputs) {
+        let asked = match self.ask(key, inputs) {
             Ok(kept) => return Ok(kept),
             Err(asked) => asked,
         };
         let value = read()?;
-        self.keep(key, inputs.into(), identities, asked, &value);
+        self.keep(key, inputs, asked, &value);
         Ok(value)
     }
 
@@ -78,12 +82,12 @@ impl<K: Clone + Eq + Hash, V: Clone> InputMemo<K, V> {
     where
         F: Future<Output = Result<V, E>>,
     {
-        let (identities, asked) = match self.ask(key, inputs) {
+        let asked = match self.ask(key, inputs) {
             Ok(kept) => return Ok(kept),
             Err(asked) => asked,
         };
         let value = read().await?;
-        self.keep(key, inputs.into(), identities, asked, &value);
+        self.keep(key, inputs, asked, &value);
         Ok(value)
     }
 
@@ -98,48 +102,67 @@ impl<K: Clone + Eq + Hash, V: Clone> InputMemo<K, V> {
         read: impl FnOnce() -> Result<(V, Vec<PathBuf>), E>,
     ) -> Result<V, E> {
         if let Some(kept) = self.kept.load().get(key) {
-            let identities: Vec<FileState> =
-                kept.inputs.iter().map(|path| FileState::of(path)).collect();
-            if stands(&kept.inputs, &kept.identities, &kept.inputs, &identities) {
+            let (watched, identities) = observe(&kept.inputs);
+            if stands(&kept.watched, &kept.identities, &watched, &identities) {
                 return Ok(kept.value.clone());
             }
         }
-        let asked = now_ns();
+        let started = now_ns();
         let (value, inputs) = read()?;
-        let identities = inputs.iter().map(|path| FileState::of(path)).collect();
-        self.keep(key, inputs.into(), identities, asked, &value);
+        let (watched, identities) = observe(&inputs);
+        self.publish(key, inputs.into(), watched, identities, started, &value);
         Ok(value)
     }
 
-    /// The kept answer for `key` when it stands for `inputs` now; else their identities and the
-    /// time they were read, taken before the reading: a change made while it runs stamps no
-    /// earlier than that, less a stamping tick.
-    fn ask(&self, key: &K, inputs: &[PathBuf]) -> Result<V, (Box<[FileState]>, Option<i128>)> {
-        let identities: Box<[FileState]> = inputs.iter().map(|path| FileState::of(path)).collect();
-        let asked = now_ns();
+    /// The kept answer for `key` when it stands for `inputs` now; else what an answer read from
+    /// them now is kept against, taken before the reading: a change made while it runs stamps no
+    /// earlier than then, less a stamping tick.
+    fn ask(&self, key: &K, inputs: &[PathBuf]) -> Result<V, Asked> {
+        let (watched, identities) = observe(inputs);
+        let started = now_ns();
         match self.kept.load().get(key) {
-            Some(kept) if stands(&kept.inputs, &kept.identities, inputs, &identities) => {
+            Some(kept)
+                if *kept.inputs == *inputs
+                    && stands(&kept.watched, &kept.identities, &watched, &identities) =>
+            {
                 Ok(kept.value.clone())
             }
-            _ => Err((identities, asked)),
+            _ => Err(Asked {
+                watched,
+                identities,
+                started,
+            }),
         }
     }
 
-    /// Publish `value` for `key` when every input's identity was settled at `asked`.
-    fn keep(
+    fn keep(&self, key: &K, inputs: &[PathBuf], asked: Asked, value: &V) {
+        self.publish(
+            key,
+            inputs.into(),
+            asked.watched,
+            asked.identities,
+            asked.started,
+            value,
+        );
+    }
+
+    /// Publish `value` for `key` when every watched identity was settled at `started`.
+    fn publish(
         &self,
         key: &K,
         inputs: Box<[PathBuf]>,
-        identities: Box<[FileState]>,
-        asked: Option<i128>,
+        watched: Vec<PathBuf>,
+        identities: Vec<FileState>,
+        started: Option<i128>,
         value: &V,
     ) {
-        if !asked.is_some_and(|asked| keeps(&identities, asked)) {
+        if !started.is_some_and(|started| keeps(&identities, started)) {
             return;
         }
         let kept = Arc::new(Kept {
             inputs,
-            identities,
+            watched: watched.into(),
+            identities: identities.into(),
             value: value.clone(),
         });
         self.kept.rcu(|answers| {
@@ -150,6 +173,33 @@ impl<K: Clone + Eq + Hash, V: Clone> InputMemo<K, V> {
     }
 }
 
+/// What an ask that found no standing answer keeps a fresh one against.
+struct Asked {
+    watched: Vec<PathBuf>,
+    identities: Vec<FileState>,
+    started: Option<i128>,
+}
+
+/// The paths that decide an answer read from `inputs`, and the identity of each now.
+fn observe(inputs: &[PathBuf]) -> (Vec<PathBuf>, Vec<FileState>) {
+    let states: Vec<FileState> = inputs.iter().map(|path| FileState::of(path)).collect();
+    let watched = watched(inputs, &states);
+    let identities = watched.iter().map(|path| FileState::of(path)).collect();
+    (watched, identities)
+}
+
+/// The paths whose identities decide an answer read from `inputs`, which had `identities`: every
+/// input, and the directory of each absent one, whose entries change when it is created even if
+/// it is removed again before the next ask.
+fn watched(inputs: &[PathBuf], identities: &[FileState]) -> Vec<PathBuf> {
+    let absent = inputs
+        .iter()
+        .zip(identities)
+        .filter(|(_, identity)| matches!(identity, FileState::Missing))
+        .filter_map(|(path, _)| path.parent().map(PathBuf::from));
+    inputs.iter().cloned().chain(absent).collect()
+}
+
 /// This process's clock, in nanoseconds since the epoch; `None` before it.
 pub(crate) fn now_ns() -> Option<i128> {
     SystemTime::now()
@@ -158,16 +208,16 @@ pub(crate) fn now_ns() -> Option<i128> {
         .and_then(|now| i128::try_from(now.as_nanos()).ok())
 }
 
-/// Whether an answer kept for `kept_inputs`, whose identities were `kept_identities` before it
-/// was read, answers an ask of `inputs` whose identities are now `identities`: the same files,
-/// each the same file state ([`FileState::same_as`]).
+/// Whether an answer kept against `kept_watched` with `kept_identities` answers an ask that
+/// watches `watched` with `identities` now: the same paths, each the same file state
+/// ([`FileState::same_as`]).
 fn stands(
-    kept_inputs: &[PathBuf],
+    kept_watched: &[PathBuf],
     kept_identities: &[FileState],
-    inputs: &[PathBuf],
+    watched: &[PathBuf],
     identities: &[FileState],
 ) -> bool {
-    kept_inputs == inputs
+    kept_watched == watched
         && kept_identities.len() == identities.len()
         && kept_identities
             .iter()
@@ -175,24 +225,24 @@ fn stands(
             .all(|(kept, now)| kept.same_as(*now))
 }
 
-/// Whether an answer read after its inputs had `identities`, read at `asked_ns` by this process's
-/// clock, is kept: every input is [`settled`] then.
-pub(crate) fn keeps(identities: &[FileState], asked_ns: i128) -> bool {
+/// Whether an answer whose watched paths have `identities`, read from `started_ns` by this
+/// process's clock, is kept: every one is [`settled`] then.
+pub(crate) fn keeps(identities: &[FileState], started_ns: i128) -> bool {
     identities
         .iter()
-        .all(|identity| settled(*identity, asked_ns))
+        .all(|identity| settled(*identity, started_ns))
 }
 
-/// Whether `identity` moves with the file's next change after `asked_ns`: absent (a creation
-/// moves it), or last changed at least [`SETTLED`] before it, so that change's stamp and any
-/// later one's cannot share a timestamp tick. An unreadable file, or a change time ahead of the
-/// clock, is never settled.
-fn settled(identity: FileState, asked_ns: i128) -> bool {
+/// Whether `identity` moves with the path's next change after `started_ns`: absent (a creation
+/// moves it, and moves the directory [`watched`] adds), or last changed at least [`SETTLED`]
+/// before it, so that change's stamp and any later one's cannot share a timestamp tick. An
+/// unreadable path, or a change time ahead of the clock, is never settled.
+fn settled(identity: FileState, started_ns: i128) -> bool {
     match identity {
         FileState::Missing => true,
         FileState::Unreadable(_) => false,
         FileState::Present { ctime_ns, .. } => {
-            asked_ns - ctime_ns >= i128::try_from(SETTLED.as_nanos()).unwrap_or(i128::MAX)
+            started_ns - ctime_ns >= i128::try_from(SETTLED.as_nanos()).unwrap_or(i128::MAX)
         }
     }
 }
@@ -290,10 +340,13 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// An absent input is kept against its directory: a file created and removed again moves
+    /// that directory, a creation moves the input itself, and a failed reading keeps nothing.
     #[test]
-    fn a_created_input_reads_again_and_a_failure_keeps_nothing() {
-        let root = scratch("created");
+    fn an_absent_input_is_watched_through_its_directory() {
+        let root = scratch("absent");
         let input = root.join("absent");
+        settle(&root);
         let memo = InputMemo::<&str, u32>::new();
         assert_eq!(
             memo.read(&"k", std::slice::from_ref(&input), || Err::<u32, &str>(
@@ -309,10 +362,16 @@ mod tests {
             memo.read(&"k", std::slice::from_ref(&input), || Ok::<_, &str>(2)),
             Ok(1)
         );
-        std::fs::write(&input, b"now").unwrap();
+        std::fs::write(&input, b"briefly").unwrap();
+        std::fs::remove_file(&input).unwrap();
         assert_eq!(
             memo.read(&"k", std::slice::from_ref(&input), || Ok::<_, &str>(3)),
             Ok(3)
+        );
+        std::fs::write(&input, b"now").unwrap();
+        assert_eq!(
+            memo.read(&"k", std::slice::from_ref(&input), || Ok::<_, &str>(4)),
+            Ok(4)
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -321,29 +380,54 @@ mod tests {
     /// Linux tick or an HFS+ second, behind this process's clock by up to one tick.
     #[derive(Clone, Debug)]
     enum Step {
-        /// Write `content` into `file`: in place (the inode stays) or by a rename over it.
+        /// Write `content` into `file`, creating it when absent: in place (the inode stays) or by
+        /// a rename over it.
         Write {
             file: usize,
             content: u8,
             renamed: bool,
         },
+        /// Remove `file` when present.
+        Remove { file: usize },
         /// Let `ns` pass.
         Advance { ns: i128 },
-        /// Ask, taking `reading_ns` to read, while `during` is written halfway through.
+        /// Ask, taking `reading_ns` to read, while `during` changes halfway through. A recorded
+        /// ask takes its identities after the reading ([`InputMemo::read_recorded`]), any other
+        /// before it ([`InputMemo::read`]).
         Ask {
-            during: Option<(usize, u8, bool)>,
+            during: Option<Change>,
             reading_ns: i128,
+            recorded: bool,
         },
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        Write {
+            file: usize,
+            content: u8,
+            renamed: bool,
+        },
+        Remove {
+            file: usize,
+        },
+        /// Create `file` and remove it again inside one reading.
+        Flicker {
+            file: usize,
+            content: u8,
+        },
+    }
+
+    /// A model directory of files, each absent or with an inode, a one-byte content (one size, so
+    /// only the clock tells two writes apart) and a change stamp; the directory's own inode and
+    /// stamp move with every creation and removal.
     struct Checkout {
         now: i128,
         tick: i128,
         lag: i128,
         next_ino: u64,
-        /// Each file's inode, one-byte content (one size, so only the clock can tell two writes
-        /// apart) and change stamp.
-        files: Vec<(u64, u8, i128)>,
+        directory: (u64, i128),
+        files: Vec<Option<(u64, u8, i128)>>,
     }
 
     impl Checkout {
@@ -354,55 +438,107 @@ mod tests {
 
         fn write(&mut self, file: usize, content: u8, renamed: bool) {
             let stamp = self.stamp();
-            let file = &mut self.files[file];
-            if renamed {
-                file.0 = self.next_ino;
-                self.next_ino += 1;
+            let created = self.files[file].is_none();
+            let ino = match self.files[file] {
+                Some((ino, ..)) if !renamed => ino,
+                _ => {
+                    self.next_ino += 1;
+                    self.next_ino
+                }
+            };
+            self.files[file] = Some((ino, content, stamp));
+            if created || renamed {
+                self.directory.1 = stamp;
             }
-            file.1 = content;
-            file.2 = stamp;
         }
 
-        fn identities(&self) -> Vec<FileState> {
+        fn remove(&mut self, file: usize) {
+            if self.files[file].take().is_some() {
+                self.directory.1 = self.stamp();
+            }
+        }
+
+        fn state(&self, path: &std::path::Path) -> FileState {
+            let present = |ino, stamp| FileState::Present {
+                dev: 1,
+                ino,
+                size: 1,
+                mtime_ns: stamp,
+                ctime_ns: stamp,
+            };
+            if path == std::path::Path::new("/m") {
+                return present(self.directory.0, self.directory.1);
+            }
+            let file: usize = path.file_name().unwrap().to_str().unwrap().parse().unwrap();
+            match self.files[file] {
+                Some((ino, _, stamp)) => present(ino, stamp),
+                None => FileState::Missing,
+            }
+        }
+
+        fn observe(&self, inputs: &[PathBuf]) -> (Vec<PathBuf>, Vec<FileState>) {
+            let states: Vec<FileState> = inputs.iter().map(|path| self.state(path)).collect();
+            let watched = watched(inputs, &states);
+            let identities = watched.iter().map(|path| self.state(path)).collect();
+            (watched, identities)
+        }
+
+        fn contents(&self) -> Vec<Option<u8>> {
             self.files
                 .iter()
-                .map(|&(ino, _, stamp)| FileState::Present {
-                    dev: 1,
-                    ino,
-                    size: 1,
-                    mtime_ns: stamp,
-                    ctime_ns: stamp,
-                })
+                .map(|file| file.map(|(_, content, _)| content))
                 .collect()
         }
+    }
 
-        fn contents(&self) -> Vec<u8> {
-            self.files.iter().map(|&(_, content, _)| content).collect()
-        }
+    fn change(files: usize) -> impl proptest::strategy::Strategy<Value = Change> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (0..files, 0_u8..3, any::<bool>()).prop_map(|(file, content, renamed)| Change::Write {
+                file,
+                content,
+                renamed
+            }),
+            (0..files).prop_map(|file| Change::Remove { file }),
+            (0..files, 0_u8..3).prop_map(|(file, content)| Change::Flicker { file, content }),
+        ]
     }
 
     fn step(files: usize) -> impl proptest::strategy::Strategy<Value = Step> {
         use proptest::prelude::*;
-        let write = (0..files, 0_u8..3, any::<bool>());
         prop_oneof![
-            write
-                .clone()
-                .prop_map(|(file, content, renamed)| Step::Write {
+            change(files).prop_map(|change| match change {
+                Change::Write {
+                    file,
+                    content,
+                    renamed,
+                } => Step::Write {
                     file,
                     content,
                     renamed
-                }),
+                },
+                Change::Remove { file } | Change::Flicker { file, .. } => Step::Remove { file },
+            }),
             prop_oneof![0_i128..2_000_000, 0_i128..5_000_000_000]
                 .prop_map(|ns| Step::Advance { ns }),
-            (proptest::option::of(write), 0_i128..3_000_000_000)
-                .prop_map(|(during, reading_ns)| Step::Ask { during, reading_ns }),
+            (
+                proptest::option::of(change(files)),
+                0_i128..3_000_000_000,
+                any::<bool>()
+            )
+                .prop_map(|(during, reading_ns, recorded)| Step::Ask {
+                    during,
+                    reading_ns,
+                    recorded
+                }),
         ]
     }
 
     proptest::proptest! {
         /// A kept answer is served only while every input still holds what it held when that
         /// answer was read, whatever the stamping tick, the lag of stamps behind the clock, and
-        /// the writes that land in place, by rename, between asks or while one reads.
+        /// the writes, creations and removals that land in place, by rename, between asks or
+        /// while one reads; whether the reading's identities are taken before it or after it.
         #[test]
         fn a_kept_answer_is_never_stale(
             tick in proptest::prop_oneof![
@@ -411,47 +547,73 @@ mod tests {
                 proptest::strategy::Just(1_000_000_000_i128),
             ],
             lag_fraction in 0.0_f64..1.0,
-            ages in proptest::collection::vec(0_i128..10_000_000_000, 1..4),
+            ages in proptest::collection::vec(proptest::option::of(0_i128..10_000_000_000), 1..4),
             steps in proptest::collection::vec(step(3), 1..60),
         ) {
             let now = 1_800_000_000_000_000_000_i128;
+            let files = ages.len();
             let mut checkout = Checkout {
                 now,
                 tick,
                 lag: (tick as f64 * lag_fraction) as i128,
-                next_ino: ages.len() as u64 + 1,
+                next_ino: files as u64 + 1,
+                directory: (1_000, now - 20_000_000_000),
                 files: ages
                     .iter()
                     .enumerate()
-                    .map(|(file, age)| (file as u64 + 1, 0, now - age))
+                    .map(|(file, age)| age.map(|age| (file as u64 + 1, 0, now - age)))
                     .collect(),
             };
             let inputs: Vec<PathBuf> =
-                (0..ages.len()).map(|file| PathBuf::from(format!("/m/{file}"))).collect();
-            let mut kept: Option<(Vec<FileState>, Vec<u8>)> = None;
+                (0..files).map(|file| PathBuf::from(format!("/m/{file}"))).collect();
+            let mut kept: Option<(Vec<PathBuf>, Vec<FileState>, Vec<Option<u8>>)> = None;
             for step in steps {
                 match step {
                     Step::Write { file, content, renamed } => {
-                        checkout.write(file % ages.len(), content, renamed);
+                        checkout.write(file % files, content, renamed);
                     }
+                    Step::Remove { file } => checkout.remove(file % files),
                     Step::Advance { ns } => checkout.now += ns,
-                    Step::Ask { during, reading_ns } => {
-                        let identities = checkout.identities();
-                        let asked = checkout.now;
-                        if let Some((identities_then, value)) = &kept
-                            && stands(&inputs, identities_then, &inputs, &identities)
-                        {
-                            proptest::prop_assert_eq!(value, &checkout.contents());
-                            continue;
+                    Step::Ask { during, reading_ns, recorded } => {
+                        if let Some((watched_then, identities_then, value)) = &kept {
+                            let (watched, identities) = checkout.observe(inputs.as_slice());
+                            if stands(watched_then, identities_then, &watched, &identities) {
+                                proptest::prop_assert_eq!(value, &checkout.contents());
+                                continue;
+                            }
                         }
+                        let before = checkout.observe(inputs.as_slice());
+                        let started = checkout.now;
                         checkout.now += reading_ns / 2;
-                        if let Some((file, content, renamed)) = during {
-                            checkout.write(file % ages.len(), content, renamed);
-                        }
+                        // The reading sees the checkout halfway through, a flicker's short-lived
+                        // file included.
+                        let value = match during {
+                            Some(Change::Write { file, content, renamed }) => {
+                                checkout.write(file % files, content, renamed);
+                                checkout.contents()
+                            }
+                            Some(Change::Remove { file }) => {
+                                checkout.remove(file % files);
+                                checkout.contents()
+                            }
+                            Some(Change::Flicker { file, content })
+                                if checkout.files[file % files].is_none() =>
+                            {
+                                checkout.write(file % files, content, false);
+                                let seen = checkout.contents();
+                                checkout.remove(file % files);
+                                seen
+                            }
+                            Some(Change::Flicker { .. }) | None => checkout.contents(),
+                        };
                         checkout.now += reading_ns - reading_ns / 2;
-                        let value = checkout.contents();
-                        if keeps(&identities, asked) {
-                            kept = Some((identities, value));
+                        let (watched, identities) = if recorded {
+                            checkout.observe(inputs.as_slice())
+                        } else {
+                            before
+                        };
+                        if keeps(&identities, started) {
+                            kept = Some((watched, identities, value));
                         }
                     }
                 }

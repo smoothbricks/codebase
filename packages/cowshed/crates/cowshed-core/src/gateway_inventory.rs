@@ -4332,6 +4332,9 @@ mod tests {
 
     #[async_trait]
     impl crate::gateway_sessions::GatewayControl for RecordingControl {
+        async fn session_current(&self, _: &str, _: u64) -> crate::Result<bool> {
+            Ok(false)
+        }
         async fn land_turns(
             &self,
         ) -> std::result::Result<

@@ -464,6 +464,49 @@ async fn host_controller_commands_reuse_one_activation_until_a_watched_file_chan
     assert_eq!(workspace.activations(), 2);
 }
 
+/// A warm command's cost through the supervisor (11_shell.md, "One spare and a SIEVE cache";
+/// "Kept readings"): after the first activates, every command of an unchanged workspace is
+/// answered by an idle host, which the pool's own counts say rather than the clock, and its
+/// admission, run, seal and reads stay within a bound. A timing bound runs only on the host, in
+/// the host-controller target, never in a gate; `COWSHED_TIMING=1` prints every step.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_warm_commands_take_an_idle_host_within_their_bound() {
+    const COMMANDS: usize = 20;
+    // Measured 2026-10-30: the warm path takes about 6 ms in a debug build; a command that
+    // spawns per exec again (mbx, git) or lists every package tree lands well above this.
+    const BOUND: Duration = Duration::from_millis(60);
+    let workspace = Workspace::new("warm-bound", 41_904);
+    workspace.envrc("export FROM_ENVRC=loaded\n");
+    let handle = workspace.supervisor(false);
+    run(&handle, request(&["/usr/bin/true"])).await.ok();
+    let mut elapsed = Vec::with_capacity(COMMANDS);
+    for _ in 0..COMMANDS {
+        let started = std::time::Instant::now();
+        run(&handle, request(&["/usr/bin/true"])).await.ok();
+        elapsed.push(started.elapsed());
+    }
+    elapsed.sort();
+    let (p50, p90) = (elapsed[COMMANDS / 2], elapsed[COMMANDS * 9 / 10]);
+    println!(
+        "warm-exec commands={COMMANDS} p50_ms={:.2} p90_ms={:.2}",
+        p50.as_secs_f64() * 1e3,
+        p90.as_secs_f64() * 1e3
+    );
+    let counts = handle.shell_pool().await.expect("pool counts");
+    assert_eq!(
+        counts.activated, 1,
+        "only the first command activates: {counts:?}"
+    );
+    assert_eq!(
+        usize::try_from(counts.idle).unwrap(),
+        COMMANDS,
+        "every later command reaches an idle host: {counts:?}"
+    );
+    assert!(p50 <= BOUND, "warm p50 {p50:?} above {BOUND:?}");
+    assert_eq!(workspace.activations(), 1);
+}
+
 /// A job's environment with the per-workspace places of its own fixture replaced by fixed
 /// names, and what differs per job or per port block left out, so two workspaces' shells can
 /// be compared.

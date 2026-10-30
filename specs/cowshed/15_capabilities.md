@@ -324,15 +324,16 @@ Each detector returns data through one `CapabilityContribution`:
   The supervisor uses the same snapshot/restore implementation at job admission and terminal cleanup, including failed
   or killed installs. Its admission snapshot is a kept reading (11_shell.md, "Kept readings"): an admission whose
   package trees, links and their resolutions are as the last capture found them takes that snapshot. A snapshot whose
-  link-holding directories were all settled when it was taken records their identities, and a terminal cleanup that
-  finds each as it was knows no link was removed, replaced or retargeted, and restores and says nothing; any change
-  plans every link as below. Measured 2026-10-30: capturing and restoring cost a warm exec of a 29-tree checkout about
-  19 ms. The remaining rules hold for every snapshot. Terminal cleanup has two distinct failures, each labelled in the
-  sealed job's stderr: a link restoration that fails is `developer-link restoration failed`, and a marker that cannot be
-  removed is `install observation cleanup failed`. Either one, or both together, leaves the job in the failed state, and
-  the waiters receive one error that names every cause that occurred. A blocking cleanup task failure is instead
-  labelled `terminal cleanup task failed`: it proves neither filesystem cause. These failures are not findings: only a
-  link absent with no observed install is one. Explicit absolute host/devenv executable paths, invocations whose first
+  link-holding directories, and every directory above them up to the checkout, were all settled when it was taken
+  records their identities, links not followed, and a terminal cleanup that finds each as it was knows no link was
+  removed, replaced or retargeted, and restores and says nothing; any change plans every link as below. Measured
+  2026-10-30: capturing and restoring cost a warm exec of a 29-tree checkout about 19 ms. The remaining rules hold for
+  every snapshot. Terminal cleanup has two distinct failures, each labelled in the sealed job's stderr: a link
+  restoration that fails is `developer-link restoration failed`, and a marker that cannot be removed is
+  `install observation cleanup failed`. Either one, or both together, leaves the job in the failed state, and the
+  waiters receive one error that names every cause that occurred. A blocking cleanup task failure is instead labelled
+  `terminal cleanup task failed`: it proves neither filesystem cause. These failures are not findings: only a link
+  absent with no observed install is one. Explicit absolute host/devenv executable paths, invocations whose first
   argument is not one of those verbs, and unregistered library-only one-shot hosts bypass immediate wrapping and get
   terminal cleanup only; chained-command preservation is not promised for those bypasses. No snapshot taken by a job or
   wrapper grants a new target. Only the mint captures canonical sibling read grants from its source. Terminal cleanup

@@ -103,11 +103,8 @@ pub trait GatewayControl: Send + Sync {
     ) -> std::result::Result<Vec<crate::api::dto::LandTurnQueue>, GatewayStatusError>;
     /// Whether the gateway holds `workspace_id`'s session at `revision`, asking nothing else:
     /// what a resident exec needs to know that the pre-exec reconcile would install nothing
-    /// (06_cli.md, "Resident workspaces"). A gateway that cannot say is never current.
-    async fn session_current(&self, workspace_id: &str, revision: u64) -> crate::Result<bool> {
-        let _ = (workspace_id, revision);
-        Ok(false)
-    }
+    /// (06_cli.md, "Resident workspaces").
+    async fn session_current(&self, workspace_id: &str, revision: u64) -> crate::Result<bool>;
 }
 
 /// The composition root constructs one owned control client from validated host storage.
