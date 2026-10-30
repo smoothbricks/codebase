@@ -39,6 +39,12 @@
       "implementation": "./dist/executors/all-verdicts/executor.js",
       "schema": "./src/executors/all-verdicts/schema.json",
       "description": "Run every command at once to its own verdict and report each one a signal ended or that never ran as UNJUDGED; resolve an ESLint sources placeholder against the files that exist when the command runs"
+    },
+    "wrangler-deploy": {
+      "implementation": "./dist/executors/wrangler-deploy/executor.js",
+      "hasher": "./dist/executors/wrangler-deploy/hasher.js",
+      "schema": "./src/executors/wrangler-deploy/schema.json",
+      "description": "Deploy a stage with smoo wrangler deploy-stage, cached on the artifact and the stage while the stage serves that artifact's version"
     }
   }
 }

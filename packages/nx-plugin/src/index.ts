@@ -1522,7 +1522,7 @@ function scriptcPlatformTargets(
 const WRANGLER_CONFIG_FILES = ['wrangler.jsonc', 'wrangler.json', 'wrangler.toml'];
 
 /**
- * ONE target that deploys whichever stage it is handed, never a configuration
+ * ONE target that deploys whichever stage it is handed (`--stage`), never a configuration
  * per stage. Pull-request stages are `prN` for unbounded N, so an enumerated
  * `configurations` map cannot describe the surface that actually exists, and a
  * project carrying both spellings would have two ways to say one thing.
@@ -1531,15 +1531,18 @@ const WRANGLER_CONFIG_FILES = ['wrangler.jsonc', 'wrangler.json', 'wrangler.toml
  * statement that CI deploys this project on every stage, and only the repository
  * can make it. A plugin that tagged what it inferred would enrol every private
  * wrangler project in CI deploys by writing the policy it is supposed to read.
- *
- * `{args.stage}` rather than `forwardAllArgs`: run-commands'
- * `interpolateArgsIntoCommand` returns as soon as it sees `{args.` and never
- * appends forwarded arguments, so `nx run web:deploy --stage=pr42` yields
- * exactly one `--stage`, for an arbitrary preview stage no map could enumerate.
- * An omitted stage interpolates to empty and `deploy-stage`'s required
- * `--stage` refuses it, which is the failure we want at the boundary.
  */
-const WRANGLER_DEPLOY_COMMAND = 'smoo wrangler deploy-stage --stage {args.stage}';
+const WRANGLER_DEPLOY_EXECUTOR = '@smoothbricks/nx-plugin:wrangler-deploy';
+
+/**
+ * What a deploy uploads: the project's files and its build half's output. Nx keys the
+ * `--stage` override with them, so the hash is the artifact and the stage.
+ */
+const WRANGLER_DEPLOY_INPUTS: NonNullable<TargetConfiguration['inputs']> = [
+  'default',
+  '^default',
+  { dependentTasksOutputFiles: '**/*', transitive: false },
+];
 
 async function createProjectTargets(
   packageJsonPath: string,
@@ -2189,37 +2192,39 @@ async function createProjectTargets(
     }
   }
 
-  // A deploy is never cached; the build half beside it always is.
+  // A deploy is cached only while its stage serves what it would deploy; the build half beside it
+  // always is.
   //
   // Nx's cache answers "did this exact input set already produce an output". A deploy's real
-  // question is "is this exact version live", and the two agree only until someone rolls back.
-  // After a rollback the workspace is unchanged, so the hash is unchanged, so a cached `deploy`
-  // reports success while the previous version keeps serving. No input tuning repairs that: a
-  // `runtime` input cannot even learn WHICH STAGE is being deployed. Nx hashes runtime inputs with
-  // the env from `getTaskSpecificEnv`, which deliberately excludes the task coordinates; input
-  // strings interpolate only `{workspaceRoot}`/`{projectRoot}`, never `{args.*}`; and overrides
-  // are not forwarded to `dependsOn` dependencies, so an auxiliary task cannot carry the stage
-  // either. (An executor's custom hasher is the single Nx API that does see `task.overrides`, if
-  // hash-level participation is ever genuinely wanted.)
+  // question is "is this exact version live", and the two agree only until someone rolls back:
+  // the workspace is then unchanged, so the hash is unchanged. No input repairs that. A `runtime`
+  // input cannot even learn WHICH STAGE is being deployed (Nx hashes runtime inputs with the env
+  // from `getTaskSpecificEnv`, which excludes the task coordinates, and input strings never
+  // interpolate `{args.*}`), and hashing the live tag in would never converge, because the
+  // deployed version is tagged with the hash. An executor's custom hasher is the one Nx API that
+  // sees `task.overrides`, so `wrangler-deploy`'s asks the question: it hashes the artifact and the
+  // stage, answers that hash only while the stage serves the version tagged with it, and otherwise
+  // adds a nonce, so the run misses and deploys (executors/wrangler-deploy/hasher.ts). The run
+  // still tags the artifact's version, so the next hash, with that version live, is the artifact's
+  // own: `deploy-stage` finds it live and changes nothing, and Nx caches that answer.
   //
-  // So the target is split along the line the question actually falls on. `deploy-build` is purely
-  // file-derived — build the artifact and whatever the build registers — and caches honestly.
-  // `deploy` reads live state every run and no-ops when live already equals the desired tag, which
-  // costs two Cloudflare calls and makes a redundant deploy provably free rather than assumed
-  // free. That is what lets ordering be an ordinary `dependsOn: ["<other>:deploy"]` edge at any
-  // depth, and it is why such an edge must point at `deploy` and not at `deploy-build`: a
-  // dependent has to re-check liveness, not inherit someone else's cache hit.
+  // So the target is split along the line the question falls on. `deploy-build` is purely
+  // file-derived — build the artifact and whatever the build registers. `deploy` checks live state
+  // on every run, in its hasher, and a cache hit replays only a deploy that would change nothing.
+  // That is what lets ordering be an ordinary `dependsOn: ["<other>:deploy"]` edge at any depth,
+  // and it is why such an edge must point at `deploy` and not at `deploy-build`: a dependent has
+  // to re-check liveness, not inherit someone else's build.
   //
   // Both are bases for a package-local declaration to land on, per the merge rules above: a
   // declaration naming `cache`, `inputs` or `dependsOn` REPLACES what is set here and inherits
   // everything it does not name, while Nx's `"..."` token expands to the inferred list at its
   // position. So a project adding a cross-project edge writes
-  // `"dependsOn": ["...", "backend:deploy"]` and keeps both the edge below and this command —
+  // `"dependsOn": ["...", "backend:deploy"]` and keeps both the edge below and this executor —
   // measured, not assumed, against an inferred base.
   //
   // `deploy` is INFERRED for a private wrangler project rather than patched onto a hand-written
-  // one. The command is a constant of the convention, not of the project: every consumer wrote
-  // the same `nx:run-commands` wrapper around it. `private: true` is the second half of the
+  // one. The executor is a constant of the convention, not of the project: every consumer wrote
+  // the same `nx:run-commands` wrapper around `smoo wrangler deploy-stage`. `private: true` is the second half of the
   // detection: a PUBLISHED package's wrangler manifest documents a binding for its consumers,
   // so inferring a deploy from it would put a live `wrangler deploy` of someone's documentation
   // one `nx run-many -t deploy` away. A published package that really is deployed declares
@@ -2241,11 +2246,12 @@ async function createProjectTargets(
           ? 'build'
           : null;
     targets[DEPLOY_TARGET] = {
-      executor: 'nx:run-commands',
-      cache: false,
+      executor: WRANGLER_DEPLOY_EXECUTOR,
+      cache: true,
+      inputs: WRANGLER_DEPLOY_INPUTS,
       outputs: [],
       ...(fileDerivedHalf === null ? {} : { dependsOn: [fileDerivedHalf] }),
-      options: { command: WRANGLER_DEPLOY_COMMAND, cwd: projectRoot },
+      options: {},
     };
   }
 

@@ -284,7 +284,7 @@ describe('nx graph project helpers', () => {
       // What the plugin infers for a private wrangler project, and what a published library
       // holding a wrangler manifest used to get: a deploy target no tag enrols in CI.
       targets: {
-        deploy: { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } },
+        deploy: { executor: '@smoothbricks/nx-plugin:wrangler-deploy' },
         'package-macos': {},
       },
     },
@@ -316,7 +316,7 @@ describe('nx graph project helpers', () => {
   });
 
   it('reads the tags as precedence: permanent excludes, staging narrows, stage generalizes', () => {
-    const deploy = { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } };
+    const deploy = { executor: '@smoothbricks/nx-plugin:wrangler-deploy' };
     const stageFor = (tags: string[]) => ({
       staging: deployTargetInfoFromProjects({ site: { tags, targets: { deploy } } }, 'staging').exists,
       production: deployTargetInfoFromProjects({ site: { tags, targets: { deploy } } }, 'production').exists,
@@ -806,7 +806,7 @@ describe('CI workflow rendering by repo shape', () => {
     // Durable Object binding for their consumers, the plugin inferred a deploy target from each,
     // and a repository that deploys nothing from CI grew a Deploy Stage step holding Cloudflare
     // credentials, a deployments permission, and a preview-cleanup workflow.
-    const deploy = { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } };
+    const deploy = { executor: '@smoothbricks/nx-plugin:wrangler-deploy' };
     const projects: NxProjects = {
       'acme-cloudflare': { tags: ['npm:private'], targets: { deploy } },
       'acme-documents': { tags: ['npm:public'], targets: { deploy } },

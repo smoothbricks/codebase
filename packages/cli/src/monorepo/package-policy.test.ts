@@ -175,12 +175,14 @@ describe('only aggregates are uncached', () => {
       },
     });
     const errors = captureConsoleErrors();
-    expect(validateCacheOnlyAggregatesUncached(projects)).toBe(4);
+    expect(validateCacheOnlyAggregatesUncached(projects)).toBe(5);
     const refusal = (target: string, executor: string) =>
       `app:${target}: "cache": false on a target that runs ${executor}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input`;
     expect(errors).toEqual([
       refusal('bench', 'nx:run-commands'),
       refusal('clean', '@smoothbricks/nx-plugin:clean-outputs'),
+      // A wrangler deploy is no exception: the plugin's own is cached, keyed on its artifact and stage.
+      refusal('deploy', 'nx:run-commands'),
       refusal('lint', 'nx:run-script'),
       refusal('serve', 'nx:run-commands'),
     ]);

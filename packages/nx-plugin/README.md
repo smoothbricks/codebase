@@ -59,14 +59,17 @@ with `tsconfig.lib.json` receives transformer-aware `tsc-js` and native `typeche
 - aggregate `build` and `lint` targets
 - a cached `shard-timings` check, which `lint` depends on, beside `bun test` targets sharded with `--shard` and balanced
   with `--timings`
-- an uncached `deploy` for a PRIVATE project with a wrangler manifest, running
-  `smoo wrangler deploy-stage --stage {args.stage}`
+- a cached `deploy` for a PRIVATE project with a wrangler manifest: the `wrangler-deploy` executor, which runs
+  `smoo wrangler deploy-stage --stage <stage>`
 
 The deploy is one target that takes whichever stage it is given, never a configuration per stage: pull-request stages
 are `prN` for unbounded N, so `nx run <project>:deploy --stage=pr42` has to work for a stage no enumeration could list.
-It is never cached, because a cache hit would mean "we once uploaded this hash", which a rollback falsifies silently.
-Declaring `deploy` locally overrides only the properties it names, so a project adds cross-project ordering with
-`"dependsOn": ["...", "backend:deploy"]` and keeps the inferred command; a project that declares `deploy-build` gets
+It is cached on what it uploads (the project's files and its build half's output) and the stage, but the executor's
+hasher answers that hash only while the stage serves the version tagged with it. Any other live version, or none it can
+read, adds a nonce to the hash, so the run misses and deploys, still tagging the artifact's version; a rollback is never
+answered from the cache. Hashing the live tag in instead would never converge, since the version is tagged with the
+hash. Declaring `deploy` locally overrides only the properties it names, so a project adds cross-project ordering with
+`"dependsOn": ["...", "backend:deploy"]` and keeps the inferred executor; a project that declares `deploy-build` gets
 that edge instead of `build`, and the plugin caches that half without inventing its command.
 
 `private: true` is half the detection, because a wrangler manifest alone does not mean deployable: a published library

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/schema",
+  "version": 2,
+  "title": "Wrangler Deploy Executor",
+  "description": "Deploy a stage with smoo wrangler deploy-stage, cached on the artifact and the stage while the stage serves that artifact's version.",
+  "type": "object",
+  "cli": "nx",
+  "required": ["stage"],
+  "properties": {
+    "stage": {
+      "type": "string",
+      "description": "staging, production, or prN: the stage this run deploys, given with --stage."
+    }
+  },
+  "additionalProperties": false
+}

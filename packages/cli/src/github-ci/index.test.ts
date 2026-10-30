@@ -996,7 +996,7 @@ describe('event-aware stage deployment', () => {
       // manifest, including a published library that ships one to document a binding.
       app: {
         targets: {
-          deploy: { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } },
+          deploy: { executor: '@smoothbricks/nx-plugin:wrangler-deploy' },
         },
       },
       'app-backend': {
@@ -1447,7 +1447,7 @@ describe('resolveDeploymentStage with a configured push branch', () => {
 
 describe('selectStageDeployProjects with a required tag', () => {
   const definitions: Record<string, unknown> = {
-    app: { targets: { deploy: { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } } } },
+    app: { targets: { deploy: { executor: '@smoothbricks/nx-plugin:wrangler-deploy' } } },
     website: {
       tags: ['stage-deploy-target', 'production-push-deploy-target'],
       targets: { deploy: { command: 'bun ../../tooling/deploy-website.ts --stage={args.stage}' } },

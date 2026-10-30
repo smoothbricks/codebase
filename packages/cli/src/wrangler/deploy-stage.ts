@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { deployVersionTag } from '@smoothbricks/nx-plugin/deploy-policy';
 import { parseJsonFileText } from '../lib/json.js';
 import { mergeEnv, printCommandOutput } from '../lib/run.js';
 import {
@@ -1151,14 +1152,11 @@ export function nxTaskVersionTag(environment: NodeJS.ProcessEnv): string | undef
     environment.NX_TASK_TARGET_TARGET !== undefined;
   if (!underNx) return undefined;
   if (!hash) throw new Error('NX_TASK_HASH is required when deploy-stage runs under Nx.');
-  if (/^(?:0|[1-9][0-9]*)$/.test(hash)) {
-    return `nx-${hash}`;
+  const tag = deployVersionTag(hash);
+  if (tag === null) {
+    throw new Error('NX_TASK_HASH must be canonical decimal digits or at least 32 hexadecimal characters.');
   }
-  const normalized = hash.toLowerCase();
-  if (/^[0-9a-f]{32,}$/.test(normalized)) {
-    return `nx-${normalized.slice(0, 32)}`;
-  }
-  throw new Error('NX_TASK_HASH must be canonical decimal digits or at least 32 hexadecimal characters.');
+  return tag;
 }
 
 /** What a freshly activated version has to be true of, and where the fact gets recorded. */

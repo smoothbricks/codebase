@@ -38,3 +38,14 @@ export function stageDeploysProject(tags: string[] | undefined, stage: Deploymen
   if (tags.includes(STAGING_DEPLOY_TAG)) return stage === 'staging';
   return tags.includes(STAGE_DEPLOY_TAG);
 }
+
+/**
+ * The tag a deploy uploads its version under, from the artifact hash it deploys: `nx-` and that hash when it is
+ * decimal (Nx's own), or the first 32 digits of a hexadecimal hash of at least 32. `smoo wrangler deploy-stage` tags
+ * with it, and the wrangler-deploy hasher compares the stage's live tag with it. Null for any other hash.
+ */
+export function deployVersionTag(artifactHash: string): string | null {
+  if (/^(?:0|[1-9][0-9]*)$/.test(artifactHash)) return `nx-${artifactHash}`;
+  const normalized = artifactHash.toLowerCase();
+  return /^[0-9a-f]{32,}$/.test(normalized) ? `nx-${normalized.slice(0, 32)}` : null;
+}

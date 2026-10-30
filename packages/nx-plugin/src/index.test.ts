@@ -3870,7 +3870,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('gives a private wrangler project a deploy that runs the stage CLI, uncached, behind its build half', async () => {
+  it('gives a private wrangler project a cached deploy, keyed on its artifact and stage, behind its build half', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/site/package.json', '{"name":"site","private":true}\n');
@@ -3879,13 +3879,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       // One target taking a stage, never a configuration per stage: pull-request stages are
       // `prN` for unbounded N, so `--configuration` could not name the stage that matters most.
-      expect(targets.deploy?.options).toEqual({
-        command: 'smoo wrangler deploy-stage --stage {args.stage}',
-        cwd: 'packages/site',
-      });
-      // A cache hit on deploy would mean "we once uploaded this hash", which a rollback falsifies
-      // silently; the step has to run and read live state instead.
-      expect(targets.deploy?.cache).toBe(false);
+      // The executor's hasher keys it on the artifact and the stage, and misses unless the stage
+      // serves that artifact's version, so a rollback is never answered from the cache.
+      expect(targets.deploy?.executor).toBe('@smoothbricks/nx-plugin:wrangler-deploy');
+      expect(targets.deploy?.options).toEqual({});
+      expect(targets.deploy?.cache).toBe(true);
+      expect(targets.deploy?.inputs).toEqual([
+        'default',
+        '^default',
+        { dependentTasksOutputFiles: '**/*', transitive: false },
+      ]);
       expect(targets.deploy?.outputs).toEqual([]);
       // No build half of any kind here, so no edge is claimed: wrangler bundles its own
       // TypeScript, so a worker with neither `build` nor `deploy-build` is legitimate.
@@ -3978,11 +3981,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // `...` expands to the inferred list at its position, so the inferred build edge survives
       // beside the declared one.
       expect(deploy?.dependsOn).toEqual(['build', { projects: ['backend'], target: 'deploy', params: 'forward' }]);
-      expect(deploy?.options).toEqual({
-        command: 'smoo wrangler deploy-stage --stage {args.stage}',
-        cwd: 'packages/site',
-      });
-      expect(deploy?.cache).toBe(false);
+      expect(deploy?.executor).toBe('@smoothbricks/nx-plugin:wrangler-deploy');
+      expect(deploy?.options).toEqual({});
+      expect(deploy?.cache).toBe(true);
       expect(deploy?.outputs).toEqual([]);
     } finally {
       await workspace.cleanup();
@@ -4020,9 +4021,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         );
         const targets = await inferProjectTargets(workspace, `packages/${name}/package.json`);
         const deploy = resolveDeclaredOverInferred(targets, declared, 'deploy');
-        // The edge rides on the inferred target: its executor and command still carry the run.
-        expect(deploy?.executor).toBe('nx:run-commands');
-        expect(deploy?.options?.command).toBe('smoo wrangler deploy-stage --stage {args.stage}');
+        // The edge rides on the inferred target: its executor still carries the run.
+        expect(deploy?.executor).toBe('@smoothbricks/nx-plugin:wrangler-deploy');
         if (deploy === undefined) throw new Error(`${name} infers no deploy`);
         nodes[name] = { name, type: 'app', data: { root: `packages/${name}`, targets: { ...targets, deploy } } };
       }

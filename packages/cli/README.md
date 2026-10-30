@@ -1210,11 +1210,15 @@ Nx then orders it, at any depth: `site:deploy` after `app-backend:deploy` after 
 order. Keep the leading `"..."`: it expands the `deploy-build` edge the plugin infers (below), which a bare list would
 drop.
 
-What makes the edge safe is that a deploy is never cached and always cheap when there is nothing to do:
+What makes the edge safe is that a deploy is answered from the cache only when it would change nothing, and is cheap
+when there is nothing to do:
 
-- `@smoothbricks/nx-plugin` gives the `deploy` it infers `cache: false`. An Nx cache hit on a deploy means "we once
-  uploaded this hash", which a rollback silently falsifies — the workspace is unchanged, so the hash is unchanged, so a
-  cached deploy would report success while the previous version keeps serving.
+- `@smoothbricks/nx-plugin` runs the `deploy` it infers with its `wrangler-deploy` executor, cached on the artifact and
+  the stage. A plain Nx cache hit on a deploy would mean "we once uploaded this hash", which a rollback silently
+  falsifies: the workspace is unchanged, so the hash is unchanged. So the executor's hasher asks
+  `smoo wrangler deployed-version --stage <stage> --refresh` which tag serves the stage, and answers the artifact hash
+  only while that tag is the artifact's. Otherwise it adds a nonce, the run misses, and `deploy-stage` deploys, still
+  tagging the artifact's version, so the next hash, with that version live, is the artifact's own.
 - `smoo wrangler deploy-stage` reads live state first. If the version tagged with this task's hash is already the one
   serving 100% of traffic, it returns `remote-cache-hit` after two API calls: no upload, no migration, no traffic shift.
 - The expensive, purely file-derived half belongs in a sibling `deploy-build` target (build the artifact, register it,
