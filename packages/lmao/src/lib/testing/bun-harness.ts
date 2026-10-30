@@ -819,9 +819,10 @@ function trackDescribes(describeStack: string[]): (label: string) => CallbackRun
  * callback, which declares no parameters, so a callback that declares more parameters than the values Bun passed gets
  * the harness's `done`: `done()` and `done(null)` pass, and any other value fails the test with that value.
  * - A callback that returns no promise settles on its first `done` call; later calls change nothing.
- * - A callback that returns a promise settles on the promise. `done()` changes nothing, and a `done(error)` before the
- *   promise resolves fails the test. A `done(error)` after it resolves throws, which Bun reports as an error between
- *   tests; Bun alone still fails the test when that call lands in the microtask drain right after the resolution.
+ * - A callback that returns a promise settles on the promise, and a rejection fails the test whatever its reason,
+ *   `undefined` included. `done()` changes nothing, and a `done(error)` before the promise resolves fails the test. A
+ *   `done(error)` after it resolves throws, which Bun reports as an error between tests; Bun alone still fails the test
+ *   when that call lands in the microtask drain right after the resolution.
  * Every rejection here settles the returned promise, so none goes unhandled.
  */
 function settleTestCallback(values: unknown[], arity: number, call: (args: unknown[]) => unknown): unknown {
@@ -868,7 +869,10 @@ function settleTestCallback(values: unknown[], arity: number, call: (args: unkno
         resolve();
       },
       (reason: unknown) => {
-        if (phase === 'awaiting-promise') settle(reason);
+        if (phase !== 'awaiting-promise') return;
+        // A rejection fails the test whatever its reason, `undefined` included; only done's value rule passes it.
+        phase = 'settled';
+        reject(reason);
       },
     );
     if (firstFailure) settle(firstFailure.error);

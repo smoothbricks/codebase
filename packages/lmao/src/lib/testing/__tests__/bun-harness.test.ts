@@ -223,8 +223,13 @@ describe('bun harness done callbacks settle as Bun settles them', () => {
     done();
     return Promise.reject(new Error('rejected'));
   });
+  wrapped.it.failing('fails on a promise rejected with no reason', (_done) => {
+    expectFailure('fails on a promise rejected with no reason', 'undefined: undefined');
+    return Promise.reject();
+  });
   wrapped.it('records each failing case as an exception, not ok', () => {
     expect(failures.map(({ span, fact }) => querySpan(span.buffer).facts().has(fact))).toEqual([
+      true,
       true,
       true,
       true,
