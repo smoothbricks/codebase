@@ -42,8 +42,14 @@ jobs:
         uses: ./.github/actions/setup-devenv
       - name: Verify frozen dependencies
         run: bun install --frozen-lockfile
-      - name: Build and verify actual packed consumers against a fresh registry graph
-        run: nx run statebus-core:verify-packages-fresh --output-style=static
+      - name: Build the packed packages
+        run:
+          nx run-many -t build -p
+          statebus-core,statebus-react,statebus-data-loader,statebus-tanstack-query,statebus-navigation-core,statebus-navigation-browser,lmao,arrow-builder,validation
+          --output-style=static
+      - name: Verify actual packed consumers against a fresh registry graph
+        working-directory: packages/statebus-core
+        run: bun scripts/verify-packages.mjs --fresh
       - name: Record exact-interest phase diagnostics in both engine orderings
         env:
           STATEBUS_BENCH_COMMIT: ${{ github.sha }}

@@ -114,10 +114,33 @@
       },
       "bench": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
+        "//": "Cached on the code it measures, the build it runs and the runtimes: a rerun with unchanged inputs measures nothing new.",
         "dependsOn": [
           "tsc-js"
         ],
+        "inputs": [
+          "default",
+          "^production",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --revision"
+          },
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node --version"
+          },
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          },
+          {
+            "env": "STATEBUS_BENCH_ORDER"
+          },
+          {
+            "env": "STATEBUS_BENCH_COMMIT"
+          }
+        ],
+        "outputs": [],
         "options": {
           "command": "bun benchmarks/interest.mjs",
           "cwd": "{projectRoot}"
@@ -130,10 +153,33 @@
       },
       "bench-exact-interest": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
+        "//": "Cached on the code it measures, the build it runs and the runtimes: a rerun with unchanged inputs measures nothing new.",
         "dependsOn": [
           "tsc-js"
         ],
+        "inputs": [
+          "default",
+          "^production",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --revision"
+          },
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node --version"
+          },
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          },
+          {
+            "env": "STATEBUS_BENCH_ORDER"
+          },
+          {
+            "env": "STATEBUS_BENCH_COMMIT"
+          }
+        ],
+        "outputs": [],
         "options": {
           "command": "bun benchmarks/exact-interest.mjs",
           "cwd": "{projectRoot}"
@@ -173,35 +219,6 @@
         ],
         "outputs": [
           "{workspaceRoot}/.cache/statebus-packages/"
-        ]
-      },
-      "verify-packages-fresh": {
-        "executor": "nx:run-commands",
-        "cache": false,
-        "parallelism": false,
-        "dependsOn": [
-          {
-            "target": "build",
-            "projects": [
-              "statebus-core",
-              "statebus-react",
-              "statebus-data-loader",
-              "statebus-tanstack-query",
-              "statebus-navigation-core",
-              "statebus-navigation-browser",
-              "lmao",
-              "arrow-builder",
-              "validation"
-            ]
-          }
-        ],
-        "options": {
-          "command": "bun scripts/verify-packages.mjs --fresh",
-          "cwd": "{projectRoot}"
-        },
-        "inputs": [
-          "verifyPackages",
-          "^dependencyDefault"
         ]
       }
     },

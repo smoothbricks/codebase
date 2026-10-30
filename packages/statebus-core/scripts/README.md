@@ -16,11 +16,12 @@ checked before that mapping. These overrides are verification-only, not changes 
 frozen install: the script derives an exact override for every dependency edge from the installed tree the workspace
 lockfile produced, and refuses a consumer lockfile holding any other version. Its verdict is therefore a function of
 hashed inputs (the packed builds, the frozen lock, the Bun and Node toolchains), so Nx caches it and a repeated basis is
-not rechecked. `verify-packages-fresh` instead lets Bun construct fresh consumer dependency graphs from today's
-registry, as a real consumer's install would; it is never cached, and the `StateBus package contracts` workflow runs it
-on pull requests and main instead of the ordinary gate. Both checks require a populated package cache or registry
-access. Each graph is reinstalled with a frozen consumer lockfile. Consumer installs disable global-store links and
-lifecycle scripts. Nothing is published, merged, or installed into the user's project. The temporary consumers are
+not rechecked. `bun scripts/verify-packages.mjs --fresh` instead lets Bun construct fresh consumer dependency graphs
+from today's registry, as a real consumer's install would. Its verdict is about the registry, not the commit, so no
+input could key it: it is a tool, not an Nx target, and the `StateBus package contracts` workflow runs it after building
+the packages, on pull requests and main, instead of the ordinary gate. Both checks require a populated package cache or
+registry access. Each graph is reinstalled with a frozen consumer lockfile. Consumer installs disable global-store links
+and lifecycle scripts. Nothing is published, merged, or installed into the user's project. The temporary consumers are
 removed even on failure.
 
 The tarballs, consumer lockfiles and checksummed result manifest are written to `.cache/statebus-packages/`. A stale
@@ -40,7 +41,7 @@ loader packages. `nx lint statebus-consumer` checks the real TypeScript with Bio
 delegates to the same built-package verification target. Both programs use strict public-declaration checks with
 unused-local checks and `noEmitOnError`. See `../CONSUMER.md` for the API contract.
 
-`StateBus package contracts` runs `verify-packages-fresh` on pull requests and main. It also runs the exact-interest
+`StateBus package contracts` runs the fresh-registry check on pull requests and main. It also runs the exact-interest
 Mitata target under Node/V8 and Bun in both orders, checking semantic equivalence and retaining individual raw samples.
 These are phase diagnostics, not a measured zero-allocation or browser-frame-time certificate; unavailable
 instrumentation is explicitly recorded. See `../benchmarks/EXACT-INTEREST.md` for the measurement boundaries.
