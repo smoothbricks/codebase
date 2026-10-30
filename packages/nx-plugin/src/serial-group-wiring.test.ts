@@ -273,37 +273,45 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
     const integration = graph.nodes.cowshed?.data.targets?.['integration-apfs'];
     expect(integration?.options?.cwd).toBe('.');
     expect(String(integration?.options?.command)).toStartWith('bun packages/cowshed/scripts/apfs-test-sweep.ts && ');
-    // The script extracts the root's archive with the native extractor, so every lane builds both before it runs.
-    const tasks = createTaskGraph(
-      graph,
-      {},
-      [ROOT_PROJECT, 'cowshed'],
-      [DEVICE_GROUP, HOST_GROUP, 'host-controller-test', 'integration-apfs'],
-      undefined,
-      {},
-    );
-    const extractor = 'nextest-extract:scriptc-native';
-    const producer = `scriptc-${process.arch}-${process.platform === 'darwin' ? 'macos' : 'linux'}`;
-    expect(tasks.dependencies[extractor]).toEqual([`nextest-extract:${producer}`]);
-    expect(graph.nodes['nextest-extract']?.data.targets?.[producer]?.options?.outputDirectory).toBe(
-      `dist/bin/${process.platform}-${process.arch}`,
-    );
-    for (const lane of [
-      `${ROOT_PROJECT}:${DEVICE_GROUP}`,
-      `${ROOT_PROJECT}:${HOST_GROUP}`,
-      'cowshed:host-controller-test',
-      'cowshed:integration-apfs',
-    ]) {
-      const reached = (tasks.dependencies[lane] ?? []).flatMap((id) => [id, ...(tasks.dependencies[id] ?? [])]);
-      expect(reached, lane).toContain(`nextest-extract:${producer}`);
-      expect(tasks.dependencies[lane], lane).toContain(`${ROOT_PROJECT}:cargo-test-archive`);
-    }
-    for (const group of [DEVICE_GROUP, HOST_GROUP]) {
-      // A serial group is inferred only where its declared cfg holds, macOS: there it runs bounded by progress, and
-      // elsewhere its root entry only orders its dependencies and runs no command.
-      const runner = graph.nodes[ROOT_PROJECT]?.data.targets?.[group];
-      if (process.platform === 'darwin') expect(runner?.options?.idleTimeoutMs).toBe(180000);
-      else expect(runner?.options?.command).toBeUndefined();
+    // The script extracts the root's archive with the native extractor, so every lane that runs builds both before it
+    // does. Linux CI infers its own graph, so this run checks that one too, not only the host's.
+    for (const { platform, arch } of GRAPH_PLATFORMS) {
+      const inferred = await projectGraph({ platform, arch });
+      const tasks = createTaskGraph(
+        inferred,
+        {},
+        [ROOT_PROJECT, 'cowshed'],
+        [DEVICE_GROUP, HOST_GROUP, 'host-controller-test', 'integration-apfs'],
+        undefined,
+        {},
+      );
+      const extractor = 'nextest-extract:scriptc-native';
+      const producer = `scriptc-${arch}-${platform === 'darwin' ? 'macos' : 'linux'}`;
+      expect(tasks.dependencies[extractor], platform).toEqual([`nextest-extract:${producer}`]);
+      expect(inferred.nodes['nextest-extract']?.data.targets?.[producer]?.options?.outputDirectory, platform).toBe(
+        `dist/bin/${platform}-${arch}`,
+      );
+      for (const [project, target] of [
+        [ROOT_PROJECT, DEVICE_GROUP],
+        [ROOT_PROJECT, HOST_GROUP],
+        ['cowshed', 'host-controller-test'],
+        ['cowshed', 'integration-apfs'],
+      ] as const) {
+        const lane = `${project}:${target}`;
+        expect(tasks.dependencies[lane], `${platform} ${lane}`).toContain(`${ROOT_PROJECT}:cargo-test-archive`);
+        // A serial group is inferred only where its declared cfg holds, macOS: there it runs bounded by progress, and
+        // elsewhere its root entry only orders its dependencies and runs no command, so it sweeps nothing.
+        const runner = inferred.nodes[project]?.data.targets?.[target];
+        const group = target === DEVICE_GROUP || target === HOST_GROUP;
+        if (group && platform === 'darwin') expect(runner?.options?.idleTimeoutMs, lane).toBe(180000);
+        if (group && platform !== 'darwin') {
+          expect(runner?.options?.command, `${platform} ${lane}`).toBeUndefined();
+          continue;
+        }
+        expect(runner?.options?.command, `${platform} ${lane}`).toBeString();
+        const reached = (tasks.dependencies[lane] ?? []).flatMap((id) => [id, ...(tasks.dependencies[id] ?? [])]);
+        expect(reached, `${platform} ${lane}`).toContain(`nextest-extract:${producer}`);
+      }
     }
     const nx = await readRecord('nx.json', JSON.parse);
     expect(child(child(nx, 'targetDefaults'), 'cargo-test-cowshed-*').dependsOn).toEqual(['...', APFS_TEST_ROOT]);
@@ -364,21 +372,59 @@ function records(value: unknown): Record<string, unknown>[] {
 }
 
 const parseProjectGraph = typia.json.createAssertParse<ProjectGraph>();
-const GRAPH_SCRIPT = `const { createProjectGraphAsync } = await import('nx/src/project-graph/project-graph.js');
-const graph = await createProjectGraphAsync({ exitOnError: false });
-process.stdout.write(JSON.stringify({ nodes: graph.nodes, dependencies: graph.dependencies }));`;
 
-/** The repository's own project graph, as Nx builds it with this plugin. */
-async function repositoryProjectGraph(): Promise<ProjectGraph> {
-  return parseProjectGraph(await runInRepositoryNx(GRAPH_SCRIPT));
+/** A platform the plugin infers targets for: Node's names, as `process.platform` and `process.arch` give them. */
+interface GraphPlatform {
+  readonly platform: NodeJS.Platform;
+  readonly arch: string;
 }
 
-let projectGraphOnce: Promise<ProjectGraph> | undefined;
+/** The host's graph, and the graph of the Linux x64 runner CI infers when the host is not that runner. */
+const GRAPH_PLATFORMS: readonly GraphPlatform[] =
+  process.platform === 'linux' && process.arch === 'x64'
+    ? [{ platform: 'linux', arch: 'x64' }]
+    : [
+        { platform: process.platform, arch: process.arch },
+        { platform: 'linux', arch: 'x64' },
+      ];
 
-/** `repositoryProjectGraph`, computed once for the file: each call costs a child process. */
-function projectGraph(): Promise<ProjectGraph> {
-  projectGraphOnce ??= repositoryProjectGraph();
-  return projectGraphOnce;
+/**
+ * The child that builds the graph. For another platform it first loads Nx, whose native binding is the host's, and the
+ * plugin itself: Nx runs a workspace plugin in a worker of its own, which would report the host's platform, so the
+ * child loads it in-process instead. Only then does it report `platform` as the process's, so the plugin infers that
+ * platform's targets everywhere it asks.
+ */
+function graphScript({ platform, arch }: GraphPlatform): string {
+  const reported =
+    platform === process.platform && arch === process.arch
+      ? ''
+      : `const { loadNxPlugin } = await import('nx/src/project-graph/plugins/in-process-loader.js');
+require('nx/src/project-graph/plugins/get-plugins.js').loadingMethod = (plugin, root, index) => loadNxPlugin(plugin, root, index);
+await import('@smoothbricks/nx-plugin');
+Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} });
+Object.defineProperty(process, 'arch', { value: ${JSON.stringify(arch)} });
+`;
+  return `const { createProjectGraphAsync } = await import('nx/src/project-graph/project-graph.js');
+${reported}const graph = await createProjectGraphAsync({ exitOnError: false });
+process.stdout.write(JSON.stringify({ nodes: graph.nodes, dependencies: graph.dependencies }));`;
+}
+
+const projectGraphs = new Map<string, Promise<ProjectGraph>>();
+
+/**
+ * The repository's own project graph as Nx builds it with this plugin on `target` (the host's by default), computed
+ * once for the file per platform: each costs a child process.
+ */
+function projectGraph(
+  target: GraphPlatform = { platform: process.platform, arch: process.arch },
+): Promise<ProjectGraph> {
+  const key = `${target.platform}-${target.arch}`;
+  let graph = projectGraphs.get(key);
+  if (graph === undefined) {
+    graph = runInRepositoryNx(graphScript(target)).then(parseProjectGraph);
+    projectGraphs.set(key, graph);
+  }
+  return graph;
 }
 
 interface RustSource {
