@@ -716,7 +716,7 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
     finish_real_image_test(result, cleanup_a);
 }
 
-/// How [`real_apfs_fixture_run_ended_by_its_parent`] ends: `panic`, `kill` or `sweep`.
+/// How [`real_apfs_fixture_run_ended_by_its_parent`] ends: `panic` or `kill`.
 #[cfg(target_os = "macos")]
 const FIXTURE_ENDING: &str = "COWSHED_TEST_FIXTURE_ENDING";
 /// The line a fixture run prints once each of its images is attached.
@@ -726,16 +726,20 @@ const FIXTURE_IMAGE: &str = "cowshed-test-fixture-image=";
 /// the root, space-separated.
 #[cfg(target_os = "macos")]
 const FIXTURE_WORKER: &str = "cowshed-test-fixture-worker=";
+/// The line a fixture run prints once its root is kept: its keeper's pid.
+#[cfg(target_os = "macos")]
+const FIXTURE_KEEPER: &str = "cowshed-test-fixture-keeper=";
 
 /// A real-image fixture leaves nothing attached and nothing running however its run ends. A
-/// panic unwinds through the scratch root's own teardown. A kill — the runner's no-progress
-/// bound, a host-wide stop — runs no teardown at all, so its parent reclaims the
-/// exact root after reaping the child. The same cleanup ends the dead owner's processes and
-/// releases its images without sweeping other host runs.
+/// panic unwinds through the scratch root's own teardown. A kill of the run's process group, as
+/// the runner's no-progress bound sends, runs no teardown at all, so the root's keeper, outside that
+/// group, reclaims exactly that root the moment the run dies: the same cleanup ends the dead
+/// owner's processes and releases its images without sweeping other runs.
 /// Fixtures staged under `$TMPDIR` stayed attached after timed-out runs, and the stock Nx daemon a
 /// timed-out test started kept running in its deleted root. The run's worker stands in for
-/// that daemon: a process the run started that outlives it, selected, as the daemon is, by its
-/// working directory alone. The run attaches two RAW images, as a failed re-adoption leaves its
+/// that daemon: a process the run started that outlives it, in a process group of its own as the
+/// daemon detaches, selected, as the daemon is, by its working directory alone. The run attaches
+/// two RAW images, as a failed re-adoption leaves its
 /// replacement and a retained input, so teardown and sweep must release both. The first is
 /// mounted, so teardown also unmounts; the retained input is attached read-only and unmounted,
 /// all its release needs, so it spends no mount.
@@ -744,10 +748,11 @@ const FIXTURE_WORKER: &str = "cowshed-test-fixture-worker=";
 fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
     use cowshed_os::fork_lock::Spawn;
     use std::io::{BufRead, BufReader};
-    use std::os::unix::process::ExitStatusExt;
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt};
     use std::process::{Child, Command, Stdio};
 
-    // Helpers retain the suite's run identity and own only the roots their parent recovers.
+    // Helpers retain the suite's run identity and own only their own roots, which their keepers
+    // recover after a kill.
     // Terse child output keeps libtest's test-name progress off the first image record.
     // Forward stderr line by line so a hung helper still shows its open step, and report
     // whether it printed a panic: its output is this test's, so a panic would read as this
@@ -765,6 +770,7 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .spawn_locked()
             .expect("spawn a fixture run");
         let stderr = BufReader::new(child.stderr.take().expect("run stderr"));
@@ -794,6 +800,13 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
             .map(|image| RealImageCleanup::new(&backend, image.clone()))
             .collect();
         assert_eq!(images.len(), 2, "the {ending} run attached {images:?}");
+        let keeper = lines
+            .find_map(|line| {
+                line.strip_prefix(FIXTURE_KEEPER)?
+                    .parse::<libc::pid_t>()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("the {ending} run never kept its root"));
         let (worker, root) = lines
             .find_map(|line| {
                 let (pid, root) = line.strip_prefix(FIXTURE_WORKER)?.split_once(' ')?;
@@ -801,7 +814,16 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
             })
             .unwrap_or_else(|| panic!("the {ending} run never started its worker"));
         if ending == "kill" {
-            child.kill().expect("kill the run mid-fixture");
+            // As the runner's no-progress bound does: the whole group the run leads.
+            let group = libc::pid_t::try_from(child.id()).expect("a pid");
+            // SAFETY: `kill` only signals; the run leads this group and nothing else is in it.
+            let killed = unsafe { libc::kill(-group, libc::SIGKILL) };
+            assert_eq!(
+                killed,
+                0,
+                "kill the run's group mid-fixture: {}",
+                io::Error::last_os_error()
+            );
         }
         lines.for_each(drop);
         let status = child.wait_bounded().expect("reap the run");
@@ -813,8 +835,8 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
             "panic" => assert_eq!(status.code(), Some(101), "the run failed"),
             _ => {
                 assert_eq!(status.signal(), Some(libc::SIGKILL), "the run was killed");
-                crate::scratch_namespace::reclaim_dead_root(&root)
-                    .expect("reclaim exactly the killed fixture's root");
+                // Nobody here reclaims the root: its keeper does, and exits once it has.
+                wait_for_exit(keeper).expect("wait for the killed run's keeper");
             }
         }
         for image in &images {
@@ -1070,12 +1092,13 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
 }
 
 /// One real-image fixture run, ended as [`FIXTURE_ENDING`] says: it fails or waits to be
-/// killed once its images are attached and its worker started. The parent owns recovery of
-/// this exact root after a kill; no child starts a host-wide sweep of unrelated runs.
+/// killed once its images are attached and its worker started. Its root's keeper owns recovery
+/// after a kill; no child starts a host-wide sweep of unrelated runs.
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "spawned by real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end"]
 fn real_apfs_fixture_run_ended_by_its_parent() {
+    use std::os::unix::process::CommandExt as _;
     let Some(ending) = std::env::var_os(FIXTURE_ENDING) else {
         return;
     };
@@ -1101,11 +1124,12 @@ fn real_apfs_fixture_run_ended_by_its_parent() {
         }
         println!("{FIXTURE_IMAGE}{}", image.display());
     }
-    // Bounded, so a worker no teardown or sweep ends still ends; a passing run ends it within
-    // seconds.
+    // Bounded, so a worker no teardown or keeper ends still ends; a passing run ends it within
+    // seconds. It leaves the run's group, as the Nx daemon it stands in for detaches, so a group
+    // kill leaves it running for the keeper to end.
     #[expect(
         clippy::zombie_processes,
-        reason = "the worker must outlive this run; the scratch root or the next sweep ends it"
+        reason = "the worker must outlive this run; the scratch root or its keeper ends it"
     )]
     let worker = cowshed_os::fork_lock::Spawn::spawn_locked(
         std::process::Command::new("/bin/sleep")
@@ -1113,9 +1137,11 @@ fn real_apfs_fixture_run_ended_by_its_parent() {
             .current_dir(root.path())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
+            .stderr(std::process::Stdio::null())
+            .process_group(0),
     )
     .expect("start a worker in the root");
+    println!("{FIXTURE_KEEPER}{}", root.keeper());
     println!("{FIXTURE_WORKER}{} {}", worker.id(), root.path().display());
     if ending == "panic" {
         // Unwinds through the scratch root's teardown as a failed assertion does, without the

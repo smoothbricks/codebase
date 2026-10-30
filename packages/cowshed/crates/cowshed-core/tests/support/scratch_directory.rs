@@ -208,7 +208,12 @@ mod tests {
                 .unwrap()
                 .is_file()
         );
-        assert!(super::super::scratch_namespace::reclaim_dead_root(namespace_root).is_err());
+        // No sweep takes a live owner's retiring tree, and it is no root a keeper reclaims.
+        assert_eq!(
+            super::super::scratch_namespace::dead_owner(namespace_root),
+            None
+        );
+        assert!(super::super::scratch_namespace::reclaim_kept_root(&retired).is_err());
         assert!(retired.exists());
         assert_eq!(
             fs::read_to_string(outside.path().join("kept")).unwrap(),

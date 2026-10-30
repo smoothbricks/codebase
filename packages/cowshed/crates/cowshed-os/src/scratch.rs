@@ -22,7 +22,8 @@ const MAX_SOCKET_ENTRIES: usize = 8;
 const NAMED_SUFFIX: usize = 17;
 
 /// The directory every test run on macOS shares: `/private/var/folders/cowshed/<euid>/t`, holding the
-/// user's image template, the lane pools and the dead-run sweep's lock and record. Each run's own
+/// user's image template, the lane pools, the dead-run sweep's lock and record, and the scratch
+/// roots' keepers' log (`keeper.log`). Each run's own
 /// tree is its test namespace's root beside it (`HostNamespace::macos_user_root`), never inside;
 /// production's names in the per-user root are `mnt` and `ram<revision>`, and nothing production
 /// runs reads `t` or a test namespace (specs/cowshed/01_storage.md, "Host namespace"). Spotlight's

@@ -88,18 +88,25 @@ fn create_root(namespace: TestNamespace) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Recover exactly the scratch root an owned child reported, after that child has been reaped.
-/// This does not take the host-wide sweep lock, enumerate unrelated dead roots, or rewrite the
-/// suite's sweep record. The parent's panic/kill witness uses the same cleanup as root drop. Only
-/// a test namespace's directory in the per-user root whose owner is gone ([`dead_owner`]: nobody
-/// holds its pid, or a process that started at another instant does) qualifies: never `t`,
-/// production's `mnt` and `ram<revision>`, or anything else there. Its images are released as that
-/// namespace.
-pub fn reclaim_dead_root(path: &Path) -> std::io::Result<()> {
-    match dead_owner(path).filter(|_| path.parent() == Some(USER_ROOT.as_path())) {
+/// The test namespace whose directory `path` is: that directory in the per-user root itself, never
+/// a path below one ([`owner_namespace`] names those too), `t`, production's `mnt` and
+/// `ram<revision>`, or anything else there. All a keeper keeps and reclaims.
+pub(super) fn root_namespace(path: &Path) -> Option<TestNamespace> {
+    owner_namespace(path).filter(|_| path.parent() == Some(USER_ROOT.as_path()))
+}
+
+/// Reclaim the scratch root `path` for a keeper whose owner died without dropping it
+/// (scratch_apfs.rs `Keeper`): end the processes working in it, release its images as its
+/// namespace and remove it, exactly as the owner's Drop would have. The caller proves the owner
+/// will never tear it down itself — the keeper by its owner's pipe ending without a release — so
+/// this asks nothing of the owner's pid, which an exited owner holds until it is reaped. It takes
+/// no host-wide sweep lock, enumerates no other root and writes no sweep record. Only a
+/// [`root_namespace`] qualifies.
+pub fn reclaim_kept_root(path: &Path) -> std::io::Result<()> {
+    match root_namespace(path) {
         Some(namespace) => tear_down_root(namespace, path),
         None => Err(std::io::Error::other(format!(
-            "refusing to reclaim a scratch root without a dead owner: {}",
+            "refusing to reclaim what is no test namespace's scratch root: {}",
             path.display()
         ))),
     }
@@ -315,9 +322,9 @@ fn holder_of(pid: i32) -> Holder {
 }
 
 /// The test namespace of the dead run that owns `path`, given its root or any path below it: what
-/// a sweep or a reclaim selects by, and the namespace it releases that run's images as. Its owner
-/// is gone by [`owner_is_gone`]; a root whose record is unusable is kept, and says so.
-pub(super) fn dead_owner(path: &Path) -> Option<TestNamespace> {
+/// the lane sweep selects by, and the namespace it releases that run's images as. Its owner is
+/// gone by [`owner_is_gone`]; a root whose record is unusable is kept, and says so.
+pub fn dead_owner(path: &Path) -> Option<TestNamespace> {
     let namespace = owner_namespace(path)?;
     let pid = owner_pid(path)?;
     let root = HostNamespace::Test(namespace).macos_user_root(euid());

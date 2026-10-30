@@ -1011,8 +1011,12 @@ measurements describe that run's load and work; they do not establish acceptance
 
 A class is a warning, never a kill or a failure. Nextest's warning cadence follows configured class policy rather than
 an independent spec duration. A test that never returns is ended only by its runner's configured no-progress bound,
-which names it and emits the pre-signal holder observation or explicit capture failure described above. A killed test
-leaves its images attached until the next run's sweep (01a_apfs.md, "How the APFS host degrades" §2).
+which names it and emits the pre-signal holder observation or explicit capture failure described above. A killed test's
+real-image scratch root is reclaimed by its keeper the moment the test dies: `cowshed-test-sweep --keep <root>`, which
+the root starts in a process group of its own, outside the runner's group kill, and which ends the root's processes,
+releases its images and removes it, exactly as the root's Drop would. The next lane's sweep reclaims only what a keeper
+could not: a root whose keeper a stop ended too, as a job's conclusion or cancellation does on Darwin when it retires
+the descendants the job retained (11_shell.md).
 
 The genuine-Nx CLI fixtures use the normal enabled daemon (16_build_volumes.md, "The Nx daemon stays on"). Both halves
 of the declared-versus-undeclared output witness require a seeded, actually adopted build volume through the typed land
@@ -1050,11 +1054,21 @@ request is a unit test of `attach_demand`.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01a_apfs.md, "How the APFS host degrades" §2), so a test pays the fewest
-attach cycles that prove its behavior. A run that killed a test leaves that test's images attached until recovery
-reclaims its dead root. `real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves panic and
-SIGKILL cleanup with one mounted RAW image and one read-only retained RAW input. Its parent owns the helper roots: panic
-drops the child's root, while a killed child's exact reported root is reclaimed after the parent reaps it. This uses the
-same process/image/tree cleanup as root drop, without starting a host-wide sweep or waiting on unrelated dead runs.
+attach cycles that prove its behavior. A run that killed a test leaves nothing attached once that test's keeper has run.
+`real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves panic and SIGKILL cleanup with one
+mounted RAW image and one read-only retained RAW input: panic drops the child's root, while a killed child's root is
+reclaimed by its keeper, whose exit the parent awaits on the kernel's exit event, never reclaiming it itself. The keeper
+is the nearest `cowshed-test-sweep` among the directories holding the test binary: the target profile directory, where a
+workspace build and the lane's nextest archive put it, whatever the binary's own layout below it. A root is handed out
+only once its keeper has said on its stdout, within the handshake bound (05_gateway.md, "Deadlines"), that it keeps that
+root; a root whose keeper cannot start, cannot keep, refuses the path or says nothing in time is torn down at
+construction, so no root a kill would leak is handed out. A keeper keeps and reclaims only a test namespace's own
+directory in the per-user root. Both its pipes are made under the exclusive fork lock (01c_macos.md, "Darwin has no
+`pipe2` and no `SOCK_CLOEXEC`"), so no concurrent spawn carries the owner's end past its `exec`, and its input is
+written only by its owner: a release line says the owner tears the root down itself; end of input without one says the
+owner died, which the owner's pid cannot yet say while the exited owner awaits its reaping. What a keeper says goes to
+`keeper.log` in the shared scratch directory, never to the test's streams a runner waits on. This uses the same
+process/image/tree cleanup as root drop, without starting a host-wide sweep or waiting on unrelated dead runs.
 Owned-attachment release selects the exact backing path the kernel holds, not the runtime image extension: a retained
 input must be released too. Ordinary runtime enumeration and attachment remain RAW-only (02_workspaces.md,
 "Re-adoption"); cleanup neither attaches nor converts an image. A scratch root's teardown and the sweep release a root's
@@ -1074,10 +1088,9 @@ completed run. An individual image-release refusal retains only the dead root co
 every refusal and still removes other dead roots after releasing their images. An inventory failure retains every root,
 since no root's image-release safety can then be proved. Root-local refusal and continued reclamation have a pure,
 platform-independent regression; one unreleased image must not leave another run's already-detached files behind. No
-sweep selects a live pid's root. Child fixtures whose parent owns recovery create only their own roots and never force a
-host-wide scan. The test lanes retain their unchanged 180-second no-finish guard; setup emits no synthetic test
-completions or progress. Ordinary sandboxed shards keep their existing root provisioning and do not acquire host-wide
-cleanup authority.
+sweep selects a live pid's root. Child fixtures create only their own roots and never force a host-wide scan. The test
+lanes retain their unchanged 180-second no-finish guard; setup emits no synthetic test completions or progress. Ordinary
+sandboxed shards keep their existing root provisioning and do not acquire host-wide cleanup authority.
 
 Pure regressions recycle a device to a RAM image during the storage-lease wait, recycle it between dissent attempts and
 before force, and repeat an image's whole-device view. They prove the guard runs after the grant, no child detaches a
