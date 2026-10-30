@@ -616,9 +616,11 @@ since edited the same lines. Work main took by squash, cherry-pick, a rewrite or
 `refs/cowshed/<name>/heads/<branch>`, is that commit or a descendant of it: main's repository holds the commits then, so
 a workspace pushed for review retires with no flag (`cowshed push <name>` keeps `cowshed/<name>`, a fork's one branch;
 `--branch` names another). A `HEAD` committed past its ref, or detached, is not kept, and a dirty tree still refuses
-first. The refusal names main's tip, each file whose change main lacks with why (`missing`, `conflict`, `added`,
-`deleted`, `changed`, `mode`, `unmergeable`; ten, then a count), the commits held by neither proof with their subjects
-(ten, then a count), and points at `cowshed land <ws>`.
+first. So does a kept build-state directory, an entry of the workspace's `.cowshed/kept` that a refresh moved aside
+intact rather than delete: retiring the image would delete it unseen, so `rm` names them, ten and a count of the rest,
+and only `--abandon` retires the workspace with them. The refusal names main's tip, each file whose change main lacks
+with why (`missing`, `conflict`, `added`, `deleted`, `changed`, `mode`, `unmergeable`; ten, then a count), the commits
+held by neither proof with their subjects (ten, then a count), and points at `cowshed land <ws>`.
 
 The project-open `cowshed: info: leaving … unfinished lifecycle operations …` line concerns other workspaces outside
 this command's recovery scope. It explicitly says those operations do not block this command; `cowshed doctor` lists
@@ -627,10 +629,10 @@ them. A refusal is reported separately with its own `next:` hint and exit code. 
 
 The two overrides authorize different losses and neither substitutes for the other:
 
-| Flag        | Overrides                                                                                                                          | Does **not** override                                                                                             |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `--force`   | the workspace's own running jobs, and a workspace younger than ten minutes                                                         | uncommitted work; an in-progress merge; the landed-content gate; a process cowshed does not run holding the mount |
-| `--abandon` | the landed-content gate, uncommitted work and an in-progress merge: each goes into the bundle, the work tree as one commit on HEAD | a process cowshed does not run holding the mount; the age floor                                                   |
+| Flag        | Overrides                                                                                                                                                                                                                          | Does **not** override                                                                                                                           |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--force`   | the workspace's own running jobs, and a workspace younger than ten minutes                                                                                                                                                         | uncommitted work; an in-progress merge; a kept build-state directory; the landed-content gate; a process cowshed does not run holding the mount |
+| `--abandon` | the landed-content gate, uncommitted work, an in-progress merge and kept build-state directories: the first three go into the bundle, the work tree as one commit on HEAD; a kept directory is not bundled and goes with the image | a process cowshed does not run holding the mount; the age floor                                                                                 |
 
 `--force` stops that workspace's running jobs (TERM, then KILL after the grace period) before detaching; without it,
 removal lets the supervisor finish its active jobs. A leftover `.git/AUTO_MERGE` alone is not an in-progress operation
@@ -1218,13 +1220,15 @@ head and the destination it sits on.
 The full close-out in one primitive: validate (`--check`) inside the sandbox, fast-forward the target's checkout to the
 workspace's branch, retire the workspace. The target is main, or with `--into <lane>` the lane base `<lane>`. A dirty
 tree, read the way `rm` reads it, is refused before the check runs: the check sees the working tree but only the commit
-lands. A gated land does not rebase; when the target has moved past the workspace's base the fast-forward is refused,
-and `cowshed rebase <name>` (with the same `--into`) is the next step. An ungated land rebases first (below). Any
-failing step before the fast-forward exits 4 with the workspace intact. A retire refused after the fast-forward keeps
-the workspace and exits with that refusal, whose message starts with what landed, so the retry is `cowshed rm`, not
-another land. The retire measures the workspace against the branch it just landed on, so a lane unit retires once its
-lane base holds its commits. The target branch (`--target`, default the branch the target's checkout has checked out)
-must be the checked-out one. `--into` refuses the workspace itself (exit 2). `--no-retire` keeps the workspace. For
+lands. A workspace whose `.cowshed/kept` holds a directory a build-state refresh moved aside is refused the same way,
+naming each entry: the retire that ends the land would delete it. Take what you need, delete it, and land again; land
+has no override. A gated land does not rebase; when the target has moved past the workspace's base the fast-forward is
+refused, and `cowshed rebase <name>` (with the same `--into`) is the next step. An ungated land rebases first (below).
+Any failing step before the fast-forward exits 4 with the workspace intact. A retire refused after the fast-forward
+keeps the workspace and exits with that refusal, whose message starts with what landed, so the retry is `cowshed rm`,
+not another land. The retire measures the workspace against the branch it just landed on, so a lane unit retires once
+its lane base holds its commits. The target branch (`--target`, default the branch the target's checkout has checked
+out) must be the checked-out one. `--into` refuses the workspace itself (exit 2). `--no-retire` keeps the workspace. For
 review-gated flows, `--push-only` validates and installs the exact head in `refs/cowshed/<name>/heads/<branch>`, without
 moving the target, adopting build state, recording a land outcome, collecting volumes or retiring the workspace, even
 when retirement is left at its default. Its text output is the preservation ref and source SHA; `--json` returns

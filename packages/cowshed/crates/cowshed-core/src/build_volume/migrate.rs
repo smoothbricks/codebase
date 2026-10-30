@@ -140,7 +140,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
 pub struct Adopted {
     /// Removed: a tool's own directory, discarded, or an empty one.
     pub discarded: Vec<DiscardedBuildStateFinding>,
-    /// A declared directory holding entries, moved aside intact and never deleted.
+    /// A declared directory holding entries, moved aside intact: no refresh or `gc` deletes it.
     pub kept: Vec<KeptBuildStateFinding>,
 }
 
@@ -210,28 +210,47 @@ fn adopt_preflighted(
     let linked = plan.linked();
     link::exclude_links(checkout, &linked)?;
     let mut adopted = Adopted::default();
+    // `rmdir(2)` first: it is the one step a writer racing the refresh can fail, and failing
+    // before any rename leaves no directory moved and unlinked behind the conflict.
+    for &(state, action) in &plan.steps {
+        if action != Action::ReplaceEmpty {
+            continue;
+        }
+        let source = state.checkout.as_path();
+        let at = checkout.join(source);
+        let origin = discard_origin(volume_root, held, state)?;
+        // Never a recursive delete: an entry a tool wrote after the directory was seen empty
+        // fails the refresh instead of being lost with it.
+        fs::remove_dir(&at).map_err(|error| {
+            if error.kind() == io::ErrorKind::DirectoryNotEmpty {
+                CowshedError::conflict(
+                    format!(
+                        "{} gained an entry while the refresh replaced it as an empty directory, \
+                         so it was left as it is",
+                        at.display()
+                    ),
+                    "retry: the next refresh decides on what is there now",
+                )
+            } else {
+                io_error("remove empty build-state directory", &at, error)
+            }
+        })?;
+        adopted.discarded.push(DiscardedBuildStateFinding {
+            path: source.to_owned(),
+            tool: BuildStateTool::of(state),
+            origin,
+        });
+    }
     for &(state, action) in &plan.steps {
         let source = state.checkout.as_path();
         let at = checkout.join(source);
         match action {
-            Action::LeaveAbsent | Action::Keep | Action::Link => {}
-            Action::ReplaceEmpty => {
-                let origin = discard_origin(volume_root, held, state)?;
-                // `rmdir(2)`, never a recursive delete: an entry a tool wrote after the directory
-                // was seen empty fails the refresh instead of being lost with it.
-                fs::remove_dir(&at).map_err(|error| {
-                    if error.kind() == io::ErrorKind::DirectoryNotEmpty {
-                        CowshedError::conflict(
-                            format!(
-                                "{} gained an entry while the refresh replaced it as an empty \
-                                 directory, so nothing was removed",
-                                at.display()
-                            ),
-                            "retry: the next refresh decides on what is there now",
-                        )
-                    } else {
-                        io_error("remove empty build-state directory", &at, error)
-                    }
+            Action::LeaveAbsent | Action::Keep | Action::Link | Action::ReplaceEmpty => {}
+            Action::Discard => {
+                let origin = discard_origin(volume_root, held, state)
+                    .map_err(|error| naming_kept(&adopted, error))?;
+                discard::move_aside(checkout, source).map_err(|error| {
+                    naming_kept(&adopted, io_error("move old build state aside", &at, error))
                 })?;
                 adopted.discarded.push(DiscardedBuildStateFinding {
                     path: source.to_owned(),
@@ -239,20 +258,16 @@ fn adopt_preflighted(
                     origin,
                 });
             }
-            Action::Discard => {
-                let origin = discard_origin(volume_root, held, state)?;
-                discard::move_aside(checkout, source)
-                    .map_err(|error| io_error("move old build state aside", &at, error))?;
-                adopted.discarded.push(DiscardedBuildStateFinding {
-                    path: source.to_owned(),
-                    tool: BuildStateTool::of(state),
-                    origin,
-                });
-            }
             Action::MoveAside => {
-                let origin = discard_origin(volume_root, held, state)?;
-                let kept = kept::keep_aside(checkout, source, SystemTime::now())
-                    .map_err(|error| io_error("keep declared build state aside", &at, error))?;
+                let origin = discard_origin(volume_root, held, state)
+                    .map_err(|error| naming_kept(&adopted, error))?;
+                let kept =
+                    kept::keep_aside(checkout, source, SystemTime::now()).map_err(|error| {
+                        naming_kept(
+                            &adopted,
+                            io_error("keep declared build state aside", &at, error),
+                        )
+                    })?;
                 adopted.kept.push(KeptBuildStateFinding {
                     path: source.to_owned(),
                     kept,
@@ -261,7 +276,8 @@ fn adopt_preflighted(
             }
         }
     }
-    link::link_paths(checkout, volume_root, &linked)?;
+    link::link_paths(checkout, volume_root, &linked)
+        .map_err(|error| naming_kept(&adopted, error))?;
     // Also whatever an earlier refresh moved aside and did not live to delete.
     discard::reap(checkout);
     Ok(adopted)
@@ -317,10 +333,10 @@ pub enum Action {
     Keep,
     /// The fixed link is made where nothing is.
     Link,
-    /// The empty directory is removed by `rmdir(2)`, which fails rather than delete an entry
-    /// written since it was observed, and the link takes the path.
+    /// A declared path's empty directory is removed by `rmdir(2)`, which fails rather than delete
+    /// an entry written since it was observed, and the link takes the path.
     ReplaceEmpty,
-    /// A tool's own directory, which its next build rebuilds, is discarded (renamed into
+    /// A tool's own directory, empty or not, which its next build rebuilds, is discarded (renamed into
     /// `.cowshed/discard` and deleted in the background), and the link takes the path.
     Discard,
     /// A declared directory is renamed, intact, into `.cowshed/kept`, which nothing of cowshed's
@@ -347,7 +363,12 @@ pub const fn decide(
             BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript => Action::Link,
         }),
         Occupant::FixedLink => Ok(Action::Keep),
-        Occupant::EmptyDirectory => Ok(Action::ReplaceEmpty),
+        Occupant::EmptyDirectory => Ok(match tool {
+            BuildStateTool::Declared => Action::ReplaceEmpty,
+            BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript => {
+                Action::Discard
+            }
+        }),
         Occupant::Directory => Ok(match tool {
             BuildStateTool::Declared => Action::MoveAside,
             BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript => {
@@ -462,6 +483,18 @@ fn observe(checkout: &Path, state: &BuildStatePath) -> Result<Occupant> {
     }
 }
 
+/// `error`, also naming every declared directory this refresh already moved aside: a failure
+/// after one moved returns no findings, so the error is the only place that says where it went.
+fn naming_kept(adopted: &Adopted, mut error: CowshedError) -> CowshedError {
+    for kept in &adopted.kept {
+        error.message.push_str(&format!(
+            "; {} was already moved aside intact to {}",
+            kept.path.display(),
+            kept.kept.display()
+        ));
+    }
+    error
+}
 fn io_error(operation: &str, path: &Path, error: io::Error) -> CowshedError {
     CowshedError::environment_missing(
         format!("cannot {operation} at {}: {error}", path.display()),

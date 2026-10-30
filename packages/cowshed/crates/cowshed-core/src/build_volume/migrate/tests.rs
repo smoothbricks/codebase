@@ -854,7 +854,9 @@ fn a_declared_checkout_is_kept_whole_and_its_path_linked() {
     );
     let report = kept.to_string();
     assert!(
-        report.contains(&kept.kept.display().to_string()) && report.contains("never deletes"),
+        report.contains(&kept.kept.display().to_string())
+            && report.contains("no refresh or gc deletes it")
+            && report.contains("rm and land refuse this workspace"),
         "{report}"
     );
     assert_eq!(
@@ -1155,57 +1157,120 @@ fn a_compile_cache_kept_before_its_link_existed_is_reported_as_predating_it() {
     discards_drain(&checkout);
 }
 
+/// Every tool and every occupant. The match makes a new variant of either a compile error here
+/// until it is listed, so the decision test cannot silently skip it.
+fn every_tool_and_occupant() -> Vec<(BuildStateTool, Occupant)> {
+    use BuildStateTool::{Cargo, Declared, JavaScript, Nx};
+    let listed = |tool: BuildStateTool, occupant: Occupant| {
+        let (BuildStateTool::Cargo | Nx | Declared | JavaScript) = tool;
+        match occupant {
+            Occupant::Absent
+            | Occupant::FixedLink
+            | Occupant::ForeignLink
+            | Occupant::EmptyDirectory
+            | Occupant::Directory
+            | Occupant::File => (tool, occupant),
+        }
+    };
+    [Cargo, Nx, Declared, JavaScript]
+        .into_iter()
+        .flat_map(|tool| {
+            [
+                Occupant::Absent,
+                Occupant::FixedLink,
+                Occupant::ForeignLink,
+                Occupant::EmptyDirectory,
+                Occupant::Directory,
+                Occupant::File,
+            ]
+            .map(|occupant| listed(tool, occupant))
+        })
+        .collect()
+}
+
 /// The decision's invariant over every tool and everything a path can hold: a file and a link
 /// cowshed did not make are never removed or linked over, only a tool's own directory is
-/// discarded, a declared directory holding anything is moved aside intact, only an empty
-/// directory is removed outright, and every path ends at its fixed link but a declared one
-/// nothing occupies.
+/// discarded (empty or not, as before), a declared directory holding anything is moved aside
+/// intact, a declared empty directory is the only thing removed outright, and every path ends at
+/// its fixed link but a declared one nothing occupies.
 #[test]
 fn the_decision_deletes_nothing_cowshed_cannot_rebuild() {
-    use BuildStateTool::{Cargo, Declared, JavaScript, Nx};
-    for tool in [Cargo, Nx, Declared, JavaScript] {
-        for occupant in [
-            Occupant::Absent,
-            Occupant::FixedLink,
-            Occupant::ForeignLink,
-            Occupant::EmptyDirectory,
-            Occupant::Directory,
-            Occupant::File,
-        ] {
-            let decided = decide(tool, occupant);
-            if matches!(occupant, Occupant::ForeignLink | Occupant::File) {
-                assert_eq!(decided, Err(Refuse), "{tool:?} {occupant:?}");
-                continue;
-            }
-            let Ok(action) = decided else {
-                panic!("{tool:?} {occupant:?} refused");
-            };
-            assert_eq!(
-                action == Action::Discard,
-                tool != Declared && occupant == Occupant::Directory,
-                "{tool:?} {occupant:?}: {action:?}"
-            );
-            assert_eq!(
-                action == Action::MoveAside,
-                tool == Declared && occupant == Occupant::Directory,
-                "{tool:?} {occupant:?}: {action:?}"
-            );
-            assert_eq!(
-                action == Action::ReplaceEmpty,
-                occupant == Occupant::EmptyDirectory,
-                "{tool:?} {occupant:?}: {action:?}"
-            );
-            assert_eq!(
-                action == Action::LeaveAbsent,
-                tool == Declared && occupant == Occupant::Absent,
-                "{tool:?} {occupant:?}: {action:?}"
-            );
+    for (tool, occupant) in every_tool_and_occupant() {
+        let declared = tool == BuildStateTool::Declared;
+        let directory = matches!(occupant, Occupant::EmptyDirectory | Occupant::Directory);
+        let decided = decide(tool, occupant);
+        if matches!(occupant, Occupant::ForeignLink | Occupant::File) {
+            assert_eq!(decided, Err(Refuse), "{tool:?} {occupant:?}");
+            continue;
         }
+        let Ok(action) = decided else {
+            panic!("{tool:?} {occupant:?} refused");
+        };
+        let case = format!("{tool:?} {occupant:?}: {action:?}");
+        assert_eq!(action == Action::Discard, !declared && directory, "{case}");
+        assert_eq!(
+            action == Action::MoveAside,
+            declared && occupant == Occupant::Directory,
+            "{case}"
+        );
+        assert_eq!(
+            action == Action::ReplaceEmpty,
+            declared && occupant == Occupant::EmptyDirectory,
+            "{case}"
+        );
+        assert_eq!(
+            action == Action::LeaveAbsent,
+            declared && occupant == Occupant::Absent,
+            "{case}"
+        );
+        assert_eq!(
+            action == Action::Keep,
+            occupant == Occupant::FixedLink,
+            "{case}"
+        );
     }
 }
 
+/// A declared directory seen empty and written into before the refresh removes it: `rmdir(2)`
+/// fails, the refresh refuses as a conflict, and the write is where the tool put it.
+#[test]
+fn a_write_into_an_empty_declared_directory_racing_the_refresh_is_kept() {
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    fs::create_dir_all(checkout.join("vendor/upstream")).unwrap();
+    link::point(&checkout, &scratch.volume()).unwrap();
+    let declared = vec![BuildStatePath::declared("vendor/upstream").unwrap()];
+    let plan = preflight(&checkout, &declared).unwrap();
+    assert_eq!(plan.steps[0].1, Action::ReplaceEmpty);
+    write(
+        &checkout,
+        "vendor/upstream/raced",
+        "written after the refresh looked",
+    );
+    let error = adopt_preflighted(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &declared,
+        &declared,
+        &plan,
+    )
+    .unwrap_err();
+    assert_eq!(error.code.as_str(), "conflict", "{}", error.message);
+    assert!(
+        error.message.contains("gained an entry"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("vendor/upstream/raced")).unwrap(),
+        "written after the refresh looked"
+    );
+}
+
 /// The refresh as a whole -- observation, decision and the shell that performs it -- over random
-/// occupants of two capability paths and two declared ones.
+/// occupants of three capability paths and three declared ones.
 mod property {
     use super::*;
     use proptest::prelude::*;

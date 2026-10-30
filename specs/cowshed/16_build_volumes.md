@@ -265,30 +265,35 @@ real directory, or something else) without changing it, and names `cowshed exec 
 
 **What a refresh does at each path.** One pure decision, `migrate::decide`, maps the tool whose state a path holds and
 what the refresh finds there to one action. The shell around it observes every path, decides all of them before it
-changes any, and performs. A refusal therefore leaves every path as it was.
+changes any, and performs. A refusal therefore changes no build-state path.
 
 | Found at the path                          | A capability's path                               | A declared path                        |
 | ------------------------------------------ | ------------------------------------------------- | -------------------------------------- |
 | nothing                                    | make the link                                     | leave it absent (Declared build state) |
 | its fixed link, dangling or not            | keep it, and make its volume directory if missing | the same                               |
-| an empty real directory                    | remove it with `rmdir(2)`, then link              | the same                               |
+| an empty real directory                    | discard it, then link                             | remove it with `rmdir(2)`, then link   |
 | a real directory with entries              | discard it, then link                             | move it aside intact, then link        |
 | a file, or any other link, dangling or not | refuse, naming the path                           | the same                               |
 
 A capability's directory is its tool's own cache, which the next build rebuilds: discarding it is rebuild-only
 migration, and keeping it would hold a Cargo target directory's tens of GiB that nobody asked for. A declared directory
-is not cowshed's to judge (Declared build state). `rmdir(2)` removes a directory only while it is still empty, so an
-entry a tool writes after the refresh looked fails the refresh instead of being lost.
+is not cowshed's to judge (Declared build state). `rmdir(2)` removes a declared directory only while it is still empty,
+so an entry a tool writes after the refresh looked fails the refresh as a conflict instead of being lost. It runs before
+any rename, so that conflict leaves every other path as it was.
 
 A kept directory is renamed in one `rename(2)`, on the same volume and never copied, to
 `<checkout>/.cowshed/kept/<UTC time>-<id>-<path>`, with `%` and `/` in the path percent-encoded, and the link then takes
-the path. The name is the whole record: when the directory was moved, and from where. Nothing of cowshed's ever deletes
-a kept directory, neither a refresh nor `gc`; the operator does, once they have taken what they need. The refresh says
-so on stderr, naming the path, the kept location and the `rm -rf` that deletes it, and `setup` lists each one in its
-result (`kept` under `--json`). `cowshed doctor` reports each one as `build-state-kept` for as long as it exists, so a
+the path. The name is the whole record: when the directory was moved, and from where. No refresh and no `gc` deletes a
+kept directory, and a workspace's retirement would delete it with the image, so `cowshed rm` and land's dirt fence
+refuse a workspace while `.cowshed/kept` has entries, naming them, exactly as they refuse uncommitted work, and only
+`--abandon` overrides that (02_workspaces.md). It stays until the operator, having taken what they need, deletes it. The
+refresh says so on stderr, naming the path, the kept location and the `rm -rf` that deletes it, and `setup` repeats each
+one in its report on stderr. `cowshed doctor` reports each one as `build-state-kept` for as long as it exists, so a
 notice missed among a refresh's progress lines loses nothing and is said again. The notice stays off stdout, which
-06_cli.md keeps for the command's result: `exec`'s stdout is the child's bytes. A fork clones `.cowshed/kept` with the
-rest of the source image, like any untracked file.
+06_cli.md keeps for the command's result: `exec`'s stdout is the child's bytes. A failure after a directory was kept
+names it in its error, since such a refresh returns no findings. A fork drops its copy of its source's `.cowshed/kept`
+(Fork step 4): the source still holds every entry, and a copy would make the fork's own `rm` and land refuse for state
+that is not the fork's.
 
 **Why move aside rather than refuse.** A refusal is the better answer where an operator is waiting. Here, often none is.
 A refresh runs before every job is admitted, gates and test runs included. It also runs after a land's fast-forward, at
@@ -299,12 +304,14 @@ its first traced test run, and on 2026-10-30 only 6 of 53 packages held that lin
 fork's next exec after testing any other package would refuse, and only an operator deleting by hand what the refresh
 declined to delete could clear it. The rename costs nothing, loses nothing, and the job proceeds.
 
-- **Enforced by**: `migrate::tests`: a decision test over every tool and occupant; a property test that runs the refresh
-  over random occupants (absent, the fixed link, a foreign or dangling link, an empty or filled directory, a file) of
-  two capability paths and two declared ones, asserting that every file and link outside a tool's own cache survives
-  byte for byte, that a file or a foreign link refuses with nothing changed, and that each declared directory's files
-  are where its finding says; and the `.bun-pin` regression, which keeps an uncommitted edit at the location its notice
-  names. `kept::tests` decodes every entry name back to its path and time.
+- **Enforced by**: `migrate::tests`: a decision test over every tool and occupant, whose list a new variant cannot
+  compile past; a property test that runs the refresh over random occupants (absent, the fixed link, a foreign or
+  dangling link, an empty or filled directory, a file) of three capability paths and three declared ones, asserting that
+  every file and link outside a tool's own cache survives byte for byte, that a file or a foreign link refuses with no
+  file or link changed, and that each declared directory's files are where its finding says; a race test writing into an
+  empty declared directory between observation and `rmdir(2)`; and the `.bun-pin` regression, which keeps an uncommitted
+  edit at the location its notice names. `kept::tests` decodes every entry name back to its path and time and refuses
+  every name it did not write.
 
 A discarded directory is first renamed into `<checkout>/.cowshed/discard/`. That is the same volume, in cowshed's
 excluded namespace, and never a sibling in the source tree. The link then takes the path, and the refresh returns
@@ -815,7 +822,10 @@ workspace. All sources use one mint path, carrying edits and untracked files war
    and mtime; Cargo freshness depends on that (rule "Clones preserve mtimes").
 4. Delete `nx/workspace-data/d` in the new build volume: a daemon record names another checkout's process and socket
    (rule "One Nx state per checkout"). Delete the checkout's inherited `target` link when it names an mbx managed
-   target: it names the source checkout's managed target, and the fork's first build places its own.
+   target: it names the source checkout's managed target, and the fork's first build places its own. Move the checkout's
+   inherited `.cowshed/kept` into `.cowshed/discard`, deleted in the background: those are the source's kept
+   directories, which the source still holds ("What a refresh does at each path"), and the fork's `rm` and land would
+   refuse for them.
 
 The lock covers what reads the target: the clone of its image, its seed refresh and the capture of its seed, all one
 hold, so the clone's checkout and its build volume come from one state of the target that no land or reseed changes

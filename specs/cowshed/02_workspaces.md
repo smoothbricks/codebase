@@ -1024,7 +1024,10 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
 1. **Refuse a dirty tree** (exit 4), read exactly as `rm` reads one (a tracked change, or an untracked file that is not
    hidden, not ignored by main's current rules, and not held by main's checkout with the same content). The check runs
    in the working tree but only the commit lands, so uncommitted work would be validated without landing, and would then
-   refuse the retire after main had already moved.
+   refuse the retire after main had already moved. Refuse the same way, naming each, a workspace whose `.cowshed/kept`
+   holds a directory a build-state refresh moved aside intact (16_build_volumes.md, "What a refresh does at each path"):
+   the retire that ends the land would delete it with the image, and nothing else would. Its owner takes what they need,
+   deletes it and lands again; `land` has no override.
 2. **Validate**: run the check _inside the sandbox_ — `--check <cmd>` if given, else no validation with one honest
    `cowshed:` stderr line saying so. Non-zero check → exit 4, workspace intact, output captured as a job (11_shell.md)
    for diagnosis. The check is an ordinary sandboxed exec, admitted at gate class as the land's own work (05_gateway.md,
@@ -1409,28 +1412,32 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    tracked change, staged or not and hidden or not, and an untracked file no ignore rule covers. An untracked hidden
    path (one with a `.` component) is junk, and so is an untracked path the target checkout's current rules ignore or
    that it holds byte for byte (or by the same symlink target); a path the workspace's own rules ignore is never work.
-   An in-progress Git operation refuses the same way. A branch other than HEAD also passes when its tip equals or is an
-   ancestor of main's repository branch of the same name or of the ref `push` wrote for it. The refusal names each
-   branch that did not pass with its tip, how many of its commits neither proof holds, each unheld file with why main
-   lacks its change (`missing`, `conflict`, `added`, `deleted`, `changed` where main deleted the file, `mode`, or
-   `unmergeable` with git's reason), ten files per branch and a count of the rest, and then those commits, each with its
-   subject, ten and a count of the rest; `ls --landed` applies the same measurement. This is not the install gate's
-   question (05_gateway.md, "The installed cowshed"), which asks whether a build holds the installed commits themselves,
-   by ancestry or patch identity alone. `--force` waives neither uncommitted work, an in-progress operation nor unlanded
-   work. An explicit `rm` (and a project purge, for each session it removes) also refuses a workspace younger than ten
-   minutes, measured from the creation time its record carries, after every other gate has passed: a clean workspace at
-   main is indistinguishable from a landed one, and one its owner forked minutes ago may not have its first edit yet.
-   The refusal names the age and the floor, and its hint the remedies that keep the work; a creation time that cannot be
-   read refuses the same way. It alone carries `removal: {reason: "young", createdAt, removableAt}`: `removableAt` is
-   the first second the floor lets the workspace go, absent when the creation cannot be read, so a caller that owns the
-   workspace waits for that second instead of copying the floor. `--force` overrides it. A `land` retiring its named
-   source, an idle peer whose own non-empty work it folded (`land` step 5), and the replay of a removal already
-   authorized, are not asked. A live peer owner is never bypassed by a land's fold cleanup. Explicit `--abandon`
-   authorizes losing all three. It requires a verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding
-   HEAD and every branch that did not pass as refs, and, when the tree holds uncommitted work, one more commit on top of
-   HEAD holding the work tree as it stands, under `refs/cowshed/uncommitted` (`AbandonedWork.uncommitted`): each dirty
-   path taken as the tree holds it and one the tree lost as its deletion, staged through a private index so the
-   workspace's own index, HEAD and branches are untouched. An in-progress operation's own state (`MERGE_HEAD`, a
+   An in-progress Git operation refuses the same way, and so does a kept build-state directory: an entry of
+   `.cowshed/kept`, which a refresh moved aside intact rather than delete (16_build_volumes.md, "What a refresh does at
+   each path") and which retiring the image would delete unseen; that refusal names ten entries and a count of the rest,
+   after any uncommitted work. A branch other than HEAD also passes when its tip equals or is an ancestor of main's
+   repository branch of the same name or of the ref `push` wrote for it. The refusal names each branch that did not pass
+   with its tip, how many of its commits neither proof holds, each unheld file with why main lacks its change
+   (`missing`, `conflict`, `added`, `deleted`, `changed` where main deleted the file, `mode`, or `unmergeable` with
+   git's reason), ten files per branch and a count of the rest, and then those commits, each with its subject, ten and a
+   count of the rest; `ls --landed` applies the same measurement. This is not the install gate's question
+   (05_gateway.md, "The installed cowshed"), which asks whether a build holds the installed commits themselves, by
+   ancestry or patch identity alone. `--force` waives neither uncommitted work, an in-progress operation, a kept
+   build-state directory nor unlanded work. An explicit `rm` (and a project purge, for each session it removes) also
+   refuses a workspace younger than ten minutes, measured from the creation time its record carries, after every other
+   gate has passed: a clean workspace at main is indistinguishable from a landed one, and one its owner forked minutes
+   ago may not have its first edit yet. The refusal names the age and the floor, and its hint the remedies that keep the
+   work; a creation time that cannot be read refuses the same way. It alone carries
+   `removal: {reason: "young", createdAt, removableAt}`: `removableAt` is the first second the floor lets the workspace
+   go, absent when the creation cannot be read, so a caller that owns the workspace waits for that second instead of
+   copying the floor. `--force` overrides it. A `land` retiring its named source, an idle peer whose own non-empty work
+   it folded (`land` step 5), and the replay of a removal already authorized, are not asked. A live peer owner is never
+   bypassed by a land's fold cleanup. Explicit `--abandon` authorizes losing all four; a kept build-state directory is
+   not bundled, and goes with the image. It requires a verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`,
+   holding HEAD and every branch that did not pass as refs, and, when the tree holds uncommitted work, one more commit
+   on top of HEAD holding the work tree as it stands, under `refs/cowshed/uncommitted` (`AbandonedWork.uncommitted`):
+   each dirty path taken as the tree holds it and one the tree lost as its deletion, staged through a private index so
+   the workspace's own index, HEAD and branches are untouched. An in-progress operation's own state (`MERGE_HEAD`, a
    rebase's plan) is not kept; its work tree is. No image is kept (step 5). The bundle is written beside that name and
    renamed into place once verified; a retried removal that finds a bundle verifying for the same range keeps it instead
    of writing another. The bundle is the only copy: nothing is written into main's repository, whose refs are the

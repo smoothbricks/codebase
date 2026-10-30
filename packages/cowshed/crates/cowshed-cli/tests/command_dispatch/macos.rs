@@ -3947,6 +3947,78 @@ async fn directory_land_preflight_refuses_an_unheld_untracked_leaf_as_land_does_
         .expect("stop the real directory project");
 }
 
+/// A unit whose refresh kept a declared directory aside (16_build_volumes.md, "What a refresh does
+/// at each path") is refused by an ungated fold and by `rm`, both naming the kept entry: the
+/// retire that ends a fold would delete it with the unit's image. The lane base and the entry
+/// stay as they were, and once the owner has deleted the entry the fold lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_fold_of_a_unit_keeping_build_state_refuses_until_it_is_gone_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let lane = new_workspace(&mut service, "lane").await;
+    succeed(&mut service, ["fork", "lane", "unit"]).await;
+    let unit = service
+        .path("unit", false)
+        .await
+        .expect("unit is mounted")
+        .mount;
+    fs::write(unit.join("unit.txt"), b"unit\n").expect("write the unit's file");
+    git(&unit, &["add", "unit.txt"]);
+    git(&unit, &["commit", "-q", "-m", "unit"]);
+    // What a refresh leaves when it moves a declared directory aside (kept::keep_aside).
+    let entry = "2026-10-30T19:41:10Z-0123abcd-vendor%2Fupstream";
+    let kept = unit.join(".cowshed/kept").join(entry);
+    fs::create_dir_all(kept.join("src")).expect("make the kept entry");
+    fs::write(kept.join("src/edit.c"), b"an uncommitted edit\n").expect("write the kept edit");
+    let lane_head = git_stdout(&lane, &["rev-parse", "HEAD"]);
+
+    for args in [
+        &["--json", "land", "unit", "--into", "lane", "--ungated"][..],
+        &["--json", "rm", "unit"],
+    ] {
+        let (result, _, stderr) = run(&mut service, args.iter().copied()).await;
+        let refused = result.expect_err("a unit holding kept build state is refused");
+        assert_eq!(
+            refused.exit_code(),
+            4,
+            "{args:?}: {refused}\n{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            refused.message.contains("keeps declared build state")
+                && refused.message.contains(entry),
+            "{args:?} did not name the kept entry: {refused}"
+        );
+    }
+    assert_eq!(
+        git_stdout(&lane, &["rev-parse", "HEAD"]),
+        lane_head,
+        "a refused fold left the lane base where it was"
+    );
+    assert_eq!(
+        fs::read(kept.join("src/edit.c")).expect("the kept edit"),
+        b"an uncommitted edit\n",
+        "the refusals kept the entry"
+    );
+
+    fs::remove_dir_all(&kept).expect("the owner deletes the entry");
+    succeed(
+        &mut service,
+        ["land", "unit", "--into", "lane", "--ungated"],
+    )
+    .await;
+    assert_ne!(
+        git_stdout(&lane, &["rev-parse", "HEAD"]),
+        lane_head,
+        "with the entry gone the fold lands"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
 /// A clean workspace passes its preflight while another process holds its land lease, which a
 /// land itself is refused for: the preflight takes no lease. Its report pins the land that runs
 /// once the lease is free.
@@ -5538,13 +5610,15 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
         "a fork of main clones main's declared state warm"
     );
     assert_eq!(
-        cowshed_core::build_volume::kept::list(&topic)
-            .expect("the fork's kept list")
-            .iter()
-            .map(|kept| kept.location.file_name().map(ToOwned::to_owned))
-            .collect::<Vec<_>>(),
-        [kept.location.file_name().map(ToOwned::to_owned)],
-        "a fork carries its source's kept directory like any untracked file"
+        cowshed_core::build_volume::kept::list(&topic).expect("the fork's kept list"),
+        [],
+        "a fork drops its copy of its source's kept directory, so its own rm and land never \
+         refuse for it"
+    );
+    assert_eq!(
+        fs::read(kept.location.join("build/build.ninja")).expect("main's kept build tree"),
+        b"before cowshed\n",
+        "main still holds the kept directory a fork dropped its copy of"
     );
     assert_build_label(namespace, &layout, &topic, "topic").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);

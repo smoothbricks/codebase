@@ -95,13 +95,40 @@ fn entry_name(at: &str, id: &str, relative: &Path) -> OsString {
     OsString::from_vec(name)
 }
 
+/// Drop a fork's copy of its source's kept entries (16_build_volumes.md, "Fork" step 4). The
+/// source still holds every one, so the copy loses nothing, and kept it would make the fork's own
+/// `rm` and land refuse for state that is not the fork's. One rename into the discard directory,
+/// deleted in the background like any discard, so the fork never waits on the delete. A
+/// checkout with no kept directory has nothing to drop.
+pub fn release_inherited(checkout: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(checkout.join(KEPT_DIRECTORY)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    super::discard::move_aside(checkout, Path::new(KEPT_DIRECTORY))?;
+    super::discard::reap(checkout);
+    Ok(())
+}
+
+/// The shell command that deletes the kept entry at `location`, quoted for any path.
+pub fn removal(location: &Path) -> String {
+    format!(
+        "rm -rf '{}'",
+        location.display().to_string().replace('\'', "'\\''")
+    )
+}
+
 /// The record [`entry_name`] wrote into `name`, or `None` for a name it did not write.
 fn decode(name: &OsStr) -> Option<Moved> {
     let (at, rest) = name.as_bytes().split_at_checked(AT_LEN)?;
     let at = std::str::from_utf8(at).ok()?;
     crate::api::dto::UtcTimestamp::new(at).ok()?;
     let (id, rest) = rest.strip_prefix(b"-")?.split_at_checked(ID_LEN)?;
-    if !id.iter().all(u8::is_ascii_hexdigit) {
+    if !id
+        .iter()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return None;
     }
     let mut encoded = rest.strip_prefix(b"-")?.iter();
@@ -116,7 +143,11 @@ fn decode(name: &OsStr) -> Option<Moved> {
             byte => byte,
         });
     }
-    (!path.is_empty()).then(|| Moved {
+    // Only a name `entry_name` wrote: a relative path of plain components, none empty.
+    let plain = path
+        .split(|byte| *byte == b'/')
+        .all(|component| !matches!(component, b"" | b"." | b".."));
+    plain.then(|| Moved {
         path: PathBuf::from(OsString::from_vec(path)),
         at: at.to_owned(),
     })
@@ -132,7 +163,7 @@ mod tests {
         /// kept under exactly as it went in, with the time it was kept.
         #[test]
         fn an_entry_name_decodes_to_the_path_and_time_it_records(
-            components in prop::collection::vec("[a-z%._-]{1,8}", 1..5),
+            components in prop::collection::vec("[a-zA-Z0-9%_-][a-zA-Z0-9%._-]{0,7}", 1..5),
             seconds in 0u64..4_102_444_800,
         ) {
             let relative = PathBuf::from(components.join("/"));
@@ -155,9 +186,39 @@ mod tests {
             "2026-13-30T19:41:10Z-0123abcd-a",
             "2026-10-30T19:41:10Z-0123abcd-a%2Gb",
             "2026-10-30T19:41:10Z-0123abcd-a%2",
+            "2026-10-30T19:41:10Z-0123ABCD-a",
+            "2026-10-30T19:41:10Z-0123abcd-%2Fa",
+            "2026-10-30T19:41:10Z-0123abcd-a%2F",
+            "2026-10-30T19:41:10Z-0123abcd-a%2F%2Fb",
+            "2026-10-30T19:41:10Z-0123abcd-a%2F..%2Fb",
+            "2026-10-30T19:41:10Z-0123abcd-.",
         ] {
             assert_eq!(decode(OsStr::new(name)), None, "{name}");
         }
+    }
+
+    /// `%2F` written in a path stays those three bytes: only `entry_name`'s own escapes decode.
+    #[test]
+    fn an_escaped_escape_decodes_to_the_literal_text() {
+        let at = "2026-10-30T19:41:10Z";
+        for path in ["a%2Fb", "a/b", "a%25b", "a%b"] {
+            assert_eq!(
+                decode(&entry_name(at, "0123abcd", Path::new(path))),
+                Some(Moved {
+                    path: PathBuf::from(path),
+                    at: at.to_owned(),
+                }),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_removal_command_quotes_any_path() {
+        assert_eq!(
+            removal(Path::new("/x/it's kept")),
+            "rm -rf '/x/it'\\''s kept'"
+        );
     }
 
     /// The directory moves whole, entries and all, and the listing names where it went and

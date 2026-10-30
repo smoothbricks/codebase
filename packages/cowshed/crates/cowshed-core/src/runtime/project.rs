@@ -5866,6 +5866,19 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ),
             ));
         }
+        // A retire ends every land, and it would delete what a refresh kept aside with the image;
+        // refused here, before the check, as `rm` refuses it, never after main moved.
+        let kept = kept_build_state(&source_mount)?
+            .into_iter()
+            .map(|kept| kept.location)
+            .collect::<Vec<_>>();
+        if !kept.is_empty() {
+            return Err(kept_build_state_refusal(
+                workspace,
+                &kept,
+                &format!("cowshed land {workspace}"),
+            ));
+        }
         let target_branch = match options.target_branch.clone() {
             Some(branch) => branch,
             None => {
@@ -7659,6 +7672,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 .dirty_paths_by(Some(&self.substrate_config.checkout_path))
                 .await?,
             in_progress: git.in_progress_operation().await?,
+            kept: kept_build_state(mount)?
+                .into_iter()
+                .map(|kept| kept.location)
+                .collect(),
         })
     }
 
@@ -11049,6 +11066,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         let last = this
                             .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
                             .await?;
+                        // An unpublished clone never admitted a job, so no refresh of its own kept
+                        // anything: an entry here is its source's, copied before the mint's "kept"
+                        // step dropped it, and the source still holds it.
+                        let last = NativeRemovalGitFence {
+                            kept: Vec::new(),
+                            ..last
+                        };
                         let forced = removal_state_gate(workspace, options, &last, None)?;
                         let NativeLandedAuthority {
                             abandoning,
@@ -11611,6 +11635,9 @@ struct NativeRemovalGitFence {
     /// in its order; empty when the tree is clean.
     dirt: Vec<PathBuf>,
     in_progress: Option<String>,
+    /// Every entry of the checkout's kept build-state directory, which a retirement would delete
+    /// with the image ([`kept_build_state_refusal`]); empty when it holds none.
+    kept: Vec<PathBuf>,
 }
 
 /// Whether the branch that outlives a workspace already holds the workspace's work.
@@ -14302,6 +14329,23 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             "locks",
                             crate::inherited_git_locks::discard_in(&stage.mount_point),
                         )
+                        .await?;
+                        timed_async("fork", "kept", async {
+                            crate::build_volume::kept::release_inherited(&stage.mount_point)
+                                .map_err(|error| {
+                                    CowshedError::environment_missing(
+                                        format!(
+                                            "cannot drop the inherited {}: {error}",
+                                            stage
+                                                .mount_point
+                                                .join(crate::build_volume::kept::KEPT_DIRECTORY)
+                                                .display()
+                                        ),
+                                        "repair that directory in the new workspace, then retry \
+                                         the fork",
+                                    )
+                                })
+                        })
                         .await?;
                         timed_async(
                             "fork",
@@ -19176,6 +19220,7 @@ mod removal_refusal_tests {
             head: oid('4'),
             dirt: dirt.iter().map(PathBuf::from).collect(),
             in_progress: in_progress.map(str::to_owned),
+            kept: Vec::new(),
         }
     }
 
@@ -20005,6 +20050,54 @@ mod removal_refusal_tests {
             .collect::<Vec<_>>();
         let message = removal_dirty_refusal(&workspace(), &many).message;
         assert!(message.ends_with("f9, and 2 more"), "{message}");
+        // A directory a refresh kept aside dies with the image: plain and forced rm refuse it,
+        // naming it, after any uncommitted work; --abandon alone retires the workspace with it.
+        let kept = |dirt: &[&str]| NativeRemovalGitFence {
+            kept: vec![PathBuf::from(
+                "/mnt/raven/.cowshed/kept/2026-10-30T19:41:10Z-0123abcd-vendor%2Fupstream",
+            )],
+            ..fence(dirt, None)
+        };
+        for (case, fence, options, expected) in [
+            (
+                "kept",
+                kept(&[]),
+                options(false, false),
+                Err("keeps declared build state"),
+            ),
+            (
+                "kept, forced",
+                kept(&[]),
+                options(true, false),
+                Err("keeps declared build state"),
+            ),
+            (
+                "kept and dirty",
+                kept(&dirty),
+                options(false, false),
+                Err(refused_dirt),
+            ),
+            (
+                "kept, abandoned",
+                kept(&dirty),
+                options(false, true),
+                Ok(None),
+            ),
+        ] {
+            let decided = removal_state_gate(&workspace(), options, &fence, None)
+                .map_err(|refusal| refusal.message);
+            match (decided, expected) {
+                (Err(message), Err(expected)) => {
+                    assert!(message.contains(expected), "{case}: {message}");
+                    if expected != refused_dirt {
+                        assert!(message.contains("vendor%2Fupstream"), "{case}: {message}");
+                    }
+                }
+                (decided, expected) => {
+                    assert_eq!(decided, expected.map_err(str::to_owned), "{case}");
+                }
+            }
+        }
         // Uncommitted work on landed commits is still work: an abandonment bundles it, and a clean
         // landed workspace has nothing to bundle.
         assert_eq!(
@@ -24056,10 +24149,11 @@ struct NativeRemovalAuthority {
 }
 
 /// The transient half of the removal gate, asked before the landed proof (02_workspaces.md, `rm`
-/// step 1): an in-progress Git operation or uncommitted work refuses, named, unless `--abandon`
-/// authorizes committing the work tree into the abandon bundle. `--force` waives neither: it
-/// overrides only the age floor, which the caller asks last. Answers what the force overrode, for
-/// the deletion log, when the removal was forced.
+/// step 1): an in-progress Git operation, uncommitted work, or a kept build-state directory
+/// refuses, named, unless `--abandon` authorizes committing the work tree into the abandon bundle
+/// and losing the kept directories with the image. `--force` waives none of them: it overrides
+/// only the age floor, which the caller asks last. Answers what the force overrode, for the
+/// deletion log, when the removal was forced.
 #[cfg(target_os = "macos")]
 fn removal_state_gate(
     workspace: &WorkspaceName,
@@ -24073,6 +24167,13 @@ fn removal_state_gate(
         }
         if !fence.dirt.is_empty() {
             return Err(removal_dirty_refusal(workspace, &fence.dirt));
+        }
+        if !fence.kept.is_empty() {
+            return Err(kept_build_state_refusal(
+                workspace,
+                &fence.kept,
+                &format!("cowshed rm {workspace}"),
+            ));
         }
     }
     Ok(options.force.then(|| overridden_by_force(young)))
@@ -24120,6 +24221,37 @@ fn removal_young_refusal(workspace: &WorkspaceName, young: &YoungWorkspace) -> C
     )
 }
 
+/// Retiring a workspace releases its image, and with it every directory a build-state refresh
+/// kept aside in `.cowshed/kept` (16_build_volumes.md, "What a refresh does at each path"). So
+/// `rm` and land refuse while any is there, naming ten and a count of the rest, with the remedy
+/// that loses nothing first; `retry` is the command to run again.
+#[cfg(target_os = "macos")]
+fn kept_build_state_refusal(
+    workspace: &WorkspaceName,
+    kept: &[PathBuf],
+    retry: &str,
+) -> CowshedError {
+    const NAMED: usize = 10;
+    let mut named = kept
+        .iter()
+        .take(NAMED)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if kept.len() > NAMED {
+        named.push_str(&format!(", and {} more", kept.len() - NAMED));
+    }
+    CowshedError::conflict(
+        format!(
+            "workspace {workspace} keeps declared build state a refresh moved aside intact, which \
+             retiring it would delete: {named}"
+        ),
+        format!(
+            "take what you need from each named directory, delete it with rm -rf, then retry: \
+             {retry}; only cowshed rm {workspace} --abandon retires {workspace} with them"
+        ),
+    )
+}
 #[cfg(target_os = "macos")]
 /// The dirt refusal names what `git status` reads as work, ten paths and a count of the rest, and
 /// remedies that lose nothing.
@@ -24935,8 +25067,8 @@ fn kept_build_state(checkout: &Path) -> Result<Vec<crate::build_volume::kept::Ke
 }
 
 /// Doctor's report of a directory a refresh moved aside, intact, from a declared build-state
-/// path where it linked the volume. Nothing of cowshed's deletes it, so it is reported until the
-/// operator does.
+/// path where it linked the volume. No refresh or `gc` deletes it, and `rm` and `land` refuse the
+/// workspace while it is there, so it is reported until the operator deletes it.
 #[cfg(target_os = "macos")]
 fn kept_build_state_finding(
     workspace: &WorkspaceName,
@@ -24946,20 +25078,23 @@ fn kept_build_state_finding(
     let message = match &kept.moved {
         Some(moved) => format!(
             "{workspace} keeps {location}: a refresh moved {} aside there intact at {} when it \
-             linked that declared build-state path, and cowshed never deletes it",
+             linked that declared build-state path; rm and land refuse {workspace} while it is there",
             moved.path.display(),
             moved.at
         ),
         None => format!(
-            "{workspace} keeps {location} in its kept build-state directory, which cowshed \
-             never deletes"
+            "{workspace} keeps {location} in its kept build-state directory; rm and land refuse \
+             {workspace} while it is there"
         ),
     };
     crate::api::dto::Finding {
         code: "build-state-kept".into(),
         severity: crate::api::dto::FindingSeverity::Warning,
         message,
-        hint: format!("take what you need from it, then rm -rf '{location}'"),
+        hint: format!(
+            "take what you need from it, then delete it: {}",
+            crate::build_volume::kept::removal(&kept.location)
+        ),
         path: Some(kept.location),
     }
 }

@@ -168,7 +168,9 @@ pub(super) fn owned_directory(
             Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
                 fs::create_dir(&directory)?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(checkout.join(relative));
+            }
             Err(error) => return Err(error),
         }
     }

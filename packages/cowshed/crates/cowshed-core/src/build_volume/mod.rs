@@ -673,8 +673,9 @@ pub enum DiscardOrigin {
 
 /// A real directory holding entries at a declared build-state path, which a refresh moved aside
 /// intact, never copied and never deleted, and linked over (16_build_volumes.md, "What a refresh
-/// does at each path"). It stays at `kept` until the operator deletes it, and `cowshed doctor`
-/// reports it until then ([`kept::list`]).
+/// does at each path"). No refresh and no `gc` deletes it, and `rm` and `land` refuse its
+/// workspace while it is there, so it stays until the operator deletes it or abandons the
+/// workspace; `cowshed doctor` reports it until then ([`kept::list`]).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeptBuildStateFinding {
@@ -695,8 +696,10 @@ impl std::fmt::Display for KeptBuildStateFinding {
         write!(
             formatter,
             "moved the real directory {path}, {stood}, aside intact to {kept} and linked {path} \
-             onto the build volume; cowshed never deletes it: take what you need from it, re-run \
-             whatever made {path} so it fills the link, then delete it (rm -rf '{kept}')"
+             onto the build volume; no refresh or gc deletes it, and rm and land refuse this \
+             workspace until it is gone: take what you need from it, re-run whatever made {path} \
+             so it fills the link, then delete it ({})",
+            kept::removal(&self.kept)
         )
     }
 }

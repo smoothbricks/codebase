@@ -876,7 +876,7 @@ where
             let projects = setup.build_state_projects().await?;
             if !projects.is_empty() {
                 output.guidance(
-                    "build-state migration discards rebuildable incremental directories; tracked source files are protected and the next build repopulates the volume",
+                    "build-state migration discards rebuildable incremental directories and keeps declared ones intact in .cowshed/kept; tracked source files are protected and the next build repopulates the volume",
                 ).map_err(output_error)?;
             }
             let mut results = Vec::with_capacity(projects.len());
@@ -1974,7 +1974,10 @@ fn repair_status(
         String::from("host services refreshed")
     } else if readiness.build_state.iter().any(|project| {
         project.result.as_ref().is_ok_and(|state| {
-            state.created || !state.added.is_empty() || !state.discarded.is_empty()
+            state.created
+                || !state.added.is_empty()
+                || !state.discarded.is_empty()
+                || !state.kept.is_empty()
         })
     }) {
         String::from("host storage is set up; build state refreshed")
