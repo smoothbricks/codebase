@@ -23,6 +23,7 @@ import {
   applyWorkspaceDependencyDefaults,
   listValidCommitScopes,
   validateAggregateMemberCache,
+  validateCacheOnlyAggregatesUncached,
   validateExplicitTaskInputs,
   validateNoStaleTestOutput,
   validateNxProjectNames,
@@ -143,8 +144,46 @@ describe('cached aggregates run cached members', () => {
     const errors = captureConsoleErrors();
     expect(validateAggregateMemberCache(projects)).toBe(4);
     const refusal = (member: string) =>
-      `app:${member}: the cached aggregate app:test runs it, but it states no "cache", so Nx never caches it and every run executes it again; state "cache": true with its inputs, or "cache": false where it cannot be cached`;
+      `app:${member}: the cached aggregate app:test runs it, but it states no "cache", so Nx never caches it and every run executes it again; state "cache": true with its inputs`;
     expect(errors).toEqual(['unit-a', 'unit-b', 'unit-c', 'test-shard1'].map(refusal));
+  });
+});
+
+describe('only aggregates are uncached', () => {
+  afterEach(() => {
+    console.error = originalConsoleError;
+  });
+
+  it('refuses an uncached target that runs work, and passes aggregates and cached targets', () => {
+    const projects = projectTargetsFromNxProjects({
+      app: {
+        root: 'packages/app',
+        targets: {
+          bench: { executor: 'nx:run-commands', cache: false, options: { command: 'cargo bench' } },
+          build: { executor: 'nx:run-commands', cache: true, options: { command: 'tsc' } },
+          'cli-native': { executor: 'nx:noop', cache: false, dependsOn: ['build'] },
+          deploy: {
+            executor: 'nx:run-commands',
+            cache: false,
+            options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' },
+          },
+          clean: { executor: '@smoothbricks/nx-plugin:clean-outputs', cache: false },
+          lint: { executor: 'nx:run-script', cache: false, options: { script: 'lint' } },
+          serve: { executor: 'nx:run-commands', cache: false, options: { command: 'vite' } },
+          test: { cache: false, dependsOn: ['build'] },
+        },
+      },
+    });
+    const errors = captureConsoleErrors();
+    expect(validateCacheOnlyAggregatesUncached(projects)).toBe(4);
+    const refusal = (target: string, executor: string) =>
+      `app:${target}: "cache": false on a target that runs ${executor}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input`;
+    expect(errors).toEqual([
+      refusal('bench', 'nx:run-commands'),
+      refusal('clean', '@smoothbricks/nx-plugin:clean-outputs'),
+      refusal('lint', 'nx:run-script'),
+      refusal('serve', 'nx:run-commands'),
+    ]);
   });
 });
 
@@ -215,7 +254,8 @@ describe('root smoo monorepo policy', () => {
       applyRootScriptDefaults(root);
 
       const { scripts } = await readJson(join(root, 'package.json'));
-      expect(scripts.clean).toBe(kept ? clean : undefined);
+      if (kept) expect(scripts).toMatchObject({ clean });
+      else expect(scripts).not.toHaveProperty('clean');
     } finally {
       await rm(root, { recursive: true, force: true });
     }

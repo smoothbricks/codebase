@@ -31,6 +31,7 @@ import {
   applyWorkspaceDependencyDefaults,
   listValidCommitScopes,
   validateAggregateMemberCache,
+  validateCacheOnlyAggregatesUncached,
   validateExplicitTaskInputs,
   validateNoStaleTestOutput,
   validateNxProjectNames,
@@ -182,6 +183,7 @@ export async function checkPolicyFailures(root: string, projectTargets: ProjectT
     validateNxProjectNames(root) +
     validateExplicitTaskInputs(projectTargets) +
     validateAggregateMemberCache(projectTargets) +
+    validateCacheOnlyAggregatesUncached(projectTargets) +
     validateNxReleaseConfig(root) +
     validatePublicTags(root) +
     validatePublicPackageMetadata(root) +
