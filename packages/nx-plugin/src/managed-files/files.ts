@@ -213,6 +213,11 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/git-hooks/pinned-revisions-served.ts',
+    target: 'tooling/git-hooks/pinned-revisions-served.ts',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/git-reword-commit',
     target: 'tooling/git-reword-commit',
     executable: true,

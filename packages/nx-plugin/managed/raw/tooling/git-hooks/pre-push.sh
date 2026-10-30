@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Two gates, in order.
+# Three gates, in order.
 #
 # 1. On every OS, the public denylist: every commit this push publishes is
 # refused if its tree, or the message of any commit the remote does not hold
@@ -8,7 +8,15 @@
 # repository so the guard never publishes what it guards; with none
 # configured the check passes silently.
 #
-# 2. The macOS-only Linux cross-compile gate. It asks Nx for cargo-lint-cross,
+# 2. On every OS, the pinned revisions. CI fetches every git revision
+# Cargo.lock pins from the remote it names, while a land builds it from the
+# local Cargo git database, so a pin can land before its repository pushes it.
+# The push holds until each remote serves its pinned revision (normally the
+# pinned repository's own push, minutes away) and refuses after 15 minutes,
+# naming each pin, so no tree CI cannot fetch is published
+# (pinned-revisions-served.ts).
+#
+# 3. The macOS-only Linux cross-compile gate. It asks Nx for cargo-lint-cross,
 # whose hit means a real `cargo-zigbuild clippy --target x86_64-unknown-linux-gnu`
 # already passed for exactly this tree, so the push is safe with no toolchain
 # present. From a plain shell the cross target itself never compiles here: on
@@ -74,6 +82,9 @@ if [ "${#pushed[@]}" -gt 0 ]; then
     echo 'pre-push: rewrite a refused commit message in place with tooling/git-reword-commit <commit> (the new message on stdin), then push again' >&2
     exit 1
   }
+fi
+if [ "${#pushed[@]}" -gt 0 ]; then
+  bun "$TOOLING/git-hooks/pinned-revisions-served.ts" --wait 900 "${pushed[@]}" || exit 1
 fi
 
 case "$(uname -s)" in

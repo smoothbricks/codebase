@@ -1,0 +1,1 @@
+../../packages/nx-plugin/managed/raw/tooling/git-hooks/pinned-revisions-served.ts
