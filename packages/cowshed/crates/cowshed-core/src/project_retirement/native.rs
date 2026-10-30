@@ -118,6 +118,7 @@ mod macos {
         store: &Path,
         repo: &RepoId,
         workspace: &WorkspaceName,
+        census: &crate::census::CensusScope,
     ) -> Result<supervisor_socket::BoundSocket> {
         let path = supervisor_socket::socket_path(store, repo, workspace);
         let present = match supervisor_socket::hello_if_present(&path).await {
@@ -158,7 +159,13 @@ mod macos {
                 ));
             }
         }
-        let bound = supervisor_socket::bind(&path).await?;
+        // A drained supervisor's exit is a release the binder waits out; with none present there
+        // was none, and the binder probes as a first binder does.
+        let bound = if present {
+            supervisor_socket::bind_released(&path, census).await?
+        } else {
+            supervisor_socket::bind(&path).await?
+        };
         require_lost_groups_released(workspace, &bound, "forget").await?;
         Ok(bound)
     }
@@ -255,7 +262,7 @@ mod macos {
         let before = contents(&project)?;
         let mut sockets = Vec::with_capacity(before.workspaces.len());
         for workspace in &before.workspaces {
-            sockets.push(drain_workspace(&store, &repo_id, workspace).await?);
+            sockets.push(drain_workspace(&store, &repo_id, workspace, &census).await?);
         }
         // This refuses a controller that still owns the project even after its supervisors ended.
         // No process-table absence or vanished fixture marker substitutes for the kernel lease.
@@ -424,6 +431,36 @@ mod macos {
             );
         }
 
+        /// A lifecycle operation that holds a workspace's socket lease with no supervisor serving
+        /// it refuses the drain at once: no supervisor was seen let the socket go, so the binder
+        /// probes as a first binder does (11_shell.md "Protocol"), and the refusal is the probe's,
+        /// with no waiter's expiry in it.
+        #[tokio::test]
+        async fn a_held_socket_lease_with_no_supervisor_refuses_the_drain_at_once() {
+            let root = crate::temp_root::TempRoot::new("pr");
+            let repo = RepoId::parse("acme/leased").unwrap();
+            let (storage, _project) = recorded(
+                &root,
+                TestNamespace::mint().expect("a test namespace"),
+                &repo,
+            );
+            let workspace = WorkspaceName::new("main").unwrap();
+            let socket = supervisor_socket::socket_path(storage.store(), &repo, &workspace);
+            let _held = supervisor_socket::lease_unserved(&socket)
+                .unwrap()
+                .expect("no supervisor serves the workspace");
+            let refused = drain_workspace(storage.store(), &repo, &workspace, &storage.census())
+                .await
+                .expect_err("a held lease refuses the drain");
+            assert_eq!(refused.code, ErrorCode::Conflict, "{refused:?}");
+            assert_eq!(
+                refused.message,
+                format!(
+                    "a supervisor or lifecycle operation owns {}",
+                    socket.display()
+                )
+            );
+        }
         #[tokio::test]
         async fn a_live_controller_blocks_archive_and_only_positive_intent_resumes() {
             let root = crate::temp_root::TempRoot::new("pr");

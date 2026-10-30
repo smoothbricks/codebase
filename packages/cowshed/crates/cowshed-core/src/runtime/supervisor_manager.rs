@@ -933,11 +933,15 @@ pub struct OtherBuildStopped {
 /// This build speaks no request of that supervisor's protocol but `drain`, the one whose shape
 /// never changes, and `drain` alone only waits for its jobs. The connected peer's non-reusable
 /// kernel identity, cross-checked with the drain reply, owns TERM and KILL after the grace: no
-/// later process that took its pid can receive either. Once it is gone, the socket is bound,
+/// later process that took its pid can receive either. Once it is gone, the socket is bound as a
+/// released one is ([`supervisor_socket::bind_released`], its lease named as `census` reads it),
 /// and its group ledger ends only positively owned processes and carries unresolved groups for
 /// the next supervisor. The jobs' records remain unterminated until that next supervisor seals
 /// them, as after any lost supervisor.
-pub async fn stop_other_build(socket: &Path) -> Result<OtherBuildStopped> {
+pub async fn stop_other_build(
+    socket: &Path,
+    census: &crate::census::CensusScope,
+) -> Result<OtherBuildStopped> {
     let drained = supervisor_socket::drain(socket).await?;
     let pid = drained.pid();
     if pid <= 1 || pid == std::process::id() {
@@ -963,7 +967,7 @@ pub async fn stop_other_build(socket: &Path) -> Result<OtherBuildStopped> {
             format!("stop pid {pid} yourself, then retry"),
         )
     })?;
-    let bound = supervisor_socket::bind(socket).await?;
+    let bound = supervisor_socket::bind_released(socket, census).await?;
     let ledger = super::job_groups::ledger_path(socket);
     let taken = ledger.clone();
     let unresolved =
@@ -1958,7 +1962,9 @@ mod tests {
             .expect("its socket")
             .ino();
 
-        let stopped = stop_other_build(&socket).await.expect("stopped");
+        let stopped = stop_other_build(&socket, &crate::census::this_test())
+            .await
+            .expect("stopped");
 
         assert_eq!(Some(stopped.pid), supervisor.id());
         assert_eq!(

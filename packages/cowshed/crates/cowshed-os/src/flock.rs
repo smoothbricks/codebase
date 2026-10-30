@@ -221,12 +221,12 @@ pub enum LeaseMode {
 }
 
 /// Why a named lease was not taken. `E` is the caller's own failure to open the directory
-/// holding it.
+/// holding it; `L` the lock's own failure: the system call's, or a waiter's ([`LockError`]).
 #[derive(Debug)]
-pub enum NamedLeaseError<E> {
+pub enum NamedLeaseError<E, L = io::Error> {
     Directory(E),
     Open(io::Error),
-    Lock(io::Error),
+    Lock(L),
     Inspect(io::Error),
     /// Its name was removed under each of [`NAMED_LEASE_REOPENS`] opens in a row.
     Replaced,
@@ -263,6 +263,36 @@ pub fn lock_named<E>(
         };
         if names_file(&held, name, &lease).map_err(NamedLeaseError::Inspect)? {
             return Ok(if busy { None } else { Some((held, lease)) });
+        }
+    }
+    Err(NamedLeaseError::Replaced)
+}
+
+/// Take the named lease `name` beneath the directory `directory` opens, exclusive, as a waiter
+/// within what is left of `deadline` ([`exclusive`]): the grant by which a release is judged, since
+/// a spawn's transient copy of a lease can outlast its holder's close (`fork_lock`). After the
+/// grant the name must still name the inode granted, as [`lock_named`] checks it, or the lease is
+/// reopened beneath a directory opened anew. `lease` is its path; at the bound the wait fails
+/// naming `holder(lease)`. `open` is [`open_lock`] outside tests.
+pub fn lock_named_within<E>(
+    mut directory: impl FnMut() -> Result<File, E>,
+    name: &CStr,
+    lease: &Path,
+    deadline: &Deadline,
+    holder: impl Fn(&Path) -> String,
+    mut open: impl FnMut(&File, &CStr) -> io::Result<Fenced<File>>,
+) -> Result<(File, Fenced<File>), NamedLeaseError<E, LockError>> {
+    for _ in 0..NAMED_LEASE_REOPENS {
+        let held = directory().map_err(NamedLeaseError::Directory)?;
+        let file = match open(&held, name) {
+            Ok(file) => file,
+            // A holder removed the directory after `directory` opened it.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(NamedLeaseError::Open(error)),
+        };
+        let file = exclusive(file, lease, deadline, &holder).map_err(NamedLeaseError::Lock)?;
+        if names_file(&held, name, &file).map_err(NamedLeaseError::Inspect)? {
+            return Ok((held, file));
         }
     }
     Err(NamedLeaseError::Replaced)

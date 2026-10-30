@@ -7560,29 +7560,14 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                 }
             }
             if let Some((path, server)) = serving {
-                // The acknowledgement follows this process's close of the lease, and a waiter's
-                // grant, never a probe, proves the release (01c_macos.md, "`posix_spawnp` leaves
-                // transient descriptor copies"): the job's `cat` searched PATH after the bind, and
-                // each failed try held a copy of the lease until it exited, after the spawn had
-                // returned.
-                let lease = path.with_extension("sock.lock");
-                let granted = cowshed_os::flock::exclusive(
-                    cowshed_os::fork_lock::Fenced::new(std::fs::File::open(&lease).unwrap()),
-                    &lease,
-                    &cowshed_os::deadline::start(
-                        "retired-socket-lease",
-                        cowshed_os::deadline::Bound::new(
-                            cowshed_os::deadline::LatencyClass::Control,
-                            cowshed_os::test_backstop::NO_PROGRESS,
-                        ),
-                    ),
-                    |lock| cowshed_core::held_lock::holders(&census(), lock),
-                )
-                .expect("retirement acknowledgement releases the real socket lease");
-                drop(granted);
-                let replacement = supervisor_socket::bind(&path)
+                // The acknowledgement follows this process's close of the lease; the replacement
+                // binds as a released socket is bound, waiting for the lease's grant rather than
+                // probing it (01c_macos.md, "`posix_spawnp` leaves transient descriptor copies"):
+                // the job's `cat` searched PATH after the bind, and each failed try held a copy of
+                // the lease until it exited, after the spawn had returned.
+                let replacement = supervisor_socket::bind_released(&path, &census())
                     .await
-                    .expect("the released socket admits its replacement");
+                    .expect("retirement acknowledgement releases the real socket lease");
                 drop(replacement);
                 server.await.unwrap().unwrap();
             }

@@ -10601,7 +10601,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         // older actor signal a mutable record nominee before the controller.
                         return Err(error);
                     }
-                    let stopped = super::supervisor_manager::stop_other_build(&socket).await?;
+                    let stopped = super::supervisor_manager::stop_other_build(
+                        &socket,
+                        &self.descriptor.storage.census(),
+                    )
+                    .await?;
                     cowshed_os::eprintln!(
                         "cowshed: stopped workspace {name}'s supervisor (pid {}) of another cowshed build",
                         stopped.pid
@@ -10613,12 +10617,23 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 Err(error) => return Err(error),
             },
         };
-        if let Some(handle) = handle {
-            Self::stop_supervisor_handle(&handle, when, nx_daemon).await?;
-        }
+        // A retirement acknowledged is a release the binder waits out; with no supervisor found
+        // there was none, and the binder probes as a first binder does.
+        let released = match handle {
+            Some(handle) => {
+                Self::stop_supervisor_handle(&handle, when, nx_daemon).await?;
+                true
+            }
+            None => false,
+        };
         self.forget_served(name).await?;
         self.sessions.retain(|(workspace, _), _| workspace != name);
-        super::supervisor_socket::bind(&socket).await
+        if released {
+            super::supervisor_socket::bind_released(&socket, &self.descriptor.storage.census())
+                .await
+        } else {
+            super::supervisor_socket::bind(&socket).await
+        }
     }
 
     /// After retirement, abort and join this process's socket server before another owner binds.

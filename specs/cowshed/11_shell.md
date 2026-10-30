@@ -640,21 +640,27 @@ path at 64 and no two workspaces share one. The serving process creates `<store>
 reaches a socket in it, binds the socket there and sets it `0600`, and verifies each connecting peer's uid before
 reading a byte. A no-follow file lease at `<digest>.sock.lock` serializes binders and stale-socket replacement. The
 lease is the inode its name names, taken as the project lease is (02_workspaces.md, `fenced`) through the one
-named-lease owner (`cowshed_os::flock::lock_named`): every taker checks after locking, and after a refused attempt, that
-the name still names the inode it locked, by device and inode without following a link, and reopens it when not. No
-holder unlinks it yet: a taker of a build from before that check would lock an inode no name names while another taker
-made a new one, and nothing lists which builds' processes still run. Removal is enabled by the build that follows the
-retirement of the first build that checks; until then the lease file stays when its holder lets it go. The lease's
-holder owns the drain report beside the socket (`<socket>.drain`, "Supervisor recovery") and that report's publication
-temps: a supervisor publishes only while it holds its socket, and releasing the socket closes publication, waiting out
-one in flight, before it withdraws the report and lets the lease go. The bound listener and lease are one owned value,
-held throughout serving or a workspace mutation. A supervisor of another build must finish the other-build drain before
-a new build binds; ensure refuses the old build while it still serves, and the lifecycle stop waits for its exit. Stream
-refusal is not absence: a live Darwin listener can refuse when its backlog is full. Recovery probes the exact filesystem
-socket with a datagram connection; wrong-type or connected means a socket remains attached to that vnode, including one
-inherited after its creator exited. Only a proven unattached socket is removed under the lease. New listeners bind
-privately in mode `0600` and publish with one exclusive rename. Cleanup removes only the bound listener's own inode
-while holding the lease. Retirement releases the listener and lease **before** acknowledging success.
+named-lease owner (`cowshed_os::flock::lock_named`, and `lock_named_within` for a waiter): every taker checks after
+locking, and after a refused attempt, that the name still names the inode it locked, by device and inode without
+following a link, and reopens it when not. No holder unlinks it yet: a taker of a build from before that check would
+lock an inode no name names while another taker made a new one, and nothing lists which builds' processes still run.
+Removal is enabled by the build that follows the retirement of the first build that checks; until then the lease file
+stays when its holder lets it go. The lease's holder owns the drain report beside the socket (`<socket>.drain`,
+"Supervisor recovery") and that report's publication temps: a supervisor publishes only while it holds its socket, and
+releasing the socket closes publication, waiting out one in flight, before it withdraws the report and lets the lease
+go. The bound listener and lease are one owned value, held throughout serving or a workspace mutation. A supervisor of
+another build must finish the other-build drain before a new build binds; ensure refuses the old build while it still
+serves, and the lifecycle stop waits for its exit. Stream refusal is not absence: a live Darwin listener can refuse when
+its backlog is full. Recovery probes the exact filesystem socket with a datagram connection; wrong-type or connected
+means a socket remains attached to that vnode, including one inherited after its creator exited. Only a proven
+unattached socket is removed under the lease. New listeners bind privately in mode `0600` and publish with one exclusive
+rename. Cleanup removes only the bound listener's own inode while holding the lease. Retirement releases the listener
+and lease **before** acknowledging success. A binder that replaces a supervisor it saw let the socket go — its
+retirement acknowledged, or its process exited after a drain or an other-build stop — takes the lease as a waiter, once
+and with no retry, within the no-progress bound (`cowshed_os::test_backstop::NO_PROGRESS`), never by a probe: a release
+can lag its close by a spawn's transient copies (below; 01c_macos.md), and a holder past the bound is refused as a probe
+refuses one, named as the held-lock census reads it. A binder that must refuse a live supervisor without stopping it,
+and the first binder of a supervisor, still probe.
 
 The same serving actor also binds `<digest>.members.sock` under its own listener lease, with the same framing and uid
 check but a separate closed request grammar: exactly `subtreeHandle` and `retireDescendants`. Unknown operations are
