@@ -585,7 +585,14 @@ export async function runBoundedExec(
   let mbxAdmitted = false;
   let admissionWait = NO_ADMISSION_WAIT;
   let lastQueueRequests: readonly MbxQueuedRequest[] = [];
-  let queueFailure: string | null = null;
+  /**
+   * Why the last admission snapshot failed, while the one after it has not succeeded; null otherwise. A snapshot only
+   * decides whether waiting on mbx admission is credited against the idle bound, so a failed one withholds that credit
+   * and ends nothing: the bounds decide, and an idle expiry names it.
+   */
+  let unconfirmedAdmission: string | null = null;
+  /** When the last successful snapshot completed (`Date.now()`): credit runs to it and no further. */
+  let confirmedAdmissionAt: number | null = null;
   const queueWait = (): AdmissionQueueWait | null =>
     mbxAdmitted || lastQueueRequests.length === 0
       ? null
@@ -851,7 +858,7 @@ export async function runBoundedExec(
   let checkingIdle = false;
   const armBoundTimer = (): void => {
     clearTimeout(boundTimer);
-    if (state.settled || state.expiry !== null || queueFailure !== null) return;
+    if (state.settled || state.expiry !== null) return;
     const next = earliestBound(checkingIdle ? { ...bounds, idle: null } : bounds);
     if (next !== null) {
       boundTimer = setTimeout(
@@ -863,7 +870,7 @@ export async function runBoundedExec(
     }
   };
   const confirmExpiry = async (kind: BoundKind, at: number): Promise<void> => {
-    if (state.settled || state.expiry !== null || queueFailure !== null) return;
+    if (state.settled || state.expiry !== null) return;
     const scheduled = earliestBound(checkingIdle ? { ...bounds, idle: null } : bounds);
     if (scheduled?.kind !== kind || scheduled.at !== at) return;
     if (kind === 'idle' && leaf !== null) {
@@ -878,13 +885,13 @@ export async function runBoundedExec(
         checkingIdle = false;
       }
     }
-    if (state.settled || state.expiry !== null || queueFailure !== null) return;
+    if (state.settled || state.expiry !== null) return;
     const next = earliestBound(bounds);
     if (next !== null && next.at <= Date.now()) expire(expiredAs(next.kind));
     else armBoundTimer();
   };
   const stepTo = (event: BoundEvent): void => {
-    if (state.settled || state.expiry !== null || queueFailure !== null) return;
+    if (state.settled || state.expiry !== null) return;
     const idleBefore = bounds.idle;
     bounds = stepBounds(
       bounds,
@@ -906,16 +913,18 @@ export async function runBoundedExec(
   let lastQueueDiagnostic = '';
   let lastQueueDiagnosticAt: number | null = null;
   let lastSnapshotDiagnostics = '';
-  const failQueueObservation = (detail: string): void => {
-    if (state.settled || state.expiry !== null || queueAbort.signal.aborted || queueFailure !== null) return;
-    queueFailure = detail;
-    tell(
-      `bounded-exec: mbx admission snapshot failed: ${detail}; queue/admission state unconfirmed, not an idle wedge\n`,
-    );
-    clearTimeout(boundTimer);
-    cancelCapture();
-    stopQueueObservation();
-    termination = terminate();
+  const unconfirmAdmission = (detail: string): void => {
+    if (state.settled || state.expiry !== null || queueAbort.signal.aborted) return;
+    if (unconfirmedAdmission !== detail) {
+      tell(
+        `bounded-exec: mbx admission snapshot failed: ${detail}; admission is unconfirmed, so this wait earns no idle credit until a snapshot succeeds\n`,
+      );
+    }
+    unconfirmedAdmission = detail;
+    lastQueueRequests = [];
+    admissionWait = stepAdmissionWait(admissionWait, { kind: 'snapshot', at: performance.now(), waiting: false });
+    // The wait since the last confirmed snapshot is unconfirmed: the idle bound resumes from that snapshot.
+    stepTo({ kind: 'admission-queue', at: confirmedAdmissionAt ?? Date.now(), waiting: false, testing: isTesting() });
   };
   const refreshQueue = async (fresh: boolean): Promise<void> => {
     if (fresh && queueSnapshot !== null) await queueSnapshot;
@@ -930,7 +939,7 @@ export async function runBoundedExec(
       );
       if (state.settled || state.expiry !== null || queueAbort.signal.aborted) return;
       if (!snapshot.ok) {
-        failQueueObservation(snapshot.detail);
+        unconfirmAdmission(snapshot.detail);
         return;
       }
       const diagnostics = snapshot.diagnostics?.join('; ') ?? '';
@@ -940,6 +949,8 @@ export async function runBoundedExec(
       const observedAt = Date.now();
       const observedWaitAt = performance.now();
       admissionWait = stepAdmissionWait(admissionWait, { kind: 'snapshot', at: observedWaitAt, waiting });
+      unconfirmedAdmission = null;
+      confirmedAdmissionAt = observedAt;
       if (waiting) {
         lastQueueRequests = snapshot.requests;
         const positions = JSON.stringify(snapshot.requests);
@@ -959,7 +970,7 @@ export async function runBoundedExec(
       stepTo({ kind: 'admission-queue', at: observedAt, waiting, testing: isTesting() });
     })()
       .catch((error: unknown) => {
-        failQueueObservation(error instanceof Error ? error.message : String(error));
+        unconfirmAdmission(error instanceof Error ? error.message : String(error));
       })
       .finally(() => {
         queueSnapshot = null;
@@ -1056,7 +1067,7 @@ export async function runBoundedExec(
     cancelCapture();
     clearTimeout(boundTimer);
     // Preserve explicit live membership before cancellation removes the queued process. A failed bounded observation
-    // reports an operational failure, never a manufactured queue or admission.
+    // leaves the admission unconfirmed, never a manufactured queue or admission.
     signalCleanup = (leaf === null ? Promise.resolve() : refreshQueue(false))
       .finally(() => {
         stopQueueObservation();
@@ -1069,10 +1080,7 @@ export async function runBoundedExec(
           signalToExitCode(signal),
           state.expiry,
           Date.now() - startedAt,
-          state.poolCloseError !== null ||
-            lifecycleFailure !== null ||
-            state.retireError !== null ||
-            queueFailure !== null,
+          state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null,
           state.noSpace === null ? null : await state.noSpace,
           state.lockWaits,
         ),
@@ -1130,7 +1138,11 @@ export async function runBoundedExec(
             bound.tests.length > 0
               ? `still running: ${bound.tests.join(', ')}`
               : 'the runner named no test still running'
-          } (cwd=${cwd}): ${command}\n`
+          } (cwd=${cwd}): ${command}\n${
+            unconfirmedAdmission === null
+              ? ''
+              : `The last mbx admission snapshot failed (${unconfirmedAdmission}), so the wait it could not confirm earned no idle credit\n`
+          }`
         : bound.kind === 'fixture'
           ? `\nFixture command timed out after ${elapsedMs}ms (fixtureTimeoutMs=${bound.limitMs}, cwd=${cwd}): ${fixture?.command ?? command}\n`
           : `\nCommand timed out after ${elapsedMs}ms (timeoutMs=${bound.limitMs}, cwd=${cwd}): ${command}\n`,
@@ -1331,18 +1343,11 @@ export async function runBoundedExec(
       appendStderr(`${describeRamTempError(full)}\n`);
     }
   }
-  await releaseLease(
-    code !== 0 ||
-      state.expiry !== null ||
-      state.poolCloseError !== null ||
-      lifecycleFailure !== null ||
-      queueFailure !== null,
-  );
+  await releaseLease(code !== 0 || state.expiry !== null || state.poolCloseError !== null || lifecycleFailure !== null);
 
   // Broken resource ownership, a lost native lifecycle, or leftovers that could not be retired fail even if a shell
   // branch later exited 0: its verdict is an ordinary operational failure, never a successful or silently unbounded run.
-  const operationalFailure =
-    state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null || queueFailure !== null;
+  const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null;
   await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen, state.lockWaits);
   return {
     success: !operationalFailure && resultFailure === null && state.expiry === null && code === 0,

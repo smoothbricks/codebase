@@ -1817,7 +1817,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
   });
 
   it.each(['queued', 'failed', 'admitted', 'fresh'] as const)(
-    'maps public admission observations into a %s terminal run without hiding operational failure',
+    'maps public admission observations into a %s run, and a failed snapshot kills nothing',
     async (mode) => {
       const workspace = await createWorkspace();
       const directory = await ownedSocketDirectory('admission-observer-', 'control.sock');
@@ -1853,6 +1853,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           "socket.on('data', message => {",
           "  if (message.toString() === 'admit') writeSync(Number(process.env.MBX_GRANT_FD), 'g');",
           "  else if (message.toString() === 'exit') process.exit(7);",
+          "  else if (message.toString() === 'pass') process.exit(0);",
           "  else console.log('advance-poll');",
           '});',
           "socket.on('error', error => { throw error; });",
@@ -1872,6 +1873,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
               send(mode === 'failed' ? 'observe' : mode === 'admitted' ? 'admit' : 'exit');
             }
             if (mode === 'admitted' && chunk.includes('mbx cargo granted')) send('exit');
+            // A failed snapshot leaves the command running: it finishes on its own, here successfully.
+            if (mode === 'failed' && chunk.includes('mbx admission snapshot failed')) send('pass');
             if (mode === 'fresh' && chunk.includes('advance-idle')) {
               // Idle expires with the first poll in flight: it must drain it, then request a fresh snapshot.
               queueMicrotask(() => queueMicrotask(() => firstSnapshot.resolve()));
@@ -1938,16 +1941,21 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
             return running;
           },
         );
-        expect(result.success).toBe(false);
+        // A host that cannot answer a snapshot in time (a stalled process table) says so and withholds the admission
+        // credit; it ends nothing, so the command's own exit decides the run.
+        expect(result.success, result.terminalOutput).toBe(mode === 'failed');
         const verdict = (await readRecord(recordDirectory))?.verdict;
-        expect(verdict?.outcome).toBe(mode === 'queued' ? 'queued' : 'failed');
+        expect(verdict?.outcome).toBe(mode === 'queued' ? 'queued' : mode === 'failed' ? 'passed' : 'failed');
         if (verdict?.outcome === 'queued') {
           expect(verdict.requests).toEqual([{ pid: 77, ticket: 31, queuePosition: 4 }]);
           expect(verdict.waitedMs).toBeGreaterThanOrEqual(0);
         }
         expect(snapshots).toBeGreaterThanOrEqual(mode === 'failed' || mode === 'fresh' ? 2 : 1);
         expect(result.terminalOutput).not.toContain('Command made no progress');
-        if (mode === 'failed') expect(result.terminalOutput).toContain('mbx admission snapshot failed');
+        if (mode === 'failed') {
+          expect(result.terminalOutput).toContain('mbx admission snapshot failed: mbx stats');
+          expect(result.terminalOutput).toContain('earns no idle credit');
+        }
         if (mode === 'admitted' || mode === 'fresh') expect(result.terminalOutput).toContain('mbx cargo granted');
       } finally {
         firstSnapshot.resolve();
