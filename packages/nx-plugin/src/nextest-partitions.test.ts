@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
-import { NEXTEST_EXTRACTION_DIRECTORY, nextestExtractionKey } from '@smoothbricks/nextest-extract';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
@@ -41,7 +40,7 @@ const exceptional = [
 const serial = Array.from({ length: 4 }, (_, index) => `serial_probe_${index}`);
 const expected = [...ordinary, ...exceptional, ...serial];
 
-/** The one Cargo fixture and archive every case reads, built once in beforeAll. */
+/** The one Cargo fixture and test build every case reads, built once in beforeAll. */
 interface SharedFixture {
   readonly root: string;
   readonly targets: Readonly<Record<string, TargetConfiguration>>;
@@ -119,9 +118,9 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.
     const result = await infer(['package.json'], undefined, { workspaceRoot: root, nxJsonConfiguration: {} });
     const targets = result[0]?.[1].projects?.['.']?.targets;
     if (targets === undefined) throw new Error('Cargo fixture inferred no targets');
-    // The archive is the one real prerequisite: every runner executes its binaries.
-    // Nx gives every task its hash; the archive command writes it beside the archive as the runners' extraction key.
-    await run(root, ['sh', '-c', command(targets, 'cargo-test-archive')], { NX_TASK_HASH: '424242' });
+    // The test build is the one real prerequisite: every runner executes its binaries where it left them. Nx gives
+    // every task its hash; the build declares it as its key and records it in the target directory it built.
+    await run(root, ['sh', '-c', command(targets, 'cargo-test-build')], { NX_TASK_HASH: '424242' });
     const source = { root, targets };
     const passingSeed = targets[GROUP_TARGET] === undefined ? undefined : await groupSucceeds(source);
     shared = { ...source, passingSeed };
@@ -259,7 +258,7 @@ function groupOptions(
 }
 
 /**
- * Every archived test runs exactly once, in the runner that owns its class, and the serial group lists exactly
+ * Every built test runs exactly once, in the runner that owns its class, and the serial group lists exactly
  * its probes. The runners are independent, so they run side by side exactly as Nx fans them out.
  */
 async function executesEveryTestOnce(): Promise<void> {
@@ -286,12 +285,14 @@ async function executesEveryTestOnce(): Promise<void> {
     const observed = (await readFile(log, 'utf8')).trim().split('\n').sort();
     expect(observed).toEqual([...tests].sort());
   }
-  // The six runners shared one extraction, in Cargo's build tree: the archive's directory holds only the archive and
-  // its key, the declared Nx outputs.
-  expect(await readdir(join(root, 'target', NEXTEST_EXTRACTION_DIRECTORY))).toEqual([
-    await nextestExtractionKey(join(root, '.cache/nextest/archive.tar.zst')),
+  // The runners ran the build's binaries in place: the build's directory holds only its reuse-build metadata, the
+  // declared Nx outputs, and Cargo's build tree holds no extraction.
+  expect((await readdir(join(root, '.cache/nextest'))).sort()).toEqual([
+    'binaries-metadata.json',
+    'build.key',
+    'cargo-metadata.json',
   ]);
-  expect((await readdir(join(root, '.cache/nextest'))).sort()).toEqual(['archive.tar.zst', 'archive.tar.zst.key']);
+  expect(await readdir(join(root, 'target'))).not.toContain('nextest-extracted');
   // The serial group is one unpartitioned runner.
   if (hasGroup) expect(command(targets, GROUP_TARGET)).not.toContain('--partition');
 }
@@ -381,7 +382,7 @@ async function continuesPastFailures(): Promise<void> {
   expect((await readFile(failureLog, 'utf8')).trim().split('\n').sort()).toEqual([...serial].sort());
 }
 
-it('executes every archived test once across the actual host runners', caseBody(executesEveryTestOnce));
+it('executes every built test once across the actual host runners', caseBody(executesEveryTestOnce));
 
 // Serial groups are a macOS capability, not a simulated Darwin plan to execute on another host.
 // Every host still executes all fixture tests above through its real inferred partition.

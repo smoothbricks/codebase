@@ -3,19 +3,19 @@
   "version": "0.0.2-0",
   "type": "module",
   "sideEffects": false,
-  "main": "./dist/ts/nextest-extraction.js",
-  "module": "./dist/ts/nextest-extraction.js",
-  "types": "./dist/ts/nextest-extraction.d.ts",
+  "main": "./dist/ts/nextest-binaries.js",
+  "module": "./dist/ts/nextest-binaries.js",
+  "types": "./dist/ts/nextest-binaries.d.ts",
   "exports": {
     "./package.json": "./package.json",
     ".": {
-      "types": "./dist/ts/nextest-extraction.d.ts",
-      "import": "./dist/ts/nextest-extraction.js",
-      "default": "./dist/ts/nextest-extraction.js"
+      "types": "./dist/ts/nextest-binaries.d.ts",
+      "import": "./dist/ts/nextest-binaries.js",
+      "default": "./dist/ts/nextest-binaries.js"
     }
   },
   "bin": {
-    "smoo-nx-nextest-extract": "./dist/ts/bin/smoo-nx-nextest-extract.js"
+    "smoo-nx-nextest-binaries": "./dist/ts/bin/smoo-nx-nextest-binaries.js"
   },
   "files": [
     "dist",

@@ -242,8 +242,8 @@ export function cargoCrossTestTargetName(triple: string): string {
 }
 
 /**
- * One archive file per triple, beside the host-native
- * `CARGO_TEST_ARCHIVE_FILE`, relative to the cargo workspace root. Distinct
+ * One archive file per triple, relative to the cargo workspace root: the only
+ * test archives, since a same-platform run executes `cargo-test-build`'s binaries in place. Distinct
  * paths are what let both exist: each is a declared Nx output, so a single path
  * for two triples would let a restored cache serve one machine's binaries under
  * the other's name.

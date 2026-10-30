@@ -4,10 +4,10 @@ import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  EXTRACTED_BINARIES_METADATA,
-  EXTRACTED_CARGO_METADATA,
-  EXTRACTED_TARGET_DIR,
-  NEXTEST_ARCHIVE_KEY_SUFFIX,
+  NEXTEST_BINARIES_BUILD_ARGS,
+  NEXTEST_BINARIES_METADATA,
+  NEXTEST_BUILD_KEY,
+  NEXTEST_CARGO_METADATA,
 } from '@smoothbricks/nextest-extract';
 import {
   type CreateDependencies,
@@ -42,8 +42,7 @@ import { CARGO_TOOLCHAIN_NAMED_INPUT, cargoRuntimeInput, cargoToolchainInputs } 
 import {
   type AttributedCargoWorkspacePackage,
   attributeCargoWorkspacePackages,
-  CARGO_TEST_ARCHIVE_FILE,
-  CARGO_TEST_ARCHIVE_TARGET,
+  CARGO_TEST_BUILD_TARGET,
   CARGO_TEST_EXCEPTIONS_SUFFIX,
   CARGO_TEST_TARGET,
   type CargoCrossTestTarget,
@@ -578,8 +577,8 @@ export function arrivedFileHashInput(path: string): { runtime: string } {
 /**
  * One shell command that runs `steps` in order and stops at the first failure.
  *
- * For a step that CONSUMES what an earlier step produces — the archive needs
- * its directory, `wasm-bindgen` reads the `.wasm` that `cargo build` writes.
+ * For a step that CONSUMES what an earlier step produces — the test build's
+ * metadata needs its directory, `wasm-bindgen` reads the `.wasm` that `cargo build` writes.
  * The order lives in the command because that is the only place a
  * producer-consumer pair inside one task can state it: `nx:run-commands`'
  * `commands` array is a set of independent commands that Nx runs side by side.
@@ -761,60 +760,80 @@ function createCargoWasmTarget(
     },
   };
 }
-
 /**
- * The workspace's test binaries, compiled once and packed into one file the
- * per-crate runners execute from.
+ * The workspace's test binaries, compiled once and run where they were built.
  *
  * This is the only cargo BUILD in the test graph. Before it, every per-crate
  * target ran `nextest run --workspace -E 'package(X)'`, which is a workspace
  * build with a filter: 32 such tasks on one repository each re-entered cargo,
  * re-resolved features and chained behind one another so the flocked `target/`
- * had a single writer. Reading from an archive removes the build from the run
- * entirely — the runners execute one extraction of it and never write cargo's
- * `target/` build tree — which is what lets the runners fan out.
+ * had a single writer. Running from a reused build removes the build from the
+ * run entirely — the runners execute the binaries this build left in Cargo's
+ * target directory and never write its build tree — which is what lets the
+ * runners fan out.
  *
  * It is also the step that keeps compilation out of the bounded test window: a
  * cold workspace can take many minutes to compile while still making progress,
  * which is not a property of the tests, and the runners start after it. It is
  * test work, so no `build` depends on it (a build never consumes test binaries)
- * and each target that executes them names the edge itself. There is no separate
- * uncached `cargo test --no-run` warm-up: it compiled the same dev units a
- * second time, queued on the same `target/` lock.
+ * and each target that executes them names the edge itself.
  *
- * Cached because it produces a VALUE: one file, not a mutable build tree Nx
- * would have to restore. `--workspace` matches the clippy selection exactly, so
- * both gates unify features the same way.
+ * Cached because it produces VALUES: nextest's reuse-build metadata, the
+ * binaries `cargo nextest list --list-type binaries-only` built (an mbx-cached
+ * build) and the `cargo metadata` of the workspace they belong to, which is
+ * what `nextest run --binaries-metadata … --cargo-metadata …` reads. The
+ * binaries themselves stay in Cargo's target directory, where every build of
+ * the workspace keeps its warmth: never in an Nx output, which would restore a
+ * multi-GB tree per hit, and never in an archive, which a same-platform run
+ * would only unpack again (measured: 290 binaries, 678 MB, 4.6s quiet and 21s
+ * in a gate, per archive). A binary's path is cargo's `-C metadata` hash, which
+ * ignores source content, so the metadata says which binaries, never which
+ * bytes: the build's task hash is its third output, the key, and its last step
+ * records that key in the target directory it built. A checkout whose build was
+ * a cache hit holds another key, or none, and possibly binaries of an older
+ * tree at the very paths the metadata names; each runner's fixture rebuilds
+ * there first ({@link nextestRunnerFixture}). The key is also what makes a
+ * dependent that hashes this target's outputs see a source change the metadata
+ * alone would hide. Only a cross lane, whose binaries are built on one platform
+ * and run on another, moves them as an archive
+ * ({@link createCargoCrossTestTargets}). `--workspace` matches the clippy
+ * selection exactly, so both gates unify features the same way.
  *
  * Tests compile the dev profile only, so no test target carries a
  * RELEASE_CONFIGURATION: Nx forwards a run's configuration down every
  * `dependsOn` edge to each target that has it, and a release configuration
  * must never turn the test binaries into release ones nobody runs.
  *
- * The directory and the archive are ONE command: nextest does not create the
- * archive's parent, so the archive step consumes what the `mkdir` produced.
- * The same command writes the task's hash beside the archive, the key every
- * runner's extraction is looked up by (smoo-nx-nextest-extract), and declares it
- * an output, so a cache hit restores the key with the archive it names.
+ * The directory and the metadata are ONE command: a shell redirect does not
+ * create its parent, so the build consumes what the `mkdir` produced. Outside
+ * Nx there is no task hash, and a build no task names is refused here rather
+ * than by every runner.
  */
-const CARGO_TEST_ARCHIVE_KEY_FILE = `${CARGO_TEST_ARCHIVE_FILE}${NEXTEST_ARCHIVE_KEY_SUFFIX}`;
-
-function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): TargetConfiguration {
+function createCargoTestBuildTarget(
+  projectRoot: string,
+  toolConfig: string,
+  nativeTools: NativeTools | null,
+): TargetConfiguration {
+  const helper = nativeToolCommand(nativeTools, projectRoot, 'nextest-extract', 'smoo-nx-nextest-binaries');
   return {
     executor: 'nx:run-commands',
     metadata: CARGO_PRODUCER_METADATA,
     cache: true,
     inputs: CARGO_INPUTS,
-    outputs: [`{projectRoot}/${CARGO_TEST_ARCHIVE_FILE}`, `{projectRoot}/${CARGO_TEST_ARCHIVE_KEY_FILE}`],
+    outputs: [
+      `{projectRoot}/${NEXTEST_BINARIES_METADATA}`,
+      `{projectRoot}/${NEXTEST_CARGO_METADATA}`,
+      `{projectRoot}/${NEXTEST_BUILD_KEY}`,
+    ],
+    dependsOn: nativeToolDependsOn(nativeTools, 'nextest-extract'),
     options: {
       command: sequence([
-        `mkdir -p ${posix.dirname(CARGO_TEST_ARCHIVE_FILE)}`,
-        cargoFrozen(
-          `nextest archive --workspace --archive-file ${CARGO_TEST_ARCHIVE_FILE} --user-config-file none ${toolConfig}`,
-        ),
-        // Outside Nx there is no task hash, and an archive no task names is refused here, not by every runner.
+        `mkdir -p ${posix.dirname(NEXTEST_BINARIES_METADATA)}`,
+        `${nextestBinariesBuild(toolConfig)} > ${NEXTEST_BINARIES_METADATA}`,
+        `${cargoFrozen('metadata --format-version 1 --all-features')} > ${NEXTEST_CARGO_METADATA}`,
         'test -n "$NX_TASK_HASH"',
-        `printf '%s\\n' "$NX_TASK_HASH" > ${CARGO_TEST_ARCHIVE_KEY_FILE}`,
+        `printf '%s\\n' "$NX_TASK_HASH" > ${NEXTEST_BUILD_KEY}`,
+        `${helper} record ${NEXTEST_BUILD_KEY}`,
       ]),
       cwd: projectRoot,
     },
@@ -822,14 +841,24 @@ function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): 
 }
 
 /**
+ * The build of the workspace's test binaries, printing nextest's binaries metadata: the command of
+ * `cargo-test-build` and of every runner's fixture, so the binaries a fixture materializes are the
+ * ones the metadata names.
+ */
+function nextestBinariesBuild(toolConfig: string): string {
+  return cargoFrozen(`${NEXTEST_BINARIES_BUILD_ARGS.join(' ')} ${toolConfig}`);
+}
+
+/**
  * One foreign triple's test archive, and the target that EXECUTES it.
  *
- * A target-triple VARIANT of `cargo-test-archive`, not a second mechanism: same
- * `nextest archive --workspace`, same tool config layering, same
- * `--workspace-remap .` on the run — only `--target <triple>` and a distinct
- * archive file are added, because both archives coexist as declared Nx outputs
- * and one path for two triples would let a restored cache serve the wrong
- * machine's binaries.
+ * The one place a test archive exists: binaries built on one platform and run
+ * on another travel as a file, while a same-platform run executes
+ * `cargo-test-build`'s binaries where they were built. Same tool config
+ * layering and `--workspace-remap .` on the run as the in-place runners;
+ * `--target <triple>` and an archive file per triple, because those archives
+ * coexist as declared Nx outputs and one path for two triples would let a
+ * restored cache serve the wrong machine's binaries.
  *
  * `cargo-nextest` where every other cargo target spells `cargo --frozen`, and
  * that is measured, not stylistic: cargo overwrites `CARGO` with its own path
@@ -915,7 +944,7 @@ function createCargoCrossTestTargets(
     [cargoCrossTestTargetName(triple)]: {
       executor: runExecutor,
       cache: true,
-      // The archive's toolchain, npm and lock keys, as `cargo-test-archive`'s: they decided the bytes it runs.
+      // The archive's toolchain, npm and lock keys, as `cargo-test-build`'s: they decided the bytes it runs.
       inputs: [
         arrivedFileHashInput(posix.join(projectRoot, archiveFile)),
         `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`,
@@ -943,7 +972,7 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
     metadata: CARGO_PRODUCER_METADATA,
     cache: true,
     inputs: CARGO_INPUTS,
-    dependsOn: [CARGO_TEST_ARCHIVE_TARGET],
+    dependsOn: [CARGO_TEST_BUILD_TARGET],
     options: {
       command: cargoFrozen('test --workspace'),
       cwd: projectRoot,
@@ -1008,8 +1037,8 @@ export function pluginInstalledIn(
 /**
  * The npm packages a cached cargo target runs, for its `externalDependencies`.
  * Cargo runs none. A target this plugin's executor runs, or whose command reads
- * the installed plugin's files (the nextest tool config, the archive
- * extractor), runs the plugin. Without the input Nx keys every task whose
+ * the installed plugin's files (the nextest tool config, the test-binaries
+ * helper), runs the plugin. Without the input Nx keys every task whose
  * executor is not an `@nx/` one on every package in the lockfile, so a
  * lockfile-only commit re-ran every cargo verdict.
  */
@@ -1747,9 +1776,9 @@ async function createProjectTargets(
   // result — duplicating the very edges the spread exists to add.
   //
   // `dependsOn` REPLACES rather than unions. These lists state what each target
-  // consumes — the fetched registry, the archive, the debug addon — and a
+  // consumes — the fetched registry, the test build, the debug addon — and a
   // package that must re-route one (build its artifact ahead of the test run,
-  // or drop `cargo-test-archive` because it compiles differently) can only say
+  // or drop `cargo-test-build` because it compiles differently) can only say
   // so by replacing the list; a union would make every inferred edge
   // unremovable and a corrected order unrepresentable.
   // Additive intent already has a spelling (`"..."` above), so a plugin-local
@@ -1786,24 +1815,26 @@ async function createProjectTargets(
     // as the outputs of the targets a repository adds to `dependsOn`. Hashing
     // those outputs here means a repository never has to restate `inputs` to
     // add them - and a restated `inputs` REPLACES this union with the root
-    // project's `default`, which owns no crate file, so the archive then
+    // project's `default`, which owns no crate file, so the test build then
     // cache-hits against edited crates while every per-crate test reruns on
     // the stale binary. That verdict is wrong, not merely slow.
     const workspaceCargoInputs: TargetConfiguration['inputs'] = [
       ...(workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS),
       { dependentTasksOutputFiles: '**/*', transitive: false },
     ];
-    targets[CARGO_TEST_ARCHIVE_TARGET] = createCargoTestArchiveTarget(
+    targets[CARGO_TEST_BUILD_TARGET] = createCargoTestBuildTarget(
       cargoWorkspaceRoot,
       nextestToolConfigArg(cargoWorkspaceRoot),
+      nativeTools,
     );
-    // `archive.include` lives in the repository's nextest config, so that file
-    // decides what the archive CONTAINS, not merely how a run behaves.
-    targets[CARGO_TEST_ARCHIVE_TARGET].inputs = [...workspaceCargoInputs, `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`];
+    // The build's `cargo nextest list` loads the repository's nextest config and
+    // refuses an invalid one, so that file keys the build as well as every run.
+    targets[CARGO_TEST_BUILD_TARGET].inputs = [...workspaceCargoInputs, `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`];
     // One archive per declared foreign triple, from the same inputs and the
-    // same repository nextest config: an archive is the workspace's test
-    // binaries whichever machine they are for, so a change that invalidates
-    // the host archive must invalidate every cross one.
+    // same repository nextest config, whose `archive.include` decides what an
+    // archive CONTAINS: it is the workspace's test binaries for another
+    // machine, so a change that invalidates the host build must invalidate
+    // every cross archive.
     for (const crossTarget of listCargoCrossTestTargets(join(workspaceRoot, cargoWorkspaceRoot))) {
       Object.assign(
         targets,
@@ -1817,10 +1848,10 @@ async function createProjectTargets(
       );
     }
     // A serial group's filter can span members, so no single crate owns it. The root
-    // owns each group's runner beside the archive it executes, and gives it the inputs
+    // owns each group's runner beside the test build it executes, and gives it the inputs
     // of exactly the members its filter can select from (`filterScope`): a group scoped
     // to its packages reruns only when their sources or local dependencies change,
-    // and an unscoped one hashes every member, as the archive itself does.
+    // and an unscoped one hashes every member, as the test build itself does.
     for (const group of cargoWorkspace.serialGroups) {
       targets[cargoTestGroupTargetName(group.group)] = cargoTestGroupTarget(
         cargoWorkspace,
@@ -1847,11 +1878,11 @@ async function createProjectTargets(
     // of its closure; a target dir per crate compiled every shared dependency
     // once per crate (49 closures, 11 GiB on one repository) and no per-crate
     // cache hit ever repaid that. The workspace inputs are exactly the union of
-    // every crate's, so the verdict caches on the same key set the archive
+    // every crate's, so the verdict caches on the same key set the test build
     // does. Non-root packages depend on this target. Its target dir is its own
     // (CARGO_LINT_CLIPPY_COMMAND, ./cross-check-policy.ts): Cargo flocks one
     // directory per invocation, and a workspace clippy holding the dev build's
-    // `target/` queued the archive and every dev build behind it.
+    // `target/` queued the test build and every dev build behind it.
     targets['cargo-lint'] = {
       executor: 'nx:run-commands',
       metadata: CARGO_PRODUCER_METADATA,
@@ -2097,7 +2128,7 @@ async function createProjectTargets(
   if (napiDebug && cargoWorkspace) {
     // A crate whose project also builds the debug cdylib runs its tests after
     // that build: the tests dlopen what `napi-debug` writes into `target/debug`,
-    // and an archived test binary still loads it from this tree.
+    // and a test binary run in place loads it from this tree.
     const runners = [
       ...cargoPackagePlans.flatMap((plan) => plan.pieces.map((piece) => piece.targetName)),
       // The root owns the serial groups' runners, so they take its build as its pieces do.
@@ -2952,7 +2983,7 @@ interface CargoWorkspace {
   packages: CargoPackagePlan[];
   rootProjectName: string;
   projectRoot: string;
-  /** The repository's serial test groups, each with one runner beside the archive (see `serialTestGroups`). */
+  /** The repository's serial test groups, each with one runner beside the test build (see `serialTestGroups`). */
   serialGroups: SerialTestGroup[];
   /** One derivation memo for the whole graph computation (see cargoPackageTestInputs). */
   inputsCache: CargoInputsCache;
@@ -3100,7 +3131,7 @@ async function resolveCargoWorkspaces(
  * own time bound never delays an ordinary shard.
  *
  * Every piece EXECUTES, it never builds: it runs the binaries
- * `cargo-test-archive` compiled once for the whole workspace. That is what
+ * `cargo-test-build` compiled once for the whole workspace. That is what
  * removed the two costs the old shape could not avoid. `nextest run --workspace
  * -E 'package(X)'` re-entered cargo once per crate, and the `-p X` form
  * re-resolved that crate's features so cargo rebuilt the divergent half inside
@@ -3110,37 +3141,32 @@ async function resolveCargoWorkspaces(
  * it, so the filterset is the only selector left, and it selects the same tests
  * it always did.
  *
- * The archive is unpacked ONCE per content, not once per piece. `nextest run
- * --archive-file` extracts the whole archive into a temporary directory of its
- * own on every run, so N pieces paid N extractions of every binary in the
- * workspace to run 1/N of the tests each: on a workspace with ~200 test
- * binaries, ~25 runners extracting side by side on a loaded host all hit the
- * 120s bound still "Extracting". `smoo-nx-nextest-extract` reads the archive's
- * key, the hash of the task that produced it (createCargoTestArchiveTarget),
- * unpacks it under that key unless a previous runner already did — one
- * extracts while the rest wait — and prints the directory; the run then reuses
- * it through nextest's own reuse-build flags, which is what `--archive-file`
- * does after unpacking. Keyed by the producing task's inputs, so a rebuilt or
- * restored archive of other inputs can never run an older extraction's binaries. The one difference
- * from `--archive-file` is the Rust standard library directory: nextest has no
- * flag to remap it, so a run uses the producing toolchain's own sysroot rather
- * than the archived copy of it — the same toolchain, because the archive's hash
- * covers the toolchain pin. The extraction lives in Cargo's own target
- * directory (`<target_directory>/nextest-extracted`), never in an Nx output: it
- * is a multi-GB tree for a cached verdict that has no outputs, rebuilt from the
- * archive like the rest of the build tree, and a checkout that keeps its build
- * state off its source tree keeps the extraction there with it.
+ * The binaries run where the build left them, never copied. An archive makes
+ * a same-platform run pay for a copy of every binary in the workspace before
+ * its first test (measured: 290 binaries, 678 MB, 4.6s on a quiet host and 21s
+ * in a gate, per archive), which only a cross lane needs
+ * (createCargoCrossTestTargets). A run reads the build's reuse-build metadata,
+ * the build's declared Nx outputs, and remaps the build's target directory onto
+ * this checkout's, which `smoo-nx-nextest-binaries target-dir` reads from
+ * Cargo, so a `build.target-dir` is honoured as every build honours it. The
+ * binaries are not Nx outputs, so a checkout whose build was a cache hit can
+ * hold the metadata without them, or with binaries of an older tree at the very
+ * paths it names: the runner's fixture (nextestRunnerFixture) compares the key
+ * the target directory records with the build's and stats each binary, and
+ * otherwise rebuilds with the build's own command through mbx, in the runner's
+ * build interval and never in its progress-bounded test window.
  *
- * `--workspace-remap .` is not cosmetic. An archive records the ABSOLUTE paths
- * of the tree that produced it; without the remap, a restored archive hands
- * every test the producing tree's `CARGO_MANIFEST_DIR` — measured on a moved
- * tree, tests then read another checkout's fixtures, or a path that no longer
- * exists. With it, the runner's own cargo workspace root wins, so the archive
- * is relocatable and one cache entry serves every checkout of the same commit.
- * nextest also re-points `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the
- * extracted binaries at RUNTIME (measured), but `env!` reads them at COMPILE
- * time: a test that spawns `env!("CARGO_BIN_EXE_x")` holds the producing tree's
- * path and must read the runtime variable instead to survive relocation.
+ * `--workspace-remap .` is not cosmetic. Reuse-build metadata records the
+ * ABSOLUTE paths of the tree that produced it; without the remap, metadata
+ * restored from another checkout hands every test the producing tree's
+ * `CARGO_MANIFEST_DIR` — measured on a moved tree, tests then read another
+ * checkout's fixtures, or a path that no longer exists. With it, the runner's
+ * own cargo workspace root wins, so the metadata is relocatable and one cache
+ * entry serves every checkout of the same commit. nextest also re-points
+ * `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the remapped binaries at
+ * RUNTIME (measured), but `env!` reads them at COMPILE time: a test that spawns
+ * `env!("CARGO_BIN_EXE_x")` holds the producing tree's path and must read the
+ * runtime variable instead to survive relocation.
  *
  * nextest.toml singles some tests out with an override: a raised `slow-timeout`
  * marks a test whose cost is not the suite's. Those are lifted OUT of the hash
@@ -3161,8 +3187,8 @@ async function resolveCargoWorkspaces(
  * making valid empty crates and shards fail execution.
  *
  * Pieces fan out rather than chain: a reused-build run writes nothing to cargo's
- * `target/`, so no piece waits on another. The one extraction per archive is
- * coordinated by `smoo-nx-nextest-extract` itself.
+ * `target/`, so no piece waits on another. Only a fixture that finds another
+ * build in place builds, once for the checkout's runners, under a lock of its own.
  */
 async function addCargoTestTargets(
   targets: Record<string, TargetConfiguration>,
@@ -3178,13 +3204,13 @@ async function addCargoTestTargets(
       continue;
     }
     const inputs = await cargoTestRunnerInputs(workspaceRoot, workspace, [plan.package.dir]);
-    const archive = cargoTargetDependency(currentProjectName, {
+    const build = cargoTargetDependency(currentProjectName, {
       projectName: workspace.rootProjectName,
-      targetName: CARGO_TEST_ARCHIVE_TARGET,
+      targetName: CARGO_TEST_BUILD_TARGET,
     });
     for (const piece of plan.pieces) {
       targetNames.push(piece.targetName);
-      targets[piece.targetName] = cargoTestRunnerTarget(workspace, nativeTools, archive, inputs, piece);
+      targets[piece.targetName] = cargoTestRunnerTarget(workspace, nativeTools, build, inputs, piece);
     }
   }
   return targetNames;
@@ -3225,7 +3251,7 @@ function serialGroupMemberDirs(workspace: CargoWorkspace, group: SerialTestGroup
  * manifests, not unrelated sibling sources.
  *
  * The repository's own nextest config layers OVER the plugin's tool config, so it
- * decides timeouts, groups and archive contents: a cached verdict that ignored it
+ * decides timeouts, groups and setup scripts: a cached verdict that ignored it
  * would survive the change that invalidates it.
  */
 async function cargoTestRunnerInputs(
@@ -3245,8 +3271,8 @@ async function cargoTestRunnerInputs(
       }),
     ),
   );
-  // The archive unifies every built package's manifest into every test binary, and a runner's key does not follow the
-  // archive's outputs, so each runner names them all: the ones Nx holds as files, the rest through the repository's
+  // The test build unifies every built package's manifest into every test binary, and a runner's key does not follow
+  // the build's outputs, so each runner names them all: the ones Nx holds as files, the rest through the repository's
   // runtime hash of external sources.
   const manifests: string[] = [];
   const external = new Map<string, string>();
@@ -3279,9 +3305,27 @@ async function cargoTestRunnerInputs(
 }
 
 /**
- * One `nextest run` over a filterset against the workspace's archive. Every runner of the
- * workspace builds its command here, so the extraction, reuse-build, tool config and cwd cannot
- * drift between the per-crate pieces and the serial groups.
+ * A runner's fixture budget: the build interval in which it rebuilds what the target directory lacks. It is a build's
+ * budget, not a test's: on a host whose mbx store lacks the units, the fixture compiles the whole workspace's
+ * tests, which a cold hosted runner takes tens of minutes to do while still making progress.
+ */
+const NEXTEST_BINARIES_FIXTURE_TIMEOUT_MS = 3_600_000;
+
+/**
+ * The fixture every runner of the workspace runs before its tests: the binaries live outside Nx outputs, so it checks
+ * that the target directory holds the build whose key the metadata came with, and every binary the metadata names,
+ * and otherwise rebuilds with the build's own command. It reports its own duration and mbx's hits and misses apart
+ * from the run's, and names the crates loudly when mbx had to compile (smoo-nx-nextest-binaries).
+ */
+function nextestRunnerFixture(workspace: CargoWorkspace, nativeTools: NativeTools | null): string {
+  const helper = nativeToolCommand(nativeTools, workspace.projectRoot, 'nextest-extract', 'smoo-nx-nextest-binaries');
+  return `${helper} ensure ${NEXTEST_BINARIES_METADATA} ${NEXTEST_BUILD_KEY} -- ${nextestBinariesBuild(nextestToolConfigArg(workspace.projectRoot))}`;
+}
+
+/**
+ * One `nextest run` over a filterset against the workspace's test build. Every runner of the
+ * workspace builds its command here, so the reuse-build, the remap, the tool config and the cwd
+ * cannot drift between the per-crate pieces and the serial groups.
  */
 function nextestRunnerCommand(
   workspace: CargoWorkspace,
@@ -3291,24 +3335,20 @@ function nextestRunnerCommand(
 ): string {
   const toolConfig = nextestToolConfigArg(workspace.projectRoot);
   // Relative to the runner's cwd, so the hashed command is the same in every checkout.
-  const extract = nativeToolCommand(nativeTools, workspace.projectRoot, 'nextest-extract', 'smoo-nx-nextest-extract');
-  const reuseExtraction =
-    `--binaries-metadata "$extracted/${EXTRACTED_BINARIES_METADATA}" ` +
-    `--cargo-metadata "$extracted/${EXTRACTED_CARGO_METADATA}" ` +
-    `--target-dir-remap "$extracted/${EXTRACTED_TARGET_DIR}"`;
-  return (
-    `extracted="$(${extract} ${CARGO_TEST_ARCHIVE_FILE})" && ` +
-    cargoFrozen(
-      `nextest run ${reuseExtraction} --workspace-remap . -E ${shellWord(selector)}${flags} --user-config-file none ${toolConfig}`,
-    )
+  const helper = nativeToolCommand(nativeTools, workspace.projectRoot, 'nextest-extract', 'smoo-nx-nextest-binaries');
+  const reuseBuild =
+    `--binaries-metadata ${NEXTEST_BINARIES_METADATA} --cargo-metadata ${NEXTEST_CARGO_METADATA} ` +
+    `--target-dir-remap "$(${helper} target-dir)"`;
+  return cargoFrozen(
+    `nextest run ${reuseBuild} --workspace-remap . -E ${shellWord(selector)}${flags} --user-config-file none ${toolConfig}`,
   );
 }
 
-/** One per-crate piece: a bounded run of its partition of the archive's tests. */
+/** One per-crate piece: a bounded run of its partition of the test build's tests. */
 function cargoTestRunnerTarget(
   workspace: CargoWorkspace,
   nativeTools: NativeTools | null,
-  archive: CargoTargetDependency,
+  build: CargoTargetDependency,
   inputs: NonNullable<TargetConfiguration['inputs']>,
   piece: CargoTestPiece,
 ): TargetConfiguration {
@@ -3316,7 +3356,7 @@ function cargoTestRunnerTarget(
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
     inputs,
-    dependsOn: [archive, ...nativeToolDependsOn(nativeTools, 'nextest-extract')],
+    dependsOn: [build, ...nativeToolDependsOn(nativeTools, 'nextest-extract')],
     options: {
       command: nextestRunnerCommand(
         workspace,
@@ -3325,6 +3365,8 @@ function cargoTestRunnerTarget(
         `${piece.extra} --no-fail-fast --no-tests=pass`,
       ),
       cwd: workspace.projectRoot,
+      fixtureCommand: nextestRunnerFixture(workspace, nativeTools),
+      fixtureTimeoutMs: NEXTEST_BINARIES_FIXTURE_TIMEOUT_MS,
       idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
     },
@@ -3349,10 +3391,12 @@ function cargoTestGroupTarget(
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
     inputs: [...inputs, fileHashInput(PLUGIN_NEXTEST_CODE_BOUND)],
-    dependsOn: [CARGO_TEST_ARCHIVE_TARGET, ...nativeToolDependsOn(nativeTools, 'nextest-extract')],
+    dependsOn: [CARGO_TEST_BUILD_TARGET, ...nativeToolDependsOn(nativeTools, 'nextest-extract')],
     options: {
       command: nextestRunnerCommand(workspace, nativeTools, group.filter, ' --no-fail-fast --no-tests=fail'),
       cwd: workspace.projectRoot,
+      fixtureCommand: nextestRunnerFixture(workspace, nativeTools),
+      fixtureTimeoutMs: NEXTEST_BINARIES_FIXTURE_TIMEOUT_MS,
       idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       parallelism: 1,

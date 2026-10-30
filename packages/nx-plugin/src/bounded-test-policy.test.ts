@@ -198,9 +198,9 @@ describe('bounded test target policy', () => {
     const project = resolvedAggregateProject();
     const resolvedProject: ResolvedProjectTargets = {
       ...project,
-      targets: new Set([...project.targets, 'typecheck-tests', 'cargo-test-archive', 'test-shards']),
+      targets: new Set([...project.targets, 'typecheck-tests', 'cargo-test-build', 'test-shards']),
       targetDependencies: new Map([
-        ['test', ['^build', 'build', 'typecheck-tests', 'cargo-test-archive', 'test-shards']],
+        ['test', ['^build', 'build', 'typecheck-tests', 'cargo-test-build', 'test-shards']],
         ['test-shards', dependencies],
       ]),
     };
@@ -789,8 +789,8 @@ describe('cargo-test reachability policy', () => {
     }
   });
 
-  it('treats the workspace nextest archive as a build, never as a runner or a crate', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'cargo-reach-archive-'));
+  it('treats the workspace test build as a build, never as a runner or a crate', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cargo-reach-build-'));
     try {
       await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
       await writeJson(join(root, 'packages/rusty/package.json'), { name: 'rusty', nx: { name: 'rusty' } });
@@ -798,52 +798,55 @@ describe('cargo-test reachability policy', () => {
       await writeFile(join(root, 'packages/rusty/Cargo.toml'), '[workspace]\nmembers = ["crates/core"]\n');
       await writeFile(join(root, 'packages/rusty/crates/core/Cargo.toml'), '[package]\nname = "rusty-core"\n');
 
-      // `cargo nextest archive` compiles test binaries and packs them. It is
-      // the same silent green as `--no-run`: the word "nextest" appears, no
-      // test runs. And `cargo-test-archive` is not a crate called "archive".
-      const archiveOptions = new Map<string, Record<string, unknown>>([
+      // `cargo nextest list --list-type binaries-only` compiles test binaries and
+      // lists them. It is the same silent green as `--no-run`: the word "nextest"
+      // appears, no test runs. And `cargo-test-build` is not a crate called "build".
+      const buildOptions = new Map<string, Record<string, unknown>>([
         [
-          'cargo-test-archive',
-          { command: 'cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst' },
+          'cargo-test-build',
+          {
+            command:
+              'cargo --frozen nextest list --workspace --list-type binaries-only --message-format json > .cache/nextest/binaries-metadata.json',
+          },
         ],
       ]);
-      const archiveOnly: ResolvedProjectTargets = {
+      const buildOnly: ResolvedProjectTargets = {
         root: 'packages/rusty',
-        targets: new Set(['test', 'cargo-test', 'cargo-test-archive']),
+        targets: new Set(['test', 'cargo-test', 'cargo-test-build']),
         targetDependencies: new Map([
           ['test', ['cargo-test']],
-          ['cargo-test', ['cargo-test-archive']],
+          ['cargo-test', ['cargo-test-build']],
         ]),
         targetExecutors: new Map([
           ['test', 'nx:noop'],
           ['cargo-test', 'nx:noop'],
-          ['cargo-test-archive', 'nx:run-commands'],
+          ['cargo-test-build', 'nx:run-commands'],
         ]),
-        targetOptions: archiveOptions,
+        targetOptions: buildOptions,
       };
       const issues = checkWorkspaceCargoTestReachabilityPolicy(root, {
-        resolvedTargetsByProject: new Map([['rusty', archiveOnly]]),
+        resolvedTargetsByProject: new Map([['rusty', buildOnly]]),
       });
       expect(issues).toHaveLength(1);
       expect(issues[0]?.message).toContain('RUNS tests');
 
       const withRunner: ResolvedProjectTargets = {
-        ...archiveOnly,
-        targets: new Set([...archiveOnly.targets, 'cargo-test-rusty-core']),
+        ...buildOnly,
+        targets: new Set([...buildOnly.targets, 'cargo-test-rusty-core']),
         targetDependencies: new Map([
           ['test', ['cargo-test']],
           ['cargo-test', ['cargo-test-rusty-core']],
-          ['cargo-test-rusty-core', ['cargo-test-archive']],
+          ['cargo-test-rusty-core', ['cargo-test-build']],
         ]),
         targetOptions: new Map([
-          ...archiveOptions,
+          ...buildOptions,
           [
             'cargo-test-rusty-core',
             {
               command:
-                'extracted="$(../../node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-extract .cache/nextest/archive.tar.zst)" && ' +
-                'cargo --frozen nextest run --binaries-metadata "$extracted/target/nextest/binaries-metadata.json" ' +
-                '--cargo-metadata "$extracted/target/nextest/cargo-metadata.json" --target-dir-remap "$extracted/target" ' +
+                'cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json ' +
+                '--cargo-metadata .cache/nextest/cargo-metadata.json ' +
+                '--target-dir-remap "$(../../node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-binaries target-dir)" ' +
                 "--workspace-remap . -E 'package(rusty-core)'",
             },
           ],
@@ -897,10 +900,10 @@ describe('cargo-test reachability policy', () => {
 
       const runnerOptions = new Map<string, Record<string, unknown>>([
         [
-          'cargo-test-archive',
+          'cargo-test-build',
           {
             command:
-              'mkdir -p .cache/nextest && cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst',
+              'mkdir -p .cache/nextest && cargo --frozen nextest list --workspace --list-type binaries-only --message-format json > .cache/nextest/binaries-metadata.json',
           },
         ],
         ['cargo-test-rusty-core', { command: 'cargo --frozen nextest run --package rusty-core' }],
@@ -908,16 +911,16 @@ describe('cargo-test reachability policy', () => {
       ]);
       const missingChild: ResolvedProjectTargets = {
         root: 'packages/rusty',
-        targets: new Set(['test', 'cargo-test', 'cargo-test-archive', 'cargo-test-rusty-core']),
+        targets: new Set(['test', 'cargo-test', 'cargo-test-build', 'cargo-test-rusty-core']),
         targetDependencies: new Map([
           ['test', ['cargo-test']],
           ['cargo-test', ['cargo-test-rusty-core']],
-          ['cargo-test-rusty-core', ['cargo-test-archive']],
+          ['cargo-test-rusty-core', ['cargo-test-build']],
         ]),
         targetExecutors: new Map([
           ['test', 'nx:noop'],
           ['cargo-test', 'nx:noop'],
-          ['cargo-test-archive', 'nx:run-commands'],
+          ['cargo-test-build', 'nx:run-commands'],
           ['cargo-test-rusty-core', BOUNDED_TEST_EXECUTOR],
         ]),
         targetOptions: runnerOptions,
@@ -934,7 +937,7 @@ describe('cargo-test reachability policy', () => {
         targetDependencies: new Map([
           ['test', ['cargo-test']],
           ['cargo-test', ['cargo-test-rusty-core', 'cargo-test-rusty-cli']],
-          ['cargo-test-rusty-core', ['cargo-test-archive']],
+          ['cargo-test-rusty-core', ['cargo-test-build']],
           ['cargo-test-rusty-cli', ['cargo-test-rusty-core']],
         ]),
         targetExecutors: new Map([
@@ -976,29 +979,29 @@ describe('cargo-test reachability policy', () => {
         targets: new Set([
           'test',
           'cargo-test',
-          'cargo-test-archive',
+          'cargo-test-build',
           'cargo-test-rusty-core-shard1',
           'cargo-test-rusty-core-shard2',
         ]),
         targetDependencies: new Map([
           ['test', ['cargo-test']],
           ['cargo-test', ['cargo-test-rusty-core-shard1', 'cargo-test-rusty-core-shard2']],
-          ['cargo-test-rusty-core-shard1', ['cargo-test-archive']],
+          ['cargo-test-rusty-core-shard1', ['cargo-test-build']],
           ['cargo-test-rusty-core-shard2', ['cargo-test-rusty-core-shard1']],
         ]),
         targetExecutors: new Map([
           ['test', 'nx:noop'],
           ['cargo-test', 'nx:noop'],
-          ['cargo-test-archive', 'nx:run-commands'],
+          ['cargo-test-build', 'nx:run-commands'],
           ['cargo-test-rusty-core-shard1', BOUNDED_TEST_EXECUTOR],
           ['cargo-test-rusty-core-shard2', BOUNDED_TEST_EXECUTOR],
         ]),
         targetOptions: new Map<string, Record<string, unknown>>([
           [
-            'cargo-test-archive',
+            'cargo-test-build',
             {
               command:
-                'mkdir -p .cache/nextest && cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst',
+                'mkdir -p .cache/nextest && cargo --frozen nextest list --workspace --list-type binaries-only --message-format json > .cache/nextest/binaries-metadata.json',
             },
           ],
           [

@@ -346,11 +346,10 @@ gets no build volume and pays nothing.
 
 A tool's own per-checkout state that no capability names belongs inside one that is named, never in the source tree
 beside an output. Content-keyed or per-run tool state is not an output, and written into the source tree it churns the
-source image that every fork clones: nextest's extracted test archive is rewritten for every new archive, and lmao's
-SQLite trace sink is rewritten page by page on every test run. The nextest extraction therefore lives under the Cargo
-target directory (`<target_directory>/nextest-extracted`), and the trace sink in `.cache/lmao`, a directory of its own
-that the project declares as build state (`packages/*/.cache/lmao`, below). A package's `.cache/` itself cannot be build
-state, because build tools declare their outputs there.
+source image that every fork clones: lmao's SQLite trace sink is rewritten page by page on every test run. The trace
+sink therefore lives in `.cache/lmao`, a directory of its own that the project declares as build state
+(`packages/*/.cache/lmao`, below). A package's `.cache/` itself cannot be build state, because build tools declare their
+outputs there.
 
 ### Declared build state
 
@@ -1364,7 +1363,7 @@ UNKNOWN in that candidate, never an invented HIT. Missing identity metadata also
 on that side. The task's key remains unresolved, with no invented hash. When both candidates are UNKNOWN, the explicit
 label is "unpriced key, worst case: misses in both". Custom hashers are the narrow qualification: Nx accepts their
 returned value directly, without requiring task identity in the key, so identity absence proves nothing and they stay
-UNKNOWN unless an exact current key is available. The gate's `@smoothbricks/codebase:cargo-test-archive` and
+UNKNOWN unless an exact current key is available. The gate's `@smoothbricks/codebase:cargo-test-build` and
 `cowshed:declaration-model-test` use stock Nx hashing, so the identity-absence proof applies to both; their
 dependency-output deferral does not make them custom hashers.
 

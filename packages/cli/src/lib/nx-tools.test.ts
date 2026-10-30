@@ -13,7 +13,7 @@ describe('smoo nx-<tool>', () => {
     const tools = nxTools();
     for (const [tool, pkg] of [
       ['nx-failures', 'failure-summary'],
-      ['nx-nextest-extract', 'nextest-extract'],
+      ['nx-nextest-binaries', 'nextest-extract'],
       ['nx-build-inputs', 'build-inputs'],
       ['nx-cargo-hash', 'nx-plugin'],
     ]) {

@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { readFile, symlink, writeFile } from 'node:fs/promises';
 import { constants } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -30,12 +30,7 @@ import {
   writeMid,
 } from '@smoothbricks/cargo-retain/testing/cargo-fixture';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
-import {
-  EXTRACTED_BINARIES_METADATA,
-  EXTRACTED_CARGO_METADATA,
-  EXTRACTED_TARGET_DIR,
-  NEXTEST_ARCHIVE_KEY_SUFFIX,
-} from '@smoothbricks/nextest-extract';
+import { NEXTEST_BINARIES_BUILD_ARGS } from '@smoothbricks/nextest-extract';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 
@@ -224,34 +219,33 @@ describe('cargo retention after real Nx runs', () => {
     });
   });
 
-  it('a cache-restored nextest archive still runs green after retention reclaims generations', async () => {
+  it('the test build still runs in place after retention reclaims superseded generations', async () => {
     await inFixture(async (root) => {
       const fx = await churnFixture(root, false);
       await scopedTo(fx.target, async () => {
         const gen = await churnGenerations(fx);
-        const archive = join(fx.ws, 'archive.tar.zst');
-        const archived = spawnSync(
-          'cargo',
-          ['--frozen', 'nextest', 'archive', '--archive-file', archive, '--workspace', '--user-config-file', 'none'],
-          { cwd: fx.ws, env: cargoEnv(), encoding: 'utf8' },
-        );
-        expect({ status: archived.status, stderr: archived.status === 0 ? '' : archived.stderr }).toEqual({
+        // cargo-test-build: the binaries stay in the target directory, the reuse-build metadata is its Nx output.
+        const listed = spawnSync('cargo', ['--frozen', ...NEXTEST_BINARIES_BUILD_ARGS], {
+          cwd: fx.ws,
+          env: cargoEnv(),
+          encoding: 'utf8',
+        });
+        expect({ status: listed.status, stderr: listed.status === 0 ? '' : listed.stderr }).toEqual({
           status: 0,
           stderr: '',
         });
-        // The outputs an Nx cache restore would hand back, in a fresh place: the archive and its task's key.
-        const restored = join(root, 'restored.tar.zst');
-        await cp(archive, restored);
-        await writeFile(`${restored}${NEXTEST_ARCHIVE_KEY_SUFFIX}`, '424242\n');
+        const binaries = join(root, 'binaries-metadata.json');
+        await writeFile(binaries, listed.stdout);
+        const workspace = spawnSync('cargo', ['--frozen', 'metadata', '--format-version', '1', '--all-features'], {
+          cwd: fx.ws,
+          env: cargoEnv(),
+          encoding: 'utf8',
+        });
+        expect(workspace.status, workspace.stderr).toBe(0);
+        const cargoMetadata = join(root, 'cargo-metadata.json');
+        await writeFile(cargoMetadata, workspace.stdout);
         const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
         expect(reclaimPaths(applied)).toEqual(expect.arrayContaining(gen.superseded));
-        const extracted = spawnSync(
-          'node',
-          [join(import.meta.dir, '../../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js'), restored],
-          { cwd: fx.ws, env: cargoEnv(), encoding: 'utf8' },
-        );
-        expect(extracted.status, extracted.stderr).toBe(0);
-        const extractionDirectory = extracted.stdout.trim();
         const ran = spawnSync(
           'cargo',
           [
@@ -259,11 +253,11 @@ describe('cargo retention after real Nx runs', () => {
             'nextest',
             'run',
             '--binaries-metadata',
-            join(extractionDirectory, EXTRACTED_BINARIES_METADATA),
+            binaries,
             '--cargo-metadata',
-            join(extractionDirectory, EXTRACTED_CARGO_METADATA),
+            cargoMetadata,
             '--target-dir-remap',
-            join(extractionDirectory, EXTRACTED_TARGET_DIR),
+            fx.target,
             '--workspace-remap',
             '.',
             '--user-config-file',

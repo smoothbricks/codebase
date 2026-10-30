@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { expandWildcardTargetConfiguration } from 'nx/src/tasks-runner/utils.js';
 import {
-  CARGO_TEST_ARCHIVE_TARGET,
+  CARGO_TEST_BUILD_TARGET,
   CARGO_TEST_TARGET,
   listCargoWorkspacePackages,
   packageNameFromCargoTestTarget,
@@ -162,7 +162,7 @@ export function checkWorkspaceBoundedTestTargetPolicy(
  *    package-local `nx.targets['cargo-test'].dependsOn` that omits the inferred
  *    runner leg leaves a target that still "reaches" its dependencies while no
  *    test binary is ever run. Reachability alone cannot see this, because
- *    `cargo-test-archive` only compiles. (Inference itself no longer skips a
+ *    `cargo-test-build` only compiles. (Inference itself no longer skips a
  *    declared cargo key, so the executor and options survive the declaration —
  *    see `index.ts`.)
  *
@@ -221,9 +221,9 @@ export function checkWorkspaceCargoTestReachabilityPolicy(
 /**
  * True when `target`, or something in its dependency closure, invokes cargo in a
  * mode that executes tests. Compile-only steps are deliberately excluded:
- * `cargo-test-archive` is `cargo nextest archive` and a `--no-run` build is
- * `cargo test --no-run`. Both prove the binaries build and nothing about them
- * running, and both say "test"/"nextest" in their command — a closure holding
+ * `cargo-test-build` is `cargo nextest list --list-type binaries-only`, a cross
+ * lane's archive is `cargo nextest archive` and a `--no-run` build is
+ * `cargo test --no-run`. Each proves the binaries build and nothing about them
  * only these is the silent green this check exists to catch.
  */
 function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string): boolean {
@@ -239,7 +239,8 @@ function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string
       command !== undefined &&
       /\btest\b|\bnextest\b/.test(command) &&
       !command.includes('--no-run') &&
-      !command.includes('nextest archive');
+      !command.includes('nextest archive') &&
+      !command.includes('nextest list');
     const reached =
       runs ||
       (project.targetDependencies?.get(targetName) ?? []).some((dependency) =>
@@ -252,7 +253,7 @@ function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string
 }
 
 /**
- * Per-crate nextest targets that `cargo-test` actually reaches. `cargo-test-archive`
+ * Per-crate nextest targets that `cargo-test` actually reaches. `cargo-test-build`
  * is excluded: it is not a runner. Members come from the same Cargo.toml walk
  * inference uses; the child list is the graph, not a hand-written crate list.
  */
@@ -453,7 +454,7 @@ function bunTestHasNoDeadline(command: string): boolean {
 
 function isTestLegTargetName(name: string): boolean {
   return (
-    name !== CARGO_TEST_ARCHIVE_TARGET &&
+    name !== CARGO_TEST_BUILD_TARGET &&
     cargoCrossTestTripleFromArchiveTarget(name) === null &&
     isTestRunnerTargetName(name)
   );

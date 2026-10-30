@@ -37,13 +37,21 @@ describe("mbx's one pool at the leaf", () => {
     // A downstream gate on 2026-10-30: under MBX_SCHEDULER_TESTS=1 each test process of an extracted-archive run
     // queued for its own mbx ticket, and codec tests of at most 0.25 s took 73.5 s apiece.
     const pool = { priority: 'low' } as const;
-    const extracted =
-      'extracted="$(smoo-nx-nextest-extract target/nextest/archive.tar.zst)" && cargo --frozen nextest run ' +
-      '--binaries-metadata "$extracted/target/nextest/binaries-metadata.json" --workspace-remap .';
-    expect(mbxLeaf(pool, 'nextest', 6, extracted)).toEqual({ kind: 'reserve', cpus: 6, priority: 'low' });
-    expect(withMbxLeaf(extracted, mbxLeaf(pool, 'nextest', 6, extracted))).toStartWith(
-      'mbx reserve --grant-fd 5 --cpus 6 --priority low -- /bin/sh -c ',
+    const inPlace =
+      'cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json ' +
+      '--cargo-metadata .cache/nextest/cargo-metadata.json ' +
+      '--target-dir-remap "$(node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-binaries target-dir)" ' +
+      "--workspace-remap . -E 'package(core)' --no-fail-fast --no-tests=pass";
+    const bunSpelled = inPlace.replace(
+      'node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-binaries',
+      'bun node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/ts/bin/smoo-nx-nextest-binaries.js',
     );
+    for (const command of [inPlace, bunSpelled]) {
+      expect(mbxLeaf(pool, 'nextest', 6, command)).toEqual({ kind: 'reserve', cpus: 6, priority: 'low' });
+      expect(withMbxLeaf(command, mbxLeaf(pool, 'nextest', 6, command))).toStartWith(
+        'mbx reserve --grant-fd 5 --cpus 6 --priority low -- /bin/sh -c ',
+      );
+    }
     expect(mbxLeaf(pool, 'nextest', 4, 'cargo nextest run --archive-file a.tar.zst')).toEqual({
       kind: 'reserve',
       cpus: 4,
@@ -90,8 +98,8 @@ describe("mbx's one pool at the leaf", () => {
     ['supported selected Cargo legs', 'cargo test --tests; cargo test --lib', true],
     ['supported alternative legs', 'cargo nextest run || cargo nextest run', true],
     [
-      'extracted nextest chain with quoted shell punctuation',
-      `extracted="$(bun extract.js archive.tar.zst)" && cargo --frozen nextest run -E 'package(core) & test(first)' && cargo --frozen nextest run --run-ignored only -E 'test(second)'`,
+      'in-place nextest chain with quoted shell punctuation',
+      `cargo --frozen nextest run --target-dir-remap "$(x/smoo-nx-nextest-binaries target-dir)" -E 'package(core) & test(first)' && cargo --frozen nextest run --run-ignored only -E 'test(second)'`,
       true,
     ],
     ['a later unscheduled Cargo leg', 'cargo nextest run && cargo test --doc', false],
@@ -117,8 +125,8 @@ describe("mbx's one pool at the leaf", () => {
       false,
     ],
     [
-      'an extracted prefix cannot swallow another command',
-      'extracted="$(printf archive)" && ./test-binary && extracted="$(printf archive)" && cargo nextest run && cargo nextest run',
+      'no prefix may run before the first Cargo leg',
+      'extracted="$(printf archive)" && cargo nextest run && cargo nextest run',
       false,
     ],
     [
@@ -138,13 +146,18 @@ describe("mbx's one pool at the leaf", () => {
     ],
     ['a quoted glob remains one literal filter', "cargo nextest run && cargo nextest run -E 'test(/foo.*/)'", true],
     [
-      'unquoted inferred paths may split into options',
-      'extracted="$(printf archive)" && cargo nextest run && cargo nextest run $extracted/',
+      "the helper's substitution is known only as the value of --target-dir-remap",
+      'cargo nextest run && cargo nextest run "$(x/smoo-nx-nextest-binaries target-dir)"',
       false,
     ],
     [
-      'a quoted inferred path must remain a known path operand',
-      'extracted="$(printf archive)" && cargo nextest run && cargo nextest run "$extracted/"',
+      'an unquoted substitution may split into options',
+      'cargo nextest run --target-dir-remap $(x/smoo-nx-nextest-binaries target-dir)',
+      false,
+    ],
+    [
+      'a substitution that says more than the target directory is unknown',
+      'cargo nextest run --target-dir-remap "$(x/smoo-nx-nextest-binaries target-dir; echo --config)"',
       false,
     ],
     ['non-shell whitespace cannot name a Cargo executable', 'cargo nextest run && cargo\u00a0nextest run', false],
@@ -155,9 +168,19 @@ describe("mbx's one pool at the leaf", () => {
     ],
     ['a quoted tilde remains literal', "cargo nextest run && cargo nextest run -E 'test(/~/)'", true],
     [
-      'the extracted-archive nextest leaf whose queued runners hit the idle bound',
-      `extracted="$(node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-extract .cache/nextest/archive.tar.zst)" && cargo --frozen nextest run --tool-config-file 'smoo-report:report.toml' --binaries-metadata "$extracted/target/nextest/binaries-metadata.json" --cargo-metadata "$extracted/target/nextest/cargo-metadata.json" --target-dir-remap "$extracted/target" --workspace-remap . -E 'package(core)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:$PWD/node_modules/@smoothbricks/nx-plugin/nextest.toml"`,
+      'the in-place nextest leaf whose queued runners hit the idle bound',
+      `cargo --frozen nextest run --tool-config-file 'smoo-report:report.toml' --binaries-metadata .cache/nextest/binaries-metadata.json --cargo-metadata .cache/nextest/cargo-metadata.json --target-dir-remap "$(node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-binaries target-dir)" --workspace-remap . -E 'package(core)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:$PWD/node_modules/@smoothbricks/nx-plugin/nextest.toml"`,
       true,
+    ],
+    [
+      "a repository's own in-place runner naming the helper's script through bun",
+      `cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json --cargo-metadata .cache/nextest/cargo-metadata.json --target-dir-remap "$(bun node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/ts/bin/smoo-nx-nextest-binaries.js target-dir)" --workspace-remap . -E 'binary_id(app::integration)' --run-ignored only`,
+      true,
+    ],
+    [
+      'another program run through bun is unknown',
+      'cargo nextest run --target-dir-remap "$(bun x/other.js target-dir)"',
+      false,
     ],
     ['selected non-doc Cargo tests', 'cargo test --tests', true],
     ['plain Cargo test can execute doctests', 'cargo test', false],

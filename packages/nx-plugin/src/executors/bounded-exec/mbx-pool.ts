@@ -77,9 +77,16 @@ export function nxTaskCores(cores: number, environment: Readonly<NodeJS.ProcessE
 }
 
 /**
+ * The value an in-place runner gives `--target-dir-remap`: smoo-nx-nextest-binaries' answer, quoted. The plugin infers
+ * the native helper; a repository's own runner may name its script through bun, which prints the same path.
+ */
+const INFERRED_TARGET_DIR_REMAP =
+  /--target-dir-remap "\$\((?:bun )?[^\s"'$`;&|()<>\\]+\/smoo-nx-nextest-binaries(?:\.js)? target-dir\)"/g;
+
+/**
  * Only a known scheduled execution may stop its idle clock at zero holds. Plain Cargo tests can run doctests;
  * archive-file targets, direct binaries and other runners are not proven scheduled at spawn (11_shell.md,
- * "Cargo test-runner boundaries"). The inferred extracted native nextest command is a supported Cargo invocation.
+ * "Cargo test-runner boundaries"). The inferred in-place nextest command is a supported Cargo invocation.
  */
 export function mbxIdleGated(leaf: MbxLeaf | null, command: string, environment: Readonly<NodeJS.ProcessEnv>): boolean {
   if (leaf === null) return false;
@@ -87,20 +94,20 @@ export function mbxIdleGated(leaf: MbxLeaf | null, command: string, environment:
   if (environment.MBX_SCHEDULER_TESTS !== '1') return false;
   if (environment.MBX_SCHEDULER === '0' || environment.MBX_SCHED_DISABLE === '1' || environment.MBX_DISABLE === '1')
     return false;
+  // The inferred in-place runner names this checkout's target directory through the plugin's helper: one quoted
+  // substitution, the value of `--target-dir-remap`, that prints a path and runs nothing mbx schedules.
+  const known = command.replace(INFERRED_TARGET_DIR_REMAP, '--target-dir-remap target');
   // invocationSpan shares the lifecycle mapper's conservative shell-syntax boundary.
-  if (/[<>\n\r`\\]/.test(command)) return false;
-  if (/[^\S \t]/.test(command)) return false;
+  if (/[<>\n\r`\\]/.test(known)) return false;
+  if (/[^\S \t]/.test(known)) return false;
   const invocation = /cargo(?:\s+(?:--frozen|--locked|--offline))*\s+(nextest\s+run|test)(?=\s|$)/;
-  const found = invocation.exec(command);
-  if (found === null) return false;
-  const prefix = command.slice(0, found.index).trim();
-  if (prefix !== '' && !/^extracted="\$\([^"\n]+\)"\s*&&$/.test(prefix)) return false;
-  let remaining = command.slice(found.index);
+  const found = invocation.exec(known);
+  if (found === null || known.slice(0, found.index).trim() !== '') return false;
+  let remaining = known.slice(found.index);
   const unquoted = remaining.replace(/"[^"]*"|'[^']*'/g, '');
   if (/[$*?{}~[\]]/.test(unquoted)) return false;
   // Only the inferred command's path templates are known expansions; arbitrary words could supply mbx overrides.
-  const paths = remaining.replace(/\$PWD(?=\/)/g, '');
-  if ((prefix === '' ? paths : paths.replace(/\$extracted(?=\/)/g, '')).includes('$')) return false;
+  if (remaining.replace(/\$PWD(?=\/)/g, '').includes('$')) return false;
   for (;;) {
     const leg = invocation.exec(remaining);
     if (leg === null || leg.index !== 0) return false;
@@ -109,14 +116,7 @@ export function mbxIdleGated(leaf: MbxLeaf | null, command: string, environment:
     for (const token of shellTokens(remaining.slice(0, argsEnd), [])) {
       if (token.kind !== 'word') return false;
       if (token.text === '--') break;
-      if (
-        token.text.startsWith('$') &&
-        !(
-          token.text.startsWith('$extracted/') &&
-          ['--binaries-metadata', '--cargo-metadata', '--target-dir-remap'].includes(args.at(-1) ?? '')
-        )
-      )
-        return false;
+      if (token.text.startsWith('$')) return false;
       args.push(token.text);
     }
     if (

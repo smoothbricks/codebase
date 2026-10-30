@@ -76,7 +76,7 @@ describe('managed publish platform discovery', () => {
       crossTestArchivesForTest({
         '@acme/codebase': {
           root: '.',
-          targets: { 'cargo-cross-test-archive-aarch64-apple-darwin': {}, 'cargo-test-archive': {}, test: {} },
+          targets: { 'cargo-cross-test-archive-aarch64-apple-darwin': {}, 'cargo-test-build': {}, test: {} },
         },
         'acme-embedded': {
           root: 'packages/embedded',

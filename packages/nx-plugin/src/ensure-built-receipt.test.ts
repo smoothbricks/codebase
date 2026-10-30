@@ -265,7 +265,7 @@ describe('provider receipt', () => {
 });
 
 describe('a tracked public output', () => {
-  // The root cargo-test-archive reads the corpus cowshed:wire-fixtures regenerates: one tracked file that is a task's
+  // The root cargo-test-build reads the corpus cowshed:wire-fixtures regenerates: one tracked file that is a task's
   // output and a later task's FILE input, which a receipt can bind only to HEAD's own bytes.
   const produced = { ...task, outputs: ['output', 'generated.txt'] } satisfies Task;
   const reads = () => ({ ...proof, files: [...proof.files, 'generated.txt'] });

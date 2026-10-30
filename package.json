@@ -271,7 +271,7 @@
           }
         ]
       },
-      "cargo-test-archive": {
+      "cargo-test-build": {
         "dependsOn": [
           "...",
           {
@@ -296,7 +296,7 @@
             "projects": [
               "@smoothbricks/codebase"
             ],
-            "target": "cargo-test-archive"
+            "target": "cargo-test-build"
           }
         ]
       },
@@ -307,7 +307,7 @@
             "projects": [
               "@smoothbricks/codebase"
             ],
-            "target": "cargo-test-archive"
+            "target": "cargo-test-build"
           }
         ]
       }

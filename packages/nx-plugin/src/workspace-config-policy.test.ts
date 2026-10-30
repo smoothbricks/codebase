@@ -85,13 +85,13 @@ describe('target family conventions', () => {
   });
 
   it('classifies the runners and compilations of tests as test work, however their names end', () => {
-    // The `test` namespace: `test`, its variants, and the plugin's own `cargo-test-<…>` targets, the archive among them.
+    // The `test` namespace: `test`, its variants, and the plugin's own `cargo-test-<…>` targets, the test build among them.
     const namespace = [
       'test',
       'test-shard1',
       'test:unit',
       'cargo-test-ferris-core',
-      'cargo-test-archive',
+      'cargo-test-build',
       'cargo-test-group-real-apfs',
     ];
     for (const name of namespace) {

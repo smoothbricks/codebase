@@ -3,8 +3,9 @@ import { CPU_TOKENS_ENV, parseInheritedTokens, runnerDemand, sizeRunner } from '
 
 /** The runner command the plugin infers for a nextest piece, as `index.ts` builds it. */
 const NEXTEST_PIECE =
-  `extracted="$(node "$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js" .cache/nextest/archive.tar.zst)" && ` +
-  `cargo --frozen nextest run --binaries-metadata "$extracted/m.json" --workspace-remap . -E 'package(core)' --partition hash:1/5 --no-tests=pass`;
+  'cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json ' +
+  '--target-dir-remap "$(../../node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-binaries target-dir)" ' +
+  "--workspace-remap . -E 'package(core)' --partition hash:1/5 --no-tests=pass";
 
 /** The test-thread ceilings of a run whose environment names none. */
 const NO_CEILINGS = { rust: null, nextest: null };
