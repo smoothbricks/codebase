@@ -7301,7 +7301,8 @@ impl<I: KeyIndex> Vm<I> {
     }
 
     /// Seal a committed image ([`crate::seal::seal_state`]): every struct map's
-    /// bytes become a function of its keys, rows and capacity alone. Like
+    /// bytes become a function of its keys, rows and capacity alone, and a TTL
+    /// slot's eviction index a function of its live entries. Like
     /// growth, sealing has no journal, so it is refused while a speculative
     /// window is open.
     pub fn seal_state<S: InternBytes + ?Sized>(

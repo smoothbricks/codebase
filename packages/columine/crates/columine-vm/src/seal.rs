@@ -1,4 +1,4 @@
-//! Canonical struct-map bytes ("seal").
+//! Canonical image bytes ("seal").
 //!
 //! A struct map's bytes depend on its history: which ordinal each key took,
 //! which rows died, the order arena payloads were appended in. Sealing
@@ -9,6 +9,11 @@
 //! present field cells, every dead row is zero, and the CSR arena is
 //! repacked in new ordinal order with its unused bytes zero. Equal key sets
 //! and rows reached through any insertion order seal to identical images.
+//!
+//! A TTL slot's eviction index holds its live entries in order, and a removal
+//! shifts them left and leaves the vacated cell as it was. Sealing keeps the
+//! live entries and zeroes every cell past them, so the index's sealed bytes
+//! are a function of its live entries alone.
 //!
 //! Sealing has no journal: like growth it runs on a committed image, never
 //! inside a speculative window. It allocates only through the caller's
@@ -26,8 +31,9 @@ use columine_types::types::{
 };
 
 /// Seal every struct-map slot of an image of key-index family `I`, resolving
-/// interned key lanes through `strings`. The image is validated first; a
-/// refusal leaves the slots sealed so far sealed and the rest untouched.
+/// interned key lanes through `strings`, and zero every TTL slot's dead
+/// eviction-index cells. The image is validated first; a refusal leaves the
+/// slots sealed so far sealed and the rest untouched.
 pub fn seal_state<I: KeyIndex, S: InternBytes + ?Sized>(
     state: &mut [u8],
     strings: &S,
@@ -35,7 +41,8 @@ pub fn seal_state<I: KeyIndex, S: InternBytes + ?Sized>(
 ) -> Result<(), ErrorCode> {
     state_init::validate_state_in::<I>(state)?;
     for slot in 0..state_num_slots(state) {
-        match SlotMetaView::read(state, slot).slot_type() {
+        let meta = SlotMetaView::read(state, slot);
+        match meta.slot_type() {
             SlotType::StructMap => {
                 let map = StructMapSlot::<I>::bind_in(state, slot);
                 let timestamps = state_init::overlay_kind_byte(state, slot_meta_base(slot)) != 0;
@@ -63,8 +70,21 @@ pub fn seal_state<I: KeyIndex, S: InternBytes + ?Sized>(
             }
             _ => {}
         }
+        if meta.has_ttl() {
+            clear_dead_evictions(state, &meta);
+        }
     }
     Ok(())
+}
+
+/// Zero `meta`'s eviction-index cells past its live entries. The validated
+/// layout holds `size <= capacity` and the whole index inside the image.
+fn clear_dead_evictions(state: &mut [u8], meta: &SlotMetaView) {
+    let entry = state_init::EVICTION_ENTRY_SIZE as usize;
+    let base = meta.eviction_index_offset(state) as usize;
+    let live = base + meta.eviction_index_size(state) as usize * entry;
+    let end = base + meta.eviction_index_capacity(state) as usize * entry;
+    state[live..end].fill(0);
 }
 
 /// Back `buffer` with `len` bytes or elements before any write.

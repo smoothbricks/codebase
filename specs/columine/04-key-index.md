@@ -82,10 +82,12 @@ reserves no slot capacity, reads only its key1 column, and records the key1's re
 `seal_state(state, strings, scratch)` (and `Vm::seal_state`) rebuilds every struct-map slot of a validated image: the
 family seals the index, each live row moves to its new ordinal keeping only its bitset and present field cells (and its
 timestamp cell), every dead row is zero, and the CSR arena is repacked in new ordinal order with every unused byte zero.
-Images holding the same keys and rows seal to identical bytes whatever history produced them. Sealing has no journal:
-`Vm::seal_state` is `SpeculationActive` while an undo window is open, as growth is refused. `HashIndex` seals by
-reinserting its live keys into an empty region in ascending `(k1, k2)` order. Seal space comes from the VM's
-`KeyScratch`; memory that cannot back it is `OutOfMemory` before that slot's first write.
+Images holding the same keys and rows seal to identical bytes whatever history produced them. A TTL slot (hash map, hash
+set or bitmap) keeps its live eviction-index entries in place and zeroes the cells past them, which a removal leaves as
+they were, so its sealed eviction index is a function of its live entries. Sealing has no journal: `Vm::seal_state` is
+`SpeculationActive` while an undo window is open, as growth is refused. `HashIndex` seals by reinserting its live keys
+into an empty region in ascending `(k1, k2)` order. Seal space comes from the VM's `KeyScratch`; memory that cannot back
+it is `OutOfMemory` before that slot's first write.
 
 ## 7. Entry points
 
