@@ -103,11 +103,6 @@ const rootScriptPolicy: Record<string, string> = {
   // every repo alongside the managed devenv profile it activates, so the fleet
   // rule that devenv equals CI holds for the cross arm too.
   [CROSS_CHECK_SCRIPT_NAME]: CROSS_CHECK_SCRIPT_COMMAND,
-  // Each project's `clean` target removes only that project's declared outputs (clean-outputs executor). It never
-  // runs `nx reset`: that deletes the cache and the task database that indexes it, which in a cowshed checkout is
-  // the build volume every fork inherits and every land carries (specs/cowshed/16_build_volumes.md). Nx's own
-  // eviction (`NX_MAX_CACHE_SIZE`) bounds the cache.
-  clean: 'nx run-many -t clean',
   'clean:node_modules': 'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
   'format:changed': 'git-format-staged --config .git-format-staged.yml --also-unstaged',
   'format:staged': 'git-format-staged --config .git-format-staged.yml',
@@ -115,6 +110,13 @@ const rootScriptPolicy: Record<string, string> = {
   'lint:fix': 'git-format-staged --config .git-format-staged.yml --unstaged',
   postinstall: DECLARED_LINKS_POSTINSTALL,
 };
+
+/**
+ * A root script the policy once managed and now removes: `clean` ran every project's inferred `clean` target, which
+ * deleted declared outputs file by file. Build state is removed whole instead (cowshed rm, mbx gc), and the target and
+ * its executor are gone. Matched by what it runs, so a repository's own `clean` stays its own.
+ */
+const retiredRootScripts: ReadonlyMap<string, RegExp> = new Map([['clean', /\bnx\s+run-many\s+-t\s+clean\b/]]);
 
 export function applyFixableMonorepoDefaults(root: string): void {
   applyRootScriptDefaults(root);
@@ -133,6 +135,13 @@ export function applyRootScriptDefaults(root: string): void {
   let changed = false;
   for (const [name, command] of Object.entries(rootScriptPolicy)) {
     changed = setStringProperty(scripts, name, command) || changed;
+  }
+  for (const [name, managed] of retiredRootScripts) {
+    const command = scripts[name];
+    if (typeof command === 'string' && managed.test(command)) {
+      delete scripts[name];
+      changed = true;
+    }
   }
   const nx = ensureNx(rootPackage);
   if (!Array.isArray(nx.includedScripts) || nx.includedScripts.length !== 0) {
@@ -897,6 +906,15 @@ function validateRootScripts(rootPackage: PackageJson): number {
   for (const [name, command] of Object.entries(rootScriptPolicy)) {
     if (scripts?.[name] !== command) {
       console.error(`package.json scripts.${name} must be ${command}`);
+      failures++;
+    }
+  }
+  for (const [name, managed] of retiredRootScripts) {
+    const command = scripts?.[name];
+    if (typeof command === 'string' && managed.test(command)) {
+      console.error(
+        `package.json scripts.${name} runs the retired clean target; run smoo monorepo update to remove it`,
+      );
       failures++;
     }
   }

@@ -681,8 +681,8 @@ prefixes.
 `bun packages/nx-plugin/benchmarks/cargo-closure-input.bench.ts` measures the real async inference entry with cached
 Cargo resolution/source scans at 1–4,096 packages, including a one-package overhead row. Its expansion oracle checks
 complete ordered input equality before timing; filesystem scanning and Cargo resolution are not part of this
-measurement. `bun packages/nx-plugin/benchmarks/compact-candidates.bench.ts` measures the unchanged output-directory
-reduction and converging dependency-graph traversal separately, without invoking an executor or gate.
+measurement. `bun packages/nx-plugin/benchmarks/compact-candidates.bench.ts` measures the converging dependency-graph
+traversal, without invoking an executor or gate.
 
 Literal `include_str!` and `include_bytes!` files also belong to the closure, including data inside a crate and tracked
 files outside its directory (such as a shipped Markdown skill). One Rust lexer excludes comments and example strings;
@@ -1199,7 +1199,7 @@ Concrete targets come from concrete files:
   `ttsc`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them.
 - `typecheck-tests` is inferred from `tsconfig.test.json` and runs the same compiler on
   `-p tsconfig.test.json --noEmit`. It first rebuilds the current package's `tsc-js` output (or its non-TypeScript
-  `build`) so self-imports resolve after `clean`. Transform calls in test files are checked when the test runner
+  `build`) so self-imports resolve from its own outputs. Transform calls in test files are checked when the test runner
   transforms them.
 - `typecheck-tests:watch` is inferred from `tsconfig.test.json` and runs the same typecheck in watch mode.
 - `test-watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives

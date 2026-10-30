@@ -103,7 +103,6 @@ import {
   isBuildOutputTargetName,
   isTestNamespaceTargetName,
   isTestRunnerTargetName,
-  PLATFORM_TARGET_GLOBS,
   RELEASE_CONFIGURATION,
 } from './workspace-config-policy.js';
 import { globIndexedFiles } from './workspace-index.js';
@@ -1555,10 +1554,8 @@ async function createProjectTargets(
     repoRootPackages,
   );
   const inferCargoWasm = cargoWasmConfig !== null && !('cargo-wasm' in declaredTargets);
-  const packageLocalBuildOutputs = classifyPackageLocalBuildOutputs(packageJson);
   const hasOrdinaryBuildOutputTarget =
-    hasLibTsconfig || napiConfig !== null || cargoWasmConfig !== null || packageLocalBuildOutputs.ordinary;
-  const hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
+    hasLibTsconfig || napiConfig !== null || cargoWasmConfig !== null || declaresPackageLocalBuildOutput(packageJson);
   const isDeployableWranglerProject =
     packageJson.private === true && WRANGLER_CONFIG_FILES.some((file) => existsSync(join(absoluteProjectRoot, file)));
 
@@ -2216,49 +2213,10 @@ async function createProjectTargets(
       ],
     };
   }
-  // Every cargo build directory this project's own commands write. `clean`
-  // cannot learn them from `outputs`: a clippy or nextest target dir is a
-  // multi-GB build tree that must never enter the Nx cache, so the targets
-  // deliberately declare `outputs: []`. Reading `--target-dir` back off the
-  // commands means the list cannot drift from what actually gets written, and a
-  // directory is named relative to the command's own cwd, not the project root.
-  // The workspace's default `target/` is not listed: every dev build shares it.
-  const cargoBuildDirs = [
-    ...new Set(
-      Object.entries(targets).flatMap(([name, target]) => {
-        const cwd: unknown = target.options?.cwd;
-        const base = typeof cwd === 'string' ? cwd : projectRoot;
-        const dirs = [...targetCommandText(target).matchAll(/--target-dir\s+(\S+)/g)].flatMap((match) =>
-          match[1] === undefined ? [] : [match[1]],
-        );
-        if (name === CARGO_TEST_ARCHIVE_TARGET) {
-          dirs.push(posix.dirname(CARGO_TEST_ARCHIVE_FILE));
-        }
-        return dirs.map((dir) => `{workspaceRoot}/${posix.normalize(posix.join(base, dir))}`);
-      }),
-    ),
-  ].sort();
-  if (hasAnyBuildOutputTarget || cargoBuildDirs.length > 0) {
-    const declaredBuild = declaredTargets.build;
-    const declaredBuildOutputs =
-      isRecord(declaredBuild) && Array.isArray(declaredBuild.outputs)
-        ? declaredBuild.outputs.filter((output): output is string => typeof output === 'string')
-        : null;
-    targets.clean = {
-      executor: '@smoothbricks/nx-plugin:clean-outputs',
-      cache: false,
-      // Naming any output REPLACES the executor's default, so the build outputs
-      // it would have used are restated here rather than lost.
-      ...(cargoBuildDirs.length > 0
-        ? { options: { outputs: [...(declaredBuildOutputs ?? ['{projectRoot}/dist']), ...cargoBuildDirs] } }
-        : {}),
-    };
-  }
-
   if (targets['typecheck-tests']) {
     if (hasLibTsconfig) {
-      // Test configs may resolve the package's own `./index.js` through dist.
-      // Rebuild that current-project declaration output after clean, not only
+      // Test configs may resolve the package's own `./index.js` through dist, so the
+      // current-project declaration output is rebuilt first, not only the
       // dependency-project outputs reached through typecheck.
       targets['typecheck-tests'].dependsOn = ['tsc-js', 'typecheck'];
     } else if (targets.build) {
@@ -2930,15 +2888,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object';
 }
 
-function classifyPackageLocalBuildOutputs(packageJson: PackageJson): { ordinary: boolean; platform: boolean } {
+function declaresPackageLocalBuildOutput(packageJson: PackageJson): boolean {
   const targets = packageJson.nx?.targets;
-  const targetNames = isRecord(targets) ? Object.keys(targets) : [];
-  return {
-    ordinary: targetNames.some(isBuildOutputTargetName),
-    platform: targetNames.some((targetName) =>
-      PLATFORM_TARGET_GLOBS.some((glob) => targetName.endsWith(glob.slice(1))),
-    ),
-  };
+  return isRecord(targets) && Object.keys(targets).some(isBuildOutputTargetName);
 }
 
 interface CargoTargetRef {

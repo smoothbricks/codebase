@@ -69,10 +69,6 @@
     "lint": {
       "cache": true
     },
-    "clean": {
-      "executor": "@smoothbricks/nx-plugin:clean-outputs",
-      "cache": false
-    },
     "cargo-test-cowshed-*": {
       "dependsOn": ["...", { "projects": ["cowshed"], "target": "apfs-test-root" }]
     },

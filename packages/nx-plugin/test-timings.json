@@ -108,7 +108,6 @@
     "src/executors/nextest-group/executor.test.ts": 28,
     "src/executors/bounded-exec/ram-temp-held.test.ts": 25,
     "src/managed-files/trace-db-artifact.test.ts": 25,
-    "src/executors/clean-outputs/executor.test.ts": 23,
     "src/managed-files/json-edit.test.ts": 22,
     "src/generators/bun-test-tracing/generator.test.ts": 21,
     "src/generators/create-package/generator.test.ts": 20,

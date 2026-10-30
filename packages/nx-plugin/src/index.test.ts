@@ -310,8 +310,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.cache).toBe(true);
       expect(targets.build?.dependsOn).toEqual(['^build', 'tsc-js']);
-      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
-      expect(targets.clean?.cache).toBe(false);
 
       expect(targets['typecheck-tests']?.executor).toBe('nx:run-commands');
       expect(targets['typecheck-tests']?.cache).toBe(true);
@@ -1039,7 +1037,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
 
-      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       expect(targets['typecheck-tests']?.dependsOn).toEqual(['tsc-js', 'typecheck']);
     } finally {
       await workspace.cleanup();
@@ -1117,7 +1114,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['tsdown-js']).toBeUndefined();
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.dependsOn).toEqual(['^build', 'tsdown-js']);
-      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
     } finally {
       await workspace.cleanup();
     }
@@ -1181,11 +1177,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = await inferProjectTargets(workspace, 'packages/platform/package.json');
 
       expect(targets.build).toBeUndefined();
-      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
-      // No ordinary aggregate above is the whole assertion: a platform suffix
-      // is not an output family, so `bundle-ios`/`-macos`/`-linux` give this
-      // project nothing for `build` to aggregate — only a `clean` to own their
-      // outputs.
+      // A platform suffix is not an output family, so `bundle-ios`/`-macos`/`-linux`
+      // give this project nothing for `build` to aggregate.
     } finally {
       await workspace.cleanup();
     }
@@ -1622,33 +1615,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(targets.bench?.options).toMatchObject({ command: 'cargo --frozen bench --workspace' });
       expectNoSchedulerThrottle(targets);
-    } finally {
-      await workspace.cleanup();
-    }
-  });
-
-  it('cleans every cargo directory its own commands write, including the ones caching refuses', async () => {
-    const workspace = await createWorkspace();
-    try {
-      await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
-      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = ["crates/ferris-core"]\n');
-      await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
-
-      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
-
-      // A clippy target dir is not an Nx output — restoring a multi-GiB build
-      // tree from a cache is worse than rebuilding it — so `clean` cannot find
-      // these through `outputs`. They are read back off the commands that
-      // write them, which is why a new `--target-dir` cannot be forgotten here.
-      // The workspace `target/` every dev build shares is not one of them.
-      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
-      expect(targets.clean?.cache).toBe(false);
-      expect(targets.clean?.options?.outputs).toEqual([
-        '{projectRoot}/dist',
-        '{workspaceRoot}/packages/ferris/.cache/nextest',
-        '{workspaceRoot}/packages/ferris/target/cargo-lint',
-        '{workspaceRoot}/packages/ferris/target/cargo-lint-cross',
-      ]);
     } finally {
       await workspace.cleanup();
     }
@@ -2198,7 +2164,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(wasm['cargo-wasm']?.dependsOn).toEqual([rootFetch, '^build']);
       // The aggregate build names its outputs, never the test archive.
       expect(wasm.build?.dependsOn).toEqual(['^build', 'cargo-wasm']);
-      expect(wasm.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
 
       // The crate whose project also builds the debug cdylib keeps that edge:
       // its tests load the artifact `napi-debug` writes into `target/debug`.
@@ -2252,7 +2217,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(native['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/{options.outputDir}/']);
       expect(native.build?.dependsOn).not.toContainEqual(rootArchive);
       expectBuildNamesNoTestWork(native);
-      expect(native.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       for (const inferred of [root, runtime, wasm, native]) {
         expectNoSchedulerThrottle(inferred);
       }
@@ -2806,7 +2770,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['tsc-js']?.dependsOn).toEqual(['^*-js', 'cargo-wasm']);
       expect(targets.typecheck?.dependsOn).toEqual(['^*-js', 'cargo-wasm']);
       expect(targets.build?.dependsOn).toEqual(['^build', 'cargo-wasm', 'tsc-js']);
-      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       // A nested crate manifest is enough for output inference, but not for
       // workspace-wide cargo-test/lint policy.
       expect(targets['cargo-test']).toBeUndefined();
@@ -3079,7 +3042,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(linuxArm64Targets['cli-native']).toBeUndefined();
       expect(linuxArm64Targets['napi-native']?.dependsOn).toEqual(['napi-arm64-linux']);
       expect(linuxArm64Targets.build?.dependsOn).toEqual(['^build', 'napi-native', 'tsc-js', 'napi-arm64-linux']);
-      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       // The test suite runs against the dev-profile addon, never a release
       // platform build: napi-debug shares target/debug with cargo-test, keeps
       // the release binaries off the test critical path, and lives outside
@@ -3159,11 +3121,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // The declared target stays the only cargo-wasm: inference never emits a
       // duplicate for Nx to merge, even with a cdylib *-wasm member crate present.
       expect(targets['cargo-wasm']).toBeUndefined();
-      // Its declared *-wasm output-family name feeds the aggregate build and
-      // clean by concrete name; the cargo workspace's test archive is test work and stays out of it.
+      // Its declared *-wasm output-family name feeds the aggregate build by concrete
+      // name; the cargo workspace's test archive is test work and stays out of it.
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.dependsOn).toEqual(['^build', 'cargo-wasm']);
-      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
     } finally {
       await workspace.cleanup();
     }

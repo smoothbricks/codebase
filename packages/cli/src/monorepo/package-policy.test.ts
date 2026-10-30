@@ -162,8 +162,8 @@ describe('root smoo monorepo policy', () => {
       );
       await writeJson(join(root, 'nx.json'), validNxJson());
 
-      expect(validateRootPackagePolicy(root)).toBe(11);
-      expect(validateNxReleaseConfig(root)).toBe(9);
+      expect(validateRootPackagePolicy(root)).toBe(10);
+      expect(validateNxReleaseConfig(root)).toBe(7);
 
       applyFixableMonorepoDefaults(root);
 
@@ -171,7 +171,6 @@ describe('root smoo monorepo policy', () => {
       const nxJson = await readJson(join(root, 'nx.json'));
       expect(rootPackage.scripts).toEqual({
         'check:linux': 'tooling/devenv -P linux-cross shell -- nx run-many -t cargo-lint-cross',
-        clean: 'nx run-many -t clean',
         'clean:node_modules':
           'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
         'format:changed': 'git-format-staged --config .git-format-staged.yml --also-unstaged',
@@ -194,25 +193,29 @@ describe('root smoo monorepo policy', () => {
     }
   });
 
-  // `nx reset` deletes the Nx cache and the task database indexing it: in a cowshed checkout, the build volume every
-  // fork inherits and every land carries. The managed `clean` used to end with it, so `bun run clean` emptied it.
-  it("migrates a root clean script that resets Nx to one that removes only projects' declared outputs", async () => {
+  // The managed `clean` ran every project's inferred `clean` target, which deleted declared outputs file by file; an
+  // older form also ended with `nx reset`. Build state is removed whole instead (cowshed rm, mbx gc).
+  it.each([
+    ['nx run-many -t clean', false],
+    ['nx run-many -t clean; nx reset', false],
+    ['bun scripts/tidy.ts', true],
+  ] as const)('removes a root clean script that runs %s unless the repository owns it', async (clean, kept) => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
     try {
-      await writeJson(
-        join(root, 'package.json'),
-        validRootPackage({ scripts: { clean: 'nx run-many -t clean; nx reset' } }),
-      );
+      await writeJson(join(root, 'package.json'), validRootPackage({ scripts: { clean } }));
       const errors = captureConsoleErrors();
 
       validateRootPackagePolicy(root);
-      expect(errors).toContain('package.json scripts.clean must be nx run-many -t clean');
+      expect(
+        errors.includes(
+          'package.json scripts.clean runs the retired clean target; run smoo monorepo update to remove it',
+        ),
+      ).toBe(!kept);
 
       applyRootScriptDefaults(root);
 
       const { scripts } = await readJson(join(root, 'package.json'));
-      expect(scripts).toMatchObject({ clean: 'nx run-many -t clean' });
-      expect(JSON.stringify(scripts)).not.toMatch(/\bnx\s+reset\b/);
+      expect(scripts.clean).toBe(kept ? clean : undefined);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -463,7 +466,7 @@ describe('root smoo monorepo policy', () => {
         },
       });
 
-      expect(validateNxReleaseConfig(root)).toBe(5);
+      expect(validateNxReleaseConfig(root)).toBe(3);
 
       applyFixableMonorepoDefaults(root);
 
@@ -1861,7 +1864,6 @@ function validConfiguredNxJson(): Record<string, unknown> {
 function validTargetDefaults(): Record<string, unknown> {
   return {
     build: { cache: true },
-    clean: { executor: '@smoothbricks/nx-plugin:clean-outputs', cache: false },
   };
 }
 

@@ -84,7 +84,11 @@ export function isTestRunnerTargetName(name: string): boolean {
 
 const nxJsTypescriptPlugin = '@nx/js/typescript';
 const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';
-const cleanOutputsExecutor = '@smoothbricks/nx-plugin:clean-outputs';
+/**
+ * The executor of the retired `clean` target, which deleted declared outputs file by file. Build state is removed whole
+ * instead (cowshed rm, mbx gc), so a `targetDefaults.clean` naming it is refused and removed.
+ */
+const retiredCleanOutputsExecutor = '@smoothbricks/nx-plugin:clean-outputs';
 const ciWorkflowNamedInput = ['{workspaceRoot}/.github/workflows/ci.yml'];
 const inferredTestTypecheckTarget = 'typecheck-tests';
 /**
@@ -138,6 +142,12 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
             'Per-project inference selects current library or build outputs before test typechecking.',
         });
       }
+      if (isRetiredCleanTargetDefault(targetDefaults, targetName)) {
+        issues.push({
+          path: 'nx.json',
+          message: `targetDefaults.clean names the retired ${retiredCleanOutputsExecutor}; run smoo monorepo update to remove it`,
+        });
+      }
     }
   }
 
@@ -148,9 +158,6 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
   validateTestTargetDefault(nxJson, 'nx.json', issues);
 
   validateLintTargetDefault(nxJson, 'nx.json', issues);
-
-  // Clean target default
-  validateCleanTargetDefault(nxJson, 'nx.json', issues);
 
   // Named input defaults
   validateNamedInputDefaults(nxJson, 'nx.json', issues);
@@ -203,7 +210,6 @@ export function applyWorkspaceConfig(nxJson: Record<string, unknown>): boolean {
   changed = applyBuildTargetDefault(nxJson) || changed;
   changed = applyTestTargetDefault(nxJson) || changed;
   changed = applyLintTargetDefault(nxJson) || changed;
-  changed = applyCleanTargetDefault(nxJson) || changed;
   changed = applyNamedInputDefaults(nxJson) || changed;
   const plugins = validatePlugins(nxJson.plugins === undefined ? [] : nxJson.plugins);
   if (plugins.success) {
@@ -319,21 +325,6 @@ function validateBuildTargetDefault(
         message: `targetDefaults.build.${property} must not be set; @smoothbricks/nx-plugin infers the build aggregate`,
       });
     }
-  }
-}
-
-function validateCleanTargetDefault(
-  nxJson: Record<string, unknown>,
-  nxJsonPath: string,
-  issues: NxPolicyIssue[],
-): void {
-  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
-  const clean = targetDefaults ? recordProperty(targetDefaults, 'clean') : null;
-  if (!clean || clean.executor !== cleanOutputsExecutor) {
-    issues.push({ path: nxJsonPath, message: `targetDefaults.clean.executor must be ${cleanOutputsExecutor}` });
-  }
-  if (clean?.cache !== false) {
-    issues.push({ path: nxJsonPath, message: 'targetDefaults.clean.cache must be false' });
   }
 }
 
@@ -471,14 +462,6 @@ function applyLintTargetDefault(nxJson: Record<string, unknown>): boolean {
   return changed;
 }
 
-function applyCleanTargetDefault(nxJson: Record<string, unknown>): boolean {
-  const targetDefaults = getOrCreateRecord(nxJson, 'targetDefaults');
-  const clean = getOrCreateRecord(targetDefaults, 'clean');
-  let changed = setStringProperty(clean, 'executor', cleanOutputsExecutor);
-  changed = setBooleanProperty(clean, 'cache', false) || changed;
-  return changed;
-}
-
 function applyNamedInputDefaults(nxJson: Record<string, unknown>): boolean {
   const namedInputs = getOrCreateRecord(nxJson, 'namedInputs');
   let changed = false;
@@ -516,12 +499,20 @@ function removeDisallowedTargetDefaults(nxJson: Record<string, unknown>): boolea
   }
   let changed = false;
   for (const targetName of Object.keys(targetDefaults)) {
-    if (targetName.includes(':') || targetName === inferredTestTypecheckTarget) {
+    if (
+      targetName.includes(':') ||
+      targetName === inferredTestTypecheckTarget ||
+      isRetiredCleanTargetDefault(targetDefaults, targetName)
+    ) {
       delete targetDefaults[targetName];
       changed = true;
     }
   }
   return changed;
+}
+
+function isRetiredCleanTargetDefault(targetDefaults: Record<string, unknown>, targetName: string): boolean {
+  return targetName === 'clean' && recordProperty(targetDefaults, 'clean')?.executor === retiredCleanOutputsExecutor;
 }
 
 function isPreciseProductionNamedInput(production: unknown[]): boolean {

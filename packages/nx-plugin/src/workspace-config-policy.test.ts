@@ -39,7 +39,6 @@ function validNxJson(): Record<string, unknown> {
 function validTargetDefaults(): Record<string, unknown> {
   return {
     build: { cache: true },
-    clean: { executor: '@smoothbricks/nx-plugin:clean-outputs', cache: false },
   };
 }
 
@@ -252,7 +251,6 @@ describe('pure core: checkWorkspaceConfig', () => {
       plugins: validPlugins(),
       targetDefaults: {
         build: { cache: false },
-        clean: { executor: '@smoothbricks/nx-plugin:clean-outputs', cache: false },
       },
       namedInputs: validNamedInputs(),
     });
@@ -757,10 +755,25 @@ describe('Tree: applyWorkspaceConfigTree', () => {
 
     const nxJson = readJson(tree, 'nx.json');
     expect(expectRecord(nxJson.targetDefaults).build).toEqual({ cache: true });
-    expect(expectRecord(nxJson.targetDefaults).clean).toEqual({
-      executor: '@smoothbricks/nx-plugin:clean-outputs',
-      cache: false,
-    });
+    expect(expectRecord(nxJson.targetDefaults).clean).toBeUndefined();
+  });
+
+  it('refuses and removes the retired clean target default', () => {
+    const nxJson = {
+      plugins: validPlugins(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        clean: { executor: '@smoothbricks/nx-plugin:clean-outputs', cache: false },
+      },
+      namedInputs: validNamedInputs(),
+    };
+    expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toContain(
+      'targetDefaults.clean names the retired @smoothbricks/nx-plugin:clean-outputs; run smoo monorepo update to remove it',
+    );
+
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+
+    expect(nxJson.targetDefaults).toEqual(validTargetDefaults());
   });
 });
 
