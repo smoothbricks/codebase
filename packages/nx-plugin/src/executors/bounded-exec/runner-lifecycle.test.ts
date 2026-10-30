@@ -104,6 +104,8 @@ describe('native runner hooks', () => {
       'cargo nextest run',
       'cargo build && cargo test',
       'go test ./... && bun test src',
+      // Prebuilt Go test binaries build nothing: the run is active from spawn.
+      'smoo-nx-go-test-run go-tests.json',
       'env FOO=bar cargo test',
       'cargo test | cat',
       'cargo test > output',

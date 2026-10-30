@@ -416,6 +416,13 @@ export const NEXTEST_RUN = /(?<=^|[\s;&|()-])nextest\s+run(?=\s|$)/g;
 export const GO_TEST = /(?<=^|[\s;&|()])go\s+test(?=\s|$)/;
 
 /**
+ * `go test`, or `smoo-nx-go-test-run` running the test binaries `smoo-nx-go-test-build` made with `go test -c`, under
+ * any path: both write `go test -json` events on stdout and run `-p` packages at once. Only `go test` builds, so only
+ * it is asked for `-json` (withProgressReport) or given a build phase (withRunnerLifecycle).
+ */
+export const GO_TEST_RUNNER = /(?<=^|[\s;&|()])(?:go\s+test|(?:[^\s;&|()<>'"`\\=]*\/)?smoo-nx-go-test-run)(?=\s|$)/;
+
+/**
  * `command` with its test runner asked to write a JUnit report into `directory`, the report
  * `judgeRun` reads. Both runners are recognised by their invocation, so every target that runs
  * one gets a report without restating it: `bun test` takes the path as flags, and nextest takes

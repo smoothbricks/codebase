@@ -230,6 +230,26 @@ describe('run progress', () => {
       },
     ]);
   });
+
+  it('maps a prebuilt Go test run as go test, scanning only its JSON', () => {
+    const lines =
+      '{"Action":"output","Package":"pkg","Test":"TestA","Output":"assertion\\n"}\n' +
+      '{"Action":"fail","Package":"pkg","Test":"TestA","Elapsed":0.5}\n{"Action":"fail","Package":"pkg"}\n';
+    const recorded = (command: string) => {
+      const results: NativeTestResult[] = [];
+      createRunProgress(command, (result) => results.push(result)).scan('stdout', lines);
+      return results;
+    };
+    expect(recorded('go test -json ./...')).toHaveLength(1);
+    expect(recorded('smoo-nx-go-test-run dist/go-tests.json')).toEqual(recorded('go test -json ./...'));
+    expect(recorded('cd go && ../node_modules/.bin/smoo-nx-go-test-run -p=4 ../dist/go-tests.json')).toEqual(
+      recorded('go test -json ./...'),
+    );
+    // A Go-only chain reports its tests through JSON alone: a text result line is no finished test there.
+    const textResult = '(pass) reads like a bun result [1.00ms]\n';
+    expect(createRunProgress('node wrapper.js').scan('stdout', textResult)).toBe(true);
+    expect(createRunProgress('smoo-nx-go-test-run dist/go-tests.json').scan('stdout', textResult)).toBe(false);
+  });
 });
 
 describe('progress report', () => {
@@ -244,6 +264,10 @@ describe('progress report', () => {
       env: {},
     });
     expect(withTestResultReport('bun test')).toEqual({ command: 'bun test', env: {} });
+    expect(withTestResultReport('cargo nextest run && smoo-nx-go-test-run go-tests.json')).toEqual({
+      command: 'cargo nextest run && smoo-nx-go-test-run go-tests.json',
+      env: {},
+    });
   });
   it('asks Go for its package execution events without changing its test selection', () => {
     expect(withProgressReport('go test -count=1 ./hts/... ./host/...')).toBe(
@@ -253,6 +277,8 @@ describe('progress report', () => {
     expect(withProgressReport('go test -json=false ./first && go test -count=1 ./second')).toBe(
       'go test -json ./first && go test -json -count=1 ./second',
     );
+    // A prebuilt run always reports JSON; only go test is asked for it.
+    expect(withProgressReport('smoo-nx-go-test-run go-tests.json')).toBe('smoo-nx-go-test-run go-tests.json');
   });
 
   it('asks a lone bun test for dots, keeping the runtime the target named', () => {

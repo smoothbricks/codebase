@@ -2016,6 +2016,7 @@ watchdog.
 | Runner                                                          | Authoritative end of build                                                 | End of active execution                                                                                                                |
 | --------------------------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | Go (`go test -json`)                                            | Native package `Action:start`, after that package's build dependencies     | Native package `pass`, `fail`, or `skip`; the clock runs while any package executes                                                    |
+| Prebuilt Go tests (`smoo-nx-go-test-run`)                       | None: it builds nothing, so it is active from command spawn                | Command exit                                                                                                                           |
 | Cargo (`cargo test --message-format=json-render-diagnostics`)   | Native `build-finished`, after `compile_tests` and before `run_unit_tests` | The owned Cargo child's close **and drained output**, never a libtest summary; custom harnesses, doctests, and teardown remain bounded |
 | Bun                                                             | No separate authoritative build event; active from command spawn           | Command exit                                                                                                                           |
 | Unknown shell wrappers, mixed unsupported commands, and nextest | No inferred build exemption; active from command spawn                     | Command exit                                                                                                                           |
@@ -2031,6 +2032,20 @@ line cannot retire the owned process or exempt its teardown. Absolute `timeoutMs
 Separately building test binaries and then executing them under the unchanged bound is a **workaround** for callers
 without a native lifecycle hook, not evidence that their combined cold-build command is safe. Direct Go/Cargo commands
 use the lifecycle channel instead; unknown wrappers retain conservative spawn accounting.
+
+A Go module whose test build should be a cached target of its own splits it from the run with two bins of this package.
+`smoo-nx-go-test-build <out-dir> <package pattern>...`, run in the module, builds one `go test -c` binary for each
+package with test files that `go list` resolves, and writes `<out-dir>/go-tests.json`:
+`{"version":1,"tests":[{"binary":…,"dir":…,"importPath":…}]}`, sorted by import path, every path relative to the
+manifest. It replaces `<out-dir>` whole and refuses a directory that holds no such manifest.
+`smoo-nx-go-test-run [-p=N] [--allow-empty] <go-tests.json>` runs each binary as `go test -json` runs a package's: in
+its package directory, under `go tool test2json -t -p <import path>`, with the flags go test passes
+(`-test.paniconexit0` and the default `-test.timeout=10m0s`), up to `-p` binaries at once (`GOMAXPROCS`, else one per
+core). Its stdout is the same event stream, one whole line per event, so bounded-exec reads results, in-flight names and
+the verdict from it and sizes its `-p` as it does for `go test` (`GO_TEST_RUNNER` in `verdict.ts`); having nothing to
+build, it is active from spawn. A manifest that lists no binary is refused unless `--allow-empty` says none is expected,
+so a package pattern that matched no tests cannot pass. It exits 1 when any binary failed and 2 when the manifest cannot
+be run.
 
 A target may name a `fixtureCommand` with its `fixtureTimeoutMs`: a compiler-fixture producer the executor runs first,
 in the same cwd, environment and CPU grant, as segment 0 of the same lifecycle — a build interval for its whole life,
@@ -2357,21 +2372,21 @@ their runnable work within that tree's count instead of each sizing its runners 
 runner's requested parallelism, read from the runner's own flag rather than the core count — nextest's `--test-threads`
 or one per core (one for `--no-capture`, which runs tests serially), `bun test --parallel=N` N, Stryker's
 `--concurrency` N or N% (default one per core less one past four cores), Vitest's `--maxWorkers` N or N% (default one
-per core less one), `go test -p` (default `GOMAXPROCS`), cargo-mutants' `--jobserver-tasks` (default one per core,
-whatever `--jobs` says), a cargo build one per core, anything else one, or the target's `parallelism` option — bounded
-by positive inherited `NEXTEST_TEST_THREADS`/`CARGO_BUILD_JOBS` ceilings. A configured count can lower an inherited
-ceiling, never raise it. The runner uses `min(bounded request, granted tokens)`: nextest's environment and named flag,
-Bun's parallel flag, Stryker's, Vitest's and go's worker flag (added when the command names none), cargo-mutants'
-jobserver tasks, `--jobs` and per-process test threads, and a cargo build's libtest and nextest test threads are sized
-to that limit. Cargo's rustc count needs no flag: the run's sub-pool is a GNU make jobserver fifo that `CARGO_MAKEFLAGS`
-and `MAKEFLAGS` name, so Cargo, its build scripts and every nested `cargo` share the grant's count with the sub-pool's
-socket children, and no grant sets `CARGO_BUILD_JOBS`. A command whose runner the executor cannot see (a script) gets
-`RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its whole held grant, since test threads take no jobserver token.
-A runner that starts its own workers or jobserver (cargo-mutants, Stryker, Vitest, `go test`) ignores that fifo, so it
-must run under `bounded-exec`, whose runner kinds size its own flag; the inferred `mutation` target does. Test threads
-retain their independent inherited/configured ceilings. `BOUNDED_EXEC_CPU_TOKENS`, the sub-pool and telemetry still name
-the actual held grant. `timeoutMs` and `idleTimeoutMs` start at the grant. The tokens go back when the command exits, or
-with the executor's socket when it is killed. The wait prints one
+per core less one), `go test -p` and `smoo-nx-go-test-run -p` (default `GOMAXPROCS`), cargo-mutants' `--jobserver-tasks`
+(default one per core, whatever `--jobs` says), a cargo build one per core, anything else one, or the target's
+`parallelism` option — bounded by positive inherited `NEXTEST_TEST_THREADS`/`CARGO_BUILD_JOBS` ceilings. A configured
+count can lower an inherited ceiling, never raise it. The runner uses `min(bounded request, granted tokens)`: nextest's
+environment and named flag, Bun's parallel flag, Stryker's, Vitest's and go's worker flag (added when the command names
+none), cargo-mutants' jobserver tasks, `--jobs` and per-process test threads, and a cargo build's libtest and nextest
+test threads are sized to that limit. Cargo's rustc count needs no flag: the run's sub-pool is a GNU make jobserver fifo
+that `CARGO_MAKEFLAGS` and `MAKEFLAGS` name, so Cargo, its build scripts and every nested `cargo` share the grant's
+count with the sub-pool's socket children, and no grant sets `CARGO_BUILD_JOBS`. A command whose runner the executor
+cannot see (a script) gets `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its whole held grant, since test
+threads take no jobserver token. A runner that starts its own workers or jobserver (cargo-mutants, Stryker, Vitest,
+`go test`) ignores that fifo, so it must run under `bounded-exec`, whose runner kinds size its own flag; the inferred
+`mutation` target does. Test threads retain their independent inherited/configured ceilings. `BOUNDED_EXEC_CPU_TOKENS`,
+the sub-pool and telemetry still name the actual held grant. `timeoutMs` and `idleTimeoutMs` start at the grant. The
+tokens go back when the command exits, or with the executor's socket when it is killed. The wait prints one
 `cowshed: cpu-pool wait done elapsed=… tokens=<granted>/<asked>` line.
 
 The plugin's `preTasksExecution` serves each Nx run that inherits no pool its own `BOUNDED_EXEC_CPU_POOL`, and
@@ -2521,9 +2536,10 @@ explicit contract, not a claim that its console output is a structured reporter 
   left unchanged because raw test output would destroy structured-channel attribution. Ignored-test delivery follows
   nextest's own channel: an ignored start is not evidence a test ran, and a binary with no executed test may omit its
   ignored terminals. The human progress display remains the owner of in-flight watchdog names.
-- Go reuses the existing `go test -json` decoder: only test-level pass/fail/skip terminals produce records, never
-  package terminals or output heartbeats. Its native test output supplies failure evidence, and `Elapsed` supplies the
-  duration when present. These records have `source: "native"`; the channel supplies no declaration location.
+- Go reuses the existing `go test -json` decoder, for `smoo-nx-go-test-run`'s stream as for `go test`'s: only test-level
+  pass/fail/skip terminals produce records, never package terminals or output heartbeats. Its native test output
+  supplies failure evidence, and `Elapsed` supplies the duration when present. These records have `source: "native"`;
+  the channel supplies no declaration location.
 - Bun reuses the watchdog's existing named result-line scan, not another console parser. Per the owner's ruling of
   2026-10-29 these records have `source: "progress"`, explicitly provisional: publish immediately when a named result
   closes, never wait for later tests. Bun prints diagnostics before its `(fail)` line, so failure evidence is the

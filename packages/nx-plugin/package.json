@@ -263,7 +263,9 @@
     "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
     "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
     "smoo-nx-publish": "./dist/bin/smoo-nx-publish.js",
-    "smoo-nx-forbidden-spellings": "./dist/bin/smoo-nx-forbidden-spellings.js"
+    "smoo-nx-forbidden-spellings": "./dist/bin/smoo-nx-forbidden-spellings.js",
+    "smoo-nx-go-test-build": "./dist/bin/smoo-nx-go-test-build.js",
+    "smoo-nx-go-test-run": "./dist/bin/smoo-nx-go-test-run.js"
   },
   "generators": "./generators.json",
   "executors": "./executors.json",
@@ -345,6 +347,41 @@
           "killAfterMs": 10000
         }
       },
+      "test-go-bins": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "...",
+          "default",
+          "^dependencyDefault",
+          "bunToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node --version"
+          },
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh go version"
+          },
+          {
+            "dependentTasksOutputFiles": "**/dist/bin/smoo-nx-go-test-*.js",
+            "transitive": true
+          },
+          {
+            "dependentTasksOutputFiles": "**/dist/go-tests.js",
+            "transitive": true
+          }
+        ],
+        "dependsOn": [
+          "...",
+          "tsc-js",
+          "typecheck-tests"
+        ],
+        "options": {
+          "command": "bun test --timeout=0 ./src/__tests__/go-test-bins.cases.ts",
+          "cwd": "{projectRoot}",
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
+        }
+      },
       "lint": {},
       "test": {
         "executor": "nx:noop",
@@ -356,6 +393,7 @@
           "test-host",
           "test-pool-silence",
           "test-nx-publish",
+          "test-go-bins",
           "test-results-runtime"
         ]
       },

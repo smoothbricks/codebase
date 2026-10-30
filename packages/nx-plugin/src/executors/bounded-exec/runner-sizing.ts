@@ -1,4 +1,4 @@
-import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
+import { BUN_TEST, GO_TEST_RUNNER, NEXTEST_RUN } from './verdict.js';
 
 /**
  * How a runner's parallelism is read from its command and sized to the tokens its CPU pool lends
@@ -101,9 +101,9 @@ const WORKER_FLAGS: Readonly<Record<WorkerFlagKind, WorkerFlag>> = {
     ownDefault: (cores) => Math.max(cores - 1, 1),
     serial: /(?<![\w-])(?:--no-file-parallelism|--file(?:P|-p)arallelism=false)(?![\w-])/,
   },
-  /** `go test -p`: packages built and tested at once, `GOMAXPROCS` by default, normally one per core. */
+  /** `go test -p`: packages built and tested at once, `GOMAXPROCS` by default, normally one per core; prebuilt runs alike. */
   'go-test': {
-    invocation: GO_TEST,
+    invocation: GO_TEST_RUNNER,
     flag: new RegExp(String.raw`(?<![\w-])-p(?:=|\s+)${WORD}`, 'g'),
     sized: (count) => `-p=${count}`,
     ownDefault: (cores, env) => parseInheritedTokens(env.GOMAXPROCS) ?? cores,

@@ -139,6 +139,15 @@ describe('runner sizing', () => {
       kind: 'go-test',
       want: 18,
     });
+    // A prebuilt Go test run takes go test's -p and default.
+    expect(runnerDemand('smoo-nx-go-test-run dist/go-tests.json', undefined, 18, { GOMAXPROCS: '4' })).toEqual({
+      kind: 'go-test',
+      want: 4,
+    });
+    expect(runnerDemand('node_modules/.bin/smoo-nx-go-test-run -p 3 go-tests.json', undefined, 18, {})).toEqual({
+      kind: 'go-test',
+      want: 3,
+    });
   });
 
   it("asks for cargo-mutants' own jobserver, one task per core unless --jobserver-tasks names fewer", () => {
@@ -267,6 +276,10 @@ describe('runner sizing', () => {
     expect(sizeRunner({ kind: 'go-test', want: 18 }, 'cd go/ttscwire && go test ./...', 2).command).toBe(
       'cd go/ttscwire && go test -p=2 ./...',
     );
+    expect(
+      sizeRunner({ kind: 'go-test', want: 18 }, 'cd go/ttscwire && smoo-nx-go-test-run ../../dist/go-tests.json', 2)
+        .command,
+    ).toBe('cd go/ttscwire && smoo-nx-go-test-run -p=2 ../../dist/go-tests.json');
   });
 
   it('sizes each runner to its grant', () => {

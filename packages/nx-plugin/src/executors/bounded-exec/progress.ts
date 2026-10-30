@@ -2,7 +2,7 @@ import { StringDecoder } from 'node:string_decoder';
 import typia, { type tags } from 'typia';
 import { invocationSpan, withInvocationFlag } from './runner-sizing.js';
 import type { NativeTestResult } from './test-result-writer.js';
-import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
+import { BUN_TEST, GO_TEST, GO_TEST_RUNNER, NEXTEST_RUN } from './verdict.js';
 
 /**
  * What a run's output says about its forward motion: whether a test finished, and which tests the runner said
@@ -99,8 +99,8 @@ function nativeTestEvent(text: string, invalid?: (detail: string) => void): Nati
 /** A direct Go chain reports tests only through JSON; other commands may also carry text runner reports. */
 function onlyGoTests(command: string): boolean {
   let rest = command.trim();
-  while (rest.search(GO_TEST) === 0) {
-    rest = rest.slice(invocationSpan(rest, GO_TEST).argsEnd).trimStart();
+  while (rest.search(GO_TEST_RUNNER) === 0) {
+    rest = rest.slice(invocationSpan(rest, GO_TEST_RUNNER).argsEnd).trimStart();
     if (rest === '') return true;
     const separator = /^(?:&&|\|\||;)\s*/.exec(rest);
     if (separator === null) return false;
@@ -117,7 +117,7 @@ interface LineState {
 
 export function createRunProgress(command = '', closed?: (result: NativeTestResult) => void): RunProgress {
   const goLifecycle = onlyGoTests(command);
-  const goResults = command.search(GO_TEST) !== -1;
+  const goResults = command.search(GO_TEST_RUNNER) !== -1;
   const streams: Record<OutputStream, LineState> = {
     stdout: { partial: '', countedDots: 0 },
     stderr: { partial: '', countedDots: 0 },
@@ -310,7 +310,7 @@ export function withTestResultReport(command: string): { command: string; env: R
   if (
     (command.match(NEXTEST_RUN)?.length ?? 0) !== 1 ||
     command.search(BUN_TEST) !== -1 ||
-    command.search(GO_TEST) !== -1 ||
+    command.search(GO_TEST_RUNNER) !== -1 ||
     UNCAPTURED_NEXTEST.test(command)
   )
     return { command, env: {} };
