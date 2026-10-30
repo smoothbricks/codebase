@@ -63,11 +63,15 @@ impl RemovalCuts {
         self.sorted = 0;
     }
 
-    /// Back `cuts` records before a batch's first write.
+    /// Back at least `cuts` records, keeping every cut already recorded.
+    /// Batch admission reserves here before the batch runs, and a container
+    /// call inside a dry run reserves its own scratch through the same path
+    /// mid-batch: forgetting the batch's cuts there would let later
+    /// producers fold rows those removals erased. Only [`Self::clear`], at
+    /// the start of each batch run, forgets them.
     pub(crate) fn reserve_for(&mut self, cuts: usize) -> Result<(), ErrorCode> {
-        self.clear();
         self.cuts
-            .try_reserve(cuts)
+            .try_reserve(cuts.saturating_sub(self.cuts.len()))
             .map_err(|_| ErrorCode::OutOfMemory)
     }
 
@@ -272,5 +276,17 @@ mod tests {
         }
         assert!(cuts.cuts.is_empty());
         assert!(!cuts.of(0).covers(CutKey::Unary(EMPTY_KEY), 0));
+    }
+
+    #[test]
+    fn a_reservation_keeps_the_cuts_already_recorded() {
+        let mut cuts = RemovalCuts::default();
+        cuts.record(3, CutKey::Unary(9), 4).unwrap();
+        cuts.reserve_for(0).unwrap();
+        cuts.reserve_for(16).unwrap();
+        assert!(cuts.cuts.capacity() >= 16);
+        assert!(cuts.of(3).covers(CutKey::Unary(9), 4));
+        cuts.clear();
+        assert!(!cuts.of(3).covers(CutKey::Unary(9), 0));
     }
 }

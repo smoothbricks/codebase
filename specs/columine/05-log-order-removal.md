@@ -33,8 +33,10 @@ The removal already erased what earlier batches left, so the skip leaves exactly
 
 Cuts are VM working memory, never image bytes. Each batch run (a dry run and the run after it alike) starts with none.
 Batch admission reserves one cut per removal execution from the row-count bound before the first write, and a sealed
-batch never grows them. A producer reads its slot's cuts ordered by key, by binary search; the cuts recorded since the
-last read are merged first, a short tail by binary insertion and a long one by sorting.
+batch never grows them. Only the start of a batch run forgets cuts: a reservation made inside one (a container call's
+own scratch in a dry run) keeps the cuts already recorded. A producer reads its slot's cuts ordered by key, by binary
+search; the cuts recorded since the last read are merged first, a short tail by binary insertion and a long one by
+sorting.
 
 ## 4. Reads of a removal target
 
