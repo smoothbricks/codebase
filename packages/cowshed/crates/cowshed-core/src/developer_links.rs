@@ -2162,7 +2162,7 @@ mod tests {
         links.restore(&root, RestoreMode::CoveredInstall).unwrap();
         assert_eq!(
             take_syncs(),
-            Syncs { fsync: 0, full: 2 },
+            Syncs { full: 2 },
             "one sync for node_modules and one for node_modules/@scope"
         );
         for name in names {

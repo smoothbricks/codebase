@@ -1108,7 +1108,7 @@ mod tests {
         apply(&tree, &plan).expect("apply");
         assert_eq!(
             take_syncs(),
-            Syncs { fsync: 0, full: 2 },
+            Syncs { full: 2 },
             "one sync for node_modules and one for node_modules/@scope"
         );
         apply(&tree, &plan).expect("apply again");

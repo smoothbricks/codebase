@@ -1676,8 +1676,8 @@ fn jobs_a_lost_supervisor_ran_are_sealed_failed_once_with_what_they_spilled() {
     assert_eq!(after.next_job_id().unwrap().get(), 3);
 }
 
-/// A job's terminal record is synced with `fsync(2)`, not past power loss, so power loss can
-/// take any suffix of it. That the cut is the same after every byte of a frame is the frame
+/// A job's terminal record is acknowledged once written, in the page cache, so a host crash can
+/// take any suffix of it (11_shell.md, "Durability of a job's own records"). That the cut is the same after every byte of a frame is the frame
 /// parser's own unit test (`a_frame_stopped_after_any_byte_is_incomplete...`); here the whole
 /// path runs once in each part of the terminal record's frame — gone entirely, inside its
 /// header, at the payload's edges, inside the digest and the trailer, one byte short: recovery

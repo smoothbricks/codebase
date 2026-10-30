@@ -24,9 +24,18 @@ module; none keeps a copy. Nothing in cowshed queries traces with `lmao-query`.
 
 **Job span segments.** The workspace supervisor writes each job's span with the trace context the controller minted or
 adopted for it (`JobInfo.trace`): a `span-start` row at admission, the `job.unattributed` row below when its terminal
-sample states unattributed usage, and a `span-ok`/`span-err` row at its terminal state, each as its own sealed segment
-`job-<order:020>-<writer>.arrow` under `<host-telemetry-root>/<yyyy-mm-dd>/`, sealed like the gateway's (create-new
-`0600` temporary, fsync, rename, directory fsync). The rows carry `repo_id`, `workspace_incarnation`, `job_id`,
+sample states unattributed usage, and a `span-ok`/`span-err` row at its terminal state. The supervisor's writer gathers
+these rows and seals them on the same interval as process rows ("Process segments"): the first row of either kind it
+gathers arms the interval, and when the interval ends, the job rows of every job gathered in it seal as one segment
+`job-<order:020>-<writer>.arrow`, in queue order, under `<host-telemetry-root>/<yyyy-mm-dd>/` (the date of its first
+row), sealed like the gateway's (create-new `0600` temporary, fsync, rename, directory fsync); the writer also seals
+them before answering a trace-health read and when it stops. One segment per interval, not one per row: a job row is
+telemetry, not a durability event (11_shell.md, "Durability of a job's own records"), and sealing each row as its own
+segment was 4 full-drive flushes per exec, 22.9 ms of flushing per exec in a supervisor sample on 2026-10-30, competing
+with the job's own record writes. Rows still gathered when the writer's process dies are lost, as process rows are. No
+count of rows seals early: rows past the writer's bound in one interval are refused and counted in the trace health. A
+row no column can state is refused and counted alone; the rest of its interval still seals. The trace health's
+`recorded` counts segments sealed, not rows. The rows carry `repo_id`, `workspace_incarnation`, `job_id`,
 `grant_revision`, the job's W3C span id and, on the terminal row, its state. The span's lmao address is span 1 of the
 thread derived from the durable key `(repo_id, workspace_incarnation, job_id)` (the first eight bytes of a
 domain-separated BLAKE3), never the workspace-local `job_id` alone: jobs of two workspaces under one adopted trace
@@ -140,7 +149,7 @@ arrivals. The independent byte limit accounts for variable-length image paths an
 row/vector storage and every string's reserved capacity, without serializing a second copy. Allocator, channel
 bookkeeping and temporary Arrow encoding storage are outside this payload bound. Admission refuses and increments a
 failure count rather than waiting for capacity; the diagnostic names the operation or byte limit that refused it.
-Draining the channel does not make the interval buffer unbounded. Sealing runs on the ten-second `PROCESS_SEAL_INTERVAL`
+Draining the channel does not make the interval buffer unbounded. Sealing runs on the ten-second shared `SEAL_INTERVAL`
 alone, regardless of operation count, with a final flush on host drop. A full queue drops detail with a counted refusal;
 it never triggers an early seal. A count-triggered seal would make full-drive flush rate grow with activity, recreating
 the defect telemetry coalescing fixes.
@@ -257,8 +266,9 @@ transition kind preserves clearing semantics without carrying a JSON payload or 
 **Process segments.** The life the job's fold retained at birth-order index `i` is span `i + 2` of the job's lmao
 thread, beside the job span (span 1), and every row of it carries its parent's address. The rows of every batch of
 events the fold emits are projected and gathered by the job's writer, which seals what it gathered as one segment
-`process-<order:020>-<writer>.arrow` beside the job's segments, by the same order and sealing, once 10 seconds have
-passed since the first of them; it also seals what it gathered before a job row, before answering a trace-health read,
+`process-<order:020>-<writer>.arrow` beside the job's segments, by the same order and sealing, once 10 seconds
+(`SEAL_INTERVAL`) have passed since the first row of either kind it gathered, each time just after the job rows it
+gathered ("Job span segments"); it also seals what it gathered, job rows first, before answering a trace-health read,
 and when it stops. No count of rows seals early: the interval is the seal rate and the gathered rows are the buffer, and
 the two are not interchangeable. Rows past 16,384 gathered in one interval are refused and counted in the trace health,
 so a burst loses rows rather than flushing the drive more often because a lot happened. A process fold batch is not a
@@ -519,24 +529,24 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
 - **Group commit** — the commitment publisher takes every record already queued when it takes one, up to 64
   (`GROUP_RECORDS`, `cowshed-core` `storage/audit.rs`), and seals them as one segment with one sync; it never waits for
   more, so a group adds no delay, and it grows only while the previous group's sync runs. The group is synced at the
-  strongest durability any of its records requires, never less: `fsync(2)` of the segment when it holds only job
-  admission and terminal records (11_shell.md, "Durability of a job's own records"), otherwise `F_FULLFSYNC` of the
-  segment and of its date directory. Every record of a group is acknowledged only after that sync returns; a failed
-  group counts each of its records as refused. Group commit changes how many records one sync carries, not which barrier
-  any record gets, and there is no cheaper barrier to give them: `F_BARRIERFSYNC` (`<sys/fcntl.h>`: "fsync + issue
-  barrier to drive") orders writes but persists nothing, and Apple's `fsync(2)` page names `F_FULLFSYNC` as the call
-  that makes data persistent on the drive. A lone producer, which waits for each acknowledgment before its next record,
-  always forms groups of one; grouping comes only from concurrent producers. A process that dies mid-group acknowledged
-  none of it, so no caller acted on a reply for any of its records: before the rename they are lost in an unsealed
-  temporary nothing reads, after it they are sealed whole but unanswered. Grouping changes when queued records are
-  written, not which a crash can take. A lost record stays lost — a job's terminal record is sealed before its
-  commitment, so the next supervisor does not re-seal that job — while the inventory and the protected records still
-  hold the facts, and nothing reads commitments for a decision.
+  strongest durability any of its records requires, never less: a group of only job admission and terminal records is
+  not synced at all, the page cache being their durability (11_shell.md, "Durability of a job's own records"), and any
+  other group takes `F_FULLFSYNC` of the segment and of its date directory, every record of it acknowledged only after
+  that sync returns. A failed group counts each of its records as refused. Group commit changes how many records one
+  sync carries, not which barrier any record gets, and there is no cheaper barrier to give them: `F_BARRIERFSYNC`
+  (`<sys/fcntl.h>`: "fsync + issue barrier to drive") orders writes but persists nothing, and Apple's `fsync(2)` page
+  names `F_FULLFSYNC` as the call that makes data persistent on the drive. A lone producer, which waits for each
+  acknowledgment before its next record, always forms groups of one; grouping comes only from concurrent producers. A
+  process that dies mid-group acknowledged none of it, so no caller acted on a reply for any of its records: before the
+  rename they are lost in an unsealed temporary nothing reads, after it they are sealed whole but unanswered. Grouping
+  changes when queued records are written, not which a crash can take. A lost record stays lost — a job's terminal
+  record is sealed before its commitment, so the next supervisor does not re-seal that job — while the inventory and the
+  protected records still hold the facts, and nothing reads commitments for a decision.
 - **Controller producer capability delivery** — each controller telemetry producer receives a dedicated IPC channel or
   inherited write-only capability/FD. It is close-on-exec/non-inheritable before any workspace child starts and is never
   named by a workspace-readable path or token. Audit records are recorded in the order the controller performed the
-  acts, each acknowledged only once it is durable (Group commit, above); the short-timer one-batch crash window applies
-  to diagnostic events; gateway decision boundaries retain the flush policy below.
+  acts, each acknowledged at the durability its group gives it (Group commit, above); the short-timer one-batch crash
+  window applies to diagnostic events; gateway decision boundaries retain the flush policy below.
 - **The one text-file survivor** — `~/Library/Logs/cowshed/daemon-stderr.log`, the launchd `StandardErrorPath` target,
   exists only for crashes before tracer initialization. It lives off the `/private/cowshed/store` mountpoint so reboot
   remount cannot be masked. `doctor` flags it when non-empty. The gateway, every workspace supervisor and their children

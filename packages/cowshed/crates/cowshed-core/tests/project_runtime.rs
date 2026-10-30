@@ -4022,19 +4022,18 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
                 let mut fields = cowshed_core::storage::trace_segment::system_fields();
                 fields.extend(cowshed_core::runtime::job_spans::job_fields());
                 assert_eq!(batch.schema().fields(), &fields.into());
-                assert_eq!(batch.num_rows(), 1);
+                assert!(batch.num_rows() > 0, "a job segment holds rows");
                 let message = batch
                     .column_by_name("message")
                     .expect("message")
                     .as_dictionary::<UInt32Type>();
-                if message.is_valid(0)
-                    && message
-                        .values()
-                        .as_string::<i32>()
-                        .value(usize::try_from(message.keys().value(0)).expect("message key"))
-                        == "job.unattributed"
-                {
-                    gaps.push(batch);
+                for row in 0..batch.num_rows() {
+                    let key = usize::try_from(message.keys().value(row)).expect("message key");
+                    if message.is_valid(row)
+                        && message.values().as_string::<i32>().value(key) == "job.unattributed"
+                    {
+                        gaps.push(batch.slice(row, 1));
+                    }
                 }
             }
         }

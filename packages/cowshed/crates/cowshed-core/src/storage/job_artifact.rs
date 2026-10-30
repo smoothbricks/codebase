@@ -48,11 +48,12 @@ mod publication;
 use crate::storage::verify_no_symlinks;
 
 /// How durable a job's own state is before the job is admitted, backgrounded or answered as
-/// ended: one `fsync(2)` per record batch, per spilled stream and per published copy, and no sync
-/// of the directory entries they add. Power loss ends every job anyway, and a job whose record it
-/// took is sealed lost at the next supervisor start (11_shell.md "Job control"). Every
-/// lifecycle record stays at [`Durability::PowerLoss`].
-const JOB_RECORD_DURABILITY: Durability = Durability::Device;
+/// ended: written, so in the page cache, which survives the death of the process that wrote it;
+/// no record batch, spilled stream or published copy is synced. A host crash ends every job
+/// anyway, and a job whose record it took is sealed lost at the next supervisor start
+/// (11_shell.md, "Durability of a job's own records"). Every lifecycle record stays at
+/// [`Durability::PowerLoss`].
+const JOB_RECORD_DURABILITY: Durability = Durability::Process;
 
 const RECORD_MAGIC: &[u8; 8] = b"CSARROW1";
 const BATCH_MAGIC: &[u8; 8] = b"CSBATCH1";
@@ -9847,10 +9848,10 @@ mod tests {
     }
 
     /// Every background or auto-backgrounded exec makes both captured streams durable, and every
-    /// `--stdout-copy` publishes a copy; both are the job's own state, so each pays `fsync(2)`
-    /// like its records and never a full-device flush (11_shell.md "Job control").
+    /// `--stdout-copy` publishes a copy; both are the job's own state, so like its records each is
+    /// left to the page cache and never synced (11_shell.md, "Durability of a job's own records").
     #[test]
-    fn backgrounding_and_publishing_a_job_pay_no_full_device_flush() {
+    fn backgrounding_and_publishing_a_job_sync_nothing() {
         let root = temp_root("job-durability");
         fs::create_dir(root.join("published")).unwrap();
         let mut store = store_at(&root, ArtifactConfig::default());
@@ -9870,8 +9871,8 @@ mod tests {
         store.prepare_background(&token).unwrap();
         assert_eq!(
             cowshed_os::fsio::take_syncs(),
-            cowshed_os::fsio::Syncs { fsync: 2, full: 0 },
-            "backgrounding syncs stdout and stderr"
+            cowshed_os::fsio::Syncs::default(),
+            "backgrounding syncs neither stdout nor stderr"
         );
 
         store.finish(token, JobState::Exited).unwrap();
@@ -9885,8 +9886,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             cowshed_os::fsio::take_syncs(),
-            cowshed_os::fsio::Syncs { fsync: 1, full: 0 },
-            "publication syncs its copy and not the directory it lands in"
+            cowshed_os::fsio::Syncs::default(),
+            "publication syncs neither its copy nor the directory it lands in"
         );
         assert_eq!(
             fs::read(root.join("published/stdout.txt")).unwrap(),

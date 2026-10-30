@@ -663,7 +663,6 @@ mod tests {
                 assert_eq!(
                     syncs,
                     Syncs {
-                        fsync: 0,
                         full: count + usize::from(count > 0),
                     },
                     "preexisting={preexisting}, appends={count}: file per append, parent once"
@@ -687,11 +686,11 @@ mod tests {
         for project in &projects {
             append_sync_entry(project, 0);
         }
-        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 4 });
+        assert_eq!(take_syncs(), Syncs { full: 4 });
         for project in &projects {
             append_sync_entry(project, 1);
         }
-        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 2 });
+        assert_eq!(take_syncs(), Syncs { full: 2 });
         for project in &projects {
             assert_sync_entries(project, 2);
         }
@@ -710,7 +709,7 @@ mod tests {
         let original_identity = original.metadata().expect("original parent identity");
         take_syncs();
         append_sync_entry(&project, 0);
-        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 2 });
+        assert_eq!(take_syncs(), Syncs { full: 2 });
         std::fs::rename(&project, &retired).expect("retire without destroying the original parent");
         std::fs::create_dir(&project).expect("readopt at the same project path");
         let replacement = File::open(&project).expect("hold the replacement parent alive");
@@ -721,14 +720,14 @@ mod tests {
             "the same path now names a different directory identity"
         );
         append_sync_entry(&project, 0);
-        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 2 });
+        assert_eq!(take_syncs(), Syncs { full: 2 });
         append_sync_entry(&project, 1);
-        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 1 });
+        assert_eq!(take_syncs(), Syncs { full: 1 });
         assert_sync_entries(&project, 2);
         append_sync_entry(&retired, 1);
         assert_eq!(
             take_syncs(),
-            Syncs { fsync: 0, full: 1 },
+            Syncs { full: 1 },
             "renaming a cached parent does not require another parent sync"
         );
         let lines: Vec<DeletionLogEntry> = std::fs::read_to_string(retired.join(DELETION_LOG_FILE))
@@ -764,9 +763,9 @@ mod tests {
         );
         std::fs::remove_dir(&path).expect("allow the real append to create its log");
         append_sync_entry(&project, 0);
-        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 2 });
+        assert_eq!(take_syncs(), Syncs { full: 2 });
         append_sync_entry(&project, 1);
-        assert_eq!(take_syncs(), Syncs { fsync: 0, full: 1 });
+        assert_eq!(take_syncs(), Syncs { full: 1 });
         assert_sync_entries(&project, 2);
     }
 
@@ -801,19 +800,18 @@ mod tests {
                     .into_iter()
                     .map(|worker| worker.join().expect("concurrent append completes"))
                     .fold(Syncs::default(), |mut total, syncs| {
-                        total.fsync += syncs.fsync;
                         total.full += syncs.full;
                         total
                     })
             });
             assert_eq!(
                 syncs,
-                Syncs { fsync: 0, full: 9 },
+                Syncs { full: 9 },
                 "eight file syncs share one successful parent sync: preexisting={preexisting}"
             );
             take_syncs();
             append_sync_entry(&project, 8);
-            assert_eq!(take_syncs(), Syncs { fsync: 0, full: 1 });
+            assert_eq!(take_syncs(), Syncs { full: 1 });
             assert_sync_entries(&project, 9);
         }
     }
