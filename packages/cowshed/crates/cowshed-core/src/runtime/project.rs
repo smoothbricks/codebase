@@ -8494,6 +8494,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 target.clone(),
                 std::sync::Arc::clone(&paths),
             );
+            let previous = previous.clone();
             measuring.spawn(async move {
                 let head = crate::git::GitRepository::from_root(&store_root, &mount)
                     .head_oid()
@@ -8501,6 +8502,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 let unreadable = |reason| crate::landing::FoldFacts {
                     touched: Err(reason),
                     landed: false,
+                    held_before_land: false,
                     dirty_files: Ok(0),
                 };
                 let facts = match head.as_ref() {
@@ -8508,8 +8510,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         Ok(base) => {
                             crate::landing::fold_facts(
                                 &store_root,
-                                &target,
-                                &paths,
+                                crate::landing::LandedRange {
+                                    target: &target,
+                                    previous: &previous,
+                                    paths: &paths,
+                                },
                                 crate::landing::FoldProvenance { base: &base, head },
                                 &mount,
                                 &main,
