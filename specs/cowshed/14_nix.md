@@ -89,8 +89,12 @@ directly does not prevent action storage and restoration. Distinct installations
 overrides gain no mapping. Reservation and compiler-admission waits block on kqueue/inotify with domain-qualified,
 rate-limited shared rescue scans for crash recovery instead of per-waiter polling. The short session root is the
 canonical environment's (11_shell.md, "Canonical mbx environment"), not a new namespace or sandbox grant (04_sandbox.md,
-"Fixture roots under /tmp"; 08_testing.md, "Fixtures"; 01c_macos.md, "sun_path is 104 bytes"). It is
-`smoothbricks/mr-boxington` at rev `5434eb066d6d141a734151d5155bec9f2ec34f0f`. No project needs to pin it: the host's
+"Fixture roots under /tmp"; 08_testing.md, "Fixtures"; 01c_macos.md, "sun_path is 104 bytes"). Further changes key a Nix
+cc-wrapper's environment flags through the same model as argv and its store path, key inputs in the Nix store by their
+store path, cache compilations that use a Clang precompiled header (every one a chain loads keyed by its bytes), model
+more compiler and rustc flags as written, identify a macOS SDK from its own files while refusing host links a Nix
+wrapper shapes, record why a compiled result was not stored, and share build-script output under `mbx exec`. It is
+`smoothbricks/mr-boxington` at rev `f3d7ba273e3219d4f71d044f58777ccb9741c9c5`. No project needs to pin it: the host's
 mbx serves every Cargo project, which reaches it through the Cargo shim that `cowshed setup` generates from it, below
 (the capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store
 path or a host path where a command is spawned; its store path is only what the link resolves to.
