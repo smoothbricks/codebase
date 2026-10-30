@@ -6800,15 +6800,38 @@ impl SupervisorActor {
 
     /// Stop publication admission only once no job can add another owned life. Completion is
     /// a selectable event, never an actor-side wait on filesystem IO or a worker join.
+    /// Begin the retiring supervisor's last writes: the span writer seals what it gathered (a
+    /// retired supervisor's process exits waiting for nothing else, 13_telemetry.md, "Job span
+    /// segments"), then the group ledger records its last cut. Retirement is answered once both
+    /// are done.
     fn begin_group_ledger_finish(&mut self) {
         if !matches!(self.group_ledger_finish, GroupLedgerFinish::Idle) {
             return;
         }
         self.record_groups();
-        self.group_ledger_finish = match self.group_ledger.as_mut() {
-            Some(writer) => GroupLedgerFinish::Pending(writer.finish()),
-            None => GroupLedgerFinish::Done(Ok(())),
-        };
+        let ledger = self.group_ledger.as_mut().map(GroupLedgerWriter::finish);
+        let spans = self.job_spans.clone();
+        if ledger.is_none() && spans.is_none() {
+            self.group_ledger_finish = GroupLedgerFinish::Done(Ok(()));
+            return;
+        }
+        let (reply, finished) = oneshot::channel();
+        tokio::spawn(async move {
+            // A writer that already stopped counted what it refused; nothing is left to seal.
+            if let Some(spans) = spans {
+                let _ = spans.health().await;
+            }
+            let recorded = match ledger {
+                Some(receiver) => receiver.await.unwrap_or_else(|error| {
+                    Err(std::io::Error::other(format!(
+                        "group-ledger writer ended before its final reply: {error}"
+                    )))
+                }),
+                None => Ok(()),
+            };
+            let _ = reply.send(recorded);
+        });
+        self.group_ledger_finish = GroupLedgerFinish::Pending(finished);
     }
 
     fn validate_authority(&self, authority: &WorkspaceAuthoritySnapshot) -> Result<()> {

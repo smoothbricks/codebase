@@ -24,10 +24,11 @@
 //! ([`write_rows`]): the job rows as one `job-<order:020>-<writer>.arrow` segment, then the
 //! process rows as one `process-<order:020>-<writer>.arrow` segment, each holding its rows in
 //! queue order, under `<telemetry root>/<yyyy-mm-dd>/` by [`crate::storage::trace_segment`]. A row
-//! is telemetry, not a durability event: sealing one segment per job row was 4 full-drive flushes
-//! per exec, 22.9 ms of flushing per exec in a supervisor sample on 2026-10-30, competing with the
-//! job's own record writes. Rows still gathered when the writer's process dies are lost, as
-//! process rows are.
+//! is telemetry, not a durability event: sealing one segment per job row, each a full flush of the
+//! segment and of its directory, cost 22.9 ms of flushing per exec in a supervisor sample of 203
+//! back-to-back execs on 2026-10-30 (load about 10), competing with the job's own record writes. A
+//! retiring supervisor seals what was gathered before it is answered; rows still gathered when the
+//! writer's process dies are lost, as process rows are.
 //!
 //! Telemetry never gates a job. The actor hands a row to [`JobSpanPublisher::record`], which
 //! queues it without waiting; the writer task gathers and seals in order, off the actor and off
@@ -81,9 +82,9 @@ const QUEUE_CAPACITY: usize = 256;
 /// segment is a full-drive flush of it and of its directory (`Durability::PowerLoss`). One seal
 /// per process fold batch made 26 seals and about 52 `F_FULLFSYNC`s a second host-wide, 5-8 s of
 /// flushing per wall second at 0.10-0.16 s each, which saturated the drive under every other
-/// process on it (measured 2026-10-21). One seal per job row made 4 full-drive flushes per exec,
-/// 22.9 ms of flushing per exec in a supervisor sample on 2026-10-30, competing with the job's own
-/// record writes. So the writer seals on this interval, and the durability of each seal is
+/// process on it (measured 2026-10-21). One seal per job row, each a full flush of the segment
+/// and of its directory, cost 22.9 ms of flushing per exec in a supervisor sample of 203
+/// back-to-back execs on 2026-10-30 (load about 10), competing with the job's own record writes. So the writer seals on this interval, and the durability of each seal is
 /// unchanged. Rows still gathered when the process dies are lost, as the gateway's one-batch audit
 /// window is (13_telemetry.md, "Job span segments", "Process segments").
 pub const SEAL_INTERVAL: Duration = Duration::from_secs(10);
@@ -483,19 +484,19 @@ async fn write_rows(
             }
         };
         match request {
-            Some(Request::Job(row)) => {
-                gathered.arm();
-                match JobCells::of(*row) {
-                    Ok(cells) => gather(
+            Some(Request::Job(row)) => match JobCells::of(*row) {
+                Ok(cells) => {
+                    gathered.arm();
+                    gather(
                         &sealer.health,
                         &mut gathered.jobs,
                         std::iter::once(cells),
                         JOB_GATHER_ROWS,
                         "job",
-                    ),
-                    Err(error) => refuse(&sealer.health, error.to_string()),
+                    )
                 }
-            }
+                Err(error) => refuse(&sealer.health, error.to_string()),
+            },
             Some(Request::Processes(rows)) => {
                 gathered.arm();
                 gather(

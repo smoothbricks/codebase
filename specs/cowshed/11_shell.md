@@ -871,9 +871,9 @@ rewriting, redaction, merging, or summary substitution. The supervisor begins ea
 neither per-job stream path eagerly. When promotion is required it exclusively creates the job directory and selected
 file without following links, writes the buffered prefix, then appends future admitted bytes. Executed shells receive a
 child profile that denies every write mutation beneath `.cowshed/job/**`; no writable protected-artifact descriptor is
-inheritable and no protected inode may be hardlinked into a workspace-writable path. Completion drains, hashes, fsyncs,
-closes, and seals file artifacts, or writes bounded inline bytes into the terminal Job Arrow batch, before publishing
-`ControllerCommitment::Terminal(TerminalCommitment)`.
+inheritable and no protected inode may be hardlinked into a workspace-writable path. Completion drains, hashes, closes,
+and seals file artifacts (never synced: "Durability of a job's own records"), or writes bounded inline bytes into the
+terminal Job Arrow batch, before publishing `ControllerCommitment::Terminal(TerminalCommitment)`.
 
 Allocation is exclusive and crash-safe without an eager job directory. One supervisor is the sole allocator for an
 attached workspace. Admission appends a complete `JobArtifactRecord` batch and publishes
@@ -896,17 +896,18 @@ the earlier store's rows.
 copies it publishes, and its admission and terminal commitments — are job bookkeeping, and the page cache is their
 durability: none is synced before the job is admitted, backgrounded, answered as ended, or its copy reported published.
 A written byte survives the death of the process that wrote it, which is all they must survive; a host crash ends every
-job and every local client that saw its answer anyway. Measured 2026-10-30, the four `fsync(2)`s a warm exec used to
-await cost 4–22 ms of its 40–60 ms, and bought only survival of a kernel panic that left the drive powered.
-`F_FULLFSYNC`, which survives power loss on macOS and on a disk image flushes every dirty block of the whole image,
-stays on lifecycle and authority state only: workspace creation and removal, landing, grants and policy revisions, and
-every lifecycle commitment. A host crash may take any suffix of the bookkeeping, and recovery reads what survived: a
-torn trailing batch is discarded as above; a counter rolled back behind the log is advanced to the log's highest
-sequence at the next open, before anything allocates; and when the next supervisor takes the workspace's socket — which
-no other supervisor then holds — it seals every job of the incarnation that has an admission and no terminal record
-`failed` with `supervisorLost`, after ending the process groups its predecessor's ledger still names, and seals a spill
-file the crash took as a stream with no bytes. A job whose terminal record was lost is therefore reported lost, never as
-having succeeded; one whose admission was lost never existed, and its id may be handed out again.
+job and every local client that saw its answer anyway. Measured 2026-10-30 by supervisor timing spans on a host under
+load 8–14, the four `fsync(2)`s a warm exec used to await cost 4–22 ms of its 40–60 ms, and bought only survival of a
+kernel panic that left the drive powered. `F_FULLFSYNC`, which survives power loss on macOS and on a disk image flushes
+every dirty block of the whole image, stays on lifecycle and authority state only: workspace creation and removal,
+landing, grants and policy revisions, and every lifecycle commitment. A host crash may take the tail of the bookkeeping,
+and recovery reads what survived: a torn trailing batch is discarded as above; a counter rolled back behind the log is
+advanced to the log's highest sequence at the next open, before anything allocates; and when the next supervisor takes
+the workspace's socket — which no other supervisor then holds — it seals every job of the incarnation that has an
+admission and no terminal record `failed` with `supervisorLost`, after ending the process groups its predecessor's
+ledger still names, and seals a spill file the crash took as a stream with no bytes. A job whose terminal record was
+lost is therefore reported lost, never as having succeeded; one whose admission was lost never existed for recovery,
+which allocates past every id the surviving records, spill directories and floor name (above).
 
 Each admission and terminal job batch also records its immutable command in a required Arrow `List<Binary>` `argv`
 column. An argv job stores its arguments; a script job stores exactly two elements, `\0script` and the script's JSON — a
@@ -1184,9 +1185,9 @@ pipe; it makes no claim over bytes redirected away by the shell.
 After terminal sealing, the publication API remains exactly `ExecRequest.stdout_copy` /
 `stderr_copy: Option<OutputPublication>`, `OutputPublication { path, policy }`, and
 `PublicationPolicy::{CreateNew, Replace}` (camelCase `stdoutCopy`/`stderrCopy`, `createNew`/`replace` in JSON/NAPI). The
-supervisor clonefiles/reflinks or extent-copies into a temporary destination, fsyncs, and atomically renames.
-Publication never changes `StreamInfo.storage`; reads and authority never resolve through it. Redirect snapshots and
-publication forbid hardlinks.
+supervisor clonefiles/reflinks or extent-copies into a temporary destination and atomically renames it, with no sync
+("Durability of a job's own records"). Publication never changes `StreamInfo.storage`; reads and authority never resolve
+through it. Redirect snapshots and publication forbid hardlinks.
 
 Controller commitments, the audit telemetry of job and lineage events, are the tagged union defined in 13_telemetry.md
 (Controller audit record schema).
@@ -1536,7 +1537,7 @@ handle.
 
 Callers that want a workspace-visible copy independent of shell syntax request `stdout_copy` and/or `stderr_copy` in
 `ExecRequest` (07_api.md). Only after terminal state and canonical artifact sealing does the supervisor materialize a
-temporary destination from that artifact, fsync it, and atomically rename it according to create/replace policy. APFS
+temporary destination from that artifact and atomically rename it according to create/replace policy, with no sync. APFS
 uses `clonefile`, ZFS uses block cloning when available, and other substrates use an extent copy. Hardlinks are
 forbidden in every case.
 

@@ -29,20 +29,21 @@ these rows and seals them on the same interval as process rows ("Process segment
 gathers arms the interval, and when the interval ends, the job rows of every job gathered in it seal as one segment
 `job-<order:020>-<writer>.arrow`, in queue order, under `<host-telemetry-root>/<yyyy-mm-dd>/` (the date of its first
 row), sealed like the gateway's (create-new `0600` temporary, fsync, rename, directory fsync); the writer also seals
-them before answering a trace-health read and when it stops. One segment per interval, not one per row: a job row is
-telemetry, not a durability event (11_shell.md, "Durability of a job's own records"), and sealing each row as its own
-segment was 4 full-drive flushes per exec, 22.9 ms of flushing per exec in a supervisor sample on 2026-10-30, competing
-with the job's own record writes. Rows still gathered when the writer's process dies are lost, as process rows are. No
-count of rows seals early: rows past the writer's bound in one interval are refused and counted in the trace health. A
-row no column can state is refused and counted alone; the rest of its interval still seals. The trace health's
-`recorded` counts segments sealed, not rows. The rows carry `repo_id`, `workspace_incarnation`, `job_id`,
-`grant_revision`, the job's W3C span id and, on the terminal row, its state. The span's lmao address is span 1 of the
-thread derived from the durable key `(repo_id, workspace_incarnation, job_id)` (the first eight bytes of a
-domain-separated BLAKE3), never the workspace-local `job_id` alone: jobs of two workspaces under one adopted trace
-context stay distinct spans. The writes run off the supervisor's actor; a refused write is counted in the supervisor's
-trace health, which every supervisor handle reads, in process or over its socket, and never fails or delays the job.
-This job span is the anchor `process.run` spans parent from. The terminal row carries the job's `env_hash` (the same
-environment identity as the job record's `envHash`, 11_shell.md).
+them before answering a trace-health read, and a retiring supervisor has them sealed before it is answered. One segment
+per interval, not one per row: a job row is telemetry, not a durability event (11_shell.md, "Durability of a job's own
+records"), and sealing each row as its own segment, each a full flush of the segment and of its directory, cost 22.9 ms
+of flushing per exec in a supervisor sample of 203 back-to-back execs on 2026-10-30 (load about 10), competing with the
+job's own record writes. Rows still gathered when the writer's process dies are lost, as process rows are. No count of
+rows seals early: rows past the writer's bound in one interval (16,384 job rows, `JOB_GATHER_ROWS`) are refused and
+counted in the trace health. A row no column can state is refused and counted alone; the rest of its interval still
+seals. The trace health's `recorded` counts segments sealed, not rows. The rows carry `repo_id`,
+`workspace_incarnation`, `job_id`, `grant_revision`, the job's W3C span id and, on the terminal row, its state. The
+span's lmao address is span 1 of the thread derived from the durable key `(repo_id, workspace_incarnation, job_id)` (the
+first eight bytes of a domain-separated BLAKE3), never the workspace-local `job_id` alone: jobs of two workspaces under
+one adopted trace context stay distinct spans. The writes run off the supervisor's actor; a refused write is counted in
+the supervisor's trace health, which every supervisor handle reads, in process or over its socket, and never fails or
+delays the job. This job span is the anchor `process.run` spans parent from. The terminal row carries the job's
+`env_hash` (the same environment identity as the job record's `envHash`, 11_shell.md).
 
 ## Trace context propagation
 
@@ -539,9 +540,10 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   acknowledgment before its next record, always forms groups of one; grouping comes only from concurrent producers. A
   process that dies mid-group acknowledged none of it, so no caller acted on a reply for any of its records: before the
   rename they are lost in an unsealed temporary nothing reads, after it they are sealed whole but unanswered. Grouping
-  changes when queued records are written, not which a crash can take. A lost record stays lost — a job's terminal
-  record is sealed before its commitment, so the next supervisor does not re-seal that job — while the inventory and the
-  protected records still hold the facts, and nothing reads commitments for a decision.
+  changes when queued records are written, not which a crash can take. A lost record stays lost, while the inventory and
+  the protected records still hold the facts, and nothing reads commitments for a decision. A job's terminal record is
+  written before its commitment, but neither is synced, so a host crash may keep the commitment and lose the record; the
+  next supervisor then seals that job lost and commits that too, and its last commitment says lost, never success.
 - **Controller producer capability delivery** — each controller telemetry producer receives a dedicated IPC channel or
   inherited write-only capability/FD. It is close-on-exec/non-inheritable before any workspace child starts and is never
   named by a workspace-readable path or token. Audit records are recorded in the order the controller performed the

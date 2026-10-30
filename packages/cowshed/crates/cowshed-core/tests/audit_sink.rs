@@ -323,7 +323,7 @@ impl AuditSinkEnvironment for CountingEnvironment {
 /// flush of its segment and of the directory its sealed name was added to (11_shell.md,
 /// "Durability of a job's own records").
 #[test]
-fn a_jobs_commitments_sync_no_directory_while_lifecycle_commitments_do() {
+fn a_jobs_commitments_sync_nothing_while_lifecycle_commitments_flush() {
     let root = TempRoot::new("job-durability");
     let directory_syncs = Arc::new(AtomicUsize::new(0));
     let mut sink = ArrowAuditSink::open_with_environment(

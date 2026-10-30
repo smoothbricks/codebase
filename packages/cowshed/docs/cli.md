@@ -1678,10 +1678,10 @@ implicit overwrite. `--replace-output` upgrades every requested copy in that inv
 either copy destination is a usage error. Structured API/JSON requests retain a separate publication policy per stream
 instead of inheriting the CLI-wide switch.
 
-Copies are published only after the canonical artifact is drained, fsynced, closed, and sealed. A destination is an
-independent clone/reflink when supported, otherwise an ordinary copy, and is atomically renamed under the selected
-policy. Publication does not alter `StreamInfo.storage` and is never used for reads or authority. Failure is a typed
-operational error and does not change the already-established process result.
+Copies are published only after the canonical artifact is drained, closed, and sealed (none of it is synced). A
+destination is an independent clone/reflink when supported, otherwise an ordinary copy, and is atomically renamed under
+the selected policy. Publication does not alter `StreamInfo.storage` and is never used for reads or authority. Failure
+is a typed operational error and does not change the already-established process result.
 
 ### Job classes and host scheduling
 

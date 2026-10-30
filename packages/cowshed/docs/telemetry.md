@@ -49,8 +49,8 @@ cowshed has no reader verb for it: each segment is an Arrow IPC stream, readable
 ```
 /private/cowshed/store/telemetry/
   <yyyy-mm-dd>/commitment-*.arrow   # controller commitments: lifecycle and job continuity records
-  <yyyy-mm-dd>/job-*.arrow          # each job's span, one segment per row: its start, the unattributed usage its terminal sample states, and its end
-  <yyyy-mm-dd>/process-*.arrow      # a job's process.run spans, one segment per batch of process events
+  <yyyy-mm-dd>/job-*.arrow          # job spans, one segment per writer interval: each job's start, the unattributed usage its terminal sample states, and its end
+  <yyyy-mm-dd>/process-*.arrow      # process.run spans, one segment per writer interval
   <yyyy-mm-dd>/wait-*.arrow         # terminal waits: TIMEOUT, SILENT and PEER_LOST
   <yyyy-mm-dd>/wait-*.sample.txt    # retained supervisor or controller stacks on macOS SILENT
   gateway/<yyyy-mm-dd>/gateway-*.arrow   # gateway egress decisions, one event per decision
@@ -95,14 +95,14 @@ revision, byte counts, stream SHA-256 digests, and terminal-batch digest, never 
 raw payload. Nothing reads them for a decision. The sink is chosen when the project opens (`COWSHED_CONTINUITY_AUDIT`):
 `arrow` (the standalone default) group-commits records into sealed Arrow IPC segments under
 `/private/cowshed/store/telemetry/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow` — every record already queued
-joins one segment, up to 64, with no added wait; one fsync (and, when a record must survive power loss, `F_FULLFSYNC`
-plus a directory sync) covers the segment, and each record is acknowledged only after it; private mode, create-new
-rename, no lock and no global order because names are unique per writer, `order` being the segment's first record's;
-`off` writes nothing; and a runtime that supervises the controller injects its own sink through
-`ProjectRuntime::open_existing_with_audit`, routing the same records into its durable log instead of files. A sink that
-refuses a record is an `audit-sink` finding in `cowshed doctor`, never a failed act. Rollback and omission are therefore
-after-the-fact questions for the audit trail: cowshed performs no image rollback, so no decision waits on proving one
-did not happen.
+joins one segment, up to 64, with no added wait; a segment of only job admission and terminal records is not synced (the
+page cache is their durability), and one holding a record that must survive power loss takes `F_FULLFSYNC` plus a
+directory sync, each of its records acknowledged only after it; private mode, create-new rename, no lock and no global
+order because names are unique per writer, `order` being the segment's first record's; `off` writes nothing; and a
+runtime that supervises the controller injects its own sink through `ProjectRuntime::open_existing_with_audit`, routing
+the same records into its durable log instead of files. A sink that refuses a record is an `audit-sink` finding in
+`cowshed doctor`, never a failed act. Rollback and omission are therefore after-the-fact questions for the audit trail:
+cowshed performs no image rollback, so no decision waits on proving one did not happen.
 
 stdout and stderr share a configurable capture quota, default 1 GiB, whose accounting includes persisted and in-flight
 bytes. A crossing yields TERM/grace/KILL of the process group, pipe drain, and the explicit authoritative `output-limit`

@@ -8494,6 +8494,41 @@ async fn an_exec_and_its_terminal_seal_one_job_span_under_the_job_s_trace_contex
     );
 }
 
+/// A supervisor that retires has its span writer seal what it gathered before its retirement is
+/// answered, with no trace-health read asking: a retired supervisor's process exits waiting for
+/// nothing else (13_telemetry.md, "Job span segments").
+#[tokio::test]
+async fn a_retiring_supervisor_seals_its_gathered_job_rows_before_it_is_answered() {
+    let root = workspace_root(&temp_parent::scratch_parent(), "job-span-retire");
+    let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).unwrap();
+    let mut h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            telemetry_root: Some(telemetry.clone()),
+            ..config(&root)
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let ended = h.handle.wait(job).await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+    assert_job_spans(&telemetry, &[expected_span(&ended, "span-ok", "exited")]);
+}
+
 /// A span row the writer cannot seal is counted in the supervisor's trace health; the job it
 /// describes ends as it would have anyway.
 #[tokio::test]

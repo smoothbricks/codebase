@@ -290,6 +290,39 @@ async fn two_jobs_rows_seal_as_one_segment_in_queue_order_and_never_before_the_i
     );
 }
 
+/// The interval alone seals gathered job rows: with no reader asking, a job's start and end seal
+/// as one segment once the interval that the first of them armed has passed (13_telemetry.md,
+/// "Job span segments").
+#[tokio::test(start_paused = true)]
+async fn job_rows_seal_when_their_interval_ends_with_no_reader_asking() {
+    let telemetry = TempRoot::new("cowshed-job-span-interval");
+    let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
+    let only = job(1);
+    publisher.record(&only, JobSpanEdge::Start { host: None });
+    publisher.record(
+        &only,
+        JobSpanEdge::end(JobState::Exited, Some(&ExitStatus::Exited { code: 0 })),
+    );
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(SEAL_INTERVAL).await;
+    // The seal runs on the blocking pool. Waiting through the runtime's own timer lets it park
+    // and drive the writer; the paused clock moves only by these short steps, never another
+    // whole interval. Real time bounds the wait.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while sealed_segments(&telemetry, "job-").is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let segments = sealed_segments(&telemetry, "job-");
+    assert_eq!(
+        segments.len(),
+        1,
+        "the interval sealed the job's rows as one segment"
+    );
+    assert_eq!(segments[0].1.num_rows(), 2);
+}
+
 /// `info`'s job, running as job `job_id`.
 fn job(job_id: u64) -> JobInfo {
     JobInfo {

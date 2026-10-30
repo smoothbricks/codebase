@@ -3060,10 +3060,11 @@ fn allocate_record_sequence(lock: &RecordsLock<'_>) -> Result<u64, ArtifactError
         "record sequence allocation exhausted",
     ))?;
     // Publish before appending: a crash may leave a gap, but can never hand the allocation out
-    // twice. Both writes remain under the same cross-process lock. The counter is not synced of
-    // its own: the record's one sync follows it, the rename cannot tear, and a counter that power
-    // loss rolled back behind the log is advanced to the log's highest sequence at the next open
-    // (`ensure_record_sequence_counter`), before anything allocates.
+    // twice. Both writes remain under the same cross-process lock. The counter is not synced, as
+    // the record is not (11_shell.md, "Durability of a job's own records"): the rename cannot
+    // tear, and a counter that a host crash rolled back behind the log is advanced to the log's
+    // highest sequence at the next open (`ensure_record_sequence_counter`), before anything
+    // allocates.
     publish_record_sequence_counter(lock, next, Durability::Process)?;
     Ok(next)
 }
@@ -3197,13 +3198,6 @@ fn verify_private_file_mode(
     Ok(())
 }
 
-fn sync_parent_directory(path: &Path) -> Result<(), ArtifactError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| integrity(0, "protected path has no parent"))?;
-    sync_directory(parent)
-}
-
 fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
     cowshed_os::fsio::sync_directory(path).map_err(|error| io_error(path, error))
 }
@@ -3316,7 +3310,12 @@ fn append_framed_batch_under_lock(
     }
     let mut file = options.open(path).map_err(|error| io_error(path, error))?;
     if !existing {
-        sync_parent_directory(path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| integrity(0, "protected path has no parent"))?;
+        durability
+            .sync_new_entry(parent)
+            .map_err(|error| io_error(parent, error))?;
     }
     let metadata = file.metadata().map_err(|error| io_error(path, error))?;
     reject_hardlink(path, &metadata)?;

@@ -121,7 +121,7 @@ integrity failure, not a last-writer-wins repair.
 
 A configurable combined stdout-plus-stderr quota defaults to 1 GiB and counts persisted plus read-but-not-yet-persisted
 bytes. At the first crossing, the supervisor atomically stops accepting payload past the boundary, sends TERM to the
-whole process group, waits the grace period, sends KILL if necessary, drains both pipes to EOF, fsyncs, and records an
+whole process group, waits the grace period, sends KILL if necessary, drains both pipes to EOF, and records an
 authoritative `output-limit` terminal state with limit and crossing metadata. It never silently truncates output while
 allowing the job to continue.
 
