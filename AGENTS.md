@@ -120,9 +120,12 @@ is the host-installed CLI of `packages/cowshed`.
    migrating every caller in the same unit and deleting the old path. Fix the defects you touch; an unrelated code
    defect gets its evidence and an owner, without replacing your goal. Update the spec in the same unit, never by
    dropping a specified capability. Done means a production (non-test) call site plus a smoke run that exercises it;
-   otherwise wire it or delete it. _Enforced by: `tooling/wiring.ts`, which refuses each added item no production code
-   reaches (`@smoothbricks/codebase:wiring`, run by `tooling/land-host.sh` before the gate) and every unreached item of
-   a project tagged `wiring:enforced` (`wiring-lint`, in the root `lint`); review for the rest._
+   otherwise wire it or delete it. A `pub` Rust item only another repository calls is wired by its crate's
+   `[[package.metadata.wiring.external]]` declaration (item, consumer crate, calling path), which that repository's lint
+   checks against its own tree, and lands in the same round as that call. _Enforced by: `tooling/wiring.ts`, which
+   refuses each added item no production code reaches (`@smoothbricks/codebase:wiring`, run by `tooling/land-host.sh`
+   before the gate) and every unreached item of a project tagged `wiring:enforced` (`wiring-lint`, in the root `lint`);
+   review for the rest._
 8. **Byproducts.** When you choose a data structure, a storage or wire format, a log or trace shape, a crate boundary,
    or a pass over data, or when you are about to add a cache, an index, a copy or a second pass → among designs with the
    same performance, pick the one whose necessary work has the most other uses, then thread it through everywhere. That

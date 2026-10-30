@@ -12,6 +12,7 @@ import {
   type Added,
   addedItems,
   enforcedTree,
+  externalConsumers,
   judgeAdded,
   WIRING_TAG,
   type WiringChange,
@@ -193,6 +194,31 @@ expectFindings(
   { 'crates/app/src/main.rs': 'fn main() { core_lib::shared_helper(); core_lib::describe(); }\n' },
 );
 
+const EXTERNAL = (item: string, consumer: string): string =>
+  `\n[[package.metadata.wiring.external]]\nitem = "${item}"\nconsumer = "${consumer}"\npath = "crates/${consumer}/src/pass.rs"\n`;
+
+expectFindings(
+  'a pub fn its crate declares an external consumer for passes; a declared consumer that is a crate of this tree, or no declaration, is refused',
+  {
+    'crates/core/Cargo.toml': CRATE('core') + EXTERNAL('feed_bind', 'rete') + EXTERNAL('feed_end', 'app'),
+    'crates/core/src/lib.rs': 'pub fn feed_bind() {}\n\npub fn feed_end() {}\n\npub fn feed_work() {}\n',
+    'crates/app/Cargo.toml': CRATE('app'),
+    'crates/app/src/main.rs': 'fn main() {}\n',
+  },
+  ['pub feed_end@crates/core/src/lib.rs:3', 'pub feed_work@crates/core/src/lib.rs:5'],
+);
+
+try {
+  externalConsumers(
+    'crates/core/Cargo.toml',
+    `${CRATE('core')}\n[[package.metadata.wiring.external]]\nitem = "feed_bind"\n`,
+  );
+  fail('a declaration without its consumer and path is refused', 'a WiringInputError', 'no error');
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!message.includes('names no consumer'))
+    fail('a declaration without its consumer and path is refused', 'names no consumer', message);
+}
 // --- Wire ops -------------------------------------------------------------------------------------------------------
 
 expectFindings(

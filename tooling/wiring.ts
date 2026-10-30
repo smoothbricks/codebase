@@ -9,7 +9,23 @@
 //           (relative paths and workspace package `exports` maps, through re-exporting barrels), or its own module
 //           uses it. A same-name identifier elsewhere is not a caller. A published package's entry modules are roots.
 //   pub     a Rust `pub` item: a non-test, non-`#[cfg(test)]` occurrence in its own crate or in a crate that depends on
-//           it; a `#[napi]` item by its JavaScript name in non-test TS/JS; a `#[no_mangle]` item by any other file.
+//           it; a `#[napi]` item by its JavaScript name in non-test TS/JS; a `#[no_mangle]` item by any other file; or an
+//           external consumer its crate's `Cargo.toml` declares (`[[package.metadata.wiring.external]]`, below).
+//
+// An external consumer is a crate outside this repository that calls a `pub` item, such as a consumer repository's
+// layer over a library this one publishes. Its declaration names the item, the consumer crate and the path in the
+// consumer's repository that calls it:
+//
+//   [[package.metadata.wiring.external]]
+//   item = "feed_bind"
+//   consumer = "rete"
+//   path = "crates/rete/src/pass.rs"
+//
+// This repository cannot see that call, so the declaration is checked from both sides: here, the consumer must be no
+// crate of this tree (a caller here is wired here); in the consumer's repository, its own lint joins every declaration
+// naming one of its crates against its tree (through `cargo metadata`, which carries each dependency's
+// `package.metadata`) and fails when the named path no longer calls the item. Such an item lands in the same round as
+// its consumer's call.
 //   op      a `*_OP` wire-op constant: a send site, i.e. a non-test use that is not a dispatch (`case X:`, `X =>`,
 //           `[X]:`, a comparison), by its constant or its string value.
 //   verb    a CLI verb (a clap `Subcommand` variant, a typer `@….command`): a non-test file outside the CLI's own
@@ -495,6 +511,43 @@ function rebased(path: string, from: string, to: string): string | undefined {
 
 /** A manifest the verdict cannot read: the run fails naming it instead of judging a tree with a hole in it. */
 class WiringInputError extends Error {}
+
+/** A crate outside this tree that calls one of this crate's `pub` items, from `[[package.metadata.wiring.external]]`. */
+export interface ExternalConsumer {
+  readonly item: string;
+  readonly consumer: string;
+  readonly path: string;
+}
+
+/** The external consumers `manifest` (a `Cargo.toml`'s text) declares; a malformed declaration is refused, never skipped. */
+export function externalConsumers(manifestPath: string, manifest: string): ExternalConsumer[] {
+  if (!manifest.includes('wiring')) return [];
+  let parsed: unknown;
+  try {
+    parsed = Bun.TOML.parse(manifest);
+  } catch (cause) {
+    throw new WiringInputError(
+      `${manifestPath} cannot be parsed: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+  }
+  const at = (value: unknown, key: string): unknown =>
+    typeof value === 'object' && value !== null ? Reflect.get(value, key) : undefined;
+  const declared = at(at(at(at(parsed, 'package'), 'metadata'), 'wiring'), 'external');
+  if (declared === undefined) return [];
+  if (!Array.isArray(declared))
+    throw new WiringInputError(`${manifestPath}: package.metadata.wiring.external is not an array of tables`);
+  return declared.map((entry: unknown, index) => {
+    const field = (key: string): string => {
+      const value = at(entry, key);
+      if (typeof value !== 'string' || value === '')
+        throw new WiringInputError(
+          `${manifestPath}: package.metadata.wiring.external[${index}] names no ${key} (item, consumer and path are required)`,
+        );
+      return value;
+    };
+    return { item: field('item'), consumer: field('consumer'), path: field('path') };
+  });
+}
 
 /** A production manifest's JSON object (package.json, project.json, executors.json). */
 function parseManifest(path: string, text: string): Record<string, unknown> {
@@ -1430,7 +1483,25 @@ class Judge {
     // An exported symbol's callers name its symbol, in any language, outside its own file.
     if (abi !== undefined && this.#production(this.#tree.filesHolding(abi, true)).some((file) => file !== path))
       return true;
-    return this.#rustUsed(path, item);
+    return this.#rustUsed(path, item) || this.#externallyConsumed(path, name);
+  }
+
+  /** Whether the item's crate declares a consumer outside this tree that calls it (`[[package.metadata.wiring.external]]`). */
+  #externallyConsumed(path: string, name: string): boolean {
+    const crate = crateOf(path, this.#tree);
+    if (crate === undefined) return false;
+    const manifest = crate.dir === '.' ? 'Cargo.toml' : `${crate.dir}/Cargo.toml`;
+    const declared = externalConsumers(manifest, this.#tree.textOf(manifest) ?? '').filter((d) => d.item === name);
+    if (declared.length === 0) return false;
+    const local = new Set(
+      this.#tree.files.flatMap((file) => {
+        if (posix.basename(file) !== 'Cargo.toml') return [];
+        const package_ = /\[package\][^[]*?\bname\s*=\s*"([^"]+)"/s.exec(this.#tree.textOf(file) ?? '')?.[1];
+        return package_ === undefined ? [] : [package_];
+      }),
+    );
+    // A consumer of this tree is wired here or not at all: its declaration vouches for nothing.
+    return declared.some((d) => !local.has(d.consumer));
   }
 
   /** A send site of a wire op: a non-test use of its constant or its string value that is not a dispatch. */
