@@ -140,6 +140,50 @@ diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/
          worker = created;
          const retire = () => {
              if (worker === created)
+diff --git a/lib/plugin/internal/source/inspectPluginBuildLock.js b/lib/plugin/internal/source/inspectPluginBuildLock.js
+--- a/lib/plugin/internal/source/inspectPluginBuildLock.js
++++ b/lib/plugin/internal/source/inspectPluginBuildLock.js
+@@ -65,9 +65,16 @@
+ const PLUGIN_BUILD_LOCK_OBSERVER = node_crypto_1.default.randomBytes(16).toString("hex");
+ function inspectV3PluginBuildLock(lockDir) {
+     const generationDir = node_path_1.default.join(lockDir, PluginBuildLockProtocol_1.PluginBuildLockProtocol.PLUGIN_BUILD_LOCK_CURRENT_DIR);
++    // `current` changes only by whole-directory renames: a holder retires it
++    // onto its tombstone, and the next holder publishes a directory that
++    // already holds its generation. A read that finds no valid generation
++    // proves the lock malformed only when the same directory was `current`
++    // before and after it. Otherwise the read straddled a handoff of the key,
++    // and a handoff is a release: the caller observes the key again.
++    const observed = pluginBuildLockDirectoryIdentity(generationDir);
+     const generation = readPluginBuildLockGeneration(generationDir);
+     if (generation === null) {
+-        if (pluginBuildLockPathMissing(generationDir)) {
++        if (observed === null || observed !== pluginBuildLockDirectoryIdentity(generationDir)) {
+             return { state: "released" };
+         }
+         throw new Error(`ttsc plugin build lock has no valid ${PluginBuildLockProtocol_1.PluginBuildLockProtocol.PLUGIN_BUILD_LOCK_GENERATION_FILE}: ${generationDir}`);
+@@ -269,6 +276,22 @@
+         return null;
+     }
+ }
++/**
++ * The device and inode of a lock directory, or null when a lookup proves it
++ * absent. A permission or sharing failure proves nothing and propagates.
++ */
++function pluginBuildLockDirectoryIdentity(directory) {
++    try {
++        const stat = node_fs_1.default.statSync(directory, { bigint: true });
++        return `${stat.dev}:${stat.ino}`;
++    }
++    catch (error) {
++        if (PluginBuildLockProtocol_1.PluginBuildLockProtocol.isMissingPathError(error)) {
++            return null;
++        }
++        throw error;
++    }
++}
+ /**
+  * Whether a path lookup proves absence. Permission and sharing failures are
+  * inconclusive, never evidence of a released or old abandoned generation.
 diff --git a/lib/plugin/internal/source/waitForPluginBinary.js b/lib/plugin/internal/source/waitForPluginBinary.js
 --- a/lib/plugin/internal/source/waitForPluginBinary.js
 +++ b/lib/plugin/internal/source/waitForPluginBinary.js

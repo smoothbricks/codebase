@@ -391,7 +391,11 @@ The patch repairs import-extension handling during the compiler's internal force
 `--noEmit` still writes no output. It also makes a source-plugin build lock waiter inspect the holder before it reports
 a published binary: a process that finds the binary still takes the cache key's lock to register as its reader, so a
 holder killed while it held that lock is proven gone and retired instead of outwaited for ttsc's 600 s admission budget,
-and a live or unprovable holder is never retired. The packaged managed asset is the source, so clean managed installs
+and a live or unprovable holder is never retired. A lock inspection whose read of `current/generation` straddles a
+handoff of the key reports the key released instead of throwing "ttsc plugin build lock has no valid generation": after
+a publication every reader takes and frees the key in turn, so the read can land after one reader retired `current/` and
+before the next published its own. Only the same `current/` directory, by device and inode, before and after a read that
+found no valid generation is refused as malformed. The packaged managed asset is the source, so clean managed installs
 receive the same repairs without a compiler fork or edits to the dependency cache. The registration applies only to that
 exact compiler version; the repository's lockfile continues to own its compiler pin.
 
