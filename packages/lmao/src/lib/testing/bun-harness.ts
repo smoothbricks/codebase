@@ -10,8 +10,9 @@
  * - initTraceTestRun() in preload sets up a lifecycle tracer pipeline
  * - mock.module('bun:test', ...) in preload patches it()/test() with trace spans
  * - One root trace per test run (tracer.trace('test-run', ...))
- * - Each it()/test() creates a child span of the root (rootCtx.span(name, fn))
- * - describe() is wrapped to track nesting — path written to `describe` schema column
+ * - Each it()/test() creates a child span of the root (rootCtx.span(name, fn)); an it.each()/test.each() row runs in
+ *   one too, named by its label template, because Bun formats each row's title itself
+ * - describe() and describe.each() are wrapped to track nesting — path written to `describe` schema column
  * - After all tests: flush tracer outputs (SQLite, stdio, or both)
  *
  * mock.module MUST be called from the preload file itself — bun only intercepts
@@ -504,14 +505,7 @@ function createTestTracerInstance<
         throw new TypeError('describe callback is required');
       }
 
-      origDescribe(nameOrFn, () => {
-        describeStack.push(String(nameOrFn));
-        try {
-          describeFn();
-        } finally {
-          describeStack.pop();
-        }
-      });
+      origDescribe(nameOrFn, () => inDescribe(describeStack, String(nameOrFn), describeFn));
     }
 
     const wrappedDescribe = Object.assign(wrappedDescribeBase, {
@@ -523,10 +517,9 @@ function createTestTracerInstance<
       if: origDescribe.if,
       skipIf: origDescribe.skipIf,
       todoIf: origDescribe.todoIf,
-      each: origDescribe.each,
+      each: wrapEach(origDescribe.each, origDescribe, (label) => (row) => inDescribe(describeStack, label, row)),
     });
     assignOnly(wrappedDescribe, origDescribe, origDescribe);
-    assignOptionalBoundTestFunction(wrappedDescribe, 'each', origDescribe, origDescribe);
     wrappedDescribe.skipIf = (condition: boolean) => (condition ? origDescribe.skip : wrappedDescribe);
     wrappedDescribe.if = (condition: boolean) => (condition ? wrappedDescribe : origDescribe.skip);
 
@@ -543,7 +536,7 @@ function createTestTracerInstance<
       fnOrOptions: TestBody | DoneTestBody | BunTestOptionsGiven,
       optionsOrFn?: BunTestOptions | TestBody | DoneTestBody,
     ): void {
-      const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
+      const describePath = describePathOf(describeStack);
       if (typeof fnOrOptions === 'function') {
         if (typeof optionsOrFn === 'function') {
           throw new TypeError(`it("${name}"): options must follow the test function, not a second function`);
@@ -570,10 +563,12 @@ function createTestTracerInstance<
       failingIf: origIt.failingIf,
       concurrentIf: origIt.concurrentIf,
       serialIf: origIt.serialIf,
-      each: origIt.each,
+      each: wrapEach(origIt.each, origIt, (label) => {
+        const describePath = describePathOf(describeStack);
+        return (row) => runTracedTest(label, row, describePath);
+      }),
     });
     assignOnly(wrappedIt, origIt, origIt);
-    assignOptionalBoundTestFunction(wrappedIt, 'each', origIt, origIt);
     wrappedIt.skipIf = (condition: boolean) => (condition ? origIt.skip : wrappedIt);
     wrappedIt.if = (condition: boolean) => (condition ? wrappedIt : origIt.skip);
 
@@ -783,14 +778,7 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
 
   // describe() callbacks run synchronously (just registering tests)
   function wrappedDescribe(name: string, fn: () => void) {
-    return origDescribe(name, () => {
-      describeStack.push(name);
-      try {
-        fn();
-      } finally {
-        describeStack.pop();
-      }
-    });
+    return origDescribe(name, () => inDescribe(describeStack, name, fn));
   }
   // skipIf/if must return wrappedDescribe (not origDescribe) when the suite should run,
   // so that describe-path tracking stays active for nested it() calls.
@@ -799,33 +787,32 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
     todo: origDescribe.todo,
     skipIf: (condition: boolean) => (condition ? origDescribe.skip : wrappedDescribe),
     if: (condition: boolean) => (condition ? wrappedDescribe : origDescribe.skip),
+    each: wrapEach(origDescribe.each, origDescribe, (label) => (row) => inDescribe(describeStack, label, row)),
   });
   assignOnly(wrappedDescribe, origDescribe, origDescribe);
-  assignOptionalBoundTestFunction(wrappedDescribe, 'each', origDescribe, origDescribe);
+
+  function runTracedTest(name: string, fn: TestBody, describePath: string | null) {
+    return rootCtx.span(name, async (ctx) => {
+      writeDescribeTag(ctx.tag, describePath);
+      try {
+        await als.run(ctx, fn);
+        return ctx.ok(undefined); // pass → span-ok
+      } catch (error) {
+        if (isExpectError(error)) {
+          ctx.err(error); // record assertion failure in span
+          throw error; // re-throw so bun:test sees the failure
+        }
+        throw error; // other throw → span-exception
+      }
+    });
+  }
 
   function wrappedIt(name: string, fn: TestBody, options?: BunTestOptions) {
     // Capture describe path at registration time (synchronous)
-    const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
+    const describePath = describePathOf(describeStack);
     // `options` carries the per-test timeout/retry/repeats. Dropping it silently demotes an
     // explicit `it(name, fn, 300_000)` to the runner's ambient testTimeout.
-    return origIt(
-      name,
-      () =>
-        rootCtx.span(name, async (ctx) => {
-          writeDescribeTag(ctx.tag, describePath);
-          try {
-            await als.run(ctx, fn);
-            return ctx.ok(undefined); // pass → span-ok
-          } catch (error) {
-            if (isExpectError(error)) {
-              ctx.err(error); // record assertion failure in span
-              throw error; // re-throw so bun:test sees the failure
-            }
-            throw error; // other throw → span-exception
-          }
-        }),
-      options,
-    );
+    return origIt(name, () => runTracedTest(name, fn, describePath), options);
   }
   // skipIf/if must return wrappedIt (not origIt) when the test should run,
   // so the ALS context is set up and useTestSpan() works inside the test body.
@@ -834,9 +821,12 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
     todo: origIt.todo,
     skipIf: (condition: boolean) => (condition ? origIt.skip : wrappedIt),
     if: (condition: boolean) => (condition ? wrappedIt : origIt.skip),
+    each: wrapEach(origIt.each, origIt, (label) => {
+      const describePath = describePathOf(describeStack);
+      return (row) => runTracedTest(label, row, describePath);
+    }),
   });
   assignOnly(wrappedIt, origIt, origIt);
-  assignOptionalBoundTestFunction(wrappedIt, 'each', origIt, origIt);
 
   return {
     ...bunTestModule,
@@ -910,6 +900,59 @@ function assignOptionalBoundTestFunction(target: object, key: string, source: ob
   const value = Reflect.get(source, key);
   if (typeof value === 'function') {
     Reflect.set(target, key, value.bind(thisArg));
+  }
+}
+
+/** Wraps one `each` row; `label` is the row's label template, passed when the row registers. */
+type EachRowWrapper = (label: string) => (row: () => unknown) => unknown;
+
+/**
+ * Bun's native `each` formats every row's title and registers the row with the native runner, which never re-enters a
+ * wrapped `it` or `describe`. Wrap the row callback instead, as the vitest harness does: Bun keeps its own title
+ * formatting, and `wrapRow` runs each row inside the harness's span or describe path, named by the label template.
+ */
+function wrapEach<F extends object>(each: F, runner: object, wrapRow: EachRowWrapper): F {
+  return new Proxy(each, {
+    apply(factory, _receiver: unknown, table: unknown[]) {
+      if (typeof factory !== 'function') throw new TypeError('bun:test each is not callable');
+      const registration: unknown = Reflect.apply(factory, runner, table);
+      if (typeof registration !== 'function') {
+        throw new TypeError('bun:test each(table) returned no registration function');
+      }
+      return new Proxy(registration, {
+        apply(register, receiver: unknown, args: unknown[]) {
+          // Bun takes `(label, fn, options?)` or the options-first `(label, options, fn)`.
+          const index = typeof args[1] === 'function' ? 1 : 2;
+          const body = args[index];
+          if (typeof body === 'function') {
+            const run = wrapRow(String(args[0]));
+            // A plain function, not a Proxy: Bun refuses a Proxy here ("test.each() expects a function as the second
+            // argument"). It keeps the body's `length`, which Bun reads to decide whether to pass `done`.
+            const row = function (this: unknown, ...values: unknown[]): unknown {
+              return run(() => Reflect.apply(body, this, values));
+            };
+            Object.defineProperty(row, 'length', { value: body.length });
+            args[index] = row;
+          }
+          return Reflect.apply(register, receiver, args);
+        },
+      });
+    },
+  });
+}
+
+/** The ` > `-joined describe path a test registers under, or null at the top level. */
+function describePathOf(describeStack: readonly string[]): string | null {
+  return describeStack.length > 0 ? describeStack.join(' > ') : null;
+}
+
+/** Runs a describe body with its label on the describe stack, so the tests it registers record the path. */
+function inDescribe<R>(describeStack: string[], label: string, body: () => R): R {
+  describeStack.push(label);
+  try {
+    return body();
+  } finally {
+    describeStack.pop();
   }
 }
 

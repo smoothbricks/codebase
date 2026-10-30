@@ -260,8 +260,11 @@ describe('order processing', () => {
 
 Setup is wiring-only: a preload/setup file calls
 `initTraceTestRun(opContext, { sqlite: { dbPath: DEFAULT_TRACE_DB_PATH } })` and installs a transparent mock so tests
-import `describe`/`it`/`expect` from their native runner as usual. Bun and Vitest are both supported
-(`@smoothbricks/lmao/testing/bun` · `@smoothbricks/lmao/testing/vitest`). `DEFAULT_TRACE_DB_PATH` resolves to
+import `describe`/`it`/`expect` from their native runner as usual. Every `it`/`test` call and every
+`it.each`/`test.each` row runs in its own child span of the run's root trace, named by the label it registered. A row's
+span carries the label template: the runner formats each row's title from the row's values itself, and the harness never
+re-encodes them. `describe` and `describe.each` labels form the `describe` column's path. Bun and Vitest are both
+supported (`@smoothbricks/lmao/testing/bun` · `@smoothbricks/lmao/testing/vitest`). `DEFAULT_TRACE_DB_PATH` resolves to
 `.cache/lmao/trace-results.db` under the package or workspace root. Project walkers and file watchers skip `.cache`,
 which the sink needs because a SQLite database churns its directory's membership through journal sidecars and a compiler
 watching that directory would call its own transform generation incoherent. And `.cache/lmao` holds only the sink, its

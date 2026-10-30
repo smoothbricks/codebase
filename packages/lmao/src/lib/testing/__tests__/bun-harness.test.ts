@@ -1,9 +1,11 @@
+import * as bunTest from 'bun:test';
 import { describe, expect, it } from 'bun:test';
 import { defineOpContext } from '../../defineOpContext.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import { type BunTestModuleShape, makeBunTestSuiteTracer, makeTestTracer } from '../bun-harness.js';
+import { querySpan } from '../queryable-span.js';
 
 type BunTestModuleLike = BunTestModuleShape;
 
@@ -156,5 +158,41 @@ describe('bun harness per-test options forwarding', () => {
       { name: 'options before the function', options: { timeout: 125 }, optionsFirst: true },
     ]);
     expect(ranOptionsFirst).toBe(true);
+  });
+});
+
+// Rows register through the real bun:test `each`, which formats every row's title itself and never re-enters a wrapped
+// `it`. Bigint rows stay exact: the harness hands the runner each row untouched and names the row's span by the label
+// template.
+describe('bun harness each rows', () => {
+  const tracer = makeTestTracer(baseBinding);
+  tracer.setup();
+  const wrapped = tracer.createBunTestMock(bunTest);
+
+  wrapped.it.each([[1n, 9_007_199_254_740_993n]])('tuple row %p and %p', async (small, beyondF64) => {
+    const span = tracer.useTestSpan();
+    await Promise.resolve();
+    expect(tracer.useTestSpan()).toBe(span);
+    expect(querySpan(span.buffer).name).toBe('tuple row %p and %p');
+    expect([small, beyondF64]).toEqual([1n, 9_007_199_254_740_993n]);
+  });
+
+  wrapped.test.each([{ until: -9_223_372_036_854_775_807n }])('object row $until', ({ until }) => {
+    expect(querySpan(tracer.useTestSpan().buffer).name).toBe('object row $until');
+    expect(until).toBe(-9_223_372_036_854_775_807n);
+  });
+
+  // Bun passes `done` only when the row callback declares more parameters than the row has values.
+  wrapped.it.each([[1n]])('done row %p', (value, done) => {
+    expect(querySpan(tracer.useTestSpan().buffer).name).toBe('done row %p');
+    expect(value).toBe(1n);
+    done();
+  });
+
+  wrapped.describe.each([['alpha']])('suite %s', (label) => {
+    wrapped.it('records the row suite in its describe path', () => {
+      expect(tracer.useTestSpan().buffer.describe_values[0]).toBe('suite %s');
+      expect(label).toBe('alpha');
+    });
   });
 });
