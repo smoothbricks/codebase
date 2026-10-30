@@ -325,7 +325,16 @@ where
             turn,
             declaration.turn(),
             "the sync with the push remote",
-            sync_with_push_remote(&*service, main, declaration, workspace, branch, output),
+            // Boxed: its remote reads inline otherwise into every dispatch future, and a debug test
+            // thread's stack overflowed on the larger one.
+            Box::pin(sync_with_push_remote(
+                &*service,
+                main,
+                declaration,
+                workspace,
+                branch,
+                output,
+            )),
         )
         .await?;
         let (base, head) = holding(
