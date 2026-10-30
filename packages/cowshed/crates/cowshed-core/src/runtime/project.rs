@@ -5867,7 +5867,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             ));
         }
         // A retire ends every land, and it would delete what a refresh kept aside with the image;
-        // refused here, before the check, as `rm` refuses it, never after main moved.
+        // refused here, before the check, as `rm` refuses it; read again after the check below.
         let kept = kept_build_state(&source_mount)?
             .into_iter()
             .map(|kept| kept.location)
@@ -11067,8 +11067,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
                             .await?;
                         // An unpublished clone never admitted a job, so no refresh of its own kept
-                        // anything: an entry here is its source's, copied before the mint's "kept"
-                        // step dropped it, and the source still holds it.
+                        // anything: an entry here is a copy its source had, made before the mint's
+                        // "kept" step dropped it. The source's own entries passed its kept gate or
+                        // were abandoned with it, so the copy guards nothing.
                         let last = NativeRemovalGitFence {
                             kept: Vec::new(),
                             ..last
@@ -14341,8 +14342,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                                 .join(crate::build_volume::kept::KEPT_DIRECTORY)
                                                 .display()
                                         ),
-                                        "repair that directory in the new workspace, then retry \
-                                         the fork",
+                                        format!(
+                                            "repair {} in the source, a real directory under a \
+                                             real .cowshed, then retry the fork",
+                                            source_mount
+                                                .join(crate::build_volume::kept::KEPT_DIRECTORY)
+                                                .display()
+                                        ),
                                     )
                                 })
                         })
@@ -16452,6 +16458,20 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             }
             LandPlan::Ungated => CheckedLandChecks::default(),
         };
+        // The check's own admission refreshed the source, which moves aside any declared
+        // directory the workspace's last job left: read the kept directory again before the
+        // fast-forward, and refuse as the fence does, while main has not moved.
+        let kept = kept_build_state(&source_mount)?
+            .into_iter()
+            .map(|kept| kept.location)
+            .collect::<Vec<_>>();
+        if !kept.is_empty() {
+            return Err(kept_build_state_refusal(
+                &workspace,
+                &kept,
+                &format!("cowshed land {workspace}"),
+            ));
+        }
 
         // Land has no branch-name contract with the workspace: it delivers whatever branch the
         // workspace has checked out, whether an agent named it `cowshed/<ws>`, `wt/<ws>`, or
@@ -20098,6 +20118,52 @@ mod removal_refusal_tests {
                 }
             }
         }
+        // Main has no --abandon to name, and doctor reports each kept entry with the command that
+        // deletes it.
+        let entry = PathBuf::from("/mnt/main/.cowshed/kept/2026-10-30T19:41:10Z-0123abcd-up");
+        let refused = kept_build_state_refusal(
+            &WorkspaceName::main(),
+            std::slice::from_ref(&entry),
+            "cowshed rm main",
+        );
+        assert!(
+            refused.hint.ends_with("main has no override"),
+            "{}",
+            refused.hint
+        );
+        let refused = kept_build_state_refusal(&workspace(), std::slice::from_ref(&entry), "x");
+        assert!(
+            refused.hint.contains("cowshed rm raven --abandon"),
+            "{}",
+            refused.hint
+        );
+        let finding = kept_build_state_finding(
+            &workspace(),
+            crate::build_volume::kept::Kept {
+                location: entry.clone(),
+                moved: Some(crate::build_volume::kept::Moved {
+                    path: PathBuf::from("up"),
+                    at: "2026-10-30T19:41:10Z".to_owned(),
+                }),
+            },
+        );
+        assert_eq!(
+            (finding.code.as_str(), finding.path.as_ref()),
+            ("build-state-kept", Some(&entry))
+        );
+        assert!(
+            finding.message.contains("moved up aside")
+                && finding.message.contains(&entry.display().to_string()),
+            "{}",
+            finding.message
+        );
+        assert_eq!(
+            finding.hint,
+            format!(
+                "take what you need from it, then delete it: {}",
+                crate::build_volume::kept::removal(&entry)
+            )
+        );
         // Uncommitted work on landed commits is still work: an abandonment bundles it, and a clean
         // landed workspace has nothing to bundle.
         assert_eq!(
@@ -24246,10 +24312,17 @@ fn kept_build_state_refusal(
             "workspace {workspace} keeps declared build state a refresh moved aside intact, which \
              retiring it would delete: {named}"
         ),
-        format!(
-            "take what you need from each named directory, delete it with rm -rf, then retry: \
-             {retry}; only cowshed rm {workspace} --abandon retires {workspace} with them"
-        ),
+        if workspace.is_main() {
+            format!(
+                "take what you need from each named directory, delete it with rm -rf, then retry: \
+                 {retry}; main has no override"
+            )
+        } else {
+            format!(
+                "take what you need from each named directory, delete it with rm -rf, then retry: \
+                 {retry}; only cowshed rm {workspace} --abandon retires {workspace} with them"
+            )
+        },
     )
 }
 #[cfg(target_os = "macos")]

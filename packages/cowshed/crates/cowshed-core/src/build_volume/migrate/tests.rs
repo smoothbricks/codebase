@@ -1231,6 +1231,26 @@ fn the_decision_deletes_nothing_cowshed_cannot_rebuild() {
     }
 }
 
+/// A failure after a declared directory was kept returns no findings, so its error names where
+/// each kept directory went.
+#[test]
+fn a_failure_after_a_directory_was_kept_names_it() {
+    let adopted = Adopted {
+        discarded: Vec::new(),
+        kept: vec![KeptBuildStateFinding {
+            path: PathBuf::from("vendor/upstream"),
+            kept: PathBuf::from("/c/.cowshed/kept/2026-10-30T19:41:10Z-0123abcd-vendor%2Fupstream"),
+            origin: DiscardOrigin::Predated,
+        }],
+    };
+    let error = naming_kept(&adopted, CowshedError::conflict("the link failed", "retry"));
+    assert_eq!(
+        error.message,
+        "the link failed; vendor/upstream was already moved aside intact to \
+         /c/.cowshed/kept/2026-10-30T19:41:10Z-0123abcd-vendor%2Fupstream"
+    );
+    assert_eq!(error.hint, "retry");
+}
 /// A declared directory seen empty and written into before the refresh removes it: `rmdir(2)`
 /// fails, the refresh refuses as a conflict, and the write is where the tool put it.
 #[test]

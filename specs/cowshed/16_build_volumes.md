@@ -279,21 +279,22 @@ A capability's directory is its tool's own cache, which the next build rebuilds:
 migration, and keeping it would hold a Cargo target directory's tens of GiB that nobody asked for. A declared directory
 is not cowshed's to judge (Declared build state). `rmdir(2)` removes a declared directory only while it is still empty,
 so an entry a tool writes after the refresh looked fails the refresh as a conflict instead of being lost. It runs before
-any rename, so that conflict leaves every other path as it was.
+any rename, so that conflict moves no directory with entries aside; an empty declared directory removed before it stays
+absent until a tool makes it again.
 
 A kept directory is renamed in one `rename(2)`, on the same volume and never copied, to
 `<checkout>/.cowshed/kept/<UTC time>-<id>-<path>`, with `%` and `/` in the path percent-encoded, and the link then takes
 the path. The name is the whole record: when the directory was moved, and from where. No refresh and no `gc` deletes a
 kept directory, and a workspace's retirement would delete it with the image, so `cowshed rm` and land's dirt fence
-refuse a workspace while `.cowshed/kept` has entries, naming them, exactly as they refuse uncommitted work, and only
-`--abandon` overrides that (02_workspaces.md). It stays until the operator, having taken what they need, deletes it. The
-refresh says so on stderr, naming the path, the kept location and the `rm -rf` that deletes it, and `setup` repeats each
-one in its report on stderr. `cowshed doctor` reports each one as `build-state-kept` for as long as it exists, so a
-notice missed among a refresh's progress lines loses nothing and is said again. The notice stays off stdout, which
-06_cli.md keeps for the command's result: `exec`'s stdout is the child's bytes. A failure after a directory was kept
-names it in its error, since such a refresh returns no findings. A fork drops its copy of its source's `.cowshed/kept`
-(Fork step 4): the source still holds every entry, and a copy would make the fork's own `rm` and land refuse for state
-that is not the fork's.
+refuse a workspace while `.cowshed/kept` has entries, naming them, exactly as they refuse uncommitted work, and only a
+session's `rm --abandon` overrides that; main has no override (02_workspaces.md). It stays until the operator, having
+taken what they need, deletes it. The refresh says so on stderr, naming the path, the kept location and the `rm -rf`
+that deletes it, and `setup` repeats each one in its report on stderr. `cowshed doctor` reports each one as
+`build-state-kept` for as long as it exists, so a notice missed among a refresh's progress lines loses nothing and is
+said again. The notice stays off stdout, which 06_cli.md keeps for the command's result: `exec`'s stdout is the child's
+bytes. A failure after a directory was kept names it in its error, since such a refresh returns no findings. A fork
+drops its copy of its source's `.cowshed/kept` (Fork step 4): the source still holds every entry, and a copy would make
+the fork's own `rm` and land refuse for state that is not the fork's.
 
 **Why move aside rather than refuse.** A refusal is the better answer where an operator is waiting. Here, often none is.
 A refresh runs before every job is admitted, gates and test runs included. It also runs after a land's fast-forward, at

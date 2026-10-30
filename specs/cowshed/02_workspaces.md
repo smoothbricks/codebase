@@ -1027,7 +1027,8 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
    refuse the retire after main had already moved. Refuse the same way, naming each, a workspace whose `.cowshed/kept`
    holds a directory a build-state refresh moved aside intact (16_build_volumes.md, "What a refresh does at each path"):
    the retire that ends the land would delete it with the image, and nothing else would. Its owner takes what they need,
-   deletes it and lands again; `land` has no override.
+   deletes it and lands again; `land` has no override. A gated land reads it again after the check and before the
+   fast-forward: the check's admission refreshes the workspace, which can keep a directory its last job left.
 2. **Validate**: run the check _inside the sandbox_ — `--check <cmd>` if given, else no validation with one honest
    `cowshed:` stderr line saying so. Non-zero check → exit 4, workspace intact, output captured as a job (11_shell.md)
    for diagnosis. The check is an ordinary sandboxed exec, admitted at gate class as the land's own work (05_gateway.md,

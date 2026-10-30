@@ -6,8 +6,9 @@
 //! one deleted an agent's edit inside it (a `.bun-pin` worktree in a downstream repository's
 //! shed). So a refresh that links a declared path where a directory with entries stands renames
 //! that directory, in one `rename(2)` on the same volume, into [`KEPT_DIRECTORY`]: cowshed's
-//! excluded namespace, never the source tree or its status. Nothing of cowshed's deletes it,
-//! neither a refresh nor `gc`.
+//! excluded namespace, never the source tree or its status. No refresh and no `gc` deletes it,
+//! and `rm` and land refuse its workspace while it is there; only `rm --abandon` takes it, with
+//! the image. A fork drops its copy ([`release_inherited`]).
 //!
 //! Each entry's name is its whole record: the UTC second it was moved, a random id, and the
 //! checkout-relative path it came from, with `%` and `/` percent-encoded, so the name decodes

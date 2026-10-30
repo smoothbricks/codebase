@@ -3975,6 +3975,7 @@ async fn directory_a_fold_of_a_unit_keeping_build_state_refuses_until_it_is_gone
 
     for args in [
         &["--json", "land", "unit", "--into", "lane", "--ungated"][..],
+        &["--json", "land", "unit", "--into", "lane"],
         &["--json", "rm", "unit"],
     ] {
         let (result, _, stderr) = run(&mut service, args.iter().copied()).await;

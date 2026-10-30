@@ -266,11 +266,11 @@ linked the path onto the build volume. Cowshed cannot rebuild what a declared di
 directory, intact, to `<checkout>/.cowshed/kept/<UTC time>-<id>-<path>` (the path with `%` written as `%25` and `/` as
 `%2F`) and said so on stderr. The usual cause is a tool that made the directory before the workspace had its link, such
 as a script that clones a patch worktree. No refresh and no `gc` deletes a kept directory, and `cowshed rm` and `land`
-refuse the workspace while it is there, naming it; only `cowshed rm <ws> --abandon` retires the workspace with it. A
-fork drops its copy, since the source still holds it. Take what you need from it (an uncommitted edit, a branch), re-run
-whatever made the directory so that it fills the link, then `rm -rf` the kept directory; doctor reports it until it is
-gone. To fill a declared path on the volume from the start, make the empty directory, run `cowshed exec <ws> -- true` so
-the refresh links it, and only then fill it.
+refuse the workspace while it is there, naming it; only `cowshed rm <ws> --abandon` retires a session with it, and main
+has no override. A fork drops its copy, since the source still holds it. Take what you need from it (an uncommitted
+edit, a branch), re-run whatever made the directory so that it fills the link, then `rm -rf` the kept directory; doctor
+reports it until it is gone. To fill a declared path on the volume from the start, make the empty directory, run
+`cowshed exec <ws> -- true` so the refresh links it, and only then fill it.
 
 ## Parallel test fixture collisions
 
