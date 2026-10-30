@@ -123,6 +123,15 @@ bytes on each entry. Both forms keep their existing behavior; neither is a fixed
 packages and does not apply developer links. Managed-file drift checks remain independent: pinning changes their input,
 not which differences they accept.
 
+A developer link selects the package's whole install surface, its bins included. Bun links every installed package's
+declared bins into its tree's `node_modules/.bin` through the package's alias, and a link that replaces the package
+would otherwise leave the installed version's bin set there: missing what the linked version added, dangling what it
+dropped. After links apply (shell entry's `smoo:developer-links`, the root postinstall) and after every install smoo
+runs, each readable live link's declared bins point through its alias as an install of the linked version would point
+them, and the entries that point into that alias for bins it no longer declares are removed; another package's entries
+are never touched. Measured on a consumer whose link outran its pin: `.bin/smoo-nx-publish` did not exist, so its land
+gate's accepted-cache publication exited 127 on every land.
+
 A live link runs whatever its checkout last built, so linking one whose build does not describe its sources refuses,
 names each such build unit and its cached Nx rebuild, and leaves every alias unchanged. Packages resolved from Bun's
 store are not judged. A producer writes `.build-inputs.json` into each output directory it owns: the SHA-256 of every

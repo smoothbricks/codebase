@@ -24,6 +24,14 @@
  * `globalStore`, each .bun entry is itself a link into the shared install
  * cache, outside every checkout.
  *
+ * A link brings its package's bins. Bun links each installed package's
+ * declared bins into its tree's node_modules/.bin through the alias, and a
+ * link leaves the .bin the install made: the installed version's bin set.
+ * After links apply and after every install, each live link's declared bins
+ * point through its alias as an install of the linked version would, and the
+ * entries into that alias for bins it no longer declares are removed
+ * (refreshDeveloperBins).
+ *
  * Unlinking a package means removing its link, and the next install puts the
  * lockfile's version there. A dangling link is removed before the install,
  * with a warning. A link whose target this process may not read (EPERM in a
@@ -231,6 +239,7 @@ export async function keepDeveloperLinks<T>(
     if (succeeded && recorded.size > 0 && process.env.GITHUB_ACTIONS !== 'true') {
       applyDeclaredLinks(root, await planDeclaredLinks(root));
     }
+    refreshDeveloperBins(root);
     if (options !== undefined || (succeeded && undeclared.size > 0)) {
       reportDeveloperLinks(root);
     } else {
@@ -272,6 +281,81 @@ export function unreadableDeveloperLinks(root: string): string[] {
 /** The package a link stands for in its tree: `name` or `@scope/name`. */
 function packageName(link: { readonly path: string }): string {
   return link.path.slice(link.path.lastIndexOf('node_modules/') + 'node_modules/'.length);
+}
+
+/** The node_modules tree a link sits directly in, relative to the root: its path up to its last node_modules. */
+function linkTree(link: { readonly path: string }): string {
+  return link.path.slice(0, link.path.lastIndexOf('node_modules/') + 'node_modules'.length);
+}
+
+/**
+ * The bins a manifest declares, by name to the package-relative file: `bin` as an object, or as one string named
+ * for the package without its scope, as an install reads it. A name that would leave .bin is not a bin.
+ */
+function declaredBins(manifest: unknown, name: string): Map<string, string> {
+  const bin = typeof manifest === 'object' && manifest !== null ? Reflect.get(manifest, 'bin') : undefined;
+  const entries: [string, unknown][] =
+    typeof bin === 'string'
+      ? [[name.slice(name.lastIndexOf('/') + 1), bin]]
+      : typeof bin === 'object' && bin !== null
+        ? Object.entries(bin)
+        : [];
+  const bins = new Map<string, string>();
+  for (const [binName, file] of entries) {
+    if (typeof file !== 'string' || binName === '' || binName.includes('/') || binName.startsWith('.')) continue;
+    bins.set(binName, path.posix.normalize(file));
+  }
+  return bins;
+}
+
+/**
+ * Puts each readable live developer link's bins in its tree's .bin. bun links every installed package's declared
+ * bins there, through the package's own alias, and a link that replaces the package leaves the .bin that install
+ * made: the installed version's bin set, missing what the linked version added and dangling what it dropped. Each
+ * link's declared bins are linked as an install of the linked version would link them, and the entries that point into
+ * its alias for bins it no longer declares are removed; another package's entries are never touched. A link this
+ * process may not read keeps the bins it has.
+ */
+function refreshDeveloperBins(root: string): void {
+  const { live, unreadable } = findDeveloperLinks(root);
+  const blocked = new Set(unreadable.map((link) => link.path));
+  const changed: string[] = [];
+  for (const link of live) {
+    if (blocked.has(link.path)) continue;
+    let manifest: unknown;
+    try {
+      manifest = JSON.parse(readFileSync(path.join(root, link.path, 'package.json'), 'utf8'));
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
+      throw error;
+    }
+    const binDirectory = path.join(root, linkTree(link), '.bin');
+    const alias = path.relative(binDirectory, path.join(root, link.path)).split(path.sep).join('/');
+    const wanted = new Map(
+      [...declaredBins(manifest, packageName(link))].map(([name, file]) => [name, path.posix.join(alias, file)]),
+    );
+    for (const entry of directoryEntries(binDirectory)) {
+      if (!entry.isSymbolicLink()) continue;
+      const at = path.join(binDirectory, entry.name);
+      const target = readlinkSync(at);
+      if (target.startsWith(`${alias}/`) && wanted.get(entry.name) !== target) {
+        rmSync(at, { force: true });
+        if (!wanted.has(entry.name)) changed.push(`-${entry.name}`);
+      }
+    }
+    for (const [name, target] of wanted) {
+      const at = path.join(binDirectory, name);
+      if (lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink() && readlinkSync(at) === target) continue;
+      mkdirSync(binDirectory, { recursive: true });
+      // Rename replaces whatever the install left at the name in one step.
+      const staged = path.join(binDirectory, `.${name}.developer-link-${process.pid}`);
+      rmSync(staged, { force: true });
+      symlinkSync(target, staged);
+      renameSync(staged, at);
+      changed.push(name);
+    }
+  }
+  if (changed.length > 0) console.error(`linked developer-link bins: ${[...new Set(changed)].join(', ')}`);
 }
 
 /** A package linked from many members is named once, with its count; each unreadable link is named on its own. */
@@ -662,7 +746,10 @@ export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void 
         break;
     }
   }
-  if (plan.changes.length === 0) return;
+  if (plan.changes.length === 0) {
+    refreshDeveloperBins(root);
+    return;
+  }
   const declared = new Map(readDeclaredLinks(root).map((link) => [link.name, link.directory]));
   const recorded = readDeclaredRecord(root);
   const counts = new Map<string, number>();
@@ -684,6 +771,7 @@ export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void 
     const entries = [...counts].map(([named, count]) => (count === 1 ? named : `${named} (${count} links)`));
     console.error(`linked declared packages to local checkouts: ${entries.join(', ')}`);
   }
+  refreshDeveloperBins(root);
 }
 
 /**
