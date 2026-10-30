@@ -68,18 +68,22 @@ export type ShippedEntry =
 export function shippedAddonProblems(host: string, read: (relative: string) => ShippedEntry): string[] {
   return NATIVE_TARGETS.flatMap(({ addon }) => {
     const relative = join('dist/native', addon.directory, addonFileName(addon.directory));
-    const entry = read(relative);
-    switch (entry.kind) {
-      case 'file':
-        return entry.bytes > 0 ? [] : [`${relative}: empty`];
-      case 'absent':
-        return addon.directory === host ? [`${relative}: missing for this host's family`] : [];
-      case 'other':
-        return [`${relative}: not a regular file`];
-      case 'unread':
-        return [`${relative}: ${entry.error}`];
-    }
+    return addonEntryProblems(relative, read(relative), addon.directory === host);
   });
+}
+
+/** The problems of the addon `read` found at `relative`; `required` says it is the host family's. */
+function addonEntryProblems(relative: string, entry: ShippedEntry, required: boolean): string[] {
+  switch (entry.kind) {
+    case 'file':
+      return entry.bytes > 0 ? [] : [`${relative}: empty`];
+    case 'absent':
+      return required ? [`${relative}: missing for this host's family`] : [];
+    case 'other':
+      return [`${relative}: not a regular file`];
+    case 'unread':
+      return [`${relative}: ${entry.error}`];
+  }
 }
 
 export function cliDirectory(platform: NodeJS.Platform, arch: string): string | null {
