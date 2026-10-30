@@ -82,26 +82,40 @@ async function syncRuntimePinsIfDrifted(): Promise<void> {
   }
 }
 
+type BootstrapPackage = {
+  directory: string;
+  invalidatesPlugin: boolean;
+  program: 'library' | 'process-lineage';
+};
+
 /**
  * The plugin, CLI and their transitive workspace runtime dependencies, once each and dependency first. The plugin's
  * closure comes first so a rebuild can invalidate only the Nx state it owns, never for CLI-only packages.
  */
-async function bootstrapPackages(): Promise<{ directory: string; invalidatesPlugin: boolean }[]> {
-  const ordered: { directory: string; invalidatesPlugin: boolean }[] = [];
-  const visit = async (directory: string, invalidatesPlugin: boolean): Promise<void> => {
+async function bootstrapPackages(): Promise<BootstrapPackage[]> {
+  const ordered: BootstrapPackage[] = [];
+  const visit = async (
+    directory: string,
+    invalidatesPlugin: boolean,
+    program: BootstrapPackage['program'] = 'library',
+  ): Promise<void> => {
     if (ordered.some((entry) => entry.directory === directory)) return;
     const manifest: unknown = JSON.parse(await readFile(path.join(directory, 'package.json'), 'utf8'));
     const dependencies =
       typeof manifest === 'object' && manifest !== null && 'dependencies' in manifest
         ? manifest.dependencies
         : undefined;
-    if (typeof dependencies === 'object' && dependencies !== null) {
+    if (program === 'library' && typeof dependencies === 'object' && dependencies !== null) {
       for (const [name, range] of Object.entries(dependencies)) {
         if (range !== 'workspace:*') continue;
-        await visit(await realpath(path.join(directory, 'node_modules', name)), invalidatesPlugin);
+        await visit(
+          await realpath(path.join(directory, 'node_modules', name)),
+          invalidatesPlugin,
+          name === '@smoothbricks/cowshed' ? 'process-lineage' : 'library',
+        );
       }
     }
-    ordered.push({ directory, invalidatesPlugin });
+    ordered.push({ directory, invalidatesPlugin, program });
   };
   await visit(path.join(projectRoot, 'packages/nx-plugin'), true);
   await visit(path.join(projectRoot, 'packages/cli'), false);
@@ -110,17 +124,35 @@ async function bootstrapPackages(): Promise<{ directory: string; invalidatesPlug
 
 async function rebuildWorkspaceToolsIfStale(): Promise<void> {
   let rebuilt = false;
-  for (const { directory, invalidatesPlugin } of await bootstrapPackages()) {
+  for (const { directory, invalidatesPlugin, program } of await bootstrapPackages()) {
     const buildMarker = path.join(directory, buildMarkerFile);
     const markerStat = await stat(buildMarker).catch(() => null);
-    // The marker stands outside `dist`, so wiping `dist` leaves it behind: only a `dist` holding files can be current.
-    const built = (await readdir(path.join(directory, 'dist')).catch(() => [])).length > 0;
+    // A full cowshed API dist does not supply its independent public lineage entry.
+    const outputDirectory = path.join(directory, program === 'process-lineage' ? 'dist/lineage' : 'dist');
+    const outputs = await readdir(outputDirectory, { withFileTypes: true }).catch((cause: unknown) => {
+      if (cause instanceof Error && 'code' in cause && cause.code === 'ENOENT') {
+        // A cold or removed output directory is the expected reason to bootstrap.
+        return [];
+      }
+      throw new Error(`Cannot read bootstrap output directory ${outputDirectory}`, { cause });
+    });
+    const built =
+      program === 'process-lineage'
+        ? ['process-lineage.d.ts', 'process-lineage.js'].every((file) =>
+            outputs.some((output) => output.name === file && output.isFile()),
+          )
+        : outputs.length > 0;
     // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the build marker.
-    if (markerStat && built && !(await hasFileNewerThanMarker(directory, markerStat.mtimeMs))) continue;
+    const configuration = program === 'process-lineage' ? 'tsconfig.lineage.json' : 'tsconfig.lib.json';
+    if (markerStat && built && !(await hasFileNewerThanMarker(directory, markerStat.mtimeMs, configuration))) continue;
     // Bootstrap invokes neither nx (whose graph loads the plugin) nor smoo (whose launcher needs CLI dist).
-    // ttsc only needs the package tsconfig, so both tools can start from missing outputs without a cycle. It emits as
-    // nx-plugin's typescript-emit executor does (EMIT_OVERRIDES, the one definition of a dist's emit).
-    await runQuietly('ttsc', ['-p', 'tsconfig.lib.json', '--emit', ...EMIT_OVERRIDES], directory);
+    // The lineage program is the same plain-tsc producer the Nx compile lane owns: no addon,
+    // generated API or native transformer. Other packages retain the ordinary library emit.
+    if (program === 'process-lineage') {
+      await runQuietly('tsc', ['--build', configuration, '--force'], directory);
+    } else {
+      await runQuietly('ttsc', ['-p', configuration, '--emit', ...EMIT_OVERRIDES], directory);
+    }
     // The marker records when dist was last VERIFIED current, not when tsc last
     // chose to write bytes. ttsc is content-incremental, so an mtime-only change —
     // a checkout, a revert, a formatter rewriting a file identically — makes it
@@ -206,8 +238,12 @@ async function runQuietly(command: string, args: readonly string[], cwd: string)
   throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.exitCode}`);
 }
 
-async function hasFileNewerThanMarker(directory: string, markerMtimeMs: number): Promise<boolean> {
-  const sourcePaths = [path.join(directory, 'src'), path.join(directory, 'tsconfig.lib.json')];
+async function hasFileNewerThanMarker(
+  directory: string,
+  markerMtimeMs: number,
+  configuration: 'tsconfig.lib.json' | 'tsconfig.lineage.json',
+): Promise<boolean> {
+  const sourcePaths = [path.join(directory, 'src'), path.join(directory, configuration)];
 
   for (const sourcePath of sourcePaths) {
     if (await pathHasFileNewerThanMarker(sourcePath, markerMtimeMs)) {

@@ -742,7 +742,7 @@
       "lineage-js": {
         "executor": "nx:run-commands",
         "cache": true,
-        "//": "The process-lineage entry (specs/cowshed/07_api.md, \"Process lineage\") compiled on its own into dist/lineage, apart from tsc-js's dist/ts: its closure is src/process-lineage.ts, src/addon.ts and src/platform.ts, with no generated or typia module, so it depends on no other target and nx-plugin compiles against it without cowshed's whole build.",
+        "//": "The process-lineage entry (specs/cowshed/07_api.md section Process lineage) compiled on its own into dist/lineage, apart from tsc-js's dist/ts: its closure is src/process-lineage.ts, src/addon.ts and src/platform.ts, with no generated or typia module, so it depends on no other target and nx-plugin compiles against it without cowshed's whole build. A cache miss forces this small program to emit so existing build-info cannot hide a missing public output.",
         "inputs": [
           "{projectRoot}/src/process-lineage.ts",
           "{projectRoot}/src/addon.ts",
@@ -760,7 +760,7 @@
           "{projectRoot}/dist/lineage"
         ],
         "options": {
-          "command": "tsc -p tsconfig.lineage.json",
+          "command": "tsc --build tsconfig.lineage.json --force",
           "cwd": "{projectRoot}"
         }
       },

@@ -12,6 +12,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
@@ -138,6 +139,94 @@ it('the rebuild emits as the Nx emit does, writing no build info into dist', () 
         '-p tsconfig.lib.json --emit --composite false --declaration true --declarationMap true --emitDeclarationOnly false --incremental false',
       );
     }
+  } finally {
+    dispose();
+  }
+});
+it('bootstrap emits the native-free lineage entry before its consumer and repairs a missing declaration in a warm dist', () => {
+  const { root, plugin, enter, dispose } = staleCheckout();
+  try {
+    const owner = join(root, 'packages/renamed-runtime');
+    mkdirSync(join(owner, 'src'), { recursive: true });
+    mkdirSync(join(owner, 'dist/ts'), { recursive: true });
+    writeFileSync(join(owner, 'package.json'), JSON.stringify({ name: '@smoothbricks/cowshed' }));
+    writeFileSync(join(owner, 'tsconfig.lib.json'), '{}');
+    writeFileSync(join(owner, 'tsconfig.lineage.json'), '{}');
+    writeFileSync(join(owner, 'src/process-lineage.ts'), 'export {};\n');
+    writeFileSync(join(owner, 'dist/ts/index.d.ts'), 'export {};\n');
+    for (const file of ['package.json', 'tsconfig.lib.json', 'tsconfig.lineage.json', 'src/process-lineage.ts']) {
+      utimesSync(join(owner, file), new Date(0), new Date(0));
+    }
+    const marker = join(owner, buildMarker);
+    mkdirSync(dirname(marker), { recursive: true });
+    writeFileSync(marker, '');
+    utimesSync(marker, new Date(1000), new Date(1000));
+    mkdirSync(join(plugin, 'node_modules/@smoothbricks'), { recursive: true });
+    symlinkSync(owner, join(plugin, 'node_modules/@smoothbricks/cowshed'));
+    writeFileSync(
+      join(plugin, 'package.json'),
+      JSON.stringify({ dependencies: { '@smoothbricks/cowshed': 'workspace:*' } }),
+    );
+
+    const bin = join(root, 'bin');
+    writeFileSync(
+      join(bin, 'tsc'),
+      `#!/bin/sh
+set -eu
+root=$(dirname "$(dirname "$0")")
+[ "$PWD" = "$root/packages/renamed-runtime" ]
+[ "$*" = '--build tsconfig.lineage.json --force' ]
+printf 'lineage\n' >> "$root/compiler-order"
+mkdir -p dist/lineage
+printf 'export {};\n' > dist/lineage/process-lineage.d.ts
+printf 'export {};\n' > dist/lineage/process-lineage.js
+`,
+    );
+    writeFileSync(
+      join(bin, 'ttsc'),
+      `#!/bin/sh
+set -eu
+root=$(dirname "$(dirname "$0")")
+if [ ! -f "$root/packages/renamed-runtime/dist/lineage/process-lineage.d.ts" ]; then
+  printf 'Cannot find module @smoothbricks/cowshed/process-lineage\n' >&2
+  exit 79
+fi
+[ -f "$root/packages/renamed-runtime/dist/lineage/process-lineage.js" ]
+[ "$PWD" != "$root/packages/renamed-runtime" ]
+mkdir -p dist
+printf 'export {};' > dist/index.js
+basename "$PWD" >> "$root/compiler-order"
+`,
+    );
+    chmodSync(join(bin, 'tsc'), 0o755);
+    chmodSync(join(bin, 'ttsc'), 0o755);
+
+    const entered = enter();
+    expect(entered.status, `${entered.stdout}${entered.stderr}`).toBe(0);
+    const order = join(root, 'compiler-order');
+    expect(readFileSync(order, 'utf8').trim().split('\n')).toEqual(['lineage', 'nx-plugin', 'cli']);
+    const warm = enter();
+    expect(warm.status, `${warm.stdout}${warm.stderr}`).toBe(0);
+    expect(readFileSync(order, 'utf8').trim().split('\n')).toEqual(['lineage', 'nx-plugin', 'cli']);
+
+    rmSync(join(owner, 'dist/lineage/process-lineage.d.ts'));
+    const repaired = enter();
+    expect(repaired.status, `${repaired.stdout}${repaired.stderr}`).toBe(0);
+    expect(readFileSync(order, 'utf8').trim().split('\n')).toEqual(['lineage', 'nx-plugin', 'cli', 'lineage']);
+
+    const configuration = join(owner, 'tsconfig.lineage.json');
+    writeFileSync(configuration, '{"compilerOptions":{"strict":true}}');
+    const changedAt = new Date(statSync(marker).mtimeMs + 1000);
+    utimesSync(configuration, changedAt, changedAt);
+    const reconfigured = enter();
+    expect(reconfigured.status, `${reconfigured.stdout}${reconfigured.stderr}`).toBe(0);
+    expect(readFileSync(order, 'utf8').trim().split('\n')).toEqual([
+      'lineage',
+      'nx-plugin',
+      'cli',
+      'lineage',
+      'lineage',
+    ]);
   } finally {
     dispose();
   }
