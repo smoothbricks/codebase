@@ -1719,44 +1719,52 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
   });
 
-  it('runs a Vitest leaf under mbx uncapped: no reservation, its own default workers', async () => {
-    // A downstream gate on 2026-10-31: each `bun vitest run` leaf reserved 17 of 18 cores (Vitest's default, one worker
-    // per core but one), and mbx's ordered admission held every reservation queued behind it while the pool drained.
-    const workspace = await createWorkspace();
-    const bin = join(workspace.root, 'stand-in-mbx');
-    await mkdir(bin);
-    const invoked = join(workspace.root, 'mbx-invoked');
-    await writeFile(join(bin, 'mbx'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${invoked}'\nexit 97\n`, { mode: 0o755 });
-    await writeFile(join(bin, 'vitest'), '#!/bin/sh\nprintf "vitest %s\\n" "$*"\n', { mode: 0o755 });
-    const saved = {
-      PATH: process.env.PATH,
-      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
-      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
-      NX_PARALLEL: process.env.NX_PARALLEL,
-    };
-    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
-    process.env.MBX_SCHEDULER = '1';
-    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
-    process.env.NX_PARALLEL = '18';
-    try {
-      const result = await runBoundedExec(
-        { command: 'vitest run', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
-        workspace.context,
-        createProcessTreeKiller(),
-        null,
-      );
+  it.each([
+    ['Vitest', 'vitest', 'vitest run', '--maxWorkers'],
+    ['Go test', 'go', 'go test ./...', '-p='],
+  ] as const)(
+    'runs a %s leaf under mbx uncapped: no reservation, its own default workers',
+    async (_runner, program, command, sizing) => {
+      // On 2026-10-31 a downstream gate's `bun vitest run` leaves each reserved 17 of 18 cores (Vitest's default, one
+      // worker per core but one), and a gate's `go test ./... -p="$(nproc)"` leaf 18 (Go's default, one package per core).
+      // mbx's ordered admission held every reservation queued behind them while the pool drained.
+      const workspace = await createWorkspace();
+      const bin = join(workspace.root, 'stand-in-mbx');
+      await mkdir(bin);
+      const invoked = join(workspace.root, 'mbx-invoked');
+      await writeFile(join(bin, 'mbx'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${invoked}'\nexit 97\n`, { mode: 0o755 });
+      await writeFile(join(bin, program), `#!/bin/sh\nprintf "${program} %s\\n" "$*"\n`, { mode: 0o755 });
+      const saved = {
+        PATH: process.env.PATH,
+        MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+        MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+        NX_PARALLEL: process.env.NX_PARALLEL,
+      };
+      process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+      process.env.MBX_SCHEDULER = '1';
+      process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+      process.env.NX_PARALLEL = '18';
+      try {
+        const result = await runBoundedExec(
+          { command, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+        );
 
-      expect(result.success, result.terminalOutput).toBe(true);
-      expect(result.terminalOutput).toContain('vitest run\n');
-      expect(result.terminalOutput).not.toContain('mbx reserve');
-      expect(await readdir(workspace.root)).not.toContain('mbx-invoked');
-    } finally {
-      for (const [name, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[name];
-        else process.env[name] = value;
+        expect(result.success, result.terminalOutput).toBe(true);
+        expect(result.terminalOutput).toContain(`${program} `);
+        expect(result.terminalOutput).not.toContain(sizing);
+        expect(result.terminalOutput).not.toContain('mbx reserve');
+        expect(await readdir(workspace.root)).not.toContain('mbx-invoked');
+      } finally {
+        for (const [name, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
       }
-    }
-  });
+    },
+  );
 
   it('does not charge admission wait in either in-place nextest chain leg', async () => {
     const workspace = await createWorkspace();

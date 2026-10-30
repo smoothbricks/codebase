@@ -51,14 +51,18 @@ export function runsPrebuiltNextest(command: string): boolean {
   return PREBUILT_NEXTEST.test(command);
 }
 
+/** Runners whose leaf enters no pool, `null` in mbxLeaf, at the owner's ruling (2026-10-31). */
+const UNPOOLED_RUNNERS: ReadonlySet<RunnerKind> = new Set<RunnerKind>(['vitest', 'go-test']);
+
 /**
- * A Vitest leaf enters no pool, `null` (owner's ruling, 2026-10-31): it holds nothing and runs its own default workers,
- * uncapped. Reserved like any other leaf, it asked for that default, one worker per core but one, so each held 17 of an
- * 18-core pool, and mbx's ordered admission kept every reservation queued behind it waiting while the pool drained: a
- * downstream gate on 2026-10-31 ran 4.9 of 18 cores busy while 25 of its tasks queued a minute or more.
+ * A Vitest or Go test leaf enters no pool, `null` (owner's ruling, 2026-10-31): it holds nothing and runs its own
+ * default workers, uncapped. Reserved like any other leaf, it asked for that default, which sizes to the host: Vitest one
+ * worker per core but one, Go one package per core. So each held 17 or 18 of an 18-core pool, and mbx's ordered admission
+ * kept every reservation queued behind it waiting while the pool drained. On 2026-10-31 a downstream gate ran 4.9 of 18
+ * cores busy while 25 of its tasks queued a minute or more, and a gate's Go test leaf waited 401 s for all 18 cores.
  */
 export function mbxLeaf(pool: MbxPool, kind: RunnerKind, want: number, command: string): MbxLeaf | null {
-  if (kind === 'vitest') return null;
+  if (UNPOOLED_RUNNERS.has(kind)) return null;
   const builds = CARGO_LEAVES.has(kind) && !(kind === 'nextest' && runsPrebuiltNextest(command));
   return builds ? { kind: 'cargo' } : { kind: 'reserve', cpus: Math.max(1, want), priority: pool.priority };
 }

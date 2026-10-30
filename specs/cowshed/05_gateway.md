@@ -1537,11 +1537,11 @@ verified for Nx leaves; until the span carries it, or when no prior peak exists,
 omitted memory request as a zero-byte charge, not a measurement or a memory guarantee. This open keying question does
 not authorize a second store (AGENTS.md, rule 8).
 
-**A Vitest leaf enters no pool.** It runs without `mbx reserve` and with its own default workers, uncapped (owner's
-ruling, 2026-10-31). Reserved at that default, one worker per core but one, each Vitest leaf held 17 of an 18-core pool,
-and mbx's ordered admission kept every reservation queued behind it waiting while the pool drained: a downstream gate on
-2026-10-31 ran 4.9 of 18 cores busy while 25 of its tasks queued a minute or more. Every other leaf keeps the rule
-above.
+**A Vitest or Go test leaf enters no pool.** It runs without `mbx reserve` and with its own default workers, uncapped
+(owner's ruling, 2026-10-31). Reserved at that default, which sizes to the host (Vitest one worker per core but one, Go
+one package per core), each held 17 or 18 of an 18-core pool, and mbx's ordered admission kept every reservation queued
+behind it waiting while the pool drained: a downstream gate on 2026-10-31 ran 4.9 of 18 cores busy while 25 of its tasks
+queued a minute or more, and a gate's Go test leaf waited 401 s for all 18 cores. Every other leaf keeps the rule above.
 
 **A nextest run of prebuilt test binaries is a reserved leaf.** The inferred extracted-archive run
 (`--binaries-metadata`), or one from `--archive-file`, builds nothing, so it enters the pool as a non-Cargo leaf does:
