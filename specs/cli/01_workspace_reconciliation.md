@@ -32,11 +32,14 @@ operation with the holder check in front of it (../cowshed/02_workspaces.md, "Ho
 emits the closure, an entry in a checkout with `.cowshed/workspace.json` runs `cowshed tree-holders` over the directory
 `.nx/workspace-data` resolves to, exempting the daemon its `d/server-process.json` names, as clearing a checkout's Nx
 state does (../cowshed/16_build_volumes.md). Another holder, or a census that cannot be taken, refuses the closure's
-emit, marker and invalidation together, and the shell still enters. Stderr names up to ten holders by their census lines
-and counts the rest, or names the census's failure and its cause. The closure stays stale, so the next entry that finds
-no other holder rebuilds it. An emit kept without its invalidation would recompile to the same bytes at that entry and
-never invalidate. CLI-only members rebuild either way. A checkout without that record runs no gate and takes no census.
-The census is the same from a sandboxed entry: run inside `cowshed exec`, it names a host process holding a file there
+emit, marker and invalidation together, and the shell still enters. The refusal also holds back every stale package
+whose workspace dependency closure reaches a held member, the CLI among them: it compiles against their dist
+(`noEmitOnError`), so a change to both, as a rebase onto a main that changed the plugin and the CLI brings, would fail
+its emit and stop the entry. Packages outside that closure rebuild. Stderr names the packages held back and up to ten
+holders by their census lines, counting the rest, or the census's failure and its cause. The held packages stay stale,
+so the next entry that finds no other holder rebuilds them. An emit kept without its invalidation would recompile to the
+same bytes at that entry and never invalidate. A checkout without that record runs no gate and takes no census. The
+census is the same from a sandboxed entry: run inside `cowshed exec`, it names a host process holding a file there
 (measured 2026-10-30), so a gate on the host refuses a sandboxed entry's rebuild as it refuses a host entry's.
 
 For managed uv projects, install-task status joins the existing input stamps with a live environment-relocation witness

@@ -28,10 +28,12 @@ const buildMarker = 'node_modules/.cache/smoo/dist-verified';
 
 /**
  * A checkout whose plugin build is stale, with `.nx/workspace-data` linked onto a build volume as cowshed links it.
- * Its `ttsc` emits each package's `src/index.ts` as its `dist/index.js`, so an emit changes `dist` only where the bytes
- * there differ. Its `cowshed` answers `tree-holders` with the `census` file beside `bin`, or fails with `census-error`,
- * and records each call in `cowshed-calls`; `manage` makes the checkout cowshed's, the only kind that asks it. `enter`
- * runs the shell entry proper over it; `root` is removed by `dispose`.
+ * The CLI depends on the plugin, as the real one does. Its `ttsc` emits each package's `src/index.ts` as its
+ * `dist/index.js`, so an emit changes `dist` only where the bytes there differ, and fails a package whose workspace
+ * dependency's `dist` is behind that dependency's source, as compiling against stale declarations under
+ * `noEmitOnError` does. Its `cowshed` answers `tree-holders` with the `census` file beside `bin`, or fails with
+ * `census-error`, and records each call in `cowshed-calls`; `manage` makes the checkout cowshed's, the only kind that
+ * asks it. `enter` runs the shell entry proper over it; `root` is removed by `dispose`.
  */
 function staleCheckout() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-enter-shell-')));
@@ -48,6 +50,14 @@ function staleCheckout() {
     utimesSync(marker, new Date(0), new Date(0));
   }
 
+  const cli = join(root, 'packages/cli');
+  writeFileSync(
+    join(cli, 'package.json'),
+    JSON.stringify({ dependencies: { '@smoothbricks/nx-plugin': 'workspace:*' } }),
+  );
+  mkdirSync(join(cli, 'node_modules/@smoothbricks'), { recursive: true });
+  symlinkSync('../../../nx-plugin', join(cli, 'node_modules/@smoothbricks/nx-plugin'));
+
   const volume = join(root, 'volume/nx/workspace-data');
   mkdirSync(volume, { recursive: true });
   mkdirSync(join(root, '.nx'));
@@ -59,7 +69,18 @@ function staleCheckout() {
   // Each call's arguments, one line per call, beside `bin`.
   writeFileSync(
     join(bin, 'ttsc'),
-    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$(dirname "$0")/../ttsc-calls"\nmkdir -p dist\ncp src/index.ts dist/index.js\n',
+    `#!/bin/sh
+printf '%s\\n' "$*" >> "$(dirname "$0")/../ttsc-calls"
+for dependency in node_modules/@smoothbricks/*; do
+  [ -d "$dependency/src" ] || continue
+  if ! cmp -s "$dependency/src/index.ts" "$dependency/dist/index.js"; then
+    echo "error TS2305: the declarations in $dependency/dist are behind its source" >&2
+    exit 2
+  fi
+done
+mkdir -p dist
+cp src/index.ts dist/index.js
+`,
   );
   chmodSync(join(bin, 'ttsc'), 0o755);
   writeFileSync(
@@ -554,19 +575,36 @@ it('a stale plugin build clears the daemon record and project graph only when it
  * the census cowshed puts in front of a destructive operation (`cowshed tree-holders`, specs/cowshed/02_workspaces.md
  * "Holders cowshed does not run") before it emits the plugin's closure. A census that cannot be taken, or another
  * holder (a gate's `nx run-many` here), leaves the closure's dist, marker and Nx state as they are and says why on
- * stderr, and the shell still enters: a census outage must not block every shell. The CLI rebuilds either way. The
- * daemon the checkout records is no other holder, so once the gate is gone the next entry rebuilds and clears.
+ * stderr, and the shell still enters: a census outage must not block every shell. The CLI compiles against the plugin's
+ * dist, so it waits with the plugin, while a package outside the plugin's closure rebuilds. The daemon the checkout
+ * records is no other holder, so once the gate is gone the next entry rebuilds and clears.
  */
 it('a census that cannot be taken, or another holder of the Nx state, defers the plugin rebuild and its clear', () => {
   const { root, plugin, volume, manage, enter, dispose } = staleCheckout();
   try {
     manage();
+    // A package outside the plugin's closure that the CLI also depends on.
+    const standalone = join(root, 'packages/standalone');
+    mkdirSync(join(standalone, 'src'), { recursive: true });
+    writeFileSync(join(standalone, 'package.json'), '{}');
+    writeFileSync(join(standalone, 'tsconfig.lib.json'), '{}');
+    writeFileSync(join(standalone, 'src/index.ts'), 'export {};\n');
+    const cli = join(root, 'packages/cli');
+    writeFileSync(
+      join(cli, 'package.json'),
+      JSON.stringify({
+        dependencies: { '@smoothbricks/standalone': 'workspace:*', '@smoothbricks/nx-plugin': 'workspace:*' },
+      }),
+    );
+    symlinkSync('../../../standalone', join(cli, 'node_modules/@smoothbricks/standalone'));
     writeFileSync(join(plugin, 'dist/index.js'), 'export const previous = 1;\n');
     plantPluginState(volume, 4241);
     const deferred = () => {
       expect(readFileSync(join(plugin, 'dist/index.js'), 'utf8')).toBe('export const previous = 1;\n');
       expect(statSync(join(plugin, buildMarker)).mtimeMs).toBe(0);
       expect(keptPluginState(volume)).toEqual(pluginState);
+      expect(existsSync(join(cli, 'dist/index.js'))).toBe(false);
+      expect(statSync(join(cli, buildMarker)).mtimeMs).toBe(0);
     };
 
     writeFileSync(join(root, 'census-error'), 'cowshed: the process table cannot be read: Operation not permitted\n');
@@ -576,7 +614,8 @@ it('a census that cannot be taken, or another holder of the Nx state, defers the
       `cowshed tree-holders ${volume}\` exited 1: cowshed: the process table cannot be read: Operation not permitted`,
     );
     deferred();
-    expect(statSync(join(root, 'packages/cli', buildMarker)).mtimeMs).toBeGreaterThan(0);
+    expect(outage.stderr).toContain('! Not rebuilding packages/nx-plugin, packages/cli:');
+    expect(readFileSync(join(standalone, 'dist/index.js'), 'utf8')).toBe('export {};\n');
 
     rmSync(join(root, 'census-error'));
     const holder = (pid: number, command: string) =>
@@ -599,6 +638,7 @@ it('a census that cannot be taken, or another holder of the Nx state, defers the
     expect(after.status, `${after.stdout}${after.stderr}`).toBe(0);
     expect(readFileSync(join(plugin, 'dist/index.js'), 'utf8')).toBe('export {};\n');
     expect(keptPluginState(volume)).toEqual([]);
+    expect(statSync(join(cli, buildMarker)).mtimeMs).toBeGreaterThan(0);
     expect(readFileSync(join(root, 'cowshed-calls'), 'utf8')).toBe(`tree-holders ${volume}\n`.repeat(3));
   } finally {
     dispose();

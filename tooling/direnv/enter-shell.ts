@@ -91,11 +91,14 @@ type BootstrapPackage = {
   program: keyof typeof programConfiguration;
   /** The directory the program emits into, which bootstrap judges and digests. */
   output: string;
+  /** The packages it compiles against: its direct `workspace:*` runtime dependencies, by directory. */
+  dependencies: string[];
 };
 
 /**
  * The plugin, CLI and their transitive workspace runtime dependencies, once each and dependency first. The plugin's
- * closure comes first so a rebuild can invalidate only the Nx state it owns, never for CLI-only packages.
+ * closure comes first so a rebuild can invalidate only the Nx state it owns, never for CLI-only packages. The lineage
+ * program compiles its entry alone, so it compiles against no dependency.
  */
 async function bootstrapPackages(): Promise<BootstrapPackage[]> {
   const ordered: BootstrapPackage[] = [];
@@ -106,18 +109,17 @@ async function bootstrapPackages(): Promise<BootstrapPackage[]> {
   ): Promise<void> => {
     if (ordered.some((entry) => entry.directory === directory)) return;
     const manifest: unknown = JSON.parse(await readFile(path.join(directory, 'package.json'), 'utf8'));
-    const dependencies =
+    const declared =
       typeof manifest === 'object' && manifest !== null && 'dependencies' in manifest
         ? manifest.dependencies
         : undefined;
-    if (program === 'library' && typeof dependencies === 'object' && dependencies !== null) {
-      for (const [name, range] of Object.entries(dependencies)) {
+    const dependencies: string[] = [];
+    if (program === 'library' && typeof declared === 'object' && declared !== null) {
+      for (const [name, range] of Object.entries(declared)) {
         if (range !== 'workspace:*') continue;
-        await visit(
-          await realpath(path.join(directory, 'node_modules', name)),
-          invalidatesPlugin,
-          name === '@smoothbricks/cowshed' ? 'process-lineage' : 'library',
-        );
+        const dependency = await realpath(path.join(directory, 'node_modules', name));
+        dependencies.push(dependency);
+        await visit(dependency, invalidatesPlugin, name === '@smoothbricks/cowshed' ? 'process-lineage' : 'library');
       }
     }
     ordered.push({
@@ -126,6 +128,7 @@ async function bootstrapPackages(): Promise<BootstrapPackage[]> {
       program,
       // A full cowshed API dist does not supply its independent public lineage entry.
       output: path.join(directory, program === 'process-lineage' ? 'dist/lineage' : 'dist'),
+      dependencies,
     });
   };
   await visit(path.join(projectRoot, 'packages/nx-plugin'), true);
@@ -134,22 +137,36 @@ async function bootstrapPackages(): Promise<BootstrapPackage[]> {
 }
 
 async function rebuildWorkspaceToolsIfStale(): Promise<void> {
-  const stale: BootstrapPackage[] = [];
-  for (const entry of await bootstrapPackages()) {
-    if (await isStale(entry)) stale.push(entry);
+  const packages = await bootstrapPackages();
+  const stale = new Set<string>();
+  for (const entry of packages) {
+    if (await isStale(entry)) stale.add(entry.directory);
   }
   // Whether the plugin's closure rebuilds at all is decided before anything is emitted: an emit kept without the clear
   // it called for would recompile to the same bytes at the next entry, which would then never clear.
-  const refusal = stale.some((entry) => entry.invalidatesPlugin) ? await nxStateRefusal() : null;
+  const refusal = packages.some((entry) => entry.invalidatesPlugin && stale.has(entry.directory))
+    ? await nxStateRefusal()
+    : null;
+  // A refusal holds back every stale member of the plugin's closure, and every package whose workspace dependency
+  // closure reaches one: it compiles against their dist, so a change to both (a rebase onto a main that changed the
+  // plugin and the CLI together) would fail its emit. Packages outside that closure rebuild.
+  const held = new Set<string>();
   if (refusal !== null) {
+    for (const { directory, invalidatesPlugin, dependencies } of packages) {
+      if ((invalidatesPlugin && stale.has(directory)) || dependencies.some((dependency) => held.has(dependency))) {
+        held.add(directory);
+      }
+    }
+    const waiting = [...held]
+      .filter((directory) => stale.has(directory))
+      .map((directory) => path.relative(projectRoot, directory));
     console.error(
-      `! Not rebuilding the stale Nx plugin and its workspace dependencies: ${refusal}\n  Their dist, the Nx daemon record and the project graph stay as they are; the next shell entry that finds no other holder rebuilds them.`,
+      `! Not rebuilding ${waiting.join(', ')}: ${refusal}\n  Their dist, the Nx daemon record and the project graph stay as they are; the next shell entry that finds no other holder rebuilds them.`,
     );
   }
   let outputChanged = false;
-  for (const { directory, invalidatesPlugin, program, output } of stale) {
-    // CLI-only packages own no Nx state, so they rebuild whatever holds it.
-    if (invalidatesPlugin && refusal !== null) continue;
+  for (const { directory, invalidatesPlugin, program, output } of packages) {
+    if (!stale.has(directory) || held.has(directory)) continue;
     const before = invalidatesPlugin ? await outputDigest(output) : null;
     // Bootstrap invokes neither nx (whose graph loads the plugin) nor smoo (whose launcher needs CLI dist).
     // The lineage program is the same plain-tsc producer the Nx compile lane owns: no addon,
