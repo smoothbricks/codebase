@@ -237,14 +237,6 @@ describe('a live developer link whose build recorded no inputs', () => {
     expect(readlinkSync(unbuilt.alias)).toBe(STORE);
   });
 
-  it('ignores documentation, tests, the manifest and builds for another host', async () => {
-    const touched = fixture();
-    record(touched);
-    for (const file of ['README.md', 'src/index.test.ts', 'package.json']) touch(join(touched.source, file), LATER);
-    expect(await link(touched)).not.toContain('refusing');
-    expect(realpathSync(touched.alias)).toBe(touched.source);
-  });
-
   it('refuses a checkout outside Git that declares a build, and links one that declares none', async () => {
     const untracked = fixture();
     rmSync(join(untracked.source, '../../.git'), { recursive: true });
@@ -291,10 +283,17 @@ function record(fixture: Fixture): void {
 }
 
 describe('a live developer link whose build recorded its inputs', () => {
-  it('links when sources were rewritten with the bytes the build read', async () => {
+  it('links when sources, documentation, tests and the manifest were rewritten with the bytes the build read', async () => {
     const touched = fixture();
     record(touched);
-    for (const file of ['src/index.ts', 'tsconfig.lib.json', 'crates/api/src/lib.rs'])
+    for (const file of [
+      'src/index.ts',
+      'tsconfig.lib.json',
+      'crates/api/src/lib.rs',
+      'README.md',
+      'src/index.test.ts',
+      'package.json',
+    ])
       touch(join(touched.source, file), LATER);
     expect(await link(touched)).not.toContain('refusing');
     expect(realpathSync(touched.alias)).toBe(touched.source);
