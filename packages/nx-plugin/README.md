@@ -545,7 +545,10 @@ Nx 23.2.1 hashes a runtime input's stdout and stderr and ignores its exit status
 its error text, one string for every history, toolchain or file it could not read, and a result cached under it is
 replayed for all of them. The script keys on the command's stdout alone and turns a nonzero exit into an Nx error: it
 ends stdout with the byte 0xFF, and Nx refuses output that is not UTF-8
-(`invalid utf-8 sequence of 1 bytes from index N`, exit 1). Nx drops a runtime input's stderr, so a failure that only
+(`invalid utf-8 sequence of 1 bytes from index N`, exit 1). That native message names neither the task nor the input;
+the carried Nx patch's hasher rethrows it as `Could not hash <tasks>: invalid utf-8 sequence …` and lists each runtime
+input of those tasks with the tasks that hash it (`patches/README.md`, "A hash failure names its tasks and runtime
+inputs"). It names the candidates, not the one that failed. Nx drops a runtime input's stderr, so a failure that only
 wrote to stderr would be invisible. The wrapper retains each failure under the checkout's
 `.runtime-input-failures/failure.XXXXXXXXXX/`, outside Nx's state and the temporary directory. These private records
 survive `nx reset`, task-cache cleanup and temporary-directory retirement; they remain until the operator removes them.
@@ -557,7 +560,7 @@ cat .runtime-input-failures/*/report
 
 `smoo github-ci nx-smart`, `nx-run-many` and `nx-deploy` print every report retained during a failed Nx run
 (`runtimeInputFailureReports(root, sinceMs)`, `@smoothbricks/nx-plugin/runtime-input-policy`), so a CI log names the
-command and its cause beside Nx's decoder error, which names neither.
+command and its cause beside Nx's error, which names only the candidates.
 
 Each readable `report` names the command, its indexed arguments, working directory, exit status and original stderr.
 `argv` retains the exact NUL-delimited argument vector (including empty arguments), `stderr` retains the original bytes

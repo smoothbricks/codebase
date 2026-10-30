@@ -32,6 +32,8 @@ const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(packageRoot));
 const script = join(packageRoot, 'runtime-input.sh');
 const nxEntry = join(repoRoot, 'node_modules', '.bin', 'nx');
+/** The probe's failing input: Nx's refusal must name it. */
+const plantedCommand = `sh -c ${shellWord('echo planted-cause >&2; exit 3')}`;
 
 interface Ran {
   readonly status: number | null;
@@ -144,9 +146,11 @@ describe('runtime-input.sh', () => {
  * stderr and ignores its exit status; the wrapper's 0xFF byte is what makes a
  * failed input an error instead of a key (runtime-input.sh). Planted through
  * real Nx, both through the daemon that hashes for a workspace's clients and
- * without one, the failure must stop the run before the task executes. A
- * future Nx that hashes those bytes turns this red; one that honours the exit
- * status changes the message, which is the cue to drop the byte.
+ * without one, the failure must stop the run before the task executes, and
+ * Nx's error must name the task and the runtime input it was hashing (the
+ * carried Nx patch's hasher). A future Nx that hashes those bytes turns this
+ * red; one that honours the exit status changes the message, which is the cue
+ * to drop the byte.
  */
 describe('a planted runtime input failure through real Nx', () => {
   for (const daemon of [false, true]) {
@@ -162,9 +166,12 @@ describe('a planted runtime input failure through real Nx', () => {
         const started = Date.now();
         const planted = nx(workspace, env, 'probe:planted');
         expect(planted.status, planted.output).toBe(1);
-        expect(planted.output).toContain('invalid utf-8 sequence');
-        // Nx's message names neither the command nor its cause; the retained report names both.
-        expect(planted.output).not.toContain('planted-cause');
+        // Nx's native refusal names neither the task nor the input. The patched hasher names
+        // both; the retained report names the cause.
+        expect(planted.output).toContain(
+          'Could not hash probe:planted: invalid utf-8 sequence of 1 bytes from index 0',
+        );
+        expect(planted.output).toContain(runtimeInput(plantedCommand).runtime);
         expect(existsSync(join(workspace, 'planted.ran'))).toBe(false);
         const record = await failureRecord(workspace);
         const reports = runtimeInputFailureReports(workspace, started);
@@ -387,7 +394,7 @@ async function writeProbeWorkspace(workspace: string): Promise<void> {
       name: 'probe',
       targets: {
         good: target('good', `sh -c ${shellWord('echo value; echo noise >&2')}`),
-        planted: target('planted', `sh -c ${shellWord('echo planted-cause >&2; exit 3')}`),
+        planted: target('planted', plantedCommand),
       },
     }),
   );

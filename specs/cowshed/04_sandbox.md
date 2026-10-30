@@ -1281,8 +1281,10 @@ sandboxed daemon, in a sandboxed client and in a daemonless host client. One tha
 client uses it, and Nx must report that failure as an error. Nx 23.2.1 ignores a runtime input's exit status and hashes
 its stdout and stderr, so a failed input would otherwise become a valid key: its error text, constant across every tree.
 Every runtime input therefore runs through `@smoothbricks/nx-plugin`'s `runtime-input.sh`, which keys on stdout alone
-and turns a nonzero exit into an Nx error. A Git input that reads an inaccessible global config fails: Git reports the
-config as unreadable rather than producing repository history.
+and turns a nonzero exit into an Nx error. Nx's error names the tasks it was hashing and their runtime inputs (the
+carried Nx patch, `patches/README.md`), and the wrapper's retained report names the failed command and its cause. A Git
+input that reads an inaccessible global config fails: Git reports the config as unreadable rather than producing
+repository history.
 
 Beyond the runtime dir, a child may bind and connect Unix sockets anywhere in its workspace's own tree — the exec temp
 dir, and for a read-write job the whole mount — so a test's socket in `TMPDIR` works as it does on the host. A write

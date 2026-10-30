@@ -1433,13 +1433,15 @@ map, and the probe's bookkeeping must not reach either candidate image.
     - **Runtime inputs run only declared programs.** Nx hashes on a developer's Mac, on a NixOS runner and in the
       sandbox; only devenv's Nix profile and the checkout's own programs are the same in all three, with `/bin/sh` and
       `/usr/bin/env`, which NixOS keeps. A host-shipped program such as macOS's `shasum` (Perl, not coreutils) hashes on
-      a Mac and exits 127 on NixOS, which Nx 23.2.1 reports only as `invalid utf-8 sequence of 1 bytes from index 0`.
-      `smoo github-ci` prints the reports runtime-input.sh retained after a failed Nx run.
+      a Mac and exits 127 on NixOS, which Nx 23.2.1's native hasher reports only as
+      `invalid utf-8 sequence of 1 bytes from index 0`; the carried Nx patch adds the tasks it was hashing and their
+      runtime inputs. `smoo github-ci` prints the reports runtime-input.sh retained after a failed Nx run, which name
+      the failed command and its cause.
   - **Enforced by**: `packages/nx-plugin/src/runtime-input.test.ts`, which judges this repository's declared runtime
     inputs on the PATH `tooling/direnv/repo-path` declares (no `/usr/bin` or `/bin`) and refuses a program found outside
     `/nix`, the checkout and the home, one nothing provides, and one only a workspace package's build output provides
     through `node_modules/.bin` (`hostPrograms`, `@smoothbricks/nx-plugin/runtime-input-policy`), and reads a planted
-    failure's report back after real Nx refuses it.
+    failure's report back after real Nx refuses it with an error naming the task and its runtime input.
 
 ### One Cargo environment on every path
 

@@ -376,9 +376,9 @@ function absentAsUndefined<T>(read: () => T): T | undefined {
 
 /**
  * The report of every failure runtime-input.sh retained under `root` at or after `sinceMs`, oldest first, each headed
- * by its path. Nx 23.2.1 names a failed runtime input only as `invalid utf-8 sequence of 1 bytes from index N` and
- * drops the input's stderr, so a headless run prints these after Nx fails: they name the command, its exit status and
- * its stderr. A record without a report (its evidence could not be written) is named as such.
+ * by its path. Nx names a failed runtime input's tasks and their runtime inputs (`Could not hash …`), not which one
+ * failed or why, and drops the input's stderr, so a headless run prints these after Nx fails: they name the command,
+ * its exit status and its stderr. A record without a report (its evidence could not be written) is named as such.
  */
 export function runtimeInputFailureReports(root: string, sinceMs: number): string[] {
   const directory = join(root, RUNTIME_INPUT_FAILURES);

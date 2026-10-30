@@ -3149,6 +3149,58 @@ index 332accab74919348073538f4198693328bf68193..a56864600a5e7a9f9e40adea9a7bfc9e
          const plansReference = this.planner.getPlansReference(taskIds, taskGraph);
          return this.inspector.inspectInputs(plansReference);
      }
+diff --git a/dist/src/hasher/native-task-hasher-impl.js b/dist/src/hasher/native-task-hasher-impl.js
+index 61b015b9a1b4665c1f0a236d9ef41858dd925163..af036e0a69e9e73cacea11c70a70a91ff0bec57d 100644
+--- a/dist/src/hasher/native-task-hasher-impl.js
++++ b/dist/src/hasher/native-task-hasher-impl.js
+@@ -29,10 +29,45 @@ class NativeTaskHasherImpl {
+         return hashes[0];
+     }
+     async hashTasks(tasks, taskGraph, perTaskEnvs, cwd, collectInputs) {
+-        const plans = this.planner.getPlansReference(tasks.map((t) => t.id), taskGraph);
++        const taskIds = tasks.map((t) => t.id);
++        const plans = this.planner.getPlansReference(taskIds, taskGraph);
+         const shouldCollectInputs = collectInputs ?? (0, task_io_service_1.getTaskIOService)().hasTaskInputSubscribers();
+-        const hashes = this.hasher.hashPlans(plans, perTaskEnvs, cwd ?? process.cwd(), shouldCollectInputs);
++        let hashes;
++        try {
++            hashes = this.hasher.hashPlans(plans, perTaskEnvs, cwd ?? process.cwd(), shouldCollectInputs);
++        }
++        catch (error) {
++            throw hashPlansError(error, this.planner.getPlans(taskIds, taskGraph));
++        }
+         return tasks.map((t) => hashes[t.id]);
+     }
+ }
+ exports.NativeTaskHasherImpl = NativeTaskHasherImpl;
++/**
++ * The native hasher's error names neither the task nor the input it failed on:
++ * a runtime input whose output is not UTF-8 fails as `invalid utf-8 sequence of
++ * 1 bytes from index 0`, which any runtime input of any task in the batch could
++ * have raised. Name the tasks and the runtime inputs their plans hold, read from
++ * the planner, so the error says where to look; nothing runs again.
++ */
++function hashPlansError(error, plans) {
++    const taskIds = Object.keys(plans).sort();
++    const tasksByRuntime = new Map();
++    for (const taskId of taskIds) {
++        for (const instruction of plans[taskId]) {
++            if (instruction.startsWith('runtime:')) {
++                const command = instruction.slice('runtime:'.length);
++                const tasks = tasksByRuntime.get(command) ?? new Set();
++                tasksByRuntime.set(command, tasks.add(taskId));
++            }
++        }
++    }
++    const lines = [`Could not hash ${taskIds.join(', ')}: ${error.message}`];
++    if (tasksByRuntime.size > 0) {
++        lines.push('Runtime inputs of those tasks:');
++        for (const command of [...tasksByRuntime.keys()].sort()) {
++            lines.push(`  ${command} (${[...tasksByRuntime.get(command)].join(', ')})`);
++        }
++    }
++    return new Error(lines.join('\n'), { cause: error });
++}
 diff --git a/dist/src/hasher/task-hasher.d.ts b/dist/src/hasher/task-hasher.d.ts
 index cf08aa6c0fb9bcbb2fbf10e554f2e0397b1b13d7..f67c434e41a776343e11225bdd12f02cd7570d0c 100644
 --- a/dist/src/hasher/task-hasher.d.ts

@@ -147,6 +147,25 @@ every root input bucket with full-closure inspection, retains the shared transit
 distinguishes configurations and unrelated files, and preserves refusal errors. A delegating control drops the
 selected-ID argument; the same oracle must then reject the old all-plan behavior without depending on a timeout.
 
+## A hash failure names its tasks and runtime inputs
+
+Nx 23.2.1's native hasher reads a runtime input's stdout and stderr with `std::str::from_utf8(…)?` (`hash_runtime.rs`),
+and the task hasher passes that error up with no context, so the client printed the bare decoder message:
+`invalid utf-8 sequence of 1 bytes from index 0`. Every failed input `runtime-input.sh` wraps ends its stdout with that
+byte (`packages/nx-plugin/README.md`, "Runtime inputs"), so that one line was all Nx said about any failed input of any
+task in the batch.
+
+`NativeTaskHasherImpl.hashTasks` (`hasher/native-task-hasher-impl.js`) now rethrows a native failure as
+`Could not hash <task ids>: <native message>`, then lists each `runtime:` instruction of those tasks' plans with the
+tasks that hash it, read from the same planner (`HashPlanner.getPlans`). Nothing runs again, and the native error is the
+`cause`. The hunk runs where the hashing runs, in the daemon or in the client, so both report the same lines. It names
+the candidates, not the input that failed: the native error does not say which, and finding out would run the inputs
+again. The wrapper's retained report names the failed command and its cause.
+
+`packages/nx-plugin/src/runtime-input.test.ts` plants a failing input through real Nx, with and without the daemon, and
+requires the error to name the task and its runtime input. Drop the hunk, and keep the test, once the installed Nx's
+hasher names the input it failed on.
+
 ## Cross-client task output ownership
 
 Clients of one checkout share a target's output tree and cache entry. Each target with declared outputs holds one

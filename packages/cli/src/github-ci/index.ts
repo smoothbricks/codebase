@@ -79,9 +79,9 @@ export function nxSmartArgs(
 
 /**
  * Runs Nx and, when it fails, prints the report of each runtime input failure runtime-input.sh retained during the run.
- * Nx 23.2.1 names a failed runtime input only as `invalid utf-8 sequence of 1 bytes from index N` and drops its stderr,
- * and a CI job has no terminal for the wrapper's own notice: without this, the record naming the command and its
- * cause stays on the runner.
+ * Nx names a failed runtime input's tasks and their runtime inputs (`Could not hash …`), not which one failed or why,
+ * and drops its stderr, and a CI job has no terminal for the wrapper's own notice: without this, the record naming the
+ * command and its cause stays on the runner.
  */
 async function runNxStatus(args: string[], root: string): Promise<number> {
   const started = Date.now();
