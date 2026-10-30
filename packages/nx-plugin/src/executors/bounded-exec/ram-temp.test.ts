@@ -9,7 +9,6 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
-  watch,
   writeFileSync,
 } from 'node:fs';
 import { open, readFile, writeFile } from 'node:fs/promises';
@@ -18,6 +17,7 @@ import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-group.js';
+import { whenChanged } from '../../__tests__/path-change.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { awaitExit, ownedSocketDirectory } from '../../testing.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
@@ -1563,7 +1563,16 @@ async function detachCustodyFixture(mode: 'stray' | 'rollback' = 'stray', boundM
   server.listen(socketPath, listening.resolve);
   await listening.promise;
   server.off('error', listening.reject);
-  const session = connected.promise.then((socket) => ({
+  // The facade's end as its bounded run reports it: the run's own answer, or the terminal receipt of a facade the run
+  // stopped waiting on. A facade that ends before it connects fails every wait on its session with its exit and stderr.
+  const output = Promise.withResolvers<CommandOutput>();
+  const facadeEnded = output.promise.then(async (result) => (await result.pending?.completion) ?? result);
+  const session = Promise.race([
+    connected.promise,
+    facadeEnded.then((end): never => {
+      throw new Error(`the scripted facade ended before it connected (exit ${end.status}): ${end.stderr}`);
+    }),
+  ]).then((socket) => ({
     socket,
     lines: createInterface({ input: socket })[Symbol.asyncIterator](),
   }));
@@ -1610,7 +1619,6 @@ socket.end();
     { mode: 0o755 },
   );
   const host = createHostCommands(join(directory, 'unused-gateway.sock'), 300, 'shared', executable);
-  const output = Promise.withResolvers<CommandOutput>();
   const calls: string[] = [];
   let attaches = 0;
   let recorded = mode === 'stray';
@@ -1623,9 +1631,10 @@ socket.end();
         return { status: 1, stdout: '', stderr: 'owned provisioning failure' };
       if (file !== '/usr/bin/hdiutil') throw new Error(`unexpected fixture command: ${file}`);
       // The production caller's bound is the subject; the scripted child cannot complete until commanded.
-      const result = await host.run(file, args, boundMs, binding);
-      output.resolve(result);
-      return result;
+      // A run that throws ends the session wait too: whatever the run answers is the facade's end.
+      const run = host.run(file, args, boundMs, binding);
+      output.resolve(run);
+      return run;
     },
     ownsRamDisk: (disk) =>
       recorded && disk.entry === entry && disk.physical === '/dev/disk7' && disk.sectors === capacity / 512,
@@ -1663,6 +1672,7 @@ socket.end();
     },
   };
   let pid: number | undefined;
+  const ledger = () => JSON.parse(readFileSync(`${paths.lockFile}.ledger`, 'utf8'));
   async function event() {
     const { lines } = await session;
     const next = await lines.next();
@@ -1684,7 +1694,16 @@ socket.end();
     output: output.promise,
     attaches: () => attaches,
     volume: () => new RamTempVolume(paths, capacity, commands),
-    ledger: () => JSON.parse(readFileSync(`${paths.lockFile}.ledger`, 'utf8')),
+    ledger,
+    /**
+     * Once the late terminal receipt's publication, one rename in `directory`, clears the ledger. A kernel watch judges
+     * it (specs/cowshed/08_testing.md, "Fixtures"): Bun's fs.watch arms after it returns and loses a rename before that.
+     */
+    ledgerCleared: () =>
+      whenChanged(directory, () => {
+        const now = ledger();
+        return now.version === 1 && now.lifecycle === null;
+      }),
     event,
     async ready() {
       const match = /^ready (\d+)$/.exec(await event());
@@ -1712,21 +1731,6 @@ socket.end();
       }
     },
   };
-}
-
-/** Publication is a rename; observe that event instead of sleeping for a late completion callback. */
-function clearedDetachLedger(directory: string, ledgerPath: string) {
-  const cleared = Promise.withResolvers<void>();
-  const watcher = watch(directory, (_event, filename) => {
-    if (filename !== 'v.lock.ledger') return;
-    try {
-      const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'));
-      if (ledger.version === 1 && ledger.lifecycle === null) cleared.resolve();
-    } catch (error) {
-      cleared.reject(error);
-    }
-  });
-  return { promise: cleared.promise, close: () => watcher.close() };
 }
 
 describe('RAM detach custody after a bounded wait', () => {
@@ -1793,23 +1797,18 @@ describe('RAM detach custody after a bounded wait', () => {
       );
       expect(fixture.ledger().version).toBe(2);
       await writeFile(fixture.registry, fixture.image);
-      const cleared = clearedDetachLedger(fixture.directory, `${fixture.paths.lockFile}.ledger`);
-      try {
-        await fixture.send('complete');
-        expect(await fixture.event()).toBe('effect');
-        await fixture.send('finish');
-        expect(await fixture.event()).toBe('exiting');
-        const output = await fixture.output;
-        expect(output.pending).toBeDefined();
-        expect(await output.pending?.completion).toEqual({
-          status: 0,
-          stdout: 'owned terminal stdout\n',
-          stderr: 'owned terminal stderr\n',
-        });
-        await cleared.promise;
-      } finally {
-        cleared.close();
-      }
+      await fixture.send('complete');
+      expect(await fixture.event()).toBe('effect');
+      await fixture.send('finish');
+      expect(await fixture.event()).toBe('exiting');
+      const output = await fixture.output;
+      expect(output.pending).toBeDefined();
+      expect(await output.pending?.completion).toEqual({
+        status: 0,
+        stdout: 'owned terminal stdout\n',
+        stderr: 'owned terminal stderr\n',
+      });
+      await fixture.ledgerCleared();
       expect(fixture.ledger()).toEqual({ version: 1, lifecycle: null, claims: [], held: [] });
       expect(JSON.stringify(await fixture.volume().acquire(fixture.subtrees))).toContain(
         'owned attach admission reached',
@@ -1831,12 +1830,16 @@ import { readFile } from 'node:fs/promises';
 import { createHostCommands, RamTempVolume } from ${JSON.stringify(new URL('../../../dist/executors/bounded-exec/ram-temp.js', import.meta.url).href)};
 const paths = ${JSON.stringify(fixture.paths)};
 const host = createHostCommands(${JSON.stringify(join(fixture.directory, 'unused-gateway.sock'))}, 300, 'shared', ${JSON.stringify(fixture.executable)});
+// Its facade's end as the bounded run reports it; none until the detach runs.
+let facadeEnded = new Promise(() => {});
 const commands = {
   async run(file, args, deadline, binding) {
     if (file === '/usr/sbin/ioreg') return { status: 0, stdout: await readFile(${JSON.stringify(fixture.registry)}, 'utf8'), stderr: '' };
     if (file === '/sbin/mount') return { status: 0, stdout: '', stderr: '' };
     if (file !== '/usr/bin/hdiutil') throw new Error('unexpected child command: ' + file);
-    return host.run(file, args, 300, binding);
+    const run = host.run(file, args, 300, binding);
+    facadeEnded = run.then(async (output) => (await output.pending?.completion) ?? output);
+    return run;
   },
   async attachRam() { throw new Error('the bounded detach must precede attach admission'); },
   ownsRamDisk: (disk) => disk.entry === ${JSON.stringify(fixture.entry)} && disk.physical === '/dev/disk7',
@@ -1846,7 +1849,13 @@ const volume = new RamTempVolume(paths, ${fixture.capacity}, commands);
 const result = await volume.acquire({ rootArgv() { throw new Error('no subtree'); }, async retire() { throw new Error('no subtree'); } });
 console.log(JSON.stringify(result));
 process.stdin.resume();
-await once(process.stdin, 'end');
+// A facade that ends while this caller lives ends the caller, saying how, so no wait on its session outlives it.
+const ended = await Promise.race([once(process.stdin, 'end').then(() => null), facadeEnded]);
+if (ended !== null) {
+  process.stderr.write('its facade ended while it lived (exit ' + ended.status + '): ' + ended.stderr + '\\n');
+  process.exitCode = 1;
+  process.stdin.destroy();
+}
 `,
     );
     const caller = spawn('node', [script], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -1915,15 +1924,10 @@ await once(process.stdin, 'end');
         'no lease admitted until terminal completion',
       );
       expect(fixture.attaches()).toBe(1);
-      const cleared = clearedDetachLedger(fixture.directory, `${fixture.paths.lockFile}.ledger`);
-      try {
-        await fixture.send('finish');
-        expect(await fixture.event()).toBe('exiting');
-        expect((await (await fixture.output).pending?.completion)?.status).toBe(0);
-        await cleared.promise;
-      } finally {
-        cleared.close();
-      }
+      await fixture.send('finish');
+      expect(await fixture.event()).toBe('exiting');
+      expect((await (await fixture.output).pending?.completion)?.status).toBe(0);
+      await fixture.ledgerCleared();
       expect(fixture.ledger()).toEqual({ version: 1, lifecycle: null, claims: [], held: [] });
       expect(fixture.calls.filter((call) => call.startsWith('/usr/bin/hdiutil'))).toEqual([
         '/usr/bin/hdiutil detach /dev/disk7',
