@@ -137,8 +137,8 @@
   },
   "dependencies": {
     "@smoothbricks/cli": "workspace:*",
-    "@smoothbricks/nx-plugin": "workspace:*",
     "@smoothbricks/failure-summary": "workspace:*",
+    "@smoothbricks/nx-plugin": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "typia": "15.2.1"
   }
