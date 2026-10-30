@@ -1759,10 +1759,20 @@ async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
 }
 
 /// Points `link` at `runtime_dir`. A link that already points there is the whole answer: every
-/// spawn of a live workspace takes that path, so it reads one link and nothing else. Creating or
-/// retargeting the link also sweeps every `cs-*` link beside it whose target is gone - a retired
-/// workspace takes its mount with it and leaves the link dangling - so the scan of the shared
-/// directory is paid once per link a workspace takes, never once per command.
+/// spawn of a live workspace takes that path, so it reads one link and nothing else.
+///
+/// Otherwise a new link made beside it is renamed over the path, so a client resolving the path
+/// never finds it absent. Unlinking first left a window in which a reconnecting Nx client's
+/// `mkdir -p` of its socket dir made the path a real directory (a checkout's link, during a land's
+/// install on 2026-10-31), and every shell of that checkout was refused after it. A real
+/// directory found at the path is such a client's socket dir: it is moved aside, removed, and said
+/// on stderr, and the link takes its place.
+///
+/// Taking a link also sweeps every `cs-*` link beside it whose workspace is gone: a retired
+/// workspace takes its mount with it and leaves the link dangling. A link whose runtime dir alone
+/// is missing stays (its volume remounting, its mountpoint present), and so does one whose
+/// workspace this process cannot inspect. The scan of the shared directory is paid once per link a
+/// workspace takes, never once per command.
 ///
 /// Blocking: [`point_runtime_link`] runs it on the blocking pool, and publishing the host
 /// environment calls it where it already runs there.
@@ -1773,18 +1783,52 @@ fn point_runtime_link_blocking(link: &Path, runtime_dir: &Path) -> Result<()> {
             "reattach the workspace and retry",
         )
     };
+    // A name beside `link`, unique to this call: its own pid and a fresh nonce.
+    let beside = |role: &str| {
+        let mut name = link.as_os_str().to_owned();
+        name.push(format!(
+            ".{role}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        PathBuf::from(name)
+    };
     match std::fs::read_link(link) {
         Ok(target) if target == runtime_dir => return Ok(()),
-        Ok(_) => {
-            std::fs::remove_file(link).map_err(|error| io("replace runtime link", link, error))?;
-            std::os::unix::fs::symlink(runtime_dir, link)
-                .map_err(|error| io("create runtime link", link, error))?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::os::unix::fs::symlink(runtime_dir, link)
-                .map_err(|error| io("create runtime link", link, error))?;
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            let found = std::fs::symlink_metadata(link)
+                .map_err(|error| io("inspect runtime link", link, error))?;
+            if !found.is_dir() {
+                return Err(io("inspect runtime link", link, error));
+            }
+            let aside = beside("displaced");
+            std::fs::rename(link, &aside)
+                .map_err(|error| io("move aside the directory at runtime link", link, error))?;
+            let removed = std::fs::remove_dir_all(&aside);
+            cowshed_os::eprintln!(
+                "cowshed: {} was a directory, a client's socket dir made while the runtime link was missing; moved it aside{} and linked {} to {}",
+                link.display(),
+                match &removed {
+                    Ok(()) => String::from(" and removed it"),
+                    Err(error) => format!(
+                        " to {}, which could not be removed: {error}",
+                        aside.display()
+                    ),
+                },
+                link.display(),
+                runtime_dir.display()
+            );
         }
         Err(error) => return Err(io("inspect runtime link", link, error)),
+    }
+    let fresh = beside("new");
+    std::os::unix::fs::symlink(runtime_dir, &fresh)
+        .map_err(|error| io("create runtime link", &fresh, error))?;
+    if let Err(error) = std::fs::rename(&fresh, link) {
+        let _ = std::fs::remove_file(&fresh);
+        return Err(io("place runtime link", link, error));
     }
     let Some(directory) = link.parent() else {
         return Ok(());
@@ -1802,11 +1846,29 @@ fn point_runtime_link_blocking(link: &Path, runtime_dir: &Path) -> Result<()> {
         let Ok(target) = std::fs::read_link(&path) else {
             continue;
         };
-        if std::fs::metadata(&target).is_err() {
+        if runtime_link_workspace_gone(&target) {
             let _ = std::fs::remove_file(&path);
         }
     }
     Ok(())
+}
+
+/// Whether the workspace a runtime link leads into is gone. A read-write link leads to
+/// `<mount>/.cowshed/run` and a read-only one to `<exec temp>/run`, so the workspace is gone when
+/// the directory that roots it, its mount or its exec temp dir, is (`ENOENT`). Its runtime dir
+/// alone says nothing: it is absent while the workspace's volume remounts and its mountpoint
+/// stays, and sweeping then let the workspace's Nx clients `mkdir -p` a real directory at the
+/// link's path (2026-10-31).
+fn runtime_link_workspace_gone(target: &Path) -> bool {
+    let parent = target.parent();
+    let root = if parent.is_some_and(|directory| directory.ends_with(".cowshed")) {
+        parent.and_then(Path::parent)
+    } else {
+        parent
+    };
+    root.is_some_and(|root| {
+        std::fs::metadata(root).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 /// The caller's variables a child may take: no bypass of managed Git configuration, no
@@ -11299,6 +11361,111 @@ mod workspace_toolchain_tests {
             dangling.symlink_metadata().is_err(),
             "taking a link sweeps the dangling one"
         );
+    }
+
+    /// A link is retargeted by renaming a new one over it, so a client resolving it in between
+    /// never finds the path absent. Unlinking first left a window in which a reconnecting Nx
+    /// client's `mkdir -p` of its socket dir made the link's path a real directory (main's, at a
+    /// land's install on 2026-10-31), and every shell of the checkout was refused after it.
+    #[tokio::test]
+    async fn retargeting_a_runtime_link_never_leaves_its_path_absent() {
+        let root = scratch("runtime-link-retarget");
+        let targets = [root.join("first"), root.join("second")];
+        for target in &targets {
+            std::fs::create_dir_all(target).expect("runtime dir");
+        }
+        let link = root.join("cs-retarget");
+        std::os::unix::fs::symlink(&targets[0], &link).expect("first link");
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (link, done) = (link.clone(), std::sync::Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut absent = 0_u64;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if link.symlink_metadata().is_err() {
+                        absent += 1;
+                    }
+                }
+                absent
+            })
+        };
+        for round in 0..2000 {
+            point_runtime_link_blocking(&link, &targets[round % 2]).expect("retarget");
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            watcher.join().expect("watcher"),
+            0,
+            "the link's path was absent"
+        );
+        assert_eq!(std::fs::read_link(&link).expect("link"), targets[1]);
+    }
+
+    /// Only a link whose target is gone is dangling. One whose target this process cannot inspect
+    /// (a denied stat, an unreadable parent) still leads to a live workspace and is kept.
+    #[tokio::test]
+    async fn a_link_whose_target_cannot_be_inspected_is_never_swept() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("runtime-link-uninspectable");
+        let runtime = root.join("run");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let sealed = root.join("sealed");
+        std::fs::create_dir_all(sealed.join("run")).expect("another workspace's runtime dir");
+        let foreign = root.join("cs-foreign");
+        std::os::unix::fs::symlink(sealed.join("run"), &foreign).expect("foreign link");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).expect("seal");
+        let taken = point_runtime_link(&root.join("cs-taken"), &runtime).await;
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).expect("unseal");
+        taken.expect("taken link");
+        assert_eq!(
+            std::fs::read_link(&foreign).expect("the foreign link stays"),
+            sealed.join("run")
+        );
+    }
+
+    /// A workspace's runtime dir is briefly absent while its volume remounts (a land's adoption,
+    /// an install), and its mountpoint stays: its link is kept then. Removed, it let the
+    /// workspace's Nx clients `mkdir -p` a real directory at its path, again and again on
+    /// 2026-10-31. Only a workspace whose mount itself is gone, a retired one, leaves a dangling link.
+    #[tokio::test]
+    async fn a_link_is_swept_only_when_its_workspace_mount_is_gone() {
+        let root = scratch("runtime-link-remount");
+        let runtime = root.join("run");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let remounting = root.join("remounting");
+        std::fs::create_dir_all(&remounting).expect("an empty mountpoint");
+        let kept = root.join("cs-remounting");
+        std::os::unix::fs::symlink(remounting.join(".cowshed/run"), &kept).expect("kept link");
+        let retired = root.join("cs-retired-mount");
+        std::os::unix::fs::symlink(root.join("retired/.cowshed/run"), &retired)
+            .expect("retired link");
+        point_runtime_link(&root.join("cs-taken"), &runtime)
+            .await
+            .expect("taken link");
+        assert!(
+            kept.symlink_metadata().is_ok(),
+            "a workspace whose mountpoint is present keeps its link"
+        );
+        assert!(
+            retired.symlink_metadata().is_err(),
+            "a workspace whose mount is gone loses its link"
+        );
+    }
+
+    /// A real directory where the link belongs (a client's `mkdir -p` of its socket dir while the
+    /// link was missing) is moved aside and the link takes its place, so the workspace's jobs and
+    /// shells reach its runtime dir again instead of failing on a path that leads nowhere.
+    #[tokio::test]
+    async fn a_real_directory_at_the_links_path_is_replaced_by_the_link() {
+        let root = scratch("runtime-link-directory");
+        let runtime = root.join("run");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let link = root.join("cs-squatted");
+        std::fs::create_dir_all(link.join("nx")).expect("a client's socket dir");
+        point_runtime_link(&link, &runtime)
+            .await
+            .expect("the link replaces the directory");
+        assert_eq!(std::fs::read_link(&link).expect("link"), runtime);
     }
 
     /// Stores hand out port blocks independently, so two live workspaces can hold one base.
