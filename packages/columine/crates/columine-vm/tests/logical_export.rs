@@ -7,9 +7,10 @@
 
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{
-    AggType, DERIVED_FACT_TOMBSTONE_IDENTITY, ErrorCode, Opcode, PROGRAM_FORMAT_VERSION,
+    AggType, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_FORMAT_VERSION,
     PROGRAM_HASH_PREFIX, ProgramHeader, SlotType, StructFieldType,
 };
+use columine_vm::bytes;
 use columine_vm::hashmap_ops::{CmpType, Strategy, batch_map_upsert};
 use columine_vm::hooks::NoVm;
 use columine_vm::logical_export::{
@@ -23,6 +24,9 @@ use columine_vm::meta::SlotMetaView;
 use columine_vm::removal_cut::SlotCuts;
 use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state, validate_state,
+};
+use columine_vm::vm::{
+    get_derived_facts_capacity, get_derived_facts_occupied_at, get_derived_facts_offset,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -680,6 +684,61 @@ fn condition_tree_round_trip_carries_derived_cells() {
     });
     let mut interner = TestInterner::default();
     round_trip(&prog, &logical, &SlotEncoding::RAW, &mut interner);
+}
+
+/// The derived-facts table keeps a fact's value split across two u32 lanes
+/// after the u64 identity lane: `values_lo: u32[capacity]`, then
+/// `values_hi: u32[capacity]`. Export reads each cell's value from those
+/// lanes, and import writes it back into them, so the table the rules wrote
+/// and the table import rebuilt are the same image. Adjacent cells with
+/// nonzero high lanes tell the split lanes from one contiguous u64 lane.
+#[test]
+fn condition_tree_cells_travel_through_split_value_lanes() {
+    let prog = program(1, &halt(slot_def(0, SlotType::ConditionTree as u8, 16)));
+    let mut written = fresh_image(&prog);
+    let identities = get_derived_facts_offset(&written);
+    let capacity = get_derived_facts_capacity(&written);
+    // (pos, identity, values_lo, values_hi) as the rules lay them down.
+    for (pos, identity, lo, hi) in [
+        (3, 0x0002_0000_0000_002a, 0x5566_7788, 0x1122_3344),
+        (4, 0x0002_0000_0000_002b, 0xddee_ff00, 0x99aa_bbcc),
+    ] {
+        bytes::write_u64(&mut written, identities + pos * 8, identity);
+        bytes::write_u32(&mut written, identities + capacity * 8 + pos * 4, lo);
+        bytes::write_u32(&mut written, identities + capacity * 12 + pos * 4, hi);
+    }
+    let occupied_at = get_derived_facts_occupied_at(&written).expect("the table names its slot");
+    bytes::write_u32(&mut written, occupied_at, 2);
+    let expected = LogicalCondition {
+        lifecycle_generation: 1,
+        last_removed_key: EMPTY_KEY,
+        cells: vec![
+            LogicalConditionCell {
+                pos: 3,
+                identity: 0x0002_0000_0000_002a,
+                value: 0x1122_3344_5566_7788,
+            },
+            LogicalConditionCell {
+                pos: 4,
+                identity: 0x0002_0000_0000_002b,
+                value: 0x99aa_bbcc_ddee_ff00,
+            },
+        ],
+    };
+    let mut interner = TestInterner::default();
+    let exported = export_slot(&written, 0, &SlotEncoding::RAW, &interner).expect("export");
+    assert_eq!(
+        exported.condition.as_ref(),
+        Some(&expected),
+        "export reads each value from its low and high lanes"
+    );
+    let mut logical = base_slot(0, SlotType::ConditionTree);
+    logical.condition = Some(expected);
+    let rebuilt = import_image(&prog, &[logical], &SlotEncoding::RAW, &mut interner);
+    assert!(
+        rebuilt == written,
+        "import writes each value into the low and high lanes the rules read"
+    );
 }
 
 #[test]
