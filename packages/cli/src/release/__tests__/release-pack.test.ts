@@ -15,6 +15,7 @@ import {
   packReleaseTarball,
   type ReleasePackManifest,
   type ReleasePackNx,
+  releaseCheckGateRefusal,
   releasePack,
   verifyReleasePackManifest,
 } from '../pack.js';
@@ -309,6 +310,22 @@ describe('release pack', () => {
         ],
       },
     );
+  });
+});
+
+describe('release-check gate', () => {
+  it('runs only a dependency-free gate cached on a runtime digest of the packed bytes', () => {
+    const digest = { runtime: 'bun scripts/verify-packaged-bin-bits.ts --digest' };
+    const refusals = [
+      { cache: true, inputs: [digest], dependsOn: ['build'] },
+      { cache: false },
+      {},
+      { cache: true, inputs: ['{projectRoot}/dist/**/*'] },
+      { cache: true, inputs: [digest] },
+    ].map((gate) => releaseCheckGateRefusal('pkg', gate));
+    expect(refusals.map((refusal) => refusal !== null)).toEqual([true, true, true, true, false]);
+    expect(refusals[0]).toContain('empty dependsOn');
+    for (const refusal of refusals.slice(1, 4)) expect(refusal).toContain('runtime input');
   });
 });
 

@@ -7,7 +7,7 @@ import { publint } from 'publint';
 import { formatMessage } from 'publint/utils';
 import typia from 'typia';
 import { githubCiNxRunMany } from '../github-ci/index.js';
-import type { PackageExports } from '../lib/json.js';
+import type { NxTargetConfig, PackageExports } from '../lib/json.js';
 import { run, runResult } from '../lib/run.js';
 import {
   getWorkspacePackages,
@@ -124,20 +124,37 @@ export async function packReleaseTarball(
   }
 }
 /**
- * Per-package release gate: when the project declares an Nx `release-check`
- * target, run it after prebuilt outputs merge and before the tarball exists.
- * The target itself owns what it asserts; this owner enforces the two
- * properties that make the assertion mean anything, reading the *resolved*
- * graph configuration so `targetDefaults` cannot smuggle either one back in:
+ * Why `gate`, a resolved `release-check` target, cannot judge the bytes being published, or null when it can:
  *
  * - Empty `dependsOn`: the gate runs in the publishing job, where the only
  *   complete artifact tree is the union of this job's build and the foreign
  *   platform outputs applied over it. A dependency would rebuild and replace
  *   that tree, so the gate would verify (or wipe) something other than what
  *   gets packed.
- * - `cache: false`: a cached gate is replayed, not run. Its inputs cannot
- *   describe artifacts merged in from another job, so a cache hit would
- *   silently skip verification of the very bytes being published.
+ * - Cached on a runtime input that digests the packed bytes: with no dependency,
+ *   no task output can key the artifacts merged in from other jobs, and no file
+ *   input sees the gitignored tree they land in, so only a runtime digest of that
+ *   tree makes a cache hit stand for exactly the bytes being published. Every
+ *   target that runs work is cached; a replay of the same bytes is the same verdict.
+ */
+export function releaseCheckGateRefusal(projectName: string, gate: NxTargetConfig): string | null {
+  const dependsOn = gate.dependsOn ?? [];
+  if (dependsOn.length > 0) {
+    return `${projectName}: the release-check target must declare an empty dependsOn so the gate cannot rebuild merged prebuilt outputs; it resolves to ${JSON.stringify(dependsOn)}.`;
+  }
+  const digested = (gate.inputs ?? []).some((input) => typeof input === 'object' && 'runtime' in input);
+  if (gate.cache !== true || !digested) {
+    return `${projectName}: the release-check target must be cached on the packed bytes: "cache": true and a runtime input that digests the artifact tree it judges, since with no dependency no task output can key the bytes merged in from other jobs.`;
+  }
+  return null;
+}
+/**
+ * Per-package release gate: when the project declares an Nx `release-check`
+ * target, run it after prebuilt outputs merge and before the tarball exists.
+ * The target itself owns what it asserts; this owner enforces the two
+ * properties that make the assertion mean anything (releaseCheckGateRefusal),
+ * reading the *resolved* graph configuration so `targetDefaults` cannot
+ * smuggle either one back in.
  *
  * Undeclared packages pack exactly as before.
  */
@@ -147,16 +164,9 @@ async function runReleaseCheckGate(root: string, pkg: PackageInfo, nx: ReleasePa
   if (!gate) {
     return;
   }
-  const dependsOn = gate.dependsOn ?? [];
-  if (dependsOn.length > 0) {
-    throw new Error(
-      `${pkg.projectName}: the release-check target must declare an empty dependsOn so the gate cannot rebuild merged prebuilt outputs; it resolves to ${JSON.stringify(dependsOn)}.`,
-    );
-  }
-  if (gate.cache !== false) {
-    throw new Error(
-      `${pkg.projectName}: the release-check target must declare cache: false so the gate cannot be replayed from cache instead of verifying the packed artifacts.`,
-    );
+  const refusal = releaseCheckGateRefusal(pkg.projectName, gate);
+  if (refusal !== null) {
+    throw new Error(refusal);
   }
   console.log(`${pkg.name}@${pkg.version}: running Nx release-check gate`);
   try {
