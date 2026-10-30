@@ -46,12 +46,24 @@ const CORES = String(spawnSync('sysctl', ['-n', 'hw.ncpu'], { encoding: 'utf8' }
 const GATE = ['run-many', '-t', 'gate', `--parallel=${CORES}`, '--nx-bail=false', '--outputStyle=static-failures-only'];
 const DAEMON_STOP: Call = { args: ['daemon', '--stop'], exit: 0 };
 const passingRun = (args: readonly string[]): Call => ({ args, exit: 0 });
-/** The shipping seam after the Linux cross check: the host production CLI, then cowshed:release-check on its bytes. */
-const SHIPPING_PRODUCER = ['run', 'cowshed:cli-native:production', '--outputStyle=static-failures-only'];
+/** The shipping seam builds the host production CLI and addon, then checks only their already-produced bytes. */
+const SHIPPING_PRODUCER = [
+  'run-many',
+  '--projects',
+  'cowshed',
+  '--targets',
+  'cli-native,napi-native',
+  '--configuration',
+  'production',
+  '--outputStyle=static-failures-only',
+];
 const SHIPPING_CHECK = ['run', 'cowshed:release-check', '--outputStyle=static-failures-only'];
 const SHIPPING_PRODUCER_PASSED: Call = {
   ...passingRun(SHIPPING_PRODUCER),
-  run: [{ taskId: 'cowshed:cli-native:production', hash: 'shipping-producer-hash', status: 0 }],
+  run: [
+    { taskId: 'cowshed:cli-native:production', hash: 'shipping-producer-hash', status: 0 },
+    { taskId: 'cowshed:napi-native:production', hash: 'shipping-addon-hash', status: 0 },
+  ],
 };
 const SHIPPING_CHECK_PASSED: Call = {
   ...passingRun(SHIPPING_CHECK),
@@ -510,7 +522,7 @@ describe('land-host.sh --gate', () => {
     const program = `${readFileSync(join(bridge, 'cache_adapter.js'), 'utf8')}\n${readFileSync(join(bridge, 'nx_publish.js'), 'utf8')}`;
     expect(readFileSync(join(gate.state, 'publish.program'), 'utf8')).toBe(program);
     expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["wiring-hash"]\n-\n${gate.ws}\n["gate-hash"]\n-\n${gate.ws}\n["shipping-producer-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
+      `-\n${gate.ws}\n["wiring-hash"]\n-\n${gate.ws}\n["gate-hash"]\n-\n${gate.ws}\n["shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
     );
   });
 
@@ -521,7 +533,7 @@ describe('land-host.sh --gate', () => {
     expect(run.nx.slice(-3)).toEqual([CROSS.join(' '), ...SHIPPING_NX]);
     // Each invocation keeps its own list: gate, cross check, shipping producer and shipping guard.
     expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["gate-hash"]\n-\n${gate.ws}\n["cross-hash"]\n-\n${gate.ws}\n["shipping-producer-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
+      `-\n${gate.ws}\n["gate-hash"]\n-\n${gate.ws}\n["cross-hash"]\n-\n${gate.ws}\n["shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
     );
   });
 
@@ -540,7 +552,7 @@ describe('land-host.sh --gate', () => {
     expect(run.log).toContain("could not read the gate's task hashes");
     expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
     expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["shipping-producer-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
+      `-\n${gate.ws}\n["shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
     );
     expect(readdirSync(join(gate.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
   });
@@ -594,7 +606,7 @@ describe('land-host.sh --gate', () => {
     );
     expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
     expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["shipping-producer-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
+      `-\n${gate.ws}\n["shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
     );
   });
 

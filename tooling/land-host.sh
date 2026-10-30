@@ -25,7 +25,7 @@
 #    whole again, and Nx's cache replays every task whose inputs did not move.
 #    After the gate passes, `bun run check:linux` cross-lints the same tree for Linux: the pre-push hook refuses a
 #    tree whose Linux cross check is not cached, so a land that skipped it would leave main unpushable.
-#    The shipping seam then builds this host's production CLI and runs cowshed:release-check on those dist bytes.
+#    The shipping seam then builds this host's production CLI and addon, and runs cowshed:release-check on those dist bytes.
 #    The guard remains uncached and dependency-free; both phases report their wall time and refuse a red land.
 #    Once the wiring preflight, gate, Linux cross check and shipping seam all pass, each captured invocation's
 #    succeeded results are published through smoo-nx-publish to the accepted Nx store. Sheds stay read-only.
@@ -224,16 +224,16 @@ gate_workspace() {
     capture_hashes 02-cross.json "$cross_began" "the Linux cross check's"
   fi
   shipping_started=$(date +%s)
-  say "building the host production CLI for shipping verification"
-  gate_job bun nx run cowshed:cli-native:production --outputStyle=static-failures-only >&2 || {
+  say "building the host production CLI and addon for shipping verification"
+  gate_job bun nx run-many --projects cowshed --targets cli-native,napi-native --configuration production --outputStyle=static-failures-only >&2 || {
     shipping_status=$?
-    say "host production CLI exited $shipping_status after $(($(date +%s) - shipping_started))s; the land stops"
+    say "host production CLI and addon exited $shipping_status after $(($(date +%s) - shipping_started))s; the land stops"
     exit "$shipping_status"
   }
   shipping_built=$(date +%s)
   capture_hashes 03-shipping-producer.json "$shipping_started" "the shipping producer's"
   shipping_check_began=$(date +%s)
-  say "checking the shipping CLI bytes with cowshed:release-check"
+  say "checking the shipping CLI and addon bytes with cowshed:release-check"
   gate_job bun nx run cowshed:release-check --outputStyle=static-failures-only >&2 || {
     shipping_status=$?
     say "shipping release-check exited $shipping_status after $(($(date +%s) - shipping_check_began))s; the land stops"

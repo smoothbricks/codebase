@@ -1,3 +1,4 @@
+import type { ProcessLineage } from '@smoothbricks/cowshed/process-lineage';
 import typia from 'typia';
 import { type HangDiagnosticHost, runProbe } from './hang-diagnostics.js';
 import { CONTROL_MS } from './lease-wait.js';
@@ -27,41 +28,45 @@ export type MbxQueueSnapshot =
   | { readonly ok: true; readonly requests: readonly MbxQueuedRequest[]; readonly diagnostics?: readonly string[] }
   | { readonly ok: false; readonly detail: string };
 
-/** One observation, including all scoped process reads, has this bounded control-plane budget. */
+/** One observation, including all scoped process reads, has this monotonic control-plane budget. */
 export const MBX_QUEUE_SNAPSHOT_MS = CONTROL_MS;
 export const MBX_QUEUE_POLL_MS = 1_000;
 
-interface ProcessIdentity {
-  readonly pid: number;
-  readonly ppid: number;
-  readonly pgid: number;
-  readonly stat: string;
+interface MbxQueueHost extends Pick<HangDiagnosticHost, 'probe'> {
+  now(): number;
+  lineages(pids: readonly number[]): Promise<readonly ProcessLineage[]>;
 }
 
 /**
- * Read only the public pool snapshot and the listed waiters' process identities/ancestors. A live member of the task's
- * process group, or its live descendant, corroborates a PID; a command name never does. No host process census is used.
- * The caller supplies the leaf's environment so stats observes the same machine-wide pool as the leaf.
+ * Read only the public pool snapshot and the listed waiters' native per-PID lineage/ancestors. A live member of the
+ * task's process group, or its live descendant, corroborates a PID; a command name never does. No ps process or host
+ * process census is used. The leaf's environment selects the same machine-wide pool as its observation.
  */
 export async function snapshotMbxQueue(
   rootPid: number,
   environment: NodeJS.ProcessEnv,
   signal: AbortSignal,
-  host: Pick<HangDiagnosticHost, 'probe'> = {
+  host: MbxQueueHost = {
+    now: () => performance.now(),
     probe: (file, args, timeoutMs, abort) => runProbe(file, args, timeoutMs, abort, environment),
+    async lineages(pids) {
+      const { processLineages } = await import('@smoothbricks/cowshed/process-lineage');
+      return processLineages(pids);
+    },
   },
-  now: () => number = Date.now,
 ): Promise<MbxQueueSnapshot> {
+  const now = () => host.now();
   const endsAt = now() + MBX_QUEUE_SNAPSHOT_MS;
-  const probe = async (file: string, args: readonly string[], emptyAllowed = false) => {
+  const probe = async (file: string, args: readonly string[]) => {
     const remaining = endsAt - now();
     if (remaining <= 0 || signal.aborted) return { ok: false, detail: 'admission snapshot deadline reached' } as const;
     const result = await host.probe(file, args, remaining, signal);
+    if (now() >= endsAt || signal.aborted) return { ok: false, detail: 'admission snapshot deadline reached' } as const;
     const command = `${file} ${args.join(' ')}`;
     if (result.status !== 'exited') {
       return { ok: false, detail: `${command}: ${result.status}: ${result.detail}; stderr=${result.stderr}` } as const;
     }
-    if (result.code !== 0 && !(emptyAllowed && result.code === 1 && result.stdout === '' && result.stderr === '')) {
+    if (result.code !== 0) {
       return { ok: false, detail: `${command}: exit=${result.code}; stderr=${result.stderr}` } as const;
     }
     if (result.stderr.trim() !== '') return { ok: false, detail: `${command}: stderr=${result.stderr}` } as const;
@@ -94,32 +99,31 @@ export async function snapshotMbxQueue(
     }
     return [{ ...row, pid }];
   });
+  if (now() >= endsAt || signal.aborted) return { ok: false, detail: 'admission snapshot deadline reached' };
   if (candidates.length === 0) return { ok: true, requests: [], ...(diagnostics.length === 0 ? {} : { diagnostics }) };
-  const table = new Map<number, ProcessIdentity>();
+  const table = new Map<number, ProcessLineage>();
   const inspected = new Set<number>();
   let pending = [...new Set([rootPid, ...candidates.map((row) => row.pid)])];
   while (pending.length > 0) {
-    const result = await probe('ps', ['-o', 'pid=,ppid=,pgid=,stat=', '-p', pending.join(',')], true);
-    if (!result.ok) return result;
-    for (const pid of pending) inspected.add(pid);
-    for (const line of result.stdout.split('\n').filter((row) => row.trim() !== '')) {
-      const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
-      if (match === null) return { ok: false, detail: `admission snapshot: invalid scoped ps row: ${line}` };
-      const [, pid, ppid, pgid, stat] = match;
-      if (pid === undefined || ppid === undefined || pgid === undefined || stat === undefined) {
-        return { ok: false, detail: `admission snapshot: incomplete scoped ps row: ${line}` };
-      }
-      const entry = { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), stat };
-      if (!pending.includes(entry.pid))
-        return { ok: false, detail: `admission snapshot: unexpected ps pid=${entry.pid}` };
-      table.set(entry.pid, entry);
+    if (now() >= endsAt || signal.aborted) return { ok: false, detail: 'admission snapshot deadline reached' };
+    let entries: readonly ProcessLineage[];
+    try {
+      entries = await host.lineages(pending);
+    } catch (error) {
+      return {
+        ok: false,
+        detail: `admission snapshot: native process lineages: ${error instanceof Error ? error.message : String(error)}`,
+      };
     }
+    if (now() >= endsAt || signal.aborted) return { ok: false, detail: 'admission snapshot deadline reached' };
+    for (const pid of pending) inspected.add(pid);
+    for (const entry of entries) table.set(entry.pid, entry);
     pending = [
       ...new Set(
         [...table.values()]
           .filter(
             (entry) =>
-              !entry.stat.startsWith('Z') &&
+              !entry.zombie &&
               entry.pgid !== rootPid &&
               entry.pid !== rootPid &&
               entry.ppid > 1 &&
@@ -132,7 +136,7 @@ export async function snapshotMbxQueue(
   const belongs = (pid: number): boolean => {
     const seen = new Set<number>();
     for (let entry = table.get(pid); entry !== undefined && !seen.has(entry.pid); entry = table.get(entry.ppid)) {
-      if (entry.stat.startsWith('Z')) return false;
+      if (entry.zombie) return false;
       if (entry.pid === rootPid || entry.pgid === rootPid) return true;
       seen.add(entry.pid);
     }
@@ -161,5 +165,6 @@ export async function snapshotMbxQueue(
     }
     requests.push({ pid: row.pid, ticket: row.ticket, queuePosition: row.queue_position });
   }
+  if (now() >= endsAt || signal.aborted) return { ok: false, detail: 'admission snapshot deadline reached' };
   return { ok: true, requests, ...(diagnostics.length === 0 ? {} : { diagnostics }) };
 }

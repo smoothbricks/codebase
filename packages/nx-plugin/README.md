@@ -1360,6 +1360,20 @@ A wildcard without a caret selects the current project instead. For example, a w
 this local relationship explicit for inferred `tsc-js` targets that also have inferred `cargo-wasm`. Package-managed
 JavaScript targets with another platform prerequisite must likewise declare that local edge themselves.
 
+A self-hosted workspace that owns the plugin's cowshed dependency builds its declared `napi-native` and independent
+`lineage-js` producers before **every bounded-exec task**, including declared Bun targets, inferred Cargo shards and
+root serial groups. Native tool discovery resolves that local owner from the linked package manifest, not a repository
+path or project-name alias; an installed consumer takes no local producer edge because its package ships the addon and
+lineage entry. The plugin's compile and typecheck targets require only `lineage-js`, never the addon or cowshed's full
+API build. Its runtime-only cowshed project dependency is excluded from ordinary caret build edges, avoiding the
+executor bootstrap cycle. Bounded targets key on the produced addon and lineage JavaScript bytes through their producer
+edges, not the workspace’s Rust sources. Declarations that replace `dependsOn` or `inputs` keep the inferred
+preconditions with Nx’s `"..."` token. When a declaration changes an inferred executor to bounded-exec, its compatible
+inferred base contains only these runtime prerequisites and output inputs; the incompatible executor’s command and
+inputs do not leak across the normal Nx override. The canonical dependency-free `release-check` is the exception: it
+judges already assembled shipping artifacts and verifies the addon is present, without compiling at runtime or disabling
+the observer (specs/cowshed/06_cli.md, `release-check`).
+
 N-API binaries are not prerequisites of TypeScript declaration emission, so compiler targets do not pull them in by
 default. Aggregate `build` remains the package-completeness boundary and includes every published local output family.
 
@@ -1951,19 +1965,22 @@ after it. EOF is not a grant or a release; a holder killed without `r` remains c
 Independently of that spawn-time zero-hold rule, **any live task process explicitly queued for mbx admission pauses
 idle**, even while another task process holds capacity or the runner is otherwise unsupported. The executor polls public
 `mbx stats --scheduler --json --activity` activity, accepting only `kind: "waiter"`, `live: true` rows whose PID is
-corroborated by a bounded, scoped process-group/ancestor observation. Names, private waiter files and decision logs
+corroborated by bounded, scoped per-PID lineage reads through cowshed's native `processLineages` owner (libproc on
+macOS, procfs on Linux), never a spawned ps or a process-table census. Names, private waiter files and decision logs
 prove nothing. Public `queue_position` is preserved, never recomputed by the consumer. A successful snapshot with no
 task waiters resumes the remaining budget when the lifecycle and hold count permit it; a finished test resets the paused
-budget. An idle callback drains any in-flight poll and takes a fresh bounded snapshot before expiring. Snapshot failures
-are reported operational failures, never manufactured queue/admission evidence or an idle wedge; an unidentifiable
-foreign legacy row is diagnosed without claiming task membership. Live diagnostics say `queued for admission N s` with
-the mbx queue position. A command that fails or is cancelled before its first admission records a distinct `queued`
-verdict with observed wait duration and its last public PID/ticket/position rows. Queue observation adds no deadline and
-changes neither total nor fixture ceilings. Queue observations take effect at snapshot completion, never backdated
-across a finished test's budget reset. Observed wait duration freezes when the command settles or cancellation stops
-observation, before teardown or report reading. The observer requires the version-2 activity-only report; the full
-statistics document's cache, savings and memory histories are not polling input. The activity projection omits those
-walks and encodings instead of raising the observer's output or control-plane limits.
+budget. An idle callback drains any in-flight poll and takes a fresh bounded snapshot before expiring. The stats read
+and every native lineage batch share one five-second monotonic control-plane budget, independent of the idle clock; late
+or cancelled snapshots never become queue or empty-membership evidence. Snapshot failures are reported operational
+failures, never manufactured queue/admission evidence or an idle wedge; an unidentifiable foreign legacy row is
+diagnosed without claiming task membership. Live diagnostics say `queued for admission N s` with the mbx queue position.
+A command that fails or is cancelled before its first admission records a distinct `queued` verdict with observed wait
+duration and its last public PID/ticket/position rows. Queue observation adds no deadline and changes neither total nor
+fixture ceilings. Queue observations take effect at snapshot completion, never backdated across a finished test's budget
+reset. Observed wait duration freezes when the command settles or cancellation stops observation, before teardown or
+report reading. The observer requires the version-2 activity-only report; the full statistics document's cache, savings
+and memory histories are not polling input. The activity projection omits those walks and encodings instead of raising
+the observer's output or control-plane limits.
 
 The decision to use zero-hold pausing is made before spawn, from the canonical scheduling switch and the supported
 command, never from silence on the pipe. The inferred extracted-archive

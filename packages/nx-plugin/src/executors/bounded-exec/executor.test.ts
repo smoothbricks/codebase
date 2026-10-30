@@ -1781,6 +1781,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
             undefined,
             null,
             {
+              // This fixture advances the executor's idle clock, not an external control-plane read.
+              now: () => 0,
               probe: async (file, args) => {
                 expect(file).toBe('mbx');
                 expect(args).toEqual(['stats', '--scheduler', '--json', '--activity']);
@@ -1791,6 +1793,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
                   stdout: '{"version":2,"scheduler":{"activity":[]}}',
                   stderr: '',
                 };
+              },
+              lineages: async (pids) => {
+                throw new Error(`empty activity must not read native lineages: ${pids.join(',')}`);
               },
             },
           ),
@@ -1895,38 +1900,38 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
               undefined,
               null,
               {
+                now: () => 0,
                 probe: async (file, args) => {
-                  if (file === 'mbx') {
-                    expect(args).toEqual(['stats', '--scheduler', '--json', '--activity']);
-                    snapshots += 1;
-                    if (mode === 'fresh' && snapshots === 1) {
-                      await firstSnapshot.promise;
-                      return {
-                        status: 'exited',
-                        code: 0,
-                        stdout: '{"version":2,"scheduler":{"activity":[]}}',
-                        stderr: '',
-                      };
-                    }
-                    if (mode === 'failed' && snapshots > 1) {
-                      return { status: 'exited', code: 2, stdout: '', stderr: 'snapshot unavailable' };
-                    }
+                  expect(file).toBe('mbx');
+                  expect(args).toEqual(['stats', '--scheduler', '--json', '--activity']);
+                  snapshots += 1;
+                  if (mode === 'fresh' && snapshots === 1) {
+                    await firstSnapshot.promise;
                     return {
                       status: 'exited',
                       code: 0,
+                      stdout: '{"version":2,"scheduler":{"activity":[]}}',
                       stderr: '',
-                      stdout:
-                        '{"version":2,"scheduler":{"activity":[{"kind":"waiter","live":true,"pid":77,"ticket":31,"queue_position":4}]}}',
                     };
                   }
-                  expect(file).toBe('ps');
-                  const rootPid = Number(args.at(-1)?.split(',')[0]);
+                  if (mode === 'failed' && snapshots > 1) {
+                    return { status: 'exited', code: 2, stdout: '', stderr: 'snapshot unavailable' };
+                  }
                   return {
                     status: 'exited',
                     code: 0,
-                    stdout: `${rootPid} 1 ${rootPid} S\n77 ${rootPid} ${rootPid} S\n`,
                     stderr: '',
+                    stdout:
+                      '{"version":2,"scheduler":{"activity":[{"kind":"waiter","live":true,"pid":77,"ticket":31,"queue_position":4}]}}',
                   };
+                },
+                lineages: async (pids) => {
+                  const rootPid = pids[0];
+                  if (rootPid === undefined) throw new Error('a native lineage read must name its task root');
+                  return [
+                    { pid: rootPid, ppid: 1, pgid: rootPid, zombie: false },
+                    { pid: 77, ppid: rootPid, pgid: rootPid, zombie: false },
+                  ];
                 },
               },
             );
