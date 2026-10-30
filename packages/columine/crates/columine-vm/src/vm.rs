@@ -32,7 +32,7 @@ use crate::key_index::{
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
 use crate::removal_cut::{self, CutKey, RemovalCuts, SlotCuts};
-use crate::row_exprs::{LiveColumns, StoredRow};
+use crate::row_exprs::{LiveColumns, StoredBinding, StoredRow};
 use crate::scratch::ScratchDemand;
 use crate::state_init::{self, EVICTION_ENTRY_SIZE};
 use crate::struct_map::{
@@ -2072,7 +2072,7 @@ pub(crate) struct StructMapUpsertOperands {
 }
 
 /// Which row a unary struct-map upsert keeps per key, as its opcode and
-/// trailing field ordinal encode it. Every pick folds rows in input order.
+/// trailing operand encode it. Every pick folds rows in input order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StructMapPick {
     /// 0x80: every row replaces.
@@ -2084,6 +2084,10 @@ pub(crate) enum StructMapPick {
     /// 0x8b: a row replaces when its key is absent, the stored reset field is
     /// true, or its own reset field is true.
     FirstSinceReset { reset_field_idx: u8 },
+    /// 0x8f: a row writes when its predicate cell is nonzero, read at the
+    /// element after the rows before it landed. A live predicate sees the
+    /// destination's stored row for the element's key.
+    LastIf { pred_col: u32 },
 }
 
 impl StructMapUpsertOperands {
@@ -2115,7 +2119,8 @@ impl StructMapUpsertOperands {
 
     /// The shared value/array tail after slot and key column: num_vals:u8,
     /// (val_col, field_idx) × num_vals, num_arrays:u8, (offsets_col,
-    /// values_col, field_idx) × num_arrays [, comparison_field_idx:u8].
+    /// values_col, field_idx) × num_arrays [, comparison_field_idx:u8 |
+    /// reset_field_idx:u8 | pred_col:index].
     fn decode_tail_from<'a, R: OperandRead<'a>>(
         &mut self,
         operands: &mut R,
@@ -2145,6 +2150,9 @@ impl StructMapUpsertOperands {
             Opcode::BatchStructMapUpsertFirstSinceReset => StructMapPick::FirstSinceReset {
                 reset_field_idx: operands.byte()?,
             },
+            Opcode::BatchStructMapUpsertLastIf => StructMapPick::LastIf {
+                pred_col: operands.index()?,
+            },
             _ => return None,
         };
         self.end = operands.pos();
@@ -2152,11 +2160,12 @@ impl StructMapUpsertOperands {
     }
 }
 
-/// Decode the shared 0x80/0x81 row operands and the trailing field ordinal of
-/// 0x82 (comparison) or 0x8b (reset) without mutating state: `slot:index,
-/// key_col:index, num_vals:u8, (val_col:index, field_idx:u8) × num_vals,
-/// num_arrays:u8, (offsets_col:index, values_col:index, field_idx:u8) ×
-/// num_arrays [, pick_field_idx:u8]`. Any other opcode decodes to `None`.
+/// Decode the shared 0x80/0x81 row operands and the trailing operand of 0x82
+/// (comparison ordinal), 0x8b (reset ordinal) or 0x8f (predicate column)
+/// without mutating state: `slot:index, key_col:index, num_vals:u8,
+/// (val_col:index, field_idx:u8) × num_vals, num_arrays:u8, (offsets_col:index,
+/// values_col:index, field_idx:u8) × num_arrays [, pick_field_idx:u8 |
+/// pred_col:index]`. Any other opcode decodes to `None`.
 /// Fixed operand arrays in both dispatch paths make their encoded maxima part
 /// of the accepted-program contract.
 pub(crate) fn decode_struct_map_upsert_operands(
@@ -2439,6 +2448,7 @@ enum ResolvedStructMapPick {
     First,
     Max(StructMapMaxComparison),
     FirstSinceReset(StructMapResetLane),
+    LastIf { pred_col: u32 },
 }
 
 /// 0x8b's reset lane: a mapped BOOL field and the column that carries it.
@@ -2458,6 +2468,7 @@ fn resolve_struct_map_pick<I: KeyIndex>(
     Some(match operands.pick {
         StructMapPick::Last => ResolvedStructMapPick::Last,
         StructMapPick::First => ResolvedStructMapPick::First,
+        StructMapPick::LastIf { pred_col } => ResolvedStructMapPick::LastIf { pred_col },
         StructMapPick::Max {
             comparison_field_idx,
         } => ResolvedStructMapPick::Max(resolve_struct_map_max_comparison(
@@ -2487,7 +2498,8 @@ fn resolve_struct_map_pick<I: KeyIndex>(
 
 /// Decide whether row `element_idx` writes its key, before bitset clearing,
 /// journaling, row or array writes, or change flags: a skipped row mutates
-/// nothing.
+/// nothing. `live` evaluates a 0x8f predicate the bind deferred.
+#[allow(clippy::too_many_arguments)]
 fn should_write_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
     state: &[u8],
     smap: &StructMapSlot<I>,
@@ -2495,6 +2507,7 @@ fn should_write_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
     pick: ResolvedStructMapPick,
     cols: &[&[u8]],
     element_idx: u32,
+    live: Option<&mut LiveColumns<'_, '_>>,
     cx: &mut KeyCx<'_, I, S>,
 ) -> Result<bool, ErrorCode> {
     match pick {
@@ -2506,7 +2519,59 @@ fn should_write_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
         ResolvedStructMapPick::FirstSinceReset(lane) => {
             should_upsert_struct_map_since_reset(state, smap, key, lane, cols, element_idx, cx)
         }
+        ResolvedStructMapPick::LastIf { pred_col } => {
+            should_upsert_struct_map_if(state, smap, key, pred_col, cols, element_idx, live, cx)
+        }
     }
+}
+
+/// The u32 cell of `col` at `element_idx`; a column that does not cover
+/// the element is `ColumnUnderrun`.
+fn element_u32_cell(cols: &[&[u8]], col: u32, element_idx: u32) -> Result<u32, ErrorCode> {
+    let start = (element_idx as usize)
+        .checked_mul(4)
+        .ok_or(ErrorCode::ColumnUnderrun)?;
+    let end = start.checked_add(4).ok_or(ErrorCode::ColumnUnderrun)?;
+    let cell = cols
+        .get(col as usize)
+        .and_then(|col| col.get(start..end))
+        .ok_or(ErrorCode::ColumnUnderrun)?;
+    Ok(bytes::read_u32(cell, 0))
+}
+
+/// 0x8f: the predicate cell at the element decides, read after the rows
+/// before it landed. A live predicate evaluates now, with `_` bound to the
+/// row `key` holds or to `StoredBinding::Absent` when it holds none; a
+/// bound one is the cell the batch carries. Zero writes nothing, so an
+/// absent key stays absent.
+#[allow(clippy::too_many_arguments)]
+fn should_upsert_struct_map_if<I: KeyIndex, S: InternBytes + ?Sized>(
+    state: &[u8],
+    smap: &StructMapSlot<I>,
+    key: u32,
+    pred_col: u32,
+    cols: &[&[u8]],
+    element_idx: u32,
+    live: Option<&mut LiveColumns<'_, '_>>,
+    cx: &mut KeyCx<'_, I, S>,
+) -> Result<bool, ErrorCode> {
+    let evaluated = match live {
+        Some(live) if live.defers(pred_col) => {
+            let stored = match smap.lookup(state, key, cx)? {
+                Some(position) => {
+                    StoredBinding::Row(StoredRow::new(state, smap.rows(), position, key, None))
+                }
+                None => StoredBinding::Absent,
+            };
+            live.stored_cell(pred_col, element_idx, state, cols, stored)
+        }
+        _ => None,
+    };
+    let cell = match evaluated {
+        Some(result) => result?,
+        None => element_u32_cell(cols, pred_col, element_idx)?,
+    };
+    Ok(cell != 0)
 }
 
 /// 0x8b: an incoming reset, an absent key or a stored reset accepts. An absent
@@ -2520,15 +2585,7 @@ fn should_upsert_struct_map_since_reset<I: KeyIndex, S: InternBytes + ?Sized>(
     element_idx: u32,
     cx: &mut KeyCx<'_, I, S>,
 ) -> Result<bool, ErrorCode> {
-    let start = (element_idx as usize)
-        .checked_mul(4)
-        .ok_or(ErrorCode::ColumnUnderrun)?;
-    let end = start.checked_add(4).ok_or(ErrorCode::ColumnUnderrun)?;
-    let cell = cols
-        .get(lane.col as usize)
-        .and_then(|col| col.get(start..end))
-        .ok_or(ErrorCode::ColumnUnderrun)?;
-    if bytes::read_u32(cell, 0) != 0 {
+    if element_u32_cell(cols, lane.col, element_idx)? != 0 {
         return Ok(true);
     }
     let Some(position) = smap.lookup(state, key, cx)? else {
@@ -3177,7 +3234,8 @@ fn guard_inst(code: &[u8], pc: usize, op: Opcode) -> Option<GuardInst> {
     Some(match op {
         Opcode::BatchStructMapUpsertLast
         | Opcode::BatchStructMapUpsertFirst
-        | Opcode::BatchStructMapUpsertMax => {
+        | Opcode::BatchStructMapUpsertMax
+        | Opcode::BatchStructMapUpsertLastIf => {
             let operands = decode_struct_map_upsert_operands(code, at, op)?;
             GuardInst::Write {
                 slot: operands.slot,
@@ -4108,7 +4166,7 @@ impl<I: KeyIndex> Vm<I> {
                     logical_row,
                     state,
                     cols,
-                    StoredRow::new(state, map.rows(), position, key, None),
+                    StoredBinding::Row(StoredRow::new(state, map.rows(), position, key, None)),
                 )
             }) {
                 Some(result) => result?,
@@ -4947,7 +5005,16 @@ impl<I: KeyIndex> Vm<I> {
                         if cuts.covers(CutKey::Unary(key), i) {
                             continue;
                         }
-                        match should_write_struct_map_row(state, &smap, key, pick, cols, i, cx) {
+                        match should_write_struct_map_row(
+                            state,
+                            &smap,
+                            key,
+                            pick,
+                            cols,
+                            i,
+                            live.as_deref_mut(),
+                            cx,
+                        ) {
                             Ok(true) => {}
                             Ok(false) => continue,
                             Err(error) => return error as u32,
@@ -6050,11 +6117,13 @@ impl<I: KeyIndex> Vm<I> {
                     }
                 }
 
-                // STRUCT_MAP_UPSERT_LAST/FIRST/MAX/FIRST_SINCE_RESET (0x80/0x81/0x82/0x8b)
+                // STRUCT_MAP_UPSERT_LAST/FIRST/MAX/FIRST_SINCE_RESET/LAST_IF
+                // (0x80/0x81/0x82/0x8b/0x8f); 0x8f is a body instruction only.
                 Opcode::BatchStructMapUpsertLast
                 | Opcode::BatchStructMapUpsertFirst
                 | Opcode::BatchStructMapUpsertMax
-                | Opcode::BatchStructMapUpsertFirstSinceReset => {
+                | Opcode::BatchStructMapUpsertFirstSinceReset
+                | Opcode::BatchStructMapUpsertLastIf => {
                     let operands = &mut self.element_struct_map;
                     if operands.decode_from(&mut r, op).is_none() {
                         return INVALID_PROGRAM;
@@ -6080,7 +6149,14 @@ impl<I: KeyIndex> Vm<I> {
                         continue;
                     }
                     let should_write = match should_write_struct_map_row(
-                        state, &smap, key, pick, cols, child_idx, cx,
+                        state,
+                        &smap,
+                        key,
+                        pick,
+                        cols,
+                        child_idx,
+                        live.as_deref_mut(),
+                        cx,
                     ) {
                         Ok(should_write) => should_write,
                         Err(error) => return error as u32,

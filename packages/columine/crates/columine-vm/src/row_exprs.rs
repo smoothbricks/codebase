@@ -53,7 +53,10 @@
 //! different values. A live column is read by the per-element conditional
 //! opcodes (the `*_IF` family) or by a top-level stored-row sweep. The sweep
 //! supplies [`StoredRow`] for each live stored key and the last input row
-//! for the logical clock. Batch aggregates still read bound cells.
+//! for the logical clock; the struct-map upsert-last-if binds the
+//! destination's stored row for the element's key, or
+//! [`StoredBinding::Absent`] when the key holds none. Batch aggregates still
+//! read bound cells.
 //! A live column read by anything else — an aggregate, an
 //! aggregate's `*_IF` predicate, a key, value, timestamp or element operand,
 //! the `FOR_EACH` type column, the table's own type column — would see the
@@ -193,6 +196,19 @@ impl<'a> StoredRow<'a> {
     }
 }
 
+/// What `_` binds to while an expression evaluates: the stored row a
+/// predicate competes with, when the instruction evaluating it has one.
+pub enum StoredBinding<'a> {
+    /// No stored row is in scope: ordinary row evaluation and admission.
+    Unbound,
+    /// The instruction's key holds no stored row: `_` is null, and every
+    /// field read through it is null.
+    Absent,
+    /// The stored row in scope: a sweep's visited row, or the row an
+    /// upsert-last-if's key already holds.
+    Row(StoredRow<'a>),
+}
+
 /// The batch as one entry sees it: the live state, the host's columns, and
 /// the derived columns the entries before it already bound.
 pub struct BatchView<'a> {
@@ -202,7 +218,7 @@ pub struct BatchView<'a> {
     /// Target column of each earlier entry, parallel to `derived`.
     derived_targets: &'a [u32],
     derived: &'a [Vec<u32>],
-    stored_row: Option<StoredRow<'a>>,
+    stored: StoredBinding<'a>,
 }
 
 impl<'a> BatchView<'a> {
@@ -215,7 +231,7 @@ impl<'a> BatchView<'a> {
             cols,
             derived_targets: &[],
             derived: &[],
-            stored_row: None,
+            stored: StoredBinding::Unbound,
         }
     }
 
@@ -229,17 +245,28 @@ impl<'a> BatchView<'a> {
         }
     }
 
-    /// The sweep's live stored row, absent during ordinary row evaluation
-    /// and admission. The view cannot outlive this batch borrow.
+    /// The stored row in scope, when there is one: absent during ordinary
+    /// row evaluation and admission, and when an upsert-last-if's key holds
+    /// no row. The view cannot outlive this batch borrow.
     pub fn stored_row(&self) -> Option<&StoredRow<'a>> {
-        self.stored_row.as_ref()
+        match &self.stored {
+            StoredBinding::Row(row) => Some(row),
+            StoredBinding::Unbound | StoredBinding::Absent => None,
+        }
+    }
+
+    /// What `_` binds to in this evaluation: an expression that reads the
+    /// stored row tells an absent key (`_` is null) from an evaluation with
+    /// no stored row in scope (a program error).
+    pub fn stored(&self) -> &StoredBinding<'a> {
+        &self.stored
     }
 
     /// Attach a stored row for stored-row expressions: the same read the
     /// sweep supplies per visited row, for an embedder evaluating an
     /// expression over a frozen stored row.
     pub fn with_stored_row(mut self, row: StoredRow<'a>) -> Self {
-        self.stored_row = Some(row);
+        self.stored = StoredBinding::Row(row);
         self
     }
 
@@ -442,6 +469,12 @@ impl LiveColumns<'_, '_> {
         self.rows.live.is_empty()
     }
 
+    /// Whether the bind deferred `col` to the reduce section: its cell is
+    /// evaluated at the row, never read from the batch.
+    pub(crate) fn defers(&self, col: u32) -> bool {
+        self.rows.live_entry(col).is_some()
+    }
+
     /// The cell of live column `col` at `row`, evaluated now, or `None` when
     /// `col` is not a live column and the batch's bytes hold its cell.
     /// `cols` is the spliced column set the reduce section reads (a live
@@ -455,7 +488,7 @@ impl LiveColumns<'_, '_> {
         state: &[u8],
         cols: &[&[u8]],
     ) -> Option<Result<u32, ErrorCode>> {
-        self.cell_at(col, row, state, cols, None)
+        self.cell_at(col, row, state, cols, StoredBinding::Unbound)
     }
 
     pub(crate) fn stored_cell<'a>(
@@ -464,9 +497,9 @@ impl LiveColumns<'_, '_> {
         row: u32,
         state: &'a [u8],
         cols: &'a [&'a [u8]],
-        stored: StoredRow<'a>,
+        stored: StoredBinding<'a>,
     ) -> Option<Result<u32, ErrorCode>> {
-        self.cell_at(col, row, state, cols, Some(stored))
+        self.cell_at(col, row, state, cols, stored)
     }
 
     fn cell_at<'a>(
@@ -475,7 +508,7 @@ impl LiveColumns<'_, '_> {
         row: u32,
         state: &'a [u8],
         cols: &'a [&'a [u8]],
-        stored: Option<StoredRow<'a>>,
+        stored: StoredBinding<'a>,
     ) -> Option<Result<u32, ErrorCode>> {
         let rows = self.rows;
         let entry = rows.live[rows.live_entry(col)?];
@@ -490,7 +523,7 @@ impl LiveColumns<'_, '_> {
         }
         let expr = &self.program[entry.expr.start..entry.expr.end];
         let mut batch = BatchView::host(state, cols, rows.batch_len);
-        batch.stored_row = stored;
+        batch.stored = stored;
         Some(self.eval.eval(expr, &batch, row))
     }
 }
@@ -704,7 +737,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
             cols: view,
             derived_targets: &out.targets[..i],
             derived: done,
-            stored_row: None,
+            stored: StoredBinding::Unbound,
         };
         let binding = eval.admit(entry.expr, &batch)?;
         let cells = &mut rest[0];

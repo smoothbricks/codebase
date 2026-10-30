@@ -499,6 +499,7 @@ export enum Opcode {
   STRUCT_MAP_SWEEP = 0x8a, // slot,predicate_col; top-level stored unary-map row sweep
   BATCH_STRUCT_MAP_REMOVE = 0x8c, // slot,key_col; sentinel/absent keys are no-ops
   BATCH_STRUCT_MAP_GUARDED_UPSERT_LAST = 0x8d, // slot,companion_slot,key_col,guard_key_col,guard_field_idx, then 0x80's field operands; writes only while the companion holds the exact guard key, removing its row
+  BATCH_STRUCT_MAP_UPSERT_LAST_IF = 0x8f, // 0x80's row operands, then pred_col; FOR_EACH/FLAT_MAP body only. A live predicate sees the destination's stored row for the key (absent when none); nonzero writes as 0x80, zero writes nothing
 
   // Ordered list ops
   SLOT_ORDERED_LIST = 0x19, // slot, type_flags, cap_lo, cap_hi [, num_fields, field_type × num_fields]

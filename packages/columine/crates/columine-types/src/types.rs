@@ -838,6 +838,16 @@ pub enum Opcode {
     /// order. A sentinel key1 is `InvalidKey`, as for 0x86; a key1 no row
     /// holds removes nothing.
     BatchStructMap2RemovePrefix = 0x8e,
+    /// Same row operands as 0x80 followed by predicate_col:index: the
+    /// struct-map record form of BatchMapUpsertLastIf (0x2a) and, like it, a
+    /// FOR_EACH/FLAT_MAP body instruction only. Per element, after the
+    /// removal cut, the predicate cell is read at the element's position: a
+    /// live row expression is evaluated then, over the rows the batch already
+    /// landed, with `_` bound to the destination's stored row for the
+    /// element's key (`StoredBinding::Absent` when the key holds none). A
+    /// nonzero cell writes the row exactly as 0x80 does; zero writes nothing,
+    /// so an absent key stays absent.
+    BatchStructMapUpsertLastIf = 0x8f,
     /// slot:index, val_col:index (body opcode inside FOR_EACH/FLAT_MAP blocks)
     ListAppend = 0x84,
     /// slot:index, num_vals:u8, \[(val_col:index, field_idx:u8) × N\]
@@ -935,6 +945,7 @@ impl Opcode {
             0x8c => Self::BatchStructMapRemove,
             0x8d => Self::BatchStructMapGuardedUpsertLast,
             0x8e => Self::BatchStructMap2RemovePrefix,
+            0x8f => Self::BatchStructMapUpsertLastIf,
             0x90 => Self::NestedSetInsert,
             0x92 => Self::NestedMapUpsertLast,
             0x95 => Self::NestedAggUpdate,

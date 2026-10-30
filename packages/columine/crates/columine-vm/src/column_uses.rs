@@ -35,8 +35,9 @@ use columine_types::types::{
 
 use crate::meta::SlotMetaView;
 use crate::vm::{
-    body_op_len, decode_struct_map_guarded_upsert_operands, decode_struct_map_upsert_operands,
-    decode_struct_map2_tuple_operands, decode_struct_map2_upsert_operands,
+    StructMapPick, body_op_len, decode_struct_map_guarded_upsert_operands,
+    decode_struct_map_upsert_operands, decode_struct_map2_tuple_operands,
+    decode_struct_map2_upsert_operands,
 };
 
 /// How the reduce section reads a column operand.
@@ -325,7 +326,8 @@ fn walk_op(
         Opcode::BatchStructMapUpsertLast
         | Opcode::BatchStructMapUpsertFirst
         | Opcode::BatchStructMapUpsertMax
-        | Opcode::BatchStructMapUpsertFirstSinceReset => {
+        | Opcode::BatchStructMapUpsertFirstSinceReset
+        | Opcode::BatchStructMapUpsertLastIf => {
             let operands = decode_struct_map_upsert_operands(code, pc + 1, op)?;
             cell(visit, operands.key_col, ColumnUse::Read);
             for &col in operands.vals.cols() {
@@ -339,6 +341,10 @@ fn walk_op(
                     offsets_col: array.offsets_col,
                     values_col: array.values_col,
                 });
+            }
+            // 0x8f's predicate, named last: a live column resolves at the row.
+            if let StructMapPick::LastIf { pred_col } = operands.pick {
+                cell(visit, pred_col, predicate);
             }
         }
         Opcode::BatchStructMapCountsFold => {

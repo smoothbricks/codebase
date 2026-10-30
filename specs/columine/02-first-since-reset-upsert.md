@@ -4,12 +4,13 @@
 
 A unary struct map keeps one row per key. Its upserts differ only in which incoming row replaces the stored one:
 
-| Opcode | Name                                        | A row replaces when                                                             |
-| ------ | ------------------------------------------- | ------------------------------------------------------------------------------- |
-| `0x80` | `BATCH_STRUCT_MAP_UPSERT_LAST`              | always                                                                          |
-| `0x81` | `BATCH_STRUCT_MAP_UPSERT_FIRST`             | the key is absent                                                               |
-| `0x82` | `BATCH_STRUCT_MAP_UPSERT_MAX`               | the key or stored comparison is absent, or the incoming one is strictly greater |
-| `0x8b` | `BATCH_STRUCT_MAP_UPSERT_FIRST_SINCE_RESET` | the key is absent, the stored reset is true, or the incoming reset is           |
+| Opcode | Name                                        | A row replaces when                                                               |
+| ------ | ------------------------------------------- | --------------------------------------------------------------------------------- |
+| `0x80` | `BATCH_STRUCT_MAP_UPSERT_LAST`              | always                                                                            |
+| `0x81` | `BATCH_STRUCT_MAP_UPSERT_FIRST`             | the key is absent                                                                 |
+| `0x82` | `BATCH_STRUCT_MAP_UPSERT_MAX`               | the key or stored comparison is absent, or the incoming one is strictly greater   |
+| `0x8b` | `BATCH_STRUCT_MAP_UPSERT_FIRST_SINCE_RESET` | the key is absent, the stored reset is true, or the incoming reset is             |
+| `0x8f` | `BATCH_STRUCT_MAP_UPSERT_LAST_IF`           | its predicate cell is nonzero ([upsert-last-if](06-struct-map-upsert-last-if.md)) |
 
 `FIRST_SINCE_RESET` keeps, for each key, the first row since that key's last reset. A row whose reset field is true is
 the reset: it replaces the stored row and is itself stored. The next row after it opens the key again, and every later

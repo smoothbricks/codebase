@@ -285,7 +285,8 @@ impl Builder<'_> {
                 Opcode::BatchStructMapUpsertLast
                 | Opcode::BatchStructMapUpsertFirst
                 | Opcode::BatchStructMapUpsertMax
-                | Opcode::BatchStructMapUpsertFirstSinceReset => {
+                | Opcode::BatchStructMapUpsertFirstSinceReset
+                | Opcode::BatchStructMapUpsertLastIf => {
                     let operands = decode_struct_map_upsert_operands(code, pc + 1, op)
                         .ok_or(invalid.clone())?;
                     // Only an array field linked to a schema is a value-object

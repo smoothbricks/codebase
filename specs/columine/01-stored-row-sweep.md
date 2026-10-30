@@ -24,8 +24,10 @@ operands. The opcode is a reduce-section instruction, not an init declaration or
 The predicate column uses the existing row-expression table and live-column binding. A live expression receives the
 unchanged input batch and a borrowed `StoredRow` view of one live row through
 `BatchView::stored_row() -> Option<&StoredRow>`. The view is absent during ordinary input-row evaluation and expression
-admission. `StoredRow::key() -> u32` and `num_fields() -> u8` describe the row;
-`field_type(field: u8) -> Result<StructFieldType, ErrorCode>` names a field's physical type;
+admission. `BatchView::stored() -> &StoredBinding` answers the same binding as `Row`, or `Unbound` where no stored row
+is in scope; `Absent` is the struct-map upsert-last-if's key with no row
+([upsert-last-if](06-struct-map-upsert-last-if.md) §3). `StoredRow::key() -> u32` and `num_fields() -> u8` describe the
+row; `field_type(field: u8) -> Result<StructFieldType, ErrorCode>` names a field's physical type;
 `field(field: u8) -> Result<Option<&[u8]>, ErrorCode>` borrows a present scalar cell or arena payload. An absent field
 is `None` and an invalid field ordinal is `InvalidProgram`. The view borrows the slot's validated geometry and is valid
 only during that evaluation. No expression can mutate the stored row or retain a reference beyond the borrow.
