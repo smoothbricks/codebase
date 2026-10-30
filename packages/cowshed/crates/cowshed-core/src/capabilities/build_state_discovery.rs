@@ -199,7 +199,8 @@ impl BuildStateDiscovery {
 /// 9: capabilities mark seed-retained subtrees and clone-invalid process files.
 /// 10: a detected JavaScript package manager links the module compile cache onto the build volume.
 /// 11: under mbx's Cargo shim the job asks `cargo -V` once; a failure is one finding per shell.
-const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 11";
+/// 12: the driver reads a cargo's header with bash 3.2's `read`, so the system bash names mbx.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 12";
 
 /// The manifest whose directory, once installed, holds a JavaScript package's tool caches.
 const PACKAGE_MANIFEST: &str = "package.json";
@@ -577,7 +578,10 @@ pub(super) const DRIVER_PROGRAMS: [&str; 3] = ["cat", "mktemp", "rm"];
 /// its stderr, each NUL-terminated, and asks nothing. Otherwise the job prints first the `mbx`
 /// its PATH resolves when its `cargo` is the shim, or nothing, NUL-terminated: the shim is a
 /// short script that sets `MBX_CARGO_SHIM_MODE`, so its first bytes say so, and a plain Cargo's
-/// never do.
+/// never do. Its `bash` may be macOS's `/bin/bash`, bash 3.2, which core links where no profile
+/// directory holds a newer one (15_capabilities.md, "Bootstrap executables"), so it uses nothing
+/// newer: its bounded header read stops at the first NUL or 4096 characters (`read -d '' -n`),
+/// never bash 4's `read -N`, which bash 3.2 refuses.
 const DRIVER: &str = r#"set -u
 parallel=$1
 count=$2
@@ -587,7 +591,7 @@ shift "$count"
 command -v cargo >/dev/null || { printf 'no-cargo\0'; exit 127; }
 cargo=$(command -v cargo)
 head=
-IFS= read -r -N 4096 head <"$cargo" 2>/dev/null || :
+IFS= read -r -d '' -n 4096 head <"$cargo" 2>/dev/null || :
 case $head in
 *MBX_CARGO_SHIM_MODE*)
   probe=$(cargo -V 2>&1 >/dev/null)
@@ -1482,6 +1486,63 @@ mod driver_tests {
                 named.then(|| fixture.root.join("bin/mbx")),
                 "{cargo}"
             );
+        }
+    }
+
+    /// The driver under the oldest `bash` core may link. On a macOS host whose Nix and Homebrew
+    /// profiles hold none, core's bootstrap `bash` is the system's `/bin/bash`, bash 3.2
+    /// (15_capabilities.md, "Bootstrap executables"), and a shell-less checkout's job runs the
+    /// driver with it. The driver still recognises mbx's Cargo shim there: a shim that runs Cargo
+    /// names mbx, and one that runs none is the batch's one route failure.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_driver_recognises_mbx_s_shim_under_the_system_bash() {
+        let version = std::process::Command::new("/bin/bash")
+            .args(["-c", "printf %s \"${BASH_VERSINFO[0]}\""])
+            .output_bounded()
+            .unwrap();
+        assert_eq!(
+            version.stdout, b"3",
+            "/bin/bash is not bash 3, so this test no longer runs the driver under bash 3.2"
+        );
+        let queries = [CargoQuery {
+            directory: PathBuf::from("/"),
+            manifest: "Cargo.toml".into(),
+        }];
+        for runs_cargo in [true, false] {
+            let fixture = Fixture::new();
+            bootstrap_links(&fixture);
+            executable(&fixture, "bin/bash", "#!/bin/sh\nexec /bin/bash \"$@\"\n");
+            executable(
+                &fixture,
+                "bin/cargo",
+                &format!(
+                    "#!/bin/sh\nMBX_CARGO_SHIM_MODE=1\nexport MBX_CARGO_SHIM_MODE\n{}\n",
+                    if runs_cargo {
+                        "echo answered"
+                    } else {
+                        "echo 'mbx[error]: no Cargo' >&2\nexit 1"
+                    }
+                ),
+            );
+            executable(&fixture, "bin/mbx", "#!/bin/sh\nexit 0\n");
+            let only_the_fixture = fixture.root.join("bin").into_os_string();
+            let output = run_driver_on(&fixture, &["locate-project"], &queries, only_the_fixture);
+            let expected = if runs_cargo {
+                CargoAnswers {
+                    answers: vec![Ok(b"answered".to_vec())],
+                    mbx: Some(fixture.root.join("bin/mbx")),
+                }
+            } else {
+                CargoAnswers {
+                    answers: vec![Err(CargoUnanswered::CargoRouteFailed {
+                        shell: None,
+                        cause: "exit status 1: mbx[error]: no Cargo".to_owned(),
+                    })],
+                    mbx: None,
+                }
+            };
+            assert_eq!(driver_answers(&output, 1, None), expected, "{output:?}");
         }
     }
 

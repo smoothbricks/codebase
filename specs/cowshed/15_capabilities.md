@@ -82,7 +82,9 @@ earlier discovery's answer, findings included. Caller environment and untracked 
 The job that answers a batch is one `bash` script. `bash`, and the `cargo`, `mktemp`, `rm` and `cat` the script runs,
 are each the first executable of their name on the PATH the job holds, never a fixed `/bin` or `/usr/bin` path: NixOS
 keeps only `/bin/sh` and `/usr/bin/env`, and a job whose shell supplies none of them reaches `bash`, `cat`, `mktemp` and
-`rm` through core's bootstrap links (Bootstrap executables, below); `cargo` is the repository's shell's.
+`rm` through core's bootstrap links (Bootstrap executables, below); `cargo` is the repository's shell's. That `bash` may
+be macOS's `/bin/bash`, bash 3.2, which core links where no profile directory holds a newer one, so the script uses
+nothing newer than bash 3.2.
 
 Cargo's contribution drops caller `CARGO_TARGET_DIR` so where a job writes depends on the tracked project files, not an
 unrelated shell's override. The remaining unit-identity environment belongs to 16_build_volumes.md, "One Cargo
@@ -176,6 +178,7 @@ discovery itself, which must run to replace a stale answer, is never refused by 
 **Enforced by:** `cowshed-core`'s `installed_mbx_enables_cargo_without_project_opt_in`,
 `a_project_pinning_another_mbx_is_admitted_with_the_installed_one`, `a_host_without_installed_mbx_contributes_nothing`,
 `the_job_names_the_mbx_its_path_resolves_before_its_answers`, `the_job_names_mbx_only_when_its_cargo_is_mbx_s_shim`,
+`the_driver_recognises_mbx_s_shim_under_the_system_bash`,
 `tracked_independent_workspaces_contribute_once_and_honor_their_own_target_config` (its mbx arm),
 `a_target_mbx_owns_leaves_the_state_and_the_mbx_is_recorded`,
 `a_route_that_runs_no_cargo_is_one_finding_carrying_mbx_s_account`,
