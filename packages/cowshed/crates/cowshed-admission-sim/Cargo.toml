@@ -1,0 +1,15 @@
+[package]
+name = "cowshed-admission-sim"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# Test code only: the host's admission stack as a discrete-event simulation on a virtual clock
+# (specs/cowshed/05_gateway.md, "Host scheduling"). Nothing here runs in production; the policy
+# it selects moves into its owner's pure core, and its decision function goes with it.
+[dev-dependencies]
+cowshed-core.workspace = true
+cowshed-gateway-types = { path = "../cowshed-gateway-types" }
+proptest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
