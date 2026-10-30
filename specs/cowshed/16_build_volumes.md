@@ -1347,9 +1347,9 @@ even for a read-only job: build state is not source, so a read-only job keeps th
 writes its checkout's build volume like any other job. Nx is configured to use its cache, never to avoid it: cowshed
 does not unset Nx's variables to sidestep a problem. Clearing Nx's graph state (a shell entry whose rebuild changed a
 stale Nx plugin's output bytes) keeps the task database: it is the cache's only index, so the cache without it is
-unreachable and never evicted. The shell entry takes the tree census before it rebuilds the plugin, and while it names
-another holder of the checkout's Nx state, a gate's Nx run among them, leaves the plugin unbuilt and that state as it is
-(specs/cli/01_workspace_reconciliation.md, "Self-hosted shell bootstrap").
+unreachable and never evicted. The shell entry takes the tree census before it rebuilds the plugin and again right
+before the clear, and while it names another holder of the checkout's Nx state, a gate's Nx run among them, that state
+stays as it is (specs/cli/01_workspace_reconciliation.md, "Self-hosted shell bootstrap").
 
 The read-only cache-reuse advisor is the sole exception: its disposable graph, file-map and native-hash bookkeeping
 lives in a scratch directory outside both candidate images. It writes no task cache entry or task database, never calls
@@ -1369,8 +1369,9 @@ second build cache: no task executes and scratch is removed after success or fai
   `smoo monorepo check` and `smoo monorepo validate` fail on an `nx.json` without it; and a shell-entry test in which a
   stale plugin rebuild removes Nx's daemon record and persisted project graph through the link and keeps every other
   entry, including a Cargo resolution a concurrent Nx process holds mid-flight, which then publishes; one whose emit
-  left the plugin's output bytes as they were keeps both; and one that another holder of the Nx state, or a census that
-  cannot be taken, defers keeps both and still enters.
+  left the plugin's output bytes as its marker verified them keeps both; one that another holder of the Nx state, or a
+  census that cannot be taken, defers keeps both and still enters; and one whose holder starts during the emit keeps
+  both until a later entry finds none.
 - The capability publishes `NX_MAX_CACHE_SIZE` as the caller-overridable default defined in
   [03_caches.md §Wiring](./03_caches.md#wiring), independent of whichever filesystem a client happens to discover. The
   hosted CI action's separate bound is `20GB`.

@@ -25,7 +25,8 @@ const pluginDerivedNxState = ['d', 'project-graph.json', 'file-map.json', 'sourc
  * whole: its emit is not incremental, so it writes no TypeScript build info, and it removes from `dist` whatever it did
  * not write, the build info this entry's own emit leaves there included. Nx restoring the target's cache artifact
  * replaces `dist` the same way. A marker under `dist` would be gone after every build, and the next shell entry would
- * rebuild a package that is current.
+ * rebuild a package that is current. Its mtime is when the package was verified current, and its content the SHA-256
+ * of the output tree it verified ({@link outputDigest}); a marker an earlier entry wrote is empty and records none.
  */
 const buildMarkerFile = 'node_modules/.cache/smoo/dist-verified';
 
@@ -138,12 +139,14 @@ async function bootstrapPackages(): Promise<BootstrapPackage[]> {
 
 async function rebuildWorkspaceToolsIfStale(): Promise<void> {
   const packages = await bootstrapPackages();
-  const stale = new Set<string>();
+  // Each stale package, by directory, with the digest of the output its marker verified.
+  const stale = new Map<string, string | null>();
   for (const entry of packages) {
-    if (await isStale(entry)) stale.add(entry.directory);
+    const verification = await readVerification(path.join(entry.directory, buildMarkerFile));
+    if (await isStale(entry, verification)) stale.set(entry.directory, verification?.digest ?? null);
   }
-  // Whether the plugin's closure rebuilds at all is decided before anything is emitted: an emit kept without the clear
-  // it called for would recompile to the same bytes at the next entry, which would then never clear.
+  // The first look comes before anything is emitted: the emit rewrites the plugin's dist, which a running Nx run loads
+  // its executors and inference from.
   const refusal = packages.some((entry) => entry.invalidatesPlugin && stale.has(entry.directory))
     ? await nxStateRefusal()
     : null;
@@ -164,10 +167,13 @@ async function rebuildWorkspaceToolsIfStale(): Promise<void> {
       `! Not rebuilding ${waiting.join(', ')}: ${refusal}\n  Their dist, the Nx daemon record and the project graph stay as they are; the next shell entry that finds no other holder rebuilds them.`,
     );
   }
-  let outputChanged = false;
+  // Members of the plugin's closure whose emit left bytes other than those their marker verified. Their markers are
+  // recorded only once the Nx state computed from the earlier bytes is cleared, so until then they stay stale and keep
+  // the digest a later entry compares against.
+  const changed: { directory: string; digest: string }[] = [];
   for (const { directory, invalidatesPlugin, program, output } of packages) {
-    if (!stale.has(directory) || held.has(directory)) continue;
-    const before = invalidatesPlugin ? await outputDigest(output) : null;
+    const verified = stale.get(directory);
+    if (verified === undefined || held.has(directory)) continue;
     // Bootstrap invokes neither nx (whose graph loads the plugin) nor smoo (whose launcher needs CLI dist).
     // The lineage program is the same plain-tsc producer the Nx compile lane owns: no addon,
     // generated API or native transformer. Other packages retain the ordinary library emit.
@@ -176,31 +182,59 @@ async function rebuildWorkspaceToolsIfStale(): Promise<void> {
     } else {
       await runQuietly('ttsc', ['-p', programConfiguration[program], '--emit', ...EMIT_OVERRIDES], directory);
     }
-    // The marker records when dist was last VERIFIED current, not when tsc last
-    // chose to write bytes. ttsc is content-incremental, so an mtime-only change —
-    // a checkout, a revert, a formatter rewriting a file identically — makes it
-    // exit 0 emitting nothing, so the entry stamps the marker itself after every
-    // successful emit. A marker left behind the sources would never pass the
-    // staleness check again, so every later shell entry and every direnv reload
-    // would rebuild the package.
-    await recordBuild(path.join(directory, buildMarkerFile));
-    // A compiler run is not a change. An emit whose sources only gained a newer mtime leaves the bytes the daemon and
-    // graph were computed from, and clearing them anyway cleared the graph under a running gate's test tasks.
-    if (before !== null && before !== (await outputDigest(output))) outputChanged = true;
+    // A compiler run is not a change. ttsc is content-incremental, so an mtime-only change (a checkout, a revert, a
+    // formatter rewriting a file identically) recompiles to the bytes the marker verified; clearing the daemon record
+    // and graph anyway cleared them under a running gate's test tasks. A marker that records no digest verified none,
+    // so its package's first emit counts as a change.
+    const digest = await outputDigest(output);
+    if (invalidatesPlugin && digest !== verified) {
+      changed.push({ directory, digest });
+    } else {
+      await recordBuild(path.join(directory, buildMarkerFile), digest);
+    }
   }
-  if (outputChanged) await clearNxDaemonState();
+  if (changed.length === 0) return;
+  // The emit takes seconds, and an Nx run that started during it reads the state the clear deletes, so the census is
+  // asked again right before the clear, as a retirement asks again before it retires (02_workspaces.md, "Holders
+  // cowshed does not run").
+  const late = await nxStateRefusal();
+  if (late !== null) {
+    const names = changed.map(({ directory }) => path.relative(projectRoot, directory)).join(', ');
+    console.error(
+      `! The output of ${names} changed, but the Nx daemon record and project graph computed from the earlier bytes stay: ${late}\n  ${names} stay stale, so the next shell entry that finds no other holder clears them.`,
+    );
+    return;
+  }
+  await clearNxDaemonState();
+  for (const { directory, digest } of changed) await recordBuild(path.join(directory, buildMarkerFile), digest);
+}
+
+/** What a package's marker says: when its output was last verified current, and the digest of that output, if any. */
+type Verification = { readonly mtimeMs: number; readonly digest: string | null };
+
+/** The verification `marker` records, or null when there is none. */
+async function readVerification(marker: string): Promise<Verification | null> {
+  try {
+    const text = await readFile(marker, 'utf8');
+    const { mtimeMs } = await stat(marker);
+    const digest = text.trim();
+    // A marker an earlier entry wrote is empty, and one torn mid-write names no digest either: both verified no bytes.
+    return { mtimeMs, digest: /^[0-9a-f]{64}$/.test(digest) ? digest : null };
+  } catch (cause) {
+    // No marker: this package was never verified, the expected reason to bootstrap.
+    if (isMissing(cause)) return null;
+    throw new Error(`Cannot read bootstrap marker ${marker}`, { cause });
+  }
 }
 
 /**
  * Whether `entry` needs an emit: it has no marker, no output (for the lineage entry, not both of its public files), or a
  * source or configuration file newer than its marker.
  */
-async function isStale({ directory, program, output }: BootstrapPackage): Promise<boolean> {
-  const markerStat = await stat(path.join(directory, buildMarkerFile)).catch((cause: unknown) => {
-    // No marker: this package was never verified, the expected reason to bootstrap.
-    if (isMissing(cause)) return null;
-    throw new Error(`Cannot read bootstrap marker ${path.join(directory, buildMarkerFile)}`, { cause });
-  });
+async function isStale(
+  { directory, program, output }: BootstrapPackage,
+  verification: Verification | null,
+): Promise<boolean> {
   const outputs = await readdir(output, { withFileTypes: true }).catch((cause: unknown) => {
     // A cold or removed output directory is the expected reason to bootstrap.
     if (isMissing(cause)) return [];
@@ -214,16 +248,16 @@ async function isStale({ directory, program, output }: BootstrapPackage): Promis
       : outputs.length > 0;
   // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the build marker.
   return (
-    markerStat === null ||
+    verification === null ||
     !built ||
-    (await hasFileNewerThanMarker(directory, markerStat.mtimeMs, programConfiguration[program]))
+    (await hasFileNewerThanMarker(directory, verification.mtimeMs, programConfiguration[program]))
   );
 }
 
 /**
  * SHA-256 over an output tree: each entry's path below `directory`, its kind, and its bytes or link text, in path
- * order; a missing tree digests as `absent`. The plugin's closure is a few megabytes, read before and after its emit,
- * so a rebuild is judged by the bytes it left rather than by the compiler having run.
+ * order; a missing tree digests as `absent`. The plugin's closure is a few megabytes, read after its emit and compared
+ * with the digest its marker recorded, so a rebuild is judged by the bytes it left rather than by the compiler running.
  */
 async function outputDigest(directory: string): Promise<string> {
   const root = await stat(directory).catch((cause: unknown) => {
@@ -338,11 +372,14 @@ function isMissing(cause: unknown): boolean {
   return cause instanceof Error && 'code' in cause && (cause.code === 'ENOENT' || cause.code === 'ENOTDIR');
 }
 
-/** Stamps `marker` with now. Failing only costs the next shell entry a rebuild, so it warns and lets the shell enter. */
-async function recordBuild(marker: string): Promise<void> {
+/**
+ * Records that `marker`'s package was verified current now, holding `digest`, the bytes it verified. Failing only costs
+ * the next shell entry a rebuild, so it warns and lets the shell enter.
+ */
+async function recordBuild(marker: string, digest: string): Promise<void> {
   try {
     await mkdir(path.dirname(marker), { recursive: true });
-    await writeFile(marker, '');
+    await writeFile(marker, `${digest}\n`);
   } catch (error) {
     console.error(
       `! Could not record the build marker ${marker} (${error instanceof Error ? error.message : String(error)}); the next shell entry rebuilds that package.`,

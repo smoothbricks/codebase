@@ -32,8 +32,9 @@ const buildMarker = 'node_modules/.cache/smoo/dist-verified';
  * `dist/index.js`, so an emit changes `dist` only where the bytes there differ, and fails a package whose workspace
  * dependency's `dist` is behind that dependency's source, as compiling against stale declarations under
  * `noEmitOnError` does. Its `cowshed` answers `tree-holders` with the `census` file beside `bin`, or fails with
- * `census-error`, and records each call in `cowshed-calls`; `manage` makes the checkout cowshed's, the only kind that
- * asks it. `enter` runs the shell entry proper over it; `root` is removed by `dispose`.
+ * `census-error`, and records each call in `cowshed-calls`; a `starts-during-emit` file becomes the `census` once a
+ * package emits, as a gate that starts while the closure emits. `manage` makes the checkout cowshed's, the only kind
+ * that asks it. `enter` runs the shell entry proper over it; `root` is removed by `dispose`.
  */
 function staleCheckout() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-enter-shell-')));
@@ -80,6 +81,8 @@ for dependency in node_modules/@smoothbricks/*; do
 done
 mkdir -p dist
 cp src/index.ts dist/index.js
+gate="$(dirname "$0")/../starts-during-emit"
+[ ! -f "$gate" ] || mv "$gate" "$(dirname "$0")/../census"
 `,
   );
   chmodSync(join(bin, 'ttsc'), 0o755);
@@ -541,16 +544,23 @@ function plantPluginState(volume: string, daemon: number): void {
 const keptPluginState = (volume: string) => pluginState.filter((entry) => existsSync(join(volume, entry)));
 
 /**
- * A compiler run is not a change. A plugin source that only gained a newer mtime (a checkout, a same-byte restore, a
- * formatter's identical rewrite) rebuilds to the bytes `dist` already holds, so the daemon record and project graph
- * every Nx run of the checkout reads stay: a gate's test tasks failed reading the graph a concurrent shell entry had
- * cleared after exactly such a rebuild. An edit the emit carries into `dist` still clears both.
+ * A compiler run is not a change. The marker records the bytes it verified, and a plugin source that only gained a
+ * newer mtime (a checkout, a same-byte restore, a formatter's identical rewrite) rebuilds to those bytes, so the daemon
+ * record and project graph every Nx run of the checkout reads stay: a gate's test tasks failed reading the graph a
+ * concurrent shell entry had cleared after exactly such a rebuild. A marker that records no bytes, as every marker an
+ * earlier entry wrote, verified none, so its first rebuild clears. An edit the emit carries into `dist` clears too.
  */
 it('a stale plugin build clears the daemon record and project graph only when its emit changed the output bytes', () => {
   const { root, plugin, volume, enter, dispose } = staleCheckout();
   try {
     writeFileSync(join(plugin, 'dist/index.js'), readFileSync(join(plugin, 'src/index.ts')));
     plantPluginState(volume, 4241);
+    const unrecorded = enter();
+    expect(unrecorded.status, `${unrecorded.stdout}${unrecorded.stderr}`).toBe(0);
+    expect(keptPluginState(volume)).toEqual([]);
+
+    plantPluginState(volume, 4241);
+    utimesSync(join(plugin, buildMarker), new Date(0), new Date(0));
     const unchanged = enter();
     expect(unchanged.status, `${unchanged.stdout}${unchanged.stderr}`).toBe(0);
     // It rebuilt: the marker says when.
@@ -577,7 +587,8 @@ it('a stale plugin build clears the daemon record and project graph only when it
  * holder (a gate's `nx run-many` here), leaves the closure's dist, marker and Nx state as they are and says why on
  * stderr, and the shell still enters: a census outage must not block every shell. The CLI compiles against the plugin's
  * dist, so it waits with the plugin, while a package outside the plugin's closure rebuilds. The daemon the checkout
- * records is no other holder, so once the gate is gone the next entry rebuilds and clears.
+ * records is no other holder. A gate that starts while the plugin emits is found by a second look right before the
+ * clear: the emitted bytes stay, but the plugin stays stale and its Nx state stays until an entry finds no other holder.
  */
 it('a census that cannot be taken, or another holder of the Nx state, defers the plugin rebuild and its clear', () => {
   const { root, plugin, volume, manage, enter, dispose } = staleCheckout();
@@ -632,6 +643,18 @@ it('a census that cannot be taken, or another holder of the Nx state, defers the
     expect(gated.stderr).toContain(gate);
     expect(gated.stderr).not.toContain('nx daemon');
     deferred();
+    deferred();
+
+    writeFileSync(join(root, 'census'), `${holder(4241, 'nx daemon')}\n`);
+    writeFileSync(join(root, 'starts-during-emit'), `${holder(4241, 'nx daemon')}\n${gate}\n`);
+    const during = enter();
+    expect(during.status, `${during.stdout}${during.stderr}`).toBe(0);
+    expect(during.stderr).toContain(gate);
+    expect(readFileSync(join(plugin, 'dist/index.js'), 'utf8')).toBe('export {};\n');
+    expect(statSync(join(plugin, buildMarker)).mtimeMs).toBe(0);
+    expect(keptPluginState(volume)).toEqual(pluginState);
+    // The CLI compiled against the plugin's new dist.
+    expect(statSync(join(cli, buildMarker)).mtimeMs).toBeGreaterThan(0);
 
     writeFileSync(join(root, 'census'), `${holder(4241, 'nx daemon')}\n`);
     const after = enter();
@@ -639,7 +662,7 @@ it('a census that cannot be taken, or another holder of the Nx state, defers the
     expect(readFileSync(join(plugin, 'dist/index.js'), 'utf8')).toBe('export {};\n');
     expect(keptPluginState(volume)).toEqual([]);
     expect(statSync(join(cli, buildMarker)).mtimeMs).toBeGreaterThan(0);
-    expect(readFileSync(join(root, 'cowshed-calls'), 'utf8')).toBe(`tree-holders ${volume}\n`.repeat(3));
+    expect(readFileSync(join(root, 'cowshed-calls'), 'utf8')).toBe(`tree-holders ${volume}\n`.repeat(6));
   } finally {
     dispose();
   }

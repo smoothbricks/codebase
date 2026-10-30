@@ -21,26 +21,36 @@ their raw scripts, not the CLI. The existing `node_modules/.cache/smoo/dist-veri
 `dist`, missing markers or newer source/config files rebuild. The lineage entry specifically requires both its public
 `dist/lineage/process-lineage.d.ts` and JavaScript file: a non-empty full-API `dist/ts` cannot stand in for it.
 
-Only an emit of the plugin's dependency closure that changed a member's output bytes invalidates the plugin's daemon
-record and project graph. The entry digests each closure member's output tree (paths, kinds, bytes and link text) before
-and after its emit, so a source that only gained a newer mtime (a checkout, a same-byte restore, a formatter's identical
-rewrite) recompiles and keeps them. A CLI-only rebuild preserves them, and every build preserves Nx task results and
-their database.
+Each package's `node_modules/.cache/smoo/dist-verified` marker also records the SHA-256 of the output tree it verified:
+paths, kinds, bytes and link text. Only an emit of the plugin's dependency closure that leaves a member's output bytes
+other than those its marker verified invalidates the plugin's daemon record and project graph, so a source that only
+gained a newer mtime (a checkout, a same-byte restore, a formatter's identical rewrite) recompiles and keeps them. A
+marker that records no digest, as one written before markers recorded it, verified no bytes, so that member's first emit
+invalidates. A CLI-only rebuild preserves them, and every build preserves Nx task results and their database.
 
 That invalidation destroys what every Nx run of the checkout in flight reads, a gate's included, so it is a destructive
 operation with the holder check in front of it (../cowshed/02_workspaces.md, "Holders cowshed does not run"). Before it
 emits the closure, an entry in a checkout with `.cowshed/workspace.json` runs `cowshed tree-holders` over the directory
 `.nx/workspace-data` resolves to, exempting the daemon its `d/server-process.json` names, as clearing a checkout's Nx
-state does (../cowshed/16_build_volumes.md). Another holder, or a census that cannot be taken, refuses the closure's
-emit, marker and invalidation together, and the shell still enters. The refusal also holds back every stale package
-whose workspace dependency closure reaches a held member, the CLI among them: it compiles against their dist
+state does (../cowshed/16_build_volumes.md). That daemon's plugin workers, which the mount census exempts with it, are
+holders here: one holding a file there defers the invalidation, the safe side. Another holder, or a census that cannot
+be taken, refuses the closure's emit, marker and invalidation together, and the shell still enters; the emit would
+rewrite the plugin's dist a running Nx run loads executors and inference from. The refusal also holds back every stale
+package whose workspace dependency closure reaches a held member, the CLI among them: it compiles against their dist
 (`noEmitOnError`), so a change to both, as a rebase onto a main that changed the plugin and the CLI brings, would fail
 its emit and stop the entry. Packages outside that closure rebuild. Stderr names the packages held back and up to ten
 holders by their census lines, counting the rest, or the census's failure and its cause. The held packages stay stale,
-so the next entry that finds no other holder rebuilds them. An emit kept without its invalidation would recompile to the
-same bytes at that entry and never invalidate. A checkout without that record runs no gate and takes no census. The
-census is the same from a sandboxed entry: run inside `cowshed exec`, it names a host process holding a file there
-(measured 2026-10-30), so a gate on the host refuses a sandboxed entry's rebuild as it refuses a host entry's.
+so the next entry that finds no other holder rebuilds them. A checkout without that record runs no gate and takes no
+census. The census is the same from a sandboxed entry: run inside `cowshed exec`, it names a host process holding a file
+there (measured 2026-10-30), so a gate on the host refuses a sandboxed entry's rebuild as it refuses a host entry's.
+
+The emit takes seconds, so the entry asks the census again right before the invalidation, as a retirement asks again
+before it retires (../cowshed/02_workspaces.md). A holder found then, such as a gate that started during the emit, keeps
+the daemon record and project graph. The changed members keep their new dist but get no new marker, so they stay stale
+with the digest their marker verified, and the next entry that finds no other holder recompiles them, finds their bytes
+still differ from that digest, and invalidates. Two windows remain. A run that starts while the closure emits runs
+against the plugin's dist as the emit rewrites it. A run that opens the Nx state after the second census walked past it
+and before the deletion loses that state; the walk took about half a second on a loaded host (measured 2026-10-30).
 
 For managed uv projects, install-task status joins the existing input stamps with a live environment-relocation witness
 instead of relying only on the task's file-digest cache. Normal project commands inherit `UV_NO_SYNC=1`; the managed
