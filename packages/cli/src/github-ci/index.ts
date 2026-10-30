@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG, stageDeploysProject } from '@smoothbricks/nx-plugin/deploy-policy';
 import { runtimeInputFailureReports } from '@smoothbricks/nx-plugin/runtime-input-policy';
 import { PLATFORM_TARGET_GLOBS, RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
@@ -762,7 +763,7 @@ async function postGithubStatus(name: string, state: string, description: string
     console.log(`Skipping GitHub commit status ${name}=${state}: fork pull requests receive a read-only GITHUB_TOKEN.`);
     return;
   }
-  const targetUrl = await getGithubStepUrl(step);
+  const targetUrl = await githubStepUrl(step);
   await ciApiRequest(`/statuses/${sha}`, 'POST', {
     state,
     context: name,
@@ -789,29 +790,54 @@ export function githubStepUrlForJobs(
   return step ? `${job.html_url}#step:${step}:1` : job.html_url;
 }
 
-async function getGithubStepUrl(step: string): Promise<string | null> {
-  const repository = process.env.GITHUB_REPOSITORY;
-  const runId = process.env.GITHUB_RUN_ID;
+export interface GithubStepUrlDependencies {
+  environment?: NodeJS.ProcessEnv;
+  request?: (path: string) => Promise<string>;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+const GITHUB_STEP_URL_ATTEMPTS = 3;
+const GITHUB_STEP_URL_RETRY_MS = 3_000;
+
+/**
+ * The log link of a commit status, at best the running job's step. A link never fails the CI step: the jobs API can
+ * list a just-started job before its runner or `in_progress` status, so the lookup retries, then links the run.
+ */
+export async function githubStepUrl(
+  step: string,
+  {
+    environment = process.env,
+    request = (path) => ciApiRequest(path, 'GET', undefined, environment),
+    sleep = (ms) => delay(ms),
+  }: GithubStepUrlDependencies = {},
+): Promise<string | null> {
+  const repository = environment.GITHUB_REPOSITORY;
+  const runId = environment.GITHUB_RUN_ID;
   if (!repository || !runId) {
     return null;
   }
-  const { forgejo, htmlBase } = ciApiContext();
-  if (forgejo) return `${htmlBase}/${repository}/actions/runs/${runId}`;
-  const runnerName = process.env.RUNNER_NAME;
-  if (!runnerName) throw new Error('Cannot link GitHub Actions logs without RUNNER_NAME.');
-  const attempt = process.env.GITHUB_RUN_ATTEMPT ?? '1';
-  for (let page = 1; ; page++) {
-    const listing = await ciApiRequest(
-      `/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`,
-      'GET',
-    );
-    const { jobs } = typia.json.assertParse<{ jobs: GithubWorkflowJob[] }>(listing);
-    const url = githubStepUrlForJobs(jobs, runnerName, step);
-    if (url) return url;
-    if (jobs.length < 100) {
-      throw new Error(`Cannot find the running GitHub Actions job for runner "${runnerName}" in run ${runId}.`);
+  const { forgejo, htmlBase } = ciApiContext(environment);
+  const runUrl = `${htmlBase}/${repository}/actions/runs/${runId}`;
+  const runnerName = environment.RUNNER_NAME;
+  if (forgejo || !runnerName) return runUrl;
+  const attempt = environment.GITHUB_RUN_ATTEMPT ?? '1';
+  try {
+    for (let tries = 1; tries <= GITHUB_STEP_URL_ATTEMPTS; tries++) {
+      if (tries > 1) await sleep(GITHUB_STEP_URL_RETRY_MS);
+      for (let page = 1; ; page++) {
+        const listing = await request(`/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`);
+        const { jobs } = typia.json.assertParse<{ jobs: GithubWorkflowJob[] }>(listing);
+        const url = githubStepUrlForJobs(jobs, runnerName, step);
+        if (url) return url;
+        if (jobs.length < 100) break;
+      }
     }
+    console.warn(`GitHub does not list runner "${runnerName}" as running in run ${runId}; linking the run instead.`);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn(`Cannot list the jobs of run ${runId} (${reason}); linking the run instead.`);
   }
+  return runUrl;
 }
 
 export function githubCommitStatusesWritable(

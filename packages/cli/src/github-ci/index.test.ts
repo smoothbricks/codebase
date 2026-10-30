@@ -12,6 +12,7 @@ import {
   githubCiNxDeploy,
   githubCiNxRunMany,
   githubCommitStatusesWritable,
+  githubStepUrl,
   githubStepUrlForJobs,
   nxRunManyArgs,
   nxRunManyBatchArgs,
@@ -87,6 +88,92 @@ describe('GitHub Actions step links', () => {
         '8',
       ),
     ).toBeNull();
+  });
+
+  it('does not select a job whose runner GitHub has not reported yet', () => {
+    expect(
+      githubStepUrlForJobs(
+        [{ name: 'Validate', runner_name: null, status: 'in_progress', html_url: `${runUrl}/job/1` }],
+        'current-runner',
+        '8',
+      ),
+    ).toBeNull();
+  });
+
+  describe('lookup during a run', () => {
+    const runner = 'bread-main-s6wltmlyvjgk';
+    const jobUrl = `${runUrl}/job/104376095985`;
+    const environment = {
+      GITHUB_REPOSITORY: 'smoothbricks/codebase',
+      GITHUB_RUN_ID: '34967722056',
+      GITHUB_RUN_ATTEMPT: '1',
+      RUNNER_NAME: runner,
+    };
+    const listing = (...jobs: { runner_name: string | null; status: string; html_url: string }[]) =>
+      JSON.stringify({ jobs: jobs.map((job) => ({ name: 'Validate', ...job })) });
+    const unreported = listing({ runner_name: null, status: 'queued', html_url: jobUrl });
+    const running = listing({ runner_name: runner, status: 'in_progress', html_url: jobUrl });
+
+    function lookup(answers: (() => string)[]) {
+      const paths: string[] = [];
+      const sleeps: number[] = [];
+      const url = githubStepUrl('8', {
+        environment,
+        request: async (path) => {
+          paths.push(path);
+          const answer = answers.shift();
+          if (!answer) throw new Error('unexpected jobs request');
+          return answer();
+        },
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+      });
+      return { url, paths, sleeps };
+    }
+
+    it('retries until GitHub lists the running job with its runner', async () => {
+      const { url, paths, sleeps } = lookup([() => unreported, () => running]);
+
+      expect(await url).toBe(`${jobUrl}#step:8:1`);
+      expect(paths).toEqual([
+        '/actions/runs/34967722056/attempts/1/jobs?per_page=100&page=1',
+        '/actions/runs/34967722056/attempts/1/jobs?per_page=100&page=1',
+      ]);
+      expect(sleeps).toHaveLength(1);
+    });
+
+    it('links the run when the job is never listed', async () => {
+      const { url, paths } = lookup([() => unreported, () => unreported, () => unreported]);
+
+      expect(await url).toBe(runUrl);
+      expect(paths).toHaveLength(3);
+    });
+
+    it('links the run when the jobs API fails', async () => {
+      const { url } = lookup([
+        () => {
+          throw new Error('GitHub API returned 502');
+        },
+      ]);
+
+      expect(await url).toBe(runUrl);
+    });
+
+    it('links the run without asking the API when RUNNER_NAME is missing', async () => {
+      const paths: string[] = [];
+      const url = await githubStepUrl('8', {
+        environment: { ...environment, RUNNER_NAME: undefined },
+        request: async (path) => {
+          paths.push(path);
+          return running;
+        },
+        sleep: async () => {},
+      });
+
+      expect(url).toBe(runUrl);
+      expect(paths).toEqual([]);
+    });
   });
 });
 
