@@ -69,7 +69,7 @@
     },
     "packages/cargo-retain": {
       "name": "@smoothbricks/cargo-retain",
-      "version": "0.0.2-next.0",
+      "version": "0.0.2-0",
       "bin": {
         "smoo-nx-cargo-retain": "./dist/ts/node-cli.js",
       },
@@ -88,7 +88,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.12.25-next.0",
+      "version": "0.12.25-0",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -115,7 +115,7 @@
     },
     "packages/columine": {
       "name": "@smoothbricks/columine",
-      "version": "0.3.2",
+      "version": "0.3.3-0",
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
         "@uwdata/flechette": "^2.7.0",
@@ -124,7 +124,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.4.3-next.0",
+      "version": "0.4.3-0",
       "bin": {
         "cowshed": "./bin/cowshed",
       },
@@ -183,7 +183,7 @@
     },
     "packages/lmao": {
       "name": "@smoothbricks/lmao",
-      "version": "0.5.8",
+      "version": "0.5.9-0",
       "dependencies": {
         "@msgpack/msgpack": "^3.1.3",
         "@neophi/sieve-cache": "^1.5.0",
@@ -228,7 +228,7 @@
     },
     "packages/lmao-inspector": {
       "name": "@smoothbricks/lmao-inspector",
-      "version": "0.1.14",
+      "version": "0.1.15",
       "dependencies": {
         "@duckdb/duckdb-wasm": "1.33.1-dev20.0",
         "@smoothbricks/lmao": "workspace:*",
@@ -268,7 +268,7 @@
     },
     "packages/nextest-extract": {
       "name": "@smoothbricks/nextest-extract",
-      "version": "0.0.2-next.0",
+      "version": "0.0.2-0",
       "bin": {
         "smoo-nx-nextest-extract": "./dist/ts/bin/smoo-nx-nextest-extract.js",
       },
@@ -300,7 +300,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.6.3-next.0",
+      "version": "0.6.3-0",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
