@@ -192,6 +192,9 @@ enum Effect {
     Opaque { slot: u32 },
     /// Remove predicate-selected stored rows without admitting new keys.
     Sweep { slot: u32 },
+    /// A removal keyed by `col` (key1 for a pair or prefix): its slot only
+    /// shrinks, and each execution records one cut (`removal_cut`).
+    Cut { slot: u32, col: u32 },
 }
 
 impl Effect {
@@ -205,10 +208,41 @@ impl Effect {
             | Effect::Routed { slot, .. }
             | Effect::Nested { slot, .. }
             | Effect::Sweep { slot }
+            | Effect::Cut { slot, .. }
             | Effect::Opaque { slot } => slot,
             Effect::Algebra { target, .. } => target,
         }
     }
+
+    /// The write this effect makes, as the removal order reads it: a
+    /// production folds rows into its slot, a cut removes keys from it. A
+    /// set or bitmap removal, a stored-row sweep and a removing algebra
+    /// record no cut and fold no row.
+    fn write(self) -> Option<SlotWrite> {
+        match self {
+            Effect::Cut { slot, .. } => Some(SlotWrite::Cut(slot)),
+            Effect::Key { slot, .. }
+            | Effect::Pair { slot, .. }
+            | Effect::Entry { slot }
+            | Effect::Arena { slot, .. }
+            | Effect::Routed { slot, .. }
+            | Effect::Nested { slot, .. }
+            | Effect::Opaque { slot } => Some(SlotWrite::Produce(slot)),
+            Effect::Algebra {
+                target, adds: true, ..
+            } => Some(SlotWrite::Produce(target)),
+            Effect::Remove { .. } | Effect::Sweep { .. } | Effect::Algebra { .. } => None,
+        }
+    }
+}
+
+/// What one instruction does to one slot, as the removal order reads it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlotWrite {
+    /// The instruction can insert or rewrite rows of the slot.
+    Produce(u32),
+    /// The instruction removes keys of the slot and records their cuts.
+    Cut(u32),
 }
 
 fn cell(cols: &[&[u8]], col: u32, row: u32) -> Option<u32> {
@@ -296,8 +330,16 @@ fn effects(op: Opcode, o: &[u32], out: &mut impl FnMut(Effect)) -> Option<()> {
         // Init frames charged for absent rows and clear fields alike.
         Opcode::BatchStructMapCountsFold => out(Effect::Opaque { slot: at(0)? }),
         Opcode::StructMapSweep => out(Effect::Sweep { slot: at(0)? }),
-        // A remove only shrinks its slot; it reserves no capacity.
-        Opcode::BatchStructMapRemove => {}
+        // A removal only shrinks its slot: slot, key (key1) column. Each
+        // execution records one cut.
+        Opcode::BatchStructMapRemove
+        | Opcode::BatchStructMap2Remove
+        | Opcode::BatchStructMap2RemovePrefix
+        | Opcode::BatchMapRemove
+        | Opcode::BatchMapRemoveIf => out(Effect::Cut {
+            slot: at(0)?,
+            col: at(1)?,
+        }),
         Opcode::BatchStructMapGuardedUpsertLast => {
             // slot, companion, key, guard_key, guard_field, num_vals,
             // (col, field) × num_vals, num_arrays, ... The companion only
@@ -394,6 +436,26 @@ fn routed(
         });
     }
     Some(())
+}
+
+/// Visit, in program order through every `FOR_EACH` and `FLAT_MAP` body,
+/// the slot writes of each instruction of `code`, classified from its
+/// capacity [`effects`]: admission and the removal order read one table.
+/// `None` when the code does not decode or `visit` refuses.
+pub(crate) fn slot_writes(
+    code: &[u8],
+    operands: &mut Vec<u32>,
+    visit: &mut impl FnMut(SlotWrite) -> Option<()>,
+) -> Option<()> {
+    walk(code, Domain::TOP, operands, &mut |op, o, _| {
+        let mut ok = Some(());
+        effects(op, o, &mut |effect| {
+            if let (Some(()), Some(write)) = (ok, effect.write()) {
+                ok = visit(write);
+            }
+        })?;
+        ok
+    })
 }
 
 /// Visit every instruction of `code` with the domain it runs over.
@@ -543,7 +605,8 @@ impl CapacityScratch {
             code.len().saturating_sub(operands_len),
         )?;
 
-        // Tier 1: the row-count bound, in program order.
+        // Tier 1: the row-count bound, in program order. A removal adds no
+        // slot demand; its executions bound the cuts the batch records.
         if self.program != code {
             self.decode(code)?;
         }
@@ -554,8 +617,13 @@ impl CapacityScratch {
             slots,
             scratch_card: scratch_members(env),
         };
+        let mut cuts = 0u64;
         for &(effect, whole_batch) in &self.effects {
-            tier1.account::<I>(effect, whole_batch, &mut self.demand, &mut self.touched)?;
+            if let Effect::Cut { col, .. } = effect {
+                cuts = cuts.saturating_add(tier1.executions(whole_batch, Some(col))?);
+            } else {
+                tier1.account::<I>(effect, whole_batch, &mut self.demand, &mut self.touched)?;
+            }
         }
 
         // Working memory: a TTL slot's planner storage follows its rows. A
@@ -563,7 +631,10 @@ impl CapacityScratch {
         // which grows that storage before the batch's first write. The same
         // pass checks the bound: every early answer is a dry run, so the
         // order of the two decisions cannot change the admission.
-        self.scratch = ScratchDemand::default();
+        self.scratch = ScratchDemand {
+            removal_cuts: usize::try_from(cuts).ok()?,
+            ..ScratchDemand::default()
+        };
         let mut cleared = true;
         for index in 0..self.touched.len() {
             let slot = self.touched[index];

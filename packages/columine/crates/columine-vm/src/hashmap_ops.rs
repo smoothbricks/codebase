@@ -16,6 +16,7 @@ use crate::bytes;
 use crate::hash_table::{ENTRY_U32, ErasePlan, EraseRanges, FlatTable};
 use crate::hooks::{ByteCapture, TtlMutation, VmHooks, batch_rows};
 use crate::meta::{BatchFlags, SlotMetaView};
+use crate::removal_cut::{CutKey, SlotCuts};
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset};
 
 pub use columine_types::CmpType;
@@ -119,7 +120,10 @@ fn should_update(strategy: Strategy, new_cmp: u64, existing: u64, cmp_type: CmpT
 /// timestamp column (stride per `cmp_type`). It is required by comparison
 /// strategies and by TTL slots.
 /// Column lengths bound the batch: `keys.len()` is `batch_len` and `vals` must
-/// match.
+/// match. Row `i` is the batch's log position `i`: a row at or before a
+/// removal of its key in the same batch (`cuts`, the slot's) writes nothing,
+/// because that removal erases it at its own position. A call outside a
+/// batch passes [`SlotCuts::NONE`].
 #[allow(clippy::too_many_arguments)]
 pub fn batch_map_upsert(
     strategy: Strategy,
@@ -127,6 +131,7 @@ pub fn batch_map_upsert(
     state: &mut [u8],
     meta: &SlotMetaView,
     _slot_idx: u32,
+    cuts: SlotCuts<'_>,
     keys: &[u32],
     vals: &[u32],
     cmp_col: Option<&[u8]>,
@@ -145,7 +150,7 @@ pub fn batch_map_upsert(
         hooks.undo_enabled(),
         meta.has_ttl(),
         upsert_rows(
-            strategy, delta_mode, state, meta, keys, vals, cmp_col, cmp_type, hooks,
+            strategy, delta_mode, state, meta, cuts, keys, vals, cmp_col, cmp_type, hooks,
         )
     )
 }
@@ -159,6 +164,7 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
+    cuts: SlotCuts<'_>,
     keys: &[u32],
     vals: &[u32],
     cmp_col: Option<&[u8]>,
@@ -174,6 +180,9 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool>(
 
     for (i, (&key, &val)) in keys.iter().zip(vals).enumerate() {
         let i = i as u32;
+        if cuts.covers(CutKey::Unary(key), i) {
+            continue;
+        }
         // Skip EMPTY_KEY and TOMBSTONE sentinels.
         let Some(probe) = tbl.find_insert(state, key) else {
             continue;
@@ -429,7 +438,17 @@ pub fn single_map_upsert(
     let cmp_col =
         (strategy.needs_timestamps() || meta.has_ttl()).then_some(&cmp_bytes[..cmp_type.stride()]);
     batch_map_upsert(
-        strategy, delta_mode, state, meta, slot_idx, &keys, &vals, cmp_col, cmp_type, hooks,
+        strategy,
+        delta_mode,
+        state,
+        meta,
+        slot_idx,
+        SlotCuts::NONE,
+        &keys,
+        &vals,
+        cmp_col,
+        cmp_type,
+        hooks,
     )
 }
 

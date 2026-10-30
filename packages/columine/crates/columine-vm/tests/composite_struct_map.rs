@@ -196,8 +196,9 @@ fn execute_tuple(
 
 #[test]
 fn permission_reducer_adds_updates_and_revokes_exact_pairs() {
-    let mut reduce = for_each(ADD, &upsert_code(1, 2, &[(3, 0), (4, 1)]));
-    reduce.extend(for_each(REVOKE, &remove_code(1, 2)));
+    // A removal precedes its target's producers.
+    let mut reduce = for_each(REVOKE, &remove_code(1, 2));
+    reduce.extend(for_each(ADD, &upsert_code(1, 2, &[(3, 0), (4, 1)])));
     let program = map2_program(8, &[4, 0], 5, &reduce);
     let mut state = init(&program);
     let mut vm = Vm::default();

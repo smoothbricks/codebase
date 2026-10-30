@@ -10,6 +10,7 @@ use columine_vm::hashmap_ops::{
 };
 use columine_vm::hooks::NoVm;
 use columine_vm::meta::SlotMetaView;
+use columine_vm::removal_cut::SlotCuts;
 use proptest::prelude::*;
 use std::hint::black_box;
 use std::time::Instant;
@@ -126,6 +127,7 @@ fn batch_order_witness() {
             &mut state,
             &meta,
             0,
+            SlotCuts::NONE,
             &keys,
             &values,
             None,

@@ -20,6 +20,7 @@ use columine_vm::logical_export::{
     rewrite_slot_set,
 };
 use columine_vm::meta::SlotMetaView;
+use columine_vm::removal_cut::SlotCuts;
 use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state, validate_state,
 };
@@ -709,6 +710,7 @@ fn generated_hashmap_states_round_trip_and_continue_identically() {
                 &mut original,
                 &meta,
                 0,
+                SlotCuts::NONE,
                 &keys,
                 &vals,
                 Some(&cmps),
@@ -752,6 +754,7 @@ fn generated_hashmap_states_round_trip_and_continue_identically() {
                     image,
                     &meta,
                     0,
+                    SlotCuts::NONE,
                     &next_keys,
                     &next_vals,
                     Some(&next_cmps),

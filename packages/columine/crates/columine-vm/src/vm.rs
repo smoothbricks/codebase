@@ -31,6 +31,7 @@ use crate::key_index::{
 };
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
+use crate::removal_cut::{self, CutKey, RemovalCuts, SlotCuts};
 use crate::row_exprs::{LiveColumns, StoredRow};
 use crate::scratch::ScratchDemand;
 use crate::state_init::{self, EVICTION_ENTRY_SIZE};
@@ -1039,15 +1040,19 @@ pub struct Vm<I: KeyIndex = HashIndex> {
     /// (zeroing and copying) the arrays per row.
     element_struct_map: StructMapUpsertOperands,
     element_struct_map_guarded: StructMapGuardedUpsertOperands,
-    /// The last reduce section whose companion pairing validated; a new
-    /// program revalidates before its first batch folds.
-    guard_validated: Vec<u8>,
+    /// The last reduce section whose whole-program invariants validated:
+    /// companion pairing and removal order. A new program revalidates
+    /// before its first batch folds.
+    validated: Vec<u8>,
     element_struct_map2: StructMap2UpsertOperands,
     element_struct_map2_tuple: StructMap2TupleOperands,
     element_list_vals: ScalarOperands,
     nested_scratch: nested::NestedScratch,
     /// The keys a stored-row sweep selected, retained across batches.
     sweep_keys: Vec<u32>,
+    /// The running batch's removal cuts (`removal_cut`), retained across
+    /// batches.
+    removal_cuts: RemovalCuts,
     /// Key-index working memory: the family's scratch and the seal space.
     keys: KeyScratch<I>,
     /// Batch capacity admission (`capacity`), retained across batches.
@@ -1083,12 +1088,13 @@ impl<I: KeyIndex> Vm<I> {
             element_plan: BodyPlan::default(),
             element_struct_map: StructMapUpsertOperands::EMPTY,
             element_struct_map_guarded: StructMapGuardedUpsertOperands::EMPTY,
-            guard_validated: Vec::new(),
+            validated: Vec::new(),
             element_struct_map2: StructMap2UpsertOperands::EMPTY,
             element_struct_map2_tuple: StructMap2TupleOperands::EMPTY,
             element_list_vals: ScalarOperands::EMPTY,
             nested_scratch: nested::NestedScratch::default(),
             sweep_keys: Vec::new(),
+            removal_cuts: RemovalCuts::default(),
             keys: KeyScratch::default(),
             capacity: CapacityScratch::default(),
             scratch_sealed: false,
@@ -1212,6 +1218,7 @@ impl<I: KeyIndex> Vm<I> {
         self.sweep_keys
             .try_reserve(demand.sweep_keys)
             .map_err(|_| ErrorCode::OutOfMemory)?;
+        self.removal_cuts.reserve_for(demand.removal_cuts)?;
         self.undo.ttl_batch_scratch.reserve_for(demand.ttl)?;
         if let Some(nested) = demand.nested {
             self.nested_scratch.reserve_for(nested)?;
@@ -1226,6 +1233,7 @@ impl<I: KeyIndex> Vm<I> {
     /// builds assert every plan fits what the batch reserved.
     fn seal_scratch(&mut self) {
         self.scratch_sealed = true;
+        self.removal_cuts.seal();
         self.undo.ttl_batch_scratch.seal();
         self.nested_scratch.seal();
         self.bitmap_env.seal();
@@ -1233,6 +1241,7 @@ impl<I: KeyIndex> Vm<I> {
 
     fn unseal_scratch(&mut self) {
         self.scratch_sealed = false;
+        self.removal_cuts.unseal();
         self.undo.ttl_batch_scratch.unseal();
         self.nested_scratch.unseal();
         self.bitmap_env.unseal();
@@ -1245,6 +1254,7 @@ impl<I: KeyIndex> Vm<I> {
             ttl: crate::ttl_plan::plan_demand(state, meta, u64::try_from(rows).unwrap_or(u64::MAX)),
             nested: None,
             sweep_keys: 0,
+            removal_cuts: 0,
             // A slot whose image cannot be read refuses in the call itself.
             bitmap: (meta.slot_type() == SlotType::Bitmap)
                 .then(|| {
@@ -1317,6 +1327,7 @@ impl<I: KeyIndex> Vm<I> {
                     state,
                     &meta,
                     slot,
+                    SlotCuts::NONE,
                     keys,
                     vals,
                     cmp_col,
@@ -3595,7 +3606,10 @@ fn counts_error(error: crate::counts_fold::CountsFoldError) -> ErrorCode {
 
 /// Apply one physically planned fold. Schema-role certification belongs to
 /// the admitted program; this mutation owns its exact physical journal.
-/// `NEEDS_GROWTH` names `op.slot`; the calling VM records it.
+/// `NEEDS_GROWTH` names `op.slot`; the calling VM records it. An element at
+/// or before a removal of its key in the batch (`cuts`, at log position
+/// `row`) folds nothing.
+#[allow(clippy::too_many_arguments)]
 fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
     delta_mode: bool,
@@ -3603,6 +3617,8 @@ fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
     op: &crate::counts_fold::CountsFoldOp<'_>,
     cols: &[&[u8]],
     element: u32,
+    row: u32,
+    cuts: SlotCuts<'_>,
     cx: &mut KeyCx<'_, I, S>,
 ) -> u32 {
     use crate::counts_fold::{CountsFoldTarget, MAX_COUNTS_HISTOGRAMS, MAX_COUNTS_MASKS};
@@ -3618,7 +3634,7 @@ fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
         Ok(key) => key,
         Err(error) => return counts_error(error) as u32,
     };
-    if key == EMPTY_KEY || key == TOMBSTONE {
+    if key == EMPTY_KEY || key == TOMBSTONE || cuts.covers(CutKey::Unary(key), row) {
         return OK;
     }
     let sample = match op.read_sample(cols, element) {
@@ -4283,25 +4299,24 @@ impl<I: KeyIndex> Vm<I> {
         if self.element_plan.reserve_for(sections.reduce_code).is_err() {
             return OUT_OF_MEMORY;
         }
-        // Companion pairing is a whole-program invariant checked once per
-        // program, before any batch of it folds: see validate_guard_pairing.
-        if sections
-            .reduce_code
-            .contains(&(Opcode::BatchStructMapGuardedUpsertLast as u8))
-            && self.guard_validated != sections.reduce_code
-        {
-            if validate_guard_pairing(sections.reduce_code).is_none() {
+        // Companion pairing and removal order are whole-program invariants
+        // checked once per program, before any batch of it folds: see
+        // validate_guard_pairing and removal_cut::validate_order.
+        if self.validated != sections.reduce_code {
+            let code = sections.reduce_code;
+            if code.contains(&(Opcode::BatchStructMapGuardedUpsertLast as u8))
+                && validate_guard_pairing(code).is_none()
+            {
                 return INVALID_PROGRAM;
             }
-            if self
-                .guard_validated
-                .try_reserve(sections.reduce_code.len())
-                .is_err()
-            {
+            if let Err(error) = removal_cut::validate_order(code) {
+                return error as u32;
+            }
+            if self.validated.try_reserve(code.len()).is_err() {
                 return OUT_OF_MEMORY;
             }
-            self.guard_validated.clear();
-            self.guard_validated.extend_from_slice(sections.reduce_code);
+            self.validated.clear();
+            self.validated.extend_from_slice(code);
         }
         match self
             .declarations
@@ -4433,6 +4448,9 @@ impl<I: KeyIndex> Vm<I> {
             cols,
             len: batch_len,
         } = batch;
+        // The batch's cuts are its own: a dry run and the run after it each
+        // record theirs from the first instruction.
+        self.removal_cuts.clear();
         let mut pc = 0usize;
         while pc < code.len() {
             let Some(_) = body_op_len(code, pc) else {
@@ -4481,6 +4499,7 @@ impl<I: KeyIndex> Vm<I> {
                         state,
                         &meta,
                         slot,
+                        self.removal_cuts.of(slot),
                         batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
                         batch_col!(col_u32_exact(col_at(cols, val_col as usize), batch_len)),
                         Some(batch_col!(cmp_col_exact(
@@ -4489,7 +4508,9 @@ impl<I: KeyIndex> Vm<I> {
                             cmp_type
                         ))),
                         cmp_type,
-                        &mut self.ctx(),
+                        &mut VmCtx {
+                            undo: &mut self.undo,
+                        },
                     );
                     if result != ErrorCode::Ok {
                         return self.signal_growth(slot, result);
@@ -4510,11 +4531,14 @@ impl<I: KeyIndex> Vm<I> {
                         state,
                         &meta,
                         slot,
+                        self.removal_cuts.of(slot),
                         batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
                         batch_col!(col_u32_exact(col_at(cols, val_col as usize), batch_len)),
                         None,
                         CmpType::F64,
-                        &mut self.ctx(),
+                        &mut VmCtx {
+                            undo: &mut self.undo,
+                        },
                     );
                     if result != ErrorCode::Ok {
                         return self.signal_growth(slot, result);
@@ -4544,11 +4568,14 @@ impl<I: KeyIndex> Vm<I> {
                         state,
                         &meta,
                         slot,
+                        self.removal_cuts.of(slot),
                         batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
                         batch_col!(col_u32_exact(col_at(cols, val_col as usize), batch_len)),
                         ts,
                         CmpType::F64,
-                        &mut self.ctx(),
+                        &mut VmCtx {
+                            undo: &mut self.undo,
+                        },
                     );
                     if result != ErrorCode::Ok {
                         return self.signal_growth(slot, result);
@@ -4570,6 +4597,7 @@ impl<I: KeyIndex> Vm<I> {
                         state,
                         &meta,
                         slot,
+                        self.removal_cuts.of(slot),
                         batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
                         batch_col!(col_u32_exact(col_at(cols, val_col as usize), batch_len)),
                         Some(batch_col!(cmp_col_exact(
@@ -4578,7 +4606,9 @@ impl<I: KeyIndex> Vm<I> {
                             CmpType::F64
                         ))),
                         CmpType::F64,
-                        &mut self.ctx(),
+                        &mut VmCtx {
+                            undo: &mut self.undo,
+                        },
                     );
                     if result != ErrorCode::Ok {
                         return self.signal_growth(slot, result);
@@ -4589,16 +4619,23 @@ impl<I: KeyIndex> Vm<I> {
                     let (slot, key_col) = (operand!(r.index()), operand!(r.index()));
                     pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
+                    let keys = batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len));
                     let result = hashmap_ops::batch_map_remove(
                         delta_mode,
                         state,
                         &meta,
                         slot,
-                        batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
+                        keys,
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
                         return self.signal_growth(slot, result);
+                    }
+                    for (row, &key) in (0..batch_len).zip(keys) {
+                        if let Err(error) = self.removal_cuts.record(slot, CutKey::Unary(key), row)
+                        {
+                            return error as u32;
+                        }
                     }
                 }
 
@@ -4625,6 +4662,7 @@ impl<I: KeyIndex> Vm<I> {
                         state,
                         &meta,
                         slot,
+                        self.removal_cuts.of(slot),
                         batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
                         batch_col!(col_u32_exact(col_at(cols, val_col as usize), batch_len)),
                         Some(batch_col!(cmp_col_exact(
@@ -4633,7 +4671,9 @@ impl<I: KeyIndex> Vm<I> {
                             cmp_type
                         ))),
                         cmp_type,
-                        &mut self.ctx(),
+                        &mut VmCtx {
+                            undo: &mut self.undo,
+                        },
                     );
                     if result != ErrorCode::Ok {
                         return self.signal_growth(slot, result);
@@ -4901,8 +4941,12 @@ impl<I: KeyIndex> Vm<I> {
                         col_at(cols, operands.key_col as usize),
                         batch_len
                     ));
+                    let cuts = self.removal_cuts.of(operands.slot);
                     for i in 0..batch_len {
                         let key = keys[i as usize];
+                        if cuts.covers(CutKey::Unary(key), i) {
+                            continue;
+                        }
                         match should_write_struct_map_row(state, &smap, key, pick, cols, i, cx) {
                             Ok(true) => {}
                             Ok(false) => continue,
@@ -4935,6 +4979,7 @@ impl<I: KeyIndex> Vm<I> {
                         Err(error) => return counts_error(error) as u32,
                     };
                     pc = operands.end;
+                    let cuts = self.removal_cuts.of(operands.slot);
                     for row in 0..batch_len {
                         let result = fold_counts_row(
                             &mut self.undo,
@@ -4943,6 +4988,8 @@ impl<I: KeyIndex> Vm<I> {
                             &operands,
                             cols,
                             row,
+                            row,
+                            cuts,
                             cx,
                         );
                         if result != OK {
@@ -4968,8 +5015,12 @@ impl<I: KeyIndex> Vm<I> {
                         col_at(cols, operands.key2_col as usize),
                         batch_len
                     ));
+                    let cuts = self.removal_cuts.of(operands.slot);
                     for i in 0..batch_len {
                         let index = i as usize;
+                        if cuts.covers_pair(keys1[index], keys2[index], i) {
+                            continue;
+                        }
                         let result = single_struct_map2_upsert_last(
                             &mut self.undo,
                             delta_mode,
@@ -5011,8 +5062,12 @@ impl<I: KeyIndex> Vm<I> {
                         col_at(cols, operands.row.key2_col as usize),
                         batch_len
                     ));
+                    let cuts = self.removal_cuts.of(operands.row.slot);
                     for i in 0..batch_len {
                         let index = i as usize;
+                        if cuts.covers_pair(keys1[index], keys2[index], i) {
+                            continue;
+                        }
                         let result = single_struct_map2_upsert_tuple(
                             &mut self.undo,
                             delta_mode,
@@ -5046,18 +5101,24 @@ impl<I: KeyIndex> Vm<I> {
                         batch_col!(col_u32_exact(col_at(cols, key1_col as usize), batch_len));
                     let keys2 =
                         batch_col!(col_u32_exact(col_at(cols, key2_col as usize), batch_len));
-                    for index in 0..batch_len as usize {
+                    for (row, (&key1, &key2)) in (0..batch_len).zip(keys1.iter().zip(keys2)) {
                         let result = single_struct_map2_remove(
                             &mut self.undo,
                             delta_mode,
                             state,
                             &smap,
                             slot,
-                            Key::two(keys1[index], keys2[index]),
+                            Key::two(key1, key2),
                             cx,
                         );
                         if result != ErrorCode::Ok {
                             return result as u32;
+                        }
+                        if let Err(error) =
+                            self.removal_cuts
+                                .record(slot, CutKey::Pair(key1, key2), row)
+                        {
+                            return error as u32;
                         }
                     }
                 }
@@ -5071,7 +5132,7 @@ impl<I: KeyIndex> Vm<I> {
                     };
                     let keys1 =
                         batch_col!(col_u32_exact(col_at(cols, key1_col as usize), batch_len));
-                    for &key1 in keys1 {
+                    for (row, &key1) in (0..batch_len).zip(keys1) {
                         let result = remove_struct_map2_prefix(
                             &mut self.undo,
                             delta_mode,
@@ -5084,6 +5145,11 @@ impl<I: KeyIndex> Vm<I> {
                         if result != ErrorCode::Ok {
                             return result as u32;
                         }
+                        if let Err(error) =
+                            self.removal_cuts.record(slot, CutKey::Prefix(key1), row)
+                        {
+                            return error as u32;
+                        }
                     }
                 }
 
@@ -5091,7 +5157,7 @@ impl<I: KeyIndex> Vm<I> {
                     let (slot, key_col) = (operand!(r.index()), operand!(r.index()));
                     pc = r.pos();
                     let keys = batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len));
-                    for &key in keys {
+                    for (row, &key) in (0..batch_len).zip(keys) {
                         let result = single_struct_map_remove(
                             &mut self.undo,
                             delta_mode,
@@ -5102,6 +5168,10 @@ impl<I: KeyIndex> Vm<I> {
                         );
                         if result != ErrorCode::Ok {
                             return result as u32;
+                        }
+                        if let Err(error) = self.removal_cuts.record(slot, CutKey::Unary(key), row)
+                        {
+                            return error as u32;
                         }
                     }
                 }
@@ -5139,7 +5209,11 @@ impl<I: KeyIndex> Vm<I> {
                         col_at(cols, operands.guard_key_col as usize),
                         batch_len
                     ));
+                    let cuts = self.removal_cuts.of(operands.row.slot);
                     for i in 0..batch_len {
+                        if cuts.covers(CutKey::Unary(keys[i as usize]), i) {
+                            continue;
+                        }
                         let result = single_struct_map_guarded_upsert_last(
                             &mut self.undo,
                             delta_mode,
@@ -5270,6 +5344,7 @@ impl<I: KeyIndex> Vm<I> {
                 state,
                 &plan.wide,
                 cols,
+                ei,
                 ei,
                 ei,
                 NO_PARENT_TS_COL,
@@ -5444,6 +5519,9 @@ impl<I: KeyIndex> Vm<I> {
         cols: &[&[u8]],
         child_idx: u32,
         parent_idx: u32,
+        // The batch row the element belongs to: its log position, which a
+        // FLAT_MAP element shares with its parent row.
+        row: u32,
         parent_ts_col: u32,
         mut live: Option<&mut LiveColumns<'_, '_>>,
         cx: &mut KeyCx<'_, I, S>,
@@ -5495,6 +5573,13 @@ impl<I: KeyIndex> Vm<I> {
                         return INVALID_PROGRAM;
                     };
                     bpc = r.pos();
+                    if self
+                        .removal_cuts
+                        .of(slot)
+                        .covers(CutKey::Unary(cell_u32(cols, key_col, child_idx)), row)
+                    {
+                        continue;
+                    }
 
                     let (cmp_raw, cmp_idx) = if parent_ts_col != NO_PARENT_TS_COL {
                         (col_at(cols, parent_ts_col as usize), parent_idx)
@@ -5529,6 +5614,13 @@ impl<I: KeyIndex> Vm<I> {
                         operand!(r.index()),
                     );
                     bpc = r.pos();
+                    if self
+                        .removal_cuts
+                        .of(slot)
+                        .covers(CutKey::Unary(cell_u32(cols, key_col, child_idx)), row)
+                    {
+                        continue;
+                    }
                     let meta = SlotMetaView::read(state, slot);
                     let result = hashmap_ops::single_map_upsert(
                         Strategy::First,
@@ -5555,6 +5647,13 @@ impl<I: KeyIndex> Vm<I> {
                         operand!(r.index()),
                     );
                     bpc = r.pos();
+                    if self
+                        .removal_cuts
+                        .of(slot)
+                        .covers(CutKey::Unary(cell_u32(cols, key_col, child_idx)), row)
+                    {
+                        continue;
+                    }
                     let meta = SlotMetaView::read(state, slot);
                     let ttl_cmp = if meta.has_ttl() {
                         cell_f64(cols, meta.timestamp_col(state), child_idx).to_bits()
@@ -5587,6 +5686,13 @@ impl<I: KeyIndex> Vm<I> {
                         operand!(r.index()),
                     );
                     bpc = r.pos();
+                    if self
+                        .removal_cuts
+                        .of(slot)
+                        .covers(CutKey::Unary(cell_u32(cols, key_col, child_idx)), row)
+                    {
+                        continue;
+                    }
                     let (ts_raw, ts_idx) = if parent_ts_col != NO_PARENT_TS_COL {
                         (col_at(cols, parent_ts_col as usize), parent_idx)
                     } else {
@@ -5617,16 +5723,20 @@ impl<I: KeyIndex> Vm<I> {
                     let (slot, key_col) = (operand!(r.index()), operand!(r.index()));
                     bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
+                    let key = cell_u32(cols, key_col, child_idx);
                     let result = hashmap_ops::single_map_remove(
                         delta_mode,
                         state,
                         &meta,
                         slot,
-                        cell_u32(cols, key_col, child_idx),
+                        key,
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
                         return self.signal_growth(slot, result);
+                    }
+                    if let Err(error) = self.removal_cuts.record(slot, CutKey::Unary(key), row) {
+                        return error as u32;
                     }
                 }
 
@@ -5642,6 +5752,13 @@ impl<I: KeyIndex> Vm<I> {
                         return INVALID_PROGRAM;
                     };
                     bpc = r.pos();
+                    if self
+                        .removal_cuts
+                        .of(slot)
+                        .covers(CutKey::Unary(cell_u32(cols, key_col, child_idx)), row)
+                    {
+                        continue;
+                    }
                     let strategy = if op == Opcode::BatchMapUpsertMax {
                         Strategy::Max
                     } else {
@@ -5685,6 +5802,13 @@ impl<I: KeyIndex> Vm<I> {
                     bpc = r.pos();
 
                     predicate!(pred_col);
+                    if self
+                        .removal_cuts
+                        .of(slot)
+                        .covers(CutKey::Unary(cell_u32(cols, key_col, child_idx)), row)
+                    {
+                        continue;
+                    }
 
                     let (cmp_raw, cmp_idx) = if parent_ts_col != NO_PARENT_TS_COL {
                         (col_at(cols, parent_ts_col as usize), parent_idx)
@@ -5722,6 +5846,13 @@ impl<I: KeyIndex> Vm<I> {
                     bpc = r.pos();
 
                     predicate!(pred_col);
+                    if self
+                        .removal_cuts
+                        .of(slot)
+                        .covers(CutKey::Unary(cell_u32(cols, key_col, child_idx)), row)
+                    {
+                        continue;
+                    }
 
                     let meta = SlotMetaView::read(state, slot);
                     let (strategy, cmp) = if op == Opcode::BatchMapUpsertFirstIf {
@@ -5761,16 +5892,20 @@ impl<I: KeyIndex> Vm<I> {
                     bpc = r.pos();
                     predicate!(pred_col);
                     let meta = SlotMetaView::read(state, slot);
+                    let key = cell_u32(cols, key_col, child_idx);
                     let result = hashmap_ops::single_map_remove(
                         delta_mode,
                         state,
                         &meta,
                         slot,
-                        cell_u32(cols, key_col, child_idx),
+                        key,
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
                         return self.signal_growth(slot, result);
+                    }
+                    if let Err(error) = self.removal_cuts.record(slot, CutKey::Unary(key), row) {
+                        return error as u32;
                     }
                 }
 
@@ -5789,6 +5924,13 @@ impl<I: KeyIndex> Vm<I> {
                     bpc = r.pos();
 
                     predicate!(pred_col);
+                    if self
+                        .removal_cuts
+                        .of(slot)
+                        .covers(CutKey::Unary(cell_u32(cols, key_col, child_idx)), row)
+                    {
+                        continue;
+                    }
 
                     let strategy = if op == Opcode::BatchMapUpsertMaxIf {
                         Strategy::Max
@@ -5930,6 +6072,13 @@ impl<I: KeyIndex> Vm<I> {
                         return INVALID_PROGRAM;
                     };
                     let key = cell_u32(cols, operands.key_col, child_idx);
+                    if self
+                        .removal_cuts
+                        .of(operands.slot)
+                        .covers(CutKey::Unary(key), row)
+                    {
+                        continue;
+                    }
                     let should_write = match should_write_struct_map_row(
                         state, &smap, key, pick, cols, child_idx, cx,
                     ) {
@@ -5971,6 +6120,8 @@ impl<I: KeyIndex> Vm<I> {
                         &operands,
                         cols,
                         child_idx,
+                        row,
+                        self.removal_cuts.of(operands.slot),
                         cx,
                     );
                     if result != OK {
@@ -5989,6 +6140,13 @@ impl<I: KeyIndex> Vm<I> {
                         Ok(map) => map,
                         Err(error) => return error as u32,
                     };
+                    if self.removal_cuts.of(operands.slot).covers_pair(
+                        cell_u32(cols, operands.key1_col, child_idx),
+                        cell_u32(cols, operands.key2_col, child_idx),
+                        row,
+                    ) {
+                        continue;
+                    }
                     let result = single_struct_map2_upsert_last(
                         &mut self.undo,
                         delta_mode,
@@ -6022,6 +6180,13 @@ impl<I: KeyIndex> Vm<I> {
                     if !validate_struct_map2_tuple(state, &smap, operands) {
                         return INVALID_PROGRAM;
                     }
+                    if self.removal_cuts.of(operands.row.slot).covers_pair(
+                        cell_u32(cols, operands.row.key1_col, child_idx),
+                        cell_u32(cols, operands.row.key2_col, child_idx),
+                        row,
+                    ) {
+                        continue;
+                    }
                     let result = single_struct_map2_upsert_tuple(
                         &mut self.undo,
                         delta_mode,
@@ -6050,20 +6215,27 @@ impl<I: KeyIndex> Vm<I> {
                         Ok(map) => map,
                         Err(error) => return error as u32,
                     };
+                    let (key1, key2) = (
+                        cell_u32(cols, key1_col, child_idx),
+                        cell_u32(cols, key2_col, child_idx),
+                    );
                     let result = single_struct_map2_remove(
                         &mut self.undo,
                         delta_mode,
                         state,
                         &smap,
                         slot,
-                        Key::two(
-                            cell_u32(cols, key1_col, child_idx),
-                            cell_u32(cols, key2_col, child_idx),
-                        ),
+                        Key::two(key1, key2),
                         cx,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
+                    }
+                    if let Err(error) =
+                        self.removal_cuts
+                            .record(slot, CutKey::Pair(key1, key2), row)
+                    {
+                        return error as u32;
                     }
                 }
                 Opcode::BatchStructMap2RemovePrefix => {
@@ -6073,33 +6245,35 @@ impl<I: KeyIndex> Vm<I> {
                         Ok(map) => map,
                         Err(error) => return error as u32,
                     };
+                    let key1 = cell_u32(cols, key1_col, child_idx);
                     let result = remove_struct_map2_prefix(
                         &mut self.undo,
                         delta_mode,
                         state,
                         &smap,
                         slot,
-                        cell_u32(cols, key1_col, child_idx),
+                        key1,
                         cx,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
+                    }
+                    if let Err(error) = self.removal_cuts.record(slot, CutKey::Prefix(key1), row) {
+                        return error as u32;
                     }
                 }
 
                 Opcode::BatchStructMapRemove => {
                     let (slot, key_col) = (operand!(r.index()), operand!(r.index()));
                     bpc = r.pos();
-                    let result = single_struct_map_remove(
-                        &mut self.undo,
-                        delta_mode,
-                        state,
-                        slot,
-                        cell_u32(cols, key_col, child_idx),
-                        cx,
-                    );
+                    let key = cell_u32(cols, key_col, child_idx);
+                    let result =
+                        single_struct_map_remove(&mut self.undo, delta_mode, state, slot, key, cx);
                     if result != ErrorCode::Ok {
                         return result as u32;
+                    }
+                    if let Err(error) = self.removal_cuts.record(slot, CutKey::Unary(key), row) {
+                        return error as u32;
                     }
                 }
                 Opcode::BatchStructMapGuardedUpsertLast => {
@@ -6127,6 +6301,12 @@ impl<I: KeyIndex> Vm<I> {
                         validate_guard_companion(state, &companion, operands.guard_field_idx)
                     {
                         return error as u32;
+                    }
+                    if self.removal_cuts.of(operands.row.slot).covers(
+                        CutKey::Unary(cell_u32(cols, operands.row.key_col, child_idx)),
+                        row,
+                    ) {
+                        continue;
                     }
                     let result = single_struct_map_guarded_upsert_last(
                         &mut self.undo,
@@ -6185,6 +6365,13 @@ impl<I: KeyIndex> Vm<I> {
 
                     let probe_row = probe.row_off(probe_pos);
                     let out_key = cell_u32(cols, out_key_col, child_idx);
+                    if self
+                        .removal_cuts
+                        .of(out_slot)
+                        .covers(CutKey::Unary(out_key), row)
+                    {
+                        continue;
+                    }
                     let result = single_struct_map_upsert_from_probe(
                         &mut self.undo,
                         delta_mode,
@@ -6310,6 +6497,13 @@ impl<I: KeyIndex> Vm<I> {
                             cell[..fsize as usize].copy_from_slice(
                                 &state[src_off as usize..(src_off + fsize) as usize],
                             );
+                            if self
+                                .removal_cuts
+                                .of(dest_slot)
+                                .covers(CutKey::Unary(out_key), row)
+                            {
+                                continue;
+                            }
                             let code = scatter_card_one(
                                 &mut self.undo,
                                 delta_mode,
@@ -6433,6 +6627,13 @@ impl<I: KeyIndex> Vm<I> {
                                 // field bytes against garbage.
                                 return INVALID_PROGRAM;
                             };
+                            if self
+                                .removal_cuts
+                                .of(dest_slot)
+                                .covers(CutKey::Unary(key), row)
+                            {
+                                continue;
+                            }
                             let code = scatter_card_one(
                                 &mut self.undo,
                                 delta_mode,
@@ -6603,7 +6804,18 @@ impl<I: KeyIndex> Vm<I> {
                     // One probe per element. An assert plans its guarded row, found
                     // or new; a retract only looks it up, because removing a value
                     // never creates a row.
-                    let target = if is_retract {
+                    // An element at or before a removal of its key in this
+                    // batch writes nothing to the guarded row that removal
+                    // erases: the row reads as absent, so no stamp or card
+                    // write lands, and a kind-1 set write is gated as for an
+                    // absent row.
+                    let target = if self
+                        .removal_cuts
+                        .of(guard_slot)
+                        .covers(CutKey::Unary(key), row)
+                    {
+                        None
+                    } else if is_retract {
                         match guarded.lookup(state, key, cx) {
                             Ok(found) => found.map(RowTarget::Present),
                             Err(error) => return error as u32,
@@ -6971,6 +7183,7 @@ impl<I: KeyIndex> Vm<I> {
                             cols,
                             j,
                             child_idx,
+                            row,
                             inner_parent_ts_col,
                             live.as_deref_mut(),
                             cx,

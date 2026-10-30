@@ -58,6 +58,7 @@ pub mod meta;
 pub mod nested;
 pub mod program_admission;
 mod program_inputs;
+pub mod removal_cut;
 pub mod row_exprs;
 mod scratch;
 pub mod seal;

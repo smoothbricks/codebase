@@ -74,7 +74,8 @@ TypeScript `Opcode.BATCH_STRUCT_MAP2_REMOVE_PREFIX`). For each element it remove
 lane 1 equals the element's key1, in the map's index order, each row in its own capture of the size, change flag, index
 writes and row bitset, and records the slot's removal change flag. A sentinel key1 is `InvalidKey`; a key1 no row holds
 removes nothing; a slot that is not a two-key map is `InvalidProgram`. It runs at top level and in element bodies,
-reserves no capacity, and reads only its key1 column.
+reserves no slot capacity, reads only its key1 column, and records the key1's removal cut
+([log-order removal](05-log-order-removal.md)).
 
 ## 6. Seal
 

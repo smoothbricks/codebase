@@ -113,10 +113,13 @@ fn guarded_program() -> Vec<u8> {
         1,
     ];
 
-    let mut reduce = for_each(SEED, &seed);
-    reduce.extend(for_each(GUARDED, &guarded));
+    // Every removal precedes its slot's producers: DELETE removes rows of
+    // both slots and REWRITE clears the companion before SEED and GUARDED
+    // write either.
+    let mut reduce = for_each(DELETE, &delete);
     reduce.extend(for_each(REWRITE, &rewrite));
-    reduce.extend(for_each(DELETE, &delete));
+    reduce.extend(for_each(SEED, &seed));
+    reduce.extend(for_each(GUARDED, &guarded));
     program(&init, 5, &reduce)
 }
 
@@ -368,9 +371,11 @@ fn variant_program(extra_type: u32, extra_body: &[u8]) -> Vec<u8> {
         1,
         0,
     ];
-    let mut reduce = for_each(SEED, &seed);
+    // The extra body leads, so a removal in it precedes every producer and
+    // the companion pairing alone decides the program.
+    let mut reduce = for_each(extra_type, extra_body);
+    reduce.extend(for_each(SEED, &seed));
     reduce.extend(for_each(GUARDED, &guarded));
-    reduce.extend(for_each(extra_type, extra_body));
     program(&init, 5, &reduce)
 }
 
