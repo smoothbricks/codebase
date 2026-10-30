@@ -1468,7 +1468,8 @@ map, and the probe's bookkeeping must not reach either candidate image.
   stream stopped with no error; Nx 23.2.1 drops FSEvents' rescan flags) and called a changed input's target "[existing
   outputs match the cache, left as is]". The carried Nx patch watches the checkout with one stream, and on macOS an nx
   command's first request answered from file state writes a probe the daemon must see come back through that stream; the
-  stream delivers in order, so every write made before the command reached the daemon. A probe lost for
+  stream delivers in order, so every write made before the command reached the daemon. A plugin worker's request is no
+  command and makes no probe: it nests in a daemon operation already current. A probe lost for
   `DAEMON_VALIDITY_SAFETY_INTERVAL_MS` tells the client "watcher stream stopped", which continues without a daemon, and
   stops the daemon; the keeper (or the next host client) starts one with a fresh stream. A checkout with no directory
   that takes a probe the watcher reports fails closed the same way. A write another process makes while a command runs

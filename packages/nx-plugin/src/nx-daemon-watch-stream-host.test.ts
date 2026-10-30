@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdir, readFile, rename, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { DAEMON_GLOB_PLUGIN, fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
  * Guards the watcher hunks of `patches/nx@23.2.1.patch` (`daemon/server/watcher.js`). A daemon's file watcher can stop
@@ -17,7 +17,9 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
  * that does not come
  * back means the stream stopped: the daemon tells the client "watcher stream stopped", which goes on without a daemon,
  * says so in its log and stops, and the next client starts a daemon with a fresh stream. The probe is made once per
- * connection, by its first request answered from file state: a command sees every write made before it started. Linux inotify has no such failure mode (no fseventsd between the kernel and the
+ * connection, by its first request answered from file state: a command sees every write made before it started. A
+ * plugin worker is no command and makes none. Linux inotify has no such failure mode (no fseventsd between the kernel
+ * and the
  * watcher), so there the daemon only drains its stream before answering; the overflow (Rescan) path stays unproven.
  *
  * A host test: the dead stream is a daemon started under a Seatbelt profile that denies FSEvents, which `sandbox_apply`
@@ -106,6 +108,31 @@ describe('the daemon answers from the files as they are when a request arrives',
     });
   });
 
+  if (process.platform === 'darwin') {
+    it('proves the command current, never the plugin worker it asks for files', async () => {
+      // A plugin worker's request for files nests in a daemon operation already current: the watcher's own recompute,
+      // which must read its own snapshot, or a command whose connection made its probe. A probe per worker connection
+      // cost every isolated graph plugin a round trip through the stream.
+      await withNxFixture('nx-worker-probe-', async ({ workspace, socketDirectory }) => {
+        await fixtureWorkspace(workspace, true);
+        await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['./daemon-glob-plugin.js'] }));
+        await writeFile(join(workspace, 'daemon-glob-plugin.js'), DAEMON_GLOB_PLUGIN);
+        const env = {
+          ...fixtureNxEnv(workspace, socketDirectory),
+          NX_DAEMON: 'true',
+          NX_TUI: 'false',
+          NX_ISOLATE_PLUGINS: 'true',
+        };
+        const started = nx(workspace, env, [], 'daemon', '--start');
+        expect(started.status, started.output).toBe(0);
+        const shown = nx(workspace, env, [], 'show', 'projects', '--json');
+        expect(shown.status, shown.output).toBe(0);
+        const log = await readFile(join(workspace, '.nx/workspace-data/d/daemon.log'), 'utf8');
+        expect(log, 'the worker asked the daemon for files').toContain('Handled json message GLOB');
+        expect(log.match(/watcher current: probe came back/g)?.length, log).toBe(1);
+      });
+    });
+  }
   if (process.platform === 'darwin') {
     // Each dead-stream case is its own daemon lifetime: its first request stops that daemon, and the layout decides
     // whether the watcher has a probe directory, which decides the message the stream gives.

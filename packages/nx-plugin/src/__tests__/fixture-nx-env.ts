@@ -15,6 +15,18 @@ import { guardEvent } from './counted-cargo.js';
 const repositoryRoot = join(import.meta.dir, '../../../..');
 
 /**
+ * A graph plugin that asks its daemon for files, as globIndexedFiles does: from an isolated worker Nx routes the glob
+ * through the worker's own daemon client.
+ */
+export const DAEMON_GLOB_PLUGIN = `const { globWithWorkspaceContext } = require('nx/src/utils/workspace-context');
+const { workspaceRoot } = require('nx/src/utils/workspace-root');
+exports.createNodesV2 = ['**/project.json', async () => {
+  await globWithWorkspaceContext(workspaceRoot, ['**/project.json']);
+  return [];
+}];
+`;
+
+/**
  * The environment of an `nx` a test runs against a fixture workspace.
  *
  * Every inherited `NX_*` variable is dropped first. Run as

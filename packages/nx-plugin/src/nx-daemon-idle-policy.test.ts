@@ -5,19 +5,10 @@ import { chmod, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { compileFunction } from 'node:vm';
-import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { DAEMON_GLOB_PLUGIN, fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { whenChanged } from './__tests__/path-change.js';
 import { nxDaemonProcesses } from './testing.js';
 
-// A graph plugin that asks its daemon for files, as globIndexedFiles does: from an isolated worker Nx routes the glob
-// through the worker's own daemon client.
-const DAEMON_GLOB_PLUGIN = `const { globWithWorkspaceContext } = require('nx/src/utils/workspace-context');
-const { workspaceRoot } = require('nx/src/utils/workspace-root');
-exports.createNodesV2 = ['**/project.json', async () => {
-  await globWithWorkspaceContext(workspaceRoot, ['**/project.json']);
-  return [];
-}];
-`;
 // The daemon logs its open connection count on every connect and close.
 const OPEN_CONNECTIONS = /Number of open connections: (\d+)$/;
 // A sync generator the daemon runs that asks the daemon for files over its socket. Code the daemon runs does that when it
