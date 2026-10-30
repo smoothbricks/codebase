@@ -61,7 +61,8 @@ const nextestWant = 8;
  * every leaf a case runs inside `mbx reserve`, whose process is then the leader a case observes, and no case here is
  * about that pool. `MBX_SCHED_DISABLE` is what `mbx reserve` hands its command: a gate's leaf that runs this suite
  * reserved, so the suite would read itself as nested inside a grant (mbxPool), and the case about mbx's pool builds its
- * own.
+ * own. `MBX_SCHEDULER_PRIORITY` is the job's priority in that pool: a gate job carries `normal`, and the case about the
+ * pool asserts the priority of a job that names none.
  */
 const INHERITED_SIZING_ENV = [
   CPU_POOL_ENV,
@@ -74,6 +75,7 @@ const INHERITED_SIZING_ENV = [
   'MFLAGS',
   'MBX_SCHEDULER',
   'MBX_SCHED_DISABLE',
+  'MBX_SCHEDULER_PRIORITY',
 ] as const;
 const inheritedSizing = INHERITED_SIZING_ENV.map((name) => [name, process.env[name]] as const);
 
