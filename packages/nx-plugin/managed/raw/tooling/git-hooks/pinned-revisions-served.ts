@@ -10,7 +10,9 @@
  * so no tree CI cannot fetch is published.
  *
  * "Served" is what cargo does: fetch the revision by id, and when the remote refuses that, fetch its branches and tags
- * and look for the revision among them. A remote the fetch cannot reach proves nothing either way and is said as that.
+ * and look for the revision among them. A remote the fetch cannot reach, or that does not answer within the time left,
+ * proves nothing either way and is said as that: no ask outlives the hold's bound or the report's budget. One remote's
+ * asks run one after another in its scratch repository, since concurrent fetches there contend for git's own locks.
  * Like the other managed git-hook helpers it imports only the runtime.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -33,7 +35,8 @@ export type PinAnswer =
   | { readonly kind: 'unserved' }
   | { readonly kind: 'unreachable'; readonly detail: string };
 
-export type AskRemote = (url: string, rev: string) => Promise<PinAnswer>;
+/** Asks one remote for one revision, answering `unreachable` once `budgetMs` has passed. */
+export type AskRemote = (url: string, rev: string, budgetMs: number) => Promise<PinAnswer>;
 
 /** The hold's one use of time, so a test can move it by hand. */
 export interface Clock {
@@ -56,10 +59,18 @@ export type HoldOutcome =
 /** How often a held push asks the remotes again. */
 export const POLL_MS = 30_000;
 
+/** How long a land gate's report waits for the remotes' answers, all of them together. */
+export const REPORT_BUDGET_MS = 60_000;
+
 const REVISION = /^[0-9a-f]{40}$/;
 
 function malformed(detail: string): PinsRead {
   return { kind: 'malformed', detail };
+}
+
+/** `Array.isArray` narrows `unknown` to `any[]`; this keeps the elements `unknown`. */
+function isArray(value: unknown): value is readonly unknown[] {
+  return Array.isArray(value);
 }
 
 /** The git sources of a Cargo.lock, `source = "git+<url>[?<reference>]#<revision>"`, one pin per remote and revision. */
@@ -73,7 +84,7 @@ export function readPins(lockText: string): PinsRead {
   if (typeof parsed !== 'object' || parsed === null) return malformed('Cargo.lock is not a table');
   if (!('package' in parsed)) return { kind: 'pins', pins: [] };
   const entries = parsed.package;
-  if (!Array.isArray(entries)) return malformed('Cargo.lock `package` is not an array of tables');
+  if (!isArray(entries)) return malformed('Cargo.lock `package` is not an array of tables');
   const pins = new Map<string, { readonly url: string; readonly rev: string; readonly packages: string[] }>();
   for (const entry of entries) {
     if (typeof entry !== 'object' || entry === null || !('name' in entry) || typeof entry.name !== 'string')
@@ -126,8 +137,9 @@ function formatSeconds(ms: number): string {
 }
 
 /**
- * Asks the remotes until each serves its pin, or until `boundMs` has passed since the first ask. An unreachable remote
- * is asked again like an unserving one: neither proves the push safe.
+ * Asks the remotes every `pollMs` until each serves its pin. A round's asks share what is left of `boundMs`, so none
+ * outlives it, and the hold refuses after the last round that ends with no room for another before the bound. An
+ * unreachable remote is asked again like an unserving one: neither proves the push safe.
  */
 export async function holdUntilServed(
   pins: readonly Pin[],
@@ -140,17 +152,18 @@ export async function holdUntilServed(
   const started = clock.now();
   let outstanding = pins;
   for (let rounds = 1; ; rounds += 1) {
+    const budgetMs = boundMs - (clock.now() - started);
     const answers = await Promise.all(
-      outstanding.map(async (pin): Promise<readonly [Pin, PinAnswer]> => [pin, await ask(pin.url, pin.rev)]),
+      outstanding.map(async (pin): Promise<readonly [Pin, PinAnswer]> => [pin, await ask(pin.url, pin.rev, budgetMs)]),
     );
     const waiting = answers.filter(([, answer]) => answer.kind !== 'served');
     const waitedMs = clock.now() - started;
     if (waiting.length === 0) return { kind: 'served', waitedMs, rounds };
-    if (waitedMs >= boundMs) return { kind: 'refused', waitedMs, outstanding: waiting };
+    if (waitedMs + pollMs >= boundMs) return { kind: 'refused', waitedMs, outstanding: waiting };
     for (const [pin, answer] of waiting)
       say(`waiting (${formatSeconds(waitedMs)} of ${formatSeconds(boundMs)}): ${describePin(pin, answer)}`);
     outstanding = waiting.map(([pin]) => pin);
-    await clock.sleep(Math.min(pollMs, boundMs - waitedMs));
+    await clock.sleep(pollMs);
   }
 }
 
@@ -160,7 +173,10 @@ interface GitRun {
   readonly stderr: string;
 }
 
-async function git(args: readonly string[], cwd: string): Promise<GitRun> {
+/** The git children alive now, which a signal that ends this process ends too. */
+const CHILDREN = new Set<{ kill(): void }>();
+
+async function git(args: readonly string[], cwd: string, signal?: AbortSignal): Promise<GitRun> {
   const child = Bun.spawn(['git', ...args], {
     cwd,
     stdin: 'ignore',
@@ -169,13 +185,19 @@ async function git(args: readonly string[], cwd: string): Promise<GitRun> {
     // A hook and a gate run unattended: a remote that wants credentials it has no helper for refuses instead of asking.
     // A partial repository never goes back to its remote for an object it lacks: absence is the answer.
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1' },
+    ...(signal === undefined ? {} : { signal }),
   });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  return { exitCode, stdout, stderr: stderr.trim() };
+  CHILDREN.add(child);
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    return { exitCode, stdout, stderr: stderr.trim() };
+  } finally {
+    CHILDREN.delete(child);
+  }
 }
 
 async function gitOrThrow(args: readonly string[], cwd: string): Promise<void> {
@@ -185,10 +207,12 @@ async function gitOrThrow(args: readonly string[], cwd: string): Promise<void> {
 
 /**
  * Asks each remote through a scratch repository of its own under `scratchRoot`, kept for the asker's life so that a
- * repeated ask fetches only what changed. Commits are all it fetches (`--filter=tree:0`).
+ * repeated ask fetches only what changed. Commits are all it fetches (`--filter=tree:0`). One remote's asks run one
+ * after another, each against the deadline it was given when it was asked, so a queued ask cannot outlive it either.
  */
 export function remoteAsker(scratchRoot: string): AskRemote {
   const repositories = new Map<string, Promise<string>>();
+  const queues = new Map<string, Promise<unknown>>();
   const repository = (url: string): Promise<string> => {
     const known = repositories.get(url);
     if (known !== undefined) return known;
@@ -202,18 +226,32 @@ export function remoteAsker(scratchRoot: string): AskRemote {
     return created;
   };
   const fetch = ['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', '--filter=tree:0'];
-  return async (url, rev) => {
+  const askNow = async (url: string, rev: string, budgetMs: number, signal: AbortSignal): Promise<PinAnswer> => {
+    const silent: PinAnswer = { kind: 'unreachable', detail: `no answer within ${formatSeconds(budgetMs)}` };
+    if (signal.aborted) return silent;
     const directory = await repository(url);
-    const direct = await git([...fetch, '--depth=1', 'pin', rev], directory);
+    const direct = await git([...fetch, '--depth=1', 'pin', rev], directory, signal);
     if (direct.exitCode === 0) return { kind: 'served' };
+    if (signal.aborted) return silent;
     const listed = await git(
       [...fetch, 'pin', '+refs/heads/*:refs/pinned/heads/*', '+refs/tags/*:refs/pinned/tags/*'],
       directory,
+      signal,
     );
+    if (signal.aborted) return silent;
     if (listed.exitCode !== 0)
       return { kind: 'unreachable', detail: listed.stderr || direct.stderr || `git fetch exited ${listed.exitCode}` };
     const found = await git(['cat-file', '-e', `${rev}^{commit}`], directory);
     return found.exitCode === 0 ? { kind: 'served' } : { kind: 'unserved' };
+  };
+  return (url, rev, budgetMs) => {
+    const signal = AbortSignal.timeout(Math.max(0, budgetMs));
+    const asked = (queues.get(url) ?? Promise.resolve()).then(() => askNow(url, rev, budgetMs, signal));
+    queues.set(
+      url,
+      asked.catch(() => undefined),
+    );
+    return asked;
   };
 }
 
@@ -239,18 +277,25 @@ async function report(root: string, ask: AskRemote): Promise<number> {
   const file = Bun.file(join(root, 'Cargo.lock'));
   if (!(await file.exists())) return 0;
   const pins = pinsOf(await file.text(), join(root, 'Cargo.lock'));
-  const answers = await Promise.all(pins.map(async (pin) => [pin, await ask(pin.url, pin.rev)] as const));
-  const waiting = answers.filter(([, answer]) => answer.kind !== 'served');
-  if (waiting.length === 0) {
+  const answers = await Promise.all(
+    pins.map(async (pin) => [pin, await ask(pin.url, pin.rev, REPORT_BUDGET_MS)] as const),
+  );
+  const unserved = answers.filter(([, answer]) => answer.kind === 'unserved');
+  const unanswered = answers.filter(([, answer]) => answer.kind === 'unreachable');
+  if (unserved.length === 0 && unanswered.length === 0) {
     const remotes = new Set(pins.map((pin) => pin.url)).size;
     console.log(
       `PINNED-REVISIONS: every git revision Cargo.lock pins is served (${pins.length} pin(s), ${remotes} remote(s))`,
     );
     return 0;
   }
+  const counted = [
+    ...(unserved.length === 0 ? [] : [`${unserved.length} pinned revision(s) their remote does not serve`]),
+    ...(unanswered.length === 0 ? [] : [`${unanswered.length} whose remote did not answer`]),
+  ].join(' and ');
   console.log(
-    `PINNED-REVISIONS note: ${waiting.length} pinned revision(s) not served by their remote, reported, not refused: the land builds them from the local Cargo git database, and the push (tooling/git-hooks/pre-push.sh) waits until the remote serves them, since CI fetches them there:\n` +
-      waiting.map(([pin, answer]) => `  ${describePin(pin, answer)}`).join('\n'),
+    `PINNED-REVISIONS note: ${counted}, reported, not refused: the land builds them from the local Cargo git database, and the push (tooling/git-hooks/pre-push.sh) waits until the remote serves them, since CI fetches them there:\n` +
+      [...unserved, ...unanswered].map(([pin, answer]) => `  ${describePin(pin, answer)}`).join('\n'),
   );
   return 0;
 }
@@ -280,6 +325,18 @@ if (import.meta.main) {
   const [mode, ...rest] = process.argv.slice(2);
   const root = process.cwd();
   const scratch = mkdtempSync(join(tmpdir(), 'pinned-revisions-'));
+  const removeScratch = () => rmSync(scratch, { recursive: true, force: true });
+  // A signal skips `finally`: end the fetches and remove what they fetched, then exit as the signal would have.
+  for (const [name, number] of [
+    ['SIGINT', 2],
+    ['SIGTERM', 15],
+    ['SIGHUP', 1],
+  ] as const)
+    process.on(name, () => {
+      for (const child of CHILDREN) child.kill();
+      removeScratch();
+      process.exit(128 + number);
+    });
   try {
     const ask = remoteAsker(scratch);
     if (mode === '--report' && rest.length === 0) process.exitCode = await report(root, ask);
@@ -290,6 +347,6 @@ if (import.meta.main) {
       process.exitCode = 2;
     }
   } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    removeScratch();
   }
 }

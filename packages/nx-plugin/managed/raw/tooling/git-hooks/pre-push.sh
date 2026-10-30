@@ -8,15 +8,7 @@
 # repository so the guard never publishes what it guards; with none
 # configured the check passes silently.
 #
-# 2. On every OS, the pinned revisions. CI fetches every git revision
-# Cargo.lock pins from the remote it names, while a land builds it from the
-# local Cargo git database, so a pin can land before its repository pushes it.
-# The push holds until each remote serves its pinned revision (normally the
-# pinned repository's own push, minutes away) and refuses after 15 minutes,
-# naming each pin, so no tree CI cannot fetch is published
-# (pinned-revisions-served.ts).
-#
-# 3. The macOS-only Linux cross-compile gate. It asks Nx for cargo-lint-cross,
+# 2. The macOS-only Linux cross-compile gate. It asks Nx for cargo-lint-cross,
 # whose hit means a real `cargo-zigbuild clippy --target x86_64-unknown-linux-gnu`
 # already passed for exactly this tree, so the push is safe with no toolchain
 # present. From a plain shell the cross target itself never compiles here: on
@@ -48,13 +40,23 @@
 # guard, so there a miss runs the check itself: the same clippy `check:linux`
 # runs, in the toolchain the user entered for it.
 #
-# The denylist gate needs only tooling/direnv/repo-path's PATH; the cross gate
-# needs direnv on the caller's PATH, and the checkout's own devenv through it,
-# not a devenv the caller entered. It must never pretend a check ran that did not.
+# 3. Last, on every OS, the pinned revisions. CI fetches every git revision
+# Cargo.lock pins from the remote it names, while a land builds it from the
+# local Cargo git database, so a pin can land before its repository pushes it.
+# The push holds until each remote serves its pinned revision (normally the
+# pinned repository's own push, minutes away) and refuses after 15 minutes,
+# naming each pin, so no tree CI cannot fetch is published
+# (pinned-revisions-served.ts). It runs after the gates that refuse in seconds,
+# so a push they refuse is never held first.
+#
+# The denylist gate needs only tooling/direnv/repo-path's PATH, and so does the
+# pinned-revisions gate (bun and git); the cross gate needs direnv on the
+# caller's PATH, and the checkout's own devenv through it, not a devenv the
+# caller entered. It must never pretend a check ran that did not.
 
 cd "$(git rev-parse --show-toplevel)"
 TOOLING="$PWD/tooling"
-# A push to the `backup` remote is a private mirror, not publication: both
+# A push to the `backup` remote is a private mirror, not publication: the
 # gates below guard publication only, so they do not apply.
 if [ "${1:-}" = backup ]; then exit 0; fi
 
@@ -83,38 +85,31 @@ if [ "${#pushed[@]}" -gt 0 ]; then
     exit 1
   }
 fi
-if [ "${#pushed[@]}" -gt 0 ]; then
-  bun "$TOOLING/git-hooks/pinned-revisions-served.ts" --wait 900 "${pushed[@]}" || exit 1
-fi
 
-case "$(uname -s)" in
-  Darwin) ;;
-  *) exit 0 ;;
-esac
+cross_gate() {
+  # The refusal uses shell builtins alone: without direnv nothing proves the
+  # caller's PATH carries coreutils, and a Nix-built host's /usr/bin and /bin
+  # hold none of them.
+  if ! command -v direnv >/dev/null; then
+    printf '%s\n' \
+      'pre-push: direnv is not on PATH, so the Linux cross-compile check cannot run in' \
+      "this checkout's environment, and a check run in any other environment keys on" \
+      'values the land gate never used. Put direnv on PATH, then push again.' >&2
+    return 1
+  fi
 
-# The refusal uses shell builtins alone: without direnv nothing proves the
-# caller's PATH carries coreutils, and a Nix-built host's /usr/bin and /bin
-# hold none of them.
-if ! command -v direnv >/dev/null; then
-  printf '%s\n' \
-    'pre-push: direnv is not on PATH, so the Linux cross-compile check cannot run in' \
-    "this checkout's environment, and a check run in any other environment keys on" \
-    'values the land gate never used. Put direnv on PATH, then push again.' >&2
-  exit 1
-fi
+  # The guard's refusal (nx-plugin cross-check-policy.ts CARGO_CROSS_LINT_REFUSAL)
+  # is the one line that means the key missed. Nx exits 1 for every task failure,
+  # so the hook reads the output for it rather than guessing from the status.
+  output=$(mktemp "${TMPDIR:-/tmp}/pre-push-cross.XXXXXX") || return 1
+  trap 'rm -f "$output"' EXIT
+  set -o pipefail
+  direnv exec "$PWD" nx run-many -t cargo-lint-cross --output-style=static 2>&1 | tee "$output"
+  status=$?
+  [ "$status" -eq 0 ] && return 0
 
-# The guard's refusal (nx-plugin cross-check-policy.ts CARGO_CROSS_LINT_REFUSAL)
-# is the one line that means the key missed. Nx exits 1 for every task failure,
-# so the hook reads the output for it rather than guessing from the status.
-output=$(mktemp "${TMPDIR:-/tmp}/pre-push-cross.XXXXXX") || exit 1
-trap 'rm -f "$output"' EXIT
-set -o pipefail
-direnv exec "$PWD" nx run-many -t cargo-lint-cross --output-style=static 2>&1 | tee "$output"
-status=$?
-[ "$status" -eq 0 ] && exit 0
-
-if grep -qF 'cargo-lint-cross needs cargo-zigbuild from the linux-cross toolchain; run: bun run check:linux' "$output"; then
-  cat >&2 <<'EOF'
+  if grep -qF 'cargo-lint-cross needs cargo-zigbuild from the linux-cross toolchain; run: bun run check:linux' "$output"; then
+    cat >&2 <<'EOF'
 
 pre-push: the Linux cross-compile check is NOT cached for this tree, so this
 push would ship code that has never been compiled for Linux. The "needs
@@ -124,13 +119,22 @@ broken toolchain.
   Run:  bun run check:linux
   Wait for it to pass, then push again.
 EOF
-else
-  cat >&2 <<EOF
+  else
+    cat >&2 <<EOF
 
 pre-push: the Linux cross-compile check failed (exit $status) before it reached
 a cache verdict, in Nx or in direnv entering this checkout's environment; the
 output above names why. This is not a cache miss, and bun run check:linux will
 not fix it.
 EOF
+  fi
+  return 1
+}
+
+case "$(uname -s)" in
+  Darwin) cross_gate || exit 1 ;;
+esac
+
+if [ "${#pushed[@]}" -gt 0 ]; then
+  bun "$TOOLING/git-hooks/pinned-revisions-served.ts" --wait 900 "${pushed[@]}" || exit 1
 fi
-exit 1

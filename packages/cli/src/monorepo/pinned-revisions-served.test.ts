@@ -67,6 +67,8 @@ function lock(...packages: readonly { name: string; source?: string }[]): string
 }
 
 const A = 'a'.repeat(40);
+/** Ample for a local file:// fetch; the budget only ends an ask that would otherwise hang. */
+const BUDGET_MS = 60_000;
 const B = 'b'.repeat(40);
 
 describe('readPins', () => {
@@ -123,14 +125,45 @@ describe('remoteAsker', () => {
   it('answers what the remote serves, and asks again after a push', async () => {
     const { url, clone, pushed, unpushed } = remoteWithUnpushed();
     const ask = remoteAsker(scratch());
-    expect(await ask(url, pushed)).toEqual({ kind: 'served' });
-    expect(await ask(url, unpushed)).toEqual({ kind: 'unserved' });
+    expect(await ask(url, pushed, BUDGET_MS)).toEqual({ kind: 'served' });
+    expect(await ask(url, unpushed, BUDGET_MS)).toEqual({ kind: 'unserved' });
     git(clone, 'push', '--quiet', 'origin', 'HEAD:refs/heads/main');
-    expect(await ask(url, unpushed)).toEqual({ kind: 'served' });
+    expect(await ask(url, unpushed, BUDGET_MS)).toEqual({ kind: 'served' });
+  });
+
+  it('asks one remote for several revisions at once without the fetches contending for its scratch repository', async () => {
+    const { clone, url, pushed, unpushed } = remoteWithUnpushed();
+    git(clone, 'commit', '--quiet', '--allow-empty', '-m', 'third');
+    const third = git(clone, 'rev-parse', 'HEAD');
+    git(clone, 'push', '--quiet', 'origin', `${unpushed}:refs/heads/main`);
+    const ask = remoteAsker(scratch());
+    const answers = await Promise.all([pushed, unpushed, third, pushed].map((rev) => ask(url, rev, BUDGET_MS)));
+    expect(answers).toEqual([{ kind: 'served' }, { kind: 'served' }, { kind: 'unserved' }, { kind: 'served' }]);
+  });
+
+  it('answers a remote that never answers as unreachable once its budget has passed', async () => {
+    // git's ext transport runs a command as the remote; `read` waits on a request git never sends before the
+    // remote's advertisement, so the fetch hangs until the asker's deadline kills it, and `read` ends with its pipe.
+    const inherited = { ...process.env };
+    Object.assign(process.env, {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'protocol.ext.allow',
+      GIT_CONFIG_VALUE_0: 'always',
+    });
+    try {
+      const started = performance.now();
+      const answer = await remoteAsker(scratch())('ext::sh -c read', A, 1_000);
+      expect(answer).toEqual({ kind: 'unreachable', detail: 'no answer within 1 s' });
+      expect(performance.now() - started).toBeLessThan(30_000);
+    } finally {
+      for (const name of ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'])
+        if (inherited[name] === undefined) delete process.env[name];
+        else process.env[name] = inherited[name];
+    }
   });
 
   it('says a remote it cannot reach is unreachable, not unserved', async () => {
-    const answer = await remoteAsker(scratch())(`file://${join(scratch(), 'missing.git')}`, A);
+    const answer = await remoteAsker(scratch())(`file://${join(scratch(), 'missing.git')}`, A, BUDGET_MS);
     expect(answer.kind).toBe('unreachable');
     expect(answer.kind === 'unreachable' && answer.detail).toContain('missing.git');
   });
@@ -152,35 +185,38 @@ describe('holdUntilServed', () => {
     };
   }
 
-  function answering(...answers: readonly PinAnswer[]): AskRemote {
-    let asked = 0;
-    return async () => answers[Math.min(asked++, answers.length - 1)] ?? { kind: 'served' };
+  /** Answers in turn, the last one from then on, and records the budget each ask was given. */
+  function answering(...answers: readonly PinAnswer[]): AskRemote & { readonly budgets: number[] } {
+    const budgets: number[] = [];
+    const ask = async (_url: string, _rev: string, budgetMs: number): Promise<PinAnswer> => {
+      budgets.push(budgetMs);
+      return answers[Math.min(budgets.length - 1, answers.length - 1)] ?? { kind: 'served' };
+    };
+    return Object.assign(ask, { budgets });
   }
 
   it('holds until the remote serves the pin, naming it while it waits', async () => {
     const clock = manualClock();
     const said: string[] = [];
-    const outcome = await holdUntilServed(
-      [pin],
-      answering({ kind: 'unserved' }, { kind: 'unreachable', detail: 'offline' }, { kind: 'served' }),
-      clock,
-      900_000,
-      30_000,
-      (line) => said.push(line),
-    );
+    const ask = answering({ kind: 'unserved' }, { kind: 'unreachable', detail: 'offline' }, { kind: 'served' });
+    const outcome = await holdUntilServed([pin], ask, clock, 900_000, 30_000, (line) => said.push(line));
     expect(outcome).toEqual({ kind: 'served', waitedMs: 60_000, rounds: 3 });
     expect(clock.slept).toEqual([30_000, 30_000]);
+    expect(ask.budgets).toEqual([900_000, 870_000, 840_000]);
     expect(said).toEqual([
       `waiting (0 s of 900 s): https://example.test/r.git does not serve ${A} (Cargo.lock builds x from it)`,
       `waiting (30 s of 900 s): could not ask https://example.test/r.git for ${A} (Cargo.lock builds x from it): offline`,
     ]);
   });
 
-  it('refuses at the bound with the pins still not served', async () => {
+  it('refuses after the last round that leaves no room for another before the bound', async () => {
     const clock = manualClock();
-    const outcome = await holdUntilServed([pin], answering({ kind: 'unserved' }), clock, 45_000, 30_000, () => {});
-    expect(outcome).toEqual({ kind: 'refused', waitedMs: 45_000, outstanding: [[pin, { kind: 'unserved' }]] });
-    expect(clock.slept).toEqual([30_000, 15_000]);
+    const ask = answering({ kind: 'unserved' });
+    const outcome = await holdUntilServed([pin], ask, clock, 45_000, 30_000, () => {});
+    expect(outcome).toEqual({ kind: 'refused', waitedMs: 30_000, outstanding: [[pin, { kind: 'unserved' }]] });
+    expect(clock.slept).toEqual([30_000]);
+    // No ask is given more than what is left of the bound when it starts.
+    expect(ask.budgets).toEqual([45_000, 15_000]);
   });
 });
 
@@ -204,8 +240,16 @@ describe('the command', () => {
     const { workspace } = workspacePinning(url, unpushed);
     const reported = run(workspace, '--report');
     expect(reported.exitCode).toBe(0);
-    expect(reported.stdout).toContain('PINNED-REVISIONS note: 1 pinned revision(s) not served by their remote');
+    expect(reported.stdout).toContain('PINNED-REVISIONS note: 1 pinned revision(s) their remote does not serve');
     expect(reported.stdout).toContain(`${url} does not serve ${unpushed} (Cargo.lock builds pinned from it)`);
+  });
+
+  it('counts a remote that did not answer apart from one that does not serve', () => {
+    const { workspace } = workspacePinning(`file://${join(scratch(), 'missing.git')}`, A);
+    const reported = run(workspace, '--report');
+    expect(reported.exitCode).toBe(0);
+    expect(reported.stdout).toContain('PINNED-REVISIONS note: 1 whose remote did not answer, reported, not refused');
+    expect(reported.stdout).not.toContain('does not serve');
   });
 
   it('says every pin is served when the remote serves them', () => {
