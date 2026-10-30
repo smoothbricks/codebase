@@ -7,7 +7,16 @@
     "targets": {
       "bench": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
+        "//": "Cached on the crate closure and toolchain it measures: a rerun with unchanged inputs measures nothing new.",
+        "inputs": [
+          "cargoClosure",
+          "cargoToolchain",
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [],
         "options": {
           "command": "cargo bench --locked -p bitmosaic --profile bench --bench ops --bench patch",
           "cwd": "{workspaceRoot}"
@@ -15,7 +24,21 @@
       },
       "fuzz": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
+        "//": "Cached on the crate closure, the fuzz targets and their regressions, the toolchain and cargo-fuzz: an unchanged tree has nothing new to search. The corpus and artifacts it writes stay local (fuzz/.gitignore).",
+        "inputs": [
+          "cargoClosure",
+          "cargoToolchain",
+          "{projectRoot}/crates/bitmosaic/fuzz/**/*",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh cargo fuzz --version"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [],
         "options": {
           "commands": [
             "cargo fuzz run --fuzz-dir packages/bitmosaic/crates/bitmosaic/fuzz patch_step -- -max_total_time=300",
