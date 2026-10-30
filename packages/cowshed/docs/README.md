@@ -235,11 +235,13 @@ tracked-source guard, discards that rebuildable directory and restores the link.
 checkout path on the build volume too, for tool state no convention file names — a gitignored patch-development checkout
 of an upstream project and its multi-GiB incremental build tree is the case it exists for. The path must be untracked,
 inside the checkout and apart from every detected tool's state; anything else refuses with the remedy. It is
-rebuild-only like all build state: the first admission after you declare it discards the existing directory, so re-run
-whatever reconstructs it once; from then on it lives on the volume and every fork gets it warm. A declared path that
-does not exist stays absent (tools read its existence as meaning) and is linked at the first admission after something
-creates it. A pattern such as `packages/*/.cache/lmao` declares the name beneath every directory the checkout tracks
-files under, so a package added later joins on its own.
+rebuild-only like all build state, but cowshed cannot see what a declared directory holds, so it never deletes one: the
+first admission after you declare it moves the existing directory aside intact into `.cowshed/kept/` and links the path
+onto the volume. Take what you need from the kept directory, re-run whatever reconstructs the state once, and delete the
+kept directory; from then on it lives on the volume and every fork gets it warm. A declared path that does not exist
+stays absent (tools read its existence as meaning) and is linked at the first admission after something creates it. A
+pattern such as `packages/*/.cache/lmao` declares the name beneath every directory the checkout tracks files under, so a
+package added later joins on its own.
 
 **The compile cache is for the work that is left.** When a workspace does have to compile something — its own edits, or
 whatever landed on main since the clone — mbx's shared store can hand back a unit another workspace or main already

@@ -2621,6 +2621,7 @@ async fn build_state_migration_reports_each_main_and_rebuild_only_findings() {
                         tool: BuildStateTool::Cargo,
                         origin: DiscardOrigin::Predated,
                     }],
+                    kept: Vec::new(),
                     findings: vec![BuildStateFinding::CargoUnavailable {
                         manifest: PathBuf::from("nested/Cargo.toml"),
                         phase: CargoDiscoveryPhase::Metadata,

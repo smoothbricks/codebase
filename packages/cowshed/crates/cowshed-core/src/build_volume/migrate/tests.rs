@@ -142,7 +142,8 @@ fn migration_discards_only_contributed_real_state_and_keeps_one_fixed_link_per_p
         &[],
     )
     .unwrap()
-    .unwrap();
+    .unwrap()
+    .discarded;
     assert_eq!(findings.len(), 3);
     assert_eq!(findings[0].tool, BuildStateTool::Cargo);
     assert_eq!(findings[1].tool, BuildStateTool::Nx);
@@ -184,7 +185,7 @@ fn migration_discards_only_contributed_real_state_and_keeps_one_fixed_link_per_p
         )
         .unwrap()
         .unwrap()
-        .is_empty()
+            == Adopted::default()
     );
     fs::remove_file(checkout.join("target")).unwrap();
     write(&checkout, "target/displaced", "cargo clean rebuilt this");
@@ -196,7 +197,8 @@ fn migration_discards_only_contributed_real_state_and_keeps_one_fixed_link_per_p
         &paths(),
     )
     .unwrap()
-    .unwrap();
+    .unwrap()
+    .discarded;
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].path, Path::new("target"));
     assert_eq!(
@@ -232,7 +234,7 @@ fn exact_links_need_no_git_query_or_discovery() {
         )
         .unwrap()
         .unwrap()
-        .is_empty()
+            == Adopted::default()
     );
 }
 
@@ -725,7 +727,7 @@ fn a_discard_a_crash_left_pending_is_finished_by_the_next_refresh() {
         )
         .unwrap()
         .unwrap()
-        .is_empty(),
+            == Adopted::default(),
         "nothing real was at the path, so nothing new is displaced"
     );
     assert!(
@@ -782,7 +784,8 @@ fn a_refresh_returns_while_the_delete_of_what_it_moved_aside_waits() {
         &target_only(),
     )
     .unwrap()
-    .unwrap();
+    .unwrap()
+    .discarded;
     assert_eq!(displaced.len(), 1);
     assert!(
         fs::symlink_metadata(checkout.join("target"))
@@ -802,20 +805,24 @@ fn a_refresh_returns_while_the_delete_of_what_it_moved_aside_waits() {
     assert_eq!(status(&checkout), "", "{}", status(&checkout));
 }
 
-/// Declared build state is build state: a real directory at a declared path -- here a nested Git
-/// checkout of an upstream project and its build tree -- is moved aside, discarded in the
-/// background, never copied, and the path becomes its fixed link into the volume's `declared/`
-/// namespace. What is written through the link afterwards lives on the volume.
+/// Declared build state goes onto the volume like any build state: a real directory at a declared
+/// path -- here a nested Git checkout of an upstream project and its build tree -- leaves its path
+/// in one rename, never copied, and the path becomes its fixed link into the volume's `declared/`
+/// namespace. Cowshed cannot rebuild what a declared directory holds, so the directory is kept
+/// whole, at the location the refresh names, and nothing deletes it. What is written through the
+/// link afterwards lives on the volume.
 #[test]
-fn a_declared_checkout_is_discarded_and_linked_like_any_build_state() {
+fn a_declared_checkout_is_kept_whole_and_its_path_linked() {
     let scratch = Scratch::new();
     let checkout = scratch.checkout();
     git(&checkout, &["init", "--quiet"]);
+    // Every cowshed checkout excludes its own namespace (02_workspaces.md).
+    fs::write(checkout.join(".git/info/exclude"), "/.cowshed/\n").unwrap();
     write(&checkout, "vendor/upstream/build/build.ninja", "stale tree");
     git(&checkout.join("vendor/upstream"), &["init", "--quiet"]);
     link::point(&checkout, &scratch.volume()).unwrap();
     let declared = vec![BuildStatePath::declared("vendor/upstream").unwrap()];
-    let displaced = adopt_paths(
+    let adopted = adopt_paths(
         &crate::census::this_test(),
         &checkout,
         &scratch.volume(),
@@ -824,20 +831,31 @@ fn a_declared_checkout_is_discarded_and_linked_like_any_build_state() {
     )
     .unwrap()
     .unwrap();
+    assert_eq!(adopted.discarded, []);
+    let [kept] = adopted.kept.as_slice() else {
+        panic!("one directory is kept: {adopted:?}");
+    };
     assert_eq!(
-        displaced,
-        [DiscardedBuildStateFinding {
-            path: PathBuf::from("vendor/upstream"),
-            tool: BuildStateTool::Declared,
-            origin: DiscardOrigin::Predated,
-        }]
+        (kept.path.as_path(), kept.origin),
+        (Path::new("vendor/upstream"), DiscardOrigin::Predated)
     );
     assert!(
-        displaced[0]
-            .to_string()
-            .contains("re-run whatever reconstructs it once"),
+        kept.kept.starts_with(checkout.join(kept::KEPT_DIRECTORY)),
         "{}",
-        displaced[0]
+        kept.kept.display()
+    );
+    assert_eq!(
+        fs::read_to_string(kept.kept.join("build/build.ninja")).unwrap(),
+        "stale tree"
+    );
+    assert!(
+        kept.kept.join(".git").is_dir(),
+        "the nested checkout moves whole"
+    );
+    let report = kept.to_string();
+    assert!(
+        report.contains(&kept.kept.display().to_string()) && report.contains("never deletes"),
+        "{report}"
     );
     assert_eq!(
         fs::read_link(checkout.join("vendor/upstream")).unwrap(),
@@ -870,11 +888,61 @@ fn a_declared_checkout_is_discarded_and_linked_like_any_build_state() {
         )
         .unwrap()
         .unwrap()
-        .is_empty(),
+            == Adopted::default(),
         "the exact link is left alone"
     );
     discards_drain(&checkout);
+    assert_eq!(
+        kept::list(&checkout).unwrap().len(),
+        1,
+        "nothing deletes a kept directory"
+    );
     assert_eq!(status(&checkout), "", "the link is excluded, never source");
+}
+
+/// A reconstruct script that wants to fill the volume on its first run makes the empty
+/// directory and lets a refresh link it (16_build_volumes.md, "Declared build state"). An empty
+/// directory holds nothing to lose, so the refresh removes it and links the path, keeping
+/// nothing.
+#[test]
+fn an_empty_declared_directory_is_linked_in_its_place() {
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    fs::create_dir_all(checkout.join("vendor/upstream")).unwrap();
+    link::point(&checkout, &scratch.volume()).unwrap();
+    let declared = vec![BuildStatePath::declared("vendor/upstream").unwrap()];
+    let adopted = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &declared,
+        &declared,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(adopted.kept, []);
+    assert_eq!(
+        adopted.discarded,
+        [DiscardedBuildStateFinding {
+            path: PathBuf::from("vendor/upstream"),
+            tool: BuildStateTool::Declared,
+            origin: DiscardOrigin::Predated,
+        }]
+    );
+    assert!(
+        adopted.discarded[0]
+            .to_string()
+            .contains("nothing was lost"),
+        "{}",
+        adopted.discarded[0]
+    );
+    assert_eq!(
+        fs::read_link(checkout.join("vendor/upstream")).unwrap(),
+        Path::new("../.cowshed/build/declared/vendor/upstream")
+    );
+    assert_eq!(kept::list(&checkout).unwrap(), []);
+    discards_drain(&checkout);
 }
 
 /// Existence carries meaning: a tool asks whether a declared directory is there (a pin worktree
@@ -902,7 +970,7 @@ fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
             )
             .unwrap()
             .unwrap()
-            .is_empty()
+                == Adopted::default()
         );
         assert!(
             fs::symlink_metadata(checkout.join("target"))
@@ -917,7 +985,7 @@ fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
         "vendor/upstream/build/build.ninja",
         "made by a tool",
     );
-    let displaced = adopt_paths(
+    let adopted = adopt_paths(
         &crate::census::this_test(),
         &checkout,
         &scratch.volume(),
@@ -926,17 +994,90 @@ fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(displaced.len(), 1);
+    assert_eq!(adopted.discarded, []);
+    assert_eq!(adopted.kept.len(), 1);
     assert_eq!(
-        (displaced[0].tool, displaced[0].origin),
-        (BuildStateTool::Declared, DiscardOrigin::Predated),
+        adopted.kept[0].origin,
+        DiscardOrigin::Predated,
         "a declared path is held before its first link"
+    );
+    assert_eq!(
+        fs::read_to_string(adopted.kept[0].kept.join("build/build.ninja")).unwrap(),
+        "made by a tool"
     );
     assert_eq!(
         fs::read_link(checkout.join("vendor/upstream")).unwrap(),
         Path::new("../.cowshed/build/declared/vendor/upstream")
     );
     assert!(scratch.volume().join("declared/vendor/upstream").is_dir());
+}
+
+/// The `.bun-pin` incident, in a downstream repository's shed: a tool cloned a patch worktree
+/// into a declared path before its link existed, an agent edited a file inside it, and the next
+/// `cowshed exec`'s refresh linked the path and deleted the directory, edit included, saying so
+/// only on stderr. Cowshed cannot rebuild what it does not know, so the refresh keeps every byte
+/// of it, intact, at a location the refresh names, and still links the path.
+#[test]
+fn a_declared_directory_survives_its_relink_at_a_location_the_refresh_names() {
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    write(
+        &checkout,
+        "packages/pin/.bun-pin/src/edited.zig",
+        "an uncommitted edit",
+    );
+    link::point(&checkout, &scratch.volume()).unwrap();
+    let declared = vec![BuildStatePath::declared("packages/pin/.bun-pin").unwrap()];
+    let adopted = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &declared,
+        &declared,
+    )
+    .unwrap()
+    .unwrap();
+    let told = adopted
+        .kept
+        .iter()
+        .map(ToString::to_string)
+        .chain(adopted.discarded.iter().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    discards_drain(&checkout);
+    assert_eq!(
+        fs::read_link(checkout.join("packages/pin/.bun-pin")).unwrap(),
+        Path::new("../../.cowshed/build/declared/packages/pin/.bun-pin")
+    );
+    let survivors = files_holding(&checkout, b"an uncommitted edit");
+    let [survivor] = survivors.as_slice() else {
+        panic!("the edit survives exactly once, not {survivors:?}; the refresh said {told:?}");
+    };
+    let kept = survivor.parent().unwrap().parent().unwrap();
+    assert!(
+        told.iter()
+            .any(|line| line.contains(&kept.display().to_string())),
+        "the refresh names {} where it kept the directory: {told:?}",
+        kept.display()
+    );
+}
+
+/// Every regular file under `root` whose bytes are `bytes`, never following a link.
+fn files_holding(root: &Path, bytes: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() && fs::read(&path).unwrap() == bytes {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 /// The module compile cache a checkout kept before discovery contributed it (its first touch, or
@@ -966,7 +1107,8 @@ fn a_compile_cache_kept_before_its_link_existed_is_reported_as_predating_it() {
         &[],
     )
     .unwrap()
-    .unwrap();
+    .unwrap()
+    .discarded;
     assert_eq!(
         discarded,
         [DiscardedBuildStateFinding {
@@ -993,7 +1135,8 @@ fn a_compile_cache_kept_before_its_link_existed_is_reported_as_predating_it() {
         &compile_cache,
     )
     .unwrap()
-    .unwrap();
+    .unwrap()
+    .discarded;
     assert_eq!(
         displaced,
         [DiscardedBuildStateFinding {
@@ -1010,4 +1153,284 @@ fn a_compile_cache_kept_before_its_link_existed_is_reported_as_predating_it() {
         displaced[0]
     );
     discards_drain(&checkout);
+}
+
+/// The decision's invariant over every tool and everything a path can hold: a file and a link
+/// cowshed did not make are never removed or linked over, only a tool's own directory is
+/// discarded, a declared directory holding anything is moved aside intact, only an empty
+/// directory is removed outright, and every path ends at its fixed link but a declared one
+/// nothing occupies.
+#[test]
+fn the_decision_deletes_nothing_cowshed_cannot_rebuild() {
+    use BuildStateTool::{Cargo, Declared, JavaScript, Nx};
+    for tool in [Cargo, Nx, Declared, JavaScript] {
+        for occupant in [
+            Occupant::Absent,
+            Occupant::FixedLink,
+            Occupant::ForeignLink,
+            Occupant::EmptyDirectory,
+            Occupant::Directory,
+            Occupant::File,
+        ] {
+            let decided = decide(tool, occupant);
+            if matches!(occupant, Occupant::ForeignLink | Occupant::File) {
+                assert_eq!(decided, Err(Refuse), "{tool:?} {occupant:?}");
+                continue;
+            }
+            let Ok(action) = decided else {
+                panic!("{tool:?} {occupant:?} refused");
+            };
+            assert_eq!(
+                action == Action::Discard,
+                tool != Declared && occupant == Occupant::Directory,
+                "{tool:?} {occupant:?}: {action:?}"
+            );
+            assert_eq!(
+                action == Action::MoveAside,
+                tool == Declared && occupant == Occupant::Directory,
+                "{tool:?} {occupant:?}: {action:?}"
+            );
+            assert_eq!(
+                action == Action::ReplaceEmpty,
+                occupant == Occupant::EmptyDirectory,
+                "{tool:?} {occupant:?}: {action:?}"
+            );
+            assert_eq!(
+                action == Action::LeaveAbsent,
+                tool == Declared && occupant == Occupant::Absent,
+                "{tool:?} {occupant:?}: {action:?}"
+            );
+        }
+    }
+}
+
+/// The refresh as a whole -- observation, decision and the shell that performs it -- over random
+/// occupants of two capability paths and two declared ones.
+mod property {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    /// What one case plants at one build-state path.
+    #[derive(Clone, Debug)]
+    enum Planted {
+        Absent,
+        /// The path's own link, onto a volume directory that holds a file or is missing.
+        FixedLink {
+            dangling: bool,
+        },
+        /// A link cowshed did not make, onto a file or onto nothing.
+        ForeignLink {
+            dangling: bool,
+        },
+        EmptyDirectory,
+        /// The bytes of each file, which sits at [`planted_file`].
+        Directory(Vec<Vec<u8>>),
+        File(Vec<u8>),
+    }
+
+    /// Weighted so that a case with six paths is a successful refresh about two times in five:
+    /// one file or foreign link anywhere refuses the whole refresh.
+    fn planted() -> impl Strategy<Value = Planted> {
+        prop_oneof![
+            3 => Just(Planted::Absent),
+            3 => any::<bool>().prop_map(|dangling| Planted::FixedLink { dangling }),
+            1 => any::<bool>().prop_map(|dangling| Planted::ForeignLink { dangling }),
+            2 => Just(Planted::EmptyDirectory),
+            4 => prop::collection::vec(prop::collection::vec(any::<u8>(), 0..16), 1..4)
+                .prop_map(Planted::Directory),
+            1 => prop::collection::vec(any::<u8>(), 0..16).prop_map(Planted::File),
+        ]
+    }
+
+    /// Three capability paths and three declared ones, disjoint. None is Nx's, whose real
+    /// directories a refresh first closes against live database holders.
+    fn paths() -> [BuildStatePath; 6] {
+        [
+            BuildStatePath::new("target", "target").unwrap(),
+            BuildStatePath::new("crates/tool/target", "crates-tool-target").unwrap(),
+            BuildStatePath::new("web/node_modules/.cache", "web-cache").unwrap(),
+            BuildStatePath::declared("vendor/upstream").unwrap(),
+            BuildStatePath::declared("packages/a/.cache/lmao").unwrap(),
+            BuildStatePath::declared("packages/runtime/.bun-pin").unwrap(),
+        ]
+    }
+
+    fn planted_file(index: usize) -> String {
+        if index % 2 == 1 {
+            format!("nested/f{index}")
+        } else {
+            format!("f{index}")
+        }
+    }
+
+    /// Bytes no other planted file holds: the path and index lead, so survival can be checked
+    /// by content wherever the bytes went.
+    fn planted_bytes(path: &Path, index: usize, bytes: &[u8]) -> Vec<u8> {
+        let mut content = format!("{}#{index}:", path.display()).into_bytes();
+        content.extend_from_slice(bytes);
+        content
+    }
+
+    fn plant(checkout: &Path, volume: &Path, state: &BuildStatePath, planted: &Planted) {
+        let path = state.checkout.as_path();
+        let at = checkout.join(path);
+        if !matches!(planted, Planted::Absent) {
+            fs::create_dir_all(at.parent().unwrap()).unwrap();
+        }
+        match planted {
+            Planted::Absent => {}
+            Planted::FixedLink { dangling } => {
+                std::os::unix::fs::symlink(
+                    link::relative_target(path, state.volume.as_path()),
+                    &at,
+                )
+                .unwrap();
+                if !dangling {
+                    let directory = volume.join(state.volume.as_path());
+                    fs::create_dir_all(&directory).unwrap();
+                    fs::write(directory.join("warm"), planted_bytes(path, 99, b"warm")).unwrap();
+                }
+            }
+            Planted::ForeignLink { dangling } => {
+                let target = if *dangling {
+                    checkout.join("nowhere")
+                } else {
+                    checkout.join("README")
+                };
+                std::os::unix::fs::symlink(target, &at).unwrap();
+            }
+            Planted::EmptyDirectory => fs::create_dir(&at).unwrap(),
+            Planted::Directory(files) => {
+                for (index, bytes) in files.iter().enumerate() {
+                    let file = at.join(planted_file(index));
+                    fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    fs::write(file, planted_bytes(path, index, bytes)).unwrap();
+                }
+            }
+            Planted::File(bytes) => fs::write(&at, planted_bytes(path, 0, bytes)).unwrap(),
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Entry {
+        File(Vec<u8>),
+        Link(PathBuf),
+    }
+
+    /// Every file and link under `root` by its path relative to `root`, never following a link,
+    /// skipping the relative paths `skip`.
+    fn entries(root: &Path, skip: &[&str]) -> BTreeMap<PathBuf, Entry> {
+        let mut found = BTreeMap::new();
+        let mut pending = vec![PathBuf::new()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(root.join(&directory)).unwrap() {
+                let relative = directory.join(entry.unwrap().file_name());
+                if skip.iter().any(|skip| relative == Path::new(skip)) {
+                    continue;
+                }
+                let path = root.join(&relative);
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                if metadata.file_type().is_symlink() {
+                    found.insert(relative, Entry::Link(fs::read_link(&path).unwrap()));
+                } else if metadata.is_dir() {
+                    pending.push(relative);
+                } else {
+                    found.insert(relative, Entry::File(fs::read(&path).unwrap()));
+                }
+            }
+        }
+        found
+    }
+
+    /// The discards a background delete is still taking.
+    const NOT_CHECKOUT_DATA: [&str; 1] = [discard::DISCARD_DIRECTORY];
+
+    /// A refresh never deletes user data. Every file and link outside a tool's own cache
+    /// directory is still in the checkout afterwards, byte for byte; a file or a foreign link at
+    /// any path refuses before any path changes; otherwise every path but an unoccupied declared
+    /// one is its fixed link, and each declared directory's files are where the refresh says it
+    /// kept them. Every case's checkout is a fresh directory of one Git repository, made once:
+    /// a Git process costs seconds on a loaded macOS host, and the tracked-source guard needs one.
+    #[test]
+    fn a_refresh_never_deletes_user_data() {
+        let scratch = Scratch::new();
+        git(&scratch.0, &["init", "--quiet"]);
+        let cases = std::sync::atomic::AtomicUsize::new(0);
+        proptest!(ProptestConfig::with_cases(32), |(planted in prop::array::uniform6(planted()))| {
+            let case = scratch
+                .0
+                .join(format!("case-{}", cases.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            let (checkout, volume) = (case.join("checkout"), case.join("volume"));
+            fs::create_dir_all(&checkout).unwrap();
+            fs::create_dir_all(&volume).unwrap();
+            fs::write(checkout.join("README"), b"outside every build-state path").unwrap();
+            link::point(&checkout, &volume).unwrap();
+            let paths = paths();
+            for (state, planted) in paths.iter().zip(&planted) {
+                plant(&checkout, &volume, state, planted);
+            }
+            let tool_cache = |relative: &Path| {
+                paths.iter().zip(&planted).any(|(state, planted)| {
+                    !state.is_declared()
+                        && matches!(planted, Planted::Directory(_))
+                        && relative.starts_with(state.checkout.as_path())
+                })
+            };
+            let before = entries(&checkout, &NOT_CHECKOUT_DATA);
+            let volume_before = entries(&volume, &[]);
+            let refuses = planted
+                .iter()
+                .any(|planted| matches!(planted, Planted::File(_) | Planted::ForeignLink { .. }));
+
+            let result = adopt_paths(&crate::census::this_test(), &checkout, &volume, &paths, &paths);
+            discards_drain(&checkout);
+
+            let after = entries(&checkout, &NOT_CHECKOUT_DATA);
+            let volume_after = entries(&volume, &[]);
+            for (relative, entry) in &volume_before {
+                prop_assert_eq!(volume_after.get(relative), Some(entry), "{}", relative.display());
+            }
+            if refuses {
+                prop_assert!(result.is_err(), "a file or a foreign link refuses: {:?}", result);
+                prop_assert_eq!(&after, &before, "a refusal changes no path");
+                return Ok(());
+            }
+            let adopted = match result {
+                Ok(Ok(adopted)) => adopted,
+                other => return Err(TestCaseError::fail(format!("refused: {other:?}"))),
+            };
+            for (relative, entry) in before.iter().filter(|(relative, _)| !tool_cache(relative.as_path())) {
+                prop_assert!(
+                    after.values().any(|survivor| survivor == entry),
+                    "{} was deleted: {:?}",
+                    relative.display(),
+                    adopted
+                );
+            }
+            for (state, planted) in paths.iter().zip(&planted) {
+                let path = state.checkout.as_path();
+                if state.is_declared() && matches!(planted, Planted::Absent) {
+                    prop_assert!(
+                        fs::symlink_metadata(checkout.join(path)).is_err(),
+                        "{} stays absent",
+                        path.display()
+                    );
+                    continue;
+                }
+                prop_assert!(link::is_fixed_link(&checkout, state), "{} is its link", path.display());
+                if let (true, Planted::Directory(files)) = (state.is_declared(), planted) {
+                    let kept = adopted.kept.iter().find(|kept| kept.path == path);
+                    prop_assert!(kept.is_some(), "{} is kept: {:?}", path.display(), adopted);
+                    let kept = &kept.unwrap().kept;
+                    for (index, bytes) in files.iter().enumerate() {
+                        prop_assert_eq!(
+                            fs::read(kept.join(planted_file(index))).unwrap(),
+                            planted_bytes(path, index, bytes)
+                        );
+                    }
+                }
+            }
+        });
+    }
 }

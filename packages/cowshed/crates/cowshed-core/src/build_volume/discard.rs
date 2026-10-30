@@ -21,7 +21,7 @@ pub const DISCARD_DIRECTORY: &str = ".cowshed/discard";
 /// Move the checkout-relative `relative` out of the tree into the checkout's discard directory,
 /// in one `rename(2)`. The name keeps the path it came from, readable in a listing.
 pub fn move_aside(checkout: &Path, relative: &Path) -> io::Result<PathBuf> {
-    let directory = discard_directory(checkout, true)?;
+    let directory = owned_directory(checkout, DISCARD_DIRECTORY, true)?;
     let moved = directory.join(leaf_name(relative));
     fs::rename(checkout.join(relative), &moved)?;
     Ok(moved)
@@ -41,7 +41,7 @@ pub fn leaf_name(relative: &Path) -> OsString {
 
 /// Every discard of `checkout` not yet deleted.
 pub fn pending(checkout: &Path) -> io::Result<Vec<PathBuf>> {
-    let directory = discard_directory(checkout, false)?;
+    let directory = owned_directory(checkout, DISCARD_DIRECTORY, false)?;
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -146,11 +146,16 @@ fn remove(discard: &Path) -> io::Result<()> {
     }
 }
 
-/// The checkout's discard directory, which must be a real directory under a real `.cowshed`: a
-/// link planted at either would aim the rename and the delete outside the checkout.
-fn discard_directory(checkout: &Path, create: bool) -> io::Result<PathBuf> {
+/// The checkout's own directory at `relative` (one of cowshed's under `.cowshed`), made when
+/// `create` asks and it is missing. Every component must be a real directory: a link planted at
+/// any would aim a rename and a delete outside the checkout.
+pub(super) fn owned_directory(
+    checkout: &Path,
+    relative: &str,
+    create: bool,
+) -> io::Result<PathBuf> {
     let mut directory = checkout.to_owned();
-    for component in Path::new(DISCARD_DIRECTORY).components() {
+    for component in Path::new(relative).components() {
         directory.push(component);
         match fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.is_dir() => {}

@@ -6995,6 +6995,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         for discarded in &refresh.discarded {
             cowshed_os::eprintln!("cowshed: {name}: {discarded}");
         }
+        for kept in &refresh.kept {
+            cowshed_os::eprintln!("cowshed: {name}: {kept}");
+        }
         for finding in &refresh.findings {
             cowshed_os::eprintln!("cowshed: {name}: {finding}");
         }
@@ -17363,6 +17366,35 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                     error,
                                 )),
                             }
+                            let checkout = expected_mount.clone();
+                            let kept = crate::doctor::probe(
+                                format!("{workspace_name}/build-state-kept"),
+                                async {
+                                    crate::storage::lifecycle::dispatch_blocking(move || {
+                                        kept_build_state(&checkout)
+                                    })
+                                    .await
+                                    .map_err(|error| {
+                                        CowshedError::internal(format!(
+                                            "kept build-state inspection failed: {error}"
+                                        ))
+                                    })
+                                    .and_then(|kept| kept)
+                                },
+                            )
+                            .await;
+                            match kept {
+                                Ok(kept) => {
+                                    findings.extend(kept.into_iter().map(|kept| {
+                                        kept_build_state_finding(&workspace_name, kept)
+                                    }))
+                                }
+                                Err(error) => findings.push(native_finding(
+                                    "build-state-kept",
+                                    crate::api::dto::FindingSeverity::Error,
+                                    error,
+                                )),
+                            }
                         }
                     }
                 }
@@ -24878,9 +24910,57 @@ fn build_link_finding(
         ),
         hint: format!(
             "cowshed exec {workspace} -- true relinks it (the refresh before every exec discards \
-             what is there; `cowshed setup` refreshes every workspace)"
+             a tool's directory there and keeps a declared one intact in .cowshed/kept; \
+             `cowshed setup` refreshes every workspace)"
         ),
         path: Some(checkout.join(path)),
+    }
+}
+
+/// Every entry of the checkout's kept build-state directory (16_build_volumes.md, "What a
+/// refresh does at each path"). Reads only.
+#[cfg(target_os = "macos")]
+fn kept_build_state(checkout: &Path) -> Result<Vec<crate::build_volume::kept::Kept>> {
+    crate::build_volume::kept::list(checkout).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot list {}: {error}",
+                checkout
+                    .join(crate::build_volume::kept::KEPT_DIRECTORY)
+                    .display()
+            ),
+            "repair that directory's permissions, then run cowshed doctor again",
+        )
+    })
+}
+
+/// Doctor's report of a directory a refresh moved aside, intact, from a declared build-state
+/// path where it linked the volume. Nothing of cowshed's deletes it, so it is reported until the
+/// operator does.
+#[cfg(target_os = "macos")]
+fn kept_build_state_finding(
+    workspace: &WorkspaceName,
+    kept: crate::build_volume::kept::Kept,
+) -> crate::api::dto::Finding {
+    let location = kept.location.display().to_string();
+    let message = match &kept.moved {
+        Some(moved) => format!(
+            "{workspace} keeps {location}: a refresh moved {} aside there intact at {} when it \
+             linked that declared build-state path, and cowshed never deletes it",
+            moved.path.display(),
+            moved.at
+        ),
+        None => format!(
+            "{workspace} keeps {location} in its kept build-state directory, which cowshed \
+             never deletes"
+        ),
+    };
+    crate::api::dto::Finding {
+        code: "build-state-kept".into(),
+        severity: crate::api::dto::FindingSeverity::Warning,
+        message,
+        hint: format!("take what you need from it, then rm -rf '{location}'"),
+        path: Some(kept.location),
     }
 }
 

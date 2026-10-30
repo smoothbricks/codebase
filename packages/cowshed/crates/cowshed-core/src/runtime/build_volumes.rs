@@ -1032,7 +1032,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                             },
                         )
                     })?;
-                    let (id, discarded) = match touched {
+                    let (id, adopted) = match touched {
                         Ok(touched) => touched,
                         Err(refusal) => return Ok(Err(refusal)),
                     };
@@ -1077,7 +1077,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                             .iter()
                             .map(|path| path.checkout.as_path().to_owned())
                             .collect(),
-                        discarded,
+                        discarded: adopted.discarded,
+                        kept: adopted.kept,
                         findings: Vec::new(),
                     }));
                 }
@@ -1095,14 +1096,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 } => held.with_discovered(&paths, &released, mbx, fingerprint, &mount)?,
             };
             release_paths(&checkout, &mount, &released);
-            let discarded = match crate::build_volume::migrate::adopt_paths(
+            let adopted = match crate::build_volume::migrate::adopt_paths(
                 host.census(),
                 &checkout,
                 &mount,
                 &state.paths,
                 &held.paths,
             )? {
-                Ok(discarded) => discarded,
+                Ok(adopted) => adopted,
                 Err(refusal) => return Ok(Err(refusal)),
             };
             if state != held {
@@ -1115,7 +1116,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     .iter()
                     .map(|path| path.checkout.as_path().to_owned())
                     .collect(),
-                discarded,
+                discarded: adopted.discarded,
+                kept: adopted.kept,
                 findings: Vec::new(),
             }))
         })

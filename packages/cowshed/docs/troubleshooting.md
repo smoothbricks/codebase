@@ -254,9 +254,21 @@ Every build-state path is a fixed link onto the checkout's build volume
 `rm -rf .nx/workspace-data` — leaves the next Nx run to make a real directory there: its task database and graph then
 live outside the volume, so no fork, land or seed sees them, and every `cowshed fork` clones the directory from main.
 `cowshed doctor` reports each such path as `build-link`; `cowshed exec <ws> -- true` relinks it (the refresh before
-every exec discards what is there), and `cowshed setup` does the same for every workspace. A script that means to clear
-Nx's state should empty the directory, never remove the path: `cowshed cache clear <ws>` does that for `.nx/cache` and
-`.nx/workspace-data` together, and clears the project's gateway Nx store too.
+every exec discards a tool's directory there, and keeps a declared one intact in `.cowshed/kept/`), and `cowshed setup`
+does the same for every workspace. A script that means to clear Nx's state should empty the directory, never remove the
+path: `cowshed cache clear <ws>` does that for `.nx/cache` and `.nx/workspace-data` together, and clears the project's
+gateway Nx store too.
+
+## `cowshed doctor` reports `build-state-kept`
+
+A refresh found a real directory with entries at a declared build-state path (`.cowshed.toml` `[build] state`) and
+linked the path onto the build volume. Cowshed cannot rebuild what a declared directory holds, so it moved the
+directory, intact, to `<checkout>/.cowshed/kept/<UTC time>-<id>-<path>` (the path with `/` written as `%2F`) and said so
+on stderr. The usual cause is a tool that made the directory before the workspace had its link, such as a script that
+clones a patch worktree. Nothing of cowshed's deletes a kept directory. Take what you need from it (an uncommitted edit,
+a branch), re-run whatever made the directory so that it fills the link, then `rm -rf` the kept directory; doctor
+reports it until it is gone. To fill a declared path on the volume from the start, make the empty directory, run
+`cowshed exec <ws> -- true` so the refresh links it, and only then fill it.
 
 ## Parallel test fixture collisions
 

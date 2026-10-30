@@ -5487,7 +5487,25 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
             .join(DECLARED_STATE)
             .join("build/build.ninja")
             .exists(),
-        "the first touch discards the old checkout and never copies it"
+        "the first touch moves the old checkout aside, intact, into .cowshed/kept and never copies it"
+    );
+    let kept = cowshed_core::build_volume::kept::list(&fixture.checkout).expect("main's kept list");
+    let [kept] = kept.as_slice() else {
+        panic!("main keeps exactly the old checkout: {kept:?}");
+    };
+    assert_eq!(
+        kept.moved.as_ref().map(|moved| moved.path.as_path()),
+        Some(Path::new(DECLARED_STATE)),
+        "the kept entry names the path it came from"
+    );
+    assert_eq!(
+        fs::read(kept.location.join("build/build.ninja")).expect("the kept build tree"),
+        b"before cowshed\n",
+        "the old checkout is kept byte for byte"
+    );
+    assert!(
+        kept.location.join(".git").is_dir(),
+        "the nested checkout moves whole"
     );
     let layout = build_volumes(&fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
@@ -5518,6 +5536,15 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
             .expect("the fork's declared state"),
         b"warm\n",
         "a fork of main clones main's declared state warm"
+    );
+    assert_eq!(
+        cowshed_core::build_volume::kept::list(&topic)
+            .expect("the fork's kept list")
+            .iter()
+            .map(|kept| kept.location.file_name().map(ToOwned::to_owned))
+            .collect::<Vec<_>>(),
+        [kept.location.file_name().map(ToOwned::to_owned)],
+        "a fork carries its source's kept directory like any untracked file"
     );
     assert_build_label(namespace, &layout, &topic, "topic").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);

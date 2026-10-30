@@ -15,6 +15,7 @@
 pub mod cache_adapter;
 pub mod cargo;
 pub mod discard;
+pub mod kept;
 pub mod link;
 #[cfg(target_os = "macos")]
 pub mod migrate;
@@ -656,8 +657,8 @@ impl BuildStateTool {
     }
 }
 
-/// Why a real directory stood where a build-state link belongs, which decides what its discard
-/// reports (16_build_volumes.md, "One link per checkout", Refresh).
+/// Why a real directory stood where a build-state link belongs, which decides what its discard or
+/// its keeping reports (16_build_volumes.md, "One link per checkout", Refresh).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DiscardOrigin {
@@ -670,8 +671,39 @@ pub enum DiscardOrigin {
     Displaced,
 }
 
+/// A real directory holding entries at a declared build-state path, which a refresh moved aside
+/// intact, never copied and never deleted, and linked over (16_build_volumes.md, "What a refresh
+/// does at each path"). It stays at `kept` until the operator deletes it, and `cowshed doctor`
+/// reports it until then ([`kept::list`]).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptBuildStateFinding {
+    /// Checkout-relative: where the directory stood.
+    pub path: PathBuf,
+    /// Absolute: where it is now, in the checkout's [`kept::KEPT_DIRECTORY`].
+    pub kept: PathBuf,
+    pub origin: DiscardOrigin,
+}
+
+impl std::fmt::Display for KeptBuildStateFinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (path, kept) = (self.path.display(), self.kept.display());
+        let stood = match self.origin {
+            DiscardOrigin::Predated => "which predates its link",
+            DiscardOrigin::Displaced => "which had displaced its volume link",
+        };
+        write!(
+            formatter,
+            "moved the real directory {path}, {stood}, aside intact to {kept} and linked {path} \
+             onto the build volume; cowshed never deletes it: take what you need from it, re-run \
+             whatever made {path} so it fills the link, then delete it (rm -rf '{kept}')"
+        )
+    }
+}
+
 /// A real directory a refresh discarded, never copied, where a build-state link belongs, and
-/// linked over.
+/// linked over: a tool's own directory, which its next build rebuilds, or an empty one. A
+/// declared directory holding anything is kept instead ([`KeptBuildStateFinding`]).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscardedBuildStateFinding {
@@ -689,8 +721,7 @@ impl std::fmt::Display for DiscardedBuildStateFinding {
                 "the next build rebuilds what is missing"
             }
             BuildStateTool::Declared => {
-                ".cowshed.toml [build] state declares it, and declared state is rebuildable, so \
-                 re-run whatever reconstructs it once, and from then on it lives on the volume and \
+                "it was empty, so nothing was lost; what fills it now writes onto the volume, and \
                  every fork inherits it warm"
             }
         };
@@ -794,7 +825,8 @@ pub(crate) fn tracked_source(
 /// What refreshing a checkout's build state did (16_build_volumes.md, "One link per checkout"):
 /// the volume it links afterwards, whether that volume was created now (the checkout's first
 /// touch), the build-state paths linked for the first time, the real directories it discarded
-/// where a link belongs, each with its origin, and what discovery could not decide.
+/// and the declared ones it moved aside and kept where a link belongs, each with its origin, and
+/// what discovery could not decide.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BuildStateRefresh {
@@ -803,6 +835,7 @@ pub struct BuildStateRefresh {
     /// Checkout-relative.
     pub added: Vec<PathBuf>,
     pub discarded: Vec<DiscardedBuildStateFinding>,
+    pub kept: Vec<KeptBuildStateFinding>,
     pub findings: Vec<crate::capabilities::BuildStateFinding>,
 }
 

@@ -85,7 +85,7 @@ impl BuildStatePath {
     /// The build state a repository declares at the checkout-relative `checkout`
     /// (`.cowshed.toml` `[build] state`), held on the volume at `declared/<checkout>`. Refuses a
     /// path that is not a normalized relative name, and one naming Git's metadata or cowshed's own
-    /// checkout namespace: declared state is discarded at its first touch.
+    /// checkout namespace: declared state leaves its path, kept intact, at its first touch.
     pub fn declared(checkout: &str) -> std::result::Result<Self, &'static str> {
         let path = super::validate_override_directory(checkout)
             .map_err(|_| "must be a nonempty normalized checkout-relative path")?;

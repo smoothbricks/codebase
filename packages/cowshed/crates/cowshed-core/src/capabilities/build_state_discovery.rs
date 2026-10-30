@@ -891,10 +891,11 @@ pub(super) fn expand_declared(
     Ok(expanded)
 }
 
-/// Join `declared` to the `discovered` paths. Declared state is discarded and rebuilt, never
-/// copied (16_build_volumes.md, "Declared build state"), so a declared path may not hold tracked
-/// source (the guard migration applies), may not reach outside the checkout through a symlinked
-/// parent, and may not overlap a tool's state, which its capability already links.
+/// Join `declared` to the `discovered` paths. Declared state leaves its path at its first touch,
+/// kept intact, and is rebuilt on the volume, never copied (16_build_volumes.md, "Declared build
+/// state"), so a declared path may not hold tracked source (the guard migration applies), may
+/// not reach outside the checkout through a symlinked parent, and may not overlap a tool's state,
+/// which its capability already links.
 fn declare(
     context: &DetectionContext<'_>,
     declared: &[BuildStatePath],
@@ -948,9 +949,9 @@ fn declare(
                 refusal.path.display()
             ),
             format!(
-                "declared build state is discarded at its first touch and rebuilt, never copied, \
-                 so it holds only untracked, rebuildable files: remove {} from [build] state, or \
-                 untrack it (`git rm -r --cached`) and ignore it",
+                "declared build state leaves its path at its first touch and is rebuilt, never \
+                 copied, on the volume, so it holds only untracked files: remove {} from [build] \
+                 state, or untrack it (`git rm -r --cached`) and ignore it",
                 refusal.path.display()
             ),
         ));

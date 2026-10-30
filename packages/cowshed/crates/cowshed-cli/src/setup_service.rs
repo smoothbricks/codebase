@@ -1164,6 +1164,11 @@ fn emit_build_state<W: Write, E: Write>(
                         .error(&format!("{}: {finding}", project.repo_id))
                         .map_err(output_error)?;
                 }
+                for kept in &state.kept {
+                    output
+                        .error(&format!("{}: {kept}", project.repo_id))
+                        .map_err(output_error)?;
+                }
                 for finding in &state.findings {
                     output
                         .error(&format!("{}: {finding}", project.repo_id))
