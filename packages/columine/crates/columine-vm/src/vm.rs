@@ -1535,6 +1535,26 @@ impl<I: KeyIndex> Vm<I> {
         })
         .unwrap_or_else(|error| error)
     }
+
+    /// Replace bitmap slot `slot`'s members with `input`, an image that
+    /// crossed a trust boundary ([`bitmap_ops::bitmap_import`]), on an
+    /// authoritatively bound slot. Like that import it sets no change flag
+    /// and records no undo; an armed change feed tracking the slot treats it
+    /// as changed whole.
+    pub fn bitmap_import(&mut self, state: &mut [u8], slot: u32, input: &[u8]) -> ErrorCode {
+        let meta = match state_init::bind_slot_in::<I>(state, slot) {
+            Ok(meta) => meta,
+            Err(error) => return error,
+        };
+        if meta.slot_type() != SlotType::Bitmap {
+            return ErrorCode::InvalidSlot;
+        }
+        let hooks = &mut VmCtx {
+            undo: &mut self.undo,
+            feed: &mut self.feed,
+        };
+        bitmap_ops::bitmap_import(&mut self.bitmap_env, hooks, state, &meta, input)
+    }
 }
 
 impl VmHooks for VmCtx<'_> {

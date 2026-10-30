@@ -45,15 +45,16 @@ A row a removal cut skips ([log-order removal](05-log-order-removal.md)) writes 
 A source overflows (counted once per pass in `FeedWork::overflowed`) when:
 
 - the entry buffer is full: the entry is dropped and counted in `FeedWork::dropped`;
-- a write names no key: bitmap algebra and nested-container writes;
+- a write names no key: bitmap algebra, a bitmap import (`Vm::bitmap_import`) and nested-container writes;
 - a fact index has no chain: indices at or past the bound fact count overflow bit 0;
 - its change flag is already set as the pass begins: a write the feed did not see (bridge fact syncs, direct map and set
   calls between passes);
 - the slot is a kind no kernel records keys for (aggregate, array, condition tree, scalar, ordered list), or the image
   does not hold it: overflowed at every pass begin.
 
-The fourth rule needs every live writer of a slot to set its change flag. `bitmap_ops::bitmap_import` is the known
-exception: it replaces a bitmap's members without setting one, so a host import between passes is invisible to the feed.
+The fourth rule needs every live writer of a slot to set its change flag. A bitmap import is the known exception: it
+sets no flag, so an import made between passes is invisible to the feed; one made while the feed is armed overflows its
+slot by the second rule.
 
 ## 5. Lifecycle and memory
 

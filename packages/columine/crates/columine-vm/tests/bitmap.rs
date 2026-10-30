@@ -1156,6 +1156,7 @@ fn set_algebra_empty_identities_copy_survivor() {
 #[test]
 fn import_keeps_the_forest_form_and_refuses_foreign_bytes() {
     let mut env = BitmapEnv::default();
+    let mut hooks = NoVm::default();
     let mut state = vec![0u8; 1 << 20];
     let meta = init_bitmap_slot_state(&mut state, 16_384);
     let storage = get_bitmap_storage(&meta);
@@ -1171,7 +1172,7 @@ fn import_keeps_the_forest_form_and_refuses_foreign_bytes() {
             .is_elias_fano()
     );
     assert_eq!(
-        bitmap_import(&mut env, &mut state, &meta, &canonical),
+        bitmap_import(&mut env, &mut hooks, &mut state, &meta, &canonical),
         ErrorCode::Ok
     );
     assert_eq!(meta.size(&state), sparse.len() as u32);
@@ -1181,19 +1182,19 @@ fn import_keeps_the_forest_form_and_refuses_foreign_bytes() {
     let dense: BTreeSet<u32> = (0..5000).collect();
     let forest = Bitmosaic::from_sorted(dense.iter().copied()).to_forest_bytes();
     assert_eq!(
-        bitmap_import(&mut env, &mut state, &meta, &forest),
+        bitmap_import(&mut env, &mut hooks, &mut state, &meta, &forest),
         ErrorCode::Ok
     );
     assert_slot_is_canonical(&state, storage, &dense);
     assert_eq!(
-        bitmap_import(&mut env, &mut state, &meta, &EMPTY_U32_IMAGE),
+        bitmap_import(&mut env, &mut hooks, &mut state, &meta, &EMPTY_U32_IMAGE),
         ErrorCode::Ok
     );
     assert_slot_is_canonical(&state, storage, &BTreeSet::new());
     assert_eq!(meta.size(&state), 0);
     // Zero-length bytes are no native encoding: refused, slot untouched.
     assert_eq!(
-        bitmap_import(&mut env, &mut state, &meta, &[]),
+        bitmap_import(&mut env, &mut hooks, &mut state, &meta, &[]),
         ErrorCode::InvalidState
     );
     assert_eq!(env.last_error, 102);
@@ -1204,6 +1205,7 @@ fn import_keeps_the_forest_form_and_refuses_foreign_bytes() {
     assert_eq!(
         bitmap_import(
             &mut env,
+            &mut hooks,
             &mut state,
             &meta,
             b"\x3a\x30\x00\x00\x01\x00\x00\x00"
@@ -1211,7 +1213,13 @@ fn import_keeps_the_forest_form_and_refuses_foreign_bytes() {
         ErrorCode::InvalidState
     );
     assert_eq!(
-        bitmap_import(&mut env, &mut state, &meta, &forest[..forest.len() - 3]),
+        bitmap_import(
+            &mut env,
+            &mut hooks,
+            &mut state,
+            &meta,
+            &forest[..forest.len() - 3]
+        ),
         ErrorCode::InvalidState
     );
     assert_eq!(state, before);
@@ -1219,7 +1227,7 @@ fn import_keeps_the_forest_form_and_refuses_foreign_bytes() {
     // More members than the element cap is a capacity refusal.
     let small = init_bitmap_slot_state(&mut state, 8);
     assert_eq!(
-        bitmap_import(&mut env, &mut state, &small, &forest),
+        bitmap_import(&mut env, &mut hooks, &mut state, &small, &forest),
         ErrorCode::CapacityExceeded
     );
 }

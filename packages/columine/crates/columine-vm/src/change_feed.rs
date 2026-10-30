@@ -14,16 +14,17 @@
 //! and the overflow bitset share it, so a consumer tests overflow with the
 //! same AND it tests wakes with. A source is overflowed ("the whole source
 //! changed") when the buffer is full, when a write names no key (bitmap
-//! algebra, nested containers), when a fact index has no chain, when the
-//! source's change flag was already set as the pass began (a write the feed
-//! did not see), or when the slot is a kind no kernel records keys for.
+//! algebra, a bitmap import, nested containers), when a fact index has no
+//! chain, when the source's change flag was already set as the pass began
+//! (a write the feed did not see), or when the slot is a kind no kernel
+//! records keys for.
 //! Nothing is ever overwritten.
 //!
 //! Precondition: every live writer of a slot sets the slot's change flag,
 //! so a write made while the feed is off is seen as overflow at the next
-//! begin. [`crate::bitmap_ops::bitmap_import`] is the known exception: it
-//! replaces a bitmap's members without setting a flag, so a host import
-//! between passes is invisible to the feed.
+//! begin. A bitmap import is the known exception: it sets no flag, so an
+//! import made between passes is invisible to the feed (one made while the
+//! feed is armed overflows its slot).
 //!
 //! Storage is reserved once by [`ChangeFeed::bind`]; recording never
 //! allocates. The feed is armed only between [`ChangeFeed::begin_pass`] and

@@ -7,6 +7,7 @@
 
 mod common;
 
+use bitmosaic::Bitmosaic;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{
     AggType, ErrorCode, Opcode, SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType,
@@ -784,6 +785,32 @@ fn an_eviction_records_the_evicted_key_and_value() {
         entries(&vm),
         [(slot(0), one(KEY), Change::Evicted(Some(10)))]
     );
+}
+
+#[test]
+fn a_bitmap_import_overflows_its_slot_while_armed() {
+    let init = [slot_def(0, SlotType::Bitmap), slot_def(1, SlotType::Bitmap)].concat();
+    let code = program(2, &init, &[]);
+    let mut state = image(&code);
+    let mut vm = Vm::default();
+    let members = Bitmosaic::from_sorted([2u32, 3, 5]).to_bytes();
+    arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    assert_eq!(vm.bitmap_import(&mut state, 1, &members), ErrorCode::Ok);
+    assert_eq!(
+        vm.feed().overflow(),
+        [0],
+        "an untracked import overflows nothing"
+    );
+    // A refused import changes nothing and overflows nothing.
+    assert_eq!(
+        vm.bitmap_import(&mut state, 0, &[]),
+        ErrorCode::InvalidState
+    );
+    assert!(!vm.feed().overflowed(slot(0)));
+    assert_eq!(vm.bitmap_import(&mut state, 0, &members), ErrorCode::Ok);
+    assert!(vm.feed().entries().is_empty(), "an import names no key");
+    assert!(vm.feed().overflowed(slot(0)));
+    assert_eq!(vm.feed_work().overflowed, 1);
 }
 
 #[test]

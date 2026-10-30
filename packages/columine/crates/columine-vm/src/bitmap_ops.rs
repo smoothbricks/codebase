@@ -1126,9 +1126,11 @@ pub fn batch_bitmap_algebra_in<I: KeyIndex>(
 /// cardinality checked against the slot's element capacity, and a sealed
 /// Elias-Fano root is re-encoded as the forest the slot keeps. The canonical
 /// empty image is the empty set; zero-length bytes are no native encoding
-/// and are refused.
+/// and are refused. An import names no key: an armed change feed tracking
+/// the slot treats it as changed whole.
 pub fn bitmap_import(
     env: &mut BitmapEnv,
+    hooks: &mut impl VmHooks,
     state: &mut [u8],
     meta: &SlotMetaView,
     input: &[u8],
@@ -1177,6 +1179,9 @@ pub fn bitmap_import(
     };
     slot[written..].fill(0);
     meta.set_size(state, card);
+    if hooks.feed_records(meta.slot()) {
+        hooks.feed_changed_whole(meta.slot());
+    }
     ErrorCode::Ok
 }
 
