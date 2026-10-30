@@ -16,6 +16,7 @@ import {
   nxRunManyArgs,
   nxRunManyBatchArgs,
   nxSmartArgs,
+  postGithubStatus,
   previewUrlsForStage,
   publishGithubDeployment,
   readGitHeadSha,
@@ -87,6 +88,45 @@ describe('GitHub Actions step links', () => {
         '8',
       ),
     ).toBeNull();
+  });
+  it('posts the commit status without a link, and goes on, when the jobs API lists no running job for this runner', async () => {
+    // SB CI run 41121957615 died before building: its runner was in no job of the run's listing, and the missing link
+    // failed the status post, which failed the whole Nx run.
+    const posted: unknown[] = [];
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === 'GET' && url.pathname === '/repos/o/r/actions/runs/7/attempts/1/jobs') {
+          return Response.json({
+            jobs: [
+              { name: 'Validate', runner_name: 'another-runner', status: 'in_progress', html_url: `${runUrl}/job/1` },
+            ],
+          });
+        }
+        if (request.method === 'POST' && url.pathname === '/repos/o/r/statuses/abc') {
+          posted.push(await request.json());
+          return Response.json({});
+        }
+        return new Response('', { status: 404 });
+      },
+    });
+    try {
+      const origin = `http://127.0.0.1:${server.port}`;
+      await postGithubStatus('build', 'pending', 'Running build...', '8', {
+        GITHUB_SERVER_URL: origin,
+        GITHUB_API_URL: origin,
+        GITHUB_REPOSITORY: 'o/r',
+        GITHUB_SHA: 'abc',
+        GITHUB_RUN_ID: '7',
+        RUNNER_NAME: 'bread-main-dom1t8xtw6tj',
+        GITHUB_TOKEN: 'token',
+      });
+      expect(posted).toEqual([{ state: 'pending', context: 'build', description: 'Running build...' }]);
+    } finally {
+      await server.stop(true);
+    }
   });
 });
 

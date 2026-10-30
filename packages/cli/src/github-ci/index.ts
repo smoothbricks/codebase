@@ -752,23 +752,34 @@ async function updateGithubStatus(name: string, state: 'success' | 'failure' | '
   await postGithubStatus(name, state, `${name} ${suffix}`, step);
 }
 
-async function postGithubStatus(name: string, state: string, description: string, step: string): Promise<void> {
-  const repository = process.env.GITHUB_REPOSITORY;
-  const sha = process.env.GITHUB_SHA;
+export async function postGithubStatus(
+  name: string,
+  state: string,
+  description: string,
+  step: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const repository = environment.GITHUB_REPOSITORY;
+  const sha = environment.GITHUB_SHA;
   if (!repository || !sha) {
     return;
   }
-  if (!githubCommitStatusesWritable(process.env, readGithubActionsEvent(process.env))) {
+  if (!githubCommitStatusesWritable(environment, readGithubActionsEvent(environment))) {
     console.log(`Skipping GitHub commit status ${name}=${state}: fork pull requests receive a read-only GITHUB_TOKEN.`);
     return;
   }
-  const targetUrl = await getGithubStepUrl(step);
-  await ciApiRequest(`/statuses/${sha}`, 'POST', {
-    state,
-    context: name,
-    description,
-    ...(targetUrl ? { target_url: targetUrl } : {}),
-  });
+  const targetUrl = await getGithubStepUrl(step, environment);
+  await ciApiRequest(
+    `/statuses/${sha}`,
+    'POST',
+    {
+      state,
+      context: name,
+      description,
+      ...(targetUrl ? { target_url: targetUrl } : {}),
+    },
+    environment,
+  );
 }
 
 interface GithubWorkflowJob {
@@ -789,28 +800,44 @@ export function githubStepUrlForJobs(
   return step ? `${job.html_url}#step:${step}:1` : job.html_url;
 }
 
-async function getGithubStepUrl(step: string): Promise<string | null> {
-  const repository = process.env.GITHUB_REPOSITORY;
-  const runId = process.env.GITHUB_RUN_ID;
+/**
+ * The link a commit status carries to this job's step, or null when there is none to give. The link is decoration: a
+ * runner the jobs API does not list as running, a missing RUNNER_NAME, or a listing the API refuses or garbles leaves
+ * the status without one and says why on stderr. It never fails the run the status reports on, as it did in SB CI run
+ * 41121957615, which died before building because its runner was in no job of the run's listing.
+ */
+async function getGithubStepUrl(step: string, environment: NodeJS.ProcessEnv): Promise<string | null> {
+  const repository = environment.GITHUB_REPOSITORY;
+  const runId = environment.GITHUB_RUN_ID;
   if (!repository || !runId) {
     return null;
   }
-  const { forgejo, htmlBase } = ciApiContext();
+  const { forgejo, htmlBase } = ciApiContext(environment);
   if (forgejo) return `${htmlBase}/${repository}/actions/runs/${runId}`;
-  const runnerName = process.env.RUNNER_NAME;
-  if (!runnerName) throw new Error('Cannot link GitHub Actions logs without RUNNER_NAME.');
-  const attempt = process.env.GITHUB_RUN_ATTEMPT ?? '1';
+  const unlinked = (why: string): null => {
+    console.warn(`The GitHub commit status goes without a log link: ${why}.`);
+    return null;
+  };
+  const runnerName = environment.RUNNER_NAME;
+  if (!runnerName) return unlinked('RUNNER_NAME is unset');
+  const attempt = environment.GITHUB_RUN_ATTEMPT ?? '1';
   for (let page = 1; ; page++) {
-    const listing = await ciApiRequest(
-      `/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`,
-      'GET',
-    );
-    const { jobs } = typia.json.assertParse<{ jobs: GithubWorkflowJob[] }>(listing);
+    let jobs: GithubWorkflowJob[];
+    try {
+      const listing = await ciApiRequest(
+        `/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`,
+        'GET',
+        undefined,
+        environment,
+      );
+      jobs = typia.json.assertParse<{ jobs: GithubWorkflowJob[] }>(listing).jobs;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return unlinked(`the jobs of run ${runId} could not be listed: ${reason}`);
+    }
     const url = githubStepUrlForJobs(jobs, runnerName, step);
     if (url) return url;
-    if (jobs.length < 100) {
-      throw new Error(`Cannot find the running GitHub Actions job for runner "${runnerName}" in run ${runId}.`);
-    }
+    if (jobs.length < 100) return unlinked(`run ${runId} lists no running job on runner "${runnerName}"`);
   }
 }
 
