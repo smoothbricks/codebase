@@ -2467,6 +2467,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         join(workspace.context.workspaceRoot, 'node_modules/@smoothbricks/nx-plugin'),
       );
       const offenders: string[] = [];
+      const values = new Map<string, Promise<string>>();
       for (const [name, target] of cachedCargoTargets(targets)) {
         for (const input of target.inputs ?? []) {
           if (typeof input === 'string') {
@@ -2478,10 +2479,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           if (input.runtime.includes(fileURLToPath(new URL('..', import.meta.url)))) {
             offenders.push(`${name}: runtime command names the plugin checkout`);
           }
-          const value = (await runtimeInputValue(input.runtime, workspace.context.workspaceRoot)).replaceAll(
-            STORE_OBJECT,
-            '',
-          );
+          const pending =
+            values.get(input.runtime) ?? runtimeInputValue(input.runtime, workspace.context.workspaceRoot);
+          values.set(input.runtime, pending);
+          const value = (await pending).replaceAll(STORE_OBJECT, '');
           const rooted = PATH_OUTSIDE_WORKSPACE.exec(value);
           if (rooted) offenders.push(`${name}: runtime input yields ${rooted[0].trim()} — from ${input.runtime}`);
         }
