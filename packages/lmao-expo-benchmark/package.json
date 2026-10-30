@@ -149,7 +149,22 @@
       "export-browser": {
         "//": "Each configuration exports its flavour to its own dist/web/<transform>-<mode>/: outputs interpolate the LMAO_BENCH_TRANSFORM and LMAO_BENCH_MODE its env sets and the command expands the same pair, so what Nx declares is what expo export writes and no two configurations share a directory. A flavour is never implicit (metro.config.cjs refuses a missing pair), so defaultConfiguration names off-steady, and the command's :? refuses an env without the pair before expo export deletes any directory.",
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": false,
+        "cache": true,
+        "inputs": [
+          "default",
+          "pluginScenarioSources",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": true
+          },
+          {
+            "externalDependencies": [
+              "bun-lock:packages/lmao-expo-benchmark"
+            ]
+          },
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md"
+        ],
         "dependsOn": [
           "...",
           "^build",
@@ -207,7 +222,22 @@
       "export-hermes": {
         "//": "The same layout under dist/headless/<transform>-<mode>/: the bytecode bundle, its source map and the assets all go to the one directory the env pair names, and defaultConfiguration is off-steady for the same reason.",
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": false,
+        "cache": true,
+        "inputs": [
+          "default",
+          "pluginScenarioSources",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": true
+          },
+          {
+            "externalDependencies": [
+              "bun-lock:packages/lmao-expo-benchmark"
+            ]
+          },
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md"
+        ],
         "dependsOn": [
           "...",
           "^build"
