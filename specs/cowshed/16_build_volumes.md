@@ -214,23 +214,25 @@ fingerprints the tracked build inputs (Cargo manifests, `.cowshed.toml`, the bui
 while the fingerprint matches the one the volume's state records, only restores a fixed link a tool displaced (a real
 directory where the link belongs is discarded and relinked, never copied, and reported). When it moved, capability
 detection runs again in the canonical job environment (the caller's `CARGO_TARGET_DIR` and the like never name a
-checkout's build state): new paths join the volume, held ones never move. A refresh never treats mbx's managed-target
-link as a displaced fixed link. For a Cargo project that gains the mbx capability, the refresh removes cowshed's own
-fixed `target` link (which names `.cowshed/build/target`), so that mbx's first build places the managed target: mbx
-leaves a `target` that is already a symlink alone (mbx docs, "Eligibility and recovery"). The volume's old `target`
-directory leaves the volume's state and is deleted in the background like a discarded directory (below), so no fork or
-seed carries it again. A checkout with build state and no volume gets its first one (its first touch) at the project's
-`[build] capacity`, and the checkout's seed with it, so it is a target from then on. Main's first volume is minted while
-`cowshed adopt` stages main's image, at the capacity the adopted checkout's `.cowshed.toml` asks, so the two attaches
-wait on `storagekitd` once (01a_apfs.md, "How the APFS host degrades"), unless nothing in the checkout can name build
-state (no tracked Cargo or package manifest, no declared `[build] state`, no enabled Nx detector match), whose first
-touch makes no volume. Main's first touch links it once main is mounted at the checkout, when main links no volume yet
-and asks the capacity it was minted at (the checkout's `.cowshed.toml` may change while main is copied; the first touch
-then mints its own at the capacity asked now). A mint that failed fails only a first touch that needs a volume, with the
-mint's own error, and is not retried. An adoption releases the volume before it completes whenever its first touch does
-not link it (nothing to hold, a refusal, a failure, a volume already linked, another capacity), and an adoption dropped
-before that (a cancelled request) releases it as it is dropped, the mint itself when it was still running. A build-state
-path that holds tracked source refuses before anything is deleted.
+checkout's build state): new paths join the volume, held ones never move. Each discarded directory is reported by
+origin: one at a path the volume did not yet link predates its link (a first touch, a newly detected path, a declared
+path's first appearance), and one at a linked path is reported as displaced, naming the tool likely to have displaced
+it. A refresh never treats mbx's managed-target link as a displaced fixed link. For a Cargo project that gains the mbx
+capability, the refresh removes cowshed's own fixed `target` link (which names `.cowshed/build/target`), so that mbx's
+first build places the managed target: mbx leaves a `target` that is already a symlink alone (mbx docs, "Eligibility and
+recovery"). The volume's old `target` directory leaves the volume's state and is deleted in the background like a
+discarded directory (below), so no fork or seed carries it again. A checkout with build state and no volume gets its
+first one (its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it is a target from
+then on. Main's first volume is minted while `cowshed adopt` stages main's image, at the capacity the adopted checkout's
+`.cowshed.toml` asks, so the two attaches wait on `storagekitd` once (01a_apfs.md, "How the APFS host degrades"), unless
+nothing in the checkout can name build state (no tracked Cargo or package manifest, no declared `[build] state`, no
+enabled Nx detector match), whose first touch makes no volume. Main's first touch links it once main is mounted at the
+checkout, when main links no volume yet and asks the capacity it was minted at (the checkout's `.cowshed.toml` may
+change while main is copied; the first touch then mints its own at the capacity asked now). A mint that failed fails
+only a first touch that needs a volume, with the mint's own error, and is not retried. An adoption releases the volume
+before it completes whenever its first touch does not link it (nothing to hold, a refusal, a failure, a volume already
+linked, another capacity), and an adoption dropped before that (a cancelled request) releases it as it is dropped, the
+mint itself when it was still running. A build-state path that holds tracked source refuses before anything is deleted.
 
 **Owned index links.** `.codegraph/` is build-volume state and follows the same fixed-link contract as other contributed
 paths. At the checkout root, `.codegraph -> .cowshed/build/codegraph`; a nested project's contribution preserves its

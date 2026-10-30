@@ -1032,7 +1032,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                             },
                         )
                     })?;
-                    let (id, displaced) = match touched {
+                    let (id, discarded) = match touched {
                         Ok(touched) => touched,
                         Err(refusal) => return Ok(Err(refusal)),
                     };
@@ -1077,7 +1077,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                             .iter()
                             .map(|path| path.checkout.as_path().to_owned())
                             .collect(),
-                        displaced,
+                        discarded,
                         findings: Vec::new(),
                     }));
                 }
@@ -1095,13 +1095,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 } => held.with_discovered(&paths, &released, mbx, fingerprint, &mount)?,
             };
             release_paths(&checkout, &mount, &released);
-            let displaced = match crate::build_volume::migrate::adopt_paths(
+            let discarded = match crate::build_volume::migrate::adopt_paths(
                 host.census(),
                 &checkout,
                 &mount,
                 &state.paths,
+                &held.paths,
             )? {
-                Ok(displaced) => displaced,
+                Ok(discarded) => discarded,
                 Err(refusal) => return Ok(Err(refusal)),
             };
             if state != held {
@@ -1114,7 +1115,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     .iter()
                     .map(|path| path.checkout.as_path().to_owned())
                     .collect(),
-                displaced,
+                discarded,
                 findings: Vec::new(),
             }))
         })
@@ -5639,15 +5640,21 @@ mod tests {
                 Vec::new()
             };
             assert_eq!(refreshed.added, expected_added);
+            // Held and linked, the index was displaced; newly discovered, it predates its link.
+            let origin = if changed {
+                crate::build_volume::DiscardOrigin::Predated
+            } else {
+                crate::build_volume::DiscardOrigin::Displaced
+            };
             assert_eq!(
                 refreshed
-                    .displaced
+                    .discarded
                     .iter()
-                    .map(|finding| finding.path.clone())
+                    .map(|finding| (finding.path.clone(), finding.origin))
                     .collect::<Vec<_>>(),
                 indexes
                     .iter()
-                    .map(|path| path.checkout.as_path().to_owned())
+                    .map(|path| (path.checkout.as_path().to_owned(), origin))
                     .collect::<Vec<_>>()
             );
             assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
@@ -5731,7 +5738,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(refreshed.volume, Some(live));
-            assert!(refreshed.displaced.is_empty());
+            assert!(refreshed.discarded.is_empty());
             assert!(refreshed.added.is_empty());
             assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
             for (path, (inode, written, bytes_written)) in state.paths.iter().zip(before) {
@@ -5801,7 +5808,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(refreshed.volume, Some(live.clone()));
-        assert!(refreshed.displaced.is_empty());
+        assert!(refreshed.discarded.is_empty());
         assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
         assert_eq!(
             fs::read_link(&at).unwrap(),

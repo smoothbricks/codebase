@@ -2603,7 +2603,9 @@ fn build_state_result(repo: &str, result: Result<BuildStateRefresh>) -> ProjectB
 
 #[tokio::test]
 async fn build_state_migration_reports_each_main_and_rebuild_only_findings() {
-    use cowshed_core::build_volume::{BuildStateTool, BuildVolumeId, DisplacedBuildStateFinding};
+    use cowshed_core::build_volume::{
+        BuildStateTool, BuildVolumeId, DiscardOrigin, DiscardedBuildStateFinding,
+    };
     use cowshed_core::capabilities::{BuildStateFinding, CargoDiscoveryPhase};
     let volume = BuildVolumeId::parse("0123456789abcdef0123456789abcdef").unwrap();
     let mut host = FakeHost {
@@ -2614,9 +2616,10 @@ async fn build_state_migration_reports_each_main_and_rebuild_only_findings() {
                     volume: Some(volume.clone()),
                     created: true,
                     added: vec![PathBuf::from("target"), PathBuf::from(".nx/cache")],
-                    displaced: vec![DisplacedBuildStateFinding {
+                    discarded: vec![DiscardedBuildStateFinding {
                         path: PathBuf::from("target"),
-                        likely_tool: BuildStateTool::Cargo,
+                        tool: BuildStateTool::Cargo,
+                        origin: DiscardOrigin::Predated,
                     }],
                     findings: vec![BuildStateFinding::CargoUnavailable {
                         manifest: PathBuf::from("nested/Cargo.toml"),
@@ -2655,7 +2658,7 @@ async fn build_state_migration_reports_each_main_and_rebuild_only_findings() {
     assert!(
         streams
             .stderr
-            .contains("cargo clean or another Cargo command"),
+            .contains("discarded the real directory target, which predates its link"),
         "{}",
         streams.stderr
     );

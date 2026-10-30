@@ -656,35 +656,67 @@ impl BuildStateTool {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Why a real directory stood where a build-state link belongs, which decides what its discard
+/// reports (16_build_volumes.md, "One link per checkout", Refresh).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DisplacedBuildStateFinding {
-    pub path: PathBuf,
-    pub likely_tool: BuildStateTool,
+pub enum DiscardOrigin {
+    /// The volume never linked the path: the checkout's first touch, a path discovery contributes
+    /// for the first time, or a declared path's first appearance. The directory is the checkout's
+    /// own state from before the link, and nothing displaced it.
+    Predated,
+    /// The volume held the path and its directory, so the link existed: a tool removed it and
+    /// wrote there since, off the volume.
+    Displaced,
 }
 
-impl std::fmt::Display for DisplacedBuildStateFinding {
+/// A real directory a refresh discarded, never copied, where a build-state link belongs, and
+/// linked over.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscardedBuildStateFinding {
+    pub path: PathBuf,
+    /// The tool whose state the path is.
+    pub tool: BuildStateTool,
+    pub origin: DiscardOrigin,
+}
+
+impl std::fmt::Display for DiscardedBuildStateFinding {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let tool = match self.likely_tool {
-            BuildStateTool::Cargo => "cargo clean or another Cargo command",
-            BuildStateTool::Nx => "an Nx reset or cache command",
-            BuildStateTool::JavaScript => "a Node or Bun process writing before its link existed",
+        let path = self.path.display();
+        let rebuild = match self.tool {
+            BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript => {
+                "the next build rebuilds what is missing"
+            }
             BuildStateTool::Declared => {
-                return write!(
-                    formatter,
-                    "discarded the real directory {} that .cowshed.toml [build] state declares \
-                     and linked it onto the build volume; declared state is rebuildable, so \
-                     re-run whatever reconstructs it once, and from then on it lives on the \
-                     volume and every fork inherits it warm",
-                    self.path.display()
-                );
+                ".cowshed.toml [build] state declares it, and declared state is rebuildable, so \
+                 re-run whatever reconstructs it once, and from then on it lives on the volume and \
+                 every fork inherits it warm"
             }
         };
-        write!(
-            formatter,
-            "discarded the real build-state directory {} and restored its volume link; {tool} may have displaced it; the next build rebuilds what is missing",
-            self.path.display()
-        )
+        match self.origin {
+            DiscardOrigin::Predated => write!(
+                formatter,
+                "discarded the real directory {path}, which predates its link, and linked it onto \
+                 the build volume; {rebuild}"
+            ),
+            DiscardOrigin::Displaced => {
+                let tool = match self.tool {
+                    BuildStateTool::Cargo => "cargo clean or another Cargo command",
+                    BuildStateTool::Nx => "an Nx reset or cache command",
+                    BuildStateTool::JavaScript => {
+                        "a cleanup or reinstall that removed its link before a Node or Bun process \
+                         wrote there"
+                    }
+                    BuildStateTool::Declared => "whatever reconstructs the declared state",
+                };
+                write!(
+                    formatter,
+                    "discarded the real build-state directory {path} and restored its volume link; \
+                     {tool} may have displaced it; {rebuild}"
+                )
+            }
+        }
     }
 }
 
@@ -761,8 +793,8 @@ pub(crate) fn tracked_source(
 
 /// What refreshing a checkout's build state did (16_build_volumes.md, "One link per checkout"):
 /// the volume it links afterwards, whether that volume was created now (the checkout's first
-/// touch), the build-state paths linked for the first time, the real directories a tool left
-/// where a link belongs, and what discovery could not decide.
+/// touch), the build-state paths linked for the first time, the real directories it discarded
+/// where a link belongs, each with its origin, and what discovery could not decide.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BuildStateRefresh {
@@ -770,7 +802,7 @@ pub struct BuildStateRefresh {
     pub created: bool,
     /// Checkout-relative.
     pub added: Vec<PathBuf>,
-    pub displaced: Vec<DisplacedBuildStateFinding>,
+    pub discarded: Vec<DiscardedBuildStateFinding>,
     pub findings: Vec<crate::capabilities::BuildStateFinding>,
 }
 
@@ -2930,9 +2962,10 @@ mod tests {
             state.cargo_targets().collect::<Vec<_>>(),
             [Path::new("target")]
         );
-        let finding = DisplacedBuildStateFinding {
+        let finding = DiscardedBuildStateFinding {
             path: PathBuf::from(NODE_COMPILE_CACHE_CHECKOUT),
-            likely_tool: BuildStateTool::JavaScript,
+            tool: BuildStateTool::JavaScript,
+            origin: DiscardOrigin::Displaced,
         };
         assert!(finding.to_string().contains("Node or Bun"), "{finding}");
         assert_eq!(

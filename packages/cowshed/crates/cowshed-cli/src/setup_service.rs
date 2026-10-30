@@ -1159,7 +1159,7 @@ fn emit_build_state<W: Write, E: Write>(
                         ))
                         .map_err(output_error)?;
                 }
-                for finding in &state.displaced {
+                for finding in &state.discarded {
                     output
                         .error(&format!("{}: {finding}", project.repo_id))
                         .map_err(output_error)?;
@@ -1969,7 +1969,7 @@ fn repair_status(
         String::from("host services refreshed")
     } else if readiness.build_state.iter().any(|project| {
         project.result.as_ref().is_ok_and(|state| {
-            state.created || !state.added.is_empty() || !state.displaced.is_empty()
+            state.created || !state.added.is_empty() || !state.discarded.is_empty()
         })
     }) {
         String::from("host storage is set up; build state refreshed")

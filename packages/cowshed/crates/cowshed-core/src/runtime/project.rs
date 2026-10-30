@@ -6992,8 +6992,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 .name_build_volume(build)
                 .await?;
         }
-        for displaced in &refresh.displaced {
-            cowshed_os::eprintln!("cowshed: {name}: {displaced}");
+        for discarded in &refresh.discarded {
+            cowshed_os::eprintln!("cowshed: {name}: {discarded}");
         }
         for finding in &refresh.findings {
             cowshed_os::eprintln!("cowshed: {name}: {finding}");

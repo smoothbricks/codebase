@@ -10,8 +10,9 @@ use std::io;
 use std::path::Path;
 
 use super::{
-    BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeState, DisplacedBuildStateFinding,
-    Registration, TrackedBuildStateRefusal, discard, link, nx, tracked_source,
+    BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeState, DiscardOrigin,
+    DiscardedBuildStateFinding, Registration, TrackedBuildStateRefusal, discard, link, nx,
+    tracked_source,
 };
 use crate::capabilities::BuildStatePath;
 use crate::runtime::storage_host::RuntimeStorageHost;
@@ -64,7 +65,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
     layout: &BuildVolumeLayout,
     migration: FirstTouch<'_>,
 ) -> Result<
-    std::result::Result<(BuildVolumeId, Vec<DisplacedBuildStateFinding>), TrackedBuildStateRefusal>,
+    std::result::Result<(BuildVolumeId, Vec<DiscardedBuildStateFinding>), TrackedBuildStateRefusal>,
 > {
     let FirstTouch {
         checkout,
@@ -117,29 +118,38 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         .map_err(storage_error)?;
     let previous = BuildVolumeState::read(&mount)?;
     let (state, _, _) = previous.with_discovered(paths, &[], mbx, fingerprint, &mount)?;
-    let displaced = adopt_preflighted(host.census(), checkout, &mount, paths, &found)?;
+    let discarded = adopt_preflighted(
+        host.census(),
+        checkout,
+        &mount,
+        paths,
+        &previous.paths,
+        &found,
+    )?;
     state.write(&mount)?;
     // Published only after every source directory has become its fixed link.
     layout.publish(&id, &registration)?;
-    Ok(Ok((id, displaced)))
+    Ok(Ok((id, discarded)))
 }
 
 /// Exact links are unchanged. Contributed real directories are discarded and relinked, never
 /// copied. Files and foreign links refuse before any build-state directory is removed. A
 /// declared path nothing occupies stays absent: tools read a directory's existence as meaning
 /// (a pin worktree is there or it is not), so its link and volume directory appear only once a
-/// tool has made the directory, at the next refresh after.
+/// tool has made the directory, at the next refresh after. `held` is what the volume's state held
+/// before this refresh, which gives each discarded directory its [`DiscardOrigin`].
 pub fn adopt_paths(
     census: &crate::census::CensusScope,
     checkout: &Path,
     volume_root: &Path,
     paths: &[BuildStatePath],
-) -> Result<std::result::Result<Vec<DisplacedBuildStateFinding>, TrackedBuildStateRefusal>> {
+    held: &[BuildStatePath],
+) -> Result<std::result::Result<Vec<DiscardedBuildStateFinding>, TrackedBuildStateRefusal>> {
     let found = preflight(checkout, paths)?;
     if let Some(refusal) = tracked_source(checkout, &found.real)? {
         return Ok(Err(refusal));
     }
-    adopt_preflighted(census, checkout, volume_root, paths, &found).map(Ok)
+    adopt_preflighted(census, checkout, volume_root, paths, held, &found).map(Ok)
 }
 
 fn adopt_preflighted(
@@ -147,8 +157,9 @@ fn adopt_preflighted(
     checkout: &Path,
     volume_root: &Path,
     paths: &[BuildStatePath],
+    held: &[BuildStatePath],
     found: &Found<'_>,
-) -> Result<Vec<DisplacedBuildStateFinding>> {
+) -> Result<Vec<DiscardedBuildStateFinding>> {
     let real = &found.real;
     if real
         .iter()
@@ -186,18 +197,44 @@ fn adopt_preflighted(
     let mut findings = Vec::with_capacity(real.len());
     for state in real {
         let source = state.checkout.as_path();
+        let origin = discard_origin(volume_root, held, state)?;
         discard::move_aside(checkout, source).map_err(|error| {
             io_error("move old build state aside", &checkout.join(source), error)
         })?;
-        findings.push(DisplacedBuildStateFinding {
+        findings.push(DiscardedBuildStateFinding {
             path: source.to_owned(),
-            likely_tool: BuildStateTool::of(state),
+            tool: BuildStateTool::of(state),
+            origin,
         });
     }
     link::link_paths(checkout, volume_root, &found.linked)?;
     // Also whatever an earlier refresh moved aside and did not live to delete.
     discard::reap(checkout);
     Ok(findings)
+}
+
+/// Why `state`'s real directory stood where its link belongs. Displaced only where the volume
+/// held the path and holds its directory: [`link::link_paths`] makes that directory with the
+/// link, and a declared path is held before its first link. Anything else predates its link.
+fn discard_origin(
+    volume_root: &Path,
+    held: &[BuildStatePath],
+    state: &BuildStatePath,
+) -> Result<DiscardOrigin> {
+    if !held.iter().any(|path| path.checkout == state.checkout) {
+        return Ok(DiscardOrigin::Predated);
+    }
+    let directory = volume_root.join(state.volume.as_path());
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => Ok(DiscardOrigin::Displaced),
+        Ok(_) => Ok(DiscardOrigin::Predated),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DiscardOrigin::Predated),
+        Err(error) => Err(io_error(
+            "inspect build-state volume directory",
+            &directory,
+            error,
+        )),
+    }
 }
 
 /// What preflight found at the build-state paths.

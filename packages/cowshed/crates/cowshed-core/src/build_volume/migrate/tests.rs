@@ -139,12 +139,19 @@ fn migration_discards_only_contributed_real_state_and_keeps_one_fixed_link_per_p
         &checkout,
         &scratch.volume(),
         &paths(),
+        &[],
     )
     .unwrap()
     .unwrap();
     assert_eq!(findings.len(), 3);
-    assert_eq!(findings[0].likely_tool, BuildStateTool::Cargo);
-    assert_eq!(findings[1].likely_tool, BuildStateTool::Nx);
+    assert_eq!(findings[0].tool, BuildStateTool::Cargo);
+    assert_eq!(findings[1].tool, BuildStateTool::Nx);
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.origin == DiscardOrigin::Predated),
+        "a volume that held none of the paths linked none of them: {findings:?}"
+    );
     for state in paths() {
         assert_eq!(
             fs::read_link(checkout.join(state.checkout.as_path())).unwrap(),
@@ -172,6 +179,7 @@ fn migration_discards_only_contributed_real_state_and_keeps_one_fixed_link_per_p
             &crate::census::this_test(),
             &checkout,
             &scratch.volume(),
+            &paths(),
             &paths()
         )
         .unwrap()
@@ -185,11 +193,23 @@ fn migration_discards_only_contributed_real_state_and_keeps_one_fixed_link_per_p
         &checkout,
         &scratch.volume(),
         &paths(),
+        &paths(),
     )
     .unwrap()
     .unwrap();
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].path, Path::new("target"));
+    assert_eq!(
+        (findings[0].tool, findings[0].origin),
+        (BuildStateTool::Cargo, DiscardOrigin::Displaced)
+    );
+    assert!(
+        findings[0]
+            .to_string()
+            .contains("cargo clean or another Cargo command may have displaced it"),
+        "{}",
+        findings[0]
+    );
     assert!(!checkout.join("target/displaced").exists());
     assert_eq!(
         fs::read_to_string(checkout.join("target/warm")).unwrap(),
@@ -207,6 +227,7 @@ fn exact_links_need_no_git_query_or_discovery() {
             &crate::census::this_test(),
             &scratch.checkout(),
             &scratch.volume(),
+            &paths(),
             &paths()
         )
         .unwrap()
@@ -231,6 +252,7 @@ fn foreign_entries_refuse_before_removing_any_real_directory() {
                 &crate::census::this_test(),
                 &scratch.checkout(),
                 &scratch.volume(),
+                &paths(),
                 &paths()
             )
             .is_err()
@@ -258,6 +280,7 @@ fn tracked_source_in_any_real_path_refuses_before_deleting_all_the_others() {
         &crate::census::this_test(),
         &checkout,
         &scratch.volume(),
+        &paths(),
         &paths(),
     )
     .unwrap()
@@ -290,6 +313,7 @@ fn overlapping_paths_and_symlinked_parents_refuse_without_deletion() {
             &crate::census::this_test(),
             &scratch.checkout(),
             &scratch.volume(),
+            &overlap,
             &overlap
         )
         .is_err()
@@ -304,6 +328,7 @@ fn overlapping_paths_and_symlinked_parents_refuse_without_deletion() {
             &crate::census::this_test(),
             &scratch.checkout(),
             &scratch.volume(),
+            &paths(),
             &paths()
         )
         .is_err()
@@ -695,6 +720,7 @@ fn a_discard_a_crash_left_pending_is_finished_by_the_next_refresh() {
             &crate::census::this_test(),
             &checkout,
             &scratch.volume(),
+            &target_only(),
             &target_only()
         )
         .unwrap()
@@ -753,6 +779,7 @@ fn a_refresh_returns_while_the_delete_of_what_it_moved_aside_waits() {
         &checkout,
         &scratch.volume(),
         &target_only(),
+        &target_only(),
     )
     .unwrap()
     .unwrap();
@@ -793,14 +820,16 @@ fn a_declared_checkout_is_discarded_and_linked_like_any_build_state() {
         &checkout,
         &scratch.volume(),
         &declared,
+        &declared,
     )
     .unwrap()
     .unwrap();
     assert_eq!(
         displaced,
-        [DisplacedBuildStateFinding {
+        [DiscardedBuildStateFinding {
             path: PathBuf::from("vendor/upstream"),
-            likely_tool: BuildStateTool::Declared,
+            tool: BuildStateTool::Declared,
+            origin: DiscardOrigin::Predated,
         }]
     );
     assert!(
@@ -836,6 +865,7 @@ fn a_declared_checkout_is_discarded_and_linked_like_any_build_state() {
             &crate::census::this_test(),
             &checkout,
             &scratch.volume(),
+            &declared,
             &declared
         )
         .unwrap()
@@ -867,6 +897,7 @@ fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
                 &crate::census::this_test(),
                 &checkout,
                 &scratch.volume(),
+                &paths,
                 &paths
             )
             .unwrap()
@@ -891,14 +922,92 @@ fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
         &checkout,
         &scratch.volume(),
         &paths,
+        &paths,
     )
     .unwrap()
     .unwrap();
     assert_eq!(displaced.len(), 1);
-    assert_eq!(displaced[0].likely_tool, BuildStateTool::Declared);
+    assert_eq!(
+        (displaced[0].tool, displaced[0].origin),
+        (BuildStateTool::Declared, DiscardOrigin::Predated),
+        "a declared path is held before its first link"
+    );
     assert_eq!(
         fs::read_link(checkout.join("vendor/upstream")).unwrap(),
         Path::new("../.cowshed/build/declared/vendor/upstream")
     );
     assert!(scratch.volume().join("declared/vendor/upstream").is_dir());
+}
+
+/// The module compile cache a checkout kept before discovery contributed it (its first touch, or
+/// the refresh after an upgrade that newly detects it) is a real directory where the new link
+/// belongs. It predates the link, so its discard says so and names no displacement: nothing
+/// removed a link that never existed. Once the volume holds the path and its directory, a real
+/// directory there again did displace the link, and says which tool's state it is.
+#[test]
+fn a_compile_cache_kept_before_its_link_existed_is_reported_as_predating_it() {
+    use crate::workspace_environment::{NODE_COMPILE_CACHE_CHECKOUT, NODE_COMPILE_CACHE_DIRECTORY};
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    write(
+        &checkout,
+        &format!("{NODE_COMPILE_CACHE_CHECKOUT}/v22/module"),
+        "compiled before the link",
+    );
+    link::point(&checkout, &scratch.volume()).unwrap();
+    let compile_cache =
+        [BuildStatePath::new(NODE_COMPILE_CACHE_CHECKOUT, NODE_COMPILE_CACHE_DIRECTORY).unwrap()];
+    let discarded = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &compile_cache,
+        &[],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        discarded,
+        [DiscardedBuildStateFinding {
+            path: PathBuf::from(NODE_COMPILE_CACHE_CHECKOUT),
+            tool: BuildStateTool::JavaScript,
+            origin: DiscardOrigin::Predated,
+        }]
+    );
+    let report = discarded[0].to_string();
+    assert!(!report.contains("displaced"), "{report}");
+    assert!(report.contains("predates its link"), "{report}");
+
+    fs::remove_file(checkout.join(NODE_COMPILE_CACHE_CHECKOUT)).unwrap();
+    write(
+        &checkout,
+        &format!("{NODE_COMPILE_CACHE_CHECKOUT}/v22/module"),
+        "written after a cleanup removed the link",
+    );
+    let displaced = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &compile_cache,
+        &compile_cache,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        displaced,
+        [DiscardedBuildStateFinding {
+            path: PathBuf::from(NODE_COMPILE_CACHE_CHECKOUT),
+            tool: BuildStateTool::JavaScript,
+            origin: DiscardOrigin::Displaced,
+        }]
+    );
+    assert!(
+        displaced[0]
+            .to_string()
+            .contains("before a Node or Bun process wrote there may have displaced it"),
+        "{}",
+        displaced[0]
+    );
+    discards_drain(&checkout);
 }
