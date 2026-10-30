@@ -742,7 +742,16 @@
       "lineage-js": {
         "executor": "nx:run-commands",
         "cache": true,
-        "//": "The process-lineage entry (specs/cowshed/07_api.md section Process lineage) compiled on its own into dist/lineage, apart from tsc-js's dist/ts: its closure is src/process-lineage.ts, src/addon.ts and src/platform.ts, with no generated or typia module, so it depends on no other target and nx-plugin compiles against it without cowshed's whole build. A cache miss forces this small program to emit so existing build-info cannot hide a missing public output.",
+
+        "dependsOn": [
+          {
+            "projects": [
+              "build-inputs"
+            ],
+            "target": "build"
+          }
+        ],
+        "//": "The process-lineage entry (specs/cowshed/07_api.md section Process lineage) compiled on its own into dist/lineage, apart from tsc-js's dist/ts: its closure is src/process-lineage.ts, src/addon.ts and src/platform.ts, with no generated or typia module, so it depends on no cowshed target and nx-plugin compiles against it without cowshed's whole build. It writes dist/lineage/.build-inputs.json through build-inputs' smoo-nx-build-inputs, its one dependency, naming the files it compiles, so a consumer that links cowshed judges dist/lineage by content (specs/cli/01_workspace_reconciliation.md). A cache miss forces this small program to emit so existing build-info cannot hide a missing public output.",
         "inputs": [
           "{projectRoot}/src/process-lineage.ts",
           "{projectRoot}/src/addon.ts",
@@ -754,13 +763,17 @@
               "@types/node",
               "typescript"
             ]
+          },
+          {
+            "dependentTasksOutputFiles": "**/*.js",
+            "transitive": false
           }
         ],
         "outputs": [
           "{projectRoot}/dist/lineage"
         ],
         "options": {
-          "command": "tsc --build tsconfig.lineage.json --force",
+          "command": "tsc --build tsconfig.lineage.json --force && node ../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js --input src/process-lineage.ts --input src/addon.ts --input src/platform.ts --input tsconfig.lineage.json --input ../../tsconfig.base.json --output dist/lineage",
           "cwd": "{projectRoot}"
         }
       },
