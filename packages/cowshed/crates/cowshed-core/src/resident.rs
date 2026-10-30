@@ -101,7 +101,7 @@ pub enum Decline {
     /// check names (11_shell.md, "Draining a supervisor of another build").
     Draining,
     /// The supervisor did not judge the build state.
-    BuildStateUnanswered,
+    AsIsUnanswered,
     /// The gateway does not hold the workspace's session at the revision its supervisor serves:
     /// the controller's pre-exec reconcile installs it.
     GatewaySession,
@@ -128,7 +128,7 @@ impl Decline {
             Self::BuildInputsUnreadable => "the build inputs cannot be fingerprinted",
             Self::BuildLinkDisplaced => "a build-state link is displaced or missing",
             Self::Draining => "the supervisor drains for a daemon of another build",
-            Self::BuildStateUnanswered => "the supervisor did not judge the build state",
+            Self::AsIsUnanswered => "the supervisor did not judge the workspace as it is",
             Self::GatewaySession => "the gateway session is not current",
             Self::GatewayUnanswered => "the gateway did not answer for the workspace's session",
         }
@@ -263,7 +263,7 @@ impl Resident {
         match self.supervisor.as_is(self.build_volume.clone()).await {
             Ok(None) => Ok(()),
             Ok(Some(decline)) => Err(decline.into()),
-            Err(_) => Err(Decline::BuildStateUnanswered),
+            Err(_) => Err(Decline::AsIsUnanswered),
         }
     }
 }
@@ -371,8 +371,8 @@ impl JobLink {
     /// Prove the lane still reaches a supervisor serving its job's incarnation, with one `hello`,
     /// and take a grant advance it served since; an error when nothing serves that incarnation
     /// any more (the supervisor retired, or another incarnation stands there).
-    pub async fn current(&mut self) -> crate::Result<()> {
-        let hello = HostProbe.hello(&self.socket).await?;
+    pub async fn current(&mut self, probe: &impl LiveProbe) -> crate::Result<()> {
+        let hello = probe.hello(&self.socket).await?;
         let lane = self.handle.snapshot();
         if hello.authority.repo_id != lane.repo_id
             || hello.authority.workspace != lane.workspace
@@ -1028,6 +1028,40 @@ mod tests {
         .await
         .expect("resident");
         assert_eq!(resident.authority(), &ahead);
+    }
+
+    /// A lane proves its supervisor before each job call: one serving the job's incarnation at a
+    /// newer grant revision is followed in place; one serving another incarnation, or none, ends
+    /// the lane, and the controller path answers the call instead.
+    #[tokio::test]
+    async fn a_lane_follows_its_supervisor_and_ends_when_none_serves_its_incarnation() {
+        let store = Store::new();
+        let resident = resolve(
+            &store.store,
+            &store.checkout,
+            &raven(),
+            &probe(&store, store.current()),
+        )
+        .await
+        .expect("resident");
+        let mut link = JobLink::new(&resident);
+        let mut ahead = store.current();
+        ahead.grant_revision += 1;
+        link.current(&probe(&store, ahead.clone()))
+            .await
+            .expect("the job's incarnation, served at a newer grant revision");
+        assert_eq!(link.handle().snapshot(), &ahead, "the advance is followed");
+        let mut other = store.current();
+        other.workspace_incarnation = incarnation(9);
+        assert!(
+            link.current(&probe(&store, other)).await.is_err(),
+            "another incarnation"
+        );
+        let unserved = Probe {
+            socket: PathBuf::from("/nowhere"),
+            ..probe(&store, store.current())
+        };
+        assert!(link.current(&unserved).await.is_err(), "no supervisor");
     }
 
     /// Unfinished lifecycle work on the named workspace or on main is the controller's to

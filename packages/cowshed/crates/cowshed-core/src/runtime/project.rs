@@ -9915,9 +9915,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         incarnation: &WorkspaceIncarnation,
     ) -> Option<crate::resident::JobLink> {
         let mut link = self.residents.get(workspace)?.clone();
-        if link.handle().snapshot().workspace_incarnation != *incarnation
-            || link.current().await.is_err()
-        {
+        // A call for another incarnation's job leaves this incarnation's lane in place.
+        if link.handle().snapshot().workspace_incarnation != *incarnation {
+            return None;
+        }
+        if link.current(&crate::resident::HostProbe).await.is_err() {
             self.residents.remove(workspace);
             return None;
         }

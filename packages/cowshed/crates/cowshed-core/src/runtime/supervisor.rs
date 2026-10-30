@@ -4583,7 +4583,19 @@ impl WorkspaceSupervisor {
                     "inspect the supervisor's thread resources and retained group ledger",
                 )
             })?;
+        let lifecycle_journal = crate::storage::StorageLayout::new(
+            &policy.ceiling().store_root,
+            &config.authority.repo_id,
+        )
+        .ok()
+        .map(|layout| {
+            layout
+                .project()
+                .project_root
+                .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE)
+        });
         let mut actor = SupervisorActor {
+            lifecycle_journal,
             authority: config.authority,
             workspace_root: config.workspace_root,
             default_cwd: config.default_cwd,
@@ -5626,6 +5638,9 @@ struct SupervisorActor {
     pressure: crate::host_pressure::Feed,
     /// Turns begun so far: a job's admission and spawn in one turn read the checkout once.
     turns: u64,
+    /// The project's lifecycle-intent journal, which `asIs` judges (`None`: its store's layout
+    /// could not be read, and every `asIs` answers `records`).
+    lifecycle_journal: Option<PathBuf>,
 }
 
 /// Runtime teardown transfers the same jobs to one retirement worker. The actor joins for a
@@ -6447,17 +6462,12 @@ impl SupervisorActor {
                 Ok(()) => {
                     // The journal and the fingerprint read the store and the checkout, and the
                     // fingerprint may run its Git: on the blocking pool, and no turn waits for it.
-                    let store_root = self.policy.ceiling().store_root.clone();
+                    let journal = self.lifecycle_journal.clone();
                     let root = self.workspace_root.clone();
                     tokio::spawn(async move {
                         let judged = off_actor::run(move || {
                             use crate::resident::AsIsDecline;
-                            let journal =
-                                crate::storage::StorageLayout::new(&store_root, &authority.repo_id)
-                                    .map_err(|_| AsIsDecline::Records)?
-                                    .project()
-                                    .project_root
-                                    .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE);
+                            let journal = journal.ok_or(AsIsDecline::Records)?;
                             crate::resident::lifecycle_settled(&journal, &authority.workspace)?;
                             crate::resident::build_state_current(&root, build_volume.as_deref())
                         })
@@ -11812,6 +11822,90 @@ import("./compile-cache-lib.mjs").then((lib) => {
 mod lifecycle_commitment_tests {
     use super::*;
 
+    /// A resident exec's lifecycle journal is judged by its supervisor (`asIs`, 06_cli.md,
+    /// "Resident workspaces"): unfinished work on its own workspace or on main declines before
+    /// the build state is read, and a journal with none goes on to the build state, which a
+    /// checkout without a build volume does not have.
+    #[tokio::test]
+    async fn as_is_declines_unfinished_lifecycle_work_before_the_build_state() {
+        let root = std::env::temp_dir().join(format!("cowshed-as-is-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let store = root.join("store");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(workspace_root.join(".cowshed")).unwrap();
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let incarnation = WorkspaceIncarnation::new("6198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let mut publisher = CommitmentPublisher::open(
+            root.join("telemetry"),
+            crate::storage::audit::ContinuityAudit::Arrow,
+            8,
+        )
+        .unwrap();
+        publisher
+            .record(CommitmentDraft::WorkspaceIntroduced {
+                repo_id: repo_id.clone(),
+                workspace_incarnation: incarnation.clone(),
+            })
+            .await
+            .unwrap();
+        let raven = WorkspaceName::new("raven").unwrap();
+        let defaults = WorkspaceSupervisorConfig::default();
+        let config = WorkspaceSupervisorConfig {
+            authority: WorkspaceAuthoritySnapshot {
+                repo_id: repo_id.clone(),
+                workspace: raven.clone(),
+                workspace_incarnation: incarnation,
+                grant_revision: 1,
+                lifecycle_revision: 1,
+            },
+            owned_repo_ids: OwnedRepoIds::sole(repo_id.clone()),
+            workspace_root: workspace_root.clone(),
+            sandbox: SandboxConfig {
+                workspace_mount: workspace_root,
+                exec_temp_dir: root.join("tmp"),
+                store_root: store.clone(),
+                ..defaults.sandbox.clone()
+            },
+            ..defaults
+        };
+        let supervisor = WorkspaceSupervisor::start(config, publisher.clone()).unwrap();
+        let journal = crate::storage::StorageLayout::new(&store, &repo_id)
+            .unwrap()
+            .project()
+            .project_root
+            .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE);
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        assert_eq!(
+            supervisor.as_is(None).await.unwrap(),
+            Some(crate::resident::AsIsDecline::Unrecorded),
+            "no unfinished work: the build state is judged, and none is recorded"
+        );
+        for target in [raven, WorkspaceName::main()] {
+            crate::storage::recovery::LifecycleIntentJournal::update(
+                &crate::census::this_test(),
+                &journal,
+                |journal| {
+                    journal.begin(crate::storage::recovery::LifecycleIntent::Create {
+                        workspace: target.clone(),
+                        options: Default::default(),
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                supervisor.as_is(None).await.unwrap(),
+                Some(crate::resident::AsIsDecline::UnfinishedWork),
+                "unfinished work on {target}"
+            );
+            std::fs::remove_file(&journal).unwrap();
+        }
+        drop(supervisor);
+        drop(publisher);
+        tokio::task::yield_now().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[tokio::test]
     async fn publisher_records_every_act_and_reports_sink_health() {
         let root = std::env::temp_dir().join(format!(

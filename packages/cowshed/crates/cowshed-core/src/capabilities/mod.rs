@@ -21,7 +21,8 @@ pub use build_state_discovery::{
     tracked_manifest_fingerprint,
 };
 pub(crate) use build_state_discovery::{
-    installed_javascript_trees, kept_listing_inputs, tracked_package_directories,
+    installed_javascript_trees, kept_listing_inputs, local_config_inputs,
+    tracked_package_directories,
 };
 pub mod bun;
 pub mod cache;

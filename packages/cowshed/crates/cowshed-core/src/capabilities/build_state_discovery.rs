@@ -1360,11 +1360,11 @@ fn ls_files(
     }
 }
 
-/// What a listing at `workspace` reads, when that is the checkout's own `.git/index` and
-/// `.git/config` alone: `.git` is a directory, and no variable of this process points Git at
-/// another repository, index or tree. A linked worktree's `.git` file, or a redirected Git, is
-/// listed afresh every time.
-pub(crate) fn kept_listing_inputs(workspace: &Path) -> Option<[PathBuf; 2]> {
+/// What a listing at `workspace` reads, when that is the checkout's own `.git/index` and its
+/// own configuration ([`local_config_inputs`]): the index first. `.git` is a directory, and no
+/// variable of this process points Git at another repository, index or tree. A linked worktree's
+/// `.git` file, or a redirected Git, is listed afresh every time.
+pub(crate) fn kept_listing_inputs(workspace: &Path) -> Option<Vec<PathBuf>> {
     const REDIRECTS: [&str; 4] = [
         "GIT_DIR",
         "GIT_INDEX_FILE",
@@ -1378,10 +1378,89 @@ pub(crate) fn kept_listing_inputs(workspace: &Path) -> Option<[PathBuf; 2]> {
         return None;
     }
     let git = workspace.join(".git");
-    fs::symlink_metadata(&git)
-        .ok()?
-        .is_dir()
-        .then(|| [git.join("index"), git.join("config")])
+    if !fs::symlink_metadata(&git).ok()?.is_dir() {
+        return None;
+    }
+    let mut inputs = vec![git.join("index")];
+    inputs.extend(local_config_inputs(&git)?);
+    Some(inputs)
+}
+
+/// The files Git's configuration lookup reads from the repository whose own directory is `git`,
+/// when that is its `config` and the files it includes unconditionally, then the `commondir`
+/// pointer whose creation would move the lookup elsewhere (11_shell.md, "Kept readings"). A
+/// missing included file is an input too: Git skips it, and its creation moves it. `None`, read
+/// again every time, when a `commondir` puts the repository's configuration and objects
+/// elsewhere, `extensions.worktreeConfig` adds a per-worktree file, an `includeIf` makes the
+/// lookup depend on the checkout's state, an included file includes further or cannot be read,
+/// or an include names a path through a home directory.
+pub(crate) fn local_config_inputs(git: &Path) -> Option<Vec<PathBuf>> {
+    let commondir = git.join("commondir");
+    if commondir.symlink_metadata().is_ok() {
+        return None;
+    }
+    let config = git.join("config");
+    let includes = config_includes(&fs::read(&config).ok()?)?;
+    let mut inputs = vec![config];
+    for include in includes {
+        if include.starts_with('~') {
+            return None;
+        }
+        // Relative to the directory of the file that includes it; an absolute path stands.
+        let included = git.join(include);
+        match fs::read(&included) {
+            Ok(bytes) if config_includes(&bytes)?.is_empty() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return None,
+        }
+        inputs.push(included);
+    }
+    inputs.push(commondir);
+    Some(inputs)
+}
+
+/// The `path` of every `[include]` section of the Git configuration `text`, as written. `None`
+/// when this does not read the text as Git does: not UTF-8, a continued line, a variable on a
+/// section's header line, a quoted or escaped include path, an `includeIf`, or
+/// `extensions.worktreeConfig`.
+fn config_includes(text: &[u8]) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(text).ok()?;
+    let mut section = String::new();
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.ends_with('\\') {
+            return None;
+        }
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            let (name, rest) = header.split_once(']')?;
+            let rest = rest.trim();
+            if !(rest.is_empty() || rest.starts_with(['#', ';'])) {
+                return None;
+            }
+            section = name.trim().to_ascii_lowercase();
+            if section.starts_with("includeif") {
+                return None;
+            }
+            continue;
+        }
+        let (key, value) = line.split_once('=').unwrap_or((line, ""));
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.split(['#', ';']).next().unwrap_or("").trim();
+        if section == "extensions" && key == "worktreeconfig" {
+            return None;
+        }
+        if section == "include" && key == "path" {
+            if value.is_empty() || value.contains(['"', '\\']) {
+                return None;
+            }
+            paths.push(value.to_owned());
+        }
+    }
+    Some(paths)
 }
 
 /// The directory of every tracked package manifest of the checkout at `workspace` outside any

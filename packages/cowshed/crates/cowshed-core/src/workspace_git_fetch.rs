@@ -355,10 +355,13 @@ async fn collect_probe_output(
 /// The object store of the checkout at `root`, when every directory its Git reaches is granted
 /// to the sandbox. Every spawn of a workspace that holds read or write grants asks it of every
 /// project's checkout (04_sandbox.md, "Exec pipeline" step 4), so its probes are a kept reading
-/// (11_shell.md, "Kept readings"): with a `.git` directory, no alternates and no included config,
-/// they read the checkout's `.git/config`, `.git/commondir` and alternates file and nothing that
-/// can change while this process runs. Measured 2026-10-30: in a workspace whose grants name two
-/// other projects' checkouts, every warm exec paid two sandboxed `git rev-parse` processes.
+/// (11_shell.md, "Kept readings"): with a `.git` directory of its own and no alternates, they
+/// read the checkout's configuration ([`crate::capabilities::local_config_inputs`]), object
+/// directory and alternates file and nothing that can change while this process runs. Git work in
+/// that checkout (an `index.lock`, a new object directory) moves `.git` or `.git/objects`, so an
+/// actively used checkout is probed again for a few seconds after it; an idle sibling is kept.
+/// Measured 2026-10-30: in a workspace whose grants name two other projects' checkouts, every
+/// warm exec paid two sandboxed `git rev-parse` processes.
 async fn repository_object_store(root: &Path, sandbox: &SandboxConfig) -> Result<Option<PathBuf>> {
     type Key = (PathBuf, Vec<PathBuf>, Vec<PathBuf>, Option<PathBuf>);
     static KEPT: std::sync::LazyLock<crate::input_memo::InputMemo<Key, Option<PathBuf>>> =
@@ -387,10 +390,11 @@ async fn repository_object_store(root: &Path, sandbox: &SandboxConfig) -> Result
 }
 
 /// What [`probed_object_store`] reads of the checkout at `root` beyond the grants, when that is
-/// its own `.git` directory's config, worktree pointer, object directory and alternates alone:
-/// `None` for a `.git` file (a linked worktree), an alternates file (whose stores may name more),
-/// or a config that includes another file, each probed every time.
-fn probed_inputs(root: &Path) -> Option<[PathBuf; 4]> {
+/// its own `.git` directory's configuration ([`crate::capabilities::local_config_inputs`]),
+/// object directory and alternates file alone: `None` for a `.git` file (a linked worktree), an
+/// alternates file (whose stores may name more), or a configuration not kept, each probed every
+/// time.
+fn probed_inputs(root: &Path) -> Option<Vec<PathBuf>> {
     let git = root.join(".git");
     if !std::fs::symlink_metadata(&git).ok()?.is_dir() {
         return None;
@@ -399,19 +403,9 @@ fn probed_inputs(root: &Path) -> Option<[PathBuf; 4]> {
     if alternates.symlink_metadata().is_ok() {
         return None;
     }
-    let config = git.join("config");
-    let included = std::fs::read(&config)
-        .ok()?
-        .windows(b"[include".len())
-        .any(|window| window.eq_ignore_ascii_case(b"[include"));
-    (!included).then(|| {
-        [
-            config,
-            git.join("commondir"),
-            git.join("objects"),
-            alternates,
-        ]
-    })
+    let mut inputs = crate::capabilities::local_config_inputs(&git)?;
+    inputs.extend([git.join("objects"), alternates]);
+    Some(inputs)
 }
 
 /// [`repository_object_store`] asked of Git: its own paths, each granted, and every alternate
@@ -1065,8 +1059,10 @@ mod tests {
     }
 
     /// A checkout's object-store probes are kept only while what they read is its own `.git`
-    /// directory's config, worktree pointer and alternates file: a linked worktree's `.git`
-    /// file, an alternates file, or a config that includes another file is probed every time.
+    /// directory's configuration, the files it includes unconditionally among its inputs, and
+    /// its object directory and alternates file: a linked worktree's `.git` file, a `commondir`,
+    /// a per-worktree configuration, a conditional or nested include, or an alternates file is
+    /// probed every time.
     #[test]
     fn only_a_plain_git_directory_keeps_its_probe() {
         let root = std::env::temp_dir().join(format!(
@@ -1078,16 +1074,61 @@ mod tests {
         std::fs::write(git.join("config"), "[core]\n\tbare = false\n").unwrap();
         assert_eq!(
             probed_inputs(&root),
-            Some([
+            Some(vec![
                 git.join("config"),
                 git.join("commondir"),
                 git.join("objects"),
                 git.join("objects/info/alternates")
             ])
         );
-        std::fs::write(git.join("config"), "[core]\n[Include]\n\tpath = other\n").unwrap();
-        assert_eq!(probed_inputs(&root), None, "an included config");
+        std::fs::write(
+            git.join("config"),
+            "[core]\n[Include]\n\tpath = ../tooling/shared.gitconfig ; shared\n",
+        )
+        .unwrap();
+        assert_eq!(
+            probed_inputs(&root),
+            Some(vec![
+                git.join("config"),
+                git.join("../tooling/shared.gitconfig"),
+                git.join("commondir"),
+                git.join("objects"),
+                git.join("objects/info/alternates")
+            ]),
+            "an included file, absent, is an input"
+        );
+        std::fs::create_dir_all(root.join("tooling")).unwrap();
+        std::fs::write(
+            root.join("tooling/shared.gitconfig"),
+            "[include]\n\tpath = more\n",
+        )
+        .unwrap();
+        assert_eq!(probed_inputs(&root), None, "a nested include");
+        for (config, case) in [
+            (
+                "[includeIf \"gitdir:/x/\"]\n\tpath = other\n",
+                "a conditional include",
+            ),
+            (
+                "[extensions]\n\tworktreeConfig = true\n",
+                "a per-worktree configuration",
+            ),
+            (
+                "[include]\n\tpath = ~/shared\n",
+                "an include through a home directory",
+            ),
+            (
+                "[include] path = other\n",
+                "a variable on its section's header line",
+            ),
+        ] {
+            std::fs::write(git.join("config"), config).unwrap();
+            assert_eq!(probed_inputs(&root), None, "{case}");
+        }
         std::fs::write(git.join("config"), "[core]\n").unwrap();
+        std::fs::write(git.join("commondir"), "../shared\n").unwrap();
+        assert_eq!(probed_inputs(&root), None, "a commondir");
+        std::fs::remove_file(git.join("commondir")).unwrap();
         std::fs::write(git.join("objects/info/alternates"), "/elsewhere/objects\n").unwrap();
         assert_eq!(probed_inputs(&root), None, "alternates");
         std::fs::remove_dir_all(&git).unwrap();

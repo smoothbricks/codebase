@@ -5,8 +5,9 @@
 //! "Detection inputs"), and their answer moves only when a file the reading depends on moves. An
 //! [`InputMemo`] keeps the last answer beside the identity ([`FileState`]: inode, size, mtime,
 //! ctime) each of those files had, and answers from it while every one of them still has that
-//! identity. An absent input is watched through the directory that would hold it, whose entries
-//! change when it is created, even when it is removed again before the next ask. A file whose last
+//! identity. An absent input is watched through the nearest directory above it that exists,
+//! whose entries change when the input or a directory on its way is created, even when it is
+//! removed again before the next ask. A file whose last
 //! change is not yet [`SETTLED`] behind the clock when the reading starts could be rewritten
 //! again within its timestamp's tick without moving its identity (a coarse Linux tick, an HFS+
 //! second), so an answer that read it is used once and not kept. Bytes are never compared: the
@@ -183,20 +184,30 @@ struct Asked {
 /// The paths that decide an answer read from `inputs`, and the identity of each now.
 fn observe(inputs: &[PathBuf]) -> (Vec<PathBuf>, Vec<FileState>) {
     let states: Vec<FileState> = inputs.iter().map(|path| FileState::of(path)).collect();
-    let watched = watched(inputs, &states);
+    let watched = watched(inputs, &states, FileState::of);
     let identities = watched.iter().map(|path| FileState::of(path)).collect();
     (watched, identities)
 }
 
 /// The paths whose identities decide an answer read from `inputs`, which had `identities`: every
-/// input, and the directory of each absent one, whose entries change when it is created even if
-/// it is removed again before the next ask.
-fn watched(inputs: &[PathBuf], identities: &[FileState]) -> Vec<PathBuf> {
+/// input, and for each absent one the nearest directory above it that exists by `state`, whose
+/// entries change when the input or a directory on its way is created, even if it is removed
+/// again before the next ask.
+fn watched(
+    inputs: &[PathBuf],
+    identities: &[FileState],
+    state: impl Fn(&std::path::Path) -> FileState,
+) -> Vec<PathBuf> {
     let absent = inputs
         .iter()
         .zip(identities)
         .filter(|(_, identity)| matches!(identity, FileState::Missing))
-        .filter_map(|(path, _)| path.parent().map(PathBuf::from));
+        .filter_map(|(path, _)| {
+            path.ancestors()
+                .skip(1)
+                .find(|directory| !matches!(state(directory), FileState::Missing))
+                .map(PathBuf::from)
+        });
     inputs.iter().cloned().chain(absent).collect()
 }
 
@@ -376,6 +387,36 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// An absent input whose directory is absent too is watched through the nearest directory
+    /// that exists: creating the directory and the input in it, and removing both again, moves
+    /// that one.
+    #[test]
+    fn an_absent_input_under_an_absent_directory_is_watched_through_the_nearest_existing_one() {
+        let root = scratch("absent-nested");
+        let input = root.join("missing/absent");
+        assert_eq!(
+            observe(std::slice::from_ref(&input)).0,
+            vec![input.clone(), root.clone()]
+        );
+        settle(&root);
+        let memo = InputMemo::<&str, u32>::new();
+        assert_eq!(
+            memo.read(&"k", std::slice::from_ref(&input), || Ok::<_, &str>(1)),
+            Ok(1)
+        );
+        assert_eq!(
+            memo.read(&"k", std::slice::from_ref(&input), || Ok::<_, &str>(2)),
+            Ok(1)
+        );
+        std::fs::create_dir(root.join("missing")).unwrap();
+        std::fs::write(&input, b"briefly").unwrap();
+        std::fs::remove_dir_all(root.join("missing")).unwrap();
+        assert_eq!(
+            memo.read(&"k", std::slice::from_ref(&input), || Ok::<_, &str>(3)),
+            Ok(3)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     /// One step of a model checkout whose files stamp their changes at a coarse clock, a
     /// Linux tick or an HFS+ second, behind this process's clock by up to one tick.
     #[derive(Clone, Debug)]
@@ -391,13 +432,15 @@ mod tests {
         Remove { file: usize },
         /// Let `ns` pass.
         Advance { ns: i128 },
-        /// Ask, taking `reading_ns` to read, while `during` changes halfway through. A recorded
-        /// ask takes its identities after the reading ([`InputMemo::read_recorded`]), any other
+        /// Ask, taking `reading_ns` to read, while `during` changes halfway through: the reading
+        /// sees the checkout after that change when `seen_after`, else before it. A recorded ask
+        /// takes its identities after the reading ([`InputMemo::read_recorded`]), any other
         /// before it ([`InputMemo::read`]).
         Ask {
             during: Option<Change>,
             reading_ns: i128,
             recorded: bool,
+            seen_after: bool,
         },
     }
 
@@ -478,7 +521,7 @@ mod tests {
 
         fn observe(&self, inputs: &[PathBuf]) -> (Vec<PathBuf>, Vec<FileState>) {
             let states: Vec<FileState> = inputs.iter().map(|path| self.state(path)).collect();
-            let watched = watched(inputs, &states);
+            let watched = watched(inputs, &states, |path| self.state(path));
             let identities = watched.iter().map(|path| self.state(path)).collect();
             (watched, identities)
         }
@@ -523,13 +566,15 @@ mod tests {
                 .prop_map(|ns| Step::Advance { ns }),
             (
                 proptest::option::of(change(files)),
-                0_i128..3_000_000_000,
+                prop_oneof![0_i128..3_000_000_000, 0_i128..10_000_000_000],
+                any::<bool>(),
                 any::<bool>()
             )
-                .prop_map(|(during, reading_ns, recorded)| Step::Ask {
+                .prop_map(|(during, reading_ns, recorded, seen_after)| Step::Ask {
                     during,
                     reading_ns,
-                    recorded
+                    recorded,
+                    seen_after
                 }),
         ]
     }
@@ -574,7 +619,7 @@ mod tests {
                     }
                     Step::Remove { file } => checkout.remove(file % files),
                     Step::Advance { ns } => checkout.now += ns,
-                    Step::Ask { during, reading_ns, recorded } => {
+                    Step::Ask { during, reading_ns, recorded, seen_after } => {
                         if let Some((watched_then, identities_then, value)) = &kept {
                             let (watched, identities) = checkout.observe(inputs.as_slice());
                             if stands(watched_then, identities_then, &watched, &identities) {
@@ -585,9 +630,10 @@ mod tests {
                         let before = checkout.observe(inputs.as_slice());
                         let started = checkout.now;
                         checkout.now += reading_ns / 2;
-                        // The reading sees the checkout halfway through, a flicker's short-lived
-                        // file included.
-                        let value = match during {
+                        // The reading sees the checkout halfway through, before or after the
+                        // change that lands then, a flicker's short-lived file included.
+                        let unchanged = checkout.contents();
+                        let changed = match during {
                             Some(Change::Write { file, content, renamed }) => {
                                 checkout.write(file % files, content, renamed);
                                 checkout.contents()
@@ -606,6 +652,7 @@ mod tests {
                             }
                             Some(Change::Flicker { .. }) | None => checkout.contents(),
                         };
+                        let value = if seen_after { changed } else { unchanged };
                         checkout.now += reading_ns - reading_ns / 2;
                         let (watched, identities) = if recorded {
                             checkout.observe(inputs.as_slice())

@@ -342,19 +342,26 @@ settings (`mbx settings get`, 15_capabilities.md, "mbx detection"), the build-st
 admitted on (06_cli.md, "Resident workspaces"), the developer-link snapshot (15_capabilities.md, "Bootstrap
 executables"), and, for a workspace with read or write grants, the object store of each project checkout those grants
 reach (`git rev-parse` in the discovery profile, 04_sandbox.md, "Exec pipeline" step 4; kept only for a `.git` directory
-with no alternates and no included config, whose config, worktree pointer and object directory are its inputs). The
-process that asks keeps each answer beside the identity — inode, size, mtime and ctime, as above — that every file the
-reading depended on had, and answers from it while each still has that identity; any other identity reads again. Bytes
-are never compared: the reading stays the authority, and identities only ask whether to run it. An answer is kept only
-when every file it read was last changed at least three seconds before the reading started, past any timestamp's tick,
-so a change made while it ran, or a second one inside the tick of the first, moves an identity. A Git listing reads the
-checkout's own `.git/index` and `.git/config` and nothing else; a linked worktree's listing, or a Git this process's
-`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` or `GIT_COMMON_DIR` redirects, is listed every time. mbx resolves
-`settings get` from its environment, which the reading clears to `HOME`, and its global settings file, so the executable
-and that file are its inputs. A developer-link capture names its own inputs as it reads: every directory it lists, every
-tracked package's directory, the build link, and every directory a link's resolution passes through. The decisions are
-pure functions of identities and the time they were read, and a model of coarse filesystem clocks (a Linux tick, an HFS+
-second, stamps behind the clock by up to a tick, writes in place and by rename, between asks and during a reading)
+of its own with no alternates, whose configuration, object directory and alternates file are its inputs), and the
+project's lifecycle-intent journal a resident `exec` is judged on (06_cli.md, "Resident workspaces"). The process that
+asks keeps each answer beside the identity — inode, size, mtime and ctime, as above — that every file the reading
+depended on had, and answers from it while each still has that identity; any other identity reads again. Bytes are never
+compared: the reading stays the authority, and identities only ask whether to run it. An answer is kept only when every
+file it read was last changed at least three seconds before the reading started, past any timestamp's tick, so a change
+made while it ran, or a second one inside the tick of the first, moves an identity. An absent input is watched through
+the nearest directory above it that exists, which moves when the input, or a directory on its way, is created, even when
+it is removed again before the next ask. A Git reading's configuration is the checkout's own `.git/config` and the files
+it includes unconditionally (each an input, present or not); a `.git/commondir`, which moves the configuration and
+objects elsewhere, an `extensions.worktreeConfig`, an `includeIf`, or an included file that includes further is read
+every time. A Git listing reads the checkout's own `.git/index` and that configuration and nothing else; a linked
+worktree's listing, or a Git this process's `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` or `GIT_COMMON_DIR` redirects,
+is listed every time. mbx resolves `settings get` from its environment, which the reading clears to `HOME`, and its
+global settings file, so the executable and that file are its inputs. A developer-link capture names its own inputs as
+it reads: every directory it lists, every tracked package's directory, the build link, and every directory a link's
+resolution passes through. The decisions are pure functions of identities and the time they were read, and a model of
+coarse filesystem clocks (a Linux tick, an HFS+ second, stamps behind the clock by up to a tick, writes in place and by
+rename, creations and removals, a file created and removed inside one reading, between asks and during a reading that
+sees the checkout before or after it, readings longer than the settling time, and identities taken after the reading)
 checks that a kept answer is never served after a change (`input_memo::tests`). Measured 2026-10-30: before they were
 kept, these readings cost every warm exec six `mbx` processes, three `git ls-files` and a canonicalization of every
 package link, about 90 of its 100–400 ms; and a workspace whose project grants reach two other checkouts paid two

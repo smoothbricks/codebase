@@ -773,8 +773,9 @@ impl GitRepository {
         static KEPT: std::sync::LazyLock<crate::input_memo::InputMemo<PathBuf, Vec<RemoteUrl>>> =
             std::sync::LazyLock::new(crate::input_memo::InputMemo::new);
         match crate::capabilities::kept_listing_inputs(&self.root) {
-            Some([_, config]) => {
-                KEPT.read_async(&self.root, &[config], || self.listed_remotes())
+            // The index is no input: `config --local` reads the configuration alone.
+            Some(inputs) => {
+                KEPT.read_async(&self.root, &inputs[1..], || self.listed_remotes())
                     .await
             }
             None => self.listed_remotes().await,
