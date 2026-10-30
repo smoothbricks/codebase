@@ -69,10 +69,21 @@ enum ProcessObservation {
     Signal(JobId, ProcessSignal),
 }
 
+/// What the fake's next spawn does; every later one spawns.
+enum NextSpawn {
+    Spawns,
+    /// Refuses, as a launcher refusing the executable does.
+    Fails,
+    /// Spawns and reports it, then holds the actor's spawn turn until the test sends on the
+    /// other end: the actor takes no command and no event meanwhile, as when that turn awaits
+    /// the job's first resource sample on the blocking pool.
+    Held(tokio::sync::oneshot::Receiver<()>),
+}
+
 struct FakeSpawner {
     spawned: mpsc::UnboundedSender<Spawned>,
     process_observations: mpsc::UnboundedSender<ProcessObservation>,
-    fail_next: bool,
+    next: NextSpawn,
     backpressure: bool,
     order: mpsc::UnboundedSender<OrderObservation>,
 }
@@ -84,13 +95,16 @@ impl SpawnSink for FakeSpawner {
         request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
-        if self.fail_next {
-            self.fail_next = false;
-            return Err(CowshedError::environment_missing(
-                "injected spawn failure",
-                "repair the executable",
-            ));
-        }
+        let held = match std::mem::replace(&mut self.next, NextSpawn::Spawns) {
+            NextSpawn::Spawns => None,
+            NextSpawn::Fails => {
+                return Err(CowshedError::environment_missing(
+                    "injected spawn failure",
+                    "repair the executable",
+                ));
+            }
+            NextSpawn::Held(release) => Some(release),
+        };
         self.order
             .send(OrderObservation::Spawn(request.job_id))
             .expect("order observer");
@@ -100,6 +114,11 @@ impl SpawnSink for FakeSpawner {
                 events: events.clone(),
             })
             .expect("spawn observer");
+        if let Some(release) = held {
+            release
+                .await
+                .expect("the test releases the spawn turn it holds");
+        }
         let pid = 10_000 + u32::try_from(request.job_id.get()).unwrap();
         Ok(Box::new(FakeProcess {
             job_id: request.job_id,
@@ -557,6 +576,23 @@ fn harness(start_id: u64, quota: u64, fail_next: bool, backpressure: bool) -> (H
     (h, root)
 }
 
+/// A harness whose first spawn holds the actor's turn after it reports the spawn, until the test
+/// sends on the returned release ([`NextSpawn::Held`]).
+fn harness_holding_first_spawn() -> (Harness, TempRoot, tokio::sync::oneshot::Sender<()>) {
+    let root = workspace_root(&temp_parent::scratch_parent(), "test-workspace");
+    let (release, held) = tokio::sync::oneshot::channel();
+    let h = harness_with_artifacts(
+        config(&root),
+        1,
+        1024,
+        NextSpawn::Held(held),
+        false,
+        None,
+        tokio::sync::watch::channel(Duration::ZERO).1,
+    );
+    (h, root, release)
+}
+
 fn harness_with_config(
     supervisor_config: WorkspaceSupervisorConfig,
     start_id: u64,
@@ -568,7 +604,11 @@ fn harness_with_config(
         supervisor_config,
         start_id,
         quota,
-        fail_next,
+        if fail_next {
+            NextSpawn::Fails
+        } else {
+            NextSpawn::Spawns
+        },
         backpressure,
         None,
         tokio::sync::watch::channel(Duration::ZERO).1,
@@ -582,7 +622,7 @@ fn harness_with_sealed_stdout(sealed_stdout: Vec<u8>) -> (Harness, TempRoot) {
         config(&root),
         1,
         1024,
-        false,
+        NextSpawn::Spawns,
         false,
         Some(sealed_stdout),
         tokio::sync::watch::channel(Duration::ZERO).1,
@@ -594,7 +634,7 @@ fn harness_with_artifacts(
     supervisor_config: WorkspaceSupervisorConfig,
     start_id: u64,
     quota: u64,
-    fail_next: bool,
+    next_spawn: NextSpawn,
     backpressure: bool,
     sealed_stdout: Option<Vec<u8>>,
     terminal_delay: tokio::sync::watch::Receiver<Duration>,
@@ -610,7 +650,7 @@ fn harness_with_artifacts(
         Box::new(FakeSpawner {
             spawned: spawn_tx,
             process_observations: process_tx,
-            fail_next,
+            next: next_spawn,
             backpressure,
             order: order_tx.clone(),
         }),
@@ -666,7 +706,7 @@ fn real_store_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
         Box::new(FakeSpawner {
             spawned: spawn_tx,
             process_observations: process_tx,
-            fail_next: false,
+            next: NextSpawn::Spawns,
             backpressure: false,
             order: order_tx.clone(),
         }),
@@ -1999,7 +2039,7 @@ async fn a_refused_terminal_commitment_keeps_the_sealed_truth_and_fails_its_call
         Box::new(FakeSpawner {
             spawned: spawn_tx,
             process_observations: process_tx,
-            fail_next: false,
+            next: NextSpawn::Spawns,
             backpressure: false,
             order: order_tx,
         }),
@@ -5113,11 +5153,15 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
 /// Measured 2026-10-20: an exec client of the replaced build came back for its job's end after the
 /// job had ended, found its drained supervisor retired, and the new build's daemon refused it, so
 /// work that succeeded reported failure. A drained supervisor now serves the end to that client:
-/// it keeps serving after its last job ends, and retires once the end has been read.
+/// it keeps serving after its last job ends, and retires once the end has been read. Measured
+/// 2026-10-30 on Linux CI: the drain was answered before it began, while the actor's spawn turn
+/// still sampled the job; the job ended before the drain took its jobs from the actor, so it owed
+/// none and retired with the end unread. The spawn turn is held here across the answer and the
+/// job's end, so only a drain that began before it answered owes the job.
 #[tokio::test]
 async fn a_drained_supervisor_serves_a_job_s_end_to_a_client_that_comes_back_for_it() {
     use cowshed_core::runtime::supervisor_socket;
-    let (mut h, _root) = harness(1, 1024, false, false);
+    let (mut h, _root, release) = harness_holding_first_spawn();
     let path = SocketPath::new();
     let listener = supervisor_socket::bind(&path).await.unwrap();
     let server = tokio::spawn(supervisor_socket::serve(
@@ -5136,14 +5180,27 @@ async fn a_drained_supervisor_serves_a_job_s_end_to_a_client_that_comes_back_for
         )
         .await
         .unwrap();
+    // The actor holds the job's spawn turn from here until `release`.
     let spawned = h.spawned.recv().await.unwrap();
     supervisor_socket::drain(&path).await.unwrap();
+    let report = path.with_extension("drain");
+    let begun: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&report).expect("the drain began, and said so, before it answered"),
+    )
+    .unwrap();
+    assert_eq!(
+        begun["waits"],
+        serde_json::json!({ "for": "jobs", "running": [job.get()] }),
+        "the drain owes the job that ran when it was asked"
+    );
 
-    // The job ends while no client waits on it.
+    // The job ends while no client waits on it, before the actor takes any later turn.
     complete(&spawned, b"done", b"", ExitStatus::Exited { code: 0 }).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        !server.is_finished(),
+    release.send(()).expect("the actor holds its spawn turn");
+    let unread = publication::read_when(report, |report| report["waits"]["for"] == "reads").await;
+    assert_eq!(
+        unread["waits"]["unread"],
+        serde_json::json!([job.get()]),
         "the job's end is unread, so the drained supervisor still serves"
     );
     supervisor_socket::hello(&path)
@@ -5244,7 +5301,7 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
         Box::new(FakeSpawner {
             spawned: spawn_tx,
             process_observations: process_tx,
-            fail_next: false,
+            next: NextSpawn::Spawns,
             backpressure: false,
             order: order_tx.clone(),
         }),
@@ -7620,7 +7677,7 @@ async fn shed_with_live_nx_daemon_publishing_after(
         supervisor_config,
         1,
         1024,
-        false,
+        NextSpawn::Spawns,
         false,
         None,
         terminal_delays,

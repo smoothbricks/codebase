@@ -1287,10 +1287,16 @@ admitted it (its requester) and the peer of every `hold`, `wait`, `sealed` and `
 identity the kernel gave its connection (an audit token on macOS, a pidfd on Linux), never by a pid alone. The drain
 registers an exit watch on each of them when it begins (`NOTE_EXIT`, a readable pidfd) and on each later one when it
 asks; the watch is an event, never a poll of the process table (04_sandbox.md, "a probe runs inside the supervisor's
-actor"). A process that had already exited when the drain looked is named as such. The drain lists its jobs before it
-closes admission, so a job admitted in between is owed and waited for like a listed one; whether its requester is
-recorded before or after the drain begins is decided under one lock, so it is never lost between the two, and the drain
-settles only once every exec in flight on its socket has recorded its requester or been refused.
+actor"). A process that had already exited when the drain looked is named as such. The drain begins before it answers
+`drain`, from its socket's own record and without a turn of the supervisor's actor, so the answer stays immediate: it
+owes every job the socket admitted that has not ended to the processes that asked for or about it, registers their
+watches and publishes its report, so a job that ends after the answer is owed. Measured 2026-10-30: a drain answered
+first and took its jobs from the actor two turns later; a job that ended in between, while the actor's spawn turn still
+sampled it, was owed nothing, and the supervisor retired with that end unread. The drain then lists the supervisor's
+jobs, owing one no process asked about to nobody, before it closes admission, so a job admitted in between is owed and
+waited for like a listed one; whether its requester is recorded before or after the drain begins is decided under one
+lock, so it is never lost between the two, and the drain settles only once every exec in flight on its socket has
+recorded its requester or been refused.
 
 A resident (`Resident` or `InteractiveResident`, 05_gateway.md "Classes") never finishes on its own: it runs each
 request its requester sends it, and nothing else reaches it. So a draining supervisor ends a running resident once its
