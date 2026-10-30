@@ -594,9 +594,10 @@ process.stdin.resume();
     expect(await withJunitReport('bun test --timeout=0 src', directory)).toBe(
       `bun test --reporter=junit --reporter-outfile='${report}' --timeout=0 src`,
     );
-    const nextest = await withJunitReport('extracted="$(x)" && cargo --frozen nextest run -E all', directory);
+    const inPlace = 'cargo --frozen nextest run --target-dir-remap "$(x/smoo-nx-nextest-binaries target-dir)" -E all';
+    const nextest = await withJunitReport(inPlace, directory);
     expect(nextest).toBe(
-      `extracted="$(x)" && cargo --frozen nextest run --tool-config-file 'smoo-report:${join(directory, 'nextest-report.toml')}' -E all`,
+      `cargo --frozen nextest run --tool-config-file 'smoo-report:${join(directory, 'nextest-report.toml')}' --target-dir-remap "$(x/smoo-nx-nextest-binaries target-dir)" -E all`,
     );
     expect(await readFile(join(directory, 'nextest-report.toml'), 'utf8')).toBe(
       `[profile.default.junit]\npath = ${JSON.stringify(report)}\n`,

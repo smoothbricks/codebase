@@ -1757,7 +1757,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       }
     }
   });
-  it('does not charge admission wait in either extracted nextest chain leg', async () => {
+
+  it('does not charge admission wait in either in-place nextest chain leg', async () => {
     const workspace = await createWorkspace();
     const directory = await ownedSocketDirectory('admission-chain-', 'control.sock');
     const endpoint = join(directory, 'control.sock');
@@ -1772,6 +1773,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const bin = join(workspace.root, 'stand-in-cargo');
     await mkdir(bin);
     await writeFile(join(bin, 'cargo'), '#!/bin/sh\nexec node queued-runner.js\n', { mode: 0o755 });
+    // The plugin's helper names this checkout's target directory; the stand-in answers as it does.
+    await writeFile(join(bin, 'smoo-nx-nextest-binaries'), '#!/bin/sh\necho "$PWD/target"\n', { mode: 0o755 });
     await workspace.write(
       'queued-runner.js',
       [
@@ -1806,8 +1809,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         () =>
           runBoundedExec(
             {
-              command:
-                'extracted="$(printf archive)" && cargo --frozen nextest run && cargo --frozen nextest run --run-ignored only',
+              command: `cargo --frozen nextest run --target-dir-remap "$(${bin}/smoo-nx-nextest-binaries target-dir)" && cargo --frozen nextest run --run-ignored only`,
               idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
               killAfterMs: 0,
               env: { PATH: `${bin}:${process.env.PATH ?? ''}`, MBX_SCHEDULER_TESTS: '1', ADMISSION_SOCKET: endpoint },
