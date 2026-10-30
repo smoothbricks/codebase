@@ -759,7 +759,7 @@ describe('Tree: applyWorkspaceConfigTree', () => {
   });
 
   it('refuses and removes the retired clean target default', () => {
-    const nxJson = {
+    const nxJson: Record<string, unknown> = {
       plugins: validPlugins(),
       targetDefaults: {
         ...validTargetDefaults(),
