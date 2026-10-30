@@ -69,8 +69,10 @@ shell answers a whole batch of lookups, so discovery pays one activation per she
 `target_directory` contributes its checkout-relative path only when the mbx capability is absent. A disabled cargo
 capability skips discovery and mbx detection; its directory override narrows the tracked manifest scan. Offline lookup
 failures, and an activation that ends before Cargo answers, are typed findings and skip that workspace, not the whole
-mint. So is a job whose PATH holds no `cargo`, because no shell selects its directory or the one that does activates
-none: cowshed links no toolchain (Bootstrap executables, below), so that batch is one finding naming its shell, or that
+mint. So is a job whose PATH holds no toolchain `cargo`, because no shell selects its directory or the one that does
+activates none: cowshed links no toolchain (Bootstrap executables, below). Under the mbx route the `cargo` that leads
+PATH is mbx's Cargo shim, which is none: it runs the first `cargo` on PATH that is not an mbx Cargo shim (14_nix.md,
+"mbx"), and the job holds a toolchain only when that one exists. Such a batch is one finding naming its shell, or that
 there is none, and every manifest it skips, never one Cargo failure per manifest. Discovery runs at mint and when
 tracked Cargo input contents change. One `git ls-files` query supplies every tracked `Cargo.toml`, `.cargo/config*` and
 `go.mod` path; BLAKE3 hashes their working-tree bytes, so unstaged edits refresh the build-state paths before the next
@@ -175,8 +177,10 @@ discovery itself, which must run to replace a stale answer, is never refused by 
 **Enforced by:** `cowshed-core`'s `installed_mbx_enables_cargo_without_project_opt_in`,
 `a_project_pinning_another_mbx_is_admitted_with_the_installed_one`, `a_host_without_installed_mbx_contributes_nothing`,
 `the_job_names_the_mbx_its_path_resolves_before_its_answers`, `the_job_names_mbx_only_when_its_cargo_is_mbx_s_shim`,
-`tracked_independent_workspaces_contribute_once_and_honor_their_own_target_config` (its mbx arm) and
-`a_target_mbx_owns_leaves_the_state_and_the_mbx_is_recorded`. The content-freshness, target-override and wrapper
+`tracked_independent_workspaces_contribute_once_and_honor_their_own_target_config` (its mbx arm),
+`a_target_mbx_owns_leaves_the_state_and_the_mbx_is_recorded`,
+`a_job_whose_only_cargo_is_the_mbx_route_is_one_finding_naming_the_missing_shell` and
+`a_shell_s_cargo_behind_the_mbx_route_names_its_workspace_root`. The content-freshness, target-override and wrapper
 refusals above, and the remaining tests listed under "Required evidence", must exist for Phase 2.
 
 ## One contribution contract

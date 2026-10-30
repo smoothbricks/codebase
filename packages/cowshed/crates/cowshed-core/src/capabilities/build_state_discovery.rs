@@ -32,11 +32,12 @@ pub enum BuildStateFinding {
         phase: CargoDiscoveryPhase,
         cause: String,
     },
-    /// The job that asks Cargo held no `cargo` on its PATH, so Cargo was asked about none of the
-    /// manifests its batch carried. `shell` is the checkout-relative directory of the workspace
-    /// shell whose activation put none there, or `None` when no shell selects the directory the
-    /// job ran in: cowshed links no toolchain of its own (15_capabilities.md, "Bootstrap
-    /// executables").
+    /// The job that asks Cargo held no toolchain `cargo` on its PATH, so Cargo was asked about none
+    /// of the manifests its batch carried: none at all, or under the mbx route none behind mbx's
+    /// Cargo shim, which runs only such a one. `shell` is the checkout-relative directory of the
+    /// workspace shell whose activation put none there, or `None` when no shell selects the
+    /// directory the job ran in: cowshed links no toolchain of its own (15_capabilities.md,
+    /// "Bootstrap executables").
     NoCargo {
         shell: Option<PathBuf>,
         manifests: Vec<PathBuf>,
@@ -141,7 +142,8 @@ impl BuildStateDiscovery {
 /// 8: installed host mbx supplies the Cargo route without a project opt-in.
 /// 9: capabilities mark seed-retained subtrees and clone-invalid process files.
 /// 10: a detected JavaScript package manager links the module compile cache onto the build volume.
-const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 10";
+/// 11: mbx's Cargo shim is no toolchain: a job with no `cargo` behind it is one finding per shell.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 11";
 
 /// The manifest whose directory, once installed, holds a JavaScript package's tool caches.
 const PACKAGE_MANIFEST: &str = "package.json";
@@ -282,10 +284,10 @@ pub struct CargoAnswers {
 pub enum CargoUnanswered {
     /// Cargo, or the job running it, ended without one; the cause is their own account.
     Failed(String),
-    /// The job of the query's batch held no `cargo` on its PATH, so Cargo never ran. `shell` is
-    /// the checkout-relative directory of the workspace shell activated before the driver, or
-    /// `None` when no shell selects the batch's directory: cowshed links no `cargo` of its own
-    /// (15_capabilities.md, "Bootstrap executables").
+    /// The job of the query's batch held no toolchain `cargo` on its PATH, not even behind mbx's
+    /// Cargo shim, so Cargo never ran. `shell` is the checkout-relative directory of the workspace
+    /// shell activated before the driver, or `None` when no shell selects the batch's directory:
+    /// cowshed links no `cargo` of its own (15_capabilities.md, "Bootstrap executables").
     NoCargo { shell: Option<PathBuf> },
 }
 
@@ -504,11 +506,14 @@ pub(super) const DRIVER_PROGRAMS: [&str; 3] = ["cat", "mktemp", "rm"];
 /// first executable of their name on the PATH the job holds, never a fixed `/bin` or `/usr/bin`
 /// path: NixOS keeps only `/bin/sh` and `/usr/bin/env`, so a job whose shell supplies none of
 /// them reaches `bash` and [`DRIVER_PROGRAMS`] through core's bootstrap links
-/// (15_capabilities.md, "Detection inputs"). A job whose PATH holds no `cargo` prints
-/// [`NO_CARGO`] alone, once for its whole batch, and asks nothing. A job that holds one prints
-/// first the `mbx` its PATH resolves when its `cargo` is mbx's Cargo shim (the canonical route,
-/// 11_shell.md, "Canonical mbx environment"), or nothing, NUL-terminated: the shim is a short
-/// script that sets `MBX_CARGO_SHIM_MODE`, so its first bytes say so, and a plain Cargo's never do.
+/// (15_capabilities.md, "Detection inputs"). A job whose PATH holds no toolchain `cargo` prints
+/// [`NO_CARGO`] alone, once for its whole batch, and asks nothing. When its `cargo` is mbx's
+/// Cargo shim (the canonical route, 11_shell.md, "Canonical mbx environment"), its toolchain is
+/// the `cargo` the shim runs: the first on PATH that is not an mbx Cargo shim (14_nix.md, "mbx").
+/// mbx's shim is a short script that sets `MBX_CARGO_SHIM_MODE`, so its first bytes say so, and a
+/// plain Cargo's never do; a dedicated one also has mbx's `mbx-target` sidecar beside it. A job
+/// that holds a toolchain prints first the `mbx` its PATH resolves when its `cargo` is the shim,
+/// or nothing, NUL-terminated.
 const DRIVER: &str = r#"set -u
 parallel=$1
 count=$2
@@ -520,7 +525,20 @@ cargo=$(command -v cargo)
 head=
 IFS= read -r -N 4096 head <"$cargo" 2>/dev/null || :
 case $head in
-*MBX_CARGO_SHIM_MODE*) printf '%s\0' "$(command -v mbx)" ;;
+*MBX_CARGO_SHIM_MODE*)
+  toolchain=
+  rest=$PATH:
+  while [[ -z $toolchain && -n $rest ]]; do
+    directory=${rest%%:*}
+    rest=${rest#*:}
+    [[ -f $directory/cargo && ! -f $directory/mbx-target ]] || continue
+    head=
+    IFS= read -r -N 4096 head <"$directory/cargo" 2>/dev/null || :
+    [[ $head == *MBX_CARGO_SHIM_MODE* ]] || toolchain=$directory/cargo
+  done
+  [[ -n $toolchain ]] || { printf 'no-cargo\0'; exit 127; }
+  printf '%s\0' "$(command -v mbx)"
+  ;;
 *) printf '\0' ;;
 esac
 work=$(mktemp -d) || exit 70
@@ -547,9 +565,10 @@ while (($# >= 2)); do
 done
 "#;
 
-/// All the driver prints when its job's PATH holds no `cargo`: no shell selects the batch's
-/// directory, or the one that does activated none, and core links none (15_capabilities.md,
-/// "Bootstrap executables"). Never the start of an answer, whose first field is a decimal status.
+/// All the driver prints when its job's PATH holds no toolchain `cargo`: no shell selects the
+/// batch's directory, or the one that does activated none, and core links none
+/// (15_capabilities.md, "Bootstrap executables"). Never the start of an answer, whose first field
+/// is a decimal status.
 const NO_CARGO: &[u8] = b"no-cargo\0";
 
 fn driver_argv(args: &[&str], queries: &[&CargoQuery]) -> Vec<OsString> {
@@ -1302,6 +1321,10 @@ mod driver_tests {
             .env("PATH", path)
             .env("HOST_PATH", host_path())
             .env("PROBE_ROOT", &fixture.root)
+            // A job's environment holds no caller target directory (15_capabilities.md,
+            // "Detection inputs"): where Cargo writes depends on the tracked project files.
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
             .output_bounded()
             .unwrap()
     }
@@ -1327,7 +1350,8 @@ mod driver_tests {
     /// mbx is the project's only where its shell routes `cargo` through mbx: the Cargo shim
     /// `mbx setup` produces (11_shell.md, "Canonical mbx environment"). An `mbx` that is merely on
     /// PATH beside a plain `cargo` names nothing, or plain Cargo would write a real `target/`
-    /// into the source tree once the build volume released it.
+    /// into the source tree once the build volume released it. The shell's toolchain `cargo` sits
+    /// behind the shim, which runs only such a one (14_nix.md, "mbx").
     #[test]
     fn the_job_names_mbx_only_when_its_cargo_is_mbx_s_shim() {
         let queries = [CargoQuery {
@@ -1345,8 +1369,11 @@ mod driver_tests {
             bootstrap_links(&fixture);
             executable(&fixture, "bin/cargo", cargo);
             executable(&fixture, "bin/mbx", "#!/bin/sh\nexit 0\n");
-            let only_the_fixture = fixture.root.join("bin").into_os_string();
-            let output = run_driver_on(&fixture, &["locate-project"], &queries, only_the_fixture);
+            executable(&fixture, "toolchain/cargo", "#!/bin/sh\necho toolchain\n");
+            let path =
+                std::env::join_paths([fixture.root.join("bin"), fixture.root.join("toolchain")])
+                    .unwrap();
+            let output = run_driver_on(&fixture, &["locate-project"], &queries, path);
             assert!(output.status.success(), "{output:?}");
             let answered = driver_answers(&output, 1, None);
             assert_eq!(answered.answers, [Ok(b"answered".to_vec())]);
@@ -1701,26 +1728,23 @@ mod tests {
         }
     }
 
-    /// A checkout that pins its toolchain (`rust-toolchain.toml`) but has no shell to supply it:
-    /// its job's PATH holds no `cargo`. That is one finding naming the missing shell and every
-    /// manifest it skips, never one Cargo failure per manifest, and discovery goes on.
-    #[test]
-    fn a_job_holding_no_cargo_is_one_finding_naming_the_missing_shell() {
-        let fixture = Fixture::new();
-        git(&fixture, &["init", "--quiet"]);
+    /// A Cargo workspace of two manifests that pins its toolchain (`rust-toolchain.toml`), with
+    /// core's bootstrap links and no shell to supply that toolchain.
+    fn toolchain_pinned_workspace(fixture: &Fixture) {
+        git(fixture, &["init", "--quiet"]);
         write(
-            &fixture,
+            fixture,
             "Cargo.toml",
             "[workspace]\nmembers = [\"probe\"]\nresolver = \"2\"\n",
         );
-        package(&fixture, "probe", "probe");
+        package(fixture, "probe", "probe");
         write(
-            &fixture,
+            fixture,
             "rust-toolchain.toml",
             "[toolchain]\nchannel = \"stable\"\n",
         );
         git(
-            &fixture,
+            fixture,
             &[
                 "add",
                 "Cargo.toml",
@@ -1728,7 +1752,16 @@ mod tests {
                 "rust-toolchain.toml",
             ],
         );
-        bootstrap_links(&fixture);
+        bootstrap_links(fixture);
+    }
+
+    /// A checkout that pins its toolchain (`rust-toolchain.toml`) but has no shell to supply it:
+    /// its job's PATH holds no `cargo`. That is one finding naming the missing shell and every
+    /// manifest it skips, never one Cargo failure per manifest, and discovery goes on.
+    #[test]
+    fn a_job_holding_no_cargo_is_one_finding_naming_the_missing_shell() {
+        let fixture = Fixture::new();
+        toolchain_pinned_workspace(&fixture);
         let state =
             discover_build_state(&fixture.context(), &mut ShelllessCargo(&fixture)).unwrap();
         assert!(state.paths.is_empty(), "{:?}", state.paths);
@@ -1738,6 +1771,117 @@ mod tests {
                 shell: None,
                 manifests: vec!["Cargo.toml".into(), "probe/Cargo.toml".into()],
             }]
+        );
+    }
+
+    /// Discovery's Cargo asked the way a job on an mbx host asks it: its PATH leads with the
+    /// installed route ([`mbx_route`]), then core's bootstrap links, then `behind`, what the
+    /// workspace shell adds (11_shell.md, "Canonical mbx environment").
+    struct RoutedCargo<'a> {
+        fixture: &'a Fixture,
+        behind: Vec<PathBuf>,
+    }
+
+    impl CargoRunner for RoutedCargo<'_> {
+        fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<CargoAnswers> {
+            let path = std::env::join_paths(
+                [
+                    self.fixture.root.join("route"),
+                    self.fixture.root.join("bin"),
+                ]
+                .into_iter()
+                .chain(self.behind.iter().cloned()),
+            )
+            .expect("fixture directories join into a PATH");
+            let output = run_driver_on(self.fixture, args, queries, path);
+            Ok(driver_answers(&output, queries.len(), None))
+        }
+    }
+
+    /// The route `cowshed setup` provisions, in the fixture's `route`: an `mbx`, and mbx's Cargo
+    /// shim, which runs the first `cargo` on PATH outside its own directory and, with none, fails
+    /// as mbx does (14_nix.md, "mbx").
+    fn mbx_route(fixture: &Fixture) {
+        executable(
+            fixture,
+            "route/cargo",
+            r#"#!/bin/sh
+MBX_CARGO_SHIM_MODE=1
+export MBX_CARGO_SHIM_MODE
+rest=$PATH:
+while [ -n "$rest" ]; do
+  directory=${rest%%:*}
+  rest=${rest#*:}
+  [ "$directory" = "${0%/*}" ] && continue
+  [ -x "$directory/cargo" ] && exec "$directory/cargo" "$@"
+done
+echo "mbx[error]: could not find the real Cargo after excluding $0" >&2
+exit 1
+"#,
+        );
+        executable(fixture, "route/mbx", "#!/bin/sh\nexit 0\n");
+    }
+
+    /// On an mbx host the route leads every Cargo job's PATH with mbx's Cargo shim, which is no
+    /// toolchain: it runs only a `cargo` behind it. A checkout whose shell supplies none there is
+    /// the one finding a job holding no `cargo` is, never one mbx failure per manifest
+    /// (15_capabilities.md, "Detection inputs").
+    #[test]
+    fn a_job_whose_only_cargo_is_the_mbx_route_is_one_finding_naming_the_missing_shell() {
+        let fixture = Fixture::new();
+        toolchain_pinned_workspace(&fixture);
+        mbx_route(&fixture);
+        let mut cargo = RoutedCargo {
+            fixture: &fixture,
+            behind: Vec::new(),
+        };
+        let state = discover_build_state(&fixture.context(), &mut cargo).unwrap();
+        assert_eq!(
+            state.findings,
+            [BuildStateFinding::NoCargo {
+                shell: None,
+                manifests: vec!["Cargo.toml".into(), "probe/Cargo.toml".into()],
+            }]
+        );
+        assert!(
+            state.paths.is_empty() && state.released.is_empty(),
+            "{state:?}"
+        );
+        assert_eq!(state.mbx, None);
+    }
+
+    /// The shell's `cargo` behind the route is the toolchain the shim runs: discovery names the
+    /// workspace root through the route, records the mbx it reaches, and releases the target mbx
+    /// owns.
+    #[test]
+    fn a_shell_s_cargo_behind_the_mbx_route_names_its_workspace_root() {
+        let fixture = Fixture::new();
+        toolchain_pinned_workspace(&fixture);
+        mbx_route(&fixture);
+        let toolchain = fixture.root.join("toolchain");
+        fs::create_dir(&toolchain).unwrap();
+        std::os::unix::fs::symlink(
+            fs::canonicalize(
+                std::env::var_os("CARGO").expect("Cargo publishes its real compiler driver"),
+            )
+            .expect("real Cargo driver"),
+            toolchain.join("cargo"),
+        )
+        .unwrap();
+        let mut cargo = RoutedCargo {
+            fixture: &fixture,
+            behind: vec![toolchain],
+        };
+        let state = discover_build_state(&fixture.context(), &mut cargo).unwrap();
+        assert!(state.findings.is_empty(), "{:?}", state.findings);
+        assert!(state.paths.is_empty(), "{:?}", state.paths);
+        assert_eq!(
+            state.released,
+            [BuildStatePath::new("target", "target").unwrap()]
+        );
+        assert_eq!(
+            state.mbx,
+            Some(fs::canonicalize(fixture.root.join("route/mbx")).unwrap())
         );
     }
 
