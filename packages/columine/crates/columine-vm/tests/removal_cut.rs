@@ -24,10 +24,8 @@ use columine_types::types::{
 };
 use columine_vm::hashmap_ops::CmpType;
 use columine_vm::key_index::NoStrings;
-use columine_vm::meta::{SlotMetaView, slot_meta_base};
-use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, EVICTION_ENTRY_SIZE, calculate_state_size, init_state,
-};
+use columine_vm::meta::slot_meta_base;
+use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
 use columine_vm::vm::{CheckedMap, Vm, f64s_as_bytes, i64s_as_bytes, u32s_as_bytes};
 use common::memory::with_allocations;
@@ -894,23 +892,13 @@ fn run_delta(vm: &mut Vm, state: &mut [u8], program: &[u8], batch: &Batch) -> u3
     vm.execute_batch_delta(state, program, &batch.slices(), batch.rows)
 }
 
-/// The image as a later batch reads it: every struct map sealed into its
-/// canonical layout, the per-batch change flags cleared, and each TTL slot's
-/// eviction-index cells past its live entries zeroed. A removal shifts the
-/// live entries left and leaves the vacated cell as it was, so those dead
-/// bytes keep a history the live index has forgotten, as a struct map's dead
-/// rows do until sealed.
+/// The image as a later batch reads it: sealed, so every struct map and every
+/// TTL eviction index holds canonical bytes, with the per-batch change flags
+/// cleared.
 fn settled(vm: &mut Vm, mut state: Vec<u8>) -> Vec<u8> {
     vm.seal_state(&mut state, &NoStrings).expect("seal");
     for slot in 0..state_num_slots(&state) {
         state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
-        let meta = SlotMetaView::read(&state, slot);
-        if meta.has_ttl() {
-            let base = meta.eviction_index_offset(&state);
-            let live = base + meta.eviction_index_size(&state) * EVICTION_ENTRY_SIZE;
-            let end = base + meta.eviction_index_capacity(&state) * EVICTION_ENTRY_SIZE;
-            state[live as usize..end as usize].fill(0);
-        }
     }
     state
 }
