@@ -299,21 +299,23 @@
           "tsc-js"
         ]
       },
-      "cli": {
-        "executor": "nx:run-commands",
-        "cache": false,
-        "//": "Runs the package launcher, not a platform binary directly: bin/cowshed resolves the host's native binary, so this works on every arch instead of only Apple Silicon. A note, not an option: nx:run-commands forwards every option it does not know to {args}, and the CLI would be handed it as a flag.",
-        "dependsOn": [
-          "cli-native"
-        ],
-        "options": {
-          "cwd": "{projectRoot}",
-          "command": "bin/cowshed {args}"
-        }
-      },
       "refresh-harnesses": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
+        "//": "Cached on upstream vercel-labs/skills main, the revision the script reads, and on the script: generated.rs is its output.",
+        "inputs": [
+          "{projectRoot}/scripts/refresh-harnesses.ts",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh git ls-remote https://github.com/vercel-labs/skills refs/heads/main"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/crates/cowshed-cli/src/skill/generated.rs"
+        ],
         "options": {
           "cwd": "packages/cowshed",
           "command": "bun scripts/refresh-harnesses.ts"
@@ -779,8 +781,20 @@
       },
       "release-check": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": false,
-        "//": "The package's release gate: smoo release pack runs it in the publishing job after every platform's prebuilt outputs are applied and before the tarball is packed, and refuses a gate that declares dependsOn or caches, so it judges the bytes that get packed, never a rebuild or a replay. It judges the shipping trees under dist/bin only (the execute bits that survive the artifact round trip), and a missing or empty tree fails it: it used to pass by finding nothing. The development builds under .cache/bin are never shipped.",
+        "cache": true,
+        "//": "The package's release gate: smoo release pack runs it in the publishing job after every platform's prebuilt outputs are applied and before the tarball is packed, and refuses a gate that declares dependsOn or is not cached on a runtime digest of the packed bytes, so it judges the bytes that get packed, never a rebuild, and a replay stands for exactly those bytes. It judges the shipping trees under dist/bin and dist/native (the execute bits that survive the artifact round trip, and the addons), and a missing or empty tree fails it: it used to pass by finding nothing. The development builds under .cache/bin are never shipped.",
+        "inputs": [
+          "{projectRoot}/scripts/verify-packaged-bin-bits.ts",
+          "{projectRoot}/src/platform.ts",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun packages/cowshed/scripts/verify-packaged-bin-bits.ts --digest"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [],
         "options": {
           "command": "bun scripts/verify-packaged-bin-bits.ts",
           "cwd": "{projectRoot}",
@@ -804,8 +818,19 @@
       },
       "apfs-test-root": {
         "executor": "nx:run-commands",
-        "cache": false,
-        "//": "Makes sure the per-user mount root that real-image fixtures keep their scratch trees below exists, as cowshed setup makes it: /private/var/folders/cowshed, its <uid> directory, and mnt inside that (specs/cowshed/08_testing.md, Integration tests). The fixtures make t themselves, and a cowshed exec sandbox denies it, so it is never touched here. On a host setup has been through it only checks, and changes nothing. cache:false is load-bearing: the directories are host state, not an Nx output, so a cached skip on a fresh runner would leave them missing. It does nothing off macOS. The note is not an option: nx:run-commands forwards every option it does not know to the command as an argument.",
+        "cache": true,
+        "//": "Makes sure the per-user mount root that real-image fixtures keep their scratch trees below exists, as cowshed setup makes it: /private/var/folders/cowshed, its <uid> directory, and mnt inside that (specs/cowshed/08_testing.md, Integration tests). The fixtures make t themselves, and a cowshed exec sandbox denies it, so it is never touched here. On a host setup has been through it only checks, and changes nothing. The directories are host state, not an Nx output, so the cache key is the --probe runtime input: provisioned on a host with all three as required, and a value of its own run while any is missing, so a fresh runner never replays a skip. It does nothing off macOS. The note is not an option: nx:run-commands forwards every option it does not know to the command as an argument.",
+        "inputs": [
+          "{projectRoot}/scripts/apfs-test-root.ts",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun packages/cowshed/scripts/apfs-test-root.ts --probe"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [],
         "options": {
           "command": "bun scripts/apfs-test-root.ts",
           "cwd": "{projectRoot}"
@@ -813,7 +838,7 @@
       },
       "apfs-test-sweep": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
         "dependsOn": [
           "apfs-test-root",
           "cli-native",
@@ -830,7 +855,22 @@
             "target": "cargo-test-archive"
           }
         ],
-        "//": "One setup owner per Nx run, shared by every fixture runner. Executes the existing dead-namespace sweep from the built archive to completion before nextest starts; no fixture teardown inherits the backlog. Host state is never cached and no test completion is emitted for cleanup.",
+        "//": "One setup owner per Nx run, shared by every fixture runner. Executes the existing dead-namespace sweep from the built archive to completion before nextest starts; no fixture teardown inherits the backlog. Cached on the archive and on the --census runtime input: clean when no dead run left a directory fixture, a root, a process or an attachment, and a value of its own run while one did, so the sweep runs exactly when there is something to reclaim. No test completion is emitted for cleanup.",
+        "inputs": [
+          "{projectRoot}/scripts/apfs-test-sweep.ts",
+          {
+            "dependentTasksOutputFiles": "**/archive.tar.zst",
+            "transitive": false
+          },
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun packages/cowshed/scripts/apfs-test-sweep.ts --census"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [],
         "options": {
           "command": "bun packages/cowshed/scripts/apfs-test-sweep.ts",
           "cwd": ".",
@@ -867,7 +907,7 @@
       },
       "host-controller-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": false,
+        "cache": true,
         "dependsOn": [
           "...",
           "cli-native",
@@ -893,8 +933,12 @@
           "default",
           "{workspaceRoot}/packages/nx-plugin/nextest.toml",
           {
-            "dependentTasksOutputFiles": "**/archive.tar.zst",
-            "transitive": false
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": true
+          },
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh uname -sr"
           }
         ],
         "//": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. Runs ignored host_controller_ tests from the owning workspace's prebuilt nextest archive, whose output bytes are hashed inputs. Compilation is cached and paid by cargo-test-archive before this run; the private runtime TMPDIR cannot change the compiled environment, so the 120s guard covers only extraction and tests. The fixtures run the development CLI (cli-native), the compiled TypeScript package (tsc-js) and the host's default Node-API addon (napi-native), which build first.",
@@ -907,7 +951,20 @@
       },
       "integration-apfs": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
+        "//": "Cached on the crate closure, the toolchain and the host kernel it exercises.",
+        "inputs": [
+          "cargoClosure",
+          "cargoToolchain",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh uname -sr"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [],
         "dependsOn": [
           "apfs-test-root",
           "apfs-test-sweep"
@@ -919,7 +976,20 @@
       },
       "benchmark-apfs": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
+        "//": "Cached on the crate closure, the toolchain and the host kernel it exercises.",
+        "inputs": [
+          "cargoClosure",
+          "cargoToolchain",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh uname -sr"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [],
         "options": {
           "cwd": "packages/cowshed",
           "command": "cargo run --release -p cowshed-core --bin apfs-benchmark"

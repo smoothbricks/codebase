@@ -646,11 +646,13 @@ superseded source in the same change.
 A cached task's key is every input it declares: its files, its dependencies' files, its environment, runtime and
 toolchain inputs. With warm caches holding a valid entry for each key — the checkout's own Nx cache and the accepted
 store behind it for tasks, the one mbx store for Cargo units (mbx, above), a land gate runs only the tasks whose key the
-landed commits (or a changed runtime or toolchain input) changed, plus the targets that state `"cache": false`, each for
-a reason its configuration names; a re-gate of an unchanged tree runs those uncached targets alone. A cold, evicted or
-unreachable entry runs its task again, as a cache degrade does (Nx accepted-task artifact service, above). Six rules
-keep the key no wider than what a task observes, each learned from a measured miss (2026-10-22, the owner's report:
-twenty minutes of gate for a one-line change).
+landed commits (or a changed runtime or toolchain input) changed. Only an aggregate (`nx:noop`, or a target that runs
+nothing and only depends on others) states `"cache": false`, and `smoo monorepo check` refuses it anywhere else; the one
+exception is the inferred wrangler `deploy`, until its key names the stage and compares the live tag. Host and remote
+state a task reads is a runtime input, so a re-gate of an unchanged tree runs nothing. unreachable entry runs its task
+again, as a cache degrade does (Nx accepted-task artifact service, above). Six rules keep the key no wider than what a
+task observes, each learned from a measured miss (2026-10-22, the owner's report: twenty minutes of gate for a one-line
+change).
 
 - **A target split from a cached target states its own cache.** Nx caches a target only when its own configuration or a
   `targetDefaults` entry for its exact name says so; `targetDefaults.test` keys the target named `test` and no other.
@@ -701,9 +703,8 @@ Cargo's own reuse is not where the time goes: a TypeScript-only land compiled no
 compiled exactly the seven cowshed crates downstream of it. For an mbx-capable project that reuse does not travel in the
 adopted build volume at all: the gate's Cargo hits come from the one mbx store, which the landing shed — and every
 sibling — already wrote to, so a land compiles only the units its own commits invalidated. Without mbx, Cargo warmth
-rides the adopted build volume. The targets that state `"cache": false` are `cargo-fetch` (the registry lives outside Nx
-outputs; nx-plugin README, "Cargo cache boundaries"), `shard-timings`, `tooling:lint-disk-commands`, the ttsc warmup
-(its cache lives outside Nx outputs) and the packaging checks; they are what a re-gate re-runs.
+rides the adopted build volume. `cargo-fetch` is cached too: its download lives outside Nx outputs, so its key names the
+registry's state (nx-plugin README, "Cargo cache boundaries").
 
 ## Convention table
 

@@ -64,8 +64,10 @@ bit, on this host's N-API addon missing at `dist/native/<directory>/cowshed.<dir
 there that is empty or unreadable (one directory per `NATIVE_TARGETS` row in `src/platform.ts`, the only tree an
 installed package loads; the publishing job has every family's, the land's shipping seam this host's). It never reads
 `.cache/bin` or `.cache/native-dev`. `smoo release pack` runs it in the publishing job, after every platform's prebuilt
-outputs are applied and before the tarball is packed, and refuses a gate that declares dependencies or a cache, so the
-gate judges the bytes that get packed, never a rebuild or a replay.
+outputs are applied and before the tarball is packed, and refuses a gate that declares dependencies or is not cached on
+a runtime digest of the packed bytes (`verify-packaged-bin-bits.ts --digest`: this host's family and every file of
+`dist/bin` and `dist/native` with its mode and bytes), so the gate judges the bytes that get packed, never a rebuild,
+and a replay stands for exactly those bytes.
 
 ### Linux artifacts
 

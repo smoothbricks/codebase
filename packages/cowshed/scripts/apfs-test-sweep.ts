@@ -49,8 +49,16 @@ export function sweepExecutable(extraction: string, metadata: unknown): string {
   return executable;
 }
 
-async function main(): Promise<number> {
-  if (process.platform !== 'darwin') return 0;
+/**
+ * The lane setup: the archive's `cowshed-test-sweep` sweeps dead runs to completion. With `--census` it only reports
+ * what a sweep would reclaim (`clean`, or what is left and a value of this run alone), the runtime input
+ * `cowshed:apfs-test-sweep` is cached on; off macOS there is nothing to sweep.
+ */
+async function main(census: boolean): Promise<number> {
+  if (process.platform !== 'darwin') {
+    if (census) console.log('not-macos');
+    return 0;
+  }
   const extraction = Bun.spawn([extractorCommand(process.platform, process.arch), '.cache/nextest/archive.tar.zst'], {
     stdin: 'inherit',
     stdout: 'pipe',
@@ -62,7 +70,7 @@ async function main(): Promise<number> {
   const directory = output.trim();
   if (directory === '') throw new Error('nextest extraction returned no directory');
   const metadata: unknown = JSON.parse(readFileSync(join(directory, 'target/nextest/binaries-metadata.json'), 'utf8'));
-  const sweep = Bun.spawn([sweepExecutable(directory, metadata), randomUUID()], {
+  const sweep = Bun.spawn([sweepExecutable(directory, metadata), census ? '--census' : randomUUID()], {
     stdin: 'inherit',
     stdout: 'inherit',
     stderr: 'inherit',
@@ -72,7 +80,7 @@ async function main(): Promise<number> {
 
 if (import.meta.main) {
   try {
-    process.exitCode = await main();
+    process.exitCode = await main(process.argv.slice(2).join(' ') === '--census');
   } catch (error) {
     console.error(`APFS lane setup refused: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;

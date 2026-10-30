@@ -13,7 +13,8 @@ mod scratch_sweep;
 
 #[cfg(target_os = "macos")]
 fn main() -> std::io::Result<()> {
-    let usage = || std::io::Error::other("usage: cowshed-test-sweep <run-id> | --keep <root>");
+    let usage =
+        || std::io::Error::other("usage: cowshed-test-sweep <run-id> | --census | --keep <root>");
     let mut arguments = std::env::args_os().skip(1);
     let first = arguments.next().ok_or_else(usage)?;
     if first == scratch_apfs::KEEP_ARGUMENT {
@@ -22,6 +23,12 @@ fn main() -> std::io::Result<()> {
             return Err(usage());
         }
         return keep(std::path::Path::new(&root));
+    }
+    if first == "--census" {
+        if arguments.next().is_some() {
+            return Err(usage());
+        }
+        return census();
     }
     let run = first
         .into_string()
@@ -33,6 +40,32 @@ fn main() -> std::io::Result<()> {
     }
     let root = scratch_apfs::ScratchRoot::new("lane-sweep")?;
     scratch_sweep::sweep_dead_runs(root.namespace(), &run)
+}
+
+/// Print `clean` when no dead run left anything a sweep would reclaim, otherwise what it left and a value of this
+/// run alone (its pid and the time): the runtime input `cowshed:apfs-test-sweep` is cached on, so a cached run stands
+/// only for a host with nothing to sweep, and any residue makes the sweep run.
+#[cfg(target_os = "macos")]
+fn census() -> std::io::Result<()> {
+    let root = scratch_apfs::ScratchRoot::new("lane-census")?;
+    let found = scratch_sweep::census(root.namespace())?;
+    if found.is_clean() {
+        println!("clean");
+    } else {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?;
+        println!(
+            "dead directory-fixtures={} roots={} processes={} images={} run={} at={}",
+            found.directory_fixtures,
+            found.roots,
+            found.processes,
+            found.images,
+            std::process::id(),
+            since.as_nanos()
+        );
+    }
+    Ok(())
 }
 
 /// Keep `root` for the owner on the other end of standard input (scratch_apfs.rs `Keeper`): once

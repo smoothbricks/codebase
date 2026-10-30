@@ -1,8 +1,9 @@
 //! The real-substrate lane's synchronous setup, never a fixture destructor.
 
-use super::scratch_namespace::processes::end_processes_in;
+use super::scratch_namespace::processes::{end_processes_in, processes_in};
 use super::scratch_namespace::{USER_ROOT, dead_owner, detach_images};
-use cowshed_os::namespace::TestNamespace;
+use cowshed_apfs::{CommandRunner as _, DiskImageSource, SystemCommandRunner};
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::test_backstop::lock_exclusive;
 use std::fs;
 use std::time::Instant;
@@ -120,7 +121,21 @@ pub(super) fn sweep_dead_runs(namespace: TestNamespace, run: &str) -> std::io::R
     Ok(())
 }
 fn sweep_dead_roots() -> std::io::Result<usize> {
-    let mut removed = 0;
+    let dead = dead_directory_fixtures()?;
+    for path in &dead {
+        reclaim(path).inspect_err(|error| {
+            cowshed_os::eprintln!(
+                "abandoned directory fixture {} was not removed: {error}",
+                path.display()
+            );
+        })?;
+    }
+    Ok(dead.len())
+}
+
+/// The directory fixtures under `/private/tmp` whose minting pid is gone.
+fn dead_directory_fixtures() -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut dead = Vec::new();
     for entry in fs::read_dir("/private/tmp")? {
         let entry = entry?;
         let name = entry.file_name();
@@ -138,15 +153,50 @@ fn sweep_dead_roots() -> std::io::Result<usize> {
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
             && entry.file_type()?.is_dir()
         {
-            let path = entry.path();
-            reclaim(&path).inspect_err(|error| {
-                cowshed_os::eprintln!(
-                    "abandoned directory fixture {} was not removed: {error}",
-                    path.display()
-                );
-            })?;
-            removed += 1;
+            dead.push(entry.path());
         }
     }
-    Ok(removed)
+    Ok(dead)
+}
+
+/// What a sweep would reclaim, counted without acting.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Census {
+    pub(super) directory_fixtures: usize,
+    pub(super) roots: usize,
+    pub(super) processes: usize,
+    pub(super) images: usize,
+}
+
+impl Census {
+    pub(super) fn is_clean(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The census `cowshed:apfs-test-sweep` is cached on (`cowshed-test-sweep --census`): the same selections
+/// [`sweep_dead_runs`] acts on, read and counted. Dead directory fixtures, per-user-root entries whose owner is
+/// gone ([`dead_owner`]), processes working in a dead run's tree, and the kernel's attachments of a dead run's
+/// images; `inventory` only reads the attachment table. A clean census means a sweep has nothing to do.
+pub(super) fn census(inventory: TestNamespace) -> std::io::Result<Census> {
+    let mut roots = 0;
+    for entry in fs::read_dir(USER_ROOT.as_path())? {
+        if dead_owner(&entry?.path()).is_some() {
+            roots += 1;
+        }
+    }
+    let images = SystemCommandRunner::new(HostNamespace::Test(inventory))
+        .attached_disk_images()?
+        .iter()
+        .filter(|attached| match &attached.source {
+            DiskImageSource::File(path) => dead_owner(path).is_some(),
+            DiskImageSource::Url(_) => false,
+        })
+        .count();
+    Ok(Census {
+        directory_fixtures: dead_directory_fixtures()?.len(),
+        roots,
+        processes: processes_in(|path| dead_owner(path).is_some())?.len(),
+        images,
+    })
 }

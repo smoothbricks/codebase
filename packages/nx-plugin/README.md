@@ -346,8 +346,8 @@ layout. Declarations interpolate the same options the commands use, so their out
 together. The host-resolved `cli-native` and `napi-native` aggregates delegate to the existing platform producers and
 declare no outputs of their own. Their `production` configuration forwards that same selection to the host producer. A
 test that executes the CLI or loads the ordinary platform addon names those producers; tests using the explicit test
-addon still name `napi-debug`. The land host runs `cowshed:cli-native:production` then the uncached, dependency-free
-`cowshed:release-check`; the guard inspects the produced shipping bytes, not a development output or a cache replay.
+addon still name `napi-debug`. The land host runs `cowshed:cli-native:production` then the dependency-free
+`cowshed:release-check`, cached on a runtime digest of the shipping bytes it inspects, never on a development output.
 
 After the fast-forward, main's output restoration explicitly requests `build`, `cli-native`, and `napi-native`. The
 normal build remains JS/dependency-only; this post-land seam restores the source-selected host CLI/addon and their input

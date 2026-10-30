@@ -12,6 +12,7 @@ import {
   judge,
   MOUNT_PREFIX,
   type Outcome,
+  probe,
   type Requirement,
   requirements,
   systemHost,
@@ -206,11 +207,13 @@ describe('the per-user mount root the real-APFS tests need', () => {
   describe('on a host with nothing', () => {
     it('makes the prefix and the per-user root as administrator, then mnt as the user, in that order', () => {
       const { host, commands } = fakeHost(fresh());
+      expect(probe(host, required, 'run 1')).toBe('unprovisioned run 1');
       expect(ensure(host, required)).toEqual({ kind: 'provisioned', changed: [MOUNT_PREFIX, ROOT, MNT] });
       expect(commands).toEqual([PREFIX_COMMAND, ROOT_COMMAND, MNT_COMMAND]);
       // A second run finds all of it as required and changes nothing.
       expect(ensure(host, required)).toEqual({ kind: 'provisioned', changed: [] });
       expect(commands).toHaveLength(3);
+      expect(probe(host, required, 'run 2')).toBe('provisioned');
     });
 
     it('makes only what is missing', () => {

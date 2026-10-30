@@ -155,6 +155,17 @@ export function ensure(host: Host, required: readonly Requirement[]): Outcome {
 }
 
 /**
+ * The runtime input `cowshed:apfs-test-root` is cached on (`--probe`): `provisioned` when every directory `required`
+ * names is already as required, so a cached run stands only for a host that needs nothing; otherwise `unprovisioned`
+ * and `run`, a value of this run alone, which no cached run matches, so the target runs and provisions or refuses.
+ */
+export function probe(host: Pick<Host, 'find'>, required: readonly Requirement[], run: string): string {
+  return required.every((requirement) => judge(requirement, host.find(requirement.path)).kind === 'current')
+    ? 'provisioned'
+    : `unprovisioned ${run}`;
+}
+
+/**
  * `sudo` acts on a path through its parent, which must therefore be a directory only root can write: anyone else could
  * swap a link in between the lstat that judged the path and the install that follows it.
  */
@@ -230,8 +241,19 @@ export const systemHost: Host = {
 };
 
 function main(): number {
+  const probing = process.argv.slice(2).join(' ') === '--probe';
   if (process.platform !== 'darwin') {
-    console.log(`apfs-test-root: ${process.platform} has no per-user APFS mount root; nothing to provision`);
+    console.log(
+      probing
+        ? 'not-macos'
+        : `apfs-test-root: ${process.platform} has no per-user APFS mount root; nothing to provision`,
+    );
+    return 0;
+  }
+  if (probing) {
+    console.log(
+      probe(systemHost, requirements(MOUNT_PREFIX, process.getuid(), process.getgid()), `${process.pid} ${Date.now()}`),
+    );
     return 0;
   }
   const uid = process.getuid();
