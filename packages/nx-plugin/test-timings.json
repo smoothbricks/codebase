@@ -5,6 +5,7 @@
     "src/ensure-built.test.ts": 63589,
     "src/owned-installation.test.ts": 52150,
     "src/nx-daemon-validity.test.ts": 50650,
+    "src/executors/bounded-exec/mbx-queue.test.ts": 45955,
     "src/executors/bounded-exec/cargo-progress-host.test.ts": 38973,
     "src/cargo-resolve-cache.test.ts": 35830,
     "src/executors/bounded-exec/executor.test.ts": 27061,
