@@ -771,10 +771,11 @@ function unavailableReason(target: string): string | null {
 }
 
 /**
- * A build unit of a linked package that does not describe its current sources: what an alias to the live checkout
- * would actually run. A unit with an input record is judged by content: one of its inputs has other bytes than the
- * build read, was removed, or was added since. A unit without one is judged by modification time (`builtAt` is null
- * for a published unit that was never built), which also refuses a file rewritten with its own bytes.
+ * A build unit of a linked package that does not describe its current sources, or cannot be shown to: what an alias
+ * to the live checkout would actually run. A unit with an input record is judged by content: one of its inputs has
+ * other bytes than the build read, was removed, or was added since. A unit with outputs but no record is
+ * `unrecorded`: nothing says which bytes built it, and modification times cannot tell a rewrite with the same bytes (a
+ * rebase, a branch switch, a stash) from a change. A published unit with no outputs was never built.
  */
 export type StaleBuild = {
   readonly packageName: string;
@@ -785,11 +786,8 @@ export type StaleBuild = {
   readonly workspaceRoot: string;
 } & (
   | { readonly basis: 'recorded'; readonly input: string; readonly change: 'changed' | 'removed' | 'added' }
-  | {
-      readonly basis: 'modification-time';
-      readonly builtAt: { readonly path: string; readonly time: Date } | null;
-      readonly newestInput: { readonly path: string; readonly time: Date };
-    }
+  | { readonly basis: 'unrecorded'; readonly output: string }
+  | { readonly basis: 'unbuilt' }
 );
 
 /**
@@ -943,25 +941,24 @@ function cachedBuildInputRecords(directory: string): string[] {
  * TypeScript emit's `outDir` is an independent boundary and accepts a standalone bootstrap's record without a producer,
  * so an enclosing old layout cannot hide it. Shell entry starts no Nx graph and normalizes no output declarations.
  *
- * Outputs no record covers fall back to modification time, per unit, so a `.md` edit or a Rust change cannot make a
- * TypeScript build stale:
+ * Outputs no record covers are grouped into units, so the refusal names what builds them:
  *
  * - the TypeScript project `tsconfig.lib.json` builds: the published, untracked files under its `outDir` less build
- *   info, read from the tracked files its `include` matches less its `exclude`, and the config itself;
- * - each target the package manifest's `nx.targets` declares with outputs among those files: its declared file
- *   inputs (`{projectRoot}` and `{workspaceRoot}` globs, `!` negations; named and runtime inputs are not files);
- * - every other published, untracked file, read from the package's tracked files less documentation and tests.
+ *   info;
+ * - each target the package manifest's `nx.targets` declares with outputs among those files;
+ * - every other published, untracked file.
  *
- * A fallback unit was built when its newest output was written. Not its oldest: an emit that leaves unchanged outputs
- * in place keeps their old times. Not a `.tsbuildinfo`: the build emits with `incremental: false`, so one under
- * `outDir` is a leftover no build rewrites. The fallback cannot tell a rewrite with the same bytes from a change, and
- * its refusal says so.
+ * Such a unit is refused as unrecorded, whatever the times of its files: it cannot be judged by content, and a
+ * modification time cannot tell a rewrite with the same bytes from a change, while a cached rebuild that finds its
+ * outputs current leaves their times as they were. Its producer has to write a record. A unit with no tracked input
+ * is not judged, and the TypeScript emit's unit, which the package publishes, is refused as never built when it has no
+ * outputs. A `.tsbuildinfo` belongs to no unit: the build emits with `incremental: false`, so one under `outDir` is a
+ * leftover no build rewrites.
  *
  * Output directories built for another host (`darwin-x64` on an arm64 Mac) are skipped: nothing here runs them.
  * The remedy names the receipt's exact producer target and configuration; `build` need not reach a native producer.
- * Missing-record published units retain their timestamp fallback and package `build` remedy. A cached build that
- * leaves a recorded unit stale is a cache-key defect (its inputs miss something its outputs depend on), never a reason
- * to skip the cache.
+ * A cached build that leaves a recorded unit stale is a cache-key defect (its inputs miss something its outputs
+ * depend on), never a reason to skip the cache.
  */
 export function staleBuilds(packageName: string, directory: string): StaleBuild[] {
   const manifest: unknown = JSON.parse(readFileSync(path.join(directory, 'package.json'), 'utf8'));
@@ -1115,7 +1112,10 @@ export function staleBuilds(packageName: string, directory: string): StaleBuild[
       const value = Reflect.get(definition, key);
       return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
     };
-    const outputs = claim(strings('outputs').flatMap((output) => under(path.normalize(resolve(output)))));
+    // A declared output names a directory with or without its trailing slash; the files under it are the same.
+    const outputs = claim(
+      strings('outputs').flatMap((output) => under(path.normalize(resolve(output)).replace(/\/+$/, ''))),
+    );
     if (outputs.length === 0) continue;
     const fileInputs = strings('inputs').filter(
       (input) => input.includes('{projectRoot}') || input.includes('{workspaceRoot}'),
@@ -1146,32 +1146,15 @@ export function staleBuilds(packageName: string, directory: string): StaleBuild[
       expected: false,
     });
 
-  // A tracked input deleted in the working tree has no time; the files that remain decide.
-  const modified = (file: string) => statSync(path.join(workspaceRoot, file), { throwIfNoEntry: false })?.mtime;
   for (const unit of units) {
     if (unit.inputs.length === 0) continue;
-    let newestInput = { path: unit.inputs[0] ?? '', time: new Date(0) };
-    for (const input of unit.inputs) {
-      const time = modified(input);
-      if (time !== undefined && time > newestInput.time) newestInput = { path: input, time };
+    const output = unit.outputs[0];
+    if (output === undefined) {
+      if (unit.expected)
+        stale.push({ basis: 'unbuilt', packageName, directory, unit: unit.label, rebuild, workspaceRoot });
+      continue;
     }
-    let builtAt: { readonly path: string; readonly time: Date } | null = null;
-    for (const output of unit.outputs) {
-      const time = modified(output);
-      if (time !== undefined && (builtAt === null || time > builtAt.time)) builtAt = { path: output, time };
-    }
-    if (builtAt === null && !unit.expected) continue;
-    if (builtAt !== null && newestInput.time <= builtAt.time) continue;
-    stale.push({
-      basis: 'modification-time',
-      packageName,
-      directory,
-      unit: unit.label,
-      builtAt,
-      newestInput,
-      rebuild,
-      workspaceRoot,
-    });
+    stale.push({ basis: 'unrecorded', packageName, directory, unit: unit.label, output, rebuild, workspaceRoot });
   }
   return stale;
 }
@@ -1188,10 +1171,9 @@ export function staleBuildsRefusal(stale: readonly StaleBuild[]): string {
             : 'was added since the build';
       return `  - ${build.packageName}: ${build.unit} is stale: input ${build.input} ${how} (its ${BUILD_INPUTS_FILE})`;
     }
-    const fallback = `no ${BUILD_INPUTS_FILE}, so judged by modification time, where a file rewritten with its own bytes also counts`;
-    return build.builtAt === null
-      ? `  - ${build.packageName}: ${build.unit} was never built (newest input ${build.newestInput.path} at ${build.newestInput.time.toISOString()}; ${fallback})`
-      : `  - ${build.packageName}: ${build.unit} was built at ${build.builtAt.time.toISOString()} (${build.builtAt.path}), but ${build.newestInput.path} changed at ${build.newestInput.time.toISOString()} (${fallback})`;
+    return build.basis === 'unbuilt'
+      ? `  - ${build.packageName}: ${build.unit} was never built`
+      : `  - ${build.packageName}: ${build.unit} records no inputs (no ${BUILD_INPUTS_FILE} covers ${build.output}), so whether it describes its sources cannot be told: modification times would also count a file rewritten with its own bytes; its producer must write ${BUILD_INPUTS_FILE} beside its outputs`;
   });
   const commands = [...new Set(stale.map((build) => `cd ${JSON.stringify(build.workspaceRoot)} && ${build.rebuild}`))];
   return `refusing developer link(s) to a live checkout whose build does not describe its sources; the link would run the old build:\n${lines.join('\n')}\nRebuild: ${commands.join('; ')}`;

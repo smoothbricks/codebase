@@ -129,9 +129,12 @@ store are not judged. A producer writes `.build-inputs.json` into each output di
 input it read and, where it knows them, the Git pathspecs whose every match is an input. The record is part of the
 target's Nx outputs, so a cache hit restores the record that describes the restored outputs. A unit with a record is
 current while every recorded input keeps its bytes and no matching source was added; a rewrite with the same bytes
-changes nothing. A unit without one is judged by modification time, and its refusal says that this also counts a file
-rewritten with its own bytes. Producer receipts above stay the proof for pins: they bind a clean HEAD and live outside
-Nx outputs, so neither a dirty working tree nor a cache hit can vouch through them.
+changes nothing. A published unit without a record is refused as unrecorded, however new its outputs are: modification
+times cannot tell a rewrite with the same bytes (a rebase, a branch switch, a stash) from a change, and a cached rebuild
+that finds its outputs current leaves their times as they were, so no rebuild could clear a time-based refusal. Every
+producer of a linked package's outputs therefore writes a record, including one that only copies files
+(`smoo-nx-build-inputs --input`). Producer receipts above stay the proof for pins: they bind a clean HEAD and live
+outside Nx outputs, so neither a dirty working tree nor a cache hit can vouch through them.
 
 The records judged are those beside the outputs the checkout runs. Writers add optional `producer` provenance to the
 existing version 1 record from the actual Nx task environment: its project, target and optional configuration. Shell
@@ -144,9 +147,9 @@ producer target and configuration as its cached rebuild: the package's `build` n
 other hosts, nondefault/production records and obsolete native records without provenance do not select a unit, and
 their surrounding trees are not judged. The TypeScript emit's directory is an independent boundary and still accepts a
 standalone bootstrap record without producer provenance; an enclosing obsolete `dist` record cannot hide the nested
-emit's record or its missing-record timestamp fallback. Normal published units without records retain their existing
-timestamp fallback. These currentness checks run at shell entry, in the `smoo:developer-links` status and again in the
-prologue's question below, never per artifact execution.
+emit's record, and without its own record the nested emit is refused as unrecorded. These currentness checks run at
+shell entry, in the `smoo:developer-links` status and again in the prologue's question below, never per artifact
+execution.
 
 Shell entry fails closed on that refusal. Once devenv's tasks have run, the managed prologue plans the declared links
 again (`setup-environment.ts --links --refusal`) and stops the entry with the planner's reason. The question is asked of

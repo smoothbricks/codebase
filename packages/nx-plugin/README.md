@@ -922,9 +922,12 @@ service", and 05, "Publication"). No task is rebuilt and no shell is evaluated b
 The canonical cache adapter and native publisher remain in
 `packages/cowshed/crates/cowshed-core/src/build_volume/{cache_adapter.js,nx_publish.js}`. The cached
 `copy-nx-publish-assets` target declares those source inputs and owns `runtime/nx-publish/`, disjoint from the entire
-TypeScript `dist/` output. It copies their unchanged bytes; there is one implementation, not two maintained sources.
-`build` depends on that producer and the emitted executable. `test-nx-publish` depends on the concrete JavaScript and
-runtime-asset producers and loads their bytes; tests never build the publisher or its runtime assets inline.
+TypeScript `dist/` output. It copies their unchanged bytes; there is one implementation, not two maintained sources. It
+writes `.build-inputs.json` beside them through `smoo-nx-build-inputs --input`, so a developer link to this checkout
+judges `runtime/nx-publish/` by the bytes it copied (specs/cli/01_workspace_reconciliation.md, "Declared developer link
+pins"). `build` depends on that producer and the emitted executable. `test-nx-publish` depends on the concrete
+JavaScript and runtime-asset producers and loads their bytes; tests never build the publisher or its runtime assets
+inline.
 
 ## Build/Test Graph Boundary
 

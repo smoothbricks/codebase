@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -298,4 +298,39 @@ describe('cargoBuildInputs', () => {
       expect(cargoBuildInputs(root, depInfo, root)).toBeNull();
     });
   });
+});
+
+describe('smoo-nx-build-inputs --input', () => {
+  const cli = join(import.meta.dir, 'bin/smoo-nx-build-inputs.ts');
+  const run = (cwd: string, args: readonly string[]) =>
+    spawnSync(process.execPath, [cli, ...args], {
+      cwd,
+      encoding: 'utf8',
+      env: { ...process.env, NX_TASK_TARGET_PROJECT: 'nx-plugin', NX_TASK_TARGET_TARGET: 'copy-assets' },
+    });
+
+  it('records the named files, relative to the working directory, and the Nx task that wrote them', () =>
+    inGitRepository(
+      { 'source/a.js': 'alpha\n', 'source/b.js': 'beta\n', 'plugin/package.json': '{}\n' },
+      async (root) => {
+        const plugin = join(root, 'plugin');
+        const written = run(plugin, ['--input', '../source/b.js', '--input', '../source/a.js', '--output', 'runtime']);
+        expect(written.status, written.stderr).toBe(0);
+        const record: BuildInputRecord = JSON.parse(await readFile(join(plugin, 'runtime/.build-inputs.json'), 'utf8'));
+        expect(record).toEqual({
+          version: 1,
+          files: { 'source/a.js': sha256('alpha\n'), 'source/b.js': sha256('beta\n') },
+          producer: { project: 'nx-plugin', target: 'copy-assets' },
+        });
+      },
+    ));
+
+  it('refuses a named file that does not exist, writing no record', () =>
+    inGitRepository({ 'plugin/package.json': '{}\n' }, async (root) => {
+      const plugin = join(root, 'plugin');
+      const refused = run(plugin, ['--input', '../source/gone.js', '--output', 'runtime']);
+      expect(refused.status).toBe(2);
+      expect(refused.stderr).toContain('../source/gone.js does not exist');
+      expect(await readdir(plugin)).toEqual(['package.json']);
+    }));
 });

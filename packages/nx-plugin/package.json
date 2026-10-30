@@ -281,18 +281,30 @@
       "copy-nx-publish-assets": {
         "executor": "nx:run-commands",
         "cache": true,
+        "dependsOn": [
+          {
+            "projects": [
+              "build-inputs"
+            ],
+            "target": "build"
+          }
+        ],
         "inputs": [
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/build_volume/cache_adapter.js",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/build_volume/nx_publish.js",
           {
             "externalDependencies": []
+          },
+          {
+            "dependentTasksOutputFiles": "**/*.js",
+            "transitive": false
           }
         ],
         "outputs": [
           "{projectRoot}/runtime/nx-publish/"
         ],
         "options": {
-          "command": "asset_source=../cowshed/crates/cowshed-core/src/build_volume; if [ -e runtime/nx-publish ]; then rm -r runtime/nx-publish; fi && mkdir -p runtime/nx-publish && cp \"$asset_source/cache_adapter.js\" \"$asset_source/nx_publish.js\" runtime/nx-publish/",
+          "command": "asset_source=../cowshed/crates/cowshed-core/src/build_volume; if [ -e runtime/nx-publish ]; then rm -r runtime/nx-publish; fi && mkdir -p runtime/nx-publish && cp \"$asset_source/cache_adapter.js\" \"$asset_source/nx_publish.js\" runtime/nx-publish/ && node ../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js --input \"$asset_source/cache_adapter.js\" --input \"$asset_source/nx_publish.js\" --output runtime/nx-publish",
           "cwd": "{projectRoot}"
         }
       },

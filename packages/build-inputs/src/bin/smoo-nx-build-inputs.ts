@@ -1,25 +1,39 @@
 #!/usr/bin/env node
 /**
- * Writes a native build's input record (build-inputs.ts) into its output directory, after the build:
+ * Writes a build's input record (build-inputs.ts) into its output directory, after the build, in one of two forms:
  *
  *   smoo-nx-build-inputs --manifest-path <Cargo.toml> --dep-info <triple-or-profile-relative .d file> --output <directory>
+ *   smoo-nx-build-inputs --input <file> [--input <file>...] --output <directory>
  *
- * `--manifest-path` is the one the build was given, so `cargo metadata` names the same target directory.
+ * A native build names its dep-info. `--manifest-path` is the one the build was given, so `cargo metadata` names the
+ * same target directory, and `--dep-info` is relative to Cargo's target directory
+ * (`aarch64-apple-darwin/debug/libcowshed_napi.d`), the file rustc wrote listing every source it read. The record lists
+ * those workspace files, the `Cargo.toml` of each crate they belong to, and the workspace `Cargo.lock`, which decides
+ * every dependency's bytes (`cargoBuildInputs`, the same record the cargo-zigbuild executor writes for a Linux build).
  *
- * `--dep-info` is relative to Cargo's target directory (`aarch64-apple-darwin/debug/libcowshed_napi.d`), the file
- * rustc wrote listing every source it read. The record lists those workspace files, the `Cargo.toml` of each crate
- * they belong to, and the workspace `Cargo.lock`, which decides every dependency's bytes (`cargoBuildInputs`, the same
- * record the cargo-zigbuild executor writes for a Linux build). It is part of the target's Nx outputs, so a cache hit
- * restores the record that describes the restored binary. Run by an Nx task, it also names that task
- * (`buildInputProducer`).
+ * A producer that knows its inputs as files, such as one that copies them, names each with `--input`, relative to the
+ * working directory, and the record lists exactly those. Each must be a file of the work tree.
+ *
+ * The record is part of the target's Nx outputs, so a cache hit restores the record that describes the restored
+ * outputs. Run by an Nx task, it also names that task (`buildInputProducer`).
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
-import { buildInputProducer, cargoBuildInputs, gitWorkspaceRoot, writeBuildInputs } from '../build-inputs.js';
+import {
+  type BuildInputRecord,
+  buildInputProducer,
+  buildInputRecord,
+  cargoBuildInputs,
+  gitWorkspaceRoot,
+  workspacePath,
+  writeBuildInputs,
+} from '../build-inputs.js';
 
-const USAGE =
-  'usage: smoo-nx-build-inputs --manifest-path <Cargo.toml> --dep-info <path under the Cargo target directory> --output <directory>';
+const USAGE = [
+  'usage: smoo-nx-build-inputs --manifest-path <Cargo.toml> --dep-info <path under the Cargo target directory> --output <directory>',
+  '       smoo-nx-build-inputs --input <file> [--input <file>...] --output <directory>',
+].join('\n');
 
 function fail(message: string): never {
   process.stderr.write(`smoo-nx-build-inputs: ${message}\n${USAGE}\n`);
@@ -42,24 +56,57 @@ function run(command: string, args: readonly string[]): string {
   return result.stdout.trim();
 }
 
+/** Every value given for the repeatable `name`. */
+function values(name: string): string[] {
+  const found: string[] = [];
+  process.argv.forEach((argument, at) => {
+    if (argument !== name) return;
+    const value = process.argv[at + 1];
+    if (value === undefined || value.startsWith('-')) fail(`missing the value of ${name}`);
+    found.push(value);
+  });
+  return found;
+}
+
 const cwd = process.cwd();
-const manifestPath = flag('--manifest-path');
-const depInfoPath = flag('--dep-info');
 const output = resolve(cwd, flag('--output'));
 const workspaceRoot = gitWorkspaceRoot(cwd) ?? fail(`${cwd} is not in a Git work tree, so no input can be named`);
-const metadata: unknown = JSON.parse(
-  run('cargo', ['metadata', '--no-deps', '--format-version', '1', '--offline', '--manifest-path', manifestPath]),
-);
-const targetDirectory =
-  typeof metadata === 'object' && metadata !== null ? Reflect.get(metadata, 'target_directory') : undefined;
-if (typeof targetDirectory !== 'string') fail('cargo metadata names no target_directory');
-const cargoRoot =
-  typeof metadata === 'object' && metadata !== null ? Reflect.get(metadata, 'workspace_root') : undefined;
-if (typeof cargoRoot !== 'string') fail('cargo metadata names no workspace_root');
-const depInfo = isAbsolute(depInfoPath) ? depInfoPath : join(targetDirectory, depInfoPath);
-if (!existsSync(depInfo)) fail(`${depInfo} does not exist: the build did not write the dep-info this target names`);
-
 const producer = buildInputProducer(process.env);
-const inputs = cargoBuildInputs(workspaceRoot, readFileSync(depInfo, 'utf8'), cargoRoot, producer);
-if (inputs === null) fail(`${depInfo} names no file of ${workspaceRoot}`);
-writeBuildInputs(output, inputs);
+
+/** The record of the files `named`, each a file of the work tree. */
+function namedInputs(named: readonly string[]): BuildInputRecord {
+  if (process.argv.includes('--manifest-path') || process.argv.includes('--dep-info'))
+    fail('--input names the inputs itself, so it takes no --manifest-path or --dep-info');
+  const files = named.map((file) => {
+    const absolute = resolve(cwd, file);
+    if (!existsSync(absolute)) fail(`${file} does not exist in ${cwd}`);
+    const relative = workspacePath(workspaceRoot, absolute);
+    if (relative.startsWith('../')) fail(`${file} is outside the work tree ${workspaceRoot}`);
+    return relative;
+  });
+  return buildInputRecord(workspaceRoot, files, undefined, producer);
+}
+
+/** The record of the workspace files a Cargo build's dep-info names. */
+function cargoInputs(): BuildInputRecord {
+  const manifestPath = flag('--manifest-path');
+  const depInfoPath = flag('--dep-info');
+  const metadata: unknown = JSON.parse(
+    run('cargo', ['metadata', '--no-deps', '--format-version', '1', '--offline', '--manifest-path', manifestPath]),
+  );
+  const targetDirectory =
+    typeof metadata === 'object' && metadata !== null ? Reflect.get(metadata, 'target_directory') : undefined;
+  if (typeof targetDirectory !== 'string') fail('cargo metadata names no target_directory');
+  const cargoRoot =
+    typeof metadata === 'object' && metadata !== null ? Reflect.get(metadata, 'workspace_root') : undefined;
+  if (typeof cargoRoot !== 'string') fail('cargo metadata names no workspace_root');
+  const depInfo = isAbsolute(depInfoPath) ? depInfoPath : join(targetDirectory, depInfoPath);
+  if (!existsSync(depInfo)) fail(`${depInfo} does not exist: the build did not write the dep-info this target names`);
+  return (
+    cargoBuildInputs(workspaceRoot, readFileSync(depInfo, 'utf8'), cargoRoot, producer) ??
+    fail(`${depInfo} names no file of ${workspaceRoot}`)
+  );
+}
+
+const named = values('--input');
+writeBuildInputs(output, named.length > 0 ? namedInputs(named) : cargoInputs());

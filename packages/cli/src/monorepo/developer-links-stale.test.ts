@@ -212,45 +212,26 @@ async function refusal(fixture: Fixture): Promise<string> {
   return failure.message;
 }
 
-const iso = (seconds: number) => new Date(seconds * 1000).toISOString();
-
-describe('a live developer link whose build is older than its sources', () => {
-  it('links a checkout whose every build unit is newer than its inputs', async () => {
-    const fresh = fixture();
-    expect(await link(fresh)).not.toContain('refusing');
-    expect(realpathSync(fresh.alias)).toBe(fresh.source);
-  });
-
-  it('refuses when a TypeScript source is newer than the build info, naming both times and the cached rebuild', async () => {
-    const stale = fixture();
-    touch(join(stale.source, 'src/index.ts'), LATER);
-    const refused = await refusal(stale);
+describe('a live developer link whose build recorded no inputs', () => {
+  it('refuses every unit no input record covers, however much newer its outputs are than its inputs', async () => {
+    // The template's every output is newer than every input: by modification time each unit would be current.
+    const unrecorded = fixture();
+    const refused = await refusal(unrecorded);
     expect(refused).toContain(
-      `packages/api/tsconfig.lib.json (outDir dist/js) was built at ${iso(BUILT)} (packages/api/dist/js/index.js), but packages/api/src/index.ts changed at ${iso(LATER)}`,
+      'linked-api: packages/api/tsconfig.lib.json (outDir dist/js) records no inputs (no .build-inputs.json covers packages/api/dist/js/index.js), so whether it describes its sources cannot be told',
     );
-    expect(refused).toContain('nx run api:build');
-    expect(refused).not.toContain('--skip-nx-cache');
-    // Without a record, the refusal says what modification time cannot tell apart.
     expect(refused).toContain(
-      'no .build-inputs.json, so judged by modification time, where a file rewritten with its own bytes also counts',
+      `linked-api: nx target native-host records no inputs (no .build-inputs.json covers packages/api/dist/bin/${HOST}/api)`,
     );
+    expect(refused).toContain('its producer must write .build-inputs.json beside its outputs');
+    expect(refused).not.toContain('was built at');
     // Refused, not fallen back: the alias is exactly what it was.
-    expect(readlinkSync(stale.alias)).toBe(STORE);
-  });
-
-  it('refuses when a declared target input is newer than that target output, and only for that unit', async () => {
-    const stale = fixture();
-    touch(join(stale.source, 'crates/api/src/lib.rs'), LATER);
-    const refused = await refusal(stale);
-    expect(refused).toContain(
-      `nx target native-host was built at ${iso(BUILT)} (packages/api/dist/bin/${HOST}/api), but packages/api/crates/api/src/lib.rs changed at ${iso(LATER)}`,
-    );
-    expect(refused).not.toContain('tsconfig.lib.json (outDir');
-    expect(readlinkSync(stale.alias)).toBe(STORE);
+    expect(readlinkSync(unrecorded.alias)).toBe(STORE);
   });
 
   it('refuses a published build that was never built', async () => {
     const unbuilt = fixture();
+    record(unbuilt);
     rmSync(join(unbuilt.source, 'dist/js'), { recursive: true });
     expect(await refusal(unbuilt)).toContain('packages/api/tsconfig.lib.json (outDir dist/js) was never built');
     expect(readlinkSync(unbuilt.alias)).toBe(STORE);
@@ -258,6 +239,7 @@ describe('a live developer link whose build is older than its sources', () => {
 
   it('ignores documentation, tests, the manifest and builds for another host', async () => {
     const touched = fixture();
+    record(touched);
     for (const file of ['README.md', 'src/index.test.ts', 'package.json']) touch(join(touched.source, file), LATER);
     expect(await link(touched)).not.toContain('refusing');
     expect(realpathSync(touched.alias)).toBe(touched.source);
@@ -274,13 +256,12 @@ describe('a live developer link whose build is older than its sources', () => {
     expect(realpathSync(untracked.alias)).toBe(untracked.source);
   });
 
-  it('links again once the rebuild rewrote the outputs', async () => {
-    const rebuilt = fixture();
-    touch(join(rebuilt.source, 'src/index.ts'), LATER);
-    await refusal(rebuilt);
-    touch(join(rebuilt.source, 'dist/js/index.js'), LATER + 1);
-    await link(rebuilt);
-    expect(realpathSync(rebuilt.alias)).toBe(rebuilt.source);
+  it('links once its producers write their records', async () => {
+    const recorded = fixture();
+    await refusal(recorded);
+    record(recorded);
+    await link(recorded);
+    expect(realpathSync(recorded.alias)).toBe(recorded.source);
   });
 });
 
@@ -351,6 +332,7 @@ describe('a live developer link whose build recorded its inputs', () => {
 
     // Deleted before the build (still in Git's index): no build read it, so it is neither recorded nor added.
     const deleted = fixture();
+    record(deleted);
     rmSync(join(deleted.source, 'src/index.ts'));
     writeFileSync(
       join(deleted.source, 'dist/js/.build-inputs.json'),
@@ -488,7 +470,7 @@ describe('a live developer link whose developer build lies outside the published
     expect(await link(dev)).not.toContain('refusing');
 
     // The standalone TypeScript receipt has no producer and still owns the nested emit independently of an old dist
-    // receipt. The same boundary also preserves the missing-record timestamp fallback.
+    // receipt, so without its own record the nested emit is refused as unrecorded, never covered by the old one.
     write(join(dev.source, 'dist/.build-inputs.json'), outdated, BUILT);
     expect(await link(dev)).not.toContain('refusing');
     write(join(dev.source, 'src/index.ts'), 'export const value = 2;\n', LATER);
@@ -499,10 +481,10 @@ describe('a live developer link whose developer build lies outside the published
     expect(emitted).toContain('nx run api:build');
     expect(emitted).not.toContain('packages/api/dist is stale');
     rmSync(join(dev.source, 'dist/js/.build-inputs.json'));
-    const fallback = await refusal(dev);
-    expect(fallback).toContain('tsconfig.lib.json (outDir dist/js) was built at');
-    expect(fallback).toContain('no .build-inputs.json, so judged by modification time');
-    expect(fallback).not.toContain('packages/api/dist is stale');
+    const unrecorded = await refusal(dev);
+    expect(unrecorded).toContain('tsconfig.lib.json (outDir dist/js) records no inputs');
+    expect(unrecorded).not.toContain('was built at');
+    expect(unrecorded).not.toContain('packages/api/dist is stale');
 
     // A present malformed identity is corrupt data, not an unselected producer that can hide its stale tree.
     writeFileSync(
