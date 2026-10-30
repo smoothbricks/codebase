@@ -1,17 +1,8 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import {
-  type AskRemote,
-  type Clock,
-  holdUntilServed,
-  type Pin,
-  type PinAnswer,
-  readPins,
-  remoteAsker,
-  unitePins,
-} from '../../../nx-plugin/managed/raw/tooling/git-hooks/pinned-revisions-served.ts';
+import { readPins, remoteAsker } from '../../../nx-plugin/managed/raw/tooling/git-hooks/pinned-revisions-served.ts';
 
 /**
  * The managed judge of whether each git revision Cargo.lock pins is served by its remote, where CI fetches it. A land
@@ -103,22 +94,6 @@ describe('readPins', () => {
   it('reads no pins from a lock without packages', () => {
     expect(readPins('version = 4\n')).toEqual({ kind: 'pins', pins: [] });
   });
-
-  it('unites the pins of several trees, each remote and revision once', () => {
-    const url = 'https://example.test/r.git';
-    expect(
-      unitePins([
-        [{ url, rev: A, packages: ['x'] }],
-        [
-          { url, rev: A, packages: ['x', 'y'] },
-          { url, rev: B, packages: ['z'] },
-        ],
-      ]),
-    ).toEqual([
-      { url, rev: A, packages: ['x', 'y'] },
-      { url, rev: B, packages: ['z'] },
-    ]);
-  });
 });
 
 describe('remoteAsker', () => {
@@ -169,65 +144,14 @@ describe('remoteAsker', () => {
   });
 });
 
-describe('holdUntilServed', () => {
-  const pin: Pin = { url: 'https://example.test/r.git', rev: A, packages: ['x'] };
-
-  function manualClock(): Clock & { readonly slept: number[] } {
-    let now = 0;
-    const slept: number[] = [];
-    return {
-      slept,
-      now: () => now,
-      sleep: async (ms) => {
-        slept.push(ms);
-        now += ms;
-      },
-    };
-  }
-
-  /** Answers in turn, the last one from then on, and records the budget each ask was given. */
-  function answering(...answers: readonly PinAnswer[]): AskRemote & { readonly budgets: number[] } {
-    const budgets: number[] = [];
-    const ask = async (_url: string, _rev: string, budgetMs: number): Promise<PinAnswer> => {
-      budgets.push(budgetMs);
-      return answers[Math.min(budgets.length - 1, answers.length - 1)] ?? { kind: 'served' };
-    };
-    return Object.assign(ask, { budgets });
-  }
-
-  it('holds until the remote serves the pin, naming it while it waits', async () => {
-    const clock = manualClock();
-    const said: string[] = [];
-    const ask = answering({ kind: 'unserved' }, { kind: 'unreachable', detail: 'offline' }, { kind: 'served' });
-    const outcome = await holdUntilServed([pin], ask, clock, 900_000, 30_000, (line) => said.push(line));
-    expect(outcome).toEqual({ kind: 'served', waitedMs: 60_000, rounds: 3 });
-    expect(clock.slept).toEqual([30_000, 30_000]);
-    expect(ask.budgets).toEqual([900_000, 870_000, 840_000]);
-    expect(said).toEqual([
-      `waiting (0 s of 900 s): https://example.test/r.git does not serve ${A} (Cargo.lock builds x from it)`,
-      `waiting (30 s of 900 s): could not ask https://example.test/r.git for ${A} (Cargo.lock builds x from it): offline`,
-    ]);
-  });
-
-  it('refuses after the last round that leaves no room for another before the bound', async () => {
-    const clock = manualClock();
-    const ask = answering({ kind: 'unserved' });
-    const outcome = await holdUntilServed([pin], ask, clock, 45_000, 30_000, () => {});
-    expect(outcome).toEqual({ kind: 'refused', waitedMs: 30_000, outstanding: [[pin, { kind: 'unserved' }]] });
-    expect(clock.slept).toEqual([30_000]);
-    // No ask is given more than what is left of the bound when it starts.
-    expect(ask.budgets).toEqual([45_000, 15_000]);
-  });
-});
-
 describe('the command', () => {
-  function workspacePinning(url: string, rev: string): { workspace: string; commit: string } {
+  function workspacePinning(url: string, rev: string): string {
     const workspace = scratch();
     git(workspace, 'init', '--quiet');
     writeFileSync(join(workspace, 'Cargo.lock'), lock({ name: 'pinned', source: `git+${url}?rev=${rev}#${rev}` }));
     git(workspace, 'add', 'Cargo.lock');
     git(workspace, 'commit', '--quiet', '-m', 'pin');
-    return { workspace, commit: git(workspace, 'rev-parse', 'HEAD') };
+    return workspace;
   }
 
   function run(cwd: string, ...args: string[]): { exitCode: number; stdout: string; stderr: string } {
@@ -237,7 +161,7 @@ describe('the command', () => {
 
   it('reports an unserved pin and passes, for a land', () => {
     const { url, unpushed } = remoteWithUnpushed();
-    const { workspace } = workspacePinning(url, unpushed);
+    const workspace = workspacePinning(url, unpushed);
     const reported = run(workspace, '--report');
     expect(reported.exitCode).toBe(0);
     expect(reported.stdout).toContain('PINNED-REVISIONS note: 1 pinned revision(s) their remote does not serve');
@@ -245,35 +169,36 @@ describe('the command', () => {
   });
 
   it('counts a remote that did not answer apart from one that does not serve', () => {
-    const { workspace } = workspacePinning(`file://${join(scratch(), 'missing.git')}`, A);
+    const workspace = workspacePinning(`file://${join(scratch(), 'missing.git')}`, A);
     const reported = run(workspace, '--report');
     expect(reported.exitCode).toBe(0);
-    expect(reported.stdout).toContain('PINNED-REVISIONS note: 1 whose remote did not answer, reported, not refused');
-    expect(reported.stdout).not.toContain('does not serve');
+    expect(reported.stdout).toContain(
+      'PINNED-REVISIONS note: 1 whose remote did not answer, reported, never waited on',
+    );
   });
 
   it('says every pin is served when the remote serves them', () => {
     const { url, pushed } = remoteWithUnpushed();
-    const { workspace } = workspacePinning(url, pushed);
+    const workspace = workspacePinning(url, pushed);
     expect(run(workspace, '--report').stdout).toContain(
       'PINNED-REVISIONS: every git revision Cargo.lock pins is served',
     );
   });
 
-  it('refuses a push of a tree whose pin its remote never serves', () => {
+  it('never holds a push or a land for a remote: the hook asks nothing, and no mode waits', () => {
+    // A push held up to 900 s for a remote to serve a pin (owner's ruling, 2026-10-30: reported, never waited on).
     const { url, unpushed } = remoteWithUnpushed();
-    const { workspace, commit } = workspacePinning(url, unpushed);
-    const held = run(workspace, '--wait', '1', commit);
-    expect(held.exitCode).toBe(1);
-    expect(held.stderr).toContain(`pre-push: ${url} does not serve ${unpushed}`);
-    expect(held.stderr).toContain('pre-push: refused: CI fetches every git revision Cargo.lock pins');
-  });
-
-  it('lets a push through once the pinned repository has pushed', () => {
-    const { url, clone, unpushed } = remoteWithUnpushed();
-    git(clone, 'push', '--quiet', 'origin', 'HEAD:refs/heads/main');
-    const { workspace, commit } = workspacePinning(url, unpushed);
-    const held = run(workspace, '--wait', '1', commit);
-    expect(held).toEqual({ exitCode: 0, stdout: '', stderr: '' });
+    const workspace = workspacePinning(url, unpushed);
+    const commit = git(workspace, 'rev-parse', 'HEAD');
+    expect(run(workspace, '--wait', '1', commit)).toEqual({
+      exitCode: 2,
+      stdout: '',
+      stderr: 'usage: pinned-revisions-served.ts --report\n',
+    });
+    const hook = readFileSync(
+      new URL('../../../nx-plugin/managed/raw/tooling/git-hooks/pre-push.sh', import.meta.url),
+      'utf8',
+    );
+    expect(hook).not.toContain('pinned-revisions-served');
   });
 });

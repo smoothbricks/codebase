@@ -989,7 +989,7 @@ may name (a local evidence path, a generated agent name) but its history message
 are judged by `git grep -i -P` like the others; one that must be case-sensitive starts with `(?-i)`. A pattern git
 cannot compile refuses the commit.
 
-The generated pre-push hook runs three gates. The first runs on every OS and guards a public repository against naming
+The generated pre-push hook runs two gates. The first runs on every OS and guards a public repository against naming
 what is private to the people working on it:
 
 ```bash
@@ -1023,36 +1023,34 @@ its samples at the pre-commit, commit-msg and pre-push judges and passes the ord
 real hooks refuse through the included file. Its samples are assembled from parts: a file that carried one would be
 refused by the shape it proves.
 
-The second runs on every OS and holds a push until CI can fetch every git revision its `Cargo.lock` pins:
+A pin's remote is reported, never waited on. A land builds a pinned crate from the local Cargo git database, so a pin
+needs no publish and no waiting to land, and a workspace can pin a revision its repository has not pushed yet. CI meets
+the pin only at the push, on a runner that has nothing but the remote, where cargo fails with "upload-pack: not our
+ref". A land gate can name such a pin without waiting on anything:
 
 ```bash
-bun tooling/git-hooks/pinned-revisions-served.ts --wait 900 <pushed-sha...>
+bun tooling/git-hooks/pinned-revisions-served.ts --report
 ```
 
-A land builds a pinned crate from the local Cargo git database, so a pin needs no publish and no waiting to land, and a
-workspace can pin a revision its repository has not pushed yet. CI meets the pin only at the push, on a runner that has
-nothing but the remote, where cargo fails with "upload-pack: not our ref". For each pushed commit the gate reads its
-`Cargo.lock` and asks each pin's remote the way cargo does: fetch the revision by id, and when the remote refuses that,
-fetch its branches and tags and look for it there, commits only (`--filter=tree:0`), in a scratch repository. A remote
-the fetch cannot reach proves nothing and is asked again. The push waits, naming every pin it waits for, until each
-remote serves its revision (normally the pinned repository's own push, minutes away) and refuses after the 900 s bound,
-naming each pin still unserved; a later push carries the same tree once its remotes have caught up. A land gate can
-report the same verdict without waiting (`--report`, exit 0), as a consumer workspace's land gate does. The third gate
-runs only on macOS. Linux `nx lint` already compiles the Linux `cfg(target_os)` arm; Darwin does not. This gate asks Nx
-for one target: it runs `direnv exec <checkout> nx run-many -t cargo-lint-cross`, in the checkout's own environment, the
-one the land gate runs in. It needs direnv on the caller's PATH and no devenv the caller entered: not "no devenv", but
-the checkout's devenv. The reason is that devenv declares a checkout's tooling and the environment it builds with, so a
-bare `nx` is an environment question rather than a PATH question. Tasks key on that environment as well as on the tree
-(the macOS SDK a native build links against, for one), and a push from a shell carrying another directory's devenv keyed
-the gate's tasks on that shell's `SDKROOT` and `DEVELOPER_DIR`, missed them, and built them against the wrong SDK. Nx
-caches the target on the Cargo inputs, so a hit is a prior real Linux clippy and the push proceeds. On a miss Nx
-restores or builds the target's dependencies in that environment, and the target's own guard refuses to start without
-`cargo-zigbuild` on PATH, which a macOS shell carries only inside the linux-cross profile, so the push is refused with
-`bun run check:linux` named; any other failure, in Nx or in direnv entering the checkout, is named as that and never as
-a miss. The hook never enters linux-cross and never starts the cross clippy, so it never costs an unbounded clippy.
-`bun run check:linux` is `tooling/devenv -P linux-cross shell --` around that same Nx target; it is the only place the
-gate runs from a plain shell, so it is deliberately not quiet. A push made from an already-entered linux-cross shell
-passes the guard and runs the check itself. `git push --no-verify` skips the hook.
+It reads `Cargo.lock` and asks each pin's remote once, the way cargo does: fetch the revision by id, and when the remote
+refuses that, fetch its branches and tags and look for it there, commits only (`--filter=tree:0`), in a scratch
+repository, all within a 60 s budget. It prints each pin its remote does not serve, and apart from those each remote
+that did not answer, and exits 0. No push or land holds for a remote: the pinned repository's own push serves the
+revision. The second gate runs only on macOS. Linux `nx lint` already compiles the Linux `cfg(target_os)` arm; Darwin
+does not. This gate asks Nx for one target: it runs `direnv exec <checkout> nx run-many -t cargo-lint-cross`, in the
+checkout's own environment, the one the land gate runs in. It needs direnv on the caller's PATH and no devenv the caller
+entered: not "no devenv", but the checkout's devenv. The reason is that devenv declares a checkout's tooling and the
+environment it builds with, so a bare `nx` is an environment question rather than a PATH question. Tasks key on that
+environment as well as on the tree (the macOS SDK a native build links against, for one), and a push from a shell
+carrying another directory's devenv keyed the gate's tasks on that shell's `SDKROOT` and `DEVELOPER_DIR`, missed them,
+and built them against the wrong SDK. Nx caches the target on the Cargo inputs, so a hit is a prior real Linux clippy
+and the push proceeds. On a miss Nx restores or builds the target's dependencies in that environment, and the target's
+own guard refuses to start without `cargo-zigbuild` on PATH, which a macOS shell carries only inside the linux-cross
+profile, so the push is refused with `bun run check:linux` named; any other failure, in Nx or in direnv entering the
+checkout, is named as that and never as a miss. The hook never enters linux-cross and never starts the cross clippy, so
+it never costs an unbounded clippy. `bun run check:linux` is `tooling/devenv -P linux-cross shell --` around that same
+Nx target; it is the only place the gate runs from a plain shell, so it is deliberately not quiet. A push made from an
+already-entered linux-cross shell passes the guard and runs the check itself. `git push --no-verify` skips the hook.
 
 Conventional commit scopes should use Nx project names. For packages in the same npm scope as the root package, smoo
 requires `package.json` `nx.name` to be the unscoped package name, such as `cli` for `@smoothbricks/cli`, so subjects

@@ -4,16 +4,14 @@
  * A workspace pins an external crate by git revision and builds it from the local Cargo git database, so a pin lands
  * with no publish and no waiting. CI meets the pin only once the tree is pushed: its runner has nothing but the remote,
  * and cargo (`net.git-fetch-with-cli`) asks the remote for the revision. When the remote does not serve it, every build
- * that reaches the crate fails ("upload-pack: not our ref"). So a land gate reports such a pin (`--report`), and the
- * pre-push hook holds the push until every remote serves its pinned revision (`--wait <seconds> <commit>...`), which
- * the pinned repository's own push normally does within minutes. Past the bound the hook refuses and names each pin,
- * so no tree CI cannot fetch is published.
+ * that reaches the crate fails ("upload-pack: not our ref"). So a land gate reports such a pin (`--report`, exit 0):
+ * reported, never waited on. No push or land holds for a remote; the pinned repository's own push serves the revision.
  *
  * "Served" is what cargo does: fetch the revision by id, and when the remote refuses that, fetch its branches and tags
- * and look for the revision among them. A remote the fetch cannot reach, or that does not answer within the time left,
- * proves nothing either way and is said as that: no ask outlives the hold's bound or the report's budget. One remote's
- * asks run one after another in its scratch repository, since concurrent fetches there contend for git's own locks.
- * Like the other managed git-hook helpers it imports only the runtime.
+ * and look for the revision among them. A remote the fetch cannot reach, or that does not answer within the report's
+ * budget, proves nothing either way and is said as that. One remote's asks run one after another in its scratch
+ * repository, since concurrent fetches there contend for git's own locks. Like the other managed git-hook helpers it
+ * imports only the runtime.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -37,27 +35,6 @@ export type PinAnswer =
 
 /** Asks one remote for one revision, answering `unreachable` once `budgetMs` has passed. */
 export type AskRemote = (url: string, rev: string, budgetMs: number) => Promise<PinAnswer>;
-
-/** The hold's one use of time, so a test can move it by hand. */
-export interface Clock {
-  /** Milliseconds on a scale that only moves forward. */
-  now(): number;
-  sleep(ms: number): Promise<void>;
-}
-
-export const systemClock: Clock = { now: () => performance.now(), sleep: (ms) => Bun.sleep(ms) };
-
-export type HoldOutcome =
-  /** `rounds` counts the asks: one means the remotes served every pin at once. */
-  | { readonly kind: 'served'; readonly waitedMs: number; readonly rounds: number }
-  | {
-      readonly kind: 'refused';
-      readonly waitedMs: number;
-      readonly outstanding: readonly (readonly [Pin, PinAnswer])[];
-    };
-
-/** How often a held push asks the remotes again. */
-export const POLL_MS = 30_000;
 
 /** How long a land gate's report waits for the remotes' answers, all of them together. */
 export const REPORT_BUDGET_MS = 60_000;
@@ -107,19 +84,6 @@ export function readPins(lockText: string): PinsRead {
   return { kind: 'pins', pins: [...pins.values()] };
 }
 
-/** The pins of several Cargo.lock files, each remote and revision once. */
-export function unitePins(reads: readonly (readonly Pin[])[]): Pin[] {
-  const united = new Map<string, { readonly url: string; readonly rev: string; readonly packages: Set<string> }>();
-  for (const pins of reads)
-    for (const pin of pins) {
-      const key = `${pin.url}#${pin.rev}`;
-      const entry = united.get(key) ?? { url: pin.url, rev: pin.rev, packages: new Set<string>() };
-      for (const name of pin.packages) entry.packages.add(name);
-      united.set(key, entry);
-    }
-  return [...united.values()].map(({ url, rev, packages }) => ({ url, rev, packages: [...packages] }));
-}
-
 export function describePin(pin: Pin, answer: PinAnswer): string {
   const built = `Cargo.lock builds ${pin.packages.join(', ')} from it`;
   switch (answer.kind) {
@@ -134,37 +98,6 @@ export function describePin(pin: Pin, answer: PinAnswer): string {
 
 function formatSeconds(ms: number): string {
   return `${Math.round(ms / 1000)} s`;
-}
-
-/**
- * Asks the remotes every `pollMs` until each serves its pin. A round's asks share what is left of `boundMs`, so none
- * outlives it, and the hold refuses after the last round that ends with no room for another before the bound. An
- * unreachable remote is asked again like an unserving one: neither proves the push safe.
- */
-export async function holdUntilServed(
-  pins: readonly Pin[],
-  ask: AskRemote,
-  clock: Clock,
-  boundMs: number,
-  pollMs: number,
-  say: (line: string) => void,
-): Promise<HoldOutcome> {
-  const started = clock.now();
-  let outstanding = pins;
-  for (let rounds = 1; ; rounds += 1) {
-    const budgetMs = boundMs - (clock.now() - started);
-    const answers = await Promise.all(
-      outstanding.map(async (pin): Promise<readonly [Pin, PinAnswer]> => [pin, await ask(pin.url, pin.rev, budgetMs)]),
-    );
-    const waiting = answers.filter(([, answer]) => answer.kind !== 'served');
-    const waitedMs = clock.now() - started;
-    if (waiting.length === 0) return { kind: 'served', waitedMs, rounds };
-    if (waitedMs + pollMs >= boundMs) return { kind: 'refused', waitedMs, outstanding: waiting };
-    for (const [pin, answer] of waiting)
-      say(`waiting (${formatSeconds(waitedMs)} of ${formatSeconds(boundMs)}): ${describePin(pin, answer)}`);
-    outstanding = waiting.map(([pin]) => pin);
-    await clock.sleep(pollMs);
-  }
 }
 
 interface GitRun {
@@ -255,23 +188,13 @@ export function remoteAsker(scratchRoot: string): AskRemote {
   };
 }
 
-/** Cargo.lock as `commit` holds it, or `undefined` when that tree has none. */
-async function lockAt(commit: string, root: string): Promise<string | undefined> {
-  const shown = await git(['cat-file', '-p', `${commit}:Cargo.lock`], root);
-  if (shown.exitCode === 0) return shown.stdout;
-  const has = await git(['cat-file', '-e', `${commit}^{tree}`], root);
-  if (has.exitCode === 0) return undefined;
-  throw new Error(`cannot read ${commit}:Cargo.lock: ${shown.stderr}`);
-}
-
 function pinsOf(text: string, where: string): readonly Pin[] {
   const read = readPins(text);
   if (read.kind === 'malformed') throw new Error(`${where}: ${read.detail}`);
   return read.pins;
 }
 
-const USAGE =
-  'usage: pinned-revisions-served.ts --report\n       pinned-revisions-served.ts --wait <seconds> <commit>...';
+const USAGE = 'usage: pinned-revisions-served.ts --report';
 
 async function report(root: string, ask: AskRemote): Promise<number> {
   const file = Bun.file(join(root, 'Cargo.lock'));
@@ -294,31 +217,10 @@ async function report(root: string, ask: AskRemote): Promise<number> {
     ...(unanswered.length === 0 ? [] : [`${unanswered.length} whose remote did not answer`]),
   ].join(' and ');
   console.log(
-    `PINNED-REVISIONS note: ${counted}, reported, not refused: the land builds them from the local Cargo git database, and the push (tooling/git-hooks/pre-push.sh) waits until the remote serves them, since CI fetches them there:\n` +
+    `PINNED-REVISIONS note: ${counted}, reported, never waited on: the land builds them from the local Cargo git database, and CI fetches them from their remote, so push each one there (the pinned repository's own land normally does):\n` +
       [...unserved, ...unanswered].map(([pin, answer]) => `  ${describePin(pin, answer)}`).join('\n'),
   );
   return 0;
-}
-
-async function hold(root: string, boundSeconds: number, commits: readonly string[], ask: AskRemote): Promise<number> {
-  const locks = await Promise.all(commits.map(async (commit) => [commit, await lockAt(commit, root)] as const));
-  const pins = unitePins(
-    locks.flatMap(([commit, text]) => (text === undefined ? [] : [pinsOf(text, `${commit}:Cargo.lock`)])),
-  );
-  if (pins.length === 0) return 0;
-  const say = (line: string) => console.error(`pre-push: ${line}`);
-  const outcome = await holdUntilServed(pins, ask, systemClock, boundSeconds * 1000, POLL_MS, say);
-  if (outcome.kind === 'served') {
-    if (outcome.rounds > 1) say(`every pinned revision is served after ${formatSeconds(outcome.waitedMs)}`);
-    return 0;
-  }
-  for (const [pin, answer] of outcome.outstanding) say(describePin(pin, answer));
-  say(
-    `refused: CI fetches every git revision Cargo.lock pins from the remote it names, and ${outcome.outstanding.length} ` +
-      `of them are not served after ${formatSeconds(outcome.waitedMs)}. Push each one to its remote (the pinned ` +
-      "repository's own land normally does), then push again.",
-  );
-  return 1;
 }
 
 if (import.meta.main) {
@@ -340,8 +242,6 @@ if (import.meta.main) {
   try {
     const ask = remoteAsker(scratch);
     if (mode === '--report' && rest.length === 0) process.exitCode = await report(root, ask);
-    else if (mode === '--wait' && rest.length > 1 && /^[1-9]\d*$/.test(rest[0] ?? ''))
-      process.exitCode = await hold(root, Number(rest[0]), rest.slice(1), ask);
     else {
       console.error(USAGE);
       process.exitCode = 2;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Three gates, in order.
+# Two gates, in order.
 #
 # 1. On every OS, the public denylist: every commit this push publishes is
 # refused if its tree, or the message of any commit the remote does not hold
@@ -40,19 +40,10 @@
 # guard, so there a miss runs the check itself: the same clippy `check:linux`
 # runs, in the toolchain the user entered for it.
 #
-# 3. Last, on every OS, the pinned revisions. CI fetches every git revision
-# Cargo.lock pins from the remote it names, while a land builds it from the
-# local Cargo git database, so a pin can land before its repository pushes it.
-# The push holds until each remote serves its pinned revision (normally the
-# pinned repository's own push, minutes away) and refuses after 15 minutes,
-# naming each pin, so no tree CI cannot fetch is published
-# (pinned-revisions-served.ts). It runs after the gates that refuse in seconds,
-# so a push they refuse is never held first.
-#
-# The denylist gate needs only tooling/direnv/repo-path's PATH, and so does the
-# pinned-revisions gate (bun and git); the cross gate needs direnv on the
-# caller's PATH, and the checkout's own devenv through it, not a devenv the
-# caller entered. It must never pretend a check ran that did not.
+# The denylist gate needs only tooling/direnv/repo-path's PATH; the cross gate
+# needs direnv on the caller's PATH, and the checkout's own devenv through it,
+# not a devenv the caller entered. It must never pretend a check ran that did
+# not.
 
 cd "$(git rev-parse --show-toplevel)"
 TOOLING="$PWD/tooling"
@@ -134,7 +125,3 @@ EOF
 case "$(uname -s)" in
   Darwin) cross_gate || exit 1 ;;
 esac
-
-if [ "${#pushed[@]}" -gt 0 ]; then
-  bun "$TOOLING/git-hooks/pinned-revisions-served.ts" --wait 900 "${pushed[@]}" || exit 1
-fi
