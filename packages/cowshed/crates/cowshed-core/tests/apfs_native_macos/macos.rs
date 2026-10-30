@@ -2455,12 +2455,17 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
     host.retain_mounted(&workspace(), attachment)
         .expect("retain");
     let described_name = || {
-        let output = Command::new("diskutil")
-            .args(["info", "-plist"])
-            .arg(&mount)
-            .output_bounded()
-            .expect("read the fixture volume's Disk Arbitration description");
-        assert!(output.status.success(), "diskutil info: {:?}", output);
+        let output = SystemCommandRunner::new(fixture.host_namespace())
+            .run(
+                &CommandRequest::new(
+                    "/usr/sbin/diskutil",
+                    ["info".as_ref(), "-plist".as_ref(), mount.as_os_str()],
+                ),
+                "fixture Disk Arbitration description",
+            )
+            .expect("read the fixture volume's Disk Arbitration description")
+            .output;
+        assert!(output.succeeded(), "diskutil info: {output:?}");
         let description: plist::Value =
             plist::from_bytes(&output.stdout).expect("disk description plist");
         description
@@ -2475,49 +2480,11 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
         described_before, label,
         "the fixture starts with its inherited name"
     );
-    struct Activity(std::process::Child);
-    impl Drop for Activity {
-        fn drop(&mut self) {
-            if let Err(error) = self.0.kill()
-                && error.kind() != std::io::ErrorKind::InvalidInput
-            {
-                eprintln!("cannot stop fixture diskutil activity: {error}");
-            }
-            if let Err(error) = self.0.wait_bounded() {
-                eprintln!("cannot reap fixture diskutil activity: {error}");
-            }
-        }
-    }
-    fn activity_until(reader: &mut impl std::io::BufRead, ready: impl Fn(&str) -> bool) -> String {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            assert_ne!(
-                reader.read_line(&mut line).expect("Disk Arbitration event"),
-                0,
-                "diskutil activity ended before its expected event"
-            );
-            if ready(&line) {
-                return line;
-            }
-        }
-    }
-    let mut activity = Activity(
-        Command::new("diskutil")
-            .arg("activity")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn_locked()
-            .expect("observe the fixture's Disk Arbitration events"),
-    );
-    let mut events = std::io::BufReader::new(activity.0.stdout.take().expect("activity stdout"));
-    activity_until(&mut events, |line| line.starts_with("***DAIdle "));
+    let mut described = disk_arbitration::Names::armed();
     let device = kernel_mount_at(&mount)
         .expect("the fixture's own mounted volume")
         .source_device;
-    let device_event = format!("('{}',", device.trim_start_matches("/dev/"));
-    let name_event = format!("DAVolumeName = '{label}'");
+    let bsd_name = device.trim_start_matches("/dev/").to_owned();
 
     assert_eq!(
         host.label_image_volume(image.image(), label)
@@ -2533,14 +2500,11 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
             .expect("an already-named volume"),
         Labelled::Already
     );
-    // Advance on DA's description-changed callback, not on elapsed time or inventory polling.
-    let changed = activity_until(&mut events, |line| {
-        line.starts_with("***DiskDescriptionChanged ")
-            && line.contains(&device_event)
-            && line.contains(&name_event)
-    });
+    // Advance on Disk Arbitration's own description-changed callback, never on time or polling.
+    described.until_named(&bsd_name, label);
+    drop(described);
     assert_eq!(described_name(), label);
-    eprintln!("Disk Arbitration observed the descriptor rename: {changed}");
+    cowshed_os::eprintln!("Disk Arbitration described {bsd_name} as {label:?}");
     assert_eq!(
         cowshed_apfs::volume_name(Path::new("/System/Volumes/Data"))
             .expect("the host's Data volume name"),
@@ -6285,6 +6249,218 @@ mod build_mount_races {
 
 #[path = "workspace_isolation.rs"]
 mod workspace_isolation;
+
+/// Disk Arbitration's record of volume names, what diskutil and Finder display (01a_apfs.md,
+/// "Ownership, identity, and the volume label"), read through the framework itself as
+/// `support/fsevents.rs` reads fseventsd: no disk tool runs. A session is armed once its first
+/// idle callback has run; every wait then ends on Disk Arbitration's own callback, run on this
+/// thread's run loop, and no clock bounds it.
+mod disk_arbitration {
+    use std::cell::RefCell;
+    use std::ffi::{CStr, c_char, c_void};
+
+    const UTF8: u32 = 0x0800_0100;
+    /// One run-loop pass in a wait: it returns after the first source it handles.
+    const RUN_UNTIL_DELIVERY: f64 = 1.0e10;
+
+    #[link(name = "DiskArbitration", kind = "framework")]
+    unsafe extern "C" {
+        static kDADiskDescriptionVolumeNameKey: *const c_void;
+        fn DASessionCreate(allocator: *const c_void) -> *const c_void;
+        fn DASessionScheduleWithRunLoop(
+            session: *const c_void,
+            run_loop: *mut c_void,
+            mode: *const c_void,
+        );
+        fn DASessionUnscheduleFromRunLoop(
+            session: *const c_void,
+            run_loop: *mut c_void,
+            mode: *const c_void,
+        );
+        fn DARegisterIdleCallback(
+            session: *const c_void,
+            callback: unsafe extern "C" fn(*mut c_void),
+            context: *mut c_void,
+        );
+        fn DARegisterDiskDescriptionChangedCallback(
+            session: *const c_void,
+            matching: *const c_void,
+            watch: *const c_void,
+            callback: unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void),
+            context: *mut c_void,
+        );
+        fn DAUnregisterCallback(
+            session: *const c_void,
+            callback: *mut c_void,
+            context: *mut c_void,
+        );
+        fn DADiskGetBSDName(disk: *const c_void) -> *const c_char;
+        fn DADiskCopyDescription(disk: *const c_void) -> *const c_void;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFRunLoopDefaultMode: *const c_void;
+        static kCFTypeArrayCallBacks: c_void;
+        fn CFArrayCreate(
+            allocator: *const c_void,
+            values: *const *const c_void,
+            count: isize,
+            callbacks: *const c_void,
+        ) -> *const c_void;
+        fn CFDictionaryGetValue(dictionary: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFStringGetCString(
+            string: *const c_void,
+            buffer: *mut c_char,
+            size: isize,
+            encoding: u32,
+        ) -> u8;
+        fn CFRelease(value: *const c_void);
+        fn CFRunLoopGetCurrent() -> *mut c_void;
+        fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: u8) -> i32;
+    }
+
+    /// What the session's callbacks have seen.
+    #[derive(Default)]
+    struct Seen {
+        idle: bool,
+        /// Each disk's BSD name with the volume name Disk Arbitration then described, in order.
+        described: Vec<(String, Option<String>)>,
+    }
+
+    pub struct Names {
+        session: *const c_void,
+        run_loop: *mut c_void,
+        seen: Box<RefCell<Seen>>,
+    }
+
+    unsafe extern "C" fn idle(context: *mut c_void) {
+        // SAFETY: `context` is the session's own `Seen`, alive until its callbacks are
+        // unregistered; they run on this thread's run loop, where no borrow of it is held.
+        let seen = unsafe { &*context.cast::<RefCell<Seen>>() };
+        seen.borrow_mut().idle = true;
+    }
+
+    unsafe extern "C" fn changed(disk: *const c_void, _keys: *const c_void, context: *mut c_void) {
+        // SAFETY: as in `idle`.
+        let seen = unsafe { &*context.cast::<RefCell<Seen>>() };
+        // SAFETY: Disk Arbitration passes a disk valid for the callback.
+        let bsd = unsafe { DADiskGetBSDName(disk) };
+        if bsd.is_null() {
+            return;
+        }
+        // SAFETY: a non-null BSD name is a NUL-terminated string the disk owns.
+        let bsd = unsafe { CStr::from_ptr(bsd) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: as above; the copied description is released below.
+        let description = unsafe { DADiskCopyDescription(disk) };
+        let name = if description.is_null() {
+            None
+        } else {
+            // SAFETY: `description` is a dictionary this callback owns until its release.
+            let name = string(unsafe {
+                CFDictionaryGetValue(description, kDADiskDescriptionVolumeNameKey)
+            });
+            // SAFETY: released once, after its value was copied out.
+            unsafe { CFRelease(description) };
+            name
+        };
+        seen.borrow_mut().described.push((bsd, name));
+    }
+
+    /// A CFString's UTF-8 text, or `None` for no string or one that does not fit.
+    fn string(value: *const c_void) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        let mut buffer: [c_char; 1024] = [0; 1024];
+        let size = isize::try_from(buffer.len()).expect("a small buffer");
+        // SAFETY: `value` is a CFString its dictionary owns; the buffer's size is passed.
+        let copied = unsafe { CFStringGetCString(value, buffer.as_mut_ptr(), size, UTF8) };
+        // SAFETY: a successful copy is NUL-terminated within the buffer.
+        (copied != 0).then(|| {
+            unsafe { CStr::from_ptr(buffer.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    impl Names {
+        /// A session watching every disk's volume name, scheduled on this thread's run loop and
+        /// armed: its first idle callback has run, so a later rename's change reaches it.
+        pub fn armed() -> Self {
+            // SAFETY: a default-allocator session, released in `drop`.
+            let session = unsafe { DASessionCreate(std::ptr::null()) };
+            assert!(!session.is_null(), "a Disk Arbitration session");
+            let seen = Box::new(RefCell::new(Seen::default()));
+            let context = std::ptr::from_ref(&*seen).cast_mut().cast::<c_void>();
+            // SAFETY: the key is Disk Arbitration's constant; the array is released after the
+            // registration copied it.
+            unsafe {
+                let keys = [kDADiskDescriptionVolumeNameKey];
+                let watch = CFArrayCreate(
+                    std::ptr::null(),
+                    keys.as_ptr(),
+                    1,
+                    (&raw const kCFTypeArrayCallBacks).cast(),
+                );
+                assert!(!watch.is_null(), "the watched description keys");
+                DARegisterDiskDescriptionChangedCallback(
+                    session,
+                    std::ptr::null(),
+                    watch,
+                    changed,
+                    context,
+                );
+                CFRelease(watch);
+                DARegisterIdleCallback(session, idle, context);
+            }
+            // SAFETY: this thread's run loop, on which every wait runs.
+            let run_loop = unsafe { CFRunLoopGetCurrent() };
+            // SAFETY: the session is unscheduled from this run loop in `drop`.
+            unsafe { DASessionScheduleWithRunLoop(session, run_loop, kCFRunLoopDefaultMode) };
+            let names = Self {
+                session,
+                run_loop,
+                seen,
+            };
+            names.until(|seen| seen.idle);
+            names
+        }
+
+        /// Wait until Disk Arbitration describes `bsd_name`'s volume as `name`.
+        pub fn until_named(&mut self, bsd_name: &str, name: &str) {
+            self.until(|seen| {
+                seen.described
+                    .iter()
+                    .any(|(disk, described)| disk == bsd_name && described.as_deref() == Some(name))
+            });
+        }
+
+        fn until(&self, done: impl Fn(&Seen) -> bool) {
+            while !done(&self.seen.borrow()) {
+                // SAFETY: the session is scheduled on this thread's run loop; no borrow of
+                // `seen` is held while its callbacks run.
+                unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, RUN_UNTIL_DELIVERY, 1) };
+            }
+        }
+    }
+
+    impl Drop for Names {
+        fn drop(&mut self) {
+            let context = std::ptr::from_ref(&*self.seen).cast_mut().cast::<c_void>();
+            // SAFETY: unscheduled and unregistered before `seen` is dropped, so no callback
+            // reaches it after; the session is released once.
+            unsafe {
+                DASessionUnscheduleFromRunLoop(self.session, self.run_loop, kCFRunLoopDefaultMode);
+                DAUnregisterCallback(self.session, changed as *mut c_void, context);
+                DAUnregisterCallback(self.session, idle as *mut c_void, context);
+                CFRelease(self.session);
+            }
+        }
+    }
+}
 
 /// The request these tests take an image lock for when they stand in for another lifecycle
 /// operation holding it: a store's gc, which names no one workspace.
