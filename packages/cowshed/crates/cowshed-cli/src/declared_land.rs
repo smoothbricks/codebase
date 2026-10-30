@@ -17,6 +17,7 @@ use cowshed_core::declared_land::{
     self as declared, AfterFastForward, AfterRequest, LandDeclaration, LandEvent, LandRecord,
 };
 use cowshed_core::land_turn::{Turn, TurnAsk};
+use cowshed_core::runtime::ref_turn::{RefTurn, RefWriter};
 use cowshed_core::{CowshedError, ErrorCode, FenceRefusal, Result};
 use cowshed_os::fork_lock::Run as _;
 
@@ -320,6 +321,13 @@ where
     let workspace = land.workspace;
     let mut regated = 0_u32;
     loop {
+        holding(
+            turn,
+            declaration.turn(),
+            "the sync with the push remote",
+            sync_with_push_remote(&*service, main, declaration, workspace, branch, output),
+        )
+        .await?;
         let (base, head) = holding(
             turn,
             declaration.turn(),
@@ -630,6 +638,197 @@ pub(crate) fn pure_environment() -> Result<Vec<(OsString, OsString)>> {
         |name| std::env::var_os(name),
         path,
     ))
+}
+
+/// Step 3 starts from the push remote's head (02_workspaces.md "A declared land"). A writer that
+/// pushes main without landing it, such as a release workflow's version commits, can leave the
+/// remote ahead of this checkout's main, and a land onto the main it left behind would gate, land
+/// and run its after-land commands on a head its push then cannot fast-forward. So main is brought
+/// to the remote's branch first when that is ahead, under the ref turn, as every writer of main's
+/// ref is. A main that holds the remote's head is landed onto as it is, and one that has diverged
+/// from it is refused, naming both heads, before anything moves. A remote that cannot be read, or
+/// that has no such branch yet, costs only this step: a land never needs its remote, so it says
+/// so and lands onto main as it is, and its push is recorded like any other.
+async fn sync_with_push_remote<S, W, E>(
+    service: &S,
+    main: &Path,
+    declaration: &LandDeclaration,
+    workspace: &str,
+    branch: &str,
+    output: &mut Output<W, E>,
+) -> Result<()>
+where
+    S: CliService,
+    W: Write + Send,
+    E: Write + Send,
+{
+    let Some(remote) = declaration.push() else {
+        return Ok(());
+    };
+    let remote = remote.as_str();
+    let theirs = match remote_head(main, remote, branch).await {
+        Ok(Some(head)) => head,
+        Ok(None) => return Ok(()),
+        Err(reason) => {
+            return say(
+                output,
+                &format!(
+                    "cannot read {remote}'s {branch} ({reason}); landing onto main as it is, so its push may be refused"
+                ),
+            );
+        }
+    };
+    let ours = main_head(main)?;
+    if ours == theirs || main_holds(main, &theirs)? {
+        return Ok(());
+    }
+    if !holds(main, &theirs, &ours)? {
+        return Err(CowshedError::new(
+            ErrorCode::Conflict,
+            format!(
+                "main is at {} and {remote}'s {branch} at {}, and neither holds the other: a land onto this main would push a head {remote} refuses",
+                ours.as_str(),
+                theirs.as_str()
+            ),
+            format!("reconcile main with {remote}'s {branch}, then cowshed land {workspace}"),
+        ));
+    }
+    let socket = service.control_socket()?;
+    let mut turn = RefTurn::acquire_in(
+        &socket,
+        declaration.ref_turn(),
+        RefWriter::Land { workspace },
+    )
+    .await?;
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(main)
+        .args(["merge", "--ff-only", "--quiet", theirs.as_str()]);
+    let ran = crate::doc_commit::run_split(command, None, Some(&mut turn)).await;
+    let moved = matches!(&ran, Ok((status, _, _)) if status.success());
+    turn.end(if moved {
+        format!("fast-forwarded main to {}", theirs.as_str())
+    } else {
+        "refused: main was not fast-forwarded".to_owned()
+    });
+    let (status, _, stderr) = ran?;
+    if !status.success() {
+        return Err(CowshedError::new(
+            ErrorCode::Conflict,
+            format!(
+                "git merge --ff-only {} in main {}: {}",
+                theirs.as_str(),
+                describe(status),
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+            format!("bring main to {remote}'s {branch}, then cowshed land {workspace}"),
+        ));
+    }
+    say(
+        output,
+        &format!(
+            "main was behind {remote}'s {branch}: fast-forwarded it from {} to {} before rebasing {workspace}",
+            ours.as_str(),
+            theirs.as_str()
+        ),
+    )
+}
+
+/// The head of `remote`'s `branch`, fetched into main's repository; `None` when the remote has no
+/// such branch. Git aborts a transfer that stalls and never prompts, so an unreachable remote
+/// answers an error instead of holding the land.
+async fn remote_head(
+    main: &Path,
+    remote: &str,
+    branch: &str,
+) -> std::result::Result<Option<GitOid>, String> {
+    let git = |args: &[&str]| {
+        let mut command = std::process::Command::new("git");
+        command
+            .arg("-C")
+            .arg(main)
+            .args(["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=60"])
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0");
+        command
+    };
+    let refname = format!("refs/heads/{branch}");
+    let (status, listed, stderr) =
+        crate::doc_commit::run_split(git(&["ls-remote", remote, &refname]), None, None)
+            .await
+            .map_err(|error| error.message)?;
+    if !status.success() {
+        return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
+    }
+    if listed.is_empty() {
+        return Ok(None);
+    }
+    let (status, _, stderr) = crate::doc_commit::run_split(
+        git(&["fetch", "--quiet", "--no-tags", remote, &refname]),
+        None,
+        None,
+    )
+    .await
+    .map_err(|error| error.message)?;
+    if !status.success() {
+        return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
+    }
+    let (status, head, stderr) = crate::doc_commit::run_split(
+        git(&["rev-parse", "--verify", "FETCH_HEAD^{commit}"]),
+        None,
+        None,
+    )
+    .await
+    .map_err(|error| error.message)?;
+    if !status.success() {
+        return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
+    }
+    GitOid::new(String::from_utf8_lossy(&head).trim().to_owned())
+        .map(Some)
+        .map_err(|error| format!("FETCH_HEAD is not an object id: {error}"))
+}
+
+/// Whether `descendant` holds `ancestor` (`git merge-base --is-ancestor`), both in main's repository.
+fn holds(main: &Path, descendant: &GitOid, ancestor: &GitOid) -> Result<bool> {
+    // WHY unbounded: a git read of this host's own main checkout: it runs no hook and waits on no
+    // other process.
+    #[allow(clippy::disallowed_methods)]
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(main)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor.as_str(),
+            descendant.as_str(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output_locked()
+        .map(|output| output.status)
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot run git to read whether {} holds {}: {error}",
+                    descendant.as_str(),
+                    ancestor.as_str()
+                ),
+                "install git",
+            )
+        })?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(CowshedError::internal(format!(
+            "git merge-base --is-ancestor {} {} in {} {}",
+            ancestor.as_str(),
+            descendant.as_str(),
+            main.display(),
+            describe(status)
+        ))),
+    }
 }
 
 /// Whether main's head holds `commit` (`git merge-base --is-ancestor`); a commit main's repository

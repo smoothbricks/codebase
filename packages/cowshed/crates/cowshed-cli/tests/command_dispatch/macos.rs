@@ -8697,3 +8697,130 @@ async fn directory_a_declared_land_whose_gate_fails_keeps_main_and_the_workspace
         .await
         .expect("stop the real directory project");
 }
+
+/// The declared land fixture's push remote, given main's head and then one commit main lacks, as
+/// a release workflow pushes its version commits: answers that commit.
+fn release_on_the_remote(fixture: &Fixture, declared: &DeclaredLand) -> String {
+    git(
+        &declared.main,
+        &["push", "-q", "landing", "HEAD:refs/heads/main"],
+    );
+    let release = fixture.granted.join("release");
+    git(
+        &fixture.granted,
+        &[
+            "clone",
+            "-q",
+            "--branch",
+            "main",
+            declared.remote.to_str().unwrap(),
+            release.to_str().unwrap(),
+        ],
+    );
+    fs::write(release.join("release.txt"), b"release\n").expect("write the release file");
+    git(&release, &["add", "release.txt"]);
+    git(&release, &["commit", "-q", "-m", "release"]);
+    git(&release, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    git_stdout(&release, &["rev-parse", "HEAD"])
+}
+
+/// A declared land starts from its push remote's head: a main behind it is fast-forwarded to it
+/// before the rebase, so the head the land gates, lands, runs its after-land command on and pushes
+/// is one commit, and the push succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_land_starts_from_its_push_remote_s_head_substrate_lifecycle() {
+    let mut fixture = Fixture::directory().with_background_program();
+    let turn = format!("fixture-behind-{}", std::process::id());
+    let declared = DeclaredLand::declare(&fixture, &turn, 0);
+    let released = release_on_the_remote(&fixture, &declared);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+
+    let (stdout, stderr) = succeed(&mut service, ["--json", "land", "topic"]).await;
+    let envelope: JsonEnvelope<LandReport> =
+        serde_json::from_slice(&stdout).expect("the land prints its report");
+    let Some(LandReport::Landed(landed)) = envelope.result() else {
+        panic!("a declared land answers a landed report: {envelope:?}\n{stderr}");
+    };
+    assert!(
+        stderr.contains("fast-forwarded it from"),
+        "the land says it brought main to the remote's head: {stderr}"
+    );
+    let head = git_stdout(&declared.main, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        landed.landed_head.as_str(),
+        head,
+        "main is at the landed head"
+    );
+    assert_eq!(
+        git_stdout(&declared.main, &["merge-base", &released, &head]),
+        released,
+        "the landed head holds the remote's commit"
+    );
+    assert!(declared.main.join("release.txt").is_file());
+    assert!(declared.main.join("topic.txt").is_file());
+
+    let lands = declared.wait_for_lands(3);
+    let events: Vec<_> = lands.iter().map(|record| record.event).collect();
+    use cowshed_core::declared_land::LandEvent;
+    assert_eq!(
+        events,
+        [LandEvent::Landed, LandEvent::AfterExited, LandEvent::Pushed],
+        "{lands:?}"
+    );
+    assert!(lands.iter().all(|record| record.head.as_str() == head));
+    assert_eq!(
+        git_stdout(&declared.remote, &["rev-parse", "main"]),
+        head,
+        "the push fast-forwarded the remote to the landed head"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
+/// A main that has diverged from its push remote is refused before the land's turn moves
+/// anything: neither head holds the other, so whatever the land made would be a head the push
+/// cannot fast-forward. No gate runs, main stays, and the workspace is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_land_refuses_a_main_diverged_from_its_push_remote_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory().with_background_program();
+    let turn = format!("fixture-diverged-{}", std::process::id());
+    let declared = DeclaredLand::declare(&fixture, &turn, 0);
+    let released = release_on_the_remote(&fixture, &declared);
+    fs::write(declared.main.join("local.txt"), b"local\n").expect("write main's own file");
+    git(&declared.main, &["add", "local.txt"]);
+    git(&declared.main, &["commit", "-q", "-m", "local"]);
+    let local = git_stdout(&declared.main, &["rev-parse", "HEAD"]);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+
+    let (result, _, stderr) = run(&mut service, ["land", "topic"]).await;
+    let refusal = result.expect_err("a main diverged from its push remote is refused");
+    assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
+    assert!(
+        refusal.message.contains(&local) && refusal.message.contains(&released),
+        "the refusal names both heads: {refusal}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(declared.gated().is_empty(), "no gate ran");
+    assert_eq!(
+        git_stdout(&declared.main, &["rev-parse", "HEAD"]),
+        local,
+        "main stays"
+    );
+    assert!(topic.exists(), "the workspace stays");
+    assert!(declared.lands().is_empty(), "nothing landed");
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}

@@ -950,7 +950,7 @@ async fn run(
 /// this process ends. One the gateway does not bind, one whose stdin cannot be written and one
 /// still running when the turn is lost are sent SIGTERM, and the hold fails once it has ended, so
 /// nothing runs in main beside the next writer and nothing is put back while it runs.
-async fn run_split(
+pub(crate) async fn run_split(
     mut command: std::process::Command,
     stdin: Option<&[u8]>,
     mut turn: Option<&mut RefTurn>,

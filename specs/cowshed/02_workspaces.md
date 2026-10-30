@@ -1231,12 +1231,19 @@ unchanged.
    `land-turn`'s, with `<ws>` as the ticket's workspace. The gate (step 4) binds itself to the turn as `land-turn`'s
    command does, from its start, so the gateway keeps the turn until the gate has ended too, however this process ends:
    a land killed alone leaves its gate holding the turn, never a second land beside it.
-3. **Rebase.** It rebases `<ws>` onto main's head as `cowshed rebase <ws> --expected-onto-head <head>` does, and again
-   onto the newer head when main moved before the rebase began (`OntoMoved`). A conflict stops the land with the
-   rebase's own refusal and the workspace as it was: the land aborts the replay the rebase stopped (`--abort`), and the
-   conflict is resolved through `cowshed rebase <ws>` and `--continue` before landing again. A turn lost while the
-   rebase runs stops the land once the rebase has ended, and one found lost before the fast-forward (step 5) stops it
-   before main moves.
+3. **Rebase.** It first brings main to the head of `[land] push`'s branch: a writer that pushes main without landing it
+   (a release workflow's version commits) can leave the remote ahead, and a land onto the main it left behind would
+   gate, land and run its after commands on a head its push cannot fast-forward. When the remote's branch is ahead of
+   main, main is fast-forwarded to it under the ref turn (step 5); when main holds it, or the remote has no such branch,
+   main is used as it is; when neither holds the other, the land refuses with both heads before anything moves. A remote
+   that cannot be read is said and costs only this: a land never needs its remote, so it lands onto main as it is and
+   its push is recorded as any other. Main's head after this step, the landed head, the head the after commands run on
+   and the pushed head are then one commit. It rebases `<ws>` onto main's head as
+   `cowshed rebase <ws> --expected-onto-head <head>` does, and again onto the newer head when main moved before the
+   rebase began (`OntoMoved`). A conflict stops the land with the rebase's own refusal and the workspace as it was: the
+   land aborts the replay the rebase stopped (`--abort`), and the conflict is resolved through `cowshed rebase <ws>` and
+   `--continue` before landing again. A turn lost while the rebase runs stops the land once the rebase has ended, and
+   one found lost before the fast-forward (step 5) stops it before main moves.
 4. **The declared gate.** It runs `[land] gate`, `{workspace}` replaced by `<ws>`, on the host in main's pure
    environment (below), its stdout and stderr on the land's stderr. A nonzero exit stops the land (exit 4, naming the
    gate and how it ended) and keeps the workspace. The gate checks the tree; it moves neither main nor the workspace,
