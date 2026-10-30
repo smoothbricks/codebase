@@ -96,7 +96,12 @@ import {
 import { runtimeInput, shellWord } from './runtime-input.js';
 import { inferredTaskKind, refuseBuildTestDependencies } from './task-graph-policy.js';
 import { postTasksExecution as postTaskResults, preTasksExecution as preTaskResults } from './task-results.js';
-import { SHARD_TIMINGS_EXECUTOR, SHARD_TIMINGS_TARGET, timingsShardedSuite } from './test-timings.js';
+import {
+  SHARD_TIMINGS_EXECUTOR,
+  SHARD_TIMINGS_TARGET,
+  timingsShardedSuite,
+  timingsSuiteInputs,
+} from './test-timings.js';
 import { assertUpstreamBasePrecondition } from './test-walk-policy.js';
 import { type NativeTools, nativeToolCommand, nativeToolDependsOn, resolveNativeTools } from './tool-bins.js';
 import {
@@ -518,14 +523,32 @@ const CARGO_OUTPUT_INPUTS = CARGO_INPUTS;
 /** The lockfiles of crates no resolved Cargo workspace claims, which have no lock-scope node. */
 const UNRESOLVED_CARGO_LOCK_INPUT = '{projectRoot}/**/Cargo.lock';
 /**
- * What the uncached `cargo-fetch` reads: the manifests and the lock that name the crates, and the Cargo configuration
- * that says where they come from. They key nothing; they are what a producer receipt binds the fetch to. Unnamed, Nx
- * plans every file of the project, which for a repository-root project includes its symlinked managed files, and a
- * receipt binds no symlink. That workspace's members belong to other projects, so its globs start at the repository root.
+ * The files `cargo-fetch` reads: the manifests and the lock that name the crates, and the Cargo configuration that says
+ * where they come from. With the registry's state (cargoFetchedInput) they are its key. Unnamed, Nx plans every file of
+ * the project, which for a repository-root project includes its symlinked managed files, and a receipt binds no
+ * symlink. That workspace's members belong to other projects, so its globs start at the repository root.
  */
 function cargoFetchInputs(projectRoot: string): string[] {
   const base = projectRoot === '.' ? '{workspaceRoot}' : '{projectRoot}';
   return [`${base}/**/Cargo.toml`, `${base}/**/Cargo.lock`, `${base}/**/.cargo/config.toml`, `!${base}/**/target/**`];
+}
+/** The locked fetch of one manifest, relative to the project it runs in. */
+function cargoFetchCommand(manifestPath: string): string {
+  return manifestPath === 'Cargo.toml' ? CARGO_FETCH_COMMAND : `${CARGO_FETCH_COMMAND} --manifest-path ${manifestPath}`;
+}
+/**
+ * Whether the registry holds every manifest's locked graph, as the runtime input that brings CARGO_HOME into
+ * `cargo-fetch`'s key: the download lands outside the workspace, so no output can stand for it. `fetched` when an
+ * offline fetch of each manifest succeeds, which asks no network and fails on any crate the registry lacks. A registry
+ * that lacks one gives a value of its own run (the shell's pid and the time), which no cached run matches, so the fetch
+ * runs; a registry that holds them all keys an unchanged lock to its cached run.
+ */
+function cargoFetchedInput(projectRoot: string, manifests: readonly string[]): { runtime: string } {
+  const offline = manifests.map((manifest) => `${cargoFetchCommand(manifest)} --offline --quiet`).join(' && ');
+  return cargoRuntimeInput(
+    projectRoot,
+    `if { ${offline}; } >/dev/null 2>&1; then echo fetched; else echo "unfetched $$ $(date +%s)"; fi`,
+  );
 }
 /** A full cargo-mutants sweep's wall-clock backstop: a sweep takes hours, and a hung one must still end. */
 const MUTATION_TIMEOUT_MS = 6 * 60 * 60 * 1000;
@@ -541,6 +564,17 @@ function fileHashInput(path: string): { runtime: string } {
   );
 }
 
+/**
+ * The bytes of a file that arrives from elsewhere, as a runtime input: their SHA-256, streamed, or `absent`. A task
+ * that needs the file fails without it, and Nx caches no failure, so no cached run is keyed on `absent`.
+ */
+export function arrivedFileHashInput(path: string): { runtime: string } {
+  const hash =
+    'const file = Bun.file(process.argv[1]); const hash = new Bun.CryptoHasher("sha256"); ' +
+    'if (!(await file.exists())) console.log("absent"); ' +
+    'else { for await (const chunk of file.stream()) hash.update(chunk); console.log(hash.digest("hex")); }';
+  return runtimeInput(`bun -e ${shellWord(hash)} ${shellWord(path)}`);
+}
 /**
  * One shell command that runs `steps` in order and stops at the first failure.
  *
@@ -809,13 +843,14 @@ function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): 
  * inputs itself: both are otherwise attached by matching the
  * `cargo --frozen` prefix in a command, and this command does not carry it.
  *
- * The RUNNER declares no dependency on the archive and is not cached. That is
- * the whole point of splitting the pair: it runs on a machine where the triple
- * is native and the archive arrived as a file, so a dependency edge would ask
- * that machine to cross-build what it was sent, and a cache verdict would be
- * keyed on sources whose binaries it did not build. It is also the one cargo
- * target that needs no cargo: `nextest run --archive-file` extracts prebuilt
- * binaries and never invokes cargo (measured, zero invocations).
+ * The RUNNER declares no dependency on the archive. That is the whole point of
+ * splitting the pair: it runs on a machine where the triple is native and the
+ * archive arrived as a file, so a dependency edge would ask that machine to
+ * cross-build what it was sent. It is cached on the archive's own bytes, the
+ * binaries it runs, never on the sources: a key of sources would vouch for
+ * binaries this machine did not build. It is also the one cargo target that
+ * needs no cargo: `nextest run --archive-file` extracts prebuilt binaries and
+ * never invokes cargo (measured, zero invocations).
  */
 function createCargoCrossTestTargets(
   projectRoot: string,
@@ -832,6 +867,10 @@ function createCargoCrossTestTargets(
       `--archive-file ${archiveFile} --user-config-file none ${toolConfig}`,
   ]);
   const archiveExecutor = 'nx:run-commands';
+  const runExecutor = '@smoothbricks/nx-plugin:bounded-exec';
+  const runCommand =
+    `cargo-nextest nextest run --archive-file ${archiveFile} --workspace-remap . ` +
+    `--no-tests=pass --user-config-file none ${toolConfig}`;
   return {
     [cargoCrossTestArchiveTargetName(triple)]: {
       executor: archiveExecutor,
@@ -874,15 +913,22 @@ function createCargoCrossTestTargets(
       },
     },
     [cargoCrossTestTargetName(triple)]: {
-      executor: '@smoothbricks/nx-plugin:bounded-exec',
-      cache: false,
-      inputs: [],
+      executor: runExecutor,
+      cache: true,
+      // The archive's toolchain, npm and lock keys, as `cargo-test-archive`'s: they decided the bytes it runs.
+      inputs: [
+        arrivedFileHashInput(posix.join(projectRoot, archiveFile)),
+        `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`,
+        fileHashInput(PLUGIN_NEXTEST_CONFIG_PATH),
+        ...cargoToolchainInputs(),
+        cargoRuntimeInput(projectRoot, 'cargo-nextest nextest --version'),
+        { externalDependencies: cargoCommandNpmPackages({ executor: runExecutor }, runCommand, pluginInstalled) },
+        { externalDependencies: [cargoLockNodeName(projectRoot)] },
+      ],
       outputs: [],
       dependsOn: [],
       options: {
-        command:
-          `cargo-nextest nextest run --archive-file ${archiveFile} --workspace-remap . ` +
-          `--no-tests=pass --user-config-file none ${toolConfig}`,
+        command: runCommand,
         cwd: projectRoot,
         idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -1856,7 +1902,8 @@ async function createProjectTargets(
         cwd: cargoWorkspaceRoot,
       },
     };
-    // Mutation runs are minutes-to-hours: never cached, never part of build/lint.
+    // Mutation runs are minutes-to-hours and never part of build/lint. Cached on the code and toolchain they mutate
+    // and on cargo-mutants' configuration, with the report as the output: an unchanged tree mutates nothing new.
     // CI runs these per-PR via `cargo mutants --in-diff` (see mutants.toml docs).
     // bounded-exec sizes cargo-mutants' own jobserver to its CPU grant (its `cargo-mutants` runner kind), which
     // otherwise starts one task per core whatever else runs on the host. It reports no test bounded-exec can read as
@@ -1864,28 +1911,18 @@ async function createProjectTargets(
     targets.mutation = {
       executor: '@smoothbricks/nx-plugin:bounded-exec',
       metadata: CARGO_PRODUCER_METADATA,
-      cache: false,
+      cache: true,
+      inputs: [...workspaceCargoInputs, '{projectRoot}/**/.cargo/mutants.toml'],
+      outputs: [`{workspaceRoot}/${posix.join(cargoWorkspaceRoot, 'mutants.out')}`],
       options: { command: cargoFrozen('mutants --workspace'), cwd: cargoWorkspaceRoot, timeoutMs: MUTATION_TIMEOUT_MS },
     };
+    // Cached on the code and toolchain it measures: a rerun with unchanged inputs measures nothing new.
     targets.bench = {
       executor: 'nx:run-commands',
       metadata: CARGO_PRODUCER_METADATA,
-      cache: false,
+      cache: true,
+      inputs: workspaceCargoInputs,
       options: { command: cargoFrozen('bench --workspace'), cwd: cargoWorkspaceRoot },
-    };
-    // A read-only preview of the retention pass the plugin's postTasksExecution
-    // schedules after runs that built (@smoothbricks/cargo-retain): the superseded unit
-    // generations it would reclaim and why everything else stays. Never cached:
-    // the verdict is about this machine's disk, not the commit.
-    const retainTool = nativeToolDependsOn(nativeTools, 'cargo-retain');
-    targets['cargo-retention'] = {
-      executor: 'nx:run-commands',
-      cache: false,
-      ...(retainTool.length > 0 ? { dependsOn: retainTool } : {}),
-      options: {
-        command: nativeToolCommand(nativeTools, cargoWorkspaceRoot, 'cargo-retain', 'smoo-nx-cargo-retain'),
-        cwd: cargoWorkspaceRoot,
-      },
     };
   }
 
@@ -1980,21 +2017,16 @@ async function createProjectTargets(
   if (frozenCargoManifests.size > 0) {
     targets[CARGO_FETCH_TARGET] = {
       executor: 'nx:run-commands',
-      // The download lands in CARGO_HOME, outside the workspace: a cache hit
-      // would skip work a cold registry still needs. Nothing here is a
-      // workspace output, so there is nothing for Nx to restore in its place.
-      cache: false,
-      inputs: cargoFetchInputs(projectRoot),
+      // The download lands in CARGO_HOME, outside the workspace, so nothing is
+      // a workspace output; the registry's state reaches the key instead
+      // (cargoFetchedInput), and a hit never stands for a crate it lacks.
+      cache: true,
+      inputs: [...cargoFetchInputs(projectRoot), cargoFetchedInput(projectRoot, [...frozenCargoManifests].sort())],
+      outputs: [],
       options: {
         // One fetch per manifest, independent of the others: Cargo's own
         // package-cache lock arbitrates the CARGO_HOME they share.
-        commands: [...frozenCargoManifests]
-          .sort()
-          .map((manifestPath) =>
-            manifestPath === 'Cargo.toml'
-              ? CARGO_FETCH_COMMAND
-              : `${CARGO_FETCH_COMMAND} --manifest-path ${manifestPath}`,
-          ),
+        commands: [...frozenCargoManifests].sort().map(cargoFetchCommand),
         cwd: projectRoot,
       },
     };
@@ -2027,7 +2059,8 @@ async function createProjectTargets(
   // lock-scope node of the directory it runs in) unless its inputs already do.
   for (const [name, target] of Object.entries(targets)) {
     const text = targetCommandText(target);
-    if (!runsFrozenCargo(text)) continue;
+    // `cargo-fetch` runs cargo unfrozen, as the one task that may reach the network, and is keyed like the rest.
+    if (!runsFrozenCargo(text) && name !== CARGO_FETCH_TARGET) continue;
     target.outputs ??= [];
     if (!target.cache) continue;
     const cwd: unknown = target.options?.cwd;
@@ -2035,7 +2068,9 @@ async function createProjectTargets(
       ? ` && cargo clippy -V${name === CARGO_CROSS_LINT_TARGET ? '' : ' && cargo fmt --version'}`
       : text.includes('nextest ')
         ? ' && cargo nextest --version'
-        : '';
+        : text.includes('mutants ')
+          ? ' && cargo mutants --version'
+          : '';
     const inputs = target.inputs ?? CARGO_INPUTS;
     const namesPackages = inputs.some(
       (input) => typeof input === 'object' && 'externalDependencies' in input && !isCargoLockInput(input),
@@ -2227,8 +2262,8 @@ async function createProjectTargets(
   // A Bun suite that `--shard` splits and a `--timings` manifest balances gets a
   // check, which `lint` depends on, that the manifest names every file the
   // shards run: Bun charges an unnamed file the median, and unnamed files
-  // cluster into one shard. Uncached, because Bun's discovery also finds
-  // gitignored files that no Nx input keys, and the check only walks a tree.
+  // cluster into one shard. Cached on the manifests, the bunfig and the names
+  // Bun's discovery would find, which include gitignored files no file input keys.
   const sharded = timingsShardedSuite(projectRoot, declaredTargets);
   if (!sharded.ok) {
     throw new Error(`${packageJsonPath}: ${sharded.error}`);
@@ -2236,7 +2271,11 @@ async function createProjectTargets(
   if (sharded.suite !== null) {
     targets[SHARD_TIMINGS_TARGET] = {
       executor: SHARD_TIMINGS_EXECUTOR,
-      cache: false,
+      cache: true,
+      inputs: [
+        ...timingsSuiteInputs(sharded.suite),
+        { externalDependencies: pluginInstalledIn(workspaceRoot) ? [PLUGIN_PACKAGE] : [] },
+      ],
       outputs: [],
       options: { cwd: sharded.suite.cwd, args: sharded.suite.args },
     };

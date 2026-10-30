@@ -36,12 +36,14 @@ import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-w
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
 import {
+  arrivedFileHashInput,
   cargoCommandNpmPackages,
   createNodesV2,
   createNodesV2ForPlatform,
   pluginInstalledIn,
   scriptcBinModules,
 } from './index.js';
+import { bunTestFileNamesInput } from './test-timings.js';
 import { nativeToolDependsOn, resolveNativeTools } from './tool-bins.js';
 import { isRecord } from './type-guards.js';
 import { applyWorkspaceConfig, isTestRunnerTargetName, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
@@ -1088,7 +1090,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       expect(sharded['shard-timings']).toEqual({
         executor: '@smoothbricks/nx-plugin:shard-timings',
-        cache: false,
+        cache: true,
+        // The manifest and bunfig it reads, and the names Bun's discovery would find, gitignored files included.
+        inputs: [
+          '{workspaceRoot}/packages/sharded/test-timings.json',
+          '{workspaceRoot}/packages/sharded/bunfig.toml',
+          bunTestFileNamesInput('packages/sharded'),
+          { externalDependencies: [] },
+        ],
         outputs: [],
         options: { cwd: 'packages/sharded', args: ['--timings=test-timings.json'] },
       });
@@ -1400,44 +1409,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
   //#region smoo!n/rust-output-target-inference
-  it("makes the retention preview wait for cargo-retain's host executable where the workspace builds it", async () => {
-    const workspace = await createWorkspace();
-    try {
-      const root = workspace.context.workspaceRoot;
-      await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
-      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = ["crates/ferris-core"]\n');
-      await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
-      await workspace.write('packages/nx-plugin/package.json', '{"name":"@smoothbricks/nx-plugin"}\n');
-      await workspace.write(
-        'packages/cargo-retain/package.json',
-        '{"name":"@smoothbricks/cargo-retain","nx":{"name":"cargo-retain"}}\n',
-      );
-      await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
-      await symlink(join(root, 'packages/nx-plugin'), join(root, 'node_modules/@smoothbricks/nx-plugin'), 'dir');
-      await prepareCargoFixture(root);
-      resetWorkspaceContext();
-      const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
-      const results = await infer(
-        ['packages/ferris/package.json', 'packages/cargo-retain/package.json'],
-        undefined,
-        workspace.context,
-      );
-      const ferris = results.find(([file]) => file === 'packages/ferris/package.json')?.[1].projects?.[
-        'packages/ferris'
-      ];
-      expect(ferris?.targets?.['cargo-retention']).toMatchObject({
-        dependsOn: [{ projects: ['cargo-retain'], target: 'scriptc-arm64-macos' }],
-        options: {
-          command:
-            '../../node_modules/@smoothbricks/nx-plugin/../cargo-retain/dist/bin/darwin-arm64/smoo-nx-cargo-retain',
-          cwd: 'packages/ferris',
-        },
-      });
-    } finally {
-      await workspace.cleanup();
-    }
-  });
-
   it('infers generic cargo workspace targets without any rust output targets', async () => {
     const workspace = await createWorkspace();
     try {
@@ -1459,32 +1430,31 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-wasm']).toBeUndefined();
       expect(targets['cargo-napi']).toBeUndefined();
       expect(targets['cargo-sweep']).toBeUndefined();
-      expect(targets['cargo-retention']?.options).toEqual({
-        command: `../../node_modules/@smoothbricks/nx-plugin/../cargo-retain/dist/bin/${HOST_TOOLS}/smoo-nx-cargo-retain`,
-        cwd: 'packages/ferris',
-      });
-      expect(targets['cargo-retention']?.cache).toBe(false);
-      // Never cached: the download lands in CARGO_HOME, so a cache hit would
-      // report success over a registry that still cannot resolve the lockfile.
-      expect(targets['cargo-fetch']?.cache).toBe(false);
+      // The retention preview reads this machine's disk, not the commit: it is the cargo-retain tool, not a target.
+      expect(targets['cargo-retention']).toBeUndefined();
+      // Cached on the lock and the manifests, and on whether the registry holds the locked graph: an incomplete
+      // registry gives a fresh key, so a cache hit never reports success over crates that are not there.
+      expect(targets['cargo-fetch']?.cache).toBe(true);
+      expect(targets['cargo-fetch']?.outputs).toEqual([]);
       expect(targets['cargo-fetch']?.options).toEqual({
         commands: ['cargo fetch --locked'],
         cwd: 'packages/ferris',
       });
-      // It keys nothing (never cached), so its inputs are what a producer receipt binds it to. Left unnamed they are the
-      // project's every file, and a receipt binds no symlink: a repository-root project's managed files are links.
-      expect(targets['cargo-fetch']?.inputs).toEqual([
+      expect(targets['cargo-fetch']?.inputs?.slice(0, 4)).toEqual([
         '{projectRoot}/**/Cargo.toml',
         '{projectRoot}/**/Cargo.lock',
         '{projectRoot}/**/.cargo/config.toml',
         '!{projectRoot}/**/target/**',
       ]);
+      const fetched = targets['cargo-fetch']?.inputs?.[4];
+      expect(typeof fetched === 'object' && 'runtime' in fetched ? fetched.runtime : '').toContain(
+        'cargo fetch --locked --offline',
+      );
       // Every frozen cargo command carries the edge: offline cargo fails at
       // resolution, so each one needs the locked graph downloaded before it runs.
       for (const name of ['cargo-test-archive', 'cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
         expect(targets[name]?.dependsOn).toContain('cargo-fetch');
       }
-      expect(targets['cargo-retention']?.dependsOn).toBeUndefined();
       // Retention starts after the tasks that build into the target directory, named by this metadata, and no other.
       for (const name of ['cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
         expect(targets[name]?.metadata).toEqual(CARGO_PRODUCER_METADATA);
@@ -1606,7 +1576,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.lint?.dependsOn).not.toContain(CARGO_CROSS_LINT_TARGET);
       expect(targets.test?.executor).toBe('nx:noop');
       expect(targets.test?.dependsOn).toEqual(['cargo-test']);
-      expect(targets.mutation?.cache).toBe(false);
+      // Keyed on the code and toolchain it mutates, with the report it writes as its output.
+      expect(targets.mutation?.cache).toBe(true);
+      expect(targets.mutation?.outputs).toEqual(['{workspaceRoot}/packages/ferris/mutants.out']);
+      expect(targets.mutation?.inputs).toContain('{projectRoot}/**/.cargo/mutants.toml');
+      expect(JSON.stringify(targets.mutation?.inputs)).toContain('cargo mutants --version');
+      expect(targets.bench?.cache).toBe(true);
       // On bounded-exec, so cargo-mutants' own per-core jobserver is sized to a CPU grant.
       expect(targets.mutation?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
       expect(targets.mutation?.options).toMatchObject({
@@ -2094,7 +2069,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cwd: '.',
       });
       // A repository-root workspace's members belong to other projects, so its fetch reads from the repository root.
-      expect(root['cargo-fetch']?.inputs).toEqual([
+      expect(root['cargo-fetch']?.inputs?.slice(0, 4)).toEqual([
         '{workspaceRoot}/**/Cargo.toml',
         '{workspaceRoot}/**/Cargo.lock',
         '{workspaceRoot}/**/.cargo/config.toml',
@@ -2319,11 +2294,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // Named, so a family that stops being cached — or a new one that starts —
       // shows up here rather than silently leaving the sweep below empty.
       expect(cached.map(([name]) => name).sort()).toEqual([
+        'bench',
+        'cargo-cross-test-aarch64-apple-darwin',
         'cargo-cross-test-archive-aarch64-apple-darwin',
+        'cargo-fetch',
         'cargo-lint',
         'cargo-lint-cross',
         'cargo-test-archive',
         'cargo-test-ferris-core',
+        'mutation',
       ]);
       // An SDK or toolchain change must invalidate every one of them. The pin
       // is the only thing in the identity that can see one, and it is declared
@@ -2546,6 +2525,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           expect([name, config]).toEqual([name, pluginNextestConfig]);
         }
         expect(configured.sort()).toEqual([
+          'cargo-cross-test-aarch64-apple-darwin',
           'cargo-cross-test-archive-aarch64-apple-darwin',
           'cargo-test-archive',
           'cargo-test-ferris-core',
@@ -3852,7 +3832,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         timeoutMs: 6 * 60 * 60 * 1000,
       });
       expect(mutation?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
-      expect(mutation?.cache).toBe(false);
+      expect(mutation?.cache).toBe(true);
 
       const bench = resolveDeclaredOverInferred(targets, declared, 'bench');
       expect(bench?.cache).toBe(true);
@@ -4094,6 +4074,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(archive?.options?.env).toEqual({ CARGO: 'scripts/cargo-for-nextest.sh' });
       // The runner needs no driver: it never invokes cargo at all.
       expect(run?.options?.env).toBeUndefined();
+      // Keyed on the archive's own bytes, the bytes it runs, and the nextest configuration it runs them under.
+      expect(run?.cache).toBe(true);
+      expect(run?.outputs).toEqual([]);
+      expect(run?.inputs).toContainEqual(
+        arrivedFileHashInput('packages/ferris/.cache/nextest/archive-aarch64-apple-darwin.tar.zst'),
+      );
+      expect(run?.inputs).toContain('{projectRoot}/.config/nextest.toml');
       expect(archive?.options?.commands).toBeUndefined();
       // `cargo-nextest`, not `cargo nextest`: cargo overwrites CARGO for its
       // subcommands, and CARGO is the only seam a cross cargo driver has.

@@ -4,10 +4,13 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import typia from 'typia';
 
+import { runtimeInputValue } from './__tests__/runtime-input.js';
 import shardTimingsExecutor from './executors/shard-timings/executor.js';
 import {
+  bunTestFileNamesInput,
   refreshTestTimingsCommand,
   type TimingManifest,
   timingsCoverage,
@@ -222,6 +225,7 @@ describe('shard-timings check', () => {
       { manifest: 'by-cli.json', args: ['--path-ignore-patterns=**/*-host.test.ts'] },
       { manifest: 'by-config.json', args: ['--config=other.toml'] },
     ];
+    const discovered = new Set<string>();
     for (const { manifest, args } of runs) {
       const suiteArgs = [`--timings=${manifest}`, ...args];
       // A run that matches no test exits 1 by design, yet writes every file it discovered to the manifest.
@@ -235,6 +239,20 @@ describe('shard-timings check', () => {
       const walker = await timingsCoverage(workspace, { cwd: 'packages/example', args: suiteArgs });
       if (!walker.ok) throw new Error(walker.error);
       expect(walker.coverage.files).toEqual(Object.keys(written.files).sort());
+      for (const file of walker.coverage.files) discovered.add(file);
     }
+    // The shard-timings key names every file any of these discoveries runs, so a file Bun would run changes it.
+    await mkdir(join(workspace, 'node_modules/@smoothbricks'), { recursive: true });
+    await symlink(
+      fileURLToPath(new URL('..', import.meta.url)),
+      join(workspace, 'node_modules/@smoothbricks/nx-plugin'),
+    );
+    const listed = new Set(
+      (await runtimeInputValue(bunTestFileNamesInput('packages/example').runtime, workspace))
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => line.replace(/^\.\//, '')),
+    );
+    expect([...discovered].filter((file) => !listed.has(file))).toEqual([]);
   });
 });

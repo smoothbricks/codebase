@@ -57,8 +57,8 @@ with `tsconfig.lib.json` receives transformer-aware `tsc-js` and native `typeche
 - `test-watch` from explicit `test` commands for Bun and Vitest packages
 - Cargo workspace targets from a neighboring workspace-root `Cargo.toml`
 - aggregate `build` and `lint` targets
-- an uncached `shard-timings` check, which `lint` depends on, beside `bun test` targets sharded with `--shard` and
-  balanced with `--timings`
+- a cached `shard-timings` check, which `lint` depends on, beside `bun test` targets sharded with `--shard` and balanced
+  with `--timings`
 - an uncached `deploy` for a PRIVATE project with a wrangler manifest, running
   `smoo wrangler deploy-stage --stage {args.stage}`
 
@@ -220,9 +220,9 @@ last 60 lines before fixture retirement removes them. The record-change and rest
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
 
 - **Workspace owner:** the project beside a workspace `Cargo.toml` owns one `cargo-fetch`, `cargo-test-archive`,
-  `cargo-lint`, cross-check, mutation, bench, and `cargo-retention` target. Its `cargo-lint` and `cargo-test` aggregates
-  reach all workspace crates, including a root `[package]`; `cargo-test` is the ordinary suite, and the project's `test`
-  also reaches the serial test groups (below).
+  `cargo-lint`, cross-check, mutation and bench target. Its `cargo-lint` and `cargo-test` aggregates reach all workspace
+  crates, including a root `[package]`; `cargo-test` is the ordinary suite, and the project's `test` also reaches the
+  serial test groups (below).
 - **Crate owner:** the deepest Nx project directory containing a crate owns `cargo-test-<crate>` targets. Its
   `cargo-lint` delegates to the workspace owner's one verdict, and `lint` never depends on the workspace test suite.
   Projects can own multiple crates. A nested independent workspace has its own prerequisites and does not inherit those
@@ -298,17 +298,18 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   `foreign-root`. A pre-created target need not carry Cargo's optional backup tag; a present but invalid tag still
   refuses the pass. Every pass still reads the current fingerprint graph. The locked scan reuses directory-entry types
   and reads its small metadata files synchronously, avoiding duplicate stats and one asynchronous dispatch per tiny
-  file; it does not walk retained artifact contents or reuse an earlier graph that could miss in-place recompiles.
-  `cargo-retention` runs that package's native `smoo-nx-cargo-retain` executable to preview the same selection, nested
-  roots included, without changing anything. Each profile's `incremental/<crate>-<id>/` directories go in the same pass:
-  rustc keeps one per build variant and never removes the one a feature, profile or flag change superseded. One is kept
-  while its newest finished session started inside the compile window (`invoked.timestamp` to the hash file's last
-  write) of a kept unit of the same crate, while it started within the recent-use window, or while the directory holds
-  an unfinished or unreadable session. The split-debuginfo objects rustc keeps inside current generations
-  (rust-lang/rust#161824) are not reclaimed, so a target directory is not bounded by them. Empty fingerprint hashes are
-  kept as unfinished compilations. The preservation proof covers Cargo's current unit and dependency records, not every
-  debug reference in copied binaries or other checkouts. In particular, a binary copied up before a failed link can
-  outlive the generation its debug map names; this pass does not establish that machine-wide debug closure.
+  file; it does not walk retained artifact contents or reuse an earlier graph that could miss in-place recompiles. That
+  package's `smoo-nx-cargo-retain [cargo-workspace-dir]` previews the same selection, nested roots included, without
+  changing anything. It is a tool run by hand, not an Nx target: its verdict is about this machine's disk, not the
+  commit, and no input could key it. Each profile's `incremental/<crate>-<id>/` directories go in the same pass: rustc
+  keeps one per build variant and never removes the one a feature, profile or flag change superseded. One is kept while
+  its newest finished session started inside the compile window (`invoked.timestamp` to the hash file's last write) of a
+  kept unit of the same crate, while it started within the recent-use window, or while the directory holds an unfinished
+  or unreadable session. The split-debuginfo objects rustc keeps inside current generations (rust-lang/rust#161824) are
+  not reclaimed, so a target directory is not bounded by them. Empty fingerprint hashes are kept as unfinished
+  compilations. The preservation proof covers Cargo's current unit and dependency records, not every debug reference in
+  copied binaries or other checkouts. In particular, a binary copied up before a failed link can outlive the generation
+  its debug map names; this pass does not establish that machine-wide debug closure.
 - **Scheduling:** inference never throttles Nx. It sets no `parallelism: false` or `parallel: false`, no cap, and no
   edge whose only purpose is keeping two cargo writers off one `target/`: Cargo owns that lock, and a second process
   waits inside cargo. An edge states a real consumer — fetch before frozen cargo, the archive before the runners,
@@ -369,13 +370,18 @@ workspace's cached nextest archive hashes that variable too, because it contains
 
 ### Cargo cache boundaries
 
-`cargo-fetch` is uncached because the registry lives outside Nx outputs. `cargo-test-archive` is the one cached cargo
-build, and it is the step that compiles the test binaries ahead of the bounded runners; there is no separate uncached
-`cargo test --no-run` warm-up, since it compiled the same units the archive does. Cargo's own incremental cache avoids
-recompiling unchanged code. Nx never restores or collects shared Cargo build directories; lint and test **results**, and
-dedicated Wasm/N-API **outputs**, remain cacheable. Being uncached, `cargo-fetch` keys nothing, and it names what it
-reads (the manifests, the lock and the Cargo configuration) so that a producer receipt binds those and not every file of
-its project, a repository-root project's symlinked managed files among them.
+Every inferred cargo target that runs work is cached, `cargo-fetch` included. Its download lands in `CARGO_HOME`,
+outside Nx outputs, so its key names the registry's state instead: the manifests, the lock and the Cargo configuration
+it reads, and a runtime input that is `fetched` when an offline `cargo fetch --locked` of each manifest succeeds. A
+registry missing a locked crate gives a value of its own run, which no cached run matches, so the fetch runs; a complete
+one makes an unchanged lock a cache hit. `cargo-test-archive` is the one cached cargo build, and it is the step that
+compiles the test binaries ahead of the bounded runners; there is no separate `cargo test --no-run` warm-up, since it
+compiled the same units the archive does. Cargo's own incremental cache avoids recompiling unchanged code. Nx never
+restores or collects shared Cargo build directories; lint and test **results**, and dedicated Wasm/N-API **outputs**,
+remain cacheable. `mutation` and `bench` key on the workspace's crates and toolchain like `cargo-lint`, `mutation` also
+on `.cargo/mutants.toml` and `cargo mutants --version` with `mutants.out` as its output: an unchanged tree measures
+nothing new. A cross-triple test runner keys on its archive's own bytes, the binaries it runs, since the machine that
+runs it did not build them.
 
 Validation inputs include the crate's files, every file its sources compile in through a literal `include_str!` or
 `include_bytes!` path outside the crate's directory (a shipped skill or a shared corpus beside the crates), the crates

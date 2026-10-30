@@ -3,7 +3,7 @@ import { join, posix } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import typia, { type IValidation } from 'typia';
 
-import { shellWord } from './runtime-input.js';
+import { runtimeInput, shellWord } from './runtime-input.js';
 import { isRecord } from './type-guards.js';
 
 /**
@@ -219,6 +219,33 @@ export async function timingsCoverage(
     for (const file of Object.keys(read.files)) timed.add(file);
   }
   return { ok: true, coverage: { manifests, files, untimed: files.filter((file) => !timed.has(file)) } };
+}
+
+/**
+ * What the shard-timings check reads, as Nx inputs: its timing manifests and its bunfig as files, and the names Bun's
+ * discovery would find as {@link bunTestFileNamesInput}. Files alone cannot key the last: discovery finds gitignored
+ * files too, and Nx hashes no ignored file.
+ */
+export function timingsSuiteInputs(suite: Pick<TimingsShardedSuite, 'cwd' | 'args'>): (string | { runtime: string })[] {
+  const inCwd = (file: string) => `{workspaceRoot}/${posix.join(suite.cwd, file)}`;
+  return [
+    ...flagValues(suite.args, '--timings').map(inCwd),
+    inCwd(flagValues(suite.args, '--config').at(-1) ?? 'bunfig.toml'),
+    bunTestFileNamesInput(suite.cwd),
+  ];
+}
+
+/**
+ * The names of the files under `cwd` (workspace-relative) Bun's discovery could run, sorted, as a runtime input. It is a
+ * superset of {@link timingsCoverage}'s rules (any extension, the whole tree whatever bunfig's `test.root`, no ignore
+ * glob), so every file discovery would find changes the value, and a name discovery skips costs at most a cache miss.
+ * Like Bun, it skips `node_modules` and hidden directories, follows symlinks, and reads no `.gitignore`.
+ */
+export function bunTestFileNamesInput(cwd: string): { runtime: string } {
+  const find =
+    "find -L . \\( -name node_modules -o -name '.?*' \\) -type d -prune -o " +
+    "\\( -iname '*.test.*' -o -iname '*_test.*' -o -iname '*.spec.*' -o -iname '*_spec.*' \\) -print";
+  return runtimeInput(`sh -c ${shellWord(`cd "$0" && ${find} | LC_ALL=C sort`)} ${shellWord(cwd)}`);
 }
 
 /**
