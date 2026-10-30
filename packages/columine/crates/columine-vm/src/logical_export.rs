@@ -253,8 +253,65 @@ pub struct LogicalCondition {
 pub struct LogicalConditionCell {
     pub pos: u32,
     pub identity: u64,
-    /// The cell's low/high u32 pair as one little-endian u64.
+    /// The cell's value: its `values_lo` lane as the low 32 bits and its
+    /// `values_hi` lane as the high 32 bits.
     pub value: u64,
+}
+
+/// A condition-tree slot's derived-facts table as init_state lays it out
+/// after the slot's lifecycle state and the rule engine writes it: a u64
+/// identity lane, then each value split across `values_lo: u32[capacity]`
+/// and `values_hi: u32[capacity]`, 16 bytes per cell. Export and import
+/// address cells only through it, so both read and write the lanes the rules do.
+#[derive(Clone, Copy)]
+struct FactLanes {
+    identities: u32,
+    capacity: u32,
+}
+
+impl FactLanes {
+    fn of(slot_offset: u32, capacity: u32) -> Self {
+        Self {
+            identities: slot_offset + CONDITION_TREE_STATE_BYTES,
+            capacity,
+        }
+    }
+
+    fn identity_at(self, pos: u32) -> u32 {
+        self.identities + pos * 8
+    }
+
+    fn lo_at(self, pos: u32) -> u32 {
+        self.identities + self.capacity * 8 + pos * 4
+    }
+
+    fn hi_at(self, pos: u32) -> u32 {
+        self.identities + self.capacity * 12 + pos * 4
+    }
+
+    fn identity(self, state: &[u8], pos: u32) -> u64 {
+        bytes::read_u64(state, self.identity_at(pos))
+    }
+
+    fn value(self, state: &[u8], pos: u32) -> u64 {
+        (u64::from(bytes::read_u32(state, self.hi_at(pos))) << 32)
+            | u64::from(bytes::read_u32(state, self.lo_at(pos)))
+    }
+
+    fn write(self, image: &mut [u8], cell: &LogicalConditionCell) {
+        let [l0, l1, l2, l3, h0, h1, h2, h3] = cell.value.to_le_bytes();
+        bytes::write_u64(image, self.identity_at(cell.pos), cell.identity);
+        bytes::write_u32(
+            image,
+            self.lo_at(cell.pos),
+            u32::from_le_bytes([l0, l1, l2, l3]),
+        );
+        bytes::write_u32(
+            image,
+            self.hi_at(cell.pos),
+            u32::from_le_bytes([h0, h1, h2, h3]),
+        );
+    }
 }
 
 /// One outer entry of a nested slot.
@@ -801,18 +858,17 @@ fn export_slot_inner<I: KeyIndex>(
             export_eviction(state, &meta, enc.value, enc.value, lookup, &mut out)?;
         }
         SlotType::ConditionTree => {
-            let identities = offset + CONDITION_TREE_STATE_BYTES;
-            let values = identities + capacity * 8;
+            let lanes = FactLanes::of(offset, capacity);
             let mut cells = Vec::new();
             for pos in 0..capacity {
-                let identity = bytes::read_u64(state, identities + pos * 8);
+                let identity = lanes.identity(state, pos);
                 if identity == DERIVED_FACT_EMPTY_IDENTITY {
                     continue;
                 }
                 cells.push(LogicalConditionCell {
                     pos,
                     identity,
-                    value: bytes::read_u64(state, values + pos * 8),
+                    value: lanes.value(state, pos),
                 });
             }
             out.condition = Some(LogicalCondition {
@@ -1661,8 +1717,7 @@ fn import_slot_inner<I: KeyIndex>(
                     "condition slot without state",
                 ))?;
             let meta = bind_target::<I>(image, logical)?;
-            let identities = meta.offset + CONDITION_TREE_STATE_BYTES;
-            let values = identities + meta.capacity * 8;
+            let lanes = FactLanes::of(meta.offset, meta.capacity);
             bytes::write_u32(image, meta.offset, condition.lifecycle_generation);
             bytes::write_u32(image, meta.offset + 4, condition.last_removed_key);
             for cell in &condition.cells {
@@ -1672,12 +1727,10 @@ fn import_slot_inner<I: KeyIndex>(
                         capacity: u64::from(meta.capacity),
                     });
                 }
-                if bytes::read_u64(image, identities + cell.pos * 8) != DERIVED_FACT_EMPTY_IDENTITY
-                {
+                if lanes.identity(image, cell.pos) != DERIVED_FACT_EMPTY_IDENTITY {
                     return Err(LogicalExportCause::DuplicateKey);
                 }
-                bytes::write_u64(image, identities + cell.pos * 8, cell.identity);
-                bytes::write_u64(image, values + cell.pos * 8, cell.value);
+                lanes.write(image, cell);
             }
             meta.set_size(image, condition.cells.len() as u32);
         }
