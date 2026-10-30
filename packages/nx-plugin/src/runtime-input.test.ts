@@ -18,6 +18,8 @@ import {
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { Task, TaskGraph } from 'nx/src/config/task-graph';
+import { NativeTaskHasherImpl } from 'nx/src/hasher/native-task-hasher-impl';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { RUNTIME_INPUT_SCRIPT, runtimeInput, shellWord } from './runtime-input.js';
 import {
@@ -206,6 +208,114 @@ describe('a planted runtime input failure through real Nx', () => {
       expect(await readFile(join(record, 'exit-status'), 'utf8')).toBe('3\n');
       expect(await readFile(join(record, 'report'), 'utf8')).toContain('runtime input exited 3: sh -c');
     });
+  });
+});
+
+/**
+ * Guards the hash-failure hunk of patches/nx@23.2.1.patch. Nx 23.2.1's native hasher fails a runtime input whose output
+ * is not UTF-8 with `invalid utf-8 sequence of 1 bytes from index 0`, naming no task and no input. The patched
+ * `hashTasks` rethrows it naming the tasks (ten, the rest counted) and the runtime inputs their plans hold, read from its
+ * planner. When the planner cannot answer, the native message still leads and the native error stays the cause. The
+ * table drives the installed `hashTasks` over stand-ins for Nx's native planner and hasher, faked at their published
+ * methods; the planted failure above proves the same path through real Nx.
+ */
+describe("Nx's error for a failed hash", () => {
+  const NATIVE = new Error('invalid utf-8 sequence of 1 bytes from index 0');
+  const GRAPH: TaskGraph = { roots: [], tasks: {}, dependencies: {}, continuousDependencies: {} };
+  const WRAPPED = runtimeInput('bun --version').runtime;
+  const MANY = Array.from({ length: 12 }, (_, index) => `p${String(index).padStart(2, '0')}:build`);
+  const TEN_AND_TWO = `${MANY.slice(0, 10).join(', ')}, and 2 more`;
+  const task = (id: string): Task => {
+    const colon = id.indexOf(':');
+    return {
+      id,
+      target: { project: id.slice(0, colon), target: id.slice(colon + 1) },
+      overrides: {},
+      outputs: [],
+      cache: false,
+    };
+  };
+
+  /** What `hashTasks` rejects with when the native hasher throws `error` and the planner's `getPlans` is the given one. */
+  async function refusal(
+    error: unknown,
+    taskIds: string[],
+    getPlans: () => Record<string, string[]>,
+  ): Promise<{ message: string; cause: unknown }> {
+    const native = {
+      planner: { getPlansReference: () => 'plans', getPlans },
+      hasher: {
+        hashPlans: () => {
+          throw error;
+        },
+      },
+    };
+    const envs = Object.fromEntries(taskIds.map((id) => [id, {}]));
+    const settled: unknown = await NativeTaskHasherImpl.prototype.hashTasks
+      .call(native, taskIds.map(task), GRAPH, envs, repoRoot, false)
+      .then(
+        () => new Error('hashTasks resolved'),
+        (rejected: unknown) => rejected,
+      );
+    return settled instanceof Error
+      ? { message: settled.message, cause: settled.cause }
+      : { message: `rejected with a non-Error: ${String(settled)}`, cause: settled };
+  }
+
+  it('names the tasks being hashed and their runtime inputs, and keeps the native error when the planner fails', async () => {
+    const rows = [
+      {
+        label: 'plans listed',
+        error: NATIVE,
+        taskIds: ['b:test', 'a:build'],
+        getPlans: () => ({
+          'a:build': [`runtime:${WRAPPED}`, 'AllExternalDependencies'],
+          'b:test': [`runtime:${WRAPPED}`, 'runtime:echo b'],
+        }),
+        message: [
+          `Could not hash a:build, b:test: ${NATIVE.message}`,
+          'Runtime inputs of those tasks:',
+          '  echo b (b:test)',
+          `  ${WRAPPED} (a:build, b:test)`,
+        ],
+      },
+      {
+        label: 'ten tasks named, the rest counted',
+        error: NATIVE,
+        taskIds: MANY,
+        getPlans: () => Object.fromEntries(MANY.map((id) => [id, [`runtime:${WRAPPED}`]])),
+        message: [
+          `Could not hash ${TEN_AND_TWO}: ${NATIVE.message}`,
+          'Runtime inputs of those tasks:',
+          `  ${WRAPPED} (${TEN_AND_TWO})`,
+        ],
+      },
+      {
+        label: 'planner fails',
+        error: NATIVE,
+        taskIds: ['a:build'],
+        getPlans: () => {
+          throw new Error('the planner is gone');
+        },
+        message: [
+          `Could not hash a:build: ${NATIVE.message}`,
+          'The runtime inputs of those tasks could not be listed: the planner is gone',
+        ],
+      },
+      {
+        label: 'native value is no Error',
+        error: 'a native failure as a string',
+        taskIds: ['a:build'],
+        getPlans: () => ({ 'a:build': ['AllExternalDependencies'] }),
+        message: ['Could not hash a:build: a native failure as a string'],
+      },
+    ];
+    const actual = await Promise.all(
+      rows.map(async (row) => ({ label: row.label, ...(await refusal(row.error, row.taskIds, row.getPlans)) })),
+    );
+    expect(actual).toEqual(
+      rows.map((row) => ({ label: row.label, message: row.message.join('\n'), cause: row.error })),
+    );
   });
 });
 

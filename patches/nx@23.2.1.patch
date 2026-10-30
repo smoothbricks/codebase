@@ -3150,10 +3150,10 @@ index 332accab74919348073538f4198693328bf68193..a56864600a5e7a9f9e40adea9a7bfc9e
          return this.inspector.inspectInputs(plansReference);
      }
 diff --git a/dist/src/hasher/native-task-hasher-impl.js b/dist/src/hasher/native-task-hasher-impl.js
-index 61b015b9a1b4665c1f0a236d9ef41858dd925163..af036e0a69e9e73cacea11c70a70a91ff0bec57d 100644
+index 61b015b9a1b4665c1f0a236d9ef41858dd925163..ea7e1b792faded260e13f101e637d2fedb36cfcf 100644
 --- a/dist/src/hasher/native-task-hasher-impl.js
 +++ b/dist/src/hasher/native-task-hasher-impl.js
-@@ -29,10 +29,45 @@ class NativeTaskHasherImpl {
+@@ -29,10 +29,65 @@ class NativeTaskHasherImpl {
          return hashes[0];
      }
      async hashTasks(tasks, taskGraph, perTaskEnvs, cwd, collectInputs) {
@@ -3167,23 +3167,44 @@ index 61b015b9a1b4665c1f0a236d9ef41858dd925163..af036e0a69e9e73cacea11c70a70a91f
 +            hashes = this.hasher.hashPlans(plans, perTaskEnvs, cwd ?? process.cwd(), shouldCollectInputs);
 +        }
 +        catch (error) {
-+            throw hashPlansError(error, this.planner.getPlans(taskIds, taskGraph));
++            throw hashPlansError(error, taskIds, this.planner, taskGraph);
 +        }
          return tasks.map((t) => hashes[t.id]);
      }
  }
  exports.NativeTaskHasherImpl = NativeTaskHasherImpl;
++/** A refusal names this many task ids and counts the rest, as cowshed's refusals do. */
++const NAMED_TASKS = 10;
++function namedTasks(ids) {
++    const named = ids.slice(0, NAMED_TASKS);
++    if (ids.length > NAMED_TASKS) {
++        named.push(`and ${ids.length - NAMED_TASKS} more`);
++    }
++    return named.join(', ');
++}
 +/**
 + * The native hasher's error names neither the task nor the input it failed on:
 + * a runtime input whose output is not UTF-8 fails as `invalid utf-8 sequence of
 + * 1 bytes from index 0`, which any runtime input of any task in the batch could
 + * have raised. Name the tasks and the runtime inputs their plans hold, read from
-+ * the planner, so the error says where to look; nothing runs again.
++ * the planner, so the error says where to look; nothing runs again. The native
++ * message always leads and the native error is the cause: a planner that cannot
++ * answer costs the listing, never the error it was asked to explain.
 + */
-+function hashPlansError(error, plans) {
-+    const taskIds = Object.keys(plans).sort();
++function hashPlansError(error, taskIds, planner, taskGraph) {
++    const native = error instanceof Error ? error.message : String(error);
++    const lines = [`Could not hash ${namedTasks([...taskIds].sort())}: ${native}`];
++    let plans;
++    try {
++        plans = planner.getPlans(taskIds, taskGraph);
++    }
++    catch (listing) {
++        const reason = listing instanceof Error ? listing.message : String(listing);
++        lines.push(`The runtime inputs of those tasks could not be listed: ${reason}`);
++        return new Error(lines.join('\n'), { cause: error });
++    }
 +    const tasksByRuntime = new Map();
-+    for (const taskId of taskIds) {
++    for (const taskId of Object.keys(plans).sort()) {
 +        for (const instruction of plans[taskId]) {
 +            if (instruction.startsWith('runtime:')) {
 +                const command = instruction.slice('runtime:'.length);
@@ -3192,11 +3213,10 @@ index 61b015b9a1b4665c1f0a236d9ef41858dd925163..af036e0a69e9e73cacea11c70a70a91f
 +            }
 +        }
 +    }
-+    const lines = [`Could not hash ${taskIds.join(', ')}: ${error.message}`];
 +    if (tasksByRuntime.size > 0) {
 +        lines.push('Runtime inputs of those tasks:');
 +        for (const command of [...tasksByRuntime.keys()].sort()) {
-+            lines.push(`  ${command} (${[...tasksByRuntime.get(command)].join(', ')})`);
++            lines.push(`  ${command} (${namedTasks([...tasksByRuntime.get(command)])})`);
 +        }
 +    }
 +    return new Error(lines.join('\n'), { cause: error });

@@ -156,14 +156,19 @@ byte (`packages/nx-plugin/README.md`, "Runtime inputs"), so that one line was al
 task in the batch.
 
 `NativeTaskHasherImpl.hashTasks` (`hasher/native-task-hasher-impl.js`) now rethrows a native failure as
-`Could not hash <task ids>: <native message>`, then lists each `runtime:` instruction of those tasks' plans with the
-tasks that hash it, read from the same planner (`HashPlanner.getPlans`). Nothing runs again, and the native error is the
-`cause`. The hunk runs where the hashing runs, in the daemon or in the client, so both report the same lines. It names
-the candidates, not the input that failed: the native error does not say which, and finding out would run the inputs
-again. The wrapper's retained report names the failed command and its cause.
+`Could not hash <task ids>: <native message>`, then each `runtime:` instruction of those tasks' plans with the tasks
+that hash it, read from the same planner (`HashPlanner.getPlans`). A list names ten task ids and counts the rest
+(`…, and 2 more`), as cowshed's refusals do. Nothing runs again, and the native error is the `cause`. A planner that
+cannot answer costs the listing, never the native error: its message still leads, and the error says why the runtime
+inputs could not be listed. A native value that is not an `Error` is named by `String`. The hunk runs where the hashing
+runs, in the daemon or in the client, so both report the same lines. It names the candidates, not the input that failed:
+the native error does not say which, and finding out would run the inputs again. The wrapper's retained report names the
+failed command and its cause.
 
-`packages/nx-plugin/src/runtime-input.test.ts` plants a failing input through real Nx, with and without the daemon, and
-requires the error to name the task and its runtime input. Drop the hunk, and keep the test, once the installed Nx's
+`packages/nx-plugin/src/runtime-input.test.ts` drives the installed `hashTasks` over stand-ins for the native planner
+and hasher, faked at their published methods: a listed planner, twelve tasks, a planner whose `getPlans` throws, and a
+native value that is not an `Error`. It also plants a failing input through real Nx, with and without the daemon,
+requiring the error to name the task and its runtime input. Drop the hunk, and keep the tests, once the installed Nx's
 hasher names the input it failed on.
 
 ## Cross-client task output ownership
