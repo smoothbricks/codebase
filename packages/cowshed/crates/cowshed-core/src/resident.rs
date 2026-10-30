@@ -14,8 +14,9 @@
 //! (11_shell.md "Draining a supervisor of another build"). [`resolve`] adds the supervisor's
 //! hello for `exec`. A declined verb opens the controller exactly as before, so the controller
 //! still answers every case that needs work done: a detached or unserved workspace, a grant the
-//! supervisor does not serve yet, unfinished lifecycle work. Nothing here lists a directory: a
-//! project with a thousand retired sessions costs what a project with one does.
+//! supervisor does not serve yet, unfinished lifecycle work ([`lifecycle_settled`]). Nothing here
+//! lists a directory: a project with a thousand retired sessions costs what a project with one
+//! does.
 //!
 //! What a resident answer does not re-check is what the serving supervisor already proved when
 //! it started: the project binding it opened under. A binding changes only through a cowshed
@@ -27,10 +28,11 @@
 //! the fingerprint the checkout's build volume records, and every fixed link that volume's state
 //! names is in place. Anything else — inputs that moved, a volume that records none or no volume
 //! at all, a link a tool displaced — declines, and the controller's refresh rediscovers or relinks
-//! before it admits the job. The workspace's supervisor judges it
-//! ([`Resident::build_state_current`]): its process keeps the Git listings the fingerprint reads
-//! while the index keeps its identity, where a CLI process would list them again for every exec.
-//! `path` admits no job and checks none of it.
+//! before it admits the job. The workspace's supervisor judges it, and the project's lifecycle
+//! journal with it ([`Resident::as_is`]): its process keeps the Git listings the fingerprint reads
+//! while the index keeps its identity, and the journal's reading while the journal keeps its own,
+//! where a CLI process would list and parse them again for every exec. `path` admits no job and
+//! checks the journal itself.
 
 use std::path::{Path, PathBuf};
 
@@ -188,6 +190,22 @@ pub struct Mounted {
     metadata: DetachedWorkspaceMetadata,
 }
 
+impl Mounted {
+    /// [`lifecycle_settled`] for this workspace's project, read now: what `path` checks itself,
+    /// asking no supervisor.
+    pub fn lifecycle_settled(&self) -> Result<(), Decline> {
+        lifecycle_settled(
+            &self
+                .layout
+                .project()
+                .project_root
+                .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE),
+            &self.workspace,
+        )
+        .map_err(Decline::from)
+    }
+}
+
 /// A mounted workspace whose supervisor serves its current authority.
 pub struct Resident {
     pub repo_id: RepoId,
@@ -235,13 +253,14 @@ impl Resident {
             Ok(false) => return Err(Decline::GatewaySession),
             Err(_) => return Err(Decline::GatewayUnanswered),
         }
-        cowshed_os::timing::spanned("resident", "build-state", self.build_state_current()).await
+        cowshed_os::timing::spanned("resident", "as-is", self.as_is()).await
     }
 
-    /// Whether a job may be admitted onto the checkout's build state as it is
-    /// ([`build_state_current`]), as the workspace's supervisor judges it.
-    pub async fn build_state_current(&self) -> Result<(), Decline> {
-        match self.supervisor.build_state(self.build_volume.clone()).await {
+    /// Whether a job may be admitted onto the workspace as it is, as its supervisor judges it: no
+    /// lifecycle work is unfinished ([`lifecycle_settled`]) and the build state is current
+    /// ([`build_state_current`]).
+    pub async fn as_is(&self) -> Result<(), Decline> {
+        match self.supervisor.as_is(self.build_volume.clone()).await {
             Ok(None) => Ok(()),
             Ok(Some(decline)) => Err(decline.into()),
             Err(_) => Err(Decline::BuildStateUnanswered),
@@ -249,11 +268,13 @@ impl Resident {
     }
 }
 
-/// Why a job may not be admitted onto a checkout's build state as it is ([`build_state_current`]),
-/// as the workspace's supervisor answers it (`buildState`, 11_shell.md, "Protocol").
+/// Why a job may not be admitted onto a workspace as it is ([`lifecycle_settled`],
+/// [`build_state_current`]), as the workspace's supervisor answers it (`asIs`, 11_shell.md,
+/// "Protocol").
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum BuildStateDecline {
+pub enum AsIsDecline {
+    UnfinishedWork,
     Unrecorded,
     Records,
     InputsMoved,
@@ -261,16 +282,42 @@ pub enum BuildStateDecline {
     LinkDisplaced,
 }
 
-impl From<BuildStateDecline> for Decline {
-    fn from(decline: BuildStateDecline) -> Self {
+impl From<AsIsDecline> for Decline {
+    fn from(decline: AsIsDecline) -> Self {
         match decline {
-            BuildStateDecline::Unrecorded => Self::BuildStateUnrecorded,
-            BuildStateDecline::Records => Self::Records,
-            BuildStateDecline::InputsMoved => Self::BuildInputsMoved,
-            BuildStateDecline::InputsUnreadable => Self::BuildInputsUnreadable,
-            BuildStateDecline::LinkDisplaced => Self::BuildLinkDisplaced,
+            AsIsDecline::UnfinishedWork => Self::UnfinishedWork,
+            AsIsDecline::Unrecorded => Self::BuildStateUnrecorded,
+            AsIsDecline::Records => Self::Records,
+            AsIsDecline::InputsMoved => Self::BuildInputsMoved,
+            AsIsDecline::InputsUnreadable => Self::BuildInputsUnreadable,
+            AsIsDecline::LinkDisplaced => Self::BuildLinkDisplaced,
         }
     }
+}
+
+/// Whether the project's lifecycle journal at `journal` holds no unfinished intent of `workspace`
+/// or of `main`: what opening the controller would finish before any verb runs
+/// (`RecoveryScope::Workspaces`). The journal's reading is kept while it keeps its identity
+/// (11_shell.md, "Kept readings"; every write replaces it): a supervisor that answers every exec
+/// of its workspace parses a journal of a thousand finished intents once, not once per exec.
+pub fn lifecycle_settled(journal: &Path, workspace: &WorkspaceName) -> Result<(), AsIsDecline> {
+    use crate::storage::recovery::LifecycleIntentJournal;
+    use std::sync::{Arc, LazyLock};
+    static READ: LazyLock<crate::input_memo::InputMemo<PathBuf, Arc<LifecycleIntentJournal>>> =
+        LazyLock::new(crate::input_memo::InputMemo::new);
+    let journal = READ
+        .read(&journal.to_owned(), &[journal.to_owned()], || {
+            LifecycleIntentJournal::load(journal).map(Arc::new)
+        })
+        .map_err(|_| AsIsDecline::Records)?;
+    if [workspace, &WorkspaceName::main()].into_iter().any(|name| {
+        journal
+            .get(name)
+            .is_some_and(|record| record.completion.is_none())
+    }) {
+        return Err(AsIsDecline::UnfinishedWork);
+    }
+    Ok(())
 }
 
 /// Whether a job may be admitted onto the build state of the checkout mounted at `mount`, whose
@@ -280,21 +327,21 @@ impl From<BuildStateDecline> for Decline {
 /// the checkout's Git listings (one `git ls-files`, one more per declared pattern, kept while the
 /// index keeps its identity) plus a hash of the tracked manifests. A pending discard is left to
 /// the next controller refresh and `cowshed gc`.
-pub fn build_state_current(mount: &Path, volume: Option<&Path>) -> Result<(), BuildStateDecline> {
+pub fn build_state_current(mount: &Path, volume: Option<&Path>) -> Result<(), AsIsDecline> {
     use crate::build_volume::{BuildVolumeState, link};
-    let volume = volume.ok_or(BuildStateDecline::Unrecorded)?;
-    let state = BuildVolumeState::read(volume).map_err(|_| BuildStateDecline::Records)?;
+    let volume = volume.ok_or(AsIsDecline::Unrecorded)?;
+    let state = BuildVolumeState::read(volume).map_err(|_| AsIsDecline::Records)?;
     let recorded = state
         .fingerprint
         .as_deref()
-        .ok_or(BuildStateDecline::Unrecorded)?;
+        .ok_or(AsIsDecline::Unrecorded)?;
     if !link::settled(mount, volume, &state.paths) {
-        return Err(BuildStateDecline::LinkDisplaced);
+        return Err(AsIsDecline::LinkDisplaced);
     }
     let fingerprint = crate::capabilities::tracked_manifest_fingerprint(mount)
-        .map_err(|_| BuildStateDecline::InputsUnreadable)?;
+        .map_err(|_| AsIsDecline::InputsUnreadable)?;
     if fingerprint != recorded {
-        return Err(BuildStateDecline::InputsMoved);
+        return Err(AsIsDecline::InputsMoved);
     }
     Ok(())
 }
@@ -468,10 +515,10 @@ pub fn mounted(
         .map_err(|_| Decline::NotAWorkspace)?;
     let repo = origin.repo_id.clone();
     let layout = StorageLayout::new(store_root, &repo).map_err(|_| Decline::Records)?;
-    let project = layout.project();
 
-    // What opening the controller would finish first: an identity change of the store, and
-    // any unfinished intent of the named workspace or of `main` (RecoveryScope::Workspaces).
+    // What opening the controller would finish first: an identity change of the store. The
+    // project's unfinished intents are the other half ([`lifecycle_settled`]), which `path`
+    // reads itself and `exec`'s supervisor judges.
     if crate::storage::recovery::RepositoryIdentityIntent::path(store_root)
         .symlink_metadata()
         .is_ok()
@@ -479,21 +526,6 @@ pub fn mounted(
         return Err(Decline::UnfinishedWork);
     }
     drop(project_span);
-    let journal_span = cowshed_os::timing::span("resident", "journal");
-    let journal = crate::storage::recovery::LifecycleIntentJournal::load(
-        &project
-            .project_root
-            .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE),
-    )
-    .map_err(|_| Decline::Records)?;
-    if [workspace, &WorkspaceName::main()].into_iter().any(|name| {
-        journal
-            .get(name)
-            .is_some_and(|record| record.completion.is_none())
-    }) {
-        return Err(Decline::UnfinishedWork);
-    }
-    drop(journal_span);
 
     let _workspace_span = cowshed_os::timing::span("resident", "workspace");
     let mount = layout
@@ -999,7 +1031,8 @@ mod tests {
     }
 
     /// Unfinished lifecycle work on the named workspace or on main is the controller's to
-    /// finish before any verb runs.
+    /// finish before any verb runs, and a journal kept while unchanged is read again once an
+    /// intent begins.
     #[tokio::test]
     async fn unfinished_work_on_the_workspace_or_main_opens_the_controller() {
         for target in [raven(), WorkspaceName::main()] {
@@ -1008,16 +1041,40 @@ mod tests {
                 workspace: target,
                 options: Default::default(),
             });
-            let declined = resolve(
+            let mounted = mounted(
                 &store.store,
                 &store.checkout,
                 &raven(),
                 &probe(&store, store.current()),
             )
-            .await
-            .err();
-            assert_eq!(declined, Some(Decline::UnfinishedWork));
+            .expect("mounted");
+            assert_eq!(
+                mounted.lifecycle_settled().err(),
+                Some(Decline::UnfinishedWork)
+            );
         }
+        let store = Store::new();
+        let journal = store
+            .layout
+            .project()
+            .project_root
+            .join(LIFECYCLE_INTENTS_FILE);
+        store.begin_intent(LifecycleIntent::Create {
+            workspace: WorkspaceName::new("finch").expect("name"),
+            options: Default::default(),
+        });
+        crate::input_memo::settle(&journal);
+        assert_eq!(lifecycle_settled(&journal, &raven()), Ok(()));
+        assert_eq!(lifecycle_settled(&journal, &raven()), Ok(()), "kept");
+        store.begin_intent(LifecycleIntent::Create {
+            workspace: raven(),
+            options: Default::default(),
+        });
+        assert_eq!(
+            lifecycle_settled(&journal, &raven()),
+            Err(AsIsDecline::UnfinishedWork),
+            "a journal that changed is read again"
+        );
     }
 
     /// A mount point whose marker names another incarnation is not the workspace's.

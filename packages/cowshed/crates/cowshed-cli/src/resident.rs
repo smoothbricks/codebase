@@ -126,12 +126,12 @@ fn mounted_workspace(cli: &Cli, name: &str) -> Result<Option<Mounted>> {
     };
     let start = invocation_start(cli.global.project.as_deref())?;
     let _span = span("resident", "mounted");
-    Ok(answered(mounted(
-        Path::new(STORE_ROOT),
-        &start,
-        &workspace,
-        &HostProbe,
-    )))
+    Ok(answered(
+        mounted(Path::new(STORE_ROOT), &start, &workspace, &HostProbe).and_then(|mounted| {
+            mounted.lifecycle_settled()?;
+            Ok(mounted)
+        }),
+    ))
 }
 
 /// The resident workspace `name` of the invocation's project, as `exec` runs in it, or `None`

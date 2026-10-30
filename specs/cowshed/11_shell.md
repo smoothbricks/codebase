@@ -805,10 +805,10 @@ kills it under the authority it serves then, and says so on its stderr.
   into it, and acknowledges them. The supervisor keeps up to 65,536 unacknowledged commitments and then drops the
   oldest, which the next read reports.
 - **calls** — `openSession`, `sessionSnapshot`, `closeSession`, `exec`, `stdinWrite`, `stdinClose`, `streamChunk`,
-  `streamEnd`, `info`, `sealed`, `jobByKey`, `list`, `kill`, `wait`, `logRead`, `retire`, `buildState`, `shellPool`: one
-  per supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it exactly
-  as it fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under
-  the wrong profile. A first `exec` allocates its numeric `jobId` before process creation; a keyed repeat answers the
+  `streamEnd`, `info`, `sealed`, `jobByKey`, `list`, `kill`, `wait`, `logRead`, `retire`, `asIs`, `shellPool`: one per
+  supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it exactly as it
+  fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under the
+  wrong profile. A first `exec` allocates its numeric `jobId` before process creation; a keyed repeat answers the
   durable existing id and spawns nothing. A spawn failure is therefore a terminal job, not a response with no identity.
   `jobByKey` reads the exact incarnation's admission records after a lost reply or supervisor restart; only proven
   absence in that current authority returns `None` (wire `null`). Missing workspace/job, stale authority, transport,
@@ -816,12 +816,13 @@ kills it under the authority it serves then, and says so on its stderr.
   absence. `info`, `list`, `kill` and `wait` answer the supervisor's own jobs; `sealed` answers a job's terminal record
   from the workspace's records — state, exit, failure, duration, output limit and both streams — for any job of the
   incarnation that has one, including a job an earlier supervisor ran and sealed, and `logRead` reads such a job's
-  sealed streams from any offset as it reads its own terminal jobs'. `buildState` judges, with the build volume the
-  caller resolved, whether a job may be admitted onto the checkout's build state as it is (06_cli.md, "Resident
-  workspaces"), on the blocking pool from the supervisor's kept readings, and answers `null` or the reason it may not;
-  no turn waits for it. `shellPool` answers the pool counts above. A client that has read the served authority holds its
-  job under it without another `hello`; a grant change since then refuses that authority as stale, and the client then
-  holds under the authority a `hello` reads.
+  sealed streams from any offset as it reads its own terminal jobs'. `asIs` judges, with the build volume the caller
+  resolved, whether a job may be admitted onto the workspace as it is (06_cli.md, "Resident workspaces"): the project's
+  lifecycle journal holds no unfinished work on the workspace or on `main`, and its build state is current. It judges on
+  the blocking pool from the supervisor's kept readings, and answers `null` or the reason it may not; no turn waits for
+  it. `shellPool` answers the pool counts above. A client that has read the served authority holds its job under it
+  without another `hello`; a grant change since then refuses that authority as stale, and the client then holds under
+  the authority a `hello` reads.
 - **stdin** — empty, inline bytes (the request's raw frame), a workspace-relative regular file opened inside the
   sandbox, a reader-backed stream, or explicit `open` with no reader or automatic EOF. A reader's `streamChunk` calls
   enter its bounded source channel in order and `streamEnd` names clean EOF or the source error. Attachment `stdinWrite`

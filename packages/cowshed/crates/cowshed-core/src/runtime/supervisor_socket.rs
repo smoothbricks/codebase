@@ -349,10 +349,11 @@ enum Call {
         job_id: JobId,
         every: SampleInterval,
     },
-    /// Whether a job may be admitted onto the checkout's build state as it is, judged with the
-    /// build volume the caller resolved: `null`, or why not (`crate::resident::build_state_current`).
+    /// Whether a job may be admitted onto the workspace as it is, judged with the build volume
+    /// the caller resolved: `null`, or why not (`crate::resident::lifecycle_settled`,
+    /// `crate::resident::build_state_current`).
     #[serde(rename_all = "camelCase")]
-    BuildState {
+    AsIs {
         build_volume: Option<PathBuf>,
     },
     ShellPool,
@@ -435,7 +436,7 @@ impl Call {
             Self::Resources { .. } => "resources",
             Self::Processes { .. } => "processes",
             Self::ProcessEvents { .. } => "process-events",
-            Self::BuildState { .. } => "build-state",
+            Self::AsIs { .. } => "as-is",
             Self::ShellPool => "shell-pool",
             Self::TraceHealth => "trace-health",
             Self::ListeningPorts { .. } => "listening-ports",
@@ -3160,8 +3161,8 @@ async fn answer(
         Call::Hold { .. } => {
             return Err(protocol_error("a hold requires its connection"));
         }
-        Call::BuildState { build_volume } => (
-            to_value(&supervisor.build_state(build_volume).await?)?,
+        Call::AsIs { build_volume } => (
+            to_value(&supervisor.as_is(build_volume).await?)?,
             Bytes::new(),
         ),
         Call::ShellPool => (to_value(&supervisor.shell_pool().await?)?, Bytes::new()),
@@ -3910,20 +3911,13 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         } => {
             let _ = reply.send(open_process_events(path, &authority, job_id, every).await);
         }
-        Command::BuildState {
+        Command::AsIs {
             authority,
             build_volume,
             reply,
         } => {
-            let _ = reply.send(
-                call(
-                    path,
-                    &authority,
-                    Call::BuildState { build_volume },
-                    Bytes::new(),
-                )
-                .await,
-            );
+            let _ =
+                reply.send(call(path, &authority, Call::AsIs { build_volume }, Bytes::new()).await);
         }
         Command::ShellPool { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::ShellPool, Bytes::new()).await);

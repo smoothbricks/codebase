@@ -24,9 +24,11 @@ Project-scoped detectors inspect the workspace root, or the contained relative d
 override. A tool invoked through a task runner gets the same cache and daemon authority as one invoked directly. There
 is no recursive walk through dependencies or build trees. Direnv alone inspects command ancestors inside the workspace
 and selects the nearest `.envrc`; an explicit directory override selects only that directory. Spawn admission refreshes
-the convention snapshot, so adding or removing a convention takes effect without restarting the supervisor. Its Git
-listing and the host mbx's scheduler settings are kept readings (11_shell.md, "Kept readings"). An unchanged snapshot
-reuses its rendered policy; a changed snapshot renders a matched sandbox/profile pair before applying job-mode
+the convention snapshot, so adding or removing a convention takes effect without restarting the supervisor; a job that
+spawns in the turn that admitted it, in the workspace root that admission read, takes that snapshot and reads no second
+one (measured 2026-10-30: each reading costs a warm exec about 2.5 ms, mostly canonicalizing bootstrap programs). Its
+Git listing and the host mbx's scheduler settings are kept readings (11_shell.md, "Kept readings"). An unchanged
+snapshot reuses its rendered policy; a changed snapshot renders a matched sandbox/profile pair before applying job-mode
 narrowing. Warm-host identity includes the resulting profile, environment and shell directory. At mint the same
 detectors inspect the minted tree. A detector may examine file contents to disambiguate a convention; it never executes
 project code during discovery. A convention that resolves outside the workspace is rejected, except for a provisioned

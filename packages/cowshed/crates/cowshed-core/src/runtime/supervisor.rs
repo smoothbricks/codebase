@@ -580,7 +580,14 @@ impl SandboxPolicy {
         })))
     }
 
-    fn for_cwd(&self, cwd: &Path) -> Result<Self> {
+    /// The policy a job spawned in `cwd` runs under: this one when the capabilities `cwd`'s
+    /// files hold now are the ones it was rendered from, else one rendered from them. `detected`
+    /// is the directory whose capabilities this policy holds as read in this very turn
+    /// ([`ProcessSpawnRequest::detected`]); a spawn there reads nothing again.
+    fn for_cwd(&self, cwd: &Path, detected: Option<&Path>) -> Result<Self> {
+        if detected == Some(cwd) {
+            return Ok(self.clone());
+        }
         let capabilities = {
             let _span = cowshed_os::timing::span("spawn", "capability-detection");
             self.ceiling().detect_capabilities_for(cwd)?
@@ -616,6 +623,10 @@ pub struct ProcessSpawnRequest {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     pub policy: SandboxPolicy,
+    /// The directory whose capabilities `policy` holds as the job's admission read them, when the
+    /// job spawns in the turn that admitted it: a spawn in that directory reads them no second
+    /// time. `None` reads them as the spawn finds them.
+    pub detected: Option<PathBuf>,
     /// Requested narrowing of the policy's ceiling.
     pub mode: crate::api::dto::RunSandboxMode,
     /// Where the command runs: in the workspace's sandbox, or a trusted coordinator's gate at the
@@ -3277,7 +3288,7 @@ async fn prepare_spawn(request: ProcessSpawnRequest, warm: bool) -> Result<Prepa
             monitor: ProcessMonitor::prepare(super::process_tree::TreeOwner::Job(request.job_id))?,
         });
     }
-    let policy = request.policy.for_cwd(&cwd)?;
+    let policy = request.policy.for_cwd(&cwd, request.detected.as_deref())?;
     let (sandbox, profile) = policy.child(request.mode);
     let environment = cowshed_os::timing::spanned(
         "spawn",
@@ -4006,13 +4017,14 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
-    /// Whether a job may be admitted onto the checkout's build state as it is, with the build
-    /// volume the caller resolved (`crate::resident::build_state_current`): `None`, or why not.
-    pub async fn build_state(
+    /// Whether a job may be admitted onto the workspace as it is, with the build volume the
+    /// caller resolved (`crate::resident::lifecycle_settled`,
+    /// `crate::resident::build_state_current`): `None`, or why not.
+    pub async fn as_is(
         &self,
         build_volume: Option<PathBuf>,
-    ) -> Result<Option<crate::resident::BuildStateDecline>> {
-        self.call(|reply| Command::BuildState {
+    ) -> Result<Option<crate::resident::AsIsDecline>> {
+        self.call(|reply| Command::AsIs {
             authority: self.authority.clone(),
             build_volume,
             reply,
@@ -4615,6 +4627,7 @@ impl WorkspaceSupervisor {
             admission: super::job_admission::Admission::default(),
             admission_effects: VecDeque::new(),
             pressure: config.memory_pressure.open(),
+            turns: 0,
         };
         // Whatever the checkout's volumes were cloned from, they are named for it from here.
         let build = actor.policy.ceiling().build_volume_mount.clone();
@@ -4711,10 +4724,10 @@ pub(super) enum Command {
         grace: Duration,
         reply: oneshot::Sender<Result<JobSubtreeRetirement>>,
     },
-    BuildState {
+    AsIs {
         authority: WorkspaceAuthoritySnapshot,
         build_volume: Option<PathBuf>,
-        reply: oneshot::Sender<Result<Option<crate::resident::BuildStateDecline>>>,
+        reply: oneshot::Sender<Result<Option<crate::resident::AsIsDecline>>>,
     },
     ShellPool {
         authority: WorkspaceAuthoritySnapshot,
@@ -4825,7 +4838,7 @@ impl Command {
             Self::SubtreeHandle { .. } => "subtree-handle",
             #[cfg(target_os = "macos")]
             Self::RetireDescendants { .. } => "retire-descendants",
-            Self::BuildState { .. } => "build-state",
+            Self::AsIs { .. } => "as-is",
             Self::ShellPool { .. } => "shell-pool",
             Self::TraceHealth { .. } => "trace-health",
             Self::ListeningPorts { .. } => "listening-ports",
@@ -5365,6 +5378,9 @@ struct PendingSpawn {
     mode: crate::api::dto::RunSandboxMode,
     scope: ExecScope,
     stdin: StdinSource,
+    /// The turn that admitted the job ([`SupervisorActor::turns`]), whose capability reading of
+    /// the workspace root `policy` holds.
+    admitted_turn: u64,
 }
 
 impl JobStateRecord {
@@ -5608,6 +5624,8 @@ struct SupervisorActor {
     admission_effects: VecDeque<super::job_admission::Effect>,
     /// The host's memory pressure, as the kernel reports it.
     pressure: crate::host_pressure::Feed,
+    /// Turns begun so far: a job's admission and spawn in one turn read the checkout once.
+    turns: u64,
 }
 
 /// Runtime teardown transfers the same jobs to one retirement worker. The actor joins for a
@@ -5999,6 +6017,7 @@ impl SupervisorActor {
     /// A turn handling `kind` starts: published for heartbeats, and timed until
     /// [`Self::end_turn`].
     fn begin_turn(&mut self, kind: &'static str) -> cowshed_os::timing::Span {
+        self.turns = self.turns.wrapping_add(1);
         self.liveness.begin(kind);
         cowshed_os::timing::span("turn", kind)
     }
@@ -6417,7 +6436,7 @@ impl SupervisorActor {
                     }
                 }
             }
-            Command::BuildState {
+            Command::AsIs {
                 authority,
                 build_volume,
                 reply,
@@ -6426,16 +6445,24 @@ impl SupervisorActor {
                     let _ = reply.send(Err(error));
                 }
                 Ok(()) => {
-                    // The fingerprint reads the checkout and may run its Git: on the blocking
-                    // pool, and no turn waits for it.
+                    // The journal and the fingerprint read the store and the checkout, and the
+                    // fingerprint may run its Git: on the blocking pool, and no turn waits for it.
+                    let store_root = self.policy.ceiling().store_root.clone();
                     let root = self.workspace_root.clone();
                     tokio::spawn(async move {
                         let judged = off_actor::run(move || {
+                            use crate::resident::AsIsDecline;
+                            let journal =
+                                crate::storage::StorageLayout::new(&store_root, &authority.repo_id)
+                                    .map_err(|_| AsIsDecline::Records)?
+                                    .project()
+                                    .project_root
+                                    .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE);
+                            crate::resident::lifecycle_settled(&journal, &authority.workspace)?;
                             crate::resident::build_state_current(&root, build_volume.as_deref())
-                                .err()
                         })
                         .await;
-                        let _ = reply.send(Ok(judged));
+                        let _ = reply.send(Ok(judged.err()));
                     });
                 }
             },
@@ -7481,6 +7508,7 @@ impl SupervisorActor {
                 mode,
                 scope: scheduling.scope(),
                 stdin,
+                admitted_turn: self.turns,
             })),
             failure: None,
         };
@@ -7537,6 +7565,7 @@ impl SupervisorActor {
             mode,
             scope,
             stdin,
+            admitted_turn,
         } = *pending;
         let directory = super::job_cpu::cpu_pool_directory(
             &policy.ceiling().store_root,
@@ -7597,6 +7626,7 @@ impl SupervisorActor {
                     cwd,
                     env,
                     policy,
+                    detected: (admitted_turn == self.turns).then(|| self.workspace_root.clone()),
                     mode,
                     scope,
                     cpu,
@@ -10845,6 +10875,7 @@ mod workspace_toolchain_tests {
             cwd: mount.clone(),
             env: BTreeMap::new(),
             policy: SandboxPolicy::render(sandbox.clone()).expect("render"),
+            detected: None,
             mode: crate::api::dto::RunSandboxMode::ReadWrite,
             scope: ExecScope::Workspace,
             cpu: CpuPlacement {
@@ -11313,7 +11344,8 @@ mod workspace_toolchain_tests {
 
     /// A spawn re-detects the conventions its command sees: unchanged ones reuse the rendered
     /// policy itself, a nested-only `.envrc` created after the policy activates for commands
-    /// under it, and deleting it removes the activation again.
+    /// under it, and deleting it removes the activation again. A spawn in the turn whose
+    /// admission read that very directory takes that reading and reads nothing again.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_policy_follows_the_conventions_a_command_sees() {
@@ -11327,14 +11359,19 @@ mod workspace_toolchain_tests {
             .expect("detect capabilities");
         let policy = SandboxPolicy::render(ceiling).expect("render");
 
-        let unchanged = policy.for_cwd(&nested).expect("refresh");
+        let unchanged = policy.for_cwd(&nested, None).expect("refresh");
         assert!(
             std::sync::Arc::ptr_eq(&policy.0, &unchanged.0),
             "unchanged conventions reuse the policy"
         );
 
         std::fs::write(nested.join(".envrc"), "").expect("nested envrc");
-        let activated = policy.for_cwd(&nested).expect("refresh");
+        let admitted = policy.for_cwd(&nested, Some(&nested)).expect("admitted");
+        assert!(
+            std::sync::Arc::ptr_eq(&policy.0, &admitted.0),
+            "the admission's reading stands for its own turn"
+        );
+        let activated = policy.for_cwd(&nested, Some(&mount)).expect("refresh");
         assert!(!std::sync::Arc::ptr_eq(&policy.0, &activated.0));
         for mode in [
             crate::api::dto::RunSandboxMode::ReadWrite,
@@ -11345,7 +11382,7 @@ mod workspace_toolchain_tests {
         }
 
         std::fs::remove_file(nested.join(".envrc")).expect("remove envrc");
-        let deactivated = activated.for_cwd(&nested).expect("refresh");
+        let deactivated = activated.for_cwd(&nested, None).expect("refresh");
         assert_eq!(shell_directory(deactivated.ceiling()), None);
     }
 
@@ -12568,6 +12605,7 @@ mod sandbox_environment_tests {
             cwd: mount.clone(),
             env: BTreeMap::from([("NX_DAEMON_START".to_owned(), "always".to_owned())]),
             policy: SandboxPolicy::render(sandbox).expect("render"),
+            detected: None,
             mode: crate::api::dto::RunSandboxMode::ReadWrite,
             scope: ExecScope::HostGate,
             cpu: CpuPlacement {

@@ -717,24 +717,27 @@ live, and `exec`'s are too once its daemon-owned supervisor (11_shell.md) alread
 newer grant revision of it, published since the records were read. They are answered from that state without opening the
 project controller. The answer reads, fresh on every call, only the records that decide this workspace: the in-image
 marker at the invocation's Git root (which names the project), the named workspace's marker at its mount and its active
-sidecar, slot records (which place the mount), and the lifecycle-intent journal; `exec` also reads the project's policy
-(whose revision is part of the effective grant revision). `path` asks the host one thing, whether a filesystem is
-mounted exactly at the mount path, and never asks the supervisor: it runs no work there, so it answers while a
-supervisor of another build drains its jobs (11_shell.md, "Draining a supervisor of another build"), as the controller
-does, whose attach of a mounted workspace attaches nothing (02_workspaces.md, "`cowshed attach` / `cowshed detach`").
-`exec` also asks which authority the supervisor's socket reports, and whether the gateway has the workspace's session
-installed at that revision — exactly the case in which the controller's pre-exec reconcile would install nothing for it.
-And `exec` admits a job only onto build state the controller's refresh (16_build_volumes.md, "One link per checkout")
-would leave as it is: every fixed link the checkout's build volume records is in place and reaches its volume directory
-(a declared path nothing occupies needs none), and the tracked build inputs still have the fingerprint that volume
-records, computed as the refresh computes it (its Git listings and a hash of the tracked manifests). The workspace's
-supervisor judges it (`buildState`, 11_shell.md, "Protocol") from listings its process keeps while the checkout's index
-keeps its identity (11_shell.md, "Kept readings"), where a CLI process would list them again for every exec. The job
-then runs through the supervisor's socket, held under the authority the `hello` read, and is relayed as the controller
-path relays it. The controller that Node-API callers reach keeps the lane for that job's later calls (`info`, `wait`,
-`kill`, `detach`, `logRead`) and proves it with one `hello` per call: a supervisor that retired or now serves another
-incarnation drops the lane, and the call takes the controller path, which answers from the sealed records. `exec --host`
-is answered the same way, as a host-scope job of the coordinator route.
+sidecar, and slot records (which place the mount); `path` also reads the lifecycle-intent journal, and `exec` the
+project's policy (whose revision is part of the effective grant revision). `exec`'s journal is judged by the serving
+supervisor with its build state (`asIs`, below), from a reading it keeps while the journal keeps its identity: the
+journal holds every finished intent too, and parsing a 1.3 MB journal cost a CLI 4.5 ms per exec (measured 2026-10-30).
+`path` asks the host one thing, whether a filesystem is mounted exactly at the mount path, and never asks the
+supervisor: it runs no work there, so it answers while a supervisor of another build drains its jobs (11_shell.md,
+"Draining a supervisor of another build"), as the controller does, whose attach of a mounted workspace attaches nothing
+(02_workspaces.md, "`cowshed attach` / `cowshed detach`"). `exec` also asks which authority the supervisor's socket
+reports, and whether the gateway has the workspace's session installed at that revision — exactly the case in which the
+controller's pre-exec reconcile would install nothing for it. And `exec` admits a job only onto build state the
+controller's refresh (16_build_volumes.md, "One link per checkout") would leave as it is: every fixed link the
+checkout's build volume records is in place and reaches its volume directory (a declared path nothing occupies needs
+none), and the tracked build inputs still have the fingerprint that volume records, computed as the refresh computes it
+(its Git listings and a hash of the tracked manifests). The workspace's supervisor judges it (`asIs`, 11_shell.md,
+"Protocol") from listings its process keeps while the checkout's index keeps its identity (11_shell.md, "Kept
+readings"), where a CLI process would list them again for every exec. The job then runs through the supervisor's socket,
+held under the authority the `hello` read, and is relayed as the controller path relays it. The controller that Node-API
+callers reach keeps the lane for that job's later calls (`info`, `wait`, `kill`, `detach`, `logRead`) and proves it with
+one `hello` per call: a supervisor that retired or now serves another incarnation drops the lane, and the call takes the
+controller path, which answers from the sealed records. `exec --host` is answered the same way, as a host-scope job of
+the coordinator route.
 
 Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached; for
 `exec`, one unserved, served under an older grant or another incarnation, a gateway session not yet at the served

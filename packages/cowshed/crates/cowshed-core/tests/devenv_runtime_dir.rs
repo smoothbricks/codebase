@@ -1127,6 +1127,7 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
         cwd: cwd.to_path_buf(),
         env: BTreeMap::new(),
         policy: SandboxPolicy::render(sandbox.clone()).expect("sandbox policy"),
+        detected: None,
         mode: cowshed_core::api::RunSandboxMode::ReadWrite,
         scope: cowshed_core::api::ExecScope::Workspace,
         cpu: cowshed_core::runtime::supervisor::CpuPlacement {
