@@ -748,13 +748,13 @@ links no build volume or whose volume records no fingerprint (only discovery say
 build-state link a tool displaced or removed, a linked worktree, a supervisor that drains (its drain report stands
 beside its socket: the daemon is of another build, which the controller's build check names; a supervisor that starts
 draining or retires after that check and before admission refuses the job as quiescing, nothing having run, and the
-retry names the build), or unfinished lifecycle work on the workspace, on `main`, or on the project identity. Git
-discovery steered by `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_CEILING_DIRECTORIES` or
-`GIT_DISCOVERY_ACROSS_FILESYSTEM`, an omitted `<ws>`, `path --slot`, and `exec --session` always go through the
-controller. No directory is listed: a project with a thousand retired sessions answers as fast as one with a single
-workspace. Once the supervisor admits the job, every later failure is that job's and is reported, never retried through
-the controller. A discard an earlier refresh left pending is resumed by the next refresh that opens the controller, or
-by `cowshed gc`.
+retry takes the controller path, which names the build when the daemon is of another one), or unfinished lifecycle work
+on the workspace, on `main`, or on the project identity. Git discovery steered by `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_COMMON_DIR`, `GIT_CEILING_DIRECTORIES` or `GIT_DISCOVERY_ACROSS_FILESYSTEM`, an omitted `<ws>`, `path --slot`, and
+`exec --session` always go through the controller. No directory is listed: a project with a thousand retired sessions
+answers as fast as one with a single workspace. Once the supervisor admits the job, every later failure is that job's
+and is reported, never retried through the controller. A discard an earlier refresh left pending is resumed by the next
+refresh that opens the controller, or by `cowshed gc`.
 
 What a resident answer does not re-check is what the serving supervisor proved when it opened: the project binding
 against Git's remotes. The recorded binding changes only through cowshed verbs, which change the records read above; a
