@@ -16,6 +16,7 @@
     "src/executors/bounded-exec/progress.test.ts": 13261,
     "src/process-group.test.ts": 11471,
     "src/cargo-closure-input.test.ts": 11140,
+    "src/managed-files/devenv-wrapper.test.ts": 10173,
     "src/nx-dot-input-policy.test.ts": 8998,
     "src/nx-daemon-claim.test.ts": 8514,
     "src/task-results.test.ts": 8194,
