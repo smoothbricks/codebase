@@ -13,6 +13,9 @@ pub const WORKSPACE_ENVIRONMENT_PATH: &str = ".cowshed/env";
 /// The variable `.cowshed/env` restores `NX_PARALLEL` from after a devenv shell sets its own: a
 /// job's Nx fan-out, its jobserver count (05_gateway.md "Parallelism inside a job").
 pub const NX_PARALLEL_RESTORE_ENV: &str = "COWSHED_NX_PARALLEL";
+/// The variable `.cowshed/env` restores `MBX_SCHEDULER_PRIORITY` from after its own canonical
+/// `low`: a job's priority in mbx's pool, its class's (05_gateway.md "Classes").
+pub const MBX_PRIORITY_RESTORE_ENV: &str = "COWSHED_MBX_SCHEDULER_PRIORITY";
 pub const WORKSPACE_TOKEN_ENV: &str = "COWSHED_WORKSPACE_TOKEN";
 pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
 /// The workspace's current port block size: `base+1 … base+size-1` are its service ports.
@@ -216,7 +219,6 @@ pub(crate) fn write_workspace_environment(
         })
         .transpose()?;
     contents.push_str(DEV_CI_POLICY);
-    contents.push_str(&nx_parallel_restore());
     if let Some(root) = build_cache_text {
         write!(&mut *contents, "export {BUILD_CACHE_ENV}=")
             .expect("writing to a String cannot fail");
@@ -327,7 +329,7 @@ pub(crate) fn write_workspace_environment(
             .expect("writing to a String cannot fail");
         }
     }
-
+    job_restores(&mut contents);
     write_atomic_bytes(
         &mount.root().join(WORKSPACE_ENVIRONMENT_PATH),
         contents.as_bytes(),
@@ -335,12 +337,24 @@ pub(crate) fn write_workspace_environment(
     Ok(())
 }
 
-/// The line that puts a job's Nx fan-out back after a devenv shell sourced before `.cowshed/env`
-/// set its own `NX_PARALLEL` (05_gateway.md "Parallelism inside a job").
-fn nx_parallel_restore() -> String {
-    format!(
-        "if [ -n \"${{{NX_PARALLEL_RESTORE_ENV}-}}\" ]; then export NX_PARALLEL=\"${NX_PARALLEL_RESTORE_ENV}\"; fi\n"
-    )
+/// What a job's supervisor owns that a shell activation inside its command sets again: the Nx
+/// fan-out a devenv shell sets, and the pool priority this file's canonical mbx environment sets
+/// to a host shell's `low`. The supervisor exports each again in its restore variable, and these
+/// last lines of the file put it back (05_gateway.md, "Classes", "Parallelism inside a job"). A
+/// shell no job started has neither variable and keeps its own values.
+const JOB_RESTORES: [(&str, &str); 2] = [
+    ("NX_PARALLEL", NX_PARALLEL_RESTORE_ENV),
+    ("MBX_SCHEDULER_PRIORITY", MBX_PRIORITY_RESTORE_ENV),
+];
+
+fn job_restores(contents: &mut String) {
+    for (name, restore) in JOB_RESTORES {
+        writeln!(
+            contents,
+            "if [ -n \"${{{restore}-}}\" ]; then export {name}=\"${restore}\"; fi"
+        )
+        .expect("writing to a String cannot fail");
+    }
 }
 
 /// The capability-contributed variables a host shell sources from `.cowshed/env` as its jobs get them: the
@@ -422,29 +436,34 @@ mod tests {
         );
     }
 
-    /// A granted job's `NX_PARALLEL` survives the devenv shell sourced before `.cowshed/env`; a
-    /// shell no grant marked keeps its own.
+    /// A job's own `NX_PARALLEL` and pool priority survive the shell activation that sources
+    /// `.cowshed/env`; a shell no job started keeps its own.
     #[test]
-    fn the_grants_nx_fan_out_is_restored_over_a_devenv_shells() {
-        let run = |granted: Option<&str>| {
+    fn a_jobs_own_values_are_restored_over_a_shell_activation() {
+        let mut restores = String::new();
+        job_restores(&mut restores);
+        let run = |job: Option<(&str, &str)>| {
             let mut shell = std::process::Command::new("/bin/sh");
             shell
                 .arg("-c")
                 .arg(format!(
-                    "{}printf %s \"$NX_PARALLEL\"",
-                    nx_parallel_restore()
+                    "{restores}printf '%s %s' \"$NX_PARALLEL\" \"$MBX_SCHEDULER_PRIORITY\""
                 ))
                 .env("NX_PARALLEL", "100%")
-                .env_remove(NX_PARALLEL_RESTORE_ENV);
-            if let Some(granted) = granted {
-                shell.env(NX_PARALLEL_RESTORE_ENV, granted);
+                .env("MBX_SCHEDULER_PRIORITY", "low")
+                .env_remove(NX_PARALLEL_RESTORE_ENV)
+                .env_remove(MBX_PRIORITY_RESTORE_ENV);
+            if let Some((tasks, priority)) = job {
+                shell
+                    .env(NX_PARALLEL_RESTORE_ENV, tasks)
+                    .env(MBX_PRIORITY_RESTORE_ENV, priority);
             }
             let output = cowshed_os::test_backstop::CommandBackstop::output_bounded(&mut shell)
                 .expect("run sh");
             String::from_utf8(output.stdout).expect("UTF-8")
         };
-        assert_eq!(run(Some("2")), "2");
-        assert_eq!(run(None), "100%");
+        assert_eq!(run(Some(("2", "normal"))), "2 normal");
+        assert_eq!(run(None), "100% low");
     }
 
     #[test]

@@ -690,13 +690,15 @@ impl CpuPlacement {
             tasks,
         ));
         if mbx {
+            let priority = OsString::from(match self.class {
+                ExecClass::Gate => "normal",
+                _ => "low",
+            });
             environment.push((
-                OsString::from("MBX_SCHEDULER_PRIORITY"),
-                OsString::from(match self.class {
-                    ExecClass::Gate => "normal",
-                    _ => "low",
-                }),
+                OsString::from(crate::workspace_environment::MBX_PRIORITY_RESTORE_ENV),
+                priority.clone(),
             ));
+            environment.push((OsString::from("MBX_SCHEDULER_PRIORITY"), priority));
             environment.push((OsString::from("CARGO_BUILD_JOBS"), tokens));
         }
         environment
@@ -804,6 +806,62 @@ mod cpu_placement_tests {
                 "{caller}"
             );
         }
+    }
+
+    /// A gate's priority in mbx's pool survives a shell activation inside its command. The
+    /// workspace's `.cowshed/env` exports the canonical `low` a host shell runs at, and a gate's
+    /// `normal` comes back over it, as its Nx fan-out does (05_gateway.md, "Classes", "Parallelism
+    /// inside a job"). On 2026-10-31 every reservation of a downstream land gate entered the pool
+    /// at `low`.
+    #[test]
+    fn a_gates_pool_priority_survives_its_commands_shell_activation() {
+        use cowshed_os::test_backstop::CommandBackstop as _;
+        let root = std::env::temp_dir().join(format!("cowshed-priority-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".cowshed")).expect("the fixture's .cowshed");
+        let mut contribution = crate::capabilities::CapabilityContribution::default();
+        contribution.env.insert(
+            "MBX_SCHEDULER_PRIORITY",
+            crate::capabilities::EnvAction::Own("low".into()),
+        );
+        crate::workspace_environment::write_workspace_environment(
+            crate::workspace_environment::EnvironmentMount::Served {
+                workspace_mount: &root,
+                host_home: &root,
+                temp_dir: &root,
+                capability_env: &contribution,
+            },
+            crate::metadata::Platform::Linux,
+            None,
+            None,
+        )
+        .expect("the workspace environment");
+        for (class, priority) in [(ExecClass::Gate, "normal"), (ExecClass::Background, "low")] {
+            let placement = CpuPlacement {
+                fifo: PathBuf::from("/pool/j"),
+                tokens: std::num::NonZeroUsize::new(4).expect("four"),
+                class,
+                #[cfg(target_os = "macos")]
+                nice: 10,
+            };
+            let output = std::process::Command::new("/bin/sh")
+                .env_clear()
+                .envs(placement.environment(&BTreeMap::new(), true))
+                .args([
+                    "-c",
+                    ". \"$1\"; printf %s \"$MBX_SCHEDULER_PRIORITY\"",
+                    "job",
+                ])
+                .arg(root.join(crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH))
+                .output_bounded()
+                .expect("source the workspace environment");
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                priority,
+                "{class:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).expect("remove the fixture");
     }
 }
 #[derive(Debug)]

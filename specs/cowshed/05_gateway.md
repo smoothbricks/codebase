@@ -1367,7 +1367,10 @@ before any job or spawn effect. Ordinary commands default to `background`. A cla
 transition moves a running job between classes. The table owns kernel placement and the non-mbx pressure policy. With
 mbx selected, all classes use its admission and pressure policy ("Memory pressure"); the land gate has
 `MBX_SCHEDULER_PRIORITY=normal`, and every other class has `low`, including interactive and resident work. The same
-mapping supplies `mbx reserve --priority`. Kernel nice and cgroup placement do not create another pool.
+mapping supplies `mbx reserve --priority`. The supervisor exports the job's value again as
+`COWSHED_MBX_SCHEDULER_PRIORITY`, which `.cowshed/env` restores after its own canonical `low`, so a shell activation
+inside a gate's command (a `direnv exec` in its script, say) keeps `normal`; on 2026-10-31 every reservation of a
+downstream land gate entered the pool at `low`. Kernel nice and cgroup placement do not create another pool.
 
 | Class                  | What runs in it                                                                                                       | Nice | Linux cgroup                                                                 | Without mbx: waits on memory pressure | Without mbx: ended at macOS Critical |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------ |
