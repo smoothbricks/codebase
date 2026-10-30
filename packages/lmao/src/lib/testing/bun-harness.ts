@@ -462,23 +462,6 @@ function createTestTracerInstance<
     return tracer;
   }
 
-  function runTracedTest(name: string, describePath: string | null, run: () => unknown): Promise<unknown> {
-    const currentRoot = assertRootCtx();
-    return currentRoot.span(name, async (ctx) => {
-      writeDescribeTag(ctx.tag, describePath);
-      try {
-        await als.run(ctx, run);
-        return ctx.ok(undefined); // pass -> span-ok
-      } catch (error) {
-        if (isExpectError(error)) {
-          ctx.err(error); // record assertion failure in span
-          throw error; // re-throw so bun:test sees the failure
-        }
-        throw error; // other throw -> span-exception
-      }
-    });
-  }
-
   return {
     setup(): void {
       if (isSetup) {
@@ -556,7 +539,7 @@ function createTestTracerInstance<
 
     createBunTestMock<TModule extends BunTestModuleShape>(bunTestModule: TModule): TModule {
       const describeStack: string[] = [];
-      const wrappedIt = wrapBunRegistration(bunTestModule.it, traceTests(describeStack, runTracedTest));
+      const wrappedIt = wrapBunRegistration(bunTestModule.it, traceTests(describeStack, assertRootCtx, als));
       return {
         ...bunTestModule,
         describe: wrapBunRegistration(bunTestModule.describe, trackDescribes(describeStack)),
@@ -670,26 +653,12 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
   }
 
   const rootCtx = _rootCtx;
-  const als = _als;
   const describeStack: string[] = [];
 
-  function runTracedTest(name: string, describePath: string | null, run: () => unknown) {
-    return rootCtx.span(name, async (ctx) => {
-      writeDescribeTag(ctx.tag, describePath);
-      try {
-        await als.run(ctx, run);
-        return ctx.ok(undefined); // pass → span-ok
-      } catch (error) {
-        if (isExpectError(error)) {
-          ctx.err(error); // record assertion failure in span
-          throw error; // re-throw so bun:test sees the failure
-        }
-        throw error; // other throw → span-exception
-      }
-    });
-  }
-
-  const wrappedIt = wrapBunRegistration(bunTestModule.it, traceTests(describeStack, runTracedTest));
+  const wrappedIt = wrapBunRegistration(
+    bunTestModule.it,
+    traceTests(describeStack, () => rootCtx, _als),
+  );
   return {
     ...bunTestModule,
     describe: wrapBunRegistration(bunTestModule.describe, trackDescribes(describeStack)),
@@ -807,14 +776,29 @@ function wrapBunRegistration<F extends object>(
   });
 }
 
-/** Runs each test callback in its own span, named by the label it registered, under the describe path it registered in. */
-function traceTests(
+/**
+ * Runs each test callback in its own child span of `rootCtx()`, named by the label it registered, under the describe
+ * path it registered in, and holds the span in `als` for useTestSpan(). An assertion failure records span-err and any
+ * other failure span-exception; both still fail the test.
+ */
+function traceTests<Ctx extends OpContext>(
   describeStack: readonly string[],
-  runTracedTest: (name: string, describePath: string | null, run: () => unknown) => unknown,
+  rootCtx: () => SpanContext<Ctx>,
+  als: AsyncLocalStorage<SpanContext<Ctx>>,
 ): (label: string) => CallbackRun {
   return (label) => {
     const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
-    return (values, arity, call) => runTracedTest(label, describePath, () => settleTestCallback(values, arity, call));
+    return (values, arity, call) =>
+      rootCtx().span(label, async (ctx) => {
+        writeDescribeTag(ctx.tag, describePath);
+        try {
+          await als.run(ctx, () => settleTestCallback(values, arity, call));
+          return ctx.ok(undefined); // pass → span-ok
+        } catch (error) {
+          if (isExpectError(error)) ctx.err(error); // assertion failure → span-err
+          throw error; // re-throw so bun:test sees the failure; any other throw → span-exception
+        }
+      });
   };
 }
 
@@ -831,19 +815,69 @@ function trackDescribes(describeStack: string[]): (label: string) => CallbackRun
 }
 
 /**
- * Settles a test callback as Bun settles it (Bun 1.4.3, measured). Bun never passes `done` to the harness's callback,
- * which declares no parameters, so a callback that declares more parameters than the values Bun passed gets the
- * harness's `done` and settles when it is called: `undefined` or `null` passes, and any other value fails the test
- * with that value. A callback that returns a promise settles with that promise, even when it also takes `done`.
+ * Settles a test callback as plain Bun settles it (Bun 1.4.3, measured). Bun never passes `done` to the harness's
+ * callback, which declares no parameters, so a callback that declares more parameters than the values Bun passed gets
+ * the harness's `done`: `done()` and `done(null)` pass, and any other value fails the test with that value.
+ * - A callback that returns no promise settles on its first `done` call; later calls change nothing.
+ * - A callback that returns a promise settles on the promise. `done()` changes nothing, and a `done(error)` before the
+ *   promise resolves fails the test. A `done(error)` after it resolves throws, which Bun reports as an error between
+ *   tests; Bun alone still fails the test when that call lands in the microtask drain right after the resolution.
+ * Every rejection here settles the returned promise, so none goes unhandled.
  */
 function settleTestCallback(values: unknown[], arity: number, call: (args: unknown[]) => unknown): unknown {
   if (arity <= values.length) return call(values);
   const { promise, resolve, reject } = Promise.withResolvers<void>();
+  // `calling` until the callback returns, because whether it returns a promise decides what a done call means.
+  let phase: 'calling' | 'awaiting-done' | 'awaiting-promise' | 'resolved-by-promise' | 'settled' = 'calling';
+  let firstCall: { readonly error: unknown } | undefined;
+  let firstFailure: { readonly error: unknown } | undefined;
+  const settle = (error: unknown): void => {
+    phase = 'settled';
+    if (error === undefined || error === null) resolve();
+    else reject(error);
+  };
   const result = call([
     ...values,
-    (error?: unknown) => (error === undefined || error === null ? resolve() : reject(error)),
+    (error?: unknown): void => {
+      const failed = error !== undefined && error !== null;
+      switch (phase) {
+        case 'calling':
+          firstCall ??= { error };
+          if (failed) firstFailure ??= { error };
+          return;
+        case 'awaiting-done':
+          settle(error);
+          return;
+        case 'awaiting-promise':
+          if (failed) settle(error);
+          return;
+        case 'resolved-by-promise':
+          if (failed) throw error;
+          return;
+        case 'settled':
+          return;
+      }
+    },
   ]);
-  return result instanceof Promise ? result : promise;
+  if (result instanceof Promise) {
+    phase = 'awaiting-promise';
+    result.then(
+      () => {
+        if (phase !== 'awaiting-promise') return;
+        phase = 'resolved-by-promise';
+        resolve();
+      },
+      (reason: unknown) => {
+        if (phase === 'awaiting-promise') settle(reason);
+      },
+    );
+    if (firstFailure) settle(firstFailure.error);
+  } else if (firstCall) {
+    settle(firstCall.error);
+  } else {
+    phase = 'awaiting-done';
+  }
+  return promise;
 }
 
 function disabledOnly(): never {

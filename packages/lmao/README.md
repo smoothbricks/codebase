@@ -265,7 +265,7 @@ in its own child span of the run's root trace, named by the label it registered,
 (`.only`, `.concurrent`, `.skipIf`, `.each`, …). An `.each` row's span carries the label template: the runner formats
 each row's title from the row's values itself, and the harness never re-encodes them. `describe` labels, through the
 same modifiers, form the `describe` column's path, and a function label is recorded by its name. Under Bun, a body that
-declares `done` settles when it calls `done`, as Bun settles it. Bun and Vitest are both supported
+declares `done` settles on `done`, or on the promise it returns, as Bun settles it. Bun and Vitest are both supported
 (`@smoothbricks/lmao/testing/bun` · `@smoothbricks/lmao/testing/vitest`). `DEFAULT_TRACE_DB_PATH` resolves to
 `.cache/lmao/trace-results.db` under the package or workspace root. Project walkers and file watchers skip `.cache`,
 which the sink needs because a SQLite database churns its directory's membership through journal sidecars and a compiler

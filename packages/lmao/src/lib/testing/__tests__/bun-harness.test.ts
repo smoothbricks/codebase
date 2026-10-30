@@ -186,6 +186,53 @@ describe('bun harness done callbacks', () => {
   });
 });
 
+// Each case takes plain Bun's verdict for the same callback (Bun 1.4.3, measured): a case Bun passes registers with `it`
+// and a case Bun fails registers with `it.failing`, so a harness that settles a done-style callback differently fails.
+// A failing case's span must record the same failure: Bun also fails a test on a rejection nobody handles, so the
+// verdict alone cannot tell a harness that settled on done from one that leaked done's rejection.
+describe('bun harness done callbacks settle as Bun settles them', () => {
+  const tracer = makeTestTracer(baseBinding);
+  tracer.setup();
+  const wrapped = tracer.createBunTestMock(bunTest);
+  const failures: { span: ReturnType<typeof tracer.useTestSpan>; fact: ReturnType<typeof spanException> }[] = [];
+  const expectFailure = (label: string, message: string) =>
+    failures.push({ span: tracer.useTestSpan(), fact: spanException(label, message) });
+
+  wrapped.it('keeps the first done call when it passes', (done) => {
+    done();
+    done(new Error('after the first done'));
+  });
+  wrapped.it.failing('keeps the first done call when it fails', (done) => {
+    expectFailure('keeps the first done call when it fails', 'first done');
+    done(new Error('first done'));
+    done();
+  });
+  wrapped.it('settles on the returned promise when done is never called', (_done) => Promise.resolve());
+  wrapped.it.failing('fails on done(error) before a resolved promise is returned', (done) => {
+    expectFailure('fails on done(error) before a resolved promise is returned', 'before return');
+    done(new Error('before return'));
+    return Promise.resolve();
+  });
+  wrapped.it.failing('fails on done(error) a microtask after a resolved promise is returned', (done) => {
+    expectFailure('fails on done(error) a microtask after a resolved promise is returned', 'in a microtask');
+    queueMicrotask(() => done(new Error('in a microtask')));
+    return Promise.resolve();
+  });
+  wrapped.it.failing('fails on a rejected promise even after done()', (done) => {
+    expectFailure('fails on a rejected promise even after done()', 'rejected');
+    done();
+    return Promise.reject(new Error('rejected'));
+  });
+  wrapped.it('records each failing case as an exception, not ok', () => {
+    expect(failures.map(({ span, fact }) => querySpan(span.buffer).facts().has(fact))).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ]);
+  });
+});
+
 // Rows register through the real bun:test `each`, which formats every row's title itself and never re-enters a wrapped
 // `it`. Bigint rows stay exact: the harness hands the runner each row untouched and names the row's span by the label
 // template.
