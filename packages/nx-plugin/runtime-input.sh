@@ -27,43 +27,70 @@
 # are visible.
 #
 # A failed command's own stdout never reaches the hasher either: it is
-# captured to a file from the start, retained in the failure record, and the
-# only byte this script emits on failure is the 0xFF poison above. Nothing
-# from a failure path flows into the hash as input bytes. Successful stdout
-# is replayed from the capture file byte-exact.
+# captured from the start, retained in the failure record, and the only byte
+# this script emits on failure is the 0xFF poison above. Nothing from a
+# failure path flows into the hash as input bytes. Successful stdout is
+# replayed from the capture.
 #
 # The command's stderr is not part of the value; it surfaces only on failure.
 # Diagnostics name temp paths, process ids and the boundary the input ran in
 # (an Nx daemon inside a sandbox runs inputs with the sandbox's view of the
 # client's environment), none of which is the input.
+# A successful input costs the command alone: both of its streams are captured
+# by command substitution, a forked subshell rather than a program run, so the
+# success path executes nothing but the command. Under Nx a runtime input runs
+# on every hash of every task that names it, and each program the wrapper ran
+# cost more than the input it wrapped. The command's stdout goes to the outer
+# capture as it is written; its stderr, then its exit status, are captured
+# within, and follow it with their length, so the value is cut from the end and
+# no delimiter has to be absent from the output. Lengths and patterns count
+# bytes (LC_ALL=C), set only once the command has run.
+#
+# The one residual difference: a shell variable cannot hold a NUL byte, so a
+# NUL in either stream is dropped. Two outputs that differ only in NUL bytes
+# share a key; a command that might print a NUL hex-encodes its output.
 set -u
 if [ "$#" -eq 0 ]; then
   echo 'usage: runtime-input.sh <command> [argument...]' >&2
   printf '\377'
   exit 64
 fi
-if diagnostic=$(mktemp "${TMPDIR:-/tmp}/nx-runtime-input-stderr.XXXXXXXXXX") &&
-  captured=$(mktemp "${TMPDIR:-/tmp}/nx-runtime-input-stdout.XXXXXXXXXX"); then
-  :
-else
+both=$(
+  exec 3>&1
+  ran=$("$@" 2>&1 1>&3 3>&-; printf ':%s' "$?")
+  LC_ALL=C
+  printf '%s;%s' "$ran" "${#ran}"
+)
+LC_ALL=C
+case $both in
+*';'*) ;;
+*)
   printf 'runtime input could not capture streams: %s\n' "$*" >&2
   printf '\377'
   exit 73
-fi
-if "$@" >"$captured" 2>"$diagnostic"; then
-  cat "$captured"
-  rm -f "$diagnostic" "$captured"
+  ;;
+esac
+length=${both##*;}
+both=${both%;*}
+tail=
+while [ "${#tail}" -lt "$length" ]; do
+  tail="$tail?"
+done
+stdout=${both%$tail}
+ran=${both#"$stdout"}
+status=${ran##*:}
+stderr=${ran%:*}
+if [ "$status" -eq 0 ]; then
+  printf '%s' "$stdout"
   exit 0
-else
-  status=$?
 fi
-cat "$diagnostic" >&2
+printf '%s' "$stderr" >&2
 if record=$(umask 077; mkdir -p "$PWD/.runtime-input-failures" &&
   mktemp -d "$PWD/.runtime-input-failures/failure.XXXXXXXXXX"); then
   if printf '%s\000' "$@" >"$record/argv" &&
     printf '%s\n' "$status" >"$record/exit-status" &&
-    mv "$diagnostic" "$record/stderr" &&
-    mv "$captured" "$record/stdout" && {
+    printf '%s' "$stderr" >"$record/stderr" &&
+    printf '%s' "$stdout" >"$record/stdout" && {
       printf 'runtime input exited %s: %s\n' "$status" "$*"
       printf 'working directory: %s\n' "$PWD"
       index=0
@@ -73,9 +100,9 @@ if record=$(umask 077; mkdir -p "$PWD/.runtime-input-failures" &&
         index=$((index + 1))
       done
       printf 'original stderr:\n'
-      cat "$record/stderr"
+      printf '%s' "$stderr"
       printf 'original stdout (never hashed):\n'
-      cat "$record/stdout"
+      printf '%s' "$stdout"
     } >"$record/report"; then
     printf '\nruntime input exited %s: %s; evidence: %s/report\n' "$status" "$*" "$record" >&2
     # Nx discards this stderr, so a controlling terminal is the one live display
@@ -91,12 +118,12 @@ if record=$(umask 077; mkdir -p "$PWD/.runtime-input-failures" &&
       exec 4>&-
     fi
   else
-    printf '\nruntime input exited %s: %s; evidence incomplete: %s; stderr capture: %s\n' \
-      "$status" "$*" "$record" "$diagnostic" >&2
+    printf '\nruntime input exited %s: %s; evidence incomplete: %s\n' \
+      "$status" "$*" "$record" >&2
   fi
 else
-  printf '\nruntime input exited %s: %s; could not retain evidence; stderr capture: %s\n' \
-    "$status" "$*" "$diagnostic" >&2
+  printf '\nruntime input exited %s: %s; could not retain evidence\n' \
+    "$status" "$*" >&2
 fi
 printf '\377'
 exit "$status"
