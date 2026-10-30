@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, readlink, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { $ } from 'bun';
 import { EMIT_OVERRIDES } from '../../packages/nx-plugin/src/executors/typescript-emit/emit-overrides.js';
@@ -13,9 +13,9 @@ const projectRoot = path.resolve(devenvRoot, '../..');
 process.chdir(projectRoot);
 
 /**
- * What a rebuilt plugin invalidates in `.nx/workspace-data`, by pinned Nx 23.2.1's own names: the daemon's directory
- * (`daemon/tmp-dir.js`), whose record names the daemon that loaded the old plugin, which exits once the record is gone;
- * and the project graph that plugin computed (`project-graph/nx-deps-cache.js`).
+ * What a plugin rebuild that changed its output invalidates in `.nx/workspace-data`, by pinned Nx 23.2.1's own names:
+ * the daemon's directory (`daemon/tmp-dir.js`), whose record names the daemon that loaded the old plugin, which exits
+ * once the record is gone; and the project graph that plugin computed (`project-graph/nx-deps-cache.js`).
  */
 const pluginDerivedNxState = ['d', 'project-graph.json', 'file-map.json', 'source-maps.json'] as const;
 
@@ -28,6 +28,9 @@ const pluginDerivedNxState = ['d', 'project-graph.json', 'file-map.json', 'sourc
  * rebuild a package that is current.
  */
 const buildMarkerFile = 'node_modules/.cache/smoo/dist-verified';
+
+/** The configuration each bootstrap program compiles. */
+const programConfiguration = { library: 'tsconfig.lib.json', 'process-lineage': 'tsconfig.lineage.json' } as const;
 
 // devenv runs this hook twice per shell entry. First it captures the shell's environment: a pass that runs the shell
 // hook to read what the prologue exports, marked DEVENV_SKIP_TASKS (`capture_shell_environment` in cachix/devenv sets
@@ -85,7 +88,9 @@ async function syncRuntimePinsIfDrifted(): Promise<void> {
 type BootstrapPackage = {
   directory: string;
   invalidatesPlugin: boolean;
-  program: 'library' | 'process-lineage';
+  program: keyof typeof programConfiguration;
+  /** The directory the program emits into, which bootstrap judges and digests. */
+  output: string;
 };
 
 /**
@@ -115,7 +120,13 @@ async function bootstrapPackages(): Promise<BootstrapPackage[]> {
         );
       }
     }
-    ordered.push({ directory, invalidatesPlugin, program });
+    ordered.push({
+      directory,
+      invalidatesPlugin,
+      program,
+      // A full cowshed API dist does not supply its independent public lineage entry.
+      output: path.join(directory, program === 'process-lineage' ? 'dist/lineage' : 'dist'),
+    });
   };
   await visit(path.join(projectRoot, 'packages/nx-plugin'), true);
   await visit(path.join(projectRoot, 'packages/cli'), false);
@@ -123,48 +134,191 @@ async function bootstrapPackages(): Promise<BootstrapPackage[]> {
 }
 
 async function rebuildWorkspaceToolsIfStale(): Promise<void> {
-  let rebuilt = false;
-  for (const { directory, invalidatesPlugin, program } of await bootstrapPackages()) {
-    const buildMarker = path.join(directory, buildMarkerFile);
-    const markerStat = await stat(buildMarker).catch(() => null);
-    // A full cowshed API dist does not supply its independent public lineage entry.
-    const outputDirectory = path.join(directory, program === 'process-lineage' ? 'dist/lineage' : 'dist');
-    const outputs = await readdir(outputDirectory, { withFileTypes: true }).catch((cause: unknown) => {
-      if (cause instanceof Error && 'code' in cause && cause.code === 'ENOENT') {
-        // A cold or removed output directory is the expected reason to bootstrap.
-        return [];
-      }
-      throw new Error(`Cannot read bootstrap output directory ${outputDirectory}`, { cause });
-    });
-    const built =
-      program === 'process-lineage'
-        ? ['process-lineage.d.ts', 'process-lineage.js'].every((file) =>
-            outputs.some((output) => output.name === file && output.isFile()),
-          )
-        : outputs.length > 0;
-    // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the build marker.
-    const configuration = program === 'process-lineage' ? 'tsconfig.lineage.json' : 'tsconfig.lib.json';
-    if (markerStat && built && !(await hasFileNewerThanMarker(directory, markerStat.mtimeMs, configuration))) continue;
+  const stale: BootstrapPackage[] = [];
+  for (const entry of await bootstrapPackages()) {
+    if (await isStale(entry)) stale.push(entry);
+  }
+  // Whether the plugin's closure rebuilds at all is decided before anything is emitted: an emit kept without the clear
+  // it called for would recompile to the same bytes at the next entry, which would then never clear.
+  const refusal = stale.some((entry) => entry.invalidatesPlugin) ? await nxStateRefusal() : null;
+  if (refusal !== null) {
+    console.error(
+      `! Not rebuilding the stale Nx plugin and its workspace dependencies: ${refusal}\n  Their dist, the Nx daemon record and the project graph stay as they are; the next shell entry that finds no other holder rebuilds them.`,
+    );
+  }
+  let outputChanged = false;
+  for (const { directory, invalidatesPlugin, program, output } of stale) {
+    // CLI-only packages own no Nx state, so they rebuild whatever holds it.
+    if (invalidatesPlugin && refusal !== null) continue;
+    const before = invalidatesPlugin ? await outputDigest(output) : null;
     // Bootstrap invokes neither nx (whose graph loads the plugin) nor smoo (whose launcher needs CLI dist).
     // The lineage program is the same plain-tsc producer the Nx compile lane owns: no addon,
     // generated API or native transformer. Other packages retain the ordinary library emit.
     if (program === 'process-lineage') {
-      await runQuietly('tsc', ['--build', configuration, '--force'], directory);
+      await runQuietly('tsc', ['--build', programConfiguration[program], '--force'], directory);
     } else {
-      await runQuietly('ttsc', ['-p', configuration, '--emit', ...EMIT_OVERRIDES], directory);
+      await runQuietly('ttsc', ['-p', programConfiguration[program], '--emit', ...EMIT_OVERRIDES], directory);
     }
     // The marker records when dist was last VERIFIED current, not when tsc last
     // chose to write bytes. ttsc is content-incremental, so an mtime-only change —
     // a checkout, a revert, a formatter rewriting a file identically — makes it
     // exit 0 emitting nothing, so the entry stamps the marker itself after every
-    // successful emit. A marker left behind the sources would never clear the
-    // condition above again, so every later shell entry and every direnv reload
-    // would rebuild and call clearNxDaemonState, permanently destroying Nx's task
-    // cache for the whole repository.
-    await recordBuild(buildMarker);
-    rebuilt ||= invalidatesPlugin;
+    // successful emit. A marker left behind the sources would never pass the
+    // staleness check again, so every later shell entry and every direnv reload
+    // would rebuild the package.
+    await recordBuild(path.join(directory, buildMarkerFile));
+    // A compiler run is not a change. An emit whose sources only gained a newer mtime leaves the bytes the daemon and
+    // graph were computed from, and clearing them anyway cleared the graph under a running gate's test tasks.
+    if (before !== null && before !== (await outputDigest(output))) outputChanged = true;
   }
-  if (rebuilt) await clearNxDaemonState();
+  if (outputChanged) await clearNxDaemonState();
+}
+
+/**
+ * Whether `entry` needs an emit: it has no marker, no output (for the lineage entry, not both of its public files), or a
+ * source or configuration file newer than its marker.
+ */
+async function isStale({ directory, program, output }: BootstrapPackage): Promise<boolean> {
+  const markerStat = await stat(path.join(directory, buildMarkerFile)).catch((cause: unknown) => {
+    // No marker: this package was never verified, the expected reason to bootstrap.
+    if (isMissing(cause)) return null;
+    throw new Error(`Cannot read bootstrap marker ${path.join(directory, buildMarkerFile)}`, { cause });
+  });
+  const outputs = await readdir(output, { withFileTypes: true }).catch((cause: unknown) => {
+    // A cold or removed output directory is the expected reason to bootstrap.
+    if (isMissing(cause)) return [];
+    throw new Error(`Cannot read bootstrap output directory ${output}`, { cause });
+  });
+  const built =
+    program === 'process-lineage'
+      ? ['process-lineage.d.ts', 'process-lineage.js'].every((file) =>
+          outputs.some((listed) => listed.name === file && listed.isFile()),
+        )
+      : outputs.length > 0;
+  // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the build marker.
+  return (
+    markerStat === null ||
+    !built ||
+    (await hasFileNewerThanMarker(directory, markerStat.mtimeMs, programConfiguration[program]))
+  );
+}
+
+/**
+ * SHA-256 over an output tree: each entry's path below `directory`, its kind, and its bytes or link text, in path
+ * order; a missing tree digests as `absent`. The plugin's closure is a few megabytes, read before and after its emit,
+ * so a rebuild is judged by the bytes it left rather than by the compiler having run.
+ */
+async function outputDigest(directory: string): Promise<string> {
+  const root = await stat(directory).catch((cause: unknown) => {
+    if (isMissing(cause)) return null;
+    throw cause;
+  });
+  if (root === null) return 'absent';
+  const hash = new Bun.CryptoHasher('sha256');
+  const visit = async (relative: string): Promise<void> => {
+    const entries = await readdir(path.join(directory, relative), { withFileTypes: true });
+    for (const entry of entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+      const name = path.join(relative, entry.name);
+      const file = path.join(directory, name);
+      if (entry.isDirectory()) {
+        hash.update(`directory\0${name}\0`);
+        await visit(name);
+      } else if (entry.isSymbolicLink()) {
+        hash.update(`link\0${name}\0${await readlink(file)}\0`);
+      } else if (entry.isFile()) {
+        const bytes = await readFile(file);
+        hash.update(`file\0${name}\0${bytes.length}\0`);
+        hash.update(bytes);
+      } else {
+        throw new Error(`Bootstrap output ${file} is neither a file, a directory nor a link`);
+      }
+    }
+  };
+  await visit('');
+  return hash.digest('hex');
+}
+
+/**
+ * Why the plugin's Nx state must not be cleared now, or null when no other process holds it. Clearing it destroys what
+ * every Nx run of this checkout in flight reads (a gate's test tasks failed reading the project graph a concurrent shell
+ * entry had cleared), so a cowshed checkout asks the census cowshed puts in front of a destructive operation
+ * (specs/cowshed/02_workspaces.md, "Holders cowshed does not run": `cowshed tree-holders`), exempting the daemon the
+ * checkout's own record names, as clearing a checkout's Nx state does (16_build_volumes.md). A census that cannot be
+ * taken refuses too, saying why. A checkout cowshed does not manage runs no gate and takes no census.
+ */
+async function nxStateRefusal(): Promise<string | null> {
+  if (!(await Bun.file(path.join(projectRoot, '.cowshed/workspace.json')).exists())) return null;
+  try {
+    const tree = await realpath(path.join(projectRoot, '.nx/workspace-data')).catch((cause: unknown) => {
+      // No Nx state yet, so nothing can hold it.
+      if (isMissing(cause)) return null;
+      throw cause;
+    });
+    if (tree === null) return null;
+    const census = await $`cowshed tree-holders ${tree}`.quiet(true).nothrow();
+    if (census.exitCode !== 0) {
+      throw new Error(`\`cowshed tree-holders ${tree}\` exited ${census.exitCode}: ${census.stderr.toString().trim()}`);
+    }
+    const lines = census.stdout
+      .toString()
+      .split('\n')
+      .filter((line) => line !== '');
+    if (lines.length === 0) return null;
+    const daemon = await recordedDaemon(path.join(tree, 'd/server-process.json'));
+    const holders = lines.filter((line) => {
+      // The prefix a shell reader may match (02_workspaces.md, "Holders cowshed does not run").
+      const pid = /^\{"pid":(\d+),"hold":"[a-z-]+",/.exec(line)?.[1];
+      if (pid === undefined) {
+        throw new Error(`\`cowshed tree-holders ${tree}\` printed a line that is no TreeHolder: ${line}`);
+      }
+      return Number(pid) !== daemon;
+    });
+    if (holders.length === 0) return null;
+    // Ten named and the rest counted, as cowshed's own refusals name holders.
+    const named = holders
+      .slice(0, 10)
+      .map((line) => `\n  ${line}`)
+      .join('');
+    const rest = holders.length > 10 ? `\n  and ${holders.length - 10} more` : '';
+    return `another process holds this checkout's Nx state in ${tree}:${named}${rest}`;
+  } catch (error) {
+    return `the census of who holds this checkout's Nx state could not be taken: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+/** The pid the checkout's Nx daemon record names, or null when there is no record. */
+async function recordedDaemon(record: string): Promise<number | null> {
+  const text = await readFile(record, 'utf8').catch((cause: unknown) => {
+    if (isMissing(cause)) return null;
+    throw cause;
+  });
+  if (text === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (cause) {
+    throw new Error(
+      `Nx daemon record ${record} is not JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+      {
+        cause,
+      },
+    );
+  }
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    !('processId' in parsed) ||
+    typeof parsed.processId !== 'number' ||
+    !Number.isSafeInteger(parsed.processId)
+  ) {
+    throw new Error(`Nx daemon record ${record} names no process id`);
+  }
+  return parsed.processId;
+}
+
+/** Whether `cause` says the path names nothing: it is absent, or a component above it is not a directory. */
+function isMissing(cause: unknown): boolean {
+  return cause instanceof Error && 'code' in cause && (cause.code === 'ENOENT' || cause.code === 'ENOTDIR');
 }
 
 /** Stamps `marker` with now. Failing only costs the next shell entry a rebuild, so it warns and lets the shell enter. */

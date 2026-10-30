@@ -19,9 +19,25 @@ The environment-capture pass (`DEVENV_SKIP_TASKS`) builds nothing. The entry p
 pin synchronization can call `smoo monorepo init --runtime-only`. Install, postinstall and developer-link setup run
 their raw scripts, not the CLI. The existing `node_modules/.cache/smoo/dist-verified` marker gates emit; absent or empty
 `dist`, missing markers or newer source/config files rebuild. The lineage entry specifically requires both its public
-`dist/lineage/process-lineage.d.ts` and JavaScript file: a non-empty full-API `dist/ts` cannot stand in for it. Only
-rebuilt members of the plugin's dependency closure invalidate its daemon record and project graph; a CLI-only rebuild
-preserves them and every build preserves Nx task results and their database.
+`dist/lineage/process-lineage.d.ts` and JavaScript file: a non-empty full-API `dist/ts` cannot stand in for it.
+
+Only an emit of the plugin's dependency closure that changed a member's output bytes invalidates the plugin's daemon
+record and project graph. The entry digests each closure member's output tree (paths, kinds, bytes and link text) before
+and after its emit, so a source that only gained a newer mtime (a checkout, a same-byte restore, a formatter's identical
+rewrite) recompiles and keeps them. A CLI-only rebuild preserves them, and every build preserves Nx task results and
+their database.
+
+That invalidation destroys what every Nx run of the checkout in flight reads, a gate's included, so it is a destructive
+operation with the holder check in front of it (../cowshed/02_workspaces.md, "Holders cowshed does not run"). Before it
+emits the closure, an entry in a checkout with `.cowshed/workspace.json` runs `cowshed tree-holders` over the directory
+`.nx/workspace-data` resolves to, exempting the daemon its `d/server-process.json` names, as clearing a checkout's Nx
+state does (../cowshed/16_build_volumes.md). Another holder, or a census that cannot be taken, refuses the closure's
+emit, marker and invalidation together, and the shell still enters. Stderr names up to ten holders by their census lines
+and counts the rest, or names the census's failure and its cause. The closure stays stale, so the next entry that finds
+no other holder rebuilds it. An emit kept without its invalidation would recompile to the same bytes at that entry and
+never invalidate. CLI-only members rebuild either way. A checkout without that record runs no gate and takes no census.
+The census is the same from a sandboxed entry: run inside `cowshed exec`, it names a host process holding a file there
+(measured 2026-10-30), so a gate on the host refuses a sandboxed entry's rebuild as it refuses a host entry's.
 
 For managed uv projects, install-task status joins the existing input stamps with a live environment-relocation witness
 instead of relying only on the task's file-digest cache. Normal project commands inherit `UV_NO_SYNC=1`; the managed

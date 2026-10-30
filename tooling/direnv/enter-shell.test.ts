@@ -27,9 +27,11 @@ const enterShell = join(import.meta.dir, 'enter-shell.ts');
 const buildMarker = 'node_modules/.cache/smoo/dist-verified';
 
 /**
- * A checkout whose plugin build is stale, with `.nx/workspace-data` linked onto a build volume as cowshed links it,
- * and a `ttsc` that succeeds emitting nothing: the rebuild itself is not under test. `enter` runs the shell entry
- * proper over it; `root` is removed by `dispose`.
+ * A checkout whose plugin build is stale, with `.nx/workspace-data` linked onto a build volume as cowshed links it.
+ * Its `ttsc` emits each package's `src/index.ts` as its `dist/index.js`, so an emit changes `dist` only where the bytes
+ * there differ. Its `cowshed` answers `tree-holders` with the `census` file beside `bin`, or fails with `census-error`,
+ * and records each call in `cowshed-calls`; `manage` makes the checkout cowshed's, the only kind that asks it. `enter`
+ * runs the shell entry proper over it; `root` is removed by `dispose`.
  */
 function staleCheckout() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-enter-shell-')));
@@ -55,8 +57,28 @@ function staleCheckout() {
   const bin = join(root, 'bin');
   mkdirSync(bin);
   // Each call's arguments, one line per call, beside `bin`.
-  writeFileSync(join(bin, 'ttsc'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$(dirname "$0")/../ttsc-calls"\nexit 0\n');
+  writeFileSync(
+    join(bin, 'ttsc'),
+    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$(dirname "$0")/../ttsc-calls"\nmkdir -p dist\ncp src/index.ts dist/index.js\n',
+  );
   chmodSync(join(bin, 'ttsc'), 0o755);
+  writeFileSync(
+    join(bin, 'cowshed'),
+    `#!/bin/sh
+here=$(dirname "$(dirname "$0")")
+printf '%s\\n' "$*" >> "$here/cowshed-calls"
+if [ -f "$here/census-error" ]; then
+  cat "$here/census-error" >&2
+  exit 1
+fi
+[ ! -f "$here/census" ] || cat "$here/census"
+`,
+  );
+  chmodSync(join(bin, 'cowshed'), 0o755);
+  const manage = () => {
+    mkdirSync(join(root, '.cowshed'));
+    writeFileSync(join(root, '.cowshed/workspace.json'), '{}');
+  };
   mkdirSync(join(root, 'tooling/direnv'), { recursive: true });
 
   const enter = () =>
@@ -71,7 +93,7 @@ function staleCheckout() {
         GITHUB_ACTIONS: 'true',
       },
     });
-  return { root, plugin, volume, link, enter, dispose: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, plugin, volume, link, manage, enter, dispose: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 /**
@@ -481,5 +503,104 @@ it('direct devenv entry sources the existing workspace policy before project hoo
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** The plugin's daemon record and project graph, as `plantPluginState` leaves them in a volume. */
+const pluginState = ['d/server-process.json', 'file-map.json', 'project-graph.json', 'source-maps.json'];
+
+/** Plants the daemon record, naming `daemon`, and the project graph a stale plugin build may invalidate. */
+function plantPluginState(volume: string, daemon: number): void {
+  mkdirSync(join(volume, 'd'));
+  writeFileSync(join(volume, 'd/server-process.json'), JSON.stringify({ processId: daemon }));
+  for (const graph of pluginState.slice(1)) writeFileSync(join(volume, graph), 'kept');
+}
+
+/** Which of the plugin's daemon record and project graph `volume` still holds. */
+const keptPluginState = (volume: string) => pluginState.filter((entry) => existsSync(join(volume, entry)));
+
+/**
+ * A compiler run is not a change. A plugin source that only gained a newer mtime (a checkout, a same-byte restore, a
+ * formatter's identical rewrite) rebuilds to the bytes `dist` already holds, so the daemon record and project graph
+ * every Nx run of the checkout reads stay: a gate's test tasks failed reading the graph a concurrent shell entry had
+ * cleared after exactly such a rebuild. An edit the emit carries into `dist` still clears both.
+ */
+it('a stale plugin build clears the daemon record and project graph only when its emit changed the output bytes', () => {
+  const { root, plugin, volume, enter, dispose } = staleCheckout();
+  try {
+    writeFileSync(join(plugin, 'dist/index.js'), readFileSync(join(plugin, 'src/index.ts')));
+    plantPluginState(volume, 4241);
+    const unchanged = enter();
+    expect(unchanged.status, `${unchanged.stdout}${unchanged.stderr}`).toBe(0);
+    // It rebuilt: the marker says when.
+    expect(statSync(join(plugin, buildMarker)).mtimeMs).toBeGreaterThan(0);
+    expect(keptPluginState(volume)).toEqual(pluginState);
+    // A checkout cowshed does not manage runs no gate and asks no census.
+    expect(existsSync(join(root, 'cowshed-calls'))).toBe(false);
+
+    writeFileSync(join(plugin, 'src/index.ts'), 'export const edited = 1;\n');
+    utimesSync(join(plugin, buildMarker), new Date(0), new Date(0));
+    const changed = enter();
+    expect(changed.status, `${changed.stdout}${changed.stderr}`).toBe(0);
+    expect(readFileSync(join(plugin, 'dist/index.js'), 'utf8')).toBe('export const edited = 1;\n');
+    expect(keptPluginState(volume)).toEqual([]);
+  } finally {
+    dispose();
+  }
+});
+
+/**
+ * Clearing the plugin's Nx state destroys what every Nx run of the checkout in flight reads, so a cowshed checkout asks
+ * the census cowshed puts in front of a destructive operation (`cowshed tree-holders`, specs/cowshed/02_workspaces.md
+ * "Holders cowshed does not run") before it emits the plugin's closure. A census that cannot be taken, or another
+ * holder (a gate's `nx run-many` here), leaves the closure's dist, marker and Nx state as they are and says why on
+ * stderr, and the shell still enters: a census outage must not block every shell. The CLI rebuilds either way. The
+ * daemon the checkout records is no other holder, so once the gate is gone the next entry rebuilds and clears.
+ */
+it('a census that cannot be taken, or another holder of the Nx state, defers the plugin rebuild and its clear', () => {
+  const { root, plugin, volume, manage, enter, dispose } = staleCheckout();
+  try {
+    manage();
+    writeFileSync(join(plugin, 'dist/index.js'), 'export const previous = 1;\n');
+    plantPluginState(volume, 4241);
+    const deferred = () => {
+      expect(readFileSync(join(plugin, 'dist/index.js'), 'utf8')).toBe('export const previous = 1;\n');
+      expect(statSync(join(plugin, buildMarker)).mtimeMs).toBe(0);
+      expect(keptPluginState(volume)).toEqual(pluginState);
+    };
+
+    writeFileSync(join(root, 'census-error'), 'cowshed: the process table cannot be read: Operation not permitted\n');
+    const outage = enter();
+    expect(outage.status, `${outage.stdout}${outage.stderr}`).toBe(0);
+    expect(outage.stderr).toContain(
+      `cowshed tree-holders ${volume}\` exited 1: cowshed: the process table cannot be read: Operation not permitted`,
+    );
+    deferred();
+    expect(statSync(join(root, 'packages/cli', buildMarker)).mtimeMs).toBeGreaterThan(0);
+
+    rmSync(join(root, 'census-error'));
+    const holder = (pid: number, command: string) =>
+      JSON.stringify({
+        pid,
+        hold: 'open-file',
+        path: { encoding: 'utf8', data: join(volume, 'A-v3.db-wal') },
+        command,
+      });
+    const gate = holder(4242, 'nx run-many -t gate --nx-bail=false');
+    writeFileSync(join(root, 'census'), `${holder(4241, 'nx daemon')}\n${gate}\n`);
+    const gated = enter();
+    expect(gated.status, `${gated.stdout}${gated.stderr}`).toBe(0);
+    expect(gated.stderr).toContain(gate);
+    expect(gated.stderr).not.toContain('nx daemon');
+    deferred();
+
+    writeFileSync(join(root, 'census'), `${holder(4241, 'nx daemon')}\n`);
+    const after = enter();
+    expect(after.status, `${after.stdout}${after.stderr}`).toBe(0);
+    expect(readFileSync(join(plugin, 'dist/index.js'), 'utf8')).toBe('export {};\n');
+    expect(keptPluginState(volume)).toEqual([]);
+    expect(readFileSync(join(root, 'cowshed-calls'), 'utf8')).toBe(`tree-holders ${volume}\n`.repeat(3));
+  } finally {
+    dispose();
   }
 });
