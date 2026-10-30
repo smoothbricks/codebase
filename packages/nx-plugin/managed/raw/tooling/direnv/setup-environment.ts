@@ -1020,9 +1020,11 @@ function bunInstaller(inputs: readonly string[]): Installer {
  * decides, because an outer shell's UV_PROJECT_ENVIRONMENT leaks into a
  * checkout that syncs nothing.
  *
- * Every package of the workspace and every dependency group is installed,
- * which is what `bun install` does for the JavaScript half: a development
- * shell carries the whole workspace. CI adds `--locked`, the counterpart of
+ * Every package of the workspace, every dependency group and every optional
+ * extra is installed, which is what `bun install` does for the JavaScript
+ * half: a development shell carries the whole workspace. Readers run under
+ * UV_NO_SYNC, so a target's `uv run --extra <name>` finds the extra only
+ * because this sync installed it. CI adds `--locked`, the counterpart of
  * `--frozen-lockfile`.
  *
  * Like node_modules, the environment is location-independent, so a copy of
@@ -1060,7 +1062,15 @@ function uvInstaller(inputs: readonly string[], options: { locked: boolean }): I
     );
   }
   const stampPath = path.join(environment, '.smoo-sync');
-  const argv = ['sync', '--python', python, '--all-packages', '--all-groups', ...(options.locked ? ['--locked'] : [])];
+  const argv = [
+    'sync',
+    '--python',
+    python,
+    '--all-packages',
+    '--all-groups',
+    '--all-extras',
+    ...(options.locked ? ['--locked'] : []),
+  ];
   const create = ['venv', '--relocatable', '--python', python, environment];
   const uv = Bun.which('uv');
   const identity = [
