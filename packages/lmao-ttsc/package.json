@@ -64,6 +64,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           {
             "externalDependencies": [
               "bun-lock:packages/lmao-ttsc"
@@ -86,6 +87,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           {
             "externalDependencies": [
               "bun-lock:packages/lmao-ttsc"

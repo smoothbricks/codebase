@@ -117,6 +117,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain"
@@ -132,6 +133,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain"
@@ -147,6 +149,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain"
@@ -162,6 +165,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain"
@@ -177,6 +181,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain"

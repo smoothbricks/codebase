@@ -2322,6 +2322,46 @@ async function createProjectTargets(
     };
   }
 
+  // The process-lineage entry has no full API-generator dependency: the generator check itself is bounded work.
+  const lineageProducer = nativeToolDependsOn(nativeTools, 'cowshed', 'lineage-js');
+  if (lineageProducer.length > 0 && packageJson.name === '@smoothbricks/nx-plugin') {
+    for (const name of ['tsc-js', 'typecheck', 'typecheck-tests']) {
+      const target = targets[name];
+      if (target === undefined) continue;
+      target.dependsOn = [...(target.dependsOn ?? []), ...lineageProducer];
+      target.inputs = [
+        ...(target.inputs ?? ['production']),
+        { dependentTasksOutputFiles: '**/dist/lineage/**/*', transitive: false },
+      ];
+    }
+  }
+
+  // Runtime observers need the local addon, not the package aggregate (which can deliberately build only JS).
+  // Declarations retain these prerequisites and output inputs with Nx's ordinary "..." merge token.
+  // The canonical release-check instead judges prebuilt shipping artifacts and must remain dependency-free.
+  const observerProducers = [...nativeToolDependsOn(nativeTools, 'cowshed'), ...lineageProducer];
+  if (observerProducers.length > 0) {
+    for (const name of new Set([...Object.keys(targets), ...Object.keys(declaredTargets)])) {
+      const declared = declaredTargets[name];
+      const executor =
+        isRecord(declared) && declared.executor !== undefined ? declared.executor : targets[name]?.executor;
+      if (executor !== '@smoothbricks/nx-plugin:bounded-exec' || name === 'release-check') continue;
+      // Nx discards an incompatible executor's inferred configuration; only the observer prerequisites belong below it.
+      if (targets[name]?.executor !== undefined && targets[name]?.executor !== executor) {
+        targets[name] = {};
+      }
+      targets[name] ??= {};
+      const target = targets[name];
+      target.dependsOn = [...(target.dependsOn ?? []), ...observerProducers];
+      const inputs =
+        target.inputs ?? (isRecord(declared) && Array.isArray(declared.inputs) ? [] : ['default', '^production']);
+      target.inputs = [
+        ...inputs,
+        { dependentTasksOutputFiles: '**/*.node', transitive: true },
+        { dependentTasksOutputFiles: '**/dist/lineage/**/*.js', transitive: true },
+      ];
+    }
+  }
   // Publish each inferred target's semantic kind (`inferredTaskKind`) as metadata. Nx merges metadata beneath a
   // declaration, so the final graph still says which tasks are build and which are test work after a package rewrites
   // one. Fresh objects: `CARGO_PRODUCER_METADATA` is shared by every producer.

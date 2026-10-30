@@ -64,6 +64,7 @@
       "test-browser": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
+          "...",
           "build",
           {
             "target": "build",
@@ -74,6 +75,7 @@
         ],
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain",

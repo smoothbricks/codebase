@@ -302,6 +302,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain",
@@ -322,6 +323,7 @@
           }
         ],
         "dependsOn": [
+          "...",
           "tsc-js",
           "copy-nx-publish-assets",
           "typecheck-tests"
@@ -350,6 +352,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain",
@@ -390,6 +393,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain",
@@ -400,6 +404,7 @@
           }
         ],
         "dependsOn": [
+          "...",
           "^build",
           "build",
           "cargo-stream-archive"
@@ -415,6 +420,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain",
@@ -425,6 +431,7 @@
           }
         ],
         "dependsOn": [
+          "...",
           "^build",
           "build",
           "cargo-stream-archive"
@@ -440,6 +447,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain",
@@ -450,6 +458,7 @@
           }
         ],
         "dependsOn": [
+          "...",
           "^build",
           "build",
           "cargo-stream-archive"
@@ -465,6 +474,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain",
@@ -475,6 +485,7 @@
           }
         ],
         "dependsOn": [
+          "...",
           "^build",
           "build",
           "cargo-stream-archive"
@@ -490,6 +501,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          "...",
           "default",
           "^dependencyDefault",
           "bunToolchain",
@@ -502,6 +514,7 @@
           }
         ],
         "dependsOn": [
+          "...",
           {
             "projects": [
               "cowshed"
@@ -528,6 +541,9 @@
     },
     "tags": [
       "npm:public"
+    ],
+    "implicitDependencies": [
+      "!cowshed"
     ],
     "name": "nx-plugin"
   },
@@ -560,6 +576,7 @@
     "@nx/js": "23.2.1",
     "@smoothbricks/build-inputs": "workspace:*",
     "@smoothbricks/cargo-retain": "workspace:*",
+    "@smoothbricks/cowshed": "workspace:*",
     "@smoothbricks/nextest-extract": "workspace:*",
     "jsonc-parser": "^3.3.1",
     "minimatch": "10.2.5",

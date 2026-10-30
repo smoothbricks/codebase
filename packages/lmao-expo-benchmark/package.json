@@ -42,9 +42,11 @@
       "typecheck": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
+          "...",
           "^build"
         ],
         "inputs": [
+          "...",
           {
             "externalDependencies": [
               "bun-lock:packages/lmao-expo-benchmark"
@@ -78,9 +80,11 @@
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
+          "...",
           "^build"
         ],
         "inputs": [
+          "...",
           "default",
           "pluginScenarioSources",
           "bunToolchain"
@@ -95,6 +99,7 @@
       "lint": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "inputs": [
+          "...",
           {
             "externalDependencies": [
               "bun-lock:packages/lmao-expo-benchmark"
@@ -104,6 +109,7 @@
           "^dependencyDefault"
         ],
         "dependsOn": [
+          "...",
           "typecheck"
         ],
         "options": {
@@ -145,6 +151,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
         "dependsOn": [
+          "...",
           "^build",
           "prepare-web-wasm"
         ],
@@ -202,6 +209,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
         "dependsOn": [
+          "...",
           "^build"
         ],
         "outputs": [

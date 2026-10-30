@@ -23,18 +23,16 @@ function toolCommand(cwd: string, tool: string, file: string): string {
   return `${posix.join(posix.relative(cwd, '.'), PLUGIN_LINK)}/../${tool}/${file}`;
 }
 
-/** The tool packages whose executables inferred commands run. */
-const NATIVE_TOOL_PACKAGES = ['build-inputs', 'cargo-retain', 'nextest-extract'] as const;
+/** The tool packages whose native artifacts inferred commands consume. */
+const NATIVE_TOOL_PACKAGES = ['build-inputs', 'cargo-retain', 'nextest-extract', 'cowshed'] as const;
 
 export type NativeToolPackage = (typeof NATIVE_TOOL_PACKAGES)[number];
 
 type TargetDependency = NonNullable<TargetConfiguration['dependsOn']>[number];
 
 /**
- * The tool packages' executables as the inferring host runs them. Every scriptc package ships each platform's
- * executable under `dist/bin/<platform>/`, so an installed tool package already carries this host's. A tool package
- * that is a project of the workspace being inferred (a checkout of the repository that builds it) has only what its
- * `scriptc-<arch>-<family>` target last wrote, so a command running it depends on that target.
+ * Native tools as the inferring host consumes them. Installed packages already ship their artifacts; a workspace
+ * package needs its declared producer. Scriptc tools use the host platform target, cowshed its napi-native addon.
  */
 export interface NativeTools {
   /** The host's directory under a tool package's `dist/bin`. */
@@ -101,8 +99,14 @@ export function nativeToolCommand(
   return toolCommand(cwd, tool, `dist/bin/${tools.platform}/${bin}`);
 }
 
-/** The task that builds `tool`'s executables for this host, when this workspace builds them. */
-export function nativeToolDependsOn(tools: NativeTools | null, tool: NativeToolPackage): TargetDependency[] {
+/** The task producing a tool artifact, only when this workspace owns its package. */
+export function nativeToolDependsOn(
+  tools: NativeTools | null,
+  tool: NativeToolPackage,
+  target?: string,
+): TargetDependency[] {
   const project = tools?.projects.get(tool);
-  return project === undefined || tools === null ? [] : [{ projects: [project], target: tools.target }];
+  return project === undefined || tools === null
+    ? []
+    : [{ projects: [project], target: target ?? (tool === 'cowshed' ? 'napi-native' : tools.target) }];
 }

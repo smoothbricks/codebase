@@ -58,7 +58,7 @@
     },
     "test": {
       "cache": true,
-      "inputs": ["default", "^dependencyDefault", "bunToolchain"]
+      "inputs": ["...", "default", "^dependencyDefault", "bunToolchain"]
     },
     "cargo-test": {
       "inputs": ["default", "^dependencyDefault", { "externalDependencies": [] }]

@@ -108,6 +108,7 @@
           "killAfterMs": 10000
         },
         "dependsOn": [
+          "...",
           "verify-packages"
         ]
       },

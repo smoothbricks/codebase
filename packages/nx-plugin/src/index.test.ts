@@ -21,6 +21,7 @@ import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-
 import { resolveNxTokensInOptions } from 'nx/src/project-graph/utils/project-configuration/target-merging.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
+import { findCycles } from 'nx/src/tasks-runner/task-graph-utils.js';
 import { getOutputsForTargetAndConfiguration } from 'nx/src/tasks-runner/utils.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { prepareCargoFixture } from './__tests__/cargo-fixture.js';
@@ -41,6 +42,7 @@ import {
   pluginInstalledIn,
   scriptcBinModules,
 } from './index.js';
+import { nativeToolDependsOn, resolveNativeTools } from './tool-bins.js';
 import { isRecord } from './type-guards.js';
 import { applyWorkspaceConfig, isTestRunnerTargetName, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
 
@@ -52,9 +54,27 @@ const HOST_TOOLS = `${process.platform === 'darwin' ? 'darwin' : 'linux'}-${proc
 const [, rawInferTargets] = createNodesV2;
 const inferTargets: typeof rawInferTargets = async (files, options, context) => {
   await prepareCargoFixture(context.workspaceRoot);
-  return rawInferTargets(files, options, context);
+  return inferFixture(rawInferTargets, files, options, context);
 };
 
+async function inferFixture(handler: CreateNodesV2[1], ...args: Parameters<CreateNodesV2[1]>) {
+  try {
+    return await handler(...args);
+  } catch (error) {
+    reportInferenceFailure(error);
+  }
+}
+
+/** Bun abbreviates AggregateCreateNodesError.errors; keep each owning file and cause visible without changing its type. */
+function reportInferenceFailure(error: unknown): never {
+  if (error instanceof AggregateCreateNodesError) {
+    error.message = [
+      error.message,
+      ...error.errors.map(([file, cause]) => `${file ?? '<workspace>'}: ${cause.stack ?? cause.message}`),
+    ].join('\n');
+  }
+  throw error;
+}
 describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('never lets a cache hit on the build aggregate restore its children’s dist', async () => {
     const workspace = await createWorkspace();
@@ -1171,6 +1191,221 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('orders every local bounded observer after the manifest-owned cowshed producers without loading its addon', async () => {
+    const workspace = await createWorkspace();
+    const bounded: TargetConfiguration = {
+      executor: '@smoothbricks/nx-plugin:bounded-exec',
+      cache: true,
+      dependsOn: ['...', 'prepare'],
+      inputs: ['...', '{projectRoot}/checks.ts'],
+      options: { command: 'bun test --timeout=0', idleTimeoutMs: 180000 },
+    };
+    const pluginTargets: Record<string, TargetConfiguration> = { check: bounded };
+    const ownerTargets: Record<string, TargetConfiguration> = {
+      lint: bounded,
+      'api-generator': { executor: 'nx:run-commands', options: { command: 'generate-api' } },
+      'api-check': { ...bounded, dependsOn: ['...', 'api-generator'] },
+      'tsc-js': { dependsOn: ['...', 'api-check'] },
+      'lineage-js': {
+        executor: 'nx:run-commands',
+        cache: true,
+        inputs: ['{projectRoot}/src/process-lineage.ts'],
+        outputs: ['{projectRoot}/dist/lineage'],
+        options: { command: 'tsc -p tsconfig.lineage.json' },
+      },
+      build: { dependsOn: ['tsc-js'] },
+      'release-check': { executor: '@smoothbricks/nx-plugin:bounded-exec', cache: false },
+    };
+    const projects = [
+      { file: 'package.json', name: 'workspace', targets: {}, manifest: { name: 'workspace' } },
+      {
+        file: 'tools/nx-plugin/package.json',
+        name: 'graph-plugin',
+        targets: pluginTargets,
+        manifest: { name: '@smoothbricks/nx-plugin', nx: { name: 'graph-plugin', targets: pluginTargets } },
+      },
+      {
+        file: 'tools/cowshed/package.json',
+        name: 'lineage-owner',
+        targets: ownerTargets,
+        manifest: {
+          name: '@smoothbricks/cowshed',
+          nx: { name: 'lineage-owner', targets: ownerTargets },
+          napi: { binaryName: 'cowshed', targets: ['aarch64-apple-darwin'] },
+          exports: { './process-lineage': './src/process-lineage.ts' },
+        },
+      },
+      {
+        file: 'services/worker/package.json',
+        name: 'worker',
+        targets: { check: bounded },
+        manifest: { name: '@fixture/worker', nx: { name: 'worker', targets: { check: bounded } } },
+      },
+    ];
+    try {
+      const root = workspace.context.workspaceRoot;
+      for (const project of projects) await workspace.write(project.file, JSON.stringify(project.manifest));
+      await workspace.write(
+        'tools/cowshed/src/process-lineage.ts',
+        'throw new Error("graph inference loaded the addon entry");\n',
+      );
+      for (const dir of ['tools/nx-plugin', 'tools/cowshed']) {
+        await workspace.write(`${dir}/tsconfig.lib.json`, '{"compilerOptions":{"rootDir":"src","outDir":"dist/ts"}}\n');
+      }
+      await workspace.write('tools/nx-plugin/tsconfig.test.json', '{}\n');
+      await workspace.write(
+        'Cargo.toml',
+        '[workspace]\nmembers = ["tools/cowshed/crates/*", "services/worker/crates/*"]\n',
+      );
+      await workspace.write(
+        'tools/cowshed/crates/cowshed-napi/Cargo.toml',
+        '[package]\nname = "cowshed-napi"\n\n[lib]\ncrate-type = ["cdylib"]\n',
+      );
+      await workspace.write(
+        'services/worker/crates/worker-core/Cargo.toml',
+        '[package]\nname = "worker-core"\n\n[package.metadata.smoothbricks.test]\nshards = 2\n',
+      );
+      await workspace.write(
+        '.config/nextest.toml',
+        [
+          '[test-groups.exclusive]',
+          'max-threads = 1',
+          '',
+          ...serialOverride('package(worker-core) and test(/exclusive/)', 'exclusive'),
+        ].join('\n'),
+      );
+      await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(join(root, 'tools/nx-plugin'), join(root, 'node_modules/@smoothbricks/nx-plugin'), 'dir');
+      const files = projects.map((project) => project.file);
+      const tools = await resolveNativeTools(
+        root,
+        [...files, 'tools/cowshed/package.json'],
+        'darwin-arm64',
+        'scriptc-arm64-macos',
+      );
+      expect([...tools.projects]).toEqual([['cowshed', 'lineage-owner']]);
+      const addon = nativeToolDependsOn(tools, 'cowshed')[0];
+      const lineage = nativeToolDependsOn(tools, 'cowshed', 'lineage-js')[0];
+      expect(addon).toEqual({ projects: ['lineage-owner'], target: 'napi-native' });
+      expect(lineage).toEqual({ projects: ['lineage-owner'], target: 'lineage-js' });
+      await prepareCargoFixture(root);
+      resetWorkspaceContext();
+      const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
+      const results = await inferFixture(infer, files, undefined, workspace.context);
+      const nodes: Record<string, ProjectGraphProjectNode> = {};
+      for (const project of projects) {
+        const inferred =
+          results.find(([file]) => file === project.file)?.[1].projects?.[dirname(project.file)]?.targets ?? {};
+        const declared: Record<string, TargetConfiguration> = project.targets;
+        const targets = Object.fromEntries(
+          [...new Set([...Object.keys(inferred), ...Object.keys(declared)])].map((name) => [
+            name,
+            mergeTargetConfigurations(declared[name] ?? {}, inferred[name] ?? {}),
+          ]),
+        );
+        nodes[project.name] = { name: project.name, type: 'lib', data: { root: dirname(project.file), targets } };
+      }
+      const graph: ProjectGraph = {
+        nodes,
+        dependencies: Object.fromEntries(projects.map((project) => [project.name, []])),
+      };
+      const expectedRunners = ['cargo-test-worker-core-shard1', 'cargo-test-worker-core-shard2'];
+      for (const name of expectedRunners)
+        expect(nodes.worker?.data.targets?.[name]?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      expect(nodes.workspace?.data.targets?.['cargo-test-group-exclusive']?.executor).toBe(
+        '@smoothbricks/nx-plugin:bounded-exec',
+      );
+      for (const node of Object.values(nodes)) {
+        for (const [name, target] of Object.entries(node.data.targets ?? {})) {
+          if (target.executor !== '@smoothbricks/nx-plugin:bounded-exec' || name === 'release-check') continue;
+          expect(target.dependsOn, `${node.name}:${name}`).toContainEqual(addon);
+          expect(target.dependsOn, `${node.name}:${name}`).toContainEqual(lineage);
+          expect(
+            target.dependsOn?.filter((dependency) => JSON.stringify(dependency) === JSON.stringify(addon)),
+          ).toHaveLength(1);
+          expect(target.inputs).toContainEqual({ dependentTasksOutputFiles: '**/*.node', transitive: true });
+          expect(target.inputs).toContainEqual({
+            dependentTasksOutputFiles: '**/dist/lineage/**/*.js',
+            transitive: true,
+          });
+          expect(target.inputs).not.toContain('{workspaceRoot}/**/*.rs');
+          const tasks = createTaskGraph(graph, {}, [node.name], [name], undefined, {});
+          expect(findCycles(tasks)).toBeNull();
+        }
+      }
+      const plugin = nodes['graph-plugin']?.data.targets ?? {};
+      for (const name of ['tsc-js', 'typecheck', 'typecheck-tests']) {
+        expect(plugin[name]?.dependsOn).toContainEqual(lineage);
+        expect(plugin[name]?.dependsOn).not.toContainEqual(addon);
+        expect(plugin[name]?.inputs).toContainEqual({
+          dependentTasksOutputFiles: '**/dist/lineage/**/*',
+          transitive: false,
+        });
+      }
+      expect(plugin.check?.dependsOn).toContain('prepare');
+      expect(plugin.check?.inputs).toContain('{projectRoot}/checks.ts');
+      expect(plugin.check?.inputs).not.toContain('default');
+      const owner = nodes['lineage-owner']?.data.targets ?? {};
+      expect(owner['napi-native']?.outputs).toEqual([]);
+      expect(owner['napi-native']?.dependsOn).toEqual(['napi-arm64-macos']);
+      expect(owner['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/{options.outputDir}/']);
+      expect(owner['napi-arm64-macos']?.options?.outputDir).toBe('.cache/native-dev/darwin-arm64');
+      expect(owner['lineage-js']?.outputs).toEqual(['{projectRoot}/dist/lineage']);
+      expect(owner['release-check']?.dependsOn).toBeUndefined();
+      expect(owner.build?.dependsOn).toEqual(['tsc-js']);
+      const build = createTaskGraph(graph, {}, ['lineage-owner'], ['build'], undefined, {});
+      expect(findCycles(build)).toBeNull();
+      expect(Object.keys(build.tasks)).toContain('lineage-owner:napi-native');
+      expect(Object.keys(build.tasks)).toContain('lineage-owner:lineage-js');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('adds no local cowshed producer for an installed plugin even when the workspace has an unrelated cowshed project', async () => {
+    const workspace = await createWorkspace();
+    try {
+      const root = workspace.context.workspaceRoot;
+      await workspace.write(
+        'app/package.json',
+        JSON.stringify({
+          name: 'app',
+          nx: {
+            targets: {
+              check: { executor: '@smoothbricks/nx-plugin:bounded-exec' },
+            },
+          },
+        }),
+      );
+      await workspace.write(
+        'tools/cowshed/package.json',
+        '{"name":"@smoothbricks/cowshed","nx":{"name":"unrelated-owner"}}\n',
+      );
+      await workspace.write(
+        'node_modules/.fixture/@smoothbricks/nx-plugin/package.json',
+        '{"name":"@smoothbricks/nx-plugin"}\n',
+      );
+      await workspace.write(
+        'node_modules/.fixture/@smoothbricks/cowshed/package.json',
+        '{"name":"@smoothbricks/cowshed"}\n',
+      );
+      await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(
+        join(root, 'node_modules/.fixture/@smoothbricks/nx-plugin'),
+        join(root, 'node_modules/@smoothbricks/nx-plugin'),
+        'dir',
+      );
+      const files = ['app/package.json', 'tools/cowshed/package.json'];
+      const tools = await resolveNativeTools(root, files, 'darwin-arm64', 'scriptc-arm64-macos');
+      expect(tools.projects.size).toBe(0);
+      expect(nativeToolDependsOn(tools, 'cowshed')).toEqual([]);
+      const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
+      const results = await inferFixture(infer, files, undefined, workspace.context);
+      expect(results.find(([file]) => file === 'app/package.json')?.[1].projects?.app?.targets?.check).toBeUndefined();
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   //#region smoo!n/rust-output-target-inference
   it("makes the retention preview wait for cargo-retain's host executable where the workspace builds it", async () => {
     const workspace = await createWorkspace();
@@ -4056,7 +4291,7 @@ async function inferProject(
   // Each inference indexes the tree as it is now, as a fresh Nx process would: the
   // in-process workspace context otherwise keeps the files of the first inference.
   resetWorkspaceContext();
-  const result = await infer([packageJsonPath], undefined, workspace.context);
+  const result = await inferFixture(infer, [packageJsonPath], undefined, workspace.context);
   return result[0]?.[1].projects?.[dirname(packageJsonPath)];
 }
 
@@ -4073,7 +4308,7 @@ async function inferProjectWithNxJson(
   const [, infer] = createNodesV2;
   await prepareCargoFixture(workspace.context.workspaceRoot);
   resetWorkspaceContext();
-  const result = await infer([packageJsonPath], undefined, {
+  const result = await inferFixture(infer, [packageJsonPath], undefined, {
     workspaceRoot: workspace.context.workspaceRoot,
     nxJsonConfiguration,
   });
