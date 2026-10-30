@@ -18,7 +18,10 @@
 //!
 //! A `range` node bounds a number by finite closed bounds and judges integer
 //! tokens and canonical int64 values exactly against them, never through a
-//! rounded double. An `array` node may demand an exact length.
+//! rounded double. A `bigint` node may carry closed safe-integer bounds, both
+//! or neither, and judges the exact integer every bigint lane spells (a native
+//! bigint, a canonical int64, the decimal string) against them. An `array` node
+//! may demand an exact length.
 //!
 //! A `key` node admits an `S.key` value: a non-empty string whose routing key
 //! component encodes to at most `maxEncodedLength` characters. Only that length
@@ -131,6 +134,9 @@ pub trait ValueView {
         None
     }
 
+    /// The exact number of a [`ValueKind::Number`], or the exact integer of a
+    /// [`ValueKind::BigInt`] whose adapter carries one; a bounded `bigint`
+    /// refuses a bigint that does not answer.
     fn as_number(&self) -> Option<NumberValue> {
         None
     }
@@ -343,6 +349,8 @@ enum Expected<'s> {
     Text(&'static str),
     Enum(&'s [String]),
     Range(NumericRange),
+    /// A bounded `bigint`: an exact integer inside these bounds.
+    BigInt(IntegerBounds),
     /// An `S.key` value: its routing key component encodes to at most this many characters.
     Key(u32),
     /// An `axId` value the host's grammar refused, with the grammar's reason.
@@ -370,6 +378,7 @@ impl fmt::Display for Expected<'_> {
                 };
                 write!(output, "{kind} in [{}, {}]", range.min, range.max)
             }
+            Self::BigInt(bounds) => write!(output, "bigint in [{}, {}]", bounds.min, bounds.max),
             Self::Key(bound) => write!(output, "key: encodes to at most {bound} characters"),
             Self::AxId(reason) => write!(output, "axId: {reason}"),
             Self::Length(length) => write!(output, "array of length {length}"),
@@ -606,8 +615,41 @@ impl NumericRange {
     }
 }
 
-/// An integer token's exact value, compared with float bounds without first
-/// rounding the integer through `f64`.
+/// Closed bounds of a bounded `bigint` node. Both bounds are safe JavaScript
+/// integers, ordered by construction, so a TypeScript producer spells each
+/// exactly as a number token and every lane compares the same two integers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntegerBounds {
+    min: i64,
+    max: i64,
+}
+
+impl IntegerBounds {
+    pub fn new(min: i64, max: i64) -> Result<Self, SchemaParseError> {
+        let safe = |value: i64| (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value);
+        if safe(min) && safe(max) && min <= max {
+            Ok(Self { min, max })
+        } else {
+            Err(SchemaParseError::InvalidOperand)
+        }
+    }
+
+    pub const fn min(self) -> i64 {
+        self.min
+    }
+
+    pub const fn max(self) -> i64 {
+        self.max
+    }
+
+    fn contains(self, value: ExactInteger) -> bool {
+        value.cmp_exact(ExactInteger::signed(i128::from(self.min))) != Ordering::Less
+            && value.cmp_exact(ExactInteger::signed(i128::from(self.max))) != Ordering::Greater
+    }
+}
+
+/// An integer's exact value, compared with a range's float bounds or a
+/// bigint's integer bounds without first rounding the integer through `f64`.
 #[derive(Clone, Copy)]
 struct ExactInteger {
     negative: bool,
@@ -642,10 +684,16 @@ impl ExactInteger {
             };
         }
         // Integral and below 2^128, so this conversion is exact.
-        let bound_magnitude = bound_magnitude as u128;
-        match (self.negative, bound_negative) {
-            (false, false) => self.magnitude.cmp(&bound_magnitude),
-            (true, true) => bound_magnitude.cmp(&self.magnitude),
+        self.cmp_exact(Self {
+            negative: bound_negative,
+            magnitude: bound_magnitude as u128,
+        })
+    }
+
+    fn cmp_exact(self, other: Self) -> Ordering {
+        match (self.negative, other.negative) {
+            (false, false) => self.magnitude.cmp(&other.magnitude),
+            (true, true) => other.magnitude.cmp(&self.magnitude),
             (false, true) => Ordering::Greater,
             (true, false) => Ordering::Less,
         }
@@ -671,7 +719,8 @@ pub enum SemanticSchema {
     Number,
     Boolean,
     Binary,
-    BigInt,
+    /// A bigint, inside closed safe-integer bounds when the node names them.
+    BigInt(Option<IntegerBounds>),
     I32,
     U32,
     /// A number inside closed finite bounds, integral when the range says so.
@@ -765,7 +814,7 @@ impl SemanticSchema {
             Self::Number => "number",
             Self::Boolean => "boolean",
             Self::Binary => "binary",
-            Self::BigInt => "bigint",
+            Self::BigInt(_) => "bigint",
             Self::I32 => "i32",
             Self::U32 => "u32",
             Self::Range(_) => "range",
@@ -856,7 +905,7 @@ pub(crate) fn collect_open_paths(
         | SemanticSchema::Number
         | SemanticSchema::Boolean
         | SemanticSchema::Binary
-        | SemanticSchema::BigInt
+        | SemanticSchema::BigInt(_)
         | SemanticSchema::I32
         | SemanticSchema::U32
         | SemanticSchema::Range(_)
@@ -895,7 +944,7 @@ fn collect_vo_metadata<'a>(schema: &'a SemanticSchema, output: &mut Vec<&'a VoMe
         | SemanticSchema::Number
         | SemanticSchema::Boolean
         | SemanticSchema::Binary
-        | SemanticSchema::BigInt
+        | SemanticSchema::BigInt(_)
         | SemanticSchema::I32
         | SemanticSchema::U32
         | SemanticSchema::Range(_)
@@ -1136,7 +1185,7 @@ impl SemanticSchema {
             Self::Number => Self::Number,
             Self::Boolean => Self::Boolean,
             Self::Binary => Self::Binary,
-            Self::BigInt => Self::BigInt,
+            Self::BigInt(bounds) => Self::BigInt(*bounds),
             Self::I32 => Self::I32,
             Self::U32 => Self::U32,
             Self::Range(range) => Self::Range(*range),
@@ -1332,7 +1381,7 @@ fn count_vo_metadata(schema: &SemanticSchema) -> usize {
         | SemanticSchema::Number
         | SemanticSchema::Boolean
         | SemanticSchema::Binary
-        | SemanticSchema::BigInt
+        | SemanticSchema::BigInt(_)
         | SemanticSchema::I32
         | SemanticSchema::U32
         | SemanticSchema::Range(_)
@@ -1560,7 +1609,7 @@ fn validate_at<'s, G: AddressGrammar>(
         SemanticSchema::AxId => validate_ax_id::<G>(value),
         SemanticSchema::Boolean => require_kind(value, ValueKind::Boolean),
         SemanticSchema::Binary => require_kind(value, ValueKind::Binary),
-        SemanticSchema::BigInt => validate_bigint(value),
+        SemanticSchema::BigInt(bounds) => validate_bigint(*bounds, value),
         SemanticSchema::Number => validate_number(value),
         SemanticSchema::I32 => validate_i32(value),
         SemanticSchema::U32 => validate_u32(value),
@@ -1839,21 +1888,53 @@ fn validate_ax_id<'s, G: AddressGrammar>(value: &dyn ValueView) -> Result<(), St
 ///
 /// A canonical int64 is also sufficient evidence: its adapter retained every
 /// bit, but the canonical codec erased the originating host's numeric type.
-fn validate_bigint<'s>(value: &dyn ValueView) -> Result<(), Stop<'s>> {
-    match value.kind() {
-        ValueKind::BigInt => Ok(()),
-        ValueKind::CanonicalInt64 if value.as_canonical_i64().is_some() => Ok(()),
-        ValueKind::String => {
-            let text = value.as_str().unwrap_or_default();
-            let digits = text.strip_prefix('-').unwrap_or(text);
-            let decimal = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
-            if decimal && (text.parse::<i64>().is_ok() || text.parse::<u64>().is_ok()) {
-                Ok(())
-            } else {
-                Err(Fault::shape("bigint", value).into())
-            }
-        }
-        _ => Err(Fault::shape("bigint", value).into()),
+///
+/// A bounded `bigint` then requires the exact integer inside its bounds on
+/// every lane that spells one: a native bigint through [`ValueView::as_number`],
+/// a canonical int64, and the decimal string. A native bigint whose adapter
+/// carries no exact integer proves nothing about a bound, so a bounded node
+/// refuses it.
+fn validate_bigint<'s>(
+    bounds: Option<IntegerBounds>,
+    value: &dyn ValueView,
+) -> Result<(), Stop<'s>> {
+    let exact = match value.kind() {
+        ValueKind::BigInt => match value.as_number() {
+            Some(NumberValue::Signed(number)) => Some(ExactInteger::signed(number)),
+            Some(NumberValue::Unsigned(number)) => Some(ExactInteger::unsigned(number)),
+            Some(NumberValue::Float(_)) | None => None,
+        },
+        ValueKind::CanonicalInt64 => match value.as_canonical_i64() {
+            Some(number) => Some(ExactInteger::signed(i128::from(number))),
+            None => return Err(Fault::shape("bigint", value).into()),
+        },
+        ValueKind::String => match decimal_bigint(value.as_str().unwrap_or_default()) {
+            Some(exact) => Some(exact),
+            None => return Err(Fault::shape("bigint", value).into()),
+        },
+        _ => return Err(Fault::shape("bigint", value).into()),
+    };
+    match bounds {
+        None => Ok(()),
+        Some(bounds) if exact.is_some_and(|exact| bounds.contains(exact)) => Ok(()),
+        Some(bounds) => Err(Fault::seen(Expected::BigInt(bounds), value.kind()).into()),
+    }
+}
+
+/// The exact integer a bigint's decimal string spells: an optional `-` and
+/// ASCII digits whose value fits `i64` or `u64`, the bigint-as-string form both
+/// extractors accept.
+fn decimal_bigint(text: &str) -> Option<ExactInteger> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    match text.parse::<i64>() {
+        Ok(number) => Some(ExactInteger::signed(i128::from(number))),
+        Err(_) => text
+            .parse::<u64>()
+            .ok()
+            .map(|number| ExactInteger::unsigned(u128::from(number))),
     }
 }
 
@@ -2009,7 +2090,7 @@ fn parse_schema(value: &JsonValue, depth: usize) -> Result<SemanticSchema, Schem
         "number" => Ok(SemanticSchema::Number),
         "boolean" => Ok(SemanticSchema::Boolean),
         "binary" => Ok(SemanticSchema::Binary),
-        "bigint" => Ok(SemanticSchema::BigInt),
+        "bigint" => parse_bigint(value),
         "i32" => Ok(SemanticSchema::I32),
         "u32" => Ok(SemanticSchema::U32),
         "enum" => Ok(SemanticSchema::Enum(parse_string_array(field(
@@ -2153,6 +2234,20 @@ fn parse_range(fields: &[(String, JsonValue)]) -> Result<NumericRange, SchemaPar
     )
 }
 
+/// A `bigint` node names both bounds or neither: one bound alone would leave
+/// the other to a default its producer never wrote. Any other member refuses.
+fn parse_bigint(value: &JsonValue) -> Result<SemanticSchema, SchemaParseError> {
+    const MEMBERS: &[&str] = &["kind", "min", "max"];
+    let members = exact_members(value, &["kind"], MEMBERS)?;
+    match (field(members, "min"), field(members, "max")) {
+        (None, None) => Ok(SemanticSchema::BigInt(None)),
+        (min, max) => Ok(SemanticSchema::BigInt(Some(IntegerBounds::new(
+            integer_bound(min)?,
+            integer_bound(max)?,
+        )?))),
+    }
+}
+
 /// A bound is any JSON number token, read as the nearest double — the value
 /// JavaScript parses the same token to. [`NumericRange::new`] then demands a
 /// finite, ordered pair and, for an integral range, safe integers, inside
@@ -2162,6 +2257,21 @@ fn range_bound(value: Option<&JsonValue>) -> Result<f64, SchemaParseError> {
         Some(JsonValue::Number(NumberValue::Float(bound))) => Ok(*bound),
         Some(JsonValue::Number(NumberValue::Signed(bound))) => Ok(*bound as f64),
         Some(JsonValue::Number(NumberValue::Unsigned(bound))) => Ok(*bound as f64),
+        Some(_) => Err(SchemaParseError::InvalidOperand),
+        None => Err(SchemaParseError::MissingOperand),
+    }
+}
+
+/// A bigint bound is an integer token that fits `i64`; [`IntegerBounds::new`]
+/// then demands an ordered pair of safe integers.
+fn integer_bound(value: Option<&JsonValue>) -> Result<i64, SchemaParseError> {
+    match value {
+        Some(JsonValue::Number(NumberValue::Signed(bound))) => {
+            i64::try_from(*bound).map_err(|_| SchemaParseError::InvalidOperand)
+        }
+        Some(JsonValue::Number(NumberValue::Unsigned(bound))) => {
+            i64::try_from(*bound).map_err(|_| SchemaParseError::InvalidOperand)
+        }
         Some(_) => Err(SchemaParseError::InvalidOperand),
         None => Err(SchemaParseError::MissingOperand),
     }
@@ -2588,7 +2698,8 @@ enum MsgpackValue<'a> {
     Number(NumberValue),
     Boolean(bool),
     Binary(&'a [u8]),
-    BigInt,
+    /// The bigint extension, with its value when that fits `i64`.
+    BigInt(Option<i64>),
     Array(Vec<Self>),
     Object(Vec<(&'a str, Self)>),
 }
@@ -2602,7 +2713,7 @@ impl ValueView for MsgpackValue<'_> {
             Self::Number(_) => ValueKind::Number,
             Self::Boolean(_) => ValueKind::Boolean,
             Self::Binary(_) => ValueKind::Binary,
-            Self::BigInt => ValueKind::BigInt,
+            Self::BigInt(_) => ValueKind::BigInt,
             Self::Array(_) => ValueKind::Array,
             Self::Object(_) => ValueKind::Object,
         }
@@ -2618,6 +2729,7 @@ impl ValueView for MsgpackValue<'_> {
     fn as_number(&self) -> Option<NumberValue> {
         match self {
             Self::Number(value) => Some(*value),
+            Self::BigInt(value) => value.map(|value| NumberValue::Signed(i128::from(value))),
             _ => None,
         }
     }
@@ -2719,9 +2831,9 @@ fn parse_msgpack_value<'a>(
     if Reader::is_ext(first) {
         // A bigint travels as the canonical bigint extension on both wires;
         // any other extension is opaque to the judgment.
-        let (kind, _payload) = reader.read_ext().ok_or(ValueParseError::InvalidMsgpack)?;
+        let (kind, payload) = reader.read_ext().ok_or(ValueParseError::InvalidMsgpack)?;
         return Ok(if kind == crate::msgpack_scanner::BIGINT_EXTENSION {
-            MsgpackValue::BigInt
+            MsgpackValue::BigInt(crate::msgpack_scanner::bigint_ext_i64(payload))
         } else {
             MsgpackValue::Unknown
         });
@@ -2832,7 +2944,10 @@ mod tests {
         let mut bigint_row = vec![0x81];
         // fixext 2, type 20, sign 0, magnitude 5
         bigint_row.extend([0xa5, b'v', b'a', b'l', b'u', b'e', 0xd5, 20, 0, 5]);
-        assert_eq!(msgpack_event_value(&bigint_row), MsgpackValue::BigInt);
+        assert_eq!(
+            msgpack_event_value(&bigint_row),
+            MsgpackValue::BigInt(Some(5))
+        );
 
         let mut number_row = vec![0x81];
         number_row.extend([0xa5, b'v', b'a', b'l', b'u', b'e', 0xce]);
@@ -3288,6 +3403,251 @@ mod tests {
             (payload(None, 0, -1), "value.limits.a"),
         ] {
             assert_eq!(violation_of(validate_value(&schema, &value)).path, path);
+        }
+    }
+
+    /// A runtime's native bigint cell: the `ValueKind::BigInt` an adapter with
+    /// an exact integer reports, answering `as_number` with that integer.
+    struct NativeBigInt(NumberValue);
+
+    impl ValueView for NativeBigInt {
+        fn kind(&self) -> ValueKind {
+            ValueKind::BigInt
+        }
+
+        fn as_number(&self) -> Option<NumberValue> {
+            Some(self.0)
+        }
+    }
+
+    /// One MessagePack event row whose `value` is the bigint extension as
+    /// fixext 8: the sign byte, then seven big-endian magnitude bytes.
+    fn msgpack_bigint_row(negative: bool, magnitude: u64) -> Vec<u8> {
+        assert!(magnitude < 1 << 56, "seven magnitude bytes");
+        let mut row = vec![0x81, 0xa5, b'v', b'a', b'l', b'u', b'e', 0xd7, 20];
+        row.push(u8::from(negative));
+        row.extend(&magnitude.to_be_bytes()[1..]);
+        row
+    }
+
+    const DATE_MS: i64 = 8_640_000_000_000_000;
+    const DATE_TREE: &str = r#"{"kind":"bigint","min":-8640000000000000,"max":8640000000000000}"#;
+
+    #[test]
+    fn bigint_bounds_are_both_or_neither_ordered_safe_integers() {
+        assert_eq!(schema(r#"{"kind":"bigint"}"#), SemanticSchema::BigInt(None));
+        assert_eq!(
+            schema(DATE_TREE),
+            SemanticSchema::BigInt(Some(IntegerBounds::new(-DATE_MS, DATE_MS).unwrap()))
+        );
+        for (tree, error) in [
+            (
+                r#"{"kind":"bigint","min":0}"#,
+                SchemaParseError::MissingOperand,
+            ),
+            (
+                r#"{"kind":"bigint","max":0}"#,
+                SchemaParseError::MissingOperand,
+            ),
+            (
+                r#"{"kind":"bigint","min":2,"max":1}"#,
+                SchemaParseError::InvalidOperand,
+            ),
+            (
+                r#"{"kind":"bigint","min":0,"max":9007199254740992}"#,
+                SchemaParseError::InvalidOperand,
+            ),
+            (
+                r#"{"kind":"bigint","min":-9007199254740992,"max":0}"#,
+                SchemaParseError::InvalidOperand,
+            ),
+            (
+                r#"{"kind":"bigint","min":0,"max":1.5}"#,
+                SchemaParseError::InvalidOperand,
+            ),
+            (
+                r#"{"kind":"bigint","min":0,"max":1e3}"#,
+                SchemaParseError::InvalidOperand,
+            ),
+            (
+                r#"{"kind":"bigint","min":0,"max":"1"}"#,
+                SchemaParseError::InvalidOperand,
+            ),
+            (
+                r#"{"kind":"bigint","min":0,"max":1,"integer":true}"#,
+                SchemaParseError::InvalidOperand,
+            ),
+            (
+                r#"{"kind":"bigint","integer":true}"#,
+                SchemaParseError::InvalidOperand,
+            ),
+            (
+                r#"{"kind":"bigint","min":0,"min":1,"max":2}"#,
+                SchemaParseError::DuplicateField,
+            ),
+        ] {
+            assert_eq!(
+                SemanticSchema::from_tree_bytes(tree.as_bytes()),
+                Err(error),
+                "{tree}"
+            );
+        }
+        assert_eq!(
+            schema(r#"{"kind":"bigint","min":-9007199254740991,"max":9007199254740991}"#),
+            SemanticSchema::BigInt(Some(
+                IntegerBounds::new(-MAX_SAFE_INTEGER, MAX_SAFE_INTEGER).unwrap()
+            ))
+        );
+        let copy = schema(DATE_TREE).try_clone().unwrap();
+        assert_eq!(copy, schema(DATE_TREE));
+    }
+
+    #[test]
+    fn bounded_bigint_admits_exactly_its_bounds_on_every_lane() {
+        let date = schema(DATE_TREE);
+        let refusal = |observed: &str| -> Result<(), ValueRefusal> {
+            Err(ValueRefusal::Violation(PayloadViolation {
+                path: "value".into(),
+                expected: "bigint in [-8640000000000000, 8640000000000000]".into(),
+                observed: observed.into(),
+                vo: None,
+            }))
+        };
+
+        // The decimal string, the JSON lane's bigint.
+        for accepted in [r#""8640000000000000""#, r#""-8640000000000000""#, r#""0""#] {
+            assert_eq!(validate_value(&date, &json(accepted)), Ok(()), "{accepted}");
+        }
+        for refused in [
+            r#""8640000000000001""#,
+            r#""-8640000000000001""#,
+            r#""18446744073709551615""#,
+        ] {
+            assert_eq!(
+                validate_value(&date, &json(refused)),
+                refusal("string"),
+                "{refused}"
+            );
+        }
+        // A value that is no bigint is refused as an unbounded bigint refuses it.
+        for wrong in [r#""abc""#, "1"] {
+            assert_eq!(
+                violation_of(validate_value(&date, &json(wrong))).expected,
+                "bigint",
+                "{wrong}"
+            );
+        }
+
+        // A canonical int64, compared exactly.
+        assert_eq!(validate_value(&date, &ExactInt64(DATE_MS)), Ok(()));
+        assert_eq!(validate_value(&date, &ExactInt64(-DATE_MS)), Ok(()));
+        assert_eq!(
+            validate_value(&date, &ExactInt64(DATE_MS + 1)),
+            refusal("canonical int64")
+        );
+        assert_eq!(
+            validate_value(&date, &JsonValue::CanonicalInt64(i64::MIN)),
+            refusal("canonical int64")
+        );
+        assert!(validate_value(&date, &UnprovenInt64(None)).is_err());
+
+        // A native bigint, through the integer its adapter answers.
+        let five = msgpack_bigint_row(false, 5);
+        assert_eq!(validate_value(&date, &msgpack_event_value(&five)), Ok(()));
+        let edge = msgpack_bigint_row(true, DATE_MS.unsigned_abs());
+        assert_eq!(validate_value(&date, &msgpack_event_value(&edge)), Ok(()));
+        let past = msgpack_bigint_row(false, DATE_MS.unsigned_abs() + 1);
+        assert_eq!(
+            validate_value(&date, &msgpack_event_value(&past)),
+            refusal("bigint")
+        );
+        assert_eq!(
+            validate_value(
+                &date,
+                &NativeBigInt(NumberValue::Unsigned(u128::from(u64::MAX)))
+            ),
+            refusal("bigint")
+        );
+        assert_eq!(
+            validate_value(
+                &date,
+                &NativeBigInt(NumberValue::Signed(-i128::from(DATE_MS)))
+            ),
+            Ok(())
+        );
+        // A bigint whose adapter carries no integer proves nothing about a bound,
+        // and stays a bigint to an unbounded node.
+        assert_eq!(validate_value(&date, &JsonValue::BigInt), refusal("bigint"));
+        assert_eq!(
+            validate_value(&schema(r#"{"kind":"bigint"}"#), &JsonValue::BigInt),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bounded_bigint_compares_signed_integers_against_any_bounds() {
+        for (tree, admitted, refused) in [
+            (
+                r#"{"kind":"bigint","min":3,"max":5}"#,
+                &[r#""3""#, r#""4""#, r#""5""#][..],
+                &[r#""2""#, r#""6""#, r#""-4""#, r#""-3""#][..],
+            ),
+            (
+                r#"{"kind":"bigint","min":-5,"max":-3}"#,
+                &[r#""-5""#, r#""-4""#, r#""-3""#][..],
+                &[r#""4""#, r#""-6""#, r#""-2""#, r#""0""#][..],
+            ),
+            (
+                r#"{"kind":"bigint","min":7,"max":7}"#,
+                &[r#""7""#][..],
+                &[r#""6""#, r#""8""#, r#""-7""#][..],
+            ),
+        ] {
+            let bounded = schema(tree);
+            for value in admitted {
+                assert_eq!(
+                    validate_value(&bounded, &json(value)),
+                    Ok(()),
+                    "{tree} {value}"
+                );
+            }
+            for value in refused {
+                assert!(
+                    violation_of(validate_value(&bounded, &json(value)))
+                        .expected
+                        .starts_with("bigint in ["),
+                    "{tree} {value}"
+                );
+            }
+        }
+
+        let small = schema(r#"{"kind":"bigint","min":3,"max":5}"#);
+        assert_eq!(validate_value(&small, &ExactInt64(4)), Ok(()));
+        assert!(validate_value(&small, &ExactInt64(-4)).is_err());
+        assert_eq!(
+            validate_value(&small, &NativeBigInt(NumberValue::Signed(4))),
+            Ok(())
+        );
+        for refused in [
+            NumberValue::Signed(-4),
+            NumberValue::Unsigned(6),
+            NumberValue::Float(4.0),
+        ] {
+            assert_eq!(
+                violation_of(validate_value(&small, &NativeBigInt(refused))).expected,
+                "bigint in [3, 5]",
+                "{refused:?}"
+            );
+        }
+        // A string that spells no bigint is refused by its shape, bounded or not.
+        for malformed in [
+            r#""+4""#, r#"" 4""#, r#""4 ""#, r#""-""#, r#""--4""#, r#""""#,
+        ] {
+            assert_eq!(
+                violation_of(validate_value(&small, &json(malformed))).expected,
+                "bigint",
+                "{malformed}"
+            );
         }
     }
 

@@ -45,6 +45,21 @@
     "observed": "string"
   },
   {
+    "name": "bounded-bigint-at-its-bound",
+    "schema": { "kind": "bigint", "min": -8640000000000000, "max": 8640000000000000 },
+    "value": "8640000000000000",
+    "verdict": "accept"
+  },
+  {
+    "name": "bounded-bigint-past-its-bound",
+    "schema": { "kind": "bigint", "min": -8640000000000000, "max": 8640000000000000 },
+    "value": "8640000000000001",
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "bigint in [-8640000000000000, 8640000000000000]",
+    "observed": "string"
+  },
+  {
     "name": "bigint-wrong-number",
     "schema": { "kind": "bigint" },
     "value": 1,
