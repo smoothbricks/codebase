@@ -293,6 +293,8 @@ describe('in place, from another checkout', () => {
         '--frozen',
         'nextest',
         'run',
+        '--color',
+        'never',
         '--binaries-metadata',
         NEXTEST_BINARIES_METADATA,
         '--cargo-metadata',
