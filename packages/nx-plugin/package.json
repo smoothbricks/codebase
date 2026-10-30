@@ -347,7 +347,7 @@
           "test-results-runtime"
         ]
       },
-      "test-results-runtime-bundle": {
+      "closed-results-runtime-bundle": {
         "executor": "nx:run-commands",
         "cache": true,
         "metadata": {
@@ -386,7 +386,7 @@
         "cache": true,
         "dependsOn": [
           "...",
-          "test-results-runtime-bundle"
+          "closed-results-runtime-bundle"
         ],
         "inputs": [
           "...",
@@ -404,7 +404,7 @@
         "options": {
           "command": "bun .cache/test-results-runtime/bundle.mjs",
           "cwd": "{projectRoot}",
-          "timeoutMs": 120000,
+          "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }
       },
