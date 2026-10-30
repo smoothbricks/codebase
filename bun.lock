@@ -228,7 +228,7 @@
     },
     "packages/lmao-inspector": {
       "name": "@smoothbricks/lmao-inspector",
-      "version": "0.1.15",
+      "version": "0.1.16-next.0",
       "dependencies": {
         "@duckdb/duckdb-wasm": "1.33.1-dev20.0",
         "@smoothbricks/lmao": "workspace:*",
