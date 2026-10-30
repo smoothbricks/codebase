@@ -239,14 +239,31 @@ export function timingsSuiteInputs(suite: Pick<TimingsShardedSuite, 'cwd' | 'arg
  * The names of the files under `cwd` (workspace-relative) Bun's discovery could run, sorted, as a runtime input. It is a
  * superset of {@link timingsCoverage}'s rules (any extension, the whole tree whatever bunfig's `test.root`, no ignore
  * glob), so every file discovery would find changes the value, and a name discovery skips costs at most a cache miss.
- * Like Bun, it skips `node_modules` and hidden directories, follows symlinks, and reads no `.gitignore`.
+ * Like Bun, it skips `node_modules` and hidden directories, follows symlinks (each directory once, by its real path),
+ * takes a link to nothing for a file, and reads no `.gitignore`. It walks with Bun, which every workspace declares.
  */
 export function bunTestFileNamesInput(cwd: string): { runtime: string } {
-  const find =
-    "find -L . \\( -name node_modules -o -name '.?*' \\) -type d -prune -o " +
-    "\\( -iname '*.test.*' -o -iname '*_test.*' -o -iname '*.spec.*' -o -iname '*_spec.*' \\) -print";
-  return runtimeInput(`sh -c ${shellWord(`cd "$0" && ${find} | LC_ALL=C sort`)} ${shellWord(cwd)}`);
+  return runtimeInput(`bun -e ${shellWord(LIST_TEST_FILE_NAMES)} ${shellWord(cwd)}`);
 }
+
+const LIST_TEST_FILE_NAMES = [
+  'const { readdirSync, realpathSync, statSync } = require("node:fs");',
+  'const names = []; const seen = new Set();',
+  'const walk = (dir) => {',
+  '  const real = realpathSync(dir); if (seen.has(real)) return; seen.add(real);',
+  '  for (const entry of readdirSync(dir, { withFileTypes: true })) {',
+  '    const path = dir === "." ? entry.name : dir + "/" + entry.name; const name = entry.name.toLowerCase();',
+  '    let directory = entry.isDirectory();',
+  '    if (entry.isSymbolicLink()) {',
+  '      try { directory = statSync(path).isDirectory(); }',
+  '      catch (error) { if (error?.code !== "ENOENT") throw error; }',
+  '    }',
+  '    if (directory) { if (!name.startsWith(".") && name !== "node_modules") walk(path); }',
+  '    else if (/[._](test|spec)[.]/.test(name)) names.push(path);',
+  '  }',
+  '};',
+  'process.chdir(process.argv[1]); walk("."); names.sort(); for (const name of names) console.log(name);',
+].join(' ');
 
 /**
  * The failure an untimed file earns: every such file, and the one command that refreshes the manifest. `cwd` is the
