@@ -44,16 +44,7 @@
 
 import { Database } from 'bun:sqlite';
 import * as bunTest from 'bun:test';
-import {
-  afterAll as _afterAll,
-  afterEach as _afterEach,
-  beforeAll as _beforeAll,
-  beforeEach as _beforeEach,
-  describe as _describe,
-  expect as _expect,
-  it as _it,
-  mock,
-} from 'bun:test';
+import { afterAll as _afterAll, describe as _describe, it as _it, mock } from 'bun:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -878,24 +869,6 @@ export function getTracer(): Tracer<OpContextBinding> {
   return _tracer;
 }
 
-/**
- * Wrapped describe — tracks describe nesting for the standalone export path.
- * describe() callbacks run synchronously (just registering tests).
- */
-export function describe(name: string, fn: () => void) {
-  return _describe(name, () => {
-    _standaloneDescribeStack.push(name);
-    try {
-      fn();
-    } finally {
-      _standaloneDescribeStack.pop();
-    }
-  });
-}
-
-// Describe stack for standalone exports (non-mock-module path)
-const _standaloneDescribeStack: string[] = [];
-
 function assignOptionalBoundTestFunction(target: object, key: string, source: object, thisArg: unknown): void {
   const value = Reflect.get(source, key);
   if (typeof value === 'function') {
@@ -1004,57 +977,6 @@ function assignOnly(target: object, source: object, thisArg: unknown): void {
 
   assignOptionalBoundTestFunction(target, 'only', source, thisArg);
 }
-
-describe.skip = _describe.skip;
-assignOnly(describe, _describe, _describe);
-describe.todo = _describe.todo;
-assignOptionalBoundTestFunction(describe, 'each', _describe, _describe);
-assignOptionalBoundTestFunction(describe, 'skipIf', _describe, _describe);
-assignOptionalBoundTestFunction(describe, 'if', _describe, _describe);
-
-/**
- * Wrapped it — creates a child span of the root trace for the test case.
- *
- * `options` is bun's per-test timeout/retry/repeats slot. It is forwarded verbatim: a wrapper
- * that swallows it demotes `it(name, fn, 300_000)` to the runner's ambient testTimeout, and the
- * resulting failure blames the test instead of the wrapper.
- */
-export function it(name: string, fn: () => void | Promise<void>, options?: BunTestOptions): void {
-  const describePath = _standaloneDescribeStack.length > 0 ? _standaloneDescribeStack.join(' > ') : null;
-  _it(
-    name,
-    () => {
-      if (!isSpanContext(_rootCtx)) throw new Error('Call initTraceTestRun() in preload before tests');
-      return _rootCtx.span(name, async (ctx: SpanContext<OpContext>) => {
-        writeDescribeTag(ctx.tag, describePath);
-        try {
-          await _als.run(ctx, fn);
-          return ctx.ok(undefined); // pass → span-ok
-        } catch (error) {
-          if (isExpectError(error)) return ctx.err(error); // expect() fail → span-err
-          throw error; // other throw → span-exception
-        }
-      });
-    },
-    options,
-  );
-}
-
-it.skip = _it.skip;
-assignOnly(it, _it, _it);
-it.todo = _it.todo;
-assignOptionalBoundTestFunction(it, 'each', _it, _it);
-assignOptionalBoundTestFunction(it, 'skipIf', _it, _it);
-assignOptionalBoundTestFunction(it, 'if', _it, _it);
-
-// Re-export everything else unchanged
-export {
-  _afterAll as afterAll,
-  _afterEach as afterEach,
-  _beforeAll as beforeAll,
-  _beforeEach as beforeEach,
-  _expect as expect,
-};
 
 // =============================================================================
 // Auto-discovery preload
