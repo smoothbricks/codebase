@@ -611,7 +611,9 @@ mod tests {
             };
             let inputs: Vec<PathBuf> =
                 (0..files).map(|file| PathBuf::from(format!("/m/{file}"))).collect();
-            let mut kept: Option<(Vec<PathBuf>, Vec<FileState>, Vec<Option<u8>>)> = None;
+            // The inputs, their states and their answers as the memo last kept them.
+            type Kept = (Vec<PathBuf>, Vec<FileState>, Vec<Option<u8>>);
+            let mut kept: Option<Kept> = None;
             for step in steps {
                 match step {
                     Step::Write { file, content, renamed } => {

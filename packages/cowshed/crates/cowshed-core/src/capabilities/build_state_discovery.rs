@@ -1332,8 +1332,9 @@ fn ls_files(
     pathspecs: &[&OsStr],
     refused: impl FnOnce(&std::process::Output) -> CowshedError,
 ) -> Result<Arc<[u8]>> {
-    static LISTINGS: LazyLock<InputMemo<(PathBuf, Vec<OsString>), Arc<[u8]>>> =
-        LazyLock::new(InputMemo::new);
+    // A workspace and the pathspecs listed in it.
+    type Listing = (PathBuf, Vec<OsString>);
+    static LISTINGS: LazyLock<InputMemo<Listing, Arc<[u8]>>> = LazyLock::new(InputMemo::new);
     let list = || {
         // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager,
         // editors and prompts off (`git_command_at`): it waits on no other process.
