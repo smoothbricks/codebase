@@ -60,6 +60,8 @@ const ROLE: &str = "COWSHED_JOB_CGROUP_ROLE";
 const ROLE_TEST: &str = "job_cgroup_role";
 const REPORT: &str = "COWSHED_JOB_CGROUP_REPORT ";
 const PAUSED: &str = "COWSHED_JOB_CGROUP_PAUSED";
+/// Reported once a workload's allocation is released, before anything else runs.
+const RELEASED: &str = "COWSHED_JOB_CGROUP_RELEASED";
 const HELD: &str = "COWSHED_JOB_CGROUP_HELD";
 /// One milestone of an escape fixture's process: this prefix, then a JSON [`Stage`].
 const STAGE: &str = "COWSHED_JOB_CGROUP_STAGE ";
@@ -96,6 +98,8 @@ struct Workload {
     burn_after_ms: u64,
     /// Anonymous memory to touch page by page and release again.
     allocate_mib: u64,
+    /// Once the allocation is released, report [`RELEASED`] and wait for one byte on stdin.
+    pause_after_release: bool,
     /// A test-owned scratch file filled through the page cache and held until workload exit.
     page_cache: Option<(PathBuf, u64)>,
     /// A test-owned scratch file written/read past the page cache (`O_DIRECT`) and flushed.
@@ -351,6 +355,14 @@ fn work(workload: &Workload) {
     }
     burn(workload.burn_after_ms);
     touch_and_release(workload.allocate_mib);
+    if workload.pause_after_release {
+        println!("{RELEASED}");
+        std::io::stdout().flush().expect("flush");
+        let mut byte = [0];
+        std::io::stdin()
+            .read_exact(&mut byte)
+            .expect("resume after the release");
+    }
     if let Some((path, mebibytes)) = &workload.page_cache {
         fill_page_cache(path, *mebibytes);
     }
@@ -767,6 +779,21 @@ fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
 /// resets.
 fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     const MIB: u64 = 1 << 20;
+    // memory.stat is not exact. Each CPU holds back fewer than MEMCG_CHARGE_BATCH (64) pages of
+    // updates before they count toward the flush threshold, and a read flushes the per-CPU counters
+    // only once that count exceeds 64 pages per online CPU (mm/memcontrol.c, memcg_rstat_updated
+    // and memcg_vmstats_needs_flush). So one reading can trail what is charged by up to 2 * 64
+    // pages per online CPU. A 4-CPU runner read 254 pages short of the cached file; the contract is
+    // the bound, not equality.
+    // SAFETY: sysconf takes a constant.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
+    // SAFETY: sysconf takes a constant.
+    let online =
+        u64::try_from(unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).expect("online CPUs");
+    let unflushed = 2 * 64 * online * page;
+    // At least 128 MiB, and large enough that its release shows past two readings' lag on any
+    // host's CPU count and page size.
+    let allocated = (128 * MIB).max(8 * unflushed).next_multiple_of(MIB);
     let job = jobs
         .admit(job_id(10), ExecClass::Background)
         .expect("admit");
@@ -774,12 +801,30 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     let mut running = Spawned::placed(
         &job,
         &Workload {
-            allocate_mib: 128,
+            pause: true,
+            allocate_mib: allocated / MIB,
+            pause_after_release: true,
             page_cache: Some((page_cache_file.clone(), 64)),
             hold: true,
             ..Workload::default()
         },
     );
+    // Paused directly before the allocation: the anonymous memory the job holds without it.
+    running.await_pause();
+    let anon_before = stat_counter(&memory_stat(&job), "anon");
+    running.resume();
+    // Paused directly after the release, before the page cache is filled: since the pause above
+    // the workload did nothing but touch the allocation and unmap it, so nothing since that pause
+    // but the allocation can have raised the peak.
+    running.await_marker(RELEASED);
+    let released = ReleasedAllocation {
+        allocated,
+        anon_before,
+        anon_after: stat_counter(&memory_stat(&job), "anon"),
+        peak: direct_charged_memory(&job).1,
+        unflushed,
+    };
+    running.resume();
     running.await_marker(HELD);
     let direct_before = direct_charged_memory(&job);
     let charged = job.charged_memory().expect("charged memory");
@@ -791,15 +836,8 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     let resident =
         live_members_resident_bytes(&job, &running).expect("read the held parent's actual RSS");
     let (current, peak) = (charged.current_bytes.get(), charged.peak_bytes.get());
-    let stat = std::fs::read_to_string(job.path().join("memory.stat")).expect("memory.stat");
-    let counter = |name: &str| -> u64 {
-        stat.lines()
-            .find_map(|line| {
-                let (key, value) = line.split_once(' ')?;
-                (key == name).then(|| value.parse().expect("memory.stat count"))
-            })
-            .unwrap_or_else(|| panic!("memory.stat has no {name}: {stat}"))
-    };
+    let stat = memory_stat(&job);
+    let counter = |name: &str| stat_counter(&stat, name);
     let (file, shmem) = (counter("file"), counter("shmem"));
     let f_type = filesystem_type(&scratch_directory()).expect("scratch statfs");
     let regular_file = file.checked_sub(shmem).expect("shmem is part of file");
@@ -812,24 +850,13 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
         "charged memory: current {current} B, peak {peak} B (direct before {direct_before:?}, \
          after {direct_after:?}); live members resident {resident} B; memory.stat file {file} B, \
          shmem {shmem} B, regular-file cache {regular_file} B; the job's file cached {cached} B; \
-         filesystem {f_type:#x}"
+         filesystem {f_type:#x}; at the release {released:?} on {online} online CPUs"
     );
     if f_type == libc::EXT4_SUPER_MAGIC {
         assert!(
             cached > 0,
             "the job's 64 MiB file left no page in the cache to attribute"
         );
-        // memory.stat is not exact: a read flushes the memcg's per-CPU counters only once their pending
-        // updates exceed MEMCG_CHARGE_BATCH (64) pages per online CPU (mm/memcontrol.c,
-        // memcg_vmstats_needs_flush: stats_updates > MEMCG_CHARGE_BATCH * num_online_cpus()), so
-        // its "file" can trail what is charged by up to that many pages. A 4-CPU runner read 254
-        // pages short of the cached file; the contract is the bound, not equality.
-        // SAFETY: sysconf takes a constant.
-        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
-        // SAFETY: sysconf takes a constant.
-        let online = u64::try_from(unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) })
-            .expect("online CPUs");
-        let unflushed = 64 * online * page;
         assert!(
             regular_file + unflushed >= cached,
             "every cached page of the job's regular file is charged as non-shmem cache: \
@@ -867,9 +894,18 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
         "the job's cached file pages are in its charge: charged {current} B, resident \
          {resident} B, the file's cached pages {cached} B"
     );
+    // The released allocation is judged directly after its release, on anonymous memory, where
+    // nothing but it can have set the peak. Judged at HELD against the whole charge, the claim
+    // assumed that nothing of the job's grew by 32 MiB after the release. CI run 41076002964's job
+    // held 34.5 MiB of shmem there that its peak never held beside the allocation, likely the tmpfs
+    // pages behind the scratch loop device, charged as the job's file was written back.
+    if let Err(message) = released.stays_in_the_peak() {
+        panic!("{message}");
+    }
     assert!(
-        peak >= 128 * MIB && peak >= current + 32 * MIB,
-        "the released 128 MiB stays in the peak: peak {peak} B, current {current} B"
+        peak >= released.peak,
+        "the released allocation stays in the peak: {} B after the release, {peak} B at HELD",
+        released.peak
     );
     assert!(
         peak_again.get() >= peak,
@@ -884,6 +920,104 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
         ended.peak_bytes.get() >= peak,
         "the peak outlives the job's processes"
     );
+}
+
+/// What a job's memory counters say about an allocation it touched whole and released, read
+/// directly before the allocation and directly after the release.
+#[derive(Clone, Copy, Debug)]
+struct ReleasedAllocation {
+    /// Bytes the workload touched page by page, all resident at once before it unmapped them.
+    allocated: u64,
+    /// `memory.stat` `anon` directly before the allocation.
+    anon_before: u64,
+    /// `memory.stat` `anon` directly after the release.
+    anon_after: u64,
+    /// `memory.peak` directly after the release. Since `anon_before` was read the workload did
+    /// nothing but the allocation, so nothing since then but the allocation can have raised it.
+    peak: u64,
+    /// How far one `memory.stat` reading may trail the charge.
+    unflushed: u64,
+}
+
+impl ReleasedAllocation {
+    /// The released allocation is in the peak and no longer in the charge, and both hold by
+    /// construction. When the allocation's last page was touched, the job held the anonymous memory
+    /// it had before plus the whole allocation, so the peak is at least their sum. Background jobs
+    /// get no swap (`memory.swap.max` 0), so no touched page left the charge first. Once the pages
+    /// were unmapped, the anonymous memory the job holds is short of that sum by the allocation.
+    /// Each `memory.stat` reading may trail by `unflushed`.
+    fn stays_in_the_peak(self) -> Result<(), String> {
+        let held = self.anon_before + self.allocated;
+        if self.peak + self.unflushed < held {
+            return Err(format!(
+                "the released {} B stays in the peak: peak {} B after the release, below the anon \
+                 before it ({} B) plus the allocation, with {} B of stat lag",
+                self.allocated, self.peak, self.anon_before, self.unflushed
+            ));
+        }
+        if self.anon_after + 2 * self.unflushed >= held {
+            return Err(format!(
+                "the {} B allocation was released: anon after it {} B, before it {} B, with {} B \
+                 of stat lag",
+                self.allocated, self.anon_after, self.anon_before, self.unflushed
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The released allocation, judged on counters shaped like CI run 41076002964, which broke the
+/// old premise. That run read a peak of 135266304 B at HELD and a current charge of 102490112 B, of
+/// which memory.stat file was 100171776 B and shmem 36196352 B. The peak was set at the allocation,
+/// 128 MiB on about 1 MiB, and the cache and shmem arrived after the release. The old premise, a
+/// peak at least 32 MiB above the whole charge at HELD, fails those counters. Judged directly after
+/// the release, the claim holds at both ends of what the counters allow. It still refuses a peak
+/// that never held the allocation, including one that late cache and shmem raised just as high at
+/// HELD, and an allocation never released.
+#[test]
+fn a_released_allocation_stays_in_the_peak_whatever_arrives_after_it() {
+    const MIB: u64 = 1 << 20;
+    let old_premise = |peak: u64, current: u64| peak >= 128 * MIB && peak >= current + 32 * MIB;
+    let (peak, current, file) = (135_266_304_u64, 102_490_112_u64, 100_171_776_u64);
+    assert!(
+        !old_premise(peak, current),
+        "the old premise held the CI run's counters"
+    );
+    let unflushed = 2 * 64 * 4 * 4096;
+    // The anon before the allocation is anything up to what the peak held beside it, plus a lag;
+    // the anon after the release is at most what the charge held beside its file pages, plus lags.
+    for anon_before in [0, peak - 128 * MIB + unflushed] {
+        let released = ReleasedAllocation {
+            allocated: 128 * MIB,
+            anon_before,
+            anon_after: current - file + 2 * unflushed,
+            peak,
+            unflushed,
+        };
+        assert_eq!(released.stays_in_the_peak(), Ok(()), "{released:?}");
+    }
+    let held = ReleasedAllocation {
+        allocated: 128 * MIB,
+        anon_before: MIB,
+        anon_after: MIB,
+        peak: 129 * MIB,
+        unflushed,
+    };
+    assert_eq!(held.stays_in_the_peak(), Ok(()), "{held:?}");
+    // An allocation that never happened leaves the peak read after the release at the job's own
+    // startup charge, whatever cache and shmem later raise it to at HELD.
+    for never in [
+        ReleasedAllocation {
+            peak: 2 * MIB,
+            ..held
+        },
+        ReleasedAllocation {
+            anon_after: 129 * MIB,
+            ..held
+        },
+    ] {
+        assert!(never.stays_in_the_peak().is_err(), "{never:?}");
+    }
 }
 
 /// Children that move bytes to and from storage past the page cache, then exit before anyone
@@ -1998,6 +2132,23 @@ fn direct_charged_memory(job: &JobCgroup) -> (u64, u64) {
             .expect("a count")
     };
     (read("memory.current"), read("memory.peak"))
+}
+
+/// The job's `memory.stat`, read directly.
+fn memory_stat(job: &JobCgroup) -> String {
+    let path = job.path().join("memory.stat");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
+/// One counter of a `memory.stat` text.
+fn stat_counter(stat: &str, name: &str) -> u64 {
+    stat.lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            (key == name).then(|| value.parse().expect("memory.stat count"))
+        })
+        .unwrap_or_else(|| panic!("memory.stat has no {name}: {stat}"))
 }
 
 /// Each live member's own user + system CPU from `/proc/<pid>/stat`. Every unavailable
