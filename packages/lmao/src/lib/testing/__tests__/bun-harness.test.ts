@@ -5,6 +5,7 @@ import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import { type BunTestModuleShape, makeBunTestSuiteTracer, makeTestTracer } from '../bun-harness.js';
+import { spanException } from '../facts.js';
 import { querySpan } from '../queryable-span.js';
 
 type BunTestModuleLike = BunTestModuleShape;
@@ -161,6 +162,30 @@ describe('bun harness per-test options forwarding', () => {
   });
 });
 
+// The immediate module returns what the harness hands it, so the test awaits the harness's own settlement.
+describe('bun harness done callbacks', () => {
+  it('settles a done-style test when it calls done, failing with the value it passes', async () => {
+    const tracer = makeTestTracer(baseBinding);
+    tracer.setup();
+    const wrapped = tracer.createBunTestMock(createImmediateBunTestModule());
+    const spans: ReturnType<typeof tracer.useTestSpan>[] = [];
+
+    const settled = Promise.resolve(
+      wrapped.it('calls done with an error after returning', (done) => {
+        spans.push(tracer.useTestSpan());
+        queueMicrotask(() => done(new Error('late')));
+      }),
+    );
+
+    await expect(settled).rejects.toThrow('late');
+    expect(
+      spans.map((span) =>
+        querySpan(span.buffer).facts().has(spanException('calls done with an error after returning', 'late')),
+      ),
+    ).toEqual([true]);
+  });
+});
+
 // Rows register through the real bun:test `each`, which formats every row's title itself and never re-enters a wrapped
 // `it`. Bigint rows stay exact: the harness hands the runner each row untouched and names the row's span by the label
 // template.
@@ -182,7 +207,7 @@ describe('bun harness each rows', () => {
     expect(until).toBe(-9_223_372_036_854_775_807n);
   });
 
-  // Bun passes `done` only when the row callback declares more parameters than the row has values.
+  // A row callback that declares more parameters than its row has values takes `done`, as under plain Bun.
   wrapped.it.each([[1n]])('done row %p', (value, done) => {
     expect(querySpan(tracer.useTestSpan().buffer).name).toBe('done row %p');
     expect(value).toBe(1n);
@@ -193,6 +218,39 @@ describe('bun harness each rows', () => {
     wrapped.it('records the row suite in its describe path', () => {
       expect(tracer.useTestSpan().buffer.describe_values[0]).toBe('suite %s');
       expect(label).toBe('alpha');
+    });
+  });
+});
+
+// Modifiers register through the real bun:test members; each one's callbacks run traced like a plain it().
+describe('bun harness modifiers', () => {
+  const tracer = makeTestTracer(baseBinding);
+  tracer.setup();
+  const wrapped = tracer.createBunTestMock(bunTest);
+
+  wrapped.it.concurrent.each([[1n], [2n]])('concurrent row %p', async () => {
+    const span = tracer.useTestSpan();
+    await Promise.resolve();
+    expect(tracer.useTestSpan()).toBe(span);
+    expect(querySpan(span.buffer).name).toBe('concurrent row %p');
+  });
+
+  // A `.failing` row passes when its body fails. This row fails only through the done it calls after returning, so it
+  // passes only if the harness settles it on done, and its span must record that failure.
+  const failingRows: ReturnType<typeof tracer.useTestSpan>[] = [];
+  wrapped.it.failing.each([[1n]])('failing done row %p', (_value, done) => {
+    failingRows.push(tracer.useTestSpan());
+    queueMicrotask(() => done(new Error('late')));
+  });
+  wrapped.it('records the failing done row as an exception, not ok', () => {
+    expect(
+      failingRows.map((span) => querySpan(span.buffer).facts().has(spanException('failing done row %p', 'late'))),
+    ).toEqual([true]);
+  });
+
+  wrapped.describe(makeTestTracer, () => {
+    wrapped.it('records a function label by its name', () => {
+      expect(tracer.useTestSpan().buffer.describe_values[0]).toBe('makeTestTracer');
     });
   });
 });
