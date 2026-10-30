@@ -1,12 +1,12 @@
 import { expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { on, once } from 'node:events';
-import { watch } from 'node:fs';
+import { once } from 'node:events';
 import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, stopFixtureNxDaemon, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { whenFound } from './__tests__/path-change.js';
 import { awaitExit, isRunning, processesOf, terminate } from './testing.js';
 
 /**
@@ -58,23 +58,26 @@ async function recordedPid(workspace: string): Promise<number | null> {
 }
 
 /**
- * The pid the record names, once it exists. The watch is armed before the first look and buffers its events from then
- * on, so a record written between a look and the next wait is not missed.
+ * The pid a whole record names. Where link(2) is refused (a cowshed sandbox), a daemon creates its record exclusively
+ * and then writes it, and removes its staged copy only after that (`patches/nx@23.2.1.patch`): a record that does not
+ * parse yet is still being written, and that removal brings the next judgment.
  */
-async function recordWritten(workspace: string): Promise<number> {
-  const watcher = watch(join(workspace, '.nx/workspace-data/d'));
-  const changes = on(watcher, 'change');
+async function wholeRecordPid(workspace: string): Promise<number | null> {
   try {
-    let pid = await recordedPid(workspace);
-    while (pid === null) {
-      await changes.next();
-      pid = await recordedPid(workspace);
-    }
-    return pid;
-  } finally {
-    watcher.close();
-    await changes.return?.();
+    return await recordedPid(workspace);
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
   }
+}
+
+/**
+ * The pid the record names, once it is whole. A kernel watch on its directory judges the record once armed and after
+ * every entry change there (specs/cowshed/08_testing.md, "Fixtures"), so a record published before the watch arms is
+ * still found. Bun's fs.watch arms after it returns, and saw such a record only through a later write to the log.
+ */
+function recordWritten(workspace: string): Promise<number> {
+  return whenFound(join(workspace, '.nx/workspace-data/d'), () => wholeRecordPid(workspace));
 }
 
 async function fixtureWorkspace(workspace: string): Promise<void> {
