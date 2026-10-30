@@ -39,9 +39,27 @@
       },
       "nx-daemon-idle-proof": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
+        "//": "Cached on the compiled proof, the patched Nx it drives and the Bun that runs it.",
         "dependsOn": [
           "nx-daemon-idle-proof-compile"
+        ],
+        "inputs": [
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          },
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --revision"
+          },
+          {
+            "externalDependencies": [
+              "nx"
+            ]
+          }
         ],
         "outputs": [],
         "options": {
@@ -120,7 +138,15 @@
       },
       "lint-disk-commands": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
+        "//": "Cached on the files it scans: every file git lists that is not ignored, the same set the {workspaceRoot} fileset hashes, the policy script among them.",
+        "inputs": [
+          "{workspaceRoot}/**/*",
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [],
         "options": {
           "command": "bun packages/nx-plugin/src/disk-command-policy.ts .",
           "cwd": "{workspaceRoot}"

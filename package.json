@@ -226,12 +226,20 @@
       },
       "monorepo-check": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
+        "inputs": [
+          "{workspaceRoot}/**/*",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh -c 'find . \\( -name node_modules -o -name target -o -name dist -o -name .?\\* \\) -type d -prune -o -name dist-test -type d -print | LC_ALL=C sort'"
+          }
+        ],
+        "outputs": [],
         "options": {
           "command": "smoo monorepo check --warn",
           "cwd": "{workspaceRoot}"
         },
-        "//": "MONOREPO: the package conventions and managed-file drift that publish's 'Check managed monorepo files' step refuses on, run in the root lint where lands are judged instead of first at publish. Uncached on purpose: one check lists the devenv release tags from the remote on every run and keeps no copy, so a cached verdict could outlive what it judged. It needs the remote reachable and fails rather than passes offline."
+        "//": "MONOREPO: the package conventions and managed-file drift that publish's 'Check managed monorepo files' step refuses on, run in the root lint where lands are judged instead of first at publish. Cached on the whole tree, which holds every manifest, lock and managed file it reads, and on the gitignored dist-test directories it refuses, which no file input sees. The devenv release check asks the remote on every run, but a pushed release tag is permanent and Nx caches no failure, so a cached pass cannot outlive what it judged; it needs the remote reachable and fails rather than passes offline."
       },
       "local-registry": {
         "executor": "@nx/js:verdaccio",
