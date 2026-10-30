@@ -34,8 +34,8 @@ use super::supervisor::{
 use super::wait_spans::{WaitFailure, peer_pid};
 use crate::api::dto::{
     AdmissionKey, CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobId, JobInfo,
-    JobJournalCursor, JobState, JobTailLimits, OutputPublication, RunSandboxMode, ScriptCommand,
-    Sha256Digest, StdinSource, TraceContext, WorkspacePath,
+    JobJournalCursor, JobRecord, JobState, JobTailLimits, OutputPublication, RunSandboxMode,
+    ScriptCommand, Sha256Digest, StdinSource, TraceContext, WorkspacePath,
 };
 #[cfg(not(target_os = "macos"))]
 use crate::api::process::JobSubtreeRefusal;
@@ -385,6 +385,12 @@ enum Call {
     Wait {
         job_id: JobId,
     },
+    /// As `wait`, for a watcher of the job: it acknowledges nothing of a caller-owned job's end
+    /// (11_shell.md, "Caller-owned jobs").
+    #[serde(rename_all = "camelCase")]
+    Ended {
+        job_id: JobId,
+    },
     /// Hold the job for as long as this connection stays open (`hold`). The job's end answers
     /// it; a [`HoldDemand::Release`] lets the job outlive it; a close before either kills it.
     #[serde(rename_all = "camelCase")]
@@ -446,6 +452,7 @@ impl Call {
             Self::Kill { .. } => "kill",
             Self::Detach { .. } => "detach",
             Self::Wait { .. } => "wait",
+            Self::Ended { .. } => "ended",
             Self::Hold { .. } => "hold",
             Self::LogRead { .. } => "log-read",
             Self::Tail { .. } => "tail",
@@ -513,6 +520,13 @@ struct ExecWire {
     class: ExecClass,
     want: Option<NonZeroUsize>,
     scope: ExecScope,
+    /// Who keeps the job's record, omitted when cowshed does, so a supervisor built before the
+    /// field still decodes the call (11_shell.md, "Caller-owned jobs").
+    #[serde(
+        default,
+        skip_serializing_if = "crate::api::operations::is_cowshed_record"
+    )]
+    record: JobRecord,
     /// The requester's own jobserver fifo, which the job reads too when its sandbox can open it
     /// (05_gateway.md "Parallelism inside a job"); absent when the requester was started by none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2205,7 +2219,8 @@ impl DrainReads {
                         // An ended job is owed nothing by a drain that begins later, and a drain
                         // that began took its entry already. A wait refused leaves the entry for
                         // the drain to weigh.
-                        if supervisor.wait(job).await.is_ok() {
+                        // A watcher: it acknowledges nothing of a caller-owned job's end.
+                        if supervisor.ended(job).await.is_ok() {
                             reads.asked().remove(&job);
                         }
                     });
@@ -3095,6 +3110,7 @@ async fn answer(
                 class: request.class,
                 want: request.want,
                 scope: request.scope,
+                record: request.record,
             };
             let session = wire.map(session);
             let job_id = supervisor
@@ -3186,6 +3202,7 @@ async fn answer(
             (unit()?, Bytes::new())
         }
         Call::Wait { job_id } => (to_value(&supervisor.wait(job_id).await?)?, Bytes::new()),
+        Call::Ended { job_id } => (to_value(&supervisor.ended(job_id).await?)?, Bytes::new()),
         Call::LogRead {
             job_id,
             stream,
@@ -3972,6 +3989,13 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         } => {
             let _ = reply.send(call(path, &authority, Call::Wait { job_id }, Bytes::new()).await);
         }
+        Command::Ended {
+            authority,
+            job_id,
+            reply,
+        } => {
+            let _ = reply.send(call(path, &authority, Call::Ended { job_id }, Bytes::new()).await);
+        }
         Command::LogRead {
             authority,
             job_id,
@@ -4131,6 +4155,7 @@ async fn forward_exec(
             class: request.class,
             want: request.want,
             scope: request.scope,
+            record: request.record,
             parent_jobserver,
         }),
     };
@@ -4970,6 +4995,37 @@ mod admission_source_tests {
             .remove("source");
         assert!(serde_json::from_value::<Call>(unrouted).is_err());
     }
+
+    /// A request cowshed records omits `record`, so a supervisor built before the field still
+    /// decodes it; one whose caller owns its record names it (11_shell.md, "Caller-owned jobs"),
+    /// and such a supervisor refuses it as an unknown field.
+    #[test]
+    fn an_exec_call_names_its_record_only_when_the_caller_owns_it() {
+        let recorded = serde_json::json!({
+            "argv": [{ "encoding": "utf8", "data": "true" }],
+            "script": null,
+            "cwd": null,
+            "mode": "readWrite",
+            "env": {},
+            "trace": null,
+            "stdin": { "kind": "empty" },
+            "stdoutCopy": null,
+            "stderrCopy": null,
+            "admissionKey": null,
+            "class": "background",
+            "want": null,
+            "scope": "workspace"
+        });
+        let wire: ExecWire = serde_json::from_value(recorded.clone()).expect("decode");
+        assert_eq!(wire.record, JobRecord::Cowshed);
+        assert_eq!(serde_json::to_value(&wire).expect("encode"), recorded);
+
+        let mut owned = recorded;
+        owned["record"] = serde_json::json!("caller");
+        let wire: ExecWire = serde_json::from_value(owned.clone()).expect("decode");
+        assert_eq!(wire.record, JobRecord::Caller);
+        assert_eq!(serde_json::to_value(&wire).expect("encode"), owned);
+    }
 }
 
 #[cfg(test)]
@@ -5630,7 +5686,7 @@ mod held_turn_tests {
     use super::*;
 
     use crate::api::dto::{
-        CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, OutputPublication,
+        CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobRecord, OutputPublication,
         RunSandboxMode, StdinSource,
     };
     use crate::runtime::supervisor::{
@@ -5810,6 +5866,7 @@ mod held_turn_tests {
                     class: ExecClass::Background,
                     want: Some(std::num::NonZeroUsize::MIN),
                     scope: ExecScope::Workspace,
+                    record: JobRecord::Cowshed,
                 };
                 supervisor
                     .exec(None, None, request, AdmissionSource::Worker)

@@ -18,7 +18,8 @@ use async_trait::async_trait;
 use cowshed_core::api::ExecClass;
 use cowshed_core::api::{
     CommandArg, ExecCommand, ExecRequest, ExecScope, ExitStatus, JobAccounting, JobFailure, JobId,
-    JobInfo, JobState, RunSandboxMode, ScriptCommand, ScriptValue, StdinSource, WorkspacePath,
+    JobInfo, JobRecord, JobState, RunSandboxMode, ScriptCommand, ScriptValue, StdinSource,
+    WorkspacePath,
 };
 use cowshed_core::build_volume::nx::tree_holders;
 use cowshed_core::error::Result;
@@ -287,6 +288,7 @@ fn request(argv: &[&str]) -> ExecRequest {
         class: ExecClass::Background,
         want: None,
         scope: ExecScope::Workspace,
+        record: JobRecord::Cowshed,
     }
 }
 
@@ -389,7 +391,7 @@ async fn host_controller_sealed_ranges_page_a_bounded_command_and_latest_tail() 
     assert_eq!(info.stdout.bytes, 196_609);
     assert!(matches!(
         info.stdout.storage.artifact(),
-        ProtectedOutput::File { .. }
+        Some(ProtectedOutput::File { .. })
     ));
     let mut offset = 0;
     for want in [65_536, 65_536, 65_536, 1] {
@@ -505,6 +507,115 @@ async fn host_controller_warm_commands_take_an_idle_host_within_their_bound() {
     );
     assert!(p50 <= BOUND, "warm p50 {p50:?} above {BOUND:?}");
     assert_eq!(workspace.activations(), 1);
+}
+
+/// Every file under `directory` and its bytes, so two readings of a tree compare whole.
+fn tree(directory: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).expect("list a protected directory") {
+            let path = entry.expect("protected entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let bytes = std::fs::read(&path).expect("read a protected file");
+                files.insert(path, bytes);
+            }
+        }
+    }
+    files
+}
+
+/// A caller-owned exec (11_shell.md, "Caller-owned jobs") runs in the same warm host as any
+/// other and answers its output, status and resources from the supervisor's memory, while the
+/// workspace's protected records stay byte for byte as they were; once its caller has read its
+/// end whole, the supervisor forgets it. Prints the warm cost of a recorded and a caller-owned
+/// exec, measured alike.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_caller_owned_exec_leaves_the_job_records_untouched() {
+    const COMMANDS: usize = 20;
+    let workspace = Workspace::new("caller-owned", 41_968);
+    let handle = workspace.supervisor(false);
+    run(&handle, request(&["/usr/bin/true"])).await.ok();
+    let records = workspace.mount().join(".cowshed/job");
+    let before = tree(&records);
+    assert!(!before.is_empty(), "the recorded job wrote its records");
+
+    let mut owned = sh("printf out; printf err >&2");
+    owned.record = JobRecord::Caller;
+    let ran = run(&handle, owned).await.ok();
+    assert_eq!((ran.stdout.as_str(), ran.stderr.as_str()), ("out", "err"));
+    assert_eq!(ran.info.state, JobState::Exited);
+    assert_eq!(
+        ran.info.stdout.storage,
+        cowshed_core::api::OutputStorage::Streamed
+    );
+    assert_eq!(
+        (ran.info.stdout.bytes, ran.info.stdout.sha256),
+        (3, cowshed_core::api::Sha256Digest::compute(b"out"))
+    );
+    assert_eq!(
+        ran.info.stderr.sha256,
+        cowshed_core::api::Sha256Digest::compute(b"err")
+    );
+    assert!(
+        ran.info.resources.is_some(),
+        "the terminal resource sample is answered from memory"
+    );
+    assert_eq!(
+        tree(&records),
+        before,
+        "a caller-owned job writes nothing under .cowshed/job"
+    );
+    let forgotten = handle
+        .info(ran.info.job_id)
+        .await
+        .expect_err("read whole, the job is forgotten");
+    assert_eq!(
+        forgotten.code,
+        cowshed_core::error::ErrorCode::NotFound,
+        "{}",
+        forgotten.message
+    );
+
+    for _ in 0..COMMANDS {
+        let mut command = request(&["/usr/bin/true"]);
+        command.record = JobRecord::Caller;
+        run(&handle, command).await.ok();
+    }
+    assert_eq!(
+        tree(&records),
+        before,
+        "twenty more caller-owned execs leave .cowshed/job as it was"
+    );
+    // Interleaved, so neither kind is timed on a host the other warmed.
+    let (mut recorded, mut caller) = (Vec::new(), Vec::new());
+    for _ in 0..COMMANDS {
+        for record in [JobRecord::Cowshed, JobRecord::Caller] {
+            let mut command = request(&["/usr/bin/true"]);
+            command.record = record;
+            let started = std::time::Instant::now();
+            run(&handle, command).await.ok();
+            match record {
+                JobRecord::Cowshed => recorded.push(started.elapsed()),
+                JobRecord::Caller => caller.push(started.elapsed()),
+            }
+        }
+    }
+    let quantiles = |elapsed: &mut Vec<Duration>| {
+        elapsed.sort();
+        (
+            elapsed[COMMANDS / 2].as_secs_f64() * 1e3,
+            elapsed[COMMANDS * 9 / 10].as_secs_f64() * 1e3,
+        )
+    };
+    let (recorded, caller) = (quantiles(&mut recorded), quantiles(&mut caller));
+    println!(
+        "warm-exec commands={COMMANDS} recorded_p50_ms={:.2} recorded_p90_ms={:.2} caller_p50_ms={:.2} caller_p90_ms={:.2}",
+        recorded.0, recorded.1, caller.0, caller.1,
+    );
 }
 
 /// A job's environment with the per-workspace places of its own fixture replaced by fixed

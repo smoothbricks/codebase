@@ -770,6 +770,11 @@ export const assertJobProcessTreeList = typia.createAssertEquals<readonly Api.Jo
 export const parseJobProcessTreeList = (json: string): readonly Api.JobProcessTree[] =>
   assertJobProcessTreeList(JSON.parse(json));
 
+export const assertJobRecord = typia.createAssertEquals<Api.JobRecord>();
+export const parseJobRecord = (json: string): Api.JobRecord => assertJobRecord(JSON.parse(json));
+export const assertJobRecordList = typia.createAssertEquals<readonly Api.JobRecord[]>();
+export const parseJobRecordList = (json: string): readonly Api.JobRecord[] => assertJobRecordList(JSON.parse(json));
+
 export const assertJobRequest = typia.createAssertEquals<Api.JobRequest>();
 export const parseJobRequest = (json: string): Api.JobRequest => assertJobRequest(JSON.parse(json));
 export const assertJobRequestList = typia.createAssertEquals<readonly Api.JobRequest[]>();

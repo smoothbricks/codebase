@@ -282,6 +282,7 @@ async fn start_after<S: CliService>(
             class: cowshed_core::api::ExecClass::Background,
             want: None,
             scope: cowshed_core::api::ExecScope::HostGate,
+            record: cowshed_core::api::JobRecord::Cowshed,
         },
         session: None,
         background: true,

@@ -2332,3 +2332,30 @@ fn a_peer_result_reads_as_its_declared_projection_and_a_request_stays_strict() {
         "{refused:?}"
     );
 }
+
+/// A caller-owned job's stream is `streamed` on the wire (11_shell.md, "Caller-owned jobs"): it
+/// names no protected artifact, and a job whose streams cowshed kept nowhere still validates.
+#[test]
+fn a_streamed_output_names_no_artifact() {
+    assert_eq!(
+        serde_json::to_value(OutputStorage::Streamed).unwrap(),
+        json!({ "kind": "streamed" })
+    );
+    assert_eq!(
+        serde_json::from_value::<OutputStorage>(json!({ "kind": "streamed" })).unwrap(),
+        OutputStorage::Streamed
+    );
+    assert_eq!(OutputStorage::Streamed.artifact(), None);
+
+    let mut info = finished_job(None);
+    info.stdout.storage = OutputStorage::Streamed;
+    info.stderr.storage = OutputStorage::Streamed;
+    info.validate()
+        .expect("a streamed job's counts need no protected artifact");
+    let value = serde_json::to_value(&info).expect("job JSON");
+    assert_eq!(value["stdout"]["storage"], json!({ "kind": "streamed" }));
+    assert_eq!(
+        serde_json::from_value::<JobInfo>(value).expect("decode"),
+        info
+    );
+}

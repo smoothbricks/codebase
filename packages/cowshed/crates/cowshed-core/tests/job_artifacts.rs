@@ -162,11 +162,11 @@ fn threshold_crossing_spills_only_the_crossing_stream_and_round_trips_arrow() {
 
     assert!(matches!(
         sealed.record.stdout.storage.artifact(),
-        ProtectedOutput::Inline { .. }
+        Some(ProtectedOutput::Inline { .. })
     ));
     assert!(matches!(
         sealed.record.stderr.storage.artifact(),
-        ProtectedOutput::File { .. }
+        Some(ProtectedOutput::File { .. })
     ));
     assert!(!root.path().join(".cowshed/job/1/out").exists());
     assert!(root.path().join(".cowshed/job/1/err").exists());
@@ -248,11 +248,11 @@ fn supervisor_budget_is_shared_but_stdout_and_stderr_transition_independently() 
     let sealed = store.finish(token, JobState::Exited).unwrap();
     assert!(matches!(
         sealed.record.stdout.storage.artifact(),
-        ProtectedOutput::Inline { .. }
+        Some(ProtectedOutput::Inline { .. })
     ));
     assert!(matches!(
         sealed.record.stderr.storage.artifact(),
-        ProtectedOutput::File { .. }
+        Some(ProtectedOutput::File { .. })
     ));
 
     assert_eq!(store.buffered_bytes(), 0);
@@ -969,8 +969,10 @@ fn sealed_output_publication_is_atomic_independent_and_policy_checked() {
         .unwrap();
     let sealed = initial_store.finish(token, JobState::Exited).unwrap();
     let protected = match sealed.record.stdout.storage.artifact() {
-        ProtectedOutput::File { path } => root.path().join(path.as_path()),
-        ProtectedOutput::Inline { .. } => panic!("expected promoted protected output"),
+        Some(ProtectedOutput::File { path }) => root.path().join(path.as_path()),
+        Some(ProtectedOutput::Inline { .. }) | None => {
+            panic!("expected promoted protected output")
+        }
     };
     drop(initial_store);
     let mut store = store(
@@ -1095,8 +1097,8 @@ fn output_publication_rejects_control_paths_symlinks_and_corrupt_evidence() {
     assert!(!root.path().join(uncommitted.path.as_path()).exists());
 
     let protected = match sealed.record.stdout.storage.artifact() {
-        ProtectedOutput::File { path } => root.path().join(path.as_path()),
-        ProtectedOutput::Inline { .. } => panic!("expected protected file"),
+        Some(ProtectedOutput::File { path }) => root.path().join(path.as_path()),
+        Some(ProtectedOutput::Inline { .. }) | None => panic!("expected protected file"),
     };
     fs::set_permissions(&protected, fs::Permissions::from_mode(0o600)).unwrap();
     fs::write(protected, b"tampered").unwrap();
@@ -1622,6 +1624,36 @@ proptest! {
         prop_assert_eq!(decoded.as_bytes(), bytes.as_slice());
         prop_assert!(encoded.len() <= bytes.len().saturating_mul(2).saturating_add(64));
     }
+}
+
+/// A caller-owned job (11_shell.md, "Caller-owned jobs") takes an id the store never records: a
+/// recorded job may skip past it, none may go back, and a reopened store allocates past the
+/// highest recorded id.
+#[test]
+fn a_recorded_job_may_skip_past_a_caller_owned_id_and_never_go_back() {
+    let root = TempRoot::new("id-skip");
+    let mut first = store(root.path(), ArtifactConfig::default());
+    let one = begin(&mut first, 3, OutputTargets::default());
+    first.finish(one, JobState::Exited).unwrap();
+    let begin_at = |store: &mut ArtifactStore, id: u64| {
+        store.begin_job(
+            JobId::new(id).unwrap(),
+            3,
+            &ExecCommand::Argv(vec!["true".into()]),
+            None,
+            JobScheduling::default(),
+            OutputTargets::default(),
+        )
+    };
+    let three = begin_at(&mut first, 3).expect("a recorded job skips past id 2, a caller's");
+    first.finish(three, JobState::Exited).unwrap();
+    assert!(
+        begin_at(&mut first, 2).is_err(),
+        "an id behind the next one is refused"
+    );
+    drop(first);
+    let reopened = store(root.path(), ArtifactConfig::default());
+    assert_eq!(reopened.next_job_id().unwrap().get(), 4);
 }
 
 #[test]

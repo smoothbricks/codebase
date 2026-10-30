@@ -12,12 +12,12 @@
 use super::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CommandArg, DefragmentResult, DoctorReport,
     EmptyResult, ExecClass, ExecScope, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet,
-    JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits, LandOptions,
-    LandReport, MirrorInfo, NxStateClearResult, OutputPublication, ProjectGrantDelta, PushOptions,
-    PushReport, RebaseOptions, RebaseReport, RekeyResult, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume, RunSandboxMode, ScriptCommand,
-    SealedJob, TraceContext, UnprovenWorkspace, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath,
-    WorkspaceTarget,
+    JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobRecord, JobTail, JobTailLimits,
+    LandOptions, LandReport, MirrorInfo, NxStateClearResult, OutputPublication, ProjectGrantDelta,
+    PushOptions, PushReport, RebaseOptions, RebaseReport, RekeyResult, RemoveOptions,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
+    RunSandboxMode, ScriptCommand, SealedJob, TraceContext, UnprovenWorkspace,
+    WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
 use super::dto::{
     BinaryData, BuildStateListing, CredentialReport, DiskCommandEvent, DiskCommandTool,
@@ -748,6 +748,11 @@ fn is_workspace(scope: &ExecScope) -> bool {
     *scope == ExecScope::Workspace
 }
 
+/// Whether cowshed keeps the job's record: the default an exec omits on every wire.
+pub(crate) fn is_cowshed_record(record: &JobRecord) -> bool {
+    *record == JobRecord::Cowshed
+}
+
 /// One job admission: the worker fence, the session it runs in, exactly one of `argv` and
 /// `script`, and the job's environment.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -783,6 +788,10 @@ pub struct ExecParams {
     /// Where the command runs; omitted for the workspace sandbox.
     #[serde(default, skip_serializing_if = "is_workspace")]
     pub scope: ExecScope,
+    /// Who keeps the job's record; omitted when cowshed does. `caller` keeps no disk record
+    /// (11_shell.md, "Caller-owned jobs"); the CLI never names it.
+    #[serde(default, skip_serializing_if = "is_cowshed_record")]
+    pub record: JobRecord,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1153,6 +1162,38 @@ mod tests {
         assert_eq!(exec.want, None);
         assert_eq!(exec.scope, ExecScope::Workspace);
         assert_eq!(request.params().expect("encode"), params);
+    }
+
+    /// An exec that names no record is cowshed's to keep, and its encoding omits the default
+    /// again; the corpus request names a caller-owned exec, which round-trips (11_shell.md,
+    /// "Caller-owned jobs").
+    #[test]
+    fn an_exec_that_names_no_record_is_kept_by_cowshed() {
+        let owned = corpus()
+            .remove("worker.exec")
+            .expect("worker.exec corpus request");
+        assert_eq!(
+            owned["record"], "caller",
+            "the corpus names a caller-owned exec"
+        );
+        let request = OperationRequest::decode("worker.exec", &owned).expect("decode");
+        let OperationRequest::WorkerExec(exec) = &request else {
+            panic!("decoded {request:?}");
+        };
+        assert_eq!(exec.record, JobRecord::Caller);
+        assert_eq!(request.params().expect("encode"), owned);
+
+        let mut recorded = owned;
+        recorded
+            .as_object_mut()
+            .expect("an object")
+            .remove("record");
+        let request = OperationRequest::decode("worker.exec", &recorded).expect("decode");
+        let OperationRequest::WorkerExec(exec) = &request else {
+            panic!("decoded {request:?}");
+        };
+        assert_eq!(exec.record, JobRecord::Cowshed);
+        assert_eq!(request.params().expect("encode"), recorded);
     }
 
     /// The coordinator route's corpus request names every scheduling field, in the camel case the

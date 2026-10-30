@@ -428,6 +428,7 @@ fn start_request(
         class: crate::api::dto::ExecClass::Resident,
         want: None,
         scope: crate::api::dto::ExecScope::Workspace,
+        record: crate::api::dto::JobRecord::Cowshed,
     })
 }
 

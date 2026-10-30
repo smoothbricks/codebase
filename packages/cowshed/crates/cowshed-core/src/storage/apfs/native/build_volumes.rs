@@ -1896,6 +1896,7 @@ mod tests {
                     class: crate::api::dto::ExecClass::Background,
                     want: None,
                     scope: crate::api::dto::ExecScope::Workspace,
+                    record: crate::api::dto::JobRecord::Cowshed,
                 },
                 crate::runtime::supervisor_socket::AdmissionSource::Worker,
             )
@@ -2725,6 +2726,7 @@ mod tests {
                     class: crate::api::dto::ExecClass::Background,
                     want: None,
                     scope: crate::api::dto::ExecScope::Workspace,
+                    record: crate::api::dto::JobRecord::Cowshed,
                 },
                 crate::runtime::supervisor_socket::AdmissionSource::Worker,
             )

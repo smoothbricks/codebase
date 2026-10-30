@@ -2572,6 +2572,7 @@ fn exec_request(
             class: params.class,
             want: params.want,
             scope: params.scope,
+            record: params.record,
         },
     ))
 }
@@ -6729,6 +6730,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     class: crate::api::dto::ExecClass::Background,
                     want: Some(std::num::NonZeroUsize::MIN),
                     scope: crate::api::dto::ExecScope::Workspace,
+                    record: crate::api::dto::JobRecord::Cowshed,
                 };
                 let job = handle
                     .exec(
@@ -6836,6 +6838,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 class: crate::api::dto::ExecClass::Background,
                 want: Some(std::num::NonZeroUsize::MIN),
                 scope: crate::api::dto::ExecScope::Workspace,
+                record: crate::api::dto::JobRecord::Cowshed,
             };
             let job = handle
                 .exec(
@@ -20734,6 +20737,7 @@ mod removal_supervisor_tests {
                     class: crate::api::dto::ExecClass::Background,
                     want: Some(std::num::NonZeroUsize::MIN),
                     scope: crate::api::dto::ExecScope::Workspace,
+                    record: crate::api::dto::JobRecord::Cowshed,
                 },
                 super::super::supervisor_socket::AdmissionSource::Worker,
             )
@@ -22276,6 +22280,7 @@ fn land_check_request(check: &str) -> ExecRequest {
         class: crate::api::dto::ExecClass::Gate,
         want: Some(NonZeroUsize::MIN),
         scope: crate::api::dto::ExecScope::Workspace,
+        record: crate::api::dto::JobRecord::Cowshed,
     }
 }
 
@@ -22479,6 +22484,7 @@ fn nx_probe_request(
         class,
         want: Some(NonZeroUsize::MIN),
         scope: crate::api::dto::ExecScope::Workspace,
+        record: crate::api::dto::JobRecord::Cowshed,
     })
 }
 

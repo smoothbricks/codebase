@@ -14,10 +14,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
     AdmissionKey, CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecClass,
-    ExecCommand, ExecRequest, ExecScope, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState,
-    JobTailBytes, JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
-    OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest,
-    StdinKind, StdinSource, StreamInfo, WorkspacePath,
+    ExecCommand, ExecRequest, ExecScope, ExitStatus, JobFailure, JobId, JobJournalCursor,
+    JobRecord, JobState, JobTailBytes, JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo,
+    OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy,
+    RunSandboxMode, Sha256Digest, StdinKind, StdinSource, StreamInfo, WorkspacePath,
 };
 #[cfg(target_os = "macos")]
 use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
@@ -744,6 +744,7 @@ fn request(stdin: StdinSource) -> ExecRequest {
         class: ExecClass::Background,
         want: None,
         scope: ExecScope::Workspace,
+        record: JobRecord::Cowshed,
     }
 }
 
@@ -813,6 +814,267 @@ async fn complete(spawned: &Spawned, stdout: &[u8], stderr: &[u8], exit: ExitSta
             .await
             .unwrap();
     }
+}
+
+/// Every file under `directory` and its bytes, so two readings of a tree compare whole.
+fn tree(directory: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).expect("list a protected directory") {
+            let path = entry.expect("protected entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let bytes = std::fs::read(&path).expect("read a protected file");
+                files.insert(path, bytes);
+            }
+        }
+    }
+    files
+}
+
+/// `stream` of `job` read to its end, as a caller serves itself.
+async fn read_all(handle: &WorkspaceSupervisorHandle, job: JobId, stream: StreamKind) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = handle
+            .log_read(job, stream, bytes.len() as u64, true)
+            .await
+            .expect("read the job's stream");
+        bytes.extend_from_slice(&chunk.bytes);
+        if chunk.eof {
+            return bytes;
+        }
+    }
+}
+
+/// A request whose caller owns the job's record (11_shell.md, "Caller-owned jobs").
+fn caller_owned(key: Option<&AdmissionKey>) -> ExecRequest {
+    let mut owned = request(StdinSource::Empty);
+    owned.record = JobRecord::Caller;
+    owned.admission_key = key.cloned();
+    owned
+}
+
+/// A caller-owned job (11_shell.md, "Caller-owned jobs") leaves the workspace's protected records
+/// byte for byte as they were, and answers its key, status and terminal facts from memory; `info`
+/// and a watcher's wake acknowledge nothing, and once its caller has been served both streams
+/// and a `sealed` answer it is forgotten, key and all.
+#[tokio::test]
+async fn a_caller_owned_job_writes_no_record_and_answers_from_memory_until_read_whole() {
+    let root = workspace_root(&temp_parent::scratch_parent(), "caller-owned");
+    let mut h = real_store_harness(config(&root));
+    let recorded = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(recorded).await.unwrap();
+    let records = root.join("workspace/.cowshed/job");
+    let before = tree(&records);
+    assert!(!before.is_empty(), "the recorded job wrote its records");
+
+    let key = AdmissionKey::new("caller-owned").unwrap();
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            caller_owned(Some(&key)),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.handle
+            .exec(
+                None,
+                None,
+                caller_owned(Some(&key)),
+                AdmissionSource::Worker
+            )
+            .await
+            .unwrap(),
+        job,
+        "a keyed repeat answers the same job from memory"
+    );
+    let mut recorded_repeat = caller_owned(Some(&key));
+    recorded_repeat.record = JobRecord::Cowshed;
+    let refused = h
+        .handle
+        .exec(None, None, recorded_repeat, AdmissionSource::Worker)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.admission_source(),
+        Some(&AdmissionRefusal::KeyConflict {
+            job_id: job,
+            fields: vec![AdmissionField::Record],
+        })
+    );
+    assert_eq!(h.handle.job_by_key(key.clone()).await.unwrap(), Some(job));
+
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"out", b"err", ExitStatus::Exited { code: 0 }).await;
+    let ended = h.handle.ended(job).await.unwrap();
+    assert_eq!(ended.stdout.storage, OutputStorage::Streamed);
+    assert_eq!(
+        (ended.stdout.bytes, ended.stdout.sha256),
+        (3, Sha256Digest::compute(b"out"))
+    );
+    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Exited);
+    assert_eq!(read_all(&h.handle, job, StreamKind::Stdout).await, b"out");
+    assert_eq!(read_all(&h.handle, job, StreamKind::Stderr).await, b"err");
+    assert!(
+        h.handle.info(job).await.is_ok(),
+        "served both streams, a job whose end no wait or sealed answer carried is held"
+    );
+    let sealed = h.handle.sealed(job).await.unwrap();
+    assert_eq!(sealed.stderr.sha256, Sha256Digest::compute(b"err"));
+    assert_eq!(
+        h.handle.info(job).await.unwrap_err().code,
+        ErrorCode::NotFound,
+        "read whole, the job is forgotten"
+    );
+    assert_eq!(h.handle.job_by_key(key).await.unwrap(), None);
+    assert_eq!(tree(&records), before, "nothing under .cowshed/job changed");
+}
+
+/// A caller that follows a caller-owned job's streams to their end through the socket and only
+/// then waits gets its wait answered: the socket's own bookkeeping watches the job's end without
+/// acknowledging it.
+#[tokio::test]
+async fn a_caller_owned_job_streamed_then_waited_through_the_socket_answers_its_wait() {
+    let (mut h, _root) = harness(1, 1024, false, false);
+    let (remote, _path) = served(&h.handle).await;
+    let job = remote
+        .exec(None, None, caller_owned(None), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"out", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(read_all(&remote, job, StreamKind::Stdout).await, b"out");
+    assert_eq!(read_all(&remote, job, StreamKind::Stderr).await, b"");
+    let ended = remote
+        .wait(job)
+        .await
+        .expect("the caller's own wait answers after its streams were served");
+    assert_eq!(ended.state, JobState::Exited);
+    assert_eq!(
+        remote.info(job).await.unwrap_err().code,
+        ErrorCode::NotFound,
+        "its wait delivered, the job is read whole"
+    );
+
+    // Waiting first and reading after: a stream is read only once a read answered its end, so
+    // even empty streams are still there to read after the wait.
+    let job = remote
+        .exec(None, None, caller_owned(None), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(remote.wait(job).await.unwrap().state, JobState::Exited);
+    assert_eq!(read_all(&remote, job, StreamKind::Stdout).await, b"");
+    assert_eq!(read_all(&remote, job, StreamKind::Stderr).await, b"");
+    assert_eq!(
+        remote.info(job).await.unwrap_err().code,
+        ErrorCode::NotFound,
+        "both empty streams read after its wait, the job is read whole"
+    );
+}
+
+/// A caller-owned job publishes no output copy (a published copy is a disk record), and its
+/// output quota is counted in the actor as the store counts a recorded job's.
+#[tokio::test]
+async fn a_caller_owned_job_refuses_an_output_copy_and_keeps_its_quota_in_memory() {
+    let root = workspace_root(&temp_parent::scratch_parent(), "caller-owned-quota");
+    let base = config(&root);
+    let mut h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            artifacts: cowshed_core::storage::job_artifact::ArtifactConfig {
+                combined_output_quota_bytes: 4,
+                ..base.artifacts.clone()
+            },
+            ..base
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    let mut copied = caller_owned(None);
+    copied.stdout_copy = Some(OutputPublication {
+        path: WorkspacePath::new("out.txt").unwrap(),
+        policy: PublicationPolicy::CreateNew,
+    });
+    let refused = h
+        .handle
+        .exec(None, None, copied, AdmissionSource::Worker)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Usage, "{}", refused.message);
+
+    let job = h
+        .handle
+        .exec(None, None, caller_owned(None), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    spawned
+        .events
+        .send(ProcessEvent::Output {
+            job_id: job,
+            stream: StreamKind::Stdout,
+            bytes: Bytes::from_static(b"abcdef"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::StdinClosed(job)
+    );
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Signal(job, ProcessSignal::Term)
+    );
+    spawned
+        .events
+        .send(ProcessEvent::Exited {
+            job_id: job,
+            exit: ExitStatus::Signaled {
+                signal: 15,
+                core_dumped: false,
+            },
+        })
+        .await
+        .unwrap();
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+        spawned
+            .events
+            .send(ProcessEvent::OutputEof {
+                job_id: job,
+                stream,
+            })
+            .await
+            .unwrap();
+    }
+    let info = h.handle.wait(job).await.unwrap();
+    assert_eq!(info.state, JobState::OutputLimit);
+    assert_eq!(info.stdout.storage, OutputStorage::Streamed);
+    assert_eq!(
+        (info.stdout.bytes, info.stdout.sha256),
+        (4, Sha256Digest::compute(b"abcd"))
+    );
+    assert_eq!(info.output_limit.unwrap().limit_bytes, 4);
 }
 
 async fn open_named(handle: &WorkspaceSupervisorHandle, name: &str) -> SessionToken {
@@ -3646,6 +3908,7 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
         AdmissionField::StdoutCopy,
         AdmissionField::StderrCopy,
         AdmissionField::Want,
+        AdmissionField::Record,
     ] {
         let mut changed = keyed("op-fields", StdinSource::Empty);
         let mut session = None;
@@ -3677,6 +3940,7 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
                 });
             }
             AdmissionField::Want => changed.want = NonZeroUsize::new(4),
+            AdmissionField::Record => changed.record = JobRecord::Caller,
             AdmissionField::Class | AdmissionField::Scope => {
                 unreachable!("a class and its scope change together, below")
             }

@@ -698,11 +698,13 @@ static OUTPUT_STORAGE: Reader = Reader::Internal {
     arms: &[
         ("captured", &OUTPUT_STORAGE__CAPTURED),
         ("redirect", &OUTPUT_STORAGE__REDIRECT),
+        ("streamed", &OUTPUT_STORAGE__STREAMED),
     ],
 };
 static OUTPUT_STORAGE__CAPTURED: Reader = Reader::Record(&[("artifact", &PROTECTED_OUTPUT)]);
 static OUTPUT_STORAGE__REDIRECT: Reader =
     Reader::Record(&[("source", &LEAF), ("artifact", &PROTECTED_OUTPUT)]);
+static OUTPUT_STORAGE__STREAMED: Reader = Reader::Record(&[]);
 static OUTPUT_SUMMARY: Reader =
     Reader::Record(&[("version", &LEAF), ("text", &LEAF), ("truncated", &LEAF)]);
 static PORT_BLOCK: Reader = Reader::Record(&[("base", &LEAF), ("size", &LEAF)]);

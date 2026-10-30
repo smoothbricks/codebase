@@ -85,19 +85,21 @@ view: it does not stop jobs or unlink the socket. Clients reconnect and resume b
 `(repo_id, workspace_incarnation, job_id)` identity and a byte offset in the selected artifact.
 
 Every accepted exec receives a positive workspace-local monotonic numeric `u64` job ID, allocated before process
-creation and never reused. `stdout` and `stderr` are separate:
+creation and never reused (a caller-owned job's id excepted once its supervisor ends; below). `stdout` and `stderr` are
+separate:
 
 ```text
 StreamInfo { storage, bytes, sha256, summary }
-OutputStorage = Captured { artifact } | Redirect { source: WorkspacePath, artifact }
+OutputStorage = Captured { artifact } | Redirect { source: WorkspacePath, artifact } | Streamed
 ProtectedOutput = Inline { data: BinaryData } | File { path: WorkspacePath }
 ```
 
 Small terminal streams may be stored directly as Arrow Binary. Protected files under `.cowshed/job/**` spill lazily when
-a stream needs file backing, rather than once per job. Representation-transparent reads always resolve `artifact`;
-`Redirect.source` is the live caller-visible destination and is never content authority. The supervisor is the only
-writer to the protected subtree. Every executed shell, named session, and descendant receives a child restriction before
-repository-controlled startup; complete record batches and sealed spill files are immutable.
+a stream needs file backing, rather than once per job. Representation-transparent reads resolve `artifact` (a
+caller-owned job's are served from memory); `Redirect.source` is the live caller-visible destination and is never
+content authority. The supervisor is the only writer to the protected subtree. Every executed shell, named session, and
+descendant receives a child restriction before repository-controlled startup; complete record batches and sealed spill
+files are immutable.
 
 Control messages, N-API objects, MCP results, JSON envelopes, and controller audit records never duplicate unbounded raw
 output. A bounded `JobInfo` carries lifecycle metadata, `StreamInfo`, byte counts, hashes, redacted summaries, and may
@@ -168,6 +170,19 @@ supervisor's pipes without this proven representation are not in the job handle.
 post-terminal from the canonical protected artifact through an independent clone/reflink/copy and atomic rename. They do
 not change `StreamInfo.storage` and are never used for reads or authority. Publication failure is a typed operational
 error and does not rewrite the already-established process exit or output-limit state. Neither path uses hardlinks.
+
+### Caller-owned jobs
+
+An embedding executor that logs each exec's request, outcome, output and resources in its own event log sets
+`record: caller` on the request (`JobRecord::Caller`); the CLI never does. Cowshed then writes nothing under
+`.cowshed/job` for that job and seals no span or commitment for it, while every job semantic still holds from the
+supervisor's memory for as long as it serves: keyed admission, `info`, `wait`, `resources`, `logRead`, `tail`,
+`jobByKey`, `sealed`, cancellation and the output and memory limits. Each stream ends with `StreamInfo.storage`
+`streamed`: counted and hashed, served, and kept nowhere else, so it has no `artifact`. `stdoutCopy` and `stderrCopy`
+are refused, since a published copy is a disk record. Once the job has ended, a read answering each stream's end (an
+empty one's included) and a `wait` or `sealed` answer carrying its end acknowledge it (`info` does not), and the
+supervisor forgets it; a supervisor that dies ends the job's process groups and seals nothing
+([11_shell.md, Caller-owned jobs](../../../specs/cowshed/11_shell.md#caller-owned-jobs)).
 
 ## Embedding the controller
 

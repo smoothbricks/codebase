@@ -243,6 +243,8 @@ pub enum AdmissionField {
     Class,
     Want,
     Scope,
+    /// Who keeps the job's record (11_shell.md, "Caller-owned jobs").
+    Record,
 }
 
 impl AdmissionField {
@@ -260,6 +262,7 @@ impl AdmissionField {
             Self::Class => "class",
             Self::Want => "want",
             Self::Scope => "scope",
+            Self::Record => "record",
         }
     }
 }
@@ -1075,6 +1078,7 @@ mod tests {
             AdmissionField::Session,
             AdmissionField::StdoutCopy,
             AdmissionField::StderrCopy,
+            AdmissionField::Record,
         ];
         for field in fields {
             assert_eq!(

@@ -857,9 +857,10 @@ cancel, and other job admissions remain serviceable while another client follows
 ## Job control
 
 Every exec submission is a job. At admission the supervisor allocates a positive `u64`-backed `jobId` in `1..=2^53-1`,
-monotonically increasing within that workspace and never reused; exhaustion is typed `Conflict`. Decimal rendering is
-canonical, with no prefix or zero padding. The protected record stream is `.cowshed/job/records.arrow`; optional spill
-files, created only on promotion, are:
+monotonically increasing within that workspace and never reused (a caller-owned job's id excepted after its supervisor
+ends: "Caller-owned jobs"); exhaustion is typed `Conflict`. Decimal rendering is canonical, with no prefix or zero
+padding. The protected record stream is `.cowshed/job/records.arrow`; optional spill files, created only on promotion,
+are:
 
 ```
 .cowshed/job/<jobId>/out
@@ -1171,9 +1172,9 @@ when large.
 
 For queued/running jobs, `StreamInfo` is a bounded current view and its artifact is not sealed content authority yet.
 Inline data may be the supervisor's current bounded buffer; background acknowledgement forces it to a protected file,
-and terminal publication freezes the final union/count/hash. Only complete protected batches and sealed files carry the
-scoped content authority described here. Representation-transparent reads always resolve `artifact`, never
-`Redirect.source`.
+and terminal publication freezes the final union/count/hash. A caller-owned job's streams are `streamed` throughout and
+have no artifact ("Caller-owned jobs"). Only complete protected batches and sealed files carry the scoped content
+authority described here. Representation-transparent reads always resolve `artifact`, never `Redirect.source`.
 
 Redirect classification is permitted only for a real shell AST whose simple literal redirection semantics are proven and
 only when the supervisor controls the actual writable descriptor and applies the same exact combined-quota boundary as
@@ -1237,7 +1238,41 @@ delivered, completion, and normalized relative source where applicable; inline s
 
 Inspect with `WorkspaceHandle::list_jobs`, `cowshed exec --json` (the final `JobInfo`), or `lmao-inspect`
 (13_telemetry.md). This is the only capture implementation. CLI, MCP, NAPI, and CI consume the same protected evidence
-and controller commitments; no client recaptures output or derives authority from summary text.
+and controller commitments; no client recaptures output or derives authority from summary text. The one exception is a
+job whose caller owns its record (below).
+
+### Caller-owned jobs
+
+An exec request's `record` names who keeps the job's record: `cowshed` (the default, and all the CLI ever sends) or
+`caller`, for an embedding executor that logs each exec's request, outcome, output and resources in its own event log
+and would otherwise have cowshed write the same facts a second time. A caller-owned job means no disk records, not fewer
+semantics. Its supervisor writes nothing under `.cowshed/job` for it — no record batch, no spill file — and seals no
+job-span or process-span row and publishes no admission or terminal commitment for it. Everything else holds, from the
+actor's memory, for as long as that supervisor serves:
+
+- **Admission.** Its id comes from the same allocator and is never reused while that supervisor serves; nothing on disk
+  names it, so a later supervisor may hand the id out again. An `admission_key` is kept in the actor's own map, so a
+  keyed repeat answers the same job, and a differing one is refused as a key conflict, exactly as through the records,
+  for a caller that restarts while the supervisor lives. `stdout_copy` and `stderr_copy` are refused: a published copy
+  is a disk record.
+- **Output.** Every byte stays in the actor's memory, as it does for every running job; the combined output quota is
+  counted there and ends the job `outputLimit` as it would through the store, and each stream's byte count and SHA-256
+  are computed there. Its terminal `StreamInfo.storage` is `streamed`: the bytes were served and are kept nowhere else.
+  Detaching and backgrounding are allowed; they concern the client, not the disk.
+- **Answers.** `info`, `wait`, `resources`, `logRead`, `tail`, `jobByKey` and `sealed` answer it from memory, so a
+  caller reattaches as it would to a recorded job. Once it has ended, the caller acknowledges its end when a read of
+  each stream has answered that stream's end, past its last byte (an empty stream's read included, so a caller that
+  waits and then reads finds the job still there), and a `wait`, `hold` or `sealed` answer carrying its end was
+  delivered to it, as a drain counts a job's end read ("Draining a supervisor of another build"); `info`, which
+  reattachment and attachment ask in passing, acknowledges nothing, and neither does a watcher that only waits for the
+  end (a drain's own bookkeeping, a progress stream's wake: `ended`). The supervisor then forgets it: a later question
+  about it is not found, or unprovable while an unread history is set aside. A job whose child no wait saw end keeps its
+  group in the ledger and is never forgotten; a job no one acknowledges is held, with every byte it wrote, until its
+  supervisor exits. A reader of an earlier build refuses an answer that names `streamed`.
+- **Control.** Accounting, resource samples, cancellation, the output and memory limits, and the process-group ledger
+  are unchanged.
+- **Crashes.** A supervisor that dies ends the job's process groups through the ledger at the next start, and seals
+  nothing: the caller owns the record, and its loss.
 
 ## Grant-change propagation
 

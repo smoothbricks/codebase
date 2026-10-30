@@ -8222,6 +8222,7 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
             class: cowshed_core::api::ExecClass::Background,
             want: None,
             scope: cowshed_core::api::ExecScope::Workspace,
+            record: cowshed_core::api::JobRecord::Cowshed,
         })
         .await
         .expect("start bun install as a covered job");

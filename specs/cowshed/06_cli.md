@@ -277,12 +277,13 @@ effects, or spawn. The supervisor consumes each `CommandArg` into `OsString`, an
 `List<Binary>`; neither the CLI nor runtime uses lossy text conversion or a second wire shape.
 
 Every `cowshed exec` submission, foreground or background, atomically allocates a positive, workspace-local,
-monotonically increasing numeric `JobId`; ids are never reused. In normal mode captured child stdout remains CLI stdout,
-so the control-plane job id and state are reported on stderr (`--background` prints the bare numeric id on stdout
-instead). With `--json`, stdout contains only the final JSON envelope: `result` carries the numeric `jobId`, `JobInfo`
-lifecycle/result metadata, hashes, bounded summaries, and—only when the canonical artifact is inline—the bounded
-`BinaryData` `utf8|base64` tagged union. Live progress on stderr remains control-only NDJSON. Unbounded child output
-never enters JSON, and controller commitments never receive either inline encoding.
+monotonically increasing numeric `JobId`; ids are never reused (an API job whose caller owns its record excepted,
+11_shell.md "Caller-owned jobs"). In normal mode captured child stdout remains CLI stdout, so the control-plane job id
+and state are reported on stderr (`--background` prints the bare numeric id on stdout instead). With `--json`, stdout
+contains only the final JSON envelope: `result` carries the numeric `jobId`, `JobInfo` lifecycle/result metadata,
+hashes, bounded summaries, and—only when the canonical artifact is inline—the bounded `BinaryData` `utf8|base64` tagged
+union. Live progress on stderr remains control-only NDJSON. Unbounded child output never enters JSON, and controller
+commitments never receive either inline encoding.
 
 The CLI writes its stdout and stderr with a blocking write's semantics whatever flags the inherited descriptors carry: a
 foreground job's relayed bytes and cowshed's own `cowshed:` diagnostic lines alike. `O_NONBLOCK` belongs to the open

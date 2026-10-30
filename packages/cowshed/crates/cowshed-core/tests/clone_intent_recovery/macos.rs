@@ -297,8 +297,8 @@ async fn an_ungated_land_keeps_a_fresh_sibling_forked_at_its_source_tip() {
 #[tokio::test]
 async fn an_ungated_land_keeps_a_folded_peer_with_a_live_supervisor_or_running_job() {
     use cowshed_core::api::dto::{
-        CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobState, RunSandboxMode,
-        StdinSource,
+        CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobRecord, JobState,
+        RunSandboxMode, StdinSource,
     };
     use cowshed_core::storage::job_artifact::StreamKind;
     for running in [false, true] {
@@ -343,6 +343,7 @@ async fn an_ungated_land_keeps_a_folded_peer_with_a_live_supervisor_or_running_j
                         class: ExecClass::Background,
                         want: None,
                         scope: ExecScope::HostGate,
+                        record: JobRecord::Cowshed,
                     },
                     supervisor_socket::AdmissionSource::Coordinator,
                 )

@@ -961,7 +961,7 @@ fn validate_protected_path(
     stream: StreamKind,
     info: &StreamInfo,
 ) -> Result<(), ArtifactError> {
-    if let ProtectedOutput::File { path } = info.storage.artifact() {
+    if let Some(ProtectedOutput::File { path }) = info.storage.artifact() {
         let expected = protected_stream_path(job_id, stream);
         if path.as_path() != Path::new(&expected) {
             return Err(ArtifactError::Integrity {
@@ -1089,6 +1089,13 @@ impl SealedStream {
         let (source, artifact) = match storage {
             OutputStorage::Captured { artifact } => (None, artifact),
             OutputStorage::Redirect { source, artifact } => (Some(source), artifact),
+            // Only a caller-owned job's streams are kept nowhere, and it has no record.
+            OutputStorage::Streamed => {
+                return Err(ArtifactError::Integrity {
+                    offset: 0,
+                    message: "a recorded stream names no artifact".into(),
+                });
+            }
         };
         let storage = match artifact {
             ProtectedOutput::Inline { data } => SealedStorage::Inline(data),
@@ -1632,10 +1639,12 @@ impl ArtifactStore {
         mut targets: OutputTargets,
     ) -> Result<JobArtifactToken, ArtifactError> {
         command.validate()?;
-        if job_id.get() != self.next_job_id {
+        // Ids only rise. A caller-owned job (11_shell.md, "Caller-owned jobs") takes one the
+        // store never records, so a recorded job may skip past it; none may go back.
+        if job_id.get() < self.next_job_id {
             return Err(ArtifactError::TokenConflict {
                 job_id,
-                message: "job id is not the next expected artifact id",
+                message: "job id is behind the next expected artifact id",
             });
         }
         if self.live_jobs.contains_key(&job_id) || self.committed_jobs.contains_key(&job_id) {
@@ -1644,8 +1653,8 @@ impl ArtifactStore {
                 message: "job id already has artifact state",
             });
         }
-        let following_job_id = self
-            .next_job_id
+        let following_job_id = job_id
+            .get()
             .checked_add(1)
             .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
         secure_redirect_target(&self.workspace_root, &mut targets.stdout)?;
@@ -1683,11 +1692,7 @@ impl ArtifactStore {
                 scheduling,
                 stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
                 stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
-                quota: QuotaLedger {
-                    accepted: 0,
-                    limit: self.config.combined_output_quota_bytes,
-                    crossing: None,
-                },
+                quota: QuotaLedger::new(self.config.combined_output_quota_bytes),
                 failed: false,
             },
         );
@@ -1853,6 +1858,13 @@ fn orphan_stream(
     let source = match &admitted.storage {
         OutputStorage::Captured { .. } => None,
         OutputStorage::Redirect { source, .. } => Some(source.clone()),
+        // Only a caller-owned job's streams are kept nowhere, and it has no record.
+        OutputStorage::Streamed => {
+            return Err(ArtifactError::Integrity {
+                offset: 0,
+                message: "a recorded stream names no artifact".into(),
+            });
+        }
     };
     Ok(SealedStream {
         storage,
@@ -1925,14 +1937,33 @@ fn secure_redirect_target(
     Ok(())
 }
 
+/// One job's combined output quota across both streams: what it accepted, its limit, and the
+/// total the write that crossed it would have made. The store keeps one per recorded job; the
+/// supervisor keeps one per caller-owned job (11_shell.md, "Caller-owned jobs").
 #[derive(Debug)]
-struct QuotaLedger {
+pub(crate) struct QuotaLedger {
     accepted: u64,
     limit: u64,
     crossing: Option<u64>,
 }
 
 impl QuotaLedger {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            accepted: 0,
+            limit,
+            crossing: None,
+        }
+    }
+
+    /// Accept what fits of `requested` more bytes: how many did. Once a write crosses the
+    /// limit, nothing more is accepted and [`Self::output_limit`] says so.
+    pub(crate) fn admit(&mut self, requested: usize) -> usize {
+        let admission = self.preview(requested);
+        self.commit(admission);
+        admission.accepted
+    }
+
     fn preview(&self, requested: usize) -> QuotaAdmission {
         if let Some(crossing) = self.crossing {
             return QuotaAdmission {
@@ -1962,7 +1993,7 @@ impl QuotaLedger {
         self.crossing = admission.crossing;
     }
 
-    fn output_limit(&self) -> Option<OutputLimitInfo> {
+    pub(crate) fn output_limit(&self) -> Option<OutputLimitInfo> {
         self.crossing.map(|crossing_bytes| OutputLimitInfo {
             limit_bytes: self.limit,
             crossing_bytes,
@@ -4123,7 +4154,7 @@ struct FlatStorage<'a> {
     protected: Option<&'a str>,
 }
 
-fn flatten_storage(storage: &OutputStorage) -> FlatStorage<'_> {
+fn flatten_storage(storage: &OutputStorage) -> Result<FlatStorage<'_>, ArtifactError> {
     let (kind, source, artifact) = match storage {
         OutputStorage::Captured { artifact } => ("captured", None, artifact),
         OutputStorage::Redirect { source, artifact } => (
@@ -4136,8 +4167,15 @@ fn flatten_storage(storage: &OutputStorage) -> FlatStorage<'_> {
             ),
             artifact,
         ),
+        // A record is never written for a caller-owned job, whose streams alone are kept nowhere.
+        OutputStorage::Streamed => {
+            return Err(ArtifactError::Integrity {
+                offset: 0,
+                message: "a recorded stream names no artifact".into(),
+            });
+        }
     };
-    match artifact {
+    Ok(match artifact {
         ProtectedOutput::Inline { data } => FlatStorage {
             kind,
             source,
@@ -4154,7 +4192,7 @@ fn flatten_storage(storage: &OutputStorage) -> FlatStorage<'_> {
                     .expect("WorkspacePath is always UTF-8"),
             ),
         },
-    }
+    })
 }
 
 #[cfg(unix)]
@@ -4205,8 +4243,8 @@ fn command_argv_array(command: &ExecCommand) -> Result<ListArray, ArtifactError>
 }
 
 fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, ArtifactError> {
-    let stdout = flatten_storage(&record.stdout.storage);
-    let stderr = flatten_storage(&record.stderr.storage);
+    let stdout = flatten_storage(&record.stdout.storage)?;
+    let stderr = flatten_storage(&record.stderr.storage)?;
     let (exit_code, exit_signal, exit_core_dumped) = exit_columns(record.exit.as_ref());
     let resources = record.resources.as_ref();
     let (source, cpu, io, charged, reconciliation) =
@@ -9106,7 +9144,8 @@ mod tests {
         let correct: &[u8] = b"sealed spill bytes";
         store.append(&token, StreamKind::Stdout, correct).unwrap();
         let terminal = store.finish(token, JobState::Exited).unwrap();
-        let ProtectedOutput::File { path: spill_path } = terminal.record.stdout.storage.artifact()
+        let Some(ProtectedOutput::File { path: spill_path }) =
+            terminal.record.stdout.storage.artifact()
         else {
             panic!("bytes beyond the inline cap are promoted to a protected file");
         };

@@ -1,11 +1,11 @@
 # Telemetry
 
 cowshed's observability is **distributed tracing into Arrow columns**, not a text logfile. Every lifecycle operation,
-every job, and every gateway request is a span; spans carry W3C trace context across cowshed's boundaries; and the spans
-flush as Arrow record batches that are queryable, assertable, and cheap to retain. The substrate is **lmao**
-(`packages/lmao`) — a spans-first tracer with deterministic Arrow encoding, arena-backed buffers, and a tracer-agnostic
-query surface (`lmao-query`). There is no OTel collector and no telemetry daemon; OTLP export, if ever wanted, is a
-projection from the Arrow store.
+every job (but a caller-owned one, whose caller keeps its record: 11_shell.md), and every gateway request is a span;
+spans carry W3C trace context across cowshed's boundaries; and the spans flush as Arrow record batches that are
+queryable, assertable, and cheap to retain. The substrate is **lmao** (`packages/lmao`) — a spans-first tracer with
+deterministic Arrow encoding, arena-backed buffers, and a tracer-agnostic query surface (`lmao-query`). There is no OTel
+collector and no telemetry daemon; OTLP export, if ever wanted, is a projection from the Arrow store.
 
 ## Why lmao, not text logs
 

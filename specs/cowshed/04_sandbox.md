@@ -898,8 +898,9 @@ These anchors are trust configuration, not secrets, so they are exported/written
    served revision follows [11_shell.md, Grant-change propagation](11_shell.md#grant-change-propagation) before
    admitting the exec.
 3. Allocate the next workspace-local monotonic numeric job ID, append a complete `JobArtifactRecord` admission batch,
-   and record the audit `ControllerCommitment::Admission(AdmissionCommitment)` before process creation. Only the trusted
-   supervisor opens the protected record stream; the audit record is telemetry and gates nothing.
+   and record the audit `ControllerCommitment::Admission(AdmissionCommitment)` before process creation; a caller-owned
+   job writes neither (11_shell.md, "Caller-owned jobs"). Only the trusted supervisor opens the protected record stream;
+   the audit record is telemetry and gates nothing.
 4. Compile the child profile before starting shell activation. Every `sandbox-exec` launch reads its profile from a
    file, `sandbox-exec -f <store>/run/profiles/<sha256>.sb`, never from an argument: a profile passes the 128 KiB a
    command argument may hold, and a job's process observation reads the launch argv back. The profile text is a pure
