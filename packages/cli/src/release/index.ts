@@ -92,6 +92,7 @@ import {
   DEPENDENCY_ONLY_RELEASE_NOTES,
   githubReleaseLookupStatus,
   importWorkspaceNx,
+  nxReleaseProjects,
   renderNxProjectChangelogContents,
   withNxWorkspaceRoot,
 } from './github-release.js';
@@ -883,7 +884,7 @@ async function versionRelease(
   // tag written here would survive a red candidate and collide on the next run.
   // `smoo release tag` creates the tags once, in the publishing job.
   if (plan.nx.length > 0) {
-    await runNxRelease(root, nxVersionArgs(nxVersionRun(plan)));
+    await runNxRelease(root, nxVersionArgs(await nxVersionRun(root, plan)));
   }
   // A first release has no commits for Nx to derive a bump from, so smoo versions it and writes the one release commit
   // once it is in, with whatever Nx staged.
@@ -895,9 +896,9 @@ async function versionRelease(
 
 /**
  * The `nx release version` run a plan asks of Nx. The real run's arguments and the dry run's options both come from it,
- * so the preview cannot report what `smoo release version` would not write. Nx versions the plan's own packages and
- * commits them, unless the plan has first releases too: those join the one release commit, which smoo then writes, so
- * Nx only stages.
+ * so the preview cannot report what `smoo release version` would not write. Nx versions the plan's own packages, with
+ * every fixed release group they touch made whole (`nxReleaseProjects`), and commits them, unless the plan has first
+ * releases too: those join the one release commit, which smoo then writes, so Nx only stages.
  */
 interface NxVersionRun {
   specifier: string | undefined;
@@ -906,11 +907,14 @@ interface NxVersionRun {
   stageChanges: boolean;
 }
 
-function nxVersionRun(plan: ReleaseVersionPlan<ReleasePackage>): NxVersionRun {
+async function nxVersionRun(root: string, plan: ReleaseVersionPlan<ReleasePackage>): Promise<NxVersionRun> {
   const smooCommits = plan.firstReleases.length > 0;
   return {
     specifier: plan.bump === 'auto' ? undefined : plan.bump,
-    projects: plan.nx.map((pkg) => pkg.projectName),
+    projects: await nxReleaseProjects(
+      root,
+      plan.nx.map((pkg) => pkg.projectName),
+    ),
     gitCommit: !smooCommits,
     stageChanges: smooCommits,
   };
@@ -922,6 +926,9 @@ function nxVersionArgs(run: NxVersionRun): string[] {
     ...(run.specifier === undefined ? [] : [run.specifier]),
     `--projects=${run.projects.join(',')}`,
     `--git-commit=${run.gitCommit}`,
+    // Nx's default subject carries the version for a lone fixed group; every later step finds the release commit by
+    // this exact subject.
+    `--git-commit-message=${RELEASE_COMMIT_SUBJECT}`,
     ...(run.stageChanges ? ['--stage-changes=true'] : []),
     '--git-tag=false',
     '--git-push=false',
@@ -948,7 +955,7 @@ async function runNxReleaseVersionPreview(
   plan: ReleaseVersionPlan<ReleasePackage>,
 ): Promise<ReleasePackage[]> {
   releasePreviewChangelogs.clear();
-  const versionedByNx = plan.nx.length === 0 ? [] : await previewNxVersion(root, nxVersionRun(plan));
+  const versionedByNx = plan.nx.length === 0 ? [] : await previewNxVersion(root, await nxVersionRun(root, plan));
   // A first release is no Nx version: its notes are the ones its GitHub Release will carry.
   for (const pkg of plan.firstReleases) {
     releasePreviewChangelogs.set(
@@ -1013,11 +1020,11 @@ async function previewNxVersion(root: string, run: NxVersionRun): Promise<Releas
   });
 }
 
-async function runNxNextPrereleaseVersion(root: string, projects: string): Promise<void> {
+async function runNxNextPrereleaseVersion(root: string, projects: string[]): Promise<void> {
   await runNxRelease(root, [
     'version',
     'prerelease',
-    `--projects=${projects}`,
+    `--projects=${(await nxReleaseProjects(root, projects)).join(',')}`,
     '--preid=next',
     '--git-commit=true',
     '--git-tag=false',
@@ -1241,7 +1248,10 @@ function releaseCompletionShell(root: string, prebuiltOutputs?: string[]): Relea
 function releaseNextShell(root: string): { bumpStablePackagesToNext(packages: ReleasePackage[]): Promise<void> } {
   return {
     bumpStablePackagesToNext: async (packages) => {
-      await runNxNextPrereleaseVersion(root, releasePackageProjects(packages));
+      await runNxNextPrereleaseVersion(
+        root,
+        packages.map((pkg) => pkg.projectName),
+      );
       await pushCurrentBranch(root);
     },
   };

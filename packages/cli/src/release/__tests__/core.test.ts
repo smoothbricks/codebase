@@ -15,6 +15,7 @@ import {
   releasePackageForTag,
   releaseTag,
   releaseTagAliases,
+  widenToFixedReleaseGroups,
 } from '../core.js';
 
 const a: ReleasePackageInfo = { name: '@scope/a', projectName: 'a', path: 'packages/a', version: '1.0.0' };
@@ -216,5 +217,36 @@ describe('what a release commit releases', () => {
     ['a version the commit leaves alone and lists at another version', '1.0.0', new Map([['a', '0.9.0']]), false],
   ])('%s', (_case, versionBefore, commitList, released) => {
     expect(releasedByCommit(a, versionBefore, commitList)).toBe(released);
+  });
+});
+
+describe('the projects an Nx release call names', () => {
+  const members = ['a', 'b', 'c', 'd'];
+  const fixedDefault = [{ projectsRelationship: 'fixed', projects: members }] as const;
+  const fixedBesideIndependent = [
+    { projectsRelationship: 'fixed', projects: ['a', 'b'] },
+    { projectsRelationship: 'independent', projects: ['c', 'd'] },
+  ] as const;
+  const independent = [{ projectsRelationship: 'independent', projects: members }] as const;
+
+  it.each([
+    [
+      'a changed subset of the fixed default group brings in the whole group',
+      ['b', 'd'],
+      fixedDefault,
+      ['b', 'd', 'a', 'c'],
+    ],
+    ['a member of a named fixed group brings in its group alone', ['b'], fixedBesideIndependent, ['b', 'a']],
+    ['an independent project beside a fixed group stays alone', ['c'], fixedBesideIndependent, ['c']],
+    [
+      'a selection across both groups makes only the fixed one whole',
+      ['d', 'a'],
+      fixedBesideIndependent,
+      ['d', 'a', 'b'],
+    ],
+    ['an independent group is filtered as selected', ['b', 'd'], independent, ['b', 'd']],
+    ['no groups leave the selection as it is', ['a'], [], ['a']],
+  ])('%s', (_case, projects, groups, named) => {
+    expect(widenToFixedReleaseGroups(projects, groups)).toEqual(named);
   });
 });

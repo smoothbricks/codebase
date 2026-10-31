@@ -27,6 +27,8 @@ const b: FixturePackage = {
 const c: FixturePackage = { name: '@scope/c', projectName: 'c', path: 'packages/c', version: '0.0.0' };
 // A first release at the version it declares, with nothing else to release beside it.
 const d: FixturePackage = { name: '@scope/d', projectName: 'd', path: 'packages/d', version: '4.5.6' };
+// A tagged package with no commits of its own, released on `a`'s version through the fixed group they share.
+const e: FixturePackage = { name: '@scope/e', projectName: 'e', path: 'packages/e', version: '1.0.0' };
 
 /**
  * The CLI as the publish workflow runs it: `bin/smoo` over the built `dist`, in
@@ -212,6 +214,56 @@ describe('release version of a first release beside a tagged package', () => {
   });
 });
 
+describe('release version of a fixed release group', () => {
+  it('versions the whole group on one version when only one member changed', async () => {
+    await withFixtureRepo(async (root) => {
+      await writeReleaseWorkspace(root, undefined, [a, e], {
+        lockstep: { projects: ['a', 'e'], projectsRelationship: 'fixed' },
+      });
+      await git(root, ['add', '-A']);
+      await git(root, ['commit', '-m', 'chore: fixture workspace']);
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'e@1.0.0', '2025-01-01T00:00:00Z');
+      await writeFile(join(root, a.path, 'README.md'), '# a\n');
+      await git(root, ['add', '-A']);
+      await git(root, ['commit', '-m', 'feat(a): document the package']);
+
+      const scratch = await realpath(await mkdtemp(join(tmpdir(), 'smoo-release-fixed-')));
+      const summary = join(scratch, 'summary.md');
+      const output = join(scratch, 'output.txt');
+      const env = {
+        ...fixtureNxEnv(root, { daemon: 'off' }, await publishFixtureSocketDirectory(root)),
+        GITHUB_STEP_SUMMARY: summary,
+      };
+      try {
+        await smoo(root, env, ['release', 'version', '--bump', 'auto', '--projects', '', '--dry-run', 'true']);
+        const preview = await readFile(summary, 'utf8');
+        expect(preview).toContain('- `@scope/a`: `1.0.0` -> `1.1.0`');
+        expect(preview).toContain('- `@scope/e`: `1.0.0` -> `1.1.0`');
+
+        await smoo(root, env, [
+          'release',
+          'version',
+          '--bump',
+          'auto',
+          '--projects',
+          '',
+          '--dry-run',
+          'false',
+          '--github-output',
+          output,
+        ]);
+
+        expect(await readFile(output, 'utf8')).toBe('mode=new\nprojects=a,e\n');
+        const released = await releasePackagesAtRef(root, [a, e], 'HEAD');
+        expect(released.map((pkg) => `${pkg.projectName}@${pkg.version}`)).toEqual(['a@1.1.0', 'e@1.1.0']);
+      } finally {
+        await rm(scratch, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
 async function smoo(cwd: string, env: Record<string, string>, args: string[]): Promise<void> {
   const child = Bun.spawn(['bun', SMOO, ...args], { cwd, env, stdout: 'pipe', stderr: 'pipe' });
   const [stdout, stderr, exitCode] = await Promise.all([
@@ -228,6 +280,7 @@ async function writeReleaseWorkspace(
   root: string,
   plugins?: string[],
   packages: FixturePackage[] = [a],
+  groups?: Record<string, { projects: string[]; projectsRelationship: 'fixed' | 'independent' }>,
 ): Promise<void> {
   await writeFile(join(root, '.gitignore'), 'node_modules\n.nx\n');
   await writeJson(join(root, 'package.json'), {
@@ -240,7 +293,7 @@ async function writeReleaseWorkspace(
   await writeJson(join(root, 'nx.json'), {
     plugins,
     release: {
-      projects: ['tag:npm:public'],
+      ...(groups ? { groups } : { projects: ['tag:npm:public'] }),
       projectsRelationship: 'independent',
       version: {
         specifierSource: 'conventional-commits',
