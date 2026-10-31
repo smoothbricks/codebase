@@ -1638,7 +1638,10 @@ async function createProjectTargets(
     packageJson.private === true && WRANGLER_CONFIG_FILES.some((file) => existsSync(join(absoluteProjectRoot, file)));
 
   if (hasLibTsconfig) {
-    const executableOutputs = packageBinOutputs(packageJson, packageJsonPath);
+    const libOutDir = typescriptOutDir(libTsconfigPath, packageJsonPath);
+    const executableOutputs = packageBinOutputs(packageJson, packageJsonPath).filter((bin) =>
+      typescriptEmitWrites(libOutDir, bin),
+    );
     // Dependency packages may publish bundled entries that raw tsc does not produce.
     // Build every JavaScript output lane before resolving package exports, without pulling
     // unrelated Wasm, N-API, native, or web outputs onto the compiler critical path.
@@ -1648,7 +1651,7 @@ async function createProjectTargets(
       executor: '@smoothbricks/nx-plugin:typescript-emit',
       cache: true,
       inputs: ['production', '^production', ...toolchainInputs, '{projectRoot}/tsconfig.lib.json'],
-      outputs: inferTypescriptOutputs(libTsconfigPath, packageJsonPath),
+      outputs: inferTypescriptOutputs(libOutDir),
       dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
         ...(executableOutputs.length > 0 ? { executableOutputs } : {}),
@@ -2640,14 +2643,25 @@ interface ResolvedNapiConfig {
   targets: string[];
 }
 
-function inferTypescriptOutputs(tsconfigPath: string, packageJsonPath: string): string[] {
-  const outDir = typescriptOutDir(tsconfigPath, packageJsonPath);
+function inferTypescriptOutputs(outDir: string | null): string[] {
   // No .tsbuildinfo here: the emit executor overlays incremental: false, so
   // tsc-js never writes one and a declared-but-absent output fails the
   // release-candidate output inspection.
   return outDir === null
     ? ['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}']
     : [`{projectRoot}/${outDir}/`];
+}
+
+/**
+ * Whether the emit `inferTypescriptOutputs(outDir)` declares writes the project-relative `path`: a file beneath
+ * outDir, or JavaScript beneath dist for a config that states no outDir. A package bin a second emit, a bundler or Git
+ * puts elsewhere is not this emit's: a tsc-js that claimed one stat'ed it on a clean checkout before anything wrote it.
+ */
+function typescriptEmitWrites(outDir: string | null, path: string): boolean {
+  const emitted = posix.normalize(path.replaceAll('\\', '/'));
+  return outDir === null
+    ? emitted.startsWith('dist/') && /\.(?:[cm]?js|jsx)$/.test(emitted)
+    : emitted.startsWith(`${outDir}/`);
 }
 
 /** The project-relative `compilerOptions.outDir` the config itself states, or null when it states none. */

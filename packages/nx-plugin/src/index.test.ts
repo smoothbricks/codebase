@@ -350,6 +350,47 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('makes executable only the bins its own emit writes', async () => {
+    const workspace = await createWorkspace();
+    try {
+      // A bin under outDir is tsc-js's. One in a sibling directory that shares its prefix (bundled by another
+      // target) or a checked-in launcher is not this emit's to make executable.
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","bin":{"example":"./dist/bin/example.js","bundled":"./dist-bin/cli.js","launcher":"./bin/example"}}\n',
+      );
+      await workspace.write('packages/example/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist"}}\n');
+      expect((await inferProjectTargets(workspace, 'packages/example/package.json'))['tsc-js']?.options).toEqual({
+        executableOutputs: ['./dist/bin/example.js'],
+        tsConfig: 'tsconfig.lib.json',
+        cwd: 'packages/example',
+      });
+
+      // tsc-js emits declarations into dist-types while a declared build, run after it, emits the bin into dist. A
+      // clean checkout runs tsc-js first, so a tsc-js that claimed the bin stat'ed a file nothing had written yet.
+      await workspace.write('packages/example/package.json', '{"name":"example","bin":{"example":"./dist/cli.js"}}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist-types"}}\n');
+      expect((await inferProjectTargets(workspace, 'packages/example/package.json'))['tsc-js']?.options).toEqual({
+        tsConfig: 'tsconfig.lib.json',
+        cwd: 'packages/example',
+      });
+
+      // A config that states no outDir is declared to emit JavaScript beneath dist; nothing else is its to claim.
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","bin":{"example":"./dist/bin/example.js","native":"./dist/bin/native","launcher":"./bin/example"}}\n',
+      );
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+      expect((await inferProjectTargets(workspace, 'packages/example/package.json'))['tsc-js']?.options).toEqual({
+        executableOutputs: ['./dist/bin/example.js'],
+        tsConfig: 'tsconfig.lib.json',
+        cwd: 'packages/example',
+      });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   describe('scriptc bin module selection', () => {
     const bins = new Map([
       ['tool', './dist/ts/node-cli.js'],

@@ -1139,25 +1139,28 @@ aggregates.
 Concrete targets come from concrete files:
 
 - `tsc-js` runs `ttsc -p tsconfig.lib.json --emit` with flags that make it emit transformed JavaScript, declarations and
-  declaration maps from one non-incremental program, then restores execute bits on outputs declared by
-  `package.json#bin`. It writes no file beside the tsconfig, whose directory a consumer's ttsc transform lists while it
-  compiles. Direct project references and every cached output lane are preserved. The config's `outDir` is the target's
-  only output and holds exactly what this emit wrote: the compiler rewrites every output it produces in place, so after
-  a successful emit the executor removes each file under `outDir` whose inode, ctime and mtime are unchanged since
-  before the emit, and each directory that leaves empty. A file an earlier build wrote and this one no longer does (a
-  bin moved to another package, a deleted module) is gone before Nx captures the output, so no cache artifact carries
-  it. A failed emit removes nothing, and an `outDir` that holds a TypeScript source is refused before the compiler runs.
-  It writes `.build-inputs.json` into the `outDir`: the SHA-256 of every file the config's `include` matches less its
-  `exclude`, taken before the emit, and those globs as Git pathspecs. Native targets write the same record from rustc's
-  dep-info through `@smoothbricks/build-inputs`: macOS uses its `smoo-nx-build-inputs` CLI and Linux's `cargo-zigbuild`
-  executor calls that same collector. A record produced under Nx also carries its producer's project, target and
-  optional configuration, taken from the actual task environment. Shell entry uses that identity to judge the selected
-  development receipts, including inferred targets absent from package manifests, and name their actual cached rebuild.
-  It constructs no Nx graph, shadow output registry or second interpolation policy. The record is inside the target's
-  outputs, so a cache hit restores it with them; a live developer link (`@smoothbricks/cli`, "Declared Links") checks it
-  to tell a current build from a stale one by content. The shell entry that bootstraps the plugin
-  (`tooling/direnv/enter-shell.ts`) keeps its build marker under `node_modules/.cache`, not under `outDir`, where the
-  executor would remove it as a file its emit did not write.
+  declaration maps from one non-incremental program, then restores execute bits on the `package.json#bin` outputs that
+  emit wrote: each beneath its `outDir`, or JavaScript beneath `dist` when the config states no `outDir`. A bin another
+  target writes (a second emit into `dist` beside a `dist-types` declaration emit, a bundle) is that target's to make
+  executable, and a launcher checked into Git keeps the mode Git gives it: a clean checkout can run `tsc-js` before such
+  a target, so a `tsc-js` that claimed its bin failed on a file nothing had written yet. It writes no file beside the
+  tsconfig, whose directory a consumer's ttsc transform lists while it compiles. Direct project references and every
+  cached output lane are preserved. The config's `outDir` is the target's only output and holds exactly what this emit
+  wrote: the compiler rewrites every output it produces in place, so after a successful emit the executor removes each
+  file under `outDir` whose inode, ctime and mtime are unchanged since before the emit, and each directory that leaves
+  empty. A file an earlier build wrote and this one no longer does (a bin moved to another package, a deleted module) is
+  gone before Nx captures the output, so no cache artifact carries it. A failed emit removes nothing, and an `outDir`
+  that holds a TypeScript source is refused before the compiler runs. It writes `.build-inputs.json` into the `outDir`:
+  the SHA-256 of every file the config's `include` matches less its `exclude`, taken before the emit, and those globs as
+  Git pathspecs. Native targets write the same record from rustc's dep-info through `@smoothbricks/build-inputs`: macOS
+  uses its `smoo-nx-build-inputs` CLI and Linux's `cargo-zigbuild` executor calls that same collector. A record produced
+  under Nx also carries its producer's project, target and optional configuration, taken from the actual task
+  environment. Shell entry uses that identity to judge the selected development receipts, including inferred targets
+  absent from package manifests, and name their actual cached rebuild. It constructs no Nx graph, shadow output registry
+  or second interpolation policy. The record is inside the target's outputs, so a cache hit restores it with them; a
+  live developer link (`@smoothbricks/cli`, "Declared Links") checks it to tell a current build from a stale one by
+  content. The shell entry that bootstraps the plugin (`tooling/direnv/enter-shell.ts`) keeps its build marker under
+  `node_modules/.cache`, not under `outDir`, where the executor would remove it as a file its emit did not write.
 - `scriptc-<arch>-<family>` (`scriptc-arm64-macos`, `scriptc-x64-macos`, `scriptc-arm64-linux`, `scriptc-x64-linux`) are
   inferred for a package that lists `scriptc` in `devDependencies` (that pin is the compiler the targets run; the
   workspace root lists `scriptc` in `trustedDependencies` so its install links the platform compiler) together with each
