@@ -140,7 +140,8 @@ pub fn settled(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> bool
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Unsettled {
     /// Nothing is there, where a link belongs: a tool removed it, and its next run makes a
-    /// directory in its place.
+    /// directory in its place; or a declared path whose directory the volume holds, which this
+    /// checkout never linked (a fork of main, or main after a land).
     Missing,
     /// A real directory displaced the link: a tool removed it and wrote there since, off the
     /// volume.
@@ -162,8 +163,9 @@ impl std::fmt::Display for Unsettled {
 
 /// Every build-state path of `checkout` that is not what a refresh at an unchanged fingerprint
 /// leaves it (`migrate::adopt_paths`): its fixed link, under real parent directories, reaching
-/// its directory in the volume mounted at `volume`; or, for a declared path nothing occupies,
-/// nothing at all. Reads only; repairing or reporting each is the refresh's.
+/// its directory in the volume mounted at `volume`; or, for a declared path nothing occupies
+/// whose directory the volume does not hold, nothing at all. Reads only; repairing or
+/// reporting each is the refresh's.
 pub fn unsettled(
     checkout: &Path,
     volume: &Path,
@@ -176,7 +178,10 @@ pub fn unsettled(
             let at = checkout.join(path);
             let found = match fs::symlink_metadata(&at) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    (!state.is_declared()).then_some(Unsettled::Missing)
+                    // An unreadable volume directory is unsettled: the refresh reports it.
+                    (!state.is_declared()
+                        || !matches!(volume_holds(volume, state), Ok(VolumeHolds::Nothing)))
+                    .then_some(Unsettled::Missing)
                 }
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     let linked = is_fixed_link(checkout, state)
@@ -200,6 +205,27 @@ pub fn is_fixed_link(checkout: &Path, state: &BuildStatePath) -> bool {
     real_parents(checkout, path)
         && fs::read_link(checkout.join(path))
             .is_ok_and(|target| target == relative_target(path, state.volume.as_path()))
+}
+
+/// What the build volume holds at a build-state path's volume directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VolumeHolds {
+    /// A real directory: state a tool made through the path's link, in this checkout or in one
+    /// whose volume this checkout cloned or adopted.
+    Directory,
+    /// Nothing, or something other than a real directory.
+    Nothing,
+}
+
+/// What the volume mounted at `volume` holds at `state`'s volume directory, never following a
+/// link there. Reads only.
+pub(crate) fn volume_holds(volume: &Path, state: &BuildStatePath) -> io::Result<VolumeHolds> {
+    match fs::symlink_metadata(volume.join(state.volume.as_path())) {
+        Ok(metadata) if metadata.is_dir() => Ok(VolumeHolds::Directory),
+        Ok(_) => Ok(VolumeHolds::Nothing),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(VolumeHolds::Nothing),
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether every directory between `checkout` and `relative`'s parent is a real directory, as
@@ -557,6 +583,14 @@ mod tests {
             "a declared path that appeared is linked by the refresh"
         );
         fs::remove_dir_all(checkout.join("upstream")).unwrap();
+
+        fs::create_dir_all(volume.join("declared/upstream/build")).unwrap();
+        assert_eq!(
+            unsettled(&checkout, &volume, &paths),
+            [(PathBuf::from("upstream/build"), Unsettled::Missing)],
+            "a declared path the volume holds is linked by the refresh"
+        );
+        fs::remove_dir_all(volume.join("declared")).unwrap();
 
         fs::remove_file(checkout.join("target")).unwrap();
         assert!(!settled(&checkout, &volume, &paths), "a removed link");

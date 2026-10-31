@@ -948,9 +948,9 @@ fn an_empty_declared_directory_is_linked_in_its_place() {
 }
 
 /// Existence carries meaning: a tool asks whether a declared directory is there (a pin worktree
-/// or none). So a refresh never makes an absent declared path -- no link, no volume directory,
-/// no parent -- while every capability's path is linked at once. Once a tool makes the
-/// directory, the next refresh adopts it.
+/// or none). So a refresh never makes an absent declared path the volume does not hold -- no
+/// link, no volume directory, no parent -- while every capability's path is linked at once. Once
+/// a tool makes the directory, the next refresh adopts it.
 #[test]
 fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
     let scratch = Scratch::new();
@@ -1012,6 +1012,64 @@ fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
         Path::new("../.cowshed/build/declared/vendor/upstream")
     );
     assert!(scratch.volume().join("declared/vendor/upstream").is_dir());
+}
+
+/// A land hands main the gate's build volume, declared state included, while the gate's links
+/// stayed in its retired source image: main, and every fork of it, holds `declared/<path>` with
+/// nothing at the path. A traced run then made a real directory there (lmao creates its sink's
+/// directory on every open), and the next refresh moved it aside into `.cowshed/kept`, which
+/// refuses the land. The refresh links what the volume holds, so the run writes through the
+/// link and the next refresh keeps nothing (16_build_volumes.md, "Declared build state").
+#[test]
+fn a_declared_path_the_volume_holds_is_linked_before_a_tool_writes_it() {
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    link::point(&checkout, &scratch.volume()).unwrap();
+    let held = scratch.volume().join("declared/packages/a/.cache/lmao");
+    fs::create_dir_all(&held).unwrap();
+    fs::write(held.join("trace-results.db"), "warm").unwrap();
+    let paths = vec![
+        BuildStatePath::declared("packages/a/.cache/lmao").unwrap(),
+        BuildStatePath::declared("packages/b/.cache/lmao").unwrap(),
+    ];
+    let refresh = || {
+        adopt_paths(
+            &crate::census::this_test(),
+            &checkout,
+            &scratch.volume(),
+            &paths,
+            &paths,
+        )
+        .unwrap()
+        .unwrap()
+    };
+    assert_eq!(refresh(), Adopted::default());
+    assert!(
+        link::is_fixed_link(&checkout, &paths[0]),
+        "the path the volume holds is linked"
+    );
+    assert!(
+        !checkout.join("packages/b").exists(),
+        "a path the volume does not hold stays absent, its parents included"
+    );
+    // The traced run: lmao makes its sink's directory, which the link already is, and writes.
+    fs::create_dir_all(checkout.join("packages/a/.cache/lmao")).unwrap();
+    fs::write(
+        checkout.join("packages/a/.cache/lmao/trace-results.db-wal"),
+        "spans",
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(held.join("trace-results.db-wal")).unwrap(),
+        "spans"
+    );
+    assert_eq!(refresh(), Adopted::default(), "nothing is kept aside");
+    assert_eq!(kept::list(&checkout).unwrap(), []);
+    assert_eq!(
+        fs::read_to_string(held.join("trace-results.db")).unwrap(),
+        "warm"
+    );
 }
 
 /// The `.bun-pin` incident, in a downstream repository's shed: a tool cloned a patch worktree
@@ -1164,7 +1222,7 @@ fn every_tool_and_occupant() -> Vec<(BuildStateTool, Occupant)> {
     let listed = |tool: BuildStateTool, occupant: Occupant| {
         let (BuildStateTool::Cargo | Nx | Declared | JavaScript) = tool;
         match occupant {
-            Occupant::Absent
+            Occupant::Absent(link::VolumeHolds::Directory | link::VolumeHolds::Nothing)
             | Occupant::FixedLink
             | Occupant::ForeignLink
             | Occupant::EmptyDirectory
@@ -1176,7 +1234,8 @@ fn every_tool_and_occupant() -> Vec<(BuildStateTool, Occupant)> {
         .into_iter()
         .flat_map(|tool| {
             [
-                Occupant::Absent,
+                Occupant::Absent(link::VolumeHolds::Directory),
+                Occupant::Absent(link::VolumeHolds::Nothing),
                 Occupant::FixedLink,
                 Occupant::ForeignLink,
                 Occupant::EmptyDirectory,
@@ -1192,7 +1251,7 @@ fn every_tool_and_occupant() -> Vec<(BuildStateTool, Occupant)> {
 /// cowshed did not make are never removed or linked over, only a tool's own directory is
 /// discarded (empty or not, as before), a declared directory holding anything is moved aside
 /// intact, a declared empty directory is the only thing removed outright, and every path ends at
-/// its fixed link but a declared one nothing occupies.
+/// its fixed link but a declared one nothing occupies whose directory the volume does not hold.
 #[test]
 fn the_decision_deletes_nothing_cowshed_cannot_rebuild() {
     for (tool, occupant) in every_tool_and_occupant() {
@@ -1220,12 +1279,18 @@ fn the_decision_deletes_nothing_cowshed_cannot_rebuild() {
         );
         assert_eq!(
             action == Action::LeaveAbsent,
-            declared && occupant == Occupant::Absent,
+            declared && occupant == Occupant::Absent(link::VolumeHolds::Nothing),
             "{case}"
         );
         assert_eq!(
             action == Action::Keep,
             occupant == Occupant::FixedLink,
+            "{case}"
+        );
+        assert_eq!(
+            action == Action::Link,
+            occupant == Occupant::Absent(link::VolumeHolds::Directory)
+                || (!declared && occupant == Occupant::Absent(link::VolumeHolds::Nothing)),
             "{case}"
         );
     }
@@ -1261,7 +1326,7 @@ fn a_write_into_an_empty_declared_directory_racing_the_refresh_is_kept() {
     fs::create_dir_all(checkout.join("vendor/upstream")).unwrap();
     link::point(&checkout, &scratch.volume()).unwrap();
     let declared = vec![BuildStatePath::declared("vendor/upstream").unwrap()];
-    let plan = preflight(&checkout, &declared).unwrap();
+    let plan = preflight(&checkout, Some(&scratch.volume()), &declared).unwrap();
     assert_eq!(plan.steps[0].1, Action::ReplaceEmpty);
     write(
         &checkout,
@@ -1300,6 +1365,9 @@ mod property {
     #[derive(Clone, Debug)]
     enum Planted {
         Absent,
+        /// Nothing at the path, and a volume directory holding a file: what a land or a fork
+        /// leaves where this checkout never linked.
+        Held,
         /// The path's own link, onto a volume directory that holds a file or is missing.
         FixedLink {
             dangling: bool,
@@ -1319,6 +1387,7 @@ mod property {
     fn planted() -> impl Strategy<Value = Planted> {
         prop_oneof![
             3 => Just(Planted::Absent),
+            1 => Just(Planted::Held),
             3 => any::<bool>().prop_map(|dangling| Planted::FixedLink { dangling }),
             1 => any::<bool>().prop_map(|dangling| Planted::ForeignLink { dangling }),
             2 => Just(Planted::EmptyDirectory),
@@ -1360,11 +1429,16 @@ mod property {
     fn plant(checkout: &Path, volume: &Path, state: &BuildStatePath, planted: &Planted) {
         let path = state.checkout.as_path();
         let at = checkout.join(path);
-        if !matches!(planted, Planted::Absent) {
+        if !matches!(planted, Planted::Absent | Planted::Held) {
             fs::create_dir_all(at.parent().unwrap()).unwrap();
         }
         match planted {
             Planted::Absent => {}
+            Planted::Held => {
+                let directory = volume.join(state.volume.as_path());
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(directory.join("warm"), planted_bytes(path, 98, b"warm")).unwrap();
+            }
             Planted::FixedLink { dangling } => {
                 std::os::unix::fs::symlink(
                     link::relative_target(path, state.volume.as_path()),
@@ -1433,7 +1507,7 @@ mod property {
 
     /// A refresh never deletes user data. Every file and link outside a tool's own cache
     /// directory is still in the checkout afterwards, byte for byte; a file or a foreign link at
-    /// any path refuses before any path changes; otherwise every path but an unoccupied declared
+    /// any path refuses before any path changes; otherwise every path but an unoccupied, unheld declared
     /// one is its fixed link, and each declared directory's files are where the refresh says it
     /// kept them. Every case's checkout is a fresh directory of one Git repository, made once:
     /// a Git process costs seconds on a loaded macOS host, and the tracked-source guard needs one.

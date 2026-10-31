@@ -62,8 +62,8 @@ pub struct MintedVolume {
 }
 
 /// The checkout's first build volume (or the one an interrupted first touch already linked),
-/// with every contributed path linked into it (a declared one once it exists), and the real
-/// directories it discarded or kept.
+/// with every contributed path linked into it (a declared one once it exists, or at the next
+/// refresh once its volume holds it), and the real directories it discarded or kept.
 pub(crate) fn first_touch<H: RuntimeStorageHost>(
     host: &H,
     layout: &BuildVolumeLayout,
@@ -78,7 +78,9 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         beside,
         registration,
     } = migration;
-    let plan = preflight(checkout, paths)?;
+    // Decided before the volume is minted or mounted: what it holds behind a declared path is
+    // linked by the refresh after this first touch, which observes the mounted volume.
+    let plan = preflight(checkout, None, paths)?;
     if let Some(refusal) = tracked_source(checkout, &plan.removed())? {
         return Ok(Err(refusal));
     }
@@ -146,11 +148,12 @@ pub struct Adopted {
 
 /// Make every build-state path what [`decide`] says, after deciding all of them: a file or a
 /// foreign link anywhere refuses, and a path holding tracked source refuses, before any path
-/// changes. A declared path nothing occupies stays absent: tools read a directory's existence as
-/// meaning (a pin worktree is there or it is not), so its link and volume directory appear only
-/// once a tool has made the directory, at the next refresh after. `held` is what the volume's
-/// state held before this refresh, which gives each removed or kept directory its
-/// [`DiscardOrigin`].
+/// changes. A declared path nothing occupies is linked only where the volume mounted at
+/// `volume_root` holds its directory: tools read a directory's existence as meaning (a pin
+/// worktree is there or it is not), so a declared link appears only where a tool made the
+/// directory, in this checkout (at the next refresh after) or in one whose volume this checkout
+/// cloned or adopted. `held` is what the volume's state held before this refresh, which gives
+/// each removed or kept directory its [`DiscardOrigin`].
 pub fn adopt_paths(
     census: &crate::census::CensusScope,
     checkout: &Path,
@@ -158,7 +161,7 @@ pub fn adopt_paths(
     paths: &[BuildStatePath],
     held: &[BuildStatePath],
 ) -> Result<std::result::Result<Adopted, TrackedBuildStateRefusal>> {
-    let plan = preflight(checkout, paths)?;
+    let plan = preflight(checkout, Some(volume_root), paths)?;
     if let Some(refusal) = tracked_source(checkout, &plan.removed())? {
         return Ok(Err(refusal));
     }
@@ -310,8 +313,9 @@ fn discard_origin(
 /// What a refresh finds at one build-state path, observed before it changes any.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Occupant {
-    /// Nothing.
-    Absent,
+    /// Nothing, with what the volume holds behind the path: a declared path is linked only over
+    /// a directory the volume holds.
+    Absent(link::VolumeHolds),
     /// The path's fixed link: a symlink whose text is [`link::relative_target`], dangling or not.
     FixedLink,
     /// A symlink with any other text, dangling or not.
@@ -327,11 +331,13 @@ pub enum Occupant {
 /// What a refresh does at one build-state path ([`decide`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
-    /// A declared path nothing occupies stays so: no link, no volume directory, no parent.
+    /// A declared path nothing occupies, whose directory the volume does not hold, stays so: no
+    /// link, no volume directory, no parent.
     LeaveAbsent,
     /// The fixed link stays; its volume directory is made if it is missing.
     Keep,
-    /// The fixed link is made where nothing is.
+    /// The fixed link is made where nothing is: a capability's path, or a declared one whose
+    /// directory the volume holds.
     Link,
     /// A declared path's empty directory is removed by `rmdir(2)`, which fails rather than delete
     /// an entry written since it was observed, and the link takes the path.
@@ -352,15 +358,19 @@ pub struct Refuse;
 /// does at each path"): from the tool whose state the path holds and what is there, what the
 /// refresh does. Pure; [`adopt_paths`] only observes and performs. Its invariant, which the
 /// property tests hold it to: a file and a link are never removed, a declared path loses nothing
-/// but an empty directory, and only a tool's own directory is discarded.
+/// but an empty directory, only a tool's own directory is discarded, and a declared path
+/// nothing occupies is linked only over a directory the volume holds.
 pub const fn decide(
     tool: BuildStateTool,
     occupant: Occupant,
 ) -> std::result::Result<Action, Refuse> {
     match occupant {
-        Occupant::Absent => Ok(match tool {
-            BuildStateTool::Declared => Action::LeaveAbsent,
-            BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript => Action::Link,
+        Occupant::Absent(holds) => Ok(match (tool, holds) {
+            (BuildStateTool::Declared, link::VolumeHolds::Nothing) => Action::LeaveAbsent,
+            (BuildStateTool::Declared, link::VolumeHolds::Directory)
+            | (BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript, _) => {
+                Action::Link
+            }
         }),
         Occupant::FixedLink => Ok(Action::Keep),
         Occupant::EmptyDirectory => Ok(match tool {
@@ -410,14 +420,20 @@ impl<'a> Plan<'a> {
     }
 }
 
-fn preflight<'a>(checkout: &Path, paths: &'a [BuildStatePath]) -> Result<Plan<'a>> {
+/// Observe and decide every path. `volume_root` is the mounted build volume the links name; a
+/// first touch decides before it mints or mounts one and passes none.
+fn preflight<'a>(
+    checkout: &Path,
+    volume_root: Option<&Path>,
+    paths: &'a [BuildStatePath],
+) -> Result<Plan<'a>> {
     super::disjoint(paths).map_err(|(left, right)| {
         super::overlapping(&checkout.join(super::STATE_FILE), left, right)
     })?;
     let steps = paths
         .iter()
         .map(|state| {
-            let occupant = observe(checkout, state)?;
+            let occupant = observe(checkout, volume_root, state)?;
             match decide(BuildStateTool::of(state), occupant) {
                 Ok(action) => Ok((state, action)),
                 Err(Refuse) => Err(CowshedError::integrity(
@@ -433,14 +449,21 @@ fn preflight<'a>(checkout: &Path, paths: &'a [BuildStatePath]) -> Result<Plan<'a
     Ok(Plan { steps })
 }
 
-/// What is at `state`'s path in `checkout`. A declared path is looked at before
+/// What is at `state`'s path in `checkout`, and behind an absent one, what the volume at
+/// `volume_root` holds ([`behind`]). A declared path is looked at before
 /// [`link::contained_parent`], which makes missing parents: an absent declared path makes
 /// nothing, its parents included.
-fn observe(checkout: &Path, state: &BuildStatePath) -> Result<Occupant> {
+fn observe(
+    checkout: &Path,
+    volume_root: Option<&Path>,
+    state: &BuildStatePath,
+) -> Result<Occupant> {
     if state.is_declared() {
         let at = checkout.join(state.checkout.as_path());
         match fs::symlink_metadata(&at) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Occupant::Absent),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return behind(volume_root, state).map(Occupant::Absent);
+            }
             Err(error) => return Err(io_error("inspect build state", &at, error)),
             Ok(_) => {}
         }
@@ -456,7 +479,9 @@ fn observe(checkout: &Path, state: &BuildStatePath) -> Result<Occupant> {
     let source = parent.join(name);
     let metadata = match fs::symlink_metadata(&source) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Occupant::Absent),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return behind(volume_root, state).map(Occupant::Absent);
+        }
         Err(error) => return Err(io_error("inspect build state", &source, error)),
     };
     if metadata.file_type().is_symlink() {
@@ -481,6 +506,22 @@ fn observe(checkout: &Path, state: &BuildStatePath) -> Result<Occupant> {
         Some(Ok(_)) => Ok(Occupant::Directory),
         Some(Err(error)) => Err(io_error("read build-state directory", &source, error)),
     }
+}
+
+/// What the volume at `volume_root` holds behind an absent path. A first touch observes before
+/// any volume is mounted: nothing there is linked by it, and the refresh after it observes the
+/// mounted volume.
+fn behind(volume_root: Option<&Path>, state: &BuildStatePath) -> Result<link::VolumeHolds> {
+    let Some(volume_root) = volume_root else {
+        return Ok(link::VolumeHolds::Nothing);
+    };
+    link::volume_holds(volume_root, state).map_err(|error| {
+        io_error(
+            "inspect build-state volume directory",
+            &volume_root.join(state.volume.as_path()),
+            error,
+        )
+    })
 }
 
 /// `error`, also naming every declared directory this refresh already moved aside: a failure

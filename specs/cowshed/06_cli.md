@@ -734,16 +734,16 @@ reports, and whether the gateway has the workspace's session installed at that r
 controller's pre-exec reconcile would install nothing for it. And `exec` admits a job only onto build state the
 controller's refresh (16_build_volumes.md, "One link per checkout") would leave as it is: every fixed link the
 checkout's build volume records is in place and reaches its volume directory (a declared path nothing occupies needs
-none), and the tracked build inputs still have the fingerprint that volume records, computed as the refresh computes it
-(its Git listings and a hash of the tracked manifests). The workspace's supervisor judges it (`asIs`, 11_shell.md,
-"Protocol") from listings its process keeps while the checkout's index keeps its identity (11_shell.md, "Kept
-readings"), where a CLI process would list them again for every exec. The job then runs through the supervisor's socket,
-held under the authority the `hello` read, and is relayed as the controller path relays it. The controller that Node-API
-callers reach keeps the lane for that job's later calls (`info`, `wait`, `kill`, `detach`, `logRead`) and proves it with
-one `hello` per call: a supervisor that retired or now serves another incarnation drops the lane, and the call takes the
-controller path, which answers from the sealed records. A supervisor that retires between that `hello` and the call
-fails that one call as unavailable, and the next takes the controller path. `exec --host` is answered the same way, as a
-host-scope job of the coordinator route.
+none unless the volume holds its directory), and the tracked build inputs still have the fingerprint that volume
+records, computed as the refresh computes it (its Git listings and a hash of the tracked manifests). The workspace's
+supervisor judges it (`asIs`, 11_shell.md, "Protocol") from listings its process keeps while the checkout's index keeps
+its identity (11_shell.md, "Kept readings"), where a CLI process would list them again for every exec. The job then runs
+through the supervisor's socket, held under the authority the `hello` read, and is relayed as the controller path relays
+it. The controller that Node-API callers reach keeps the lane for that job's later calls (`info`, `wait`, `kill`,
+`detach`, `logRead`) and proves it with one `hello` per call: a supervisor that retired or now serves another
+incarnation drops the lane, and the call takes the controller path, which answers from the sealed records. A supervisor
+that retires between that `hello` and the call fails that one call as unavailable, and the next takes the controller
+path. `exec --host` is answered the same way, as a host-scope job of the coordinator route.
 
 Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached; for
 `exec`, one unserved, served under an older grant or another incarnation, a gateway session not yet at the served

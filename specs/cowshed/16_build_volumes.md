@@ -268,13 +268,13 @@ real directory, or something else) without changing it, and names `cowshed exec 
 what the refresh finds there to one action. The shell around it observes every path, decides all of them before it
 changes any, and performs. A refusal therefore changes no build-state path.
 
-| Found at the path                          | A capability's path                               | A declared path                        |
-| ------------------------------------------ | ------------------------------------------------- | -------------------------------------- |
-| nothing                                    | make the link                                     | leave it absent (Declared build state) |
-| its fixed link, dangling or not            | keep it, and make its volume directory if missing | the same                               |
-| an empty real directory                    | discard it, then link                             | remove it with `rmdir(2)`, then link   |
-| a real directory with entries              | discard it, then link                             | move it aside intact, then link        |
-| a file, or any other link, dangling or not | refuse, naming the path                           | the same                               |
+| Found at the path                          | A capability's path                               | A declared path                                                                                |
+| ------------------------------------------ | ------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| nothing                                    | make the link                                     | make the link when the volume holds its directory, else leave it absent (Declared build state) |
+| its fixed link, dangling or not            | keep it, and make its volume directory if missing | the same                                                                                       |
+| an empty real directory                    | discard it, then link                             | remove it with `rmdir(2)`, then link                                                           |
+| a real directory with entries              | discard it, then link                             | move it aside intact, then link                                                                |
+| a file, or any other link, dangling or not | refuse, naming the path                           | the same                                                                                       |
 
 A capability's directory is its tool's own cache, which the next build rebuilds: discarding it is rebuild-only
 migration, and keeping it would hold a Cargo target directory's tens of GiB that nobody asked for. A declared directory
@@ -394,14 +394,25 @@ directory. The author takes what they need from the kept directory, re-runs the 
 deletes the kept directory. From then on the state lives on the volume, every fork inherits it warm, and main adopts it
 at a land.
 
-**A declared path is linked when it appears, never before.** A capability's path is linked at once, and its tool finds
-an empty directory it fills. A declared path's existence carries meaning to tools cowshed does not know: a build script
-that builds the upstream checkout when it is there, and takes a prebuilt artifact when it is not, would find an empty
-directory and try to build nothing. So a refresh makes nothing for a declared path nothing occupies, neither the link,
-the volume directory nor a missing parent; the volume's state still holds the path. Once a tool has made the directory,
-the next refresh adopts it as above. A reconstruct script that wants to fill the volume on its first run makes the empty
-directory, lets a refresh link it (any `cowshed exec`), and only then fills it. The rule holds per pattern match: a
-package whose tests never wrote a trace store gets no link.
+**A declared path is linked when it appears or when the volume already holds it, never before.** A capability's path is
+linked at once, and its tool finds an empty directory it fills. A declared path's existence carries meaning to tools
+cowshed does not know: a build script that builds the upstream checkout when it is there, and takes a prebuilt artifact
+when it is not, would find an empty directory and try to build nothing. So a refresh makes nothing for a declared path
+that nothing occupies and whose directory the volume does not hold, neither the link, the volume directory nor a missing
+parent; the volume's state still holds the path. Once a tool has made the directory, the next refresh adopts it as
+above. A reconstruct script that wants to fill the volume on its first run makes the empty directory, lets a refresh
+link it (any `cowshed exec`), and only then fills it. The rule holds per pattern match: a package whose tests never
+wrote a trace store gets no link.
+
+A directory the volume already holds is a tool's own, made through the path's link in this checkout or in one whose
+volume this checkout cloned or adopted, so a refresh links it wherever nothing occupies the path, making the link's
+missing parents; `exec`'s resident judgement (06_cli.md) counts such a path as one the refresh would change. **Why**: a
+land hands main the gate's build volume while the gate's links stay in its retired source image, and Git carries no
+link. Main, and every fork of it, then held `declared/<path>` with nothing at the path. A traced run made a real
+directory there (a trace sink's opener makes its directory on every open), and the next refresh moved it aside into
+`.cowshed/kept`, which refuses the land: measured 2026-10-31, one fork of a lane base kept 27 trace stores in one
+refresh. A link to what the volume holds is the warm state a land and a fork exist to carry, not an empty directory a
+tool would misread.
 
 A tool whose own state records absolute paths sees the volume's: the declared path is a link, and a process that
 resolves its working directory (`getcwd`, `pwd -P`) gets `<mount-root>/.build/<owner>/<repo>/<id>/declared/<path>`. That
@@ -420,9 +431,11 @@ the top mount instead. The swap would therefore be an unmount and a mount, which
 - **Enforced by**: a real-APFS test in which main's first touch moves a declared nested checkout aside and links the
   path, the reconstructed state is written through the link, and a fork of main reads it warm; discovery tests refusing
   a tracked, overlapping or escaping declaration with its remedy; migration tests keeping a declared checkout whole at
-  the location its finding names, linking an empty declared directory in place, and leaving an absent declared path
-  absent until a tool makes it; a discovery test expanding a pattern over tracked packages only, rediscovering when one
-  is added; and configuration parse tests.
+  the location its finding names, linking an empty declared directory in place, leaving an absent declared path the
+  volume does not hold absent until a tool makes it, and linking one the volume holds so that a traced run writes
+  through the link and the next refresh keeps nothing aside; `link.rs`'s settled-links test counting a held, unlinked
+  declared path as one the refresh changes; a discovery test expanding a pattern over tracked packages only,
+  rediscovering when one is added; and configuration parse tests.
 
 ### Targets and seeds
 
