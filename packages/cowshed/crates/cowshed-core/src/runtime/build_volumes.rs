@@ -6238,10 +6238,12 @@ mod tests {
         .unwrap();
         fs::write(source.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
         // The build script is a witness, run for what it does to the listener rather than for
-        // its output, so it says Cargo must rerun it every time (an empty `rerun-if-changed`).
-        // Declaring nothing would make its package the input, and with the package's files the
-        // same on every run, mbx under a gate restores the script's output instead of running it,
-        // and Cargo finishes without ever connecting.
+        // its output. It declares an empty `rerun-if-changed`, which mbx reads as "rerun every
+        // time" and never stores or restores; Cargo reads it as the package's whole tree, and each
+        // test builds once into a fresh target, so Cargo runs it too. Declaring nothing would make
+        // the package the input, and with the package's files the same on every run, mbx under a
+        // gate restores the script's output instead of running it, and Cargo finishes without the
+        // script ever connecting.
         fs::write(
             source.join("build.rs"),
             r#"use std::io::{Read, Write};
