@@ -14,7 +14,7 @@
         "@swc/core": "1.15.43",
         "@swc/helpers": "0.5.23",
         "@types/bun": "1.4.4",
-        "@types/node": "^26.6.6",
+        "@types/node": "catalog:",
         "@typescript-eslint/eslint-plugin": "^8.70.0",
         "@typescript-eslint/parser": "^8.70.0",
         "@typescript/native": "npm:typescript@^7.0.2",
@@ -136,7 +136,7 @@
         "@napi-rs/cli": "3.7.3",
         "@smoothbricks/lmao": "workspace:*",
         "@smoothbricks/validation": "workspace:*",
-        "@types/node": "^26.6.5",
+        "@types/node": "catalog:",
         "typescript": "^6.0.3",
       },
     },
@@ -527,6 +527,9 @@
     "@nx/js": "23.2.1",
     "nx": "23.2.1",
     "typia": "15.2.1",
+  },
+  "catalog": {
+    "@types/node": "^26.6.6",
   },
   "packages": {
     "@ai-sdk/provider": ["@ai-sdk/provider@3.0.8", "", { "dependencies": { "json-schema": "^0.4.0" } }, "sha512-oGMAgGoQdBXbZqNG0Ze56CHjDZ1IDYOwGYxYjO5KLSlz5HiNQ9udIXsPZ61VWaHGZ5XW/jyjmr6t2xz2jGVwbQ=="],

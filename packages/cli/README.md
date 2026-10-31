@@ -127,7 +127,7 @@ evaluation's Bun over the shell's.
 
 Bun types are also a root runtime policy. The root `@types/bun` version follows the exact `packageManager` Bun version,
 while package manifests are not forced to depend on Bun just because a test tsconfig opts into Bun globals. If a package
-does explicitly declare `@types/bun`, `sherif` can keep duplicate declarations consistent, but `smoo` owns the semantic
+does explicitly declare `@types/bun`, it names the root's catalog entry for it (below), and `smoo` owns the semantic
 root `bun@x.y.z` to `@types/bun x.y.z` relationship.
 
 A root dependency these policies check (the tool devDependencies, `@types/bun`, `@types/node`, `ttsc`) may be a Bun
@@ -135,6 +135,12 @@ catalog reference, `catalog:` or `catalog:<name>`. smoo then judges the catalog 
 a failure (`package.json workspaces.catalog.nx must be ...`), and `update`, `validate --fix` and `init --runtime-only`
 repair the entry and keep the reference. Bun reads the catalogs from the object form of `workspaces` once it holds
 `catalog` or `catalogs`, and otherwise from the top level of the root manifest; smoo reads them from the same place.
+
+`init --runtime-only` writes the root manifest alone and runs no package hygiene. A member that declares a runtime type
+the root pins (`@types/node`, `@types/bun`) therefore names it `catalog:`, the root names it `catalog:` too, and the
+version lives once, in the root's catalog, where the runtime sync writes it. A range of the member's own stays behind
+when the runtime moves, and `validate`'s package hygiene (`sherif --fail-on-warnings`, `multiple-dependency-versions`)
+then refuses the release, as it refused cowshed's `^26.6.5` beside the root's `^26.6.6` after Bun 1.4.4.
 
 ## LMAO Test Tracing
 

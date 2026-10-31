@@ -972,7 +972,7 @@
     "@napi-rs/cli": "3.7.3",
     "@smoothbricks/lmao": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
-    "@types/node": "^26.6.5",
+    "@types/node": "catalog:",
     "typescript": "^6.0.3"
   },
   "description": "Warm git workspaces: instant isolated copy-on-write workspaces with layered sandboxing (CLI, Rust API, NAPI bindings)",
