@@ -163,9 +163,11 @@ where
 {
     /// Mint the empty build volume `id` at `capacity` and mount it: `registration` is written
     /// first, then one `clonefile` of the store's blank template and one attach (01a_apfs.md,
-    /// "Images"). The record stays registered, and the answered hold keeps every release off the
-    /// volume, until the caller publishes it once it holds what it should (a migration's linked
-    /// build state, main's first touch). A mint that fails releases what it registered. The
+    /// "Images"). The record stays registered, and the answered exclusive claim
+    /// ([`BuildVolumeLayout::register_claiming`]) keeps every release and job off the volume, until
+    /// the caller publishes it once it holds what it should (a migration's linked build state,
+    /// main's first touch) and captures its seed under that claim (16_build_volumes.md, "Targets
+    /// and seeds"). A mint that fails releases what it registered under the claim. The
     /// clone carries the template's label until the checkout's supervisor names it after the
     /// checkout (16_build_volumes.md, "Substrate"): the label is cosmetic, so naming never runs
     /// on a provisioning path.
@@ -175,14 +177,25 @@ where
         id: &BuildVolumeId,
         capacity: ImageCapacity,
         registration: &Registration,
-    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError> {
+    ) -> Result<(PathBuf, ReleaseClaim), ApfsStorageError> {
         let image = layout.image(id);
         self.verify_controller_path(&image)?;
         Self::ensure_parent(&image)?;
-        let creating = layout.register(id, registration).map_err(host_error)?;
+        let creating = layout
+            .register_claiming(id, registration)
+            .map_err(host_error)?;
         let mount = layout.mount(id);
-        if let Err(error) = self.mint(capacity, &image, &mount) {
-            return Err(self.unregister(layout, id, creating, error));
+        if let Err(primary) = self.mint(capacity, &image, &mount) {
+            return Err(
+                match crate::storage::apfs::combine_cleanup::<std::convert::Infallible>(
+                    "release a build volume whose creation failed",
+                    primary,
+                    self.release_claimed(layout, creating).map(drop),
+                ) {
+                    Err(error) => error,
+                    Ok(never) => match never {},
+                },
+            );
         }
         Ok((mount, creating))
     }

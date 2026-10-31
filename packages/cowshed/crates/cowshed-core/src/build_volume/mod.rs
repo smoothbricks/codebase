@@ -1172,7 +1172,7 @@ impl BuildVolumeLayout {
 
     /// Hold `id` for a land, for as long as the answer lives: while any hold lives, no
     /// release unmounts the volume (16_build_volumes.md, "Garbage collection"). An exclusive claim
-    /// on the volume (a release, a seed capture, a reseed, a cache clear, a dry-run probe) is waited
+    /// on the volume (a release, a seed capture, a reseed, a cache clear, a dry-run probe, a first volume's creation) is waited
     /// out, because only what it leaves says whether the volume is still there. Refused with
     /// [`io::ErrorKind::ResourceBusy`] only once a release has deleted the volume: a release deletes
     /// the image before it lets go of its claim, so a hold that waited for it finds no image, and
@@ -1255,22 +1255,31 @@ impl BuildVolumeLayout {
         }
     }
 
-    /// Claim `id` exclusively for the operation creating it, before its image exists, as
-    /// [`Self::hold_new`] holds it ([`Self::register_claimed`]): no release takes the volume and
-    /// no job is admitted on it while the creation runs. A checkout's first volume is created so:
-    /// its creator captures the checkout's seed under this claim (16_build_volumes.md, "Targets
-    /// and seeds"), where a claim taken anew once a shared creation hold dropped is refused by a
-    /// transient kernel copy of that hold's descriptor (cowshed-os `fork_lock`). Nothing claims
-    /// an id before its image exists, so the lock is never contended; one that is refuses as
-    /// [`io::ErrorKind::ResourceBusy`].
-    pub fn claim_new(&self, id: &BuildVolumeId) -> io::Result<ReleaseClaim> {
-        fs::create_dir_all(&self.images)?;
-        self.claim_release(id)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                format!("build volume {id} is held before its image exists"),
-            )
-        })
+    /// [`Self::register`], held by an exclusive claim instead of a shared creation hold: no release
+    /// takes the volume and no job is admitted on it until the creator lets the claim go. An empty
+    /// volume is created so, and its creator captures its seed under the same claim
+    /// (16_build_volumes.md, "Targets and seeds"): a claim taken anew once a shared creation hold
+    /// dropped is refused by a transient kernel copy of that hold's descriptor (cowshed-os
+    /// `fork_lock`). Nothing claims an id before its image exists, so the claim is never
+    /// contended; one that is refuses as [`io::ErrorKind::ResourceBusy`].
+    pub fn register_claiming(
+        &self,
+        id: &BuildVolumeId,
+        registration: &Registration,
+    ) -> crate::Result<ReleaseClaim> {
+        self.require_imageless(id)?;
+        let claim = self
+            .claim_release(id)
+            .and_then(|claim| claim.ok_or_else(|| claimed(id)))
+            .map_err(|error| {
+                io_error(
+                    "claim a build volume while it is created",
+                    &self.hold_path(id),
+                    &error,
+                )
+            })?;
+        self.write_registration(id, registration)?;
+        Ok(claim)
     }
 
     /// Whether a job holds `id` now, asked without taking or creating anything: what a dry run
@@ -1769,7 +1778,7 @@ fn claimed(id: &BuildVolumeId) -> io::Error {
     io::Error::new(
         io::ErrorKind::ResourceBusy,
         format!(
-            "build volume {id} is claimed exclusively by a release, a seed capture, a reseed, a cache clear or a hold probe"
+            "build volume {id} is claimed exclusively by a release, a seed capture, a reseed, a cache clear, a compaction move, a hold probe or the creation of a first volume"
         ),
     )
 }

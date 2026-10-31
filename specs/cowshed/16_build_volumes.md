@@ -1179,9 +1179,9 @@ seed the lane base already had and builds the folded delta incrementally, as an 
   or superseding a seed releases every volume that no checkout links and no target keeps as its latest seed. `rm` and
   `land` (including `--no-retire`) run collection before returning, not only on a later explicit `gc`.
 - Ownership is a job hold, a land's hold on its landing volume, an unfinished create/fork/adopt in the lifecycle intent
-  journal, or a creation's own hold on the volume it registered, not the kernel's refusal to unmount. Every admitted
-  cowshed job holds a shared flock on the build volume's `<id>.dmg.hold` for its lifetime; release must claim it
-  exclusively. A running job therefore keeps main's previous volume across a swap, and that volume stays recorded as
+  journal, or a creation's own hold or claim on the volume it registered, not the kernel's refusal to unmount. Every
+  admitted cowshed job holds a shared flock on the build volume's `<id>.dmg.hold` for its lifetime; release must claim
+  it exclusively. A running job therefore keeps main's previous volume across a swap, and that volume stays recorded as
   main's (superseded, at main's incarnation) while it does: when the job ends, its supervisor has the controller release
   a superseded volume then and waits for that release before it reports the job ended; a release that cannot run or
   fails is the job's terminal failure and leaves the record naming its owner, never a later collection's work. Job
@@ -1213,12 +1213,13 @@ seed the lane base already had and builds the folded delta incrementally, as an 
   intents and before it answers, reads every registered sidecar and releases each whose registrant is gone, by that
   exact id, image and sidecar, as `interruptedBuildVolume`. A registered sidecar's authority is exact, never a workspace
   name a later verb may reuse: its live creator's hold on that id (a creation holds the volume from before its
-  registration until it publishes it, and an adopt's mint is claimed by the adopt until its first touch takes the claim
-  or the adopt releases the mint under it), an unfinished re-adoption's journaled record naming that id, or a detached
-  checkout's unreadable link. One such authority still owns stays with it; one whose release fails, or whose sidecar or
-  image cannot be read, refuses the open, naming each, with its sidecar still naming its owner. Every collection decides
-  registered sidecars the same way. No pass looks for images nobody owns: an image with no sidecar predates owner
-  registration, is named with its path on every pass, and is never released on a guess.
+  registration until it publishes it, a checkout's first volume by its claim until its seed is captured, and an adopt's
+  mint is claimed by the adopt until its first touch takes the claim or the adopt releases the mint under it), an
+  unfinished re-adoption's journaled record naming that id, or a detached checkout's unreadable link. One such authority
+  still owns stays with it; one whose release fails, or whose sidecar or image cannot be read, refuses the open, naming
+  each, with its sidecar still naming its owner. Every collection decides registered sidecars the same way. No pass
+  looks for images nobody owns: an image with no sidecar predates owner registration, is named with its path on every
+  pass, and is never released on a guess.
 - Release retains the volume's owner record and exclusive claim while it requests a non-forced unmount and allows a
   bounded wall-clock grace for unmanaged holders to release it. Time spent waiting on command execution or a disk lease
   counts, not only requested poll sleeps. If the kernel still refuses, cowshed forces the unmount and detaches the

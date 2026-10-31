@@ -451,7 +451,7 @@ where
                     ImageCapacity::from_bytes(build.capacity_bytes),
                     &registration,
                 )
-                .map(drop),
+                .map(|_| None),
             None => self
                 .create_build_volume(
                     layout,
@@ -459,13 +459,14 @@ where
                     ImageCapacity::from_bytes(build.capacity_bytes),
                     &registration,
                 )
-                .map(drop),
+                .map(|(_, creating)| Some(creating)),
         };
-        match (exists(&image)?, recorded) {
+        let created = match (exists(&image)?, recorded) {
             (false, None) => create()?,
             (false, Some(found)) if found == *registration.registered() => create()?,
             (true, Some(found)) if ours(&found) => {
                 self.mount_build_volume(layout, &build.id)?;
+                None
             }
             (true, None) => {
                 return Err(ApfsStorageError::InvalidPlan(
@@ -482,8 +483,11 @@ where
                     "main's build volume record names a missing image; refusing to publish over it",
                 ));
             }
-        }
+        };
         layout.publish(&build.id, &registration).map_err(host)?;
+        // A volume minted here is seeded under the claim it was created under, never under a
+        // second one taken once that is let go (16_build_volumes.md, "Targets and seeds").
+        let seed = created.as_ref().map_or(seed, SeedSource::Claimed);
         self.seed_replacement(layout, source, seed, &build.record, mbx, retention)
     }
 

@@ -63,7 +63,7 @@ pub struct MintedVolume {
 
 /// What a first touch made: the checkout's volume, what it did to the real directories standing
 /// where its links belong, and, when it minted the volume, the exclusive claim it minted it under
-/// ([`create_first_volume`]), which its caller captures the checkout's seed under and then lets
+/// ([`RuntimeStorageHost::create_build_volume`]), which its caller captures the checkout's seed under and then lets
 /// go.
 #[derive(Debug)]
 pub(crate) struct Touched {
@@ -117,7 +117,8 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
                 MintedBeside::Failed(error) => return Err(error),
                 MintedBeside::Nothing | MintedBeside::Volume(_) => {
                     let id = BuildVolumeId::mint();
-                    let claim = create_first_volume(host, layout, &id, capacity, &registration)
+                    let (_, claim) = host
+                        .create_build_volume(layout, &id, capacity, &registration)
                         .map_err(storage_error)?;
                     (id, Some(claim))
                 }
@@ -149,40 +150,6 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         adopted,
         creation,
     }))
-}
-
-/// Create a checkout's first build volume `id` at `capacity`, registered as `registration`,
-/// under an exclusive claim on its hold instead of a shared creation hold
-/// ([`BuildVolumeLayout::claim_new`]): its creator captures the checkout's seed from it under
-/// that same claim and lets it go only then (16_build_volumes.md, "Targets and seeds"). A
-/// creation that fails releases what it registered under the claim, and answers both failures
-/// when that release fails too.
-pub(crate) fn create_first_volume<H: RuntimeStorageHost>(
-    host: &H,
-    layout: &BuildVolumeLayout,
-    id: &BuildVolumeId,
-    capacity: ImageCapacity,
-    registration: &Registration,
-) -> std::result::Result<ReleaseClaim, crate::storage::apfs::ApfsStorageError> {
-    use crate::storage::apfs::ApfsStorageError;
-    let claim = layout
-        .claim_new(id)
-        .map_err(|source| ApfsStorageError::Io {
-            operation: "claim a build volume while it is created",
-            path: layout.hold_path(id),
-            source,
-        })?;
-    match host.create_claimed_build_volume(layout, &claim, capacity, registration) {
-        Ok(_) => Ok(claim),
-        Err(primary) => Err(match host.release_claimed(layout, claim) {
-            Ok(_) => primary,
-            Err(cleanup) => ApfsStorageError::Cleanup {
-                operation: "release a build volume whose creation failed",
-                primary: Box::new(primary),
-                cleanup: Box::new(cleanup),
-            },
-        }),
-    }
 }
 
 /// What adopting a checkout's build-state paths did to the real directories standing where their

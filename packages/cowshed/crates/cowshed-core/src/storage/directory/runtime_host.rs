@@ -48,6 +48,15 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         Err(unsupported("volume labels"))
     }
 
+    fn create_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+        capacity: ImageCapacity,
+        registration: &Registration,
+    ) -> Result<(PathBuf, ReleaseClaim), ApfsStorageError> {
+        DirectoryExecutionHost::create_build_volume(self, layout, id, capacity, registration)
+    }
     fn create_claimed_build_volume(
         &self,
         layout: &BuildVolumeLayout,

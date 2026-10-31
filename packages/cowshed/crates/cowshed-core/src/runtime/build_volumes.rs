@@ -661,9 +661,9 @@ pub(crate) struct OwnedMint<H: RuntimeStorageHost = Host> {
 }
 
 /// A volume minted beside main's image, registered and not yet published, with the exclusive
-/// claim it was created under ([`crate::build_volume::migrate::create_first_volume`]): it keeps
+/// claim it was created under ([`RuntimeStorageHost::create_build_volume`]): it keeps
 /// every release in any process off it, by its exact id, until its release takes it or main's
-/// first touch takes it for main's seed capture ([`Lent::published`]).
+/// first touch takes it for main's seed capture ([`Lent::touch`]).
 pub(crate) struct Minted {
     volume: MintedVolume,
     claim: ReleaseClaim,
@@ -804,34 +804,37 @@ impl<H: RuntimeStorageHost> FirstMint<H> {
 }
 
 impl Lent {
-    /// Run `touch` with what was minted, holding the slot locked throughout.
-    fn hold<T>(&self, touch: impl FnOnce(MintedBeside) -> T) -> T {
+    /// Run `touch`, a first touch, with what was minted, holding the slot locked throughout. When
+    /// it published the minted volume, the adopt's claim on it passes to its answer inside that
+    /// same lock, so a dropped adopt's release never takes the claim in between: the first touch
+    /// captures main's seed under it and then lets it go, as a creation's hold ends once
+    /// published (16_build_volumes.md, "Targets and seeds", "Garbage collection"), and settling
+    /// finds nothing left to decide. The checkout's link keeps the volume from then on.
+    fn touch<R>(
+        &self,
+        touch: impl FnOnce(
+            MintedBeside,
+        )
+            -> Result<std::result::Result<crate::build_volume::migrate::Touched, R>>,
+    ) -> Result<std::result::Result<crate::build_volume::migrate::Touched, R>> {
         match self {
             Self::Nothing => touch(MintedBeside::Nothing),
             Self::Failed(error) => touch(MintedBeside::Failed(error.clone())),
             Self::Volume(slot) => {
-                let held = lock(slot);
-                touch(held.as_ref().map_or(MintedBeside::Nothing, |minted| {
+                let mut held = lock(slot);
+                let beside = held.as_ref().map_or(MintedBeside::Nothing, |minted| {
                     MintedBeside::Volume(minted.volume.clone())
-                }))
+                });
+                let mut touched = touch(beside)?;
+                if let Ok(touched) = &mut touched
+                    && held
+                        .as_ref()
+                        .is_some_and(|minted| minted.volume.id == touched.id)
+                {
+                    touched.creation = held.take().map(|minted| minted.claim);
+                }
+                Ok(touched)
             }
-        }
-    }
-
-    /// Main's first touch published `id`. When that is the minted volume, the adopt's claim on it
-    /// passes here to the first touch, which captures main's seed under it and then lets it go,
-    /// as a creation's hold ends once published (16_build_volumes.md, "Targets and seeds",
-    /// "Garbage collection"); settling then finds nothing left to decide. The checkout's link
-    /// keeps it from then on.
-    fn published(&self, id: &BuildVolumeId) -> Option<ReleaseClaim> {
-        let Self::Volume(slot) = self else {
-            return None;
-        };
-        let mut held = lock(slot);
-        if held.as_ref().is_some_and(|minted| &minted.volume.id == id) {
-            held.take().map(|minted| minted.claim)
-        } else {
-            None
         }
     }
 }
@@ -937,7 +940,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// work a refusal would discard (build-state discovery: a shell activation and its Cargo
     /// queries). `Ok(None)` when the checkout links none. The shared hold a job takes is tried
     /// and let go at once: an exclusive claim (a release, a seed capture, a reseed, a cache
-    /// clear) refuses with the refusal admission itself gives at the supervisor, so the exec
+    /// clear, a first volume's creation) refuses with the refusal admission itself gives at the
+    /// supervisor, so the exec
     /// is answered in milliseconds instead of after the discovery it would have thrown away.
     /// A claim taken after this probe still refuses at admission, unchanged.
     pub fn probe_admissible(
@@ -1014,7 +1018,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                         ..
                     },
                 ) => {
-                    let touched = lent.hold(|beside| {
+                    let touched = lent.touch(|beside| {
                         crate::build_volume::migrate::first_touch(
                             host,
                             layout,
@@ -1042,17 +1046,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     let crate::build_volume::migrate::Touched {
                         id,
                         adopted,
-                        creation: own,
+                        creation,
                     } = match touched {
                         Ok(touched) => touched,
                         Err(refusal) => return Ok(Err(refusal)),
                     };
                     // The claim the volume was created under, the first touch's own or the
-                    // adopt's: the seed is captured under it, never under a second claim taken
-                    // once it is let go, which a transient kernel copy of its descriptor refuses
-                    // (16_build_volumes.md, "Targets and seeds").
-                    let adopts = lent.published(&id);
-                    let creation = own.or(adopts);
+                    // adopt's ([`Lent::touch`]): the seed is captured under it, never under a
+                    // second claim taken once it is let go, which a transient kernel copy of its
+                    // descriptor refuses (16_build_volumes.md, "Targets and seeds").
                     if layout.seed_of(&owner.name, &owner.incarnation)?.is_none() {
                         let state = BuildVolumeState::read(&layout.mount(&id))?;
                         if state.mbx.is_some() {
@@ -1181,22 +1183,22 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                         // registered by the adopt's intent and claimed by its exact id, by the
                         // slot, until its release or main's first touch takes the claim: never by
                         // main's name.
-                        let claim = crate::build_volume::migrate::create_first_volume(
-                            host,
-                            layout,
-                            &id,
-                            capacity,
-                            &Registration::new(
-                                BuildVolumeRecord::new(
-                                    None,
-                                    BuildVolumeRole::Linked {
-                                        checkout: WorkspaceName::main(),
-                                    },
+                        let (_, claim) = host
+                            .create_build_volume(
+                                layout,
+                                &id,
+                                capacity,
+                                &Registration::new(
+                                    BuildVolumeRecord::new(
+                                        None,
+                                        BuildVolumeRole::Linked {
+                                            checkout: WorkspaceName::main(),
+                                        },
+                                    ),
+                                    Registrant::Intent,
                                 ),
-                                Registrant::Intent,
-                            ),
-                        )
-                        .map_err(storage)?;
+                            )
+                            .map_err(storage)?;
                         Ok(Minted {
                             volume: MintedVolume { id, capacity },
                             claim,
@@ -5415,18 +5417,16 @@ mod tests {
             }
         }
 
-        /// `name`'s checkout, linked to a new live volume registered as its own before its image
-        /// exists and published once it is minted.
+        /// `name`'s checkout, linked to a new live volume that the scenario's mint registers as its
+        /// own before its image exists, published once it is minted.
         fn linked_checkout(&self, name: &str, gib: u64) -> (PathBuf, BuildVolumeId, PathBuf) {
             let checkout = self.root.path().join(name);
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
             let id = BuildVolumeId::mint();
             let registration = registered(BuildVolumeRecord::new(None, linked(name)));
-            let creating = self.layout.register(&id, &registration).unwrap();
             let mount = (self.mint)(&self.host, &self.layout, &id, gib, &registration);
             BuildVolumeState::default().write(&mount).unwrap();
             self.layout.publish(&id, &registration).unwrap();
-            drop(creating);
             link::point(&checkout, &mount).unwrap();
             (checkout, id, mount)
         }
@@ -8747,6 +8747,45 @@ fn main() {
                 .unwrap()
                 .is_some(),
             "main is seeded from its first volume"
+        );
+        scratch.release_all();
+    }
+
+    /// A volume minted beside main's image that main's first touch does not link is released under
+    /// the claim it was created under, though a spawn's child copied that claim's descriptor
+    /// (cowshed-os `fork_lock`): a release that let the creation go and claimed the volume anew
+    /// found it held through the copy, and the volume stayed.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_main_releases_its_unlinked_first_volume_though_a_spawn_copied_its_creation_descriptor()
+     {
+        let scratch = Scratch::directory("build-minted-copied-unlinked");
+        let checkout = tracked_checkout(scratch.root.path(), "main", AT_THE_CAP, &["package.json"]);
+        let first = scratch
+            .volumes
+            .mint_first(checkout.clone(), checkout.clone())
+            .await;
+        let unused = minted(&first);
+        let copied = cowshed_os::fork_lock::in_flight::InFlight::unlocked();
+        let refresh = scratch
+            .volumes
+            .refresh(
+                owner("main", '0'),
+                checkout.clone(),
+                discovered(Vec::new()),
+                first.lend(),
+            )
+            .await;
+        first.settle().await;
+        copied.finish();
+        assert_eq!(
+            refresh.unwrap().unwrap().volume,
+            None,
+            "nothing to hold links nothing"
+        );
+        assert!(
+            !scratch.layout.image(&unused.id).exists(),
+            "released under the claim it was created under"
         );
         scratch.release_all();
     }

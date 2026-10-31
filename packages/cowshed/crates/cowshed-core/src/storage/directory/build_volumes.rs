@@ -319,20 +319,25 @@ impl DirectoryExecutionHost {
         }
     }
 
-    /// Mint the empty build volume `id` and mount it, its owner record registered first and left
-    /// registered, held by the answered hold, until the caller publishes it. A directory has no
-    /// capacity; `capacity` bounds nothing here, the store's filesystem does.
+    /// Mint the empty build volume `id` and mount it, its owner record registered first under the
+    /// answered exclusive claim ([`BuildVolumeLayout::register_claiming`]) and left registered
+    /// until the caller publishes it; the caller keeps the claim through the seed it captures from
+    /// the volume (16_build_volumes.md, "Targets and seeds"). A mint that fails releases what it
+    /// registered under that claim. A directory has no capacity; `capacity` bounds nothing here,
+    /// the store's filesystem does.
     pub fn create_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
         _capacity: ImageCapacity,
         registration: &Registration,
-    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError> {
+    ) -> Result<(PathBuf, ReleaseClaim), ApfsStorageError> {
         let image = layout.image(id);
         self.require_store_image(&image)?;
         super::ensure_parent(&image)?;
-        let creating = layout.register(id, registration).map_err(host_error)?;
+        let creating = layout
+            .register_claiming(id, registration)
+            .map_err(host_error)?;
         let made = (|| {
             fs::create_dir(&image)
                 .map_err(|error| io_error("create build volume payload", &image, error))?;
@@ -343,7 +348,16 @@ impl DirectoryExecutionHost {
         })();
         match made {
             Ok(mount) => Ok((mount, creating)),
-            Err(error) => Err(self.unregister(layout, id, creating, error)),
+            Err(primary) => Err(
+                match crate::storage::apfs::combine_cleanup::<std::convert::Infallible>(
+                    "release a build volume whose creation failed",
+                    primary,
+                    self.release_claimed(layout, creating).map(drop),
+                ) {
+                    Err(error) => error,
+                    Ok(never) => match never {},
+                },
+            ),
         }
     }
 
