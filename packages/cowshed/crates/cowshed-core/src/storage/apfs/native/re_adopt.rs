@@ -422,7 +422,7 @@ where
     /// image"): its recorded owner record registered under the recorded id before an empty RAW
     /// volume is minted there at the recorded capacity, mounted where main's build link points,
     /// and published, then one seed of it for the replacement incarnation, filtered under mbx and
-    /// otherwise captured under `seed`'s claim. Converges from an attempt interrupted after registration, whether or not
+    /// otherwise captured under `seed`'s claim, or, for a volume minted here, under the claim it was created under. Converges from an attempt interrupted after registration, whether or not
     /// the image was minted. An image without an owner record, an image holding another record,
     /// or another record that names no image refuses: nothing is published over any of them.
     fn publish_empty_build(
@@ -451,7 +451,7 @@ where
                     ImageCapacity::from_bytes(build.capacity_bytes),
                     &registration,
                 )
-                .map(drop),
+                .map(|_| None),
             None => self
                 .create_build_volume(
                     layout,
@@ -459,13 +459,14 @@ where
                     ImageCapacity::from_bytes(build.capacity_bytes),
                     &registration,
                 )
-                .map(drop),
+                .map(|(_, creating)| Some(creating)),
         };
-        match (exists(&image)?, recorded) {
+        let created = match (exists(&image)?, recorded) {
             (false, None) => create()?,
             (false, Some(found)) if found == *registration.registered() => create()?,
             (true, Some(found)) if ours(&found) => {
                 self.mount_build_volume(layout, &build.id)?;
+                None
             }
             (true, None) => {
                 return Err(ApfsStorageError::InvalidPlan(
@@ -482,8 +483,11 @@ where
                     "main's build volume record names a missing image; refusing to publish over it",
                 ));
             }
-        }
+        };
         layout.publish(&build.id, &registration).map_err(host)?;
+        // A volume minted here is seeded under the claim it was created under, never under a
+        // second one taken once that is let go (16_build_volumes.md, "Targets and seeds").
+        let seed = created.as_ref().map_or(seed, SeedSource::Claimed);
         self.seed_replacement(layout, source, seed, &build.record, mbx, retention)
     }
 

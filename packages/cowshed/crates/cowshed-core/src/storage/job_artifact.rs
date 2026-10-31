@@ -48,11 +48,12 @@ mod publication;
 use crate::storage::verify_no_symlinks;
 
 /// How durable a job's own state is before the job is admitted, backgrounded or answered as
-/// ended: one `fsync(2)` per record batch, per spilled stream and per published copy, and no sync
-/// of the directory entries they add. Power loss ends every job anyway, and a job whose record it
-/// took is sealed lost at the next supervisor start (11_shell.md "Job control"). Every
-/// lifecycle record stays at [`Durability::PowerLoss`].
-const JOB_RECORD_DURABILITY: Durability = Durability::Device;
+/// ended: written, so in the page cache, which survives the death of the process that wrote it;
+/// no record batch, spilled stream or published copy is synced. A host crash ends every job
+/// anyway, and a job whose record it took is sealed lost at the next supervisor start
+/// (11_shell.md, "Durability of a job's own records"). Every lifecycle record stays at
+/// [`Durability::PowerLoss`].
+const JOB_RECORD_DURABILITY: Durability = Durability::Process;
 
 const RECORD_MAGIC: &[u8; 8] = b"CSARROW1";
 const BATCH_MAGIC: &[u8; 8] = b"CSBATCH1";
@@ -960,7 +961,7 @@ fn validate_protected_path(
     stream: StreamKind,
     info: &StreamInfo,
 ) -> Result<(), ArtifactError> {
-    if let ProtectedOutput::File { path } = info.storage.artifact() {
+    if let Some(ProtectedOutput::File { path }) = info.storage.artifact() {
         let expected = protected_stream_path(job_id, stream);
         if path.as_path() != Path::new(&expected) {
             return Err(ArtifactError::Integrity {
@@ -1088,6 +1089,13 @@ impl SealedStream {
         let (source, artifact) = match storage {
             OutputStorage::Captured { artifact } => (None, artifact),
             OutputStorage::Redirect { source, artifact } => (Some(source), artifact),
+            // Only a caller-owned job's streams are kept nowhere, and it has no record.
+            OutputStorage::Streamed => {
+                return Err(ArtifactError::Integrity {
+                    offset: 0,
+                    message: "a recorded stream names no artifact".into(),
+                });
+            }
         };
         let storage = match artifact {
             ProtectedOutput::Inline { data } => SealedStorage::Inline(data),
@@ -1631,10 +1639,12 @@ impl ArtifactStore {
         mut targets: OutputTargets,
     ) -> Result<JobArtifactToken, ArtifactError> {
         command.validate()?;
-        if job_id.get() != self.next_job_id {
+        // Ids only rise. A caller-owned job (11_shell.md, "Caller-owned jobs") takes one the
+        // store never records, so a recorded job may skip past it; none may go back.
+        if job_id.get() < self.next_job_id {
             return Err(ArtifactError::TokenConflict {
                 job_id,
-                message: "job id is not the next expected artifact id",
+                message: "job id is behind the next expected artifact id",
             });
         }
         if self.live_jobs.contains_key(&job_id) || self.committed_jobs.contains_key(&job_id) {
@@ -1643,8 +1653,8 @@ impl ArtifactStore {
                 message: "job id already has artifact state",
             });
         }
-        let following_job_id = self
-            .next_job_id
+        let following_job_id = job_id
+            .get()
             .checked_add(1)
             .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
         secure_redirect_target(&self.workspace_root, &mut targets.stdout)?;
@@ -1682,11 +1692,7 @@ impl ArtifactStore {
                 scheduling,
                 stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
                 stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
-                quota: QuotaLedger {
-                    accepted: 0,
-                    limit: self.config.combined_output_quota_bytes,
-                    crossing: None,
-                },
+                quota: QuotaLedger::new(self.config.combined_output_quota_bytes),
                 failed: false,
             },
         );
@@ -1852,6 +1858,13 @@ fn orphan_stream(
     let source = match &admitted.storage {
         OutputStorage::Captured { .. } => None,
         OutputStorage::Redirect { source, .. } => Some(source.clone()),
+        // Only a caller-owned job's streams are kept nowhere, and it has no record.
+        OutputStorage::Streamed => {
+            return Err(ArtifactError::Integrity {
+                offset: 0,
+                message: "a recorded stream names no artifact".into(),
+            });
+        }
     };
     Ok(SealedStream {
         storage,
@@ -1924,14 +1937,33 @@ fn secure_redirect_target(
     Ok(())
 }
 
+/// One job's combined output quota across both streams: what it accepted, its limit, and the
+/// total the write that crossed it would have made. The store keeps one per recorded job; the
+/// supervisor keeps one per caller-owned job (11_shell.md, "Caller-owned jobs").
 #[derive(Debug)]
-struct QuotaLedger {
+pub(crate) struct QuotaLedger {
     accepted: u64,
     limit: u64,
     crossing: Option<u64>,
 }
 
 impl QuotaLedger {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            accepted: 0,
+            limit,
+            crossing: None,
+        }
+    }
+
+    /// Accept what fits of `requested` more bytes: how many did. Once a write crosses the
+    /// limit, nothing more is accepted and [`Self::output_limit`] says so.
+    pub(crate) fn admit(&mut self, requested: usize) -> usize {
+        let admission = self.preview(requested);
+        self.commit(admission);
+        admission.accepted
+    }
+
     fn preview(&self, requested: usize) -> QuotaAdmission {
         if let Some(crossing) = self.crossing {
             return QuotaAdmission {
@@ -1961,7 +1993,7 @@ impl QuotaLedger {
         self.crossing = admission.crossing;
     }
 
-    fn output_limit(&self) -> Option<OutputLimitInfo> {
+    pub(crate) fn output_limit(&self) -> Option<OutputLimitInfo> {
         self.crossing.map(|crossing_bytes| OutputLimitInfo {
             limit_bytes: self.limit,
             crossing_bytes,
@@ -3059,10 +3091,11 @@ fn allocate_record_sequence(lock: &RecordsLock<'_>) -> Result<u64, ArtifactError
         "record sequence allocation exhausted",
     ))?;
     // Publish before appending: a crash may leave a gap, but can never hand the allocation out
-    // twice. Both writes remain under the same cross-process lock. The counter is not synced of
-    // its own: the record's one sync follows it, the rename cannot tear, and a counter that power
-    // loss rolled back behind the log is advanced to the log's highest sequence at the next open
-    // (`ensure_record_sequence_counter`), before anything allocates.
+    // twice. Both writes remain under the same cross-process lock. The counter is not synced, as
+    // the record is not (11_shell.md, "Durability of a job's own records"): the rename cannot
+    // tear, and a counter that a host crash rolled back behind the log is advanced to the log's
+    // highest sequence at the next open (`ensure_record_sequence_counter`), before anything
+    // allocates.
     publish_record_sequence_counter(lock, next, Durability::Process)?;
     Ok(next)
 }
@@ -3196,13 +3229,6 @@ fn verify_private_file_mode(
     Ok(())
 }
 
-fn sync_parent_directory(path: &Path) -> Result<(), ArtifactError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| integrity(0, "protected path has no parent"))?;
-    sync_directory(parent)
-}
-
 fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
     cowshed_os::fsio::sync_directory(path).map_err(|error| io_error(path, error))
 }
@@ -3315,7 +3341,12 @@ fn append_framed_batch_under_lock(
     }
     let mut file = options.open(path).map_err(|error| io_error(path, error))?;
     if !existing {
-        sync_parent_directory(path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| integrity(0, "protected path has no parent"))?;
+        durability
+            .sync_new_entry(parent)
+            .map_err(|error| io_error(parent, error))?;
     }
     let metadata = file.metadata().map_err(|error| io_error(path, error))?;
     reject_hardlink(path, &metadata)?;
@@ -4123,7 +4154,7 @@ struct FlatStorage<'a> {
     protected: Option<&'a str>,
 }
 
-fn flatten_storage(storage: &OutputStorage) -> FlatStorage<'_> {
+fn flatten_storage(storage: &OutputStorage) -> Result<FlatStorage<'_>, ArtifactError> {
     let (kind, source, artifact) = match storage {
         OutputStorage::Captured { artifact } => ("captured", None, artifact),
         OutputStorage::Redirect { source, artifact } => (
@@ -4136,8 +4167,15 @@ fn flatten_storage(storage: &OutputStorage) -> FlatStorage<'_> {
             ),
             artifact,
         ),
+        // A record is never written for a caller-owned job, whose streams alone are kept nowhere.
+        OutputStorage::Streamed => {
+            return Err(ArtifactError::Integrity {
+                offset: 0,
+                message: "a recorded stream names no artifact".into(),
+            });
+        }
     };
-    match artifact {
+    Ok(match artifact {
         ProtectedOutput::Inline { data } => FlatStorage {
             kind,
             source,
@@ -4154,7 +4192,7 @@ fn flatten_storage(storage: &OutputStorage) -> FlatStorage<'_> {
                     .expect("WorkspacePath is always UTF-8"),
             ),
         },
-    }
+    })
 }
 
 #[cfg(unix)]
@@ -4205,8 +4243,8 @@ fn command_argv_array(command: &ExecCommand) -> Result<ListArray, ArtifactError>
 }
 
 fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, ArtifactError> {
-    let stdout = flatten_storage(&record.stdout.storage);
-    let stderr = flatten_storage(&record.stderr.storage);
+    let stdout = flatten_storage(&record.stdout.storage)?;
+    let stderr = flatten_storage(&record.stderr.storage)?;
     let (exit_code, exit_signal, exit_core_dumped) = exit_columns(record.exit.as_ref());
     let resources = record.resources.as_ref();
     let (source, cpu, io, charged, reconciliation) =
@@ -9106,7 +9144,8 @@ mod tests {
         let correct: &[u8] = b"sealed spill bytes";
         store.append(&token, StreamKind::Stdout, correct).unwrap();
         let terminal = store.finish(token, JobState::Exited).unwrap();
-        let ProtectedOutput::File { path: spill_path } = terminal.record.stdout.storage.artifact()
+        let Some(ProtectedOutput::File { path: spill_path }) =
+            terminal.record.stdout.storage.artifact()
         else {
             panic!("bytes beyond the inline cap are promoted to a protected file");
         };
@@ -9847,14 +9886,15 @@ mod tests {
     }
 
     /// Every background or auto-backgrounded exec makes both captured streams durable, and every
-    /// `--stdout-copy` publishes a copy; both are the job's own state, so each pays `fsync(2)`
-    /// like its records and never a full-device flush (11_shell.md "Job control").
+    /// `--stdout-copy` publishes a copy; both are the job's own state, so like its records each is
+    /// left to the page cache and never synced (11_shell.md, "Durability of a job's own records").
     #[test]
-    fn backgrounding_and_publishing_a_job_pay_no_full_device_flush() {
+    fn backgrounding_and_publishing_a_job_sync_nothing() {
         let root = temp_root("job-durability");
         fs::create_dir(root.join("published")).unwrap();
         let mut store = store_at(&root, ArtifactConfig::default());
         let job_id = JobId::new(1).unwrap();
+        cowshed_os::fsio::take_syncs();
         let token = store
             .begin_job(
                 job_id,
@@ -9865,13 +9905,18 @@ mod tests {
                 OutputTargets::default(),
             )
             .unwrap();
+        assert_eq!(
+            cowshed_os::fsio::take_syncs(),
+            cowshed_os::fsio::Syncs::default(),
+            "the first record of a store syncs nothing, its directory entry included"
+        );
         store.append(&token, StreamKind::Stdout, b"built").unwrap();
         cowshed_os::fsio::take_syncs();
         store.prepare_background(&token).unwrap();
         assert_eq!(
             cowshed_os::fsio::take_syncs(),
-            cowshed_os::fsio::Syncs { fsync: 2, full: 0 },
-            "backgrounding syncs stdout and stderr"
+            cowshed_os::fsio::Syncs::default(),
+            "backgrounding syncs neither stdout nor stderr"
         );
 
         store.finish(token, JobState::Exited).unwrap();
@@ -9885,8 +9930,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             cowshed_os::fsio::take_syncs(),
-            cowshed_os::fsio::Syncs { fsync: 1, full: 0 },
-            "publication syncs its copy and not the directory it lands in"
+            cowshed_os::fsio::Syncs::default(),
+            "publication syncs neither its copy nor the directory it lands in"
         );
         assert_eq!(
             fs::read(root.join("published/stdout.txt")).unwrap(),

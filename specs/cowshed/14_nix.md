@@ -77,27 +77,32 @@ Cowshed's package pins mbx by git revision as a flake input; `cowshed setup` ins
 cowshed binary, and cowshed invokes it through that link for its own reads and for external-work reservations
 (05_gateway.md, "Host scheduling"), never by a PATH lookup: a launchd agent's PATH is whatever shell set it up, and on
 this host it led with a project's devenv profile, whose `mbx` is exactly the arbitrary one 05_gateway.md says selects
-nothing. The pin is mbx v1.28.0 plus changes that are not upstream yet: one front-codes C and C++ predictions so a large
-C++ build's task manifest is written, one admits queued work whenever the pool has free capacity, a nested reservation's
-included, so no request waits behind another while capacity is idle, one says each hold on the pool on a descriptor the
-caller names (`mbx reserve --grant-fd N`, and `MBX_GRANT_FD` for every admission of a tree), so a runner's clocks run
-only while its work holds the pool (05_gateway.md, "Parallelism inside a job"), one accepts the caller's
-`MBX_SESSION_ROOT` so session sockets can use the workspace's existing short runtime path instead of its long `TMPDIR`,
-one skips every mbx Cargo shim when resolving the real Cargo, so an older project shim cannot loop with the installed
-route, and one maps the selected compiler's physical default sysroot into portable keys, so naming a Nix toolchain
-directly does not prevent action storage and restoration. Distinct installations remain distinct, and arbitrary sysroot
-overrides gain no mapping. Reservation and compiler-admission waits block on kqueue/inotify with domain-qualified,
-rate-limited shared rescue scans for crash recovery instead of per-waiter polling. The short session root is the
-canonical environment's (11_shell.md, "Canonical mbx environment"), not a new namespace or sandbox grant (04_sandbox.md,
-"Fixture roots under /tmp"; 08_testing.md, "Fixtures"; 01c_macos.md, "sun_path is 104 bytes"). Further changes key a Nix
-cc-wrapper's environment flags through the same model as argv and its store path, key inputs in the Nix store by their
-store path, cache compilations that use a Clang precompiled header (every one a chain loads keyed by its bytes), model
-more compiler and rustc flags as written, identify a macOS SDK from its own files while refusing host links a Nix
-wrapper shapes, record why a compiled result was not stored, and share build-script output under `mbx exec`. It is
-`smoothbricks/mr-boxington` at rev `f3d7ba273e3219d4f71d044f58777ccb9741c9c5`. No project needs to pin it: the host's
-mbx serves every Cargo project, which reaches it through the Cargo shim that `cowshed setup` generates from it, below
-(the capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store
-path or a host path where a command is spawned; its store path is only what the link resolves to.
+nothing. The pin is mbx v1.29.0 plus changes that are not upstream yet: one front-codes C and C++ predictions so a large
+C++ build's task manifest is written, one admits by one pool rule, normal priority first and a request that has waited
+30 s before younger ones of its priority, starting an `mbx reserve` on as many of its `--cpus` as are free and telling
+its command that count as `MBX_RESERVE_CPUS`, so no request waits behind another while cores it could start on are idle,
+one says each hold on the pool on a descriptor the caller names (`mbx reserve --grant-fd N`, and `MBX_GRANT_FD` for
+every admission of a tree), so a runner's clocks run only while its work holds the pool (05_gateway.md, "Parallelism
+inside a job"), one accepts the caller's `MBX_SESSION_ROOT` so session sockets can use the workspace's existing short
+runtime path instead of its long `TMPDIR`, one skips every mbx Cargo shim when resolving the real Cargo, so an older
+project shim cannot loop with the installed route, and one maps the selected compiler's physical default sysroot into
+portable keys, so naming a Nix toolchain directly does not prevent action storage and restoration. Distinct
+installations remain distinct, and arbitrary sysroot overrides gain no mapping. Reservation and compiler-admission waits
+block on kqueue/inotify with domain-qualified, rate-limited shared rescue scans for crash recovery instead of per-waiter
+polling. The short session root is the canonical environment's (11_shell.md, "Canonical mbx environment"), not a new
+namespace or sandbox grant (04_sandbox.md, "Fixture roots under /tmp"; 08_testing.md, "Fixtures"; 01c_macos.md,
+"sun_path is 104 bytes"). Further changes key a Nix cc-wrapper's environment flags through the same model as argv and
+its store path, key inputs in the Nix store by their store path, cache compilations that use a Clang precompiled header
+(every one a chain loads keyed by its bytes), model more compiler and rustc flags as written, identify a macOS SDK from
+its own files while refusing host links a Nix wrapper shapes, record why a compiled result was not stored, and share
+build-script output under `mbx exec`. The latest count a crate's edit against the commit HEAD it last compiled under
+(16_build_volumes.md, "One Cargo environment on every path"), refresh the store's recency only for hits a build exposed,
+predict build scripts per target, map a nested Cargo's own target, and seed a managed target from one donor checkout
+only, so no target mixes two lineages of one crate. It is `smoothbricks/mr-boxington` at rev
+`5b9b0f86a0ab481d9ad5b85e586f4ba6872f74fb`. No project needs to pin it: the host's mbx serves every Cargo project, which
+reaches it through the Cargo shim that `cowshed setup` generates from it, below (the capability is 15_capabilities.md's,
+its route 11_shell.md's). The installed mbx is never spelled as a Nix store path or a host path where a command is
+spawned; its store path is only what the link resolves to.
 
 Managed-target seeding installs a profile's build-script shim pins before publishing a copied unit and rejects damaged
 donors, so cancellation cannot leave a fresh launcher without its executable. For unmeasured Cargo test binaries, the

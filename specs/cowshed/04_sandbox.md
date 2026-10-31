@@ -898,8 +898,9 @@ These anchors are trust configuration, not secrets, so they are exported/written
    served revision follows [11_shell.md, Grant-change propagation](11_shell.md#grant-change-propagation) before
    admitting the exec.
 3. Allocate the next workspace-local monotonic numeric job ID, append a complete `JobArtifactRecord` admission batch,
-   and record the audit `ControllerCommitment::Admission(AdmissionCommitment)` before process creation. Only the trusted
-   supervisor opens the protected record stream; the audit record is telemetry and gates nothing.
+   and record the audit `ControllerCommitment::Admission(AdmissionCommitment)` before process creation; a caller-owned
+   job writes neither (11_shell.md, "Caller-owned jobs"). Only the trusted supervisor opens the protected record stream;
+   the audit record is telemetry and gates nothing.
 4. Compile the child profile before starting shell activation. Every `sandbox-exec` launch reads its profile from a
    file, `sandbox-exec -f <store>/run/profiles/<sha256>.sb`, never from an argument: a profile passes the 128 KiB a
    command argument may hold, and a job's process observation reads the launch argv back. The profile text is a pure
@@ -1136,13 +1137,19 @@ the `nx` leaf of `<mount>/.cowshed/run`, inside the checkout's tree, which jobs 
 `/tmp/cs-<digest>/nx`, below the workspace's read-write runtime link. A host shell of a cowshed checkout names the same
 leaf by the same literal path: every supervisor start writes that link into the checkout's `.cowshed/env` as
 `COWSHED_RUNTIME_LINK`, and the managed devenv's `NX_SOCKET_DIR` reads it from there, never re-deriving it, and takes
-the workspace's own short link, creating it when no job has yet. Any other path fails, for three reasons. The checkout
-path is too long for Nx's plugin-worker sockets, and Nx refuses a symlinked leaf. The daemon adopts each connecting
-client's environment, so its plugin workers bind under the client's `NX_SOCKET_DIR`. And the profile admits Unix sockets
-by literal path, so a sandboxed daemon's worker that reaches the leaf through any other link is refused (`EPERM`) and
-its plugin fails to load. Main's jobs therefore connect to main's host daemon while it runs and otherwise run without
-one, never starting their own or overwriting its record, and a host client in a workspace uses the workspace's sandboxed
-daemon without breaking its plugin workers.
+the workspace's own short link, creating it when no job has yet. Cowshed places that link by renaming a new link over
+its path, never unlinking first, so no client resolving it finds the path absent: a reconnecting Nx client's `mkdir -p`
+of its socket dir in that window made a checkout's link path a real directory on 2026-10-31, and every shell of the
+checkout was refused after it. A real directory found there is moved aside, removed and said on stderr, and the link
+takes its place. Taking a link sweeps only the `cs-*` links whose workspace is gone, its mount or exec temp dir
+`ENOENT`: never one whose runtime dir alone is missing, as while its volume remounts with its mountpoint present, nor
+one the sweeping process cannot inspect. Any other path fails, for three reasons. The checkout path is too long for Nx's
+plugin-worker sockets, and Nx refuses a symlinked leaf. The daemon adopts each connecting client's environment, so its
+plugin workers bind under the client's `NX_SOCKET_DIR`. And the profile admits Unix sockets by literal path, so a
+sandboxed daemon's worker that reaches the leaf through any other link is refused (`EPERM`) and its plugin fails to
+load. Main's jobs therefore connect to main's host daemon while it runs and otherwise run without one, never starting
+their own or overwriting its record, and a host client in a workspace uses the workspace's sandboxed daemon without
+breaking its plugin workers.
 
 A workspace's daemon executes the project-graph plugins of the workspace's checkout, which is unsigned code that runs
 only inside the sandbox, and stock Nx 23.2.1 has no setting that makes a client connect to a live daemon without ever

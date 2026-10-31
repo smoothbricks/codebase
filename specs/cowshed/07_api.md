@@ -202,6 +202,7 @@ pub struct ExecRequest {
     pub want: Option<NonZeroUsize>,       // the job's jobserver count, min(want, cores); None: cores
                                           // (05_gateway.md "Parallelism inside a job")
     pub scope: ExecScope,                 // Workspace default; HostGate: coordinator route only, any class
+    pub record: JobRecord,                // Cowshed default; Caller: no disk records (11_shell.md "Caller-owned jobs")
 }
 
 /// The exec's own class: one row of 05_gateway.md "Classes" (nice, Linux class cgroup, memory-pressure
@@ -297,6 +298,7 @@ pub enum OutputStorage {
         source: WorkspacePath,           // mutable live shell destination; never authority
         artifact: ProtectedOutput,       // independent sealed canonical bytes
     },
+    Streamed,                            // a caller-owned job's (11_shell.md "Caller-owned jobs"): served, kept nowhere
 }
 
 pub struct StreamInfo {
@@ -418,9 +420,9 @@ impl JobHandle {
     // Without follow, drain the currently written bytes and end even while the job lives.
     // Follow waits on supervisor output notifications past that end, until the job is terminal.
     pub async fn logs(&self, stream: JobStream, offset: u64, follow: bool)
-        -> Result<RawByteStream, CowshedError>; // representation-transparent; always resolves storage.artifact
+        -> Result<RawByteStream, CowshedError>; // representation-transparent; resolves storage.artifact (a caller-owned job's memory)
     pub async fn attach(&self, cursor: Option<JobJournalCursor>) -> Result<JobAttachment, CowshedError>;
-    pub async fn detach(&self) -> Result<(), CowshedError>;          // job continues; its captured prefixes are durable first
+    pub async fn detach(&self) -> Result<(), CowshedError>;          // job continues; a recorded job's captured prefixes are durable first
     pub async fn wait(&self) -> Result<JobInfo, CowshedError>;
     pub async fn kill(&self) -> Result<(), CowshedError>;            // awaits complete process-tree termination
 }
@@ -828,8 +830,8 @@ required field, a retyped value and an unknown enum variant still refuse by name
 its own and no compatibility shim stands in for the declaration moving.
 
 JSON and N-API use the same camel-case projection. `StreamInfo` is exactly `{storage,bytes,sha256,summary}`. `storage`
-is `{kind:"captured",artifact}` or `{kind:"redirect",source,artifact}`; an artifact is `{kind:"inline",data}` or
-`{kind:"file",path}`. Inline `data` is the bounded wire union
+is `{kind:"captured",artifact}`, `{kind:"redirect",source,artifact}` or, for a caller-owned job, `{kind:"streamed"}`; an
+artifact is `{kind:"inline",data}` or `{kind:"file",path}`. Inline `data` is the bounded wire union
 `{encoding:"utf8",data:"…"} | {encoding:"base64",data:"…"}`; `sha256` is 64 lowercase hex characters. Ordinary `JobInfo`
 JSON may carry this bounded inline data, while controller commitments carry no payload. No path exists for an inline
 artifact, and no adapter adds a synthetic one. `Redirect.source` is mutable caller-visible state; readers and authority
@@ -1808,7 +1810,7 @@ export interface WorkerDescriptor {
 export function connectCoordinator(endpoint: CoordinatorEndpoint, path: string): Promise<Coordinator>;
 export function connectWorkspace(descriptor: WorkerDescriptor): Promise<WorkspaceHandle>;
 
-/** Positive exact integer, local to one workspace and never reused. */
+/** Positive exact integer, local to one workspace and never reused (11_shell.md "Caller-owned jobs" excepted). */
 export type JobId = number;
 export type JobStream = 'stdout' | 'stderr';
 
@@ -2148,8 +2150,9 @@ workspace. No exec request carries a priority.
 
 The API also carries what a one-shot CLI process cannot use, none of which asks the scheduler for anything: script
 commands (`ExecCommand::Script`), open stdin written through the job's attachment, the request `env` and `trace`,
-`admission_key` for idempotent keyed admission, and reattaching to a job by id or key (`WorkspaceHandle::job`,
-`job_by_key`).
+`admission_key` for idempotent keyed admission, reattaching to a job by id or key (`WorkspaceHandle::job`,
+`job_by_key`), and `record: caller` for an executor that keeps each job's record itself (11_shell.md, "Caller-owned
+jobs").
 
 One behaviour is the CLI's alone, on purpose: a foreground `cowshed exec` holds its job (11_shell.md, `hold`), so a
 client killed by its caller's timeout leaves no orphan (05_gateway.md, "A job lives with its requester"). An API job

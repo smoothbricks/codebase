@@ -1,3 +1,4 @@
+import type { Stats } from 'node:fs';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, posix } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
@@ -187,10 +188,11 @@ const validateBunfigDiscovery = typia.createValidate<BunfigDiscovery>();
  * Bun's test discovery for `args` in `cwd`, replayed without running a test: files named `*.test.*`, `*_test.*`,
  * `*.spec.*` or `*_spec.*` with a JavaScript extension, in any letter case, under bunfig's `test.root`, outside
  * `node_modules` and hidden directories. A symlink counts as its target, a directory entered and a file matched, and a
- * link to nothing as a file; the link's own name is the one the name rules see. `--path-ignore-patterns` globs match
- * the cwd-relative path as written and replace bunfig's `pathIgnorePatterns` when given; `--config=` names another
- * bunfig; `.gitignore` plays no part. These are the rules of Bun 1.4: `test-timings.test.ts` compares them with the
- * files `bun test --update-timings` writes for a fixture, so a Bun release that changes them fails there.
+ * link to nothing is skipped; any other link it cannot resolve refuses the replay. The link's own name is the one the
+ * name rules see. `--path-ignore-patterns` globs match the cwd-relative path as written and replace bunfig's
+ * `pathIgnorePatterns` when given; `--config=` names another bunfig; `.gitignore` plays no part. These are the rules
+ * of Bun 1.4.4: `test-timings.test.ts` compares them with the files `bun test --update-timings` writes for a fixture,
+ * so a Bun release that changes them fails there.
  */
 export async function timingsCoverage(
   workspaceRoot: string,
@@ -210,7 +212,12 @@ export async function timingsCoverage(
     cliIgnores.length > 0 ? cliIgnores : typeof bunfigIgnores === 'string' ? [bunfigIgnores] : bunfigIgnores;
   const root = posix.normalize(bunfig.test?.root ?? '.');
   const files: string[] = [];
-  await collectTestFiles(cwd, root === '.' ? '' : root.replace(/\/$/, ''), ignores, files);
+  try {
+    await collectTestFiles(cwd, root === '.' ? '' : root.replace(/\/$/, ''), ignores, files);
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error)) throw error;
+    return { ok: false, error: `cannot replay Bun's discovery under ${posix.join(suite.cwd, root)}: ${error.message}` };
+  }
   files.sort();
   const timed = new Set<string>();
   for (const manifest of manifests) {
@@ -240,7 +247,7 @@ export function timingsSuiteInputs(suite: Pick<TimingsShardedSuite, 'cwd' | 'arg
  * superset of {@link timingsCoverage}'s rules (any extension, the whole tree whatever bunfig's `test.root`, no ignore
  * glob), so every file discovery would find changes the value, and a name discovery skips costs at most a cache miss.
  * Like Bun, it skips `node_modules` and hidden directories, follows symlinks (each directory once, by its real path),
- * takes a link to nothing for a file, and reads no `.gitignore`. It walks with Bun, which every workspace declares.
+ * skips a link to nothing, and reads no `.gitignore`. It walks with Bun, which every workspace declares.
  */
 export function bunTestFileNamesInput(cwd: string): { runtime: string } {
   return runtimeInput(`bun -e ${shellWord(LIST_TEST_FILE_NAMES)} ${shellWord(cwd)}`);
@@ -256,7 +263,7 @@ const LIST_TEST_FILE_NAMES = [
   '    let directory = entry.isDirectory();',
   '    if (entry.isSymbolicLink()) {',
   '      try { directory = statSync(path).isDirectory(); }',
-  '      catch (error) { if (error?.code !== "ENOENT") throw error; }',
+  '      catch (error) { if (error?.code !== "ENOENT") throw error; continue; }',
   '    }',
   '    if (directory) { if (!name.startsWith(".") && name !== "node_modules") walk(path); }',
   '    else if (/[._](test|spec)[.]/.test(name)) names.push(path);',
@@ -286,17 +293,14 @@ async function collectTestFiles(cwd: string, dir: string, ignores: readonly stri
     const path = dir === '' ? entry.name : `${dir}/${entry.name}`;
     // Bun matches every name in lower case, and its ignore globs see the path as written.
     const name = entry.name.toLowerCase();
-    // Bun follows a symlink to what it points at and takes one that points at nothing for a file.
-    const resolved = entry.isSymbolicLink() ? await stat(join(cwd, path)).catch(() => null) : entry;
-    if (resolved?.isDirectory()) {
+    // Bun follows a symlink to what it points at and skips one that points at nothing.
+    const resolved = entry.isSymbolicLink() ? await statUnlessMissing(join(cwd, path)) : entry;
+    if (resolved === null) continue;
+    if (resolved.isDirectory()) {
       if (!name.startsWith('.') && name !== 'node_modules') {
         await collectTestFiles(cwd, path, ignores, files);
       }
-    } else if (
-      (resolved === null || resolved.isFile()) &&
-      TEST_FILE.test(name) &&
-      !ignores.some((glob) => posix.matchesGlob(path, glob))
-    ) {
+    } else if (resolved.isFile() && TEST_FILE.test(name) && !ignores.some((glob) => posix.matchesGlob(path, glob))) {
       files.push(path);
     }
   }
@@ -339,6 +343,16 @@ async function readTimingManifest(
     return { ok: false, error: `not a Bun timing manifest: ${validationErrors(validated.errors)}` };
   }
   return { ok: true, files: validated.data.files };
+}
+
+/** What a symlink at `path` leads to, or null when it leads nowhere; any other failure to resolve it is thrown. */
+async function statUnlessMissing(path: string): Promise<Stats | null> {
+  try {
+    return await stat(path);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 async function readOptionalFile(path: string): Promise<string | null> {

@@ -72,7 +72,7 @@ import {
   ramTempPaths,
 } from './ram-temp.js';
 import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
-import { CPU_TOKENS_ENV, runnerDemand, sizeRunner } from './runner-sizing.js';
+import { CPU_TOKENS_ENV, runnerDemand, sizeRunner, sizeRunnerToGrant } from './runner-sizing.js';
 import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import type { BoundedExecOptions } from './schema.js';
 import { createTestResultWriter, type TestResultWriter } from './test-result-writer.js';
@@ -537,8 +537,8 @@ export async function runBoundedExec(
   // (`run-cpu-pool.ts`), so a task takes its tokens from a parent's pool; a command that inherits none runs exactly as
   // asked and nothing is said.
   const cores = availableParallelism();
-  // A prebuilt nextest leaf under mbx reserves what its runner asks for, all of it for its whole run: its runner's
-  // default is the task's share of the host, never every core (`nxTaskCores`). A declared or named count still wins.
+  // A prebuilt nextest leaf under mbx asks for its task's share of the host (`nxTaskCores`), not every core: it knows
+  // no count of its tests. A declared or named count still wins.
   const mbx = mbxPool(process.env);
   const leafCores =
     mbx !== null && runsPrebuiltNextest(requested) ? nxTaskCores(cores, { ...process.env, ...options.env }) : cores;
@@ -563,16 +563,18 @@ export async function runBoundedExec(
   const waitedMs = Date.now() - asked;
   let cpu: BoundedExecRecord['cpu'];
   let sized: { command: string; env: Record<string, string> } = { command: requested, env: {} };
-  // With mbx the leaf's admission is mbx's one pool, not a parent's tokens: its runner is sized to the job's count,
-  // and a non-Cargo leaf holds that much of the pool for its run (specs/cowshed/05_gateway.md, "Parallelism inside a
-  // job"). No grant and no sub-pool beside it.
-  const leaf = mbx === null ? null : mbxLeaf(mbx, demand.kind, demand.want, requested);
+  // With mbx the leaf's admission is mbx's one pool, not a parent's tokens. A leaf mbx does not admit itself asks for
+  // its runner's count, a maximum, and its runner runs on the cores it is granted, which only the command learns
+  // (specs/cowshed/05_gateway.md, "Parallelism inside a job"). No grant and no sub-pool beside it.
+  const leaf = mbx === null ? null : mbxLeaf(mbx, demand, requested);
   if (grant !== null) {
     sized = sizeRunner(demand, requested, grant.tokens);
     cpu = { tokens: grant.tokens, want: demand.want, waitedMs };
     appendStderr(
       `cowshed: cpu-pool wait done elapsed=${waitedMs}ms status=ok tokens=${grant.tokens}/${demand.want} runner=${demand.kind}\n`,
     );
+  } else if (leaf?.kind === 'reserve') {
+    sized = { command: sizeRunnerToGrant(leaf.demand, requested), env: {} };
   } else if (leaf !== null) {
     sized = sizeRunner(demand, requested, demand.want);
   }
@@ -730,7 +732,7 @@ export async function runBoundedExec(
   // With a supervisor, `cowshed subtree-root` asks it for a handle on itself, writes the answer to the handle
   // descriptor, and execs `/bin/sh -c command` in the same process: the command's pid, group and life are unchanged.
   const unadmitted = hooked?.command ?? (fixture === null ? command : `${fixture.command} && ${command}`);
-  const shellCommand = leaf === null ? unadmitted : withMbxLeaf(unadmitted, leaf);
+  const shellCommand = withMbxLeaf(unadmitted, leaf);
   // Only leaves known to be scheduled can exclude zero-hold time. Others keep lifecycle hang protection.
   const queued = mbxIdleGated(leaf, sized.command, { ...process.env, ...env });
   // fd 4 is unused without a subtree admission, so the grant takes fd 5 either way.
@@ -1276,7 +1278,7 @@ export async function runBoundedExec(
             said = true;
             tell(
               leaf.kind === 'reserve'
-                ? `cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms cpus=${leaf.cpus} priority=${leaf.priority}\n`
+                ? `cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms asked=${leaf.demand.want} priority=${leaf.priority}\n`
                 : `cowshed: mbx cargo granted elapsed=${Date.now() - startedAt}ms\n`,
             );
           }

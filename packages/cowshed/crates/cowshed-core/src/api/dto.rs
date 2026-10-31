@@ -1737,12 +1737,17 @@ pub enum OutputStorage {
         source: WorkspacePath,
         artifact: ProtectedOutput,
     },
+    /// A caller-owned job's stream (11_shell.md, "Caller-owned jobs"): its bytes were served
+    /// and are kept nowhere else.
+    Streamed,
 }
 
 impl OutputStorage {
-    pub fn artifact(&self) -> &ProtectedOutput {
+    /// The protected bytes cowshed sealed for this stream; a streamed one has none.
+    pub fn artifact(&self) -> Option<&ProtectedOutput> {
         match self {
-            Self::Captured { artifact } | Self::Redirect { artifact, .. } => artifact,
+            Self::Captured { artifact } | Self::Redirect { artifact, .. } => Some(artifact),
+            Self::Streamed => None,
         }
     }
 }
@@ -1768,7 +1773,7 @@ impl StreamInfo {
                 "summary text exceeds the bounded DTO limit",
             ));
         }
-        if let ProtectedOutput::Inline { data } = self.storage.artifact() {
+        if let Some(ProtectedOutput::Inline { data }) = self.storage.artifact() {
             if self.bytes != data.as_bytes().len() as u64 {
                 return Err(DtoError::InvalidStreamProjection(
                     "inline byte count does not match data",
@@ -1785,7 +1790,7 @@ impl StreamInfo {
 
     fn validate_for(&self, job_id: JobId, leaf: &str) -> Result<(), DtoError> {
         self.validate()?;
-        if let ProtectedOutput::File { path } = self.storage.artifact() {
+        if let Some(ProtectedOutput::File { path }) = self.storage.artifact() {
             let expected = format!(".cowshed/job/{}/{leaf}", job_id.get());
             if path.as_path() != Path::new(&expected) {
                 return Err(DtoError::InvalidStreamProjection(
@@ -3148,6 +3153,9 @@ pub struct ExecRequest {
     pub want: Option<NonZeroUsize>,
     /// Where the command runs: the workspace sandbox, or a coordinator's host boundary outside it.
     pub scope: ExecScope,
+    /// Who keeps the job's record: cowshed, in the workspace's protected records, or the caller,
+    /// in its own log, with no disk record kept here (11_shell.md, "Caller-owned jobs").
+    pub record: JobRecord,
 }
 
 /// Where an exec's command runs (07_api.md "Exec and grants").
@@ -3161,6 +3169,19 @@ pub enum ExecScope {
     /// at whatever class it names: the land's real-APFS gate, or host unit work at background.
     /// Only the coordinator route admits it; the class alone decides its CPU admission.
     HostGate,
+}
+
+/// Who keeps a job's record (11_shell.md, "Caller-owned jobs"): cowshed, in the workspace's
+/// protected records, or the caller, in its own log, with no disk record kept here.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JobRecord {
+    /// The workspace's protected records keep it, as they keep every CLI exec's.
+    #[default]
+    Cowshed,
+    /// The caller keeps it in its own log: cowshed writes no disk record for the job and serves
+    /// it from its supervisor's memory.
+    Caller,
 }
 
 /// Public environment names permitted in JobAdmission.env records for every exec scope

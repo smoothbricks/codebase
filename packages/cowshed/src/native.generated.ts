@@ -301,6 +301,7 @@ export type CoordinatorExecArguments = Pick<
   | 'class'
   | 'want'
   | 'scope'
+  | 'record'
 >;
 
 /**
@@ -1328,6 +1329,7 @@ export type WorkerExecArguments = Pick<
   | 'class'
   | 'want'
   | 'scope'
+  | 'record'
 >;
 
 /**

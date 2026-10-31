@@ -672,18 +672,21 @@ and whose probe path the root `.nxignore` does not ignore: the native watcher ap
 workspace that ignores every dot path (`.*`, as this repository does) hides `.nx` and `.git`. Where none qualifies (a
 linked `node_modules` under such an `.nxignore`, say), nothing can prove the stream current: the daemon answers the
 first file-state request with the reason, tagged as below, and stops. Every write made before the nx command reached the
-daemon by then. Requests that arrive while a probe is out share the next one. The nx-plugin's producer census records
-`node_modules` membership without the probe (`packages/nx-plugin/README.md`, producer receipts), so a probe during a
-producer run is no tool change. A probe that has not come back after `DAEMON_VALIDITY_SAFETY_INTERVAL_MS` means the
-stream stopped: the daemon replies with an error tagged `daemonStartForbidden` (the client's "continue without this
-daemon in this process" tag), so the command goes on without a daemon at once (the client turns the daemon off for its
-own process, `disableDaemonForThisProcess`, so no later request of the command dials the stopping daemon), then logs
-`watcher stream stopped` and stops. It stops rather than restarts: a successor it spawned would inherit the cause. The
-next client, or the shed's keeper, starts one with a fresh stream. Later requests on the same connection are served as
-Nx always served them, so a write another process makes while a command runs is as visible as it was. Linux inotify has
-no daemon between the kernel and the watcher that can stop serving it, and Nx registers no watch under the hard-coded
-ignores where a probe could live; there the daemon only drains its watcher, as Nx did before serving a graph, and the
-inotify overflow (Rescan) path stays unproven.
+daemon by then. Requests that arrive while a probe is out share the next one. A plugin worker's request, which its
+daemon client tags `fromPluginWorker`, makes no probe: a worker is no command, and its request nests in a daemon
+operation already current, the watcher's own recompute, which must read that recompute's files, or a command whose
+connection made its probe. Each worker connection's probe cost an isolated graph plugin a round trip through the stream
+(56 ms in the regression's fixture). The nx-plugin's producer census records `node_modules` membership without the probe
+(`packages/nx-plugin/README.md`, producer receipts), so a probe during a producer run is no tool change. A probe that
+has not come back after `DAEMON_VALIDITY_SAFETY_INTERVAL_MS` means the stream stopped: the daemon replies with an error
+tagged `daemonStartForbidden` (the client's "continue without this daemon in this process" tag), so the command goes on
+without a daemon at once (the client turns the daemon off for its own process, `disableDaemonForThisProcess`, so no
+later request of the command dials the stopping daemon), then logs `watcher stream stopped` and stops. It stops rather
+than restarts: a successor it spawned would inherit the cause. The next client, or the shed's keeper, starts one with a
+fresh stream. Later requests on the same connection are served as Nx always served them, so a write another process
+makes while a command runs is as visible as it was. Linux inotify has no daemon between the kernel and the watcher that
+can stop serving it, and Nx registers no watch under the hard-coded ignores where a probe could live; there the daemon
+only drains its watcher, as Nx did before serving a graph, and the inotify overflow (Rescan) path stays unproven.
 
 Measured on macOS, a 47-task chain of cache hits: stock 0.51–0.82 s per run; patched 0.79–0.96 s, one probe of 63–103 ms
 per command. A probe before every file-state request cost 51 probes of 65–78 ms, 3.3–3.9 s per run, and was dropped. A
@@ -695,7 +698,8 @@ fixture daemon rebuilds a target whose input was replaced by rename. On macOS a 
 that denies FSEvents (which `sandbox_apply` refuses inside another sandbox) must tell the command
 `watcher stream stopped`, which continues without it, log it, and never call the changed input's target cached; a
 healthy daemon whose `.nxignore` hides every dot path must see its probe come back from a real `node_modules`; and one
-with nowhere to put a probe must answer `cannot be proven current` and never serve a stale verdict.
+with nowhere to put a probe must answer `cannot be proven current` and never serve a stale verdict. An isolated graph
+plugin that asks the daemon for files must leave one probe in the daemon's log, its command's.
 `nx-daemon-watch-filter.test.ts` (an ordinary shard) holds a nested workspace whose `.gitignore` re-includes `keep.txt`
 under its parent repository's `*.txt`: a fresh walk indexes it, and the daemon must rebuild the target whose input it is
 once it changes. Drop these hunks only when the installed upstream watcher reports a stopped stream, retaining the

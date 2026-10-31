@@ -753,23 +753,34 @@ async function updateGithubStatus(name: string, state: 'success' | 'failure' | '
   await postGithubStatus(name, state, `${name} ${suffix}`, step);
 }
 
-async function postGithubStatus(name: string, state: string, description: string, step: string): Promise<void> {
-  const repository = process.env.GITHUB_REPOSITORY;
-  const sha = process.env.GITHUB_SHA;
+export async function postGithubStatus(
+  name: string,
+  state: string,
+  description: string,
+  step: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const repository = environment.GITHUB_REPOSITORY;
+  const sha = environment.GITHUB_SHA;
   if (!repository || !sha) {
     return;
   }
-  if (!githubCommitStatusesWritable(process.env, readGithubActionsEvent(process.env))) {
+  if (!githubCommitStatusesWritable(environment, readGithubActionsEvent(environment))) {
     console.log(`Skipping GitHub commit status ${name}=${state}: fork pull requests receive a read-only GITHUB_TOKEN.`);
     return;
   }
-  const targetUrl = await githubStepUrl(step);
-  await ciApiRequest(`/statuses/${sha}`, 'POST', {
-    state,
-    context: name,
-    description,
-    ...(targetUrl ? { target_url: targetUrl } : {}),
-  });
+  const targetUrl = await githubStepUrl(step, { environment });
+  await ciApiRequest(
+    `/statuses/${sha}`,
+    'POST',
+    {
+      state,
+      context: name,
+      description,
+      ...(targetUrl ? { target_url: targetUrl } : {}),
+    },
+    environment,
+  );
 }
 
 interface GithubWorkflowJob {

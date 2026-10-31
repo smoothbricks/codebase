@@ -20,7 +20,6 @@ import {
   runtimeDependencyFields,
   workspaceDependencyFields,
 } from '../lib/workspace.js';
-import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 import { withPublishManifest } from '../monorepo/publish-manifest.js';
 import { loadNxProjects, type NxProjects, projectTargetsFromNxProjects } from '../nx/index.js';
@@ -71,16 +70,15 @@ function tarballFileName(pkg: Pick<PackageInfo, 'name' | 'version'>): string {
 }
 
 /**
- * Shared artifact pack helper extracted from the publish path: normalize
- * workspace versions, pack with lifecycle scripts disabled, and assert the
- * packed manifest carries exact versions. Returns the temp tarball plus a
- * cleanup the caller runs in a finally. Both `release publish` and
- * `release pack` pack through here; there is no second exporter.
+ * Shared artifact pack helper extracted from the publish path: pin workspace
+ * versions, pack with lifecycle scripts disabled, and assert the packed
+ * manifest carries exact versions. Returns the temp tarball plus a cleanup the
+ * caller runs in a finally. Both `release publish` and `release pack` pack
+ * through here; there is no second exporter.
  *
- * Artifact-only means artifact-only: bun.lock is snapshotted byte-for-byte
- * before the publish-mode sync and restored on every path (success or
- * failure), never "normalized" to install mode, so the source tree and lock
- * are unchanged after packing.
+ * Artifact-only means artifact-only: the package manifest is rewritten for the
+ * pack and restored on every path (withPublishManifest), and nothing here
+ * writes bun.lock, so the source tree and lock are unchanged after packing.
  */
 export async function packReleaseTarball(
   root: string,
@@ -88,23 +86,22 @@ export async function packReleaseTarball(
   options: { publishConfigRegistry?: string } = {},
   nx: ReleasePackNx = WORKSPACE_NX,
 ): Promise<{ tarball: string; cleanup: () => Promise<void> }> {
-  const lockSnapshot = await snapshotBunLockfile(root);
   const tempDir = await mkdtemp(join(tmpdir(), 'smoo-pack-'));
   const tarball = join(tempDir, tarballFileName(pkg));
   const cleanup = async (): Promise<void> => {
     await rm(tempDir, { recursive: true, force: true });
   };
-  // bun pm pack resolves workspace:* from bun.lock. Temporarily rewrite
-  // unpublished -next entries to the last stable tag so the tarball embeds
-  // installable versions, then restore the exact original bytes.
   try {
-    syncBunLockfileVersions(root, { mode: 'publish', log: true });
     await runReleaseCheckGate(root, pkg, nx);
     console.log(`${pkg.name}@${pkg.version}: packing with bun pm pack`);
     await withPublishManifest(
       join(root, pkg.path),
       () => run('bun', ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], join(root, pkg.path)),
-      { log: true, ...(options.publishConfigRegistry ? { publishConfigRegistry: options.publishConfigRegistry } : {}) },
+      {
+        log: true,
+        workspaceRoot: root,
+        ...(options.publishConfigRegistry ? { publishConfigRegistry: options.publishConfigRegistry } : {}),
+      },
     );
     const failures = validatePackedWorkspaceDependencies(
       root,
@@ -119,8 +116,6 @@ export async function packReleaseTarball(
   } catch (error) {
     await cleanup();
     throw error;
-  } finally {
-    await restoreBunLockfile(lockSnapshot);
   }
 }
 /**
@@ -178,26 +173,6 @@ async function runReleaseCheckGate(root: string, pkg: PackageInfo, nx: ReleasePa
     );
   } catch (error) {
     throw new Error(`${pkg.name}@${pkg.version}: release-check gate refused the release`, { cause: error });
-  }
-}
-
-interface BunLockSnapshot {
-  path: string;
-  bytes: Uint8Array;
-}
-
-async function snapshotBunLockfile(root: string): Promise<BunLockSnapshot | null> {
-  const path = join(root, 'bun.lock');
-  try {
-    return { path, bytes: await readFile(path) };
-  } catch {
-    return null;
-  }
-}
-
-async function restoreBunLockfile(snapshot: BunLockSnapshot | null): Promise<void> {
-  if (snapshot) {
-    await writeFile(snapshot.path, snapshot.bytes);
   }
 }
 

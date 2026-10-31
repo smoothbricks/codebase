@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
-import { NEXTEST_EXTRACTION_DIRECTORY } from '@smoothbricks/nextest-extract';
 import { isEslintFileSet } from '@smoothbricks/nx-plugin/eslint-file-set';
 import type {
   CreateNodesContextV2,
@@ -1452,7 +1451,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       // Every frozen cargo command carries the edge: offline cargo fails at
       // resolution, so each one needs the locked graph downloaded before it runs.
-      for (const name of ['cargo-test-archive', 'cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
+      for (const name of ['cargo-test-build', 'cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
         expect(targets[name]?.dependsOn).toContain('cargo-fetch');
       }
       // Retention starts after the tasks that build into the target directory, named by this metadata, and no other.
@@ -1460,8 +1459,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         expect(targets[name]?.metadata).toEqual(CARGO_PRODUCER_METADATA);
       }
       expect(targets['cargo-fetch']?.metadata).toBeUndefined();
-      // The archive compiles the tests, so it is test work as well as a producer, and says so beside the marker.
-      expect(targets['cargo-test-archive']?.metadata).toEqual({ ...CARGO_PRODUCER_METADATA, smooTaskKind: 'test' });
+      // The test build compiles the tests, so it is test work as well as a producer, and says so beside the marker.
+      expect(targets['cargo-test-build']?.metadata).toEqual({ ...CARGO_PRODUCER_METADATA, smooTaskKind: 'test' });
       // Build and test work state their kind and nothing else does: the final graph reads it from here, a crate named
       // `ferris-wasm` included, whose runner ends in a build family.
       expect(
@@ -1471,71 +1470,89 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           ),
         ),
       ).toEqual({
-        'cargo-test-archive': 'test',
+        'cargo-test-build': 'test',
         'cargo-test-ferris-core': 'test',
         'cargo-test-ferris-wasm': 'test',
         'cargo-test': 'test',
         test: 'test',
       });
-      // The archive and the lints hash every crate's sources
+      // The test build and the lints hash every crate's sources
       // AND the outputs of the targets they depend on: generated crate inputs
       // are gitignored, so a repository that had to restate `inputs` to add
       // them replaced the crate union with the root's `default` and shipped a
-      // stale archive to every per-crate test.
-      for (const name of ['cargo-test-archive', 'cargo-lint', CARGO_CROSS_LINT_TARGET]) {
+      // stale test build to every per-crate test.
+      for (const name of ['cargo-test-build', 'cargo-lint', CARGO_CROSS_LINT_TARGET]) {
         const inputs = targets[name]?.inputs ?? [];
         expect(inputs).toContainEqual({ dependentTasksOutputFiles: '**/*', transitive: false });
         expect(inputs).toContain('{workspaceRoot}/packages/ferris/crates/ferris-core/**/*');
       }
-      // The archive is the one test compile; no uncached `--no-run` warm-up compiles the same units again.
+      // The test build is the one test compile; no uncached `--no-run` warm-up compiles the same units again.
       expect(targets['cargo-test-compile']).toBeUndefined();
       expect(targets['cargo-test']?.executor).toBe('nx:noop');
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-test-ferris-wasm']);
-      // One workspace compile, packed once. Every per-crate runner reads that
-      // archive, so the runners fan out instead of chaining: none of them
-      // builds, re-resolves features, or writes cargo's flocked `target/`.
-      expect(targets['cargo-test-archive']?.executor).toBe('nx:run-commands');
-      expect(targets['cargo-test-archive']?.cache).toBe(true);
-      expect(targets['cargo-test-archive']?.outputs).toEqual([
-        '{projectRoot}/.cache/nextest/archive.tar.zst',
-        '{projectRoot}/.cache/nextest/archive.tar.zst.key',
+      // One workspace compile, kept in place. Every per-crate runner executes
+      // the binaries that build left in this checkout's target directory, so
+      // the runners fan out instead of chaining: none of them builds,
+      // re-resolves features, or writes cargo's flocked `target/`, and none
+      // unpacks a copy of the workspace's binaries first.
+      expect(targets['cargo-test-archive']).toBeUndefined();
+      expect(targets['cargo-test-build']?.executor).toBe('nx:run-commands');
+      expect(targets['cargo-test-build']?.cache).toBe(true);
+      // nextest's reuse-build metadata and the build's key are its whole Nx output: values, never the build tree they
+      // describe. The key is the task's hash: a binary's path ignores its source, so only the key says which build.
+      expect(targets['cargo-test-build']?.outputs).toEqual([
+        '{projectRoot}/.cache/nextest/binaries-metadata.json',
+        '{projectRoot}/.cache/nextest/cargo-metadata.json',
+        '{projectRoot}/.cache/nextest/build.key',
       ]);
-      expect(targets['cargo-test-archive']?.options).toMatchObject({ cwd: 'packages/ferris' });
-      // nextest does not create the archive's parent directory and fails the
-      // whole build if it is missing (measured: "error writing to archive").
-      // The directory and the archive are ONE command, in the order the archive needs.
-      expect(targets['cargo-test-archive']?.options?.commands).toBeUndefined();
+      expect(targets['cargo-test-build']?.options).toMatchObject({ cwd: 'packages/ferris' });
+      expect(targets['cargo-test-build']?.options?.commands).toBeUndefined();
       // `--tool-config-file`, never `--config-file`: the plugin's settings must
-      // sit UNDER the repository's `.config/nextest.toml`, which is the only
-      // place an `archive.include` for a cdylib or fixture can be declared.
-      // `$PWD` because tool config paths must be absolute and an absolute path
-      // in the command text would split one cache entry per checkout; through
-      // the root `node_modules` link because the plugin's real location is a
-      // different number of `../` away from each checkout.
-      expect(String(targets['cargo-test-archive']?.options?.command)).toBe(
-        'mkdir -p .cache/nextest && cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst --user-config-file none --tool-config-file "smoo:$PWD/../../node_modules/@smoothbricks/nx-plugin/nextest.toml" && ' +
-          'test -n "$NX_TASK_HASH" && printf \'%s\\n\' "$NX_TASK_HASH" > .cache/nextest/archive.tar.zst.key',
+      // sit UNDER the repository's `.config/nextest.toml`. `$PWD` because tool
+      // config paths must be absolute and an absolute path in the command text
+      // would split one cache entry per checkout; through the root
+      // `node_modules` link because the plugin's real location is a different
+      // number of `../` away from each checkout.
+      const build =
+        'cargo --frozen nextest list --workspace --list-type binaries-only --message-format json --user-config-file none --tool-config-file "smoo:$PWD/../../node_modules/@smoothbricks/nx-plugin/nextest.toml"';
+      const helper = `../../node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/${HOST_TOOLS}/smoo-nx-nextest-binaries`;
+      expect(String(targets['cargo-test-build']?.options?.command)).toBe(
+        `mkdir -p .cache/nextest && ${build} > .cache/nextest/binaries-metadata.json && ` +
+          'cargo --frozen metadata --format-version 1 --all-features > .cache/nextest/cargo-metadata.json && ' +
+          'test -n "$NX_TASK_HASH" && printf \'%s\\n\' "$NX_TASK_HASH" > .cache/nextest/build.key && ' +
+          `${helper} record .cache/nextest/build.key`,
       );
-      expect(targets['cargo-test-archive']?.inputs).toContain('{projectRoot}/.config/nextest.toml');
+      expect(targets['cargo-test-build']?.inputs).toContain('{projectRoot}/.config/nextest.toml');
       // Tests compile the dev profile only. Nx forwards a run's configuration
       // down every edge to each target that has it, so a release configuration
       // here would make a release `build` compile test binaries nobody runs.
-      for (const name of ['cargo-test-archive', 'cargo-test', 'cargo-test-ferris-core', 'test']) {
+      for (const name of ['cargo-test-build', 'cargo-test', 'cargo-test-ferris-core', 'test']) {
         expect(targets[name]).toBeDefined();
         expect(targets[name]?.configurations?.[RELEASE_CONFIGURATION]).toBeUndefined();
       }
-      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
-      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
-      // The runner executes the archive's binaries, unpacked once for every
-      // runner by the plugin's helper (through the root `node_modules` link,
-      // so the hashed command names no machine path), and remaps the
-      // workspace root: without `--workspace-remap`, a restored archive hands
-      // tests the PRODUCING tree's absolute CARGO_MANIFEST_DIR (measured on a
-      // moved tree). `--workspace` is not merely redundant here, nextest
-      // rejects it beside a reused build.
-      expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^extracted="\$\(\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/\.\.\/nextest-extract\/dist\/bin\/[a-z0-9-]+\/smoo-nx-nextest-extract \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(ferris-core\)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/nextest\.toml"$/,
+      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build']);
+      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build']);
+      // The runner executes the build's binaries where they are, remapping the
+      // build's target directory onto this checkout's (the plugin's helper asks
+      // Cargo for it, through the root `node_modules` link, so the hashed command
+      // names no machine path) and its workspace root: without
+      // `--workspace-remap`, metadata restored from another checkout hands tests
+      // the PRODUCING tree's absolute CARGO_MANIFEST_DIR. `--workspace` is not
+      // merely redundant here, nextest rejects it beside a reused build.
+      expect(targets['cargo-test-ferris-core']?.options?.command).toBe(
+        'cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json ' +
+          `--cargo-metadata .cache/nextest/cargo-metadata.json --target-dir-remap "$(${helper} target-dir)" ` +
+          "--workspace-remap . -E 'package(ferris-core)' --no-fail-fast --no-tests=pass --user-config-file none " +
+          '--tool-config-file "smoo:$PWD/../../node_modules/@smoothbricks/nx-plugin/nextest.toml"',
       );
+      // The binaries live outside Nx outputs, so a checkout whose build was a cache hit may lack them, or hold an older
+      // tree's at the same paths: the runner's fixture compares the target's recorded key with the build's and stats
+      // each binary, and otherwise rebuilds with the build's own command, through mbx, in the runner's build interval,
+      // never in its progress-bounded test window.
+      expect(targets['cargo-test-ferris-core']?.options).toMatchObject({
+        fixtureCommand: `${helper} ensure .cache/nextest/binaries-metadata.json .cache/nextest/build.key -- ${build}`,
+        fixtureTimeoutMs: 3_600_000,
+      });
       expect(targets['cargo-test-ferris-core']?.inputs).toContain(
         '{workspaceRoot}/packages/ferris/.config/nextest.toml',
       );
@@ -1551,14 +1568,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       expect(targets['cargo-test-ferris-core']?.inputs).not.toContain('{workspaceRoot}/packages/ferris/Cargo.lock');
       // One clippy for the workspace, in a target dir of its own: sharing the
-      // dev build's `target/` queued the archive behind clippy's build lock.
+      // dev build's `target/` queued the test build behind clippy's build lock.
       const [fmt, clippy] = targets['cargo-lint']?.options?.commands ?? [];
       expect(fmt).toBe('cargo fmt --all --check');
       expect(clippy).toBe(CARGO_LINT_CLIPPY_COMMAND);
       expect(clippy).toMatch(/^cargo --frozen clippy --workspace --all-targets /);
       expect(clippy).toContain(' --target-dir target/cargo-lint ');
-      expect(targets['cargo-test-archive']?.options?.command).not.toContain('--target-dir');
-      expect(targets['cargo-lint']?.options?.cwd).toBe(targets['cargo-test-archive']?.options?.cwd);
+      expect(targets['cargo-test-build']?.options?.command).not.toContain('--target-dir');
+      expect(targets['cargo-lint']?.options?.cwd).toBe(targets['cargo-test-build']?.options?.cwd);
       expect(targets['cargo-lint']?.cache).toBe(true);
       expect(targets['cargo-lint']?.outputs).toEqual([]);
       expect(targets['cargo-lint']?.inputs).toEqual(
@@ -2057,11 +2074,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const native = projects.get('packages/native')?.targets ?? {};
       const rootProject = '@fixture/codebase';
       const rootFetch = { projects: [rootProject], target: 'cargo-fetch' };
-      const rootArchive = { projects: [rootProject], target: 'cargo-test-archive' };
+      const rootBuild = { projects: [rootProject], target: 'cargo-test-build' };
 
       expect(
         [...projects]
-          .filter(([, project]) => project.targets?.['cargo-test-archive'])
+          .filter(([, project]) => project.targets?.['cargo-test-build'])
           .map(([projectRoot]) => projectRoot),
       ).toEqual(['.']);
       expect(root['cargo-fetch']?.options).toEqual({
@@ -2077,25 +2094,25 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ]);
       // The root owns the one workspace clippy, run from the workspace root.
       expect(String(root['cargo-lint']?.options?.commands?.[1])).toContain('clippy --workspace');
-      expect(root['cargo-lint']?.options?.cwd).toBe(root['cargo-test-archive']?.options?.cwd);
+      expect(root['cargo-lint']?.options?.cwd).toBe(root['cargo-test-build']?.options?.cwd);
       expect(root['cargo-lint']?.dependsOn).toContain('cargo-fetch');
       expect(root['cargo-test']?.dependsOn).toHaveLength(6);
 
-      // Root mode: every piece of every project hangs off the one root archive,
+      // Root mode: every piece of every project hangs off the one root test build,
       // in any order. The crate is selected by filterset alone — `-p` would
       // re-resolve features, and there is nothing left to build anyway.
-      expect(runtime['cargo-test-runtime-core-shard1']?.dependsOn).toEqual([rootFetch, rootArchive]);
-      expect(runtime['cargo-test-runtime-core-shard2']?.dependsOn).toEqual([rootFetch, rootArchive]);
-      expect(runtime['cargo-test-runtime-core-exceptions-shard1']?.dependsOn).toEqual([rootFetch, rootArchive]);
-      expect(runtime['cargo-test-runtime-core-exceptions-shard2']?.dependsOn).toEqual([rootFetch, rootArchive]);
+      expect(runtime['cargo-test-runtime-core-shard1']?.dependsOn).toEqual([rootFetch, rootBuild]);
+      expect(runtime['cargo-test-runtime-core-shard2']?.dependsOn).toEqual([rootFetch, rootBuild]);
+      expect(runtime['cargo-test-runtime-core-exceptions-shard1']?.dependsOn).toEqual([rootFetch, rootBuild]);
+      expect(runtime['cargo-test-runtime-core-exceptions-shard2']?.dependsOn).toEqual([rootFetch, rootBuild]);
       expect(runtime['cargo-test-runtime-core-shard1']?.options).toMatchObject({ cwd: '.' });
       // At the root the helper and the plugin's nextest config are the root's
       // own `node_modules` link, no `../`.
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toStartWith(
-        `extracted="$(node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/${HOST_TOOLS}/smoo-nx-nextest-extract .cache/nextest/archive.tar.zst)" && `,
-      );
-      expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toContain(
-        `--target-dir-remap "$extracted/target" --workspace-remap . -E 'package(runtime-core)`,
+        'cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json ' +
+          '--cargo-metadata .cache/nextest/cargo-metadata.json ' +
+          `--target-dir-remap "$(node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/${HOST_TOOLS}/smoo-nx-nextest-binaries target-dir)" ` +
+          "--workspace-remap . -E 'package(runtime-core)",
       );
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toEndWith(
         '--tool-config-file "smoo:$PWD/node_modules/@smoothbricks/nx-plugin/nextest.toml"',
@@ -2113,7 +2130,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(runtime['cargo-lint-runtime-core']).toBeUndefined();
       expect(runtime.clean).toBeUndefined();
 
-      expect(wasm['cargo-test-runtime-wasm']?.dependsOn).toEqual([rootFetch, rootArchive]);
+      expect(wasm['cargo-test-runtime-wasm']?.dependsOn).toEqual([rootFetch, rootBuild]);
       expect(wasm['cargo-wasm']?.inputs).toContain(CARGO_CLOSURE_INPUT);
       expect(wasm['cargo-wasm']?.inputs).not.toContain('{workspaceRoot}/**/*.rs');
       expect(wasm['cargo-wasm']?.options).toMatchObject({ cwd: '.' });
@@ -2137,12 +2154,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(wasm['cargo-wasm']?.outputs).toEqual(['{projectRoot}/{options.outputDir}/']);
       expect(wasm['cargo-wasm']?.dependsOn).toEqual([rootFetch, '^build']);
-      // The aggregate build names its outputs, never the test archive.
+      // The aggregate build names its outputs, never the test build's.
       expect(wasm.build?.dependsOn).toEqual(['^build', 'cargo-wasm']);
 
       // The crate whose project also builds the debug cdylib keeps that edge:
       // its tests load the artifact `napi-debug` writes into `target/debug`.
-      expect(native['cargo-test-native-napi']?.dependsOn).toEqual([rootFetch, rootArchive, 'napi-debug']);
+      expect(native['cargo-test-native-napi']?.dependsOn).toEqual([rootFetch, rootBuild, 'napi-debug']);
       // The addon build consumes only its dependencies' outputs; it is not
       // ordered behind the test compile.
       expect(native['napi-debug']?.dependsOn).toEqual(['^build']);
@@ -2190,7 +2207,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         outputDir: 'dist/native/darwin-arm64',
       });
       expect(native['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/{options.outputDir}/']);
-      expect(native.build?.dependsOn).not.toContainEqual(rootArchive);
+      expect(native.build?.dependsOn).not.toContainEqual(rootBuild);
       expectBuildNamesNoTestWork(native);
       for (const inferred of [root, runtime, wasm, native]) {
         expectNoSchedulerThrottle(inferred);
@@ -2243,8 +2260,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // Workspace-anchored, because Nx hashes a `{projectRoot}` glob against
       // only the files its project owns, and the group project owns alpha and
       // beta: spelled from the root project, those globs hash nothing and the
-      // archive replays stale binaries against edited crates.
-      for (const name of ['cargo-lint', 'cargo-test-archive']) {
+      // test build replays stale binaries against edited crates.
+      for (const name of ['cargo-lint', 'cargo-test-build']) {
         expect(outer[name]?.inputs).toEqual(
           expect.arrayContaining([
             '{workspaceRoot}/packages/group/crates/alpha/**/*',
@@ -2269,9 +2286,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(leaf['cargo-test-inner-leaf']?.options?.cwd).toBe('nested');
       expect(leaf['cargo-test-inner-leaf']?.dependsOn).toEqual([
         { projects: ['inner-root'], target: 'cargo-fetch' },
-        { projects: ['inner-root'], target: 'cargo-test-archive' },
+        { projects: ['inner-root'], target: 'cargo-test-build' },
       ]);
-      expect(inner['cargo-test-archive']?.options?.cwd).toBe('nested');
+      expect(inner['cargo-test-build']?.options?.cwd).toBe('nested');
       expect(resolveDeclaredOverInferred(group, declared, 'cargo-lint')).toMatchObject({
         executor: 'nx:noop',
         cache: true,
@@ -2300,7 +2317,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-fetch',
         'cargo-lint',
         'cargo-lint-cross',
-        'cargo-test-archive',
+        'cargo-test-build',
         'cargo-test-ferris-core',
         'mutation',
       ]);
@@ -2363,7 +2380,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       const project = await inferProject(workspace, 'packages/fixture/package.json');
       expect(project?.namedInputs?.[CARGO_TOOLCHAIN_NAMED_INPUT]).toEqual(cargoToolchainInputs());
-      expect(project?.targets?.['cargo-test-archive']).toBeUndefined();
+      expect(project?.targets?.['cargo-test-build']).toBeUndefined();
     } finally {
       await workspace.cleanup();
     }
@@ -2371,7 +2388,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   // Without an `externalDependencies` input Nx keys a task whose executor is
   // not an `@nx/` one on every package in the lockfile, so a lockfile-only
   // commit re-ran every cargo verdict (measured in a consumer: every cargo-test-*
-  // runner and the archive re-keyed on a one-integrity bun.lock edit). Here
+  // runner and the test build re-keyed on a one-integrity bun.lock edit). Here
   // the plugin is this repository's workspace project, which Nx refuses as an
   // external dependency, so each target names no npm package: its lockfile reach is one Cargo.lock scope node.
   it('keys every cached cargo target on the npm packages it runs, not the lockfile', async () => {
@@ -2401,14 +2418,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('names the installed plugin for a cargo target that runs its executor or files, and nothing for cargo alone', () => {
     const plugin = 'node_modules/.bun/@smoothbricks+nx-plugin@0.4.26/node_modules/@smoothbricks/nx-plugin';
     const runner = { executor: '@smoothbricks/nx-plugin:bounded-exec' };
-    const archive = `cargo --frozen nextest archive --workspace --tool-config-file "smoo:$PWD/${plugin}/nextest.toml"`;
+    const build = `cargo --frozen nextest list --workspace --list-type binaries-only --tool-config-file "smoo:$PWD/${plugin}/nextest.toml"`;
     const clippy = CARGO_LINT_CLIPPY_COMMAND;
     expect(cargoCommandNpmPackages(runner, 'cargo --frozen nextest run', true)).toEqual(['@smoothbricks/nx-plugin']);
-    expect(cargoCommandNpmPackages({ executor: 'nx:run-commands' }, archive, true)).toEqual([
-      '@smoothbricks/nx-plugin',
-    ]);
+    expect(cargoCommandNpmPackages({ executor: 'nx:run-commands' }, build, true)).toEqual(['@smoothbricks/nx-plugin']);
     expect(cargoCommandNpmPackages({ executor: 'nx:run-commands' }, clippy, true)).toEqual([]);
-    expect(cargoCommandNpmPackages(runner, archive, false)).toEqual([]);
+    expect(cargoCommandNpmPackages(runner, build, false)).toEqual([]);
   });
 
   it('names itself an external dependency only where it is no project of the workspace, however its code was loaded', async () => {
@@ -2528,7 +2543,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         expect(configured.sort()).toEqual([
           'cargo-cross-test-aarch64-apple-darwin',
           'cargo-cross-test-archive-aarch64-apple-darwin',
-          'cargo-test-archive',
+          'cargo-test-build',
           'cargo-test-ferris-core',
         ]);
         inferred.push(JSON.stringify(project, null, 2));
@@ -2552,7 +2567,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
 
-      // Scoped by filterset over one archived workspace build: exactly one
+      // Scoped by filterset over one workspace test build: exactly one
       // crate runs, and no `-p` re-resolves its features.
       expect(cargoPackageSelection(String(targets['cargo-test-ferris-core']?.options?.command ?? ''))).toEqual({
         prebuiltRun: true,
@@ -2564,15 +2579,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         packageFlags: [],
         filtered: ['ferris-wasm'],
       });
-      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
-      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
+      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build']);
+      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build']);
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-test-ferris-wasm']);
     } finally {
       await workspace.cleanup();
     }
   });
 
-  it('extracts the test archive once for all per-crate runners, and again only when its task changes', async () => {
+  it('runs every per-crate runner in place, building only when this checkout lacks a binary the metadata names', async () => {
     const workspace = await createWorkspace();
     const root = workspace.context.workspaceRoot;
     const crates = ['ferris-a', 'ferris-b', 'ferris-c'];
@@ -2586,98 +2601,87 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // Installed the way a consumer has it, so each command finds the helper it names.
       await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
       await symlink(fileURLToPath(new URL('..', import.meta.url)), join(root, 'node_modules/@smoothbricks/nx-plugin'));
-      // A cargo that does what nextest does with an archive, and says so: an
-      // `--archive-file` unpacks it (into `--extract-to`, or a private temp
-      // dir when a run is given the archive itself), and a run reports which
-      // archive's binaries it executed. `metadata` names the workspace's
-      // target directory, where the extraction root lives.
+      // A cargo that does what the test build and a reused-build run do, and says so: `metadata` names the
+      // workspace's target directory, `nextest list` (the build) writes the binary there through an mbx miss, and
+      // `nextest run` reports the target directory the build's was remapped onto.
       const log = join(root, 'nextest.log');
       await workspace.write(
         'bin/cargo',
         [
           '#!/bin/sh',
-          'archive= dest= binaries=',
+          'case " $* " in *" metadata "*) printf \'{"target_directory":"%s/target"}\\n\' "$PWD"; exit 0 ;; esac',
+          'mode= remap=',
           'while [ $# -gt 0 ]; do',
           '  case "$1" in',
-          '    metadata) printf \'{"target_directory":"%s/target"}\\n\' "$PWD"; exit 0 ;;',
-          '    --archive-file) archive=$2; shift ;;',
-          '    --extract-to) dest=$2; shift ;;',
-          '    --binaries-metadata) binaries=$2; shift ;;',
+          '    list) mode=build ;;',
+          '    run) mode=run ;;',
+          '    --target-dir-remap) remap=$2; shift ;;',
           '  esac',
           '  shift',
           'done',
-          'if [ -n "$archive" ]; then',
-          '  echo "extract $(cat "$archive")" >> "$FAKE_NEXTEST_LOG"',
-          '  if [ -z "$dest" ]; then echo "run $(cat "$archive")" >> "$FAKE_NEXTEST_LOG"; exit 0; fi',
-          '  mkdir -p "$dest/target/nextest"',
-          '  cat "$archive" > "$dest/target/nextest/binaries-metadata.json"',
-          '  cat "$archive" > "$dest/target/nextest/cargo-metadata.json"',
+          'if [ "$mode" = build ]; then',
+          '  echo build >> "$FAKE_NEXTEST_LOG"',
+          '  mkdir -p target/debug/deps && : > target/debug/deps/ferris-1',
+          "  echo '   Compiling ferris-a v0.1.0' >&2",
+          "  echo 'mbx[cache]: 0 hits, 1 misses' >&2",
           '  exit 0',
           'fi',
-          'echo "run $(cat "$binaries")" >> "$FAKE_NEXTEST_LOG"',
+          'echo "run $remap" >> "$FAKE_NEXTEST_LOG"',
           '',
         ].join('\n'),
       );
       await chmod(join(root, 'bin/cargo'), 0o755);
-      // Every runner at once, through `sh -c` exactly as bounded-exec spawns it.
-      const runAll = () =>
-        Promise.all(
-          crates.map(async (crate) => {
-            const options = targets[`cargo-test-${crate}`]?.options;
-            const child = Bun.spawn(['sh', '-c', String(options?.command)], {
-              cwd: join(root, String(options?.cwd)),
-              env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, FAKE_NEXTEST_LOG: log },
-              stdout: 'pipe',
-              stderr: 'pipe',
-            });
-            const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-            return { crate, exitCode, stderr };
-          }),
-        );
-
-      await workspace.write('packages/ferris/.cache/nextest/archive.tar.zst', 'first archive');
-      // The key its cargo-test-archive task writes beside it: that task's hash.
-      await workspace.write('packages/ferris/.cache/nextest/archive.tar.zst.key', '1001\n');
-      for (const run of await runAll()) {
-        expect(run).toMatchObject({ exitCode: 0 });
-      }
-      expect((await readFile(log, 'utf8')).trim().split('\n').sort()).toEqual([
-        'extract first archive',
-        'run first archive',
-        'run first archive',
-        'run first archive',
-      ]);
-
-      // A rebuilt archive is another task's output at the same path: the runners
-      // must not execute what the old one unpacked, and the old unpacking is garbage.
-      await workspace.write('packages/ferris/.cache/nextest/archive.tar.zst', 'second archive');
-      await workspace.write('packages/ferris/.cache/nextest/archive.tar.zst.key', '1002\n');
-      for (const run of await runAll()) {
-        expect(run).toMatchObject({ exitCode: 0 });
-      }
-      expect((await readFile(log, 'utf8')).trim().split('\n').sort()).toEqual([
-        'extract first archive',
-        'extract second archive',
-        'run first archive',
-        'run first archive',
-        'run first archive',
-        'run second archive',
-        'run second archive',
-        'run second archive',
-      ]);
-      // The old unpacking is gone from Cargo's build tree, and the archive's
-      // directory holds only the archive and its key, the declared Nx outputs.
-      const extracted = join(root, 'packages/ferris/target', NEXTEST_EXTRACTION_DIRECTORY);
-      const unpacked = (await readdir(extracted, { recursive: true })).filter((path) =>
-        path.endsWith('binaries-metadata.json'),
+      // The build's output, restored from another checkout: every path in it is that checkout's.
+      await workspace.write(
+        'packages/ferris/.cache/nextest/binaries-metadata.json',
+        JSON.stringify({
+          'rust-build-meta': { 'target-directory': '/elsewhere/target', 'non-test-binaries': {} },
+          'rust-binaries': {
+            'ferris-a': { 'binary-id': 'ferris-a', 'binary-path': '/elsewhere/target/debug/deps/ferris-1' },
+          },
+        }),
       );
-      expect(await Promise.all(unpacked.map((path) => readFile(join(extracted, path), 'utf8')))).toEqual([
-        'second archive',
-      ]);
+      await workspace.write('packages/ferris/.cache/nextest/cargo-metadata.json', '{}');
+      await workspace.write('packages/ferris/.cache/nextest/build.key', 'task-1\n');
+      // Through `sh -c` exactly as bounded-exec spawns a fixture and then its command.
+      const shell = async (crate: string, option: 'fixtureCommand' | 'command') => {
+        const options = targets[`cargo-test-${crate}`]?.options;
+        const child = Bun.spawn(['sh', '-c', String(options?.[option])], {
+          cwd: join(root, String(options?.cwd)),
+          env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, FAKE_NEXTEST_LOG: log },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+        return { exitCode, stderr };
+      };
+      const fixtures: { exitCode: number; stderr: string }[] = [];
+      for (const crate of crates) fixtures.push(await shell(crate, 'fixtureCommand'));
+      for (const run of await Promise.all(crates.map((crate) => shell(crate, 'command')))) {
+        expect(run).toMatchObject({ exitCode: 0 });
+      }
+      // The first fixture found the binary absent and built it, saying what mbx compiled; the others found it.
+      for (const fixture of fixtures) {
+        expect({ exitCode: fixture.exitCode, stderr: fixture.stderr }).toMatchObject({ exitCode: 0 });
+      }
+      expect(fixtures[0]?.stderr).toContain('build task-1: the target held no recorded build in ');
+      expect(fixtures[0]?.stderr).toContain(
+        'CACHE MISS: mbx compiled 1 units building the test binaries; the crates cargo built: ferris-a',
+      );
+      for (const fixture of fixtures.slice(1)) {
+        expect(fixture.stderr).toContain('build task-1: 1 test binaries present in ');
+      }
+      const lines = (await readFile(log, 'utf8')).trim().split('\n');
+      expect(lines[0]).toBe('build');
+      expect(lines.slice(1)).toHaveLength(3);
+      for (const line of lines.slice(1)) expect(line).toMatch(/^run \/.*\/packages\/ferris\/target$/);
+      // Nothing was unpacked: the build's directory holds only its metadata, the declared Nx outputs.
       expect((await readdir(join(root, 'packages/ferris/.cache/nextest'))).sort()).toEqual([
-        'archive.tar.zst',
-        'archive.tar.zst.key',
+        'binaries-metadata.json',
+        'build.key',
+        'cargo-metadata.json',
       ]);
+      expect((await readdir(join(root, 'packages/ferris/target'))).sort()).toEqual(['debug', 'nextest-build.key']);
     } finally {
       await workspace.cleanup();
     }
@@ -2916,7 +2920,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         outputDir: 'dist/native/darwin-arm64',
       });
       expect(targets['napi-arm64-macos']?.options?.env).toBeUndefined();
-      // No cargo-test-archive edge here, on ANY host: the platform build consumes
+      // No cargo-test-build edge here, on ANY host: the platform build consumes
       // nothing from it, and a platform target's dependency closure may only reach
       // its own family (`validatePlatformTargetDependencies`).
       expect(targets['napi-arm64-macos']?.dependsOn).toBeUndefined();
@@ -2973,7 +2977,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       }
       // The aggregate build pulls in exactly the inferring host's
       // platform-suffixed targets (publish still owns foreign platforms), and
-      // no test work at all: the archive and every RUNNER are reached through `test`. Both hosts are asserted here so the
+      // no test work at all: the test build and every RUNNER are reached through `test`. Both hosts are asserted here so the
       // expectation does not depend on which machine runs the suite: the
       // previous form read `process.platform`, and the macOS answer was the only
       // one anyone checked.
@@ -3041,15 +3045,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
       // cargo-fetch survives the napi-debug edge: the per-crate runner is itself
       // a frozen cargo command, so its precondition is its own edge. It reads
-      // the workspace archive and still waits for the debug cdylib its own
+      // the workspace test build and still waits for the debug cdylib its own
       // project builds, because its tests load that artifact from `target/`.
-      expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual([
-        'cargo-fetch',
-        'cargo-test-archive',
-        'napi-debug',
-      ]);
+      expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build', 'napi-debug']);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^extracted="\$\(\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/\.\.\/nextest-extract\/dist\/bin\/[a-z0-9-]+\/smoo-nx-nextest-extract \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(cowshed-napi\)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^cargo --frozen nextest run --binaries-metadata \.cache\/nextest\/binaries-metadata\.json --cargo-metadata \.cache\/nextest\/cargo-metadata\.json --target-dir-remap "\$\(\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/\.\.\/nextest-extract\/dist\/bin\/[a-z0-9-]+\/smoo-nx-nextest-binaries target-dir\)" --workspace-remap \. -E 'package\(cowshed-napi\)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -3103,7 +3103,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // duplicate for Nx to merge, even with a cdylib *-wasm member crate present.
       expect(targets['cargo-wasm']).toBeUndefined();
       // Its declared *-wasm output-family name feeds the aggregate build by concrete
-      // name; the cargo workspace's test archive is test work and stays out of it.
+      // name; the cargo workspace's test build is test work and stays out of it.
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.dependsOn).toEqual(['^build', 'cargo-wasm']);
     } finally {
@@ -3193,7 +3193,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-small-exceptions']).toBeUndefined();
       expect(targets['cargo-test-big']).toBeUndefined();
       // Every piece reaches the aggregate, and they all hang off the one
-      // archive: a run extracts binaries to its own temp directory and writes
+      // test build: a run executes its binaries in place and writes
       // nothing to cargo's target/, so no piece waits on another.
       expect(targets['cargo-test']?.dependsOn).toEqual([
         'cargo-test-big-shard1',
@@ -3219,7 +3219,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-test-big-exceptions-shard3',
         'cargo-test-small',
       ]) {
-        expect(targets[name]?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
+        expect(targets[name]?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build']);
       }
       // Pieces of one crate share its inputs: they are one suite, split only to
       // fit the bound, so any change to the crate invalidates all of them.
@@ -3298,11 +3298,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       const serial = '(test(/real_apfs_/))';
       const group = macos['cargo-test-group-real-apfs'];
-      // One runner for the workspace, owned by the cargo root beside the archive it executes: a progress bound and no
+      // One runner for the workspace, owned by the cargo root beside the test build it executes: a progress bound and no
       // ceiling like every test target, one CPU token, no partition and no thread flag. A filter that selects
       // nothing fails the run.
       expect(group?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
-      expect(group?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
+      expect(group?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build']);
       expect(String(group?.options?.command)).toContain('nextest run ');
       expect(String(group?.options?.command)).toContain(
         `-E '${serial}' --no-fail-fast --no-tests=fail --user-config-file none`,
@@ -3371,7 +3371,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // A group scoped to packages hashes those crates and every crate they link, and no other.
       expect(hashedCrates(device)).toEqual(['cowshed-apfs', 'cowshed-apfs-tests', 'cowshed-os']);
       expect(hashedCrates(host)).toEqual(['cowshed-apfs', 'cowshed-cli', 'cowshed-core', 'cowshed-os']);
-      // A filter scoped to no package keeps every member's tree, as the archive hashes them.
+      // A filter scoped to no package keeps every member's tree, as the test build hashes them.
       expect(hashedCrates(wide)).toEqual([
         'cowshed-apfs',
         'cowshed-apfs-tests',
@@ -3467,7 +3467,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // An edit to a crate the dependency links reruns both.
       expect(hashedBy('packages/cowshed/crates/cowshed-os/src/lib.rs')).toEqual({ cli: true, core: true });
       expect(hashedBy('packages/cowshed/crates/cowshed-core/src/lib.rs')).toEqual({ cli: true, core: true });
-      // The helper's manifest stays in both keys: the workspace archive unifies its features into every binary.
+      // The helper's manifest stays in both keys: the workspace test build unifies its features into every binary.
       for (const runner of [cli, core]) {
         expect(runner?.inputs).toContain('{workspaceRoot}/packages/lmao/crates/lmao-core/Cargo.toml');
       }
@@ -3477,7 +3477,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   });
 
   // A path package outside the Nx workspace that only some member's tests build is no fileset, yet the workspace
-  // archive unifies its manifest's features into every test binary, and a runner's key does not follow the archive's
+  // test build unifies its manifest's features into every test binary, and a runner's key does not follow the build's
   // outputs. Every runner therefore names the repository's runtime hash of external sources.
   it('keys every runner on externalRustCrates while the workspace builds a path package outside Nx', async () => {
     const outside = await realpath(await mkdtemp(join(tmpdir(), 'smoothbricks-nx-plugin-outside-')));
@@ -3578,7 +3578,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       // Inference orders nothing between the groups: that edge is the repository's explicit config.
       for (const name of ['cargo-test-group-real-apfs', 'cargo-test-group-real-apfs-host']) {
-        expect(root[name]?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
+        expect(root[name]?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build']);
       }
 
       // Every crate piece, scoped to a package the groups hold or not, excludes both groups' tests.
@@ -3616,7 +3616,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const rootTargets = macos.get('.') ?? {};
 
       // The edge as the repository's nx.json states it. Nx expands `...` to the inferred list, so the
-      // archive and the locked fetch stay ahead of the host group beside the device group.
+      // test build and the locked fetch stay ahead of the host group beside the device group.
       const nxJson = {
         targetDefaults: { 'cargo-test-group-real-apfs-host': { dependsOn: ['...', 'cargo-test-group-real-apfs'] } },
       };
@@ -3629,7 +3629,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         const target = result.projects?.['.']?.targets?.['cargo-test-group-real-apfs-host'];
         if (target) host = mergeTargetConfigurations(target, host);
       }
-      expect(host.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive', 'cargo-test-group-real-apfs']);
+      expect(host.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build', 'cargo-test-group-real-apfs']);
 
       const nodes: Record<string, ProjectGraphProjectNode> = {
         [rootProject]: {
@@ -3778,7 +3778,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // — executor, options, inputs, cache — must survive the declaration
       // instead of being replaced wholesale by it.
       'cargo-test': { dependsOn: ['cargo-test-ferris-core', 'cargo-wasm'] },
-      'cargo-test-archive': { dependsOn: ['cargo-wasm'] },
+      'cargo-test-build': { dependsOn: ['cargo-wasm'] },
       'cargo-lint': { inputs: ['{projectRoot}/clippy.toml'] },
       mutation: { options: { command: 'cargo mutants --in-diff' } },
       bench: { cache: true },
@@ -3797,7 +3797,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // partial declaration must keep that inferred base, not erase the chain.
       expect(targets['cargo-test']?.executor).toBe('nx:noop');
       expect(targets['cargo-test-ferris-core']?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
-      expect(targets['cargo-test-archive']?.executor).toBe('nx:run-commands');
+      expect(targets['cargo-test-build']?.executor).toBe('nx:run-commands');
       expect(targets['cargo-lint']?.options).toMatchObject({
         commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
       });
@@ -3810,13 +3810,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-ferris-core']?.options?.command).toContain("-E 'package(ferris-core)'");
       expect(targets['cargo-test-ferris-core']?.options?.idleTimeoutMs).toBe(BOUNDED_TEST_IDLE_TIMEOUT_MS);
 
-      const cargoTestArchive = resolveDeclaredOverInferred(targets, declared, 'cargo-test-archive');
-      expect(cargoTestArchive?.executor).toBe('nx:run-commands');
+      const cargoTestBuild = resolveDeclaredOverInferred(targets, declared, 'cargo-test-build');
+      expect(cargoTestBuild?.executor).toBe('nx:run-commands');
       // A replacing array drops every inferred edge, cargo-fetch included: the
-      // package now owns ordering the locked fetch ahead of its frozen archive.
-      expect(cargoTestArchive?.dependsOn).toEqual(['cargo-wasm']);
-      expect(targets['cargo-test-archive']?.dependsOn).toEqual(['cargo-fetch']);
-      expect(String(cargoTestArchive?.options?.command)).toContain('cargo --frozen nextest archive --workspace ');
+      // package now owns ordering the locked fetch ahead of its frozen test build.
+      expect(cargoTestBuild?.dependsOn).toEqual(['cargo-wasm']);
+      expect(targets['cargo-test-build']?.dependsOn).toEqual(['cargo-fetch']);
+      expect(String(cargoTestBuild?.options?.command)).toContain('cargo --frozen nextest list --workspace ');
 
       // A declared array replaces the inferred one; the command it guards stays.
       const cargoLint = resolveDeclaredOverInferred(targets, declared, 'cargo-lint');
@@ -3870,7 +3870,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('gives a private wrangler project a deploy that runs the stage CLI, uncached, behind its build half', async () => {
+  it('gives a private wrangler project a cached deploy, keyed on its artifact and stage, behind its build half', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/site/package.json', '{"name":"site","private":true}\n');
@@ -3879,13 +3879,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       // One target taking a stage, never a configuration per stage: pull-request stages are
       // `prN` for unbounded N, so `--configuration` could not name the stage that matters most.
-      expect(targets.deploy?.options).toEqual({
-        command: 'smoo wrangler deploy-stage --stage {args.stage}',
-        cwd: 'packages/site',
-      });
-      // A cache hit on deploy would mean "we once uploaded this hash", which a rollback falsifies
-      // silently; the step has to run and read live state instead.
-      expect(targets.deploy?.cache).toBe(false);
+      // The executor's hasher keys it on the artifact and the stage, and misses unless the stage
+      // serves that artifact's version, so a rollback is never answered from the cache.
+      expect(targets.deploy?.executor).toBe('@smoothbricks/nx-plugin:wrangler-deploy');
+      expect(targets.deploy?.options).toEqual({});
+      expect(targets.deploy?.cache).toBe(true);
+      expect(targets.deploy?.inputs).toEqual([
+        'default',
+        '^default',
+        { dependentTasksOutputFiles: '**/*', transitive: false },
+      ]);
       expect(targets.deploy?.outputs).toEqual([]);
       // No build half of any kind here, so no edge is claimed: wrangler bundles its own
       // TypeScript, so a worker with neither `build` nor `deploy-build` is legitimate.
@@ -3978,11 +3981,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // `...` expands to the inferred list at its position, so the inferred build edge survives
       // beside the declared one.
       expect(deploy?.dependsOn).toEqual(['build', { projects: ['backend'], target: 'deploy', params: 'forward' }]);
-      expect(deploy?.options).toEqual({
-        command: 'smoo wrangler deploy-stage --stage {args.stage}',
-        cwd: 'packages/site',
-      });
-      expect(deploy?.cache).toBe(false);
+      expect(deploy?.executor).toBe('@smoothbricks/nx-plugin:wrangler-deploy');
+      expect(deploy?.options).toEqual({});
+      expect(deploy?.cache).toBe(true);
       expect(deploy?.outputs).toEqual([]);
     } finally {
       await workspace.cleanup();
@@ -4020,9 +4021,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         );
         const targets = await inferProjectTargets(workspace, `packages/${name}/package.json`);
         const deploy = resolveDeclaredOverInferred(targets, declared, 'deploy');
-        // The edge rides on the inferred target: its executor and command still carry the run.
-        expect(deploy?.executor).toBe('nx:run-commands');
-        expect(deploy?.options?.command).toBe('smoo wrangler deploy-stage --stage {args.stage}');
+        // The edge rides on the inferred target: its executor still carries the run.
+        expect(deploy?.executor).toBe('@smoothbricks/nx-plugin:wrangler-deploy');
         if (deploy === undefined) throw new Error(`${name} infers no deploy`);
         nodes[name] = { name, type: 'app', data: { root: `packages/${name}`, targets: { ...targets, deploy } } };
       }
@@ -4038,7 +4038,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('archives a declared foreign triple beside the host archive, and runs it without building', async () => {
+  it('archives a declared foreign triple beside the host test build, and runs it without building', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
@@ -4056,20 +4056,21 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const run = targets['cargo-cross-test-aarch64-apple-darwin'];
 
       // A distinct archive file, declared as this target's output: the host
-      // archive must survive a cross build and each must be cached as itself.
+      // test build's metadata must survive a cross build and each must be cached as itself.
       expect(archive?.outputs).toEqual(['{projectRoot}/.cache/nextest/archive-aarch64-apple-darwin.tar.zst']);
-      expect(targets['cargo-test-archive']?.outputs).toEqual([
-        '{projectRoot}/.cache/nextest/archive.tar.zst',
-        '{projectRoot}/.cache/nextest/archive.tar.zst.key',
+      expect(targets['cargo-test-build']?.outputs).toEqual([
+        '{projectRoot}/.cache/nextest/binaries-metadata.json',
+        '{projectRoot}/.cache/nextest/cargo-metadata.json',
+        '{projectRoot}/.cache/nextest/build.key',
       ]);
       expect(archive?.cache).toBe(true);
-      // Everything the host archive hashes, plus the declared driver: the
+      // Everything the host test build hashes, plus the declared driver: the
       // script that decides how the foreign link happens is an input of the
       // bytes it produces.
-      for (const input of targets['cargo-test-archive']?.inputs ?? []) {
+      for (const input of targets['cargo-test-build']?.inputs ?? []) {
         expect(archive?.inputs).toContainEqual(input);
       }
-      // The lock-scope node the host archive names: the archive builds against the same locked crates.
+      // The lock-scope node the host test build names: the archive builds against the same locked crates.
       expect(archive?.inputs).toContainEqual({ externalDependencies: ['cargo-lock:packages/ferris'] });
       expect(archive?.inputs).toContain('{projectRoot}/scripts/cargo-for-nextest.sh');
       expect(archive?.options?.env).toEqual({ CARGO: 'scripts/cargo-for-nextest.sh' });
@@ -4197,7 +4198,7 @@ const STORE_OBJECT = new RegExp(`${NIX_STORE_ROOT}/[0-9a-z]{32}-[^\\s/]+`, 'g');
 
 /**
  * One Cargo workspace producing every cached cargo target family inference can
- * make: the host archive, a per-crate run, both lint verdicts, and — through
+ * make: the host test build, a per-crate run, both lint verdicts, and — through
  * the `cross-targets` declaration — the foreign-triple archive, which states
  * its own inputs instead of receiving them from the `cargo --frozen` sweep.
  */
@@ -4294,7 +4295,7 @@ function resolveDeclaredOverInferred(
  * that can independently go wrong.
  *
  * `--binaries-metadata` must be present: the runner executes binaries one
- * workspace `cargo nextest archive --workspace` already built, so a per-crate
+ * workspace test build (`cargo nextest list --workspace`) already built, so a per-crate
  * run cannot compile anything. Narrowing comes from the nextest filterset,
  * which selects what RUNS. `--package` narrows too, but it re-resolves that
  * crate's features, which is a build — 57.9s of a 120s bounded budget on a

@@ -400,7 +400,7 @@ index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..6b982fae848cc82a310eee9a1036be1a
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..8f26121c957183135bc75ad428fb7ef809a5471e 100644
+index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..54af453aee4d3aaa56d6fe19c328c814e471c659 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -744,7 +744,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..8f26121c957183135bc75ad428fb7ef8
          }
      }
      establishConnection() {
-@@ -998,6 +1124,9 @@ class DaemonClient {
+@@ -998,14 +1124,31 @@ class DaemonClient {
          return { available: false, refusal };
      }
      async sendMessageToDaemon(message, force) {
@@ -754,9 +754,15 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..8f26121c957183135bc75ad428fb7ef8
          // the first message sent to the daemon includes an env prop
          // that updates the process.env values on the daemon.
          if (!this.envReflectionSent && !global.NX_PLUGIN_WORKER) {
-@@ -1005,7 +1134,15 @@ class DaemonClient {
+             message.env = (0, daemon_environment_1.getDaemonEnv)();
              this.envReflectionSent = true;
          }
++        // A plugin worker is no command: its request nests in a daemon operation
++        // already current, so the daemon serves it without a probe of its own
++        // (server.js, handleMessage).
++        if (global.NX_PLUGIN_WORKER) {
++            message.fromPluginWorker = true;
++        }
          await this.startDaemonIfNecessary();
 +        // The request waits on the daemon its record names. Its socket can outlive it: a
 +        // listener a surviving child inherited accepts the request and never answers, and the
@@ -770,7 +776,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..8f26121c957183135bc75ad428fb7ef8
          return new Promise((resolve, reject) => {
              perf_hooks_1.performance.mark('sendMessageToDaemon-start');
              // An open promise isn't enough to keep the event loop
-@@ -1016,12 +1153,25 @@ class DaemonClient {
+@@ -1016,12 +1159,25 @@ class DaemonClient {
              keepAlive = setTimeout(() => {
                  reject(new Error('The daemon timed out while processing ' + message.type));
              }, 20 * 60 * 1000);
@@ -796,7 +802,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..8f26121c957183135bc75ad428fb7ef8
          });
      }
      async registerDaemonProcessWithMetricsService(daemonPid) {
-@@ -1055,7 +1205,13 @@ class DaemonClient {
+@@ -1055,7 +1211,13 @@ class DaemonClient {
                  console[parsedResult.level](parsedResult.message);
                  return;
              }
@@ -811,7 +817,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..8f26121c957183135bc75ad428fb7ef8
                  this.currentReject(parsedResult.error);
              }
              else {
-@@ -1132,8 +1288,11 @@ class DaemonClient {
+@@ -1132,8 +1294,11 @@ class DaemonClient {
           */
          const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
          if (available) {
@@ -825,7 +831,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..8f26121c957183135bc75ad428fb7ef8
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
-@@ -1161,19 +1320,31 @@ class DaemonClient {
+@@ -1161,19 +1326,31 @@ class DaemonClient {
              ].join('\n'));
          }
      }
@@ -867,7 +873,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..8f26121c957183135bc75ad428fb7ef8
              }
          }
          (0, tmp_dir_1.removeSocketDir)();
-@@ -1200,6 +1371,44 @@ function isDocker() {
+@@ -1200,6 +1377,44 @@ function isDocker() {
  function nxJsonIsNotPresent() {
      return !(0, nx_json_1.hasNxJson)(workspace_root_1.workspaceRoot);
  }
@@ -912,7 +918,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..8f26121c957183135bc75ad428fb7ef8
  /**
   * The operating system refused the connection. Most often the socket belongs to
   * another user, which is the guarantee the owner-only socket directory buys —
-@@ -1226,6 +1435,21 @@ function daemonPermissionException(socketPath, cause) {
+@@ -1226,6 +1441,21 @@ function daemonPermissionException(socketPath, cause) {
      error.daemonPermissionError = true;
      return error;
  }
@@ -1218,10 +1224,23 @@ index 427ced7822fb05ba966d0543c224c5760b016572..303548db369472e0f99f31c3bc66ae9b
  }
  function getChangedEnvKeys(before, after) {
 diff --git a/dist/src/daemon/message-types/daemon-message.d.ts b/dist/src/daemon/message-types/daemon-message.d.ts
-index 9dd6123ad6d9adb20a07f7db56fc476be78cbcca..0b1ee217729d63a29806cf6c38d0fc5d4a2161a5 100644
+index 9dd6123ad6d9adb20a07f7db56fc476be78cbcca..6ea90cf3fea484641b20aa11fd6a07d5a71c65fc 100644
 --- a/dist/src/daemon/message-types/daemon-message.d.ts
 +++ b/dist/src/daemon/message-types/daemon-message.d.ts
-@@ -11,6 +11,8 @@ export type DaemonMessage = {
+@@ -1,6 +1,12 @@
+ export type DaemonMessage = {
+     type: string;
+     env?: Record<string, string>;
++    /**
++     * Set by a plugin worker's daemon client. The daemon serves such a request
++     * without proving its watcher current: it nests in an operation already
++     * current.
++     */
++    fromPluginWorker?: boolean;
+     /**
+      * Stamped centrally by `DaemonSocketMessenger.sendMessage`, not by the ~30
+      * sites that construct messages — hence optional. It can also be absent on a
+@@ -11,6 +17,8 @@ export type DaemonMessage = {
      data?: any;
  };
  export declare function isDaemonMessage(msg: unknown): msg is DaemonMessage;
@@ -1230,7 +1249,7 @@ index 9dd6123ad6d9adb20a07f7db56fc476be78cbcca..0b1ee217729d63a29806cf6c38d0fc5d
  /**
   * Any message carrying the sender's workspace root. Structural so the checks
   * below serve the daemon and the plugin worker without either importing the
-@@ -24,7 +26,7 @@ type WorkspaceScopedMessage = {
+@@ -24,7 +32,7 @@ type WorkspaceScopedMessage = {
  /**
   * A message from a different workspace — two sharing an NX_SOCKET_DIR — must not
   * be processed. Roots are normalized first so that a workspace does not look
@@ -1900,7 +1919,7 @@ index 0000000000000000000000000000000000000000..0c065105dff1ed0847e28672661b1792
 +    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets, notice });
 +}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966a83c3074 100644
+index b1c143e244efd435b28642ed86e999d6c86f7d94..0fa42a0dd66fc6706fa36db9ed608486978a384d 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -7,17 +7,13 @@ const fs_1 = require("fs");
@@ -1962,7 +1981,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966
  async function handleMessage(socket, data) {
      if (workspaceWatcherError) {
          await (0, shutdown_utils_1.respondWithErrorAndExit)(socket, `File watcher error in the workspace '${workspace_root_1.workspaceRoot}'.`, workspaceWatcherError);
-@@ -134,9 +134,36 @@ async function handleMessage(socket, data) {
+@@ -134,9 +134,39 @@ async function handleMessage(socket, data) {
              return;
          }
      }
@@ -1981,8 +2000,11 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966
 +    // always did, so a write another process makes while the command runs is
 +    // as visible as it was. A watcher that stopped delivering stops the daemon
 +    // instead; the client is told so first, and continues without a daemon at
-+    // once.
-+    if (answersFromFiles(payload) && !provenConnections.has(socket)) {
++    // once. A plugin worker's request (`fromPluginWorker`) is no command and
++    // makes no probe: it nests in a daemon operation already current, the
++    // watcher's own recompute, which must read that recompute's files, or a
++    // command whose connection made its probe.
++    if (answersFromFiles(payload) && !payload.fromPluginWorker && !provenConnections.has(socket)) {
 +        const stopped = await (0, watcher_1.proveWatcherCurrent)();
 +        if (stopped !== undefined) {
 +            const error = new Error(`The Nx daemon stopped: ${stopped}. This command continues without it.`);
@@ -1999,7 +2021,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966
      if (payload.type === 'PING') {
          await handleResult(socket, 'PING', () => Promise.resolve({ response: true, description: 'ping' }), mode);
      }
-@@ -185,15 +212,6 @@ async function handleMessage(socket, data) {
+@@ -185,15 +215,6 @@ async function handleMessage(socket, data) {
      else if ((0, hash_glob_1.isHandleHashMultiGlobMessage)(payload)) {
          await handleResult(socket, hash_glob_1.HASH_GLOB, () => (0, handle_hash_glob_1.handleHashMultiGlob)(payload.globGroups), mode);
      }
@@ -2015,7 +2037,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966
      else if ((0, force_shutdown_1.isHandleForceShutdownMessage)(payload)) {
          await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
      }
-@@ -231,6 +249,22 @@ async function handleMessage(socket, data) {
+@@ -231,6 +252,22 @@ async function handleMessage(socket, data) {
          await (0, shutdown_utils_1.respondWithErrorAndExit)(socket, `Invalid payload from the client`, new Error(`Unsupported payload sent to daemon server: ${(0, consume_messages_from_socket_1.describeMessage)(unparsedPayload, { maxBytes: 200 })}`));
      }
  }
@@ -2038,7 +2060,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966
  async function handleResult(socket, type, hrFn, mode) {
      let hr;
      const startMark = new Date();
-@@ -242,7 +276,12 @@ async function handleResult(socket, type, hrFn, mode) {
+@@ -242,7 +279,12 @@ async function handleResult(socket, type, hrFn, mode) {
      }
      const doneHandlingMark = new Date();
      if (hr.error) {
@@ -2052,7 +2074,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966
      }
      else {
          logger_1.serverLogger.log(`Serializing response for ${type} message in ${mode} mode`);
-@@ -256,9 +295,10 @@ async function handleResult(socket, type, hrFn, mode) {
+@@ -256,9 +298,10 @@ async function handleResult(socket, type, hrFn, mode) {
      logger_1.serverLogger.log(`Handled ${mode} message ${type}. Handling time: ${doneHandlingMark.getTime() - startMark.getTime()}. Response time: ${endMark.getTime() - doneHandlingMark.getTime()}.`);
  }
  function handleInactivityTimeout() {
@@ -2065,7 +2087,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966
          (0, shutdown_utils_1.resetInactivityTimeout)(handleInactivityTimeout);
      }
      else {
-@@ -287,37 +327,6 @@ function registerProcessTerminationListeners() {
+@@ -287,37 +330,6 @@ function registerProcessTerminationListeners() {
          sockets: exports.openSockets,
      }));
  }
@@ -2103,7 +2125,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966
  /**
   * When applicable files in the workspaces are changed (created, updated, deleted),
   * we need to recompute the cached serialized project graph so that it is readily
-@@ -339,6 +348,11 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+@@ -339,6 +351,11 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
              return;
          }
          logger_1.serverLogger.watcherLog((0, watcher_1.convertChangeEventsToLogMessage)(changeEvents));
@@ -2115,7 +2137,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966
          (0, route_workspace_changes_1.routeWorkspaceChanges)(changeEvents);
      }
      catch (err) {
-@@ -348,65 +362,68 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+@@ -348,65 +365,68 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
          (0, file_watcher_sockets_1.notifyFileWatcherSocketsOfError)(err);
      }
  };
@@ -2223,7 +2245,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..cd24ff30639e538422cf813679e80966
      return new Promise(async (resolve, reject) => {
          // `listen` reports a failed bind asynchronously on the server, which the
          // try below cannot catch — without this an EACCES became an uncaught
-@@ -432,25 +449,19 @@ async function startServer() {
+@@ -432,25 +452,19 @@ async function startServer() {
                              // Best effort; the 0700 socket directory is the primary control.
                          }
                      }

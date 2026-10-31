@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { mbxIdleGated, mbxLeaf, mbxPool, nxTaskCores, runsPrebuiltNextest, withMbxLeaf } from './mbx-pool.js';
-import { runnerDemand, sizeRunner } from './runner-sizing.js';
+import { runnerDemand } from './runner-sizing.js';
 
 describe("mbx's one pool at the leaf", () => {
   it('is named only by the canonical mbx environment, at the priority of the job', () => {
@@ -19,69 +19,77 @@ describe("mbx's one pool at the leaf", () => {
     expect(mbxPool({ MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx', MBX_SCHED_DISABLE: '1' })).toBeNull();
   });
 
-  it('lets a building Cargo leaf through mbx as it is and reserves any other leaf at the job count, once', () => {
+  it('lets a building Cargo leaf through mbx as it is and reserves any other leaf at its runner count, once', () => {
     const pool = { priority: 'low' } as const;
-    for (const kind of ['cargo', 'cargo-mutants', 'nextest'] as const) {
-      expect(mbxLeaf(pool, kind, 8, 'cargo test -p x')).toEqual({ kind: 'cargo' });
-      expect(withMbxLeaf('cargo test -p x', mbxLeaf(pool, kind, 8, 'cargo test -p x'))).toBe('cargo test -p x');
+    const leafOf = (command: string, declared?: number) =>
+      mbxLeaf(pool, runnerDemand(command, declared, 18, {}), command);
+    for (const command of ['cargo test -p x', 'cargo mutants', 'cargo nextest run -p x']) {
+      expect(leafOf(command)).toEqual({ kind: 'cargo' });
+      expect(withMbxLeaf(command, leafOf(command))).toBe(command);
     }
-    const leaf = mbxLeaf(pool, 'process', 4, "bun test 'a b'");
-    expect(leaf).toEqual({ kind: 'reserve', cpus: 4, priority: 'low' });
-    expect(withMbxLeaf("bun test 'a b'", leaf)).toBe(
-      "mbx reserve --grant-fd 5 --cpus 4 --priority low -- /bin/sh -c 'bun test '\\''a b'\\'''",
-    );
-    expect(mbxLeaf(pool, 'vitest', 0, 'bun vitest run')).toEqual({ kind: 'reserve', cpus: 1, priority: 'low' });
+    const leaf = leafOf("bun test 'a b'", 4);
+    expect(leaf).toMatchObject({ kind: 'reserve', priority: 'low', demand: { kind: 'process', want: 4 } });
+    const reserved = withMbxLeaf("bun test 'a b'", leaf);
+    expect(reserved).toStartWith("mbx reserve --grant-fd 5 --cpus 4 --priority low -- /bin/sh -c 'export ");
+    expect(reserved).toEndWith(">&2; bun test '\\''a b'\\'''");
+    // A Vitest or Go test leaf enters no pool and runs its own default workers (owner's ruling, 2026-10-31).
+    expect(leafOf('bun vitest run')).toBeNull();
+    expect(leafOf('go test ./...')).toBeNull();
   });
 
   it('admits a nextest run of prebuilt binaries once for its whole grant, never a ticket per test process', () => {
     // A downstream gate on 2026-10-30: under MBX_SCHEDULER_TESTS=1 each test process of an extracted-archive run
     // queued for its own mbx ticket, and codec tests of at most 0.25 s took 73.5 s apiece.
     const pool = { priority: 'low' } as const;
-    const extracted =
-      'extracted="$(smoo-nx-nextest-extract target/nextest/archive.tar.zst)" && cargo --frozen nextest run ' +
-      '--binaries-metadata "$extracted/target/nextest/binaries-metadata.json" --workspace-remap .';
-    expect(mbxLeaf(pool, 'nextest', 6, extracted)).toEqual({ kind: 'reserve', cpus: 6, priority: 'low' });
-    expect(withMbxLeaf(extracted, mbxLeaf(pool, 'nextest', 6, extracted))).toStartWith(
-      'mbx reserve --grant-fd 5 --cpus 6 --priority low -- /bin/sh -c ',
+    const inPlace =
+      'cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json ' +
+      '--cargo-metadata .cache/nextest/cargo-metadata.json ' +
+      '--target-dir-remap "$(node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-binaries target-dir)" ' +
+      "--workspace-remap . -E 'package(core)' --no-fail-fast --no-tests=pass";
+    const bunSpelled = inPlace.replace(
+      'node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-binaries',
+      'bun node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/ts/bin/smoo-nx-nextest-binaries.js',
     );
-    expect(mbxLeaf(pool, 'nextest', 4, 'cargo nextest run --archive-file a.tar.zst')).toEqual({
+    const leafOf = (command: string, declared: number) =>
+      mbxLeaf(pool, runnerDemand(command, declared, 18, {}), command);
+    for (const command of [inPlace, bunSpelled]) {
+      expect(leafOf(command, 6)).toMatchObject({
+        kind: 'reserve',
+        priority: 'low',
+        demand: { kind: 'nextest', want: 6 },
+      });
+      expect(withMbxLeaf(command, leafOf(command, 6))).toStartWith(
+        'mbx reserve --grant-fd 5 --cpus 6 --priority low -- /bin/sh -c ',
+      );
+    }
+    expect(leafOf('cargo nextest run --archive-file a.tar.zst', 4)).toMatchObject({
       kind: 'reserve',
-      cpus: 4,
+      demand: { kind: 'nextest', want: 4 },
       priority: 'low',
     });
     // A nextest run that builds its tests first still lets mbx admit its compilers.
-    expect(mbxLeaf(pool, 'nextest', 8, 'cargo nextest run -p x')).toEqual({ kind: 'cargo' });
+    expect(leafOf('cargo nextest run -p x', 8)).toEqual({ kind: 'cargo' });
   });
 
-  it("sizes a prebuilt nextest leaf to its task's share, so the run's cargo-test leaves hold the pool side by side", () => {
+  it("asks for a prebuilt nextest leaf's task share, of which mbx grants as many cores as are free", () => {
     // A gate on 2026-10-30: every cargo-test leaf reserved `--cpus 18` of an 18-core pool, so they ran one at a time
-    // and the host sat 70% idle.
+    // and the host sat 70% idle. Knowing no count of its tests, the leaf asks for its task's share of the host.
     const pool = { priority: 'low' } as const;
     const command =
       'cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json --workspace-remap .';
     expect(runsPrebuiltNextest(command)).toBe(true);
     expect(runsPrebuiltNextest('cargo nextest run -p x')).toBe(false);
-    const leaf = (environment: NodeJS.ProcessEnv, declared?: number, ran = command) =>
-      mbxLeaf(pool, 'nextest', runnerDemand(ran, declared, nxTaskCores(18, environment), {}).want, ran);
-    // Nx runs every task at once under 100%: each leaf counts one core, and two of them fit beside each other.
-    const reserved = [leaf({ NX_PARALLEL: '100%' }), leaf({ NX_PARALLEL: '100%' })];
-    expect(reserved).toEqual([
-      { kind: 'reserve', cpus: 1, priority: 'low' },
-      { kind: 'reserve', cpus: 1, priority: 'low' },
-    ]);
+    const leafOf = (environment: NodeJS.ProcessEnv, declared?: number) =>
+      mbxLeaf(pool, runnerDemand(command, declared, nxTaskCores(18, environment), {}), command);
+    // Nx runs every task at once under 100%: each leaf counts one core.
+    expect(leafOf({ NX_PARALLEL: '100%' })).toMatchObject({ kind: 'reserve', demand: { kind: 'nextest', want: 1 } });
     expect(nxTaskCores(18, { NX_PARALLEL: '6' })).toBe(3);
     expect(nxTaskCores(18, { NX_PARALLEL: '50%' })).toBe(2);
     // Nx's own default of three tasks at once.
     expect(nxTaskCores(18, {})).toBe(6);
     expect(nxTaskCores(2, { NX_PARALLEL: '8' })).toBe(1);
-    // A declared or named count is the target's own word and still wins.
-    expect(leaf({ NX_PARALLEL: '100%' }, 4)).toEqual({ kind: 'reserve', cpus: 4, priority: 'low' });
-    expect(leaf({ NX_PARALLEL: '100%' }, undefined, `${command} --test-threads=2`)).toEqual({
-      kind: 'reserve',
-      cpus: 2,
-      priority: 'low',
-    });
-    expect(sizeRunner({ kind: 'nextest', want: 1 }, command, 1).env.NEXTEST_TEST_THREADS).toBe('1');
+    // A declared count is the target's own word and still wins.
+    expect(leafOf({ NX_PARALLEL: '100%' }, 4)).toMatchObject({ kind: 'reserve', demand: { want: 4 } });
   });
 
   it.each<[string, string, boolean]>([
@@ -90,8 +98,8 @@ describe("mbx's one pool at the leaf", () => {
     ['supported selected Cargo legs', 'cargo test --tests; cargo test --lib', true],
     ['supported alternative legs', 'cargo nextest run || cargo nextest run', true],
     [
-      'extracted nextest chain with quoted shell punctuation',
-      `extracted="$(bun extract.js archive.tar.zst)" && cargo --frozen nextest run -E 'package(core) & test(first)' && cargo --frozen nextest run --run-ignored only -E 'test(second)'`,
+      'in-place nextest chain with quoted shell punctuation',
+      `cargo --frozen nextest run --target-dir-remap "$(x/smoo-nx-nextest-binaries target-dir)" -E 'package(core) & test(first)' && cargo --frozen nextest run --run-ignored only -E 'test(second)'`,
       true,
     ],
     ['a later unscheduled Cargo leg', 'cargo nextest run && cargo test --doc', false],
@@ -117,8 +125,8 @@ describe("mbx's one pool at the leaf", () => {
       false,
     ],
     [
-      'an extracted prefix cannot swallow another command',
-      'extracted="$(printf archive)" && ./test-binary && extracted="$(printf archive)" && cargo nextest run && cargo nextest run',
+      'no prefix may run before the first Cargo leg',
+      'extracted="$(printf archive)" && cargo nextest run && cargo nextest run',
       false,
     ],
     [
@@ -138,13 +146,18 @@ describe("mbx's one pool at the leaf", () => {
     ],
     ['a quoted glob remains one literal filter', "cargo nextest run && cargo nextest run -E 'test(/foo.*/)'", true],
     [
-      'unquoted inferred paths may split into options',
-      'extracted="$(printf archive)" && cargo nextest run && cargo nextest run $extracted/',
+      "the helper's substitution is known only as the value of --target-dir-remap",
+      'cargo nextest run && cargo nextest run "$(x/smoo-nx-nextest-binaries target-dir)"',
       false,
     ],
     [
-      'a quoted inferred path must remain a known path operand',
-      'extracted="$(printf archive)" && cargo nextest run && cargo nextest run "$extracted/"',
+      'an unquoted substitution may split into options',
+      'cargo nextest run --target-dir-remap $(x/smoo-nx-nextest-binaries target-dir)',
+      false,
+    ],
+    [
+      'a substitution that says more than the target directory is unknown',
+      'cargo nextest run --target-dir-remap "$(x/smoo-nx-nextest-binaries target-dir; echo --config)"',
       false,
     ],
     ['non-shell whitespace cannot name a Cargo executable', 'cargo nextest run && cargo\u00a0nextest run', false],
@@ -155,9 +168,19 @@ describe("mbx's one pool at the leaf", () => {
     ],
     ['a quoted tilde remains literal', "cargo nextest run && cargo nextest run -E 'test(/~/)'", true],
     [
-      'the extracted-archive nextest leaf whose queued runners hit the idle bound',
-      `extracted="$(node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-extract .cache/nextest/archive.tar.zst)" && cargo --frozen nextest run --tool-config-file 'smoo-report:report.toml' --binaries-metadata "$extracted/target/nextest/binaries-metadata.json" --cargo-metadata "$extracted/target/nextest/cargo-metadata.json" --target-dir-remap "$extracted/target" --workspace-remap . -E 'package(core)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:$PWD/node_modules/@smoothbricks/nx-plugin/nextest.toml"`,
+      'the in-place nextest leaf whose queued runners hit the idle bound',
+      `cargo --frozen nextest run --tool-config-file 'smoo-report:report.toml' --binaries-metadata .cache/nextest/binaries-metadata.json --cargo-metadata .cache/nextest/cargo-metadata.json --target-dir-remap "$(node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/darwin-arm64/smoo-nx-nextest-binaries target-dir)" --workspace-remap . -E 'package(core)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:$PWD/node_modules/@smoothbricks/nx-plugin/nextest.toml"`,
       true,
+    ],
+    [
+      "a repository's own in-place runner naming the helper's script through bun",
+      `cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json --cargo-metadata .cache/nextest/cargo-metadata.json --target-dir-remap "$(bun node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/ts/bin/smoo-nx-nextest-binaries.js target-dir)" --workspace-remap . -E 'binary_id(app::integration)' --run-ignored only`,
+      true,
+    ],
+    [
+      'another program run through bun is unknown',
+      'cargo nextest run --target-dir-remap "$(bun x/other.js target-dir)"',
+      false,
     ],
     ['selected non-doc Cargo tests', 'cargo test --tests', true],
     ['plain Cargo test can execute doctests', 'cargo test', false],

@@ -1023,28 +1023,34 @@ async fn a_job_s_charged_memory_and_its_process_s_resident_memory_are_recorded_a
         let job_rows = if charged.is_some() { 2 } else { 3 };
         assert_eq!(
             (health.recorded, health.failed),
-            (u64::try_from(1 + job_rows).unwrap(), 0),
-            "{label}: process segments, job edges and any unattributed row: {health:?}"
+            (2, 0),
+            "{label}: the process rows and the job rows seal as a segment each: {health:?}"
         );
 
         // The job span: its end row states the source's pair, or nothing.
         let jobs = sealed_segments_among_kinds(&telemetry, "job-");
-        assert_eq!(jobs.len(), job_rows);
-        let cells = |batch: &RecordBatch| {
+        assert_eq!(jobs.len(), 1, "{label}: the job rows are one segment");
+        let batch = &jobs[0].1;
+        assert_eq!(
+            batch.num_rows(),
+            job_rows,
+            "{label}: job edges and any unattributed row"
+        );
+        let cells = |row: usize| {
             (
-                number_cell::<UInt64Type>(batch, "charged_memory_current_bytes", 0),
-                number_cell::<UInt64Type>(batch, "charged_memory_peak_bytes", 0),
+                number_cell::<UInt64Type>(batch, "charged_memory_current_bytes", row),
+                number_cell::<UInt64Type>(batch, "charged_memory_peak_bytes", row),
             )
         };
-        for (_, batch) in &jobs[..job_rows - 1] {
+        for row in 0..job_rows - 1 {
             assert_eq!(
-                cells(batch),
+                cells(row),
                 (None, None),
                 "{label}: only the end row is charged"
             );
         }
         assert_eq!(
-            cells(&jobs[job_rows - 1].1),
+            cells(job_rows - 1),
             charged.map_or((None, None), |(current, peak)| (Some(current), Some(peak))),
             "{label}: the end row"
         );
@@ -1074,7 +1080,7 @@ async fn a_job_s_charged_memory_and_its_process_s_resident_memory_are_recorded_a
         }
         let thread = job.thread();
         assert_eq!(
-            number_cell::<UInt64Type>(&jobs[job_rows - 1].1, "thread_id", 0),
+            number_cell::<UInt64Type>(batch, "thread_id", job_rows - 1),
             Some(thread)
         );
         assert!(

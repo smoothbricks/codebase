@@ -42,7 +42,7 @@ describe('what shell entry syncs for a uv project', () => {
       const venv = join(state, 'venv');
       const uv = { uvProjectEnvironment: venv, python: PYTHON };
       const create = ['venv', '--relocatable', '--python', PYTHON, venv];
-      const sync = ['sync', '--python', PYTHON, '--all-packages', '--all-groups'];
+      const sync = ['sync', '--python', PYTHON, '--all-packages', '--all-groups', '--all-extras'];
 
       // Entered from another repository's uv shell, whose variable is inherited: this shell's module passed no
       // interpreter, so nothing syncs.

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow_array::RecordBatch;
 use uuid::Uuid;
 
-use crate::runtime::job_spans::PROCESS_SEAL_INTERVAL;
+use crate::runtime::job_spans::SEAL_INTERVAL;
 use crate::storage::apfs::extents;
 use crate::storage::trace_columns::{I64, Optional, Required, U32, U64, Utf8, trace_columns};
 use crate::storage::trace_segment::{
@@ -529,7 +529,7 @@ fn gather(
     first: Observation,
     mut receive: impl FnMut(Duration) -> Result<Observation, mpsc::RecvTimeoutError>,
 ) -> (Vec<Observation>, bool) {
-    let deadline = Instant::now() + PROCESS_SEAL_INTERVAL;
+    let deadline = Instant::now() + SEAL_INTERVAL;
     let mut observations = Vec::with_capacity(QUEUE_CAPACITY);
     observations.push(first);
     loop {

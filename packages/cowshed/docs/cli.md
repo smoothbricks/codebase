@@ -274,7 +274,7 @@ cowshed: host storage is partially set up: 1 volume lives outside this host's co
 ```
 
 `setup` installs **cowshed's pinned mbx** (specs/cowshed/14_nix.md, "mbx") on every run once storage is up and the
-invoking build is the installed cowshed. It builds the flake the package ships at `nix/mbx` (mbx v1.28.0 plus compact
+invoking build is the installed cowshed. It builds the flake the package ships at `nix/mbx` (mbx v1.29.0 plus compact
 predictions, scheduler admission, grant descriptors, short session roots, Cargo shim-chain selection and selected
 default sysroots, from `smoothbricks/mr-boxington` at the pinned revision, with mbx's own locked nixpkgs), roots the
 result with a nix GC root at `~/Library/Application Support/dev.cowshed/nix/mbx`, and links `mbx` in cowshed's `bin`
@@ -1678,10 +1678,10 @@ implicit overwrite. `--replace-output` upgrades every requested copy in that inv
 either copy destination is a usage error. Structured API/JSON requests retain a separate publication policy per stream
 instead of inheriting the CLI-wide switch.
 
-Copies are published only after the canonical artifact is drained, fsynced, closed, and sealed. A destination is an
-independent clone/reflink when supported, otherwise an ordinary copy, and is atomically renamed under the selected
-policy. Publication does not alter `StreamInfo.storage` and is never used for reads or authority. Failure is a typed
-operational error and does not change the already-established process result.
+Copies are published only after the canonical artifact is drained, closed, and sealed (none of it is synced). A
+destination is an independent clone/reflink when supported, otherwise an ordinary copy, and is atomically renamed under
+the selected policy. Publication does not alter `StreamInfo.storage` and is never used for reads or authority. Failure
+is a typed operational error and does not change the already-established process result.
 
 ### Job classes and host scheduling
 

@@ -461,16 +461,17 @@ impl FileComparison {
 /// byte, holes included: it is recorded evidence (the recovery journal's `published` digest and
 /// adopt's verified-copy content line). Every transfer is positional, so the descriptors' offsets
 /// are irrelevant; callers have matched both lengths to `length` and recheck identities after.
+/// `comparison` is the walk's one scratch: a scratch per file zero-fills its two 1 MiB buffers for
+/// every file it compares.
 fn compare_file_bytes(
+    comparison: &mut FileComparison,
     source: &fs::File,
     destination: &fs::File,
     length: u64,
 ) -> io::Result<crate::api::Sha256Digest> {
     use sha2::{Digest as _, Sha256};
     let mut digest = Sha256::new();
-    if !FileComparison::new()
-        .visit_equal(source, destination, length, |bytes| digest.update(bytes))?
-    {
+    if !comparison.visit_equal(source, destination, length, |bytes| digest.update(bytes))? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "file content differs",
@@ -602,6 +603,7 @@ fn verify_with_snapshot(
     let mut source_allocated_bytes = 0_u64;
     let mut copied_allocated_bytes = 0_u64;
     let mut aliases: BTreeMap<(u64, u64), VerifiedAlias> = BTreeMap::new();
+    let mut comparison = FileComparison::new();
     for (relative, original) in &before {
         let copy = copied
             .get(relative)
@@ -682,9 +684,13 @@ fn verify_with_snapshot(
                 {
                     return Err(mismatch(relative, "sparse holes were materialized"));
                 }
-                let payload_digest =
-                    compare_file_bytes(&source_file, &destination_file, original.size)
-                        .map_err(|error| mismatch(relative, &error.to_string()))?;
+                let payload_digest = compare_file_bytes(
+                    &mut comparison,
+                    &source_file,
+                    &destination_file,
+                    original.size,
+                )
+                .map_err(|error| mismatch(relative, &error.to_string()))?;
                 digest.update(payload_digest.as_bytes());
                 if original.is_hard_linked() {
                     aliases.insert(
@@ -1972,6 +1978,38 @@ mod tests {
         .expect_err("a moved modification time is a change");
         assert_eq!(error.code, crate::ErrorCode::Conflict);
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// A verification walk compares every file through one scratch it allocates once: the bytes it
+    /// allocates grow with its file count by the walk's bookkeeping, never by a scratch per file. A
+    /// scratch per file zero-filled two 1 MiB buffers for each file of an Nx checkout, nine tenths of
+    /// its adopt verification.
+    #[test]
+    fn a_verification_walk_allocates_its_comparison_scratch_once() {
+        let census = |files: usize| {
+            let scratch = crate::temp_root::TempRoot::new_in(
+                &std::env::temp_dir(),
+                &format!("cowshed-copy-scratch-{files}"),
+            );
+            let (source, destination) = (scratch.join("source"), scratch.join("destination"));
+            fs::create_dir(&source).expect("create source");
+            fs::create_dir(&destination).expect("create destination");
+            for index in 0..files {
+                fs::write(source.join(format!("file-{index}")), b"payload\n").unwrap();
+            }
+            run(&source, &destination, 6);
+            let (verified, (_, bytes)) = crate::alloc_census::allocations(|| {
+                super::verify_tree_blocking(&source, &destination)
+            });
+            verified.expect("the copy verifies");
+            bytes
+        };
+        let one = census(1);
+        let many = census(64);
+        assert!(
+            many < one + super::COMPARE_CHUNK_BYTES,
+            "verifying 64 files allocated {many} bytes and one file {one}: a scratch per file"
+        );
     }
 
     #[test]

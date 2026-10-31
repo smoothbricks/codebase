@@ -10,8 +10,7 @@ use std::time::SystemTime;
 
 use super::{DirectoryExecutionHost, unsupported};
 use crate::build_volume::{
-    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration,
-    ReleaseClaim,
+    BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration, ReleaseClaim,
 };
 use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use crate::repository::RepoId;
@@ -55,10 +54,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         id: &BuildVolumeId,
         capacity: ImageCapacity,
         registration: &Registration,
-    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError> {
+    ) -> Result<(PathBuf, ReleaseClaim), ApfsStorageError> {
         DirectoryExecutionHost::create_build_volume(self, layout, id, capacity, registration)
     }
-
     fn create_claimed_build_volume(
         &self,
         layout: &BuildVolumeLayout,

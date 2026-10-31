@@ -100,7 +100,7 @@
           "!{workspaceRoot}/patches/**/*.md"
         ],
         "options": {
-          "command": "bun ../scripts/gen-go-work.mjs && go test ./... -p=\"$(nproc)\"",
+          "command": "bun ../scripts/gen-go-work.mjs && go test ./...",
           "cwd": "{projectRoot}/plugin",
           "timeoutMs": 600000,
           "killAfterMs": 10000

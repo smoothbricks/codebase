@@ -34,7 +34,6 @@ import {
   ensurePublishConfig,
   ensureRepositoryObject,
   ensureScripts,
-  type NxTargetOptions,
   type PackageExportMap,
   type PackageExports,
   type PackageJson,
@@ -415,14 +414,6 @@ export function validateAggregateMemberCache(projects: readonly ProjectTargets[]
   return failures;
 }
 
-const INFERRED_WRANGLER_DEPLOY = 'smoo wrangler deploy-stage ';
-
-function isInferredWranglerDeploy(target: string, options: NxTargetOptions | undefined): boolean {
-  return (
-    target === 'deploy' && typeof options?.command === 'string' && options.command.startsWith(INFERRED_WRANGLER_DEPLOY)
-  );
-}
-
 /**
  * `"cache": false` belongs to an aggregate alone: `nx:noop`, or a target that runs nothing and only depends on others
  * (the owner's rule, 2026-10-30). Every target that runs something keys what it reads and writes, so a rerun with
@@ -431,11 +422,6 @@ function isInferredWranglerDeploy(target: string, options: NxTargetOptions | und
  * `"continuous": true`, a measurement keys on the code and toolchain it measures, and the host state a target reads
  * is a runtime input. A target that deletes build state file by file (`clean`) has no place at all: build state is
  * removed whole (cowshed rm, mbx gc).
- *
- * One exception is admitted by name: the wrangler `deploy` nx-plugin infers (`smoo wrangler deploy-stage`). Its
- * version tag is the task hash, so keying the live tag into that hash would never converge; its cached form keys the
- * artifact and the stage alone, tags with that hash, and compares the live tag in a custom hasher that sees the stage.
- * Until that lands it states `"cache": false`.
  */
 export function validateCacheOnlyAggregatesUncached(projects: readonly ProjectTargets[]): number {
   let failures = 0;
@@ -452,7 +438,7 @@ export function validateCacheOnlyAggregatesUncached(projects: readonly ProjectTa
             : options?.command !== undefined || options?.commands !== undefined
               ? 'nx:run-commands'
               : null;
-      if (runs === null || isInferredWranglerDeploy(target, options)) continue;
+      if (runs === null) continue;
       console.error(
         `${project.project}:${target}: "cache": false on a target that runs ${runs}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input`,
       );

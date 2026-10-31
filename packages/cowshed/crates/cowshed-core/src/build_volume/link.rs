@@ -18,6 +18,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 
+use super::BuildStateTool;
 use crate::capabilities::BuildStatePath;
 use crate::error::{CowshedError, Result};
 
@@ -140,7 +141,9 @@ pub fn settled(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> bool
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Unsettled {
     /// Nothing is there, where a link belongs: a tool removed it, and its next run makes a
-    /// directory in its place.
+    /// directory in its place; or a declared path whose link this checkout lacks, never made here
+    /// (a fork of main, main after a land, a cache's first refresh) or removed by a tool, a kept
+    /// one (`[build] keep`) only while its volume directory holds entries.
     Missing,
     /// A real directory displaced the link: a tool removed it and wrote there since, off the
     /// volume.
@@ -162,8 +165,9 @@ impl std::fmt::Display for Unsettled {
 
 /// Every build-state path of `checkout` that is not what a refresh at an unchanged fingerprint
 /// leaves it (`migrate::adopt_paths`): its fixed link, under real parent directories, reaching
-/// its directory in the volume mounted at `volume`; or, for a declared path nothing occupies,
-/// nothing at all. Reads only; repairing or reporting each is the refresh's.
+/// its directory in the volume mounted at `volume`; or, for a kept declared path (`[build] keep`)
+/// nothing occupies whose volume directory holds no entry, nothing at all. Reads only; repairing or
+/// reporting each is the refresh's.
 pub fn unsettled(
     checkout: &Path,
     volume: &Path,
@@ -176,7 +180,13 @@ pub fn unsettled(
             let at = checkout.join(path);
             let found = match fs::symlink_metadata(&at) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    (!state.is_declared()).then_some(Unsettled::Missing)
+                    // An unreadable volume directory is unsettled: the refresh reports it.
+                    (BuildStateTool::of(state) != BuildStateTool::Declared
+                        || !matches!(
+                            volume_holds(volume, state),
+                            Ok(VolumeHolds::Nothing | VolumeHolds::EmptyDirectory)
+                        ))
+                    .then_some(Unsettled::Missing)
                 }
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     let linked = is_fixed_link(checkout, state)
@@ -200,6 +210,35 @@ pub fn is_fixed_link(checkout: &Path, state: &BuildStatePath) -> bool {
     real_parents(checkout, path)
         && fs::read_link(checkout.join(path))
             .is_ok_and(|target| target == relative_target(path, state.volume.as_path()))
+}
+
+/// What the build volume holds at a build-state path's volume directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VolumeHolds {
+    /// A real directory with entries: state a tool wrote through the path's link, in this
+    /// checkout or in one whose volume this checkout cloned or adopted.
+    Directory,
+    /// A real directory with no entry: a refresh makes one with every link it makes, so it says
+    /// nothing a tool made.
+    EmptyDirectory,
+    /// Nothing, or something other than a real directory.
+    Nothing,
+}
+
+/// What the volume mounted at `volume` holds at `state`'s volume directory, never following a
+/// link there. Reads only.
+pub(crate) fn volume_holds(volume: &Path, state: &BuildStatePath) -> io::Result<VolumeHolds> {
+    let directory = volume.join(state.volume.as_path());
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => match fs::read_dir(&directory)?.next() {
+            None => Ok(VolumeHolds::EmptyDirectory),
+            Some(Ok(_)) => Ok(VolumeHolds::Directory),
+            Some(Err(error)) => Err(error),
+        },
+        Ok(_) => Ok(VolumeHolds::Nothing),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(VolumeHolds::Nothing),
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether every directory between `checkout` and `relative`'s parent is a real directory, as
@@ -535,6 +574,26 @@ mod tests {
         assert!(volume.join("nx/cache/run.json").is_file());
     }
 
+    /// A declared path `[build] keep` does not name is a cache, linked like a capability's: where
+    /// nothing is, a refresh makes its link, so a resident `exec` sends the job through it.
+    #[test]
+    fn a_declared_cache_nothing_occupies_is_missing_its_link() {
+        let scratch = Scratch::new("declared-cache");
+        let checkout = scratch.checkout();
+        let volume = scratch.volume("volume-a");
+        point(&checkout, &volume).unwrap();
+        let paths = [BuildStatePath::declared("packages/a/.cache/lmao").unwrap()];
+        assert_eq!(
+            unsettled(&checkout, &volume, &paths),
+            [(PathBuf::from("packages/a/.cache/lmao"), Unsettled::Missing)]
+        );
+        link_paths(&checkout, &volume, &paths).unwrap();
+        assert!(
+            settled(&checkout, &volume, &paths),
+            "its link is what the refresh leaves"
+        );
+    }
+
     /// A resident `exec` admits a job without the controller's refresh only while every link is
     /// what that refresh would leave; each way a tool can disturb one sends the job through it.
     #[test]
@@ -545,10 +604,10 @@ mod tests {
         point(&checkout, &volume).unwrap();
         let mut paths = paths();
         link_paths(&checkout, &volume, &paths).unwrap();
-        paths.push(BuildStatePath::declared("upstream/build").unwrap());
+        paths.push(BuildStatePath::declared("upstream/build").unwrap().kept());
         assert!(
             settled(&checkout, &volume, &paths),
-            "a declared path nothing occupies needs no link"
+            "a kept declared path nothing occupies needs no link"
         );
 
         fs::create_dir_all(checkout.join("upstream/build")).unwrap();
@@ -557,6 +616,29 @@ mod tests {
             "a declared path that appeared is linked by the refresh"
         );
         fs::remove_dir_all(checkout.join("upstream")).unwrap();
+
+        fs::create_dir_all(volume.join("declared/upstream/build")).unwrap();
+        assert!(
+            settled(&checkout, &volume, &paths),
+            "an empty volume directory is no tool's state"
+        );
+        fs::write(volume.join("declared/upstream/build/state"), b"made").unwrap();
+        assert_eq!(
+            unsettled(&checkout, &volume, &paths),
+            [(PathBuf::from("upstream/build"), Unsettled::Missing)],
+            "a declared path the volume holds is linked by the refresh"
+        );
+        let mode = |mode| <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode);
+        fs::set_permissions(volume.join("declared/upstream"), mode(0o000)).unwrap();
+        // Restored before asserting, so the scratch tree's teardown can enter it on every exit.
+        let unreadable = unsettled(&checkout, &volume, &paths);
+        fs::set_permissions(volume.join("declared/upstream"), mode(0o755)).unwrap();
+        assert_eq!(
+            unreadable,
+            [(PathBuf::from("upstream/build"), Unsettled::Missing)],
+            "an unreadable volume directory is left to the refresh, which reports it"
+        );
+        fs::remove_dir_all(volume.join("declared")).unwrap();
 
         fs::remove_file(checkout.join("target")).unwrap();
         assert!(!settled(&checkout, &volume, &paths), "a removed link");

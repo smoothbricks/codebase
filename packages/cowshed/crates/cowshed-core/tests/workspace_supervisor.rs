@@ -14,10 +14,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
     AdmissionKey, CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecClass,
-    ExecCommand, ExecRequest, ExecScope, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState,
-    JobTailBytes, JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
-    OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest,
-    StdinKind, StdinSource, StreamInfo, WorkspacePath,
+    ExecCommand, ExecRequest, ExecScope, ExitStatus, JobFailure, JobId, JobJournalCursor,
+    JobRecord, JobState, JobTailBytes, JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo,
+    OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy,
+    RunSandboxMode, Sha256Digest, StdinKind, StdinSource, StreamInfo, WorkspacePath,
 };
 #[cfg(target_os = "macos")]
 use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
@@ -744,6 +744,7 @@ fn request(stdin: StdinSource) -> ExecRequest {
         class: ExecClass::Background,
         want: None,
         scope: ExecScope::Workspace,
+        record: JobRecord::Cowshed,
     }
 }
 
@@ -813,6 +814,267 @@ async fn complete(spawned: &Spawned, stdout: &[u8], stderr: &[u8], exit: ExitSta
             .await
             .unwrap();
     }
+}
+
+/// Every file under `directory` and its bytes, so two readings of a tree compare whole.
+fn tree(directory: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).expect("list a protected directory") {
+            let path = entry.expect("protected entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let bytes = std::fs::read(&path).expect("read a protected file");
+                files.insert(path, bytes);
+            }
+        }
+    }
+    files
+}
+
+/// `stream` of `job` read to its end, as a caller serves itself.
+async fn read_all(handle: &WorkspaceSupervisorHandle, job: JobId, stream: StreamKind) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = handle
+            .log_read(job, stream, bytes.len() as u64, true)
+            .await
+            .expect("read the job's stream");
+        bytes.extend_from_slice(&chunk.bytes);
+        if chunk.eof {
+            return bytes;
+        }
+    }
+}
+
+/// A request whose caller owns the job's record (11_shell.md, "Caller-owned jobs").
+fn caller_owned(key: Option<&AdmissionKey>) -> ExecRequest {
+    let mut owned = request(StdinSource::Empty);
+    owned.record = JobRecord::Caller;
+    owned.admission_key = key.cloned();
+    owned
+}
+
+/// A caller-owned job (11_shell.md, "Caller-owned jobs") leaves the workspace's protected records
+/// byte for byte as they were, and answers its key, status and terminal facts from memory; `info`
+/// and a watcher's wake acknowledge nothing, and once its caller has been served both streams
+/// and a `sealed` answer it is forgotten, key and all.
+#[tokio::test]
+async fn a_caller_owned_job_writes_no_record_and_answers_from_memory_until_read_whole() {
+    let root = workspace_root(&temp_parent::scratch_parent(), "caller-owned");
+    let mut h = real_store_harness(config(&root));
+    let recorded = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(recorded).await.unwrap();
+    let records = root.join("workspace/.cowshed/job");
+    let before = tree(&records);
+    assert!(!before.is_empty(), "the recorded job wrote its records");
+
+    let key = AdmissionKey::new("caller-owned").unwrap();
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            caller_owned(Some(&key)),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.handle
+            .exec(
+                None,
+                None,
+                caller_owned(Some(&key)),
+                AdmissionSource::Worker
+            )
+            .await
+            .unwrap(),
+        job,
+        "a keyed repeat answers the same job from memory"
+    );
+    let mut recorded_repeat = caller_owned(Some(&key));
+    recorded_repeat.record = JobRecord::Cowshed;
+    let refused = h
+        .handle
+        .exec(None, None, recorded_repeat, AdmissionSource::Worker)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.admission_source(),
+        Some(&AdmissionRefusal::KeyConflict {
+            job_id: job,
+            fields: vec![AdmissionField::Record],
+        })
+    );
+    assert_eq!(h.handle.job_by_key(key.clone()).await.unwrap(), Some(job));
+
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"out", b"err", ExitStatus::Exited { code: 0 }).await;
+    let ended = h.handle.ended(job).await.unwrap();
+    assert_eq!(ended.stdout.storage, OutputStorage::Streamed);
+    assert_eq!(
+        (ended.stdout.bytes, ended.stdout.sha256),
+        (3, Sha256Digest::compute(b"out"))
+    );
+    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Exited);
+    assert_eq!(read_all(&h.handle, job, StreamKind::Stdout).await, b"out");
+    assert_eq!(read_all(&h.handle, job, StreamKind::Stderr).await, b"err");
+    assert!(
+        h.handle.info(job).await.is_ok(),
+        "served both streams, a job whose end no wait or sealed answer carried is held"
+    );
+    let sealed = h.handle.sealed(job).await.unwrap();
+    assert_eq!(sealed.stderr.sha256, Sha256Digest::compute(b"err"));
+    assert_eq!(
+        h.handle.info(job).await.unwrap_err().code,
+        ErrorCode::NotFound,
+        "read whole, the job is forgotten"
+    );
+    assert_eq!(h.handle.job_by_key(key).await.unwrap(), None);
+    assert_eq!(tree(&records), before, "nothing under .cowshed/job changed");
+}
+
+/// A caller that follows a caller-owned job's streams to their end through the socket and only
+/// then waits gets its wait answered: the socket's own bookkeeping watches the job's end without
+/// acknowledging it.
+#[tokio::test]
+async fn a_caller_owned_job_streamed_then_waited_through_the_socket_answers_its_wait() {
+    let (mut h, _root) = harness(1, 1024, false, false);
+    let (remote, _path) = served(&h.handle).await;
+    let job = remote
+        .exec(None, None, caller_owned(None), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"out", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(read_all(&remote, job, StreamKind::Stdout).await, b"out");
+    assert_eq!(read_all(&remote, job, StreamKind::Stderr).await, b"");
+    let ended = remote
+        .wait(job)
+        .await
+        .expect("the caller's own wait answers after its streams were served");
+    assert_eq!(ended.state, JobState::Exited);
+    assert_eq!(
+        remote.info(job).await.unwrap_err().code,
+        ErrorCode::NotFound,
+        "its wait delivered, the job is read whole"
+    );
+
+    // Waiting first and reading after: a stream is read only once a read answered its end, so
+    // even empty streams are still there to read after the wait.
+    let job = remote
+        .exec(None, None, caller_owned(None), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(remote.wait(job).await.unwrap().state, JobState::Exited);
+    assert_eq!(read_all(&remote, job, StreamKind::Stdout).await, b"");
+    assert_eq!(read_all(&remote, job, StreamKind::Stderr).await, b"");
+    assert_eq!(
+        remote.info(job).await.unwrap_err().code,
+        ErrorCode::NotFound,
+        "both empty streams read after its wait, the job is read whole"
+    );
+}
+
+/// A caller-owned job publishes no output copy (a published copy is a disk record), and its
+/// output quota is counted in the actor as the store counts a recorded job's.
+#[tokio::test]
+async fn a_caller_owned_job_refuses_an_output_copy_and_keeps_its_quota_in_memory() {
+    let root = workspace_root(&temp_parent::scratch_parent(), "caller-owned-quota");
+    let base = config(&root);
+    let mut h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            artifacts: cowshed_core::storage::job_artifact::ArtifactConfig {
+                combined_output_quota_bytes: 4,
+                ..base.artifacts.clone()
+            },
+            ..base
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    let mut copied = caller_owned(None);
+    copied.stdout_copy = Some(OutputPublication {
+        path: WorkspacePath::new("out.txt").unwrap(),
+        policy: PublicationPolicy::CreateNew,
+    });
+    let refused = h
+        .handle
+        .exec(None, None, copied, AdmissionSource::Worker)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Usage, "{}", refused.message);
+
+    let job = h
+        .handle
+        .exec(None, None, caller_owned(None), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    spawned
+        .events
+        .send(ProcessEvent::Output {
+            job_id: job,
+            stream: StreamKind::Stdout,
+            bytes: Bytes::from_static(b"abcdef"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::StdinClosed(job)
+    );
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Signal(job, ProcessSignal::Term)
+    );
+    spawned
+        .events
+        .send(ProcessEvent::Exited {
+            job_id: job,
+            exit: ExitStatus::Signaled {
+                signal: 15,
+                core_dumped: false,
+            },
+        })
+        .await
+        .unwrap();
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+        spawned
+            .events
+            .send(ProcessEvent::OutputEof {
+                job_id: job,
+                stream,
+            })
+            .await
+            .unwrap();
+    }
+    let info = h.handle.wait(job).await.unwrap();
+    assert_eq!(info.state, JobState::OutputLimit);
+    assert_eq!(info.stdout.storage, OutputStorage::Streamed);
+    assert_eq!(
+        (info.stdout.bytes, info.stdout.sha256),
+        (4, Sha256Digest::compute(b"abcd"))
+    );
+    assert_eq!(info.output_limit.unwrap().limit_bytes, 4);
 }
 
 async fn open_named(handle: &WorkspaceSupervisorHandle, name: &str) -> SessionToken {
@@ -3646,6 +3908,7 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
         AdmissionField::StdoutCopy,
         AdmissionField::StderrCopy,
         AdmissionField::Want,
+        AdmissionField::Record,
     ] {
         let mut changed = keyed("op-fields", StdinSource::Empty);
         let mut session = None;
@@ -3677,6 +3940,7 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
                 });
             }
             AdmissionField::Want => changed.want = NonZeroUsize::new(4),
+            AdmissionField::Record => changed.record = JobRecord::Caller,
             AdmissionField::Class | AdmissionField::Scope => {
                 unreachable!("a class and its scope change together, below")
             }
@@ -8167,7 +8431,7 @@ struct JobSpanRow {
 }
 
 /// Every job-span segment under `telemetry`, in the order its writer sealed them: its name and its
-/// one batch of one row.
+/// one batch, of one row or more.
 fn job_span_batches(telemetry: &Path) -> Vec<(String, arrow_array::RecordBatch)> {
     let mut segments = Vec::new();
     for partition in std::fs::read_dir(telemetry).expect("list telemetry root") {
@@ -8190,14 +8454,14 @@ fn job_span_batches(telemetry: &Path) -> Vec<(String, arrow_array::RecordBatch)>
             .expect("Arrow stream");
             let batch = reader.next().expect("one batch").expect("valid batch");
             assert!(reader.next().is_none(), "{name} holds one batch");
-            assert_eq!(batch.num_rows(), 1, "{name} holds one row");
+            assert!(batch.num_rows() > 0, "{name} holds rows");
             (name, batch)
         })
         .collect()
 }
 
-/// Every job-span segment under `telemetry`, in the order its writer sealed them, as one row
-/// each.
+/// Every row of the job-span segments under `telemetry`, read across them in the order their
+/// writer sealed them: its segment's name and the row.
 fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
     use arrow_array::Array as _;
     use arrow_array::cast::AsArray as _;
@@ -8205,68 +8469,75 @@ fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
 
     job_span_batches(telemetry)
         .into_iter()
-        .map(|(name, batch)| {
+        .flat_map(|(name, batch)| {
             let column = |name: &str| batch.column_by_name(name).expect(name).clone();
-            let text = |name: &str| {
+            let text = |name: &str, row: usize| {
                 let column = column(name);
                 let dictionary = column.as_dictionary_opt::<UInt32Type>();
                 match dictionary {
                     Some(dictionary) => {
-                        let key = usize::try_from(dictionary.keys().value(0)).unwrap();
+                        let key = usize::try_from(dictionary.keys().value(row)).unwrap();
                         dictionary.values().as_string::<i32>().value(key).to_owned()
                     }
-                    None => column.as_string::<i32>().value(0).to_owned(),
+                    None => column.as_string::<i32>().value(row).to_owned(),
                 }
             };
-            let number = |name: &str| column(name).as_primitive::<UInt64Type>().value(0);
+            let number =
+                |name: &str, row: usize| column(name).as_primitive::<UInt64Type>().value(row);
             let entry_types = column("entry_type");
             let entry_types = entry_types.as_dictionary::<UInt8Type>();
+            let span_ids = column("span_id");
+            let span_ids = span_ids.as_primitive::<UInt32Type>();
             let parent = column("parent_span_id");
             let parent = parent.as_primitive::<UInt32Type>();
             let state = column("job_state");
             let state = state.as_string::<i32>();
-            let signed = |name: &str| {
+            let signed = |name: &str, row: usize| {
                 let column = column(name);
                 let column = column.as_primitive::<Int64Type>();
-                column.is_valid(0).then(|| column.value(0))
+                column.is_valid(row).then(|| column.value(row))
             };
-            let enum_text = |name: &str| {
+            let enum_text = |name: &str, row: usize| {
                 let column = column(name);
                 let dictionary = column.as_dictionary::<UInt16Type>();
-                dictionary.is_valid(0).then(|| {
-                    let key = usize::from(dictionary.keys().value(0));
+                dictionary.is_valid(row).then(|| {
+                    let key = usize::from(dictionary.keys().value(row));
                     dictionary.values().as_string::<i32>().value(key).to_owned()
                 })
             };
             let gap_pid = column("unattributed_gap_pid");
             let gap_pid = gap_pid.as_primitive::<UInt32Type>();
-            let row = JobSpanRow {
-                trace_id: text("trace_id"),
-                thread_id: number("thread_id"),
-                span_id: column("span_id").as_primitive::<UInt32Type>().value(0),
-                parent_span_id: parent.is_valid(0).then(|| parent.value(0)),
-                entry_type: entry_types
-                    .values()
-                    .as_string::<i32>()
-                    .value(usize::from(entry_types.keys().value(0)))
-                    .to_owned(),
-                message: text("message"),
-                repo_id: text("repo_id"),
-                workspace_incarnation: text("workspace_incarnation"),
-                job_id: number("job_id"),
-                grant_revision: number("grant_revision"),
-                w3c_span_id: number("w3c_span_id"),
-                job_state: state.is_valid(0).then(|| state.value(0).to_owned()),
-                unattributed: Unattributed {
-                    cpu_us: signed("unattributed_cpu_us"),
-                    io_read_bytes: signed("unattributed_io_read_bytes"),
-                    io_write_bytes: signed("unattributed_io_write_bytes"),
-                    source: enum_text("unattributed_source"),
-                    coverage: enum_text("unattributed_coverage"),
-                    gap_pid: gap_pid.is_valid(0).then(|| gap_pid.value(0)),
-                },
-            };
-            (name, row)
+            (0..batch.num_rows())
+                .map(|row| {
+                    let span = JobSpanRow {
+                        trace_id: text("trace_id", row),
+                        thread_id: number("thread_id", row),
+                        span_id: span_ids.value(row),
+                        parent_span_id: parent.is_valid(row).then(|| parent.value(row)),
+                        entry_type: entry_types
+                            .values()
+                            .as_string::<i32>()
+                            .value(usize::from(entry_types.keys().value(row)))
+                            .to_owned(),
+                        message: text("message", row),
+                        repo_id: text("repo_id", row),
+                        workspace_incarnation: text("workspace_incarnation", row),
+                        job_id: number("job_id", row),
+                        grant_revision: number("grant_revision", row),
+                        w3c_span_id: number("w3c_span_id", row),
+                        job_state: state.is_valid(row).then(|| state.value(row).to_owned()),
+                        unattributed: Unattributed {
+                            cpu_us: signed("unattributed_cpu_us", row),
+                            io_read_bytes: signed("unattributed_io_read_bytes", row),
+                            io_write_bytes: signed("unattributed_io_write_bytes", row),
+                            source: enum_text("unattributed_source", row),
+                            coverage: enum_text("unattributed_coverage", row),
+                            gap_pid: gap_pid.is_valid(row).then(|| gap_pid.value(row)),
+                        },
+                    };
+                    (name.clone(), span)
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -8356,33 +8627,33 @@ fn expected_span(
     .collect()
 }
 
-/// Asserts the segments under `telemetry` are exactly `spans`, each job's rows in sealing order,
-/// each named `job-<order>-<writer>.arrow` by one writer counting from 1.
-fn assert_job_spans(telemetry: &Path, spans: &[Vec<JobSpanRow>]) {
+/// Asserts the rows of the job segments under `telemetry`, read across the segments in sealing
+/// order, are exactly `spans`, each job's rows in order, and that one writer named the segments
+/// `job-<order>-<writer>.arrow`, its order rising from each segment to the next. Returns how many
+/// segments hold those rows: one per seal, however many rows each holds.
+fn assert_job_spans(telemetry: &Path, spans: &[Vec<JobSpanRow>]) -> u64 {
     let sealed = job_spans(telemetry);
-    let names = sealed
+    let mut names = sealed
         .iter()
         .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(
-        names.len(),
-        spans.iter().map(Vec::len).sum::<usize>(),
-        "one sealed segment per row of each job's span: {names:?}"
-    );
+    names.dedup();
     let writer = &names[0]["job-00000000000000000001-".len()..];
     let mut previous = 0;
     for name in &names {
         let order: u64 = name["job-".len().."job-".len() + 20].parse().unwrap();
         assert!(
             order > previous,
-            "one shared writer's ordered job rows: {names:?}"
+            "one shared writer's ordered job segments: {names:?}"
         );
         assert_eq!(&name["job-00000000000000000001-".len()..], writer);
         previous = order;
     }
+    let segments = u64::try_from(names.len()).expect("a segment count fits u64");
     let rows = sealed.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
     let expected = spans.iter().flatten().collect::<Vec<_>>();
     assert_eq!(rows.iter().collect::<Vec<_>>(), expected);
+    segments
 }
 
 #[cfg(target_os = "macos")]
@@ -8441,8 +8712,15 @@ async fn an_exec_and_its_terminal_seal_one_job_span_under_the_job_s_trace_contex
     let clean = h.handle.wait(job).await.unwrap();
     assert_eq!(clean.trace, adopted_trace());
     let health = h.handle.trace_health().await.unwrap();
-    assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
-    assert_job_spans(&telemetry, &[expected_span(&clean, "span-ok", "exited")]);
+    assert_eq!(
+        (health.recorded, health.failed),
+        (1, 0),
+        "the health read seals the job's rows as one segment: {health:?}"
+    );
+    assert_eq!(
+        assert_job_spans(&telemetry, &[expected_span(&clean, "span-ok", "exited")]),
+        health.recorded
+    );
 
     let job = h
         .handle
@@ -8463,14 +8741,56 @@ async fn an_exec_and_its_terminal_seal_one_job_span_under_the_job_s_trace_contex
         "the supervisor minted this job's trace"
     );
     let health = h.handle.trace_health().await.unwrap();
-    assert_eq!((health.recorded, health.failed), (4, 0), "{health:?}");
-    assert_job_spans(
-        &telemetry,
-        &[
-            expected_span(&clean, "span-ok", "exited"),
-            expected_span(&failed, "span-err", "exited"),
-        ],
+    assert_eq!(
+        (health.recorded, health.failed),
+        (2, 0),
+        "one segment per health read, each holding its job's rows: {health:?}"
     );
+    assert_eq!(
+        assert_job_spans(
+            &telemetry,
+            &[
+                expected_span(&clean, "span-ok", "exited"),
+                expected_span(&failed, "span-err", "exited"),
+            ],
+        ),
+        health.recorded
+    );
+}
+
+/// A supervisor that retires has its span writer seal what it gathered before its retirement is
+/// answered, with no trace-health read asking: a retired supervisor's process exits waiting for
+/// nothing else (13_telemetry.md, "Job span segments").
+#[tokio::test]
+async fn a_retiring_supervisor_seals_its_gathered_job_rows_before_it_is_answered() {
+    let root = workspace_root(&temp_parent::scratch_parent(), "job-span-retire");
+    let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).unwrap();
+    let mut h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            telemetry_root: Some(telemetry.clone()),
+            ..config(&root)
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let ended = h.handle.wait(job).await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+    assert_job_spans(&telemetry, &[expected_span(&ended, "span-ok", "exited")]);
 }
 
 /// A span row the writer cannot seal is counted in the supervisor's trace health; the job it
@@ -8555,7 +8875,11 @@ async fn jobs_sharing_an_adopted_trace_and_a_job_id_across_workspaces_are_distin
         complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
         ended.push(h.handle.wait(job).await.unwrap());
         let health = h.handle.trace_health().await.unwrap();
-        assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+        assert_eq!(
+            (health.recorded, health.failed),
+            (1, 0),
+            "the job's rows seal as one segment: {health:?}"
+        );
     }
     assert_eq!(
         ended[0].job_id, ended[1].job_id,
@@ -8630,7 +8954,11 @@ async fn a_served_supervisor_answers_its_trace_health() {
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     remote.wait(job).await.unwrap();
     let health = remote.trace_health().await.unwrap();
-    assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+    assert_eq!(
+        (health.recorded, health.failed),
+        (1, 0),
+        "the job's rows seal as one segment: {health:?}"
+    );
     assert_eq!(health, h.handle.trace_health().await.unwrap());
 
     let (silent, _root) = harness(1, 1024, false, false);
@@ -9063,8 +9391,9 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
         terminal.volumes
     );
     let health = handle.trace_health().await.unwrap();
-    assert_eq!((health.recorded, health.failed), (3, 0), "{health:?}");
-    let facts = |batch: &arrow_array::RecordBatch| {
+    assert_eq!(health.failed, 0, "{health:?}");
+    let facts = |(batch, row): (&arrow_array::RecordBatch, usize)| {
+        let batch = batch.slice(row, 1);
         let cell = |name: &str| batch.column_by_name(name).expect(name).clone();
         let milli = cell("load1_milli");
         let cores = cell("cores");
@@ -9083,7 +9412,16 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
     };
     let batches = job_span_batches(&telemetry);
     assert_eq!(
-        batches.len(),
+        u64::try_from(batches.len()).unwrap(),
+        health.recorded,
+        "the trace health counts the job segments sealed, not their rows"
+    );
+    let rows = batches
+        .iter()
+        .flat_map(|(_, batch)| (0..batch.num_rows()).map(move |row| (batch, row)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.len(),
         3,
         "a start row, the unattributed usage its terminal sample states -- a polled census never covers the whole tree -- and an end row"
     );
@@ -9093,7 +9431,7 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
         milli(before).load1_milli.min(milli(after).load1_milli),
         milli(before).load1_milli.max(milli(after).load1_milli),
     );
-    let (start_load, start_cores, start_workspace, start_build) = facts(&batches[0].1);
+    let (start_load, start_cores, start_workspace, start_build) = facts(rows[0]);
     assert!(
         start_load.is_some_and(|load| (low..=high).contains(&load)),
         "start load {start_load:?} outside {low}..={high}"
@@ -9101,11 +9439,11 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
     assert_eq!(start_cores, Some(before.cores.get()));
     assert_eq!((start_workspace, start_build), (None, None));
     // The unattributed-usage row states no host or volume fact of its own.
-    assert_eq!(facts(&batches[1].1), (None, None, None, None));
+    assert_eq!(facts(rows[1]), (None, None, None, None));
     // The end row is the terminal sample's host, and no volume change it did not state.
     let host = milli(terminal.host);
     assert_eq!(
-        facts(&batches[2].1),
+        facts(rows[2]),
         (Some(host.load1_milli), Some(host.cores), None, None)
     );
 }
@@ -9170,8 +9508,12 @@ async fn cpu_the_observed_processes_never_counted_is_the_job_span_s_unattributed
         "a polled census never claims the whole tree: {reconciliation:?}"
     );
     let health = handle.trace_health().await.unwrap();
-    assert_eq!((health.recorded, health.failed), (3, 0), "{health:?}");
-    assert_job_spans(&telemetry, &[expected_span(&ended, "span-ok", "exited")]);
+    assert_eq!(health.failed, 0, "{health:?}");
+    assert_eq!(
+        assert_job_spans(&telemetry, &[expected_span(&ended, "span-ok", "exited")]),
+        health.recorded,
+        "the trace health counts the job segments sealed, not their rows"
+    );
     let rows = job_spans(&telemetry);
     let stated = &rows[1].1;
     assert_eq!(

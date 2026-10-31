@@ -207,20 +207,9 @@ function buildProgram(): Command {
   monorepo
     .command('sync-bun-lockfile-versions')
     .option('--stage', 'stage bun.lock when versions were resynced; quiet when clean')
-    .addOption(
-      new Option(
-        '--mode <mode>',
-        'install: match package.json (default, CI); publish: map unpublished -next to last stable tag (pre-pack only)',
-      )
-        .choices(['install', 'publish'])
-        .default('install'),
-    )
-    .action(async (options: { stage?: boolean; mode: 'install' | 'publish' }) => {
+    .action(async (options: { stage?: boolean }) => {
       const { syncBunLockfileVersions } = await import('./monorepo/index.js');
-      syncBunLockfileVersions(await findRepoRoot(), {
-        mode: options.mode,
-        ...(options.stage ? { log: false, stage: true } : {}),
-      });
+      syncBunLockfileVersions(await findRepoRoot(), options.stage ? { log: false, stage: true } : {});
     });
   monorepo
     .command('list-release-packages')

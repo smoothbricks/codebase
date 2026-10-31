@@ -170,6 +170,7 @@ type ReaderName =
   | 'OUTPUT_STORAGE'
   | 'OUTPUT_STORAGE__CAPTURED'
   | 'OUTPUT_STORAGE__REDIRECT'
+  | 'OUTPUT_STORAGE__STREAMED'
   | 'OUTPUT_SUMMARY'
   | 'PORT_BLOCK'
   | 'PRESERVED_REF'
@@ -1431,6 +1432,7 @@ const READERS: Readers<ReaderName> = {
     arms: [
       ['captured', 'OUTPUT_STORAGE__CAPTURED'],
       ['redirect', 'OUTPUT_STORAGE__REDIRECT'],
+      ['streamed', 'OUTPUT_STORAGE__STREAMED'],
     ],
   },
   OUTPUT_STORAGE__CAPTURED: { kind: 'record', fields: [['artifact', 'PROTECTED_OUTPUT']] },
@@ -1441,6 +1443,7 @@ const READERS: Readers<ReaderName> = {
       ['artifact', 'PROTECTED_OUTPUT'],
     ],
   },
+  OUTPUT_STORAGE__STREAMED: { kind: 'record', fields: [] },
   OUTPUT_SUMMARY: {
     kind: 'record',
     fields: [

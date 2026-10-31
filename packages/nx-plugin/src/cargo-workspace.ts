@@ -267,7 +267,7 @@ async function deriveCargoPackageTestInputs(
   // hashes a `{projectRoot}` glob against only the files its project OWNS, and
   // a nested Nx project owns the crates under it. A repository-root cargo
   // workspace whose members live in `packages/*` would then hash none of its
-  // members' sources, and its archive would cache-hit against edited crates
+  // members' sources, and its test build would cache-hit against edited crates
   // while every per-crate runner reran on the stale binaries.
   const inputRoot = posix.join('{workspaceRoot}', relative(workspaceRoot, absoluteProjectRoot).split(sep).join('/'));
   const loadManifest = (path: string): Promise<TomlTable> => {
@@ -578,24 +578,12 @@ function readTestShards(cratePackage: Record<string, unknown>, crateTomlPath: st
 export const CARGO_TEST_TARGET = 'cargo-test';
 
 /**
- * The one workspace-wide `cargo nextest archive` every per-crate runner
- * executes from. Named here beside the other cargo target names so the policy
- * that checks a workspace's test graph and the inference that builds it read
- * the same string.
+ * The one workspace-wide test build every per-crate runner executes from, in
+ * place. Named here beside the other cargo target names so the policy that
+ * checks a workspace's test graph and the inference that builds it read the
+ * same string.
  */
-export const CARGO_TEST_ARCHIVE_TARGET = 'cargo-test-archive';
-
-/**
- * Where that archive lands, relative to the cargo workspace root — the cwd both
- * the archive command and every runner already use. `cargo nextest archive`
- * does NOT create this parent directory and fails the whole build when it is
- * missing ("error writing to archive ... No such file or directory"), so the
- * target mkdir's it first.
- * The archive is an Nx-restored output, so it lives on the source volume, never
- * beneath Cargo's symlinked target directory (16_build_volumes.md).
- */
-export const CARGO_TEST_ARCHIVE_FILE = '.cache/nextest/archive.tar.zst';
-
+export const CARGO_TEST_BUILD_TARGET = 'cargo-test-build';
 /**
  * One foreign target triple this cargo workspace also archives its tests for.
  */
@@ -717,14 +705,14 @@ export function cargoTestGroupTargetName(group: string): string {
  * crate collapse back to that crate, so a split crate counts as covered once.
  *
  * The workspace-wide `cargo-test-*` targets are not crates: reading them as one
- * would invent members named "compile" and "archive", and a serial group's runner
+ * would invent a member named "build", and a serial group's runner
  * would invent one named after its group. Each reports every crate's coverage
  * against a set that can never match.
  */
 export function packageNameFromCargoTestTarget(targetName: string): string | null {
   if (
     !targetName.startsWith('cargo-test-') ||
-    targetName === CARGO_TEST_ARCHIVE_TARGET ||
+    targetName === CARGO_TEST_BUILD_TARGET ||
     targetName.startsWith(CARGO_TEST_GROUP_PREFIX)
   ) {
     return null;
@@ -1063,9 +1051,9 @@ export const PLUGIN_NEXTEST_CONFIG_PATH = 'node_modules/@smoothbricks/nx-plugin/
  * The plugin's own nextest settings, as a config layer BENEATH the repository's.
  *
  * `--config-file` replaces `<workspace>/.config/nextest.toml` outright, which
- * made every plugin default unoverridable and — now that per-crate runs execute
- * from an archive — left a repository no way to declare `archive.include` for a
- * cdylib or fixture its tests need. `--tool-config-file` is nextest's mechanism
+ * made every plugin default unoverridable and left a repository no way to
+ * declare a setting of its own, such as the `archive.include` a cross lane needs
+ * for a cdylib or fixture. `--tool-config-file` is nextest's mechanism
  * for exactly this: "lower than --config-file in priority but above the default
  * config shipped with nextest". Measured: with only this layer a 1s
  * slow-timeout terminates a 3s test; adding `.config/nextest.toml` with 10s
@@ -1073,7 +1061,7 @@ export const PLUGIN_NEXTEST_CONFIG_PATH = 'node_modules/@smoothbricks/nx-plugin/
  *
  * The path must be absolute, and an absolute path written into the command text
  * would differ per checkout and split one Nx cache entry per machine. `$PWD`
- * resolves at exec time — both the archive (`nx:run-commands`) and the runners
+ * resolves at exec time — both the test build (`nx:run-commands`) and the runners
  * (`bounded-exec`, which spawns with `shell: true`) go through a shell — so the
  * command text stays identical everywhere. Quoted, because a workspace path may
  * contain spaces.

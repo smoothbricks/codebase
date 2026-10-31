@@ -163,9 +163,11 @@ where
 {
     /// Mint the empty build volume `id` at `capacity` and mount it: `registration` is written
     /// first, then one `clonefile` of the store's blank template and one attach (01a_apfs.md,
-    /// "Images"). The record stays registered, and the answered hold keeps every release off the
-    /// volume, until the caller publishes it once it holds what it should (a migration's linked
-    /// build state, main's first touch). A mint that fails releases what it registered. The
+    /// "Images"). The record stays registered, and the answered exclusive claim
+    /// ([`BuildVolumeLayout::register_claiming`]) keeps every release and job off the volume, until
+    /// the caller publishes it once it holds what it should (a migration's linked build state,
+    /// main's first touch) and captures its seed under that claim (16_build_volumes.md, "Targets
+    /// and seeds"). A mint that fails releases what it registered under the claim. The
     /// clone carries the template's label until the checkout's supervisor names it after the
     /// checkout (16_build_volumes.md, "Substrate"): the label is cosmetic, so naming never runs
     /// on a provisioning path.
@@ -175,14 +177,25 @@ where
         id: &BuildVolumeId,
         capacity: ImageCapacity,
         registration: &Registration,
-    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError> {
+    ) -> Result<(PathBuf, ReleaseClaim), ApfsStorageError> {
         let image = layout.image(id);
         self.verify_controller_path(&image)?;
         Self::ensure_parent(&image)?;
-        let creating = layout.register(id, registration).map_err(host_error)?;
+        let creating = layout
+            .register_claiming(id, registration)
+            .map_err(host_error)?;
         let mount = layout.mount(id);
-        if let Err(error) = self.mint(capacity, &image, &mount) {
-            return Err(self.unregister(layout, id, creating, error));
+        if let Err(primary) = self.mint(capacity, &image, &mount) {
+            return Err(
+                match crate::storage::apfs::combine_cleanup::<std::convert::Infallible>(
+                    "release a build volume whose creation failed",
+                    primary,
+                    self.release_claimed(layout, creating).map(drop),
+                ) {
+                    Err(error) => error,
+                    Ok(never) => match never {},
+                },
+            );
         }
         Ok((mount, creating))
     }
@@ -565,24 +578,27 @@ where
         set_written(&image, written)
     }
 
-    /// Fork step 3's capture (16_build_volumes.md, "Fork"), the one step of it that reads `seed`
-    /// and so the one the fork takes under its source's image lock: a new live volume
-    /// registered as `registration` and holding `seed`'s bytes. A seed is never mounted, so it
-    /// is captured detached. [`Self::ready_fork_build_volume`] makes it usable once that lock
-    /// is let go.
+    /// Fork step 3's capture (16_build_volumes.md, "Fork"), the one step of it that reads
+    /// `source` and so the one the fork takes under its source's image lock: a new live volume
+    /// registered as `registration` and holding `source`'s bytes. A seed is never mounted, so it
+    /// is captured detached; an mbx target's live volume, held shared by the caller, is captured
+    /// live from its mount. [`Self::ready_fork_build_volume`] makes it usable once that lock is
+    /// let go.
     pub fn capture_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
-        seed: &BuildVolumeId,
+        source: &BuildVolumeId,
         registration: &Registration,
     ) -> Result<CapturedBuildVolume, ApfsStorageError> {
-        self.verify_controller_path(&layout.image(seed))?;
+        self.verify_controller_path(&layout.image(source))?;
+        let mount = layout.mount(source);
+        let mounted = self.mounted_at(&mount)?.is_some();
         self.capture_build_volume_under_hold(
             layout,
-            seed,
+            source,
             &BuildVolumeId::mint(),
             registration,
-            None,
+            mounted.then_some(mount.as_path()),
         )
     }
 
@@ -619,6 +635,7 @@ where
                     |error| io_error("discard the seed's Nx daemon record", &mount, error),
                 )?;
                 state.discard_clone_invalid(&mount).map_err(host_error)?;
+                state.discard_rebuildable(&mount).map_err(host_error)?;
                 Ok((mount, capture_elapsed.max(elapsed)))
             });
         match mounted {
@@ -1896,6 +1913,7 @@ mod tests {
                     class: crate::api::dto::ExecClass::Background,
                     want: None,
                     scope: crate::api::dto::ExecScope::Workspace,
+                    record: crate::api::dto::JobRecord::Cowshed,
                 },
                 crate::runtime::supervisor_socket::AdmissionSource::Worker,
             )
@@ -2725,6 +2743,7 @@ mod tests {
                     class: crate::api::dto::ExecClass::Background,
                     want: None,
                     scope: crate::api::dto::ExecScope::Workspace,
+                    record: crate::api::dto::JobRecord::Cowshed,
                 },
                 crate::runtime::supervisor_socket::AdmissionSource::Worker,
             )

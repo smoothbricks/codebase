@@ -27,8 +27,8 @@ const cases: { name: string; graph: ProjectGraph; edges: string[] }[] = [
   },
   {
     name: 'direct inferred archive',
-    graph: graph({ build: run({ dependsOn: ['cargo-test-archive'] }), 'cargo-test-archive': run() }),
-    edges: ['app:build -> app:cargo-test-archive'],
+    graph: graph({ build: run({ dependsOn: ['cargo-test-build'] }), 'cargo-test-build': run() }),
+    edges: ['app:build -> app:cargo-test-build'],
   },
   {
     name: 'transitive declared edge',
@@ -79,7 +79,7 @@ const cases: { name: string; graph: ProjectGraph; edges: string[] }[] = [
   { name: 'absent optional wildcard', graph: graph({ build: run({ dependsOn: ['missing-*'] }) }), edges: [] },
   {
     name: 'unreachable test work',
-    graph: graph({ build: run(), test: run({ dependsOn: ['cargo-test-archive'] }), 'cargo-test-archive': run() }),
+    graph: graph({ build: run(), test: run({ dependsOn: ['cargo-test-build'] }), 'cargo-test-build': run() }),
     edges: [],
   },
   {

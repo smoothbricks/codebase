@@ -807,20 +807,25 @@ pub fn discover_build_state(
 /// Every checkout path the `[build] state` entries name, sorted: a literal as spelled, and a
 /// pattern once per directory its selector matches among those the checkout tracks files under
 /// (one `git ls-files` per pattern, with Git's own glob reading), each with the pattern's
-/// literal state beneath it. No two may overlap: a pattern's match inside a literal path, or
-/// the other way round, would link state through state.
+/// literal state beneath it. A literal and a pattern's match naming one path are one declared
+/// path, kept when either entry is. No two may overlap: a pattern's match inside a literal path,
+/// or the other way round, would link state through state.
 pub(super) fn expand_declared(
     workspace: &Path,
     entries: &[DeclaredState],
 ) -> Result<Vec<BuildStatePath>> {
-    let mut expanded = BTreeSet::new();
+    let mut expanded = BTreeMap::new();
     for entry in entries {
-        let (selector, state) = match entry {
+        let (selector, state, keep) = match entry {
             DeclaredState::Path(path) => {
-                expanded.insert(path.clone());
+                insert_declared(&mut expanded, path.clone());
                 continue;
             }
-            DeclaredState::Pattern { selector, state } => (selector, state),
+            DeclaredState::Pattern {
+                selector,
+                state,
+                keep,
+            } => (selector, state, *keep),
         };
         if fs::symlink_metadata(workspace.join(".git")).is_err() {
             continue;
@@ -851,6 +856,7 @@ pub(super) fn expand_declared(
                 .to_str()
                 .ok_or("is not UTF-8")
                 .and_then(BuildStatePath::declared)
+                .map(|path| if keep { path.kept() } else { path })
                 .map_err(|reason| {
                     CowshedError::usage(
                         format!(
@@ -861,10 +867,10 @@ pub(super) fn expand_declared(
                         "narrow the pattern so it selects only checkout directories",
                     )
                 })?;
-            expanded.insert(declared);
+            insert_declared(&mut expanded, declared);
         }
     }
-    let expanded: Vec<BuildStatePath> = expanded.into_iter().collect();
+    let expanded: Vec<BuildStatePath> = expanded.into_values().collect();
     for (index, outer) in expanded.iter().enumerate() {
         if let Some(inner) = expanded[index + 1..].iter().find(|inner| {
             inner
@@ -885,9 +891,20 @@ pub(super) fn expand_declared(
     Ok(expanded)
 }
 
+/// Add `path` to the expansion: a literal and a pattern's match naming one checkout path are one
+/// declared path, kept when either entry is.
+fn insert_declared(expanded: &mut BTreeMap<PathBuf, BuildStatePath>, path: BuildStatePath) {
+    let keep = path.keep;
+    expanded
+        .entry(path.checkout.as_path().to_owned())
+        .and_modify(|held| held.keep |= keep)
+        .or_insert(path);
+}
+
 /// Join `declared` to the `discovered` paths. Declared state leaves its path at its first touch,
-/// kept intact, and is rebuilt on the volume, never copied (16_build_volumes.md, "Declared build
-/// state"), so a declared path may not hold tracked source (the guard migration applies), may
+/// discarded as a cache or, where `[build] keep` names it, kept intact, and is rebuilt on the
+/// volume, never copied (16_build_volumes.md, "Declared build state"), so a declared path may not
+/// hold tracked source (the guard migration applies), may
 /// not reach outside the checkout through a symlinked parent, and may not overlap a tool's state,
 /// which its capability already links.
 fn declare(
@@ -2847,5 +2864,38 @@ printf '%s:%s\n' "$index" "$PWD"
             overlap.message,
             ".cowshed.toml [build] state declares packages/a/.cache/lmao inside packages/a/.cache"
         );
+    }
+
+    /// A pattern `[build] keep` names expands to kept paths, one per match, and the entries it
+    /// does not name stay caches; a literal and a pattern's match naming one path are one declared
+    /// path, kept when either entry is.
+    #[test]
+    fn a_kept_pattern_expands_to_kept_paths() {
+        let fixture = Fixture::new();
+        git(&fixture, &["init", "--quiet"]);
+        write(&fixture, "packages/a/package.json", "{}\n");
+        write(&fixture, "packages/b/package.json", "{}\n");
+        git(&fixture, &["add", "packages"]);
+        for (keep, b_kept) in [("packages/*/.pin", true), ("packages/a/.pin", false)] {
+            write(
+                &fixture,
+                ".cowshed.toml",
+                &format!(
+                    "[build]\nstate = [\"packages/*/.pin\", \"packages/a/.pin\", \".cache/lmao\"]\nkeep = [\"{keep}\"]\n"
+                ),
+            );
+            let state = cargo_paths(&fixture);
+            assert!(state.findings.is_empty(), "{keep}: {:?}", state.findings);
+            let b = BuildStatePath::declared("packages/b/.pin").unwrap();
+            assert_eq!(
+                state.paths,
+                [
+                    BuildStatePath::declared(".cache/lmao").unwrap(),
+                    BuildStatePath::declared("packages/a/.pin").unwrap().kept(),
+                    if b_kept { b.kept() } else { b },
+                ],
+                "{keep}"
+            );
+        }
     }
 }

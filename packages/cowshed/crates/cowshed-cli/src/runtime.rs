@@ -2551,6 +2551,7 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
             class: args.class,
             want: args.want,
             scope: args.scope,
+            record: cowshed_core::api::JobRecord::Cowshed,
         },
         session: args.session,
         background: args.background,
@@ -6099,6 +6100,7 @@ mod tests {
                     class: cowshed_core::api::ExecClass::Background,
                     want: None,
                     scope: cowshed_core::api::ExecScope::Workspace,
+                    record: cowshed_core::api::JobRecord::Cowshed,
                 })
                 .await
                 .expect("exec")
@@ -6192,6 +6194,10 @@ mod tests {
                     ),
                     ("coordinator.exec", class, scope),
                     "{argv:?}"
+                );
+                assert!(
+                    params.get("record").is_none(),
+                    "{argv:?}: the CLI never names a caller-owned record"
                 );
             }
         }

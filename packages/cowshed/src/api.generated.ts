@@ -89,7 +89,8 @@ export type AdmissionField =
   | 'stderrCopy'
   | 'class'
   | 'want'
-  | 'scope';
+  | 'scope'
+  | 'record';
 
 /**
  * The caller's name for one idempotent exec within a workspace incarnation (07_api "Keyed
@@ -749,6 +750,11 @@ export type ExecParams = {
    * Where the command runs; omitted for the workspace sandbox.
    */
   readonly scope?: ExecScope;
+  /**
+   * Who keeps the job's record; omitted when cowshed does. `caller` keeps no disk record
+   * (11_shell.md, "Caller-owned jobs"); the CLI never names it.
+   */
+  readonly record?: JobRecord;
 };
 
 export type ExecRecord = ExecRecordRef;
@@ -1666,6 +1672,12 @@ export type JobProcessTree = {
   readonly coverage: ProcessCoverage;
 };
 
+/**
+ * Who keeps a job's record (11_shell.md, "Caller-owned jobs"): cowshed, in the workspace's
+ * protected records, or the caller, in its own log, with no disk record kept here.
+ */
+export type JobRecord = 'cowshed' | 'caller';
+
 export type JobRequest = {
   readonly repoId: RepoId;
   readonly workspace: WorkspaceName;
@@ -2470,7 +2482,8 @@ export type OutputStorage =
   | ({ readonly kind: 'redirect' } & {
       readonly source: WorkspacePath;
       readonly artifact: ProtectedOutput;
-    });
+    })
+  | { readonly kind: 'streamed' };
 
 export type OutputSummary = {
   readonly version: number & tags.Type<'uint32'> & tags.Maximum<65535>;

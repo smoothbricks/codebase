@@ -124,7 +124,7 @@ No mounts, no root, no network — pure functions with table-driven cases:
   request in `operations.corpus.json`; the codec, controller authority routing, and served-handle decoding tests consume
   that same corpus. Process-tree and process-event reply goldens cover omitted observations, observed exits, sparse
   changes, and coverage gaps through core serialization and the generated public validators. `cowshed:wire-fixtures`
-  regenerates those goldens before the workspace's `cargo-test-archive` compiles them with `include_str!`; the archive
+  regenerates those goldens before the workspace's `cargo-test-build` compiles them with `include_str!`; the test build
   hashes the produced JSON. Generated JSON is never edited by hand. The target renders and formats the corpus in a
   git-ignored staging directory and publishes it with one rename, so a reader running beside it (`cowshed:lint`) sees
   the old corpus or the new one, never a truncated or unformatted file; `cowshed:wire-fixtures-test` witnesses that.
@@ -407,20 +407,21 @@ Run `nx run cowshed:host-controller-test` from the owned checkout in an unsandbo
 uncached target selects `test(/host_controller_/)` across `cowshed-core`, `cowshed-cli`, `cowshed-shell`, and
 `cowshed-gateway` with `--run-ignored only`, without a second list of fixture names. Its `build` dependency, the
 existing inferred host build aggregate, completes first and refreshes the JS and host-platform native addon the worker
-proofs load, so they never load a stale `dist/native` addon from an earlier build. Its owning `cargo-test-archive`
-dependency compiles once before the run, and the target hashes the archive output bytes. The host runner consumes that
-prebuilt archive with `--archive-file` and remaps its workspace to the exact owned checkout; it never recompiles under
-the test guard or lets its private runtime `TMPDIR` change compiled artifacts. An empty selection fails.
-Controller-owned filesystem and kernel-profile fixtures carry that prefix and an explicit ignore reason naming this
-target. Ordinary sandboxed nextest runs report them ignored: an enclosing executed-child profile cannot grant an inner
-supervisor independent authority. Pure policy tests and pre-spawn refusal tests remain in the ordinary lane. The host
-runner probes actual hard-link authority before running and refuses with the same actionable command if an enclosing
-sandbox denies it; neither a write grant nor a nested profile can undo that denial. It pins `TMPDIR` to a unique
-disposable directory under the exact owned checkout's `.cowshed/tmp` and removes it afterward. Unix-socket fixtures use
-the existing short owned `ScratchRoot` so Darwin's socket-path bound is independent of that private `TMPDIR`. Fixtures
-use only disposable local data and never change installed host services or checkout source. The descriptor-inheritance
-proof launches only its unique one-shot agent from the generated gateway plist, holds 10000 descriptors with finite
-`OPEN_MAX`, and unloads that agent on every exit path.
+proofs load, so they never load a stale `dist/native` addon from an earlier build. Its owning `cargo-test-build`
+dependency compiles once before the run, and the target hashes the build's reuse-build metadata. The host runner runs
+that build's binaries in place with `--binaries-metadata` and remaps its workspace to the exact owned checkout; its
+fixture first builds any binary a cache-hit build left absent, so it never recompiles under the test guard or lets its
+private runtime `TMPDIR` change compiled artifacts. An empty selection fails. Controller-owned filesystem and
+kernel-profile fixtures carry that prefix and an explicit ignore reason naming this target. Ordinary sandboxed nextest
+runs report them ignored: an enclosing executed-child profile cannot grant an inner supervisor independent authority.
+Pure policy tests and pre-spawn refusal tests remain in the ordinary lane. The host runner probes actual hard-link
+authority before running and refuses with the same actionable command if an enclosing sandbox denies it; neither a write
+grant nor a nested profile can undo that denial. It pins `TMPDIR` to a unique disposable directory under the exact owned
+checkout's `.cowshed/tmp` and removes it afterward. Unix-socket fixtures use the existing short owned `ScratchRoot` so
+Darwin's socket-path bound is independent of that private `TMPDIR`. Fixtures use only disposable local data and never
+change installed host services or checkout source. The descriptor-inheritance proof launches only its unique one-shot
+agent from the generated gateway plist, holds 10000 descriptors with finite `OPEN_MAX`, and unloads that agent on every
+exit path.
 
 Workspace supervisors and children deliberately deny `file-link`; this host-controller proof cannot run inside them.
 

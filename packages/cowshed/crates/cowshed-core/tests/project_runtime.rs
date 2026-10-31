@@ -16,10 +16,11 @@ use cowshed_core::api::dto::{
     AbandonedPreservation, AbandonedWork, AdoptOptions, AttachOptions, CommandArg,
     DefragmentResult, DoctorReport, ExecClass, ExecCommand, ExecRequest, ExecScope, Finding,
     FindingSeverity, ForkOptions, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, JobId,
-    JobInfo, JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits, LandOptions,
-    LandReport, MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
-    RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    JobInfo, JobJournalCursor, JobRecord, JobState, JobTail, JobTailBytes, JobTailLimits,
+    LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions,
+    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult,
+    ResizeVolume, RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState,
+    WorkspaceTarget,
 };
 use cowshed_core::api::operations::{
     JobLogs, LogsRequest, Operation, OperationRequest, ReAdoption,
@@ -2259,6 +2260,7 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            record: JobRecord::Cowshed,
         })
         .await
         .expect("exec");
@@ -2527,6 +2529,7 @@ fn gated_request(class: ExecClass) -> ExecRequest {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
+        record: JobRecord::Cowshed,
     }
 }
 
@@ -2838,6 +2841,7 @@ async fn exec_in(
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            record: JobRecord::Cowshed,
         })
         .await
         .expect("exec")
@@ -2920,6 +2924,7 @@ async fn a_keyed_lookup_reaches_one_job_or_proven_absence_over_the_controller() 
         stdout_copy: None,
         stderr_copy: None,
         admission_key: Some(key.clone()),
+        record: JobRecord::Cowshed,
     };
     let job = worker.exec(request()).await.expect("admit the keyed job");
     let process = jobs.spawned.recv().await.expect("one process");
@@ -4022,19 +4027,18 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
                 let mut fields = cowshed_core::storage::trace_segment::system_fields();
                 fields.extend(cowshed_core::runtime::job_spans::job_fields());
                 assert_eq!(batch.schema().fields(), &fields.into());
-                assert_eq!(batch.num_rows(), 1);
+                assert!(batch.num_rows() > 0, "a job segment holds rows");
                 let message = batch
                     .column_by_name("message")
                     .expect("message")
                     .as_dictionary::<UInt32Type>();
-                if message.is_valid(0)
-                    && message
-                        .values()
-                        .as_string::<i32>()
-                        .value(usize::try_from(message.keys().value(0)).expect("message key"))
-                        == "job.unattributed"
-                {
-                    gaps.push(batch);
+                for row in 0..batch.num_rows() {
+                    let key = usize::try_from(message.keys().value(row)).expect("message key");
+                    if message.is_valid(row)
+                        && message.values().as_string::<i32>().value(key) == "job.unattributed"
+                    {
+                        gaps.push(batch.slice(row, 1));
+                    }
                 }
             }
         }
@@ -4217,6 +4221,7 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: Some(cowshed_core::api::AdmissionKey::new("session-op").unwrap()),
+        record: JobRecord::Cowshed,
     };
     let job = supervisor
         .exec(
@@ -4595,6 +4600,7 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            record: JobRecord::Cowshed,
         })
         .await
         .expect("open exec");
@@ -4754,6 +4760,7 @@ async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            record: JobRecord::Cowshed,
         })
         .await
         .expect("exec");
@@ -5007,6 +5014,7 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            record: JobRecord::Cowshed,
         })
         .await
         .expect("exec");

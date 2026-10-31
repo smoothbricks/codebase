@@ -36,13 +36,16 @@ Without an install, or for `setup` and `gateway`, the package's source authority
 `crates/cowshed-cli/src/main.rs`, which a published package never ships, and runs its development build,
 `.cache/bin/<platform>/cowshed`; a published package runs its release build, `dist/bin/<platform>/cowshed`, restoring an
 execute bit a publish dropped. A launcher invoked from within its own checkout always keeps that development authority,
-even with an install present. Neither source authority substitutes the other build or a cargo `target/release/cowshed`:
-a checkout without its selected development build exits 5 naming the path and `nx run cowshed:cli-native`, a package
-without its selected binary exits 5 naming its path, and a host the package ships no binary for exits 5 naming the host.
-It is a shell script rather than Node because it runs before every command, and Node's own start (~30 ms) costs more
-than the fastest verbs take in total; `exec` hands the binary the command's signals, exit status and standard streams
-unchanged. The library's `runCli`, `openHost` and the typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`,
-`spawnLandTurn`; 07_api.md, "Launchers") run the CLI through the same script, so one rule picks the binary.
+even with an install present. "Within" is judged physically on both sides: a developer link reaches the package through
+a directory link, and the checkout read lexically through it would be the consumer's own `node_modules`, which holds the
+consumer's `.bin`. An invocation by a bare name, which keeps no directory, is judged by its working directory. Neither
+source authority substitutes the other build or a cargo `target/release/cowshed`: a checkout without its selected
+development build exits 5 naming the path and `nx run cowshed:cli-native`, a package without its selected binary exits 5
+naming its path, and a host the package ships no binary for exits 5 naming the host. It is a shell script rather than
+Node because it runs before every command, and Node's own start (~30 ms) costs more than the fastest verbs take in
+total; `exec` hands the binary the command's signals, exit status and standard streams unchanged. The library's
+`runCli`, `openHost` and the typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`, `spawnLandTurn`; 07_api.md,
+"Launchers") run the CLI through the same script, so one rule picks the binary.
 
 The launcher is how a build that is not installed yet is run, and not the `cowshed` on `PATH`. After `setup`, the
 `cowshed` on `PATH` is the installed copy (05_gateway.md "The installed cowshed"): setup repoints the first `cowshed` on
@@ -274,12 +277,13 @@ effects, or spawn. The supervisor consumes each `CommandArg` into `OsString`, an
 `List<Binary>`; neither the CLI nor runtime uses lossy text conversion or a second wire shape.
 
 Every `cowshed exec` submission, foreground or background, atomically allocates a positive, workspace-local,
-monotonically increasing numeric `JobId`; ids are never reused. In normal mode captured child stdout remains CLI stdout,
-so the control-plane job id and state are reported on stderr (`--background` prints the bare numeric id on stdout
-instead). With `--json`, stdout contains only the final JSON envelope: `result` carries the numeric `jobId`, `JobInfo`
-lifecycle/result metadata, hashes, bounded summaries, and—only when the canonical artifact is inline—the bounded
-`BinaryData` `utf8|base64` tagged union. Live progress on stderr remains control-only NDJSON. Unbounded child output
-never enters JSON, and controller commitments never receive either inline encoding.
+monotonically increasing numeric `JobId`; ids are never reused (an API job whose caller owns its record excepted,
+11_shell.md "Caller-owned jobs"). In normal mode captured child stdout remains CLI stdout, so the control-plane job id
+and state are reported on stderr (`--background` prints the bare numeric id on stdout instead). With `--json`, stdout
+contains only the final JSON envelope: `result` carries the numeric `jobId`, `JobInfo` lifecycle/result metadata,
+hashes, bounded summaries, and—only when the canonical artifact is inline—the bounded `BinaryData` `utf8|base64` tagged
+union. Live progress on stderr remains control-only NDJSON. Unbounded child output never enters JSON, and controller
+commitments never receive either inline encoding.
 
 The CLI writes its stdout and stderr with a blocking write's semantics whatever flags the inherited descriptors carry: a
 foreground job's relayed bytes and cowshed's own `cowshed:` diagnostic lines alike. `O_NONBLOCK` belongs to the open
@@ -729,17 +733,17 @@ supervisor: it runs no work there, so it answers while a supervisor of another b
 reports, and whether the gateway has the workspace's session installed at that revision — exactly the case in which the
 controller's pre-exec reconcile would install nothing for it. And `exec` admits a job only onto build state the
 controller's refresh (16_build_volumes.md, "One link per checkout") would leave as it is: every fixed link the
-checkout's build volume records is in place and reaches its volume directory (a declared path nothing occupies needs
-none), and the tracked build inputs still have the fingerprint that volume records, computed as the refresh computes it
-(its Git listings and a hash of the tracked manifests). The workspace's supervisor judges it (`asIs`, 11_shell.md,
-"Protocol") from listings its process keeps while the checkout's index keeps its identity (11_shell.md, "Kept
-readings"), where a CLI process would list them again for every exec. The job then runs through the supervisor's socket,
-held under the authority the `hello` read, and is relayed as the controller path relays it. The controller that Node-API
-callers reach keeps the lane for that job's later calls (`info`, `wait`, `kill`, `detach`, `logRead`) and proves it with
-one `hello` per call: a supervisor that retired or now serves another incarnation drops the lane, and the call takes the
-controller path, which answers from the sealed records. A supervisor that retires between that `hello` and the call
-fails that one call as unavailable, and the next takes the controller path. `exec --host` is answered the same way, as a
-host-scope job of the coordinator route.
+checkout's build volume records is in place and reaches its volume directory (a kept declared path, `[build] keep`,
+nothing occupies needs none unless its volume directory holds entries), and the tracked build inputs still have the
+fingerprint that volume records, computed as the refresh computes it (its Git listings and a hash of the tracked
+manifests). The workspace's supervisor judges it (`asIs`, 11_shell.md, "Protocol") from listings its process keeps while
+the checkout's index keeps its identity (11_shell.md, "Kept readings"), where a CLI process would list them again for
+every exec. The job then runs through the supervisor's socket, held under the authority the `hello` read, and is relayed
+as the controller path relays it. The controller that Node-API callers reach keeps the lane for that job's later calls
+(`info`, `wait`, `kill`, `detach`, `logRead`) and proves it with one `hello` per call: a supervisor that retired or now
+serves another incarnation drops the lane, and the call takes the controller path, which answers from the sealed
+records. A supervisor that retires between that `hello` and the call fails that one call as unavailable, and the next
+takes the controller path. `exec --host` is answered the same way, as a host-scope job of the coordinator route.
 
 Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached; for
 `exec`, one unserved, served under an older grant or another incarnation, a gateway session not yet at the served
@@ -771,6 +775,7 @@ capacity = "100g"              # image cap
 [build]
 capacity = "100g"              # build volume cap for a volume created from nothing; clones inherit theirs
 state = ["vendor/upstream"]    # declared build state no capability detects (16_build_volumes.md)
+keep = ["vendor/upstream"]     # declared state that holds work: moved aside intact, never discarded
 [gateway]
 port = 7644                    # macOS host control plane; Linux private-netns connector; never a service port
 [cache]                        # extend (never replace) the convention table

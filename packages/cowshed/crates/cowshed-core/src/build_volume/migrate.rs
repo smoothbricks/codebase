@@ -4,9 +4,9 @@
 //! is published next, so a retry finds the same volume and GC preserves it. What happens at each
 //! build-state path is one pure decision, [`decide`], from whose state the path holds and what
 //! is there; the shell here only observes each path, decides every one before it changes any,
-//! and performs. A tool's own directory is discarded; a declared directory holding anything is
-//! kept intact ([`kept`]); a file or a foreign link refuses. A partially removed directory
-//! resumes without copying or touching source.
+//! and performs. A tool's own directory and a declared cache are discarded; a kept declared
+//! directory (`[build] keep`) holding anything is kept intact ([`kept`]); a file or a foreign
+//! link refuses. A partially removed directory resumes without copying or touching source.
 
 use std::fs;
 use std::io;
@@ -15,8 +15,8 @@ use std::time::SystemTime;
 
 use super::{
     BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeState, DiscardOrigin,
-    DiscardedBuildStateFinding, KeptBuildStateFinding, Registration, TrackedBuildStateRefusal,
-    discard, kept, link, nx, tracked_source,
+    DiscardedBuildStateFinding, KeptBuildStateFinding, Registration, ReleaseClaim,
+    TrackedBuildStateRefusal, discard, kept, link, nx, tracked_source,
 };
 use crate::capabilities::BuildStatePath;
 use crate::runtime::storage_host::RuntimeStorageHost;
@@ -61,14 +61,25 @@ pub struct MintedVolume {
     pub capacity: ImageCapacity,
 }
 
+/// What a first touch made: the checkout's volume, what it did to the real directories standing
+/// where its links belong, and, when it minted the volume, the exclusive claim it minted it under
+/// ([`RuntimeStorageHost::create_build_volume`]), which its caller captures the checkout's seed under and then lets
+/// go.
+#[derive(Debug)]
+pub(crate) struct Touched {
+    pub id: BuildVolumeId,
+    pub adopted: Adopted,
+    pub creation: Option<ReleaseClaim>,
+}
+
 /// The checkout's first build volume (or the one an interrupted first touch already linked),
-/// with every contributed path linked into it (a declared one once it exists), and the real
-/// directories it discarded or kept.
+/// with every contributed path linked into it (a kept declared one once it exists, or at the next
+/// refresh once its volume holds it with entries) ([`Touched`]).
 pub(crate) fn first_touch<H: RuntimeStorageHost>(
     host: &H,
     layout: &BuildVolumeLayout,
     migration: FirstTouch<'_>,
-) -> Result<std::result::Result<(BuildVolumeId, Adopted), TrackedBuildStateRefusal>> {
+) -> Result<std::result::Result<Touched, TrackedBuildStateRefusal>> {
     let FirstTouch {
         checkout,
         paths,
@@ -78,12 +89,15 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         beside,
         registration,
     } = migration;
-    let plan = preflight(checkout, paths)?;
+    // Decided before the volume is mounted: a minted volume holds nothing, and an interrupted
+    // first touch's holds a declared directory only behind the link it made.
+    let plan = preflight(checkout, None, paths)?;
     if let Some(refusal) = tracked_source(checkout, &plan.removed())? {
         return Ok(Err(refusal));
     }
-    // A volume minted here stays held by its creation until its record is published below.
-    let (id, _creating) = match link::linked(checkout)? {
+    // A volume minted here stays claimed by its creation until its record is published below,
+    // and past that through its caller's seed capture.
+    let (id, creation) = match link::linked(checkout)? {
         Some(mount) => {
             let id = layout.volume_at(&mount).ok_or_else(|| {
                 CowshedError::integrity(
@@ -98,21 +112,21 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
             (id, None)
         }
         None => {
-            let (id, creating) = match beside {
+            let (id, creation) = match beside {
                 MintedBeside::Volume(minted) if minted.capacity == capacity => (minted.id, None),
                 MintedBeside::Failed(error) => return Err(error),
                 MintedBeside::Nothing | MintedBeside::Volume(_) => {
                     let id = BuildVolumeId::mint();
-                    let (_, creating) = host
+                    let (_, claim) = host
                         .create_build_volume(layout, &id, capacity, &registration)
                         .map_err(storage_error)?;
-                    (id, Some(creating))
+                    (id, Some(claim))
                 }
             };
-            // Linked while a creation still holds it: from here the link protects the
+            // Linked while its creation still claims it: from here the link protects the
             // registered volume from GC and lets a retry find it.
             link::point(checkout, &layout.mount(&id))?;
-            (id, creating)
+            (id, creation)
         }
     };
     let (mount, _) = host
@@ -131,26 +145,32 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
     state.write(&mount)?;
     // Published only after every source directory has become its fixed link.
     layout.publish(&id, &registration)?;
-    Ok(Ok((id, adopted)))
+    Ok(Ok(Touched {
+        id,
+        adopted,
+        creation,
+    }))
 }
 
 /// What adopting a checkout's build-state paths did to the real directories standing where their
 /// links belong.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Adopted {
-    /// Removed: a tool's own directory, discarded, or an empty one.
+    /// Removed: a tool's own directory or a declared cache, discarded, or an empty one.
     pub discarded: Vec<DiscardedBuildStateFinding>,
-    /// A declared directory holding entries, moved aside intact: no refresh or `gc` deletes it.
+    /// A kept declared directory holding entries, moved aside intact: no refresh or `gc` deletes
+    /// it.
     pub kept: Vec<KeptBuildStateFinding>,
 }
 
 /// Make every build-state path what [`decide`] says, after deciding all of them: a file or a
 /// foreign link anywhere refuses, and a path holding tracked source refuses, before any path
-/// changes. A declared path nothing occupies stays absent: tools read a directory's existence as
-/// meaning (a pin worktree is there or it is not), so its link and volume directory appear only
-/// once a tool has made the directory, at the next refresh after. `held` is what the volume's
-/// state held before this refresh, which gives each removed or kept directory its
-/// [`DiscardOrigin`].
+/// changes. A kept declared path nothing occupies is linked only where the volume mounted at
+/// `volume_root` holds its directory with entries: tools read a directory's existence as
+/// meaning (a pin worktree is there or it is not), so a kept link appears only where a tool
+/// made the directory, in this checkout (at the next refresh after) or in one whose volume this
+/// checkout cloned or adopted. `held` is what the volume's state held before this refresh, which
+/// gives each removed or kept directory its [`DiscardOrigin`].
 pub fn adopt_paths(
     census: &crate::census::CensusScope,
     checkout: &Path,
@@ -158,7 +178,7 @@ pub fn adopt_paths(
     paths: &[BuildStatePath],
     held: &[BuildStatePath],
 ) -> Result<std::result::Result<Adopted, TrackedBuildStateRefusal>> {
-    let plan = preflight(checkout, paths)?;
+    let plan = preflight(checkout, Some(volume_root), paths)?;
     if let Some(refusal) = tracked_source(checkout, &plan.removed())? {
         return Ok(Err(refusal));
     }
@@ -201,11 +221,11 @@ fn adopt_preflighted(
     // WHY rename first: a shell entering the checkout (its toolchain stamp) or a build can write
     // into a build-state directory while it is being deleted, and a recursive delete of a
     // directory something is still filling fails with "Directory not empty". `rename(2)` moves
-    // the whole tree aside atomically, into `.cowshed/discard` (or, for a declared directory,
-    // `.cowshed/kept`) on the same volume and outside the source tree, the link takes the path
-    // at once, and a discarded tree is deleted in the background: a late writer lands in the
-    // aside tree or follows the new link, never in a half-deleted path, and no job waits on the
-    // delete (`discard`).
+    // the whole tree aside atomically, into `.cowshed/discard` (or, for a kept declared
+    // directory, `.cowshed/kept`) on the same volume and outside the source tree, the link takes
+    // the path at once, and a discarded tree is deleted in the background: a late writer lands in
+    // the aside tree or follows the new link, never in a half-deleted path, and no job waits on
+    // the delete (`discard`).
     // Excluded first: a process that dies after a move aside leaves nothing `git status` shows.
     let linked = plan.linked();
     link::exclude_links(checkout, &linked)?;
@@ -294,24 +314,20 @@ fn discard_origin(
     if !held.iter().any(|path| path.checkout == state.checkout) {
         return Ok(DiscardOrigin::Predated);
     }
-    let directory = volume_root.join(state.volume.as_path());
-    match fs::symlink_metadata(&directory) {
-        Ok(metadata) if metadata.is_dir() => Ok(DiscardOrigin::Displaced),
-        Ok(_) => Ok(DiscardOrigin::Predated),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DiscardOrigin::Predated),
-        Err(error) => Err(io_error(
-            "inspect build-state volume directory",
-            &directory,
-            error,
-        )),
-    }
+    Ok(match behind(Some(volume_root), state)? {
+        link::VolumeHolds::Nothing => DiscardOrigin::Predated,
+        link::VolumeHolds::EmptyDirectory | link::VolumeHolds::Directory => {
+            DiscardOrigin::Displaced
+        }
+    })
 }
 
 /// What a refresh finds at one build-state path, observed before it changes any.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Occupant {
-    /// Nothing.
-    Absent,
+    /// Nothing, with what the volume holds behind the path: a declared path is linked only over
+    /// a volume directory holding entries.
+    Absent(link::VolumeHolds),
     /// The path's fixed link: a symlink whose text is [`link::relative_target`], dangling or not.
     FixedLink,
     /// A symlink with any other text, dangling or not.
@@ -327,20 +343,23 @@ pub enum Occupant {
 /// What a refresh does at one build-state path ([`decide`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
-    /// A declared path nothing occupies stays so: no link, no volume directory, no parent.
+    /// A kept declared path nothing occupies, whose volume directory holds no entry, stays so: no
+    /// link, no volume directory, no parent.
     LeaveAbsent,
     /// The fixed link stays; its volume directory is made if it is missing.
     Keep,
-    /// The fixed link is made where nothing is.
+    /// The fixed link is made where nothing is: a capability's path or a declared cache, or a
+    /// kept declared one whose volume directory holds entries.
     Link,
-    /// A declared path's empty directory is removed by `rmdir(2)`, which fails rather than delete
-    /// an entry written since it was observed, and the link takes the path.
+    /// A kept declared path's empty directory is removed by `rmdir(2)`, which fails rather than
+    /// delete an entry written since it was observed, and the link takes the path.
     ReplaceEmpty,
-    /// A tool's own directory, empty or not, which its next build rebuilds, is discarded (renamed into
-    /// `.cowshed/discard` and deleted in the background), and the link takes the path.
+    /// A tool's own directory or a declared cache, empty or not, which its next run rebuilds, is
+    /// discarded (renamed into `.cowshed/discard` and deleted in the background), and the link
+    /// takes the path.
     Discard,
-    /// A declared directory is renamed, intact, into `.cowshed/kept`, which nothing of cowshed's
-    /// deletes, and the link takes the path.
+    /// A kept declared directory is renamed, intact, into `.cowshed/kept`, which nothing of
+    /// cowshed's deletes, and the link takes the path.
     MoveAside,
 }
 
@@ -351,29 +370,43 @@ pub struct Refuse;
 /// The whole policy of a refresh at one build-state path (16_build_volumes.md, "What a refresh
 /// does at each path"): from the tool whose state the path holds and what is there, what the
 /// refresh does. Pure; [`adopt_paths`] only observes and performs. Its invariant, which the
-/// property tests hold it to: a file and a link are never removed, a declared path loses nothing
-/// but an empty directory, and only a tool's own directory is discarded.
+/// property tests hold it to: a file and a link are never removed, a kept declared path loses
+/// nothing but an empty directory, only a tool's own directory or a declared cache is discarded,
+/// and a kept declared path nothing occupies is linked only over a volume directory holding
+/// entries.
 pub const fn decide(
     tool: BuildStateTool,
     occupant: Occupant,
 ) -> std::result::Result<Action, Refuse> {
     match occupant {
-        Occupant::Absent => Ok(match tool {
-            BuildStateTool::Declared => Action::LeaveAbsent,
-            BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript => Action::Link,
+        Occupant::Absent(holds) => Ok(match (tool, holds) {
+            (
+                BuildStateTool::Declared,
+                link::VolumeHolds::Nothing | link::VolumeHolds::EmptyDirectory,
+            ) => Action::LeaveAbsent,
+            (BuildStateTool::Declared, link::VolumeHolds::Directory)
+            | (
+                BuildStateTool::Cargo
+                | BuildStateTool::Nx
+                | BuildStateTool::JavaScript
+                | BuildStateTool::DeclaredCache,
+                _,
+            ) => Action::Link,
         }),
         Occupant::FixedLink => Ok(Action::Keep),
         Occupant::EmptyDirectory => Ok(match tool {
             BuildStateTool::Declared => Action::ReplaceEmpty,
-            BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript => {
-                Action::Discard
-            }
+            BuildStateTool::Cargo
+            | BuildStateTool::Nx
+            | BuildStateTool::JavaScript
+            | BuildStateTool::DeclaredCache => Action::Discard,
         }),
         Occupant::Directory => Ok(match tool {
             BuildStateTool::Declared => Action::MoveAside,
-            BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript => {
-                Action::Discard
-            }
+            BuildStateTool::Cargo
+            | BuildStateTool::Nx
+            | BuildStateTool::JavaScript
+            | BuildStateTool::DeclaredCache => Action::Discard,
         }),
         Occupant::ForeignLink | Occupant::File => Err(Refuse),
     }
@@ -399,7 +432,7 @@ impl<'a> Plan<'a> {
             .collect()
     }
 
-    /// The paths whose fixed link the refresh makes or keeps: all but a declared path left
+    /// The paths whose fixed link the refresh makes or keeps: all but a kept declared path left
     /// absent.
     fn linked(&self) -> Vec<BuildStatePath> {
         self.steps
@@ -410,14 +443,20 @@ impl<'a> Plan<'a> {
     }
 }
 
-fn preflight<'a>(checkout: &Path, paths: &'a [BuildStatePath]) -> Result<Plan<'a>> {
+/// Observe and decide every path. `volume_root` is the mounted build volume the links name; a
+/// first touch decides before it mounts one and passes none.
+fn preflight<'a>(
+    checkout: &Path,
+    volume_root: Option<&Path>,
+    paths: &'a [BuildStatePath],
+) -> Result<Plan<'a>> {
     super::disjoint(paths).map_err(|(left, right)| {
         super::overlapping(&checkout.join(super::STATE_FILE), left, right)
     })?;
     let steps = paths
         .iter()
         .map(|state| {
-            let occupant = observe(checkout, state)?;
+            let occupant = observe(checkout, volume_root, state)?;
             match decide(BuildStateTool::of(state), occupant) {
                 Ok(action) => Ok((state, action)),
                 Err(Refuse) => Err(CowshedError::integrity(
@@ -433,14 +472,32 @@ fn preflight<'a>(checkout: &Path, paths: &'a [BuildStatePath]) -> Result<Plan<'a
     Ok(Plan { steps })
 }
 
-/// What is at `state`'s path in `checkout`. A declared path is looked at before
-/// [`link::contained_parent`], which makes missing parents: an absent declared path makes
-/// nothing, its parents included.
-fn observe(checkout: &Path, state: &BuildStatePath) -> Result<Occupant> {
-    if state.is_declared() {
+/// What is at `state`'s path in `checkout`, and behind an absent one, what the volume at
+/// `volume_root` holds ([`behind`]). A kept declared path is looked at before
+/// [`link::contained_parent`], which checks and makes missing parents: a kept declared path the
+/// refresh leaves absent makes nothing, its parents included, and one it links over the
+/// volume's directory has its parents checked and made like a capability's.
+fn observe(
+    checkout: &Path,
+    volume_root: Option<&Path>,
+    state: &BuildStatePath,
+) -> Result<Occupant> {
+    // What observe saw behind a kept declared path it found absent and the refresh will link: the
+    // parent check below runs for it, and the observation is not taken twice.
+    let mut linked_over = None;
+    if BuildStateTool::of(state) == BuildStateTool::Declared {
         let at = checkout.join(state.checkout.as_path());
         match fs::symlink_metadata(&at) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Occupant::Absent),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let absent = Occupant::Absent(behind(volume_root, state)?);
+                if matches!(
+                    decide(BuildStateTool::Declared, absent),
+                    Ok(Action::LeaveAbsent)
+                ) {
+                    return Ok(absent);
+                }
+                linked_over = Some(absent);
+            }
             Err(error) => return Err(io_error("inspect build state", &at, error)),
             Ok(_) => {}
         }
@@ -456,7 +513,12 @@ fn observe(checkout: &Path, state: &BuildStatePath) -> Result<Occupant> {
     let source = parent.join(name);
     let metadata = match fs::symlink_metadata(&source) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Occupant::Absent),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return match linked_over {
+                Some(absent) => Ok(absent),
+                None => behind(volume_root, state).map(Occupant::Absent),
+            };
+        }
         Err(error) => return Err(io_error("inspect build state", &source, error)),
     };
     if metadata.file_type().is_symlink() {
@@ -481,6 +543,22 @@ fn observe(checkout: &Path, state: &BuildStatePath) -> Result<Occupant> {
         Some(Ok(_)) => Ok(Occupant::Directory),
         Some(Err(error)) => Err(io_error("read build-state directory", &source, error)),
     }
+}
+
+/// What the volume at `volume_root` holds behind an absent path. A first touch observes before
+/// its volume is mounted: a minted volume holds nothing, and an interrupted first touch's holds
+/// a kept declared directory only behind the link it made, which [`observe`] finds as that link.
+fn behind(volume_root: Option<&Path>, state: &BuildStatePath) -> Result<link::VolumeHolds> {
+    let Some(volume_root) = volume_root else {
+        return Ok(link::VolumeHolds::Nothing);
+    };
+    link::volume_holds(volume_root, state).map_err(|error| {
+        io_error(
+            "inspect build-state volume directory",
+            &volume_root.join(state.volume.as_path()),
+            error,
+        )
+    })
 }
 
 /// `error`, also naming every declared directory this refresh already moved aside: a failure

@@ -61,7 +61,8 @@ const nextestWant = 8;
  * every leaf a case runs inside `mbx reserve`, whose process is then the leader a case observes, and no case here is
  * about that pool. `MBX_SCHED_DISABLE` is what `mbx reserve` hands its command: a gate's leaf that runs this suite
  * reserved, so the suite would read itself as nested inside a grant (mbxPool), and the case about mbx's pool builds its
- * own.
+ * own. `MBX_SCHEDULER_PRIORITY` is the job's priority in that pool: a gate job carries `normal`, and the case about the
+ * pool asserts the priority of a job that names none.
  */
 const INHERITED_SIZING_ENV = [
   CPU_POOL_ENV,
@@ -74,6 +75,7 @@ const INHERITED_SIZING_ENV = [
   'MFLAGS',
   'MBX_SCHEDULER',
   'MBX_SCHED_DISABLE',
+  'MBX_SCHEDULER_PRIORITY',
 ] as const;
 const inheritedSizing = INHERITED_SIZING_ENV.map((name) => [name, process.env[name]] as const);
 
@@ -1708,7 +1710,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       expect(result.terminalOutput).toMatch(
         kind === 'cargo'
           ? /cowshed: mbx cargo granted elapsed=\d+ms\n/
-          : /cowshed: mbx reserve granted elapsed=\d+ms cpus=1 priority=low\n/,
+          : /cowshed: mbx reserve granted elapsed=\d+ms asked=1 priority=low\n/,
       );
       expect(result.terminalOutput).not.toContain('Bad file descriptor');
     } finally {
@@ -1719,7 +1721,113 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
   });
 
-  it('does not charge admission wait in either extracted nextest chain leg', async () => {
+  it("runs a reserved leaf's runner on the cores mbx granted it, not on those it asked for", async () => {
+    // mbx grants a reservation as many of its `--cpus` as are free once one is, and names the count to the command as
+    // MBX_RESERVE_CPUS; a runner sized to its ask would run more workers than its grant holds.
+    const workspace = await createWorkspace();
+    const bin = join(workspace.root, 'stand-in-mbx');
+    await mkdir(bin);
+    const asked = join(workspace.root, 'mbx-asked');
+    await writeFile(
+      join(bin, 'mbx'),
+      [
+        '#!/bin/sh',
+        `if [ "$1" = stats ]; then printf '{"version":2,"scheduler":{"activity":[]}}\\n'; exit; fi`,
+        `printf '%s\\n' "$*" > '${asked}'`,
+        'shift',
+        'while [ "$1" != -- ]; do',
+        '  if [ "$1" = --grant-fd ]; then shift; fd=$1; fi',
+        '  shift',
+        'done',
+        'shift',
+        'eval "printf g >&$fd"',
+        'export MBX_RESERVE_CPUS=2',
+        'exec "$@"',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    await writeFile(
+      join(bin, 'stryker'),
+      '#!/bin/sh\nprintf "stryker %s tokens=%s\\n" "$*" "$BOUNDED_EXEC_CPU_TOKENS"\n',
+      { mode: 0o755 },
+    );
+    const saved = {
+      PATH: process.env.PATH,
+      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+    };
+    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    try {
+      const result = await runBoundedExec(
+        { command: 'stryker run --concurrency=6', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+      );
+
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(await readFile(asked, 'utf8')).toContain('--cpus 6');
+      expect(result.terminalOutput).toContain('stryker run --concurrency=2 tokens=2\n');
+      expect(result.terminalOutput).toContain('cowshed: mbx reserve running cpus=2 asked=6\n');
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
+  it.each([
+    ['Vitest', 'vitest', 'vitest run', '--maxWorkers'],
+    ['Go test', 'go', 'go test ./...', '-p='],
+  ] as const)(
+    'runs a %s leaf under mbx uncapped: no reservation, its own default workers',
+    async (_runner, program, command, sizing) => {
+      // On 2026-10-31 a downstream gate's `bun vitest run` leaves each reserved 17 of 18 cores (Vitest's default, one
+      // worker per core but one), and a gate's `go test ./... -p="$(nproc)"` leaf 18 (Go's default, one package per core).
+      // mbx's ordered admission held every reservation queued behind them while the pool drained.
+      const workspace = await createWorkspace();
+      const bin = join(workspace.root, 'stand-in-mbx');
+      await mkdir(bin);
+      const invoked = join(workspace.root, 'mbx-invoked');
+      await writeFile(join(bin, 'mbx'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${invoked}'\nexit 97\n`, { mode: 0o755 });
+      await writeFile(join(bin, program), `#!/bin/sh\nprintf "${program} %s\\n" "$*"\n`, { mode: 0o755 });
+      const saved = {
+        PATH: process.env.PATH,
+        MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+        MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+        NX_PARALLEL: process.env.NX_PARALLEL,
+      };
+      process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+      process.env.MBX_SCHEDULER = '1';
+      process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+      process.env.NX_PARALLEL = '18';
+      try {
+        const result = await runBoundedExec(
+          { command, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+        );
+
+        expect(result.success, result.terminalOutput).toBe(true);
+        expect(result.terminalOutput).toContain(`${program} `);
+        expect(result.terminalOutput).not.toContain(sizing);
+        expect(result.terminalOutput).not.toContain('mbx reserve');
+        expect(await readdir(workspace.root)).not.toContain('mbx-invoked');
+      } finally {
+        for (const [name, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+    },
+  );
+
+  it('does not charge admission wait in either in-place nextest chain leg', async () => {
     const workspace = await createWorkspace();
     const directory = await ownedSocketDirectory('admission-chain-', 'control.sock');
     const endpoint = join(directory, 'control.sock');
@@ -1734,6 +1842,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const bin = join(workspace.root, 'stand-in-cargo');
     await mkdir(bin);
     await writeFile(join(bin, 'cargo'), '#!/bin/sh\nexec node queued-runner.js\n', { mode: 0o755 });
+    // The plugin's helper names this checkout's target directory; the stand-in answers as it does.
+    await writeFile(join(bin, 'smoo-nx-nextest-binaries'), '#!/bin/sh\necho "$PWD/target"\n', { mode: 0o755 });
     await workspace.write(
       'queued-runner.js',
       [
@@ -1768,8 +1878,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         () =>
           runBoundedExec(
             {
-              command:
-                'extracted="$(printf archive)" && cargo --frozen nextest run && cargo --frozen nextest run --run-ignored only',
+              command: `cargo --frozen nextest run --target-dir-remap "$(${bin}/smoo-nx-nextest-binaries target-dir)" && cargo --frozen nextest run --run-ignored only`,
               idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
               killAfterMs: 0,
               env: { PATH: `${bin}:${process.env.PATH ?? ''}`, MBX_SCHEDULER_TESTS: '1', ADMISSION_SOCKET: endpoint },

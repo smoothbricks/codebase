@@ -97,7 +97,8 @@
     "stdin": { "kind": "inline" },
     "stdoutCopy": null,
     "stderrCopy": null,
-    "admissionKey": "operation-7"
+    "admissionKey": "operation-7",
+    "record": "caller"
   },
   "worker.stdinChunk": {
     "repoId": "acme/widget",

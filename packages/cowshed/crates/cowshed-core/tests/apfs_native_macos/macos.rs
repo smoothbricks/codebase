@@ -5640,7 +5640,7 @@ fn quarantine_keyless_canonical_sidecar_leaves_image_and_spares_healthy_sibling(
         .expect("a keyless canonical must quarantine, not abort the pass");
     assert_eq!(
         cowshed_os::fsio::take_syncs(),
-        cowshed_os::fsio::Syncs { fsync: 0, full: 3 },
+        cowshed_os::fsio::Syncs { full: 3 },
         "one new quarantine-parent barrier and the JSON publisher's file/parent barriers"
     );
 

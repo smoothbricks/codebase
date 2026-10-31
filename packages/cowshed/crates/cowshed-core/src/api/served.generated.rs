@@ -1109,6 +1109,8 @@ impl Serves<CoordinatorExec> for Coordinator {
             want: Option<NonZeroUsize>,
             #[serde(default)]
             scope: ExecScope,
+            #[serde(default)]
+            record: JobRecord,
         }
         let Caller {
             workspace,
@@ -1127,6 +1129,7 @@ impl Serves<CoordinatorExec> for Coordinator {
             class,
             want,
             scope,
+            record,
         } = decode::<CoordinatorExec, Caller>(arguments)?;
         Ok(ExecParams {
             repo_id: owned(authority.repo_id),
@@ -1146,6 +1149,7 @@ impl Serves<CoordinatorExec> for Coordinator {
             class,
             want,
             scope,
+            record,
         })
     }
 }
@@ -1199,6 +1203,8 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             want: Option<NonZeroUsize>,
             #[serde(default)]
             scope: ExecScope,
+            #[serde(default)]
+            record: JobRecord,
         }
         let Caller {
             session,
@@ -1215,6 +1221,7 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             class,
             want,
             scope,
+            record,
         } = decode::<WorkerExec, Caller>(arguments)?;
         Ok(ExecParams {
             repo_id: owned(authority.repo_id),
@@ -1234,6 +1241,7 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             class,
             want,
             scope,
+            record,
         })
     }
 }

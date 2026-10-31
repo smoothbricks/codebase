@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/cowshed",
-  "version": "0.4.3-0",
+  "version": "0.4.4-next.0",
   "type": "module",
   "sideEffects": false,
   "scripts": {
@@ -587,7 +587,7 @@
       "wire-fixtures": {
         "executor": "nx:run-commands",
         "cache": true,
-        "//": "The napi wire corpus is DERIVED from cowshed-core's DTOs: regenerating it is a build step with declared inputs, never a recipe an author has to remember after changing a DTO. Runs ahead of cargo-test-archive because crates/cowshed-napi includes the file with include_str!, so the corpus has to be current before any test binary compiles it in. The Rust assertion that the committed file equals what core serializes stays as the proof; this target is what keeps it true.",
+        "//": "The napi wire corpus is DERIVED from cowshed-core's DTOs: regenerating it is a build step with declared inputs, never a recipe an author has to remember after changing a DTO. Runs ahead of cargo-test-build because crates/cowshed-napi includes the file with include_str!, so the corpus has to be current before any test binary compiles it in. The Rust assertion that the committed file equals what core serializes stays as the proof; this target is what keeps it true.",
         "dependsOn": [
           "api-check",
           {
@@ -843,7 +843,7 @@
           "...",
           "{projectRoot}/scripts/apfs-test-root.ts",
           "{projectRoot}/scripts/apfs-test-sweep.ts",
-          "{workspaceRoot}/packages/nx-plugin/src/tool-bins.ts",
+          "{workspaceRoot}/packages/nextest-extract/src/nextest-binaries.ts",
           "{projectRoot}/scripts/apfs-test-root.test.ts",
           "{projectRoot}/crates/cowshed-core/src/storage/host_config.rs",
           "{projectRoot}/crates/cowshed-core/src/storage/bootstrap/native/macos.rs",
@@ -872,13 +872,7 @@
           "tsc-js",
           "apfs-test-root",
           {
-            "projects": [
-              "nextest-extract"
-            ],
-            "target": "scriptc-native"
-          },
-          {
-            "target": "cargo-test-archive",
+            "target": "cargo-test-build",
             "projects": [
               "@smoothbricks/codebase"
             ]
@@ -894,6 +888,7 @@
           "...",
           "default",
           "{workspaceRoot}/packages/nx-plugin/nextest.toml",
+          "{workspaceRoot}/packages/nextest-extract/src/nextest-binaries.ts",
           {
             "dependentTasksOutputFiles": "**/*",
             "transitive": true
@@ -903,9 +898,11 @@
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh uname -sr"
           }
         ],
-        "//": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. Runs ignored host_controller_ tests from the owning workspace's prebuilt nextest archive, whose output bytes are hashed inputs. Compilation is cached and paid by cargo-test-archive before this run; the private runtime TMPDIR cannot change the compiled environment, so the 120s guard covers only extraction and tests. The fixtures run the development CLI (cli-native), the compiled TypeScript package (tsc-js) and the host's default Node-API addon (napi-native), which build first.",
+        "//": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. Runs ignored host_controller_ tests in place from the owning workspace's test build, whose reuse-build metadata is a hashed input. Compilation is cached and paid by cargo-test-build before this run, or by the script's ensure step when that build was a cache hit that restored only the metadata; the private runtime TMPDIR cannot change the compiled environment. The fixtures run the development CLI (cli-native), the compiled TypeScript package (tsc-js) and the host's default Node-API addon (napi-native), which build first.",
         "options": {
           "command": "bun packages/cowshed/scripts/host-controller-test.ts",
+          "fixtureCommand": "bun packages/cowshed/scripts/host-controller-test.ts --ensure-binaries",
+          "fixtureTimeoutMs": 3600000,
           "cwd": ".",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -914,7 +911,7 @@
       "integration-apfs": {
         "executor": "nx:run-commands",
         "cache": true,
-        "//": "Cached on the crate closure, the toolchain and the host kernel it exercises. It runs from the workspace root so its first step can sweep dead runs (scripts/apfs-test-sweep.ts, from the root's archive) before its fixtures start; replayed from cache it starts none and sweeps nothing.",
+        "//": "Cached on the crate closure, the toolchain and the host kernel it exercises. It runs from the workspace root so its first step can sweep dead runs (scripts/apfs-test-sweep.ts, from the root's test build, in place) before its fixtures start; replayed from cache it starts none and sweeps nothing.",
         "inputs": [
           "cargoClosure",
           "cargoToolchain",
@@ -931,15 +928,9 @@
           "apfs-test-root",
           {
             "projects": [
-              "nextest-extract"
-            ],
-            "target": "scriptc-native"
-          },
-          {
-            "projects": [
               "@smoothbricks/codebase"
             ],
-            "target": "cargo-test-archive"
+            "target": "cargo-test-build"
           }
         ],
         "options": {
@@ -981,7 +972,7 @@
     "@napi-rs/cli": "3.7.3",
     "@smoothbricks/lmao": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
-    "@types/node": "^26.6.5",
+    "@types/node": "catalog:",
     "typescript": "^6.0.3"
   },
   "description": "Warm git workspaces: instant isolated copy-on-write workspaces with layered sandboxing (CLI, Rust API, NAPI bindings)",

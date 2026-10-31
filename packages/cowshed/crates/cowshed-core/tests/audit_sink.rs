@@ -318,11 +318,12 @@ impl AuditSinkEnvironment for CountingEnvironment {
     }
 }
 
-/// A job's admission and terminal commitments are written for every exec: each takes one
-/// `fsync(2)` of its own segment and no directory sync, while a lifecycle commitment still syncs
-/// the directory its sealed name was added to.
+/// A job's admission and terminal commitments are written for every exec: each is acknowledged
+/// with its segment written and nothing synced, while a lifecycle commitment still takes a full
+/// flush of its segment and of the directory its sealed name was added to (11_shell.md,
+/// "Durability of a job's own records").
 #[test]
-fn a_jobs_commitments_sync_no_directory_while_lifecycle_commitments_do() {
+fn a_jobs_commitments_sync_nothing_while_lifecycle_commitments_flush() {
     let root = TempRoot::new("job-durability");
     let directory_syncs = Arc::new(AtomicUsize::new(0));
     let mut sink = ArrowAuditSink::open_with_environment(
@@ -336,6 +337,7 @@ fn a_jobs_commitments_sync_no_directory_while_lifecycle_commitments_do() {
     record(&mut sink, introduced()).unwrap();
     assert_eq!(directory_syncs.swap(0, Ordering::SeqCst), 2);
 
+    cowshed_os::fsio::take_syncs();
     record(&mut sink, admission(1)).unwrap();
     record(
         &mut sink,
@@ -354,6 +356,11 @@ fn a_jobs_commitments_sync_no_directory_while_lifecycle_commitments_do() {
         },
     )
     .unwrap();
+    assert_eq!(
+        cowshed_os::fsio::take_syncs(),
+        cowshed_os::fsio::Syncs::default(),
+        "both job commitments answered with nothing synced"
+    );
     assert_eq!(directory_syncs.load(Ordering::SeqCst), 0);
     assert_eq!(sealed_segments(root.path()).len(), 3);
 

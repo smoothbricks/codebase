@@ -455,22 +455,22 @@ Enforced by `a_capability_gained_while_the_supervisor_runs_reaches_the_host_envi
 
 The canonical environment carries these owned values when the capability is present:
 
-| Variable                                                                   | Value or source                                                                                                                                                     |
-| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `COWSHED_CARGO_ROUTE`                                                      | `dev.cowshed/mbx-shim/` beside the installed `bin`, where `cowshed setup` provisions mbx's Cargo shim; it leads PATH (below).                                       |
-| `MBX_CACHE_DIR`                                                            | `$COWSHED_BUILD_CACHE/mbx`, the shared store specified by 03_caches.md, "mbx"; the root comes from 02_workspaces.md, "Workspace environment", never a spelled path. |
-| `MBX_SESSION_ROOT`                                                         | The `mbx` leaf under the workspace's existing short runtime link, without canonicalizing the alias.                                                                 |
-| `MBX_TARGET_VIEWS`                                                         | `1`, enabling mbx's managed targets.                                                                                                                                |
-| `MBX_TARGET_ROOT`                                                          | Unset, retaining mbx's default managed root on the cache filesystem.                                                                                                |
-| `MBX_DISABLE`                                                              | Unset; the canonical route does not bypass mbx.                                                                                                                     |
-| `MBX_INCREMENTAL`                                                          | Unset; Cargo incremental identity follows 16_build_volumes.md, "One Cargo environment on every path".                                                               |
-| `CARGO_TARGET_DIR`                                                         | Caller value removed by the Cargo contribution (15_capabilities.md, "Detection inputs").                                                                            |
-| `MBX_SCHEDULER`                                                            | `1`.                                                                                                                                                                |
-| `MBX_SCHEDULER_CPUS`, `MBX_SCHEDULER_RESERVE_CPUS`, `MBX_SCHEDULER_MEMORY` | Values resolved from the installed mbx's host-global settings, without a project's workspace policy or caller overrides.                                            |
-| `MBX_SCHEDULER_PRESSURE`                                                   | `1`.                                                                                                                                                                |
-| `MBX_SCHEDULER_SUSPEND`                                                    | `0`; scheduling never freezes processes (AGENTS.md, rule 6).                                                                                                        |
-| `MBX_SCHEDULER_TESTS`                                                      | `1`, enabling mbx's supported Cargo-test and nextest target runners.                                                                                                |
-| `MBX_SCHEDULER_PRIORITY`                                                   | The class mapping owned by 05_gateway.md, "Classes"; outside a job, the non-gate value.                                                                             |
+| Variable                                                                   | Value or source                                                                                                                                                              |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `COWSHED_CARGO_ROUTE`                                                      | `dev.cowshed/mbx-shim/` beside the installed `bin`, where `cowshed setup` provisions mbx's Cargo shim; it leads PATH (below).                                                |
+| `MBX_CACHE_DIR`                                                            | `$COWSHED_BUILD_CACHE/mbx`, the shared store specified by 03_caches.md, "mbx"; the root comes from 02_workspaces.md, "Workspace environment", never a spelled path.          |
+| `MBX_SESSION_ROOT`                                                         | The `mbx` leaf under the workspace's existing short runtime link, without canonicalizing the alias.                                                                          |
+| `MBX_TARGET_VIEWS`                                                         | `1`, enabling mbx's managed targets.                                                                                                                                         |
+| `MBX_TARGET_ROOT`                                                          | Unset, retaining mbx's default managed root on the cache filesystem.                                                                                                         |
+| `MBX_DISABLE`                                                              | Unset; the canonical route does not bypass mbx.                                                                                                                              |
+| `MBX_INCREMENTAL`                                                          | Unset; Cargo incremental identity follows 16_build_volumes.md, "One Cargo environment on every path".                                                                        |
+| `CARGO_TARGET_DIR`                                                         | Caller value removed by the Cargo contribution (15_capabilities.md, "Detection inputs").                                                                                     |
+| `MBX_SCHEDULER`                                                            | `1`.                                                                                                                                                                         |
+| `MBX_SCHEDULER_CPUS`, `MBX_SCHEDULER_RESERVE_CPUS`, `MBX_SCHEDULER_MEMORY` | Values resolved from the installed mbx's host-global settings, without a project's workspace policy or caller overrides.                                                     |
+| `MBX_SCHEDULER_PRESSURE`                                                   | `1`.                                                                                                                                                                         |
+| `MBX_SCHEDULER_SUSPEND`                                                    | `0`; scheduling never freezes processes (AGENTS.md, rule 6).                                                                                                                 |
+| `MBX_SCHEDULER_TESTS`                                                      | `1`, enabling mbx's supported Cargo-test and nextest target runners.                                                                                                         |
+| `MBX_SCHEDULER_PRIORITY`                                                   | The class mapping owned by 05_gateway.md, "Classes"; outside a job, the non-gate value. A job's own value, carried in `COWSHED_MBX_SCHEDULER_PRIORITY`, is restored over it. |
 
 The session root is a capability-owned writable runtime leaf in every job mode, prepared before the host shell's
 `.cowshed/env` is published, initially and after a capability change. Host shells receive it too: their served `TMPDIR`
@@ -560,13 +560,14 @@ The host pin and this consumer cut over together (14_nix.md, "mbx").
 
 Plain `cargo test` may include doctests and keeps its lifecycle clock. Commands with unsupported overrides, direct
 binaries, other runners and archives whose target is unknown at spawn keep that same conservative hang protection, not
-an unbounded wait for a grant they never take. The plugin's native extracted-archive nextest command uses
-`--binaries-metadata` under the canonical Cargo shim and is hold-gated, including a chain of supported Cargo test
-executions joined by `&&`, `||`, or `;`. Every leg must satisfy the boundary; a later unscheduled command, pipeline or
-background command keeps conservative idle protection for the whole command. The plugin's `mbx-pool.test.ts` table owns
-this spawn-time mapping; `bounds.test.ts` owns the grant/release/progress sequences without real clocks.
+an unbounded wait for a grant they never take. The plugin's inferred in-place nextest command uses `--binaries-metadata`
+under the canonical Cargo shim, with one known substitution, this checkout's target directory from
+`smoo-nx-nextest-binaries` as the value of `--target-dir-remap`, and is hold-gated, including a chain of supported Cargo
+test executions joined by `&&`, `||`, or `;`. Every leg must satisfy the boundary; a later unscheduled command, pipeline
+or background command keeps conservative idle protection for the whole command. The plugin's `mbx-pool.test.ts` table
+owns this spawn-time mapping; `bounds.test.ts` owns the grant/release/progress sequences without real clocks.
 `mbx-queue.test.ts` owns versioned activity-only reads and scoped PID membership; `verdict.test.ts` owns persistence of
-never-admitted queue failures. The executor's mbx leaf and extracted-nextest chain checks prove these observers remain
+never-admitted queue failures. The executor's mbx leaf and in-place nextest chain checks prove these observers remain
 wired alongside live closed-test result publication.
 
 **Enforced by:** for Phase 2, `canonical_mbx_environment_matches_host_warm_and_host_gate_paths` must compare the
@@ -856,9 +857,10 @@ cancel, and other job admissions remain serviceable while another client follows
 ## Job control
 
 Every exec submission is a job. At admission the supervisor allocates a positive `u64`-backed `jobId` in `1..=2^53-1`,
-monotonically increasing within that workspace and never reused; exhaustion is typed `Conflict`. Decimal rendering is
-canonical, with no prefix or zero padding. The protected record stream is `.cowshed/job/records.arrow`; optional spill
-files, created only on promotion, are:
+monotonically increasing within that workspace and never reused (a caller-owned job's id excepted after its supervisor
+ends: "Caller-owned jobs"); exhaustion is typed `Conflict`. Decimal rendering is canonical, with no prefix or zero
+padding. The protected record stream is `.cowshed/job/records.arrow`; optional spill files, created only on promotion,
+are:
 
 ```
 .cowshed/job/<jobId>/out
@@ -870,42 +872,43 @@ rewriting, redaction, merging, or summary substitution. The supervisor begins ea
 neither per-job stream path eagerly. When promotion is required it exclusively creates the job directory and selected
 file without following links, writes the buffered prefix, then appends future admitted bytes. Executed shells receive a
 child profile that denies every write mutation beneath `.cowshed/job/**`; no writable protected-artifact descriptor is
-inheritable and no protected inode may be hardlinked into a workspace-writable path. Completion drains, hashes, fsyncs,
-closes, and seals file artifacts, or writes bounded inline bytes into the terminal Job Arrow batch, before publishing
-`ControllerCommitment::Terminal(TerminalCommitment)`.
+inheritable and no protected inode may be hardlinked into a workspace-writable path. Completion drains, hashes, closes,
+and seals file artifacts (never synced: "Durability of a job's own records"), or writes bounded inline bytes into the
+terminal Job Arrow batch, before publishing `ControllerCommitment::Terminal(TerminalCommitment)`.
 
 Allocation is exclusive and crash-safe without an eager job directory. One supervisor is the sole allocator for an
 attached workspace. Admission appends a complete `JobArtifactRecord` batch and publishes
 `ControllerCommitment::Admission(AdmissionCommitment)` before process creation, so spawn failure retains durable
 identity. A record's sequence comes from the `records.sequence` counter, published by atomic rename before the record is
 appended under the same lock, so a crash may leave a gap but never hands a sequence out twice. At startup the supervisor
-takes the maximum canonical `job_id` across valid complete in-volume allocation batches, controller commitments for the
-active lineage, canonical spill directories and the checked `records.job-floor` counter, then chooses `max + 1` (or `1`
-when none exist). Any disagreement or duplicate durable key is `Integrity`, not a reason to reuse a number.
-Open/recovery requires every record's `repo_id` to equal the workspace's bound repository. A record incarnation may
-differ from the current marker only when the marker's fork lineage names it as an ancestor or controller fork lineage
-and commitments admit it as inherited history; an unknown historical incarnation, or any new allocation under a
-non-current incarnation, is `Integrity`. Thus copied histories are intentional but cannot smuggle a foreign
+takes the maximum canonical `job_id` across valid complete in-volume allocation batches, canonical spill directories and
+the checked `records.job-floor` counter (never the controller commitments, which nothing reads for a decision), then
+chooses `max + 1` (or `1` when none exist). Any disagreement or duplicate durable key is `Integrity`, not a reason to
+reuse a number. Open/recovery requires every record's `repo_id` to equal the workspace's bound repository. A record
+incarnation may differ from the current marker only when the marker's fork lineage names it as an ancestor or controller
+fork lineage and commitments admit it as inherited history; an unknown historical incarnation, or any new allocation
+under a non-current incarnation, is `Integrity`. Thus copied histories are intentional but cannot smuggle a foreign
 repository/timeline. Supervisor replacement and attach otherwise discard only an incomplete trailing Arrow batch and
 never rewrite a complete batch or sealed artifact. Fork copies start above every inherited allocation, including the
 maximum id retained by `records.job-floor` for a store set aside unread. That floor record never decodes or retrofits
 the earlier store's rows.
 
-**Durability of a job's own records.** A job's records — its admission and terminal batches, its spill files (made
-durable when it backgrounds, sealed when it ends), the output copies it publishes, and its admission and terminal
-commitments — are written for every exec and survive the death of the process that wrote them, not power loss: each
-takes exactly one `fsync(2)` of the file it appends or creates, and no directory sync, before the job is admitted,
-backgrounded, answered as ended, or its copy reported published; commitments queued together share one segment and its
-one `fsync(2)` (13_telemetry.md, "Group commit"); the sequence counter's rename is not synced at all. `F_FULLFSYNC` is
-what survives power loss on macOS, and on a disk image it flushes every dirty block of the whole image — tens of
-milliseconds to seconds right after a build — so it stays on lifecycle and authority state only: workspace creation and
-removal, landing, grants and policy revisions, and every lifecycle commitment. Power loss ends every job anyway, and may
-take any suffix of the records written since: a torn trailing batch is discarded as above; a counter rolled back behind
-the log is advanced to the log's highest sequence at the next open, before anything allocates; and when the next
-supervisor takes the workspace's socket — which no other supervisor then holds — it seals every job of the incarnation
-that has an admission and no terminal record `failed` with `supervisorLost`, after ending the process groups its
-predecessor's ledger still names, and seals a spill file the power took as a stream with no bytes. A job whose terminal
-record was lost is therefore reported lost, never as having succeeded.
+**Durability of a job's own records.** A job's records — its admission and terminal batches, its spill files, the output
+copies it publishes, and its admission and terminal commitments — are job bookkeeping, and the page cache is their
+durability: none is synced before the job is admitted, backgrounded, answered as ended, or its copy reported published.
+A written byte survives the death of the process that wrote it, which is all they must survive; a host crash ends every
+job and every local client that saw its answer anyway. Measured 2026-10-30 by supervisor timing spans on a host under
+load 8–14, the four `fsync(2)`s a warm exec used to await cost 4–22 ms of its 40–60 ms, and bought only survival of a
+kernel panic that left the drive powered. `F_FULLFSYNC`, which survives power loss on macOS and on a disk image flushes
+every dirty block of the whole image, stays on lifecycle and authority state only: workspace creation and removal,
+landing, grants and policy revisions, and every lifecycle commitment. A host crash may take the tail of the bookkeeping,
+and recovery reads what survived: a torn trailing batch is discarded as above; a counter rolled back behind the log is
+advanced to the log's highest sequence at the next open, before anything allocates; and when the next supervisor takes
+the workspace's socket — which no other supervisor then holds — it seals every job of the incarnation that has an
+admission and no terminal record `failed` with `supervisorLost`, after ending the process groups its predecessor's
+ledger still names, and seals a spill file the crash took as a stream with no bytes. A job whose terminal record was
+lost is therefore reported lost, never as having succeeded; one whose admission was lost never existed for recovery,
+which allocates past every id the surviving records, spill directories and floor name (above).
 
 Each admission and terminal job batch also records its immutable command in a required Arrow `List<Binary>` `argv`
 column. An argv job stores its arguments; a script job stores exactly two elements, `\0script` and the script's JSON — a
@@ -1169,9 +1172,9 @@ when large.
 
 For queued/running jobs, `StreamInfo` is a bounded current view and its artifact is not sealed content authority yet.
 Inline data may be the supervisor's current bounded buffer; background acknowledgement forces it to a protected file,
-and terminal publication freezes the final union/count/hash. Only complete protected batches and sealed files carry the
-scoped content authority described here. Representation-transparent reads always resolve `artifact`, never
-`Redirect.source`.
+and terminal publication freezes the final union/count/hash. A caller-owned job's streams are `streamed` throughout and
+have no artifact ("Caller-owned jobs"). Only complete protected batches and sealed files carry the scoped content
+authority described here. Representation-transparent reads always resolve `artifact`, never `Redirect.source`.
 
 Redirect classification is permitted only for a real shell AST whose simple literal redirection semantics are proven and
 only when the supervisor controls the actual writable descriptor and applies the same exact combined-quota boundary as
@@ -1183,9 +1186,9 @@ pipe; it makes no claim over bytes redirected away by the shell.
 After terminal sealing, the publication API remains exactly `ExecRequest.stdout_copy` /
 `stderr_copy: Option<OutputPublication>`, `OutputPublication { path, policy }`, and
 `PublicationPolicy::{CreateNew, Replace}` (camelCase `stdoutCopy`/`stderrCopy`, `createNew`/`replace` in JSON/NAPI). The
-supervisor clonefiles/reflinks or extent-copies into a temporary destination, fsyncs, and atomically renames.
-Publication never changes `StreamInfo.storage`; reads and authority never resolve through it. Redirect snapshots and
-publication forbid hardlinks.
+supervisor clonefiles/reflinks or extent-copies into a temporary destination and atomically renames it, with no sync
+("Durability of a job's own records"). Publication never changes `StreamInfo.storage`; reads and authority never resolve
+through it. Redirect snapshots and publication forbid hardlinks.
 
 Controller commitments, the audit telemetry of job and lineage events, are the tagged union defined in 13_telemetry.md
 (Controller audit record schema).
@@ -1235,7 +1238,41 @@ delivered, completion, and normalized relative source where applicable; inline s
 
 Inspect with `WorkspaceHandle::list_jobs`, `cowshed exec --json` (the final `JobInfo`), or `lmao-inspect`
 (13_telemetry.md). This is the only capture implementation. CLI, MCP, NAPI, and CI consume the same protected evidence
-and controller commitments; no client recaptures output or derives authority from summary text.
+and controller commitments; no client recaptures output or derives authority from summary text. The one exception is a
+job whose caller owns its record (below).
+
+### Caller-owned jobs
+
+An exec request's `record` names who keeps the job's record: `cowshed` (the default, and all the CLI ever sends) or
+`caller`, for an embedding executor that logs each exec's request, outcome, output and resources in its own event log
+and would otherwise have cowshed write the same facts a second time. A caller-owned job means no disk records, not fewer
+semantics. Its supervisor writes nothing under `.cowshed/job` for it — no record batch, no spill file — and seals no
+job-span or process-span row and publishes no admission or terminal commitment for it. Everything else holds, from the
+actor's memory, for as long as that supervisor serves:
+
+- **Admission.** Its id comes from the same allocator and is never reused while that supervisor serves; nothing on disk
+  names it, so a later supervisor may hand the id out again. An `admission_key` is kept in the actor's own map, so a
+  keyed repeat answers the same job, and a differing one is refused as a key conflict, exactly as through the records,
+  for a caller that restarts while the supervisor lives. `stdout_copy` and `stderr_copy` are refused: a published copy
+  is a disk record.
+- **Output.** Every byte stays in the actor's memory, as it does for every running job; the combined output quota is
+  counted there and ends the job `outputLimit` as it would through the store, and each stream's byte count and SHA-256
+  are computed there. Its terminal `StreamInfo.storage` is `streamed`: the bytes were served and are kept nowhere else.
+  Detaching and backgrounding are allowed; they concern the client, not the disk.
+- **Answers.** `info`, `wait`, `resources`, `logRead`, `tail`, `jobByKey` and `sealed` answer it from memory, so a
+  caller reattaches as it would to a recorded job. Once it has ended, the caller acknowledges its end when a read of
+  each stream has answered that stream's end, past its last byte (an empty stream's read included, so a caller that
+  waits and then reads finds the job still there), and a `wait`, `hold` or `sealed` answer carrying its end was
+  delivered to it, as a drain counts a job's end read ("Draining a supervisor of another build"); `info`, which
+  reattachment and attachment ask in passing, acknowledges nothing, and neither does a watcher that only waits for the
+  end (a drain's own bookkeeping, a progress stream's wake: `ended`). The supervisor then forgets it: a later question
+  about it is not found, or unprovable while an unread history is set aside. A job whose child no wait saw end keeps its
+  group in the ledger and is never forgotten; a job no one acknowledges is held, with every byte it wrote, until its
+  supervisor exits. A reader of an earlier build refuses an answer that names `streamed`.
+- **Control.** Accounting, resource samples, cancellation, the output and memory limits, and the process-group ledger
+  are unchanged.
+- **Crashes.** A supervisor that dies ends the job's process groups through the ledger at the next start, and seals
+  nothing: the caller owns the record, and its loss.
 
 ## Grant-change propagation
 
@@ -1535,7 +1572,7 @@ handle.
 
 Callers that want a workspace-visible copy independent of shell syntax request `stdout_copy` and/or `stderr_copy` in
 `ExecRequest` (07_api.md). Only after terminal state and canonical artifact sealing does the supervisor materialize a
-temporary destination from that artifact, fsync it, and atomically rename it according to create/replace policy. APFS
+temporary destination from that artifact and atomically rename it according to create/replace policy, with no sync. APFS
 uses `clonefile`, ZFS uses block cloning when available, and other substrates use an extent copy. Hardlinks are
 forbidden in every case.
 

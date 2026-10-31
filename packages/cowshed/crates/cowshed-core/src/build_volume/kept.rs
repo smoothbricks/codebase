@@ -1,14 +1,15 @@
-//! Declared build state a refresh moved out of its path, kept intact until the operator deletes
-//! it (16_build_volumes.md, "What a refresh does at each path").
+//! Kept declared build state (`.cowshed.toml` `[build] keep`) a refresh moved out of its path,
+//! kept intact until the operator deletes it (16_build_volumes.md, "What a refresh does at each
+//! path").
 //!
-//! Cowshed cannot rebuild what a declared directory holds. The motivating case is a
+//! Cowshed cannot rebuild what a kept declared directory holds. The motivating case is a
 //! patch-development checkout, whose patches are uncommitted edits, and a refresh that discarded
 //! one deleted an agent's edit inside it (a `.bun-pin` worktree in a downstream repository's
-//! shed). So a refresh that links a declared path where a directory with entries stands renames
-//! that directory, in one `rename(2)` on the same volume, into [`KEPT_DIRECTORY`]: cowshed's
-//! excluded namespace, never the source tree or its status. No refresh and no `gc` deletes it,
-//! and `rm` and land refuse its workspace while it is there; only `rm --abandon` takes it, with
-//! the image. A fork drops its copy ([`release_inherited`]).
+//! shed). So a refresh that links a kept declared path where a directory with entries stands
+//! renames that directory, in one `rename(2)` on the same volume, into [`KEPT_DIRECTORY`]:
+//! cowshed's excluded namespace, never the source tree or its status. No refresh and no `gc`
+//! deletes it, and `rm` and land refuse its workspace while it is there; only `rm --abandon`
+//! takes it, with the image. A fork drops its copy ([`release_inherited`]).
 //!
 //! Each entry's name is its whole record: the UTC second it was moved, a random id, and the
 //! checkout-relative path it came from, with `%` and `/` percent-encoded, so the name decodes
@@ -22,7 +23,7 @@ use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Where a checkout keeps the declared directories a refresh moved aside, relative to the
+/// Where a checkout holds the kept declared directories a refresh moved aside, relative to the
 /// checkout.
 pub const KEPT_DIRECTORY: &str = ".cowshed/kept";
 

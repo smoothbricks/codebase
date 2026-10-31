@@ -7,7 +7,7 @@ import type { Result } from './ram-temp.js';
 /**
  * A leg that runs `bun` runs the Bun its workspace declares.
  *
- * The root `package.json` names that Bun in `packageManager` (`bun@1.4.3`); the Bun the command gets is the first `bun`
+ * The root `package.json` names that Bun in `packageManager` (`bun@x.y.z`); the Bun the command gets is the first `bun`
  * on the PATH it runs with. When the two disagree the leg is refused before it asks for anything, naming both versions
  * and the binary. A Bun other than the declared one does not fail at startup: on Bun 1.4.2 `console.log` drops what a
  * full pipe refuses, so a child's JSON document reaches the parent that reads it cut in the middle of a string, the

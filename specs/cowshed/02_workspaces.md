@@ -1137,12 +1137,15 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
 
    Of those peers, a workspace is folded only when all its own work is held by the landed result, measured by `rm` step
    1 against the branch the source landed on, every local branch included, and its HEAD held by the tip itself: a HEAD
-   only a `push` ref keeps is work the tip lacks, so it is no fold. The others are neither touched nor named. A folded
-   peer is measured again under its own land lease. The age floor is bypassed only for an idle peer: any live
-   supervisor, running or queued job, or attached shell keeps it, without quiescing, draining or stopping its owner. The
-   supervisor socket's exclusive lease fences new admission through retirement. A process cowshed does not run that
-   holds its mount refuses as for `rm` ("Holders cowshed does not run"). A dirty peer is kept too. The named source
-   workspace still retires by the ordinary land path, however young.
+   only a `push` ref keeps is work the tip lacks, so it is no fold. Nor is a peer whose work the target's previous head
+   already held by the same measure: that land carried none of it. A batch rebased onto an integration workspace holds
+   that workspace's commits before any unit lands into it, and landing a unit there touches the same paths, yet never
+   retires the integration workspace. The others are neither touched nor named. A folded peer is measured again under
+   its own land lease. The age floor is bypassed only for an idle peer: any live supervisor, running or queued job, or
+   attached shell keeps it, without quiescing, draining or stopping its owner. The supervisor socket's exclusive lease
+   fences new admission through retirement. A process cowshed does not run that holds its mount refuses as for `rm`
+   ("Holders cowshed does not run"). A dirty peer is kept too. The named source workspace still retires by the ordinary
+   land path, however young.
 
    Each folded peer is reported in `LandedReport.folded` with its head and outcome, `retired`, or `kept` with why
    (`dirty` with its file count, or `refused` with the refusal's code and message), and said on stderr. A kept peer

@@ -273,8 +273,9 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
     const integration = graph.nodes.cowshed?.data.targets?.['integration-apfs'];
     expect(integration?.options?.cwd).toBe('.');
     expect(String(integration?.options?.command)).toStartWith('bun packages/cowshed/scripts/apfs-test-sweep.ts && ');
-    // The script extracts the root's archive with the native extractor, so every lane that runs builds both before it
-    // does. Linux CI infers its own graph, so this run checks that one too, not only the host's.
+    // Every lane runs the root's test build in place: the inferred groups through the native helper, which builds before
+    // them, and cowshed's lanes through the helper's source their scripts import. Linux CI infers its own graph, so this
+    // run checks that one too, not only the host's.
     for (const { platform, arch } of GRAPH_PLATFORMS) {
       const inferred = await projectGraph({ platform, arch });
       const tasks = createTaskGraph(
@@ -285,12 +286,12 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
         undefined,
         {},
       );
-      const extractor = 'nextest-extract:scriptc-native';
       const producer = `scriptc-${arch}-${platform === 'darwin' ? 'macos' : 'linux'}`;
-      expect(tasks.dependencies[extractor], platform).toEqual([`nextest-extract:${producer}`]);
-      expect(inferred.nodes['nextest-extract']?.data.targets?.[producer]?.options?.outputDirectory, platform).toBe(
-        `dist/bin/${platform}-${arch}`,
-      );
+      if (platform === 'darwin') {
+        expect(inferred.nodes['nextest-extract']?.data.targets?.[producer]?.options?.outputDirectory, platform).toBe(
+          `dist/bin/${platform}-${arch}`,
+        );
+      }
       for (const [project, target] of [
         [ROOT_PROJECT, DEVICE_GROUP],
         [ROOT_PROJECT, HOST_GROUP],
@@ -298,7 +299,7 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
         ['cowshed', 'integration-apfs'],
       ] as const) {
         const lane = `${project}:${target}`;
-        expect(tasks.dependencies[lane], `${platform} ${lane}`).toContain(`${ROOT_PROJECT}:cargo-test-archive`);
+        expect(tasks.dependencies[lane], `${platform} ${lane}`).toContain(`${ROOT_PROJECT}:cargo-test-build`);
         // A serial group is inferred only where its declared cfg holds, macOS: there it runs bounded by progress, and
         // elsewhere its root entry only orders its dependencies and runs no command, so it sweeps nothing.
         const runner = inferred.nodes[project]?.data.targets?.[target];
@@ -309,6 +310,7 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
           continue;
         }
         expect(runner?.options?.command, `${platform} ${lane}`).toBeString();
+        if (!group) continue;
         const reached = (tasks.dependencies[lane] ?? []).flatMap((id) => [id, ...(tasks.dependencies[id] ?? [])]);
         expect(reached, `${platform} ${lane}`).toContain(`nextest-extract:${producer}`);
       }

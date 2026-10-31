@@ -159,23 +159,26 @@ impl Quiet {
 /// [`BuildVolumes::abandon_captured_fork`] releases it when the fork's own image is not captured.
 #[derive(Debug)]
 pub(crate) struct CapturedFork {
-    seed: BuildVolumeId,
+    /// The volume the fork's was cloned from: the target's seed, or an mbx target's live volume.
+    from: BuildVolumeId,
     tree: Option<GitOid>,
     captured: CapturedBuildVolume,
     source: Owner,
     operation_elapsed: Option<Duration>,
     started: Instant,
+    /// Whether the fork gets a seed of its own, so others fork from it: a non-mbx fork does.
+    own_seed: bool,
 }
 
 /// A fork's live volume, published and mounted beside its own image's attach and mount, after its
-/// source's image lock is let go (Fork steps 2 and 3), with `own_seed`, the destination's seed,
-/// cloned from it before the mount: the staged checkout it is for does not exist yet.
-/// [`BuildVolumes::finish_fork`] links the checkout to it; [`BuildVolumes::abandon_fork`]
+/// source's image lock is let go (Fork steps 2 and 3), with a non-mbx fork's `own_seed`, the
+/// destination's seed, cloned from it before the mount: the staged checkout it is for does not
+/// exist yet. [`BuildVolumes::finish_fork`] links the checkout to it; [`BuildVolumes::abandon_fork`]
 /// releases both when no checkout staged.
 #[derive(Debug)]
 pub(crate) struct PreparedFork {
-    seed: BuildVolumeId,
-    own_seed: BuildVolumeId,
+    from: BuildVolumeId,
+    own_seed: Option<BuildVolumeId>,
     live: BuildVolumeId,
     mount: PathBuf,
     source: Owner,
@@ -657,11 +660,13 @@ pub(crate) struct OwnedMint<H: RuntimeStorageHost = Host> {
     slot: MintSlot,
 }
 
-/// A volume minted beside main's image, registered and not yet published, with the creation hold
-/// that keeps every release in any process off it, by its exact id, until its release takes it.
+/// A volume minted beside main's image, registered and not yet published, with the exclusive
+/// claim it was created under ([`RuntimeStorageHost::create_build_volume`]): it keeps
+/// every release in any process off it, by its exact id, until its release takes it or main's
+/// first touch takes it for main's seed capture ([`Lent::touch`]).
 pub(crate) struct Minted {
     volume: MintedVolume,
-    _creating: BuildVolumeHold,
+    claim: ReleaseClaim,
 }
 
 /// The volume an [`OwnedMint`] holds until its release takes it.
@@ -688,10 +693,9 @@ fn release_slot(
     checkout: &Path,
     whose: &str,
 ) {
-    // The creation hold goes first, so the release can claim the volume.
-    if let Some(Minted { volume, _creating }) = lock(slot).take() {
-        drop(_creating);
-        release_minted(host, layout, &volume, checkout, whose);
+    // Released under the claim it was created under, never a second one taken after it.
+    if let Some(Minted { volume, claim }) = lock(slot).take() {
+        release_minted(host, layout, &volume, claim, checkout, whose);
     }
 }
 
@@ -800,30 +804,40 @@ impl<H: RuntimeStorageHost> FirstMint<H> {
 }
 
 impl Lent {
-    /// Run `touch` with what was minted, holding the slot locked throughout.
-    fn hold<T>(&self, touch: impl FnOnce(MintedBeside) -> T) -> T {
+    /// Run `touch`, a first touch, with what was minted, holding the slot locked throughout. When
+    /// it published the minted volume, the adopt's claim on it passes to its answer inside that
+    /// same lock, so a dropped adopt's release never takes the claim in between: the first touch
+    /// captures main's seed under it and then lets it go, as a creation's hold ends once
+    /// published (16_build_volumes.md, "Targets and seeds", "Garbage collection"), and settling
+    /// finds nothing left to decide. The checkout's link keeps the volume from then on.
+    fn touch<R>(
+        &self,
+        touch: impl FnOnce(
+            MintedBeside,
+        )
+            -> Result<std::result::Result<crate::build_volume::migrate::Touched, R>>,
+    ) -> Result<std::result::Result<crate::build_volume::migrate::Touched, R>> {
         match self {
             Self::Nothing => touch(MintedBeside::Nothing),
             Self::Failed(error) => touch(MintedBeside::Failed(error.clone())),
             Self::Volume(slot) => {
-                let held = lock(slot);
-                touch(held.as_ref().map_or(MintedBeside::Nothing, |minted| {
+                let mut held = lock(slot);
+                let beside = held.as_ref().map_or(MintedBeside::Nothing, |minted| {
                     MintedBeside::Volume(minted.volume.clone())
-                }))
-            }
-        }
-    }
-
-    /// Main's first touch published `id`. When that is the minted volume, the adopt's hold on it
-    /// ends here, as its creation's does once published (16_build_volumes.md, "Garbage
-    /// collection"): the slot lets it go, creation hold and all, so the claim of main's seed
-    /// capture is free to take it, and settling finds nothing left to decide. The checkout's
-    /// link keeps it from then on.
-    fn published(&self, id: &BuildVolumeId) {
-        if let Self::Volume(slot) = self {
-            let mut held = lock(slot);
-            if held.as_ref().is_some_and(|minted| &minted.volume.id == id) {
-                *held = None;
+                });
+                let mut touched = touch(beside)?;
+                if let Ok(touched) = &mut touched
+                    && held
+                        .as_ref()
+                        .is_some_and(|minted| minted.volume.id == touched.id)
+                {
+                    debug_assert!(
+                        touched.creation.is_none(),
+                        "a first touch that mints its own volume mints it under a fresh id"
+                    );
+                    touched.creation = held.take().map(|minted| minted.claim);
+                }
+                Ok(touched)
             }
         }
     }
@@ -930,7 +944,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// work a refusal would discard (build-state discovery: a shell activation and its Cargo
     /// queries). `Ok(None)` when the checkout links none. The shared hold a job takes is tried
     /// and let go at once: an exclusive claim (a release, a seed capture, a reseed, a cache
-    /// clear) refuses with the refusal admission itself gives at the supervisor, so the exec
+    /// clear, a first volume's creation) refuses with the refusal admission itself gives at the
+    /// supervisor, so the exec
     /// is answered in milliseconds instead of after the discovery it would have thrown away.
     /// A claim taken after this probe still refuses at admission, unchanged.
     pub fn probe_admissible(
@@ -1007,7 +1022,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                         ..
                     },
                 ) => {
-                    let touched = lent.hold(|beside| {
+                    let touched = lent.touch(|beside| {
                         crate::build_volume::migrate::first_touch(
                             host,
                             layout,
@@ -1032,44 +1047,68 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                             },
                         )
                     })?;
-                    let (id, adopted) = match touched {
+                    let crate::build_volume::migrate::Touched {
+                        id,
+                        adopted,
+                        creation,
+                    } = match touched {
                         Ok(touched) => touched,
                         Err(refusal) => return Ok(Err(refusal)),
                     };
-                    lent.published(&id);
+                    // The claim the volume was created under, the first touch's own or the
+                    // adopt's ([`Lent::touch`]): the seed is captured under it, never under a
+                    // second claim taken once it is let go, which a transient kernel copy of its
+                    // descriptor refuses (16_build_volumes.md, "Targets and seeds").
                     if layout.seed_of(&owner.name, &owner.incarnation)?.is_none() {
                         let state = BuildVolumeState::read(&layout.mount(&id))?;
                         if state.mbx.is_some() {
-                            let source = HeldVolume::for_seed(host, layout, id.clone())?;
-                            let superseded = retained_seed(
-                                host,
-                                layout,
-                                &owner,
-                                SeedCapture::Shared(&source),
-                                &state,
-                            )?;
+                            let superseded = match &creation {
+                                Some(claim) => retained_seed(
+                                    host,
+                                    layout,
+                                    &owner,
+                                    SeedCapture::Claimed(claim),
+                                    &state,
+                                )?,
+                                None => {
+                                    let source = HeldVolume::for_seed(host, layout, id.clone())?;
+                                    retained_seed(
+                                        host,
+                                        layout,
+                                        &owner,
+                                        SeedCapture::Shared(&source),
+                                        &state,
+                                    )?
+                                }
+                            };
                             retire_seeds(host, layout, superseded)?;
                         } else {
-                            host.clone_build_volume(
-                                layout,
-                                &id,
-                                &BuildVolumeId::mint(),
-                                &Registration::new(
-                                    BuildVolumeRecord::new(
-                                        None,
-                                        BuildVolumeRole::Seed {
-                                            target: owner.name,
-                                            incarnation: owner.incarnation.clone(),
-                                        },
-                                    ),
-                                    Registrant::Workspace {
-                                        incarnation: owner.incarnation,
+                            let seed = BuildVolumeId::mint();
+                            let registration = Registration::new(
+                                BuildVolumeRecord::new(
+                                    None,
+                                    BuildVolumeRole::Seed {
+                                        target: owner.name,
+                                        incarnation: owner.incarnation.clone(),
                                     },
                                 ),
-                            )
+                                Registrant::Workspace {
+                                    incarnation: owner.incarnation,
+                                },
+                            );
+                            match &creation {
+                                Some(claim) => host.clone_claimed_build_volume(
+                                    layout,
+                                    claim,
+                                    &seed,
+                                    &registration,
+                                ),
+                                None => host.clone_build_volume(layout, &id, &seed, &registration),
+                            }
                             .map_err(storage)?;
                         }
                     }
+                    drop(creation);
                     return Ok(Ok(BuildStateRefresh {
                         volume: Some(id),
                         created: true,
@@ -1145,9 +1184,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     .map(|capacity| {
                         let id = BuildVolumeId::mint();
                         // Main has no incarnation until the adopt publishes it, so the volume is
-                        // registered by the adopt's intent and held by its exact id, by the slot,
-                        // until its release takes it: never by main's name.
-                        let (_, creating) = host
+                        // registered by the adopt's intent and claimed by its exact id, by the
+                        // slot, until its release or main's first touch takes the claim: never by
+                        // main's name.
+                        let (_, claim) = host
                             .create_build_volume(
                                 layout,
                                 &id,
@@ -1165,7 +1205,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                             .map_err(storage)?;
                         Ok(Minted {
                             volume: MintedVolume { id, capacity },
-                            _creating: creating,
+                            claim,
                         })
                     })
                     .transpose()
@@ -1212,6 +1252,35 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     ) -> (Result<Option<CapturedFork>>, Option<SupersededSeeds>) {
         // Where the new workspace's live volume is placed: the tree its checkout starts at.
         let placed = aim.tree.clone();
+        let this = self.clone();
+        let checkout = source_checkout.clone();
+        let mbx_live = crate::storage::lifecycle::dispatch_blocking(move || {
+            this.state_of(&checkout).map(|state| {
+                state
+                    .filter(|(_, state)| state.mbx.is_some())
+                    .map(|(live, _)| live)
+            })
+        })
+        .await;
+        match mbx_live {
+            Ok(Ok(Some(live))) => {
+                return (
+                    self.capture_live_fork(source, live, destination, placed)
+                        .await,
+                    None,
+                );
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => return (Err(error), None),
+            Err(error) => {
+                return (
+                    Err(CowshedError::internal(format!(
+                        "build volume task failed: {error}"
+                    ))),
+                    None,
+                );
+            }
+        }
         let mut refreshed = match self
             .refresh_seed(
                 source.clone(),
@@ -1254,59 +1323,118 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     )
                     .map_err(storage)?;
                 Ok(Some(CapturedFork {
-                    seed,
+                    from: seed,
                     tree: record.tree,
                     source,
                     operation_elapsed: operation_elapsed.max(captured.capture_elapsed),
                     captured,
                     started,
+                    own_seed: true,
                 }))
             })
             .await;
         (captured, superseded)
     }
 
-    /// The captured live volume proven and published, `destination`'s own seed cloned from it
-    /// before anything mounts it, so the seed holds exactly what the source's seed held and
-    /// `destination` is a target others can fork from, and the live volume mounted with no daemon
-    /// record. It runs beside the attach and mount of the fork's own image: none of it reads the
-    /// source, so it runs after the source's image lock is let go. The seed comes before the
-    /// link: a crash between them leaves an unlinked volume, never a target without a seed. The
-    /// staged checkout's [`Self::finish_fork`] then links the live volume.
+    /// An mbx fork's capture (16_build_volumes.md, "Fork" step 3): the target's live volume itself,
+    /// cloned under the shared hold its jobs take, so they keep running. No seed is refreshed or
+    /// minted and nothing is copied: [`Self::ready_fork`]'s mount deletes what is not the fork's
+    /// ([`crate::build_volume::BuildVolumeState::discard_rebuildable`]).
+    async fn capture_live_fork(
+        &self,
+        source: Owner,
+        live: BuildVolumeId,
+        destination: WorkspaceName,
+        placed: GitOid,
+    ) -> Result<Option<CapturedFork>> {
+        self.blocking(move |host, layout| {
+            let held = HeldVolume::for_seed(host, layout, live)?;
+            let record = layout.read_record(held.id())?;
+            let started = Instant::now();
+            let captured = host
+                .capture_fork_build_volume(
+                    layout,
+                    held.id(),
+                    &Registration::new(
+                        BuildVolumeRecord {
+                            checked_out: Some(placed),
+                            ..BuildVolumeRecord::new(
+                                record.tree.clone(),
+                                BuildVolumeRole::Linked {
+                                    checkout: destination,
+                                },
+                            )
+                        },
+                        Registrant::Intent,
+                    ),
+                )
+                .map_err(storage)?;
+            Ok(Some(CapturedFork {
+                from: held.id().clone(),
+                tree: record.tree,
+                source,
+                operation_elapsed: captured.capture_elapsed,
+                captured,
+                started,
+                own_seed: false,
+            }))
+        })
+        .await
+    }
+
+    /// The captured live volume proven and published, then, for a non-mbx fork, `destination`'s
+    /// own seed cloned from it before anything mounts it, so the seed holds exactly what the
+    /// source's seed held and `destination` is a target others can fork from, and the live volume
+    /// mounted with no daemon record and, for an mbx fork, none of its target's rebuildable state.
+    /// It runs beside the attach and mount of the fork's own image: none of it reads the source,
+    /// so it runs after the source's image lock is let go. The seed comes before the link: a crash
+    /// between them leaves an unlinked volume, never a target without a seed. The staged
+    /// checkout's [`Self::finish_fork`] then links the live volume.
     pub async fn ready_fork(
         &self,
         captured: Result<Option<CapturedFork>>,
         destination: Owner,
     ) -> Result<Option<PreparedFork>> {
         let Some(CapturedFork {
-            seed,
+            from,
             tree,
             captured,
             started,
             source,
             operation_elapsed,
+            own_seed,
         }) = captured?
         else {
             return Ok(None);
         };
         self.blocking(move |host, layout| {
-            let own_seed = BuildVolumeId::mint();
-            let registration = Registration::new(
-                BuildVolumeRecord::new(
-                    tree,
-                    BuildVolumeRole::Seed {
-                        target: destination.name,
-                        incarnation: destination.incarnation,
-                    },
-                ),
-                Registrant::Intent,
-            );
+            let own_seed = own_seed.then(|| {
+                (
+                    BuildVolumeId::mint(),
+                    Registration::new(
+                        BuildVolumeRecord::new(
+                            tree,
+                            BuildVolumeRole::Seed {
+                                target: destination.name,
+                                incarnation: destination.incarnation,
+                            },
+                        ),
+                        Registrant::Intent,
+                    ),
+                )
+            });
             let (live, mount, elapsed) = host
-                .ready_fork_build_volume(layout, captured, Some((&own_seed, &registration)))
+                .ready_fork_build_volume(
+                    layout,
+                    captured,
+                    own_seed
+                        .as_ref()
+                        .map(|(seed, registration)| (seed, registration)),
+                )
                 .map_err(storage)?;
             Ok(Some(PreparedFork {
-                seed,
-                own_seed,
+                from,
+                own_seed: own_seed.map(|(seed, _)| seed),
                 live,
                 mount,
                 started,
@@ -1368,7 +1496,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     ) -> Result<Option<BuildVolumeId>> {
         self.blocking(move |_, _| {
             let Some(PreparedFork {
-                seed,
+                from,
                 own_seed: _,
                 live,
                 mount,
@@ -1394,7 +1522,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             // clock here to pre-pay that would sync the volume on every fork.
             cowshed_os::timing::event("build-volume", || {
                 format!(
-                    "fork {} from seed {seed} in {:?}",
+                    "fork {} from {from} in {:?}",
                     destination.name,
                     started.elapsed()
                 )
@@ -1413,10 +1541,9 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         };
         let live = prepared.live.clone();
         let own_seed = prepared.own_seed.clone();
-        for (id, whose) in [
-            (live, "a fork that never staged"),
-            (own_seed, "the seed of a fork that never staged"),
-        ] {
+        for (id, whose) in std::iter::once((live, "a fork that never staged"))
+            .chain(own_seed.map(|seed| (seed, "the seed of a fork that never staged")))
+        {
             let releasing = id.clone();
             let released = self
                 .blocking(move |host, layout| {
@@ -2910,12 +3037,13 @@ fn may_mint(source: &Path) -> Result<Option<ImageCapacity>> {
     ))
 }
 
-/// Release a volume minted beside main's image unless `checkout` links it, and say on stderr
-/// what the release did or why the volume stays.
+/// Release a volume minted beside main's image under `claim`, the one it was created under,
+/// unless `checkout` links it, and say on stderr what the release did or why the volume stays.
 fn release_minted(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     volume: &MintedVolume,
+    claim: ReleaseClaim,
     checkout: &Path,
     whose: &str,
 ) {
@@ -2924,8 +3052,8 @@ fn release_minted(
         if linked.as_ref() == Some(id) {
             return Ok(None);
         }
-        host.release_build_volume(layout, id)
-            .map(Some)
+        host.release_claimed(layout, claim)
+            .map(|refused| Some(BuildVolumeRelease::Deleted { refused }))
             .map_err(storage)
     });
     match released {
@@ -5293,18 +5421,16 @@ mod tests {
             }
         }
 
-        /// `name`'s checkout, linked to a new live volume registered as its own before its image
-        /// exists and published once it is minted.
+        /// `name`'s checkout, linked to a new live volume that the scenario's mint registers as its
+        /// own before its image exists, published once it is minted.
         fn linked_checkout(&self, name: &str, gib: u64) -> (PathBuf, BuildVolumeId, PathBuf) {
             let checkout = self.root.path().join(name);
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
             let id = BuildVolumeId::mint();
             let registration = registered(BuildVolumeRecord::new(None, linked(name)));
-            let creating = self.layout.register(&id, &registration).unwrap();
             let mount = (self.mint)(&self.host, &self.layout, &id, gib, &registration);
             BuildVolumeState::default().write(&mount).unwrap();
             self.layout.publish(&id, &registration).unwrap();
-            drop(creating);
             link::point(&checkout, &mount).unwrap();
             (checkout, id, mount)
         }
@@ -6163,15 +6289,33 @@ fn main() {
         stream.read_exact(&mut ready).await.unwrap();
         assert_eq!(ready, *b"R");
         let [pid, executable, makeflags, tokens] = fields;
-        let pid: libc::pid_t = pid.parse().expect("the build script's actual parent PID");
-        assert!(pid > 0, "the actual Cargo PID is positive");
-        let arguments = cowshed_os::process::process_arguments(pid)
-            .expect("the kernel names the build script's live Cargo parent");
-        let kernel_executable = PathBuf::from(OsString::from_vec(arguments.executable));
+        let parent: libc::pid_t = pid.parse().expect("the build script's actual parent PID");
+        assert!(parent > 0, "the build script's parent PID is positive");
         let cargo = PathBuf::from(executable)
             .canonicalize()
             .expect("the build script's CARGO");
-        assert_eq!(kernel_executable.canonicalize().unwrap(), cargo);
+        // A build-script wrapper (mbx's cache shim under a gate) may sit between Cargo and its build
+        // script: the live Cargo is the nearest ancestor whose kernel executable is the build's CARGO.
+        let mut pid = parent;
+        let mut seen = Vec::new();
+        let arguments = loop {
+            let arguments = cowshed_os::process::process_arguments(pid)
+                .expect("the kernel names each live ancestor of the build script");
+            let kernel_executable = PathBuf::from(OsString::from_vec(arguments.executable.clone()));
+            if kernel_executable.canonicalize().unwrap() == cargo {
+                break arguments;
+            }
+            seen.push(kernel_executable);
+            assert!(
+                seen.len() < 4,
+                "no ancestor of the build script runs its CARGO {}: {seen:?}",
+                cargo.display()
+            );
+            pid = cowshed_os::process::lineage(pid)
+                .expect("read the ancestor's lineage")
+                .expect("the ancestor is live")
+                .ppid;
+        };
         assert_eq!(cargo.file_name().unwrap(), "cargo");
         assert!(
             arguments.argv.windows(4).any(|args| {
@@ -6978,8 +7122,13 @@ fn main() {
         scratch.release_all();
     }
 
+    /// An mbx fork is a clone of its target's live volume, not of a seed (16_build_volumes.md,
+    /// "Fork"): two forks with no land between them refresh and mint no seed, for the target or
+    /// for either fork, and copy nothing into one. Each holds the retained state as the target held
+    /// it at its capture, and none of its rebuildable state or clone-invalid files, while the
+    /// target's own job keeps its shared hold and writes on.
     #[cfg(target_os = "macos")]
-    async fn mbx_fork_with_live_shared_source<H: RuntimeStorageHost>(scratch: Scratch<H>) {
+    async fn mbx_fork_clones_the_live_volume<H: RuntimeStorageHost>(scratch: Scratch<H>) {
         let (checkout, live, mount) = scratch.linked_checkout("main", 1);
         let target = owner("main", '0');
         BuildVolumeState {
@@ -7009,59 +7158,77 @@ fn main() {
             .append(true)
             .open(mount.join("kept/marker"))
             .unwrap();
-        // Arrange a pre-cutover full seed through the substrate, not the new retention owner.
-        let previous = BuildVolumeId::mint();
-        scratch
-            .host
-            .clone_build_volume(
-                &scratch.layout,
-                &live,
-                &previous,
-                &Registration::new(
-                    BuildVolumeRecord::new(
-                        None,
-                        BuildVolumeRole::Seed {
-                            target: target.name.clone(),
-                            incarnation: target.incarnation.clone(),
-                        },
-                    ),
-                    Registrant::Workspace {
-                        incarnation: target.incarnation.clone(),
-                    },
-                ),
-            )
-            .unwrap();
         let hold = scratch.layout.admit(&live).unwrap();
-        let locked = scratch.lock(&target).await;
-        let (captured, superseded) = scratch
-            .volumes
-            .capture_fork(
-                target.clone(),
-                checkout,
-                name("next"),
-                Aim {
-                    tree: GitOid::new("a".repeat(40)).unwrap(),
-                    landed: Vec::new(),
-                },
-            )
-            .await;
-        let captured = captured
-            .expect("an existing shared source job must not block retained-only capture")
-            .expect("the source has build state");
-        let (seed, _) = scratch
+        let before = scratch.layout.collection_ids().unwrap();
+        let mut forks = Vec::new();
+        for (fork, digit) in [("next", '1'), ("after", '2')] {
+            let locked = scratch.lock(&target).await;
+            let (captured, superseded) = scratch
+                .volumes
+                .capture_fork(
+                    target.clone(),
+                    checkout.clone(),
+                    name(fork),
+                    Aim {
+                        tree: GitOid::new("a".repeat(40)).unwrap(),
+                        landed: Vec::new(),
+                    },
+                )
+                .await;
+            drop(locked);
+            assert!(superseded.is_none(), "an mbx fork refreshes no seed");
+            let captured = captured
+                .expect("an existing shared source job must not block the fork")
+                .expect("the source has build state");
+            assert_eq!(
+                captured.from, live,
+                "the fork is cloned from the live volume"
+            );
+            let prepared = scratch
+                .volumes
+                .ready_fork(Ok(Some(captured)), owner(fork, digit))
+                .await
+                .expect("the fork readies")
+                .expect("the fork has a build volume");
+            assert_eq!(
+                prepared.own_seed, None,
+                "an mbx fork keeps no seed of its own"
+            );
+            assert_eq!(
+                fs::read(prepared.mount.join("kept/marker")).unwrap(),
+                b"live"
+            );
+            assert!(
+                prepared.mount.join("discarded").is_dir(),
+                "a rebuildable directory stays for its link"
+            );
+            assert!(
+                !prepared.mount.join("discarded/marker").exists(),
+                "the target's rebuildable state is not the fork's"
+            );
+            assert!(!prepared.mount.join("kept/fixture-owner.pid").exists());
+            forks.push(prepared);
+        }
+        assert!(
+            scratch
+                .layout
+                .seed_of(&target.name, &target.incarnation)
+                .unwrap()
+                .is_none(),
+            "no seed is minted for the target"
+        );
+        let made: Vec<_> = scratch
             .layout
-            .seed_of(&target.name, &target.incarnation)
+            .collection_ids()
             .unwrap()
-            .unwrap();
-        assert_ne!(seed, previous, "never fall back to the old full-cache seed");
-        assert_eq!(captured.seed, seed);
-        let (seed_mount, _) = scratch
-            .host
-            .mount_build_volume(&scratch.layout, &seed)
-            .unwrap();
-        assert_eq!(fs::read(seed_mount.join("kept/marker")).unwrap(), b"live");
-        assert!(!seed_mount.join("discarded/marker").exists());
-        assert!(!seed_mount.join("kept/fixture-owner.pid").exists());
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(
+            made.len(),
+            2,
+            "two forks make their two volumes, nothing else: {made:?}"
+        );
         assert!(
             scratch.layout.claim_release(&live).unwrap().is_none(),
             "the source job's original shared hold stays admitted"
@@ -7081,23 +7248,18 @@ fn main() {
             fs::read(mount.join(crate::build_volume::STATE_FILE)).unwrap(),
             state_before
         );
-        writer.write_all(b" after snapshot").unwrap();
+        writer.write_all(b" after capture").unwrap();
         assert_eq!(
             fs::read(mount.join("kept/marker")).unwrap(),
-            b"live after snapshot"
+            b"live after capture"
         );
         assert_eq!(
-            fs::read(seed_mount.join("kept/marker")).unwrap(),
+            fs::read(forks[0].mount.join("kept/marker")).unwrap(),
             b"live",
-            "the source writer remains usable without changing the immutable capture"
+            "the source writer remains usable without changing the fork's capture"
         );
-        drop(locked);
-        scratch
-            .volumes
-            .abandon_captured_fork(Ok(Some(captured)))
-            .await;
-        if let Some(superseded) = superseded {
-            scratch.volumes.retire_superseded(superseded).await;
+        for prepared in forks {
+            scratch.volumes.abandon_fork(Ok(Some(prepared))).await;
         }
         drop(writer);
         drop(hold);
@@ -7106,14 +7268,14 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn directory_mbx_fork_captures_retained_state_while_source_shared_hold_stays_live() {
-        mbx_fork_with_live_shared_source(Scratch::directory("mbx-retention-shared")).await;
+    async fn directory_mbx_fork_clones_the_live_volume_and_mints_no_seed() {
+        mbx_fork_clones_the_live_volume(Scratch::directory("mbx-fork-live")).await;
     }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_mbx_fork_captures_retained_state_while_source_shared_hold_stays_live() {
-        mbx_fork_with_live_shared_source(Scratch::new("mbx-retention-shared-native")).await;
+    async fn real_apfs_mbx_fork_clones_the_live_volume_and_mints_no_seed() {
+        mbx_fork_clones_the_live_volume(Scratch::new("mbx-fork-live-native")).await;
     }
 
     #[cfg(target_os = "macos")]
@@ -8549,6 +8711,89 @@ fn main() {
         scratch.release_all();
     }
 
+    /// A transient kernel copy of the descriptor main's first volume was created under refuses
+    /// nothing of main's first touch: the child of another thread's spawn keeps such a copy past
+    /// the spawn's return, beyond the fork lock's reach (cowshed-os `fork_lock`), and it closes
+    /// moments later with no owner. The first touch's seed capture borrows the claim the volume
+    /// was minted under, so the copy holds that very claim and is no other holder. A capture
+    /// that let the creation's hold go and then claimed the volume anew found it held through the
+    /// copy, and once the copy had closed no census could name a holder: "in use, but no process
+    /// of this user holds" it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_main_seeds_its_first_volume_though_a_spawn_copied_its_creation_descriptor() {
+        let scratch = Scratch::directory("build-minted-copied");
+        let main = owner("main", '0');
+        let checkout = tracked_checkout(scratch.root.path(), "main", AT_THE_CAP, &["package.json"]);
+        let first = scratch
+            .volumes
+            .mint_first(checkout.clone(), checkout.clone())
+            .await;
+        let volume = minted(&first);
+        let copied = cowshed_os::fork_lock::in_flight::InFlight::unlocked();
+        let refresh = scratch
+            .volumes
+            .refresh(
+                main.clone(),
+                checkout.clone(),
+                discovered(vec![BuildStatePath::new("target", "target").unwrap()]),
+                first.lend(),
+            )
+            .await;
+        copied.finish();
+        let refresh = refresh.unwrap().unwrap();
+        assert_eq!(refresh.volume, Some(volume.id));
+        first.settle().await;
+        assert!(
+            scratch
+                .layout
+                .seed_of(&main.name, &main.incarnation)
+                .unwrap()
+                .is_some(),
+            "main is seeded from its first volume"
+        );
+        scratch.release_all();
+    }
+
+    /// A volume minted beside main's image that main's first touch does not link is released under
+    /// the claim it was created under, though a spawn's child copied that claim's descriptor
+    /// (cowshed-os `fork_lock`): a release that let the creation go and claimed the volume anew
+    /// found it held through the copy, and the volume stayed.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_main_releases_its_unlinked_first_volume_though_a_spawn_copied_its_creation_descriptor()
+     {
+        let scratch = Scratch::directory("build-minted-copied-unlinked");
+        let checkout = tracked_checkout(scratch.root.path(), "main", AT_THE_CAP, &["package.json"]);
+        let first = scratch
+            .volumes
+            .mint_first(checkout.clone(), checkout.clone())
+            .await;
+        let unused = minted(&first);
+        let copied = cowshed_os::fork_lock::in_flight::InFlight::unlocked();
+        let refresh = scratch
+            .volumes
+            .refresh(
+                owner("main", '0'),
+                checkout.clone(),
+                discovered(Vec::new()),
+                first.lend(),
+            )
+            .await;
+        first.settle().await;
+        copied.finish();
+        assert_eq!(
+            refresh.unwrap().unwrap().volume,
+            None,
+            "nothing to hold links nothing"
+        );
+        assert!(
+            !scratch.layout.image(&unused.id).exists(),
+            "released under the claim it was created under"
+        );
+        scratch.release_all();
+    }
+
     /// A failed mint beside main's image is no reason to mint again: a first touch that needs a
     /// volume answers the mint's own error and makes none; one that needs none (nothing
     /// discovered) is not failed by it.
@@ -8991,8 +9236,8 @@ fn main() {
             .volumes
             .finish_fork(
                 Some(PreparedFork {
-                    seed: seed.clone(),
-                    own_seed,
+                    from: seed.clone(),
+                    own_seed: Some(own_seed),
                     live: live.clone(),
                     mount,
                     started,

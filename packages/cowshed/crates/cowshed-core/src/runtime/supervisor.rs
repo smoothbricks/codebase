@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::api::dto::ExecClass;
 use crate::api::dto::{
     AdmissionKey, BinaryData, CommandArg, ExecCommand, ExecRequest, ExecScope, ExitStatus,
-    JobFailure, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobState, JobTail,
+    JobFailure, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobRecord, JobState, JobTail,
     JobTailLimits, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
     ProtectedOutput, SealedJob, Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo,
     TraceContext, UtcTimestamp, WorkspacePath,
@@ -690,13 +690,15 @@ impl CpuPlacement {
             tasks,
         ));
         if mbx {
+            let priority = OsString::from(match self.class {
+                ExecClass::Gate => "normal",
+                _ => "low",
+            });
             environment.push((
-                OsString::from("MBX_SCHEDULER_PRIORITY"),
-                OsString::from(match self.class {
-                    ExecClass::Gate => "normal",
-                    _ => "low",
-                }),
+                OsString::from(crate::workspace_environment::MBX_PRIORITY_RESTORE_ENV),
+                priority.clone(),
             ));
+            environment.push((OsString::from("MBX_SCHEDULER_PRIORITY"), priority));
             environment.push((OsString::from("CARGO_BUILD_JOBS"), tokens));
         }
         environment
@@ -804,6 +806,62 @@ mod cpu_placement_tests {
                 "{caller}"
             );
         }
+    }
+
+    /// A gate's priority in mbx's pool survives a shell activation inside its command. The
+    /// workspace's `.cowshed/env` exports the canonical `low` a host shell runs at, and a gate's
+    /// `normal` comes back over it, as its Nx fan-out does (05_gateway.md, "Classes", "Parallelism
+    /// inside a job"). On 2026-10-31 every reservation of a downstream land gate entered the pool
+    /// at `low`.
+    #[test]
+    fn a_gates_pool_priority_survives_its_commands_shell_activation() {
+        use cowshed_os::test_backstop::CommandBackstop as _;
+        let root = std::env::temp_dir().join(format!("cowshed-priority-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".cowshed")).expect("the fixture's .cowshed");
+        let mut contribution = crate::capabilities::CapabilityContribution::default();
+        contribution.env.insert(
+            "MBX_SCHEDULER_PRIORITY",
+            crate::capabilities::EnvAction::Own("low".into()),
+        );
+        crate::workspace_environment::write_workspace_environment(
+            crate::workspace_environment::EnvironmentMount::Served {
+                workspace_mount: &root,
+                host_home: &root,
+                temp_dir: &root,
+                capability_env: &contribution,
+            },
+            crate::metadata::Platform::Linux,
+            None,
+            None,
+        )
+        .expect("the workspace environment");
+        for (class, priority) in [(ExecClass::Gate, "normal"), (ExecClass::Background, "low")] {
+            let placement = CpuPlacement {
+                fifo: PathBuf::from("/pool/j"),
+                tokens: std::num::NonZeroUsize::new(4).expect("four"),
+                class,
+                #[cfg(target_os = "macos")]
+                nice: 10,
+            };
+            let output = std::process::Command::new("/bin/sh")
+                .env_clear()
+                .envs(placement.environment(&BTreeMap::new(), true))
+                .args([
+                    "-c",
+                    ". \"$1\"; printf %s \"$MBX_SCHEDULER_PRIORITY\"",
+                    "job",
+                ])
+                .arg(root.join(crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH))
+                .output_bounded()
+                .expect("source the workspace environment");
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                priority,
+                "{class:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).expect("remove the fixture");
     }
 }
 #[derive(Debug)]
@@ -1701,10 +1759,20 @@ async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
 }
 
 /// Points `link` at `runtime_dir`. A link that already points there is the whole answer: every
-/// spawn of a live workspace takes that path, so it reads one link and nothing else. Creating or
-/// retargeting the link also sweeps every `cs-*` link beside it whose target is gone - a retired
-/// workspace takes its mount with it and leaves the link dangling - so the scan of the shared
-/// directory is paid once per link a workspace takes, never once per command.
+/// spawn of a live workspace takes that path, so it reads one link and nothing else.
+///
+/// Otherwise a new link made beside it is renamed over the path, so a client resolving the path
+/// never finds it absent. Unlinking first left a window in which a reconnecting Nx client's
+/// `mkdir -p` of its socket dir made the path a real directory (a checkout's link, during a land's
+/// install on 2026-10-31), and every shell of that checkout was refused after it. A real
+/// directory found at the path is such a client's socket dir: it is moved aside, removed, and said
+/// on stderr, and the link takes its place.
+///
+/// Taking a link also sweeps every `cs-*` link beside it whose workspace is gone: a retired
+/// workspace takes its mount with it and leaves the link dangling. A link whose runtime dir alone
+/// is missing stays (its volume remounting, its mountpoint present), and so does one whose
+/// workspace this process cannot inspect. The scan of the shared directory is paid once per link a
+/// workspace takes, never once per command.
 ///
 /// Blocking: [`point_runtime_link`] runs it on the blocking pool, and publishing the host
 /// environment calls it where it already runs there.
@@ -1715,18 +1783,52 @@ fn point_runtime_link_blocking(link: &Path, runtime_dir: &Path) -> Result<()> {
             "reattach the workspace and retry",
         )
     };
+    // A name beside `link`, unique to this call: its own pid and a fresh nonce.
+    let beside = |role: &str| {
+        let mut name = link.as_os_str().to_owned();
+        name.push(format!(
+            ".{role}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        PathBuf::from(name)
+    };
     match std::fs::read_link(link) {
         Ok(target) if target == runtime_dir => return Ok(()),
-        Ok(_) => {
-            std::fs::remove_file(link).map_err(|error| io("replace runtime link", link, error))?;
-            std::os::unix::fs::symlink(runtime_dir, link)
-                .map_err(|error| io("create runtime link", link, error))?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::os::unix::fs::symlink(runtime_dir, link)
-                .map_err(|error| io("create runtime link", link, error))?;
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            let found = std::fs::symlink_metadata(link)
+                .map_err(|error| io("inspect runtime link", link, error))?;
+            if !found.is_dir() {
+                return Err(io("inspect runtime link", link, error));
+            }
+            let aside = beside("displaced");
+            std::fs::rename(link, &aside)
+                .map_err(|error| io("move aside the directory at runtime link", link, error))?;
+            let removed = std::fs::remove_dir_all(&aside);
+            cowshed_os::eprintln!(
+                "cowshed: {} was a directory, a client's socket dir made while the runtime link was missing; moved it aside{} and linked {} to {}",
+                link.display(),
+                match &removed {
+                    Ok(()) => String::from(" and removed it"),
+                    Err(error) => format!(
+                        " to {}, which could not be removed: {error}",
+                        aside.display()
+                    ),
+                },
+                link.display(),
+                runtime_dir.display()
+            );
         }
         Err(error) => return Err(io("inspect runtime link", link, error)),
+    }
+    let fresh = beside("new");
+    std::os::unix::fs::symlink(runtime_dir, &fresh)
+        .map_err(|error| io("create runtime link", &fresh, error))?;
+    if let Err(error) = std::fs::rename(&fresh, link) {
+        let _ = std::fs::remove_file(&fresh);
+        return Err(io("place runtime link", link, error));
     }
     let Some(directory) = link.parent() else {
         return Ok(());
@@ -1744,11 +1846,29 @@ fn point_runtime_link_blocking(link: &Path, runtime_dir: &Path) -> Result<()> {
         let Ok(target) = std::fs::read_link(&path) else {
             continue;
         };
-        if std::fs::metadata(&target).is_err() {
+        if runtime_link_workspace_gone(&target) {
             let _ = std::fs::remove_file(&path);
         }
     }
     Ok(())
+}
+
+/// Whether the workspace a runtime link leads into is gone. A read-write link leads to
+/// `<mount>/.cowshed/run` and a read-only one to `<exec temp>/run`, so the workspace is gone when
+/// the directory that roots it, its mount or its exec temp dir, is (`ENOENT`). Its runtime dir
+/// alone says nothing: it is absent while the workspace's volume remounts and its mountpoint
+/// stays, and sweeping then let the workspace's Nx clients `mkdir -p` a real directory at the
+/// link's path (2026-10-31).
+fn runtime_link_workspace_gone(target: &Path) -> bool {
+    let parent = target.parent();
+    let root = if parent.is_some_and(|directory| directory.ends_with(".cowshed")) {
+        parent.and_then(Path::parent)
+    } else {
+        parent
+    };
+    root.is_some_and(|root| {
+        std::fs::metadata(root).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 /// The caller's variables a child may take: no bypass of managed Git configuration, no
@@ -2540,6 +2660,7 @@ pub fn project_tool_request(mount: &Path, cwd: &Path, argv: Vec<OsString>) -> Re
         class: ExecClass::Background,
         want: Some(std::num::NonZeroUsize::MIN),
         scope: ExecScope::Workspace,
+        record: JobRecord::Cowshed,
     })
 }
 
@@ -4295,8 +4416,11 @@ impl WorkspaceSupervisorHandle {
             },
             async move {
                 // Only the wake matters: the read that follows answers how the job ended, and
-                // says why when it cannot.
-                let _ = waiter.wait(job_id).await;
+                // says why when it cannot. A supervisor of an earlier build answers no `ended`
+                // and holds no caller-owned job, so its `wait` wakes the same.
+                if waiter.ended(job_id).await.is_err() {
+                    let _ = waiter.wait(job_id).await;
+                }
             },
         )
     }
@@ -4331,6 +4455,17 @@ impl WorkspaceSupervisorHandle {
 
     pub async fn wait(&self, job_id: JobId) -> Result<JobInfo> {
         self.call(|reply| Command::Wait {
+            authority: self.authority.clone(),
+            job_id,
+            reply,
+        })
+        .await
+    }
+
+    /// Wake once `job_id` ended, as [`Self::wait`] does, acknowledging nothing of a
+    /// caller-owned job's end: for a watcher of the job, never its caller.
+    pub async fn ended(&self, job_id: JobId) -> Result<JobInfo> {
+        self.call(|reply| Command::Ended {
             authority: self.authority.clone(),
             job_id,
             reply,
@@ -4650,6 +4785,8 @@ impl WorkspaceSupervisor {
             admission_effects: VecDeque::new(),
             pressure: config.memory_pressure.open(),
             turns: 0,
+            caller_keys: std::collections::HashMap::new(),
+            output_quota: config.artifacts.combined_output_quota_bytes,
         };
         // Whatever the checkout's volumes were cloned from, they are named for it from here.
         let build = actor.policy.ceiling().build_volume_mount.clone();
@@ -4788,6 +4925,13 @@ pub(super) enum Command {
         job_id: JobId,
         reply: oneshot::Sender<Result<JobInfo>>,
     },
+    /// As `Wait`, for a watcher that only needs to know the job ended: it acknowledges nothing
+    /// of a caller-owned job's end (11_shell.md, "Caller-owned jobs").
+    Ended {
+        authority: WorkspaceAuthoritySnapshot,
+        job_id: JobId,
+        reply: oneshot::Sender<Result<JobInfo>>,
+    },
     LogRead {
         authority: WorkspaceAuthoritySnapshot,
         job_id: JobId,
@@ -4869,6 +5013,7 @@ impl Command {
             Self::List { .. } => "list",
             Self::Kill { .. } => "kill",
             Self::Wait { .. } => "wait",
+            Self::Ended { .. } => "ended",
             Self::LogRead { .. } => "log-read",
             Self::Tail { .. } => "tail",
             Self::Quiesce { .. } => "quiesce",
@@ -5096,6 +5241,40 @@ enum Conclusion {
     /// serving the output it captured, the ledger keeps the group, and the workspace's next
     /// supervisor seals the unterminated record as lost.
     Unsealed(CowshedError),
+    /// A caller-owned job ended (11_shell.md, "Caller-owned jobs"): its caller keeps the
+    /// record, so nothing was sealed, and its status projects the actor's own view of it.
+    Streamed,
+}
+
+/// What a caller-owned job keeps in the actor in place of its records (11_shell.md,
+/// "Caller-owned jobs"): the key it was admitted under, its combined output quota, each
+/// stream's running digest, and how much of its end its caller has read.
+struct CallerOwned {
+    key: Option<AdmissionKey>,
+    quota: crate::storage::job_artifact::QuotaLedger,
+    stdout_digest: Sha256,
+    stderr_digest: Sha256,
+    read: EndRead,
+}
+
+/// How much of a caller-owned job's end its caller has been answered: the furthest offset at
+/// which a read of each stream answered its end (an empty stream's included, so a caller that
+/// waits and then reads finds it still there), and whether a `wait` or `sealed` answer carried
+/// its end. A byte appended after such a read is unread.
+#[derive(Clone, Copy, Debug, Default)]
+struct EndRead {
+    stdout: Option<u64>,
+    stderr: Option<u64>,
+    terminal: bool,
+}
+
+/// A key a caller-owned job was admitted under, kept as its record would have kept it, so a
+/// repeat answers that job and a differing request is a key conflict.
+struct CallerKey {
+    job_id: JobId,
+    command: ExecCommand,
+    admission: JobAdmission,
+    scheduling: JobScheduling,
 }
 
 /// The per-job marker the covered install wrapper writes before it runs the install, named by the
@@ -5326,6 +5505,8 @@ struct JobStateRecord {
     close_stdin_when_drained: bool,
     close_waiters: Vec<oneshot::Sender<Result<()>>>,
     waiters: Vec<oneshot::Sender<Result<JobInfo>>>,
+    /// Waiters that only watch for the job's end and acknowledge nothing of it.
+    watchers: Vec<oneshot::Sender<Result<JobInfo>>>,
     kill_waiters: Vec<oneshot::Sender<Result<()>>>,
     log_waiters: Vec<PendingLog>,
     session_identity: Option<u64>,
@@ -5340,6 +5521,9 @@ struct JobStateRecord {
     cpu: CpuStanding,
     /// Why the job failed before any status of its own could say, when it did.
     failure: Option<JobFailure>,
+    /// What the actor keeps of a caller-owned job in place of its records; `None` for a job
+    /// cowshed records.
+    caller: Option<CallerOwned>,
 }
 
 /// Process, volume and CPU claims remain held through draining and every refusal.
@@ -5410,10 +5594,59 @@ impl JobStateRecord {
         self.conclusion.is_some()
     }
 
-    /// Whether the job's terminal record is durable, so the store is the authority for its
-    /// output and its group no longer belongs in the ledger.
+    /// Whether the job's terminal record is written, so the store is the authority for its
+    /// output.
     fn sealed(&self) -> bool {
         matches!(self.conclusion, Some(Conclusion::Sealed { .. }))
+    }
+
+    /// Whether the job's end is settled: sealed into its record or, for a caller-owned job,
+    /// concluded with nothing to seal. Its group no longer belongs in the ledger, and its process
+    /// observation is released.
+    fn settled(&self) -> bool {
+        matches!(
+            self.conclusion,
+            Some(Conclusion::Sealed { .. } | Conclusion::Streamed)
+        )
+    }
+
+    /// Note that a read of `stream` answered its end at `offset`.
+    fn read_to_end(&mut self, stream: StreamKind, offset: u64) {
+        if let Some(caller) = &mut self.caller {
+            let read = match stream {
+                StreamKind::Stdout => &mut caller.read.stdout,
+                StreamKind::Stderr => &mut caller.read.stderr,
+            };
+            *read = Some(read.map_or(offset, |known| known.max(offset)));
+        }
+    }
+
+    /// Note that a caller's `wait` or `sealed` answer carried how the job ended.
+    fn read_terminal(&mut self) {
+        if self.terminal()
+            && let Some(caller) = &mut self.caller
+        {
+            caller.read.terminal = true;
+        }
+    }
+
+    /// Whether a caller-owned job has ended and its caller has read it whole: its end, and every
+    /// byte of both streams. A job whose child no wait saw end keeps its group in the ledger, so
+    /// it is never forgotten.
+    fn read_whole(&self) -> bool {
+        self.terminal()
+            && self.wait_failure.is_none()
+            && self.caller.as_ref().is_some_and(|caller| {
+                caller.read.terminal
+                    && caller
+                        .read
+                        .stdout
+                        .is_some_and(|read| read >= self.stdout_tally.bytes())
+                    && caller
+                        .read
+                        .stderr
+                        .is_some_and(|read| read >= self.stderr_tally.bytes())
+            })
     }
 
     /// The job as status reports it.
@@ -5441,7 +5674,7 @@ impl JobStateRecord {
                     publication,
                 }) => commitment.as_ref().or(publication.as_ref()),
                 Some(Conclusion::Unsealed(error)) => Some(error),
-                None => None,
+                Some(Conclusion::Streamed) | None => None,
             });
         match failure {
             Some(error) => Err(error.clone()),
@@ -5450,8 +5683,8 @@ impl JobStateRecord {
     }
 
     fn processes(&self) -> Result<JobProcessTree> {
-        if self.sealed() {
-            return Err(observation_released(self.info.job_id));
+        if self.settled() {
+            return Err(self.observation_ended());
         }
         #[cfg(target_os = "macos")]
         if let Some(monitor) = &self.monitor {
@@ -5465,8 +5698,8 @@ impl JobStateRecord {
         every: SampleInterval,
         reply: oneshot::Sender<Result<JobProcessStream>>,
     ) {
-        if self.sealed() {
-            let _ = reply.send(Err(observation_released(self.info.job_id)));
+        if self.settled() {
+            let _ = reply.send(Err(self.observation_ended()));
             return;
         }
         #[cfg(target_os = "macos")]
@@ -5486,6 +5719,23 @@ impl JobStateRecord {
         match stream {
             StreamKind::Stdout => (&self.stdout, self.stdout_tally.bytes(), self.stdout_eof),
             StreamKind::Stderr => (&self.stderr, self.stderr_tally.bytes(), self.stderr_eof),
+        }
+    }
+}
+
+impl JobStateRecord {
+    /// Why a settled job's process tree and events are no longer observed.
+    fn observation_ended(&self) -> CowshedError {
+        match self.caller {
+            Some(_) => CowshedError::conflict(
+                format!(
+                    "job {} has ended: its process tree and events were released, and its caller \
+                     holds its record",
+                    self.info.job_id.get()
+                ),
+                "read the job's end from its wait or sealed answer",
+            ),
+            None => observation_released(self.info.job_id),
         }
     }
 }
@@ -5538,6 +5788,14 @@ async fn next_group_ledger_finish(state: &mut GroupLedgerFinish) -> std::io::Res
         GroupLedgerFinish::Idle | GroupLedgerFinish::Done(_) => std::future::pending().await,
     }
 }
+/// Who an answer about a job's end goes to: its caller, whose `wait` acknowledges a
+/// caller-owned job's end, or a watcher that only needs to know it ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Answer {
+    Caller,
+    Watcher,
+}
+
 /// A successful exec request either admitted work now or found its existing keyed job.
 enum ExecAdmission {
     New(JobId),
@@ -5651,6 +5909,11 @@ struct SupervisorActor {
     /// The project's lifecycle-intent journal, which `asIs` judges (`None`: its store's layout
     /// could not be read, and every `asIs` answers `records`).
     lifecycle_journal: Option<PathBuf>,
+    /// The keys caller-owned jobs were admitted under, for as long as each job is held
+    /// (11_shell.md, "Caller-owned jobs"); a recorded job's key lives in its record.
+    caller_keys: std::collections::HashMap<AdmissionKey, CallerKey>,
+    /// The combined output quota of one job, which the actor counts for a caller-owned job.
+    output_quota: u64,
 }
 
 /// Runtime teardown transfers the same jobs to one retirement worker. The actor joins for a
@@ -5773,9 +6036,9 @@ fn job_group_claims(
     jobs: &BTreeMap<JobId, JobStateRecord>,
 ) -> impl Iterator<Item = super::job_groups::JobGroupClaim> + Clone + '_ {
     jobs.iter()
-        // A job sealed after a wait failure may have left its group running: nothing saw it
+        // A job settled after a wait failure may have left its group running: nothing saw it
         // end, so the ledger keeps it for whoever finds this supervisor gone.
-        .filter(|(_, job)| !job.sealed() || job.wait_failure.is_some())
+        .filter(|(_, job)| !job.settled() || job.wait_failure.is_some())
         .filter_map(|(job_id, job)| {
             let leader = job.birth.as_ref()?.leader()?;
             #[cfg(target_os = "macos")]
@@ -5804,7 +6067,7 @@ fn retire_dropped_jobs(
     for id in ids {
         let job = jobs.get(&id).expect("the retained job exists");
         if job.terminal() {
-            if job.sealed() && job.wait_failure.is_none() {
+            if job.settled() && job.wait_failure.is_none() {
                 jobs.remove(&id);
             }
             continue;
@@ -6326,6 +6589,20 @@ impl SupervisorActor {
             } => {
                 let result = match self.validate_authority(&authority) {
                     Err(error) => Err(error),
+                    // A caller-owned job's end is its terminal facts, from memory.
+                    Ok(())
+                        if self
+                            .jobs
+                            .get(&job_id)
+                            .is_some_and(|job| job.caller.is_some()) =>
+                    {
+                        let job = &self.jobs[&job_id];
+                        if job.terminal() {
+                            job.status().map(|info| sealed_from_memory(&info))
+                        } else {
+                            Err(unsealed_job(job_id))
+                        }
+                    }
                     // A job this supervisor holds unsealed has no terminal record yet. Its own
                     // state answers: no store refresh, no unread-history refusal.
                     Ok(()) if self.jobs.get(&job_id).is_some_and(|job| !job.sealed()) => {
@@ -6341,7 +6618,15 @@ impl SupervisorActor {
                                 .ok_or_else(|| unsealed_job(job_id))
                         }),
                 };
-                let _ = reply.send(result);
+                // A caller-owned job's end acknowledged once its `sealed` answer is delivered.
+                let caller_end = result.is_ok()
+                    && self
+                        .jobs
+                        .get(&job_id)
+                        .is_some_and(|job| job.caller.is_some());
+                if reply.send(result).is_ok() && caller_end {
+                    self.terminal_read(job_id);
+                }
             }
             Command::Resources {
                 authority,
@@ -6525,6 +6810,9 @@ impl SupervisorActor {
                 reply,
             } => {
                 let result = self.validate_authority(&authority).and_then(|()| {
+                    if let Some(kept) = self.caller_keys.get(&key) {
+                        return Ok(Some(kept.job_id));
+                    }
                     match self.artifacts.in_memory().admitted(&key) {
                         AdmissionLookup::Admitted { job_id, .. } => Ok(Some(job_id)),
                         AdmissionLookup::Absent => Ok(None),
@@ -6571,7 +6859,12 @@ impl SupervisorActor {
                 authority,
                 job_id,
                 reply,
-            } => self.wait(&authority, job_id, reply),
+            } => self.wait(&authority, job_id, reply, Answer::Caller),
+            Command::Ended {
+                authority,
+                job_id,
+                reply,
+            } => self.wait(&authority, job_id, reply, Answer::Watcher),
             Command::LogRead {
                 authority,
                 job_id,
@@ -6742,15 +7035,41 @@ impl SupervisorActor {
 
     /// Stop publication admission only once no job can add another owned life. Completion is
     /// a selectable event, never an actor-side wait on filesystem IO or a worker join.
+    ///
+    /// These are the retiring supervisor's last writes: the group ledger's last cut and, beside
+    /// it, the span writer's seal of what it gathered (a retired supervisor's process exits
+    /// waiting for nothing else, 13_telemetry.md, "Job span segments"). Retirement is answered
+    /// once both are done.
     fn begin_group_ledger_finish(&mut self) {
         if !matches!(self.group_ledger_finish, GroupLedgerFinish::Idle) {
             return;
         }
         self.record_groups();
-        self.group_ledger_finish = match self.group_ledger.as_mut() {
-            Some(writer) => GroupLedgerFinish::Pending(writer.finish()),
-            None => GroupLedgerFinish::Done(Ok(())),
-        };
+        let ledger = self.group_ledger.as_mut().map(GroupLedgerWriter::finish);
+        let spans = self.job_spans.clone();
+        if ledger.is_none() && spans.is_none() {
+            self.group_ledger_finish = GroupLedgerFinish::Done(Ok(()));
+            return;
+        }
+        let (reply, finished) = oneshot::channel();
+        tokio::spawn(async move {
+            // A writer that already stopped counted what it refused; nothing is left to seal.
+            if let Some(spans) = spans {
+                let _ = spans.health().await;
+            }
+            let recorded = match ledger {
+                Some(receiver) => receiver.await.unwrap_or_else(|error| {
+                    Err(std::io::Error::other(format!(
+                        "group-ledger writer ended before its final reply: {error}"
+                    )))
+                }),
+                None => Ok(()),
+            };
+            // A task the runtime dropped before this reply reads as the ledger writer's end: the
+            // span seal itself never fails retirement.
+            let _ = reply.send(recorded);
+        });
+        self.group_ledger_finish = GroupLedgerFinish::Pending(finished);
     }
 
     fn validate_authority(&self, authority: &WorkspaceAuthoritySnapshot) -> Result<()> {
@@ -7135,6 +7454,14 @@ impl SupervisorActor {
         // The host boundary takes no session overlay a worker controls. Environment names do
         // not restrict execution; the public-name projection is applied only when recording.
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
+        if request.record == JobRecord::Caller
+            && (request.stdout_copy.is_some() || request.stderr_copy.is_some())
+        {
+            return Err(CowshedError::usage(
+                "a caller-owned job publishes no output copy: a published copy is a disk record",
+                "drop stdoutCopy and stderrCopy, or let cowshed keep the job's record",
+            ));
+        }
         let scheduling = JobScheduling::requested(
             request.scope,
             request.class,
@@ -7159,25 +7486,45 @@ impl SupervisorActor {
         }
         // A key's repeat answers before anything else is touched: its session keeps the cwd and
         // environment it had, no build volume is held and no job id is taken.
+        // A caller-owned job's key is in the actor's own map, a recorded job's in its record.
         let admission = match &request.admission_key {
             None => None,
-            Some(key) => match self.artifacts.in_memory().admitted(key) {
-                AdmissionLookup::Absent => {
+            Some(key) => match self.caller_keys.get(key).map_or_else(
+                || (self.artifacts.in_memory().admitted(key), JobRecord::Cowshed),
+                |kept| {
+                    (
+                        AdmissionLookup::Admitted {
+                            job_id: kept.job_id,
+                            command: &kept.command,
+                            admission: &kept.admission,
+                            scheduling: kept.scheduling,
+                        },
+                        JobRecord::Caller,
+                    )
+                },
+            ) {
+                (AdmissionLookup::Absent, _) => {
                     Some(self.job_admission(key.clone(), &request, session.as_ref())?)
                 }
-                AdmissionLookup::Admitted {
-                    job_id,
-                    command,
-                    admission: admitted,
-                    scheduling: bound,
-                } => {
-                    let fields = self.admission_differences(
+                (
+                    AdmissionLookup::Admitted {
+                        job_id,
+                        command,
+                        admission: admitted,
+                        scheduling: bound,
+                    },
+                    owner,
+                ) => {
+                    let mut fields = self.admission_differences(
                         admitted,
                         command,
                         bound,
                         &request,
                         session.as_ref(),
                     );
+                    if owner != request.record {
+                        fields.push(AdmissionField::Record);
+                    }
                     return if !fields.is_empty() {
                         Err(CowshedError::admission_refusal(
                             AdmissionRefusal::KeyConflict { job_id, fields },
@@ -7190,7 +7537,7 @@ impl SupervisorActor {
                         Ok(ExecAdmission::Existing(job_id))
                     };
                 }
-                AdmissionLookup::Unprovable { set_aside } => {
+                (AdmissionLookup::Unprovable { set_aside }, _) => {
                     return Err(CowshedError::admission_refusal(
                         AdmissionRefusal::Unprovable {
                             set_aside: set_aside.to_path_buf(),
@@ -7274,6 +7621,7 @@ impl SupervisorActor {
             class: _,
             want: _,
             scope: _,
+            record,
         } = request;
         command.validate().map_err(|error| {
             CowshedError::usage(error.to_string(), "provide a valid bounded command")
@@ -7357,35 +7705,51 @@ impl SupervisorActor {
             .spawner
             .admit_cgroup(&self.authority, job_id, scheduling.class())
             .await?;
-        {
-            let _span = cowshed_os::timing::span("admit", "record");
-            let grant_revision = self.authority.grant_revision;
-            let recorded = command.clone();
-            let admitted = self
-                .artifacts
-                .run(move |sink| {
-                    sink.admit(job_id, grant_revision, &recorded, admission, scheduling)
-                })
-                .await;
-            #[cfg(target_os = "linux")]
-            let admitted = match admitted {
-                Err(error) => Err(refused_cgroup(error, cgroup.clone()).await),
-                recorded => recorded,
-            };
-            admitted?;
-        }
-        self.next_job_id = expected_next;
-        let admission = cowshed_os::timing::spanned(
-            "admit",
-            "commitment",
-            self.commitments.record(CommitmentDraft::Admission {
-                repo_id: self.authority.repo_id.clone(),
-                workspace_incarnation: self.authority.workspace_incarnation.clone(),
+        // A caller-owned job is recorded by its caller (11_shell.md, "Caller-owned jobs"): no
+        // record batch and no commitment here, only its key, kept in the actor.
+        let caller_key = match record {
+            JobRecord::Cowshed => {
+                let _span = cowshed_os::timing::span("admit", "record");
+                let grant_revision = self.authority.grant_revision;
+                let recorded = command.clone();
+                let admitted = self
+                    .artifacts
+                    .run(move |sink| {
+                        sink.admit(job_id, grant_revision, &recorded, admission, scheduling)
+                    })
+                    .await;
+                #[cfg(target_os = "linux")]
+                let admitted = match admitted {
+                    Err(error) => Err(refused_cgroup(error, cgroup.clone()).await),
+                    recorded => recorded,
+                };
+                admitted?;
+                None
+            }
+            JobRecord::Caller => admission.map(|admission| CallerKey {
                 job_id,
-                grant_revision: self.authority.grant_revision,
+                command: command.clone(),
+                admission,
+                scheduling,
             }),
-        )
-        .await;
+        };
+        self.next_job_id = expected_next;
+        let admission = match record {
+            JobRecord::Cowshed => {
+                cowshed_os::timing::spanned(
+                    "admit",
+                    "commitment",
+                    self.commitments.record(CommitmentDraft::Admission {
+                        repo_id: self.authority.repo_id.clone(),
+                        workspace_incarnation: self.authority.workspace_incarnation.clone(),
+                        job_id,
+                        grant_revision: self.authority.grant_revision,
+                    }),
+                )
+                .await
+            }
+            JobRecord::Caller => Ok(()),
+        };
         if let Err(error) = admission {
             let _ = self
                 .artifacts
@@ -7405,12 +7769,14 @@ impl SupervisorActor {
         let started = match utc_now() {
             Ok(started) => started,
             Err(error) => {
-                let _ = self
-                    .artifacts
-                    .run(move |sink| {
-                        sink.seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy)
-                    })
-                    .await;
+                if record == JobRecord::Cowshed {
+                    let _ = self
+                        .artifacts
+                        .run(move |sink| {
+                            sink.seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy)
+                        })
+                        .await;
+                }
                 #[cfg(target_os = "linux")]
                 let error = refused_cgroup(error, cgroup).await;
                 return Err(error);
@@ -7430,8 +7796,14 @@ impl SupervisorActor {
             duration_ms: None,
             resources: None,
             exit: None,
-            stdout: empty_stream(),
-            stderr: empty_stream(),
+            stdout: match record {
+                JobRecord::Cowshed => empty_stream(),
+                JobRecord::Caller => streamed_stream(0, &Sha256::new()),
+            },
+            stderr: match record {
+                JobRecord::Cowshed => empty_stream(),
+                JobRecord::Caller => streamed_stream(0, &Sha256::new()),
+            },
             trace,
             output_limit: None,
             stdin: stdin_info,
@@ -7452,7 +7824,9 @@ impl SupervisorActor {
             off_actor::run(move || VolumeBaseline::admitted(workspace.as_ref(), build.as_deref()))
                 .await
         };
-        if let Some(job_spans) = &self.job_spans {
+        if let Some(job_spans) = &self.job_spans
+            && record == JobRecord::Cowshed
+        {
             job_spans.record(
                 &info,
                 JobSpanEdge::Start {
@@ -7511,6 +7885,7 @@ impl SupervisorActor {
             close_stdin_when_drained: false,
             close_waiters: Vec::new(),
             waiters: Vec::new(),
+            watchers: Vec::new(),
             kill_waiters: Vec::new(),
             log_waiters: Vec::new(),
             session_identity,
@@ -7531,7 +7906,17 @@ impl SupervisorActor {
                 admitted_turn: self.turns,
             })),
             failure: None,
+            caller: (record == JobRecord::Caller).then(|| CallerOwned {
+                key: caller_key.as_ref().map(|kept| kept.admission.key.clone()),
+                quota: crate::storage::job_artifact::QuotaLedger::new(self.output_quota),
+                stdout_digest: Sha256::new(),
+                stderr_digest: Sha256::new(),
+                read: EndRead::default(),
+            }),
         };
+        if let Some(kept) = caller_key {
+            self.caller_keys.insert(kept.admission.key.clone(), kept);
+        }
         self.jobs.insert(job_id, job);
         self.admission_event(super::job_admission::Event::Requested {
             job: job_id,
@@ -7541,18 +7926,22 @@ impl SupervisorActor {
         Ok(ExecAdmission::New(job_id))
     }
 
-    /// Leave `job_id` running with nobody attached: both captured prefixes become durable in
-    /// their protected files before this answers, and a session's job joins its session's
-    /// background set until it ends. A job that ended is sealed, so it is durable already.
+    /// Leave `job_id` running with nobody attached: a recorded job's captured prefixes become
+    /// durable in their protected files before this answers, while a caller-owned job's stay
+    /// served from memory; a session's job joins its session's background set until it ends. A
+    /// job that ended is answered as it is.
     async fn detach(&mut self, job_id: JobId) -> Result<()> {
         let job = self.job(job_id)?;
         if job.terminal() {
             return Ok(());
         }
         let session_identity = job.session_identity;
-        self.artifacts
-            .run(move |sink| sink.prepare_background(job_id))
-            .await?;
+        // A caller-owned job has no protected prefix to make durable: its bytes stay served.
+        if job.caller.is_none() {
+            self.artifacts
+                .run(move |sink| sink.prepare_background(job_id))
+                .await?;
+        }
         if let Some(identity) = session_identity
             && let Some(session) = self.sessions.get_mut(&identity)
         {
@@ -7683,6 +8072,7 @@ impl SupervisorActor {
                 );
             }
             if let (Some(monitor), Some(publisher)) = (&job.monitor, &self.job_spans)
+                && job.caller.is_none()
                 && let Err(error) = monitor.trace(publisher.clone(), &job.info)
             {
                 cowshed_os::eprintln!(
@@ -8155,6 +8545,7 @@ impl SupervisorActor {
         authority: &WorkspaceAuthoritySnapshot,
         job_id: JobId,
         reply: oneshot::Sender<Result<JobInfo>>,
+        to: Answer,
     ) {
         if let Err(error) = self.validate_authority(authority) {
             let _ = reply.send(Err(error));
@@ -8165,11 +8556,42 @@ impl SupervisorActor {
             return;
         };
         if job.terminal() {
-            let _ = reply.send(job.terminal_outcome());
+            if reply.send(job.terminal_outcome()).is_ok() && to == Answer::Caller {
+                self.terminal_read(job_id);
+            }
         } else if let RetirementState::Refused(refusal) = &job.retirement {
             let _ = reply.send(Err(refusal.error().clone()));
         } else {
-            job.waiters.push(reply);
+            match to {
+                Answer::Caller => job.waiters.push(reply),
+                Answer::Watcher => job.watchers.push(reply),
+            }
+        }
+    }
+
+    /// A reader was told how `job_id` ended: a caller-owned job whose caller has now read its
+    /// end whole is forgotten.
+    fn terminal_read(&mut self, job_id: JobId) {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.read_terminal();
+        }
+        self.forget_if_read(job_id);
+    }
+
+    /// Forget a caller-owned job its caller has read whole (11_shell.md, "Caller-owned jobs"):
+    /// its output, its state and its key. Every later question about it is not found.
+    fn forget_if_read(&mut self, job_id: JobId) {
+        if !self
+            .jobs
+            .get(&job_id)
+            .is_some_and(JobStateRecord::read_whole)
+        {
+            return;
+        }
+        if let Some(job) = self.jobs.remove(&job_id)
+            && let Some(key) = job.caller.and_then(|caller| caller.key)
+        {
+            self.caller_keys.remove(&key);
         }
     }
     fn kill(
@@ -8280,7 +8702,10 @@ impl SupervisorActor {
         }
         match make_log_chunk(job, stream, offset) {
             Ok(Some(chunk)) => {
-                let _ = reply.send(Ok(chunk));
+                let (next, eof) = (chunk.next_offset, chunk.eof);
+                if reply.send(Ok(chunk)).is_ok() && eof {
+                    job.read_to_end(stream, next);
+                }
             }
             Ok(None) => match at_end(
                 follow,
@@ -8299,17 +8724,24 @@ impl SupervisorActor {
                 }
                 AtEnd::Answer => {
                     let (_, len, eof) = job.stream(stream);
-                    let _ = reply.send(Ok(LogChunk {
-                        bytes: Bytes::new(),
-                        next_offset: len,
-                        eof: eof || job.terminal(),
-                    }));
+                    let eof = eof || job.terminal();
+                    let delivered = reply
+                        .send(Ok(LogChunk {
+                            bytes: Bytes::new(),
+                            next_offset: len,
+                            eof,
+                        }))
+                        .is_ok();
+                    if delivered && eof {
+                        job.read_to_end(stream, len);
+                    }
                 }
             },
             Err(error) => {
                 let _ = reply.send(Err(error));
             }
         }
+        self.forget_if_read(job_id);
     }
 
     async fn tail(
@@ -8557,6 +8989,38 @@ impl SupervisorActor {
         if job.terminal() {
             return;
         }
+        // A caller-owned job's output is served from the actor alone: its quota and digests are
+        // counted here, and nothing reaches the store.
+        if job.caller.is_some() {
+            let job = self
+                .jobs
+                .get_mut(&job_id)
+                .expect("a caller-owned job remains actor-owned");
+            let caller = job.caller.as_mut().expect("checked caller-owned");
+            let accepted = bytes.slice(..caller.quota.admit(bytes.len()));
+            let crossed = caller.quota.output_limit();
+            match stream {
+                _ if accepted.is_empty() => {}
+                StreamKind::Stdout => {
+                    caller.stdout_digest.update(&accepted);
+                    job.stdout_tally.admit(&accepted);
+                    job.stdout.push_back(accepted);
+                }
+                StreamKind::Stderr => {
+                    caller.stderr_digest.update(&accepted);
+                    job.stderr_tally.admit(&accepted);
+                    job.stderr.push_back(accepted);
+                }
+            }
+            if let Some(limit) = crossed.clone() {
+                job.output_limit = Some(limit);
+            }
+            flush_log_waiters(job);
+            if crossed.is_some() {
+                let _ = self.begin_kill(job_id, KillReason::OutputLimit);
+            }
+            return;
+        }
         // Past its first 64 KiB a stream spills to its protected file, so a write may block on
         // the file system: on the blocking pool.
         let written = {
@@ -8782,7 +9246,7 @@ impl SupervisorActor {
             job_id.get(),
             error.message
         );
-        for waiter in job.waiters.drain(..) {
+        for waiter in job.waiters.drain(..).chain(job.watchers.drain(..)) {
             let _ = waiter.send(Err(error.clone()));
         }
         for waiter in job.kill_waiters.drain(..) {
@@ -8985,7 +9449,9 @@ impl SupervisorActor {
         }
         // State the terminal sample while the admitted build volume is still held. A missing
         // sample stays absent: no fresh boundary read invents host or volume facts for it.
-        if let Some(job_spans) = &self.job_spans {
+        if let Some(job_spans) = &self.job_spans
+            && job.caller.is_none()
+        {
             job_spans.record(&job.info, JobSpanEdge::end(state, job.exit.as_ref()));
         }
         // Only a failed job names why; a job killed meanwhile ended by the kill.
@@ -9005,45 +9471,64 @@ impl SupervisorActor {
             outlived: job.info.outlived.clone(),
             outlived_incomplete: job.info.outlived_incomplete,
         };
-        let seal_span = cowshed_os::timing::span("seal", "record");
-        let (stdout_copy, stderr_copy) = (job.stdout_copy.take(), job.stderr_copy.take());
-        let sealed = self
-            .artifacts
-            .run(move |sink| sink.seal(job_id, ending, stdout_copy, stderr_copy))
-            .await;
-        drop(seal_span);
         // The membership and direct child have ended whatever becomes of their record, so the
         // job concludes on every path below and every waiter is answered. The claim was held
-        // through the native proof, not merely through a successful artifact write.
-        let conclusion = match sealed {
-            Ok(seal) => {
-                let commitment = cowshed_os::timing::spanned(
-                    "seal",
-                    "commitment",
-                    self.commitments.record(CommitmentDraft::Terminal {
-                        repo_id: self.authority.repo_id.clone(),
-                        workspace_incarnation: self.authority.workspace_incarnation.clone(),
-                        job_id,
-                        state,
-                        grant_revision: job.info.grant_revision,
-                        stdout_bytes: seal.stdout.bytes,
-                        stdout_sha256: seal.stdout.sha256,
-                        stderr_bytes: seal.stderr.bytes,
-                        stderr_sha256: seal.stderr.sha256,
-                        batch_sha256: seal.terminal_batch_sha256,
-                        output_limit: seal.output_limit.clone(),
-                    }),
-                )
-                .await;
-                job.info.stdout = seal.stdout;
-                job.info.stderr = seal.stderr;
-                job.info.output_limit = seal.output_limit;
-                Conclusion::Sealed {
-                    commitment: commitment.err(),
-                    publication: seal.publication_failure,
+        // through the native proof, not merely through a successful artifact write. A
+        // caller-owned job seals nothing (11_shell.md, "Caller-owned jobs"): its streams' counts
+        // and digests are the actor's own.
+        let streamed = job.caller.as_ref().map(|caller| {
+            (
+                streamed_stream(job.stdout_tally.bytes(), &caller.stdout_digest),
+                streamed_stream(job.stderr_tally.bytes(), &caller.stderr_digest),
+            )
+        });
+        let conclusion = match streamed {
+            Some((stdout, stderr)) => {
+                job.info.stdout = stdout;
+                job.info.stderr = stderr;
+                job.info.output_limit = job.output_limit.clone();
+                Conclusion::Streamed
+            }
+            None => {
+                let sealed = {
+                    let _span = cowshed_os::timing::span("seal", "record");
+                    let (stdout_copy, stderr_copy) =
+                        (job.stdout_copy.take(), job.stderr_copy.take());
+                    self.artifacts
+                        .run(move |sink| sink.seal(job_id, ending, stdout_copy, stderr_copy))
+                        .await
+                };
+                match sealed {
+                    Ok(seal) => {
+                        let commitment = cowshed_os::timing::spanned(
+                            "seal",
+                            "commitment",
+                            self.commitments.record(CommitmentDraft::Terminal {
+                                repo_id: self.authority.repo_id.clone(),
+                                workspace_incarnation: self.authority.workspace_incarnation.clone(),
+                                job_id,
+                                state,
+                                grant_revision: job.info.grant_revision,
+                                stdout_bytes: seal.stdout.bytes,
+                                stdout_sha256: seal.stdout.sha256,
+                                stderr_bytes: seal.stderr.bytes,
+                                stderr_sha256: seal.stderr.sha256,
+                                batch_sha256: seal.terminal_batch_sha256,
+                                output_limit: seal.output_limit.clone(),
+                            }),
+                        )
+                        .await;
+                        job.info.stdout = seal.stdout;
+                        job.info.stderr = seal.stderr;
+                        job.info.output_limit = seal.output_limit;
+                        Conclusion::Sealed {
+                            commitment: commitment.err(),
+                            publication: seal.publication_failure,
+                        }
+                    }
+                    Err(error) => Conclusion::Unsealed(error),
                 }
             }
-            Err(error) => Conclusion::Unsealed(error),
         };
         job.conclusion = Some(conclusion);
         // The job concluded: nothing signals its group any more, and its leader is reaped.
@@ -9099,25 +9584,35 @@ impl SupervisorActor {
             session.background_jobs.remove(&job_id);
         }
         let outcome = job.terminal_outcome();
+        let mut told = false;
         for waiter in job.waiters.drain(..) {
-            let _ = waiter.send(outcome.clone());
+            told |= waiter.send(outcome.clone()).is_ok();
+        }
+        if told {
+            job.read_terminal();
+        }
+        for watcher in job.watchers.drain(..) {
+            let _ = watcher.send(outcome.clone());
         }
         for waiter in job.kill_waiters.drain(..) {
             let _ = waiter.send(outcome.clone().map(|_| ()));
         }
         flush_log_waiters(job);
-        if !job.sealed() {
-            // Without a durable record the actor's copy is the output it serves, and the ledger
+        if !job.settled() {
+            // Without a terminal record the actor's copy is the output it serves, and the ledger
             // keeps the group for the workspace's next supervisor to end.
             return;
         }
-        // Release the actor's copy of the output. The store already holds every byte, under a
-        // committed digest, and its per-job quota is a gigabyte -- so retaining this second copy
-        // for the supervisor's lifetime is growth with no closed form, and a workspace that
-        // execs often exhausts memory while its disk quota still holds. Ordered after the
-        // waiters so a follower that is mid-stream is served from the live deque first.
-        job.stdout = VecDeque::new();
-        job.stderr = VecDeque::new();
+        // Release the actor's copy of a recorded job's output. The store already holds every
+        // byte, under a committed digest, and its per-job quota is a gigabyte -- so retaining
+        // this second copy for the supervisor's lifetime is growth with no closed form, and a
+        // workspace that execs often exhausts memory while its disk quota still holds. Ordered
+        // after the waiters so a follower that is mid-stream is served from the live deque
+        // first. A caller-owned job's copy is the only one, kept until its caller has read it.
+        if job.sealed() {
+            job.stdout = VecDeque::new();
+            job.stderr = VecDeque::new();
+        }
         if job.birth.is_some() {
             self.record_groups();
         }
@@ -9125,6 +9620,7 @@ impl SupervisorActor {
         // nothing awaited between its waiters' answers and that record.
         #[cfg(target_os = "macos")]
         self.release_observation(job_id).await;
+        self.forget_if_read(job_id);
     }
 
     /// Release a sealed job's process observation (07_api.md, "Process-tree observations"):
@@ -9390,6 +9886,42 @@ fn stdin_info(stdin: &StdinSource) -> StdinInfo {
             workspace_path: Some(path.clone()),
             complete: false,
         },
+    }
+}
+
+/// A caller-owned job's stream at its end (11_shell.md, "Caller-owned jobs"): its count and
+/// digest, served and kept nowhere else.
+fn streamed_stream(bytes: u64, digest: &Sha256) -> StreamInfo {
+    StreamInfo {
+        storage: OutputStorage::Streamed,
+        bytes,
+        sha256: Sha256Digest::from_bytes(digest.clone().finalize().into()),
+        summary: OutputSummary {
+            version: 1,
+            text: String::new(),
+            truncated: false,
+        },
+    }
+}
+
+/// A caller-owned job's terminal facts, as `sealed` answers them from the actor's memory.
+fn sealed_from_memory(info: &JobInfo) -> SealedJob {
+    SealedJob {
+        job_id: info.job_id,
+        state: info.state,
+        exit: info.exit.clone(),
+        failure: info.failure,
+        duration_ms: info.duration_ms,
+        resources: info.resources.clone(),
+        output_limit: info.output_limit.clone(),
+        stdout: info.stdout.clone(),
+        stderr: info.stderr.clone(),
+        class: info.class,
+        scope: info.scope,
+        nice: info.nice,
+        containment: info.containment.clone(),
+        outlived: info.outlived.clone(),
+        outlived_incomplete: info.outlived_incomplete,
     }
 }
 
@@ -9934,16 +10466,25 @@ fn flush_log_waiters(job: &mut JobStateRecord) {
     for waiter in waiters {
         match make_log_chunk(job, waiter.stream, waiter.offset) {
             Ok(Some(chunk)) => {
-                let _ = waiter.reply.send(Ok(chunk));
+                let (next, eof) = (chunk.next_offset, chunk.eof);
+                if waiter.reply.send(Ok(chunk)).is_ok() && eof {
+                    job.read_to_end(waiter.stream, next);
+                }
             }
             Ok(None) if !job.terminal() => job.log_waiters.push(waiter),
             Ok(None) => {
                 let (_, len, _) = job.stream(waiter.stream);
-                let _ = waiter.reply.send(Ok(LogChunk {
-                    bytes: Bytes::new(),
-                    next_offset: len,
-                    eof: true,
-                }));
+                let delivered = waiter
+                    .reply
+                    .send(Ok(LogChunk {
+                        bytes: Bytes::new(),
+                        next_offset: len,
+                        eof: true,
+                    }))
+                    .is_ok();
+                if delivered {
+                    job.read_to_end(waiter.stream, len);
+                }
             }
             Err(error) => {
                 let _ = waiter.reply.send(Err(error));
@@ -11215,6 +11756,111 @@ mod workspace_toolchain_tests {
             dangling.symlink_metadata().is_err(),
             "taking a link sweeps the dangling one"
         );
+    }
+
+    /// A link is retargeted by renaming a new one over it, so a client resolving it in between
+    /// never finds the path absent. Unlinking first left a window in which a reconnecting Nx
+    /// client's `mkdir -p` of its socket dir made the link's path a real directory (main's, at a
+    /// land's install on 2026-10-31), and every shell of the checkout was refused after it.
+    #[tokio::test]
+    async fn retargeting_a_runtime_link_never_leaves_its_path_absent() {
+        let root = scratch("runtime-link-retarget");
+        let targets = [root.join("first"), root.join("second")];
+        for target in &targets {
+            std::fs::create_dir_all(target).expect("runtime dir");
+        }
+        let link = root.join("cs-retarget");
+        std::os::unix::fs::symlink(&targets[0], &link).expect("first link");
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (link, done) = (link.clone(), std::sync::Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut absent = 0_u64;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if link.symlink_metadata().is_err() {
+                        absent += 1;
+                    }
+                }
+                absent
+            })
+        };
+        for round in 0..2000 {
+            point_runtime_link_blocking(&link, &targets[round % 2]).expect("retarget");
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            watcher.join().expect("watcher"),
+            0,
+            "the link's path was absent"
+        );
+        assert_eq!(std::fs::read_link(&link).expect("link"), targets[1]);
+    }
+
+    /// Only a link whose target is gone is dangling. One whose target this process cannot inspect
+    /// (a denied stat, an unreadable parent) still leads to a live workspace and is kept.
+    #[tokio::test]
+    async fn a_link_whose_target_cannot_be_inspected_is_never_swept() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("runtime-link-uninspectable");
+        let runtime = root.join("run");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let sealed = root.join("sealed");
+        std::fs::create_dir_all(sealed.join("run")).expect("another workspace's runtime dir");
+        let foreign = root.join("cs-foreign");
+        std::os::unix::fs::symlink(sealed.join("run"), &foreign).expect("foreign link");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).expect("seal");
+        let taken = point_runtime_link(&root.join("cs-taken"), &runtime).await;
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).expect("unseal");
+        taken.expect("taken link");
+        assert_eq!(
+            std::fs::read_link(&foreign).expect("the foreign link stays"),
+            sealed.join("run")
+        );
+    }
+
+    /// A workspace's runtime dir is briefly absent while its volume remounts (a land's adoption,
+    /// an install), and its mountpoint stays: its link is kept then. Removed, it let the
+    /// workspace's Nx clients `mkdir -p` a real directory at its path, again and again on
+    /// 2026-10-31. Only a workspace whose mount itself is gone, a retired one, leaves a dangling link.
+    #[tokio::test]
+    async fn a_link_is_swept_only_when_its_workspace_mount_is_gone() {
+        let root = scratch("runtime-link-remount");
+        let runtime = root.join("run");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let remounting = root.join("remounting");
+        std::fs::create_dir_all(&remounting).expect("an empty mountpoint");
+        let kept = root.join("cs-remounting");
+        std::os::unix::fs::symlink(remounting.join(".cowshed/run"), &kept).expect("kept link");
+        let retired = root.join("cs-retired-mount");
+        std::os::unix::fs::symlink(root.join("retired/.cowshed/run"), &retired)
+            .expect("retired link");
+        point_runtime_link(&root.join("cs-taken"), &runtime)
+            .await
+            .expect("taken link");
+        assert!(
+            kept.symlink_metadata().is_ok(),
+            "a workspace whose mountpoint is present keeps its link"
+        );
+        assert!(
+            retired.symlink_metadata().is_err(),
+            "a workspace whose mount is gone loses its link"
+        );
+    }
+
+    /// A real directory where the link belongs (a client's `mkdir -p` of its socket dir while the
+    /// link was missing) is moved aside and the link takes its place, so the workspace's jobs and
+    /// shells reach its runtime dir again instead of failing on a path that leads nowhere.
+    #[tokio::test]
+    async fn a_real_directory_at_the_links_path_is_replaced_by_the_link() {
+        let root = scratch("runtime-link-directory");
+        let runtime = root.join("run");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let link = root.join("cs-squatted");
+        std::fs::create_dir_all(link.join("nx")).expect("a client's socket dir");
+        point_runtime_link(&link, &runtime)
+            .await
+            .expect("the link replaces the directory");
+        assert_eq!(std::fs::read_link(&link).expect("link"), runtime);
     }
 
     /// Stores hand out port blocks independently, so two live workspaces can hold one base.

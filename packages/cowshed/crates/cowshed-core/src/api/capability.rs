@@ -375,6 +375,7 @@ impl ControllerRuntime for ActorRuntime {
             class,
             want,
             scope,
+            record,
         } = request;
         let (stdin, inline, mut stream) = match stdin {
             StdinSource::Empty => (ExecStdin::Empty, None, None),
@@ -407,6 +408,7 @@ impl ControllerRuntime for ActorRuntime {
             class,
             want,
             scope,
+            record,
         };
         let job_id = match (source, inline) {
             (AdmissionSource::Worker, Some(bytes)) => {
@@ -3117,7 +3119,7 @@ mod tests {
     use super::*;
     use crate::api::call::{Arguments, Serves, call};
     use crate::api::dto::RunSandboxMode;
-    use crate::api::dto::{ExecClass, ExecScope};
+    use crate::api::dto::{ExecClass, ExecScope, JobRecord};
     use crate::api::operations::{self, OPERATIONS, Scope};
     use crate::error::CpuAdmissionRefusal;
     use serde_json::json;
@@ -4056,6 +4058,7 @@ mod tests {
             class: ExecClass::Background,
             want: None,
             scope: ExecScope::Workspace,
+            record: JobRecord::Cowshed,
         }
     }
     fn workspace_ref(runtime: Arc<dyn ControllerRuntime>) -> WorkspaceRef {

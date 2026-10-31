@@ -30,8 +30,8 @@ catalogs. The items below remain; each names the code, the evidence and the acce
 
 ## Packed-manifest guard
 
-- `packReleaseTarball` relies on `bun pm pack`, which resolves `catalog:` from `bun.lock` (probe with Bun 1.4.3: the
-  packed manifest carries the catalog range; without a lockfile pack fails loudly). The post-pack guard
-  (`release/pack.ts:294`) and `packed-manifest.ts:41-45` match `workspace:`/`link:`/`file:` only.
+- `packReleaseTarball` relies on `bun pm pack` to resolve `catalog:` (probe with Bun 1.4.4: the packed manifest carries
+  the catalog range, with or without a lockfile; Bun 1.4.3 refused to pack without one). The post-pack guard
+  (`assertPackedArtifact` in `release/pack.ts`) and `packed-manifest.ts:41-45` match `workspace:`/`link:`/`file:` only.
 - Work: add `catalog:` to the unresolved-protocol guard so a packed `catalog:` refuses publication.
 - Acceptance: a tarball whose manifest still says `catalog:` fails the guard.

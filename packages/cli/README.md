@@ -37,7 +37,7 @@ smoo monorepo validate-commit-msg <commit-msg-file>
 smoo monorepo check-public-denylist [--remote <name>] [revisions...]
 smoo monorepo check-public-denylist --staged
 smoo monorepo check-public-denylist --commit-message <commit-msg-file>
-smoo monorepo sync-bun-lockfile-versions [--mode <install|publish>] [--stage]
+smoo monorepo sync-bun-lockfile-versions [--stage]
 smoo monorepo list-release-packages [--fail-empty] [--github-output <path>]
 smoo monorepo validate-public-tags
 smoo monorepo setup-test-tracing (--all | --projects <projects>) [--dry-run]
@@ -127,7 +127,7 @@ evaluation's Bun over the shell's.
 
 Bun types are also a root runtime policy. The root `@types/bun` version follows the exact `packageManager` Bun version,
 while package manifests are not forced to depend on Bun just because a test tsconfig opts into Bun globals. If a package
-does explicitly declare `@types/bun`, `sherif` can keep duplicate declarations consistent, but `smoo` owns the semantic
+does explicitly declare `@types/bun`, it names the root's catalog entry for it (below), and `smoo` owns the semantic
 root `bun@x.y.z` to `@types/bun x.y.z` relationship.
 
 A root dependency these policies check (the tool devDependencies, `@types/bun`, `@types/node`, `ttsc`) may be a Bun
@@ -135,6 +135,12 @@ catalog reference, `catalog:` or `catalog:<name>`. smoo then judges the catalog 
 a failure (`package.json workspaces.catalog.nx must be ...`), and `update`, `validate --fix` and `init --runtime-only`
 repair the entry and keep the reference. Bun reads the catalogs from the object form of `workspaces` once it holds
 `catalog` or `catalogs`, and otherwise from the top level of the root manifest; smoo reads them from the same place.
+
+`init --runtime-only` writes the root manifest alone and runs no package hygiene. A member that declares a runtime type
+the root pins (`@types/node`, `@types/bun`) therefore names it `catalog:`, the root names it `catalog:` too, and the
+version lives once, in the root's catalog, where the runtime sync writes it. A range of the member's own stays behind
+when the runtime moves, and `validate`'s package hygiene (`sherif --fail-on-warnings`, `multiple-dependency-versions`)
+then refuses the release, as it refused cowshed's `^26.6.5` beside the root's `^26.6.6` after Bun 1.4.4.
 
 ## LMAO Test Tracing
 
@@ -395,9 +401,12 @@ and a live or unprovable holder is never retired. A lock inspection whose read o
 handoff of the key reports the key released instead of throwing "ttsc plugin build lock has no valid generation": after
 a publication every reader takes and frees the key in turn, so the read can land after one reader retired `current/` and
 before the next published its own. Only the same `current/` directory, by device and inode, before and after a read that
-found no valid generation is refused as malformed. The packaged managed asset is the source, so clean managed installs
-receive the same repairs without a compiler fork or edits to the dependency cache. The registration applies only to that
-exact compiler version; the repository's lockfile continues to own its compiler pin.
+found no valid generation is refused as malformed. ttsc's own go invocations run in workspace mode (`GOWORK=auto`),
+where go accepts only `-mod=readonly` or `-mod=vendor`, so the patch drops a caller's `-mod` flag from their `GOFLAGS`
+and keeps the rest: a host shell exporting `GOFLAGS=-mod=mod` failed its entry rebuilding a tool, "selecting Go packages
+for plugin `typia` failed". The packaged managed asset is the source, so clean managed installs receive the same repairs
+without a compiler fork or edits to the dependency cache. The registration applies only to that exact compiler version;
+the repository's lockfile continues to own its compiler pin.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
@@ -538,15 +547,15 @@ nothing when nothing changed:
   refusal.
 
 - A repository whose `devenv.nix` enables `languages.python.uv` gets its uv workspace synced the same way
-  (`uv sync --all-packages --all-groups`, `--locked` on a CI runner) into devenv's `UV_PROJECT_ENVIRONMENT`, with the
-  interpreter devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and
-  every workspace member's `pyproject.toml`. The environment names no path of its checkout, so a copy-on-write clone of
-  an installed checkout enters installed: uv creates it relocatable, each workspace member's editable `.pth` line is
-  rewritten relative to site-packages after every sync, currentness and replacement share one witness that the
-  environment is still the relocatable one that sync would leave (no launcher or interpreter link naming an environment
-  or a checkout, no absolute `.pth` line), and the managed module clears `languages.python.libraries`, whose default
-  would put the checkout's `.devenv/profile` into the interpreter's store path. devenv's own `languages.python.venv` and
-  `uv.sync` must stay off; the module refuses them.
+  (`uv sync --all-packages --all-groups --all-extras`, `--locked` on a CI runner) into devenv's
+  `UV_PROJECT_ENVIRONMENT`, with the interpreter devenv provides, and activated after the sync. Its inputs are the root
+  `pyproject.toml`, `uv.lock` and every workspace member's `pyproject.toml`. The environment names no path of its
+  checkout, so a copy-on-write clone of an installed checkout enters installed: uv creates it relocatable, each
+  workspace member's editable `.pth` line is rewritten relative to site-packages after every sync, currentness and
+  replacement share one witness that the environment is still the relocatable one that sync would leave (no launcher or
+  interpreter link naming an environment or a checkout, no absolute `.pth` line), and the managed module clears
+  `languages.python.libraries`, whose default would put the checkout's `.devenv/profile` into the interpreter's store
+  path. devenv's own `languages.python.venv` and `uv.sync` must stay off; the module refuses them.
 - Bun/uv installs, installed-package repairs, alias/link writes and repository git configuration/hooks in one checkout
   share a flock(2) on `node_modules/.smoo-install.lock`. A second mutating entry waits (and says so), then rechecks the
   first entry's stamps and links. The kernel releases the lock when its holder exits, so a killed shell entry leaves
@@ -1207,11 +1216,15 @@ Nx then orders it, at any depth: `site:deploy` after `app-backend:deploy` after 
 order. Keep the leading `"..."`: it expands the `deploy-build` edge the plugin infers (below), which a bare list would
 drop.
 
-What makes the edge safe is that a deploy is never cached and always cheap when there is nothing to do:
+What makes the edge safe is that a deploy is answered from the cache only when it would change nothing, and is cheap
+when there is nothing to do:
 
-- `@smoothbricks/nx-plugin` gives the `deploy` it infers `cache: false`. An Nx cache hit on a deploy means "we once
-  uploaded this hash", which a rollback silently falsifies — the workspace is unchanged, so the hash is unchanged, so a
-  cached deploy would report success while the previous version keeps serving.
+- `@smoothbricks/nx-plugin` runs the `deploy` it infers with its `wrangler-deploy` executor, cached on the artifact and
+  the stage. A plain Nx cache hit on a deploy would mean "we once uploaded this hash", which a rollback silently
+  falsifies: the workspace is unchanged, so the hash is unchanged. So the executor's hasher asks
+  `smoo wrangler deployed-version --stage <stage> --refresh` which tag serves the stage, and answers the artifact hash
+  only while that tag is the artifact's. Otherwise it adds a nonce, the run misses, and `deploy-stage` deploys, still
+  tagging the artifact's version, so the next hash, with that version live, is the artifact's own.
 - `smoo wrangler deploy-stage` reads live state first. If the version tagged with this task's hash is already the one
   serving 100% of traffic, it returns `remote-cache-hit` after two API calls: no upload, no migration, no traffic shift.
 - The expensive, purely file-derived half belongs in a sibling `deploy-build` target (build the artifact, register it,
@@ -1461,10 +1474,11 @@ Versioning:
   lines verbatim, and a failure before npm ran (packing) is reported as itself.
 - `--dry-run` previews versioning and completion without pushing refs, publishing npm packages, or writing GitHub
   Releases.
-- The pack path maps unpublished `-next` lock entries to the last stable tag because `bun pm pack` resolves
-  `workspace:*` from `bun.lock`. Supported Buns keep the lockfile fresh on install
-  ([18906](https://github.com/oven-sh/bun/issues/18906), [20477](https://github.com/oven-sh/bun/issues/20477),
-  [20829](https://github.com/oven-sh/bun/issues/20829)), so no staleness repair remains.
+- The pack path pins each `workspace:*` dependency in the packed manifest: at the dependency's own version, or, when
+  that is a prerelease (the `-next` version a package stays on after its release), at its last stable tag. A prerelease
+  with no stable tag stays as it is, and the packed-manifest check refuses it outside `devDependencies`. smoo writes the
+  pin itself because `bun pm pack` 1.4.4 resolves `workspace:*` from the dependency's manifest, which holds the `-next`
+  version; nothing rewrites `bun.lock` for a pack.
 - Package release tags must use the Nx project name and version, for example `nx-plugin@0.0.2`. smoo derives release
   package/version pairs from that tag shape and maps project names back to npm package names before checking npm state.
 - `smoo release retag-unpublished <tag...>` is a break-glass recovery command for the case where Nx already committed a
@@ -1526,9 +1540,8 @@ Publishing:
   the same projects, and it keeps reruns self-sufficient when repairing a previously selected `HEAD` release target.
 - Publish uses `bun pm pack` to create package tarballs, then publishes those tarballs with latest npm CLI and
   `--provenance`. Each package uses the npm dist-tag implied by its own version (`next` for prereleases, `latest` for
-  stable versions). Bun pack resolves internal `workspace:*` dependency ranges to real versions in the tarball manifest;
-  smoo fails before publish if a packed manifest still contains `workspace:` or if an internal dependency does not match
-  the current workspace package version.
+  stable versions). smoo pins internal `workspace:*` dependency ranges to exact versions in the packed manifest and
+  fails before publish if a packed manifest still contains `workspace:` or an internal dependency other than its pin.
 - npmjs accepts `--provenance` only from GitHub-hosted runners (`RUNNER_ENVIRONMENT=github-hosted`). On GitHub Actions,
   smoo refuses a public provenance publish when `RUNNER_ENVIRONMENT=self-hosted` before calling npm, so the failure
   names runner policy instead of trusted-publishing credentials. Private Forgejo publication does not use provenance.
@@ -1768,8 +1781,8 @@ The important design goal is one source of truth per convention:
 - Managed files decide what generated CI and hooks should look like.
 - Root package metadata provides defaults only for owned public packages.
 - Actual workspace package names decide which dependency ranges become `workspace:*`.
-- Package manifests decide Bun lockfile workspace versions; the pre-publish pack maps unpublished `-next` entries to the
-  last stable tag.
+- Package manifests decide Bun lockfile workspace versions; a release pack pins an unpublished `-next` dependency at its
+  last stable tag in the packed manifest, never in the lockfile.
 - [`sherif`] handles broad package hygiene.
 - [`jactionlint`] checks GitHub Actions correctness, security, and policy.
 - [`publint`] and [`attw`][are-the-types-wrong] validate real packed artifacts.

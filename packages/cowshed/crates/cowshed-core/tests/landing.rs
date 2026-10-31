@@ -1301,8 +1301,11 @@ async fn a_head_only_the_push_ref_keeps_is_retirable_and_not_a_fold() {
         GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("peer head");
     let facts = fold_facts(
         fixture.store(),
-        &target,
-        &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        cowshed_core::landing::LandedRange {
+            target: &target,
+            previous: &previous,
+            paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        },
         cowshed_core::landing::FoldProvenance {
             base: &previous,
             head: &head,
@@ -1345,8 +1348,11 @@ async fn a_fold_uses_the_captured_peer_head_and_landed_result_not_later_refs() {
     git(&mount, ["checkout", "-q", "--detach", base.as_str()]);
     let facts = fold_facts(
         fixture.store(),
-        &target,
-        &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        cowshed_core::landing::LandedRange {
+            target: &target,
+            previous: &base,
+            paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        },
         cowshed_core::landing::FoldProvenance {
             base: &base,
             head: &head,
@@ -1371,6 +1377,117 @@ async fn a_fold_uses_the_captured_peer_head_and_landed_result_not_later_refs() {
         "an unrelated later commit never authorizes peer retirement"
     );
 }
+
+/// A land folds only work it brought into the target (02_workspaces.md, land step 5, "Folds"). A
+/// batch rebased onto an integration shed holds that shed's commits before the land; landing a unit
+/// into the batch then changed the same paths, and the integration shed was retired as a "folded
+/// peer" although the land carried none of its work.
+#[tokio::test]
+async fn a_peer_the_target_held_before_the_land_is_not_a_fold() {
+    let fixture = Fixture::new("fold-held-before");
+    let mount = fixture.clone_workspace("train");
+    let base =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("fork base");
+    workspace_commit(&mount, "story.txt", "train's story\n", "train work");
+    let head =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("peer head");
+    // The target takes the peer's commit before the land, as a batch rebased onto it does.
+    git(
+        fixture.parent(),
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            mount.as_os_str(),
+            OsStr::new("train"),
+        ],
+    );
+    git(fixture.parent(), ["merge", "-q", "--ff-only", "FETCH_HEAD"]);
+    let previous = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("the target before the land")
+        .tip()
+        .clone();
+    // The land then carries a unit's change to the same path.
+    fixture.land_content_separately("story.txt", "the unit's story\n", "the unit's change");
+    let target = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("the landed target");
+    let facts = fold_facts(
+        fixture.store(),
+        cowshed_core::landing::LandedRange {
+            target: &target,
+            previous: &previous,
+            paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        },
+        cowshed_core::landing::FoldProvenance {
+            base: &base,
+            head: &head,
+        },
+        &mount,
+        &fixture.parent(),
+        "train",
+    )
+    .await;
+    assert_eq!(facts.touched, Ok(true), "the land changed the same path");
+    assert_eq!(
+        fold_step(&facts),
+        None,
+        "the target held the peer before the land, so the land neither retires nor names it: {facts:?}"
+    );
+}
+
+/// The other side of the rule above: a peer whose work the target lacked before the land and holds
+/// after it is the land's fold, retired when its tree is clean.
+#[tokio::test]
+async fn a_peer_whose_work_this_land_brought_in_is_a_fold() {
+    let fixture = Fixture::new("fold-brought-in");
+    let mount = fixture.clone_workspace("peer");
+    let base =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("fork base");
+    workspace_commit(&mount, "story.txt", "peer's story\n", "peer work");
+    let head =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("peer head");
+    let previous = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("the target before the land")
+        .tip()
+        .clone();
+    // The land carries the peer's commit into the target.
+    git(
+        fixture.parent(),
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            mount.as_os_str(),
+            OsStr::new("peer"),
+        ],
+    );
+    git(fixture.parent(), ["merge", "-q", "--ff-only", "FETCH_HEAD"]);
+    let target = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("the landed target");
+    let facts = fold_facts(
+        fixture.store(),
+        cowshed_core::landing::LandedRange {
+            target: &target,
+            previous: &previous,
+            paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        },
+        cowshed_core::landing::FoldProvenance {
+            base: &base,
+            head: &head,
+        },
+        &mount,
+        &fixture.parent(),
+        "peer",
+    )
+    .await;
+    assert!(facts.landed && !facts.held_before_land, "{facts:?}");
+    assert_eq!(
+        fold_step(&facts),
+        Some(cowshed_core::landing::FoldStep::Retire)
+    );
+}
 /// A peer with no commits after its recorded fork base never folded work (02_workspaces.md,
 /// land step 5), even when the land changed paths in the history it inherited.
 #[tokio::test]
@@ -1385,8 +1502,11 @@ async fn a_session_without_commits_after_its_fork_base_is_not_a_fold() {
         .expect("main's target");
     let facts = fold_facts(
         fixture.store(),
-        &target,
-        &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        cowshed_core::landing::LandedRange {
+            target: &target,
+            previous: &fork_base,
+            paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        },
         cowshed_core::landing::FoldProvenance {
             base: &fork_base,
             head: &fork_base,

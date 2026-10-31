@@ -1,9 +1,11 @@
 //! A job's span through the supervisor's production span writer (13_telemetry.md, "Job span
-//! segments", "Process-tree spans"): the writer seals each edge of the span as the segment a
-//! reader of lmao's trace schema decodes, carrying exactly the columns the declaration names and
-//! the host and volume facts of the job's two boundaries.
+//! segments", "Process-tree spans"): the writer gathers the edges of every job's span and seals
+//! them as one segment per interval, each row of which a reader of lmao's trace schema decodes,
+//! carrying exactly the columns the declaration names and the host and volume facts of the job's
+//! two boundaries.
 
 use std::path::Path;
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_array::types::{Int64Type, UInt16Type, UInt32Type, UInt64Type};
@@ -20,7 +22,7 @@ use cowshed_core::api::{
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::job_spans::{
-    JobSpanEdge, JobSpanPublisher, job_fields, job_span_thread,
+    JobSpanEdge, JobSpanPublisher, SEAL_INTERVAL, job_fields, job_span_thread,
 };
 
 #[path = "support/accounting_fixture.rs"]
@@ -28,7 +30,10 @@ mod accounting_fixture;
 use accounting_fixture::terminal_sample;
 #[path = "support/span_schema.rs"]
 mod span_schema;
-use span_schema::{Column, exact_schema, fields, number_cell, sealed_segments, text_cell};
+use span_schema::{
+    Column, exact_schema, fields, number_cell, sealed_segments, sealed_segments_among_kinds,
+    text_cell,
+};
 #[path = "support/temp_root.rs"]
 mod temp_root;
 use temp_root::TempRoot;
@@ -127,7 +132,7 @@ fn running_job() -> JobInfo {
 }
 
 /// Seal the job's start and its clean end through a production writer under `telemetry`, and
-/// return the two segments it sealed.
+/// return what it sealed: the one segment its health read sealed both rows in.
 async fn sealed_start_and_end(telemetry: &Path, info: &JobInfo) -> Vec<(String, RecordBatch)> {
     let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
     publisher.record(info, JobSpanEdge::Start { host: None });
@@ -136,8 +141,17 @@ async fn sealed_start_and_end(telemetry: &Path, info: &JobInfo) -> Vec<(String, 
         JobSpanEdge::end(JobState::Exited, Some(&ExitStatus::Exited { code: 0 })),
     );
     let health = publisher.health().await.expect("the writer answers");
-    assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+    assert_eq!((health.recorded, health.failed), (1, 0), "{health:?}");
     sealed_segments(telemetry, "job-")
+}
+
+/// Every row of `segments`, read across them in sealing order: its segment's batch and its index
+/// in that batch.
+fn sealed_rows(segments: &[(String, RecordBatch)]) -> Vec<(&RecordBatch, usize)> {
+    segments
+        .iter()
+        .flat_map(|(_, batch)| (0..batch.num_rows()).map(move |row| (batch, row)))
+        .collect()
 }
 
 /// The declaration is the spec's table: the schema the writer derives from it is exactly these
@@ -147,29 +161,29 @@ fn the_declared_job_columns_are_the_spec_s() {
     assert_eq!(job_fields(), fields(&spec_job_columns()));
 }
 
-/// Each edge of a job span is one sealed segment holding exactly lmao's system columns and the
-/// declared job columns, with the job's durable key, its W3C span id and, on the end row only,
-/// its state.
+/// Both edges of a job span seal as one segment, one row each, holding exactly lmao's system
+/// columns and the declared job columns, with the job's durable key, its W3C span id and, on the
+/// end row only, its state.
 #[tokio::test]
 async fn a_sealed_job_span_carries_exactly_the_declared_columns() {
     let telemetry = TempRoot::new("cowshed-job-spans");
     let info = running_job();
     let segments = sealed_start_and_end(&telemetry, &info).await;
-    assert_eq!(segments.len(), 2);
+    assert_eq!(segments.len(), 1, "one health read seals one job segment");
     for (name, batch) in &segments {
         exact_schema(&batch.schema(), &spec_job_columns())
             .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(batch.num_rows(), 1, "{name} holds one row");
+        assert_eq!(batch.num_rows(), 2, "{name} holds both edges");
     }
 
     let thread = job_span_thread(&info.repo_id, &info.workspace_incarnation, info.job_id);
     let w3c_span_id = u64::from_str_radix(info.trace.span_id.as_str(), 16).expect("hex span id");
-    for ((_, batch), (entry_type, job_state)) in segments
-        .iter()
+    for ((batch, row), (entry_type, job_state)) in sealed_rows(&segments)
+        .into_iter()
         .zip([("span-start", None), ("span-ok", Some("exited"))])
     {
-        let text = |column: &str| text_cell(batch, column, 0);
-        let number = |column: &str| number_cell::<UInt64Type>(batch, column, 0);
+        let text = |column: &str| text_cell(batch, column, row);
+        let number = |column: &str| number_cell::<UInt64Type>(batch, column, row);
         assert_eq!(text("trace_id").as_deref(), Some(TRACE));
         assert_eq!(number("thread_id"), Some(thread));
         assert_eq!(text("entry_type").as_deref(), Some(entry_type));
@@ -212,6 +226,107 @@ async fn a_sealed_job_span_carries_exactly_the_declared_columns() {
         exact_schema(&schema, &nullable).is_err(),
         "a required column read as nullable"
     );
+}
+
+/// Job rows are gathered like process rows, never sealed one by one: two jobs' starts and ends
+/// queued inside one interval wait for it with no reader asking, and one health read seals all
+/// four as exactly one segment, in the order they were queued (13_telemetry.md, "Job span
+/// segments").
+#[tokio::test(start_paused = true)]
+async fn two_jobs_rows_seal_as_one_segment_in_queue_order_and_never_before_the_interval() {
+    let telemetry = TempRoot::new("cowshed-job-span-gathered");
+    let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
+    let end = JobSpanEdge::end(JobState::Exited, Some(&ExitStatus::Exited { code: 0 }));
+    let (first, second) = (job(1), job(2));
+    publisher.record(&first, JobSpanEdge::Start { host: None });
+    publisher.record(&second, JobSpanEdge::Start { host: None });
+    publisher.record(&first, end);
+    publisher.record(&second, end);
+    // Lets the writer take what is queued, without advancing the paused clock.
+    let settle = || async {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    };
+    settle().await;
+    tokio::time::advance(SEAL_INTERVAL - Duration::from_millis(1)).await;
+    settle().await;
+    // A seal the writer started would run on the blocking pool in real time. Blocking this thread
+    // gives it that time without parking the runtime, which would move the paused clock.
+    std::thread::sleep(Duration::from_millis(200));
+    settle().await;
+    assert_eq!(
+        std::fs::read_dir(&*telemetry)
+            .expect("list telemetry root")
+            .count(),
+        0,
+        "rows queued inside the interval wait for it: no seal has started a partition"
+    );
+
+    let health = publisher.health().await.expect("the writer answers");
+    assert_eq!(
+        (health.recorded, health.failed),
+        (1, 0),
+        "one health read seals the four rows as one segment: {health:?}"
+    );
+    let segments = sealed_segments(&telemetry, "job-");
+    assert_eq!(segments.len(), 1, "one job segment, not one per row");
+    assert_eq!(segments[0].1.num_rows(), 4);
+    let queued = sealed_rows(&segments)
+        .into_iter()
+        .map(|(batch, row)| {
+            (
+                number_cell::<UInt64Type>(batch, "job_id", row),
+                text_cell(batch, "entry_type", row),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued,
+        [
+            (Some(1), Some("span-start".to_owned())),
+            (Some(2), Some("span-start".to_owned())),
+            (Some(1), Some("span-ok".to_owned())),
+            (Some(2), Some("span-ok".to_owned())),
+        ],
+        "the rows keep the order they were queued in, across jobs"
+    );
+}
+
+/// The interval alone seals gathered job rows: with no reader asking, a job's start and end seal
+/// as one segment once the interval that the first of them armed has passed (13_telemetry.md,
+/// "Job span segments").
+#[tokio::test(start_paused = true)]
+async fn job_rows_seal_when_their_interval_ends_with_no_reader_asking() {
+    let telemetry = TempRoot::new("cowshed-job-span-interval");
+    let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
+    let only = job(1);
+    publisher.record(&only, JobSpanEdge::Start { host: None });
+    publisher.record(
+        &only,
+        JobSpanEdge::end(JobState::Exited, Some(&ExitStatus::Exited { code: 0 })),
+    );
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(SEAL_INTERVAL).await;
+    // The seal runs on the blocking pool. Waiting through the runtime's own timer lets it park
+    // and drive the writer; the paused clock moves only by these short steps, never another
+    // whole interval. Real time bounds the wait.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // The seal's temporary may stand in the partition while it runs: poll for sealed names only.
+    while sealed_segments_among_kinds(&telemetry, "job-").is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let segments = sealed_segments(&telemetry, "job-");
+    assert_eq!(
+        segments.len(),
+        1,
+        "the interval sealed the job's rows as one segment"
+    );
+    assert_eq!(segments[0].1.num_rows(), 2);
 }
 
 /// `info`'s job, running as job `job_id`.
@@ -297,12 +412,13 @@ impl Facts {
         disk_build_delta_bytes: None,
     };
 
-    fn of(batch: &RecordBatch) -> Self {
+    /// What `row` of `batch` states.
+    fn of((batch, row): (&RecordBatch, usize)) -> Self {
         Self {
-            load1_milli: number_cell::<UInt32Type>(batch, "load1_milli", 0),
-            cores: number_cell::<UInt16Type>(batch, "cores", 0),
-            disk_ws_delta_bytes: number_cell::<Int64Type>(batch, "disk_ws_delta_bytes", 0),
-            disk_build_delta_bytes: number_cell::<Int64Type>(batch, "disk_build_delta_bytes", 0),
+            load1_milli: number_cell::<UInt32Type>(batch, "load1_milli", row),
+            cores: number_cell::<UInt16Type>(batch, "cores", row),
+            disk_ws_delta_bytes: number_cell::<Int64Type>(batch, "disk_ws_delta_bytes", row),
+            disk_build_delta_bytes: number_cell::<Int64Type>(batch, "disk_build_delta_bytes", row),
         }
     }
 }
@@ -376,19 +492,27 @@ async fn host_and_volume_facts_reach_the_start_and_end_rows_of_each_job_span() {
     publisher.record(&unsampled, JobSpanEdge::Start { host: None });
     publisher.record(&unsampled, end);
     let health = publisher.health().await.expect("the writer answers");
-    assert_eq!((health.recorded, health.failed), (10, 0), "{health:?}");
+    assert_eq!((health.recorded, health.failed), (1, 0), "{health:?}");
 
     let segments = sealed_segments(&telemetry, "job-");
-    assert_eq!(segments.len(), 10);
+    assert_eq!(segments.len(), 1, "one health read seals one job segment");
     for (name, batch) in &segments {
         exact_schema(&batch.schema(), &spec_job_columns())
             .unwrap_or_else(|error| panic!("{name}: {error}"));
     }
+    let rows = sealed_rows(&segments);
+    assert_eq!(rows.len(), 10, "five jobs' starts and ends");
     for (index, (_, (workspace, build))) in cases.iter().enumerate() {
-        let (start, end) = (&segments[index * 2].1, &segments[index * 2 + 1].1);
+        let (start, end) = (rows[index * 2], rows[index * 2 + 1]);
         let job_id = u64::try_from(index).unwrap() + 1;
-        assert_eq!(number_cell::<UInt64Type>(start, "job_id", 0), Some(job_id));
-        assert_eq!(number_cell::<UInt64Type>(end, "job_id", 0), Some(job_id));
+        assert_eq!(
+            number_cell::<UInt64Type>(start.0, "job_id", start.1),
+            Some(job_id)
+        );
+        assert_eq!(
+            number_cell::<UInt64Type>(end.0, "job_id", end.1),
+            Some(job_id)
+        );
         assert_eq!(
             Facts::of(start),
             Facts {
@@ -409,8 +533,8 @@ async fn host_and_volume_facts_reach_the_start_and_end_rows_of_each_job_span() {
             "job {job_id}'s end row"
         );
     }
-    assert_eq!(Facts::of(&segments[8].1), Facts::NONE);
-    assert_eq!(Facts::of(&segments[9].1), Facts::NONE);
+    assert_eq!(Facts::of(rows[8]), Facts::NONE);
+    assert_eq!(Facts::of(rows[9]), Facts::NONE);
 }
 
 /// A load that no `u32` milliload holds is refused by the checked conversion, never truncated:
@@ -449,9 +573,10 @@ async fn a_load_no_milliload_column_holds_is_refused_and_counted() {
         "{health:?}"
     );
     let segments = sealed_segments(&telemetry, "job-");
-    assert_eq!(segments.len(), 1, "only the start row was sealed");
+    assert_eq!(segments.len(), 1, "the start row's interval sealed");
+    assert_eq!(segments[0].1.num_rows(), 1, "only the start row was sealed");
     assert_eq!(
-        Facts::of(&segments[0].1),
+        Facts::of((&segments[0].1, 0)),
         Facts {
             load1_milli: Some(1000),
             cores: Some(8),
@@ -543,33 +668,30 @@ fn ended_job(job_id: u64, resources: Option<JobResourceSample>) -> JobInfo {
     }
 }
 
-/// Seal the end of each of `jobs` through one production writer under `telemetry`, and return the
-/// segments it sealed, in the order it sealed them.
+/// Seal the end of each of `jobs` through one production writer under `telemetry`, and return what
+/// it sealed: the one segment its health read sealed every row in, in the order they were queued.
 async fn sealed_ends(telemetry: &Path, jobs: &[JobInfo]) -> Vec<(String, RecordBatch)> {
     let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
     for job in jobs {
         publisher.record(job, JobSpanEdge::end(job.state, job.exit.as_ref()));
     }
     let health = publisher.health().await.expect("the writer answers");
-    assert_eq!(health.failed, 0, "{health:?}");
+    assert_eq!((health.recorded, health.failed), (1, 0), "{health:?}");
     let sealed = sealed_segments(telemetry, "job-");
-    assert_eq!(
-        usize::try_from(health.recorded).unwrap(),
-        sealed.len(),
-        "{health:?}"
-    );
+    assert_eq!(sealed.len(), 1, "one health read seals one job segment");
     sealed
 }
 
-/// The kind of each sealed row: its lmao entry type and its message, as `<entry type> <message>`.
+/// The kind of each sealed row, read across the segments in sealing order: its lmao entry type and
+/// its message, as `<entry type> <message>`.
 fn kinds(segments: &[(String, RecordBatch)]) -> Vec<String> {
-    segments
-        .iter()
-        .map(|(_, batch)| {
+    sealed_rows(segments)
+        .into_iter()
+        .map(|(batch, row)| {
             format!(
                 "{} {}",
-                text_cell(batch, "entry_type", 0).expect("an entry type"),
-                text_cell(batch, "message", 0).expect("a message"),
+                text_cell(batch, "entry_type", row).expect("an entry type"),
+                text_cell(batch, "message", row).expect("a message"),
             )
         })
         .collect()
@@ -586,14 +708,15 @@ struct Unattributed {
     gap_pid: Option<u32>,
 }
 
-fn unattributed_cells(batch: &RecordBatch) -> Unattributed {
+/// The unattributed-usage cells `row` of `batch` states.
+fn unattributed_cells((batch, row): (&RecordBatch, usize)) -> Unattributed {
     Unattributed {
-        cpu_us: number_cell::<Int64Type>(batch, "unattributed_cpu_us", 0),
-        io_read_bytes: number_cell::<Int64Type>(batch, "unattributed_io_read_bytes", 0),
-        io_write_bytes: number_cell::<Int64Type>(batch, "unattributed_io_write_bytes", 0),
-        source: text_cell(batch, "unattributed_source", 0),
-        coverage: text_cell(batch, "unattributed_coverage", 0),
-        gap_pid: number_cell::<UInt32Type>(batch, "unattributed_gap_pid", 0),
+        cpu_us: number_cell::<Int64Type>(batch, "unattributed_cpu_us", row),
+        io_read_bytes: number_cell::<Int64Type>(batch, "unattributed_io_read_bytes", row),
+        io_write_bytes: number_cell::<Int64Type>(batch, "unattributed_io_write_bytes", row),
+        source: text_cell(batch, "unattributed_source", row),
+        coverage: text_cell(batch, "unattributed_coverage", row),
+        gap_pid: number_cell::<UInt32Type>(batch, "unattributed_gap_pid", row),
     }
 }
 
@@ -704,9 +827,10 @@ async fn a_terminal_reconciliation_reaches_its_span_as_one_row_that_keeps_every_
         [UNATTRIBUTED_ROW, END_ROW].repeat(3),
         "each job states its unattributed usage once, before its end"
     );
-    let cells = segments
+    let rows = sealed_rows(&segments);
+    let cells = rows
         .iter()
-        .map(|(_, batch)| unattributed_cells(batch))
+        .map(|&row| unattributed_cells(row))
         .collect::<Vec<_>>();
     assert_eq!(
         cells,
@@ -750,10 +874,10 @@ async fn a_terminal_reconciliation_reaches_its_span_as_one_row_that_keeps_every_
     }
 
     // The unattributed-usage row states no host or volume fact; the end row states the sample's.
-    for row in segments.chunks(2) {
-        assert_eq!(Facts::of(&row[0].1), Facts::NONE);
+    for pair in rows.chunks(2) {
+        assert_eq!(Facts::of(pair[0]), Facts::NONE);
         assert_eq!(
-            Facts::of(&row[1].1),
+            Facts::of(pair[1]),
             Facts {
                 load1_milli: Some(4500),
                 cores: Some(16),
@@ -831,10 +955,10 @@ async fn every_coverage_gap_reaches_the_span_as_its_own_kind_with_its_evidence()
         kinds(&segments),
         [UNATTRIBUTED_ROW, END_ROW].repeat(gaps.len())
     );
-    let stated = segments
-        .iter()
+    let stated = sealed_rows(&segments)
+        .into_iter()
         .step_by(2)
-        .map(|(_, batch)| unattributed_cells(batch))
+        .map(unattributed_cells)
         .collect::<Vec<_>>();
     assert_eq!(
         stated
@@ -872,10 +996,10 @@ async fn signed_differences_keep_their_sign_and_their_largest_exact_magnitude() 
     let telemetry = TempRoot::new("cowshed-job-unattributed-signed");
     let segments = sealed_ends(&telemetry, &jobs).await;
 
-    let stated = segments
-        .iter()
+    let stated = sealed_rows(&segments)
+        .into_iter()
         .step_by(2)
-        .map(|(_, batch)| unattributed_cells(batch))
+        .map(unattributed_cells)
         .collect::<Vec<_>>();
     assert_eq!(
         stated
@@ -910,8 +1034,8 @@ async fn a_job_with_nothing_unattributed_writes_only_its_end_row() {
     let telemetry = TempRoot::new("cowshed-job-unattributed-none");
     let segments = sealed_ends(&telemetry, &[unsampled, agreed]).await;
     assert_eq!(kinds(&segments), [END_ROW, END_ROW]);
-    for (name, batch) in &segments {
-        assert_eq!(unattributed_cells(batch), nothing_stated(), "{name}");
+    for (index, row) in sealed_rows(&segments).into_iter().enumerate() {
+        assert_eq!(unattributed_cells(row), nothing_stated(), "row {index}");
     }
 }
 
@@ -956,18 +1080,18 @@ async fn the_row_states_the_reconciliation_whatever_leaf_the_sample_names() {
     let segments = sealed_ends(&telemetry, &jobs).await;
 
     assert_eq!(kinds(&segments), [UNATTRIBUTED_ROW, END_ROW].repeat(3));
-    let stated = segments
-        .iter()
+    let stated = sealed_rows(&segments)
+        .into_iter()
         .step_by(2)
-        .map(|(_, batch)| unattributed_cells(batch))
+        .map(unattributed_cells)
         .collect::<Vec<_>>();
     assert_eq!(stated[0], stated[1]);
     assert_eq!(stated[1], stated[2]);
     assert_eq!(restated(&stated[0]), Some(stated_by(&jobs[0])));
 }
 
-/// A row the writer cannot seal is counted, the unattributed-usage row among them: a refused gap
-/// is never silently dropped.
+/// A segment the writer cannot seal counts each of its rows as refused, the unattributed-usage row
+/// among them: a refused gap is never silently dropped.
 #[tokio::test]
 async fn a_refused_unattributed_row_is_counted_beside_its_end_row() {
     let root = TempRoot::new("cowshed-job-unattributed-refused");
@@ -1080,34 +1204,29 @@ async fn charged_cells(label: &str, info: &JobInfo) -> [(Option<u64>, Option<u64
         2
     };
     let health = publisher.health().await.expect("the writer answers");
-    assert_eq!(
-        (health.recorded, health.failed),
-        (expected_rows, 0),
-        "{health:?}"
-    );
+    assert_eq!((health.recorded, health.failed), (1, 0), "{health:?}");
     let segments = sealed_segments(&telemetry, "job-");
-    assert_eq!(segments.len(), usize::try_from(expected_rows).unwrap());
-    let cells = |batch: &RecordBatch| {
-        (
-            number_cell::<UInt64Type>(batch, "charged_memory_current_bytes", 0),
-            number_cell::<UInt64Type>(batch, "charged_memory_peak_bytes", 0),
-        )
-    };
-    for (index, (name, batch)) in segments.iter().enumerate() {
+    assert_eq!(segments.len(), 1, "one health read seals one job segment");
+    for (name, batch) in &segments {
         exact_schema(&batch.schema(), &spec_job_columns())
             .unwrap_or_else(|error| panic!("{name}: {error}"));
-        if index + 1 < segments.len() {
-            assert_eq!(
-                cells(batch),
-                (None, None),
-                "only the end row carries charged memory"
-            );
-        }
     }
-    [
-        cells(&segments[0].1),
-        cells(&segments[segments.len() - 1].1),
-    ]
+    let rows = sealed_rows(&segments);
+    assert_eq!(rows.len(), expected_rows);
+    let cells = |(batch, row): (&RecordBatch, usize)| {
+        (
+            number_cell::<UInt64Type>(batch, "charged_memory_current_bytes", row),
+            number_cell::<UInt64Type>(batch, "charged_memory_peak_bytes", row),
+        )
+    };
+    for &row in &rows[..rows.len() - 1] {
+        assert_eq!(
+            cells(row),
+            (None, None),
+            "only the end row carries charged memory"
+        );
+    }
+    [cells(rows[0]), cells(rows[rows.len() - 1])]
 }
 
 /// Cgroup charges and process RSS are distinct, and checked bytes survive without conversion.

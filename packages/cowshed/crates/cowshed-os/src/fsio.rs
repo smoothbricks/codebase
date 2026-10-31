@@ -1122,17 +1122,14 @@ pub enum PublishError<E> {
 ///
 /// The level is a property of the state, not of the writer: lifecycle and authority state
 /// (workspace creation and removal, landing, grants, policy revisions) survives power loss, while
-/// a per-job record survives the death of the process that wrote it. Power loss ends every job
-/// anyway, and recovery treats a job whose record went missing or torn with it as a lost job
-/// (11_shell.md "Job control").
+/// a job's own bookkeeping survives the death of the process that wrote it, which the page cache
+/// already gives. A host crash ends every job anyway, and recovery treats a job whose record went
+/// missing or torn with it as a lost job (11_shell.md, "Durability of a job's own records").
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Durability {
     /// No sync: the kernel holds the bytes, so they survive the writer's death. For state that a
     /// later open re-derives from whatever did survive.
     Process,
-    /// `fsync(2)` on the file: the bytes reach the device, which on macOS may still lose them to
-    /// power loss. A new directory entry is not synced: losing it is losing the record.
-    Device,
     /// `F_FULLFSYNC` on macOS (Rust's `sync_all`) on the file and on the directory holding a new
     /// entry: survives power loss.
     PowerLoss,
@@ -1142,16 +1139,6 @@ impl Durability {
     pub fn sync_file(self, file: &File) -> io::Result<()> {
         match self {
             Self::Process => Ok(()),
-            Self::Device => {
-                #[cfg(any(test, feature = "test-hooks"))]
-                count_sync(|syncs| syncs.fsync += 1);
-                // SAFETY: fsync on a descriptor the borrowed `File` keeps open.
-                if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }
             Self::PowerLoss => full_sync(file),
         }
     }
@@ -1159,7 +1146,7 @@ impl Durability {
     /// Make a directory entry this write created as durable as the write itself.
     pub fn sync_new_entry(self, directory: &Path) -> io::Result<()> {
         match self {
-            Self::Process | Self::Device => Ok(()),
+            Self::Process => Ok(()),
             Self::PowerLoss => sync_directory(directory),
         }
     }
@@ -1167,14 +1154,13 @@ impl Durability {
     /// [`Self::sync_new_entry`] through a directory descriptor the writer already holds.
     pub fn sync_new_entry_at(self, directory: &File) -> io::Result<()> {
         match self {
-            Self::Process | Self::Device => Ok(()),
+            Self::Process => Ok(()),
             Self::PowerLoss => full_sync(directory),
         }
     }
 }
 
-/// `F_FULLFSYNC` on macOS (`fsync(2)` elsewhere), the only full-device flush a [`Durability`]
-/// issues.
+/// `F_FULLFSYNC` on macOS (`fsync(2)` elsewhere), the only flush a [`Durability`] issues.
 fn full_sync(file: &File) -> io::Result<()> {
     #[cfg(any(test, feature = "test-hooks"))]
     count_sync(|syncs| syncs.full += 1);
@@ -1186,15 +1172,13 @@ fn full_sync(file: &File) -> io::Result<()> {
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Syncs {
-    /// `fsync(2)`: [`Durability::Device`].
-    pub fsync: usize,
     /// Full-device flushes: [`Durability::PowerLoss`] files and directories.
     pub full: usize,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
-    static SYNCS: std::cell::Cell<Syncs> = const { std::cell::Cell::new(Syncs { fsync: 0, full: 0 }) };
+    static SYNCS: std::cell::Cell<Syncs> = const { std::cell::Cell::new(Syncs { full: 0 }) };
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -2032,7 +2016,7 @@ mod tests {
         held.sync().unwrap();
         assert_eq!(
             take_syncs(),
-            Syncs { fsync: 0, full: 1 },
+            Syncs { full: 1 },
             "the held directory is synced once"
         );
     }

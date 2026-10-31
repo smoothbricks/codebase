@@ -3,30 +3,38 @@
 //!
 //! Each job is one lmao span carrying the trace context the controller minted or adopted for it
 //! (`JobInfo.trace`): a `span-start` row at admission and a `span-ok`/`span-err` row at its
-//! terminal state, each sealed as its own segment `job-<order:020>-<writer>.arrow` under
-//! `<telemetry root>/<yyyy-mm-dd>/` by [`crate::storage::trace_segment`]. The span's lmao address
-//! is thread [`job_span_thread`] of the job's durable key, span 1; the W3C span id rides beside it
-//! as `w3c_span_id`. `env_hash` is not computed by the supervisor yet, so no row carries it. The
-//! end row also states what the job's accounting source charged its cgroup for memory
-//! ([`charged_memory_at`]), when that source has such a counter; no process span carries it.
+//! terminal state. The span's lmao address is thread [`job_span_thread`] of the job's durable key,
+//! span 1; the W3C span id rides beside it as `w3c_span_id`. `env_hash` is not computed by the
+//! supervisor yet, so no row carries it. The end row also states what the job's accounting source
+//! charged its cgroup for memory ([`charged_memory_at`]), when that source has such a counter; no
+//! process span carries it.
 //!
 //! Each row also states the host and volume facts of its boundary ([`super::job_span_facts`]):
 //! the start row the host as admission read it, the end row the job's terminal resource sample.
 //!
-//! A job whose terminal sample states unattributed usage ([`UnattributedUsage`]) also seals the
+//! A job whose terminal sample states unattributed usage ([`UnattributedUsage`]) also records the
 //! `job.unattributed` row of the same span, just before its end row: the sample's reconciliation
 //! whole in six columns that every other row of the span leaves null.
 //!
 //! The job's processes are `process.run` spans of the same thread, hanging from the job span.
 //! The native observer projects each emitted fold batch through [`super::process_spans`] and
-//! hands it to [`JobSpanPublisher::record_process`]. The writer gathers those rows and seals them
-//! as one `process-<order:020>-<writer>.arrow` segment per [`PROCESS_SEAL_INTERVAL`], through the
-//! same writer and order as the job rows ([`write_rows`]).
+//! hands it to [`JobSpanPublisher::record_process`].
+//!
+//! One writer gathers both kinds of row and seals what it gathered once per [`SEAL_INTERVAL`]
+//! ([`write_rows`]): the job rows as one `job-<order:020>-<writer>.arrow` segment, then the
+//! process rows as one `process-<order:020>-<writer>.arrow` segment, each holding its rows in
+//! queue order, under `<telemetry root>/<yyyy-mm-dd>/` by [`crate::storage::trace_segment`]. A row
+//! is telemetry, not a durability event: sealing one segment per job row, each a full flush of the
+//! segment and of its directory, cost 22.9 ms of flushing per exec in a supervisor sample of 203
+//! back-to-back execs on 2026-10-30 (load about 10), competing with the job's own record writes. A
+//! retiring supervisor seals what was gathered before it is answered; rows still gathered when the
+//! writer's process dies are lost, as process rows are.
 //!
 //! Telemetry never gates a job. The actor hands a row to [`JobSpanPublisher::record`], which
-//! queues it without waiting; one writer task seals segments in order, off the actor and off the
-//! async workers. A segment the queue refuses or the writer fails to seal, and an event the
-//! projection cannot place, is counted in [`TraceHealth`], never dropped silently.
+//! queues it without waiting; the writer task gathers and seals in order, off the actor and off
+//! the async workers. A row the queue refuses, the writer cannot encode or gathers past its bound,
+//! a segment the writer fails to seal, and an event the projection cannot place, are counted in
+//! [`TraceHealth`], never dropped silently.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -38,7 +46,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::api::dto::{ExitStatus, JobId, JobInfo, JobState, TraceContext};
+use crate::api::dto::{ExitStatus, JobId, JobInfo, JobState, TraceContext, TraceId};
 use crate::api::resources::{ChargedMemoryUsage, HostLoadSample, VolumeUsedBytesDelta};
 use crate::error::CowshedError;
 use crate::metadata::WorkspaceIncarnation;
@@ -62,20 +70,30 @@ pub const JOB_SPAN_MESSAGE: &str = "cowshed.job";
 /// A job span is the first span of its job's lmao thread ([`job_span_thread`]); its process spans
 /// follow it.
 pub const JOB_SPAN_ID: u32 = 1;
-/// Segments waiting for the writer: up to three rows per job, so this covers a burst of concurrent
-/// admissions and terminals far beyond what a workspace's actor queue admits at once. A full queue
-/// refuses segments rather than delaying the actor.
+/// Requests waiting for the writer: one job row or one fold batch each. A job queues up to three
+/// rows, so this covers a burst of concurrent admissions and terminals far beyond what a
+/// workspace's actor queue admits at once. A full queue refuses rows rather than delaying the
+/// actor.
 const QUEUE_CAPACITY: usize = 256;
 
-/// How long a writer gathers process rows before it seals them as one segment. A process fold
-/// batch is not a durability event: sealing one is a full-drive flush of the segment and of its
-/// directory (`Durability::PowerLoss`), and one seal per fold batch made 26 seals and about 52
-/// `F_FULLFSYNC`s a second host-wide, 5-8 s of flushing per wall second at 0.10-0.16 s each,
-/// which saturated the drive under every other process on it (measured 2026-10-21). So the writer
-/// seals on this interval, and the durability of each seal is unchanged. Rows still waiting
-/// when the process dies are lost, as the gateway's one-batch audit window is (13_telemetry.md,
-/// "Process segments").
-pub const PROCESS_SEAL_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a writer gathers rows before it seals them: the first row of either kind it gathers
+/// arms one deadline this far away, and when it passes the gathered job rows seal as one segment
+/// and the gathered process rows as another. A row is not a durability event, and sealing a
+/// segment is a full-drive flush of it and of its directory (`Durability::PowerLoss`). One seal
+/// per process fold batch made 26 seals and about 52 `F_FULLFSYNC`s a second host-wide, 5-8 s of
+/// flushing per wall second at 0.10-0.16 s each, which saturated the drive under every other
+/// process on it (measured 2026-10-21). One seal per job row, each a full flush of the segment
+/// and of its directory, cost 22.9 ms of flushing per exec in a supervisor sample of 203
+/// back-to-back execs on 2026-10-30 (load about 10), competing with the job's own record writes.
+/// So the writer seals on this interval, and the durability of each seal is unchanged. Rows still gathered when the process dies are lost, as the gateway's one-batch audit
+/// window is (13_telemetry.md, "Job span segments", "Process segments").
+pub const SEAL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The most job rows a writer gathers in one interval. A row past it is refused and counted in
+/// the trace health, never sealed early, as a process row past [`PROCESS_GATHER_ROWS`] is: the
+/// interval is the seal rate and this bound is only the memory a burst of jobs may hold
+/// (13_telemetry.md, "Job span segments").
+const JOB_GATHER_ROWS: usize = 16_384;
 
 /// The most process rows a writer gathers in one interval. A row past it is refused and counted
 /// in the trace health, never sealed early: the interval is the seal rate and this bound is only
@@ -105,13 +123,19 @@ pub fn job_span_thread(
     u64::from_le_bytes(thread)
 }
 
-/// What a supervisor's span writer did: segments sealed, segments and events refused, and the
-/// last refusal.
+/// What a supervisor's span writer did: the segments it sealed, what it refused, and the last
+/// refusal.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TraceHealth {
+    /// Segments sealed, never rows: one seal makes at most one job segment and one process
+    /// segment, however many rows each holds.
     pub recorded: u64,
+    /// Refusals: each row or fold batch the queue refused, each row the writer could not encode
+    /// or gathered past its bound, each event the projection could not place, and each row of a
+    /// segment whose seal failed.
     pub failed: u64,
+    /// Why the last refusal was refused.
     pub last_failure: Option<String>,
 }
 
@@ -246,14 +270,27 @@ fn charged_memory_at(kind: RowKind, info: &JobInfo) -> Option<ChargedMemoryUsage
     }
 }
 
-/// What one sealed segment holds.
+/// What one sealed segment holds: the rows of one kind a writer gathered in one interval, in
+/// queue order, never none.
 enum Segment {
-    Job(Box<JobSpanRow>),
+    Jobs(Vec<JobCells>),
     Processes(Vec<ProcessSpanRow>),
 }
 
+impl Segment {
+    /// How many rows the segment holds: what a failed seal refuses.
+    fn rows(&self) -> usize {
+        match self {
+            Self::Jobs(rows) => rows.len(),
+            Self::Processes(rows) => rows.len(),
+        }
+    }
+}
+
+/// What the writer's queue carries: one job row, the rows of one fold batch, or a health read.
 enum Request {
-    Seal(Segment),
+    Job(Box<JobSpanRow>),
+    Processes(Vec<ProcessSpanRow>),
     Health { reply: oneshot::Sender<TraceHealth> },
 }
 
@@ -263,6 +300,8 @@ enum JobSpanError {
     BeforeEpoch,
     #[error("span time exceeds i64 nanoseconds")]
     BeyondNanoseconds,
+    #[error("a job segment holds no rows")]
+    NoRows,
     #[error(transparent)]
     Segment(#[from] TraceSegmentError),
     #[error(transparent)]
@@ -327,7 +366,7 @@ impl JobSpanPublisher {
             RowKind::Edge(JobSpanEdge::End { .. }) => SpanFacts::end(info.resources.as_ref()),
             RowKind::Unattributed(_) => SpanFacts::default(),
         };
-        permit.send(Request::Seal(Segment::Job(Box::new(JobSpanRow {
+        permit.send(Request::Job(Box::new(JobSpanRow {
             at: SystemTime::now(),
             trace: info.trace.clone(),
             repo_id: info.repo_id.clone(),
@@ -337,11 +376,11 @@ impl JobSpanPublisher {
             facts,
             kind,
             charged_memory: charged_memory_at(kind, info),
-        }))));
+        })));
     }
 
     /// Queue all projected rows of one emitted fold batch for the writer, which seals them with
-    /// the other rows of its interval ([`PROCESS_SEAL_INTERVAL`]). Each refused event is counted
+    /// the other rows of its interval ([`SEAL_INTERVAL`]). Each refused event is counted
     /// and contributes no row; successful rows remain in the same batch.
     pub fn record_process(
         &self,
@@ -361,11 +400,11 @@ impl JobSpanPublisher {
         let Some(permit) = self.reserve() else {
             return;
         };
-        permit.send(Request::Seal(Segment::Processes(rows)));
+        permit.send(Request::Processes(rows));
     }
 
     /// A slot in the writer's queue; `None`, with the refusal counted, when the queue is full or
-    /// the writer stopped. A segment is built only once it has a slot.
+    /// the writer stopped. A row is built only once it has a slot.
     fn reserve(&self) -> Option<mpsc::Permit<'_, Request>> {
         match self.sender.try_reserve() {
             Ok(permit) => Some(permit),
@@ -380,7 +419,8 @@ impl JobSpanPublisher {
         }
     }
 
-    /// The writer's health once every segment queued before this call is sealed or refused.
+    /// The writer's health once every row queued before this call is sealed or refused: the
+    /// writer seals what it gathered before it answers.
     pub async fn health(&self) -> crate::error::Result<TraceHealth> {
         let (reply, receive) = oneshot::channel();
         self.sender
@@ -412,13 +452,15 @@ fn refuse_rows(health: &Mutex<TraceHealth>, rows: usize, reason: String) {
     health.last_failure = Some(reason);
 }
 
-/// Seal segments in queue order. Job rows seal as they come; process rows are gathered and sealed
-/// together once [`PROCESS_SEAL_INTERVAL`] has passed since the first of them, and rows past
-/// [`PROCESS_GATHER_ROWS`] in that interval are refused. Whatever is gathered seals first, before a job row, before a health
-/// answer, which promises every row queued before it, and when the queue closes, so segments
-/// keep queue order and nothing queued is left behind by a writer that ends in order. Sealing
-/// syncs files and directories, so it runs on the blocking pool; the order advances on every
-/// attempt, so a name a failed attempt may have published is never reused.
+/// Gather rows and seal them in order. The first row of either kind arms one deadline,
+/// [`SEAL_INTERVAL`] away. When it passes, before a health answer, which promises every row
+/// queued before it, and when the queue closes, the writer seals the gathered job rows as one
+/// segment and then the gathered process rows as another, each in queue order, so nothing queued
+/// is left behind by a writer that ends in order. No count seals early: rows past
+/// [`JOB_GATHER_ROWS`] or [`PROCESS_GATHER_ROWS`] in one interval are refused. A job row is
+/// encoded as it is gathered ([`JobCells::of`]), so a row no column can state is refused alone.
+/// Sealing syncs files and directories, so it runs on the blocking pool; the order advances on
+/// every attempt, so a name a failed attempt may have published is never reused.
 async fn write_rows(
     root: PathBuf,
     writer: Uuid,
@@ -431,40 +473,42 @@ async fn write_rows(
         order: 1,
         health,
     };
-    let mut gathered: Vec<ProcessSpanRow> = Vec::new();
-    let mut due: Option<Instant> = None;
+    let mut gathered = Gathered::default();
     loop {
+        let due = gathered.due;
         let request = tokio::select! {
             request = receiver.recv() => request,
             () = tokio::time::sleep_until(due.unwrap_or_else(Instant::now)), if due.is_some() => {
                 sealer.seal_gathered(&mut gathered).await;
-                due = None;
                 continue;
             }
         };
         match request {
-            Some(Request::Seal(Segment::Processes(rows))) => {
-                due.get_or_insert_with(|| Instant::now() + PROCESS_SEAL_INTERVAL);
-                let room = PROCESS_GATHER_ROWS.saturating_sub(gathered.len());
-                if rows.len() > room {
-                    refuse_rows(
+            Some(Request::Job(row)) => match JobCells::of(*row) {
+                Ok(cells) => {
+                    gathered.arm();
+                    gather(
                         &sealer.health,
-                        rows.len() - room,
-                        format!(
-                            "{PROCESS_GATHER_ROWS} process rows are already gathered this interval"
-                        ),
-                    );
+                        &mut gathered.jobs,
+                        std::iter::once(cells),
+                        JOB_GATHER_ROWS,
+                        "job",
+                    )
                 }
-                gathered.extend(rows.into_iter().take(room));
-            }
-            Some(Request::Seal(job)) => {
-                sealer.seal_gathered(&mut gathered).await;
-                due = None;
-                sealer.seal(job).await;
+                Err(error) => refuse(&sealer.health, error.to_string()),
+            },
+            Some(Request::Processes(rows)) => {
+                gathered.arm();
+                gather(
+                    &sealer.health,
+                    &mut gathered.processes,
+                    rows.into_iter(),
+                    PROCESS_GATHER_ROWS,
+                    "process",
+                );
             }
             Some(Request::Health { reply }) => {
                 sealer.seal_gathered(&mut gathered).await;
-                due = None;
                 // A caller that stopped waiting has nothing left to tell.
                 let _ = reply.send(lock(&sealer.health).clone());
             }
@@ -476,6 +520,44 @@ async fn write_rows(
     }
 }
 
+/// What a writer gathered since its last seal, each kind in queue order, and when it seals.
+#[derive(Default)]
+struct Gathered {
+    jobs: Vec<JobCells>,
+    processes: Vec<ProcessSpanRow>,
+    /// [`SEAL_INTERVAL`] after the first row that arrived since the last seal; `None` until one
+    /// does.
+    due: Option<Instant>,
+}
+
+impl Gathered {
+    /// Arm the deadline, unless a row that arrived earlier in this interval armed it.
+    fn arm(&mut self) {
+        self.due
+            .get_or_insert_with(|| Instant::now() + SEAL_INTERVAL);
+    }
+}
+
+/// Gather `rows` into `gathered`, up to `bound` rows of `kind` an interval, and count each row past
+/// it as refused: the bound is the memory one interval may hold, never a reason to seal early.
+fn gather<T>(
+    health: &Mutex<TraceHealth>,
+    gathered: &mut Vec<T>,
+    rows: impl ExactSizeIterator<Item = T>,
+    bound: usize,
+    kind: &str,
+) {
+    let room = bound.saturating_sub(gathered.len());
+    if rows.len() > room {
+        refuse_rows(
+            health,
+            rows.len() - room,
+            format!("{bound} {kind} rows are already gathered this interval"),
+        );
+    }
+    gathered.extend(rows.take(room));
+}
+
 /// One writer's sealing state: where its segments go, its name and its next order.
 struct Sealer {
     root: PathBuf,
@@ -485,16 +567,24 @@ struct Sealer {
 }
 
 impl Sealer {
-    /// Seal the gathered process rows as one segment, if there are any.
-    async fn seal_gathered(&mut self, gathered: &mut Vec<ProcessSpanRow>) {
-        if !gathered.is_empty() {
-            self.seal(Segment::Processes(std::mem::take(gathered)))
+    /// Seal what `gathered` holds and disarm its deadline: its job rows as one segment, then its
+    /// process rows as another, each only if there are any.
+    async fn seal_gathered(&mut self, gathered: &mut Gathered) {
+        gathered.due = None;
+        if !gathered.jobs.is_empty() {
+            self.seal(Segment::Jobs(std::mem::take(&mut gathered.jobs)))
+                .await;
+        }
+        if !gathered.processes.is_empty() {
+            self.seal(Segment::Processes(std::mem::take(&mut gathered.processes)))
                 .await;
         }
     }
 
+    /// Seal `segment` as this writer's next order. A failed seal refuses each row it held.
     async fn seal(&mut self, segment: Segment) {
         let (root, writer, order) = (self.root.clone(), self.writer, self.order);
+        let rows = segment.rows();
         let sealed =
             tokio::task::spawn_blocking(move || seal(&root, writer, order, &segment)).await;
         self.order = self.order.saturating_add(1);
@@ -503,36 +593,33 @@ impl Sealer {
                 let mut health = lock(&self.health);
                 health.recorded = health.recorded.saturating_add(1);
             }
-            Ok(Err(error)) => refuse(&self.health, error.to_string()),
-            Err(error) => refuse(
+            Ok(Err(error)) => refuse_rows(&self.health, rows, error.to_string()),
+            Err(error) => refuse_rows(
                 &self.health,
+                rows,
                 format!("the job span seal task failed: {error}"),
             ),
         }
     }
 }
 
+/// Seal `segment` as `order` of `writer` under `root`: a job segment's telemetry partition is the
+/// UTC date of its first row, as a process segment's is.
 fn seal(root: &Path, writer: Uuid, order: u64, segment: &Segment) -> Result<(), JobSpanError> {
-    let row = match segment {
-        Segment::Job(row) => row,
+    match segment {
+        Segment::Jobs(rows) => {
+            let first = rows.first().ok_or(JobSpanError::NoRows)?;
+            seal_segment(
+                root,
+                first.date,
+                &format!("job-{order:020}-{writer}"),
+                &job_span_batch(rows)?,
+            )?;
+        }
         Segment::Processes(rows) => {
             seal_process_batch(root, writer, order, rows)?;
-            return Ok(());
         }
-    };
-    let since_epoch = row
-        .at
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| JobSpanError::BeforeEpoch)?;
-    let timestamp_ns =
-        i64::try_from(since_epoch.as_nanos()).map_err(|_| JobSpanError::BeyondNanoseconds)?;
-    let batch = job_span_batch(row, timestamp_ns)?;
-    seal_segment(
-        root,
-        TelemetryDate::from_unix_seconds(since_epoch.as_secs()),
-        &format!("job-{order:020}-{writer}"),
-        &batch,
-    )?;
+    }
     Ok(())
 }
 
@@ -583,51 +670,91 @@ trace_columns! {
     unattributed_gap_pid: Optional<U32>,
 }
 
-fn job_span_batch(row: &JobSpanRow, timestamp_ns: i64) -> Result<RecordBatch, JobSpanError> {
-    let mut system = SystemColumns::with_capacity(1);
-    system.push(SystemRow {
-        timestamp_ns,
-        trace_id: row.trace.trace_id.as_str(),
-        span: SpanAddress {
+/// A gathered job row as the cells its segment holds. The writer encodes each row as it gathers
+/// it, so a row no column can state is refused alone, and a segment of encoded rows refuses none
+/// of them.
+struct JobCells {
+    timestamp_ns: i64,
+    /// The row's UTC date: its segment's partition when it is the segment's first row.
+    date: TelemetryDate,
+    trace_id: TraceId,
+    span: SpanAddress,
+    kind: RowKind,
+    columns: JobColumns,
+}
+
+impl JobCells {
+    /// `row` as its cells: refused when its time precedes the epoch or passes `i64` nanoseconds,
+    /// or when no column can state its host.
+    fn of(row: JobSpanRow) -> Result<Self, JobSpanError> {
+        let since_epoch = row
+            .at
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| JobSpanError::BeforeEpoch)?;
+        let timestamp_ns =
+            i64::try_from(since_epoch.as_nanos()).map_err(|_| JobSpanError::BeyondNanoseconds)?;
+        let host = row.facts.host.map(HostColumns::of).transpose()?;
+        let usage = row.kind.unattributed();
+        let reconciliation = usage.map(|usage| usage.reconciliation);
+        let coverage =
+            reconciliation.map(|reconciliation| CoverageKind::of(reconciliation.coverage));
+        let span = SpanAddress {
             thread_id: job_span_thread(&row.repo_id, &row.workspace_incarnation, row.job_id),
             span_id: JOB_SPAN_ID,
-        },
-        parent: None,
-        entry_type: row.kind.entry_type(),
-        message: Some(row.kind.message()),
-    })?;
-    let host = row.facts.host.map(HostColumns::of).transpose()?;
-    let usage = row.kind.unattributed();
-    let reconciliation = usage.map(|usage| usage.reconciliation);
-    let coverage = reconciliation.map(|reconciliation| CoverageKind::of(reconciliation.coverage));
-    let columns = JobColumns {
-        repo_id: row.repo_id.as_str().to_owned(),
-        workspace_incarnation: row.workspace_incarnation.as_str().to_owned(),
-        job_id: row.job_id.get(),
-        grant_revision: row.grant_revision,
-        w3c_span_id: u64::from_str_radix(row.trace.span_id.as_str(), 16)
-            .expect("a SpanId is exactly 16 lowercase hex digits"),
-        job_state: row.kind.state().map(|state| state_name(state).to_owned()),
-        disk_ws_delta_bytes: row.facts.workspace_delta.map(VolumeUsedBytesDelta::get),
-        disk_build_delta_bytes: row.facts.build_delta.map(VolumeUsedBytesDelta::get),
-        load1_milli: host.map(|host| host.load1_milli),
-        cores: host.map(|host| host.cores),
-        charged_memory_current_bytes: row
-            .charged_memory
-            .map(|charged| charged.current_bytes.get()),
-        charged_memory_peak_bytes: row.charged_memory.map(|charged| charged.peak_bytes.get()),
-        unattributed_cpu_us: reconciliation.map(|reconciliation| reconciliation.cpu_us.get()),
-        unattributed_io_read_bytes: reconciliation
-            .and_then(|reconciliation| reconciliation.io_read_bytes)
-            .map(|delta| delta.get()),
-        unattributed_io_write_bytes: reconciliation
-            .and_then(|reconciliation| reconciliation.io_write_bytes)
-            .map(|delta| delta.get()),
-        unattributed_source: usage.map(|usage| usage.source),
-        unattributed_coverage: coverage.map(|(kind, _)| kind),
-        unattributed_gap_pid: coverage.and_then(|(_, pid)| pid),
-    };
-    let arrays = job_column_arrays([&columns]).map_err(TraceSegmentError::from)?;
+        };
+        let columns = JobColumns {
+            repo_id: row.repo_id.as_str().to_owned(),
+            workspace_incarnation: row.workspace_incarnation.as_str().to_owned(),
+            job_id: row.job_id.get(),
+            grant_revision: row.grant_revision,
+            w3c_span_id: u64::from_str_radix(row.trace.span_id.as_str(), 16)
+                .expect("a SpanId is exactly 16 lowercase hex digits"),
+            job_state: row.kind.state().map(|state| state_name(state).to_owned()),
+            disk_ws_delta_bytes: row.facts.workspace_delta.map(VolumeUsedBytesDelta::get),
+            disk_build_delta_bytes: row.facts.build_delta.map(VolumeUsedBytesDelta::get),
+            load1_milli: host.map(|host| host.load1_milli),
+            cores: host.map(|host| host.cores),
+            charged_memory_current_bytes: row
+                .charged_memory
+                .map(|charged| charged.current_bytes.get()),
+            charged_memory_peak_bytes: row.charged_memory.map(|charged| charged.peak_bytes.get()),
+            unattributed_cpu_us: reconciliation.map(|reconciliation| reconciliation.cpu_us.get()),
+            unattributed_io_read_bytes: reconciliation
+                .and_then(|reconciliation| reconciliation.io_read_bytes)
+                .map(|delta| delta.get()),
+            unattributed_io_write_bytes: reconciliation
+                .and_then(|reconciliation| reconciliation.io_write_bytes)
+                .map(|delta| delta.get()),
+            unattributed_source: usage.map(|usage| usage.source),
+            unattributed_coverage: coverage.map(|(kind, _)| kind),
+            unattributed_gap_pid: coverage.and_then(|(_, pid)| pid),
+        };
+        Ok(Self {
+            timestamp_ns,
+            date: TelemetryDate::from_unix_seconds(since_epoch.as_secs()),
+            trace_id: row.trace.trace_id,
+            span,
+            kind: row.kind,
+            columns,
+        })
+    }
+}
+
+/// One record batch of `rows`, in order: lmao's system columns and the job columns of each row.
+fn job_span_batch(rows: &[JobCells]) -> Result<RecordBatch, JobSpanError> {
+    let mut system = SystemColumns::with_capacity(rows.len());
+    for row in rows {
+        system.push(SystemRow {
+            timestamp_ns: row.timestamp_ns,
+            trace_id: row.trace_id.as_str(),
+            span: row.span,
+            parent: None,
+            entry_type: row.kind.entry_type(),
+            message: Some(row.kind.message()),
+        })?;
+    }
+    let arrays =
+        job_column_arrays(rows.iter().map(|row| &row.columns)).map_err(TraceSegmentError::from)?;
     Ok(trace_batch(system, arrays)?)
 }
 
@@ -760,7 +887,7 @@ mod tests {
     /// second. A burst past [`PROCESS_GATHER_ROWS`] does not seal early: the rows past it are
     /// refused and counted, and the interval's rows still seal once, at its end. A process fold
     /// batch is not a durability event; one seal per batch saturated the drive with full flushes
-    /// (`PROCESS_SEAL_INTERVAL`).
+    /// ([`SEAL_INTERVAL`]).
     #[tokio::test(start_paused = true)]
     async fn fold_batches_seal_once_per_interval_and_never_early_on_a_count() {
         use crate::api::dto::{CommandArg, UtcTimestamp};
@@ -830,7 +957,7 @@ mod tests {
 
         for pid in 1..=5 {
             publisher.record_process([born(pid)]);
-            tokio::time::advance(PROCESS_SEAL_INTERVAL / 10).await;
+            tokio::time::advance(SEAL_INTERVAL / 10).await;
         }
         settle().await;
         assert!(
@@ -838,7 +965,7 @@ mod tests {
             "five batches inside the interval wait for it to end"
         );
 
-        tokio::time::advance(PROCESS_SEAL_INTERVAL).await;
+        tokio::time::advance(SEAL_INTERVAL).await;
         // The seal runs on the blocking pool. Waiting through the runtime's own timer lets it park
         // and drive the writer; the paused clock moves only by the interval already advanced and
         // these short steps, never another whole interval. Real time bounds the wait.
@@ -870,7 +997,7 @@ mod tests {
             2,
             "a burst past the gather bound waits for the interval like any other batch"
         );
-        tokio::time::advance(PROCESS_SEAL_INTERVAL).await;
+        tokio::time::advance(SEAL_INTERVAL).await;
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while segments(&root).len() < 3 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;

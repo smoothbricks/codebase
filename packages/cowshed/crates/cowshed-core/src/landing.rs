@@ -548,6 +548,11 @@ pub struct FoldFacts {
     /// (02_workspaces.md, `land` step 5, "Folds"), so a session whose work is merely preserved is
     /// neither retired nor named by the land.
     pub landed: bool,
+    /// Whether the target held its head before this land, as `rm` measures it. Then the land
+    /// carried none of its work, so it is no fold of this land, however much of the landed range
+    /// its own commits touch: a batch rebased onto an integration shed holds that shed's commits
+    /// before any unit lands into it, and landing a unit there must never retire the shed.
+    pub held_before_land: bool,
     /// Its uncommitted changes (tracked, and untracked no ignore rule covers), or why they could
     /// not be counted.
     pub dirty_files: std::result::Result<u64, String>,
@@ -576,7 +581,7 @@ pub fn fold_step(facts: &FoldFacts) -> Option<FoldStep> {
             }));
         }
         Ok(false) => return None,
-        Ok(true) if !facts.landed => return None,
+        Ok(true) if !facts.landed || facts.held_before_land => return None,
         Ok(true) => {}
     }
     Some(match &facts.dirty_files {
@@ -609,18 +614,32 @@ pub struct FoldProvenance<'a> {
     pub base: &'a GitOid,
     pub head: &'a GitOid,
 }
-/// Read the fold decision facts: non-empty own commits in the captured provenance
-/// touching `landed_paths`, then whether the target holds them as `rm` measures them
-/// ([`measure`]), and how dirty the peer's tree is.
+
+/// The land a fold is measured against (02_workspaces.md, land step 5, "Folds"): its target at the
+/// landed head, the target's head before the land, and the paths the range between them changes.
+#[derive(Clone, Copy, Debug)]
+pub struct LandedRange<'a> {
+    pub target: &'a LandingTarget,
+    pub previous: &'a GitOid,
+    pub paths: &'a std::collections::BTreeSet<Vec<u8>>,
+}
+
+/// Read the fold decision facts: non-empty own commits in the captured provenance touching the
+/// landed range's paths, then whether the target holds them as `rm` measures them ([`measure`]) at
+/// the landed head and held them already at its previous head, and how dirty the peer's tree is.
 pub async fn fold_facts(
     store_root: &std::sync::Arc<Path>,
-    target: &LandingTarget,
-    landed_paths: &std::collections::BTreeSet<Vec<u8>>,
+    landed_range: LandedRange<'_>,
     provenance: FoldProvenance<'_>,
     workspace_mount: &Path,
     push_repository: &Path,
     workspace: &str,
 ) -> FoldFacts {
+    let LandedRange {
+        target,
+        previous,
+        paths: landed_paths,
+    } = landed_range;
     let fork_base = provenance.base.as_str();
     let head = provenance.head.as_str();
     let touched = match GitRepository::from_root(store_root, workspace_mount)
@@ -641,6 +660,7 @@ pub async fn fold_facts(
         return FoldFacts {
             touched,
             landed: false,
+            held_before_land: false,
             dirty_files: Ok(0),
         };
     }
@@ -653,9 +673,23 @@ pub async fn fold_facts(
         head,
     )
     .await;
+    let landed = landing.commits.held_by_target() && landing.branches.fully_landed();
+    let held_before_land = landed
+        && measure(
+            store_root,
+            &Ok(target.clone().at(previous.clone())),
+            workspace_mount,
+            push_repository,
+            workspace,
+            head,
+        )
+        .await
+        .commits
+        .held_by_target();
     FoldFacts {
         touched,
-        landed: landing.commits.held_by_target() && landing.branches.fully_landed(),
+        landed,
+        held_before_land,
         dirty_files: landing
             .dirty_files
             .ok_or_else(|| String::from("git status could not be read")),
@@ -909,6 +943,7 @@ mod tests {
         let facts = |touched, landed, dirty_files| FoldFacts {
             touched,
             landed,
+            held_before_land: false,
             dirty_files,
         };
         for (facts, step) in [
@@ -916,6 +951,13 @@ mod tests {
             (facts(Ok(true), false, Ok(0)), None),
             (facts(Ok(false), false, Ok(3)), None),
             (facts(Ok(true), true, Ok(0)), Some(FoldStep::Retire)),
+            (
+                FoldFacts {
+                    held_before_land: true,
+                    ..facts(Ok(true), true, Ok(0))
+                },
+                None,
+            ),
             (
                 facts(Ok(true), true, Ok(2)),
                 Some(FoldStep::Keep(FoldKept::Dirty { files: 2 })),

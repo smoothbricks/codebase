@@ -1367,7 +1367,10 @@ before any job or spawn effect. Ordinary commands default to `background`. A cla
 transition moves a running job between classes. The table owns kernel placement and the non-mbx pressure policy. With
 mbx selected, all classes use its admission and pressure policy ("Memory pressure"); the land gate has
 `MBX_SCHEDULER_PRIORITY=normal`, and every other class has `low`, including interactive and resident work. The same
-mapping supplies `mbx reserve --priority`. Kernel nice and cgroup placement do not create another pool.
+mapping supplies `mbx reserve --priority`. The supervisor exports the job's value again as
+`COWSHED_MBX_SCHEDULER_PRIORITY`, which `.cowshed/env` restores after its own canonical `low`, so a shell activation
+inside a gate's command (a `direnv exec` in its script, say) keeps `normal`; on 2026-10-31 every reservation of a
+downstream land gate entered the pool at `low`. Kernel nice and cgroup placement do not create another pool.
 
 | Class                  | What runs in it                                                                                                       | Nice | Linux cgroup                                                                 | Without mbx: waits on memory pressure | Without mbx: ended at macOS Critical |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------ |
@@ -1498,8 +1501,10 @@ The policy it holds:
   `a_long_holder_admitted_on_an_idle_host_never_holds_a_later_start`). Inside an mbx project, mbx admits each rustc and,
   with `MBX_SCHEDULER_TESTS=1`, each test process of a Cargo run that builds, so a long `cargo nextest` gives its grant
   back as each one exits. A non-Cargo leaf's `mbx reserve`, and so a nextest run of prebuilt test binaries ("Parallelism
-  inside a job"), holds its `--cpus g` until the leaf concludes ("Tradeoff" under "Status"): the hole stays open there,
-  bounded by one leaf and its own `g`.
+  inside a job"), holds its grant, at most `--cpus g`, until the leaf concludes ("Tradeoff" under "Status"). Such a
+  holder no longer convoys the pool: mbx starts a waiting reservation on whatever cores are free, and lets later
+  requests pass one that cannot start until it has waited 30 s (mbx's pool rule,
+  [Machine-wide compile scheduling](https://mr-boxington.jdx.dev/scheduling#machine-wide-compile-scheduling)).
 
 **The kernel tells the supervisor the pressure.** Each supervisor opens one feed (`host_pressure::Feed`) when it starts:
 one reading, then a new reading each time the kernel notifies a change. On macOS the notification is libdispatch's
@@ -1526,13 +1531,21 @@ fifo bounds one build tree's own fan-out at the same `g`, never host capacity, s
 reads `MAKEFLAGS` as well as `CARGO_MAKEFLAGS`, so withholding one would bound nothing. A non-Cargo leaf runs under
 `mbx reserve --cpus g --priority <job-priority> -- <command>`, the host's installed mbx invoked through its link beside
 the installed cowshed (14_nix.md, "mbx"), `g` being the job's own count from its `--want`, never a host figure. The
-grant is the job's admission: its command stays queued until mbx grants it, then its existing jobserver, runner flags
-and thread variables are bounded by that grant. The memory request is the same task identity's last recorded resource
-peak from existing LMAO job/process spans (13_telemetry.md, "Job resource peaks"), passed as `--memory <bytes>`; no
-cowshed peak ledger or prediction table exists. [INFERENCE] The task-identity key needed to select that span is not
-verified for Nx leaves; until the span carries it, or when no prior peak exists, `--memory` is omitted. mbx defines an
-omitted memory request as a zero-byte charge, not a measurement or a memory guarantee. This open keying question does
-not authorize a second store (AGENTS.md, rule 8).
+grant is the job's admission: its command stays queued until mbx grants it, as soon as one core is free, as many of the
+`g` cores as are free then, and passes that count as `MBX_RESERVE_CPUS`. bounded-exec sizes the leaf's runner flags and
+thread variables to that count as the command starts, so the runner runs on what it holds (an mbx that names no count
+grants `g` whole). The memory request is the same task identity's last recorded resource peak from existing LMAO
+job/process spans (13_telemetry.md, "Job resource peaks"), passed as `--memory <bytes>`; no cowshed peak ledger or
+prediction table exists. [INFERENCE] The task-identity key needed to select that span is not verified for Nx leaves;
+until the span carries it, or when no prior peak exists, `--memory` is omitted. mbx defines an omitted memory request as
+a zero-byte charge, not a measurement or a memory guarantee. This open keying question does not authorize a second store
+(AGENTS.md, rule 8).
+
+**A Vitest or Go test leaf enters no pool.** It runs without `mbx reserve` and with its own default workers, uncapped
+(owner's ruling, 2026-10-31). Reserved at that default, which sizes to the host (Vitest one worker per core but one, Go
+one package per core), each held 17 or 18 of an 18-core pool, and mbx's ordered admission kept every reservation queued
+behind it waiting while the pool drained: a downstream gate on 2026-10-31 ran 4.9 of 18 cores busy while 25 of its tasks
+queued a minute or more, and a gate's Go test leaf waited 401 s for all 18 cores. Every other leaf keeps the rule above.
 
 **A nextest run of prebuilt test binaries is a reserved leaf.** The inferred extracted-archive run
 (`--binaries-metadata`), or one from `--archive-file`, builds nothing, so it enters the pool as a non-Cargo leaf does:
@@ -1740,6 +1753,11 @@ Kernel nice/cgroup behavior and mbx's internal scheduling policy remain their ow
   identify the same Nx task across runs. Inspect that correlation before enabling the span-derived memory request;
   absent or unprovable identity uses the specified zero-byte charge, never a shadow table.
 - The known unscheduled Cargo test-runner gap and its closing measurement belong to 11_shell.md, "Open questions".
+- **A reserved leaf's width.** A leaf should ask mbx for the width its runner can use (its tests, files or workers, at
+  most the cores) and run on what it is granted. bounded-exec knows no unit count for any reserved runner yet, so a
+  prebuilt nextest leaf asks for its task's share of the host (`nxTaskCores` in the nx-plugin) and the others their
+  runner's own count. Asking for every core instead would let a leaf of a few long tests hold the idle rest of a grant
+  mbx made from the free cores. Counting a leaf's units, and with it deleting the task share, is the open change.
 
 ## The task server schedules work units
 

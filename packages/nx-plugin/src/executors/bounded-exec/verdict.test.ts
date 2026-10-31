@@ -594,9 +594,10 @@ process.stdin.resume();
     expect(await withJunitReport('bun test --timeout=0 src', directory)).toBe(
       `bun test --reporter=junit --reporter-outfile='${report}' --timeout=0 src`,
     );
-    const nextest = await withJunitReport('extracted="$(x)" && cargo --frozen nextest run -E all', directory);
+    const inPlace = 'cargo --frozen nextest run --target-dir-remap "$(x/smoo-nx-nextest-binaries target-dir)" -E all';
+    const nextest = await withJunitReport(inPlace, directory);
     expect(nextest).toBe(
-      `extracted="$(x)" && cargo --frozen nextest run --tool-config-file 'smoo-report:${join(directory, 'nextest-report.toml')}' -E all`,
+      `cargo --frozen nextest run --tool-config-file 'smoo-report:${join(directory, 'nextest-report.toml')}' --target-dir-remap "$(x/smoo-nx-nextest-binaries target-dir)" -E all`,
     );
     expect(await readFile(join(directory, 'nextest-report.toml'), 'utf8')).toBe(
       `[profile.default.junit]\npath = ${JSON.stringify(report)}\n`,
@@ -675,8 +676,9 @@ process.stdin.resume();
     // The clock is faked: it moves once, when the command reports, by a generated amount short of the total bound, and
     // then the command exits. Below the bound the verdict is a function of the exit, never of how long a loaded host
     // took to get there (a land gate measured 5243 ms for `node -e ""` under a 5000 ms bound). The step is at least
-    // 1 ms: Bun 1.4.3's `advanceTimersByTime(0)` moves the fake clock 1 ms, and a run that never moves it is the case
-    // above. The command prints its report through `printf`, so the line naming the command never matches it.
+    // 1 ms: `advanceTimersByTime(0)` moves Bun's fake clock 1 ms (measured on 1.4.3 and 1.4.4), and a run that never
+    // moves it is the case above. The command prints its report through `printf`, so the line naming the command never
+    // matches it.
     const reported = 'bounded-exec-property-reported';
     await fc.assert(
       fc.asyncProperty(

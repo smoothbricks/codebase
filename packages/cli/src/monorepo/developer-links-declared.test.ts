@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it, spyOn } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from 'node:fs';
 import { chmod, cp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -179,6 +179,54 @@ describe('as smoo.developerLinks declares them', () => {
     });
   });
 
+  it("puts the linked package's declared bins in its tree's .bin, as an install of it would, and drops the ones it no longer declares", async () => {
+    await withInstalled(WORKSPACE, { '@fixture/lib': '../local-lib' }, async (root) => {
+      await install(root);
+      const main = join(dirname(root), 'projects', 'main');
+      await mkdir(main, { recursive: true });
+      await mkdir(join(root, '.cowshed'), { recursive: true });
+      await writeFile(join(root, '.cowshed', 'workspace.json'), JSON.stringify({ projectRoot: main }));
+      const local = await checkout(join(dirname(root), 'projects', 'local-lib'), '@fixture/lib');
+      await writeFile(
+        join(local, 'package.json'),
+        JSON.stringify({
+          name: '@fixture/lib',
+          version: '9.9.9',
+          bin: { 'lib-kept': './kept.js', 'lib-new': './dist/new.js' },
+        }),
+      );
+      // What an install of the installed version made: its bins, through the alias, beside another package's.
+      const bin = join(root, APP, 'node_modules', '.bin');
+      const installedBins = async () => {
+        await rm(bin, { recursive: true, force: true });
+        await mkdir(bin, { recursive: true });
+        symlinkSync('../@fixture/lib/old.js', join(bin, 'lib-old'));
+        symlinkSync('../@fixture/lib/kept.js', join(bin, 'lib-kept'));
+        symlinkSync('../util/util.js', join(bin, 'util-bin'));
+      };
+      const linkedBins = () => {
+        expect(readlinkSync(join(bin, 'lib-new'))).toBe('../@fixture/lib/dist/new.js');
+        expect(readlinkSync(join(bin, 'lib-kept'))).toBe('../@fixture/lib/kept.js');
+        expect(lstatSync(join(bin, 'lib-old'), { throwIfNoEntry: false })).toBeUndefined();
+        expect(readlinkSync(join(bin, 'util-bin'))).toBe('../util/util.js');
+      };
+      await installedBins();
+      await link(root);
+      expect(readlinkSync(join(root, LINKED))).toBe(local);
+      linkedBins();
+
+      // A shell entry whose link is already in place changes no link, and still finds the bins in place.
+      await installedBins();
+      expect(await planDeclaredLinks(root)).toEqual(CURRENT);
+      await link(root);
+      linkedBins();
+
+      // An install re-points .bin at the installed version's bins; the link it keeps brings its own back.
+      await installedBins();
+      await install(root);
+      linkedBins();
+    });
+  });
   it('keeps an inherited absolute sibling link even when the declaration cannot resolve at this checkout depth', async () => {
     await withInstalled(WORKSPACE, { '@fixture/lib': '../provider/lib' }, async (root) => {
       await install(root);

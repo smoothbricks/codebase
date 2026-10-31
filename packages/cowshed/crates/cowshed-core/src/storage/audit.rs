@@ -11,8 +11,8 @@
 //!
 //! Three sinks: [`ArrowAuditSink`] writes one sealed Arrow IPC segment per [`CommitmentGroup`]
 //! under the telemetry root — private file, fsync, `rename(2)` without replace, directory sync —
-//! the standalone CLI's default (a group of only job admission and terminal records takes one
-//! `fsync(2)` and no `F_FULLFSYNC`, see [`commitment_durability`]); [`NullAuditSink`] discards;
+//! the standalone CLI's default (a group of only job admission and terminal records is not synced
+//! at all, see [`commitment_durability`]); [`NullAuditSink`] discards;
 //! and any external implementation of the trait a host injects (an embedding runtime routes the
 //! records into its own durable log). Segment names are `commitment-<order>-<writer>.arrow`,
 //! `order` being the writer-local, monotone order of the segment's first record, with a fresh
@@ -51,13 +51,14 @@ use cowshed_os::fsio::{
 };
 
 /// How durable one commitment is before it is acknowledged. A job's admission and terminal
-/// commitments are written for every exec and stay the job's own: they survive the writer's death
-/// (`fsync(2)`), and power loss — which ends every job — may take them, leaving a lost job for the
-/// supervisor to seal. Every other commitment records lifecycle and survives power loss.
+/// commitments are written for every exec and stay the job's own: written, they are in the page
+/// cache and survive the writer's death, and none is synced; a host crash ends every job anyway,
+/// leaving a lost job for the supervisor to seal (11_shell.md, "Durability of a job's own
+/// records"). Every other commitment records lifecycle and survives power loss.
 fn commitment_durability(commitment: &ControllerCommitment) -> Durability {
     match commitment {
         ControllerCommitment::Admission(_) | ControllerCommitment::Terminal(_) => {
-            Durability::Device
+            Durability::Process
         }
         ControllerCommitment::WorkspaceIntroduced(_)
         | ControllerCommitment::WorkspaceRetired(_)
@@ -68,7 +69,7 @@ fn commitment_durability(commitment: &ControllerCommitment) -> Durability {
 }
 
 /// The durability a group's one sync gives every record in it: power loss if any record must
-/// survive it, else the device. A group never weakens the barrier any of its records requires.
+/// survive it, else none. A group never weakens the barrier any of its records requires.
 fn group_durability(commitments: &[ControllerCommitment]) -> Durability {
     if commitments
         .iter()
@@ -76,7 +77,7 @@ fn group_durability(commitments: &[ControllerCommitment]) -> Durability {
     {
         Durability::PowerLoss
     } else {
-        Durability::Device
+        Durability::Process
     }
 }
 

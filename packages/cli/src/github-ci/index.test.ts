@@ -17,6 +17,7 @@ import {
   nxRunManyArgs,
   nxRunManyBatchArgs,
   nxSmartArgs,
+  postGithubStatus,
   previewUrlsForStage,
   publishGithubDeployment,
   readGitHeadSha,
@@ -174,6 +175,49 @@ describe('GitHub Actions step links', () => {
       expect(url).toBe(runUrl);
       expect(paths).toEqual([]);
     });
+  });
+
+  it('posts the commit status linking the run, and goes on, when the jobs API cannot list the jobs', async () => {
+    // SB CI run 41121957615 died before building: the step link lookup failed the status post, which failed the whole
+    // Nx run.
+    const posted: unknown[] = [];
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === 'GET' && url.pathname === '/repos/o/r/actions/runs/7/attempts/1/jobs') {
+          return new Response('', { status: 502 });
+        }
+        if (request.method === 'POST' && url.pathname === '/repos/o/r/statuses/abc') {
+          posted.push(await request.json());
+          return Response.json({});
+        }
+        return new Response('', { status: 404 });
+      },
+    });
+    try {
+      const origin = `http://127.0.0.1:${server.port}`;
+      await postGithubStatus('build', 'pending', 'Running build...', '8', {
+        GITHUB_SERVER_URL: origin,
+        GITHUB_API_URL: origin,
+        GITHUB_REPOSITORY: 'o/r',
+        GITHUB_SHA: 'abc',
+        GITHUB_RUN_ID: '7',
+        RUNNER_NAME: 'bread-main-dom1t8xtw6tj',
+        GITHUB_TOKEN: 'token',
+      });
+      expect(posted).toEqual([
+        {
+          state: 'pending',
+          context: 'build',
+          description: 'Running build...',
+          target_url: `${origin}/o/r/actions/runs/7`,
+        },
+      ]);
+    } finally {
+      await server.stop(true);
+    }
   });
 });
 
@@ -1043,7 +1087,7 @@ describe('event-aware stage deployment', () => {
       // manifest, including a published library that ships one to document a binding.
       app: {
         targets: {
-          deploy: { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } },
+          deploy: { executor: '@smoothbricks/nx-plugin:wrangler-deploy' },
         },
       },
       'app-backend': {
@@ -1494,7 +1538,7 @@ describe('resolveDeploymentStage with a configured push branch', () => {
 
 describe('selectStageDeployProjects with a required tag', () => {
   const definitions: Record<string, unknown> = {
-    app: { targets: { deploy: { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } } } },
+    app: { targets: { deploy: { executor: '@smoothbricks/nx-plugin:wrangler-deploy' } } },
     website: {
       tags: ['stage-deploy-target', 'production-push-deploy-target'],
       targets: { deploy: { command: 'bun ../../tooling/deploy-website.ts --stage={args.stage}' } },

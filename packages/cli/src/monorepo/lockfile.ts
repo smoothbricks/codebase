@@ -1,45 +1,19 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { printCommandOutput } from '../lib/run.js';
 import { escapeRegex, getWorkspacePackages } from '../lib/workspace.js';
 
 export interface SyncBunLockfileVersionsOptions {
   log?: boolean;
   /** `git add` bun.lock when versions were resynced. */
   stage?: boolean;
-  /**
-   * `install` (default): lockfile must match package.json (including -next).
-   * `publish`: rewrite unpublished prerelease package.json versions to the last
-   * stable git tag so `bun pm pack` embeds installable dependency versions.
-   * Only use publish mode around pack; never leave the tree in publish mode.
-   */
-  mode?: 'install' | 'publish';
 }
 
-// Pre-publish pack support: `bun pm pack` resolves `workspace:*` versions
-// from bun.lock, so packing a tree whose manifests carry unpublished
-// prereleases (post-release "prepare next") would embed uninstallable
-// -next dependency versions. Publish mode temporarily rewrites those lock
-// entries to the last stable tag — restored byte-exactly afterwards — so the
-// tarball embeds installable versions. (Supported Buns now keep lock entries
-// fresh on install — oven-sh/bun#18906, #20477, #20829 — so unlike the earlier
-// form of this workaround, nothing here repairs staleness; it serves only
-// the -next mapping.)
-//
-// Two modes, because one lockfile serves two jobs:
-//
-// 1) install / frozen CI  → lockfile ≡ package.json (including -next)
-// 2) pre-publish pack    → for package.json prereleases that were never published
-//                          (post-release "prepare next"), lockfile entry := last
-//                          stable tag so a releasing package does not embed an
-//                          unpublished -next dependency version.
-//
-// Do not run publish-mode rewrite in day-to-day validate or pre-commit: bun install
-// rewrites lockfile back to package.json and frozen CI then fails.
+// Install / frozen CI invariant: each bun.lock workspace version equals its package.json version, `-next`
+// prereleases included. A release pack never rewrites the lockfile: it pins its workspace dependencies in the packed
+// manifest instead (withPublishManifest).
 export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVersionsOptions = {}): number {
   const log = options.log ?? true;
-  const mode = options.mode ?? 'install';
   const lockfilePath = join(root, 'bun.lock');
   if (!existsSync(lockfilePath)) {
     throw new Error('bun.lock not found');
@@ -48,7 +22,7 @@ export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVe
   let lockfile = readFileSync(lockfilePath, 'utf8');
   let updated = 0;
   for (const pkg of packages) {
-    const targetVersion = lockfileTargetVersion(root, pkg.projectName, pkg.version, mode);
+    const targetVersion = pkg.version;
     const relativePath = pkg.path.replaceAll('\\', '/');
     const escaped = escapeRegex(relativePath);
     const pattern = new RegExp(`("${escaped}":\\s*\\{[^}]*"version":\\s*")([^"]+)(")`);
@@ -68,11 +42,7 @@ export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVe
     }
     lockfile = lockfile.replace(pattern, `$1${targetVersion}$3`);
     if (log) {
-      const suffix =
-        mode === 'publish' && targetVersion !== pkg.version
-          ? ` (latest stable tag; package.json has ${pkg.version})`
-          : '';
-      console.log(`fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}${suffix}`);
+      console.log(`fix:  ${relativePath}: ${lockVersion} -> ${targetVersion}`);
     }
     updated++;
   }
@@ -130,51 +100,4 @@ export function validateBunLockfileVersions(root: string): number {
     console.log('bun.lock workspace versions are valid.');
   }
   return failures;
-}
-
-/**
- * Version Bun should embed for a workspace dependency when packing for publish.
- * Unpublished package.json prereleases (prepare-next) map to the last stable tag.
- */
-export function publishPackDependencyVersion(root: string, projectName: string, packageVersion: string): string {
-  return lockfileTargetVersion(root, projectName, packageVersion, 'publish');
-}
-
-function lockfileTargetVersion(
-  root: string,
-  projectName: string,
-  packageVersion: string,
-  mode: 'install' | 'publish',
-): string {
-  if (mode === 'install' || !packageVersion.includes('-')) {
-    return packageVersion;
-  }
-  return latestStableTagVersion(root, projectName) ?? packageVersion;
-}
-
-function latestStableTagVersion(root: string, projectName: string): string | null {
-  const args = ['tag', '--list', `${projectName}@*`, '--sort=-v:refname'];
-  const command = `git ${args.join(' ')}`;
-  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git tag listing: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
-  const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
-  if (result.error) {
-    printCommandOutput(result.stdout ?? '', result.stderr ?? '');
-    console.error(`${command} failed to start: ${result.error.message}`);
-    return null;
-  }
-  if (result.status !== 0) {
-    printCommandOutput(result.stdout ?? '', result.stderr ?? '');
-    console.error(`${command} failed with exit code ${result.status ?? 1}`);
-    return null;
-  }
-  const prefix = `${projectName}@`;
-  for (const line of result.stdout.split('\n')) {
-    const tag = line.trim();
-    if (!tag.startsWith(prefix)) continue;
-    const version = tag.slice(prefix.length);
-    if (version && !version.includes('-')) {
-      return version;
-    }
-  }
-  return null;
 }

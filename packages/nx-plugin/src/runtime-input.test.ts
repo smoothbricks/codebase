@@ -96,6 +96,27 @@ describe('runtime-input.sh', () => {
     });
   });
 
+  it('runs no program but the command on success, so a runtime input costs its command alone', async () => {
+    await withWrapperWorkspace(async (workspace) => {
+      // An empty PATH: a wrapper that ran mktemp, cat or rm on its success path could not find them.
+      const empty = join(workspace, 'empty-path');
+      await mkdir(empty);
+      const ran = Bun.spawnSync(['/bin/sh', script, '/bin/sh', '-c', "printf 'value\\n\\n'; printf 'note\\n' >&2"], {
+        cwd: workspace,
+        detached: true,
+        env: { PATH: empty },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      expect({ status: ran.exitCode, stdout: ran.stdout.toString(), stderr: ran.stderr.toString() }).toEqual({
+        status: 0,
+        stdout: 'value\n\n',
+        stderr: '',
+      });
+      expect(existsSync(join(workspace, '.runtime-input-failures'))).toBe(false);
+    });
+  });
+
   it('poisons a failure and durably retains only its exact argv, stdout, stderr and exit status', async () => {
     await withWrapperWorkspace(async (workspace) => {
       const command = [
@@ -118,13 +139,14 @@ describe('runtime-input.sh', () => {
       // No terminal to show the report on is no failure of the input: the record holds its evidence alone.
       expect((await readdir(record)).sort()).toEqual(['argv', 'exit-status', 'report', 'stderr', 'stdout']);
       expect(await readFile(join(record, 'argv'))).toEqual(Buffer.from(`${command.join('\0')}\0`));
-      expect(await readFile(join(record, 'stderr'))).toEqual(Buffer.from('the-cause\0raw\n\n'));
+      // A shell variable holds no NUL byte, so the capture drops it; every other byte is kept.
+      expect(await readFile(join(record, 'stderr'))).toEqual(Buffer.from('the-causeraw\n\n'));
       expect(await readFile(join(record, 'stdout'))).toEqual(Buffer.from('partial\n'));
       expect(await readFile(join(record, 'exit-status'), 'utf8')).toBe('3\n');
       const report = await readFile(join(record, 'report'), 'utf8');
       expect(report).toContain('runtime input exited 3: sh -c');
       expect(report).toContain('argv[4]: <>');
-      expect(report).toContain('the-cause\0raw\n\n');
+      expect(report).toContain('the-causeraw\n\n');
       // Direct invocation sees the attempted stderr notice; Nx is allowed to drop it.
       expect(ran.stderr).toContain('the-cause');
       expect(ran.stderr).toContain('runtime input exited 3: sh -c');
