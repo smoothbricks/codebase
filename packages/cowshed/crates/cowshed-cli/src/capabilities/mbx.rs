@@ -98,7 +98,7 @@ impl MbxInstall {
                     exit_phrase(*status)
                 ),
                 format!(
-                    "run nix build path:{}#{FLAKE_ATTRIBUTE} to see the failure in full",
+                    "run nix build --no-update-lock-file path:{}#{FLAKE_ATTRIBUTE} to see the failure in full",
                     flake.display()
                 ),
             )),
@@ -124,8 +124,9 @@ fn exit_phrase(status: Option<i32>) -> String {
 /// Build the shipped flake, root it, and link the host's `mbx` to the rooted executable.
 ///
 /// The flake is built as a `path:` flake, so a checkout whose `nix/mbx` is not yet tracked builds
-/// the same lock a published package does. `--no-update-lock-file` makes that lock the only record
-/// of the revision: a flake whose lock no longer matches it fails the build instead of relocking.
+/// the same lock a published package does. With `--no-update-lock-file` the build reads that lock and
+/// never rewrites it: a lock that no longer matches the revision `flake.nix` names fails the build
+/// instead of relocking.
 pub fn install(home: &Path, flake: &Path) -> Result<MbxInstall> {
     let root = mbx::gc_root(home);
     let parent = root
