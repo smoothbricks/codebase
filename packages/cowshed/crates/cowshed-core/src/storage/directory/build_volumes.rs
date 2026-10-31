@@ -646,6 +646,7 @@ impl DirectoryExecutionHost {
             crate::build_volume::nx::discard_daemon_records(&mount, &state)
                 .map_err(|error| io_error("discard the seed's Nx daemon record", &mount, error))?;
             state.discard_clone_invalid(&mount).map_err(host_error)?;
+            state.discard_rebuildable(&mount).map_err(host_error)?;
             Ok(mount)
         });
         match mounted {

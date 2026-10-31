@@ -565,24 +565,27 @@ where
         set_written(&image, written)
     }
 
-    /// Fork step 3's capture (16_build_volumes.md, "Fork"), the one step of it that reads `seed`
-    /// and so the one the fork takes under its source's image lock: a new live volume
-    /// registered as `registration` and holding `seed`'s bytes. A seed is never mounted, so it
-    /// is captured detached. [`Self::ready_fork_build_volume`] makes it usable once that lock
-    /// is let go.
+    /// Fork step 3's capture (16_build_volumes.md, "Fork"), the one step of it that reads
+    /// `source` and so the one the fork takes under its source's image lock: a new live volume
+    /// registered as `registration` and holding `source`'s bytes. A seed is never mounted, so it
+    /// is captured detached; an mbx target's live volume, held shared by the caller, is captured
+    /// live from its mount. [`Self::ready_fork_build_volume`] makes it usable once that lock is
+    /// let go.
     pub fn capture_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
-        seed: &BuildVolumeId,
+        source: &BuildVolumeId,
         registration: &Registration,
     ) -> Result<CapturedBuildVolume, ApfsStorageError> {
-        self.verify_controller_path(&layout.image(seed))?;
+        self.verify_controller_path(&layout.image(source))?;
+        let mount = layout.mount(source);
+        let mounted = self.mounted_at(&mount)?.is_some();
         self.capture_build_volume_under_hold(
             layout,
-            seed,
+            source,
             &BuildVolumeId::mint(),
             registration,
-            None,
+            mounted.then_some(mount.as_path()),
         )
     }
 
@@ -619,6 +622,7 @@ where
                     |error| io_error("discard the seed's Nx daemon record", &mount, error),
                 )?;
                 state.discard_clone_invalid(&mount).map_err(host_error)?;
+                state.discard_rebuildable(&mount).map_err(host_error)?;
                 Ok((mount, capture_elapsed.max(elapsed)))
             });
         match mounted {

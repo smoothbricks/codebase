@@ -531,6 +531,37 @@ impl BuildVolumeState {
         Ok(())
     }
 
+    /// Empty what an mbx fork's clone of its target's live volume must not inherit: every path
+    /// not retained, captured while the target's jobs may have been writing it
+    /// (16_build_volumes.md, "Fork"). A rebuildable directory is left empty for its link; one
+    /// declared but not retained is left absent. A non-mbx volume is a seed's clone, captured
+    /// under its writers' exclusion, and keeps everything.
+    pub fn discard_rebuildable(&self, volume_root: &Path) -> crate::Result<()> {
+        if self.mbx.is_none() {
+            return Ok(());
+        }
+        for path in self.paths.iter().filter(|path| !path.retained()) {
+            let directory = volume_root.join(path.volume.as_path());
+            match fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&directory),
+                Ok(_) => fs::remove_file(&directory),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+            .map_err(|error| io_error("discard a fork's rebuildable state", &directory, &error))?;
+            if !path.is_declared() {
+                fs::create_dir_all(&directory).map_err(|error| {
+                    io_error(
+                        "recreate a fork's rebuildable directory",
+                        &directory,
+                        &error,
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Every Nx `workspace-data` directory the volume holds, relative to its root: where Nx keeps
     /// its task database and its daemon's record (`d/`).
     pub fn nx_workspace_data(&self) -> impl Iterator<Item = &Path> {

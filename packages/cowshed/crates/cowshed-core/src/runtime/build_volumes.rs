@@ -159,23 +159,26 @@ impl Quiet {
 /// [`BuildVolumes::abandon_captured_fork`] releases it when the fork's own image is not captured.
 #[derive(Debug)]
 pub(crate) struct CapturedFork {
-    seed: BuildVolumeId,
+    /// The volume the fork's was cloned from: the target's seed, or an mbx target's live volume.
+    from: BuildVolumeId,
     tree: Option<GitOid>,
     captured: CapturedBuildVolume,
     source: Owner,
     operation_elapsed: Option<Duration>,
     started: Instant,
+    /// Whether the fork gets a seed of its own, so others fork from it: a non-mbx fork does.
+    own_seed: bool,
 }
 
 /// A fork's live volume, published and mounted beside its own image's attach and mount, after its
-/// source's image lock is let go (Fork steps 2 and 3), with `own_seed`, the destination's seed,
-/// cloned from it before the mount: the staged checkout it is for does not exist yet.
-/// [`BuildVolumes::finish_fork`] links the checkout to it; [`BuildVolumes::abandon_fork`]
+/// source's image lock is let go (Fork steps 2 and 3), with a non-mbx fork's `own_seed`, the
+/// destination's seed, cloned from it before the mount: the staged checkout it is for does not
+/// exist yet. [`BuildVolumes::finish_fork`] links the checkout to it; [`BuildVolumes::abandon_fork`]
 /// releases both when no checkout staged.
 #[derive(Debug)]
 pub(crate) struct PreparedFork {
-    seed: BuildVolumeId,
-    own_seed: BuildVolumeId,
+    from: BuildVolumeId,
+    own_seed: Option<BuildVolumeId>,
     live: BuildVolumeId,
     mount: PathBuf,
     source: Owner,
@@ -1212,6 +1215,35 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     ) -> (Result<Option<CapturedFork>>, Option<SupersededSeeds>) {
         // Where the new workspace's live volume is placed: the tree its checkout starts at.
         let placed = aim.tree.clone();
+        let this = self.clone();
+        let checkout = source_checkout.clone();
+        let mbx_live = crate::storage::lifecycle::dispatch_blocking(move || {
+            this.state_of(&checkout).map(|state| {
+                state
+                    .filter(|(_, state)| state.mbx.is_some())
+                    .map(|(live, _)| live)
+            })
+        })
+        .await;
+        match mbx_live {
+            Ok(Ok(Some(live))) => {
+                return (
+                    self.capture_live_fork(source, live, destination, placed)
+                        .await,
+                    None,
+                );
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => return (Err(error), None),
+            Err(error) => {
+                return (
+                    Err(CowshedError::internal(format!(
+                        "build volume task failed: {error}"
+                    ))),
+                    None,
+                );
+            }
+        }
         let mut refreshed = match self
             .refresh_seed(
                 source.clone(),
@@ -1254,59 +1286,118 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     )
                     .map_err(storage)?;
                 Ok(Some(CapturedFork {
-                    seed,
+                    from: seed,
                     tree: record.tree,
                     source,
                     operation_elapsed: operation_elapsed.max(captured.capture_elapsed),
                     captured,
                     started,
+                    own_seed: true,
                 }))
             })
             .await;
         (captured, superseded)
     }
 
-    /// The captured live volume proven and published, `destination`'s own seed cloned from it
-    /// before anything mounts it, so the seed holds exactly what the source's seed held and
-    /// `destination` is a target others can fork from, and the live volume mounted with no daemon
-    /// record. It runs beside the attach and mount of the fork's own image: none of it reads the
-    /// source, so it runs after the source's image lock is let go. The seed comes before the
-    /// link: a crash between them leaves an unlinked volume, never a target without a seed. The
-    /// staged checkout's [`Self::finish_fork`] then links the live volume.
+    /// An mbx fork's capture (16_build_volumes.md, "Fork" step 3): the target's live volume itself,
+    /// cloned under the shared hold its jobs take, so they keep running. No seed is refreshed or
+    /// minted and nothing is copied: [`Self::ready_fork`]'s mount deletes what is not the fork's
+    /// ([`crate::build_volume::BuildVolumeState::discard_rebuildable`]).
+    async fn capture_live_fork(
+        &self,
+        source: Owner,
+        live: BuildVolumeId,
+        destination: WorkspaceName,
+        placed: GitOid,
+    ) -> Result<Option<CapturedFork>> {
+        self.blocking(move |host, layout| {
+            let held = HeldVolume::for_seed(host, layout, live)?;
+            let record = layout.read_record(held.id())?;
+            let started = Instant::now();
+            let captured = host
+                .capture_fork_build_volume(
+                    layout,
+                    held.id(),
+                    &Registration::new(
+                        BuildVolumeRecord {
+                            checked_out: Some(placed),
+                            ..BuildVolumeRecord::new(
+                                record.tree.clone(),
+                                BuildVolumeRole::Linked {
+                                    checkout: destination,
+                                },
+                            )
+                        },
+                        Registrant::Intent,
+                    ),
+                )
+                .map_err(storage)?;
+            Ok(Some(CapturedFork {
+                from: held.id().clone(),
+                tree: record.tree,
+                source,
+                operation_elapsed: captured.capture_elapsed,
+                captured,
+                started,
+                own_seed: false,
+            }))
+        })
+        .await
+    }
+
+    /// The captured live volume proven and published, then, for a non-mbx fork, `destination`'s
+    /// own seed cloned from it before anything mounts it, so the seed holds exactly what the
+    /// source's seed held and `destination` is a target others can fork from, and the live volume
+    /// mounted with no daemon record and, for an mbx fork, none of its target's rebuildable state.
+    /// It runs beside the attach and mount of the fork's own image: none of it reads the source,
+    /// so it runs after the source's image lock is let go. The seed comes before the link: a crash
+    /// between them leaves an unlinked volume, never a target without a seed. The staged
+    /// checkout's [`Self::finish_fork`] then links the live volume.
     pub async fn ready_fork(
         &self,
         captured: Result<Option<CapturedFork>>,
         destination: Owner,
     ) -> Result<Option<PreparedFork>> {
         let Some(CapturedFork {
-            seed,
+            from,
             tree,
             captured,
             started,
             source,
             operation_elapsed,
+            own_seed,
         }) = captured?
         else {
             return Ok(None);
         };
         self.blocking(move |host, layout| {
-            let own_seed = BuildVolumeId::mint();
-            let registration = Registration::new(
-                BuildVolumeRecord::new(
-                    tree,
-                    BuildVolumeRole::Seed {
-                        target: destination.name,
-                        incarnation: destination.incarnation,
-                    },
-                ),
-                Registrant::Intent,
-            );
+            let own_seed = own_seed.then(|| {
+                (
+                    BuildVolumeId::mint(),
+                    Registration::new(
+                        BuildVolumeRecord::new(
+                            tree,
+                            BuildVolumeRole::Seed {
+                                target: destination.name,
+                                incarnation: destination.incarnation,
+                            },
+                        ),
+                        Registrant::Intent,
+                    ),
+                )
+            });
             let (live, mount, elapsed) = host
-                .ready_fork_build_volume(layout, captured, Some((&own_seed, &registration)))
+                .ready_fork_build_volume(
+                    layout,
+                    captured,
+                    own_seed
+                        .as_ref()
+                        .map(|(seed, registration)| (seed, registration)),
+                )
                 .map_err(storage)?;
             Ok(Some(PreparedFork {
-                seed,
-                own_seed,
+                from,
+                own_seed: own_seed.map(|(seed, _)| seed),
                 live,
                 mount,
                 started,
@@ -1368,7 +1459,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     ) -> Result<Option<BuildVolumeId>> {
         self.blocking(move |_, _| {
             let Some(PreparedFork {
-                seed,
+                from,
                 own_seed: _,
                 live,
                 mount,
@@ -1394,7 +1485,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             // clock here to pre-pay that would sync the volume on every fork.
             cowshed_os::timing::event("build-volume", || {
                 format!(
-                    "fork {} from seed {seed} in {:?}",
+                    "fork {} from {from} in {:?}",
                     destination.name,
                     started.elapsed()
                 )
@@ -1413,10 +1504,9 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         };
         let live = prepared.live.clone();
         let own_seed = prepared.own_seed.clone();
-        for (id, whose) in [
-            (live, "a fork that never staged"),
-            (own_seed, "the seed of a fork that never staged"),
-        ] {
+        for (id, whose) in std::iter::once((live, "a fork that never staged"))
+            .chain(own_seed.map(|seed| (seed, "the seed of a fork that never staged")))
+        {
             let releasing = id.clone();
             let released = self
                 .blocking(move |host, layout| {
@@ -6978,8 +7068,13 @@ fn main() {
         scratch.release_all();
     }
 
+    /// An mbx fork is a clone of its target's live volume, not of a seed (16_build_volumes.md,
+    /// "Fork"): two forks with no land between them refresh and mint no seed, for the target or
+    /// for either fork, and copy nothing into one. Each holds the retained state as the target held
+    /// it at its capture, and none of its rebuildable state or clone-invalid files, while the
+    /// target's own job keeps its shared hold and writes on.
     #[cfg(target_os = "macos")]
-    async fn mbx_fork_with_live_shared_source<H: RuntimeStorageHost>(scratch: Scratch<H>) {
+    async fn mbx_fork_clones_the_live_volume<H: RuntimeStorageHost>(scratch: Scratch<H>) {
         let (checkout, live, mount) = scratch.linked_checkout("main", 1);
         let target = owner("main", '0');
         BuildVolumeState {
@@ -7009,59 +7104,77 @@ fn main() {
             .append(true)
             .open(mount.join("kept/marker"))
             .unwrap();
-        // Arrange a pre-cutover full seed through the substrate, not the new retention owner.
-        let previous = BuildVolumeId::mint();
-        scratch
-            .host
-            .clone_build_volume(
-                &scratch.layout,
-                &live,
-                &previous,
-                &Registration::new(
-                    BuildVolumeRecord::new(
-                        None,
-                        BuildVolumeRole::Seed {
-                            target: target.name.clone(),
-                            incarnation: target.incarnation.clone(),
-                        },
-                    ),
-                    Registrant::Workspace {
-                        incarnation: target.incarnation.clone(),
-                    },
-                ),
-            )
-            .unwrap();
         let hold = scratch.layout.admit(&live).unwrap();
-        let locked = scratch.lock(&target).await;
-        let (captured, superseded) = scratch
-            .volumes
-            .capture_fork(
-                target.clone(),
-                checkout,
-                name("next"),
-                Aim {
-                    tree: GitOid::new("a".repeat(40)).unwrap(),
-                    landed: Vec::new(),
-                },
-            )
-            .await;
-        let captured = captured
-            .expect("an existing shared source job must not block retained-only capture")
-            .expect("the source has build state");
-        let (seed, _) = scratch
+        let before = scratch.layout.collection_ids().unwrap();
+        let mut forks = Vec::new();
+        for (fork, digit) in [("next", '1'), ("after", '2')] {
+            let locked = scratch.lock(&target).await;
+            let (captured, superseded) = scratch
+                .volumes
+                .capture_fork(
+                    target.clone(),
+                    checkout.clone(),
+                    name(fork),
+                    Aim {
+                        tree: GitOid::new("a".repeat(40)).unwrap(),
+                        landed: Vec::new(),
+                    },
+                )
+                .await;
+            drop(locked);
+            assert!(superseded.is_none(), "an mbx fork refreshes no seed");
+            let captured = captured
+                .expect("an existing shared source job must not block the fork")
+                .expect("the source has build state");
+            assert_eq!(
+                captured.from, live,
+                "the fork is cloned from the live volume"
+            );
+            let prepared = scratch
+                .volumes
+                .ready_fork(Ok(Some(captured)), owner(fork, digit))
+                .await
+                .expect("the fork readies")
+                .expect("the fork has a build volume");
+            assert_eq!(
+                prepared.own_seed, None,
+                "an mbx fork keeps no seed of its own"
+            );
+            assert_eq!(
+                fs::read(prepared.mount.join("kept/marker")).unwrap(),
+                b"live"
+            );
+            assert!(
+                prepared.mount.join("discarded").is_dir(),
+                "a rebuildable directory stays for its link"
+            );
+            assert!(
+                !prepared.mount.join("discarded/marker").exists(),
+                "the target's rebuildable state is not the fork's"
+            );
+            assert!(!prepared.mount.join("kept/fixture-owner.pid").exists());
+            forks.push(prepared);
+        }
+        assert!(
+            scratch
+                .layout
+                .seed_of(&target.name, &target.incarnation)
+                .unwrap()
+                .is_none(),
+            "no seed is minted for the target"
+        );
+        let made: Vec<_> = scratch
             .layout
-            .seed_of(&target.name, &target.incarnation)
+            .collection_ids()
             .unwrap()
-            .unwrap();
-        assert_ne!(seed, previous, "never fall back to the old full-cache seed");
-        assert_eq!(captured.seed, seed);
-        let (seed_mount, _) = scratch
-            .host
-            .mount_build_volume(&scratch.layout, &seed)
-            .unwrap();
-        assert_eq!(fs::read(seed_mount.join("kept/marker")).unwrap(), b"live");
-        assert!(!seed_mount.join("discarded/marker").exists());
-        assert!(!seed_mount.join("kept/fixture-owner.pid").exists());
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(
+            made.len(),
+            2,
+            "two forks make their two volumes, nothing else: {made:?}"
+        );
         assert!(
             scratch.layout.claim_release(&live).unwrap().is_none(),
             "the source job's original shared hold stays admitted"
@@ -7081,23 +7194,18 @@ fn main() {
             fs::read(mount.join(crate::build_volume::STATE_FILE)).unwrap(),
             state_before
         );
-        writer.write_all(b" after snapshot").unwrap();
+        writer.write_all(b" after capture").unwrap();
         assert_eq!(
             fs::read(mount.join("kept/marker")).unwrap(),
-            b"live after snapshot"
+            b"live after capture"
         );
         assert_eq!(
-            fs::read(seed_mount.join("kept/marker")).unwrap(),
+            fs::read(forks[0].mount.join("kept/marker")).unwrap(),
             b"live",
-            "the source writer remains usable without changing the immutable capture"
+            "the source writer remains usable without changing the fork's capture"
         );
-        drop(locked);
-        scratch
-            .volumes
-            .abandon_captured_fork(Ok(Some(captured)))
-            .await;
-        if let Some(superseded) = superseded {
-            scratch.volumes.retire_superseded(superseded).await;
+        for prepared in forks {
+            scratch.volumes.abandon_fork(Ok(Some(prepared))).await;
         }
         drop(writer);
         drop(hold);
@@ -7106,14 +7214,14 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn directory_mbx_fork_captures_retained_state_while_source_shared_hold_stays_live() {
-        mbx_fork_with_live_shared_source(Scratch::directory("mbx-retention-shared")).await;
+    async fn directory_mbx_fork_clones_the_live_volume_and_mints_no_seed() {
+        mbx_fork_clones_the_live_volume(Scratch::directory("mbx-fork-live")).await;
     }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_mbx_fork_captures_retained_state_while_source_shared_hold_stays_live() {
-        mbx_fork_with_live_shared_source(Scratch::new("mbx-retention-shared-native")).await;
+    async fn real_apfs_mbx_fork_clones_the_live_volume_and_mints_no_seed() {
+        mbx_fork_clones_the_live_volume(Scratch::new("mbx-fork-live-native")).await;
     }
 
     #[cfg(target_os = "macos")]
@@ -8991,8 +9099,8 @@ fn main() {
             .volumes
             .finish_fork(
                 Some(PreparedFork {
-                    seed: seed.clone(),
-                    own_seed,
+                    from: seed.clone(),
+                    own_seed: Some(own_seed),
                     live: live.clone(),
                     mount,
                     started,
