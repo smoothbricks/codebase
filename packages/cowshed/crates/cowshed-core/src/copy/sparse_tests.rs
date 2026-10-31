@@ -14,7 +14,7 @@ use crate::api::Sha256Digest;
 use crate::storage::directory::tests::Scratch;
 
 use super::native::next_data_region;
-use super::{Content, Run, Runs, ZEROS, compare_file_bytes};
+use super::{Content, FileComparison, Run, Runs, ZEROS, compare_file_bytes};
 
 const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;
@@ -148,8 +148,13 @@ fn a_destination_with_data_in_a_source_hole_is_refused() {
     let destination = sparse_file(&scratch.path().join("destination"), SMALL_LENGTH, &stray);
     assert_eq!(data_regions(&destination, SMALL_LENGTH), stray);
 
-    let error = compare_file_bytes(&source, &destination, SMALL_LENGTH)
-        .expect_err("data inside a source hole must refuse");
+    let error = compare_file_bytes(
+        &mut FileComparison::new(),
+        &source,
+        &destination,
+        SMALL_LENGTH,
+    )
+    .expect_err("data inside a source hole must refuse");
 
     assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     assert_eq!(error.to_string(), "file content differs");
@@ -189,10 +194,20 @@ fn a_destination_with_allocated_zeros_in_a_source_hole_is_accepted() {
         "only the destination is read over the source's hole"
     );
 
-    let digest = compare_file_bytes(&source, &destination, SMALL_LENGTH)
-        .expect("allocated zeros equal a hole");
-    let reverse = compare_file_bytes(&destination, &source, SMALL_LENGTH)
-        .expect("a hole equals allocated zeros");
+    let digest = compare_file_bytes(
+        &mut FileComparison::new(),
+        &source,
+        &destination,
+        SMALL_LENGTH,
+    )
+    .expect("allocated zeros equal a hole");
+    let reverse = compare_file_bytes(
+        &mut FileComparison::new(),
+        &destination,
+        &source,
+        SMALL_LENGTH,
+    )
+    .expect("a hole equals allocated zeros");
 
     assert_eq!(digest, expected_digest(SMALL_LENGTH, &SMALL_REGIONS));
     assert_eq!(reverse, digest);
