@@ -99,11 +99,11 @@ its own files while refusing host links a Nix wrapper shapes, record why a compi
 build-script output under `mbx exec`. The latest count a crate's edit against the commit HEAD it last compiled under
 (16_build_volumes.md, "One Cargo environment on every path"), refresh the store's recency only for hits a build exposed,
 predict build scripts per target, map a nested Cargo's own target, and seed a managed target from one donor checkout
-only, so no target mixes two lineages of one crate. It is `smoothbricks/mr-boxington` at rev
-`0f1542efb017ed36d6018f08346d5eee7f779df7`. No project needs to pin it: the host's mbx serves every Cargo project, which
-reaches it through the Cargo shim that `cowshed setup` generates from it, below (the capability is 15_capabilities.md's,
-its route 11_shell.md's). The installed mbx is never spelled as a Nix store path or a host path where a command is
-spawned; its store path is only what the link resolves to.
+only, so no target mixes two lineages of one crate. It is `smoothbricks/mr-boxington` at the revision
+`nix/mbx/flake.lock` locks, which no source restates. No project needs to pin it: the host's mbx serves every Cargo
+project, which reaches it through the Cargo shim that `cowshed setup` generates from it, below (the capability is
+15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store path or a host path
+where a command is spawned; its store path is only what the link resolves to.
 
 Managed-target seeding installs a profile's build-script shim pins before publishing a copied unit and rejects damaged
 donors, so cancellation cannot leave a fresh launcher without its executable. For unmeasured Cargo test binaries, the
@@ -138,15 +138,15 @@ workspace's warm-up truncated its event recording, and `mbx explain --last` then
 units it had dropped (measured 2026-10-28). for the units it had dropped (measured 2026-10-28).
 
 The imperative install is four steps of every `cowshed setup` that reaches its host services: build the flake the
-package ships at `nix/mbx` (its `flake.lock` locks mbx's own nixpkgs exactly as mbx's flake does, so the build is the
-store path mbx's own flake realizes at that revision), root the result with `--out-link` at
-`~/Library/Application Support/dev.cowshed/nix/mbx`, point `dev.cowshed/bin/mbx` at the rooted executable by an atomic
-rename of a fresh link, and run that installed mbx's own `mbx setup`, which generates the Cargo shim and its one-line
-`mbx-target` sidecar into `dev.cowshed/mbx-shim/`, beside `bin`, so no project provides either. A link that already
-names it is left; one naming another build is retargeted; anything there that is not a link is not cowshed's and fails
-the run untouched. A host without `nix` keeps no mbx, which is the non-mbx scheduling path, not a failure
-(05_gateway.md, "Host scheduling"). `--uninstall` removes the link, the shim directory and the root and nothing under
-the nix store. Enforced by `cowshed-core`'s
+package ships at `nix/mbx` with `--no-update-lock-file`, so its `flake.lock` alone decides the revision and locks mbx's
+own nixpkgs exactly as mbx's flake does (the build is the store path mbx's own flake realizes at that revision), root
+the result with `--out-link` at `~/Library/Application Support/dev.cowshed/nix/mbx`, point `dev.cowshed/bin/mbx` at the
+rooted executable by an atomic rename of a fresh link, and run that installed mbx's own `mbx setup`, which generates the
+Cargo shim and its one-line `mbx-target` sidecar into `dev.cowshed/mbx-shim/`, beside `bin`, so no project provides
+either. A link that already names it is left; one naming another build is retargeted; anything there that is not a link
+is not cowshed's and fails the run untouched. A host without `nix` keeps no mbx, which is the non-mbx scheduling path,
+not a failure (05_gateway.md, "Host scheduling"). `--uninstall` removes the link, the shim directory and the root and
+nothing under the nix store. Enforced by `cowshed-core`'s
 `the_host_link_is_made_once_retargeted_to_a_new_pin_and_never_replaces_a_foreign_file` and
 `the_link_is_observed_without_following_it`, `cowshed-cli`'s `the_host_mbx_is_one_link_to_the_rooted_executable` and the
 setup cells `a_repair_links_the_pinned_mbx_after_storage_and_names_it`,

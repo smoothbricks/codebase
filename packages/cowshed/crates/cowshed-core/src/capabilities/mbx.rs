@@ -15,17 +15,6 @@ use super::{
 use crate::input_memo::InputMemo;
 use crate::{CowshedError, Result};
 
-/// The lock of the flake cowshed's package ships at `nix/mbx`: the one record of the pinned
-/// revision, read rather than restated.
-const PIN_LOCK: &str = include_str!("../../../../nix/mbx/flake.lock");
-
-/// The mbx revision cowshed pins, as its flake lock records it.
-pub fn pinned_revision() -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(PIN_LOCK).ok()?["nodes"]["mbx"]["locked"]["rev"]
-        .as_str()
-        .map(str::to_owned)
-}
-
 /// The executable's name, in the pinned package's `bin` and beside the installed cowshed.
 pub const BINARY_NAME: &str = "mbx";
 
@@ -1006,14 +995,6 @@ mod tests {
         );
         assert_eq!(reads(), 6);
         std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn the_pin_is_the_revision_the_shipped_lock_names() {
-        assert_eq!(
-            pinned_revision().as_deref(),
-            Some("0f1542efb017ed36d6018f08346d5eee7f779df7")
-        );
     }
 
     #[test]

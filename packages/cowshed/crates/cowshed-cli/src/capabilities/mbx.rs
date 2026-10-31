@@ -124,7 +124,8 @@ fn exit_phrase(status: Option<i32>) -> String {
 /// Build the shipped flake, root it, and link the host's `mbx` to the rooted executable.
 ///
 /// The flake is built as a `path:` flake, so a checkout whose `nix/mbx` is not yet tracked builds
-/// the same lock a published package does.
+/// the same lock a published package does. `--no-update-lock-file` makes that lock the only record
+/// of the revision: a flake whose lock no longer matches it fails the build instead of relocking.
 pub fn install(home: &Path, flake: &Path) -> Result<MbxInstall> {
     let root = mbx::gc_root(home);
     let parent = root
@@ -138,6 +139,7 @@ pub fn install(home: &Path, flake: &Path) -> Result<MbxInstall> {
     #[allow(clippy::disallowed_methods)]
     let output = match Command::new(NIX_EXECUTABLE)
         .arg("build")
+        .arg("--no-update-lock-file")
         .arg(format!("path:{}#{FLAKE_ATTRIBUTE}", flake.display()))
         .arg("--out-link")
         .arg(&root)
