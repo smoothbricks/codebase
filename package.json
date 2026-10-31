@@ -245,6 +245,20 @@
       "monorepo-check": {
         "executor": "nx:run-commands",
         "cache": true,
+        "dependsOn": [
+          {
+            "target": "tsc-js",
+            "projects": [
+              "cli"
+            ]
+          },
+          {
+            "target": "tsc-js",
+            "projects": [
+              "nx-plugin"
+            ]
+          }
+        ],
         "inputs": [
           "{workspaceRoot}/**/*",
           "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
@@ -257,7 +271,7 @@
           "command": "smoo monorepo check --warn",
           "cwd": "{workspaceRoot}"
         },
-        "//": "MONOREPO: the package conventions and managed-file drift that publish's 'Check managed monorepo files' step refuses on, run in the root lint where lands are judged instead of first at publish. Cached on the whole tree, which holds every manifest, lock and managed file it reads, and on the gitignored dist-test directories it refuses, which no file input sees. The devenv release check asks the remote on every run, but a pushed release tag is permanent and Nx caches no failure, so a cached pass cannot outlive what it judged; it needs the remote reachable and fails rather than passes offline."
+        "//": "MONOREPO: the package conventions and managed-file drift that publish's 'Check managed monorepo files' step refuses on, run in the root lint where lands are judged instead of first at publish. It runs smoo from packages/cli/dist (tooling/smoo) and its project graph loads the Nx plugin from packages/nx-plugin/dist, so it depends on the tsc-js emit that writes each, whose ^*-js orders the emits they import: an emit Nx restores in the same graph replaces its dist, and a read meanwhile fails with ENOENT. Cached on the whole tree, which holds every manifest, lock and managed file it reads and every source those emits compile, so their outputs add nothing to the key, and on the gitignored dist-test directories it refuses, which no file input sees. The devenv release check asks the remote on every run, but a pushed release tag is permanent and Nx caches no failure, so a cached pass cannot outlive what it judged; it needs the remote reachable and fails rather than passes offline."
       },
       "local-registry": {
         "executor": "@nx/js:verdaccio",
