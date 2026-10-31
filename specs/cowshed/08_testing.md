@@ -1448,10 +1448,10 @@ established before the Linux leg gates.
   Tests and Browser Tests through `smoo github-ci nx-smart`, on Linux only — the self-hosted `nixos-latest-x64` runner
   for the repository's own branches, `ubuntu-latest` for pull requests from forks. There are no macOS runners, no
   Linux+ZFS runner, and no nightly run, so every macOS-only test (APFS, Seatbelt, launchd, the escape tests, the
-  built-addon host proof) runs only where a developer runs the gate: `bun nx run-many -t gate` on a Mac, with
-  `bun run check:linux` cross-linting the Linux target. The check compiles test targets too; native-only methods and
-  fixture helpers share their callers' platform guards, never warning suppressions. Retained-input attach construction
-  remains available to portable tests; APFS supervisor mounting is macOS-only, and the macOS child-fence race keeps its
-  imports inside that test.
+  built-addon host proof) runs only where a developer runs the gate: `bun nx run-many -t gate` on a Mac, with the gate's
+  `cargo-lint-cross` (also `bun run check:linux`) cross-linting the Linux target. The check compiles test targets too;
+  native-only methods and fixture helpers share their callers' platform guards, never warning suppressions.
+  Retained-input attach construction remains available to portable tests; APFS supervisor mounting is macOS-only, and
+  the macOS child-fence race keeps its imports inside that test.
 - Lint is `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --config 'build.warnings="deny"'` (repo
   rule: fix everything you see — no pre-existing-failure waivers).

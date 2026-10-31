@@ -55,15 +55,9 @@ const SHIPPING_CHECK_PASSED: Call = {
 const SHIPPING = [SHIPPING_CHECK_PASSED];
 const SHIPPING_NX = SHIPPING.map((call) => call.args.join(' '));
 
-/** The Linux cross check as an Nx run of its own: its run summary names the task the pre-push hook asks Nx for. */
-const CROSS = ['run-many', '-t', 'cargo-lint-cross'];
-const CROSS_PASSED: Call = {
-  ...passingRun(CROSS),
-  run: [{ taskId: 'cowshed:cargo-lint-cross', hash: 'cross-hash', status: 0 }],
-};
 /**
- * A whole gate that passed: its run summary carries the root aggregate's row and the host production CLI and addon its
- * graph built, the hashes a land publishes.
+ * A whole gate that passed: its run summary carries the root aggregate's row, the host production CLI and addon and
+ * the Linux cross lint its graph ran, the hashes a land publishes.
  */
 const GATE_PASSED: Call = {
   ...passingRun(GATE),
@@ -71,6 +65,7 @@ const GATE_PASSED: Call = {
     { taskId: '@smoothbricks/codebase:gate', hash: 'gate-hash', status: 0 },
     { taskId: 'cowshed:cli-native:production', hash: 'shipping-producer-hash', status: 0 },
     { taskId: 'cowshed:napi-native:production', hash: 'shipping-addon-hash', status: 0 },
+    { taskId: '@smoothbricks/codebase:cargo-lint-cross', hash: 'cross-hash', status: 0 },
   ],
 };
 /** The files Nx hashes for each task and the tasks it waits for: the workspace's one commit writes change.txt. */
@@ -215,10 +210,6 @@ interface FixtureOptions {
   readonly replayFails?: boolean;
   /** The publisher refuses. */
   readonly publishFails?: boolean;
-  /** The Linux cross check exits 5. */
-  readonly linuxFails?: boolean;
-  /** The Linux cross check is an Nx run of its own, which the scenario scripts. */
-  readonly crossRuns?: boolean;
 }
 
 const roots: string[] = [];
@@ -229,12 +220,7 @@ afterEach(() => {
 });
 
 /** A main repository carrying the gate tooling, and a workspace one commit ahead of it, as cowshed's rebase leaves it. */
-function fixture({
-  replayFails = false,
-  publishFails = false,
-  linuxFails = false,
-  crossRuns = false,
-}: FixtureOptions = {}): GateFixture {
+function fixture({ replayFails = false, publishFails = false }: FixtureOptions = {}): GateFixture {
   const root = mkdtempSync(join(tmpdir(), 'land-host-'));
   roots.push(root);
   const main = join(root, 'main');
@@ -263,13 +249,7 @@ function fixture({
   mkdirSync(join(main, 'packages'), { recursive: true });
   symlinkSync(join(repo, 'packages/failure-summary'), join(main, 'packages/failure-summary'));
   writeFileSync(join(main, 'nx.json'), '{}\n');
-  // The gate cross-lints the gated tree for Linux after the gate; the fixture's check passes unless it is told to fail.
-  const linux = linuxFails
-    ? 'echo linux cross check failed; exit 5'
-    : crossRuns
-      ? 'bun nx run-many -t cargo-lint-cross'
-      : 'echo linux cross check passed';
-  writeFileSync(join(main, 'package.json'), `${JSON.stringify({ scripts: { 'check:linux': linux } })}\n`);
+  writeFileSync(join(main, 'package.json'), '{}\n');
   writeFileSync(join(main, '.envrc'), '# approved\n');
   writeFileSync(join(main, '.gitignore'), 'node_modules\n.nx\n');
   git(main, 'init', '-q', '-b', 'main');
@@ -471,29 +451,21 @@ describe('land-host.sh --gate', () => {
   it.each([{ phase: 'shipping guard', calls: [{ args: SHIPPING_CHECK, exit: 19 }], status: 19 }])(
     'stops before publishing when the $phase fails',
     ({ calls, status }) => {
-      const gate = fixture({ crossRuns: true });
+      const gate = fixture();
       const base = git(gate.main, 'rev-parse', 'HEAD');
-      const run = gate.gate([DAEMON_STOP, passingRun(WIRING(base)), GATE_PASSED, CROSS_PASSED, ...calls]);
+      const run = gate.gate([DAEMON_STOP, passingRun(WIRING(base)), GATE_PASSED, ...calls]);
       expect(run.status, run.log).toBe(status);
       expect(run.log).toContain('the land stops');
       expect(run.nx).toEqual([
         'daemon --stop',
         WIRING(base).join(' '),
         GATE.join(' '),
-        CROSS.join(' '),
         ...calls.map((call) => call.args.join(' ')),
       ]);
       expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
       expect(readdirSync(join(gate.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
     },
   );
-
-  it('exits with the Linux cross check status when it fails after a passing gate, and publishes nothing', () => {
-    const gate = fixture({ linuxFails: true });
-    const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED]);
-    expect(run.status, run.log).toBe(5);
-    expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
-  });
 
   it('publishes gate and shipping results only after every check passes', () => {
     const gate = fixture();
@@ -512,19 +484,7 @@ describe('land-host.sh --gate', () => {
     const program = `${readFileSync(join(bridge, 'cache_adapter.js'), 'utf8')}\n${readFileSync(join(bridge, 'nx_publish.js'), 'utf8')}`;
     expect(readFileSync(join(gate.state, 'publish.program'), 'utf8')).toBe(program);
     expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["wiring-hash"]\n-\n${gate.ws}\n["gate-hash","shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
-    );
-  });
-
-  it("publishes the Linux cross check's own task results beside the gate's, so main finds cargo-lint-cross cached", () => {
-    const gate = fixture({ crossRuns: true });
-    const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, CROSS_PASSED, ...SHIPPING]);
-    expect(run.status, run.log).toBe(0);
-    expect(run.nx.slice(-2)).toEqual([CROSS.join(' '), ...SHIPPING_NX]);
-    // Each invocation keeps its own list: the gate's (the host production producers among it), the cross check's and the
-    // shipping guard's.
-    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["gate-hash","shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["cross-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
+      `-\n${gate.ws}\n["wiring-hash"]\n-\n${gate.ws}\n["gate-hash","shipping-producer-hash","shipping-addon-hash","cross-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
     );
   });
 

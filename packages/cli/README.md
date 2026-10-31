@@ -1054,12 +1054,13 @@ environment as well as on the tree (the macOS SDK a native build links against, 
 carrying another directory's devenv keyed the gate's tasks on that shell's `SDKROOT` and `DEVELOPER_DIR`, missed them,
 and built them against the wrong SDK. Nx caches the target on the Cargo inputs, so a hit is a prior real Linux clippy
 and the push proceeds. On a miss Nx restores or builds the target's dependencies in that environment, and the target's
-own guard refuses to start without `cargo-zigbuild` on PATH, which a macOS shell carries only inside the linux-cross
-profile, so the push is refused with `bun run check:linux` named; any other failure, in Nx or in direnv entering the
-checkout, is named as that and never as a miss. The hook never enters linux-cross and never starts the cross clippy, so
-it never costs an unbounded clippy. `bun run check:linux` is `tooling/devenv -P linux-cross shell --` around that same
-Nx target; it is the only place the gate runs from a plain shell, so it is deliberately not quiet. A push made from an
-already-entered linux-cross shell passes the guard and runs the check itself. `git push --no-verify` skips the hook.
+own guard refuses: the hook runs Nx with `SMOO_CROSS_LINT_REPLAY_ONLY=1`, under which the target never starts
+`cargo-zigbuild`, so the push is refused with `bun run check:linux` named; any other failure, in Nx or in direnv
+entering the checkout, is named as that and never as a miss. Nx hashes no environment the target does not declare, so
+the probe's key is the gate's. The hook never starts the cross clippy, so it never costs an unbounded clippy, although
+every checkout shell carries zig, `cargo-zigbuild` and the x86_64 Linux rust-std. `bun run check:linux` is that same Nx
+target run plainly, which the land gate's Nx graph also holds; it is deliberately not quiet. `git push --no-verify`
+skips the hook.
 
 Conventional commit scopes should use Nx project names. For packages in the same npm scope as the root package, smoo
 requires `package.json` `nx.name` to be the unscoped package name, such as `cli` for `@smoothbricks/cli`, so subjects

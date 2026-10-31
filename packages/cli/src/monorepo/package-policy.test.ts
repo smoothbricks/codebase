@@ -211,7 +211,7 @@ describe('root smoo monorepo policy', () => {
       const rootPackage = await readJson(join(root, 'package.json'));
       const nxJson = await readJson(join(root, 'nx.json'));
       expect(rootPackage.scripts).toEqual({
-        'check:linux': 'tooling/devenv -P linux-cross shell -- nx run-many -t cargo-lint-cross',
+        'check:linux': 'nx run-many -t cargo-lint-cross',
         'clean:node_modules':
           'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
         'format:changed': 'git-format-staged --config .git-format-staged.yml --also-unstaged',

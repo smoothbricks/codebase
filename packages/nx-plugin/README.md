@@ -1362,8 +1362,8 @@ Concrete targets come from concrete files:
   executor with `bin` set; a static CLI targets `<arch>-unknown-linux-musl`. The executor runs `cargo-zigbuild`
   directly, removes any compiler or linker the shell names for its triple (a Linux shell pins its host compiler for
   `x86_64-unknown-linux-gnu`), and reads the artifact path from cargo's JSON messages. zig and cargo-zigbuild come from
-  the managed devenv module: a Linux shell carries them, a macOS shell only inside the `linux-cross` profile
-  (`tooling/devenv -P linux-cross shell -- …`).
+  the managed devenv module, in every shell; the Linux rust-std set beyond `x86_64-unknown-linux-gnu` comes with a Linux
+  shell, and on macOS only inside the `linux-cross` profile (`tooling/devenv -P linux-cross shell -- …`).
 - `build` is inferred only when the project has at least one concrete build target to run, such as inferred `tsc-js`, a
   package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
   `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.

@@ -5,10 +5,10 @@
  * compiles is invisible to every check a macOS host can run: a full local lint
  * passes and CI still goes red on unused imports, unresolved names and dead code
  * inside the `not(target_os = "macos")` branch. Closing that needs three pieces
- * to agree — a devenv profile carrying the Linux toolchain (zig, cargo-zigbuild
- * and the Linux rust-std set), an Nx target per Cargo workspace that asks for
- * the triple, and a root script that runs the second inside the first. They
- * live here together because the plugin infers the target while the CLI
+ * to agree: a shell carrying the Linux toolchain (zig, cargo-zigbuild and the
+ * x86_64-unknown-linux-gnu rust-std, every managed devenv shell's), an Nx target
+ * per Cargo workspace that asks for the triple, and a root script that runs it.
+ * They live here together because the plugin infers the target while the CLI
  * installs the script and reports a project missing it; kept apart, the three
  * spellings drift and the gate silently stops gating.
  */
@@ -18,14 +18,6 @@
  * `languages.rust.targets` in the managed devenv module installs its rust-std.
  */
 export const CARGO_LINUX_TRIPLE = 'x86_64-unknown-linux-gnu';
-
-/**
- * The devenv profile carrying the Linux toolchain — zig, cargo-zigbuild and the
- * Linux rust-std set — defined in the managed `tooling/direnv/devenv.smoo.nix`.
- * Opt-in on macOS because zig alone is a 380 MiB closure that nothing but a
- * Linux artifact or this check uses.
- */
-export const DEVENV_CROSS_PROFILE = 'linux-cross';
 
 /**
  * Nx target name. No colons, per the repo's target-naming rule.
@@ -41,15 +33,24 @@ export const DEVENV_CROSS_PROFILE = 'linux-cross';
 export const CARGO_CROSS_LINT_TARGET = 'cargo-lint-cross';
 
 /**
- * What the cross lint prints when it refuses to compile without cargo-zigbuild
- * on PATH: on a Darwin cache miss this line, and only this line, means the
- * key missed. The managed pre-push hook reads its output for exactly this text
- * to tell a miss from any other Nx failure.
+ * What the cross lint prints when it is asked to replay and not compile: on a
+ * Darwin cache miss under the managed pre-push probe this line, and only this
+ * line, means the key missed. The hook reads its output for exactly this text to
+ * tell a miss from any other Nx failure.
  */
-export const CARGO_CROSS_LINT_REFUSAL =
-  'cargo-lint-cross needs cargo-zigbuild from the linux-cross toolchain; run: bun run check:linux';
+export const CARGO_CROSS_LINT_REFUSAL = 'cargo-lint-cross is not cached for this tree; run: bun run check:linux';
 
-const CARGO_CROSS_LINT_GUARD = `command -v cargo-zigbuild >/dev/null || { echo '${CARGO_CROSS_LINT_REFUSAL}' >&2; exit 2; }`;
+/**
+ * Set to `1` by the managed pre-push probe, which asks Nx for the cross target's
+ * cached verdict and must never start the clippy itself. Nx hashes no
+ * environment a target does not declare, so the probe's key is the gate's.
+ */
+export const CARGO_CROSS_LINT_REPLAY_ONLY_ENV = 'SMOO_CROSS_LINT_REPLAY_ONLY';
+
+const CARGO_CROSS_LINT_MISSING_TOOL =
+  "cargo-lint-cross needs cargo-zigbuild, which every managed devenv shell carries; run it in the checkout's shell: bun run check:linux";
+
+const CARGO_CROSS_LINT_GUARD = `[ "\${${CARGO_CROSS_LINT_REPLAY_ONLY_ENV}:-}" != 1 ] || { echo '${CARGO_CROSS_LINT_REFUSAL}' >&2; exit 2; }; command -v cargo-zigbuild >/dev/null || { echo "${CARGO_CROSS_LINT_MISSING_TOOL}" >&2; exit 2; }`;
 
 /**
  * The prefix `cargoFrozen` writes. Exported so target inference can recognize
@@ -147,7 +148,7 @@ export const CARGO_DENY_WARNINGS = `--config 'build.warnings="deny"'`;
  * cross test target; it could only recompile these crates to produce a harness it
  * must then refuse to launch.
  *
- * `--target` is explicit rather than inherited from a CARGO_BUILD_TARGET exported
+ * `--target` is explicit rather than inherited from an ambient CARGO_BUILD_TARGET,
  * by the profile, so running this outside the cross shell fails loudly on the
  * missing cargo-zigbuild instead of quietly linting the host and reporting green.
  *
@@ -192,19 +193,15 @@ export const CROSS_CHECK_SCRIPT_NAME = 'check:linux';
 
 /**
  * The developer entry point: one command on macOS that reports what CI's Linux
- * job would. `tooling/devenv` is the managed wrapper, so this resolves the
- * repository's devenv config from any repo in the fleet without naming its path.
+ * job would. A plain Nx run, because every managed devenv shell carries the
+ * cross toolchain; the land gate's Nx graph holds the same target.
  *
  * Deliberately NOT `--quiet`. The pre-push gate is a probe: it consults the Nx
- * cache and refuses a push that has no hit, never entering a profile or starting
- * a compile of its own. That makes this script the only place the gate ever
- * runs, and a human watching it needs devenv's progress too — the cross profile
- * adds about 0.9 GiB (zig plus three rust-std targets) and the clippy behind it
- * is unbounded, so a silent terminal is indistinguishable from a hang.
- * Suppressing that output only paid while a hook ran this for you and nobody
- * read it.
+ * cache and refuses a push that has no hit, never starting a compile of its own.
+ * The clippy behind this script is unbounded, so a silent terminal is
+ * indistinguishable from a hang.
  */
-export const CROSS_CHECK_SCRIPT_COMMAND = `tooling/devenv -P ${DEVENV_CROSS_PROFILE} shell -- nx run-many -t ${CARGO_CROSS_LINT_TARGET}`;
+export const CROSS_CHECK_SCRIPT_COMMAND = `nx run-many -t ${CARGO_CROSS_LINT_TARGET}`;
 
 /**
  * A cross-built test archive and the target that EXECUTES it, per foreign

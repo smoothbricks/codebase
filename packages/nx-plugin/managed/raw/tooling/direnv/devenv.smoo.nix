@@ -95,13 +95,11 @@
     ln -s ${pkgs.python3Packages.pyflakes}/bin/pyflakes "$out/bin/pyflakes"
   '';
 
-  # Builds every Linux Rust artifact and the cross clippy; see
-  # `profiles.linux-cross` below for where it applies and why. zig itself is in
-  # the base shell (see `pkgs.zig` in `packages`). The rust-std set is every
-  # Linux triple an artifact ships for except x86_64-unknown-linux-gnu, which the
-  # base shell already carries.
+  # The Linux rust-std set every Linux Rust artifact ships for except
+  # x86_64-unknown-linux-gnu, which the base shell already carries; see
+  # `profiles.linux-cross` below for where it applies and why. zig and
+  # cargo-zigbuild are in the base shell (see `packages`).
   linuxToolchain = {
-    packages = [pkgs.cargo-zigbuild];
     languages.rust.targets = [
       "aarch64-unknown-linux-gnu"
       "x86_64-unknown-linux-musl"
@@ -270,35 +268,32 @@ in {
       ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxToolchain.languages.rust.targets;
   };
 
-  # The Linux Rust toolchain: cargo-zigbuild driving zig, plus the Linux
+  # The Linux Rust toolchain is cargo-zigbuild driving zig, plus the Linux
   # rust-std set. It builds every published Linux Rust artifact — static musl
-  # CLIs, glibc 2.17 N-API addons — and `check:linux`'s cross clippy, with the
+  # CLIs, glibc 2.17 N-API addons — and the `cargo-lint-cross` clippy, with the
   # same command on every host. zig carries glibc symbol-version stubs for every
   # glibc and the musl sources inside its own store path, so nothing on the
   # build machine reaches the artifact: no loader path, no RUNPATH, no build
   # host's glibc floor. cargo-zigbuild supplies the `zig cc` shims and per-triple
   # compiler variables itself, so this module sets no environment.
   #
-  # A Linux host carries it in the base shell, because its ordinary `build`
-  # includes its own platform's artifacts. A macOS host opts in through the
-  # `linux-cross` profile, activated by `devenv -P linux-cross` and driven by
-  # the root `check:linux` script: the three rust-std targets are about 0.5 GiB
-  # and nothing else on Darwin needs them. zig is not in the profile: every
-  # host's base shell carries it, because the scriptc-<arch>-<family> targets
-  # compile every platform's executables through `zig cc` on every host, the
-  # host's own platform included (see `pkgs.zig` in `packages` below). devenv
-  # 2.2.3 has first-class profiles, so this is one gated module in the shared
-  # file rather than a second config directory that would re-import and re-pin
-  # everything here.
+  # Every host's base shell carries zig, cargo-zigbuild and the
+  # x86_64-unknown-linux-gnu rust-std, which is all the cross clippy needs, so
+  # `cargo-lint-cross` runs in any checkout's shell and in the land gate's one Nx
+  # graph beside every other gate task. A Linux host also carries the remaining
+  # Linux rust-std set in the base shell, because its ordinary `build` includes
+  # its own platform's artifacts. A macOS host opts into that set through the
+  # `linux-cross` profile, activated by `devenv -P linux-cross`: the three
+  # rust-std targets are about 0.5 GiB and only a Linux artifact built on Darwin
+  # needs them. devenv 2.2.3 has first-class profiles, so this is one gated
+  # module in the shared file rather than a second config directory that would
+  # re-import and re-pin everything here.
   #
-  # The profile supplies the toolchain and nothing else. CARGO_BUILD_TARGET is
-  # deliberately NOT set: the triple belongs to the Nx target that asks for it
-  # (`cargo-lint-cross` passes `--target` explicitly), not to the ambient
-  # environment. An ambient triple would make the check silently host-local
-  # whenever the profile was forgotten — reporting green having compiled macOS.
-  # With the flag on the target instead, running it outside this profile fails
-  # loudly on the missing cargo-zigbuild, and a host lint can never be mistaken
-  # for a cross one.
+  # Neither shell sets CARGO_BUILD_TARGET: the triple belongs to the Nx target
+  # that asks for it (`cargo-lint-cross` passes `--target` explicitly), not to
+  # the ambient environment. An ambient triple would make the check silently
+  # host-local wherever it was missing, reporting green having compiled macOS,
+  # and a host lint can never be mistaken for a cross one.
   profiles.linux-cross.module = {
     config = lib.mkIf (!pkgs.stdenv.hostPlatform.isLinux) linuxToolchain;
   };
@@ -424,8 +419,13 @@ in {
       # on profiles below). The closure is about 380 MiB, fetched once per Nix
       # store, not per checkout.
       pkgs.zig
+      pkgs.zig
+      # Drives zig as the C compiler and linker of every Linux triple, for the
+      # Linux artifacts and for the `cargo-lint-cross` clippy, which therefore
+      # runs in every shell and in the land gate's Nx graph.
+      pkgs.cargo-zigbuild
     ]
-    ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux ([pkgs.chromium] ++ linuxToolchain.packages);
+    ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.chromium];
 
   # devenv wraps the Python interpreter to find native libraries in
   # `languages.python.libraries`, whose default is this checkout's

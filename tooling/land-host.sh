@@ -23,14 +23,14 @@
 #    A red names, for each task the gate failed, the commits of the land that change a file Nx hashes for it or for a
 #    task it waits for (tooling/land-attribution.ts); naming never changes the verdict. A red land's next attempt gates
 #    whole again, and Nx's cache replays every task whose inputs did not move.
-#    After the gate passes, `bun run check:linux` cross-lints the same tree for Linux: the pre-push hook refuses a
-#    tree whose Linux cross check is not cached, so a land that skipped it would leave main unpushable.
-#    The gate's graph also builds this host's production CLI and addon: the root gate target depends on
-#    cowshed:cli-native and cowshed:napi-native in their production configuration, so they build beside the rest of the
-#    gate and replay when their inputs did not move. After the cross check, the shipping guard runs
-#    cowshed:release-check on those dist bytes. It is dependency-free, cached on a digest of the bytes it judges, reports
-#    its wall time and refuses a red land.
-#    Once the wiring preflight, gate, Linux cross check and shipping guard all pass, each captured invocation's
+#    The gate's graph also cross-lints the same tree for Linux (cargo-lint-cross, which the root gate target depends
+#    on): the pre-push hook refuses a tree whose Linux cross check is not cached, so a land that skipped it would leave
+#    main unpushable. It builds this host's production CLI and addon as well: the root gate target depends on
+#    cowshed:cli-native and cowshed:napi-native in their production configuration. Both run beside the rest of the gate
+#    and replay when their inputs did not move. After the gate, the shipping guard runs cowshed:release-check on those
+#    dist bytes. It is dependency-free, cached on a digest of the bytes it judges, reports its wall time and refuses a
+#    red land.
+#    Once the wiring preflight, gate and shipping guard all pass, each captured invocation's
 #    succeeded results are published through smoo-nx-publish to the accepted Nx store. Sheds stay read-only.
 #    Hashes are captured before the next invocation overwrites its summary; a red publishes nothing.
 #    The cache never blocks a land: unreadable task hashes or a failed publish are said, and the land goes on.
@@ -210,22 +210,6 @@ gate_workspace() {
   # earlier invocation began is refused). The cache never blocks a land (05_gateway.md, "Publication"): hashes that
   # cannot be read are said, and the land goes on unpublished.
   capture_hashes 01-gate.json "$began" "the gate's"
-  gate_summary=$(cksum <"$checkout/.nx/cache/run.json" 2>/dev/null || :)
-  cross_began=$(date +%s)
-  say "cross-linting $head for Linux"
-  gate_job bun run check:linux >"$output" 2>&1 || {
-    linux_status=$?
-    replay_gate_output "$output"
-    say "Linux cross check exited $linux_status; the land stops; complete output: $output"
-    exit "$linux_status"
-  }
-  rm "$output"
-  # The pre-push hook asks Nx for cargo-lint-cross, the cross check's own run and not the gate's: main finds it cached
-  # by adopting this workspace's build volume, which a held target refuses, and a green land is then unpushable. When
-  # the cross check wrote a run summary of its own, its task hashes are read the way the gate's were and published too.
-  if [ "$(cksum <"$checkout/.nx/cache/run.json" 2>/dev/null || :)" != "$gate_summary" ]; then
-    capture_hashes 02-cross.json "$cross_began" "the Linux cross check's"
-  fi
   shipping_check_began=$(date +%s)
   say "checking the shipping CLI and addon bytes the gate built with cowshed:release-check"
   gate_job bun nx run cowshed:release-check --outputStyle=static-failures-only >&2 || {
@@ -233,7 +217,7 @@ gate_workspace() {
     say "shipping release-check exited $shipping_status after $(($(date +%s) - shipping_check_began))s; the land stops"
     exit "$shipping_status"
   }
-  capture_hashes 03-shipping-check.json "$shipping_check_began" "the shipping guard's"
+  capture_hashes 02-shipping-check.json "$shipping_check_began" "the shipping guard's"
   say "shipping verification: release-check $(($(date +%s) - shipping_check_began))s"
   # All checks passed; publication is a loud, nonblocking cache optimization.
   if [ -n "$hashes_dir" ]; then

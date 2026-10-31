@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import {
   CARGO_CROSS_LINT_COMMAND,
   CARGO_CROSS_LINT_REFUSAL,
+  CARGO_CROSS_LINT_REPLAY_ONLY_ENV,
   CARGO_CROSS_LINT_TARGET,
   CARGO_DENY_WARNINGS,
   CARGO_LINT_CLIPPY_COMMAND,
@@ -14,7 +15,6 @@ import {
   CROSS_CHECK_SCRIPT_COMMAND,
   CROSS_CHECK_SCRIPT_NAME,
   cargoFrozen,
-  DEVENV_CROSS_PROFILE,
   runsFrozenCargo,
 } from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
@@ -122,7 +122,7 @@ describe('Linux cross-check policy', () => {
   });
 
   it('refuses to start without cargo-zigbuild instead of compiling', async () => {
-    // Without this guard a cache miss outside the linux-cross toolchain would
+    // Without this guard a cache miss in a shell lacking the cross toolchain would
     // start a compile that cannot finish. Run for real against a PATH with no
     // cargo-zigbuild: it must refuse, name the fix, and never reach cargo.
     const child = Bun.spawn(['/bin/sh', '-c', CARGO_CROSS_LINT_COMMAND], {
@@ -139,6 +139,30 @@ describe('Linux cross-check policy', () => {
 
   it('prints the refusal the managed pre-push hook reads as a cache miss', () => {
     expect(CARGO_CROSS_LINT_COMMAND).toContain(`echo '${CARGO_CROSS_LINT_REFUSAL}' >&2; exit 2`);
+  });
+
+  it('refuses the replay-only probe on a miss, before cargo-zigbuild can start', async () => {
+    // The pre-push probe asks for a cached verdict only. Run for real with a
+    // cargo-zigbuild on PATH that records any start: it must never run, and the
+    // refusal must be the line the hook reads as a miss.
+    const bin = await mkdtemp(join(tmpdir(), 'cross-replay-'));
+    try {
+      const started = join(bin, 'started');
+      await writeFile(join(bin, 'cargo-zigbuild'), `#!/bin/sh\ntouch '${started}'\n`);
+      await chmod(join(bin, 'cargo-zigbuild'), 0o755);
+      const child = Bun.spawn(['/bin/sh', '-c', CARGO_CROSS_LINT_COMMAND], {
+        cwd: tmpdir(),
+        env: { PATH: `${bin}:/usr/bin:/bin`, [CARGO_CROSS_LINT_REPLAY_ONLY_ENV]: '1' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+      expect(exitCode).toBe(2);
+      expect(stderr.trim()).toBe(CARGO_CROSS_LINT_REFUSAL);
+      expect(await Bun.file(started).exists()).toBe(false);
+    } finally {
+      await rm(bin, { recursive: true, force: true });
+    }
   });
 
   it('carries the triple explicitly so a host lint cannot pass for a cross one', () => {
@@ -197,18 +221,13 @@ describe('Linux cross-check policy', () => {
     expect(runsFrozenCargo('cargo clippy --workspace')).toBe(false);
   });
 
-  it('drives the Nx target through the cross profile from the root script', () => {
+  it('runs the Nx target from the root script in the checkout shell', () => {
     expect(CROSS_CHECK_SCRIPT_NAME).toBe('check:linux');
-    // Activates the profile...
-    expect(CROSS_CHECK_SCRIPT_COMMAND).toContain(`-P ${DEVENV_CROSS_PROFILE}`);
-    // ...via the managed wrapper, so it resolves devenv config in any fleet repo...
-    expect(CROSS_CHECK_SCRIPT_COMMAND).toStartWith('tooling/devenv ');
-    // ...and runs Nx rather than cargo directly, so caching and project
-    // discovery stay Nx's job.
-    expect(CROSS_CHECK_SCRIPT_COMMAND).toContain(`nx run-many -t ${CARGO_CROSS_LINT_TARGET}`);
-    // The pre-push gate never enters the cross profile, so a human does — and
-    // devenv's own progress has to reach them, or a 0.9 GiB toolchain closure
-    // and an unbounded clippy are indistinguishable from a hang.
+    // Nx rather than cargo directly, so caching and project discovery stay Nx's
+    // job, and no profile: every managed shell carries the cross toolchain.
+    expect(CROSS_CHECK_SCRIPT_COMMAND).toBe(`nx run-many -t ${CARGO_CROSS_LINT_TARGET}`);
+    // The pre-push gate never compiles, so a human runs this, and an unbounded
+    // clippy must show its progress.
     expect(CROSS_CHECK_SCRIPT_COMMAND).not.toContain('--quiet');
   });
 });
@@ -246,7 +265,7 @@ describe('managed pre-push cross probe', () => {
       // Nx keys on the environment it runs in: outside the checkout's, it is not the gate's run.
       await stub(
         'nx',
-        `[ "$SDKROOT" = '${CHECKOUT_SDK}' ] || { echo "nx stub: keyed on the caller's SDKROOT $SDKROOT" >&2; exit 1; }\nprintf '%s\\n' "$NX_STUB_OUTPUT"; exit ${nxStatus}`,
+        `[ "$SDKROOT" = '${CHECKOUT_SDK}' ] || { echo "nx stub: keyed on the caller's SDKROOT $SDKROOT" >&2; exit 1; }\n[ "$${CARGO_CROSS_LINT_REPLAY_ONLY_ENV}" = 1 ] || { echo "nx stub: the probe would let the cross target compile" >&2; exit 1; }\nprintf '%s\\n' "$NX_STUB_OUTPUT"; exit ${nxStatus}`,
       );
       if (direnv) {
         // The checkout's .envrc: `direnv exec <checkout>` enters the environment that checkout declares.
