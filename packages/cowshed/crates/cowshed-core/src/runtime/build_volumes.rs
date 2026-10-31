@@ -6256,7 +6256,9 @@ fn main() {
 "#,
         )
         .unwrap();
-        let socket = source.join("writer.sock");
+        // Beside the package, not in it: a build script that declares no input watches its whole
+        // package, and a socket there has no contents a cache can key, so mbx bypassed the build.
+        let socket = source.with_file_name("writer.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let mut child = tokio::process::Command::new("cargo")
             .args(["build", "--offline", "--profile", profile])
