@@ -5,17 +5,17 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1793471137,
-        "narHash": "sha256-ro6zg4tX9LWn5BZPjuchgyzmR+jDrcKPgAJPV1oJp8Q=",
+        "lastModified": 1793481039,
+        "narHash": "sha256-kGuACFWPIzep+DfyqV/i29iYfMmtk4c97AxDu4UEYuQ=",
         "owner": "smoothbricks",
         "repo": "mr-boxington",
-        "rev": "0f1542efb017ed36d6018f08346d5eee7f779df7",
+        "rev": "6a1741803cce7974df1ac391092512c8433029d6",
         "type": "github"
       },
       "original": {
         "owner": "smoothbricks",
         "repo": "mr-boxington",
-        "rev": "0f1542efb017ed36d6018f08346d5eee7f779df7",
+        "rev": "6a1741803cce7974df1ac391092512c8433029d6",
         "type": "github"
       }
     },
