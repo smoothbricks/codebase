@@ -704,7 +704,9 @@ restored to its recorded link. A different live developer binding is kept as the
 attestation. A link that is absent with no observed install is reported as `developer-link-ambiguous` and stays absent.
 A covered install restores its snapshot exactly before it returns, so a relink made through a covered `bun`, `npm` or
 `pnpm` install is reverted. A relink made outside covered installs, by an absolute bypass or a command that is not an
-install, keeps its intent.
+install, keeps its intent. Neither puts back a link `smoo.developerLinks` made once the root manifest names its package
+no more, even when the job captured it while the manifest still did (the workspace's kept Nx daemon, say): the install
+that followed the dropped declaration keeps the version it installed.
 
 While such links exist, every shell entry and every install smoo runs prints one line naming them, such as
 `linked to local checkouts: @smoothbricks/lmao -> ~/src/smoothbricks/packages/lmao (12 links)`. Entries that install

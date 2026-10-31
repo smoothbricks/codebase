@@ -155,14 +155,18 @@ struct ReleasedLink {
     target: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DeveloperLink {
     at: PathBuf,
     target: PathBuf,
     binding: Binding,
+    /// The package `smoo.developerLinks` made this link for, when its receipt recorded this exact
+    /// text at capture and the manifest named that package: the link is the declaration's, and no
+    /// restore puts it back once the manifest names that package no more.
+    declaration: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Binding {
     Owned(PathBuf),
     Sibling(PathBuf),
@@ -241,7 +245,7 @@ impl DeveloperLinks {
         let volume = build_volume(&root)?;
         reads.path(&root.join(DECLARED_RECORD));
         reads.path(&root.join("package.json"));
-        let released = released_links(&root)?;
+        let receipts = declaration_receipts(&root)?;
         reads.packages(&root)?;
         let mut snapshot = Self {
             links: Vec::new(),
@@ -272,7 +276,7 @@ impl DeveloperLinks {
                         snapshot.capture_entry(
                             &root,
                             volume.as_deref(),
-                            &released,
+                            &receipts,
                             package,
                             mode,
                             reads,
@@ -282,7 +286,7 @@ impl DeveloperLinks {
                     snapshot.capture_entry(
                         &root,
                         volume.as_deref(),
-                        &released,
+                        &receipts,
                         entry,
                         mode,
                         reads,
@@ -332,14 +336,14 @@ impl DeveloperLinks {
 
     /// `volume` is the physical build volume `root` reaches through its build link: the checkout's
     /// own build state, declared state included, lives there (16_build_volumes.md), so a product
-    /// a contained link reaches through it is owned like one beneath `root`. `released` holds the
-    /// receipts of links the declaration no longer names; a link still spelled as its receipt
-    /// records is the declaration's own and is released rather than captured.
+    /// a contained link reaches through it is owned like one beneath `root`. `receipts` holds the
+    /// declaration's receipts: a link still spelled as its receipt records is the declaration's,
+    /// released rather than captured once the manifest no longer names its package.
     fn capture_entry(
         &mut self,
         root: &Path,
         volume: Option<&Path>,
-        released: &BTreeMap<PathBuf, PathBuf>,
+        receipts: &BTreeMap<PathBuf, Receipted>,
         entry: fs::DirEntry,
         mode: CaptureMode,
         reads: &mut Reads,
@@ -354,13 +358,17 @@ impl DeveloperLinks {
         }
         let target = fs::read_link(&at).map_err(|error| link_error(&at, error))?;
         let relative = at.strip_prefix(root).expect("the package tree is owned");
-        if released.get(relative) == Some(&target) {
+        let receipt = receipts
+            .get(relative)
+            .filter(|receipt| receipt.target == target);
+        if let Some(Receipted { declared: None, .. }) = receipt {
             self.released.push(ReleasedLink {
                 at: relative.to_owned(),
                 target,
             });
             return Ok(());
         }
+        let declaration = receipt.and_then(|receipt| receipt.declared.clone());
         let parent = relative.parent().expect("a package link has a parent");
         let resolved = crate::inherited_links::resolve_in_source(root, parent, &target);
         // Bun and pnpm's own package-store entries are installer state, not developer choices.
@@ -375,7 +383,7 @@ impl DeveloperLinks {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) if unreadable(&error, mode) => {
-                return self.push_unclassified(relative, target);
+                return self.push_unclassified(relative, target, declaration);
             }
             Err(error) => return Err(link_error(&at, error)),
         };
@@ -386,7 +394,7 @@ impl DeveloperLinks {
         let metadata = match fs::metadata(&canonical) {
             Ok(metadata) => metadata,
             Err(error) if unreadable(&error, mode) => {
-                return self.push_unclassified(relative, target);
+                return self.push_unclassified(relative, target, declaration);
             }
             Err(error) => return Err(link_error(&at, error)),
         };
@@ -408,6 +416,7 @@ impl DeveloperLinks {
         self.links.push(DeveloperLink {
             at: relative.to_owned(),
             target,
+            declaration,
             binding: if owned {
                 Binding::Owned(canonical)
             } else {
@@ -417,11 +426,17 @@ impl DeveloperLinks {
         Ok(())
     }
 
-    fn push_unclassified(&mut self, relative: &Path, target: PathBuf) -> Result<()> {
+    fn push_unclassified(
+        &mut self,
+        relative: &Path,
+        target: PathBuf,
+        declaration: Option<String>,
+    ) -> Result<()> {
         self.links.push(DeveloperLink {
             at: relative.to_owned(),
             target,
             binding: Binding::Unclassified,
+            declaration,
         });
         Ok(())
     }
@@ -467,6 +482,7 @@ impl DeveloperLinks {
                             .to_owned(),
                         target: fs::read_link(&at).map_err(|error| link_error(&at, error))?,
                         binding: Binding::Unclassified,
+                        declaration: None,
                     });
                     continue;
                 }
@@ -491,6 +507,7 @@ impl DeveloperLinks {
                         .to_owned(),
                     target: fs::read_link(&at).map_err(|error| link_error(&at, error))?,
                     binding: Binding::Executable(owner),
+                    declaration: None,
                 });
             }
         }
@@ -526,12 +543,44 @@ impl DeveloperLinks {
         if self.is_empty() {
             return Ok(Vec::new());
         }
+        // A link the declaration made is not put back once the manifest names its package no more:
+        // the install that followed the dropped declaration keeps what it installed, as for a link
+        // released before the snapshot was taken (15_capabilities.md, "Bootstrap executables").
+        // Such links leave before planning, so none of them can stop the others' restore. A
+        // manifest that cannot be read leaves every link as captured, and says why.
+        let mut findings = Vec::new();
+        let declared = if self.links.iter().any(|link| link.declaration.is_some()) {
+            match declared_packages(root) {
+                Ok(declared) => Some(declared),
+                Err(error) => {
+                    findings.push(format!("developer links are restored as captured: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let dropped = |link: &DeveloperLink| match (&declared, &link.declaration) {
+            (Some(declared), Some(package)) => !declared.contains(package),
+            _ => false,
+        };
+        let links: std::borrow::Cow<'_, [DeveloperLink]> = if self.links.iter().any(dropped) {
+            for link in self.links.iter().filter(|link| dropped(link)) {
+                say_unrestored(root, &link.at, &link.target)?;
+            }
+            self.links
+                .iter()
+                .filter(|link| !dropped(link))
+                .cloned()
+                .collect()
+        } else {
+            std::borrow::Cow::Borrowed(&self.links)
+        };
         // Phase one plans every link before any mutation, so alias and owner decisions read the
         // installer's pre-restore state.
-        let decisions = plan_links(root, &self.stores, &self.links, mode)?;
-        let mut findings = Vec::new();
+        let decisions = plan_links(root, &self.stores, &links, mode)?;
         let mut restores = Vec::new();
-        for (link, decision) in self.links.iter().zip(decisions) {
+        for (link, decision) in links.iter().zip(decisions) {
             match decision {
                 Plan::Keep => {}
                 Plan::Finding(message) => findings.push(message),
@@ -547,18 +596,24 @@ impl DeveloperLinks {
     /// released alias, so this reads the state the installer left.
     fn say_released(&self, root: &Path) -> Result<()> {
         for link in &self.released {
-            let at = root.join(&link.at);
-            let current = current_target(&at).map_err(|error| link_error(&at, error))?;
-            if current.as_deref() != Some(link.target.as_os_str().as_bytes()) {
-                cowshed_os::eprintln!(
-                    "cowshed: developer link {} -> {} is not restored: smoo.developerLinks no longer declares its package",
-                    link.at.display(),
-                    link.target.display()
-                );
-            }
+            say_unrestored(root, &link.at, &link.target)?;
         }
         Ok(())
     }
+}
+
+/// Names a declaration's link that is not restored, when the install left something else at it.
+fn say_unrestored(root: &Path, relative: &Path, target: &Path) -> Result<()> {
+    let at = root.join(relative);
+    let current = current_target(&at).map_err(|error| link_error(&at, error))?;
+    if current.as_deref() != Some(target.as_os_str().as_bytes()) {
+        cowshed_os::eprintln!(
+            "cowshed: developer link {} -> {} is not restored: smoo.developerLinks no longer declares its package",
+            relative.display(),
+            target.display()
+        );
+    }
+    Ok(())
 }
 
 fn link_error(path: &Path, error: impl std::fmt::Display) -> CowshedError {
@@ -697,11 +752,18 @@ struct Receipt {
     target: PathBuf,
 }
 
-/// The receipts of links `smoo.developerLinks` made and no longer names, by alias, each with the
-/// link text the declaration wrote: the same rule `keepDeveloperLinks` applies before an install
-/// (cli README, "Declared Links"). A checkout without receipts reads no manifest. Malformed
-/// ownership is an error, never no ownership, as in the managed script's `readDeclaredRecord`.
-fn released_links(root: &Path) -> Result<BTreeMap<PathBuf, PathBuf>> {
+/// A receipt's alias: the link text the declaration wrote, and the package it wrote it for while
+/// the root manifest's `smoo.developerLinks` names that package (`None` once it does not).
+struct Receipted {
+    target: PathBuf,
+    declared: Option<String>,
+}
+
+/// The receipts of links `smoo.developerLinks` made, by alias: the same ownership
+/// `keepDeveloperLinks` reads before an install (cli README, "Declared Links"). A checkout without
+/// receipts reads no manifest. Malformed ownership is an error, never no ownership, as in the
+/// managed script's `readDeclaredRecord`.
+fn declaration_receipts(root: &Path) -> Result<BTreeMap<PathBuf, Receipted>> {
     let record = root.join(DECLARED_RECORD);
     let bytes = match fs::read(&record) {
         Ok(bytes) => bytes,
@@ -713,38 +775,40 @@ fn released_links(root: &Path) -> Result<BTreeMap<PathBuf, PathBuf>> {
     if receipts.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let manifest = root.join("package.json");
-    let manifest_bytes = fs::read(&manifest).map_err(|error| link_error(&manifest, error))?;
-    let manifest_value: serde_json::Value =
-        serde_json::from_slice(&manifest_bytes).map_err(|error| link_error(&manifest, error))?;
-    let declared = match manifest_value
-        .get("smoo")
-        .and_then(|smoo| smoo.get("developerLinks"))
-    {
-        None => None,
-        Some(serde_json::Value::Object(declared)) => Some(declared),
-        Some(_) => {
-            return Err(link_error(
-                &manifest,
-                "smoo.developerLinks must map package names to checkout directories",
-            ));
-        }
-    };
-    let mut released = BTreeMap::new();
-    let mut seen = BTreeSet::new();
+    let declared = declared_packages(root)?;
+    let mut owned = BTreeMap::new();
     for Receipt { path, target } in receipts {
-        if !seen.insert(path.clone()) {
+        if owned.contains_key(Path::new(&path)) {
             return Err(link_error(&record, format!("duplicate receipt for {path}")));
         }
         // The package an alias stands for in its tree: `name` or `@scope/name`.
         let package = path
             .rsplit_once("node_modules/")
             .map_or(path.as_str(), |(_, package)| package);
-        if declared.is_none_or(|declared| !declared.contains_key(package)) {
-            released.insert(PathBuf::from(path), target);
-        }
+        let declared = declared.contains(package).then(|| package.to_owned());
+        owned.insert(PathBuf::from(&path), Receipted { target, declared });
     }
-    Ok(released)
+    Ok(owned)
+}
+
+/// The packages the root manifest's `smoo.developerLinks` names. A malformed declaration is an
+/// error, as in the managed script's `readDeclaredLinks`.
+fn declared_packages(root: &Path) -> Result<BTreeSet<String>> {
+    let manifest = root.join("package.json");
+    let bytes = fs::read(&manifest).map_err(|error| link_error(&manifest, error))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| link_error(&manifest, error))?;
+    match value
+        .get("smoo")
+        .and_then(|smoo| smoo.get("developerLinks"))
+    {
+        None => Ok(BTreeSet::new()),
+        Some(serde_json::Value::Object(declared)) => Ok(declared.keys().cloned().collect()),
+        Some(_) => Err(link_error(
+            &manifest,
+            "smoo.developerLinks must map package names to checkout directories",
+        )),
+    }
 }
 
 /// The installer's own entries: a link into the checkout's own `.bun`/`.pnpm`, or into a shared
@@ -1906,6 +1970,101 @@ mod tests {
     }
 
     #[test]
+    fn a_link_its_declaration_stops_naming_during_a_job_is_not_restored_at_its_end() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-dropped-declaration");
+        let root = scratch.join("checkout");
+        fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
+        fs::create_dir_all(root.join("node_modules/.bun/registry/pkg")).unwrap();
+        let provider = scratch.join("provider");
+        fs::create_dir_all(&provider).unwrap();
+        let declares = "{\"smoo\":{\"developerLinks\":{\"@scope/lib\":\"../provider\"}}}\n";
+        fs::write(root.join("package.json"), declares).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status_bounded()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "package.json"])
+                .current_dir(&root)
+                .status_bounded()
+                .unwrap()
+                .success()
+        );
+        let alias = root.join("node_modules/@scope/lib");
+        let receipt = format!(
+            "[{{\"path\":\"node_modules/@scope/lib\",\"declaration\":\"../provider\",\"target\":\"{}\"}}]\n",
+            provider.display()
+        );
+        let installed = Path::new("../.bun/registry/pkg");
+        // A job admitted while the manifest declares the link keeps it as the declaration's.
+        let declared = || {
+            fs::write(root.join(DECLARED_RECORD), &receipt).unwrap();
+            let _ = fs::remove_file(&alias);
+            symlink(&provider, &alias).unwrap();
+            let job = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap();
+            assert_eq!(job.links.len(), 1);
+            job
+        };
+        // The install that follows the dropped declaration removes its receipt and leaves the
+        // version it installs, as keepDeveloperLinks does.
+        let install = || {
+            fs::remove_file(root.join(DECLARED_RECORD)).unwrap();
+            fs::remove_file(&alias).unwrap();
+            symlink(installed, &alias).unwrap();
+        };
+        let job = declared();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        install();
+        job.restore(&root, RestoreMode::JobTerminal).unwrap();
+        assert_eq!(fs::read_link(&alias).unwrap(), installed);
+        // While the manifest still declares it, the same end restores the link.
+        fs::write(root.join("package.json"), declares).unwrap();
+        let job = declared();
+        install();
+        job.restore(&root, RestoreMode::JobTerminal).unwrap();
+        assert_eq!(fs::read_link(&alias).unwrap(), provider);
+    }
+
+    /// A link a sandboxed capture could not read keeps its declaration, so dropping the
+    /// declaration leaves it unrestored too; while the manifest names it, it is restored.
+    #[test]
+    fn an_unreadable_declared_link_is_not_restored_once_its_declaration_is_dropped() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-unreadable-declared");
+        let root = scratch.join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        let target = scratch.join("opaque");
+        let alias = root.join("node_modules/@scope/opaque");
+        let links = DeveloperLinks {
+            links: vec![DeveloperLink {
+                at: PathBuf::from("node_modules/@scope/opaque"),
+                target: target.clone(),
+                binding: Binding::Unclassified,
+                declaration: Some("@scope/opaque".to_owned()),
+            }],
+            released: Vec::new(),
+            stores: PackageStores::default(),
+            holders: None,
+        };
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        links.restore(&root, RestoreMode::CoveredInstall).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&alias).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::write(
+            root.join("package.json"),
+            "{\"smoo\":{\"developerLinks\":{\"@scope/opaque\":\"../opaque\"}}}\n",
+        )
+        .unwrap();
+        links.restore(&root, RestoreMode::CoveredInstall).unwrap();
+        assert_eq!(fs::read_link(&alias).unwrap(), target);
+    }
+    #[test]
     fn unreadable_targets_are_unclassified_only_for_jobs_and_restorable_without_grants() {
         assert!(unreadable(
             &io::Error::from_raw_os_error(libc::EPERM),
@@ -1932,6 +2091,7 @@ mod tests {
                 at: PathBuf::from("node_modules/@scope/opaque"),
                 target: target.clone(),
                 binding: Binding::Unclassified,
+                declaration: None,
             }],
             released: Vec::new(),
             stores: PackageStores::default(),
@@ -2152,6 +2312,7 @@ mod tests {
                     at: PathBuf::from(at),
                     target: target.clone(),
                     binding: Binding::Unclassified,
+                    declaration: None,
                 })
                 .collect(),
             released: Vec::new(),
@@ -2710,6 +2871,7 @@ mod tests {
                 at,
                 target,
                 binding: Binding::Unclassified,
+                declaration: None,
             });
         }
         DeveloperLinks {
@@ -2734,6 +2896,7 @@ mod tests {
             at: PathBuf::from("node_modules/absent-parent/link"),
             target: PathBuf::from("../../product"),
             binding: Binding::Unclassified,
+            declaration: None,
         });
         snapshot
             .links

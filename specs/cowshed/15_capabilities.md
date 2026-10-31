@@ -321,7 +321,13 @@ Each detector returns data through one `CapabilityContribution`:
   names, one whose text still matches its `node_modules/.smoo-declared-links` receipt while the root manifest's
   `smoo.developerLinks` no longer names its package, is the declaration's and not a developer link
   (packages/cli/README.md, "Declared Links"): no snapshot captures it, so neither the wrapper nor terminal cleanup
-  restores it, the install leaves the version it installs, and the wrapper names it on stderr.
+  restores it, the install leaves the version it installs, and the wrapper names it on stderr. A snapshot taken while
+  the manifest still named the package keeps such a link as the declaration's, its declaration kept even when the
+  capture could not read the link's target, and a restore that finds the manifest naming that package no more leaves
+  what the install put there and names it the same way, before it plans any other link. A dropped declaration so sticks
+  under a job admitted before the drop too, such as the workspace's kept Nx daemon, whose end once put the provider
+  links back as receipt-less links every later install kept. A restore that cannot read the manifest restores every link
+  as captured and says so as a finding.
 
   The supervisor uses the same snapshot/restore implementation at job admission and terminal cleanup, including failed
   or killed installs. Its admission snapshot is a kept reading (11_shell.md, "Kept readings"): an admission whose
