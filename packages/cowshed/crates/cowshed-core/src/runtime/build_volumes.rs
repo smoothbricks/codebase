@@ -6253,15 +6253,33 @@ fn main() {
         stream.read_exact(&mut ready).await.unwrap();
         assert_eq!(ready, *b"R");
         let [pid, executable, makeflags, tokens] = fields;
-        let pid: libc::pid_t = pid.parse().expect("the build script's actual parent PID");
-        assert!(pid > 0, "the actual Cargo PID is positive");
-        let arguments = cowshed_os::process::process_arguments(pid)
-            .expect("the kernel names the build script's live Cargo parent");
-        let kernel_executable = PathBuf::from(OsString::from_vec(arguments.executable));
+        let parent: libc::pid_t = pid.parse().expect("the build script's actual parent PID");
+        assert!(parent > 0, "the build script's parent PID is positive");
         let cargo = PathBuf::from(executable)
             .canonicalize()
             .expect("the build script's CARGO");
-        assert_eq!(kernel_executable.canonicalize().unwrap(), cargo);
+        // A build-script wrapper (mbx's cache shim under a gate) may sit between Cargo and its build
+        // script: the live Cargo is the nearest ancestor whose kernel executable is the build's CARGO.
+        let mut pid = parent;
+        let mut seen = Vec::new();
+        let arguments = loop {
+            let arguments = cowshed_os::process::process_arguments(pid)
+                .expect("the kernel names each live ancestor of the build script");
+            let kernel_executable = PathBuf::from(OsString::from_vec(arguments.executable.clone()));
+            if kernel_executable.canonicalize().unwrap() == cargo {
+                break arguments;
+            }
+            seen.push(kernel_executable);
+            assert!(
+                seen.len() < 4,
+                "no ancestor of the build script runs its CARGO {}: {seen:?}",
+                cargo.display()
+            );
+            pid = cowshed_os::process::lineage(pid)
+                .expect("read the ancestor's lineage")
+                .expect("the ancestor is live")
+                .ppid;
+        };
         assert_eq!(cargo.file_name().unwrap(), "cargo");
         assert!(
             arguments.argv.windows(4).any(|args| {
