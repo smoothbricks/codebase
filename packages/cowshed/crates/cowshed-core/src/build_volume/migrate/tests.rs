@@ -1014,6 +1014,46 @@ fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
     assert!(scratch.volume().join("declared/vendor/upstream").is_dir());
 }
 
+/// A declared path linked over what the volume holds has its parents checked like a
+/// capability's: a parent that is a symlink out of the checkout refuses in preflight, before
+/// the refresh moves any other path's directory aside.
+#[test]
+fn a_held_declared_path_under_a_symlinked_parent_refuses_before_any_path_changes() {
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    link::point(&checkout, &scratch.volume()).unwrap();
+    write(&checkout, "target/old", "a tool's own state");
+    let elsewhere = scratch.0.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, checkout.join("vendor")).unwrap();
+    let held = scratch.volume().join("declared/vendor/upstream");
+    fs::create_dir_all(&held).unwrap();
+    fs::write(held.join("build.ninja"), "made by a tool").unwrap();
+    let paths = vec![
+        BuildStatePath::new("target", "target").unwrap(),
+        BuildStatePath::declared("vendor/upstream").unwrap(),
+    ];
+    assert!(
+        adopt_paths(
+            &crate::census::this_test(),
+            &checkout,
+            &scratch.volume(),
+            &paths,
+            &paths,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("target/old")).unwrap(),
+        "a tool's own state",
+        "no other path changed"
+    );
+    assert!(
+        fs::read_dir(&elsewhere).unwrap().next().is_none(),
+        "nothing was linked through the symlink"
+    );
+}
 /// A land hands main the gate's build volume, declared state included, while the gate's links
 /// stayed in its retired source image: main, and every fork of it, holds `declared/<path>` with
 /// nothing at the path. A traced run then made a real directory there (lmao creates its sink's
@@ -1222,7 +1262,11 @@ fn every_tool_and_occupant() -> Vec<(BuildStateTool, Occupant)> {
     let listed = |tool: BuildStateTool, occupant: Occupant| {
         let (BuildStateTool::Cargo | Nx | Declared | JavaScript) = tool;
         match occupant {
-            Occupant::Absent(link::VolumeHolds::Directory | link::VolumeHolds::Nothing)
+            Occupant::Absent(
+                link::VolumeHolds::Directory
+                | link::VolumeHolds::EmptyDirectory
+                | link::VolumeHolds::Nothing,
+            )
             | Occupant::FixedLink
             | Occupant::ForeignLink
             | Occupant::EmptyDirectory
@@ -1236,6 +1280,7 @@ fn every_tool_and_occupant() -> Vec<(BuildStateTool, Occupant)> {
             [
                 Occupant::Absent(link::VolumeHolds::Directory),
                 Occupant::Absent(link::VolumeHolds::Nothing),
+                Occupant::Absent(link::VolumeHolds::EmptyDirectory),
                 Occupant::FixedLink,
                 Occupant::ForeignLink,
                 Occupant::EmptyDirectory,
@@ -1279,7 +1324,13 @@ fn the_decision_deletes_nothing_cowshed_cannot_rebuild() {
         );
         assert_eq!(
             action == Action::LeaveAbsent,
-            declared && occupant == Occupant::Absent(link::VolumeHolds::Nothing),
+            declared
+                && matches!(
+                    occupant,
+                    Occupant::Absent(
+                        link::VolumeHolds::Nothing | link::VolumeHolds::EmptyDirectory
+                    )
+                ),
             "{case}"
         );
         assert_eq!(
@@ -1290,7 +1341,7 @@ fn the_decision_deletes_nothing_cowshed_cannot_rebuild() {
         assert_eq!(
             action == Action::Link,
             occupant == Occupant::Absent(link::VolumeHolds::Directory)
-                || (!declared && occupant == Occupant::Absent(link::VolumeHolds::Nothing)),
+                || (!declared && matches!(occupant, Occupant::Absent(_))),
             "{case}"
         );
     }
@@ -1368,6 +1419,9 @@ mod property {
         /// Nothing at the path, and a volume directory holding a file: what a land or a fork
         /// leaves where this checkout never linked.
         Held,
+        /// Nothing at the path, and an empty volume directory: what a refresh made with a link
+        /// no tool wrote through.
+        HeldEmpty,
         /// The path's own link, onto a volume directory that holds a file or is missing.
         FixedLink {
             dangling: bool,
@@ -1388,6 +1442,7 @@ mod property {
         prop_oneof![
             3 => Just(Planted::Absent),
             1 => Just(Planted::Held),
+            1 => Just(Planted::HeldEmpty),
             3 => any::<bool>().prop_map(|dangling| Planted::FixedLink { dangling }),
             1 => any::<bool>().prop_map(|dangling| Planted::ForeignLink { dangling }),
             2 => Just(Planted::EmptyDirectory),
@@ -1429,7 +1484,10 @@ mod property {
     fn plant(checkout: &Path, volume: &Path, state: &BuildStatePath, planted: &Planted) {
         let path = state.checkout.as_path();
         let at = checkout.join(path);
-        if !matches!(planted, Planted::Absent | Planted::Held) {
+        if !matches!(
+            planted,
+            Planted::Absent | Planted::Held | Planted::HeldEmpty
+        ) {
             fs::create_dir_all(at.parent().unwrap()).unwrap();
         }
         match planted {
@@ -1439,6 +1497,7 @@ mod property {
                 fs::create_dir_all(&directory).unwrap();
                 fs::write(directory.join("warm"), planted_bytes(path, 98, b"warm")).unwrap();
             }
+            Planted::HeldEmpty => fs::create_dir_all(volume.join(state.volume.as_path())).unwrap(),
             Planted::FixedLink { dangling } => {
                 std::os::unix::fs::symlink(
                     link::relative_target(path, state.volume.as_path()),
@@ -1507,8 +1566,9 @@ mod property {
 
     /// A refresh never deletes user data. Every file and link outside a tool's own cache
     /// directory is still in the checkout afterwards, byte for byte; a file or a foreign link at
-    /// any path refuses before any path changes; otherwise every path but an unoccupied, unheld declared
-    /// one is its fixed link, and each declared directory's files are where the refresh says it
+    /// any path refuses before any path changes; otherwise every path but an unoccupied declared
+    /// one whose volume directory holds no entry is its fixed link, and each declared directory's
+    /// files are where the refresh says it
     /// kept them. Every case's checkout is a fresh directory of one Git repository, made once:
     /// a Git process costs seconds on a loaded macOS host, and the tracked-source guard needs one.
     #[test]
@@ -1569,7 +1629,7 @@ mod property {
             }
             for (state, planted) in paths.iter().zip(&planted) {
                 let path = state.checkout.as_path();
-                if state.is_declared() && matches!(planted, Planted::Absent) {
+                if state.is_declared() && matches!(planted, Planted::Absent | Planted::HeldEmpty) {
                     prop_assert!(
                         fs::symlink_metadata(checkout.join(path)).is_err(),
                         "{} stays absent",

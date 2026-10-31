@@ -78,8 +78,8 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         beside,
         registration,
     } = migration;
-    // Decided before the volume is minted or mounted: what it holds behind a declared path is
-    // linked by the refresh after this first touch, which observes the mounted volume.
+    // Decided before the volume is mounted: a minted volume holds nothing, and an interrupted
+    // first touch's holds a declared directory only behind the link it made.
     let plan = preflight(checkout, None, paths)?;
     if let Some(refusal) = tracked_source(checkout, &plan.removed())? {
         return Ok(Err(refusal));
@@ -297,17 +297,12 @@ fn discard_origin(
     if !held.iter().any(|path| path.checkout == state.checkout) {
         return Ok(DiscardOrigin::Predated);
     }
-    let directory = volume_root.join(state.volume.as_path());
-    match fs::symlink_metadata(&directory) {
-        Ok(metadata) if metadata.is_dir() => Ok(DiscardOrigin::Displaced),
-        Ok(_) => Ok(DiscardOrigin::Predated),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DiscardOrigin::Predated),
-        Err(error) => Err(io_error(
-            "inspect build-state volume directory",
-            &directory,
-            error,
-        )),
-    }
+    Ok(match behind(Some(volume_root), state)? {
+        link::VolumeHolds::Nothing => DiscardOrigin::Predated,
+        link::VolumeHolds::EmptyDirectory | link::VolumeHolds::Directory => {
+            DiscardOrigin::Displaced
+        }
+    })
 }
 
 /// What a refresh finds at one build-state path, observed before it changes any.
@@ -366,7 +361,10 @@ pub const fn decide(
 ) -> std::result::Result<Action, Refuse> {
     match occupant {
         Occupant::Absent(holds) => Ok(match (tool, holds) {
-            (BuildStateTool::Declared, link::VolumeHolds::Nothing) => Action::LeaveAbsent,
+            (
+                BuildStateTool::Declared,
+                link::VolumeHolds::Nothing | link::VolumeHolds::EmptyDirectory,
+            ) => Action::LeaveAbsent,
             (BuildStateTool::Declared, link::VolumeHolds::Directory)
             | (BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript, _) => {
                 Action::Link
@@ -421,7 +419,7 @@ impl<'a> Plan<'a> {
 }
 
 /// Observe and decide every path. `volume_root` is the mounted build volume the links name; a
-/// first touch decides before it mints or mounts one and passes none.
+/// first touch decides before it mounts one and passes none.
 fn preflight<'a>(
     checkout: &Path,
     volume_root: Option<&Path>,
@@ -451,8 +449,9 @@ fn preflight<'a>(
 
 /// What is at `state`'s path in `checkout`, and behind an absent one, what the volume at
 /// `volume_root` holds ([`behind`]). A declared path is looked at before
-/// [`link::contained_parent`], which makes missing parents: an absent declared path makes
-/// nothing, its parents included.
+/// [`link::contained_parent`], which checks and makes missing parents: a declared path the
+/// refresh leaves absent makes nothing, its parents included, and one it links over the
+/// volume's directory has its parents checked and made like a capability's.
 fn observe(
     checkout: &Path,
     volume_root: Option<&Path>,
@@ -462,7 +461,10 @@ fn observe(
         let at = checkout.join(state.checkout.as_path());
         match fs::symlink_metadata(&at) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return behind(volume_root, state).map(Occupant::Absent);
+                let holds = behind(volume_root, state)?;
+                if holds != link::VolumeHolds::Directory {
+                    return Ok(Occupant::Absent(holds));
+                }
             }
             Err(error) => return Err(io_error("inspect build state", &at, error)),
             Ok(_) => {}
@@ -509,8 +511,8 @@ fn observe(
 }
 
 /// What the volume at `volume_root` holds behind an absent path. A first touch observes before
-/// any volume is mounted: nothing there is linked by it, and the refresh after it observes the
-/// mounted volume.
+/// its volume is mounted: a minted volume holds nothing, and an interrupted first touch's holds
+/// a declared directory only behind the link it made, which [`observe`] finds as that link.
 fn behind(volume_root: Option<&Path>, state: &BuildStatePath) -> Result<link::VolumeHolds> {
     let Some(volume_root) = volume_root else {
         return Ok(link::VolumeHolds::Nothing);

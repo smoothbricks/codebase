@@ -140,8 +140,9 @@ pub fn settled(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> bool
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Unsettled {
     /// Nothing is there, where a link belongs: a tool removed it, and its next run makes a
-    /// directory in its place; or a declared path whose directory the volume holds, which this
-    /// checkout never linked (a fork of main, or main after a land).
+    /// directory in its place; or a declared path whose volume directory holds entries and whose
+    /// link this checkout lacks: never made here (a fork of main, main after a land) or removed
+    /// by a tool.
     Missing,
     /// A real directory displaced the link: a tool removed it and wrote there since, off the
     /// volume.
@@ -180,7 +181,10 @@ pub fn unsettled(
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     // An unreadable volume directory is unsettled: the refresh reports it.
                     (!state.is_declared()
-                        || !matches!(volume_holds(volume, state), Ok(VolumeHolds::Nothing)))
+                        || !matches!(
+                            volume_holds(volume, state),
+                            Ok(VolumeHolds::Nothing | VolumeHolds::EmptyDirectory)
+                        ))
                     .then_some(Unsettled::Missing)
                 }
                 Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -210,9 +214,12 @@ pub fn is_fixed_link(checkout: &Path, state: &BuildStatePath) -> bool {
 /// What the build volume holds at a build-state path's volume directory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VolumeHolds {
-    /// A real directory: state a tool made through the path's link, in this checkout or in one
-    /// whose volume this checkout cloned or adopted.
+    /// A real directory with entries: state a tool wrote through the path's link, in this
+    /// checkout or in one whose volume this checkout cloned or adopted.
     Directory,
+    /// A real directory with no entry: a refresh makes one with every link it makes, so it says
+    /// nothing a tool made.
+    EmptyDirectory,
     /// Nothing, or something other than a real directory.
     Nothing,
 }
@@ -220,8 +227,13 @@ pub enum VolumeHolds {
 /// What the volume mounted at `volume` holds at `state`'s volume directory, never following a
 /// link there. Reads only.
 pub(crate) fn volume_holds(volume: &Path, state: &BuildStatePath) -> io::Result<VolumeHolds> {
-    match fs::symlink_metadata(volume.join(state.volume.as_path())) {
-        Ok(metadata) if metadata.is_dir() => Ok(VolumeHolds::Directory),
+    let directory = volume.join(state.volume.as_path());
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => match fs::read_dir(&directory)?.next() {
+            None => Ok(VolumeHolds::EmptyDirectory),
+            Some(Ok(_)) => Ok(VolumeHolds::Directory),
+            Some(Err(error)) => Err(error),
+        },
         Ok(_) => Ok(VolumeHolds::Nothing),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(VolumeHolds::Nothing),
         Err(error) => Err(error),
@@ -585,11 +597,24 @@ mod tests {
         fs::remove_dir_all(checkout.join("upstream")).unwrap();
 
         fs::create_dir_all(volume.join("declared/upstream/build")).unwrap();
+        assert!(
+            settled(&checkout, &volume, &paths),
+            "an empty volume directory is no tool's state"
+        );
+        fs::write(volume.join("declared/upstream/build/state"), b"made").unwrap();
         assert_eq!(
             unsettled(&checkout, &volume, &paths),
             [(PathBuf::from("upstream/build"), Unsettled::Missing)],
             "a declared path the volume holds is linked by the refresh"
         );
+        let mode = |mode| <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode);
+        fs::set_permissions(volume.join("declared/upstream"), mode(0o000)).unwrap();
+        assert_eq!(
+            unsettled(&checkout, &volume, &paths),
+            [(PathBuf::from("upstream/build"), Unsettled::Missing)],
+            "an unreadable volume directory is left to the refresh, which reports it"
+        );
+        fs::set_permissions(volume.join("declared/upstream"), mode(0o755)).unwrap();
         fs::remove_dir_all(volume.join("declared")).unwrap();
 
         fs::remove_file(checkout.join("target")).unwrap();
