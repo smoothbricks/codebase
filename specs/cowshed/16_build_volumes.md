@@ -535,10 +535,11 @@ seed mark instead of taking a second exclusive claim.
 A first touch borrows its creation's claim the same way. A checkout's first build volume, main's minted beside its image
 by `cowshed adopt` or one the first touch mints itself, is created under an exclusive claim on its `<id>.dmg.hold`
 rather than a shared creation hold. The first touch captures the checkout's seed (warm, or mbx-retained) under that
-claim and lets it go once the seed is published. Letting the creation's hold go and then claiming the volume again would
-race the hold's own descriptor: a transient kernel copy of it from another thread's spawn (cowshed-os `fork_lock`) keeps
-the lock past its close, the second claim finds the volume held, and once the copy closes no census can name a holder
-("in use, but no process of this user holds" it).
+claim and lets it go once the seed is published. Re-adoption of a missing main publishes main's empty build volume the
+same way: created under its own claim, and the replacement incarnation's seed captured under it. Letting the creation's
+hold go and then claiming the volume again would race the hold's own descriptor: a transient kernel copy of it from
+another thread's spawn (cowshed-os `fork_lock`) keeps the lock past its close, the second claim finds the volume held,
+and once the copy closes no census can name a holder ("in use, but no process of this user holds" it).
 
 - **First-touch claim enforced by**: a directory-host test in which a spawn's child keeps a copy of every descriptor,
   the creation's claim included, across main's first touch, which still seeds main.

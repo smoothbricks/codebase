@@ -831,6 +831,10 @@ impl Lent {
                         .as_ref()
                         .is_some_and(|minted| minted.volume.id == touched.id)
                 {
+                    debug_assert!(
+                        touched.creation.is_none(),
+                        "a first touch that mints its own volume mints it under a fresh id"
+                    );
                     touched.creation = held.take().map(|minted| minted.claim);
                 }
                 Ok(touched)

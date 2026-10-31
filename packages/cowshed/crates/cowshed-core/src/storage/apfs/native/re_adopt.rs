@@ -422,7 +422,7 @@ where
     /// image"): its recorded owner record registered under the recorded id before an empty RAW
     /// volume is minted there at the recorded capacity, mounted where main's build link points,
     /// and published, then one seed of it for the replacement incarnation, filtered under mbx and
-    /// otherwise captured under `seed`'s claim. Converges from an attempt interrupted after registration, whether or not
+    /// otherwise captured under `seed`'s claim, or, for a volume minted here, under the claim it was created under. Converges from an attempt interrupted after registration, whether or not
     /// the image was minted. An image without an owner record, an image holding another record,
     /// or another record that names no image refuses: nothing is published over any of them.
     fn publish_empty_build(
