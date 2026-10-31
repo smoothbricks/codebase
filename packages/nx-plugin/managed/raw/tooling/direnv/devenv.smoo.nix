@@ -254,8 +254,8 @@ in {
     # type-check the arm CI compiles. rust-std alone reaches every crate whose
     # dependency graph is pure Rust; a dependency that compiles C for the target
     # — ring, openssl-sys, libgit2-sys, libz-sys — additionally needs a C
-    # compiler for the target, which is zig in the `linux-cross` toolchain
-    # below, kept off every macOS shell and macOS runner.
+    # compiler for the target: zig, driven by cargo-zigbuild, both in every
+    # shell (see `packages` below).
     #
     # The reverse direction is not available at any price: type-checking an Apple
     # target from Linux needs an Apple SDK for those same C-building
@@ -418,7 +418,6 @@ in {
       # commits in a plain `devenv shell`, which passes no profile (see the note
       # on profiles below). The closure is about 380 MiB, fetched once per Nix
       # store, not per checkout.
-      pkgs.zig
       pkgs.zig
       # Drives zig as the C compiler and linker of every Linux triple, for the
       # Linux artifacts and for the `cargo-lint-cross` clippy, which therefore

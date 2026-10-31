@@ -149,8 +149,8 @@ export const CARGO_DENY_WARNINGS = `--config 'build.warnings="deny"'`;
  * must then refuse to launch.
  *
  * `--target` is explicit rather than inherited from an ambient CARGO_BUILD_TARGET,
- * by the profile, so running this outside the cross shell fails loudly on the
- * missing cargo-zigbuild instead of quietly linting the host and reporting green.
+ * so the triple belongs to this target and a host lint can never pass for a cross
+ * one.
  *
  * cargo-zigbuild rather than plain cargo because ring compiles C for the target
  * from its build script, and build scripts run even under clippy: zig is the

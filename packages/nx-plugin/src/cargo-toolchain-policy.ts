@@ -22,8 +22,8 @@ import { runtimeInput, shellWord } from './runtime-input.js';
  * differs between a bare shell and a devenv profile for the SAME sources: in
  * the `linux-cross` profile `CARGO_INSTALL_ROOT` moves under
  * `profiles/linux-cross/`, and every variable the profile's tools set appears,
- * so the entry `check:linux` writes inside the profile could never be hit by
- * the pre-push probe, which runs bare. Measured on one repository-root archive
+ * so an entry written inside the profile could never be hit from a bare shell (the
+ * pre-push probe ran bare while `check:linux` ran in the profile). Measured on one repository-root archive
  * target with the dump still in place: bare 18197306115812424011, in-profile
  * 12567954759860890767.
  *

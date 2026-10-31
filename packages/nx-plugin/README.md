@@ -406,13 +406,13 @@ sources are not hashed instead: the managed module alone changed 43 times in the
 would have rekeyed every cargo verdict; evaluated at those commits on Linux x86_64, the observed store objects did not
 change. rustc and cargo are not in the list on purpose. Cargo keys units on the output of rustc's version command, which
 is hashed beside this input, never on rustc's path. On a non-Linux host the default shell and its linux-cross profile
-carry different rust-std sets, so that path would split the pre-push probe from the cached cross-check verdict. Only a
-path in the Nix store counts; a path elsewhere is ignored. A linker named only by Cargo configuration is outside this
-environment probe: a target that runs one must name the script itself as an input. Workspace test runners additionally
-hash the manifest of every package the workspace build compiles inside the Nx workspace (a member's, and a path
-package's that reaches the build only as some crate's dev-dependency), because those affect unified features, and the
-nextest executable/configuration. While the build compiles a path package outside the Nx workspace, every runner also
-names externalRustCrates, which then must be declared: a runner's key does not follow the test build's outputs.
+carry different rust-std sets, so that path would split one target's key between the two shells. Only a path in the Nix
+store counts; a path elsewhere is ignored. A linker named only by Cargo configuration is outside this environment probe:
+a target that runs one must name the script itself as an input. Workspace test runners additionally hash the manifest of
+every package the workspace build compiles inside the Nx workspace (a member's, and a path package's that reaches the
+build only as some crate's dev-dependency), because those affect unified features, and the nextest
+executable/configuration. While the build compiles a path package outside the Nx workspace, every runner also names
+externalRustCrates, which then must be declared: a runner's key does not follow the test build's outputs.
 
 Nothing machine-local takes part. The ambient cargo environment as a whole and the global `$CARGO_HOME/config.toml` are
 deliberately not hashed: their values carry per-checkout state directories (`CARGO_INSTALL_ROOT` moves under the active

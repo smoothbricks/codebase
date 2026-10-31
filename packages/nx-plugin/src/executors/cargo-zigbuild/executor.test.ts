@@ -10,6 +10,7 @@ import {
   buildInputsOf,
   cargoTriple,
   depInfoPath,
+  missingRustStdRemedy,
   publishArtifact,
   type ZigbuildArtifact,
   zigbuildArgs,
@@ -89,6 +90,17 @@ describe('cargo-zigbuild executor', () => {
   it('names the bare triple cargo sees under a glibc suffix', () => {
     expect(cargoTriple('x86_64-unknown-linux-gnu.2.17')).toBe('x86_64-unknown-linux-gnu');
     expect(cargoTriple('aarch64-unknown-linux-musl')).toBe('aarch64-unknown-linux-musl');
+  });
+
+  it('names the linux-cross profile when a macOS build lacks the triple rust-std, and stays silent otherwise', () => {
+    const absent = { path: '/sysroot/lib/rustlib/aarch64-unknown-linux-gnu/lib', exists: false };
+    const remedy = missingRustStdRemedy('cowshed:cli-arm64-linux', 'aarch64-unknown-linux-gnu.2.17', 'darwin', absent);
+    expect(remedy).toContain('rustc has no standard library for aarch64-unknown-linux-gnu');
+    expect(remedy).toContain('tooling/devenv -P linux-cross shell -- nx run <project>:<target>');
+    expect(missingRustStdRemedy('c', 'aarch64-unknown-linux-gnu', 'darwin', { ...absent, exists: true })).toBeNull();
+    expect(missingRustStdRemedy('c', 'aarch64-unknown-linux-gnu', 'linux', absent)).toBeNull();
+    // rustc could not answer: no claim about the profile.
+    expect(missingRustStdRemedy('c', 'aarch64-unknown-linux-gnu', 'darwin', null)).toBeNull();
   });
 
   it("drops the shell's compilers for the artifact's triple and keeps everything else", () => {

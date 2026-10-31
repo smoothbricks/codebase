@@ -218,8 +218,8 @@ is the host-installed CLI of `packages/cowshed`.
   It does not replace the land gate; read its exit status and evidence, and add `-p @smoothbricks/codebase` to run the
   root `lint` policies. Nx runs the targets in its graph's order; lint first is a local fail-fast, never a serialization
   of the fleet. Bare `cargo` or `bun test` may diagnose a runner and never replaces Nx acceptance. For
-  platform-conditional Rust, run `bun run check:linux` before the final land or push; it proves Linux compilation, not
-  Linux test execution.
+  platform-conditional Rust, `bun run check:linux` proves Linux compilation before a push (the land gate's graph runs
+  the same `cargo-lint-cross`), not Linux test execution.
 - **Land:** `cowshed land <ws>` from the trusted host shell. Main's `.cowshed.toml` declares the route (`[land]`):
   cowshed takes the land turn, rebases `<ws>` onto main, runs the declared gate `tooling/land-host.sh --gate <ws>`,
   which owns acceptance of the rebased tree (do not invoke it directly or reconstruct its retry/waiver taxonomy in this

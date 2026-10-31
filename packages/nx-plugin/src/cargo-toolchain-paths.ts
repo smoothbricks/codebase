@@ -20,7 +20,7 @@ import { delimiter, join } from 'node:path';
  *
  * rustc and cargo are not here on purpose. Cargo keys units on the output of `rustc -vV`, never on rustc's path, and the
  * version recipe beside this one hashes it. On a non-Linux host the default shell and its linux-cross profile carry
- * different rust-std targets, so a rustc path would split the pre-push probe from the cached cross-check verdict.
+ * different rust-std targets, so a rustc path would split one target's key between the two shells.
  *
  * Only a path in the Nix store counts. A store object is named by the hash of everything it was built from, so one
  * shell gives one object on every machine of a platform. A path elsewhere belongs to the machine and takes no part.

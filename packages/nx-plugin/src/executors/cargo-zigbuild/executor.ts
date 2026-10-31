@@ -75,6 +75,44 @@ export function cargoTriple(target: string): string {
 }
 
 /**
+ * The remedy for a failed build of `target` on this host, when rustc has no standard library for its triple: every
+ * managed shell carries `x86_64-unknown-linux-gnu`'s, and on macOS the rest of the Linux set is the `linux-cross`
+ * profile's. A build outside it fails in rustc, which names the missing target but not the profile. `libdir` is what
+ * `rustc --print target-libdir --target <triple>` printed, or null when rustc could not answer.
+ */
+export function missingRustStdRemedy(
+  command: string,
+  target: string,
+  platform: NodeJS.Platform,
+  libdir: { readonly path: string; readonly exists: boolean } | null,
+): string | null {
+  if (platform !== 'darwin' || libdir === null || libdir.exists) return null;
+  return (
+    `${command}: rustc has no standard library for ${cargoTriple(target)} (${libdir.path} is absent). On macOS the ` +
+    "Linux rust-std set beyond x86_64-unknown-linux-gnu is the linux-cross profile's: tooling/devenv -P linux-cross " +
+    'shell -- nx run <project>:<target>'
+  );
+}
+
+/** What `rustc --print target-libdir` names for the triple of `target`, and whether it exists; null if rustc failed. */
+async function rustLibdir(target: string): Promise<{ readonly path: string; readonly exists: boolean } | null> {
+  const child = spawn('rustc', ['--print', 'target-libdir', '--target', cargoTriple(target)], {
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  let printed = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => {
+    printed += chunk;
+  });
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: rustc answers a --print query from its own sysroot without compiling; the enclosing runner's bound ends a hung one
+  const code = await new Promise<number | null>((resolve) => {
+    child.once('error', () => resolve(null));
+    child.once('close', resolve);
+  });
+  const libdir = printed.trim();
+  return code === 0 && libdir !== '' ? { path: libdir, exists: existsSync(libdir) } : null;
+}
+/**
  * The environment without any compiler or linker named for this triple.
  *
  * cargo-zigbuild supplies the triple's `CC_`/`CXX_`/`AR_`/`RANLIB_` and
@@ -215,8 +253,8 @@ export default async function cargoZigbuildExecutor(
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
       console.error(
-        `${command}: cargo-zigbuild is not on PATH. Linux artifacts build with the linux-cross toolchain; ` +
-          'on macOS run the target inside it: tooling/devenv -P linux-cross shell -- nx run <project>:<target>',
+        `${command}: cargo-zigbuild is not on PATH, which every managed devenv shell carries; run the target in the ` +
+          "checkout's shell: direnv exec <checkout> nx run <project>:<target>",
       );
       return { success: false };
     }
@@ -224,6 +262,8 @@ export default async function cargoZigbuildExecutor(
   }
   if (status.code !== 0) {
     console.error(`${command}: exited with ${status.signal ?? `status ${status.code}`}`);
+    const remedy = missingRustStdRemedy(command, options.target, process.platform, await rustLibdir(options.target));
+    if (remedy !== null) console.error(remedy);
     return { success: false };
   }
   if (built === null) {
