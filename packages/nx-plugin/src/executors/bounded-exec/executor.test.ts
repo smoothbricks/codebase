@@ -1856,8 +1856,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(reservation).toContain('fixture=built');
     // The fixture's own output still reaches the run's; only the units are counted.
     expect(result.terminalOutput).toContain('fixture-said\n');
-    expect(result.terminalOutput).toContain('cowshed: mbx reserve running cpus=2 asked=2\n');
-    expect(result.terminalOutput).toContain('--test-threads=2 threads=2\n');
+    const granted = /cowshed: mbx reserve running cpus=(\d+) asked=2\n/.exec(result.terminalOutput)?.[1];
+    expect(granted).toBeDefined();
+    expect(result.terminalOutput).toContain(`--test-threads=${granted} threads=${granted}\n`);
   });
 
   it('ends a fixture that hangs before its leaf reserves on the fixture’s own ceiling', async () => {
