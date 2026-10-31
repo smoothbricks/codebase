@@ -40,12 +40,26 @@ export interface TestThreadCeilings {
  * ceilings their sizing keeps; cargo-mutants carries how many cargo processes it runs at once, which share its grant.
  */
 export type Demand =
-  | { kind: 'cargo' | 'process'; want: number; testThreads: TestThreadCeilings }
+  | { kind: 'cargo'; want: number; testThreads: TestThreadCeilings }
+  | { kind: 'process'; want: number; testThreads: TestThreadCeilings }
   | { kind: 'cargo-mutants'; want: number; jobs: number }
-  | { kind: Exclude<RunnerKind, 'cargo' | 'cargo-mutants' | 'process'>; want: number };
+  | { kind: 'nextest'; want: number }
+  | { kind: 'bun-parallel'; want: number }
+  | { kind: 'stryker'; want: number }
+  | { kind: 'vitest'; want: number }
+  | { kind: 'go-test'; want: number };
+
+/** A runner a leaf reserves for under mbx (mbx-pool.ts, `mbxLeaf`): one that Cargo does not admit through mbx itself. */
+export type ReservedDemand = Extract<Demand, { kind: 'nextest' | 'bun-parallel' | 'stryker' | 'process' }>;
 
 /** Every budgeted command learns its grant here, so a script that starts a runner can size it. */
 export const CPU_TOKENS_ENV = 'BOUNDED_EXEC_CPU_TOKENS';
+
+/**
+ * The cores mbx granted the reservation a leaf runs under: `mbx reserve --cpus N` names at most N to its command, as many
+ * as were free once one was.
+ */
+export const GRANTED_CPUS_ENV = 'MBX_RESERVE_CPUS';
 
 const CARGO_BUILD =
   /(?<=^|[\s;&|()])(?:cargo(?:\s+-\S+)*\s+(?:build|test|check|clippy|rustc|doc|run|nextest\s+archive)|napi\s+build)(?=\s|$)/;
@@ -75,7 +89,7 @@ interface WorkerFlag {
   /** The flag with its value, one shell word, captured. */
   readonly flag: RegExp;
   /** The flag naming `count`. */
-  readonly sized: (count: number) => string;
+  readonly sized: (count: string) => string;
   /** The runner's own count when the flag names none, from the cores and the environment the command will see. */
   readonly ownDefault: (cores: number, env: Readonly<NodeJS.ProcessEnv>) => number;
   /** A flag with which the runner runs one worker whatever count it names. */
@@ -322,7 +336,7 @@ export function sizeRunner(
     case 'go-test': {
       const runner = WORKER_FLAGS[demand.kind];
       return {
-        command: withInvocationFlag(command, runner.invocation, runner.flag, runner.sized(runnerCount), true),
+        command: withInvocationFlag(command, runner.invocation, runner.flag, runner.sized(count), true),
         env: { [CPU_TOKENS_ENV]: held },
       };
     }
@@ -343,6 +357,58 @@ export function sizeRunner(
         },
       };
     }
+  }
+}
+
+/**
+ * The shell statements that run first in a reserved leaf's reservation and size its runner to the grant, which only
+ * the command learns as it starts: `CPU_TOKENS_ENV` becomes the cores mbx granted (`GRANTED_CPUS_ENV`), never more
+ * than the leaf asked for, its `--cpus` (the runner's own count), which also stands in under an mbx that grants a
+ * reservation whole and names none. The test-thread variables a sizing sets follow from it, under their inherited
+ * ceilings, outranking the target's own as a numeric grant's do (`sizeRunner`).
+ */
+export function grantedSizing(demand: ReservedDemand): string {
+  const asked = demand.want;
+  const named = `\${${GRANTED_CPUS_ENV}:-${asked}}`;
+  const tokens = `$${CPU_TOKENS_ENV}`;
+  const atMost = (ceiling: number | null): string =>
+    ceiling === null ? `"${tokens}"` : `"$(( ${tokens} < ${ceiling} ? ${tokens} : ${ceiling} ))"`;
+  const statements = [`export ${CPU_TOKENS_ENV}="$(( ${named} < ${asked} ? ${named} : ${asked} ))"`];
+  switch (demand.kind) {
+    case 'nextest':
+      statements.push(`export NEXTEST_TEST_THREADS="${tokens}"`);
+      break;
+    case 'process':
+      // A process's script may start Cargo, whose test threads take no jobserver token: its whole grant.
+      statements.push(
+        `export RUST_TEST_THREADS=${atMost(demand.testThreads.rust)}`,
+        `export NEXTEST_TEST_THREADS=${atMost(demand.testThreads.nextest)}`,
+      );
+      break;
+    case 'bun-parallel':
+    case 'stryker':
+      break;
+  }
+  return statements.map((statement) => `${statement}; `).join('');
+}
+
+/**
+ * `command` with a reserved runner's named count read from its grant, `CPU_TOKENS_ENV` as `grantedSizing` sets it,
+ * where the runner's shell runs it; the runner then runs on all it holds.
+ */
+export function sizeRunnerToGrant(demand: ReservedDemand, command: string): string {
+  const granted = `\${${CPU_TOKENS_ENV}}`;
+  switch (demand.kind) {
+    case 'nextest':
+      return command.replace(TEST_THREADS, `--test-threads=${granted}`);
+    case 'bun-parallel':
+      return command.replace(BUN_PARALLEL, `--parallel=${granted}`);
+    case 'stryker': {
+      const runner = WORKER_FLAGS.stryker;
+      return withInvocationFlag(command, runner.invocation, runner.flag, runner.sized(granted), true);
+    }
+    case 'process':
+      return command;
   }
 }
 

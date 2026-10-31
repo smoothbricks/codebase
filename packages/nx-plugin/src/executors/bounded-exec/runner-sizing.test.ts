@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'bun:test';
-import { CPU_TOKENS_ENV, parseInheritedTokens, runnerDemand, sizeRunner } from './runner-sizing.js';
+import { spawnSync } from 'node:child_process';
+import {
+  CPU_TOKENS_ENV,
+  grantedSizing,
+  parseInheritedTokens,
+  type ReservedDemand,
+  runnerDemand,
+  sizeRunner,
+  sizeRunnerToGrant,
+} from './runner-sizing.js';
 
 /** The runner command the plugin infers for a nextest piece, as `index.ts` builds it. */
 const NEXTEST_PIECE =
@@ -381,5 +390,51 @@ describe('runner sizing', () => {
         sizeRunner({ kind: 'process', want: 5, testThreads: NO_CEILINGS }, 'bun scripts/x.ts', 5).env[CPU_TOKENS_ENV],
       ),
     ).toBe(5);
+  });
+});
+
+describe("a reserved leaf's runner on its mbx grant", () => {
+  /**
+   * `demand`'s runner `command` as its reservation runs it, granted `granted` cores or under an mbx that names none,
+   * each runner a function that prints its arguments and the sizing variables it sees.
+   */
+  const run = (demand: ReservedDemand, command: string, granted?: string): string => {
+    const stub = (name: string): string =>
+      `${name}() { printf '${name} %s | tokens=%s rust=%s nextest=%s\\n' "$*" "$BOUNDED_EXEC_CPU_TOKENS" "$RUST_TEST_THREADS" "$NEXTEST_TEST_THREADS"; }; `;
+    const sized = grantedSizing(demand) + sizeRunnerToGrant(demand, command);
+    const shell = spawnSync('/bin/sh', ['-c', ['cargo', 'bun', 'stryker', 'script'].map(stub).join('') + sized], {
+      env: { PATH: process.env.PATH, ...(granted === undefined ? {} : { MBX_RESERVE_CPUS: granted }) },
+      encoding: 'utf8',
+    });
+    expect(shell.stderr).toBe('');
+    return shell.stdout;
+  };
+
+  it('runs every worker it was granted, and only those', () => {
+    expect(run({ kind: 'nextest', want: 6 }, 'cargo nextest run --binaries-metadata m.json', '2')).toBe(
+      'cargo nextest run --binaries-metadata m.json | tokens=2 rust= nextest=2\n',
+    );
+    expect(run({ kind: 'bun-parallel', want: 8 }, 'bun test --parallel', '3')).toBe(
+      'bun test --parallel=3 | tokens=3 rust= nextest=\n',
+    );
+    expect(run({ kind: 'stryker', want: 5 }, 'stryker run', '1')).toBe(
+      'stryker run --concurrency=1 | tokens=1 rust= nextest=\n',
+    );
+  });
+
+  it("keeps a process's inherited test-thread ceilings under its grant", () => {
+    const demand: ReservedDemand = { kind: 'process', want: 4, testThreads: { rust: 2, nextest: null } };
+    expect(run(demand, 'script', '3')).toBe('script  | tokens=3 rust=2 nextest=3\n');
+    expect(run(demand, 'script', '1')).toBe('script  | tokens=1 rust=1 nextest=1\n');
+  });
+
+  it('runs on no more than it asked for, all of it under an mbx that names no count', () => {
+    // An enclosing reservation's count reaches a nested one's command from an mbx that names none of its own.
+    expect(run({ kind: 'bun-parallel', want: 8 }, 'bun test --parallel', '12')).toBe(
+      'bun test --parallel=8 | tokens=8 rust= nextest=\n',
+    );
+    expect(run({ kind: 'bun-parallel', want: 8 }, 'bun test --parallel')).toBe(
+      'bun test --parallel=8 | tokens=8 rust= nextest=\n',
+    );
   });
 });

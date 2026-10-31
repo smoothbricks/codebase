@@ -1532,13 +1532,14 @@ reads `MAKEFLAGS` as well as `CARGO_MAKEFLAGS`, so withholding one would bound n
 `mbx reserve --cpus g --priority <job-priority> -- <command>`, the host's installed mbx invoked through its link beside
 the installed cowshed (14_nix.md, "mbx"), `g` being the job's own count from its `--want`, never a host figure. The
 grant is the job's admission: its command stays queued until mbx grants it, as soon as one core is free, as many of the
-`g` cores as are free then, and passes that count as `MBX_RESERVE_CPUS`; its existing jobserver, runner flags and thread
-variables are bounded by `g` ("Open questions"). The memory request is the same task identity's last recorded resource
-peak from existing LMAO job/process spans (13_telemetry.md, "Job resource peaks"), passed as `--memory <bytes>`; no
-cowshed peak ledger or prediction table exists. [INFERENCE] The task-identity key needed to select that span is not
-verified for Nx leaves; until the span carries it, or when no prior peak exists, `--memory` is omitted. mbx defines an
-omitted memory request as a zero-byte charge, not a measurement or a memory guarantee. This open keying question does
-not authorize a second store (AGENTS.md, rule 8).
+`g` cores as are free then, and passes that count as `MBX_RESERVE_CPUS`. bounded-exec sizes the leaf's runner flags and
+thread variables to that count as the command starts, so the runner runs on what it holds (an mbx that names no count
+grants `g` whole). The memory request is the same task identity's last recorded resource peak from existing LMAO
+job/process spans (13_telemetry.md, "Job resource peaks"), passed as `--memory <bytes>`; no cowshed peak ledger or
+prediction table exists. [INFERENCE] The task-identity key needed to select that span is not verified for Nx leaves;
+until the span carries it, or when no prior peak exists, `--memory` is omitted. mbx defines an omitted memory request as
+a zero-byte charge, not a measurement or a memory guarantee. This open keying question does not authorize a second store
+(AGENTS.md, rule 8).
 
 **A Vitest or Go test leaf enters no pool.** It runs without `mbx reserve` and with its own default workers, uncapped
 (owner's ruling, 2026-10-31). Reserved at that default, which sizes to the host (Vitest one worker per core but one, Go
@@ -1752,10 +1753,11 @@ Kernel nice/cgroup behavior and mbx's internal scheduling policy remain their ow
   identify the same Nx task across runs. Inspect that correlation before enabling the span-derived memory request;
   absent or unprovable identity uses the specified zero-byte charge, never a shadow table.
 - The known unscheduled Cargo test-runner gap and its closing measurement belong to 11_shell.md, "Open questions".
-- **A reserved leaf's runner count.** mbx may grant a reservation fewer cores than its `--cpus g` and passes the granted
-  count as `MBX_RESERVE_CPUS`; `bounded-exec` still sizes the leaf's runner from `g`, so a narrower grant's runner runs
-  more threads than it holds. Sizing the runner from the granted count, and deleting the share arithmetic it replaces,
-  is the open change.
+- **A reserved leaf's width.** A leaf should ask mbx for the width its runner can use (its tests, files or workers, at
+  most the cores) and run on what it is granted. bounded-exec knows no unit count for any reserved runner yet, so a
+  prebuilt nextest leaf asks for its task's share of the host (`nxTaskCores` in the nx-plugin) and the others their
+  runner's own count. Asking for every core instead would let a leaf of a few long tests hold the idle rest of a grant
+  mbx made from the free cores. Counting a leaf's units, and with it deleting the task share, is the open change.
 
 ## The task server schedules work units
 

@@ -1710,9 +1710,68 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       expect(result.terminalOutput).toMatch(
         kind === 'cargo'
           ? /cowshed: mbx cargo granted elapsed=\d+ms\n/
-          : /cowshed: mbx reserve granted elapsed=\d+ms cpus=1 priority=low\n/,
+          : /cowshed: mbx reserve granted elapsed=\d+ms asked=1 priority=low\n/,
       );
       expect(result.terminalOutput).not.toContain('Bad file descriptor');
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
+  it("runs a reserved leaf's runner on the cores mbx granted it, not on those it asked for", async () => {
+    // mbx grants a reservation as many of its `--cpus` as are free once one is, and names the count to the command as
+    // MBX_RESERVE_CPUS; a runner sized to its ask would run more workers than its grant holds.
+    const workspace = await createWorkspace();
+    const bin = join(workspace.root, 'stand-in-mbx');
+    await mkdir(bin);
+    const asked = join(workspace.root, 'mbx-asked');
+    await writeFile(
+      join(bin, 'mbx'),
+      [
+        '#!/bin/sh',
+        `if [ "$1" = stats ]; then printf '{"version":2,"scheduler":{"activity":[]}}\\n'; exit; fi`,
+        `printf '%s\\n' "$*" > '${asked}'`,
+        'shift',
+        'while [ "$1" != -- ]; do',
+        '  if [ "$1" = --grant-fd ]; then shift; fd=$1; fi',
+        '  shift',
+        'done',
+        'shift',
+        'eval "printf g >&$fd"',
+        'export MBX_RESERVE_CPUS=2',
+        'exec "$@"',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    await writeFile(
+      join(bin, 'stryker'),
+      '#!/bin/sh\nprintf "stryker %s tokens=%s\\n" "$*" "$BOUNDED_EXEC_CPU_TOKENS"\n',
+      { mode: 0o755 },
+    );
+    const saved = {
+      PATH: process.env.PATH,
+      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+    };
+    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    try {
+      const result = await runBoundedExec(
+        { command: 'stryker run --concurrency=6', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+      );
+
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(await readFile(asked, 'utf8')).toContain('--cpus 6');
+      expect(result.terminalOutput).toContain('stryker run --concurrency=2 tokens=2\n');
+      expect(result.terminalOutput).toContain('cowshed: mbx reserve running cpus=2 asked=6\n');
     } finally {
       for (const [name, value] of Object.entries(saved)) {
         if (value === undefined) delete process.env[name];
