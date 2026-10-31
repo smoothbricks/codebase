@@ -478,7 +478,7 @@ fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
     );
     fs::remove_file(mount.join(super::super::STATE_FILE)).unwrap();
     for _ in 0..2 {
-        let (linked, _) = first_touch(
+        let linked = first_touch(
             &host,
             &layout,
             FirstTouch {
@@ -492,7 +492,8 @@ fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
             },
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .id;
         assert_eq!(
             linked, id,
             "a retry keeps the early pointer, never mints another image"

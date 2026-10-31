@@ -15,8 +15,8 @@ use std::time::SystemTime;
 
 use super::{
     BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeState, DiscardOrigin,
-    DiscardedBuildStateFinding, KeptBuildStateFinding, Registration, TrackedBuildStateRefusal,
-    discard, kept, link, nx, tracked_source,
+    DiscardedBuildStateFinding, KeptBuildStateFinding, Registration, ReleaseClaim,
+    TrackedBuildStateRefusal, discard, kept, link, nx, tracked_source,
 };
 use crate::capabilities::BuildStatePath;
 use crate::runtime::storage_host::RuntimeStorageHost;
@@ -61,14 +61,25 @@ pub struct MintedVolume {
     pub capacity: ImageCapacity,
 }
 
+/// What a first touch made: the checkout's volume, what it did to the real directories standing
+/// where its links belong, and, when it minted the volume, the exclusive claim it minted it under
+/// ([`create_first_volume`]), which its caller captures the checkout's seed under and then lets
+/// go.
+#[derive(Debug)]
+pub(crate) struct Touched {
+    pub id: BuildVolumeId,
+    pub adopted: Adopted,
+    pub creation: Option<ReleaseClaim>,
+}
+
 /// The checkout's first build volume (or the one an interrupted first touch already linked),
 /// with every contributed path linked into it (a kept declared one once it exists, or at the next
-/// refresh once its volume holds it with entries), and the real directories it discarded or kept.
+/// refresh once its volume holds it with entries) ([`Touched`]).
 pub(crate) fn first_touch<H: RuntimeStorageHost>(
     host: &H,
     layout: &BuildVolumeLayout,
     migration: FirstTouch<'_>,
-) -> Result<std::result::Result<(BuildVolumeId, Adopted), TrackedBuildStateRefusal>> {
+) -> Result<std::result::Result<Touched, TrackedBuildStateRefusal>> {
     let FirstTouch {
         checkout,
         paths,
@@ -84,8 +95,9 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
     if let Some(refusal) = tracked_source(checkout, &plan.removed())? {
         return Ok(Err(refusal));
     }
-    // A volume minted here stays held by its creation until its record is published below.
-    let (id, _creating) = match link::linked(checkout)? {
+    // A volume minted here stays claimed by its creation until its record is published below,
+    // and past that through its caller's seed capture.
+    let (id, creation) = match link::linked(checkout)? {
         Some(mount) => {
             let id = layout.volume_at(&mount).ok_or_else(|| {
                 CowshedError::integrity(
@@ -100,21 +112,20 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
             (id, None)
         }
         None => {
-            let (id, creating) = match beside {
+            let (id, creation) = match beside {
                 MintedBeside::Volume(minted) if minted.capacity == capacity => (minted.id, None),
                 MintedBeside::Failed(error) => return Err(error),
                 MintedBeside::Nothing | MintedBeside::Volume(_) => {
                     let id = BuildVolumeId::mint();
-                    let (_, creating) = host
-                        .create_build_volume(layout, &id, capacity, &registration)
+                    let claim = create_first_volume(host, layout, &id, capacity, &registration)
                         .map_err(storage_error)?;
-                    (id, Some(creating))
+                    (id, Some(claim))
                 }
             };
-            // Linked while a creation still holds it: from here the link protects the
+            // Linked while its creation still claims it: from here the link protects the
             // registered volume from GC and lets a retry find it.
             link::point(checkout, &layout.mount(&id))?;
-            (id, creating)
+            (id, creation)
         }
     };
     let (mount, _) = host
@@ -133,7 +144,45 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
     state.write(&mount)?;
     // Published only after every source directory has become its fixed link.
     layout.publish(&id, &registration)?;
-    Ok(Ok((id, adopted)))
+    Ok(Ok(Touched {
+        id,
+        adopted,
+        creation,
+    }))
+}
+
+/// Create a checkout's first build volume `id` at `capacity`, registered as `registration`,
+/// under an exclusive claim on its hold instead of a shared creation hold
+/// ([`BuildVolumeLayout::claim_new`]): its creator captures the checkout's seed from it under
+/// that same claim and lets it go only then (16_build_volumes.md, "Targets and seeds"). A
+/// creation that fails releases what it registered under the claim, and answers both failures
+/// when that release fails too.
+pub(crate) fn create_first_volume<H: RuntimeStorageHost>(
+    host: &H,
+    layout: &BuildVolumeLayout,
+    id: &BuildVolumeId,
+    capacity: ImageCapacity,
+    registration: &Registration,
+) -> std::result::Result<ReleaseClaim, crate::storage::apfs::ApfsStorageError> {
+    use crate::storage::apfs::ApfsStorageError;
+    let claim = layout
+        .claim_new(id)
+        .map_err(|source| ApfsStorageError::Io {
+            operation: "claim a build volume while it is created",
+            path: layout.hold_path(id),
+            source,
+        })?;
+    match host.create_claimed_build_volume(layout, &claim, capacity, registration) {
+        Ok(_) => Ok(claim),
+        Err(primary) => Err(match host.release_claimed(layout, claim) {
+            Ok(_) => primary,
+            Err(cleanup) => ApfsStorageError::Cleanup {
+                operation: "release a build volume whose creation failed",
+                primary: Box::new(primary),
+                cleanup: Box::new(cleanup),
+            },
+        }),
+    }
 }
 
 /// What adopting a checkout's build-state paths did to the real directories standing where their

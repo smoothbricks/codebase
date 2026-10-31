@@ -1255,6 +1255,24 @@ impl BuildVolumeLayout {
         }
     }
 
+    /// Claim `id` exclusively for the operation creating it, before its image exists, as
+    /// [`Self::hold_new`] holds it ([`Self::register_claimed`]): no release takes the volume and
+    /// no job is admitted on it while the creation runs. A checkout's first volume is created so:
+    /// its creator captures the checkout's seed under this claim (16_build_volumes.md, "Targets
+    /// and seeds"), where a claim taken anew once a shared creation hold dropped is refused by a
+    /// transient kernel copy of that hold's descriptor (cowshed-os `fork_lock`). Nothing claims
+    /// an id before its image exists, so the lock is never contended; one that is refuses as
+    /// [`io::ErrorKind::ResourceBusy`].
+    pub fn claim_new(&self, id: &BuildVolumeId) -> io::Result<ReleaseClaim> {
+        fs::create_dir_all(&self.images)?;
+        self.claim_release(id)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!("build volume {id} is held before its image exists"),
+            )
+        })
+    }
+
     /// Whether a job holds `id` now, asked without taking or creating anything: what a dry run
     /// reports in place of a release. The probe's own momentary lock is fenced too, so no child
     /// spawned meanwhile keeps it and refuses a hold taken after this answer.

@@ -28,16 +28,6 @@ where
         MacOsApfsExecutionHost::label_image_volume(self, image, label)
     }
 
-    fn create_build_volume(
-        &self,
-        layout: &BuildVolumeLayout,
-        id: &BuildVolumeId,
-        capacity: ImageCapacity,
-        registration: &Registration,
-    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError> {
-        MacOsApfsExecutionHost::create_build_volume(self, layout, id, capacity, registration)
-    }
-
     fn create_claimed_build_volume(
         &self,
         layout: &BuildVolumeLayout,

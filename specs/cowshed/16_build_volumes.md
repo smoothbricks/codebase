@@ -225,9 +225,10 @@ mbx's first build places the managed target: mbx leaves a `target` that is alrea
 "Eligibility and recovery"). The volume's old `target` directory leaves the volume's state and is deleted in the
 background like a discarded directory (below), so no fork or seed carries it again. A checkout with build state and no
 volume gets its first one (its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it
-is a target from then on. Main's first volume is minted while `cowshed adopt` stages main's image, at the capacity the
-adopted checkout's `.cowshed.toml` asks, so the two attaches wait on `storagekitd` once (01a_apfs.md, "How the APFS host
-degrades"), unless nothing in the checkout can name build state (no tracked Cargo or package manifest, no declared
+is a target from then on. That volume is created under an exclusive claim on its hold file, which the seed's capture
+borrows (Targets and seeds). Main's first volume is minted while `cowshed adopt` stages main's image, at the capacity
+the adopted checkout's `.cowshed.toml` asks, so the two attaches wait on `storagekitd` once (01a_apfs.md, "How the APFS
+host degrades"), unless nothing in the checkout can name build state (no tracked Cargo or package manifest, no declared
 `[build] state`, no enabled Nx detector match), whose first touch makes no volume. Main's first touch links it once main
 is mounted at the checkout, when main links no volume yet and asks the capacity it was minted at (the checkout's
 `.cowshed.toml` may change while main is copied; the first touch then mints its own at the capacity asked now). A mint
@@ -530,6 +531,17 @@ collected as one. Re-adoption carries its existing exclusive source `ReleaseClai
 and its RAW replacement share the canonical hold resource, so registration and an empty replacement's mint borrow that
 claim instead of taking a conflicting shared creation hold. Capture borrows it through seal, restore and the immutable
 seed mark instead of taking a second exclusive claim.
+
+A first touch borrows its creation's claim the same way. A checkout's first build volume, main's minted beside its image
+by `cowshed adopt` or one the first touch mints itself, is created under an exclusive claim on its `<id>.dmg.hold`
+rather than a shared creation hold. The first touch captures the checkout's seed (warm, or mbx-retained) under that
+claim and lets it go once the seed is published. Letting the creation's hold go and then claiming the volume again would
+race the hold's own descriptor: a transient kernel copy of it from another thread's spawn (cowshed-os `fork_lock`) keeps
+the lock past its close, the second claim finds the volume held, and once the copy closes no census can name a holder
+("in use, but no process of this user holds" it).
+
+- **First-touch claim enforced by**: a directory-host test in which a spawn's child keeps a copy of every descriptor,
+  the creation's claim included, across main's first touch, which still seeds main.
 
 **Why a reseed.** A land freezes the seed before the target runs anything on the adopted volume. Everything the target
 runs afterwards (its own builds and gates, the land's output restoration, a developer's build in main) is written to its
@@ -1174,9 +1186,9 @@ seed the lane base already had and builds the folded delta incrementally, as an 
   a superseded volume then and waits for that release before it reports the job ended; a release that cannot run or
   fails is the job's terminal failure and leaves the record naming its owner, never a later collection's work. Job
   admission takes its hold without waiting and refuses while any exclusive claim has the volume (a release, a capture, a
-  compaction move, a cache clear, a dry-run probe), naming it claimed, not released. A land's hold waits out an
-  exclusive claim instead, and then refuses only when the image is gone: only a release deletes it, so a capture, a
-  probe or a release that declines under its claim delays such a hold and never refuses it.
+  first volume's creation, a compaction move, a cache clear, a dry-run probe), naming it claimed, not released. A land's
+  hold waits out an exclusive claim instead, and then refuses only when the image is gone: only a release deletes it, so
+  a capture, a probe or a release that declines under its claim delays such a hold and never refuses it.
 - A held lifecycle or image lock likewise defers release. A superseded seed is claimed under its target's image lock,
   which the land and reseed paths hold while they replace it, and released once that lock is let go: the claim keeps
   collection, and a later land or reseed of the target, off it, so none releases a seed another is retiring, and no
@@ -1194,18 +1206,19 @@ seed the lane base already had and builds the folded delta incrementally, as an 
   under the claim: a volume a checkout's link names now is that checkout's and stays, and one whose sidecar is no longer
   the one the collection judged it by is left to the next pass. Whatever makes a volume someone's holds it while it
   does: a land from before its landing workspace's jobs stop until its build-volume steps end, a creation (an empty
-  mint, a seed, a fork's volume) from before its sidecar is registered, ahead of its image, until it is published.
+  mint, a seed, a fork's volume) from before its sidecar is registered, ahead of its image, until it is published (a
+  checkout's first volume until its seed is captured).
 - A creation that fails after registering releases what it registered, image and sidecar, before it answers. A creation
   a crash interrupts leaves its registered sidecar: the next open of the project, after it recovers the lifecycle
   intents and before it answers, reads every registered sidecar and releases each whose registrant is gone, by that
   exact id, image and sidecar, as `interruptedBuildVolume`. A registered sidecar's authority is exact, never a workspace
   name a later verb may reuse: its live creator's hold on that id (a creation holds the volume from before its
-  registration until it publishes it, and an adopt's mint is held by the adopt until its first touch publishes it or it
-  releases the mint), an unfinished re-adoption's journaled record naming that id, or a detached checkout's unreadable
-  link. One such authority still owns stays with it; one whose release fails, or whose sidecar or image cannot be read,
-  refuses the open, naming each, with its sidecar still naming its owner. Every collection decides registered sidecars
-  the same way. No pass looks for images nobody owns: an image with no sidecar predates owner registration, is named
-  with its path on every pass, and is never released on a guess.
+  registration until it publishes it, and an adopt's mint is claimed by the adopt until its first touch takes the claim
+  or the adopt releases the mint under it), an unfinished re-adoption's journaled record naming that id, or a detached
+  checkout's unreadable link. One such authority still owns stays with it; one whose release fails, or whose sidecar or
+  image cannot be read, refuses the open, naming each, with its sidecar still naming its owner. Every collection decides
+  registered sidecars the same way. No pass looks for images nobody owns: an image with no sidecar predates owner
+  registration, is named with its path on every pass, and is never released on a guess.
 - Release retains the volume's owner record and exclusive claim while it requests a non-forced unmount and allows a
   bounded wall-clock grace for unmanaged holders to release it. Time spent waiting on command execution or a disk lease
   counts, not only requested poll sleeps. If the kernel still refuses, cowshed forces the unmount and detaches the

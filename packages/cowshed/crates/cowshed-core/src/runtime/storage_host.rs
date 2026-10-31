@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::build_volume::{
-    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration,
-    ReleaseClaim,
+    BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration, ReleaseClaim,
 };
 use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use crate::repository::RepoId;
@@ -45,17 +44,9 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
     fn label_image_volume(&self, image: &Path, label: &str) -> Result<Labelled, ApfsStorageError>;
 
     /// Every operation here that writes a build image registers `registration`'s owner record
-    /// before the image's first byte exists (16_build_volumes.md, "Garbage collection"). A
-    /// created volume stays registered, held by the answered hold, until the caller publishes
-    /// it; a clone is published before it answers.
-    fn create_build_volume(
-        &self,
-        layout: &BuildVolumeLayout,
-        id: &BuildVolumeId,
-        capacity: ImageCapacity,
-        registration: &Registration,
-    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError>;
-    /// Mint a blank image while the caller retains its exclusive claim through publication.
+    /// before the image's first byte exists (16_build_volumes.md, "Garbage collection"); a clone
+    /// is published before it answers. This mints a blank image while the caller retains its
+    /// exclusive claim through publication.
     fn create_claimed_build_volume(
         &self,
         layout: &BuildVolumeLayout,

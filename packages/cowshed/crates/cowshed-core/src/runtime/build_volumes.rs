@@ -660,11 +660,13 @@ pub(crate) struct OwnedMint<H: RuntimeStorageHost = Host> {
     slot: MintSlot,
 }
 
-/// A volume minted beside main's image, registered and not yet published, with the creation hold
-/// that keeps every release in any process off it, by its exact id, until its release takes it.
+/// A volume minted beside main's image, registered and not yet published, with the exclusive
+/// claim it was created under ([`crate::build_volume::migrate::create_first_volume`]): it keeps
+/// every release in any process off it, by its exact id, until its release takes it or main's
+/// first touch takes it for main's seed capture ([`Lent::published`]).
 pub(crate) struct Minted {
     volume: MintedVolume,
-    _creating: BuildVolumeHold,
+    claim: ReleaseClaim,
 }
 
 /// The volume an [`OwnedMint`] holds until its release takes it.
@@ -691,10 +693,9 @@ fn release_slot(
     checkout: &Path,
     whose: &str,
 ) {
-    // The creation hold goes first, so the release can claim the volume.
-    if let Some(Minted { volume, _creating }) = lock(slot).take() {
-        drop(_creating);
-        release_minted(host, layout, &volume, checkout, whose);
+    // Released under the claim it was created under, never a second one taken after it.
+    if let Some(Minted { volume, claim }) = lock(slot).take() {
+        release_minted(host, layout, &volume, claim, checkout, whose);
     }
 }
 
@@ -817,17 +818,20 @@ impl Lent {
         }
     }
 
-    /// Main's first touch published `id`. When that is the minted volume, the adopt's hold on it
-    /// ends here, as its creation's does once published (16_build_volumes.md, "Garbage
-    /// collection"): the slot lets it go, creation hold and all, so the claim of main's seed
-    /// capture is free to take it, and settling finds nothing left to decide. The checkout's
-    /// link keeps it from then on.
-    fn published(&self, id: &BuildVolumeId) {
-        if let Self::Volume(slot) = self {
-            let mut held = lock(slot);
-            if held.as_ref().is_some_and(|minted| &minted.volume.id == id) {
-                *held = None;
-            }
+    /// Main's first touch published `id`. When that is the minted volume, the adopt's claim on it
+    /// passes here to the first touch, which captures main's seed under it and then lets it go,
+    /// as a creation's hold ends once published (16_build_volumes.md, "Targets and seeds",
+    /// "Garbage collection"); settling then finds nothing left to decide. The checkout's link
+    /// keeps it from then on.
+    fn published(&self, id: &BuildVolumeId) -> Option<ReleaseClaim> {
+        let Self::Volume(slot) = self else {
+            return None;
+        };
+        let mut held = lock(slot);
+        if held.as_ref().is_some_and(|minted| &minted.volume.id == id) {
+            held.take().map(|minted| minted.claim)
+        } else {
+            None
         }
     }
 }
@@ -1035,44 +1039,70 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                             },
                         )
                     })?;
-                    let (id, adopted) = match touched {
+                    let crate::build_volume::migrate::Touched {
+                        id,
+                        adopted,
+                        creation: own,
+                    } = match touched {
                         Ok(touched) => touched,
                         Err(refusal) => return Ok(Err(refusal)),
                     };
-                    lent.published(&id);
+                    // The claim the volume was created under, the first touch's own or the
+                    // adopt's: the seed is captured under it, never under a second claim taken
+                    // once it is let go, which a transient kernel copy of its descriptor refuses
+                    // (16_build_volumes.md, "Targets and seeds").
+                    let adopts = lent.published(&id);
+                    let creation = own.or(adopts);
                     if layout.seed_of(&owner.name, &owner.incarnation)?.is_none() {
                         let state = BuildVolumeState::read(&layout.mount(&id))?;
                         if state.mbx.is_some() {
-                            let source = HeldVolume::for_seed(host, layout, id.clone())?;
-                            let superseded = retained_seed(
-                                host,
-                                layout,
-                                &owner,
-                                SeedCapture::Shared(&source),
-                                &state,
-                            )?;
+                            let superseded = match &creation {
+                                Some(claim) => retained_seed(
+                                    host,
+                                    layout,
+                                    &owner,
+                                    SeedCapture::Claimed(claim),
+                                    &state,
+                                )?,
+                                None => {
+                                    let source = HeldVolume::for_seed(host, layout, id.clone())?;
+                                    retained_seed(
+                                        host,
+                                        layout,
+                                        &owner,
+                                        SeedCapture::Shared(&source),
+                                        &state,
+                                    )?
+                                }
+                            };
                             retire_seeds(host, layout, superseded)?;
                         } else {
-                            host.clone_build_volume(
-                                layout,
-                                &id,
-                                &BuildVolumeId::mint(),
-                                &Registration::new(
-                                    BuildVolumeRecord::new(
-                                        None,
-                                        BuildVolumeRole::Seed {
-                                            target: owner.name,
-                                            incarnation: owner.incarnation.clone(),
-                                        },
-                                    ),
-                                    Registrant::Workspace {
-                                        incarnation: owner.incarnation,
+                            let seed = BuildVolumeId::mint();
+                            let registration = Registration::new(
+                                BuildVolumeRecord::new(
+                                    None,
+                                    BuildVolumeRole::Seed {
+                                        target: owner.name,
+                                        incarnation: owner.incarnation.clone(),
                                     },
                                 ),
-                            )
+                                Registrant::Workspace {
+                                    incarnation: owner.incarnation,
+                                },
+                            );
+                            match &creation {
+                                Some(claim) => host.clone_claimed_build_volume(
+                                    layout,
+                                    claim,
+                                    &seed,
+                                    &registration,
+                                ),
+                                None => host.clone_build_volume(layout, &id, &seed, &registration),
+                            }
                             .map_err(storage)?;
                         }
                     }
+                    drop(creation);
                     return Ok(Ok(BuildStateRefresh {
                         volume: Some(id),
                         created: true,
@@ -1148,27 +1178,28 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     .map(|capacity| {
                         let id = BuildVolumeId::mint();
                         // Main has no incarnation until the adopt publishes it, so the volume is
-                        // registered by the adopt's intent and held by its exact id, by the slot,
-                        // until its release takes it: never by main's name.
-                        let (_, creating) = host
-                            .create_build_volume(
-                                layout,
-                                &id,
-                                capacity,
-                                &Registration::new(
-                                    BuildVolumeRecord::new(
-                                        None,
-                                        BuildVolumeRole::Linked {
-                                            checkout: WorkspaceName::main(),
-                                        },
-                                    ),
-                                    Registrant::Intent,
+                        // registered by the adopt's intent and claimed by its exact id, by the
+                        // slot, until its release or main's first touch takes the claim: never by
+                        // main's name.
+                        let claim = crate::build_volume::migrate::create_first_volume(
+                            host,
+                            layout,
+                            &id,
+                            capacity,
+                            &Registration::new(
+                                BuildVolumeRecord::new(
+                                    None,
+                                    BuildVolumeRole::Linked {
+                                        checkout: WorkspaceName::main(),
+                                    },
                                 ),
-                            )
-                            .map_err(storage)?;
+                                Registrant::Intent,
+                            ),
+                        )
+                        .map_err(storage)?;
                         Ok(Minted {
                             volume: MintedVolume { id, capacity },
-                            _creating: creating,
+                            claim,
                         })
                     })
                     .transpose()
@@ -3000,12 +3031,13 @@ fn may_mint(source: &Path) -> Result<Option<ImageCapacity>> {
     ))
 }
 
-/// Release a volume minted beside main's image unless `checkout` links it, and say on stderr
-/// what the release did or why the volume stays.
+/// Release a volume minted beside main's image under `claim`, the one it was created under,
+/// unless `checkout` links it, and say on stderr what the release did or why the volume stays.
 fn release_minted(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     volume: &MintedVolume,
+    claim: ReleaseClaim,
     checkout: &Path,
     whose: &str,
 ) {
@@ -3014,8 +3046,8 @@ fn release_minted(
         if linked.as_ref() == Some(id) {
             return Ok(None);
         }
-        host.release_build_volume(layout, id)
-            .map(Some)
+        host.release_claimed(layout, claim)
+            .map(|refused| Some(BuildVolumeRelease::Deleted { refused }))
             .map_err(storage)
     });
     match released {
@@ -8672,6 +8704,50 @@ fn main() {
         first.settle().await;
         assert!(!scratch.layout.image(&stale.id).exists());
         assert_eq!(scratch.layout.linked(&resized).unwrap(), Some(own));
+        scratch.release_all();
+    }
+
+    /// A transient kernel copy of the descriptor main's first volume was created under refuses
+    /// nothing of main's first touch: the child of another thread's spawn keeps such a copy past
+    /// the spawn's return, beyond the fork lock's reach (cowshed-os `fork_lock`), and it closes
+    /// moments later with no owner. The first touch's seed capture borrows the claim the volume
+    /// was minted under, so the copy holds that very claim and is no other holder. A capture
+    /// that let the creation's hold go and then claimed the volume anew found it held through the
+    /// copy, and once the copy had closed no census could name a holder: "in use, but no process
+    /// of this user holds" it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_main_seeds_its_first_volume_though_a_spawn_copied_its_creation_descriptor() {
+        let scratch = Scratch::directory("build-minted-copied");
+        let main = owner("main", '0');
+        let checkout = tracked_checkout(scratch.root.path(), "main", AT_THE_CAP, &["package.json"]);
+        let first = scratch
+            .volumes
+            .mint_first(checkout.clone(), checkout.clone())
+            .await;
+        let volume = minted(&first);
+        let copied = cowshed_os::fork_lock::in_flight::InFlight::unlocked();
+        let refresh = scratch
+            .volumes
+            .refresh(
+                main.clone(),
+                checkout.clone(),
+                discovered(vec![BuildStatePath::new("target", "target").unwrap()]),
+                first.lend(),
+            )
+            .await;
+        copied.finish();
+        let refresh = refresh.unwrap().unwrap();
+        assert_eq!(refresh.volume, Some(volume.id));
+        first.settle().await;
+        assert!(
+            scratch
+                .layout
+                .seed_of(&main.name, &main.incarnation)
+                .unwrap()
+                .is_some(),
+            "main is seeded from its first volume"
+        );
         scratch.release_all();
     }
 

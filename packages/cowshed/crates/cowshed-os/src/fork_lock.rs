@@ -311,6 +311,24 @@ pub mod in_flight {
 
     impl InFlight {
         pub fn start() -> Self {
+            Self::park(|command| command.spawn_locked())
+        }
+
+        /// A spawn held in flight outside the fork lock: its parked child keeps a copy of every
+        /// descriptor of this process while a [`super::Fenced`] drop returns at once, as a
+        /// transient kernel copy a spawn leaves past its return does ("The return does not mean
+        /// every close-on-exec copy is closed").
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a copy beyond the fork lock's reach, as a spawn's transient kernel copies are"
+        )]
+        pub fn unlocked() -> Self {
+            Self::park(|command| command.spawn())
+        }
+
+        fn park(
+            run: impl FnOnce(&mut Command) -> io::Result<std::process::Child> + Send + 'static,
+        ) -> Self {
             let (mut started, started_writer) = std::io::pipe().unwrap();
             let (go_reader, go) = std::io::pipe().unwrap();
             let (started_fd, go_fd) = (started_writer.as_raw_fd(), go_reader.as_raw_fd());
@@ -336,7 +354,7 @@ pub mod in_flight {
                 });
             }
             let spawn = std::thread::spawn(move || {
-                let child = command.spawn_locked();
+                let child = run(&mut command);
                 drop((started_writer, go_reader));
                 child
             });
