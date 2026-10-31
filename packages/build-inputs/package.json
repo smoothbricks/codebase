@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/build-inputs",
-  "version": "0.0.2-next.0",
+  "version": "0.0.2",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/ts/build-inputs.js",

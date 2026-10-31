@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/nextest-extract",
-  "version": "0.0.2-0",
+  "version": "0.0.2",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/ts/nextest-binaries.js",
