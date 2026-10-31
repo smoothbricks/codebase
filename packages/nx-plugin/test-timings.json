@@ -12,6 +12,7 @@
     "src/ensure-built-receipt.test.ts": 20391,
     "src/cargo-resolve-cache.test.ts": 20246,
     "src/cargo-source-hash.test.ts": 16053,
+    "src/managed-files/setup-devenv-stable-path.test.ts": 12535,
     "src/linked-snapshots.nx.test.ts": 11920,
     "src/index.test.ts": 8528,
     "src/cargo-closure-input.test.ts": 8157,
