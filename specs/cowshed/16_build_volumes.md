@@ -1527,10 +1527,16 @@ Concretely:
   job. A tracked `build.target-dir` or `build.build-dir`, or a `CARGO_TARGET_DIR` in the canonical environment, is
   refused the same way, because mbx leaves such a target unmanaged (15_capabilities.md, "mbx detection").
 - **Incremental compilation is mbx's.** mbx sets `CARGO_INCREMENTAL=0` and gives a workspace crate private incremental
-  state on its first source edit, seeded from the most recently used checkout's state for the same crate and flags on
-  rustc 1.98 or later (mbx docs, "Incremental"). A caller's `CARGO_INCREMENTAL=0` already wins and changes nothing; no
-  path sets `CARGO_INCREMENTAL=1` or `MBX_INCREMENTAL`, which would hand workspace crates to Cargo's checkout-specific
-  incremental state, outside the shared store.
+  state on its first edit, seeded from the most recently used checkout's state for the same crate and flags on rustc
+  1.98 or later (mbx docs, "Incremental"). A caller's `CARGO_INCREMENTAL=0` already wins and changes nothing; no path
+  sets `CARGO_INCREMENTAL=1` or `MBX_INCREMENTAL`, which would hand workspace crates to Cargo's checkout-specific
+  incremental state, outside the shared store. An edit is a change to the crate's sources made under the commit HEAD
+  named when that checkout last compiled it, or one still uncommitted on top of a new HEAD (the edit-then-commit loop
+  keeps its private state). A change a moved HEAD brought with nothing of the crate uncommitted is no edit: main after a
+  land, a train after a rebase and a gate compile such a crate and its dependents normally and publish them, so the next
+  checkout at that commit restores them. Measured 2026-10-30: before this rule, a downstream main's builds after lands
+  compiled whole dependent cones privately and stored nothing (cargo-lint clippy 128 not looked up / 128 incremental;
+  nextest archive 93 / 93, 0 B stored), and every later checkout at those commits recompiled them as "not looked up".
 - **No `CI` in a dev environment.** Cargo turns incremental compilation off for workspace crates whenever `CI` is set,
   which changes their `-C metadata` and writes a second set of units into the same target directory: a target built
   without `CI` is not wholly `Fresh` under `CI=true`. Agent harnesses export `CI=true` on every command. The workspace
