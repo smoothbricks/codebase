@@ -17,7 +17,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/5b9b0f86a0ab481d9ad5b85e586f4ba6872f74fb";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/0f1542efb017ed36d6018f08346d5eee7f779df7";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;

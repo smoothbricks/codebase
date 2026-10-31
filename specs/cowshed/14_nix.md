@@ -85,8 +85,9 @@ one says each hold on the pool on a descriptor the caller names (`mbx reserve --
 every admission of a tree), so a runner's clocks run only while its work holds the pool (05_gateway.md, "Parallelism
 inside a job"), one accepts the caller's `MBX_SESSION_ROOT` so session sockets can use the workspace's existing short
 runtime path instead of its long `TMPDIR`, one skips every mbx Cargo shim when resolving the real Cargo, so an older
-project shim cannot loop with the installed route, and one maps the selected compiler's physical default sysroot into
-portable keys, so naming a Nix toolchain directly does not prevent action storage and restoration. Distinct
+project shim cannot loop with the installed route, and one maps the selected compiler's physical default sysroot, the
+toolchain its executable resolves into, where rustc finds it, into portable keys, so naming a Nix toolchain directly, or
+reaching its join as `rustc` through a devenv profile, does not prevent action storage and restoration. Distinct
 installations remain distinct, and arbitrary sysroot overrides gain no mapping. Reservation and compiler-admission waits
 block on kqueue/inotify with domain-qualified, rate-limited shared rescue scans for crash recovery instead of per-waiter
 polling. The short session root is the canonical environment's (11_shell.md, "Canonical mbx environment"), not a new
@@ -99,7 +100,7 @@ build-script output under `mbx exec`. The latest count a crate's edit against th
 (16_build_volumes.md, "One Cargo environment on every path"), refresh the store's recency only for hits a build exposed,
 predict build scripts per target, map a nested Cargo's own target, and seed a managed target from one donor checkout
 only, so no target mixes two lineages of one crate. It is `smoothbricks/mr-boxington` at rev
-`5b9b0f86a0ab481d9ad5b85e586f4ba6872f74fb`. No project needs to pin it: the host's mbx serves every Cargo project, which
+`0f1542efb017ed36d6018f08346d5eee7f779df7`. No project needs to pin it: the host's mbx serves every Cargo project, which
 reaches it through the Cargo shim that `cowshed setup` generates from it, below (the capability is 15_capabilities.md's,
 its route 11_shell.md's). The installed mbx is never spelled as a Nix store path or a host path where a command is
 spawned; its store path is only what the link resolves to.
