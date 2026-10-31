@@ -34,19 +34,18 @@ const PUBLISHED_DEPENDENCY_FIELDS = ['dependencies', 'peerDependencies', 'option
 const afterAllProjectsVersioned: AfterAllProjectsVersioned = async (cwd, options) => {
   const result = await nxJsVersionActions.afterAllProjectsVersioned(cwd, options);
 
-  // Temporary Bun workaround. Delete this hook together with the CLI lockfile
-  // sync/validation code once supported Bun versions fix all three issues:
-  // - https://github.com/oven-sh/bun/issues/18906
-  // - https://github.com/oven-sh/bun/issues/20477
-  // - https://github.com/oven-sh/bun/issues/20829
-  //
   // After ANY version bump (release or prepare-next), bun.lock workspace versions
-  // must match package.json exactly — including unpublished -next. Day-to-day CI
-  // and frozen installs require that invariant.
+  // must match package.json exactly, unpublished -next included, and
+  // `smoo monorepo validate` refuses a lock that does not. The Bun bugs this hook
+  // began as a workaround for are closed (oven-sh/bun#18906, #20477, #20829):
+  // measured on Bun 1.4.4, `bun install --lockfile-only`, the lock update Nx runs
+  // after versioning, writes a bumped package.json version into bun.lock. But
+  // `bun install --frozen-lockfile` still accepts an entry the manifest moved
+  // past, so the release commit's lock is made exact here whatever ran before.
   //
-  // Publish-time pack rewrites (-next → last stable tag) happen only in
-  // `smoo release publish` around `bun pm pack`, never here. Doing publish-mode
-  // rewrite on prepare-next is what left lock at 0.x.y while package.json said
+  // Publish-time pins (-next → last stable tag) go only into the packed manifest
+  // of `smoo release publish`, never into bun.lock. Rewriting the lock that way
+  // on prepare-next is what left it at 0.x.y while package.json said
   // 0.x.y-next.0 and blew up monorepo validate / packed-package-manifest.
   const updated = syncBunLockfileVersionsToPackageJson(cwd);
   if (updated === 0) {

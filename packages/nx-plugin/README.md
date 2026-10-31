@@ -2554,7 +2554,7 @@ explicit contract, not a claim that its console output is a structured reporter 
   2026-10-29 these records have `source: "progress"`, explicitly provisional: publish immediately when a named result
   closes, never wait for later tests. Bun prints diagnostics before its `(fail)` line, so failure evidence is the
   captured stderr interval since the preceding named result through this failure line. It can include unrelated output
-  and is not proof of root-cause ownership. The pinned Bun 1.4.3 inspector reporter loses events at exit and under
+  and is not proof of root-cause ownership. Bun's inspector reporter (measured on 1.4.3) loses events at exit and under
   parallel/isolate execution, while its JUnit reporter writes only at the end; neither is a reliable complete live
   channel. Dots and agent-mode output omit passing/skip names, so no identities are invented for dots. Terminal Bun
   JUnit supplies those missing named results as `source: "junit"`. If its status contradicts a provisional record of the

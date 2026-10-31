@@ -414,9 +414,9 @@ export function catalogName(value: string): string | null {
 /**
  * Where Bun reads a root manifest's catalogs: from the object form of `workspaces` once it holds `catalog` or
  * `catalogs`, and then from nowhere else; otherwise from the manifest's own top-level `catalog` and `catalogs`.
- * Measured with `bun install` 1.4.3: beside a `workspaces.catalog`, a top-level `catalog` entry is not in the catalog
- * and a top-level `catalogs` name is "no catalog named"; beside a `workspaces` object without either, the top level
- * resolves.
+ * Measured with `bun install` 1.4.3 and 1.4.4: beside a `workspaces.catalog`, a top-level `catalog` entry is not in
+ * the catalog and a top-level `catalogs` name is "no catalog named"; beside a `workspaces` object without either, the
+ * top level resolves.
  */
 function catalogHolder(root: PackageJson): { holder: PackageCatalogs; path: string } {
   const workspaces = root.workspaces;

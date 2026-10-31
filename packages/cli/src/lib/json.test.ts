@@ -44,7 +44,7 @@ describe('dependencyVersion through root catalogs', () => {
     expect(dependencyVersion(root, 'dependencies', members, 'absent')).toBeUndefined();
   });
 
-  it('reads the top-level catalogs only while workspaces holds none, as bun install 1.4.3 does', () => {
+  it('reads the top-level catalogs only while workspaces holds none, as bun install 1.4.3 and 1.4.4 do', () => {
     const topLevel: PackageJson = { workspaces: { packages: ['packages/*'] }, catalog: { zod: '^3.0.0' } };
     expect(dependencyVersion(topLevel, 'dependencies', members, 'zod')).toEqual({
       version: '^3.0.0',
