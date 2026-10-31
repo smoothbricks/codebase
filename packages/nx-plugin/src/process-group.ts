@@ -173,8 +173,8 @@ export function killProcessGroupNow(pgid: number, patience: Patience): boolean {
  * Waits `ms` of host time without blocking this thread, so that the event loop serves everything else meanwhile and
  * reaps the group's leader. Two waits, and whichever ends first ends the pause: a timer, which keeps the process alive
  * while it waits, and `Atomics.waitAsync`, which does not (a process with nothing else pending exits under it, as
- * measured on Node 26 and Bun 1.4.3) but is not a timer. A timer alone is its caller's clock, and a test that fakes the
- * clock stops it for good, while what a kill waits for is the kernel.
+ * measured on Node 26 and Bun 1.4.3 and 1.4.4) but is not a timer. A timer alone is its caller's clock, and a test
+ * that fakes the clock stops it for good, while what a kill waits for is the kernel.
  */
 function pause(ms: number): Promise<void> {
   return new Promise((resolve) => {

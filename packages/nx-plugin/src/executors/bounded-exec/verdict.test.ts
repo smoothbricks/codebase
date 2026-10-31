@@ -676,8 +676,9 @@ process.stdin.resume();
     // The clock is faked: it moves once, when the command reports, by a generated amount short of the total bound, and
     // then the command exits. Below the bound the verdict is a function of the exit, never of how long a loaded host
     // took to get there (a land gate measured 5243 ms for `node -e ""` under a 5000 ms bound). The step is at least
-    // 1 ms: Bun 1.4.3's `advanceTimersByTime(0)` moves the fake clock 1 ms, and a run that never moves it is the case
-    // above. The command prints its report through `printf`, so the line naming the command never matches it.
+    // 1 ms: `advanceTimersByTime(0)` moves Bun's fake clock 1 ms (measured on 1.4.3 and 1.4.4), and a run that never
+    // moves it is the case above. The command prints its report through `printf`, so the line naming the command never
+    // matches it.
     const reported = 'bounded-exec-property-reported';
     await fc.assert(
       fc.asyncProperty(

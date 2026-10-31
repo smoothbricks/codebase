@@ -815,9 +815,9 @@ function trackDescribes(describeStack: string[]): (label: string) => CallbackRun
 }
 
 /**
- * Settles a test callback as plain Bun settles it (Bun 1.4.3, measured). Bun never passes `done` to the harness's
- * callback, which declares no parameters, so a callback that declares more parameters than the values Bun passed gets
- * the harness's `done`: `done()` and `done(null)` pass, and any other value fails the test with that value.
+ * Settles a test callback as plain Bun settles it (Bun 1.4.3 and 1.4.4, measured). Bun never passes `done` to the
+ * harness's callback, which declares no parameters, so a callback that declares more parameters than the values Bun
+ * passed gets the harness's `done`: `done()` and `done(null)` pass, and any other value fails the test with that value.
  * - A callback that returns no promise settles on its first `done` call; later calls change nothing.
  * - A callback that returns a promise settles on the promise, and a rejection fails the test whatever its reason,
  *   `undefined` included. `done()` changes nothing, and a `done(error)` before the promise resolves fails the test. A

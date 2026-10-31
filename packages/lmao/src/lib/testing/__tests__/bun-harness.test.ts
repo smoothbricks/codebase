@@ -186,8 +186,9 @@ describe('bun harness done callbacks', () => {
   });
 });
 
-// Each case takes plain Bun's verdict for the same callback (Bun 1.4.3, measured): a case Bun passes registers with `it`
-// and a case Bun fails registers with `it.failing`, so a harness that settles a done-style callback differently fails.
+// Each case takes plain Bun's verdict for the same callback (Bun 1.4.3 and 1.4.4, measured): a case Bun passes
+// registers with `it` and a case Bun fails registers with `it.failing`, so a harness that settles a done-style callback
+// differently fails.
 // A failing case's span must record the same failure: Bun also fails a test on a rejection nobody handles, so the
 // verdict alone cannot tell a harness that settled on done from one that leaked done's rejection.
 describe('bun harness done callbacks settle as Bun settles them', () => {
