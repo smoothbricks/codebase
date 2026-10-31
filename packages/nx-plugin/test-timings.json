@@ -23,6 +23,7 @@
     "src/task-history-namespace.test.ts": 5246,
     "src/executors/bounded-exec/run-cpu-pool.test.ts": 5185,
     "src/task-results.test.ts": 4915,
+    "src/nx-depends-on-configuration.test.ts": 4601,
     "src/nx-daemon-start-never.test.ts": 4590,
     "src/serial-group-wiring.test.ts": 4153,
     "src/nx-daemon-ignore-files.test.ts": 4149,

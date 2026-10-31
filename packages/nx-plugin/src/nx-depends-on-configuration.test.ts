@@ -1,5 +1,6 @@
 import { expect, it } from 'bun:test';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
+import type { TargetConfiguration } from 'nx/src/config/workspace-json-project-json';
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 
 /**
@@ -12,10 +13,7 @@ import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 
 function project(
   name: string,
-  targets: Record<
-    string,
-    { dependsOn: ProjectGraphProjectNode['data']['targets'][string]['dependsOn']; production?: true }
-  >,
+  targets: Record<string, { dependsOn: TargetConfiguration['dependsOn']; production?: true }>,
 ): ProjectGraphProjectNode {
   return {
     name,
