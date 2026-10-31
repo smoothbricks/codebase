@@ -129,6 +129,22 @@ index 006c077033a6e92a8bdcc6c732110736fb465b5a..2ac4a0252c813cec5492b7ac83e2d516
      }
      catch {
          try {
+diff --git a/dist/src/config/workspace-json-project-json.d.ts b/dist/src/config/workspace-json-project-json.d.ts
+index ed6dcf88fe5f67b35ee12efa9642179d64ab4b85..fe482b3a907b0704a50d8771e1b2d264e1d99bea 100644
+--- a/dist/src/config/workspace-json-project-json.d.ts
++++ b/dist/src/config/workspace-json-project-json.d.ts
+@@ -171,6 +171,11 @@ export interface TargetDependencyConfig {
+      * Whether to forward task options to the dependency target.
+      */
+     options?: 'ignore' | 'forward';
++    /**
++     * The configuration the dependency target runs in, which it also passes on to its own dependencies. Without it, the
++     * dependency runs in the configuration the run asked for.
++     */
++    configuration?: string;
+ }
+ export type InputDefinition = {
+     input: string;
 diff --git a/dist/src/daemon/cache.d.ts b/dist/src/daemon/cache.d.ts
 index 65e58a019d7c1f7ba7c8243ad119aa444ec3a499..cb060c6d90352cbaf69d105652617d5a995385ea 100644
 --- a/dist/src/daemon/cache.d.ts
@@ -4772,7 +4788,7 @@ index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..5f58606a9c57eb9b587cbe901201cfdb
  /**
   * Converts a string representation of a max cache size to a number.
 diff --git a/dist/src/tasks-runner/create-task-graph.js b/dist/src/tasks-runner/create-task-graph.js
-index f0996420e6a01e90f58512e433bd98cdd299d47b..cdb4fdcb687916f6098b8b77c9471da934bf0243 100644
+index f0996420e6a01e90f58512e433bd98cdd299d47b..673918a8b8686606941ef615c6b1261825e0d4d0 100644
 --- a/dist/src/tasks-runner/create-task-graph.js
 +++ b/dist/src/tasks-runner/create-task-graph.js
 @@ -77,7 +77,33 @@ class ProcessTasks {
@@ -4810,6 +4826,27 @@ index f0996420e6a01e90f58512e433bd98cdd299d47b..cdb4fdcb687916f6098b8b77c9471da9
              this.continuousDependencies[d].length === 0);
      }
      processTask(task, projectUsedToDeriveDependencies, configuration, overrides) {
+@@ -89,14 +115,17 @@ class ProcessTasks {
+         const dependencyConfigs = (0, utils_1.getDependencyConfigs)({ project: task.target.project, target: task.target.target }, this.extraTargetDependencies, this.projectGraph, this.allTargetNames);
+         for (const dependencyConfig of dependencyConfigs) {
+             const taskOverrides = createTaskOverrides(dependencyConfig, overrides, task, this.projectGraph);
++            // A dependency that names its configuration runs in it and passes it on to what it depends on; one that
++            // names none runs in the configuration the run asked for, as before.
++            const dependencyConfiguration = dependencyConfig.configuration ?? configuration;
+             if (dependencyConfig.projects) {
+-                this.processTasksForMultipleProjects(dependencyConfig, configuration, task, taskOverrides, overrides);
++                this.processTasksForMultipleProjects(dependencyConfig, dependencyConfiguration, task, taskOverrides, overrides);
+             }
+             else if (dependencyConfig.dependencies) {
+-                this.processTasksForDependencies(projectUsedToDeriveDependencies, dependencyConfig, configuration, task, taskOverrides, overrides);
++                this.processTasksForDependencies(projectUsedToDeriveDependencies, dependencyConfig, dependencyConfiguration, task, taskOverrides, overrides);
+             }
+             else {
+-                this.processTasksForSingleProject(task, task.target.project, dependencyConfig, configuration, taskOverrides, overrides);
++                this.processTasksForSingleProject(task, task.target.project, dependencyConfig, dependencyConfiguration, taskOverrides, overrides);
+             }
+         }
+     }
 diff --git a/dist/src/tasks-runner/default-tasks-runner.js b/dist/src/tasks-runner/default-tasks-runner.js
 index 713453e37ce42da670e6a37d62e0bab763d7cf37..841eb089b99e0c6029c0d860bf5e0a305fe6ad50 100644
 --- a/dist/src/tasks-runner/default-tasks-runner.js
@@ -7201,3 +7238,48 @@ index 74f0682269ede01ee9ee4819e39f38c90a719894..03686ffeeff54286b99386fddeef77d0
 +        }
      }
  }
+diff --git a/schemas/nx-schema.json b/schemas/nx-schema.json
+index 78fd574277f3223316e12661aef0d9a7b5576e48..fbb80ce4be091224f1128b3b857c3dbb3fd550ca 100644
+--- a/schemas/nx-schema.json
++++ b/schemas/nx-schema.json
+@@ -1014,6 +1014,10 @@
+                     "description": "Configuration for params handling.",
+                     "enum": ["ignore", "forward"],
+                     "default": "ignore"
++                  },
++                  "configuration": {
++                    "type": "string",
++                    "description": "The configuration the dependency target runs in, which it also passes on to its own dependencies. Without it, the dependency runs in the configuration the run asked for."
+                   }
+                 },
+                 "oneOf": [
+diff --git a/schemas/project-schema.json b/schemas/project-schema.json
+index 07daea57dd94d204399de88c6698d0a753bfd89b..caf68740038c5a1ed41dad9f5328a4d25692235e 100644
+--- a/schemas/project-schema.json
++++ b/schemas/project-schema.json
+@@ -102,6 +102,10 @@
+                       "description": "Configuration for params handling.",
+                       "enum": ["ignore", "forward"],
+                       "default": "ignore"
++                    },
++                    "configuration": {
++                      "type": "string",
++                      "description": "The configuration the dependency target runs in, which it also passes on to its own dependencies. Without it, the dependency runs in the configuration the run asked for."
+                     }
+                   },
+                   "oneOf": [
+diff --git a/schemas/workspace-schema.json b/schemas/workspace-schema.json
+index 2cd72f6d94098f83a29b9100bcfffd749dbc5047..38499ef75993f26f70f0eeee2599d0745e4fb5d6 100644
+--- a/schemas/workspace-schema.json
++++ b/schemas/workspace-schema.json
+@@ -91,6 +91,10 @@
+                                       "description": "Configuration for params handling.",
+                                       "enum": ["ignore", "forward"],
+                                       "default": "ignore"
++                                    },
++                                    "configuration": {
++                                      "type": "string",
++                                      "description": "The configuration the dependency target runs in, which it also passes on to its own dependencies. Without it, the dependency runs in the configuration the run asked for."
+                                     }
+                                   },
+                                   "oneOf": [

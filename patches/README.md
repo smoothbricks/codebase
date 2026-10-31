@@ -857,6 +857,26 @@ patched package. Ordinary installation applies the current patch before test typ
 or generated product substitutes for the lock-selected implementation. Drop each carried hunk only when the installed
 upstream version contains its respective repair, retaining the regressions.
 
+## A dependency's configuration
+
+Stock Nx 23.2.1 runs every task of a graph in the configuration the run asked for (a target's own `defaultConfiguration`
+aside): a `dependsOn` entry cannot say that its dependency runs in another. A land gate, `nx run-many -t gate` in the
+default configuration, therefore could not hold the host's production CLI and addon, and `tooling/land-host.sh` built
+them in a second Nx run after the gate, sequentially and outside the graph that schedules every other task: 501 s of an
+804 s SmoothBricks land (2026-10-31).
+
+The `create-task-graph` hunk reads an optional `configuration` on a `dependsOn` object. The dependency runs in it, if
+its target has that configuration (otherwise in its own default, as for any configuration a run names), and passes it on
+to its own dependencies, so `{ "target": "cli-native", "projects": ["cowshed"], "configuration": "production" }` reaches
+`cli-<arch>-<os>:production` as `nx run cowshed:cli-native:production` would. An entry that names none behaves as
+before, so one graph can hold a development and a production task of one target, under their distinct task ids.
+`TargetDependencyConfig` and the project, workspace and `targetDefaults` schemas declare the field.
+
+`packages/nx-plugin/src/nx-depends-on-configuration.test.ts` runs the installed `createTaskGraph` on a graph whose
+aggregate asks for one target in production beside a test that asks for the same target with no configuration, and
+requires both tasks, the production one's dependency in production too. Against stock Nx both of its tests fail. Drop
+the hunk once the installed upstream version has the field, retaining the regression.
+
 ## Upstream PR draft: Nx `findCycles`
 
 Status: drafted, not opened. Written against nrwl/nx `master` at `a37b5ca4c6630bb9ea5df9ac0546edc3a186bc2f`, whose

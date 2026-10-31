@@ -336,12 +336,12 @@ gate and the cross check keep their own `target/cargo-lint` and `target/cargo-li
 The `production` configuration adds `--release` to the targets that build shipped artifacts (`cargo-napi`,
 `napi-<arch>-<os>`, `cargo-wasm`) and is selected for shipping: the generated publish workflow's build and platform-leg
 steps, the `smoo release` commands it runs, and the build and deploy runs of a production `smoo github-ci nx-deploy`.
-The land seam also builds the host production CLI before its shipping-byte guard; ordinary build and test graphs never
-reach that seam. Test targets have no `production` configuration, so a release build never compiles release test
-binaries. A package-local target that builds a shipped artifact follows the same rule: its default options compile `dev`
-and its `production` configuration compiles a shipping profile. A shipping profile other than `release` is only for an
-artifact family no other build compiles, such as a size-optimised wasm32 lane; a profile that compiles the same crates
-for the same target as `dev` or `release` compiles every dependency a second time.
+The land gate also builds the host production CLI and addon before its shipping-byte guard; ordinary build and test
+graphs never reach that seam. Test targets have no `production` configuration, so a release build never compiles release
+test binaries. A package-local target that builds a shipped artifact follows the same rule: its default options compile
+`dev` and its `production` configuration compiles a shipping profile. A shipping profile other than `release` is only
+for an artifact family no other build compiles, such as a size-optimised wasm32 lane; a profile that compiles the same
+crates for the same target as `dev` or `release` compiles every dependency a second time.
 
 Native profiles have disjoint output trees: development CLIs live under `.cache/bin/<platform>/` and development
 platform addons under `.cache/native-dev/<platform>/`; production retains the shipping `dist/bin/` and `dist/native/`
@@ -349,8 +349,11 @@ layout. Declarations interpolate the same options the commands use, so their out
 together. The host-resolved `cli-native` and `napi-native` aggregates delegate to the existing platform producers and
 declare no outputs of their own. Their `production` configuration forwards that same selection to the host producer. A
 test that executes the CLI or loads the ordinary platform addon names those producers; tests using the explicit test
-addon still name `napi-debug`. The land host runs `cowshed:cli-native:production` then the dependency-free
-`cowshed:release-check`, cached on a runtime digest of the shipping bytes it inspects, never on a development output.
+addon still name `napi-debug`. The root `gate` target depends on `cowshed:cli-native` and `cowshed:napi-native` in their
+`production` configuration (a `dependsOn` entry's `configuration`, a hunk of the carried Nx patch), so the land gate's
+one Nx graph builds them beside its other tasks and replays them when their inputs did not move. The land host then runs
+the dependency-free `cowshed:release-check`, cached on a runtime digest of the shipping bytes it inspects, never on a
+development output.
 
 After the fast-forward, main's output restoration explicitly requests `build`, `cli-native`, and `napi-native`. The
 normal build remains JS/dependency-only; this post-land seam restores the source-selected host CLI/addon and their input

@@ -30,9 +30,9 @@ is the host-installed CLI of `packages/cowshed`.
 - **Land**: the land command (see Commands). Under the repository's **land turn** (a FIFO queue per repo, holder named),
   it rebases the shed onto `main`, runs the gate main's `.cowshed.toml` declares (`tooling/land-host.sh --gate`: it
   refuses what the rebased tree adds that no production code reaches (`@smoothbricks/codebase:wiring`), then runs
-  `nx run-many -t gate`, the root aggregate of every project's lint, test and build plus `host-e2e`, and
-  `bun run check:linux`), fast-forwards `main` on green and retires the shed, then pushes `main` and runs the declared
-  after-land commands.
+  `nx run-many -t gate`, the root aggregate of every project's lint, test and build plus `host-e2e` and the host
+  production CLI and addon, then `bun run check:linux` and `cowshed:release-check` on those shipping bytes),
+  fast-forwards `main` on green and retires the shed, then pushes `main` and runs the declared after-land commands.
 - **Nx**: the build and test runner. `@smoothbricks/nx-plugin` infers most targets.
 - **LMAO spans**: the traces `@smoothbricks/lmao` records. Tests flush them to each package's SQLite sink
   (`<package>/.cache/lmao/trace-results.db`); `TraceQuery` or the `sqlite3` CLI reads them

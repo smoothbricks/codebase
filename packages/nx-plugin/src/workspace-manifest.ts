@@ -347,6 +347,11 @@ export interface NxDependsOnObject {
   projects?: string | string[];
   /** The same target of every dependency project, as the `^target` string form says. */
   dependencies?: boolean;
+  /**
+   * The configuration the dependency runs in, which it passes on to its own dependencies; without it, the one the run
+   * asked for (the dependsOn-configuration hunk of `patches/nx@23.2.1.patch`).
+   */
+  configuration?: string;
 }
 
 export type NxDependsOn = string | NxDependsOnObject;

@@ -46,30 +46,13 @@ const CORES = String(spawnSync('sysctl', ['-n', 'hw.ncpu'], { encoding: 'utf8' }
 const GATE = ['run-many', '-t', 'gate', `--parallel=${CORES}`, '--nx-bail=false', '--outputStyle=static-failures-only'];
 const DAEMON_STOP: Call = { args: ['daemon', '--stop'], exit: 0 };
 const passingRun = (args: readonly string[]): Call => ({ args, exit: 0 });
-/** The shipping seam builds the host production CLI and addon, then checks only their already-produced bytes. */
-const SHIPPING_PRODUCER = [
-  'run-many',
-  '--projects',
-  'cowshed',
-  '--targets',
-  'cli-native,napi-native',
-  '--configuration',
-  'production',
-  '--outputStyle=static-failures-only',
-];
+/** The shipping guard checks only the bytes the gate's own graph produced: it runs nothing else. */
 const SHIPPING_CHECK = ['run', 'cowshed:release-check', '--outputStyle=static-failures-only'];
-const SHIPPING_PRODUCER_PASSED: Call = {
-  ...passingRun(SHIPPING_PRODUCER),
-  run: [
-    { taskId: 'cowshed:cli-native:production', hash: 'shipping-producer-hash', status: 0 },
-    { taskId: 'cowshed:napi-native:production', hash: 'shipping-addon-hash', status: 0 },
-  ],
-};
 const SHIPPING_CHECK_PASSED: Call = {
   ...passingRun(SHIPPING_CHECK),
   run: [{ taskId: 'cowshed:release-check', hash: 'shipping-check-hash', status: 0 }],
 };
-const SHIPPING = [SHIPPING_PRODUCER_PASSED, SHIPPING_CHECK_PASSED];
+const SHIPPING = [SHIPPING_CHECK_PASSED];
 const SHIPPING_NX = SHIPPING.map((call) => call.args.join(' '));
 
 /** The Linux cross check as an Nx run of its own: its run summary names the task the pre-push hook asks Nx for. */
@@ -78,10 +61,17 @@ const CROSS_PASSED: Call = {
   ...passingRun(CROSS),
   run: [{ taskId: 'cowshed:cargo-lint-cross', hash: 'cross-hash', status: 0 }],
 };
-/** A whole gate that passed: its run summary carries the root aggregate's row, the hash a land publishes. */
+/**
+ * A whole gate that passed: its run summary carries the root aggregate's row and the host production CLI and addon its
+ * graph built, the hashes a land publishes.
+ */
 const GATE_PASSED: Call = {
   ...passingRun(GATE),
-  run: [{ taskId: '@smoothbricks/codebase:gate', hash: 'gate-hash', status: 0 }],
+  run: [
+    { taskId: '@smoothbricks/codebase:gate', hash: 'gate-hash', status: 0 },
+    { taskId: 'cowshed:cli-native:production', hash: 'shipping-producer-hash', status: 0 },
+    { taskId: 'cowshed:napi-native:production', hash: 'shipping-addon-hash', status: 0 },
+  ],
 };
 /** The files Nx hashes for each task and the tasks it waits for: the workspace's one commit writes change.txt. */
 const INPUTS = { 'lib:lint': ['change.txt', 'lib/src/index.ts'], 'lib:test': ['lib/src/index.ts'] };
@@ -478,25 +468,25 @@ describe('land-host.sh --gate', () => {
     if (output !== undefined) expect(readFileSync(output, 'utf8')).toContain('error: original failure');
   });
 
-  it.each([
-    { phase: 'host production producer', calls: [{ args: SHIPPING_PRODUCER, exit: 17 }], status: 17 },
-    { phase: 'shipping guard', calls: [SHIPPING_PRODUCER_PASSED, { args: SHIPPING_CHECK, exit: 19 }], status: 19 },
-  ])('stops before publishing when the $phase fails', ({ calls, status }) => {
-    const gate = fixture({ crossRuns: true });
-    const base = git(gate.main, 'rev-parse', 'HEAD');
-    const run = gate.gate([DAEMON_STOP, passingRun(WIRING(base)), GATE_PASSED, CROSS_PASSED, ...calls]);
-    expect(run.status, run.log).toBe(status);
-    expect(run.log).toContain('the land stops');
-    expect(run.nx).toEqual([
-      'daemon --stop',
-      WIRING(base).join(' '),
-      GATE.join(' '),
-      CROSS.join(' '),
-      ...calls.map((call) => call.args.join(' ')),
-    ]);
-    expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
-    expect(readdirSync(join(gate.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
-  });
+  it.each([{ phase: 'shipping guard', calls: [{ args: SHIPPING_CHECK, exit: 19 }], status: 19 }])(
+    'stops before publishing when the $phase fails',
+    ({ calls, status }) => {
+      const gate = fixture({ crossRuns: true });
+      const base = git(gate.main, 'rev-parse', 'HEAD');
+      const run = gate.gate([DAEMON_STOP, passingRun(WIRING(base)), GATE_PASSED, CROSS_PASSED, ...calls]);
+      expect(run.status, run.log).toBe(status);
+      expect(run.log).toContain('the land stops');
+      expect(run.nx).toEqual([
+        'daemon --stop',
+        WIRING(base).join(' '),
+        GATE.join(' '),
+        CROSS.join(' '),
+        ...calls.map((call) => call.args.join(' ')),
+      ]);
+      expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
+      expect(readdirSync(join(gate.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
+    },
+  );
 
   it('exits with the Linux cross check status when it fails after a passing gate, and publishes nothing', () => {
     const gate = fixture({ linuxFails: true });
@@ -522,7 +512,7 @@ describe('land-host.sh --gate', () => {
     const program = `${readFileSync(join(bridge, 'cache_adapter.js'), 'utf8')}\n${readFileSync(join(bridge, 'nx_publish.js'), 'utf8')}`;
     expect(readFileSync(join(gate.state, 'publish.program'), 'utf8')).toBe(program);
     expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["wiring-hash"]\n-\n${gate.ws}\n["gate-hash"]\n-\n${gate.ws}\n["shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
+      `-\n${gate.ws}\n["wiring-hash"]\n-\n${gate.ws}\n["gate-hash","shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
     );
   });
 
@@ -530,10 +520,11 @@ describe('land-host.sh --gate', () => {
     const gate = fixture({ crossRuns: true });
     const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, CROSS_PASSED, ...SHIPPING]);
     expect(run.status, run.log).toBe(0);
-    expect(run.nx.slice(-3)).toEqual([CROSS.join(' '), ...SHIPPING_NX]);
-    // Each invocation keeps its own list: gate, cross check, shipping producer and shipping guard.
+    expect(run.nx.slice(-2)).toEqual([CROSS.join(' '), ...SHIPPING_NX]);
+    // Each invocation keeps its own list: the gate's (the host production producers among it), the cross check's and the
+    // shipping guard's.
     expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["gate-hash"]\n-\n${gate.ws}\n["cross-hash"]\n-\n${gate.ws}\n["shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
+      `-\n${gate.ws}\n["gate-hash","shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["cross-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
     );
   });
 
@@ -551,9 +542,7 @@ describe('land-host.sh --gate', () => {
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain("could not read the gate's task hashes");
     expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
-    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
-    );
+    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(`-\n${gate.ws}\n["shipping-check-hash"]\n`);
     expect(readdirSync(join(gate.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
   });
 
@@ -605,9 +594,7 @@ describe('land-host.sh --gate', () => {
       'the run summary is of an invocation that began at 2026-01-01T00:00:00.000Z, before this gate',
     );
     expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
-    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
-      `-\n${gate.ws}\n["shipping-producer-hash","shipping-addon-hash"]\n-\n${gate.ws}\n["shipping-check-hash"]\n`,
-    );
+    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(`-\n${gate.ws}\n["shipping-check-hash"]\n`);
   });
 
   it('names no commit from a run summary an earlier invocation wrote', () => {

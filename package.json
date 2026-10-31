@@ -110,7 +110,21 @@
               "*"
             ]
           },
-          "host-e2e"
+          "host-e2e",
+          {
+            "target": "cli-native",
+            "projects": [
+              "cowshed"
+            ],
+            "configuration": "production"
+          },
+          {
+            "target": "napi-native",
+            "projects": [
+              "cowshed"
+            ],
+            "configuration": "production"
+          }
         ]
       },
       "lint": {
