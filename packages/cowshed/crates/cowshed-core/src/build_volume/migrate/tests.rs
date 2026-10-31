@@ -1060,7 +1060,6 @@ fn a_held_declared_path_under_a_symlinked_parent_refuses_before_any_path_changes
 fn an_unreadable_volume_directory_behind_a_declared_path_is_an_error_naming_it() {
     let scratch = Scratch::new();
     let checkout = scratch.checkout();
-    git(&checkout, &["init", "--quiet"]);
     link::point(&checkout, &scratch.volume()).unwrap();
     let held = scratch.volume().join("declared/vendor/upstream");
     fs::create_dir_all(&held).unwrap();
@@ -1607,8 +1606,8 @@ mod property {
     /// any path refuses before any path changes; otherwise every path but an unoccupied declared
     /// one whose volume directory holds no entry is its fixed link, and each declared directory's
     /// files are where the refresh says it kept them. Every case's checkout is a fresh directory
-    /// of one Git repository, made once:
-    /// a Git process costs seconds on a loaded macOS host, and the tracked-source guard needs one.
+    /// of one Git repository, made once: a Git process costs seconds on a loaded macOS host, and
+    /// the tracked-source guard needs one.
     #[test]
     fn a_refresh_never_deletes_user_data() {
         let scratch = Scratch::new();
