@@ -165,7 +165,7 @@ impl std::fmt::Display for Unsettled {
 /// Every build-state path of `checkout` that is not what a refresh at an unchanged fingerprint
 /// leaves it (`migrate::adopt_paths`): its fixed link, under real parent directories, reaching
 /// its directory in the volume mounted at `volume`; or, for a declared path nothing occupies
-/// whose directory the volume does not hold, nothing at all. Reads only; repairing or
+/// whose volume directory holds no entry, nothing at all. Reads only; repairing or
 /// reporting each is the refresh's.
 pub fn unsettled(
     checkout: &Path,
@@ -609,12 +609,14 @@ mod tests {
         );
         let mode = |mode| <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode);
         fs::set_permissions(volume.join("declared/upstream"), mode(0o000)).unwrap();
+        // Restored before asserting, so the scratch tree's teardown can enter it on every exit.
+        let unreadable = unsettled(&checkout, &volume, &paths);
+        fs::set_permissions(volume.join("declared/upstream"), mode(0o755)).unwrap();
         assert_eq!(
-            unsettled(&checkout, &volume, &paths),
+            unreadable,
             [(PathBuf::from("upstream/build"), Unsettled::Missing)],
             "an unreadable volume directory is left to the refresh, which reports it"
         );
-        fs::set_permissions(volume.join("declared/upstream"), mode(0o755)).unwrap();
         fs::remove_dir_all(volume.join("declared")).unwrap();
 
         fs::remove_file(checkout.join("target")).unwrap();

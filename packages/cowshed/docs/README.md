@@ -241,7 +241,8 @@ directory aside intact into `.cowshed/kept/` and links the path onto the volume.
 directory, re-run whatever reconstructs the state once, and delete the kept directory; from then on it lives on the
 volume and every fork gets it warm. A declared path that does not exist stays absent (tools read its existence as
 meaning) until something creates it, unless the build volume already holds its directory with entries (a fork of a
-checkout that linked it, or main after a land of one); either is linked at the next admission. A pattern such as
+checkout that linked it, or main after a land of one); either is linked at the next admission. Removing only its link
+does not make such a path absent: empty it through the link, then remove the link. A pattern such as
 `packages/*/.cache/lmao` declares the name beneath every directory the checkout tracks files under, so a package added
 later joins on its own.
 

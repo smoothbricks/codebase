@@ -948,9 +948,9 @@ fn an_empty_declared_directory_is_linked_in_its_place() {
 }
 
 /// Existence carries meaning: a tool asks whether a declared directory is there (a pin worktree
-/// or none). So a refresh never makes an absent declared path the volume does not hold -- no
-/// link, no volume directory, no parent -- while every capability's path is linked at once. Once
-/// a tool makes the directory, the next refresh adopts it.
+/// or none). So a refresh never makes an absent declared path whose volume directory holds no
+/// entry -- no link, no volume directory, no parent -- while every capability's path is linked
+/// at once. Once a tool makes the directory, the next refresh adopts it.
 #[test]
 fn an_absent_declared_path_stays_absent_until_a_tool_makes_it() {
     let scratch = Scratch::new();
@@ -1034,16 +1034,15 @@ fn a_held_declared_path_under_a_symlinked_parent_refuses_before_any_path_changes
         BuildStatePath::new("target", "target").unwrap(),
         BuildStatePath::declared("vendor/upstream").unwrap(),
     ];
-    assert!(
-        adopt_paths(
-            &crate::census::this_test(),
-            &checkout,
-            &scratch.volume(),
-            &paths,
-            &paths,
-        )
-        .is_err()
-    );
+    let error = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &paths,
+        &paths,
+    )
+    .unwrap_err();
+    assert!(error.message.contains("not a real directory"), "{error}");
     assert_eq!(
         fs::read_to_string(checkout.join("target/old")).unwrap(),
         "a tool's own state",
@@ -1054,6 +1053,45 @@ fn a_held_declared_path_under_a_symlinked_parent_refuses_before_any_path_changes
         "nothing was linked through the symlink"
     );
 }
+
+/// A volume directory the refresh cannot read behind a declared path is an error naming it,
+/// never taken for an empty or absent one.
+#[test]
+fn an_unreadable_volume_directory_behind_a_declared_path_is_an_error_naming_it() {
+    let scratch = Scratch::new();
+    let checkout = scratch.checkout();
+    git(&checkout, &["init", "--quiet"]);
+    link::point(&checkout, &scratch.volume()).unwrap();
+    let held = scratch.volume().join("declared/vendor/upstream");
+    fs::create_dir_all(&held).unwrap();
+    fs::write(held.join("build.ninja"), "made by a tool").unwrap();
+    let paths = vec![BuildStatePath::declared("vendor/upstream").unwrap()];
+    let mode = |mode| <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode);
+    let parent = scratch.volume().join("declared/vendor");
+    fs::set_permissions(&parent, mode(0o000)).unwrap();
+    // Restored before asserting, so the scratch tree's teardown can enter it on every exit.
+    let refreshed = adopt_paths(
+        &crate::census::this_test(),
+        &checkout,
+        &scratch.volume(),
+        &paths,
+        &paths,
+    );
+    fs::set_permissions(&parent, mode(0o755)).unwrap();
+    let error = refreshed.unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("inspect build-state volume directory"),
+        "{error}"
+    );
+    assert!(
+        error.message.contains("declared/vendor/upstream"),
+        "{error}"
+    );
+    assert!(!checkout.join("vendor").exists(), "nothing was made");
+}
+
 /// A land hands main the gate's build volume, declared state included, while the gate's links
 /// stayed in its retired source image: main, and every fork of it, holds `declared/<path>` with
 /// nothing at the path. A traced run then made a real directory there (lmao creates its sink's
@@ -1296,7 +1334,7 @@ fn every_tool_and_occupant() -> Vec<(BuildStateTool, Occupant)> {
 /// cowshed did not make are never removed or linked over, only a tool's own directory is
 /// discarded (empty or not, as before), a declared directory holding anything is moved aside
 /// intact, a declared empty directory is the only thing removed outright, and every path ends at
-/// its fixed link but a declared one nothing occupies whose directory the volume does not hold.
+/// its fixed link but a declared one nothing occupies whose volume directory holds no entry.
 #[test]
 fn the_decision_deletes_nothing_cowshed_cannot_rebuild() {
     for (tool, occupant) in every_tool_and_occupant() {
@@ -1568,8 +1606,8 @@ mod property {
     /// directory is still in the checkout afterwards, byte for byte; a file or a foreign link at
     /// any path refuses before any path changes; otherwise every path but an unoccupied declared
     /// one whose volume directory holds no entry is its fixed link, and each declared directory's
-    /// files are where the refresh says it
-    /// kept them. Every case's checkout is a fresh directory of one Git repository, made once:
+    /// files are where the refresh says it kept them. Every case's checkout is a fresh directory
+    /// of one Git repository, made once:
     /// a Git process costs seconds on a loaded macOS host, and the tracked-source guard needs one.
     #[test]
     fn a_refresh_never_deletes_user_data() {
@@ -1633,6 +1671,11 @@ mod property {
                     prop_assert!(
                         fs::symlink_metadata(checkout.join(path)).is_err(),
                         "{} stays absent",
+                        path.display()
+                    );
+                    prop_assert!(
+                        fs::symlink_metadata(checkout.join(path.parent().unwrap())).is_err(),
+                        "{} made no parent",
                         path.display()
                     );
                     continue;

@@ -268,20 +268,20 @@ real directory, or something else) without changing it, and names `cowshed exec 
 what the refresh finds there to one action. The shell around it observes every path, decides all of them before it
 changes any, and performs. A refusal therefore changes no build-state path.
 
-| Found at the path                          | A capability's path                               | A declared path                                                                                |
-| ------------------------------------------ | ------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| nothing                                    | make the link                                     | make the link when the volume holds its directory, else leave it absent (Declared build state) |
-| its fixed link, dangling or not            | keep it, and make its volume directory if missing | the same                                                                                       |
-| an empty real directory                    | discard it, then link                             | remove it with `rmdir(2)`, then link                                                           |
-| a real directory with entries              | discard it, then link                             | move it aside intact, then link                                                                |
-| a file, or any other link, dangling or not | refuse, naming the path                           | the same                                                                                       |
+| Found at the path                          | A capability's path                               | A declared path                                                                                             |
+| ------------------------------------------ | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| nothing                                    | make the link                                     | make the link when the volume holds its directory with entries, else leave it absent (Declared build state) |
+| its fixed link, dangling or not            | keep it, and make its volume directory if missing | the same                                                                                                    |
+| an empty real directory                    | discard it, then link                             | remove it with `rmdir(2)`, then link                                                                        |
+| a real directory with entries              | discard it, then link                             | move it aside intact, then link                                                                             |
+| a file, or any other link, dangling or not | refuse, naming the path                           | the same                                                                                                    |
 
 A capability's directory is its tool's own cache, which the next build rebuilds: discarding it is rebuild-only
 migration, and keeping it would hold a Cargo target directory's tens of GiB that nobody asked for. A declared directory
 is not cowshed's to judge (Declared build state). `rmdir(2)` removes a declared directory only while it is still empty,
 so an entry a tool writes after the refresh looked fails the refresh as a conflict instead of being lost. It runs before
 any rename, so that conflict moves no directory with entries aside; an empty declared directory removed before it stays
-absent until a tool makes it again, or, where the volume already holds the path's directory with entries, until that
+absent until a tool makes it again, or, where the volume already holds the path's directory with entries, until the next
 refresh links it.
 
 A kept directory is renamed in one `rename(2)`, on the same volume and never copied, to
@@ -308,13 +308,13 @@ fork's next exec after testing any other package would refuse, and only an opera
 declined to delete could clear it. The rename costs nothing, loses nothing, and the job proceeds.
 
 - **Enforced by**: `migrate::tests`: a decision test over every tool and occupant, whose list a new variant cannot
-  compile past; a property test that runs the refresh over random occupants (absent with or without the volume holding
-  the path's directory, the fixed link, a foreign or dangling link, an empty or filled directory, a file) of three
-  capability paths and three declared ones, asserting that every file and link outside a tool's own cache survives byte
-  for byte, that a file or a foreign link refuses with no file or link changed, and that each declared directory's files
-  are where its finding says; a race test writing into an empty declared directory between observation and `rmdir(2)`;
-  and the `.bun-pin` regression, which keeps an uncommitted edit at the location its notice names. `kept::tests` decodes
-  every entry name back to its path and time and refuses every name it did not write.
+  compile past; a property test that runs the refresh over random occupants (absent with the volume holding nothing, an
+  empty directory or one with entries, the fixed link, a foreign or dangling link, an empty or filled directory, a file)
+  of three capability paths and three declared ones, asserting that every file and link outside a tool's own cache
+  survives byte for byte, that a file or a foreign link refuses with no file or link changed, and that each declared
+  directory's files are where its finding says; a race test writing into an empty declared directory between observation
+  and `rmdir(2)`; and the `.bun-pin` regression, which keeps an uncommitted edit at the location its notice names.
+  `kept::tests` decodes every entry name back to its path and time and refuses every name it did not write.
 
 A discarded directory is first renamed into `<checkout>/.cowshed/discard/`. That is the same volume, in cowshed's
 excluded namespace, and never a sibling in the source tree. The link then takes the path, and the refresh returns
@@ -395,15 +395,15 @@ directory. The author takes what they need from the kept directory, re-runs the 
 deletes the kept directory. From then on the state lives on the volume, every fork inherits it warm, and main adopts it
 at a land.
 
-**A declared path is linked when it appears or when the volume already holds it, never before.** A capability's path is
-linked at once, and its tool finds an empty directory it fills. A declared path's existence carries meaning to tools
-cowshed does not know: a build script that builds the upstream checkout when it is there, and takes a prebuilt artifact
-when it is not, would find an empty directory and try to build nothing. So a refresh makes nothing for a declared path
-that nothing occupies and whose directory the volume does not hold, neither the link, the volume directory nor a missing
-parent; the volume's state still holds the path. Once a tool has made the directory, the next refresh adopts it as
-above. A reconstruct script that wants to fill the volume on its first run makes the empty directory, lets a refresh
-link it (any `cowshed exec`), and only then fills it. The rule holds per pattern match: a package whose tests never
-wrote a trace store gets no link.
+**A declared path is linked when it appears or when the volume already holds it with entries, never before.** A
+capability's path is linked at once, and its tool finds an empty directory it fills. A declared path's existence carries
+meaning to tools cowshed does not know: a build script that builds the upstream checkout when it is there, and takes a
+prebuilt artifact when it is not, would find an empty directory and try to build nothing. So a refresh makes nothing for
+a declared path that nothing occupies and whose volume directory holds no entry, neither the link, the volume directory
+nor a missing parent; the volume's state still holds the path. Once a tool has made the directory, the next refresh
+adopts it as above. A reconstruct script that wants to fill the volume on its first run makes the empty directory, lets
+a refresh link it (any `cowshed exec`), and only then fills it. The rule holds per pattern match: a package whose tests
+never wrote a trace store gets no link.
 
 A directory with entries that the volume already holds is a tool's own, written through the path's link in this checkout
 or in one whose volume this checkout cloned or adopted, so a refresh links it wherever nothing occupies the path,
@@ -438,7 +438,7 @@ the top mount instead. The swap would therefore be an unmount and a mount, which
   path, the reconstructed state is written through the link, and a fork of main reads it warm; discovery tests refusing
   a tracked, overlapping or escaping declaration with its remedy; migration tests keeping a declared checkout whole at
   the location its finding names, linking an empty declared directory in place, leaving an absent declared path the
-  volume does not hold absent until a tool makes it, and linking one the volume holds so that a traced run writes
+  volume holds no entries for absent until a tool makes it, and linking one the volume holds so that a traced run writes
   through the link and the next refresh keeps nothing aside, leaving an empty held directory unlinked, and refusing a
   held path under a symlinked parent before any other path changes; `link.rs`'s settled-links test counting a held,
   unlinked declared path as one the refresh changes; a discovery test expanding a pattern over tracked packages only,

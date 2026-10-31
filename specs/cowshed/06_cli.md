@@ -734,7 +734,7 @@ reports, and whether the gateway has the workspace's session installed at that r
 controller's pre-exec reconcile would install nothing for it. And `exec` admits a job only onto build state the
 controller's refresh (16_build_volumes.md, "One link per checkout") would leave as it is: every fixed link the
 checkout's build volume records is in place and reaches its volume directory (a declared path nothing occupies needs
-none unless the volume holds its directory), and the tracked build inputs still have the fingerprint that volume
+none unless its volume directory holds entries), and the tracked build inputs still have the fingerprint that volume
 records, computed as the refresh computes it (its Git listings and a hash of the tracked manifests). The workspace's
 supervisor judges it (`asIs`, 11_shell.md, "Protocol") from listings its process keeps while the checkout's index keeps
 its identity (11_shell.md, "Kept readings"), where a CLI process would list them again for every exec. The job then runs
