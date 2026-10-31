@@ -18,6 +18,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 
+use super::BuildStateTool;
 use crate::capabilities::BuildStatePath;
 use crate::error::{CowshedError, Result};
 
@@ -140,9 +141,9 @@ pub fn settled(checkout: &Path, volume: &Path, paths: &[BuildStatePath]) -> bool
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Unsettled {
     /// Nothing is there, where a link belongs: a tool removed it, and its next run makes a
-    /// directory in its place; or a declared path whose volume directory holds entries and whose
-    /// link this checkout lacks: never made here (a fork of main, main after a land) or removed
-    /// by a tool.
+    /// directory in its place; or a declared path whose link this checkout lacks, never made here
+    /// (a fork of main, main after a land, a cache's first refresh) or removed by a tool, a kept
+    /// one (`[build] keep`) only while its volume directory holds entries.
     Missing,
     /// A real directory displaced the link: a tool removed it and wrote there since, off the
     /// volume.
@@ -164,8 +165,8 @@ impl std::fmt::Display for Unsettled {
 
 /// Every build-state path of `checkout` that is not what a refresh at an unchanged fingerprint
 /// leaves it (`migrate::adopt_paths`): its fixed link, under real parent directories, reaching
-/// its directory in the volume mounted at `volume`; or, for a declared path nothing occupies
-/// whose volume directory holds no entry, nothing at all. Reads only; repairing or
+/// its directory in the volume mounted at `volume`; or, for a kept declared path (`[build] keep`)
+/// nothing occupies whose volume directory holds no entry, nothing at all. Reads only; repairing or
 /// reporting each is the refresh's.
 pub fn unsettled(
     checkout: &Path,
@@ -180,7 +181,7 @@ pub fn unsettled(
             let found = match fs::symlink_metadata(&at) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     // An unreadable volume directory is unsettled: the refresh reports it.
-                    (!state.is_declared()
+                    (BuildStateTool::of(state) != BuildStateTool::Declared
                         || !matches!(
                             volume_holds(volume, state),
                             Ok(VolumeHolds::Nothing | VolumeHolds::EmptyDirectory)
@@ -573,6 +574,26 @@ mod tests {
         assert!(volume.join("nx/cache/run.json").is_file());
     }
 
+    /// A declared path `[build] keep` does not name is a cache, linked like a capability's: where
+    /// nothing is, a refresh makes its link, so a resident `exec` sends the job through it.
+    #[test]
+    fn a_declared_cache_nothing_occupies_is_missing_its_link() {
+        let scratch = Scratch::new("declared-cache");
+        let checkout = scratch.checkout();
+        let volume = scratch.volume("volume-a");
+        point(&checkout, &volume).unwrap();
+        let paths = [BuildStatePath::declared("packages/a/.cache/lmao").unwrap()];
+        assert_eq!(
+            unsettled(&checkout, &volume, &paths),
+            [(PathBuf::from("packages/a/.cache/lmao"), Unsettled::Missing)]
+        );
+        link_paths(&checkout, &volume, &paths).unwrap();
+        assert!(
+            settled(&checkout, &volume, &paths),
+            "its link is what the refresh leaves"
+        );
+    }
+
     /// A resident `exec` admits a job without the controller's refresh only while every link is
     /// what that refresh would leave; each way a tool can disturb one sends the job through it.
     #[test]
@@ -583,10 +604,10 @@ mod tests {
         point(&checkout, &volume).unwrap();
         let mut paths = paths();
         link_paths(&checkout, &volume, &paths).unwrap();
-        paths.push(BuildStatePath::declared("upstream/build").unwrap());
+        paths.push(BuildStatePath::declared("upstream/build").unwrap().kept());
         assert!(
             settled(&checkout, &volume, &paths),
-            "a declared path nothing occupies needs no link"
+            "a kept declared path nothing occupies needs no link"
         );
 
         fs::create_dir_all(checkout.join("upstream/build")).unwrap();

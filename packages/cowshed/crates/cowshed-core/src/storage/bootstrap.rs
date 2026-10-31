@@ -475,6 +475,9 @@ struct SandboxSection {
 struct BuildSection {
     capacity: Option<Spanned<String>>,
     state: Option<Vec<Spanned<String>>>,
+    /// `[build] keep`: the `[build] state` entries that hold work, kept intact when a refresh
+    /// finds a real directory at their path; every other declared path is a cache it discards.
+    keep: Option<Vec<Spanned<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -523,8 +526,13 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
         Some(BuildSection {
             capacity: None,
             state: None,
+            keep: None,
         }) => return Err(ConfigError::EmptySection("build")),
-        Some(BuildSection { capacity, state }) => (
+        Some(BuildSection {
+            capacity,
+            state,
+            keep,
+        }) => (
             capacity
                 .map(|capacity| {
                     cowshed_apfs::image::ImageCapacity::parse(capacity.get_ref()).map_err(
@@ -535,10 +543,14 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                     )
                 })
                 .transpose()?,
-            match state {
-                Some(entries) => build_state(input, entries)?,
-                None => Vec::new(),
-            },
+            build_keep(
+                input,
+                match state {
+                    Some(entries) => build_state(input, entries)?,
+                    None => Vec::new(),
+                },
+                keep.unwrap_or_default(),
+            )?,
         ),
     };
     let nx_daemon_idle = file
@@ -815,6 +827,27 @@ fn build_state(
     Ok(state.into_iter().map(|(entry, _)| entry).collect())
 }
 
+/// `[build] keep`: mark each named `[build] state` entry kept. An entry names one state entry by
+/// its spelling, so a keep that matches none is refused rather than whitelisting nothing.
+fn build_keep(
+    input: &str,
+    mut state: Vec<DeclaredState>,
+    keep: Vec<Spanned<String>>,
+) -> Result<Vec<DeclaredState>, ConfigError> {
+    for entry in keep {
+        let line = line_of(input, &entry);
+        let path = entry.into_inner();
+        let Some(index) = state
+            .iter()
+            .position(|declared| declared.spelling() == Path::new(&path))
+        else {
+            return Err(ConfigError::KeepNotDeclared { line, path });
+        };
+        state[index] = state[index].clone().kept();
+    }
+    Ok(state)
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ConfigError {
     /// Not TOML, or TOML that is not a `.cowshed.toml`: a syntax error, a duplicated or unknown
@@ -865,6 +898,10 @@ pub enum ConfigError {
         outer: PathBuf,
         inner: PathBuf,
     },
+    #[error(
+        "[build] keep entry {path:?} at line {line} is not a [build] state entry; keep names declared state as [build] state spells it"
+    )]
+    KeepNotDeclared { line: usize, path: String },
     #[error(
         "[nx] daemon_idle {value:?} at line {line} must be a whole number of seconds, minutes or hours above zero, such as \"5m\""
     )]

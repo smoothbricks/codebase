@@ -321,6 +321,9 @@ struct PathWire {
     retention: crate::capabilities::SeedRetention,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     clone_invalid: Vec<String>,
+    /// `[build] keep` names this declared path: written only when it does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    keep: bool,
 }
 
 impl BuildVolumeState {
@@ -371,6 +374,7 @@ impl BuildVolumeState {
                         .iter()
                         .map(|path| path.as_path().to_string_lossy().into_owned())
                         .collect(),
+                    keep: state.keep,
                 })
                 .collect(),
             fingerprint: self.fingerprint.clone(),
@@ -384,7 +388,8 @@ impl BuildVolumeState {
     /// and dropped. A path already held keeps its volume name: links are fixed once made
     /// (16_build_volumes.md, "One link per checkout"); only a discovery that found the path's owner
     /// gone off the volume releases it (a Cargo target under mbx). A new path that overlaps a held
-    /// one is refused, naming both.
+    /// one is refused, naming both. A held path takes each discovered path's seed policy and
+    /// `[build] keep` from its contributor.
     /// Complete canonical discovery resolves an unowned legacy path to rebuildable state,
     /// without moving its fixed volume name or changing already-known retained ownership.
     pub fn with_discovered(
@@ -428,6 +433,7 @@ impl BuildVolumeState {
             {
                 held.retention = current.retention;
                 held.clone_invalid.clone_from(&current.clone_invalid);
+                held.keep = current.keep;
             } else if held.retention == crate::capabilities::SeedRetention::Unrecorded {
                 held.retention = crate::capabilities::SeedRetention::Rebuild;
                 held.clone_invalid.clear();
@@ -617,6 +623,16 @@ fn path_from_wire(wire: &PathWire) -> crate::Result<BuildStatePath> {
         .iter()
         .map(|value| crate::capabilities::RelPath::new(value))
         .collect::<crate::Result<_>>()?;
+    if wire.keep && !path.is_declared() {
+        return Err(crate::CowshedError::integrity(
+            format!(
+                "build-state path {} records [build] keep, which only declared build state has",
+                wire.checkout
+            ),
+            "cowshed doctor --json",
+        ));
+    }
+    path.keep = wire.keep;
     Ok(path)
 }
 
@@ -653,8 +669,12 @@ fn overlapping(path: &Path, left: &BuildStatePath, right: &BuildStatePath) -> cr
 pub enum BuildStateTool {
     Cargo,
     Nx,
-    /// `.cowshed.toml` `[build] state`: a tool no capability detects.
+    /// `.cowshed.toml` `[build] state` that `[build] keep` names: declared state that holds work,
+    /// such as a patch worktree, which a refresh moves aside intact rather than discard.
     Declared,
+    /// `.cowshed.toml` `[build] state` that `[build] keep` does not name: a cache of a tool no
+    /// capability detects, which a refresh discards and links like a capability's.
+    DeclaredCache,
     /// A JavaScript cache: an installed package's `node_modules/.cache`, or the module compile
     /// cache Node and Bun keep at `NODE_COMPILE_CACHE`.
     #[serde(rename = "javascript")]
@@ -662,9 +682,10 @@ pub enum BuildStateTool {
 }
 
 impl BuildStateTool {
-    /// The tool whose state `path` is: declared state by its own volume namespace, Nx's
-    /// directories under `.nx`, a JavaScript cache (an installed package's `node_modules/.cache`
-    /// or the module compile cache), and otherwise a Cargo target directory.
+    /// The tool whose state `path` is: declared state by its own volume namespace, kept or a
+    /// cache by its `[build] keep`, Nx's directories under `.nx`, a JavaScript cache (an
+    /// installed package's `node_modules/.cache` or the module compile cache), and otherwise a
+    /// Cargo target directory.
     pub fn of(path: &BuildStatePath) -> Self {
         let checkout = path.checkout.as_path();
         let parent_named = |name: &str| {
@@ -674,7 +695,11 @@ impl BuildStateTool {
                 .is_some_and(|parent| parent == name)
         };
         if path.is_declared() {
-            Self::Declared
+            if path.keep {
+                Self::Declared
+            } else {
+                Self::DeclaredCache
+            }
         } else if parent_named(".nx") {
             Self::Nx
         } else if checkout == Path::new(crate::workspace_environment::NODE_COMPILE_CACHE_CHECKOUT)
@@ -702,11 +727,11 @@ pub enum DiscardOrigin {
     Displaced,
 }
 
-/// A real directory holding entries at a declared build-state path, which a refresh moved aside
-/// intact, never copied and never deleted, and linked over (16_build_volumes.md, "What a refresh
-/// does at each path"). No refresh and no `gc` deletes it, and `rm` and `land` refuse its
-/// workspace while it is there, so it stays until the operator deletes it or abandons the
-/// workspace; `cowshed doctor` reports it until then ([`kept::list`]).
+/// A real directory holding entries at a kept declared build-state path (`[build] keep`), which a
+/// refresh moved aside intact, never copied and never deleted, and linked over
+/// (16_build_volumes.md, "What a refresh does at each path"). No refresh and no `gc` deletes it,
+/// and `rm` and `land` refuse its workspace while it is there, so it stays until the operator
+/// deletes it or abandons the workspace; `cowshed doctor` reports it until then ([`kept::list`]).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeptBuildStateFinding {
@@ -736,8 +761,9 @@ impl std::fmt::Display for KeptBuildStateFinding {
 }
 
 /// A real directory a refresh discarded, never copied, where a build-state link belongs, and
-/// linked over: a tool's own directory, which its next build rebuilds, or an empty one. A
-/// declared directory holding anything is kept instead ([`KeptBuildStateFinding`]).
+/// linked over: a tool's own directory or a declared cache, which its next run rebuilds, or an
+/// empty kept declared one. A kept declared directory holding anything is moved aside instead
+/// ([`KeptBuildStateFinding`]).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscardedBuildStateFinding {
@@ -753,6 +779,9 @@ impl std::fmt::Display for DiscardedBuildStateFinding {
         let rebuild = match self.tool {
             BuildStateTool::Cargo | BuildStateTool::Nx | BuildStateTool::JavaScript => {
                 "the next build rebuilds what is missing"
+            }
+            BuildStateTool::DeclaredCache => {
+                "[build] keep does not name it, so it is a cache its tool's next run rebuilds"
             }
             BuildStateTool::Declared => {
                 "it was empty, so nothing was lost; what fills it now writes onto the volume, and \
@@ -774,6 +803,9 @@ impl std::fmt::Display for DiscardedBuildStateFinding {
                          wrote there"
                     }
                     BuildStateTool::Declared => "whatever reconstructs the declared state",
+                    BuildStateTool::DeclaredCache => {
+                        "a git clean or rm -rf that removed its link before its tool wrote there"
+                    }
                 };
                 write!(
                     formatter,
@@ -1833,6 +1865,59 @@ mod tests {
         assert_eq!(
             BuildVolumeState::read(&root.join("roundtrip")).unwrap(),
             next
+        );
+    }
+
+    /// `[build] keep` lives in the volume's state: a refresh at an unchanged fingerprint reads its
+    /// paths from that record alone, so a kept declared path stays kept across it, and the next
+    /// discovery moves a held path's keep with its declaration.
+    #[test]
+    fn a_declared_path_s_keep_is_recorded_and_follows_its_declaration() {
+        let root = crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "cs-declared-keep");
+        let volume = root.join("volume");
+        fs::create_dir_all(&volume).unwrap();
+        let pin = BuildStatePath::declared("packages/pin/.bun-pin").unwrap();
+        let traces = BuildStatePath::declared(".cache/lmao").unwrap();
+        let tools = |state: &BuildVolumeState| {
+            state
+                .paths
+                .iter()
+                .map(BuildStateTool::of)
+                .collect::<Vec<_>>()
+        };
+        let (kept, _, _) = BuildVolumeState::default()
+            .with_discovered(
+                &[pin.clone().kept(), traces.clone()],
+                &[],
+                None,
+                "kept".into(),
+                &volume,
+            )
+            .unwrap();
+        kept.write(&volume).unwrap();
+        let read = BuildVolumeState::read(&volume).unwrap();
+        assert_eq!(read, kept);
+        assert_eq!(
+            tools(&read),
+            [BuildStateTool::Declared, BuildStateTool::DeclaredCache]
+        );
+        let (unkept, _, _) = read
+            .with_discovered(&[pin, traces], &[], None, "unkept".into(), &volume)
+            .unwrap();
+        assert_eq!(
+            tools(&unkept),
+            [BuildStateTool::DeclaredCache, BuildStateTool::DeclaredCache],
+            "a path dropped from [build] keep is a cache from its next discovery"
+        );
+        fs::write(
+            volume.join(STATE_FILE),
+            br#"{"version":1,"paths":[{"checkout":"target","volume":"target","keep":true}]}"#,
+        )
+        .unwrap();
+        let refused = BuildVolumeState::read(&volume).unwrap_err();
+        assert!(
+            refused.message.contains("target records [build] keep"),
+            "a capability's path is never kept: {refused:?}"
         );
     }
 

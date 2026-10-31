@@ -234,15 +234,17 @@ tracked-source guard, discards that rebuildable directory and restores the link.
 **State no capability detects is declared.** `.cowshed.toml` `[build] state = ["vendor/upstream"]` puts each listed
 checkout path on the build volume too, for tool state no convention file names — a gitignored patch-development checkout
 of an upstream project and its multi-GiB incremental build tree is the case it exists for. The path must be untracked,
-inside the checkout and apart from every detected tool's state; anything else refuses with the remedy. It is
-rebuild-only like all build state, but cowshed cannot see what a declared directory holds, so it never deletes one, and
-`rm` and `land` refuse the workspace while one is kept: the first admission after you declare it moves the existing
-directory aside intact into `.cowshed/kept/` and links the path onto the volume. Take what you need from the kept
-directory, re-run whatever reconstructs the state once, and delete the kept directory; from then on it lives on the
-volume and every fork gets it warm. A declared path that does not exist stays absent (tools read its existence as
-meaning) until something creates it, unless the build volume already holds its directory with entries (a fork of a
-checkout that linked it, or main after a land of one); either is linked at the next admission. Removing only its link
-does not make such a path absent: empty it through the link, then remove the link. A pattern such as
+inside the checkout and apart from every detected tool's state; anything else refuses with the remedy. A declared path
+is a cache, like a detected tool's: the first admission links it, and a real directory found there is discarded, so `rm`
+and `land` never trip on it. A declared path that holds work cowshed cannot rebuild, such as a patch worktree or sealed
+snapshots, is also listed in `[build] keep = ["vendor/upstream"]`, spelled as `[build] state` spells it. Cowshed never
+deletes such a directory, and `rm` and `land` refuse the workspace while one is kept: the first admission after you
+declare it moves the existing directory aside intact into `.cowshed/kept/` and links the path onto the volume. Take what
+you need from the kept directory, re-run whatever reconstructs the state once, and delete the kept directory; from then
+on it lives on the volume and every fork gets it warm. A kept path that does not exist stays absent (tools read its
+existence as meaning) until something creates it, unless the build volume already holds its directory with entries (a
+fork of a checkout that linked it, or main after a land of one); either is linked at the next admission. Removing only
+its link does not make such a path absent: empty it through the link, then remove the link. A pattern such as
 `packages/*/.cache/lmao` declares the name beneath every directory the checkout tracks files under, so a package added
 later joins on its own.
 

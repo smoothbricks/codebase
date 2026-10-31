@@ -75,17 +75,17 @@ each of them.
 
 ### What lives where
 
-| State                                                                                                                                                                                               | Volume                                                                                  | Shared how                                                                                                                 |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                                                                      | Source volume                                                                           | Cloned with the workspace image                                                                                            |
-| Cargo target directories of a project without the mbx capability; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                                                                            | Non-mbx: cloned at fork; mbx: starts empty; live volume adopted at land                                                    |
-| Cargo target directory of a project with the mbx capability                                                                                                                                         | mbx's managed target for the checkout, `<build-cache>/mbx/targets/v1/<checkout digest>` | Per checkout, never travels; restored from the mbx store by content                                                        |
-| Cargo compiled actions, build-script runs, host links, learned incremental state                                                                                                                    | The mbx store, `<build-cache>/mbx`                                                      | One per host, written and read by every checkout (03_caches.md)                                                            |
-| Codegraph's per-tree `.codegraph/` index                                                                                                                                                            | Build volume                                                                            | Retained in an mbx fork's clone; full warm seed otherwise; adopted at land                                                 |
-| Node/Bun module compile cache (`NODE_COMPILE_CACHE`) of a checkout with a detected JavaScript package manager                                                                                       | Build volume, linked at `.cowshed/cache/node-compile-cache`                             | Non-mbx: cloned at fork; mbx: starts empty; live volume adopted at land                                                    |
-| Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                                                              | Build volume                                                                            | Retained in an mbx fork's clone; full warm seed otherwise; absent declarations the volume holds no entries for stay absent |
-| Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                                                         | Per checkout, never travels                                                             | Deleted from a build volume before main adopts it (below)                                                                  |
-| Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv)                                                                                                         | Shared cache paths (03_caches.md)                                                       | Written once, read by every checkout; never in any image                                                                   |
+| State                                                                                                                                                                                               | Volume                                                                                  | Shared how                                                                                                                                       |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                                                                      | Source volume                                                                           | Cloned with the workspace image                                                                                                                  |
+| Cargo target directories of a project without the mbx capability; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                                                                            | Non-mbx: cloned at fork; mbx: starts empty; live volume adopted at land                                                                          |
+| Cargo target directory of a project with the mbx capability                                                                                                                                         | mbx's managed target for the checkout, `<build-cache>/mbx/targets/v1/<checkout digest>` | Per checkout, never travels; restored from the mbx store by content                                                                              |
+| Cargo compiled actions, build-script runs, host links, learned incremental state                                                                                                                    | The mbx store, `<build-cache>/mbx`                                                      | One per host, written and read by every checkout (03_caches.md)                                                                                  |
+| Codegraph's per-tree `.codegraph/` index                                                                                                                                                            | Build volume                                                                            | Retained in an mbx fork's clone; full warm seed otherwise; adopted at land                                                                       |
+| Node/Bun module compile cache (`NODE_COMPILE_CACHE`) of a checkout with a detected JavaScript package manager                                                                                       | Build volume, linked at `.cowshed/cache/node-compile-cache`                             | Non-mbx: cloned at fork; mbx: starts empty; live volume adopted at land                                                                          |
+| Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                                                              | Build volume                                                                            | Retained in an mbx fork's clone; full warm seed otherwise; absent kept declarations (`[build] keep`) the volume holds no entries for stay absent |
+| Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                                                         | Per checkout, never travels                                                             | Deleted from a build volume before main adopts it (below)                                                                                        |
+| Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv)                                                                                                         | Shared cache paths (03_caches.md)                                                       | Written once, read by every checkout; never in any image                                                                                         |
 
 The build volume holds exactly the state a build tool keeps **for one tree and keys by its own fingerprints**: state
 that is correct to reuse for any tree the tool checks against, but costly to rebuild and private to one checkout. Jobs
@@ -213,28 +213,29 @@ collected.
 for main, and from `cowshed setup` for every mounted workspace, cowshed refreshes the checkout's build state: it
 fingerprints the tracked build inputs (Cargo manifests, `.cowshed.toml`, the build-state capabilities' markers) and,
 while the fingerprint matches the one the volume's state records, only restores a fixed link a tool displaced (a tool's
-real directory where the link belongs is discarded and relinked, a declared one is moved aside intact, neither is
-copied, and each is reported: "What a refresh does at each path" below). When it moved, capability detection runs again
-in the canonical job environment (the caller's `CARGO_TARGET_DIR` and the like never name a checkout's build state): new
-paths join the volume, held ones never move. Each discarded or kept directory is reported by origin: one at a path the
-volume did not yet link predates its link (a first touch, a newly detected path, a declared path's first appearance),
-and one at a linked path is reported as displaced, naming the tool likely to have displaced it. A refresh never treats
-mbx's managed-target link as a displaced fixed link. For a Cargo project that gains the mbx capability, the refresh
-removes cowshed's own fixed `target` link (which names `.cowshed/build/target`), so that mbx's first build places the
-managed target: mbx leaves a `target` that is already a symlink alone (mbx docs, "Eligibility and recovery"). The
-volume's old `target` directory leaves the volume's state and is deleted in the background like a discarded directory
-(below), so no fork or seed carries it again. A checkout with build state and no volume gets its first one (its first
-touch) at the project's `[build] capacity`, and the checkout's seed with it, so it is a target from then on. Main's
-first volume is minted while `cowshed adopt` stages main's image, at the capacity the adopted checkout's `.cowshed.toml`
-asks, so the two attaches wait on `storagekitd` once (01a_apfs.md, "How the APFS host degrades"), unless nothing in the
-checkout can name build state (no tracked Cargo or package manifest, no declared `[build] state`, no enabled Nx detector
-match), whose first touch makes no volume. Main's first touch links it once main is mounted at the checkout, when main
-links no volume yet and asks the capacity it was minted at (the checkout's `.cowshed.toml` may change while main is
-copied; the first touch then mints its own at the capacity asked now). A mint that failed fails only a first touch that
-needs a volume, with the mint's own error, and is not retried. An adoption releases the volume before it completes
-whenever its first touch does not link it (nothing to hold, a refusal, a failure, a volume already linked, another
-capacity), and an adoption dropped before that (a cancelled request) releases it as it is dropped, the mint itself when
-it was still running. A build-state path that holds tracked source refuses before anything is deleted.
+real directory or a declared cache's where the link belongs is discarded and relinked, a kept declared one is moved
+aside intact, neither is copied, and each is reported: "What a refresh does at each path" below). When it moved,
+capability detection runs again in the canonical job environment (the caller's `CARGO_TARGET_DIR` and the like never
+name a checkout's build state): new paths join the volume, held ones never move. Each discarded or kept directory is
+reported by origin: one at a path the volume did not yet link predates its link (a first touch, a newly detected path, a
+declared path's first appearance), and one at a linked path is reported as displaced, naming the tool likely to have
+displaced it. A refresh never treats mbx's managed-target link as a displaced fixed link. For a Cargo project that gains
+the mbx capability, the refresh removes cowshed's own fixed `target` link (which names `.cowshed/build/target`), so that
+mbx's first build places the managed target: mbx leaves a `target` that is already a symlink alone (mbx docs,
+"Eligibility and recovery"). The volume's old `target` directory leaves the volume's state and is deleted in the
+background like a discarded directory (below), so no fork or seed carries it again. A checkout with build state and no
+volume gets its first one (its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it
+is a target from then on. Main's first volume is minted while `cowshed adopt` stages main's image, at the capacity the
+adopted checkout's `.cowshed.toml` asks, so the two attaches wait on `storagekitd` once (01a_apfs.md, "How the APFS host
+degrades"), unless nothing in the checkout can name build state (no tracked Cargo or package manifest, no declared
+`[build] state`, no enabled Nx detector match), whose first touch makes no volume. Main's first touch links it once main
+is mounted at the checkout, when main links no volume yet and asks the capacity it was minted at (the checkout's
+`.cowshed.toml` may change while main is copied; the first touch then mints its own at the capacity asked now). A mint
+that failed fails only a first touch that needs a volume, with the mint's own error, and is not retried. An adoption
+releases the volume before it completes whenever its first touch does not link it (nothing to hold, a refusal, a
+failure, a volume already linked, another capacity), and an adoption dropped before that (a cancelled request) releases
+it as it is dropped, the mint itself when it was still running. A build-state path that holds tracked source refuses
+before anything is deleted.
 
 **Owned index links.** `.codegraph/` is build-volume state and follows the same fixed-link contract as other contributed
 paths. At the checkout root, `.codegraph -> .cowshed/build/codegraph`; a nested project's contribution preserves its
@@ -268,7 +269,7 @@ real directory, or something else) without changing it, and names `cowshed exec 
 what the refresh finds there to one action. The shell around it observes every path, decides all of them before it
 changes any, and performs. A refusal therefore changes no build-state path.
 
-| Found at the path                          | A capability's path                               | A declared path                                                                                             |
+| Found at the path                          | A capability's path or a declared cache           | A kept declared path (`[build] keep`)                                                                       |
 | ------------------------------------------ | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | nothing                                    | make the link                                     | make the link when the volume holds its directory with entries, else leave it absent (Declared build state) |
 | its fixed link, dangling or not            | keep it, and make its volume directory if missing | the same                                                                                                    |
@@ -277,12 +278,13 @@ changes any, and performs. A refusal therefore changes no build-state path.
 | a file, or any other link, dangling or not | refuse, naming the path                           | the same                                                                                                    |
 
 A capability's directory is its tool's own cache, which the next build rebuilds: discarding it is rebuild-only
-migration, and keeping it would hold a Cargo target directory's tens of GiB that nobody asked for. A declared directory
-is not cowshed's to judge (Declared build state). `rmdir(2)` removes a declared directory only while it is still empty,
-so an entry a tool writes after the refresh looked fails the refresh as a conflict instead of being lost. It runs before
-any rename, so that conflict moves no directory with entries aside; an empty declared directory removed before it stays
-absent until a tool makes it again, or, where the volume already holds the path's directory with entries, until the next
-refresh links it.
+migration, and keeping it would hold a Cargo target directory's tens of GiB that nobody asked for. A declared path that
+`[build] keep` does not name is such a cache too, and follows the same column. What a kept declared directory holds is
+not cowshed's to judge (Declared build state). `rmdir(2)` removes a kept declared directory only while it is still
+empty, so an entry a tool writes after the refresh looked fails the refresh as a conflict instead of being lost. It runs
+before any rename, so that conflict moves no directory with entries aside; an empty kept declared directory removed
+before it stays absent until a tool makes it again, or, where the volume already holds the path's directory with
+entries, until the next refresh links it.
 
 A kept directory is renamed in one `rename(2)`, on the same volume and never copied, to
 `<checkout>/.cowshed/kept/<UTC time>-<id>-<path>`, with `%` and `/` in the path percent-encoded, and the link then takes
@@ -301,19 +303,20 @@ the fork's own `rm` and land refuse for state that is not the fork's.
 **Why move aside rather than refuse.** A refusal is the better answer where an operator is waiting. Here, often none is.
 A refresh runs before every job is admitted, gates and test runs included. It also runs after a land's fast-forward, at
 Land step 7's output restoration and for the job a declared land starts on main. And it runs when the unattended
-`__collect-build-volumes` and `__compact-seed` openers replay main's unfinished adoption. Declared state also routinely
-first appears as a directory a job has just filled. A package's lmao trace sink (`packages/*/.cache/lmao`) appears at
-its first traced test run, and on 2026-10-30 only 6 of 53 packages held that link in one downstream repository's main. A
-fork's next exec after testing any other package would refuse, and only an operator deleting by hand what the refresh
-declined to delete could clear it. The rename costs nothing, loses nothing, and the job proceeds.
+`__collect-build-volumes` and `__compact-seed` openers replay main's unfinished adoption. Kept declared state also first
+appears as a directory a tool has just filled: a pin script clones a patch worktree before the shed has its link. A
+refusal there would hold every job of the shed until an operator moved by hand what the refresh declined to touch. The
+rename costs nothing, loses nothing, and the job proceeds.
 
 - **Enforced by**: `migrate::tests`: a decision test over every tool and occupant, whose list a new variant cannot
   compile past; a property test that runs the refresh over random occupants (absent with the volume holding nothing, an
   empty directory or one with entries, the fixed link, a foreign or dangling link, an empty or filled directory, a file)
-  of three capability paths and three declared ones, asserting that every file and link outside a tool's own cache
-  survives byte for byte, that a file or a foreign link refuses with no file or link changed, and that each declared
-  directory's files are where its finding says; a race test writing into an empty declared directory between observation
-  and `rmdir(2)`; and the `.bun-pin` regression, which keeps an uncommitted edit at the location its notice names.
+  of three capability paths, two kept declared ones and a declared cache, asserting that every file and link outside a
+  tool's own cache or a declared cache survives byte for byte, that a file or a foreign link refuses with no file or
+  link changed, that each kept declared directory's files are where its finding says, and that nothing else is kept; a
+  race test writing into an empty kept declared directory between observation and `rmdir(2)`; the `.bun-pin` regression,
+  which keeps an uncommitted edit at the location its notice names; and two declared-cache tests, one linking the path
+  at its first refresh with the volume holding nothing, one discarding a directory with entries there with nothing kept.
   `kept::tests` decodes every entry name back to its path and time and refuses every name it did not write.
 
 A discarded directory is first renamed into `<checkout>/.cowshed/discard/`. That is the same volume, in cowshed's
@@ -362,6 +365,20 @@ the source image, it is the largest thing a fork clones and the main source of m
 on the build volume it is cloned at fork and adopted at land, as a Cargo target directory is only in a project without
 the mbx capability.
 
+`[build] keep = ["<entry>", ...]` names the `[build] state` entries that hold work cowshed cannot rebuild, each spelled
+exactly as `[build] state` spells it (a pattern by its pattern, keeping every match; a literal and a pattern's match
+naming one path are one declared path, kept when either entry is); an entry that names no state entry is refused when
+`.cowshed.toml` is parsed. Every other declared path is a cache: a refresh links it from its first touch and discards a
+real directory it finds there, exactly as at a capability's path ("What a refresh does at each path"), so a cache never
+puts anything in `.cowshed/kept` and never makes `rm` or land refuse. A kept path is moved aside intact instead, and
+linked only once it appears or its volume directory holds entries (below). Each path's keep is recorded with it in the
+volume's state, so a refresh at an unchanged fingerprint applies it; an edit of `[build] keep` is an edit of
+`.cowshed.toml`, which moves the fingerprint, and the rediscovery takes each held path's keep from its current
+declaration. **Why**: a gitignored cache must never make `cowshed rm` or land trip (maintainer ruling, 2026-10-31).
+While every declared path was kept, each trace store a traced run made before its link was moved into `.cowshed/kept`,
+which refuses the land (27 in one fork's refresh, measured 2026-10-31, below). Most declared state is a cache its tool
+rebuilds; only a patch-development checkout or sealed developer-link snapshots hold work.
+
 An entry may be a pattern, `packages/*/.cache/lmao`: its leading components hold `*`, `?` or `[...]`, each matching one
 directory level as Git's glob pathspec reads them (`**` is refused), and its last components are a literal name. At
 discovery the pattern selects every directory the checkout tracks files under (`git ls-files` of `<selector>/**`), never
@@ -384,41 +401,42 @@ link. Validation refuses, before anything is deleted and with the remedy named:
 - a path that overlaps a capability's build state: the capability already links it;
 - a path holding tracked source: the same `git ls-files` guard migration applies.
 
-A real directory at a declared path leaves its path like any build state a capability contributes, never copied ("What a
-refresh does at each path"), but it is moved aside intact and kept, never deleted. Declared state is meant to be
-rebuildable, but cowshed cannot see what a declared directory holds. The motivating case is a patch-development
-checkout, and its patches are uncommitted edits. Incident, in a downstream repository's shed: a pin script cloned a Bun
-worktree into `.bun-pin` before the shed had its declared link, an agent edited a file in it, and the next
-`cowshed exec`'s refresh linked the path and deleted the directory, edit included, saying so in one stderr line. Copying
-many GiB onto the volume would cost the minutes this design exists to avoid, so the path is linked to an empty volume
-directory. The author takes what they need from the kept directory, re-runs the checkout's reconstruct script once, and
-deletes the kept directory. From then on the state lives on the volume, every fork inherits it warm, and main adopts it
-at a land.
+A real directory at a kept declared path leaves its path like any build state a capability contributes, never copied
+("What a refresh does at each path"), but it is moved aside intact and kept, never deleted: cowshed cannot see what a
+kept declared directory holds. The motivating case is a patch-development checkout, and its patches are uncommitted
+edits. Incident, in a downstream repository's shed: a pin script cloned a Bun worktree into `.bun-pin` before the shed
+had its declared link, an agent edited a file in it, and the next `cowshed exec`'s refresh linked the path and deleted
+the directory, edit included, saying so in one stderr line. Copying many GiB onto the volume would cost the minutes this
+design exists to avoid, so the path is linked to an empty volume directory. The author takes what they need from the
+kept directory, re-runs the checkout's reconstruct script once, and deletes the kept directory. From then on the state
+lives on the volume, every fork inherits it warm, and main adopts it at a land.
 
-**A declared path is linked when it appears or when the volume already holds it with entries, never before.** A
-capability's path is linked at once, and its tool finds an empty directory it fills. A declared path's existence carries
-meaning to tools cowshed does not know: a build script that builds the upstream checkout when it is there, and takes a
-prebuilt artifact when it is not, would find an empty directory and try to build nothing. So a refresh makes nothing for
-a declared path that nothing occupies and whose volume directory holds no entry, neither the link, the volume directory
-nor a missing parent; the volume's state still holds the path. Once a tool has made the directory, the next refresh
-adopts it as above. A reconstruct script that wants to fill the volume on its first run makes the empty directory, lets
-a refresh link it (any `cowshed exec`), and only then fills it. The rule holds per pattern match: a package whose tests
-never wrote a trace store gets no link.
+**A kept declared path is linked when it appears or when the volume already holds it with entries, never before.** A
+capability's path and a declared cache are linked at once, and the tool finds an empty directory it fills. A kept
+declared path's existence carries meaning to tools cowshed does not know: a build script that builds the upstream
+checkout when it is there, and takes a prebuilt artifact when it is not, would find an empty directory and try to build
+nothing. So a refresh makes nothing for a kept declared path that nothing occupies and whose volume directory holds no
+entry, neither the link, the volume directory nor a missing parent; the volume's state still holds the path. Once a tool
+has made the directory, the next refresh adopts it as above. A reconstruct script that wants to fill the volume on its
+first run makes the empty directory, lets a refresh link it (any `cowshed exec`), and only then fills it. The rule holds
+per match of a kept pattern: a package whose tool never made the directory gets no link.
 
-A directory with entries that the volume already holds is a tool's own, written through the path's link in this checkout
-or in one whose volume this checkout cloned or adopted, so a refresh links it wherever nothing occupies the path,
-checking and making the link's parents as a capability's; `exec`'s resident judgement (06_cli.md) counts such a path as
-one the refresh would change. An empty one is left unlinked: a refresh makes the volume directory with every link it
-makes, so emptiness says nothing a tool made. Removing only a declared path's link (`rm -rf <path>`, `git clean -fdx`)
-therefore does not make the path absent while its volume directory holds entries, and neither does dropping its
-declaration, which keeps the held path: the next refresh links it again, as it links a held path whose package the
-checkout no longer tracks, making that package's directory for the link. A tool that wants the path absent empties it
-through the link and then removes the link. **Why**: a land hands main the gate's build volume while the gate's links
-stay in its retired source image, and Git carries no link. Main, and every fork of it, then held `declared/<path>` with
-nothing at the path. A traced run made a real directory there (a trace sink's opener makes its directory on every open),
-and the next refresh moved it aside into `.cowshed/kept`, which refuses the land: measured 2026-10-31, one fork of a
-lane base kept 27 trace stores in one refresh. A link to what the volume holds is the warm state a land and a fork exist
-to carry, not an empty directory a tool would misread.
+A directory with entries that the volume already holds behind a kept declared path is a tool's own, written through the
+path's link in this checkout or in one whose volume this checkout cloned or adopted, so a refresh links it wherever
+nothing occupies the path, checking and making the link's parents as a capability's; `exec`'s resident judgement
+(06_cli.md) counts such a path as one the refresh would change. An empty one is left unlinked: a refresh makes the
+volume directory with every link it makes, so emptiness says nothing a tool made. Removing only a kept declared path's
+link (`rm -rf <path>`, `git clean -fdx`) therefore does not make the path absent while its volume directory holds
+entries, and neither does dropping its declaration, which keeps the held path: the next refresh links it again, as it
+links a held path whose package the checkout no longer tracks, making that package's directory for the link. A tool that
+wants the path absent empties it through the link and then removes the link. **Why**: a land hands main the gate's build
+volume while the gate's links stay in its retired source image, and Git carries no link. Main, and every fork of it,
+then held `declared/<path>` with nothing at the path. A traced run made a real directory there (a trace sink's opener
+makes its directory on every open), and the next refresh moved it aside into `.cowshed/kept`, which refuses the land:
+measured 2026-10-31, one fork of a lane base kept 27 trace stores in one refresh. Those were caches, which a refresh now
+links at once (above); a kept path a land or a fork inherits meets the same hazard when a tool makes its directory. A
+link to what the volume holds is the warm state a land and a fork exist to carry, not an empty directory a tool would
+misread.
 
 A tool whose own state records absolute paths sees the volume's: the declared path is a link, and a process that
 resolves its working directory (`getcwd`, `pwd -P`) gets `<mount-root>/.build/<owner>/<repo>/<id>/declared/<path>`. That
@@ -434,15 +452,19 @@ directory was entered under the covered volume reads the new one, and `diskutil 
 the top mount instead. The swap would therefore be an unmount and a mount, which must skip adoption whenever any process
 (rust-analyzer included) holds main's build volume, on every land.
 
-- **Enforced by**: a real-APFS test in which main's first touch moves a declared nested checkout aside and links the
-  path, the reconstructed state is written through the link, and a fork of main reads it warm; discovery tests refusing
-  a tracked, overlapping or escaping declaration with its remedy; migration tests keeping a declared checkout whole at
-  the location its finding names, linking an empty declared directory in place, leaving an absent declared path the
-  volume holds no entries for absent until a tool makes it, and linking one the volume holds so that a traced run writes
-  through the link and the next refresh keeps nothing aside, leaving an empty held directory unlinked, and refusing a
-  held path under a symlinked parent before any other path changes; `link.rs`'s settled-links test counting a held,
-  unlinked declared path as one the refresh changes; a discovery test expanding a pattern over tracked packages only,
-  rediscovering when one is added; and configuration parse tests.
+- **Enforced by**: a real-APFS test in which main's first touch moves a kept declared nested checkout aside and links
+  the path, the reconstructed state is written through the link, and a fork of main reads it warm; discovery tests
+  refusing a tracked, overlapping or escaping declaration with its remedy; migration tests keeping a kept declared
+  checkout whole at the location its finding names, linking an empty kept declared directory in place, leaving an absent
+  kept declared path the volume holds no entries for absent until a tool makes it, and linking one the volume holds so
+  that a tool's run writes through the link and the next refresh keeps nothing aside, leaving an empty held directory
+  unlinked, and refusing a held path under a symlinked parent before any other path changes; the declared-cache
+  migration tests above; a state test in which `[build] keep` survives the volume's state record, follows its
+  declaration at the next discovery, and is refused on a capability's path; `link.rs`'s settled-links test counting a
+  held, unlinked kept declared path, and an unlinked declared cache, as ones the refresh changes; a discovery test
+  expanding a pattern over tracked packages only, rediscovering when one is added, and one expanding a kept pattern to
+  kept paths, merging a literal with a pattern's match kept when either is; and configuration parse tests,
+  `[build] keep` marking the entries it names and refusing one that names no `[build] state` entry.
 
 ### Targets and seeds
 
@@ -799,10 +821,10 @@ A land still harmonizes source mtimes with the landing checkout's (Land step 5.3
 source file's metadata. Non-mbx compaction's internal move onto the workspace's own seed proves that no write would be
 lost (Seed compaction).
 
-Declared build state may hold authority: sealed developer-link snapshots and ignored patch-development repositories
-("Declared build state"). Main keeps its live sealed pins, and the declared-state contributor retains those paths in a
-seed. A checkout missing a newly captured fixed pin imports it from main under specs/cli/01_workspace_reconciliation.md,
-"Declared developer link pins"; it never recaptures a missing ID.
+Kept declared build state (`[build] keep`) may hold authority: sealed developer-link snapshots and ignored
+patch-development repositories ("Declared build state"). Main keeps its live sealed pins, and the declared-state
+contributor retains those paths in a seed. A checkout missing a newly captured fixed pin imports it from main under
+specs/cli/01_workspace_reconciliation.md, "Declared developer link pins"; it never recaptures a missing ID.
 
 ### Clearing a checkout's Nx state
 

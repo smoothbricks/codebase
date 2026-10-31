@@ -506,6 +506,7 @@ fn build_state_declares_disjoint_checkout_relative_paths() {
             DeclaredState::Pattern {
                 selector: "packages/*".into(),
                 state: ".cache/lmao".into(),
+                keep: false,
             },
         ]
     );
@@ -551,6 +552,63 @@ fn build_state_declares_disjoint_checkout_relative_paths() {
     for (source, message) in invalid {
         let error = parse_cowshed_config(source).unwrap_err();
         assert!(error.to_string().contains(message), "{source:?}: {error}");
+    }
+}
+
+/// `[build] keep` names the `[build] state` entries that hold work, spelled as `[build] state`
+/// spells them: each is kept, every other declared entry is a cache, and a keep entry naming no
+/// state entry is refused rather than whitelisting nothing (16_build_volumes.md, "Declared build
+/// state").
+#[test]
+fn build_keep_marks_the_state_entries_it_names_and_refuses_any_other() {
+    use cowshed_core::capabilities::{BuildStatePath, DeclaredState};
+    let config = parse_cowshed_config(
+        "[build]\nstate = [\"packages/pin/.bun-pin\", \".cache/lmao\", \"packages/*/.cache/linked\"]\nkeep = [\"packages/*/.cache/linked\", \"packages/pin/.bun-pin\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.build_state(),
+        [
+            DeclaredState::Path(BuildStatePath::declared(".cache/lmao").unwrap()),
+            DeclaredState::Path(
+                BuildStatePath::declared("packages/pin/.bun-pin")
+                    .unwrap()
+                    .kept()
+            ),
+            DeclaredState::Pattern {
+                selector: "packages/*".into(),
+                state: ".cache/linked".into(),
+                keep: true,
+            },
+        ]
+    );
+    for (source, line, path) in [
+        (
+            "[build]\nstate = [\".cache/lmao\"]\nkeep = [\n  \".bun-pin\",\n]\n",
+            4,
+            ".bun-pin",
+        ),
+        (
+            "[build]\nkeep = [\"vendor/upstream\"]\n",
+            2,
+            "vendor/upstream",
+        ),
+    ] {
+        let error = parse_cowshed_config(source).unwrap_err();
+        assert_eq!(
+            error,
+            ConfigError::KeepNotDeclared {
+                line,
+                path: path.to_owned()
+            },
+            "{source:?}"
+        );
+        assert!(
+            error.to_string().contains(&format!(
+                "[build] keep entry {path:?} at line {line} is not a [build] state entry"
+            )),
+            "{error}"
+        );
     }
 }
 

@@ -876,7 +876,7 @@ where
             let projects = setup.build_state_projects().await?;
             if !projects.is_empty() {
                 output.guidance(
-                    "build-state migration discards rebuildable incremental directories and keeps declared ones intact in .cowshed/kept; tracked source files are protected and the next build repopulates the volume",
+                    "build-state migration discards rebuildable incremental directories and declared caches and keeps [build] keep ones intact in .cowshed/kept; tracked source files are protected and the next build repopulates the volume",
                 ).map_err(output_error)?;
             }
             let mut results = Vec::with_capacity(projects.len());

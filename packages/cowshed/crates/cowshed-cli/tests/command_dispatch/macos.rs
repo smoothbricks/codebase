@@ -277,8 +277,9 @@ enum Project<'a> {
         nx: Option<(&'a Path, &'a Path)>,
         rust: Option<&'a RustToolchain>,
     },
-    /// [`Project::Plain`] whose `.cowshed.toml` also declares [`DECLARED_STATE`] build state,
-    /// with an ignored, untracked nested Git checkout already there ([`write_declared_project`]).
+    /// [`Project::Plain`] whose `.cowshed.toml` also declares and keeps [`DECLARED_STATE`]
+    /// build state, with an ignored, untracked nested Git checkout already there
+    /// ([`write_declared_project`]).
     Declared,
 }
 
@@ -4486,14 +4487,15 @@ async fn directory_a_noop_cargo_build_stamps_the_units_it_uses_and_no_others_sub
 const DECLARED_STATE: &str = "upstream";
 
 /// Main's tree for the declared-build-state test: `.cowshed.toml` declares [`DECLARED_STATE`]
-/// as build state, in a multi-line array the way an author lays out a growing list, and
+/// as build state, in a multi-line array the way an author lays out a growing list, keeps it
+/// (`[build] keep`: it holds work cowshed cannot rebuild), and
 /// `.gitignore` ignores it, committed; then, untracked, what an author's reconstruct script
 /// leaves there before cowshed ever saw it: a nested Git checkout of an upstream project and its
 /// build tree.
 fn write_declared_project(checkout: &Path) {
     fs::write(
         checkout.join(".cowshed.toml"),
-        format!("{FIXTURE_COWSHED_TOML}state = [\n  # rebuilt by the reconstruct script\n  \"{DECLARED_STATE}\",\n]\n"),
+        format!("{FIXTURE_COWSHED_TOML}state = [\n  # rebuilt by the reconstruct script\n  \"{DECLARED_STATE}\",\n]\nkeep = [\"{DECLARED_STATE}\"]\n"),
     )
     .unwrap();
     fs::write(checkout.join(".gitignore"), format!("/{DECLARED_STATE}/\n")).unwrap();

@@ -58,6 +58,10 @@ pub struct BuildStatePath {
     pub volume: RelPath,
     pub retention: SeedRetention,
     pub clone_invalid: Vec<RelPath>,
+    /// Declared build state a refresh moves aside intact when it finds a real directory at its
+    /// path: `.cowshed.toml` `[build] keep`, the declared paths that hold work, such as a patch
+    /// worktree. Every other path, declared or a capability's, is a cache the refresh discards.
+    pub keep: bool,
 }
 
 impl BuildStatePath {
@@ -67,6 +71,7 @@ impl BuildStatePath {
             volume: RelPath::new(volume)?,
             retention: SeedRetention::Rebuild,
             clone_invalid: Vec::new(),
+            keep: false,
         })
     }
 
@@ -83,9 +88,10 @@ impl BuildStatePath {
     }
 
     /// The build state a repository declares at the checkout-relative `checkout`
-    /// (`.cowshed.toml` `[build] state`), held on the volume at `declared/<checkout>`. Refuses a
-    /// path that is not a normalized relative name, and one naming Git's metadata or cowshed's own
-    /// checkout namespace: declared state leaves its path, kept intact, at its first touch.
+    /// (`.cowshed.toml` `[build] state`), held on the volume at `declared/<checkout>`: a cache,
+    /// linked like a capability's, unless [`Self::kept`]. Refuses a path that is not a
+    /// normalized relative name, and one naming Git's metadata or cowshed's own checkout
+    /// namespace.
     pub fn declared(checkout: &str) -> std::result::Result<Self, &'static str> {
         let path = super::validate_override_directory(checkout)
             .map_err(|_| "must be a nonempty normalized checkout-relative path")?;
@@ -100,7 +106,21 @@ impl BuildStatePath {
             checkout: RelPath(path),
             retention: SeedRetention::Retain,
             clone_invalid: Vec::new(),
+            keep: false,
         })
+    }
+
+    /// This declared path holds work (`[build] keep`): a real directory a refresh finds at it is
+    /// moved aside intact, never discarded. Only declared build state is kept: calling this on a
+    /// capability's path is a programmer error.
+    pub fn kept(mut self) -> Self {
+        assert!(
+            self.is_declared(),
+            "only declared build state is kept, not {}",
+            self.checkout.as_path().display()
+        );
+        self.keep = true;
+        self
     }
 
     /// Keep this capability-owned subtree in a seed instead of rebuilding it.
@@ -134,8 +154,13 @@ pub enum DeclaredState {
     /// `*`, `?` or `[...]` (one directory level each, as Git's glob pathspec reads them) and
     /// select each directory the checkout tracks files under; `state` is the literal path
     /// beneath every selected directory. Expanded at discovery
-    /// (`build_state_discovery::expand_declared`), so a newly tracked package joins.
-    Pattern { selector: PathBuf, state: PathBuf },
+    /// (`build_state_discovery::expand_declared`), so a newly tracked package joins. `keep` is
+    /// whether `[build] keep` names it ([`BuildStatePath::kept`]).
+    Pattern {
+        selector: PathBuf,
+        state: PathBuf,
+        keep: bool,
+    },
 }
 
 impl DeclaredState {
@@ -173,14 +198,31 @@ impl DeclaredState {
         Ok(Self::Pattern {
             selector: parts[..=last].iter().collect(),
             state: parts[last + 1..].iter().collect(),
+            keep: false,
         })
+    }
+
+    /// This entry as `[build] keep` whitelists it.
+    pub fn kept(self) -> Self {
+        match self {
+            Self::Path(path) => Self::Path(path.kept()),
+            Self::Pattern {
+                selector, state, ..
+            } => Self::Pattern {
+                selector,
+                state,
+                keep: true,
+            },
+        }
     }
 
     /// The entry as `.cowshed.toml` spells it.
     pub fn spelling(&self) -> PathBuf {
         match self {
             Self::Path(path) => path.checkout.as_path().to_owned(),
-            Self::Pattern { selector, state } => selector.join(state),
+            Self::Pattern {
+                selector, state, ..
+            } => selector.join(state),
         }
     }
 }
@@ -263,6 +305,7 @@ mod tests {
             DeclaredState::Pattern {
                 selector: PathBuf::from("packages/*"),
                 state: PathBuf::from(".cache/lmao"),
+                keep: false,
             }
         );
         assert_eq!(
@@ -270,6 +313,7 @@ mod tests {
             DeclaredState::Pattern {
                 selector: PathBuf::from("apps/web-[ab]/x?"),
                 state: PathBuf::from("out"),
+                keep: false,
             }
         );
         assert_eq!(
