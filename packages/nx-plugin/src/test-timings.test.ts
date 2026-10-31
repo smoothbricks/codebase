@@ -181,6 +181,16 @@ describe('shard-timings check', () => {
     });
   });
 
+  it('refuses a discovery it cannot replay, naming where, rather than guess what Bun runs', async () => {
+    const workspaceRoot = await fixture([]);
+    await symlink('loop.test.ts', join(workspaceRoot, 'packages/example/src/loop.test.ts'));
+    // A link to itself resolves to nothing stat can return (ELOOP, or EPERM under a sandbox), unlike a missing target.
+    expect(await timingsCoverage(workspaceRoot, { cwd: 'packages/example', args: SUITE_ARGS })).toEqual({
+      ok: false,
+      error: expect.stringMatching(/^cannot replay Bun's discovery under packages\/example: /),
+    });
+  });
+
   it('finds the test files Bun itself runs', async () => {
     const workspace = await realpath(await mkdtemp(join(tmpdir(), 'smoothbricks-bun-discovery-')));
     root = workspace;
@@ -215,7 +225,7 @@ describe('shard-timings check', () => {
     await writeFile(join(project, '.gitignore'), 'src/ignored.test.ts\n');
     await writeFile(join(project, 'bunfig.toml'), '[test]\nroot = "src"\npathIgnorePatterns = ["src/nested/**"]\n');
     await writeFile(join(project, 'other.toml'), '[test]\nroot = "src/names"\n');
-    // Bun follows a symlink wherever it leads, outside the project too, and takes one that leads nowhere for a file.
+    // Bun follows a symlink wherever it leads, outside the project too, and skips one that leads nowhere.
     await symlink(external, join(project, 'src/linkdir'), 'dir');
     await symlink('../outside.test.ts', join(project, 'src/linkfile.test.ts'));
     await symlink('missing.test.ts', join(project, 'src/dangling.test.ts'));
@@ -254,5 +264,11 @@ describe('shard-timings check', () => {
         .map((line) => line.replace(/^\.\//, '')),
     );
     expect([...discovered].filter((file) => !listed.has(file))).toEqual([]);
+    // A link to nothing is no file Bun runs until its target appears, and the key moves when it does.
+    expect(listed.has('src/dangling.test.ts')).toBe(false);
+    await put(project, 'src/missing.test.ts');
+    expect(await runtimeInputValue(bunTestFileNamesInput('packages/example').runtime, workspace)).toContain(
+      'src/dangling.test.ts',
+    );
   });
 });
