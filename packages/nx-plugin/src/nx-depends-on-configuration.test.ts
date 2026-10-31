@@ -72,3 +72,61 @@ it('keeps the run configuration for an entry that names none, beside a named one
     'root:gate',
   ]);
 });
+
+/** Every edge of a task graph with each task's dependencies sorted: the shape two orders of one request must share. */
+function edges(graph: ProjectGraph, gate: NonNullable<TargetConfiguration['dependsOn']>): Record<string, string[]> {
+  const withGate: ProjectGraph = {
+    ...graph,
+    nodes: { ...graph.nodes, root: project('root', { gate: { dependsOn: gate } }) },
+    dependencies: { ...graph.dependencies, root: [] },
+  };
+  const tasks = createTaskGraph(withGate, {}, ['root'], ['gate'], undefined, {});
+  return Object.fromEntries(
+    Object.entries(tasks.dependencies)
+      .map(([task, dependencies]): [string, string[]] => [task, [...dependencies].sort()])
+      .sort(([left], [right]) => (left < right ? -1 : 1)),
+  );
+}
+
+it('expands a task without the named configuration under each configuration that reaches it, whatever the order', () => {
+  // `tool` has no production configuration, so the production `cli` and the development `cli` share it. Under stock
+  // ordering its `compile` dependency was whichever configuration reached `tool` first.
+  const shared: ProjectGraph = {
+    nodes: {
+      pkg: project('pkg', {
+        cli: { dependsOn: ['tool'], production: true },
+        tool: { dependsOn: ['compile'] },
+        compile: { dependsOn: [], production: true },
+        test: { dependsOn: ['cli'] },
+      }),
+    },
+    dependencies: { pkg: [] },
+  };
+  const test = { projects: ['pkg'], target: 'test' };
+  const shipping = { projects: ['pkg'], target: 'cli', configuration: 'production' };
+  const developmentFirst = edges(shared, [test, shipping]);
+  expect(edges(shared, [shipping, test])).toEqual(developmentFirst);
+  expect(developmentFirst['pkg:tool']).toEqual(['pkg:compile', 'pkg:compile:production']);
+});
+
+it("resolves a production parent's ^ dependency through a project without the target in production, whatever the order", () => {
+  // `mid` has no `build`, so `app:build`'s `^build` is a dummy task for it; the production parent's dummy is its own.
+  const chain: ProjectGraph = {
+    nodes: {
+      app: project('app', { build: { dependsOn: ['^build'], production: true } }),
+      mid: project('mid', {}),
+      lib: project('lib', { build: { dependsOn: [], production: true } }),
+    },
+    dependencies: {
+      app: [{ source: 'app', target: 'mid', type: 'static' }],
+      mid: [{ source: 'mid', target: 'lib', type: 'static' }],
+      lib: [],
+    },
+  };
+  const development = { projects: ['app'], target: 'build' };
+  const production = { projects: ['app'], target: 'build', configuration: 'production' };
+  const developmentFirst = edges(chain, [development, production]);
+  expect(edges(chain, [production, development])).toEqual(developmentFirst);
+  expect(developmentFirst['app:build']).toEqual(['lib:build']);
+  expect(developmentFirst['app:build:production']).toEqual(['lib:build:production']);
+});

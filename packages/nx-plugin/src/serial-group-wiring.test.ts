@@ -113,7 +113,7 @@ describe('the real-APFS serial groups of this repository', () => {
     }
   });
 
-  it('reaches the host proofs only through the explicit host and land gates, adding them to the old land task set', async () => {
+  it('reaches the host proofs only through the explicit host and land gates, and plans the old land task set in one graph', async () => {
     const graph = await projectGraph();
     const projects = Object.keys(graph.nodes);
     const targets = [...new Set(projects.flatMap((name) => Object.keys(graph.nodes[name]?.data.targets ?? {})))];
@@ -163,7 +163,17 @@ describe('the real-APFS serial groups of this repository', () => {
       );
       return Object.keys(createTaskGraph(graph, {}, runnable, selected, undefined, {}).tasks).sort();
     };
-    const landSet = planned(['lint', 'test', 'build', DEVICE_GROUP, HOST_GROUP, HOST_NAPI]);
+    // The land once ran three Nx invocations: the gate, `check:linux`'s cross lint, and the host production CLI and
+    // addon in the `production` configuration. The gate's one graph now plans exactly their union.
+    const shipping = Object.keys(
+      createTaskGraph(graph, {}, ['cowshed'], ['cli-native', 'napi-native'], 'production', {}).tasks,
+    );
+    const landSet = [
+      ...new Set([
+        ...planned(['lint', 'test', 'build', DEVICE_GROUP, HOST_GROUP, HOST_NAPI, 'cargo-lint-cross']),
+        ...shipping,
+      ]),
+    ].sort();
     expect(planned(['gate']).filter((id) => id !== gate && id !== hostGate)).toEqual(landSet);
     expect(planned(['host-e2e']).filter((id) => id !== hostGate)).toEqual(
       planned([DEVICE_GROUP, HOST_GROUP, HOST_NAPI]),

@@ -872,10 +872,22 @@ to its own dependencies, so `{ "target": "cli-native", "projects": ["cowshed"], 
 before, so one graph can hold a development and a production task of one target, under their distinct task ids.
 `TargetDependencyConfig` and the project, workspace and `targetDefaults` schemas declare the field.
 
-`packages/nx-plugin/src/nx-depends-on-configuration.test.ts` runs the installed `createTaskGraph` on a graph whose
-aggregate asks for one target in production beside a test that asks for the same target with no configuration, and
-requires both tasks, the production one's dependency in production too. Against stock Nx both of its tests fail. Drop
-the hunk once the installed upstream version has the field, retaining the regression.
+Two configurations in one graph must not make a task's dependencies depend on which path reached it first. A task whose
+target lacks the named configuration keeps one task id for both paths, so it expands its dependencies under every
+configuration that reaches it (the configuration it inherits is part of its seen key) and depends on the union, each
+edge once. A dummy task, which stands in for a `^` dependency through a project without the target, carries its parent's
+configuration in its id, so a development and a production parent get distinct dummies. With one configuration per run,
+as stock Nx always has, both rules change nothing.
+
+`packages/nx-plugin/src/nx-depends-on-configuration.test.ts` runs the installed `createTaskGraph` on graphs whose
+aggregate asks for one target in production beside a test that asks for the same target with no configuration. It
+requires both tasks, the production one's dependency in production too, the same edges in either order of the
+aggregate's entries for a shared task without the configuration, and production dependencies behind a production
+parent's dummy. Against stock Nx the first two tests fail; the hunk's first version, which kept the seen key and the
+dummy ids, wired both order cases by which entry came first (reproduced in review against the installed package).
+`serial-group-wiring.test.ts` plans the root gate against the repository's real graph and requires it to equal the old
+land's three invocations together: lint, test, build and the host proofs, the Linux cross lint, and the host production
+CLI and addon. Drop the hunk once the installed upstream version has the field, retaining the regressions.
 
 ## Upstream PR draft: Nx `findCycles`
 

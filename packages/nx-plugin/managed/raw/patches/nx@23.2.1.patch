@@ -4788,10 +4788,10 @@ index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..5f58606a9c57eb9b587cbe901201cfdb
  /**
   * Converts a string representation of a max cache size to a number.
 diff --git a/dist/src/tasks-runner/create-task-graph.js b/dist/src/tasks-runner/create-task-graph.js
-index f0996420e6a01e90f58512e433bd98cdd299d47b..673918a8b8686606941ef615c6b1261825e0d4d0 100644
+index f0996420e6a01e90f58512e433bd98cdd299d47b..f5fb290a125eb7d1f8773761118f2baf5a16f5cd 100644
 --- a/dist/src/tasks-runner/create-task-graph.js
 +++ b/dist/src/tasks-runner/create-task-graph.js
-@@ -77,7 +77,33 @@ class ProcessTasks {
+@@ -77,11 +77,40 @@ class ProcessTasks {
                  ];
              }
          }
@@ -4826,7 +4826,15 @@ index f0996420e6a01e90f58512e433bd98cdd299d47b..673918a8b8686606941ef615c6b12618
              this.continuousDependencies[d].length === 0);
      }
      processTask(task, projectUsedToDeriveDependencies, configuration, overrides) {
-@@ -89,14 +115,17 @@ class ProcessTasks {
+-        const seenKey = `${task.id}-${projectUsedToDeriveDependencies}`;
++        // The configuration a task inherits is part of what it was expanded under: a task with no configuration of its
++        // own, reached once from a development path and once from a dependsOn entry naming `production`, expands its
++        // dependencies under each, so neither path's order decides them.
++        const seenKey = `${task.id}-${projectUsedToDeriveDependencies}-${configuration ?? ''}`;
+         if (this.seen.has(seenKey)) {
+             return;
+         }
+@@ -89,14 +118,17 @@ class ProcessTasks {
          const dependencyConfigs = (0, utils_1.getDependencyConfigs)({ project: task.target.project, target: task.target.target }, this.extraTargetDependencies, this.projectGraph, this.allTargetNames);
          for (const dependencyConfig of dependencyConfigs) {
              const taskOverrides = createTaskOverrides(dependencyConfig, overrides, task, this.projectGraph);
@@ -4847,6 +4855,65 @@ index f0996420e6a01e90f58512e433bd98cdd299d47b..673918a8b8686606941ef615c6b12618
              }
          }
      }
+@@ -123,14 +155,12 @@ class ProcessTasks {
+                 this.tasks[selfTaskId] = newTask;
+                 this.dependencies[selfTaskId] = [];
+                 this.continuousDependencies[selfTaskId] = [];
+-                this.processTask(newTask, newTask.target.project, configuration, overrides);
+             }
++            this.processTask(this.tasks[selfTaskId], selfProject.name, configuration, overrides);
+             if (task.id !== selfTaskId) {
+-                if (this.tasks[selfTaskId].continuous) {
+-                    this.continuousDependencies[task.id].push(selfTaskId);
+-                }
+-                else {
+-                    this.dependencies[task.id].push(selfTaskId);
++                const edges = this.tasks[selfTaskId].continuous ? this.continuousDependencies[task.id] : this.dependencies[task.id];
++                if (!edges.includes(selfTaskId)) {
++                    edges.push(selfTaskId);
+                 }
+             }
+         }
+@@ -149,11 +179,9 @@ class ProcessTasks {
+                 const depTargetId = (0, utils_1.createTaskId)(depProject.name, dependencyConfig.target, resolvedConfiguration);
+                 const depTargetConfiguration = this.projectGraph.nodes[depProject.name].data.targets[dependencyConfig.target];
+                 if (task.id !== depTargetId) {
+-                    if (depTargetConfiguration.continuous) {
+-                        this.continuousDependencies[task.id].push(depTargetId);
+-                    }
+-                    else {
+-                        this.dependencies[task.id].push(depTargetId);
++                    const edges = depTargetConfiguration.continuous ? this.continuousDependencies[task.id] : this.dependencies[task.id];
++                    if (!edges.includes(depTargetId)) {
++                        edges.push(depTargetId);
+                     }
+                 }
+                 if (!this.tasks[depTargetId]) {
+@@ -161,17 +189,22 @@ class ProcessTasks {
+                     this.tasks[depTargetId] = newTask;
+                     this.dependencies[depTargetId] = [];
+                     this.continuousDependencies[depTargetId] = [];
+-                    this.processTask(newTask, newTask.target.project, configuration, overrides);
+                 }
++                this.processTask(this.tasks[depTargetId], depProject.name, configuration, overrides);
+             }
+             else {
+                 // Create a dummy task for task.target.project... which simulates if depProject had dependencyConfig.target
++                // Create a dummy task for task.target.project... which simulates if depProject had dependencyConfig.target.
++                // Its id carries the parent's configuration, so a development and a production parent get distinct dummies.
+                 const dummyId = (0, utils_1.createTaskId)(depProject.name, task.target.project +
+                     task.target.target +
++                    (task.target.configuration ?? '') +
+                     '__' +
+                     dependencyConfig.target +
+                     DUMMY_TASK_TARGET, undefined);
+-                this.dependencies[task.id].push(dummyId);
++                if (!this.dependencies[task.id].includes(dummyId)) {
++                    this.dependencies[task.id].push(dummyId);
++                }
+                 this.dependencies[dummyId] ??= [];
+                 this.continuousDependencies[dummyId] ??= [];
+                 const noopTask = this.createDummyTask(dummyId, task);
 diff --git a/dist/src/tasks-runner/default-tasks-runner.js b/dist/src/tasks-runner/default-tasks-runner.js
 index 713453e37ce42da670e6a37d62e0bab763d7cf37..841eb089b99e0c6029c0d860bf5e0a305fe6ad50 100644
 --- a/dist/src/tasks-runner/default-tasks-runner.js
