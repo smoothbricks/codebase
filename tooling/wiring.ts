@@ -765,6 +765,12 @@ function macroArgument(text: string, at: number): boolean {
 }
 
 /**
+ * A serde attribute key whose string value names a function by path (`skip_serializing_if = "is_default"`): the derived
+ * code calls that function, so the name in the string is an occurrence.
+ */
+const SERDE_PATH_KEY = /\b(?:skip_serializing_if|default|with|serialize_with|deserialize_with)\s*=\s*$/;
+
+/**
  * Rust text with comments, string and char literal contents, lifetimes and labels blanked to spaces; offsets and
  * newlines kept. A macro's format string keeps its inline captures (`{name}`, `{name:?}`), which are uses.
  */
@@ -808,6 +814,9 @@ function blankRust(text: string): string {
       let j = i + 1;
       while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
       blank(i + 1, j);
+      if (SERDE_PATH_KEY.test(text.slice(Math.max(0, i - 64), i))) {
+        for (let k = i + 1; k < j; k++) out[k] = text[k] ?? ' ';
+      }
       if (macroArgument(text, i)) {
         // `{{` is an escaped brace, not a capture.
         for (const capture of text.slice(i + 1, j).matchAll(/(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)[:}]/g)) {

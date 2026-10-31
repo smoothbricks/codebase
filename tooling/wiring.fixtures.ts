@@ -470,6 +470,18 @@ expectFindings(
 );
 // --- The root lint's scope ------------------------------------------------------------------------------------------
 
+expectFindings(
+  'a function a serde attribute names by path is called by the derived code; one no attribute names is refused',
+  {
+    'crates/api/Cargo.toml': CRATE('api'),
+    'crates/api/src/lib.rs':
+      'mod wire;\n\npub(crate) fn is_default(value: &u8) -> bool {\n    *value == 0\n}\n\npub(crate) fn zero() -> u8 {\n    0\n}\n\npub(crate) fn unnamed() {}\n\npub fn run() -> wire::Message {\n    wire::Message { value: 0 }\n}\n',
+    'crates/api/src/wire.rs':
+      '#[derive(serde::Serialize, serde::Deserialize)]\npub struct Message {\n    #[serde(skip_serializing_if = "crate::is_default", default = "crate::zero")]\n    pub value: u8,\n}\n',
+  },
+  ['pub unnamed@crates/api/src/lib.rs:11', 'pub run@crates/api/src/lib.rs:13'],
+);
+
 {
   const texts = new Map(
     Object.entries({
