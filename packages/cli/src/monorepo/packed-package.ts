@@ -314,13 +314,14 @@ function exportPointsToNonJs(value: PackageExports): boolean {
 
 async function packPackage(root: string, pkg: PackageInfo): Promise<{ path: string; arrayBuffer: ArrayBuffer }> {
   const packageDir = join(root, pkg.path);
-  const tarballName = `.smoo-${process.pid}-${Date.now()}.tgz`;
-  const tarballPath = join(root, tarballName);
+  const tarballPath = join(root, `.smoo-${process.pid}-${Date.now()}.tgz`);
   try {
     // Pruned here too, so publint/attw/manifest checks validate the exports
     // shape a release would publish.
     const result = await withPublishManifest(packageDir, () =>
-      runResult('bun', ['pm', 'pack', '--filename', tarballName, '--ignore-scripts', '--quiet'], packageDir),
+      // Bun 1.4.3 wrote a relative `--filename` into the workspace root and 1.4.4 writes it into the directory it packs
+      // (both measured): an absolute path is the one file this function reads and removes.
+      runResult('bun', ['pm', 'pack', '--filename', tarballPath, '--ignore-scripts', '--quiet'], packageDir),
     );
     if (result.exitCode !== 0) {
       printCommandOutput(result.stdout, result.stderr);
