@@ -38,15 +38,7 @@ import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import type { CpuWaitRow } from './lease-wait.js';
 import type { LockWait } from './lock-wait.js';
-import {
-  MBX_GRANT_FD,
-  mbxIdleGated,
-  mbxLeaf,
-  mbxPool,
-  nxTaskCores,
-  runsPrebuiltNextest,
-  withMbxLeaf,
-} from './mbx-pool.js';
+import { MBX_GRANT_FD, mbxIdleGated, mbxLeaf, mbxPool, withCountedReservation, withMbxLeaf } from './mbx-pool.js';
 import { MBX_QUEUE_POLL_MS, type MbxQueuedRequest, snapshotMbxQueue } from './mbx-queue.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
@@ -367,13 +359,14 @@ export async function runBoundedExec(
   };
 
   // The fixture pair names one segment: a fixture with no build budget, or a budget with no fixture, is a
-  // target that does not say what it runs, so it does not run.
+  // target that does not say what it runs, so it does not run. Units are counted at the end of that segment.
   if (
     (options.fixtureCommand === undefined) !== (options.fixtureTimeoutMs === undefined) ||
+    (options.unitsCommand !== undefined && options.fixtureCommand === undefined) ||
     (fixture !== null && !(fixture.timeoutMs > 0))
   ) {
     appendStderr(
-      'bounded-exec: fixtureCommand and a positive fixtureTimeoutMs must be named together; refusing to run the command\n',
+      'bounded-exec: fixtureCommand and a positive fixtureTimeoutMs must be named together, and unitsCommand only with them; refusing to run the command\n',
     );
     if (context.record !== undefined) {
       const { task, directory: recordDirectory } = context.record;
@@ -386,7 +379,7 @@ export async function runBoundedExec(
   // CPU tokens: a refusal that waited in its pool's queue first would say nothing for minutes.
   const runtime = await checkRuntimePin({
     root: context.root,
-    command: fixture === null ? requested : `${fixture.command} && ${requested}`,
+    command: [fixture?.command, options.unitsCommand, requested].filter((part) => part !== undefined).join(' && '),
     env: { ...withoutPoolEnv(process.env), ...options.env },
     cwd,
     pathSource: options.env?.PATH === undefined ? 'the inherited environment' : "the target's env",
@@ -537,12 +530,8 @@ export async function runBoundedExec(
   // (`run-cpu-pool.ts`), so a task takes its tokens from a parent's pool; a command that inherits none runs exactly as
   // asked and nothing is said.
   const cores = availableParallelism();
-  // A prebuilt nextest leaf under mbx asks for its task's share of the host (`nxTaskCores`), not every core: it knows
-  // no count of its tests. A declared or named count still wins.
   const mbx = mbxPool(process.env);
-  const leafCores =
-    mbx !== null && runsPrebuiltNextest(requested) ? nxTaskCores(cores, { ...process.env, ...options.env }) : cores;
-  const demand = runnerDemand(requested, options.parallelism, leafCores, process.env, options.env);
+  const demand = runnerDemand(requested, options.parallelism, cores, process.env, options.env);
   const asked = Date.now();
   // A pool that answered and refused is a live budget, and running beside it would count the run twice: the run fails
   // instead. A pool whose endpoint is gone (its holder exited) lends nothing, and the run goes on as asked.
@@ -718,21 +707,27 @@ export async function runBoundedExec(
     ...(leaf?.kind === 'cargo' ? { MBX_GRANT_FD: String(MBX_GRANT_FD) } : {}),
   };
   // A fixture rides as segment 0 of the lifecycle. Without the channel (Windows) it is plain shell text ahead
-  // of the command: the progress bound runs during it and its own ceiling does not.
-  const hooked =
-    process.platform === 'win32'
-      ? null
-      : fixture === null
-        ? withRunnerLifecycle(command)
-        : withFixtureLifecycle(fixture.command, command);
+  // of the command: the progress bound runs during it and its own ceiling does not. Under mbx a leaf that names its
+  // units counts them at the end of that segment, under the fixture's ceiling, its fixture's own output on stderr, and
+  // reserves after it (`withCountedReservation`).
+  const counted =
+    process.platform !== 'win32' && leaf?.kind === 'reserve' && fixture !== null && options.unitsCommand !== undefined;
+  const segment =
+    fixture === null ? null : counted ? `{ ${fixture.command}; } >&2 && ${options.unitsCommand}` : fixture.command;
+  const fixtureHooked =
+    process.platform === 'win32' || segment === null ? null : withFixtureLifecycle(segment, command);
+  const hooked = process.platform === 'win32' ? null : (fixtureHooked ?? withRunnerLifecycle(command));
   const lifecycle = hooked === null ? null : createRunnerLifecycle(hooked.runners);
   let lifecycleFailure: string | null = null;
   const isTesting = (): boolean => lifecycleFailure !== null || (lifecycle?.isTesting() ?? true);
   const startedAt = Date.now();
   // With a supervisor, `cowshed subtree-root` asks it for a handle on itself, writes the answer to the handle
   // descriptor, and execs `/bin/sh -c command` in the same process: the command's pid, group and life are unchanged.
-  const unadmitted = hooked?.command ?? (fixture === null ? command : `${fixture.command} && ${command}`);
-  const shellCommand = withMbxLeaf(unadmitted, leaf);
+  const unadmitted = hooked?.command ?? (segment === null ? command : `${segment} && ${command}`);
+  const shellCommand =
+    leaf?.kind === 'reserve' && counted && fixtureHooked !== null
+      ? withCountedReservation(fixtureHooked.fixture, fixtureHooked.main, leaf)
+      : withMbxLeaf(unadmitted, leaf);
   // Only leaves known to be scheduled can exclude zero-hold time. Others keep lifecycle hang protection.
   const queued = mbxIdleGated(leaf, sized.command, { ...process.env, ...env });
   // fd 4 is unused without a subtree admission, so the grant takes fd 5 either way.
@@ -942,6 +937,8 @@ export async function runBoundedExec(
   };
   const refreshQueue = async (fresh: boolean): Promise<void> => {
     if (fresh && queueSnapshot !== null) await queueSnapshot;
+    // A leaf that counts its units before reserving waits in no reservation queue while its fixture builds.
+    if (counted && !fixtureDone) return;
     if (state.settled || state.expiry !== null || queueAbort.signal.aborted || child.pid === undefined) return;
     const pid = child.pid;
     queueSnapshot ??= (async () => {
@@ -1158,7 +1155,7 @@ export async function runBoundedExec(
               : `The last mbx admission snapshot failed (${unconfirmedAdmission}), so the wait it could not confirm earned no idle credit\n`
           }`
         : bound.kind === 'fixture'
-          ? `\nFixture command timed out after ${elapsedMs}ms (fixtureTimeoutMs=${bound.limitMs}, cwd=${cwd}): ${fixture?.command ?? command}\n`
+          ? `\nFixture command timed out after ${elapsedMs}ms (fixtureTimeoutMs=${bound.limitMs}, cwd=${cwd}): ${segment ?? command}\n`
           : `\nCommand timed out after ${elapsedMs}ms (timeoutMs=${bound.limitMs}, cwd=${cwd}): ${command}\n`,
     );
     if (bound.kind === 'idle') {
@@ -1257,6 +1254,7 @@ export async function runBoundedExec(
     at: Date.now(),
     testing: isTesting(),
     fixture: fixture !== null && lifecycle !== null,
+    fixtureFirst: counted && lifecycle !== null,
     queued,
   });
   // Read every byte after spawn accounting: a chunk can contain several grants and releases. EOF is neither.
@@ -1278,7 +1276,7 @@ export async function runBoundedExec(
             said = true;
             tell(
               leaf.kind === 'reserve'
-                ? `cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms asked=${leaf.demand.want} priority=${leaf.priority}\n`
+                ? `cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms priority=${leaf.priority}\n`
                 : `cowshed: mbx cargo granted elapsed=${Date.now() - startedAt}ms\n`,
             );
           }
@@ -1336,7 +1334,7 @@ export async function runBoundedExec(
   if (code !== 0 && state.expiry === null) {
     appendStderr(
       fixture !== null && !mainStarted
-        ? `Fixture command exited with status ${code}: ${fixture.command}\n`
+        ? `Fixture command exited with status ${code}: ${segment ?? fixture.command}\n`
         : `Command exited with status ${code}: ${command}\n`,
     );
   }

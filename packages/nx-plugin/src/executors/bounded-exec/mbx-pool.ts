@@ -1,5 +1,12 @@
 import { shellTokens } from '../../runtime-input-policy.js';
-import { CPU_TOKENS_ENV, type Demand, grantedSizing, invocationSpan, type ReservedDemand } from './runner-sizing.js';
+import {
+  CPU_TOKENS_ENV,
+  type Demand,
+  grantedSizing,
+  invocationSpan,
+  type ReservedDemand,
+  WANT_ENV,
+} from './runner-sizing.js';
 import { shellQuote } from './verdict.js';
 
 /**
@@ -45,6 +52,9 @@ export type MbxLeaf =
       readonly demand: ReservedDemand;
     };
 
+/** A leaf mbx's pool reserves for. */
+export type ReservedLeaf = Extract<MbxLeaf, { kind: 'reserve' }>;
+
 /** A nextest invocation that runs test binaries already built, from extracted archive metadata or an archive file. */
 const PREBUILT_NEXTEST = /(?<![\w-])--(?:binaries-metadata|archive-file)(?=[=\s]|$)/;
 
@@ -80,28 +90,6 @@ export function mbxLeaf(pool: MbxPool, demand: Demand, command: string): MbxLeaf
     case 'process':
       return reserve(demand);
   }
-}
-
-/** Nx's own default count of tasks at once, when nothing names one. */
-const NX_DEFAULT_PARALLEL = 3;
-
-/**
- * The cores one task of an Nx run counts as its own: the host's cores divided among the tasks Nx runs at once, at
- * least one. Nx reads that count from `NX_PARALLEL`, a number or a share of the cores (`100%`), else runs three.
- *
- * A prebuilt nextest leaf asks for this share rather than its runner's own count, every core by default, because it
- * does not know how many tests it runs: mbx grants a reservation as many of its cores as are free, so a leaf of a few
- * long tests asking for every core would hold the idle rest for its whole run (specs/cowshed/05_gateway.md, "Open
- * questions"). Before mbx granted reservations their free cores, every cargo-test leaf of a gate reserved the whole
- * pool and they ran one at a time: on 2026-10-30 a gate's 18-core host ran 4.2 cores busy, its leaves each holding
- * `mbx reserve --cpus 18`.
- */
-export function nxTaskCores(cores: number, environment: Readonly<NodeJS.ProcessEnv>): number {
-  const named = environment.NX_PARALLEL?.trim() ?? '';
-  const share = /^(\d+)%$/.exec(named);
-  const count = share?.[1] !== undefined ? (cores * Number(share[1])) / 100 : /^\d+$/.test(named) ? Number(named) : 0;
-  const parallel = count >= 1 ? Math.floor(count) : NX_DEFAULT_PARALLEL;
-  return Math.max(1, Math.floor(cores / parallel));
 }
 /**
  * The value an in-place runner gives `--target-dir-remap`: smoo-nx-nextest-binaries' answer, quoted. The plugin infers
@@ -174,16 +162,34 @@ export function mbxIdleGated(leaf: MbxLeaf | null, command: string, environment:
 export const MBX_GRANT_FD = 5;
 
 /**
- * `command` as the shell runs it under its leaf's admission, or as it is for a leaf in no pool (`null`). A reserved leaf
- * asks for its runner's count, and its reservation first sizes the runner to what mbx granted (`grantedSizing`) and says
- * so on stderr. `mbx` is the canonical environment's, whose realpath cowshed's admission proved to be the host's pinned
- * mbx; it writes the grant on this descriptor itself.
+ * `command` as the shell runs it under its leaf's admission, or as it is for a leaf in no pool (`null`): a reserved
+ * leaf asks for its runner's count (`reservation`).
  */
 export function withMbxLeaf(command: string, leaf: MbxLeaf | null): string {
   if (leaf === null || leaf.kind === 'cargo') {
     return command;
   }
-  const asked = leaf.demand.want;
-  const said = `printf 'cowshed: mbx reserve running cpus=%s asked=${asked}\\n' "$${CPU_TOKENS_ENV}" >&2; `;
-  return `mbx reserve --grant-fd ${MBX_GRANT_FD} --cpus ${asked} --priority ${leaf.priority} -- /bin/sh -c ${shellQuote(`${grantedSizing(leaf.demand)}${said}${command}`)}`;
+  return `${WANT_ENV}=${leaf.demand.want} && ${reservation(command, leaf)}`;
+}
+
+/**
+ * A reserved leaf whose `fixture` segment ends by printing one line per unit its `command` runs (`unitsCommand`): the
+ * segment runs first, outside the reservation, since a build's compilers are admitted by mbx one by one, and the leaf
+ * asks for its units, at most its runner's count and at least one. A segment that fails fails the run before anything
+ * is reserved.
+ */
+export function withCountedReservation(fixture: string, command: string, leaf: ReservedLeaf): string {
+  const most = leaf.demand.want;
+  const count = `n=0; while IFS= read -r unit; do if [ -n "$unit" ]; then n=$((n + 1)); fi; done; echo "$(( n < 1 ? 1 : n < ${most} ? n : ${most} ))"`;
+  return `bounded_exec_units=$(${fixture}) && ${WANT_ENV}=$(printf '%s\\n' "$bounded_exec_units" | { ${count}; }) && ${reservation(command, leaf)}`;
+}
+
+/**
+ * The reservation of `WANT_ENV` cores, set by the caller, that runs `command` once mbx grants it: the reservation sizes
+ * the runner to what mbx granted (`grantedSizing`) and says so on stderr. `mbx` is the canonical environment's, whose
+ * realpath cowshed's admission proved to be the host's pinned mbx; it writes the grant on this descriptor itself.
+ */
+function reservation(command: string, leaf: ReservedLeaf): string {
+  const said = `printf 'cowshed: mbx reserve running cpus=%s asked=%s\\n' "$${CPU_TOKENS_ENV}" "$${WANT_ENV}" >&2; `;
+  return `export ${WANT_ENV} && mbx reserve --grant-fd ${MBX_GRANT_FD} --cpus "$${WANT_ENV}" --priority ${leaf.priority} -- /bin/sh -c ${shellQuote(`${grantedSizing(leaf.demand)}${said}${command}`)}`;
 }

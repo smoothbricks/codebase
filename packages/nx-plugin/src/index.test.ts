@@ -1593,6 +1593,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-ferris-core']?.options).toMatchObject({
         fixtureCommand: `${helper} ensure .cache/nextest/binaries-metadata.json .cache/nextest/build.key -- ${build}`,
         fixtureTimeoutMs: 3_600_000,
+        // Under mbx the piece asks for no more cores than it has tests: the same selection, listed one per line.
+        unitsCommand:
+          'cargo --frozen nextest list --binaries-metadata .cache/nextest/binaries-metadata.json ' +
+          `--cargo-metadata .cache/nextest/cargo-metadata.json --target-dir-remap "$(${helper} target-dir)" ` +
+          "--workspace-remap . -E 'package(ferris-core)' -T oneline --user-config-file none " +
+          '--tool-config-file "smoo:$PWD/../../node_modules/@smoothbricks/nx-plugin/nextest.toml"',
       });
       expect(targets['cargo-test-ferris-core']?.inputs).toContain(
         '{workspaceRoot}/packages/ferris/.config/nextest.toml',
@@ -3215,6 +3221,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       for (const index of [1, 2, 3]) {
         expect(targets[`cargo-test-big-shard${index}`]?.options?.command).toContain(
           `-E 'package(big) and not (${exceptional})' --partition hash:${index}/3 --no-fail-fast --no-tests=pass`,
+        );
+        // Its units are the tests of its own partition: the run's selection and partition, listed, not run.
+        expect(targets[`cargo-test-big-shard${index}`]?.options?.unitsCommand).toContain(
+          'nextest list --binaries-metadata .cache/nextest/binaries-metadata.json',
+        );
+        expect(targets[`cargo-test-big-shard${index}`]?.options?.unitsCommand).toContain(
+          `-E 'package(big) and not (${exceptional})' --partition hash:${index}/3 -T oneline --user-config-file none`,
         );
         expect(targets[`cargo-test-big-shard${index}`]?.options?.idleTimeoutMs).toBe(BOUNDED_TEST_IDLE_TIMEOUT_MS);
         expect(targets[`cargo-test-big-shard${index}`]?.options).not.toHaveProperty('timeoutMs');

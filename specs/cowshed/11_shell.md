@@ -534,8 +534,9 @@ A bounded leaf's hang clock follows this boundary too. A supported Cargo test ex
 `MBX_SCHEDULER_TESTS=1`, or a reserved external leaf, may suspend its no-progress clock while mbx holds no capacity. The
 grant descriptor carries every admission (`g`) and permit drop (`r`); overlapping holds are counted, zero-hold time
 spends no idle budget, and a finished test resets the budget. A signal-killed holder writes no release and stays counted
-until the command ends. The first admission starts total and fixture ceilings; later queue intervals do not pause those
-ceilings. EOF proves neither admission nor release.
+until the command ends. The first admission starts total and fixture ceilings, except that a fixture run before its
+leaf's reservation, to count the leaf's units (05_gateway.md, "Parallelism inside a job"), starts its ceiling at spawn;
+later queue intervals do not pause those ceilings. EOF proves neither admission nor release.
 
 Independently, any live process of the bounded task explicitly queued for mbx admission pauses the remaining idle
 budget, including alongside a held grant and for an otherwise unsupported runner. Public

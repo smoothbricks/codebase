@@ -3343,11 +3343,12 @@ function nextestRunnerFixture(workspace: CargoWorkspace, nativeTools: NativeTool
 }
 
 /**
- * One `nextest run` over a filterset against the workspace's test build. Every runner of the
- * workspace builds its command here, so the reuse-build, the remap, the tool config and the cwd
- * cannot drift between the per-crate pieces and the serial groups.
+ * One `nextest run`, or `nextest list`, over a filterset against the workspace's test build. Every runner of the
+ * workspace builds its command here, so the reuse-build, the remap, the tool config and the cwd cannot drift between
+ * the per-crate pieces, their test lists and the serial groups.
  */
 function nextestRunnerCommand(
+  verb: 'run' | 'list',
   workspace: CargoWorkspace,
   nativeTools: NativeTools | null,
   selector: string,
@@ -3360,7 +3361,7 @@ function nextestRunnerCommand(
     `--binaries-metadata ${NEXTEST_BINARIES_METADATA} --cargo-metadata ${NEXTEST_CARGO_METADATA} ` +
     `--target-dir-remap "$(${helper} target-dir)"`;
   return cargoFrozen(
-    `nextest run ${reuseBuild} --workspace-remap . -E ${shellWord(selector)}${flags} --user-config-file none ${toolConfig}`,
+    `nextest ${verb} ${reuseBuild} --workspace-remap . -E ${shellWord(selector)}${flags} --user-config-file none ${toolConfig}`,
   );
 }
 
@@ -3379,6 +3380,7 @@ function cargoTestRunnerTarget(
     dependsOn: [build, ...nativeToolDependsOn(nativeTools, 'nextest-extract')],
     options: {
       command: nextestRunnerCommand(
+        'run',
         workspace,
         nativeTools,
         piece.selector,
@@ -3387,6 +3389,8 @@ function cargoTestRunnerTarget(
       cwd: workspace.projectRoot,
       fixtureCommand: nextestRunnerFixture(workspace, nativeTools),
       fixtureTimeoutMs: NEXTEST_BINARIES_FIXTURE_TIMEOUT_MS,
+      // One line per test the piece runs, so under mbx it reserves no more cores than it has tests.
+      unitsCommand: nextestRunnerCommand('list', workspace, nativeTools, piece.selector, `${piece.extra} -T oneline`),
       idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
     },
@@ -3413,7 +3417,7 @@ function cargoTestGroupTarget(
     inputs: [...inputs, fileHashInput(PLUGIN_NEXTEST_CODE_BOUND)],
     dependsOn: [CARGO_TEST_BUILD_TARGET, ...nativeToolDependsOn(nativeTools, 'nextest-extract')],
     options: {
-      command: nextestRunnerCommand(workspace, nativeTools, group.filter, ' --no-fail-fast --no-tests=fail'),
+      command: nextestRunnerCommand('run', workspace, nativeTools, group.filter, ' --no-fail-fast --no-tests=fail'),
       cwd: workspace.projectRoot,
       fixtureCommand: nextestRunnerFixture(workspace, nativeTools),
       fixtureTimeoutMs: NEXTEST_BINARIES_FIXTURE_TIMEOUT_MS,

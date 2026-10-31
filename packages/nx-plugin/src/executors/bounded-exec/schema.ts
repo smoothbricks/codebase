@@ -28,9 +28,11 @@ export interface BoundedExecCommand {
   killAfterMs?: number;
 
   /**
-   * A compiler-fixture producer for `command`: a shell command run first, in the same cwd, environment and CPU
-   * grant, whose whole life is a lifecycle build interval — the progress bound does not run during it, as it does
-   * not run during a `cargo test` build. Its failure fails the run; `command` starts only after it exits 0.
+   * A compiler-fixture producer for `command`: a shell command run first, in the same cwd and environment, inside
+   * the run's CPU grant; under mbx inside its leaf's reservation, or before it when `unitsCommand` counts the leaf's
+   * units, since then the fixture is a build whose compilers mbx admits one by one.
+   * Its whole life is a lifecycle build interval — the progress bound does not run during it, as it does not run
+   * during a `cargo test` build. Its failure fails the run; `command` starts only after it exits 0.
    *
    * It exists for warmth that lives outside Nx outputs (a compiler plugin cache, a Cargo target directory). As a
    * separate `cache: false` prerequisite that warmth was paid even when every consumer then hit the cache, since
@@ -44,6 +46,13 @@ export interface BoundedExecCommand {
    * only the fixture interval, never the command it prepares.
    */
   fixtureTimeoutMs?: number;
+  /**
+   * A shell command that prints one line per unit `command` runs (a test, a file), run at the end of the fixture
+   * segment, under its ceiling; refused without `fixtureCommand`. A leaf that mbx's pool reserves for asks for no more
+   * cores than it prints lines, at least one: a run of two slow tests holds two cores, not every core its runner could
+   * use. Its failure fails the run before anything is reserved.
+   */
+  unitsCommand?: string;
   /**
    * The most threads or processes the command runs at once, which is how many CPU tokens it asks
    * its live parent pool for. Absent, the runner in the command decides:

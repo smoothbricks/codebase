@@ -2061,17 +2061,27 @@ so a package pattern that matched no tests cannot pass. It exits 1 when any bina
 be run.
 
 A target may name a `fixtureCommand` with its `fixtureTimeoutMs`: a compiler-fixture producer the executor runs first,
-in the same cwd, environment and CPU grant, as segment 0 of the same lifecycle — a build interval for its whole life,
-under its own supervisor and acknowledged like a runner's phases. The command follows under `&&` (a direct Go/Cargo
-chain keeps its phases behind a brace group; any other command runs as one segment active from its spawn), so a fixture
-failure ends the run before a test starts, and fixture output earns no progress. `fixtureTimeoutMs` is the segment's own
-wall-clock ceiling, a build budget; the segment's terminal retires it, and expiring it records a `fixture` bound, since
-no test was running. The pair is refused unpaired, and a run that names it names no shadow record of warmth. This exists
-for warmth that lives outside Nx outputs — a compiler plugin cache, a Cargo `target/`: it cannot be a cacheable output,
-and as a `cache: false` prerequisite it executed even when every consumer then restored its verdict from cache, because
-Nx runs an uncached dependency before reaching its cached consumer. Inside the consumer's own task the cache decides: a
-hit restores the verdict and warms nothing; an execution warms first. Without the lifecycle channel (Windows) the
-fixture is plain shell text ahead of the command, bounded from spawn like any wrapper, and its ceiling does not apply.
+in the same cwd, environment and CPU grant (under mbx inside the leaf's reservation, or before it when its units are
+counted, below; a build's compilers are admitted one by one), as segment 0 of the same lifecycle — a build interval for
+its whole life, under its own supervisor and acknowledged like a runner's phases. The command follows under `&&` (a
+direct Go/Cargo chain keeps its phases behind a brace group; any other command runs as one segment active from its
+spawn), so a fixture failure ends the run before a test starts, and fixture output earns no progress. `fixtureTimeoutMs`
+is the segment's own wall-clock ceiling, a build budget; the segment's terminal retires it, and expiring it records a
+`fixture` bound, since no test was running. The pair is refused unpaired, and a run that names it names no shadow record
+of warmth. This exists for warmth that lives outside Nx outputs — a compiler plugin cache, a Cargo `target/`: it cannot
+be a cacheable output, and as a `cache: false` prerequisite it executed even when every consumer then restored its
+verdict from cache, because Nx runs an uncached dependency before reaching its cached consumer. Inside the consumer's
+own task the cache decides: a hit restores the verdict and warms nothing; an execution warms first. Without the
+lifecycle channel (Windows) the fixture is plain shell text ahead of the command, bounded from spawn like any wrapper,
+and its ceiling does not apply.
+
+Under mbx, a reserved leaf whose target names a `unitsCommand` (a shell command printing one line per unit `command`
+runs; the plugin's nextest pieces name the same `nextest list -T oneline` of their selection and partition) runs that
+command at the end of its fixture segment, under the fixture's ceiling, which then starts at spawn, with the fixture's
+own output on stderr; the fixture runs before the reservation, not inside it. The leaf then reserves
+`--cpus min(units, its runner's count)`, at least one, and its reservation says
+`cowshed: mbx reserve running cpus=<granted> asked=<asked>`. A count that fails fails the run before anything is
+reserved, named as the fixture segment. `unitsCommand` is refused without `fixtureCommand`.
 
 Process-group timeout fixtures retain cleanup authority only until the command leader exits and every descendant closes
 its inherited lifetime FIFO. EOF is the terminal ownership event; a later `afterEach` must not signal the retired PGID

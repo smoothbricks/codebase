@@ -61,6 +61,12 @@ export const CPU_TOKENS_ENV = 'BOUNDED_EXEC_CPU_TOKENS';
  */
 export const GRANTED_CPUS_ENV = 'MBX_RESERVE_CPUS';
 
+/**
+ * The most cores a reserved leaf asks mbx for, as its reservation's shell sets it before reserving: its runner's own
+ * count, or fewer when it has fewer units than that (`unitsCommand`).
+ */
+export const WANT_ENV = 'BOUNDED_EXEC_CPU_WANT';
+
 const CARGO_BUILD =
   /(?<=^|[\s;&|()])(?:cargo(?:\s+-\S+)*\s+(?:build|test|check|clippy|rustc|doc|run|nextest\s+archive)|napi\s+build)(?=\s|$)/;
 const TEST_THREADS = /--test-threads(?:=|\s+)(\d+)/g;
@@ -363,12 +369,12 @@ export function sizeRunner(
 /**
  * The shell statements that run first in a reserved leaf's reservation and size its runner to the grant, which only
  * the command learns as it starts: `CPU_TOKENS_ENV` becomes the cores mbx granted (`GRANTED_CPUS_ENV`), never more
- * than the leaf asked for, its `--cpus` (the runner's own count), which also stands in under an mbx that grants a
+ * than the leaf asked for (`WANT_ENV`, set before it reserved), which also stands in under an mbx that grants a
  * reservation whole and names none. The test-thread variables a sizing sets follow from it, under their inherited
  * ceilings, outranking the target's own as a numeric grant's do (`sizeRunner`).
  */
 export function grantedSizing(demand: ReservedDemand): string {
-  const asked = demand.want;
+  const asked = `$${WANT_ENV}`;
   const named = `\${${GRANTED_CPUS_ENV}:-${asked}}`;
   const tokens = `$${CPU_TOKENS_ENV}`;
   const atMost = (ceiling: number | null): string =>

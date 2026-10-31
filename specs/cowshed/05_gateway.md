@@ -1554,6 +1554,16 @@ none of them beneath the reservation. Admitted one test process at a time under 
 a ticket of its own: a downstream gate on 2026-10-30 measured 73.5 s apiece for codec tests of at most 0.25 s, whose 121
 tests run in 1.18 s unqueued (owner's ruling, 2026-10-30).
 
+**A reserved leaf asks for no more than its units.** A leaf whose target names a `unitsCommand` (the plugin's nextest
+pieces: the same `nextest list` of the piece's selection and partition, one line per test) runs that command at the end
+of its fixture segment, under the fixture's ceiling, so the fixture runs first and outside any reservation (its build's
+compilers mbx admits one by one), then `mbx reserve --cpus min(units, g)`, at least one. A piece of two slow tests
+reserves two cores, not every core its runner could use, so a grant mbx makes from the free cores is not held idle for
+the piece's whole run. Units count tests, not nextest's per-test thread slots, so a test with `threads-required` above
+one runs on fewer cores than it could use. A count that fails fails the leaf before anything is reserved. A leaf with no
+units command, such as a cross-target archive run, asks for its runner's own count `g`, its fixture inside the
+reservation.
+
 The boundary is the actual leaf runner (`bounded-exec` and equivalent direct runners), not an enclosing orchestration
 command. An Nx run mixing Cargo and non-Cargo leaves holds no reservation of its own: Cargo leaves use mbx, non-Cargo
 leaves reserve, and local fan-out consumes only the admitted leaf's grant. `mbx reserve` does not discover Cargo
@@ -1753,11 +1763,6 @@ Kernel nice/cgroup behavior and mbx's internal scheduling policy remain their ow
   identify the same Nx task across runs. Inspect that correlation before enabling the span-derived memory request;
   absent or unprovable identity uses the specified zero-byte charge, never a shadow table.
 - The known unscheduled Cargo test-runner gap and its closing measurement belong to 11_shell.md, "Open questions".
-- **A reserved leaf's width.** A leaf should ask mbx for the width its runner can use (its tests, files or workers, at
-  most the cores) and run on what it is granted. bounded-exec knows no unit count for any reserved runner yet, so a
-  prebuilt nextest leaf asks for its task's share of the host (`nxTaskCores` in the nx-plugin) and the others their
-  runner's own count. Asking for every core instead would let a leaf of a few long tests hold the idle rest of a grant
-  mbx made from the free cores. Counting a leaf's units, and with it deleting the task share, is the open change.
 
 ## The task server schedules work units
 

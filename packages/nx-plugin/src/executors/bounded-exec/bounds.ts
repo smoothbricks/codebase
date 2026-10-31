@@ -3,7 +3,8 @@
  * a pure function of the run's events and the times they happened at, so a table can test it with no clock and no
  * process (verdict.ts says why the bounds are separate).
  *
- * - A scheduled leaf arms nothing until its first grant. Later zero-hold intervals pause only the idle budget.
+ * - A scheduled leaf arms nothing until its first grant, but for a fixture that runs before its reservation, whose
+ *   ceiling starts at spawn. Later zero-hold intervals pause only the idle budget.
  * - Any explicitly queued task process pauses idle, including alongside held grants; ceilings keep running.
  * - The fixture ceiling ends with its segment. The idle clock also stops outside the testing lifecycle.
  * - Finished tests reset the idle budget whether their release byte arrived before or after their output.
@@ -18,7 +19,7 @@ export interface BoundLimits {
 
 /**
  * When each armed bound expires, in the clock's milliseconds; `null` when it is not armed. `queued`: the run waits for
- * its pool's grant, so none is armed yet.
+ * its pool's grant, so none is armed yet but a fixture ceiling started at spawn (`fixtureFirst`).
  */
 export interface Bounds {
   readonly idle: number | null;
@@ -35,7 +36,8 @@ export type BoundKind = 'idle' | 'fixture' | 'total';
 export type BoundEvent =
   /**
    * The command started; `testing` is the lifecycle's answer then, `fixture` whether a supervised fixture leads it,
-   * `queued` whether mbx schedules this leaf, as known before spawn.
+   * `queued` whether mbx schedules this leaf, as known before spawn, and `fixtureFirst` whether that fixture runs
+   * before the leaf's reservation (it counts the leaf's units), so its ceiling starts now, not at the grant.
    */
   | {
       readonly kind: 'spawn';
@@ -43,6 +45,7 @@ export type BoundEvent =
       readonly testing: boolean;
       readonly fixture: boolean;
       readonly queued: boolean;
+      readonly fixtureFirst: boolean;
     }
   /** Each admission begins a hold; the first one starts the queued leaf's ceilings. */
   | { readonly kind: 'granted'; readonly at: number; readonly testing: boolean; readonly fixture: boolean }
@@ -91,7 +94,13 @@ export function stepBounds(bounds: Bounds, limits: BoundLimits, event: BoundEven
   switch (event.kind) {
     case 'spawn':
       return event.queued
-        ? { ...UNARMED, queued: true, holds: 0, idleRemaining: limits.idleMs ?? null }
+        ? {
+            ...UNARMED,
+            queued: true,
+            holds: 0,
+            idleRemaining: limits.idleMs ?? null,
+            fixture: event.fixtureFirst && limits.fixtureMs !== undefined ? event.at + limits.fixtureMs : null,
+          }
         : armed(limits, event.at, event.testing, event.fixture);
     case 'granted': {
       if (bounds.holds === null) return bounds;

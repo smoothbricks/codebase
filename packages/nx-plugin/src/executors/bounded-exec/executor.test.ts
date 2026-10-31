@@ -1710,7 +1710,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       expect(result.terminalOutput).toMatch(
         kind === 'cargo'
           ? /cowshed: mbx cargo granted elapsed=\d+ms\n/
-          : /cowshed: mbx reserve granted elapsed=\d+ms asked=1 priority=low\n/,
+          : /cowshed: mbx reserve granted elapsed=\d+ms priority=low\n/,
       );
       expect(result.terminalOutput).not.toContain('Bad file descriptor');
     } finally {
@@ -1778,6 +1778,115 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         else process.env[name] = value;
       }
     }
+  });
+
+  /**
+   * A prebuilt nextest leaf under a stand-in mbx that records what it was asked for, and whether the fixture had run
+   * by then, and runs the reservation's command on the cores it was asked for.
+   */
+  const reservedNextest = async (fixtureCommand: string, unitsCommand: string, fixtureTimeoutMs: number) => {
+    const workspace = await createWorkspace();
+    const bin = join(workspace.root, 'stand-in-mbx');
+    await mkdir(bin);
+    const asked = join(workspace.root, 'mbx-asked');
+    await writeFile(
+      join(bin, 'mbx'),
+      [
+        '#!/bin/sh',
+        `if [ "$1" = stats ]; then printf '{"version":2,"scheduler":{"activity":[]}}\\n'; exit; fi`,
+        `printf '%s fixture=%s\\n' "$*" "$(cat fixture-ran 2>/dev/null)" > '${asked}'`,
+        'shift',
+        'while [ "$1" != -- ]; do',
+        '  if [ "$1" = --grant-fd ]; then shift; fd=$1; fi',
+        '  shift',
+        'done',
+        'shift',
+        'eval "printf g >&$fd"',
+        'exec "$@"',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    await writeFile(join(bin, 'cargo'), '#!/bin/sh\nprintf "cargo %s threads=%s\\n" "$*" "$NEXTEST_TEST_THREADS"\n', {
+      mode: 0o755,
+    });
+    const saved = {
+      PATH: process.env.PATH,
+      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+    };
+    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    try {
+      const result = await runBoundedExec(
+        {
+          command: 'cargo nextest run --binaries-metadata m.json --test-threads=6',
+          fixtureCommand,
+          fixtureTimeoutMs,
+          unitsCommand,
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          killAfterMs: 0,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+      );
+      const reservation = await readFile(asked, 'utf8').catch(() => null);
+      return { result, reservation };
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  };
+
+  it('builds a reserved leaf’s fixture before it reserves, then asks for no more cores than it has units', async () => {
+    // A prebuilt nextest piece knows its tests only once its fixture has written the test build's metadata; reserved
+    // for every core it can use, a piece of two slow tests held the idle rest of its grant for its whole run.
+    const { result, reservation } = await reservedNextest(
+      'printf built > fixture-ran; echo fixture-said',
+      "printf 'crate a\\ncrate b\\n'",
+      BOUNDED_TEST_IDLE_TIMEOUT_MS,
+    );
+
+    expect(result.success, result.terminalOutput).toBe(true);
+    expect(reservation).toContain('--cpus 2 ');
+    expect(reservation).toContain('fixture=built');
+    // The fixture's own output still reaches the run's; only the units are counted.
+    expect(result.terminalOutput).toContain('fixture-said\n');
+    expect(result.terminalOutput).toContain('cowshed: mbx reserve running cpus=2 asked=2\n');
+    expect(result.terminalOutput).toContain('--test-threads=2 threads=2\n');
+  });
+
+  it('ends a fixture that hangs before its leaf reserves on the fixture’s own ceiling', async () => {
+    // No grant arrives while the fixture runs, so only a ceiling started at spawn can end it.
+    const { result, reservation } = await reservedNextest(
+      'node -e "process.stdin.resume()"',
+      "printf 'crate a\\n'",
+      150,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('Fixture command timed out after');
+    expect(result.terminalOutput).toContain('fixtureTimeoutMs=150');
+    expect(reservation).toBeNull();
+  });
+
+  it('fails a reserved leaf whose units cannot be counted, reserving nothing', async () => {
+    const { result, reservation } = await reservedNextest(
+      'printf built > fixture-ran',
+      'echo cannot-list >&2; exit 4',
+      BOUNDED_TEST_IDLE_TIMEOUT_MS,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('cannot-list');
+    expect(result.terminalOutput).toContain(
+      'Fixture command exited with status 4: { printf built > fixture-ran; } >&2 && echo cannot-list',
+    );
+    expect(reservation).toBeNull();
   });
 
   it.each([

@@ -403,7 +403,11 @@ describe("a reserved leaf's runner on its mbx grant", () => {
       `${name}() { printf '${name} %s | tokens=%s rust=%s nextest=%s\\n' "$*" "$BOUNDED_EXEC_CPU_TOKENS" "$RUST_TEST_THREADS" "$NEXTEST_TEST_THREADS"; }; `;
     const sized = grantedSizing(demand) + sizeRunnerToGrant(demand, command);
     const shell = spawnSync('/bin/sh', ['-c', ['cargo', 'bun', 'stryker', 'script'].map(stub).join('') + sized], {
-      env: { PATH: process.env.PATH, ...(granted === undefined ? {} : { MBX_RESERVE_CPUS: granted }) },
+      env: {
+        PATH: process.env.PATH,
+        BOUNDED_EXEC_CPU_WANT: String(demand.want),
+        ...(granted === undefined ? {} : { MBX_RESERVE_CPUS: granted }),
+      },
       encoding: 'utf8',
     });
     expect(shell.stderr).toBe('');

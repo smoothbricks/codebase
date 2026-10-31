@@ -69,13 +69,20 @@ export function withRunnerLifecycle(command: string, firstId = 0): { command: st
  * descendant holding the private descriptor. The fixture is arbitrary shell, so it rides under `/bin/sh -c`;
  * this lifecycle is POSIX-only, as the channel itself is.
  */
-export function withFixtureLifecycle(fixtureCommand: string, command: string): { command: string; runners: number } {
+export function withFixtureLifecycle(
+  fixtureCommand: string,
+  command: string,
+): { command: string; runners: number; fixture: string; main: string } {
   const fixture = hookInvocation(0, 'build', `/bin/sh -c ${shellWord(fixtureCommand)}`);
-  const main = withRunnerLifecycle(command, 1);
-  if (main !== null) {
-    return { command: `${fixture} && { ${main.command}; }`, runners: main.runners + 1 };
-  }
-  return { command: `${fixture} && ${hookInvocation(1, 'run', `/bin/sh -c ${shellWord(command)}`)}`, runners: 2 };
+  const hooked = withRunnerLifecycle(command, 1);
+  const main = hooked?.command ?? hookInvocation(1, 'run', `/bin/sh -c ${shellWord(command)}`);
+  const runners = (hooked?.runners ?? 1) + 1;
+  return {
+    command: hooked === null ? `${fixture} && ${main}` : `${fixture} && { ${main}; }`,
+    runners,
+    fixture,
+    main,
+  };
 }
 
 /** A private supervisor channel, not runner output, grants authority to pause the test clock. */
