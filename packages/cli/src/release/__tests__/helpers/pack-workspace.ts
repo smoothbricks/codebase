@@ -110,10 +110,9 @@ export async function withPackWorkspace(
     for (const pkg of options.packages ?? []) {
       await writePackWorkspacePackage(root, pkg);
     }
-    // `bun pm pack` resolves `workspace:*` from bun.lock and refuses to pack
-    // without one ("Failed to resolve workspace version"), so the fixture needs
-    // a real lockfile. `--lockfile-only` writes it from the local workspace
-    // alone: no network, no node_modules.
+    // A workspace smoo releases has a lockfile, and packing must leave it as it was, so the fixture writes one
+    // (`bun pm pack` 1.4.4 itself packs without it). `--lockfile-only` writes it from the local workspace alone: no
+    // network, no node_modules.
     await writeLockfile(root);
     await git(root, ['add', '-A']);
     await git(root, ['commit', '-m', 'fixture closure']);

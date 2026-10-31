@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isPackageJson, type PackageJson } from '../lib/json.js';
-import { prunePublishedExports, withPublishManifest } from './publish-manifest.js';
+import { prunePublishedExports, publishPackDependencyVersion, withPublishManifest } from './publish-manifest.js';
 
 function conditionKeys(exports: PackageJson['exports'], subpath: string): string[] {
   assert(exports && typeof exports === 'object');
@@ -260,6 +261,99 @@ describe('withPublishManifest', () => {
       assert(isPackageJson(seenPkg));
       expect(conditionKeys(seenPkg.exports, '.')[0]).toBe('types');
       expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(original);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('pins workspace:* dependencies at their published version for a release pack and restores the bytes', async () => {
+    const root = gitWorkspace(
+      {
+        app: {
+          name: '@fixture/app',
+          version: '1.2.0',
+          nx: { name: 'app' },
+          dependencies: { '@fixture/dep': 'workspace:*', 'left-pad': '^1.3.0' },
+          devDependencies: { '@fixture/tool': 'workspace:*' },
+          peerDependencies: { '@fixture/tool': 'workspace:^' },
+        },
+        dep: { name: '@fixture/dep', version: '0.2.1-next.0', nx: { name: 'dep' } },
+        tool: { name: '@fixture/tool', version: '3.0.0', nx: { name: 'tool' } },
+      },
+      ['dep@0.2.0'],
+    );
+    const manifestPath = join(root, 'packages/app/package.json');
+    try {
+      const before = readFileSync(manifestPath, 'utf8');
+      const seen: unknown = JSON.parse(
+        await withPublishManifest(join(root, 'packages/app'), async () => readFileSync(manifestPath, 'utf8'), {
+          workspaceRoot: root,
+        }),
+      );
+      assert(isPackageJson(seen));
+      expect(seen.dependencies).toEqual({ '@fixture/dep': '0.2.0', 'left-pad': '^1.3.0' });
+      expect(seen.devDependencies).toEqual({ '@fixture/tool': '3.0.0' });
+      // Any other workspace range is left for the packed-manifest check to refuse.
+      expect(seen.peerDependencies).toEqual({ '@fixture/tool': 'workspace:^' });
+      expect(readFileSync(manifestPath, 'utf8')).toBe(before);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/** A git workspace of `packages/<dir>` manifests whose one commit carries `tags`. */
+function gitWorkspace(packages: Record<string, object>, tags: readonly string[]): string {
+  const root = mkdtempSync(join(tmpdir(), 'smoo-publish-pins-'));
+  writeFileSync(
+    join(root, 'package.json'),
+    JSON.stringify({ name: 'fixture-root', private: true, workspaces: ['packages/*'] }),
+  );
+  for (const [dir, manifest] of Object.entries(packages)) {
+    mkdirSync(join(root, 'packages', dir), { recursive: true });
+    writeFileSync(join(root, 'packages', dir, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  }
+  const steps = [
+    ['init', '-q'],
+    ['config', 'user.name', 'Test'],
+    ['config', 'user.email', 'test@example.com'],
+    ['commit', '-q', '--allow-empty', '-m', 'init'],
+    ...tags.map((tag) => ['tag', tag]),
+  ];
+  for (const args of steps) {
+    const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+    if (result.status !== 0) {
+      rmSync(root, { recursive: true, force: true });
+      throw new Error(`git ${args.join(' ')} failed: ${result.error?.message ?? result.stderr}`);
+    }
+  }
+  return root;
+}
+
+describe('publishPackDependencyVersion', () => {
+  test('pins a prerelease at its last stable tag and any other version as written', () => {
+    const root = gitWorkspace({}, ['foo@0.1.1', 'foo@0.1.2', 'foo@0.1.3-rc.1', 'bar@1.0.0-next.0']);
+    try {
+      const cases = [
+        ['foo', '0.1.3-next.0', '0.1.2'], // the newest stable tag, past a newer prerelease tag
+        ['foo', '0.4.0', '0.4.0'], // a stable version as written, whatever the tags say
+        ['bar', '1.0.0-next.0', '1.0.0-next.0'], // no stable tag: the prerelease, for the packed-manifest check
+        ['baz', '0.0.1-next.0', '0.0.1-next.0'], // no tag at all
+      ] as const;
+      expect(cases.map(([project, version]) => publishPackDependencyVersion(root, project, version))).toEqual(
+        cases.map(([, , pinned]) => pinned),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('refuses to pin a prerelease when the tags cannot be listed, naming the git command', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'smoo-publish-pins-no-repo-'));
+    try {
+      expect(() => publishPackDependencyVersion(dir, 'foo', '0.1.0-next.0')).toThrow(
+        /git tag --list foo@\* .* in .* (exited|failed to start)/,
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

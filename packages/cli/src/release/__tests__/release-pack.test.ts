@@ -281,8 +281,8 @@ describe('release pack', () => {
         const consumerManifestBefore = await readFile(consumerManifestPath);
 
         await withPackedTarball(root, 'next-consumer', {}, async ({ tarball }) => {
-          // publish-mode sync rewrote the -next lock entry to the stable tag
-          // mid-flight; the packed dependency must embed the stable version...
+          // the publish manifest pinned the unpublished -next dependency at its
+          // last stable tag; the packed dependency must embed that version...
           expect(await packedManifestJson(tarball)).toContain('"@priv.test/next-dep": "0.2.0"');
           // ...and both workspace files must be back to their original bytes
           // after packing, including the manifest the export prune rewrote.

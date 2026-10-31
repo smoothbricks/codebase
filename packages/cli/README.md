@@ -37,7 +37,7 @@ smoo monorepo validate-commit-msg <commit-msg-file>
 smoo monorepo check-public-denylist [--remote <name>] [revisions...]
 smoo monorepo check-public-denylist --staged
 smoo monorepo check-public-denylist --commit-message <commit-msg-file>
-smoo monorepo sync-bun-lockfile-versions [--mode <install|publish>] [--stage]
+smoo monorepo sync-bun-lockfile-versions [--stage]
 smoo monorepo list-release-packages [--fail-empty] [--github-output <path>]
 smoo monorepo validate-public-tags
 smoo monorepo setup-test-tracing (--all | --projects <projects>) [--dry-run]
@@ -1468,10 +1468,11 @@ Versioning:
   lines verbatim, and a failure before npm ran (packing) is reported as itself.
 - `--dry-run` previews versioning and completion without pushing refs, publishing npm packages, or writing GitHub
   Releases.
-- The pack path maps unpublished `-next` lock entries to the last stable tag because `bun pm pack` resolves
-  `workspace:*` from `bun.lock`. Supported Buns keep the lockfile fresh on install
-  ([18906](https://github.com/oven-sh/bun/issues/18906), [20477](https://github.com/oven-sh/bun/issues/20477),
-  [20829](https://github.com/oven-sh/bun/issues/20829)), so no staleness repair remains.
+- The pack path pins each `workspace:*` dependency in the packed manifest: at the dependency's own version, or, when
+  that is a prerelease (the `-next` version a package stays on after its release), at its last stable tag. A prerelease
+  with no stable tag stays as it is, and the packed-manifest check refuses it outside `devDependencies`. smoo writes the
+  pin itself because `bun pm pack` 1.4.4 resolves `workspace:*` from the dependency's manifest, which holds the `-next`
+  version; nothing rewrites `bun.lock` for a pack.
 - Package release tags must use the Nx project name and version, for example `nx-plugin@0.0.2`. smoo derives release
   package/version pairs from that tag shape and maps project names back to npm package names before checking npm state.
 - `smoo release retag-unpublished <tag...>` is a break-glass recovery command for the case where Nx already committed a
@@ -1533,9 +1534,8 @@ Publishing:
   the same projects, and it keeps reruns self-sufficient when repairing a previously selected `HEAD` release target.
 - Publish uses `bun pm pack` to create package tarballs, then publishes those tarballs with latest npm CLI and
   `--provenance`. Each package uses the npm dist-tag implied by its own version (`next` for prereleases, `latest` for
-  stable versions). Bun pack resolves internal `workspace:*` dependency ranges to real versions in the tarball manifest;
-  smoo fails before publish if a packed manifest still contains `workspace:` or if an internal dependency does not match
-  the current workspace package version.
+  stable versions). smoo pins internal `workspace:*` dependency ranges to exact versions in the packed manifest and
+  fails before publish if a packed manifest still contains `workspace:` or an internal dependency other than its pin.
 - npmjs accepts `--provenance` only from GitHub-hosted runners (`RUNNER_ENVIRONMENT=github-hosted`). On GitHub Actions,
   smoo refuses a public provenance publish when `RUNNER_ENVIRONMENT=self-hosted` before calling npm, so the failure
   names runner policy instead of trusted-publishing credentials. Private Forgejo publication does not use provenance.
@@ -1775,8 +1775,8 @@ The important design goal is one source of truth per convention:
 - Managed files decide what generated CI and hooks should look like.
 - Root package metadata provides defaults only for owned public packages.
 - Actual workspace package names decide which dependency ranges become `workspace:*`.
-- Package manifests decide Bun lockfile workspace versions; the pre-publish pack maps unpublished `-next` entries to the
-  last stable tag.
+- Package manifests decide Bun lockfile workspace versions; a release pack pins an unpublished `-next` dependency at its
+  last stable tag in the packed manifest, never in the lockfile.
 - [`sherif`] handles broad package hygiene.
 - [`jactionlint`] checks GitHub Actions correctness, security, and policy.
 - [`publint`] and [`attw`][are-the-types-wrong] validate real packed artifacts.

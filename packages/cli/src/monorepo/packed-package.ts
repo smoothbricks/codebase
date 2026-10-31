@@ -317,7 +317,7 @@ async function packPackage(root: string, pkg: PackageInfo): Promise<{ path: stri
   const tarballName = `.smoo-${process.pid}-${Date.now()}.tgz`;
   const tarballPath = join(root, tarballName);
   try {
-    // Pruned here too, so publint/attw/manifest checks validate the exact
+    // Pruned here too, so publint/attw/manifest checks validate the exports
     // shape a release would publish.
     const result = await withPublishManifest(packageDir, () =>
       runResult('bun', ['pm', 'pack', '--filename', tarballName, '--ignore-scripts', '--quiet'], packageDir),

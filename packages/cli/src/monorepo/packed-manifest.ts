@@ -5,7 +5,7 @@ import { getWorkspacePackages, runtimeDependencyFields, workspaceDependencyField
 import { releaseCandidateShell } from '../release/candidate-shell.js';
 import { packagePinFreshness } from '../release/candidates.js';
 import { npmVersionExists } from '../release/index.js';
-import { publishPackDependencyVersion } from './lockfile.js';
+import { publishPackDependencyVersion } from './publish-manifest.js';
 
 export async function readPackedPackageJson(root: string, tarball: string, packageName: string): Promise<PackageJson> {
   const result = await runResult('tar', ['-xOf', tarball, 'package/package.json'], root);
@@ -56,8 +56,8 @@ export function validatePackedWorkspaceDependencies(
       if (sourceRange !== 'workspace:*') {
         failures.push(`${sourcePackage.path}: source ${field}.${name} must use workspace:*`);
       }
-      // install: what day-to-day pack embeds (package.json / lockfile aligned)
-      // publish: what pre-publish sync embeds (unpublished -next → last stable tag)
+      // install: what a day-to-day pack embeds (each dependency's own manifest version)
+      // publish: what the publish manifest pins (unpublished -next → last stable tag)
       const expectedVersion =
         mode === 'publish' ? publishPackDependencyVersion(root, dep.projectName, dep.version) : dep.version;
       if (packedRange !== expectedVersion) {
