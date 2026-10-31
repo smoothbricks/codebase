@@ -6237,11 +6237,17 @@ mod tests {
         )
         .unwrap();
         fs::write(source.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        // The build script is a witness, run for what it does to the listener rather than for
+        // its output, so it says Cargo must rerun it every time (an empty `rerun-if-changed`).
+        // Declaring nothing would make its package the input, and with the package's files the
+        // same on every run, mbx under a gate restores the script's output instead of running it,
+        // and Cargo finishes without ever connecting.
         fs::write(
             source.join("build.rs"),
             r#"use std::io::{Read, Write};
 unsafe extern "C" { fn getppid() -> i32; }
 fn main() {
+    println!("cargo::rerun-if-changed=");
     let path = std::env::var_os("CAPTURE_WRITER_SOCKET").unwrap();
     let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
     // SAFETY: getppid has no preconditions and cannot fail.
@@ -6256,8 +6262,7 @@ fn main() {
 "#,
         )
         .unwrap();
-        // Beside the package, not in it: a build script that declares no input watches its whole
-        // package, and a socket there has no contents a cache can key, so mbx bypassed the build.
+        // Beside the package, not in it: a socket has no contents a cache can key.
         let socket = source.with_file_name("writer.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let mut child = tokio::process::Command::new("cargo")
