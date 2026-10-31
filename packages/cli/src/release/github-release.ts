@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { ChangelogOptions } from 'nx/src/command-line/release/command-object.js';
 import type { NxReleaseConfiguration } from 'nx/src/config/nx-json.js';
-import { type ReleasePackageInfo, releaseTag } from './core.js';
+import { type ReleasePackageInfo, releaseTag, widenToFixedReleaseGroups } from './core.js';
 import { type DurableState, isTransportFailure, undetermined } from './durable-state.js';
 
 const nxRenderOnlyReleaseConfig = {
@@ -36,12 +36,13 @@ export interface GithubReleaseWriteShell {
 }
 
 export async function renderNxProjectChangelogContents(input: RenderNxProjectChangelogInput): Promise<string> {
+  const projects = await nxReleaseProjects(input.root, [input.pkg.projectName]);
   return withNxWorkspaceRoot(input.root, async () => {
     const { createAPI } = await importWorkspaceNx(input.root, 'src/command-line/release/changelog.js');
     const result = await createAPI(
       nxRenderOnlyReleaseConfig,
       false,
-    )(nxProjectChangelogArgs(input.pkg, input.previousTag, input.dryRun));
+    )({ ...nxProjectChangelogArgs(input.pkg, input.previousTag, input.dryRun), projects });
     return projectChangelogContents(result, input.pkg.projectName);
   });
 }
@@ -162,6 +163,10 @@ interface WorkspaceNxModules {
   'src/utils/workspace-root.js': typeof import('nx/src/utils/workspace-root.js');
   'src/command-line/release/version.js': typeof import('nx/src/command-line/release/version.js');
   'src/command-line/release/changelog.js': typeof import('nx/src/command-line/release/changelog.js');
+  'src/command-line/release/config/config.js': typeof import('nx/src/command-line/release/config/config.js');
+  'src/config/nx-json.js': typeof import('nx/src/config/nx-json.js');
+  'src/project-graph/project-graph.js': typeof import('nx/src/project-graph/project-graph.js');
+  'src/project-graph/file-map-utils.js': typeof import('nx/src/project-graph/file-map-utils.js');
 }
 
 export async function importWorkspaceNx<Subpath extends keyof WorkspaceNxModules>(
@@ -194,4 +199,36 @@ export async function withNxWorkspaceRoot<T>(root: string, run: () => Promise<T>
     }
     process.chdir(previousCwd);
   }
+}
+
+/**
+ * The projects every Nx release call in `root` names for `projects`: `widenToFixedReleaseGroups` over the release groups
+ * the workspace's Nx resolves from its nx.json, the resolution `nx release` itself runs.
+ */
+export async function nxReleaseProjects(root: string, projects: readonly string[]): Promise<string[]> {
+  return withNxWorkspaceRoot(root, async () => {
+    const { createProjectGraphAsync } = await importWorkspaceNx(root, 'src/project-graph/project-graph.js');
+    const { createProjectFileMapUsingProjectGraph } = await importWorkspaceNx(
+      root,
+      'src/project-graph/file-map-utils.js',
+    );
+    const { readNxJson } = await importWorkspaceNx(root, 'src/config/nx-json.js');
+    const { createNxReleaseConfig, handleNxReleaseConfigError } = await importWorkspaceNx(
+      root,
+      'src/command-line/release/config/config.js',
+    );
+    const graph = await createProjectGraphAsync({ exitOnError: true });
+    const { error, nxReleaseConfig } = await createNxReleaseConfig(
+      graph,
+      await createProjectFileMapUsingProjectGraph(graph),
+      readNxJson().release,
+    );
+    if (error) {
+      return handleNxReleaseConfigError(error);
+    }
+    if (!nxReleaseConfig?.groups) {
+      throw new Error('Nx resolved no release groups and reported no error.');
+    }
+    return widenToFixedReleaseGroups(projects, Object.values(nxReleaseConfig.groups));
+  });
 }

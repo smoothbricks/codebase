@@ -385,6 +385,32 @@ export function pendingReleaseTargets<Package extends ReleasePackageInfo>(
   return pending.reverse();
 }
 
+/** A release group as Nx resolves it from nx.json: its relationship and the projects it holds. */
+export interface ReleaseGroupProjects {
+  projectsRelationship: 'fixed' | 'independent';
+  projects: readonly string[];
+}
+
+/**
+ * The project filter an Nx release call takes for `projects`. A fixed group releases its projects on one version, and Nx
+ * refuses a filter that names only some of them, so a selected member brings in its whole group; a project of an
+ * independent group stays alone.
+ */
+export function widenToFixedReleaseGroups(
+  projects: readonly string[],
+  groups: readonly ReleaseGroupProjects[],
+): string[] {
+  const selected = new Set(projects);
+  for (const group of groups) {
+    if (group.projectsRelationship === 'fixed' && group.projects.some((project) => selected.has(project))) {
+      for (const project of group.projects) {
+        selected.add(project);
+      }
+    }
+  }
+  return [...selected];
+}
+
 /**
  * Compile an Nx-style glob: a single `*` stops at a path separator, a doubled one crosses them,
  * and a doubled star followed by a separator also matches zero segments, so `a/` + `**` + `/b`

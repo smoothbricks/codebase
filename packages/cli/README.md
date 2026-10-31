@@ -1426,6 +1426,12 @@ Versioning:
   selection comes from `--projects`: blank selects the package-local changed set (the same filter `--bump auto` uses),
   whatever the bump mode is. `--projects <a,b,...>` releases exactly those owned Nx projects without change detection,
   and `--projects all` is the deliberate whole-fleet opt-in that versions every owned release package.
+- An Nx release group with `projectsRelationship: "fixed"` (a named group under `release.groups`, beside the top-level
+  `"independent"` that `smoo monorepo validate` requires) releases together: a selected member brings in every project
+  of its group, in the Nx version run, its preview, the changelog render and the `next` prerelease bump alike, because
+  Nx refuses a project filter that names only part of a fixed group. Projects of independent groups stay as selected.
+  smoo passes the release commit's subject (`--git-commit-message="chore(release): publish"`), since Nx's default for a
+  lone fixed group appends the version, and every later step finds the release commit by that exact subject.
 - Release packages are discovered from `npm:public` packages whose `repository.url` exactly matches the root package.
 - [Nx Release][nx-release] config must use `currentVersionResolver: "git-tag"` with
   `fallbackCurrentVersionResolver: "disk"`. Conventional-commit versioning requires git tags as the primary source,
