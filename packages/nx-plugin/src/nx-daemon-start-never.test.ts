@@ -32,7 +32,88 @@ const cases = {
   descriptors: 'a restarting daemon closes the log descriptors it hands its successor',
   midrun: 'a run whose daemon stops under it continues without one, and disables nothing',
   restart: 'a run whose daemon restarts itself under it finishes',
+  fresh: 'a run that continues without its daemon hashes over the graph it builds, not the planner of its daemon run',
+  requests: 'a plugin-capabilities request and an affected-task selection whose daemon stops continue in this process',
 } as const;
+
+// The child owns Nx's workspace singletons. It hands the daemon-based hasher a planning context built over a graph
+// whose `p:build` runs another command, as the daemon run's planner was, then hashes `p:build` with the in-process
+// hasher the run continues with and with one built fresh over the same graph.
+const FRESH_PROBE = String.raw`
+const { join } = require('node:path');
+const nx = process.argv[2];
+const { daemonClient } = require(join(nx, 'dist/src/daemon/client/client.js'));
+const { createTaskHasher } = require(join(nx, 'dist/src/hasher/create-task-hasher.js'));
+const { createProjectGraphAsync } = require(join(nx, 'dist/src/project-graph/project-graph.js'));
+const { createTaskGraph } = require(join(nx, 'dist/src/tasks-runner/create-task-graph.js'));
+const { readNxJson } = require(join(nx, 'dist/src/config/nx-json.js'));
+const { transformProjectGraphForRust } = require(join(nx, 'dist/src/native/transform-objects.js'));
+const { HashPlanner } = require(join(nx, 'dist/src/native/index.js'));
+(async () => {
+  const nxJson = readNxJson();
+  const graph = await createProjectGraphAsync({ exitOnError: false });
+  const planned = structuredClone(graph);
+  planned.nodes.p.data.targets.build.options.command = 'echo planned';
+  const projectGraphRef = transformProjectGraphForRust(planned);
+  const planningContext = { projectGraphRef, planner: new HashPlanner(nxJson, projectGraphRef) };
+  daemonClient.enabled = () => true;
+  const daemonBased = createTaskHasher(graph, nxJson, {}, undefined, planningContext);
+  // The stopped daemon turns the daemon off for this process before the run continues.
+  daemonClient.enabled = () => false;
+  const continued = await daemonBased.withoutDaemon();
+  const fresh = createTaskHasher(graph, nxJson, {}, undefined, undefined);
+  const taskGraph = createTaskGraph(graph, {}, ['p'], ['build'], undefined, {});
+  const task = taskGraph.tasks['p:build'];
+  const env = { [task.id]: process.env };
+  const [fromContinued] = await continued.hashTasks([{ ...task }], taskGraph, env);
+  const [fromFresh] = await fresh.hashTasks([{ ...task }], taskGraph, env);
+  process.stdout.write(JSON.stringify({ continued: fromContinued.value, fresh: fromFresh.value }) + '\n');
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+`;
+
+// The child owns Nx's daemon client. It finds a running daemon (`enabled()` already answered true), whose request
+// for `argv[3]` then fails as a daemon that stopped under a client that may never start one fails it. For the affected
+// selection the daemon still answers plugin capabilities, which the in-process selection asks for too: only the
+// selection's own request may turn the daemon off.
+const REQUEST_PROBE = String.raw`
+const { join } = require('node:path');
+const nx = process.argv[2];
+const request = process.argv[3];
+const { daemonClient } = require(join(nx, 'dist/src/daemon/client/client.js'));
+const { capabilitiesOfConfiguredPlugins } = require(join(nx, 'dist/src/project-graph/plugins/get-plugins.js'));
+const { computeAffectedTasks } = require(join(nx, 'dist/src/project-graph/affected/affected-tasks.js'));
+const { createProjectGraphAsync } = require(join(nx, 'dist/src/project-graph/project-graph.js'));
+const { readNxJson } = require(join(nx, 'dist/src/config/nx-json.js'));
+const stopped = async () => {
+  throw Object.assign(new Error('The daemon stopped under this run.'), { daemonStartForbidden: true });
+};
+(async () => {
+  const nxJson = readNxJson();
+  const projectGraph = await createProjectGraphAsync({ exitOnError: false });
+  daemonClient._enabled = true;
+  daemonClient.getPluginCapabilities = request === 'capabilities' ? stopped : async () => [];
+  daemonClient.selectAffectedTasks = stopped;
+  let answered;
+  if (request === 'capabilities') {
+    answered = (await capabilitiesOfConfiguredPlugins(nxJson)).length > 0;
+  } else {
+    const selection = await computeAffectedTasks({
+      targets: ['build'],
+      touchedFiles: [{ file: 'p/src.txt', getChanges: () => [] }],
+      nxJson,
+      projectGraph,
+    });
+    answered = selection.affectedTaskIds.has('p:build');
+  }
+  process.stdout.write(JSON.stringify({ answered, daemonOn: daemonClient.enabled() }) + '\n');
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+`;
 
 const record = (workspace: string) => join(workspace, '.nx/workspace-data/d/server-process.json');
 const daemonLog = (workspace: string) => join(workspace, '.nx/workspace-data/d/daemon.log');
@@ -326,5 +407,58 @@ it('a run whose daemon stops under it, then one whose daemon restarts under it, 
     expect(await readFile(daemonLog(workspace), 'utf8'), `${cases.restart}: the successor restarted`).toContain(
       'Restarting daemon',
     );
+  });
+});
+
+it(cases.fresh, async () => {
+  await withNxFixture('nx-start-never-fresh-', async ({ workspace, socketDirectory }) => {
+    await fixtureWorkspace(workspace);
+    await writeFile(
+      join(workspace, 'p', 'project.json'),
+      JSON.stringify({ name: 'p', targets: { build: build('echo built') } }),
+    );
+    await writeFile(join(workspace, 'probe.cjs'), FRESH_PROBE);
+    const env = fixtureNxEnv(workspace, socketDirectory);
+    const ran = spawnSync('node', ['probe.cjs', join(repositoryRoot, 'node_modules/nx')], {
+      cwd: workspace,
+      env,
+      encoding: 'utf8',
+    });
+    const output = `${ran.stdout}${ran.stderr}`;
+    expect(ran.status, `${cases.fresh}: ${output}`).toBe(0);
+    const hashes = JSON.parse(ran.stdout.trimEnd().split('\n').at(-1) ?? '');
+    expect(hashes.continued, `${cases.fresh}: ${output}`).toBe(hashes.fresh);
+  });
+});
+
+it(cases.requests, async () => {
+  await withNxFixture('nx-start-never-requests-', async ({ workspace, socketDirectory }) => {
+    await fixtureWorkspace(workspace);
+    await writeFile(
+      join(workspace, 'p', 'project.json'),
+      JSON.stringify({
+        name: 'p',
+        targets: { build: { ...build('cat p/src.txt'), inputs: ['{projectRoot}/src.txt'] } },
+      }),
+    );
+    await writeFile(join(workspace, 'p', 'src.txt'), 'one\n');
+    await writeFile(join(workspace, 'probe.cjs'), REQUEST_PROBE);
+    const env = fixtureNxEnv(workspace, socketDirectory);
+    for (const request of ['capabilities', 'affected']) {
+      const ran = spawnSync('node', ['probe.cjs', join(repositoryRoot, 'node_modules/nx'), request], {
+        cwd: workspace,
+        env,
+        encoding: 'utf8',
+      });
+      const output = `${ran.stdout}${ran.stderr}`;
+      const label = `${cases.requests}: ${request}`;
+      expect(ran.status, `${label}: ${output}`).toBe(0);
+      // The client says it continues without the daemon, and the daemon stays off for the rest of its process.
+      expect(output, label).toContain('The daemon stopped under this run. Continuing without the daemon.');
+      expect(JSON.parse(ran.stdout.trimEnd().split('\n').at(-1) ?? ''), `${label}: ${output}`).toEqual({
+        answered: true,
+        daemonOn: false,
+      });
+    }
   });
 });

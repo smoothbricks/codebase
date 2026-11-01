@@ -1677,7 +1677,7 @@ index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..7b8e536cf989571698d2b693f9ea2995
              `Created:\n${summarize((0, restart_checks_1.fileNames)(batch.createdFiles))}\n` +
              `Updated:\n${summarize((0, restart_checks_1.fileNames)(batch.updatedFiles))}\n` +
 diff --git a/dist/src/daemon/server/restart-checks.d.ts b/dist/src/daemon/server/restart-checks.d.ts
-index e99e10b616b35b81b1060b25eeb0acc2351c4776..87f23b0d6c1c5a5ac9cfad612064e75844fb3c12 100644
+index e99e10b616b35b81b1060b25eeb0acc2351c4776..e94e74921349d081353fc14498178ccec8fbe42f 100644
 --- a/dist/src/daemon/server/restart-checks.d.ts
 +++ b/dist/src/daemon/server/restart-checks.d.ts
 @@ -1,6 +1,6 @@
@@ -1688,31 +1688,33 @@ index e99e10b616b35b81b1060b25eeb0acc2351c4776..87f23b0d6c1c5a5ac9cfad612064e758
  /**
   * The daemon's own process file, workspace-relative. It lives under the
   * hardcoded-ignored .nx/workspace-data, so the watch admits it explicitly;
-@@ -15,8 +15,20 @@ export declare function changedPaths(batch: ChangeBatch): string[];
+@@ -15,8 +15,24 @@ export declare function changedPaths(batch: ChangeBatch): string[];
   * needs a daemon restart to take effect. True when it stopped the daemon.
   */
  export declare function restartDaemonIfIgnoreFilesChanged(paths: string[]): boolean;
 +/** Stamps the filesystem's clock just before the workspace context starts the daemon's watch. */
 +export declare function recordIgnoreFilterRead(): void;
- /**
-- * Stops this daemon when the events show another process has written the
-- * daemon's process file. True when it stopped the daemon.
++/**
 + * Stops the daemon when a watch event names an ignore file whose bytes the watch's filter may not hold. True when it
 + * stopped the daemon.
-  */
++ */
 +export declare function stopDaemonIfIgnoreFilterStale(events: WatchEvent[]): Promise<boolean>;
 +/** Takes, once the scan has them, the ignore files the watch's filter read; call right after the watch starts. */
 +export declare function rememberIgnoreFilterRead(): Promise<ReadonlyMap<string, string>>;
 +export declare function registerDaemonForRestartChecks(server: Server, sockets: Iterable<Socket>, socketPath: string): void;
 +export declare function recordInstallationBaseline(): Promise<void>;
 +export declare function restartDaemonIfLockFilesChanged(paths: string[]): boolean;
+ /**
+  * Stops this daemon when the events show another process has written the
+  * daemon's process file. True when it stopped the daemon.
+  */
  export declare function stopDaemonIfReplaced(events: WatchEvent[]): boolean;
 +export declare function stopDaemonIfOutdated(): boolean;
 +export declare function stopDaemonIfWorkspaceGone(): boolean;
 +/** Stops the daemon, naming `reason` in its log: its file watcher stopped delivering. */
 +export declare function stopDaemonForStoppedWatcher(reason: string): void;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
-index e692c3cfc73bacf3252e117d4e895b981412f4b9..d1bc19201a9cb6d9cf5e3a93fc0474c785a96b4d 100644
+index e692c3cfc73bacf3252e117d4e895b981412f4b9..94c06c88dfac8df73dd1c12f5c09b900b0bdac05 100644
 --- a/dist/src/daemon/server/restart-checks.js
 +++ b/dist/src/daemon/server/restart-checks.js
 @@ -1,22 +1,46 @@
@@ -1777,7 +1779,7 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..d1bc19201a9cb6d9cf5e3a93fc0474c7
      for (const path of paths) {
          const basename = path.slice(path.lastIndexOf('/') + 1);
          if (IGNORE_FILE_NAMES.includes(basename)) {
-@@ -54,24 +80,441 @@ function restartDaemonIfIgnoreFilesChanged(paths) {
+@@ -54,24 +80,445 @@ function restartDaemonIfIgnoreFilesChanged(paths) {
      }
      return false;
  }
@@ -1839,15 +1841,13 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..d1bc19201a9cb6d9cf5e3a93fc0474c7
 +    });
 +    return ignoreFilesAtStart;
 +}
- /**
-- * Stops this daemon when the events show another process has written the
-- * daemon's process file. True when it stopped the daemon.
++/**
 + * Stops the daemon when a watch event names an ignore file whose bytes the
 + * filter may not hold: one the filter read whose bytes moved, or a workspace
 + * file it is not known to have read. A rewrite with the same bytes (a checkout,
 + * a formatter) keeps the daemon, and so does an ignore file under an ignored
 + * directory, which no rule comes from. True when it stopped the daemon.
-  */
++ */
 +async function stopDaemonIfIgnoreFilterStale(events) {
 +    const paths = events.map((event) => event.path).filter(isIgnoreFile);
 +    if (paths.length === 0 || terminating)
@@ -2140,6 +2140,10 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..d1bc19201a9cb6d9cf5e3a93fc0474c7
 +    restartDaemon('LOCK_FILES_CHANGED');
 +    return true;
 +}
+ /**
+  * Stops this daemon when the events show another process has written the
+  * daemon's process file. True when it stopped the daemon.
+  */
  function stopDaemonIfReplaced(events) {
 -    const replaced = events.some((event) => event.path === exports.relativeServerProcess &&
 -        (0, cache_1.getDaemonProcessIdSync)() !== process.pid);
@@ -2896,10 +2900,10 @@ index b027c02a6df7532cce64ae9684bfb76e56bf975b..ce045a0e126de3d349a10d0f367a0bdb
      hashInputsCache.set(taskId, result);
      return result;
 diff --git a/dist/src/hasher/create-task-hasher.js b/dist/src/hasher/create-task-hasher.js
-index 2c6c2f499f0f0a63f07181224552ca32236d2bee..7c9f0aa7e8aa140544e54ac323ed2640ca5847a0 100644
+index 2c6c2f499f0f0a63f07181224552ca32236d2bee..dd84697f2331398cc8c38d326c856d71d5b2cdca 100644
 --- a/dist/src/hasher/create-task-hasher.js
 +++ b/dist/src/hasher/create-task-hasher.js
-@@ -11,7 +11,14 @@ const task_hasher_1 = require("./task-hasher");
+@@ -11,7 +11,15 @@ const task_hasher_1 = require("./task-hasher");
   */
  function createTaskHasher(projectGraph, nxJson, runnerOptions, ultracacheConfigurations, planningContext) {
      if (client_1.daemonClient.enabled()) {
@@ -2907,10 +2911,11 @@ index 2c6c2f499f0f0a63f07181224552ca32236d2bee..7c9f0aa7e8aa140544e54ac323ed2640
 +        // A daemon that stops under a client that may never start one leaves the
 +        // run to hash in this process, over a graph built here: the in-process
 +        // hasher reads the file data of this process's build, which a graph from
-+        // the daemon never brought.
++        // the daemon never brought. The run's planning context was built over
++        // another graph, so this hasher plans its own.
 +        return new task_hasher_1.DaemonBasedTaskHasher(client_1.daemonClient, runnerOptions, async () => {
 +            const { createProjectGraphAsync } = require('../project-graph/project-graph');
-+            return createTaskHasher(await createProjectGraphAsync({ exitOnError: false }), nxJson, runnerOptions, ultracacheConfigurations, planningContext);
++            return createTaskHasher(await createProjectGraphAsync({ exitOnError: false }), nxJson, runnerOptions, ultracacheConfigurations, undefined);
 +        }, ultracacheConfigurations
              ? {
                  commit: ultracacheConfigurations.commit,
@@ -3152,6 +3157,41 @@ index 169563d598af64c8b74d00ab9815dd651650ec9d..0bd5e1f536b1e0e02843396e01b29dce
                  workspaceNames.add(name);
              }
              // Check if this is a workspace-specific variant (e.g., "@quz/pkg1/lodash")
+diff --git a/dist/src/project-graph/affected/affected-tasks.js b/dist/src/project-graph/affected/affected-tasks.js
+index 63d31ac684db1ae64d396771733f07fb2e562eb7..b79292b2b642e07f0092f2eb26c104bcb0fc8fb6 100644
+--- a/dist/src/project-graph/affected/affected-tasks.js
++++ b/dist/src/project-graph/affected/affected-tasks.js
+@@ -76,16 +76,20 @@ async function computeAffectedTasks(opts) {
+     }
+     if (!(0, is_on_daemon_1.isOnDaemon)() && client_1.daemonClient.enabled()) {
+         try {
+-            const selection = await client_1.daemonClient.selectAffectedTasks(request);
+-            return {
+-                ...selection,
+-                affectedTaskIds: new Set(selection.affectedTaskIds),
+-                explanation: selection.explanation && (0, affected_reasons_1.hydrateExplanation)(selection.explanation),
+-                taskSelection: {
+-                    ...selection.taskSelection,
+-                    ultracacheConfigurationOutcome: opts.ultracacheConfigurationOutcome,
+-                },
+-            };
++            // A daemon that stops under a client that may never start one turns the
++            // daemon off for this process; the selection then runs below, in it.
++            const selection = await client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.selectAffectedTasks(request), () => undefined);
++            if (selection !== undefined) {
++                return {
++                    ...selection,
++                    affectedTaskIds: new Set(selection.affectedTaskIds),
++                    explanation: selection.explanation && (0, affected_reasons_1.hydrateExplanation)(selection.explanation),
++                    taskSelection: {
++                        ...selection.taskSelection,
++                        ultracacheConfigurationOutcome: opts.ultracacheConfigurationOutcome,
++                    },
++                };
++            }
+         }
+         catch (e) {
+             if (e?.name === error_types_1.DaemonProjectGraphError.name) {
 diff --git a/dist/src/project-graph/build-project-graph.js b/dist/src/project-graph/build-project-graph.js
 index 28c9655c4612dcc85a881816f172dce98642bb0c..ea65f019024da507dd81f4ace12020914a6f97a1 100644
 --- a/dist/src/project-graph/build-project-graph.js
@@ -3178,7 +3218,7 @@ index cfa79106b0f90b3e60d90b28307960ec91eecec1..445481873b171fcccd48deda560ce08e
      title: string;
      bodyLines: string[];
 diff --git a/dist/src/project-graph/error-types.js b/dist/src/project-graph/error-types.js
-index cb8790172cd9f47d7d270dae1ccf689b27615c9f..d7c8bcf379ed0619f62d77d2a3d06a0a37c1b893 100644
+index cb8790172cd9f47d7d270dae1ccf689b27615c9f..a76d0c41f275d47a2427a758011348c2cf96c2df 100644
 --- a/dist/src/project-graph/error-types.js
 +++ b/dist/src/project-graph/error-types.js
 @@ -15,6 +15,7 @@ exports.isCreateMetadataError = isCreateMetadataError;
@@ -3189,6 +3229,15 @@ index cb8790172cd9f47d7d270dae1ccf689b27615c9f..d7c8bcf379ed0619f62d77d2a3d06a0a
  const tslib_1 = require("tslib");
  class StaleProjectGraphCacheError extends Error {
      constructor() {
+@@ -239,7 +240,7 @@ function formatProjectGraphError(error, isVerbose) {
+         bodyLines: isVerbose
+             ? [formatErrorStackAndCause(error)]
+             : [
+-                ...errors.map((e) => e.message),
++                ...errors.map((e) => formatErrorMessages(e)),
+                 '',
+                 'Pass --verbose to see the stacktraces.',
+             ],
 @@ -356,9 +357,10 @@ function formatAggregateCreateNodesError(error, pluginName) {
              errorStackLines.push(` - ${file}:`);
          }
@@ -3203,7 +3252,7 @@ index cb8790172cd9f47d7d270dae1ccf689b27615c9f..d7c8bcf379ed0619f62d77d2a3d06a0a
              if (file) {
                  errorBodyLines.push(...messageLines.map((line) => `      ${line}`));
                  errorStackLines.push(...stackLines.map((line) => `     ${line}`));
-@@ -498,6 +500,61 @@ function indentString(str, indent) {
+@@ -498,6 +500,38 @@ function indentString(str, indent) {
              .map((line) => ' '.repeat(indent) + line)
              .join('\n'));
  }
@@ -3238,29 +3287,6 @@ index cb8790172cd9f47d7d270dae1ccf689b27615c9f..d7c8bcf379ed0619f62d77d2a3d06a0a
 +        ancestors.delete(error);
 +    }
 +    return message;
-+}
-+// nrwl/nx#37103: without --verbose, name every underlying error (messages and
-+// causes) instead of the bare "Failed to process project graph." headline.
-+function formatProjectGraphError(error, isVerbose) {
-+    const errors = isProjectConfigurationsError(error)
-+        ? error.errors
-+        : error.getErrors();
-+    let title = error.message;
-+    if (error.cause &&
-+        typeof error.cause === 'object' &&
-+        'message' in error.cause) {
-+        title += ' ' + error.cause.message + '.';
-+    }
-+    return {
-+        title,
-+        bodyLines: isVerbose
-+            ? [formatErrorStackAndCause(error)]
-+            : [
-+                ...errors.map((e) => formatErrorMessages(e)),
-+                '',
-+                'Pass --verbose to see the stacktraces.',
-+            ],
-+    };
 +}
  function formatErrorStackAndCause(error) {
      const cause = describeCause(error.cause);
@@ -3391,7 +3417,7 @@ index 93f05fdfa622883efbb45dba383fd419938a605c..34ec5d92356d4262c233dfbef88804a0
   * Returns specified plugins (from nx.json) and default plugins (project.json,
   * package.json, etc.) as separate arrays. This separation is needed for
 diff --git a/dist/src/project-graph/plugins/get-plugins.js b/dist/src/project-graph/plugins/get-plugins.js
-index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..6f40eb7502c1db24092f8204beeafb384160b801 100644
+index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca92d014885 100644
 --- a/dist/src/project-graph/plugins/get-plugins.js
 +++ b/dist/src/project-graph/plugins/get-plugins.js
 @@ -4,6 +4,7 @@ exports.loadingMethod = void 0;
@@ -3486,7 +3512,18 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..6f40eb7502c1db24092f8204beeafb38
      if (cachedSeparatedPlugins &&
          pluginsConfigurationHash === currentPluginsConfigurationHash) {
          return cachedSeparatedPlugins;
-@@ -311,7 +337,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
+@@ -281,7 +307,9 @@ async function loadPlugins(loader, pluginConfigurations, root, assignIndexes) {
+ }
+ async function capabilitiesOfConfiguredPlugins(nxJson, root = workspace_root_1.workspaceRoot) {
+     if (!(0, is_on_daemon_1.isOnDaemon)() && (0, client_1.isDaemonEnabled)()) {
+-        return client_1.daemonClient.getPluginCapabilities();
++        // A daemon that stops under a client that may never start one turns the
++        // daemon off for this process, so the call below takes the path after it.
++        return client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.getPluginCapabilities(), () => capabilitiesOfConfiguredPlugins(nxJson, root));
+     }
+     const recorded = (0, nx_plugin_capabilities_1.capabilitiesOfNxPluginsReadFromCache)();
+     if (recorded) {
+@@ -311,7 +339,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
          // Cleared so the next call retries instead of re-awaiting this rejection.
          pendingDefaultPluginPromise = undefined;
          const errorMessage = errors
@@ -3495,7 +3532,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..6f40eb7502c1db24092f8204beeafb38
              .join('\n');
          throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} default Nx plugin(s):\n${errorMessage}`);
      }
-@@ -348,7 +374,7 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
+@@ -348,7 +376,7 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
      if (errors.length > 0) {
          // Wants are not retracted: a newer load may own the declaration by now.
          const errorMessage = errors
@@ -3504,7 +3541,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..6f40eb7502c1db24092f8204beeafb38
              .join('\n');
          throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} Nx plugin(s):\n${errorMessage}`);
      }
-@@ -363,6 +389,12 @@ function reasonToError(reason) {
+@@ -363,6 +391,12 @@ function reasonToError(reason) {
          if ('stack' in reason) {
              error.stack = String(reason.stack);
          }
@@ -5181,7 +5218,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..856ca410b3f12ef3e6f96e04c28a186d
      private runTaskInForkedProcess;
      startContinuousTask(task: Task, groupId: number): Promise<NoopChildProcess | RunningTask | SharedRunningTask>;
 diff --git a/dist/src/tasks-runner/task-orchestrator.js b/dist/src/tasks-runner/task-orchestrator.js
-index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38ac1cf391 100644
+index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd9974939036 100644
 --- a/dist/src/tasks-runner/task-orchestrator.js
 +++ b/dist/src/tasks-runner/task-orchestrator.js
 @@ -32,6 +32,8 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
@@ -5208,7 +5245,17 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
          this.cacheMissedHashes = new Set();
          // The files the cache just wrote or restored, by task id, for postRunSteps
          // to hand the daemon instead of it walking the outputs again.
-@@ -173,6 +173,7 @@ class TaskOrchestrator {
+@@ -164,6 +164,9 @@ class TaskOrchestrator {
+         this.pendingDiscreteWorkers = new Set();
+         this.groups = [];
+         this.continuousTasksStarted = 0;
++        // Extra critical-path workers, whose group ids follow every continuous task's.
++        this.criticalWorkersStarted = 0;
++        this.continuousGroupCount = 0;
+         /**
+          * How many folds each batch id has rendered. A batch that reports a strict
+          * subset of its tasks is re-run under the same id, so one id can produce more
+@@ -173,6 +176,7 @@ class TaskOrchestrator {
          this.bailed = false;
          this.resolveStopPromise = null;
          this.stopRequested = false;
@@ -5216,7 +5263,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
          this.runningContinuousTasks = new Map();
          this.runningRunCommandsTasks = new Map();
          this.runningDiscreteTasks = new Map();
-@@ -195,6 +196,9 @@ class TaskOrchestrator {
+@@ -195,6 +199,9 @@ class TaskOrchestrator {
          // exit, and the paths that never spawn one write it inline. The backstop in
          // postRunSteps consults this so a task's output is written exactly once.
          this.tasksWithPersistedOutput = new Set();
@@ -5226,7 +5273,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
      }
      async init() {
          this.setupSignalHandlers();
-@@ -214,6 +218,20 @@ class TaskOrchestrator {
+@@ -214,9 +221,24 @@ class TaskOrchestrator {
          }
      }
      async run() {
@@ -5247,7 +5294,11 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
          await this.init();
          perf_hooks_1.performance.mark('task-execution:start');
          const { discrete, continuous, total } = getThreadPoolSize(this.options, this.taskGraph);
-@@ -252,8 +270,6 @@ class TaskOrchestrator {
++        this.continuousGroupCount = continuous;
+         process.stdout.setMaxListeners(total + events_1.defaultMaxListeners);
+         process.stderr.setMaxListeners(total + events_1.defaultMaxListeners);
+         process.setMaxListeners(total + events_1.defaultMaxListeners);
+@@ -252,8 +274,6 @@ class TaskOrchestrator {
              // the native half does not exist.
              (0, cache_1.sweepBatchOutputs)();
          }
@@ -5256,7 +5307,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
          // Public API (defaultTasksRunner) returns a plain object keyed by
          // task id. Internal state is a Map for faster lookup.
          return Object.fromEntries(this.completedTasks);
-@@ -345,6 +361,18 @@ class TaskOrchestrator {
+@@ -345,6 +365,18 @@ class TaskOrchestrator {
                  const groupId = this.closeGroup();
                  this.dispatchDiscreteWorker(doNotSkipCache, task, groupId);
              }
@@ -5269,13 +5320,13 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
 +            if (this.pendingDiscreteWorkers.size === parallelism) {
 +                const task = this.tasksSchedule.nextCriticalTask((t) => !t.continuous);
 +                if (task) {
-+                    this.dispatchDiscreteWorker(doNotSkipCache, task, this.options.parallel + this.continuousTasksStarted++);
++                    this.dispatchDiscreteWorker(doNotSkipCache, task, this.options.parallel + this.continuousGroupCount + this.criticalWorkersStarted++);
 +                }
 +            }
              // 6. Nothing left to dispatch and nothing in flight — done.
              if (!this.tasksSchedule.hasTasks() &&
                  this.pendingDiscreteWorkers.size === 0) {
-@@ -581,12 +609,9 @@ class TaskOrchestrator {
+@@ -581,12 +613,9 @@ class TaskOrchestrator {
       * cache fetch + lifecycle to the public method. Returns true if any
       * tasks were resolved.
       *
@@ -5291,7 +5342,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
       */
      async resolveCachedTasksBulk() {
          const { scheduledTasks } = this.tasksSchedule.getAllScheduledTasks();
-@@ -709,6 +734,17 @@ class TaskOrchestrator {
+@@ -709,6 +738,17 @@ class TaskOrchestrator {
          if (this.bailed || this.stopRequested) {
              return [];
          }
@@ -5309,7 +5360,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
          const applyFromCacheOrRunBatchStart = perf_hooks_1.performance.mark('TaskOrchestrator-apply-from-cache-or-run-batch:start');
          const taskIds = Object.keys(batch.taskGraph.tasks);
          this.options.lifeCycle.registerRunningBatch?.(batch.id, {
-@@ -1062,6 +1098,20 @@ class TaskOrchestrator {
+@@ -1062,6 +1102,20 @@ class TaskOrchestrator {
       * don't actually compete for parallelism.
       */
      async resolveCachedTasks(doNotSkipCache, tasks, groupId) {
@@ -5330,7 +5381,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
          if (!doNotSkipCache || tasks.length === 0)
              return [];
          const cacheableTasks = tasks.filter((t) => t.cache);
-@@ -1088,10 +1138,8 @@ class TaskOrchestrator {
+@@ -1088,10 +1142,8 @@ class TaskOrchestrator {
      }
      /**
       * Fire a discrete-task worker and track it in pendingDiscreteWorkers until
@@ -5343,7 +5394,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
       */
      dispatchDiscreteWorker(doNotSkipCache, task, groupId) {
          const worker = this.runTaskDirectly(doNotSkipCache, task, groupId)
-@@ -1125,9 +1173,11 @@ class TaskOrchestrator {
+@@ -1125,9 +1177,11 @@ class TaskOrchestrator {
          await this.postRunSteps([{ task, status: 'failure', terminalOutput }], doNotSkipCache, groupId);
      }
      /**
@@ -5358,7 +5409,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
       */
      async runTaskDirectly(doNotSkipCache, task, groupId) {
          // Wait for task to be processed
-@@ -1155,6 +1205,18 @@ class TaskOrchestrator {
+@@ -1155,6 +1209,18 @@ class TaskOrchestrator {
                  terminalOutput: waitError.message,
              };
          }
@@ -5377,7 +5428,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
          await this.preRunSteps([task], { groupId });
          const pipeOutput = await this.pipeOutputCapture(task);
          const temporaryOutputPath = this.cache.temporaryOutputPath(task);
-@@ -1382,8 +1444,22 @@ class TaskOrchestrator {
+@@ -1382,8 +1448,22 @@ class TaskOrchestrator {
          }
      }
      async startContinuousTask(task, groupId) {
@@ -5402,7 +5453,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
              // This branch never reads the hash, so a failure to compute it is dropped
              void this.processedTasks.get(task.id)?.catch(() => { });
              let readyWhen;
-@@ -1432,11 +1508,6 @@ class TaskOrchestrator {
+@@ -1432,11 +1512,6 @@ class TaskOrchestrator {
              await this.scheduleNextTasksAndReleaseThreads();
              return runningTask;
          }
@@ -5414,7 +5465,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
          let pipeOutput;
          let temporaryOutputPath;
          let streamOutput;
-@@ -1485,7 +1556,11 @@ class TaskOrchestrator {
+@@ -1485,7 +1560,11 @@ class TaskOrchestrator {
              return new noop_child_process_1.NoopChildProcess({ code: 1, terminalOutput: '' });
          }
          let childProcess;
@@ -5426,7 +5477,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
              await this.preRunSteps([task], { groupId });
              this.detectTaskInvocationLoop(task);
              childProcess = await this.runTask(task, streamOutput, env, temporaryOutputPath, pipeOutput);
-@@ -1515,15 +1590,19 @@ class TaskOrchestrator {
+@@ -1515,15 +1594,19 @@ class TaskOrchestrator {
              // release paths (completeContinuousTask, the signal handler) both iterate
              // that map. Drop it here or siblings wait on a task no one is running.
              this.runningTasksService?.removeRunningTask(task.id);
@@ -5453,7 +5504,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
              });
          }));
          await this.scheduleNextTasksAndReleaseThreads();
-@@ -2114,22 +2193,28 @@ class TaskOrchestrator {
+@@ -2114,22 +2197,28 @@ class TaskOrchestrator {
          if (tasks.length === 0)
              return resultMap;
          if (this.daemon?.enabled()) {
@@ -5487,7 +5538,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
          }
      }
      // endregion utils
-@@ -2208,6 +2293,8 @@ class TaskOrchestrator {
+@@ -2208,6 +2297,8 @@ class TaskOrchestrator {
          // Waiters must not sit out a probe once the run is stopping
          this.abortAllReadiness();
          this.readySignal?.close();
@@ -5496,7 +5547,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..7c9cc46a49898cbfbcbf256fffe38b38
          // Mark all running tasks for intentional stop
          const reason = this.stopRequested ? 'interrupted' : 'fulfilled';
          for (const entry of this.runningContinuousTasks.values()) {
-@@ -2277,6 +2364,7 @@ class TaskOrchestrator {
+@@ -2277,6 +2368,7 @@ class TaskOrchestrator {
              if (this.stopRequested)
                  return;
              this.stopRequested = true;

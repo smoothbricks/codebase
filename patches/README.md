@@ -493,11 +493,13 @@ and fails the request with an error tagged `daemonStartForbidden` that names the
 cause. Every daemon request of a command continues from that error in its own process through
 `DaemonClient.orWithoutDaemon`, which notes the stop once per process and lets the connection go, so the caller's own
 in-process path answers: the project graph, task hashing (`DaemonBasedTaskHasher` builds the graph in this process once,
-for the in-process hasher's file data), output-hash record and compare (the outputs stamps below), the pre/post
-tasks-execution hooks, sync generators and the workspace-context file queries. A run whose daemon stops under it
-therefore finishes. The client never calls `startInBackground` implicitly, and an explicit `nx daemon --start`
-(`command-line/daemon/daemon.js`), which would call it directly, is refused as policy: exit 1 with a reason naming the
-variable and the test fixture escape. Without the variable nothing changes.
+for the in-process hasher's file data, and plans over it rather than with the planning context of the graph the daemon
+run planned over), output-hash record and compare (the outputs stamps below), the pre/post tasks-execution hooks, sync
+generators, the workspace-context file queries, and Nx 24's plugin-capabilities request (`getPluginCapabilities`) and
+affected-task selection (`selectAffectedTasks`). A run whose daemon stops under it therefore finishes. The client never
+calls `startInBackground` implicitly, and an explicit `nx daemon --start` (`command-line/daemon/daemon.js`), which would
+call it directly, is refused as policy: exit 1 with a reason naming the variable and the test fixture escape. Without
+the variable nothing changes.
 
 A daemon that restarts itself opens the log file twice for its successor's stdout and stderr. The restart closes both
 descriptors right after the spawn, which keeps duplicates for the child, as the client's own start already did: left to
@@ -518,7 +520,11 @@ restarting daemon with the socket its clients were still writing to.
 - the restart's successor spawn, run under Node with garbage collected right after it (`startNewDaemonInBackground`,
   exported for this), exits cleanly with no `ERR_INVALID_STATE`;
 - `nx daemon --start` under the variable exits 1 naming it and the fixture escape, and leaves no record; without the
-  variable it starts a daemon.
+  variable it starts a daemon;
+- a run that continues without its daemon hashes `p:build` as a hasher built fresh over the same graph does, though the
+  daemon-based hasher was handed a planning context built over a graph whose `p:build` runs another command;
+- a plugin-capabilities request and an affected-task selection whose daemon stops under them note the stop, answer in
+  their own process and leave the daemon off for it.
 
 Drop the hunk only when cowshed no longer ends a job's tree around a shared daemon, or upstream Nx has an equivalent
 setting; retain the regression. Stock Nx starting the daemon is not enough; see
@@ -560,12 +566,15 @@ longest remaining chain, or nothing while a running task or one not yet ready he
 `--parallel`. The extra worker exists because the jobserver is the CPU admission: cowshed gives every job a fifo with as
 many slots as the host has cores, served by its supervisor, and the kernel schedules what it admits (05_gateway.md,
 "Parallelism inside a job", "Host scheduling"). An Nx slot is a second admission, and holding the chain behind it buys
-no CPU anyone else uses.
+no CPU anyone else uses. The extra worker takes its group id from a counter of its own, after every continuous task's:
+taking it from the count of continuous tasks started, as an earlier version did, made the continuous loops end before
+every continuous task had started, so a task depending on one never ran.
 
 `nx-critical-path-schedule.test.ts`: with `--parallel=1`, the head of a four-task chain starts before a task with two
-direct dependents that heads a chain of two; and `nextCriticalTask` offers nothing while the running head of the longest
-chain runs, and offers the next head once that chain's predecessor ended without freeing a slot. Drop the hunks, and
-keep the test, once the Nx in use schedules by critical path.
+direct dependents that heads a chain of two; `nextCriticalTask` offers nothing while the running head of the longest
+chain runs, and offers the next head once that chain's predecessor ended without freeing a slot; and at Nx's default
+three slots, four ready chains start an extra worker while a continuous task still waits on a slow dependency, which
+must start and let its dependent run. Drop the hunks, and keep the test, once the Nx in use schedules by critical path.
 
 ## A lost daemon ends the command
 

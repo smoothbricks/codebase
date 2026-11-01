@@ -99,3 +99,54 @@ const projectGraph = { nodes: { p: { name: 'p', type: 'lib', data: { root: 'p' }
     expect(child.status, child.stdout + child.stderr).toBe(0);
   });
 });
+
+it('starts every continuous task of a run whose extra worker started past the slot count', async () => {
+  await withNxFixture('nx-critical-continuous-', async ({ workspace, socketDirectory }) => {
+    const git = spawnSync('git', ['init', '--quiet', workspace]);
+    expect(git.status, git.stderr.toString()).toBe(0);
+    await symlink(join(repoRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+    await writeFile(join(workspace, 'nx.json'), '{}\n');
+    await mkdir(join(workspace, 'p'));
+    // Four ready chains of three at Nx's default three slots: three take the slots and the fourth starts as the extra
+    // worker. `serve`, continuous, waits on `a1`, which ends last, so the continuous loop wakes for other tasks' ends
+    // while `serve` is not ready yet; `after` waits on `serve`.
+    const chain = (head: string) => ({
+      [head]: append(head),
+      [`${head}b`]: { ...append(`${head}b`), dependsOn: [head] },
+      [`${head}c`]: { ...append(`${head}c`), dependsOn: [`${head}b`] },
+    });
+    await writeFile(
+      join(workspace, 'p', 'project.json'),
+      JSON.stringify({
+        name: 'p',
+        targets: {
+          a1: { executor: 'nx:run-commands', options: { command: 'sleep 1 && echo a1 >> order.log' } },
+          serve: {
+            executor: 'nx:run-commands',
+            continuous: true,
+            dependsOn: ['a1'],
+            options: { command: 'echo serve >> order.log && exec sleep 30' },
+          },
+          after: { ...append('after'), dependsOn: ['serve'] },
+          ...chain('a2'),
+          ...chain('a3'),
+          ...chain('a4'),
+        },
+      }),
+    );
+    const child = spawnSync(
+      'bun',
+      [nxEntry, 'run-many', '-t', 'after,a2c,a3c,a4c', '-p', 'p', '--outputStyle=static'],
+      {
+        cwd: workspace,
+        env: fixtureNxEnv(workspace, socketDirectory),
+        encoding: 'utf8',
+        timeout: 60_000,
+      },
+    );
+    expect(child.status, `${child.signal ?? ''} ${child.stdout}${child.stderr}`).toBe(0);
+    const order = (await readFile(join(workspace, 'order.log'), 'utf8')).trim().split('\n');
+    expect(order, order.join(' ')).toContain('serve');
+    expect(order.indexOf('after'), order.join(' ')).toBeGreaterThan(order.indexOf('serve'));
+  });
+});
