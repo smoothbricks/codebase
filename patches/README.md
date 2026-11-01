@@ -925,6 +925,27 @@ dummy ids, wired both order cases by which entry came first (reproduced in revie
 land's three invocations together: lint, test, build and the host proofs, the Linux cross lint, and the host production
 CLI and addon. Drop the hunk once the installed upstream version has the field, retaining the regressions.
 
+## Known upstream defect: the watch reads a FIFO
+
+No hunk carries this, because the defect is in Nx's native code. Nx 24.0.3's workspace context (`workspace/context.rs`,
+`apply`) calls `std::fs::read` on every created or updated path its watch admits, with no file-type check, while its
+walk skips non-regular files. A FIFO created at a path the workspace's ignore rules let through is therefore read. With
+a writer holding it open, the read blocks the daemon's only thread until every writer closes. On a make jobserver fifo,
+such as the bounded-exec CPU pool's, it first drains the token bytes, so the pool's children lose their job slots. Nx
+23.2.1's `update_files` read the same way; 24's own watch now reports the created path.
+
+This repository keeps every fifo it makes out of the watch:
+
+- in a shed, the pool's socket namespace is `.cowshed/run`, which cowshed's `.git/info/exclude` entry hides;
+- outside cowshed, the managed shell puts `NX_SOCKET_DIR` under `$DEVENV_RUNTIME`, outside the checkout;
+- a test fixture's `.nx/sockets` carries its own `.gitignore` (`publishFixtureSocketDirectory`), which the watch reads
+  before the daemon starts.
+
+A consumer that binds `NX_SOCKET_DIR` inside its checkout must have Nx ignore that directory before its daemon starts.
+An ignore file written after the start does not help: the watch has read its rules, and a new ignore file stops the
+daemon. Enforced by: the FIFO case in `packages/nx-plugin/src/testing.test.ts`, which hung 180 s before the fixture's
+ignore file existed. Drop this section once upstream reads only regular files.
+
 ## Upstream PR draft: Nx `findCycles`
 
 Status: drafted, not opened. Written against nrwl/nx `master` at `a37b5ca4c6630bb9ea5df9ac0546edc3a186bc2f`, whose

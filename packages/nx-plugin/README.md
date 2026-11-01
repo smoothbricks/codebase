@@ -2421,12 +2421,14 @@ pool grants at most what it can. A lent pool accounts for siblings together; eac
 allocation to grandchildren. Closing a child's connection returns its local allocation, never the parent's upstream
 grant. Upstream loss revokes the downstream pool, so a dead parent grants nothing more; a command whose grant closes
 while it runs (the lending parent's exit) runs on over budget to its own exit, and stderr says
-`cowshed: cpu-pool grant ended`. A bare count proves no pool. An absent endpoint lends nothing: the command runs as
-configured, and stderr says so. A connected parent pool's refusal or protocol failure instead fails admission: running
-beside it would count the command twice. `options.env` cannot inject either marker, nor a jobserver (`CARGO_MAKEFLAGS`,
-`MAKEFLAGS`, `MFLAGS`); a parent make's jobserver the executor inherits still reaches an ungranted command. The verdict
-records the grant and its actual local wait as `cpu`. Pool setup, listener and cleanup errors fail rather than bypassing
-accounting. Command bounds stay unchanged.
+`cowshed: cpu-pool grant ended`. The fifo is made beside the pool's socket in `NX_SOCKET_DIR`, so a socket directory
+inside the checkout must be one Nx ignores before its daemon starts: Nx 24's watch reads a created fifo and blocks on it
+(`patches/README.md`, "Known upstream defect: the watch reads a FIFO"). A bare count proves no pool. An absent endpoint
+lends nothing: the command runs as configured, and stderr says so. A connected parent pool's refusal or protocol failure
+instead fails admission: running beside it would count the command twice. `options.env` cannot inject either marker, nor
+a jobserver (`CARGO_MAKEFLAGS`, `MAKEFLAGS`, `MFLAGS`); a parent make's jobserver the executor inherits still reaches an
+ungranted command. The verdict records the grant and its actual local wait as `cpu`. Pool setup, listener and cleanup
+errors fail rather than bypassing accounting. Command bounds stay unchanged.
 
 A land gate (`tooling/land-host.sh`) runs as `cowshed exec <workspace> --class gate --host -- COMMAND [ARGS...]` after
 daemon-stop. It is never CPU-limited: its class sets the priority the kernel schedules it at, and its Nx run serves its
