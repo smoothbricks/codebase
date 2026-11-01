@@ -9,21 +9,13 @@ const DECLARATION = '{projectRoot}/tsconfig.test.json';
 
 let root = '';
 let external = '';
-let inheritedData: string | undefined;
 
-// One Nx state per checkout: the fixture is its own workspace, so the runner's NX_WORKSPACE_DATA_DIRECTORY must not
-// name the archive its file index writes.
 beforeEach(async () => {
   root = await realpath(await mkdtemp(join(tmpdir(), 'eslint-sources-')));
   external = await realpath(await mkdtemp(join(tmpdir(), 'eslint-sources-outside-')));
-  inheritedData = process.env.NX_WORKSPACE_DATA_DIRECTORY;
-  process.env.NX_WORKSPACE_DATA_DIRECTORY = join(root, '.nx', 'workspace-data');
-  await mkdir(process.env.NX_WORKSPACE_DATA_DIRECTORY, { recursive: true });
 });
 
 afterEach(async () => {
-  if (inheritedData === undefined) delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
-  else process.env.NX_WORKSPACE_DATA_DIRECTORY = inheritedData;
   await rm(root, { recursive: true, force: true });
   await rm(external, { recursive: true, force: true });
 });

@@ -184,6 +184,14 @@ their own `nx.json`; this keeps the native task database local too, rather than 
 Offline, path-only Cargo fixtures likewise own a temporary `CARGO_HOME`; production commands still keep the caller's
 Cargo home.
 
+Fixtures the suite infers in its own process own their Nx state the same way. The package's test preload
+(`src/__tests__/isolate-nx-state.ts`) drops the `NX_WORKSPACE_DATA_DIRECTORY`, `NX_PROJECT_GRAPH_CACHE_DIRECTORY` and
+`NX_CACHE_DIRECTORY` the suite inherits from its job (CI's setup-devenv action, a cowshed job), so every fixture root
+resolves its own `.nx`. Nx's native file index shares one walk among every context of one workspace-data directory: the
+walk holds `nx_files.lock` there, and a context that waits on it loads the archive that walk wrote instead of walking
+its own root. Resolved through the job's absolute directory, a fixture's context gets the files of whichever root walked
+there last.
+
 Fixture sockets and loopback listeners live where a Cowshed sandbox admits them, never at a literal `/tmp` path or on
 port 0. A fixture's short socket parent alias lives beside the Nx socket directory the job supplies (the parent of
 `NX_SOCKET_DIR`, the workspace's short runtime link), else under `COWSHED_RUNTIME_LINK`, else the temp directory. The

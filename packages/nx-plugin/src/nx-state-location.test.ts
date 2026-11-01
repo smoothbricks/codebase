@@ -2,6 +2,7 @@ import { expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { realpath, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { cacheDirectoryForWorkspace, workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import { nxFixtureRoot } from './__tests__/fixture-nx-env.js';
 
 /**
@@ -59,5 +60,28 @@ it("keeps a host shell's Nx cache and task database in the checkout's own .nx", 
     });
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Guards the same rule for the fixtures this suite infers in its own process. Nx 24's native file index shares one walk
+ * among every context of one workspace-data directory: the walk holds `nx_files.lock` there, and a context that waits
+ * on it loads the archive that walk wrote (`nx_files_v2.nxt`) instead of walking its own root. The job running this
+ * suite (CI's setup-devenv action, a cowshed job) exports absolute locations of its checkout's state, which the suite
+ * inherits, so a fixture resolving through them indexed whatever root walked there last: CI's test-shard3 lost a
+ * fixture's Cargo member from the file index that way.
+ */
+it("resolves an in-process fixture's Nx state in the fixture's own .nx, never in the outer workspace's", async () => {
+  const fixture = await nxFixtureRoot('nx-state-fixture-');
+  try {
+    expect({
+      workspaceData: workspaceDataDirectoryForWorkspace(fixture),
+      cache: cacheDirectoryForWorkspace(fixture),
+    }).toEqual({
+      workspaceData: join(fixture, '.nx', 'workspace-data'),
+      cache: join(fixture, '.nx', 'cache'),
+    });
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
   }
 });
