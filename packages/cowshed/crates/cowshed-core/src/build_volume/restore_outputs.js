@@ -11,6 +11,20 @@ process.env.NX_WORKSPACE_ROOT_PATH = root;
 process.env.NX_WORKSPACE_DATA_DIRECTORY = path.join(root, '.nx', 'workspace-data');
 process.env.NX_CACHE_DIRECTORY = path.join(root, '.nx', 'cache');
 const requireNx = createRequire(path.join(root, 'package.json'));
+// A task graph's dependency entry in each Nx version this helper was read against (`TaskGraph`,
+// that version's `native/index.d.ts`): 23.2.1 lists the task's id, 24.0.3 a `TaskGraphEdge` naming
+// it in `id`. Any other version is refused by name before Nx is loaded: requalify the helper first.
+const DEPENDENCY_TASK = new Map([
+  ['23.2.1', (taskId) => taskId],
+  ['24.0.3', (edge) => edge.id],
+]);
+const nxVersion = requireNx('nx/package.json').version;
+const dependencyTask = DEPENDENCY_TASK.get(nxVersion);
+if (!dependencyTask) {
+  throw new Error(
+    `cache-only restoration supports exactly Nx ${[...DEPENDENCY_TASK.keys()].join(' or ')}, not ${nxVersion}; requalify it before upgrading`,
+  );
+}
 const yargs = createRequire(requireNx.resolve('nx/package.json'))('yargs');
 const { readNxJson } = requireNx('nx/src/config/nx-json');
 const { createProjectGraphAsync } = requireNx('nx/src/project-graph/project-graph');
@@ -107,8 +121,8 @@ async function main() {
     if (done.has(id)) return done.get(id);
     const task = graph.tasks[id];
     let dependenciesRestored = true;
-    for (const { id: dependency } of [...graph.dependencies[id], ...(graph.continuousDependencies[id] ?? [])]) {
-      if (!(await restore(dependency))) dependenciesRestored = false;
+    for (const dependency of [...graph.dependencies[id], ...(graph.continuousDependencies[id] ?? [])]) {
+      if (!(await restore(dependencyTask(dependency)))) dependenciesRestored = false;
     }
     let reason;
     if (!dependenciesRestored) reason = 'a dependency has no restorable result; task was not executed';

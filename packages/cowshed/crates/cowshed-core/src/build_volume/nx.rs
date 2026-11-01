@@ -2755,6 +2755,193 @@ mod tests {
         );
     }
 
+    /// `node` in `checkout` as Land step 7's helper runs there: without the caller's `NX_*` or `CI`,
+    /// no daemon, no Nx Cloud, plugins loaded in process as every cowshed job loads them, and Nx's
+    /// cache and task database in the checkout (`.nx/`).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn checkout_node(checkout: &Path) -> std::process::Command {
+        let mut node = std::process::Command::new("node");
+        node.current_dir(checkout)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("NX_") || key == "CI" {
+                node.env_remove(key);
+            }
+        }
+        node.env("NX_DAEMON", "false")
+            .env("NX_NO_CLOUD", "true")
+            .env("NX_TUI", "false")
+            .env("NX_ISOLATE_PLUGINS", "false")
+            .env("NX_CACHE_DIRECTORY", checkout.join(".nx/cache"))
+            .env(
+                "NX_WORKSPACE_DATA_DIRECTORY",
+                checkout.join(".nx/workspace-data"),
+            );
+        node
+    }
+
+    /// Run `node` with `stdin` as its whole input; what it exited with and printed.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn node_output(mut node: std::process::Command, stdin: &[u8]) -> std::process::Output {
+        use std::io::Write as _;
+        let mut child = node.spawn_locked().expect("node runs");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin)
+            .unwrap();
+        child.wait_with_output_bounded().expect("node ends")
+    }
+
+    /// Land step 7 (16_build_volumes.md) under each Nx version `restore_outputs.js` declares, each
+    /// a real install of the repository: `nx run a:build` caches `a:build` and the `a:prep` it
+    /// depends on, their outputs are removed, and the helper restores both from the checkout's own
+    /// cache, the dependency first. Nx 23.2.1 lists a task's dependency by its id, 24.0.3 as an
+    /// edge naming it in `id`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn restore_outputs_restores_a_dependency_from_the_cache_of_each_declared_nx() {
+        const PROJECT: &str = r#"{"name":"a","targets":{
+            "prep":{"executor":"nx:run-commands","cache":true,"inputs":["{projectRoot}/src.txt"],"outputs":["{projectRoot}/prep.txt"],"options":{"command":"node -e \"require('fs').writeFileSync('a/prep.txt','prep')\""}},
+            "build":{"executor":"nx:run-commands","cache":true,"dependsOn":["prep"],"inputs":["{projectRoot}/src.txt"],"outputs":["{projectRoot}/build.txt"],"options":{"command":"node -e \"require('fs').writeFileSync('a/build.txt','build')\""}}}}"#;
+        // Read at run time, as [`StockNx::new`] reads it.
+        let repository = PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR")
+                .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process"),
+        )
+        .join("../../../..");
+        for (version, installed) in [
+            ("23.2.1", "packages/nx-23.2.1/node_modules/nx-23.2.1"),
+            ("24.0.3", "node_modules/nx"),
+        ] {
+            let nx = repository
+                .join(installed)
+                .canonicalize()
+                .expect("the repository installs this Nx");
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(nx.join("package.json")).unwrap()).unwrap();
+            assert_eq!(manifest["version"], version, "{}", nx.display());
+            let checkout = scratch("restore-outputs");
+            fs::write(
+                checkout.join("package.json"),
+                r#"{"name":"fixture","private":true}"#,
+            )
+            .unwrap();
+            fs::write(
+                checkout.join("nx.json"),
+                r#"{"cacheDirectory":".nx/cache","maxCacheSize":"1GB"}"#,
+            )
+            .unwrap();
+            fs::create_dir_all(checkout.join("a")).unwrap();
+            fs::write(checkout.join("a/src.txt"), "source\n").unwrap();
+            fs::write(checkout.join("a/project.json"), PROJECT).unwrap();
+            fs::create_dir_all(checkout.join("node_modules")).unwrap();
+            std::os::unix::fs::symlink(&nx, checkout.join("node_modules/nx")).unwrap();
+
+            let mut run = checkout_node(&checkout);
+            run.arg(nx.join("dist/bin/nx.js")).args(["run", "a:build"]);
+            let ran = node_output(run, b"");
+            assert!(
+                ran.status.success(),
+                "Nx {version} nx run a:build: {}{}",
+                String::from_utf8_lossy(&ran.stdout),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+            let summary: serde_json::Value = serde_json::from_slice(
+                &fs::read(checkout.join(".nx/cache").join(RUN_SUMMARY)).unwrap(),
+            )
+            .unwrap();
+            let tasks: std::collections::BTreeMap<String, String> = summary["tasks"]
+                .as_array()
+                .expect("the run summary lists its tasks")
+                .iter()
+                .map(|task| {
+                    (
+                        task["taskId"].as_str().unwrap().to_owned(),
+                        task["hash"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                tasks.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["a:build", "a:prep"],
+                "Nx {version}"
+            );
+            for output in ["a/prep.txt", "a/build.txt"] {
+                fs::remove_file(checkout.join(output)).unwrap();
+            }
+
+            let checked = CheckedRun {
+                check: "nx run a:build".to_owned(),
+                cache: checkout.join(".nx/cache"),
+                command: "nx run a:build".to_owned(),
+                tasks,
+            };
+            let mut restore = checkout_node(&checkout);
+            restore
+                .arg("-")
+                .arg(&checkout)
+                .arg(serde_json::to_string(&checked).unwrap());
+            let restored = node_output(restore, RESTORE_OUTPUTS_SCRIPT.as_bytes());
+            assert!(
+                restored.status.success(),
+                "Nx {version} restoration: {}",
+                String::from_utf8_lossy(&restored.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&restored.stdout),
+                "{\"hits\":2,\"misses\":[]}\n",
+                "Nx {version}"
+            );
+            assert_eq!(
+                fs::read_to_string(checkout.join("a/prep.txt")).unwrap(),
+                "prep"
+            );
+            assert_eq!(
+                fs::read_to_string(checkout.join("a/build.txt")).unwrap(),
+                "build"
+            );
+            fs::remove_dir_all(&checkout).unwrap();
+        }
+    }
+
+    /// A root whose Nx is a version `restore_outputs.js` does not declare is refused by name before
+    /// Nx is loaded: no task graph is read and no Nx state is written.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn restore_outputs_refuses_an_undeclared_nx_before_loading_it() {
+        let checkout = scratch("restore-outputs-refusal");
+        fs::create_dir_all(checkout.join("node_modules/nx")).unwrap();
+        fs::write(checkout.join("package.json"), "{}").unwrap();
+        fs::write(
+            checkout.join("node_modules/nx/package.json"),
+            r#"{"name":"nx","version":"24.0.4"}"#,
+        )
+        .unwrap();
+        let mut restore = checkout_node(&checkout);
+        restore
+            .arg("-")
+            .arg(&checkout)
+            .arg(r#"{"command":"nx run a:build","tasks":{}}"#);
+        let refused = node_output(restore, RESTORE_OUTPUTS_SCRIPT.as_bytes());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "{stderr}");
+        assert!(
+            stderr.contains(
+                "cache-only restoration supports exactly Nx 23.2.1 or 24.0.3, not 24.0.4"
+            ),
+            "{stderr}"
+        );
+        assert!(refused.stdout.is_empty());
+        assert!(
+            !checkout.join(".nx").exists(),
+            "a refusal writes no Nx state"
+        );
+        fs::remove_dir_all(&checkout).unwrap();
+    }
     /// Stopping the daemon natively is exactly stock `nx daemon --stop` (`SIGTERM` to the
     /// recorded pid): a real Nx daemon exits on it, and `nx daemon --start` afterwards starts a
     /// new one cleanly. If stock Nx ever needs more than the signal, this fails.

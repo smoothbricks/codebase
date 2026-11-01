@@ -1078,7 +1078,10 @@ unit's export.
    Explicit `run`, `run-many` and infix task commands use the same stock parser paths. Graph-query selections
    (`affected`) are not reconstructed; restoration reports them unsupported. Its task IDs must equal the captured IDs; a
    different graph refuses restoration and is reported, never expanded. Hash and restore dependencies before their
-   consumers, using only successful entries in the adopted local Nx cache.
+   consumers, using only successful entries in the adopted local Nx cache. The graph is stock Nx's internal one, shaped
+   by the installed Nx version: the helper declares each version it was read against (23.2.1 lists a task's dependencies
+   by task id, 24.0.3 as edges naming the task in `id`) and refuses any other by name before it loads Nx, a helper
+   failure the land reports.
 
    Each recomputed hash must equal the source check's captured hash; a different input identity is a miss, never a
    different cached result silently substituted for the validated one. Declared outputs live on the source volume, so

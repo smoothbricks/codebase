@@ -1,0 +1,12 @@
+{
+  "name": "@smoothbricks/nx-23.2.1",
+  "version": "0.0.0",
+  "private": true,
+  "nx": {
+    "name": "nx-23.2.1"
+  },
+  "description": "Nx 23.2.1, installed for the tests that run cowshed's Nx boundaries against each Nx version they declare besides the repository's own.",
+  "devDependencies": {
+    "nx-23.2.1": "npm:nx@23.2.1"
+  }
+}
