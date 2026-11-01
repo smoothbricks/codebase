@@ -127,7 +127,6 @@ for (const [version, installed] of DECLARED_NX) {
   it(`the emitted publisher stores a real Nx ${version} run that another checkout's Nx ${version} restores without executing`, async () => {
     const nx = await realpath(installed);
     expect(JSON.parse(await readFile(join(nx, 'package.json'), 'utf8')).version).toBe(version);
-    const root = await mkdtemp(join(tmpdir(), 'nx-publish-round-trip-'));
     const store = new Map<string, Uint8Array>();
     const server = Bun.serve({
       hostname: '127.0.0.1',
@@ -155,7 +154,8 @@ for (const [version, installed] of DECLARED_NX) {
       NX_TUI: 'false',
       NX_ISOLATE_PLUGINS: 'false',
     };
-    // A land's own run has no project cache (stock 23.2.1 has no read-only client); its publish and every other checkout read it.
+    // The landed run reads no project cache: stock 23.2.1 ignores READ_ONLY and would store its own results, so the store
+    // holds only what the publisher sent. The publish and the other checkout read it, read-only, as every job does.
     const reading = {
       ...base,
       NX_SELF_HOSTED_REMOTE_CACHE_SERVER: origin,
@@ -170,6 +170,7 @@ for (const [version, installed] of DECLARED_NX) {
       ]);
       return { status, stdout, stderr };
     }
+    const root = await mkdtemp(join(tmpdir(), 'nx-publish-round-trip-'));
     try {
       const [landed, other] = [join(root, 'landed'), join(root, 'other')];
       for (const checkout of [landed, other]) {

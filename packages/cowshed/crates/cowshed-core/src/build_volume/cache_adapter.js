@@ -3,22 +3,21 @@
 // it was read against is declared in openNxCache with the layout it relies on, and any other is refused.
 // biome-ignore lint/correctness/noUnusedVariables: invoked by the bodies cache_adapter::script prefixes (cache_adapter.rs), not from this file.
 function openNxCache(root) {
-  const fs = require('node:fs');
   const path = require('node:path');
   const { createRequire } = require('node:module');
   if (!root || !path.isAbsolute(root)) {
     throw new Error(`Nx cache adapter requires an absolute checkout root, got ${JSON.stringify(root)}`);
   }
   // What each qualified Nx version fixes for this adapter, read in nrwl/nx at that tag: the checkout's
-  // task-database and cache directories (`utils/cache-directory.ts`), and the schema suffix of the task
-  // database `NxCache.get` queries (`native/db/initialize.rs` DB_VERSION, named `<machine>-v<N>.db` by
-  // `native/db/mod.rs` `connect_to_nx_db`). In both, an entry is `<cache>/<hash>/` with its terminal output
-  // in `<cache>/terminalOutputs/<hash>` (`native/cache/cache.rs`), `CachedResult` is `{ code, terminalOutput,
-  // outputsPath, size }`, and `HttpRemoteCache.store` archives the entry alike (`native/cache/http_remote_cache.rs`,
+  // task-database and cache directories (`utils/cache-directory.ts`). In both, the task database is
+  // `<machine>-v<DB_VERSION>.db` there (v3 in 23.2.1, v6 in 24.0.3: `native/db/mod.rs`, `initialize.rs`),
+  // reached only through Nx's own `NxCache.get`; an entry is `<cache>/<hash>/` with its terminal output in
+  // `<cache>/terminalOutputs/<hash>` (`native/cache/cache.rs`); `CachedResult` is `{ code, terminalOutput,
+  // outputsPath, size }`; and `HttpRemoteCache.store` archives the entry alike (`native/cache/http_remote_cache.rs`,
   // the same source). 23.2.1's `get` answers a row whose entry directory is gone; 24.0.3's does not.
   const layouts = new Map([
-    ['23.2.1', { workspaceData: '.nx/workspace-data', cache: '.nx/cache', taskDatabase: '-v3.db' }],
-    ['24.0.3', { workspaceData: '.nx/workspace-data', cache: '.nx/cache', taskDatabase: '-v6.db' }],
+    ['23.2.1', { workspaceData: '.nx/workspace-data', cache: '.nx/cache' }],
+    ['24.0.3', { workspaceData: '.nx/workspace-data', cache: '.nx/cache' }],
   ]);
   const requireNx = createRequire(path.join(root, 'package.json'));
   const version = requireNx('nx/package.json').version;
@@ -54,12 +53,6 @@ function openNxCache(root) {
   }
   if (path.resolve(native.cacheDirectory) !== path.resolve(cacheDir)) {
     throw new Error(`Nx ${version} cache directory changed: expected ${cacheDir}, actual ${native.cacheDirectory}`);
-  }
-  // The construction opened the task database: it must be the schema this version declares.
-  if (!fs.readdirSync(workspaceData).some((name) => name.endsWith(layout.taskDatabase))) {
-    throw new Error(
-      `Nx ${version} opened no *${layout.taskDatabase} task database in ${workspaceData}; requalify the adapter`,
-    );
   }
   return { requireNx, cache, cacheDir: native.cacheDirectory, getLocal: (hash) => native.get(hash) };
 }

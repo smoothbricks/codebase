@@ -47,6 +47,14 @@ mod tests {
         ));
         let _guard = FixtureGuard(root.clone());
         std::fs::create_dir_all(root.join("node_modules/nx")).expect("create negative Nx fixture");
+        // The first Nx module the adapter loads past its version gate marks a load.
+        std::fs::create_dir_all(root.join("node_modules/nx/src/native"))
+            .expect("create the fixture's Nx native module directory");
+        std::fs::write(
+            root.join("node_modules/nx/src/native/index.js"),
+            "require('fs').writeFileSync(require('path').join(__dirname, 'loaded'), '');",
+        )
+        .expect("write the fixture's load marker");
         std::fs::write(root.join("package.json"), "{}").expect("write fixture package.json");
         std::fs::write(
             root.join("node_modules/nx/package.json"),
@@ -84,8 +92,8 @@ mod tests {
             String::from_utf8_lossy(&output.stdout)
         );
         assert!(
-            !root.join(".nx").exists(),
-            "unsupported Nx version must not create cache state"
+            !root.join("node_modules/nx/src/native/loaded").exists(),
+            "an unsupported Nx version must load no Nx module"
         );
     }
 }

@@ -628,10 +628,9 @@ gate passes. The plugin's cached asset producer packages unchanged bytes from th
 red gate publishes nothing; a failed publication is a distinct diagnostic with the cause, never a claim that results
 were stored. `cache_adapter.js` is the one boundary to the checkout's local Nx cache, whose `DbCache` and native cache
 are Nx internals: it declares each Nx version it was read against (23.2.1 and 24.0.3) with the layout it relies on — the
-checkout's `.nx/workspace-data` and `.nx/cache`, and the schema suffix of the task database Nx opens there (`-v3.db`,
-`-v6.db`) — opens the cache through the installed version's entry and checks Nx resolved that layout, and refuses any
-other version by name. So a land publishes from a repository on either version, and an upgrade requalifies the adapter
-first.
+checkout's `.nx/workspace-data` and `.nx/cache` — opens the cache through the installed version's entry and checks Nx
+resolved that layout, and refuses any other version by name before it loads Nx. So a land publishes from a repository on
+either version, and an upgrade requalifies the adapter first.
 
 The existing artifact server is a controller-owned foreground child. The gateway passes `--exit-on-stdin-eof` and
 retains the write end of its stdin pipe; EOF drains the server and releases its store lock. A gateway SIGKILL closes
