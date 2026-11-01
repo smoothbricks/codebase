@@ -503,12 +503,19 @@ and worktree metadata grants. The probe executes Git through the system-selected
 `/usr/bin/git` launcher: the launcher requires xcrun host-cache writes even for read-only operations. Publication
 fixtures provide the existing `.cowshed` directory that workspace creation owns.
 
-cowshed-core's tests run real Nx installs: the repository's own, patched by its carried `patches/nx@*.patch`, and each
-other version a cowshed Nx boundary declares (`packages/nx-23.2.1`). Their shards' cache key names both (nx.json
-`targetDefaults` `cargo-test-cowshed-core-*`: the lockfile nodes `npm:nx@24.0.3` and `npm:nx@23.2.1` with every package
-each reaches in bun.lock, and the carried patch files), so a change to either, a patch-only one included, reruns them.
-After an Nx bump that leaves a name in the list uninstalled, every run that hashes these shards fails with Nx's "The
-externalDependency 'nx@24.0.3' … could not be found" until the list follows.
+Some cowshed tests run real Nx installs: cowshed-core's, cowshed-cli's (its real-APFS ones included) and
+cowshed-gateway's (its host-controller ones included) run the repository's own, patched by its carried
+`patches/nx@*.patch`, and cowshed-core's also each other version a cowshed Nx boundary declares (`packages/nx-23.2.1`).
+The cache keys of the targets that run them name the Nx they run: nx.json `targetDefaults` `cargo-test-cowshed-core-*`,
+`cargo-test-cowshed-cli-*`, `cargo-test-cowshed-gateway` and `cargo-test-group-real-apfs-host` add the lockfile node
+`npm:nx@24.0.3`, and for cowshed-core `npm:nx@23.2.1`, with every package each reaches in bun.lock, and the carried
+patch files; `cowshed:host-controller-test` already keys every lockfile package and adds the carried patch files. A
+change to either, a patch-only one included, reruns those targets (the real-APFS host group and the host-controller lane
+whole, each one target) while every other cowshed cargo test target keeps its cache. The cli and gateway keys repeat
+`cargo-test-cowshed-*`'s `dependsOn`, as Nx applies one `targetDefaults` entry to a target, and the gateway's names its
+single unsharded target exactly: sharding that crate renames it and needs the key to follow. After an Nx bump that
+leaves a name in the list uninstalled, every run that hashes these targets fails with Nx's "The externalDependency
+'nx@24.0.3' … could not be found" until the list follows.
 
 Nx-backed host-controller probes share `tests/support/nx_reads.rs`: it walks the checkout's pinned Bun-installed Nx
 package and its reachable package-private namespaces, admitting only the required external Bun-store payloads and

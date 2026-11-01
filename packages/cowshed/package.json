@@ -893,6 +893,7 @@
             "dependentTasksOutputFiles": "**/*",
             "transitive": true
           },
+          "{workspaceRoot}/patches/nx@*.patch",
           "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
           {
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh uname -sr"

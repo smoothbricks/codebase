@@ -85,6 +85,14 @@
         "{workspaceRoot}/patches/nx@*.patch"
       ]
     },
+    "cargo-test-cowshed-cli-*": {
+      "dependsOn": ["...", { "projects": ["cowshed"], "target": "apfs-test-root" }],
+      "inputs": ["...", { "externalDependencies": ["nx@24.0.3"] }, "{workspaceRoot}/patches/nx@*.patch"]
+    },
+    "cargo-test-cowshed-gateway": {
+      "dependsOn": ["...", { "projects": ["cowshed"], "target": "apfs-test-root" }],
+      "inputs": ["...", { "externalDependencies": ["nx@24.0.3"] }, "{workspaceRoot}/patches/nx@*.patch"]
+    },
     "cargo-test-group-real-apfs": {
       "dependsOn": [
         "...",
@@ -100,6 +108,7 @@
         { "projects": ["cowshed"], "target": "apfs-test-root" },
         "cargo-test-group-real-apfs"
       ],
+      "inputs": ["...", { "externalDependencies": ["nx@24.0.3"] }, "{workspaceRoot}/patches/nx@*.patch"],
       "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
     }
   },
