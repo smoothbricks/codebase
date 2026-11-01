@@ -10,7 +10,7 @@ import { whenFound } from './__tests__/path-change.js';
 import { awaitExit, isRunning, processesOf, terminate } from './testing.js';
 
 /**
- * Guards the `NX_DAEMON_START=never` hunks of `patches/nx@23.2.1.patch`. A stock client that finds no live daemon
+ * Guards the `NX_DAEMON_START=never` hunks of `patches/nx@24.0.3.patch`. A stock client that finds no live daemon
  * starts one, detached into a session of its own, and the record shares it with every client of the checkout. Cowshed
  * ends a job's whole process tree when the job ends (`specs/cowshed/11_shell.md`), so a daemon one job's client
  * started would end with that job while another job's `nx run` still used it. Every cowshed job therefore runs with
@@ -59,7 +59,7 @@ async function recordedPid(workspace: string): Promise<number | null> {
 
 /**
  * The pid a whole record names. Where link(2) is refused (a cowshed sandbox), a daemon creates its record exclusively
- * and then writes it, and removes its staged copy only after that (`patches/nx@23.2.1.patch`): a record that does not
+ * and then writes it, and removes its staged copy only after that (`patches/nx@24.0.3.patch`): a record that does not
  * parse yet is still being written, and that removal brings the next judgment.
  */
 async function wholeRecordPid(workspace: string): Promise<number | null> {

@@ -6,7 +6,7 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { bindListener } from './testing.js';
 
 /**
- * Guards the restore-time hunk of `patches/nx@23.2.1.patch`. Nx 23.2.1
+ * Guards the restore-time hunk of `patches/nx@24.0.3.patch`. Nx 24.0.3
  * restores a cached output with its native `copy` (`std::fs::copy`), which on
  * macOS clones the file and keeps its timestamps: the restored output carries
  * the mtime it had when its cache entry was written. Build an output from

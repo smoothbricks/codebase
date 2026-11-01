@@ -8,7 +8,7 @@ import { nxFixtureRoot } from './__tests__/fixture-nx-env.js';
  * Guards cowshed's rule "Every checkout has exactly one Nx state" (specs/cowshed/16_build_volumes.md) for host shells:
  * a host shell's Nx keeps its cache and task database in the checkout's own `.nx`, which a cowshed checkout links into
  * its build volume. Cowshed's jobs name those directories through `NX_CACHE_DIRECTORY` and
- * `NX_WORKSPACE_DATA_DIRECTORY`; a host shell names neither. Without a configured location the pinned Nx 23.2.1
+ * `NX_WORKSPACE_DATA_DIRECTORY`; a host shell names neither. Without a configured location the pinned Nx 24.0.3
  * (`utils/cache-directory.js`, `computeSharedDataLocation`) moves both to `~/.nx/<hash of the repository key>`, shared
  * by every checkout whose git remote keys alike and read by no build volume: land gates then ran cold, and a rebase
  * carried nothing because main's volume indexed nothing. The repository's `nx.json` `cacheDirectory`, which smoo's

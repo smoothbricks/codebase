@@ -1,7 +1,7 @@
 //! Nx (`nx.json`): one task cache, one task database and one daemon per checkout, shared by every
 //! boundary that runs Nx there (04_sandbox.md, "One Nx state per checkout").
 //!
-//! Nx 23 keeps its task database in the workspace-data directory, and that database indexes
+//! Nx 24 keeps its task database in the workspace-data directory, and that database indexes
 //! exactly one cache directory: a run restores only the artifacts its own database has rows for.
 //! The daemon's rendezvous record, `d/server-process.json`, lives in the same workspace-data
 //! directory, and setting any of `NX_WORKSPACE_DATA_DIRECTORY`, `NX_CACHE_DIRECTORY` or

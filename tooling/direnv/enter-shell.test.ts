@@ -145,7 +145,7 @@ it('a stale plugin build clears the daemon record and project graph through its 
       'A-v3.db-shm',
       'A-v3.lock',
       'project-graph.lock',
-      'nx_files.nxt',
+      'nx_files_v2.nxt',
       'lockfile-nodes.hash',
       'parsed-lock-file.nodes.json',
       'producer-receipt-0123.json',

@@ -18,8 +18,8 @@ catalogs. The items below remain; each names the code, the evidence and the acce
 
 ## Nx Bun lockfile parser does not resolve `catalog:`
 
-- Code: the patched Nx 23.2.1 `lock-file/bun-parser.js` `processSingleDependency` (patch:
-  `packages/nx-plugin/managed/raw/patches/nx@23.2.1.patch`) skips `workspace:` and passes `catalog:` to
+- Code: the patched Nx 24.0.3 `lock-file/bun-parser.js` `processSingleDependency` (patch:
+  `packages/nx-plugin/managed/raw/patches/nx@24.0.3.patch`) skips `workspace:` and passes `catalog:` to
   `findResolvedVersion`; `findBestVersionMatch` then falls back to the first candidate. Nx's own `BunCatalogManager`
   (`utils/catalog/bun-manager.js`) reads `workspaces.catalog` but only the pnpm parser and pruning call it.
 - Status: not reproduced. With one resolved version per package the edge is right; with several (a nested older copy)

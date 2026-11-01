@@ -166,7 +166,7 @@ describe('runtime-input.sh', () => {
 });
 
 /**
- * WHY this test is permanent. Nx 23.2.1 hashes a runtime input's stdout and
+ * WHY this test is permanent. Nx 24.0.3 hashes a runtime input's stdout and
  * stderr and ignores its exit status; the wrapper's 0xFF byte is what makes a
  * failed input an error instead of a key (runtime-input.sh). Planted through
  * real Nx, both through the daemon that hashes for a workspace's clients and
@@ -234,7 +234,7 @@ describe('a planted runtime input failure through real Nx', () => {
 });
 
 /**
- * Guards the hash-failure hunk of patches/nx@23.2.1.patch. Nx 23.2.1's native hasher fails a runtime input whose output
+ * Guards the hash-failure hunk of patches/nx@24.0.3.patch. Nx 24.0.3's native hasher fails a runtime input whose output
  * is not UTF-8 with `invalid utf-8 sequence of 1 bytes from index 0`, naming no task and no input. The patched
  * `hashTasks` rethrows it naming the tasks (ten, the rest counted) and the runtime inputs their plans hold, read from its
  * planner. When the planner cannot answer, the native message still leads and the native error stays the cause. The
@@ -264,14 +264,16 @@ describe("Nx's error for a failed hash", () => {
     taskIds: string[],
     getPlans: () => Record<string, string[]>,
   ): Promise<{ message: string; cause: unknown }> {
-    const native = {
+    // The installed class's own methods (Nx 24 plans through `plan`); only the native planner and hasher are faked.
+    const native = Object.assign(Object.create(NativeTaskHasherImpl.prototype), {
+      upfrontPlans: null,
       planner: { getPlansReference: () => 'plans', getPlans },
       hasher: {
         hashPlans: () => {
           throw error;
         },
       },
-    };
+    });
     const envs = Object.fromEntries(taskIds.map((id) => [id, {}]));
     const settled: unknown = await NativeTaskHasherImpl.prototype.hashTasks
       .call(native, taskIds.map(task), GRAPH, envs, repoRoot, false)

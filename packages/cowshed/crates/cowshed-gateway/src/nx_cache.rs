@@ -64,7 +64,7 @@ pub(crate) fn unavailable_status(method: &http::Method) -> http::StatusCode {
     }
 }
 
-/// Whether stock Nx 23.2.1 reads `status` for `method` without failing the task
+/// Whether stock Nx 24.0.3 reads `status` for `method` without failing the task
 /// (`native/cache/http_remote_cache.rs`): `GET` 200/404, `PUT` 200/403/409. Every other status is
 /// its fatal "misconfigured remote cache", so the gateway never forwards one.
 pub(crate) fn client_reads(method: &http::Method, status: http::StatusCode) -> bool {

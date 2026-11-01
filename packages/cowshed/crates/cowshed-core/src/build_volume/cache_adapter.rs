@@ -50,7 +50,7 @@ mod tests {
         std::fs::write(root.join("package.json"), "{}").expect("write fixture package.json");
         std::fs::write(
             root.join("node_modules/nx/package.json"),
-            r#"{"version":"23.2.2"}"#,
+            r#"{"version":"24.0.4"}"#,
         )
         .expect("write fixture Nx metadata");
 
@@ -75,7 +75,7 @@ mod tests {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("supports exactly Nx 23.2.1, not 23.2.2"),
+            stderr.contains("supports exactly Nx 24.0.3, not 24.0.4"),
             "{stderr}"
         );
         assert!(

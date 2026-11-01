@@ -9,7 +9,7 @@ import {
 } from 'nx/src/project-graph/plugins/local-plugin-source.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
-/** Guards the plugin-load aggregation hunk of patches/nx@23.2.1.patch against the actual Bun-installed Nx. */
+/** Guards the plugin-load aggregation hunk of patches/nx@24.0.3.patch against the actual Bun-installed Nx. */
 const repositoryRoot = join(import.meta.dir, '../../..');
 const nxEntry = join(repositoryRoot, 'node_modules/.bin/nx');
 

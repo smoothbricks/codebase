@@ -367,10 +367,13 @@ describe("the producer hook's installed-closure census", () => {
     }
   });
 
-  it('knows the probe by the name the installed patched watcher gives it, in the node_modules it writes it to', async () => {
-    const watcher = await readFile(fileURLToPath(import.meta.resolve('nx/src/daemon/server/watcher.js')), 'utf8');
-    expect(watcher).toContain("const PROBE_NAME = 'nx-watch-probe-';");
-    expect(watcher).toContain('`${probeDirectory}/${PROBE_NAME}${process.pid}-${++probeSequence}`');
-    expect(watcher).toContain("(0, path_1.join)(workspace_root_1.workspaceRoot, 'node_modules'),");
+  it('knows the probe by the name the installed patched watch probe gives it, in the node_modules it writes it to', async () => {
+    const probe = await readFile(
+      fileURLToPath(import.meta.resolve('nx/src/daemon/server/file-watching/watch-probe.js')),
+      'utf8',
+    );
+    expect(probe).toContain("const PROBE_NAME = 'nx-watch-probe-';");
+    expect(probe).toContain('`${probeDirectory}/${PROBE_NAME}${process.pid}-${++probeSequence}`');
+    expect(probe).toContain("(0, node_path_1.join)(workspace_root_1.workspaceRoot, 'node_modules'),");
   });
 });

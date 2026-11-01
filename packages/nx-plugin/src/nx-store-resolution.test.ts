@@ -8,16 +8,15 @@ import { readModulePackageJson } from 'nx/src/utils/package-json.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the workspace-resolution hunk of `patches/nx@23.2.1.patch`, the local build of nrwl/nx#37272. The
- * fixture links the installed Nx and this repository's TypeScript into a workspace, so the graph is computed by the
- * Nx this repository runs. Nx 23.2.1 loads `typescript` with a plain `require` from its own location; where that
- * location cannot see TypeScript, its dependency analysis skips every TypeScript import and the graph loses each
- * edge one project's source import makes to another, without a warning (12 of this repository's 44 edges). Bun's
- * project-local layout hoists a TypeScript into the ancestry of Nx, so the graph alone no longer proves the fix: the
- * test also asserts that `resolveFromWorkspace` returns the workspace's `typescript`. Release version actions take
- * the same resolution; `packages/cli`'s release-version tests run them through it.
- *
- * Drop the hunk, and keep this test, once the Nx version in use contains that fix.
+ * Guards Nx's resolution of workspace-provided packages from the workspace, nrwl/nx#37272, which Nx carries since
+ * 24.0.3 (this repository carried it as a patch hunk on 23.2.1). The fixture links the installed Nx and this
+ * repository's TypeScript into a workspace, so the graph is computed by the Nx this repository runs. Nx 23.2.1 loaded
+ * `typescript` with a plain `require` from its own location; where that location could not see TypeScript, its
+ * dependency analysis skipped every TypeScript import and the graph lost each edge one project's source import makes
+ * to another, without a warning (12 of this repository's 44 edges). Bun's project-local layout hoists a TypeScript into
+ * the ancestry of Nx, so the graph alone does not prove the fix: the test also asserts that `resolveFromWorkspace`
+ * returns the workspace's `typescript`. Release version actions take the same resolution; `packages/cli`'s
+ * release-version tests run them through it.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');

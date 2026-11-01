@@ -1295,7 +1295,7 @@ mod tests {
             serde_json::json!({
                 "processId": pid,
                 "socketPath": socket,
-                "nxVersion": "23.2.1",
+                "nxVersion": "24.0.3",
             })
             .to_string(),
         )

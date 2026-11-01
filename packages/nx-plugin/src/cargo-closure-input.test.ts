@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
-import { Watcher, WorkspaceContext } from 'nx/src/native/index.js';
+import { type ChangeBatch, WorkspaceContext } from 'nx/src/native/index.js';
 import { globWithWorkspaceContextSync, resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { byFile, closureFixture, closureOf, graphComputation } from './__tests__/cargo-closure-fixture.js';
 import {
@@ -434,41 +434,53 @@ it("indexes a source tree's Cargo manifests and none of the runtime state a cows
 
 const SOURCE_FILE = 'src/lib.rs';
 
+/** Every path a change batch names: created, updated and deleted. */
+function batchPaths(batch: ChangeBatch): string[] {
+  return [
+    ...batch.createdFiles.map(({ file }) => file),
+    ...batch.updatedFiles.map(({ file }) => file),
+    ...batch.deletedFiles,
+  ];
+}
+
 /**
- * Every path the native watcher reports for a fresh workspace under `nxignore`
- * while a cowshed writes its runtime state (the daemon's own log, job output,
- * a supervisor's pid file) beside a source file that changes every round. This is
- * the watcher Nx's daemon subscribes to the workspace with: it recomputes the
- * project graph for each batch of events it reports, with no filter of its
- * own. Each round advances on its unique source file's native callback, not
- * on a guessed subscription or debounce delay.
+ * Every path Nx's workspace context reports changed for a fresh workspace under `nxignore` while a cowshed writes its
+ * runtime state (the daemon's own log, job output, a supervisor's pid file) beside a source file that changes every
+ * round. These are the batches Nx 24's daemon recomputes the project graph from (`onChanges`): the context's own watch
+ * applies the workspace's ignore rules, and the daemon adds no filter of its own. Each round advances on its unique
+ * source file's native callback, not on a guessed subscription or debounce delay.
  */
 async function watchedPaths(nxignore: string): Promise<string[]> {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-watch-')));
+  const data = await mkdtemp(join(tmpdir(), 'cargo-closure-watch-data-'));
   const reported = new Set<string>();
   const failures: string[] = [];
-  let watcher: Watcher | undefined;
+  let context: WorkspaceContext | undefined;
   let pending: { path: string; resolve(): void; reject(error: Error): void } | undefined;
+  const report = (paths: readonly string[]) => {
+    for (const path of paths) {
+      reported.add(path);
+      if (path === pending?.path) {
+        pending.resolve();
+        pending = undefined;
+      }
+    }
+  };
   try {
     execFileSync('git', ['init', '--quiet', root], { stdio: 'pipe' });
     await writeFile(join(root, '.nxignore'), nxignore);
     await mkdir(join(root, 'src'), { recursive: true });
     await mkdir(join(root, '.cowshed/cache/nx/workspace-data/d'), { recursive: true });
     await mkdir(join(root, '.cowshed/run'), { recursive: true });
-    watcher = new Watcher(root);
-    // Native watch() registers the filesystem subscription synchronously.
-    watcher.watch((error, events) => {
+    // The context starts its watch before its walk, so every write below reaches a batch.
+    context = new WorkspaceContext(root, data, { watch: true });
+    await context.ready();
+    context.onChanges((error, batch) => {
       if (error !== null) {
-        failures.push(error);
-        pending?.reject(new Error(error));
+        failures.push(error.message);
+        pending?.reject(error);
       }
-      for (const event of events) {
-        reported.add(event.path);
-        if (event.path === pending?.path) {
-          pending.resolve();
-          pending = undefined;
-        }
-      }
+      if (batch !== null) report(batchPaths(batch));
     });
     for (let round = 0; round < 5; round += 1) {
       const source = round === 0 ? SOURCE_FILE : `src/round-${round}.rs`;
@@ -482,16 +494,17 @@ async function watchedPaths(nxignore: string): Promise<string[]> {
         await writeFile(join(root, '.cowshed/run/supervisor.pid'), `${round}\n`);
         await writeFile(join(root, source), `pub fn round() -> u8 { ${round} }\n`);
       })();
-      await guardEvent(Promise.all([observed, writes]), `native watcher callback for ${source}`, () =>
+      await guardEvent(Promise.all([observed, writes]), `workspace context change for ${source}`, () =>
         JSON.stringify({ pending: pending?.path, reported: [...reported], failures }),
       );
-      for (const event of watcher.forceFlushPending()) reported.add(event.path);
+      report(batchPaths(context.settle()));
     }
     expect(failures).toEqual([]);
     return [...reported].sort();
   } finally {
-    await watcher?.stop();
+    context?.stopWatching();
     await rm(root, { recursive: true, force: true });
+    await rm(data, { recursive: true, force: true });
   }
 }
 

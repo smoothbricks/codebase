@@ -109,7 +109,7 @@ const impreciseProductionInputs = new Set(['default', '{projectRoot}/**/*', '{pr
 
 /**
  * Every checkout keeps its Nx state in its own `.nx` (specs/cowshed/16_build_volumes.md, "Every checkout has exactly
- * one Nx state"). With no `NX_*_DIRECTORY` set, as in a host shell, the pinned Nx 23.2.1 otherwise moves the task cache
+ * one Nx state"). With no `NX_*_DIRECTORY` set, as in a host shell, the pinned Nx 24.0.3 otherwise moves the task cache
  * and its database to a per-user `~/.nx/<id>` keyed by the repository's remote (`utils/cache-directory.js`,
  * `computeSharedDataLocation`), shared by every checkout of the repository. A configured `cacheDirectory` keeps both
  * local: the cache here, the task database in Nx's default `.nx/workspace-data`. nx.json has no key for the latter.

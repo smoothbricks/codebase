@@ -5,22 +5,21 @@ import { join } from 'node:path';
 import { DAEMON_GLOB_PLUGIN, fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the watcher hunks of `patches/nx@23.2.1.patch` (`daemon/server/watcher.js`). A daemon's file watcher can stop
- * delivering without a word: Nx 23.2.1's native watcher drops FSEvents' rescan and dropped-event flags, and an
- * FSEventStream that fseventsd stopped serving (a restarted fseventsd, a stream that never started) reports nothing. The
+ * Guards the watch-probe hunk of `patches/nx@24.0.3.patch` (`daemon/server/file-watching/watch-probe.js`). A daemon's
+ * file watch can stop delivering without a word: an FSEventStream that fseventsd stopped serving (a restarted
+ * fseventsd, a stream that never started) reports nothing, and Nx 24's watch settles by time, not by an event it waited
+ * for (Nx 23.2.1's native watcher also dropped FSEvents' rescan flags; Nx 24 turns them into a rescan marker). The
  * daemon then hashed every task from the file state it last saw: a shed's daemon received no event for 33 minutes, and
  * `nx run-many` called a changed input's target "[existing outputs match the cache, left as is]", so its tests ran the
  * old build.
  *
- * One stream now carries every change the daemon acts on, and on macOS a command's first request that answers from
- * file state first writes a probe and waits for it to come back through that stream, which delivers in order. A probe
- * that does not come
- * back means the stream stopped: the daemon tells the client "watcher stream stopped", which goes on without a daemon,
- * says so in its log and stops, and the next client starts a daemon with a fresh stream. The probe is made once per
- * connection, by its first request answered from file state: a command sees every write made before it started. A
- * plugin worker is no command and makes none. Linux inotify has no such failure mode (no fseventsd between the kernel
- * and the
- * watcher), so there the daemon only drains its stream before answering; the overflow (Rescan) path stays unproven.
+ * One stream carries every change the daemon acts on, and on macOS a command's first request that answers from file
+ * state first writes a probe and waits for it to come back through that stream, which delivers in order. A probe that
+ * does not come back means the stream stopped: the daemon tells the client "watcher stream stopped", which goes on
+ * without a daemon, says so in its log and stops, and the next client starts a daemon with a fresh stream. The probe is
+ * made once per connection, by its first request answered from file state: a command sees every write made before it
+ * started. A plugin worker is no command and makes none. Linux inotify has no such failure mode (no fseventsd between
+ * the kernel and the watcher), so there the daemon only settles its watch before answering.
  *
  * A host test: the dead stream is a daemon started under a Seatbelt profile that denies FSEvents, which `sandbox_apply`
  * refuses inside another sandbox, such as a cowshed job's.
@@ -34,8 +33,8 @@ const DOT_HIDDEN_CASE = 'proves its watcher current where .nxignore hides every 
 
 /**
  * The fixture's `node_modules` links the repository's. With `hidesDotPaths` the fixture ignores every dot path in its
- * `.nxignore`, as this repository does, which hides `.nx` and `.git` from the watcher, and holds a real
- * `node_modules` directory linking only `nx`, where the daemon then puts its probes.
+ * `.nxignore`, as this repository does, and holds a real `node_modules` directory linking only `nx`. The daemon's watch
+ * admits its probe by name (`alwaysWatch`), which wins over the ignore files, so the probe still comes back.
  */
 async function fixtureWorkspace(workspace: string, hidesDotPaths = false): Promise<void> {
   if (hidesDotPaths) {
@@ -80,8 +79,8 @@ async function copy(workspace: string, env: Record<string, string>): Promise<{ o
 
 describe('the daemon answers from the files as they are when a request arrives', () => {
   it('rebuilds a target whose input was replaced by rename, through the one stream, and proves its watcher current where .nxignore hides every dot path', async () => {
-    // One healthy daemon walks both cases over the dot-hidden layout. Its probe must come back from node_modules:
-    // a probe in .nx or .git would never come back there, and the healthy daemon would stop.
+    // One healthy daemon walks both cases over the dot-hidden layout. Its probe must come back though .nxignore hides
+    // every dot path, its workspace data directory included: the daemon's watch admits the probe by name.
     // A rename needs only the stream.
     await withNxFixture('nx-dot-hidden-', async ({ workspace, socketDirectory }) => {
       await fixtureWorkspace(workspace, true);
@@ -157,22 +156,33 @@ describe('the daemon answers from the files as they are when a request arrives',
     });
 
     it('serves nothing from a watcher it has nowhere to prove current', async () => {
-      await withNxFixture('nx-no-probe-', async ({ workspace, socketDirectory }) => {
-        // Every dot path ignored, and node_modules linked from outside: no directory takes a probe the watcher reports.
-        await fixtureWorkspace(workspace);
-        await writeFile(join(workspace, '.nxignore'), '.*\n!/.gitignore\n!/.nxignore\n');
-        const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_TUI: 'false' };
-        const started = nx(workspace, env, ['sandbox-exec', '-p', DEAD_STREAM], 'daemon', '--start');
-        expect(started.status, started.output).toBe(0);
-        const first = await copy(workspace, env);
-        expect(first.output).toContain('cannot be proven current');
-        expect(first.output).toContain('Continuing without the daemon.');
-        expect(first.out).toBe('one\n');
-        await writeFile(join(workspace, 'p', 'src.txt'), 'two\n');
-        const second = await copy(workspace, env);
-        expect(second.output).not.toContain('existing outputs match the cache');
-        expect(second.out).toBe('two\n');
-      });
+      await withNxFixture(
+        'nx-no-probe-',
+        async ({ root, workspace, socketDirectory }) => {
+          // Workspace data on another directory, as a cowshed shed's is, node_modules linked from outside and no .git:
+          // no directory inside the checkout takes a probe the watcher reports.
+          await fixtureWorkspace(workspace);
+          const data = join(root, 'elsewhere-data');
+          await mkdir(data);
+          const env = {
+            ...fixtureNxEnv(workspace, socketDirectory),
+            NX_WORKSPACE_DATA_DIRECTORY: data,
+            NX_DAEMON: 'true',
+            NX_TUI: 'false',
+          };
+          const started = nx(workspace, env, ['sandbox-exec', '-p', DEAD_STREAM], 'daemon', '--start');
+          expect(started.status, started.output).toBe(0);
+          const first = await copy(workspace, env);
+          expect(first.output).toContain('cannot be proven current');
+          expect(first.output).toContain('Continuing without the daemon.');
+          expect(first.out).toBe('one\n');
+          await writeFile(join(workspace, 'p', 'src.txt'), 'two\n');
+          const second = await copy(workspace, env);
+          expect(second.output).not.toContain('existing outputs match the cache');
+          expect(second.out).toBe('two\n');
+        },
+        'ws',
+      );
     });
   }
 });

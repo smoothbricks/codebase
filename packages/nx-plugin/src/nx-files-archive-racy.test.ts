@@ -5,23 +5,17 @@ import { fileURLToPath } from 'node:url';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the racy-archive hunk of `patches/nx@23.2.1.patch`. Every Nx 23.2.1
- * context (each daemonless run, and the daemon at its start) hashes the
- * workspace's files through `<workspace-data>/nx_files.nxt`, which on Unix
- * keeps each file's hash beside its mtime in whole seconds, and reuses an
- * archived hash while that second is unchanged (`selective_files_hash`; size
- * and nanoseconds are not compared). A file written again in the second it
- * was hashed in keeps its mtime, so the next run hashes it as the bytes it
- * replaced: a revert replays the cache entry of the edit it reverts, and a
- * new edit hits the old entry. The patch applies Git's racy-index rule: an
- * archive holding an mtime from the seconds its own hashing pass ran in, or
- * later, is not trusted, and every file is hashed again.
+ * Guards Git's racy-index rule for Nx's file hashes, which Nx 24 applies natively (this repository carried a JS check
+ * of the archive as a patch hunk on Nx 23.2.1). Every Nx context (each daemonless run, and the daemon at its start)
+ * hashes the workspace's files through its archive in the workspace data directory, which on Unix keeps each file's
+ * hash beside its mtime in whole seconds and reuses an archived hash while that second is unchanged; size and
+ * nanoseconds are not compared. A file written again in the second it was hashed in keeps its mtime, so a reused hash
+ * would hash it as the bytes it replaced: a revert would replay the cache entry of the edit it reverts, and a new edit
+ * would hit the old entry. Nx 24's archive (`nx_files_v2.nxt`) records when the gather that wrote it began
+ * (`gathered_at`) and reuses no entry whose mtime is that second or later.
  *
- * The case writes each input with a fixed mtime second and gives the archive
- * the same second, as if the input had been written and hashed in the second
- * the archive was written: the race, without depending on the clock. Last,
- * an input dated a minute ahead of the archive, as under a clock that runs
- * ahead, is rewritten under that date.
+ * The case dates each input a minute ahead, so every gather below begins before the input's mtime second: the race,
+ * without depending on the clock. Each rewrite within that second must hash the bytes written, never an entry.
  */
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -60,7 +54,6 @@ it('hashes an input rewritten in the second its archived hash was taken', async 
     }
     const env = fixtureNxEnv(workspace, socketDirectory);
     const source = join(workspace, 'app', 'source.txt');
-    const archive = join(env.NX_WORKSPACE_DATA_DIRECTORY, 'nx_files.nxt');
     // Writes the input dated `second`, builds, and reports the log and the output.
     const build = async (text: string, second: number) => {
       await writeFile(source, text);
@@ -71,27 +64,18 @@ it('hashes an input rewritten in the second its archived hash was taken', async 
       return { log, result: await readFile(join(workspace, 'app', 'result.txt'), 'utf8') };
     };
 
-    const first = Math.floor(Date.now() / 1000) - 60;
-    expect((await build('A', first)).result).toBe('A');
-    const second = first + 1;
-    expect((await build('B', second)).result).toBe('B');
+    // Every build below gathers before this second, so each input dated in it was read while it could still change.
+    const racy = Math.floor(Date.now() / 1000) + 60;
+    expect((await build('A', racy)).result).toBe('A');
+    expect((await build('B', racy)).result).toBe('B');
 
-    // The archive written in B's second, then a revert to A within that second: A's entry, never B's.
-    await utimes(archive, second, second);
-    const reverted = await build('A', second);
+    // A revert within that second: A's entry, never B's.
+    const reverted = await build('A', racy);
     expect(reverted.result).toBe('A');
 
-    // Again, and a new edit within that second: no entry at all.
-    await utimes(archive, second, second);
-    const edited = await build('C', second);
+    // A new edit within that second: no entry at all.
+    const edited = await build('C', racy);
     expect(edited.log).not.toContain('[local cache]');
     expect(edited.result).toBe('C');
-
-    // An input dated ahead of the archive's write, rewritten under that date: no entry either.
-    const ahead = Math.floor(Date.now() / 1000) + 60;
-    expect((await build('D', ahead)).result).toBe('D');
-    const skewed = await build('E', ahead);
-    expect(skewed.log).not.toContain('[local cache]');
-    expect(skewed.result).toBe('E');
   });
 });

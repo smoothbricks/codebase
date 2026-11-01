@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the outputs-stamp hunk of `patches/nx@23.2.1.patch`. Nx 23.2.1 keeps
+ * Guards the outputs-stamp hunk of `patches/nx@24.0.3.patch`. Nx 24.0.3 keeps
  * a cache hit's outputs in place only when its daemon recorded them
  * (`outputsHashesMatchBatch`); a client with no daemon "can't verify on-disk
  * outputs, always copy". A cowshed job's client starts none

@@ -573,7 +573,7 @@ or the checksum database and verifies the database's signed tree.
 
 **This cache is an optimization for cross-shed reuse and never blocks a build.** Every refusal or failure on this route
 reaches the client as a miss (`GET` 404) or not-stored (`PUT` 403). The task then runs, or keeps the result it already
-produced, exactly as it would with no cache. Stock Nx 23.2.1 fails a task on any other status (Busy gateway, below), so
+produced, exactly as it would with no cache. Stock Nx 24.0.3 fails a task on any other status (Busy gateway, below), so
 the gateway never answers or forwards one: drain, a closed audit sink, a stopped actor, a queue bound, a body timeout
 and a backend response head that Nx cannot read are all the method's 404/403. The audit and the log record the cause.
 
@@ -655,7 +655,7 @@ successful read: its 404 is not evidence that a hash is absent and never counts 
 
 **Busy gateway.** Nx requests wait under the gateway's queued-request bounds whether their backend is starting or
 `Ready`. A full queue is an audited `limited` `nx-queue-limited` 404/403 and an expired queue wait an audited
-`timed-out` `queue-timeout` 404/403, never a 429 or 504. Stock Nx 23.2.1 retries no `GET`, ignores `Retry-After`, and
+`timed-out` `queue-timeout` 404/403, never a 429 or 504. Stock Nx 24.0.3 retries no `GET`, ignores `Retry-After`, and
 reads every status but `GET` 200/404 and `PUT` 200/403/409 as a fatal misconfiguration (`native/cache/errors.rs`
 `convert_response_to_error`). The carried patch reads only a 5xx among them as the client's own outage ("The client
 half", above); every other status stays fatal. So a busy gateway answers what a cache may always answer, not served now,
@@ -692,7 +692,7 @@ commits a success head, the gateway keeps `200` and cannot change it. A body tha
 ends early, and its audit event is `failed` with classification `nx-transfer-failed`, never a hit or a completed read. A
 client must treat a short body as a failed read; the gateway stages and buffers nothing to hide the cut.
 
-**A shed never uploads.** Stock Nx 23.2.1's `native/cache/http_remote_cache.rs` has no read-only option: its `store`
+**A shed never uploads.** Stock Nx 24.0.3's `native/cache/http_remote_cache.rs` has no read-only option: its `store`
 first builds an in-memory gzip tar archive, then attempts `PUT`, and `skipRemoteCache` disables reads too. The carried
 patch's read-only client (Sheds read; a land writes, above) answers every store before that archive exists, so a shed's
 run costs its project cache lookups only. Measure lookups and a land's publication separately (13_telemetry.md).

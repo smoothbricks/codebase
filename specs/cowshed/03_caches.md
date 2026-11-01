@@ -540,7 +540,7 @@ together (16_build_volumes.md, "Clearing a checkout's Nx state"). Jobs reach bot
 build-volume grant (04_sandbox.md), read-only jobs included: a read-only job's source tree is read-only, its build
 volume is not.
 
-**A shared local content directory is refused**, for two facts read in the pinned Nx 23.2.1's native cache
+**A shared local content directory is refused**, for two facts read in the pinned Nx 24.0.3's native cache
 (`packages/nx/src/native/cache/cache.rs`). First, it buys nothing: a local lookup is a query against the checkout's own
 database — an update-and-return on its `cache_outputs` row for the hash — so an entry another checkout wrote into a
 shared directory, with no row in this database, is a miss; sharing the directory produces no cross-checkout hits at all.
@@ -800,7 +800,7 @@ the mbx capability's canonical environment for builds no file can configure, `NO
 module compilation, and the per-job private environment and trust anchors only the supervisor can set.
 
 **A shared local Nx content directory rejected.** It reads as free shed-to-shed sharing and is neither shareable nor
-free under the pinned Nx 23.2.1: a local hit is gated on the checkout's own task-database row, so shared bytes yield no
+free under the pinned Nx 24.0.3: a local hit is gated on the checkout's own task-database row, so shared bytes yield no
 hits, and a store removes then rewrites the entry, so siblings destroy each other's payloads (Nx cache, above). Sharing
 travels the route that carries a record with its payload — the accepted-task artifact service.
 

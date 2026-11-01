@@ -5,7 +5,7 @@ import { delimiter, join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the `latest-nx.js` and `bin/nx.js` hunks of `patches/nx@23.2.1.patch`. Stock Nx 23.2.1 answers the Nx
+ * Guards the `latest-nx.js` and `bin/nx.js` hunks of `patches/nx@24.0.3.patch`. Stock Nx 24.0.3 answers the Nx
  * Console and AI-agent status every `nx run` asks its daemon for by installing `nx@latest` from the registry into a
  * temporary directory (`npm install`), unless the environment the client sent the daemon says `NX_USE_LOCAL=true`.
  * Agents, cowshed jobs and test fixtures run Nx without that variable, and the daemon took it from whichever client

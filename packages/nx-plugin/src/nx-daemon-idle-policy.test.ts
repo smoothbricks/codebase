@@ -196,7 +196,7 @@ function commonJsSyntaxError(source: string, filename: string): string | undefin
 
 it('syntax-checks every JavaScript file patched in the actual installed Nx product', () => {
   const installedNxRoot = dirname(createRequire(import.meta.url).resolve('nx/package.json'));
-  const patch = readFileSync(new URL('../../../patches/nx@23.2.1.patch', import.meta.url), 'utf8');
+  const patch = readFileSync(new URL('../../../patches/nx@24.0.3.patch', import.meta.url), 'utf8');
   const patchedJavaScript = patch
     .split('\n')
     .filter((line) => line.startsWith('+++ b/') && line.endsWith('.js'))

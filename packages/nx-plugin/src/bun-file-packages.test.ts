@@ -5,7 +5,7 @@ import { getBunTextLockfileDependencies, getBunTextLockfileNodes } from 'nx/src/
 import type { CreateDependenciesContext } from 'nx/src/project-graph/plugins';
 
 // A local file package is not an Nx workspace merely because Bun copied it.
-// Keep the real parser and native hasher: these assertions fail on stock Nx 23.2.1.
+// Keep the real parser and native hasher: these assertions fail on stock Nx 24.0.3.
 test('Bun file packages retain their external node and consumer edge without externalizing actual workspaces', () => {
   const lock = JSON.stringify({
     lockfileVersion: 3,

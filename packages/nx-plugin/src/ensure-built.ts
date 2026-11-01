@@ -921,7 +921,7 @@ export function providerInputProof(
   taskGraph: TaskGraph,
   requireNx: WorkspaceNxRequire,
 ): ProviderInputProof {
-  const { WorkspaceContext, HashPlanInspector, HashPlanner, transferProjectGraph } = requireNx('nx/src/native');
+  const { WorkspaceContext, HashPlanInspector, HashPlanner } = requireNx('nx/src/native');
   const { transformProjectGraphForRust } = requireNx('nx/src/native/transform-objects');
   const { createProjectRootMappings } = requireNx('nx/src/project-graph/utils/find-project-for-path');
   const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
@@ -937,7 +937,7 @@ export function providerInputProof(
       runtimeSource: { kind: 'opaque', detail: 'Nx supplied no native file-input proof' },
     };
   }
-  const planner = new HashPlanner(nxJson, transferProjectGraph(transformProjectGraphForRust(projectGraph)));
+  const planner = new HashPlanner(nxJson, transformProjectGraphForRust(projectGraph));
   const inspector = new HashPlanInspector(
     externalReferences.allWorkspaceFiles,
     externalReferences.projectFiles,

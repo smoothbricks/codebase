@@ -16,8 +16,8 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { bindListener, claimRefusingPort } from './testing.js';
 
 /**
- * Guards the remote-cache outage hunk of `patches/nx@23.2.1.patch` (`patches/README.md`, "A remote cache outage is a
- * miss"). Stock Nx 23.2.1's native self-hosted cache client rejects when its server cannot be reached
+ * Guards the remote-cache outage hunk of `patches/nx@24.0.3.patch` (`patches/README.md`, "A remote cache outage is a
+ * miss"). Stock Nx 24.0.3's native self-hosted cache client rejects when its server cannot be reached
  * (`Failed to send request …`), and the rejection failed the whole run; a server that accepts and never answers held
  * the run forever, since the client sets no timeout. The patched client reads either as an outage: the lookup misses,
  * the task runs, nothing more is asked of the server, and one line names the server and the cause. A 5xx answer is an

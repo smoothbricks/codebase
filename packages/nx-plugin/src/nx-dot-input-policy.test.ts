@@ -16,7 +16,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import { Watcher, WorkspaceContext } from 'nx/src/native/index.js';
+import { type ChangeBatch, WorkspaceContext } from 'nx/src/native/index.js';
 import { globWithWorkspaceContextSync, resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
@@ -103,31 +103,45 @@ function indexed(root: string, candidates: string[]): string[] {
   return candidates.filter((path) => matched.has(path)).sort();
 }
 
+/** Every path a change batch names: created, updated and deleted. */
+function batchPaths(batch: ChangeBatch): string[] {
+  return [
+    ...batch.createdFiles.map(({ file }) => file),
+    ...batch.updatedFiles.map(({ file }) => file),
+    ...batch.deletedFiles,
+  ];
+}
+
 /**
- * Paths the native watcher reports once `TRACKED_DOT_WRITE` changes, after the runtime
- * state is written. The watcher is the one the daemon subscribes to, with no filter of
- * its own: it reports whatever its `.nxignore` lets through.
+ * Paths Nx's workspace context reports changed once `TRACKED_DOT_WRITE` changes, after the runtime state is written.
+ * These are the batches Nx 24's daemon recomputes the project graph from (`onChanges`), with no filter of its own: the
+ * context's watch reports whatever its `.nxignore` lets through.
  */
 async function reportedAfterWrites(root: string): Promise<string[]> {
+  const data = await mkdtemp(join(tmpdir(), 'nx-dot-input-data-'));
   const reported = new Set<string>();
   const failures: string[] = [];
-  let watcher: Watcher | undefined;
+  let context: WorkspaceContext | undefined;
   let pending: { path: string; resolve(): void; reject(error: Error): void } | undefined;
+  const report = (paths: readonly string[]) => {
+    for (const path of paths) {
+      reported.add(path);
+      if (path === pending?.path) {
+        pending.resolve();
+        pending = undefined;
+      }
+    }
+  };
   try {
-    watcher = new Watcher(root);
-    // Native watch() registers the filesystem subscription synchronously.
-    watcher.watch((error, events) => {
+    // The context starts its watch before its walk, so every write below reaches a batch.
+    context = new WorkspaceContext(root, data, { watch: true });
+    await context.ready();
+    context.onChanges((error, batch) => {
       if (error !== null) {
-        failures.push(error);
-        pending?.reject(new Error(error));
+        failures.push(error.message);
+        pending?.reject(error);
       }
-      for (const event of events) {
-        reported.add(event.path);
-        if (event.path === pending?.path) {
-          pending.resolve();
-          pending = undefined;
-        }
-      }
+      if (batch !== null) report(batchPaths(batch));
     });
     const observed = new Promise<void>((resolve, reject) => {
       pending = { path: TRACKED_DOT_WRITE, resolve, reject };
@@ -136,14 +150,15 @@ async function reportedAfterWrites(root: string): Promise<string[]> {
       for (const path of RUNTIME_DOT_STATE) await appendFile(join(root, path), 'round 1\n');
       await appendFile(join(root, TRACKED_DOT_WRITE), 'round 1\n');
     })();
-    await guardEvent(Promise.all([observed, writes]), `native watcher callback for ${TRACKED_DOT_WRITE}`, () =>
+    await guardEvent(Promise.all([observed, writes]), `workspace context change for ${TRACKED_DOT_WRITE}`, () =>
       JSON.stringify({ pending: pending?.path, reported: [...reported], failures }),
     );
-    for (const event of watcher.forceFlushPending()) reported.add(event.path);
+    report(batchPaths(context.settle()));
     expect(failures).toEqual([]);
     return [...reported].sort();
   } finally {
-    await watcher?.stop();
+    context?.stopWatching();
+    await rm(data, { recursive: true, force: true });
   }
 }
 

@@ -466,7 +466,7 @@ task-result restoration or cutover evidence.
 Governing sections: `specs/cowshed/05_gateway.md`, “`/nx/v1/cache/{hash}` — accepted-project Nx artifacts”;
 `specs/cowshed/13_telemetry.md`, “Accepted-project Nx cache measurements”.
 
-Nx 23.2.1's native HTTP cache has a zero-argument constructor configured by `NX_SELF_HOSTED_REMOTE_CACHE_SERVER`.
+Nx 24.0.3's native HTTP cache has a zero-argument constructor configured by `NX_SELF_HOSTED_REMOTE_CACHE_SERVER`.
 `DbCache` checks its local cache first. On a local miss, it can retrieve an accepted artifact through HTTP. After an
 executed task, it stores the result locally and then calls the remote store operation.
 
@@ -485,9 +485,9 @@ evidence alone does not prove the artifact service, gateway or installed cutover
 Primary sources:
 
 - [Nx self-hosted cache protocol and configuration](https://nx.dev/docs/kb/self-hosted-caching.md)
-- [Pinned native HTTP cache constructor/retrieve/store implementation](https://raw.githubusercontent.com/nrwl/nx/23.2.1/packages/nx/src/native/cache/http_remote_cache.rs)
-- [Pinned DbCache local-first flow and fixed provider discovery](https://raw.githubusercontent.com/nrwl/nx/23.2.1/packages/nx/src/tasks-runner/cache.ts)
-- [Pinned native allocator definition](https://raw.githubusercontent.com/nrwl/nx/23.2.1/packages/nx/src/lib.rs)
+- [Pinned native HTTP cache constructor/retrieve/store implementation](https://raw.githubusercontent.com/nrwl/nx/24.0.3/packages/nx/src/native/cache/http_remote_cache.rs)
+- [Pinned DbCache local-first flow and fixed provider discovery](https://raw.githubusercontent.com/nrwl/nx/24.0.3/packages/nx/src/tasks-runner/cache.ts)
+- [Pinned native allocator definition](https://raw.githubusercontent.com/nrwl/nx/24.0.3/packages/nx/src/lib.rs)
 - [Supported task lifecycle hooks](https://nx.dev/docs/kb/task-running-lifecycle.md)
 
 ## Storage: one authority tier, one audit trail, one Arrow substrate

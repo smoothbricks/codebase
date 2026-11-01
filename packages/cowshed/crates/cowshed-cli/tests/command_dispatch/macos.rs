@@ -1550,7 +1550,7 @@ async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
         serde_json::json!({
             "processId": daemon.id(),
             "socketPath": socket,
-            "nxVersion": "23.2.1",
+            "nxVersion": "24.0.3",
         })
         .to_string(),
     )
@@ -7855,7 +7855,7 @@ async fn directory_managed_install_restores_developer_links_before_nx_and_cleans
     fs::create_dir_all(registry.join("dist/bin")).unwrap();
     fs::write(
         registry.join("package.json"),
-        r#"{"name":"nx","version":"23.2.1","bin":{"nx":"dist/bin/nx.js"}}"#,
+        r#"{"name":"nx","version":"24.0.3","bin":{"nx":"dist/bin/nx.js"}}"#,
     )
     .unwrap();
     fs::write(
@@ -7937,7 +7937,7 @@ async fn directory_managed_install_restores_developer_links_before_nx_and_cleans
     )
     .unwrap();
     assert_eq!(native_identity["name"], "@nx/nx-darwin-arm64");
-    assert_eq!(native_identity["version"], "23.2.1");
+    assert_eq!(native_identity["version"], "24.0.3");
     let closure_probe = format!(
         "node -e 'const assert=require(\"node:assert/strict\"); const root=require(\"node:path\").resolve({},\"../../../../\"); assert.equal(root,{}); assert.equal(require(\"node:module\").createRequire(root+\"/package.json\").resolve(\"nx/bin/nx.js\"),{}); require(\"fs\").readFileSync({}); require(\"fs\").readFileSync({}); require({})'",
         serde_json::to_string(&nx.join("dist/bin").to_string_lossy()).unwrap(),

@@ -1,7 +1,7 @@
 //! An Nx daemon's exit and the children it forked, watched from before the daemon is stopped, so
 //! its stop ends its plugin workers with it (04_sandbox.md: "its plugin workers go with it").
 //!
-//! Nx spawns each isolated plugin worker detached (pinned Nx 23.2.1,
+//! Nx spawns each isolated plugin worker detached (pinned Nx 24.0.3,
 //! `project-graph/plugins/isolation/isolated-plugin.js`), so a worker leads its own session and
 //! group: neither the job's ledgered group nor the daemon's session names it. When the daemon
 //! exits, launchd adopts its children, and from then on each one's kernel record names launchd as

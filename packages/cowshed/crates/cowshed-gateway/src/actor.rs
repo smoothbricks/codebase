@@ -934,7 +934,7 @@ impl NxRefusal {
         }
     }
 
-    /// A full queue, whether the project's backend is starting or Ready. Stock Nx 23.2.1 retries
+    /// A full queue, whether the project's backend is starting or Ready. Stock Nx 24.0.3 retries
     /// no `GET` and reads any status but 200/404 as a fatal misconfiguration, so a busy gateway
     /// answers the method's miss or refusal (05_gateway.md "Busy gateway"), never 429.
     fn queue_limited() -> Self {
@@ -4393,7 +4393,7 @@ mod tests {
         fixture.finish().await;
     }
 
-    /// Stock Nx 23.2.1 reads every GET status but 200/404 as a fatal misconfiguration and retries
+    /// Stock Nx 24.0.3 reads every GET status but 200/404 as a fatal misconfiguration and retries
     /// no GET, so a full queue answers its method's miss/refusal whether the backend is starting
     /// or Ready: a 429 here ends the caller's whole run.
     #[cfg(target_os = "macos")]

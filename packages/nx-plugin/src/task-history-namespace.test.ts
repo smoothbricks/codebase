@@ -7,8 +7,8 @@ import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, stopFixtureNxDaemon, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards `patches/nx@23.2.1.patch`, the local build of nrwl/nx#37268 (issue
- * nrwl/nx#37118): Nx 23.2.1 forwards task history to its daemon, whose database
+ * Guards `patches/nx@24.0.3.patch`, the local build of nrwl/nx#37268 (issue
+ * nrwl/nx#37118): stock Nx 24.0.3 forwards task history to its daemon, whose database
  * scope can differ from the client's, and a run then exits 1 with SQLite
  * FOREIGN KEY 787 after its tasks succeed. Drop the patch, and keep this test,
  * once the Nx version in use contains that fix.
@@ -151,7 +151,7 @@ it('records task history in the client database when the running daemon resolved
       });
 
       // Same daemon, but this client's TaskDetails select the checkout DB. Unpatched
-      // Nx 23.2.1 forwards RECORD_TASK_RUNS to the daemon, whose DB scope was frozen
+      // Stock Nx 24.0.3 forwards RECORD_TASK_RUNS to the daemon, whose DB scope was frozen
       // shared at startup and lacks the new hash: after the successful task footer
       // it prints "DB transaction error ... extended_code: 787" and exits 1.
       await runNx(root, localEnv, 'second');

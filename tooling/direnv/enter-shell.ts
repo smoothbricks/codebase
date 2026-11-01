@@ -13,7 +13,7 @@ const projectRoot = path.resolve(devenvRoot, '../..');
 process.chdir(projectRoot);
 
 /**
- * What a plugin rebuild that changed its output invalidates in `.nx/workspace-data`, by pinned Nx 23.2.1's own names:
+ * What a plugin rebuild that changed its output invalidates in `.nx/workspace-data`, by pinned Nx 24.0.3's own names:
  * the daemon's directory (`daemon/tmp-dir.js`), whose record names the daemon that loaded the old plugin, which exits
  * once the record is gone; and the project graph that plugin computed (`project-graph/nx-deps-cache.js`).
  */

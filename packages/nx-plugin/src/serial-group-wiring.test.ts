@@ -138,10 +138,8 @@ describe('the real-APFS serial groups of this repository', () => {
         expect(target?.options?.command, name).toBeUndefined();
       }
     }
-    const edges = (id: string): string[] => [
-      ...(tasks.dependencies[id] ?? []),
-      ...(tasks.continuousDependencies?.[id] ?? []),
-    ];
+    const edges = (id: string): string[] =>
+      [...(tasks.dependencies[id] ?? []), ...(tasks.continuousDependencies?.[id] ?? [])].map((edge) => edge.id);
     const proofsReached: Record<string, string[]> = {};
     for (const id of Object.keys(tasks.tasks)) {
       const seen = new Set<string>();
@@ -309,7 +307,10 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
         ['cowshed', 'integration-apfs'],
       ] as const) {
         const lane = `${project}:${target}`;
-        expect(tasks.dependencies[lane], `${platform} ${lane}`).toContain(`${ROOT_PROJECT}:cargo-test-build`);
+        expect(
+          tasks.dependencies[lane]?.map((edge) => edge.id),
+          `${platform} ${lane}`,
+        ).toContain(`${ROOT_PROJECT}:cargo-test-build`);
         // A serial group is inferred only where its declared cfg holds, macOS: there it runs bounded by progress, and
         // elsewhere its root entry only orders its dependencies and runs no command, so it sweeps nothing.
         const runner = inferred.nodes[project]?.data.targets?.[target];
@@ -321,7 +322,10 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
         }
         expect(runner?.options?.command, `${platform} ${lane}`).toBeString();
         if (!group) continue;
-        const reached = (tasks.dependencies[lane] ?? []).flatMap((id) => [id, ...(tasks.dependencies[id] ?? [])]);
+        const reached = (tasks.dependencies[lane] ?? []).flatMap(({ id }) => [
+          id,
+          ...(tasks.dependencies[id] ?? []).map((edge) => edge.id),
+        ]);
         expect(reached, `${platform} ${lane}`).toContain(`nextest-extract:${producer}`);
       }
     }
@@ -357,7 +361,10 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
     const tasks = createTaskGraph(graph, {}, projects, targets, undefined, {});
     for (const { project, target } of consumers) {
       const id = `${project}:${target}`;
-      expect(tasks.dependencies[id], id).toContain(APFS_TEST_ROOT_TASK);
+      expect(
+        tasks.dependencies[id]?.map((edge) => edge.id),
+        id,
+      ).toContain(APFS_TEST_ROOT_TASK);
     }
   });
 });

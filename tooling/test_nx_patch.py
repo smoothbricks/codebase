@@ -14,7 +14,7 @@ from nx_patch import generate
 
 class NxPatchRegeneration(unittest.TestCase):
     def fixture(self, root: Path) -> tuple[Path, bytes]:
-        package = {"name": "nx", "version": "23.2.1"}
+        package = {"name": "nx", "version": "24.0.3"}
         files = {"package.json": json.dumps(package), "deleted.js": "old\n", "changed.js": "before\n"}
         stream = io.BytesIO()
         with tarfile.open(fileobj=stream, mode="w:gz") as tar:
@@ -27,10 +27,10 @@ class NxPatchRegeneration(unittest.TestCase):
         archive = stream.getvalue()
         integrity = "sha512-" + base64.b64encode(hashlib.sha512(archive).digest()).decode()
         (root / "package.json").write_text(json.dumps({
-            "overrides": {"nx": "23.2.1"},
-            "patchedDependencies": {"nx@23.2.1": "patches/nx@23.2.1.patch"},
+            "overrides": {"nx": "24.0.3"},
+            "patchedDependencies": {"nx@24.0.3": "patches/nx@24.0.3.patch"},
         }))
-        (root / "bun.lock").write_text('"nx": ' + json.dumps(["nx@23.2.1", "", {}, integrity]) + ',\n')
+        (root / "bun.lock").write_text('"nx": ' + json.dumps(["nx@24.0.3", "", {}, integrity]) + ',\n')
         prepared = root / "prepared"
         prepared.mkdir()
         for name, text in files.items():
@@ -79,7 +79,7 @@ class NxPatchRegeneration(unittest.TestCase):
             root = Path(temporary)
             prepared, archive = self.fixture(root)
             (prepared / "package.json").write_text(json.dumps({"name": "nx", "version": "other"}))
-            with self.assertRaisesRegex(ValueError, "not lock-selected nx@23.2.1"):
+            with self.assertRaisesRegex(ValueError, "not lock-selected nx@24.0.3"):
                 generate(root, prepared, archive)
 
 

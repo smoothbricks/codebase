@@ -1,9 +1,10 @@
 # Patches
 
 Patches this repository applies to its dependencies. `bun install` applies the root `package.json`'s
-`patchedDependencies`, including `nx@23.2.1.patch`. The root `overrides.nx` pins the registry version `23.2.1`;
+`patchedDependencies`, including `nx@24.0.3.patch`. The root `overrides.nx` pins the registry version `24.0.3`;
 `bun.lock` is written by Bun and records that version, registry integrity and patch path. The root `overrides["@nx/js"]`
-likewise pins `23.2.1`, the version its patch applies to.
+likewise pins `24.0.3`, the version its patch applies to: `@nx/js` 24.0.3 still imports `nx` without declaring it
+([nrwl/nx#34087](https://github.com/nrwl/nx/issues/34087)), and `@nx%2Fjs@24.0.3.patch` declares the peer.
 
 ## Flechette factory declarations
 
@@ -50,10 +51,10 @@ Retire each when typia or scriptc removes its cause; bump both with typia.
 
 ## Activating a patch change
 
-Prepare Nx changes with `bun patch nx@23.2.1`, then use the registry-index regeneration flow:
+Prepare Nx changes with `bun patch nx@24.0.3`, then use the registry-index regeneration flow:
 
 ```sh
-bun patch nx@23.2.1
+bun patch nx@24.0.3
 python3 tooling/nx_patch.py --check
 # Edit the Bun-prepared node_modules/nx package only after the no-op check passes.
 python3 tooling/nx_patch.py
@@ -86,10 +87,17 @@ installed-product regression runs `node --check` on every patched JavaScript fil
 inactivity policy.
 
 The nx-plugin managed files distribute the same Nx patch to consumers. The root monorepo policy maintains
-`overrides.nx = "23.2.1"` and `patchedDependencies["nx@23.2.1"] = "patches/nx@23.2.1.patch"`. Run `smoo monorepo update`
+`overrides.nx = "24.0.3"` and `patchedDependencies["nx@24.0.3"] = "patches/nx@24.0.3.patch"`. Run `smoo monorepo update`
 and ordinary `bun install` in a consumer to adopt it. Tests import the actual installed Nx package, so a source gate
 covers the currently maintained patch without publishing anything. Drop a carried hunk only when the installed upstream
 version contains its repair, retaining its regression test.
+
+Moving to another Nx version carries every hunk the new version still needs and drops the rest, each by its section
+below. Point the `nx` and `@nx/*` pins and `overrides` at the new version and leave its `nx@<version>` entry out of
+`patchedDependencies`, so `bun install` locks the unpatched registry package. Then `bun patch nx@<version>`, carry the
+hunks onto the prepared package, add the entry back naming `patches/nx@<version>.patch`, run
+`python3 tooling/nx_patch.py`, retire the prepared copy and `bun install` as above, and delete the previous version's
+patch and its managed copy. The no-op `--check` then reproduces the new patch byte-identically.
 
 ### Known Bun 1.4.2 deletion-patch bug
 
@@ -149,13 +157,14 @@ selected-ID argument; the same oracle must then reject the old all-plan behavior
 
 ## A hash failure names its tasks and runtime inputs
 
-Nx 23.2.1's native hasher reads a runtime input's stdout and stderr with `std::str::from_utf8(…)?` (`hash_runtime.rs`),
-and the task hasher passes that error up with no context, so the client printed the bare decoder message:
-`invalid utf-8 sequence of 1 bytes from index 0`. Every failed input `runtime-input.sh` wraps ends its stdout with that
-byte (`packages/nx-plugin/README.md`, "Runtime inputs"), so that one line was all Nx said about any failed input of any
-task in the batch.
+Nx's native hasher (23.2.1, and 24.0.3 unchanged) reads a runtime input's stdout and stderr with
+`std::str::from_utf8(…)?` (`hash_runtime.rs`), and the task hasher passes that error up with no context, so the client
+printed the bare decoder message: `invalid utf-8 sequence of 1 bytes from index 0`. Every failed input
+`runtime-input.sh` wraps ends its stdout with that byte (`packages/nx-plugin/README.md`, "Runtime inputs"), so that one
+line was all Nx said about any failed input of any task in the batch.
 
-`NativeTaskHasherImpl.hashTasks` (`hasher/native-task-hasher-impl.js`) now rethrows a native failure as
+`NativeTaskHasherImpl` (`hasher/native-task-hasher-impl.js`) now rethrows a failure of each native hash call (Nx 24's
+`hashPlansUpfront` of the up-front pass, `hashPlansFor` over its reused plans, and `hashPlans`) as
 `Could not hash <task ids>: <native message>`, then each `runtime:` instruction of those tasks' plans with the tasks
 that hash it, read from the same planner (`HashPlanner.getPlans`). A list names ten task ids and counts the rest
 (`…, and 2 more`), as cowshed's refusals do. Nothing runs again, and the native error is the `cause`. A planner that
@@ -165,11 +174,11 @@ runs, in the daemon or in the client, so both report the same lines. It names th
 the native error does not say which, and finding out would run the inputs again. The wrapper's retained report names the
 failed command and its cause.
 
-`packages/nx-plugin/src/runtime-input.test.ts` drives the installed `hashTasks` over stand-ins for the native planner
-and hasher, faked at their published methods: a listed planner, twelve tasks, a planner whose `getPlans` throws, and a
-native value that is not an `Error`. It also plants a failing input through real Nx, with and without the daemon,
-requiring the error to name the task and its runtime input. Drop the hunk, and keep the tests, once the installed Nx's
-hasher names the input it failed on.
+`packages/nx-plugin/src/runtime-input.test.ts` drives the installed `hashTasks`, on an instance of the installed class,
+over stand-ins for the native planner and hasher, faked at their published methods: a listed planner, twelve tasks, a
+planner whose `getPlans` throws, and a native value that is not an `Error`. It also plants a failing input through real
+Nx, with and without the daemon, requiring the error to name the task and its runtime input. Drop the hunk, and keep the
+tests, once the installed Nx's hasher names the input it failed on.
 
 ## Cross-client task output ownership
 
@@ -223,6 +232,14 @@ A helper keeps one `FileLock` per lock file for its lifetime and locks and unloc
 `FileLock` has no close, so opening one per acquire kept every descriptor until garbage collection: one helper held 27
 descriptors for 14 lock files, growing with every task until `EMFILE`.
 
+Nx 24 adds readiness and waves around these lifetimes; the lease keeps to the same boundary. A discrete task first waits
+for the continuous tasks it depends on to be ready (`readyWhen`) and takes its lease only then: a waiter holding a slot
+of the bounded helper pool could keep the producer it waits for from taking its own. Nx 24 claims a continuous task's
+running-task row before its readiness wait, so the startup lease covers that check and claim, and the owner takes its
+output lease before it spawns the producer. A batch holds its targets' leases across all of Nx 24's batch waves. A
+nested client refuses, before it blocks, a target whose lock an ancestor client holds, since that ancestor waits on it:
+the ancestors are Nx 24's `NX_INVOCATION_ANCESTOR_PIDS`, and a held lock file names the client that took it.
+
 `packages/nx-plugin/src/nx-task-output-lease.test.ts` exercises two actual Nx clients against one output tree, pauses
 the real cache capture while another producer attempts to publish, checks both complete byte-exact artifacts, then
 restores one through a dependent runtime-input hash. Binary file content is hashed as bytes by its producer; the
@@ -235,11 +252,11 @@ same complete lifetime and atomic startup, retaining the regressions.
 
 ## A remote cache outage is a miss
 
-Nx 23.2.1's native self-hosted cache client (`HttpRemoteCache`) sets no timeout and rejects every transport failure with
-`Failed to send request: …`; the task runner awaits it unguarded, so an unreachable cache failed the whole run and a
-server that accepts and never answers held it forever. Measured 2026-10-22: every Nx run in the affected sheds exited 1
-with `Failed to send request … http://127.0.0.1:<port>/nx/v1/cache/<hash>` while a host-wide APFS stall held the
-gateway's cache server. Cache downtime must never stop work (the owner's ruling, 2026-10-17;
+Nx's native self-hosted cache client (`HttpRemoteCache`, 23.2.1 and 24.0.3 alike) sets no timeout and rejects every
+transport failure with `Failed to send request: …`; the task runner awaits it unguarded, so an unreachable cache failed
+the whole run and a server that accepts and never answers held it forever. Measured 2026-10-22: every Nx run in the
+affected sheds exited 1 with `Failed to send request … http://127.0.0.1:<port>/nx/v1/cache/<hash>` while a host-wide
+APFS stall held the gateway's cache server. Cache downtime must never stop work (the owner's ruling, 2026-10-17;
 `specs/cowshed/05_gateway.md` "`/nx/v1/cache/{hash}`", `specs/cowshed/03_caches.md` "Nx accepted-task artifact
 service").
 
@@ -273,14 +290,14 @@ unreachable cache as a miss ([nrwl/nx#36651](https://github.com/nrwl/nx/pull/366
 
 ## A shed reads the remote cache and never stores
 
-Stock Nx 23.2.1 has no read-only self-hosted cache: its `store` builds the gzip archive before the PUT. Every cowshed
-workspace's environment sets `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true` beside `NX_SELF_HOSTED_REMOTE_CACHE_SERVER`
-(`specs/cowshed/05_gateway.md` "`/nx/v1/cache/{hash}`"; the owner's rulings, 2026-10-10 and 2026-10-25). `getHttpCache`
-then wraps the guard in `ReadOnlyRemoteCache` (`tasks-runner/remote-cache-outage.js`), whose `store` answers false
-before building anything. Only a land publishes, with the native client directly. The test "a run that reads the remote
-cache and never stores" in `packages/nx-plugin/src/nx-remote-cache-outage.test.ts` runs a cacheable task against a
-server that answers 404 and requires only GETs, no PUT. Drop the hunk once upstream Nx has a read-only self-hosted
-option.
+Stock Nx (23.2.1 through 24.0.3) has no read-only self-hosted cache: its `store` builds the gzip archive before the PUT.
+Every cowshed workspace's environment sets `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true` beside
+`NX_SELF_HOSTED_REMOTE_CACHE_SERVER` (`specs/cowshed/05_gateway.md` "`/nx/v1/cache/{hash}`"; the owner's rulings,
+2026-10-10 and 2026-10-25). `getHttpCache` then wraps the guard in `ReadOnlyRemoteCache`
+(`tasks-runner/remote-cache-outage.js`), whose `store` answers false before building anything. Only a land publishes,
+with the native client directly. The test "a run that reads the remote cache and never stores" in
+`packages/nx-plugin/src/nx-remote-cache-outage.test.ts` runs a cacheable task against a server that answers 404 and
+requires only GETs, no PUT. Drop the hunk once upstream Nx has a read-only self-hosted option.
 
 ## Non-workspace file packages
 
@@ -333,12 +350,12 @@ when the installed upstream version preserves these diagnostics, retaining the r
 
 ## Project-graph error causes
 
-The project-graph error hunks carry [nrwl/nx PR #37103](https://github.com/nrwl/nx/pull/37103) (`a935bb7d0af8`, not in
-23.2.1) to the pinned distribution. Stock 23.2.1 `handleProjectGraphError` printed only
-`Failed to process project graph.` and `Pass --verbose to see the stacktraces.` for every command that exits on a graph
-error (`run-many`, `affected`, `exec`, `release` …): a consumer's CI failed that way for days, and only a
-`NX_VERBOSE_LOGGING=true` reproduction named the createNodes refusal. `formatProjectGraphError` now serves both that
-handler and `handleErrors`: without `--verbose` the body names every underlying error, then the hint.
+Nx 24.0.3 carries [nrwl/nx PR #37103](https://github.com/nrwl/nx/pull/37103) (`a935bb7d0af8`), which this repository
+carried as patch hunks on 23.2.1. Stock 23.2.1 `handleProjectGraphError` printed only `Failed to process project graph.`
+and `Pass --verbose to see the stacktraces.` for every command that exits on a graph error (`run-many`, `affected`,
+`exec`, `release` …): a consumer's CI failed that way for days, and only a `NX_VERBOSE_LOGGING=true` reproduction named
+the createNodes refusal. `formatProjectGraphError` now serves both that handler and `handleErrors`: without `--verbose`
+the body names every underlying error, then the hint.
 
 Beyond upstream, the body uses the plugin-load formatter, moved to `error-types.js` as `formatErrorMessages` and shared
 by `get-plugins.js`: each error's message, its complete `cause` chain and its nested `errors`, circular references
@@ -348,23 +365,26 @@ formats each entry the same way), so they are not repeated. Verbose stack lines 
 `packages/nx-plugin/src/nx-project-graph-errors.test.ts` drives the actual installed Nx: a local plugin whose
 createNodes throws an error with a cause, under `run-many` and `show projects`, in-process and isolated. The non-verbose
 output must name the message and its cause without stack frames; verbose keeps frames and the chain. Drop the carried
-hunks when the installed upstream version contains #37103, retaining the regression and the cause chain.
+hunks when the installed upstream version formats each error's cause chain the same way, retaining the regression and
+the cause chain.
 
 ## Event-driven daemon validity
 
 The daemon-validity hunks adapt [nrwl/nx PR #37113](https://github.com/nrwl/nx/pull/37113)
 (`5812d81d9b00818c00b4a2022f04c998bd1fa381`, addressing [#37112](https://github.com/nrwl/nx/issues/37112)) to the pinned
-Nx 23.2.1 distribution. Root lockfile changes restart the daemon only after the native workspace context has hashed the
-watcher batch and dropped same-byte rewrites. The startup lockfile baseline is captured before watch/scan. Nested
-lockfiles are not workspace lockfiles. The owner-record watcher retires a displaced daemon without waiting for a poll.
+Nx 24.0.3 distribution. Root lockfile changes restart the daemon only after the native workspace context has hashed the
+watcher batch and dropped same-byte rewrites (Nx 24's content-filtered batches, `routeAppliedChanges`). The startup
+lockfile baseline is captured before watch/scan. Nested lockfiles are not workspace lockfiles. The owner-record watcher
+retires a displaced daemon without waiting for a poll.
 
-Nx 23.2.1 has neither the upstream `ChangeBatch` API nor its `rescan` event. This adaptation checks validity once per
-request, including requests on an existing connection, and retains a 5000ms unref'd safety interval for missed events
-and socket loss. There is no 20ms validity loop. Each check preserves fresh installed-version resolution and the
-daemon's captured socket inode/path: a package-link swap, replaced ownership record or replaced socket cannot leave the
-old daemon serving requests or deleting its successor's socket. Root lockfile names as well as bytes enter the fallback
-hash, so a missed rename between lockfile formats is visible. A termination latch prevents duplicate replacement spawns
-and serving queued requests during asynchronous restart.
+Nx 24.0.3 delivers the upstream `ChangeBatch` and its `rescan` event, but still checks the daemon record, the Nx version
+and the root lockfiles every 20 ms. This adaptation replaces that loop: it checks validity once per request, including
+requests on an existing connection, and retains a 5000ms unref'd safety interval for missed events and socket loss.
+There is no 20ms validity loop. Each check preserves fresh installed-version resolution and the daemon's captured socket
+inode/path: a package-link swap, replaced ownership record or replaced socket cannot leave the old daemon serving
+requests or deleting its successor's socket. Root lockfile names as well as bytes enter the fallback hash, so a missed
+rename between lockfile formats is visible. A termination latch prevents duplicate replacement spawns and serving queued
+requests during asynchronous restart.
 
 The installed-version owner reads the literal `node_modules/<package>/package.json` through each `getNxRequirePaths()`
 directory, in order, so the filesystem follows the current link on every read. Node's module resolver can retain stale
@@ -404,15 +424,16 @@ of being served until its next change. From then on, every watcher batch reaches
 the native workspace context having dropped same-byte rewrites when it hashed the batch. The changed paths are
 intersected with each local plugin's closure — a pure decision, which changed paths reload which plugin — and only a
 plugin whose closure they touch has its worker retired and reloaded and the cached plugin set's identity generation
-advanced, so the recompute that batch already schedules builds the graph from the new code. A closure member under an
-ignored path never reaches that filtered batch, so an observed member like it is judged on the raw watcher stream
-instead: the event's file is compared with the digest recorded when the worker loaded it, the same bytes keep the
-worker, and changed bytes retire it and invalidate the graph. Only ignored closure members are judged this way, each
-against its own recorded digest; no other file is hashed for it. The daemon itself is not restarted and keeps its
-process; every other plugin keeps the worker and state it had. Bun has no module customization hooks, so a daemon whose
-CLI runs under Bun spawns these workers with the `node` on PATH rather than its own executable.
-`nx-daemon-validity.test.ts` walks the reload end to end in one daemon: a CJS and an ESM local plugin whose helpers
-change, and a third local plugin that must not reload.
+advanced, so the recompute that batch already schedules builds the graph from the new code. On Nx 24 the retired worker
+leaves Nx's isolated-plugin cache, so that recompute's load starts a new worker for that plugin alone and reuses every
+other plugin's. A closure member under an ignored path never reaches that filtered batch, so an observed member like it
+is judged on the raw watcher stream (the context's watch events) instead: the event's file is compared with the digest
+recorded when the worker loaded it, the same bytes keep the worker, and changed bytes retire it and invalidate the
+graph. Only ignored closure members are judged this way, each against its own recorded digest; no other file is hashed
+for it. The daemon itself is not restarted and keeps its process; every other plugin keeps the worker and state it had.
+Bun has no module customization hooks, so a daemon whose CLI runs under Bun spawns these workers with the `node` on PATH
+rather than its own executable. `nx-daemon-validity.test.ts` walks the reload end to end in one daemon: a CJS and an ESM
+local plugin whose helpers change, and a third local plugin that must not reload.
 
 A `REQUEST_PROJECT_GRAPH` failure, including a plugin that fails to load, is a nonterminal error value: the daemon
 answers it with the shared `respondWithError` helper and keeps serving. A developer correcting a local plugin must not
@@ -436,8 +457,12 @@ reconnect within their 60 s poll and resend, while a linked plugin's change ends
 ([A lost daemon ends the command](#a-lost-daemon-ends-the-command)). Read once at boot from argv, which no client's
 environment can rewrite. Any other daemon restarts itself as before.
 
-The existing ignore-file content snapshot, watch-before-scan ordering, exclusive daemon claim and five-minute inactivity
-policy remain unchanged. This follows `specs/cowshed/04_sandbox.md`'s fixture ownership and one-state-per- checkout
+The ignore-file content snapshot, exclusive daemon claim and five-minute inactivity policy remain unchanged; Nx 24's
+workspace context starts its watch before its scan itself. That watch reads the ignore files once, as it starts, and its
+content-filtered batches show no change for an ignore file rewritten before the scan read it, so `restart-checks.js`
+stamps the filesystem's clock before the watch starts, keeps the ignore files the scan read that had not changed since,
+and stops the daemon on a watch event for any other ignore file of the workspace or for one whose bytes moved; a
+same-bytes rewrite keeps it. This follows `specs/cowshed/04_sandbox.md`'s fixture ownership and one-state-per- checkout
 contract and `packages/nx-plugin/README.md`'s runtime-state exclusions and daemon policy. `nx-daemon-validity.test.ts`
 exercises the installed product's lockfiles, metadata, ownership and socket lifecycle; the existing claim, ignore-file
 and idle-policy regressions remain required. The opt-in `nx-daemon-idle-cpu.test.ts` measures an owned idle daemon using
@@ -562,6 +587,7 @@ keeper or restart starts a successor. The client waits its reconnect window (600
 wait early) and then fails that request. Stock 23.2.1 left the client `CONNECTING` with its ready signal never given, so
 every later request waited for a reconnect that had already failed. pid 23683, a consumer's land gate on 2026-10-25, sat
 for 2 h 48 min after its daemon's SIGTERM with no task running, while its output-lease helpers kept the process alive.
+Nx 24 rejects the requests parked on that reconnect, but a later request dials or starts a daemon again.
 `DaemonClient.loseDaemon` now ends this process's use of the daemon in one place. The waiting request, any request
 parked on the reconnect, and every later request fail at once with the loss, including a version mismatch found on
 reconnect. A job's client gets the loss tagged `daemonStartForbidden` and continues in its own process, as the previous
@@ -594,9 +620,9 @@ hunk it waited out the keep-alive.
 A client a package manager runs (`bun nx`, `bun run`, `npm run` …) sends the daemon a PATH with `node_modules/.bin`
 directories in front, for the run's directory and each ancestor, and from Bun a NODE naming the `node` it found on PATH
 (or, with none there, a temporary directory whose `node` is Bun, also put first on PATH). A plain `nx` client of the
-same shell sends neither. Stock 23.2.1 counted both as project-graph identity, so every switch between the two kinds of
-client discarded the daemon's graph and computed it again: on a consumer's dev boot about 2.6 s and a fresh task hasher
-per switch, with all 47 task hashes the same under both environments.
+same shell sends neither. Stock Nx (23.2.1, and 24.0.3 unchanged) counts both as project-graph identity, so every switch
+between the two kinds of client discarded the daemon's graph and computed it again: on a consumer's dev boot about 2.6 s
+and a fresh task hasher per switch, with all 47 task hashes the same under both environments.
 
 `normalizeDaemonEnvironmentForGraph` now leaves that scaffolding out, beside Yarn Berry's per-invocation bin folder.
 Where an absolute PATH entry lies is judged on its spelling and on its real path, so a link inside the workspace (its
@@ -647,63 +673,62 @@ record naming pid 1, a live process of another user, and one naming an exited pr
 
 ## A stopped watcher stream is never served from
 
-A daemon's file watcher can stop delivering without a word. Nx 23.2.1's native watcher drops FSEvents' rescan and
-dropped-event flags, and an FSEventStream fseventsd stopped serving (a restarted fseventsd, a stream refused at start)
-reports nothing. The daemon then hashed tasks, graphs and output verdicts from the files it last saw: a shed's daemon
-received no event for 33 minutes after a host-side stop, and `nx run-many` called a changed input's target
+A daemon's file watcher can stop delivering without a word. Nx 23.2.1's native watcher dropped FSEvents' rescan and
+dropped-event flags; Nx 24's turns them into a `rescan` marker, but an FSEventStream fseventsd stopped serving (a
+restarted fseventsd, a stream refused at start) still reports nothing, and Nx 24's watch settles by time, never by an
+event it waited for. The daemon then hashed tasks, graphs and output verdicts from the files it last saw: a shed's
+daemon received no event for 33 minutes after a host-side stop, and `nx run-many` called a changed input's target
 `[existing outputs match the cache, left as is]`, so the tests ran the old build.
 
-The daemon now watches the checkout with one native watcher (`daemon/server/watcher.js`), not one for sources and one
-for outputs: FSEvents orders events within one stream only. The native filter keeps Nx's hard-coded ignores; the
-workspace view applies the ignore files Nx's native workspace watcher read, in its order (`watch_filterer.rs`): the root
-`.nxignore` first, whose ignore or re-include decides; then the `.gitignore` files from the event's directory up to the
-workspace root, then those between a nested workspace and its git root, the nearest opinion deciding. A path under a
-directory those rules exclude is excluded, as the walker never enters it. A root `.nxignore` `!p/keep.txt` therefore
-keeps a file `p/.gitignore` ignores, and a nested workspace's `!keep.txt` keeps a file its parent repository's `*.txt`
-ignores, as watcher and walker do. A nested `.nxignore`, which only the walker reads, is not read, as Nx's watcher never
-read it. A change to one of the files read stops the daemon, as before. The daemon record and the outputs tracking take
-every event, as the outputs watcher did.
+The daemon watches the checkout with one native watch, which Nx 24's workspace context owns (this repository carried the
+single watcher as `daemon/server/watcher.js` on 23.2.1): FSEvents orders events within one stream only. The native
+filter keeps Nx's hard-coded ignores and applies the ignore files the walk read (`watch_filterer.rs`): every `.nxignore`
+before every `.gitignore`, the nearest first within each, then the `.gitignore` files between a nested workspace and its
+git root. A root `.nxignore` `!p/keep.txt` therefore keeps a file `p/.gitignore` ignores, and a nested workspace's
+`!keep.txt` keeps a file its parent repository's `*.txt` ignores, as watch and walker do. A change to one of those files
+stops the daemon, as before; the daemon record and the outputs tracking take every event.
 
 On macOS the first request of a connection that is answered from the workspace's files (everything but liveness,
 shutdown, subscriptions and the Nx Console and AI agent status) writes an empty probe, `nx-watch-probe-<pid>-<n>`, and
-drains the stream until the probe comes back. The probe lives in the first of the workspace data directory, `.git` and
-`node_modules` that lies physically inside the checkout (a cowshed shed links its workspace data onto another volume)
-and whose probe path the root `.nxignore` does not ignore: the native watcher applies that file to every event, and a
-workspace that ignores every dot path (`.*`, as this repository does) hides `.nx` and `.git`. Where none qualifies (a
-linked `node_modules` under such an `.nxignore`, say), nothing can prove the stream current: the daemon answers the
-first file-state request with the reason, tagged as below, and stops. Every write made before the nx command reached the
-daemon by then. Requests that arrive while a probe is out share the next one. A plugin worker's request, which its
-daemon client tags `fromPluginWorker`, makes no probe: a worker is no command, and its request nests in a daemon
-operation already current, the watcher's own recompute, which must read that recompute's files, or a command whose
-connection made its probe. Each worker connection's probe cost an isolated graph plugin a round trip through the stream
-(56 ms in the regression's fixture). The nx-plugin's producer census records `node_modules` membership without the probe
-(`packages/nx-plugin/README.md`, producer receipts), so a probe during a producer run is no tool change. A probe that
-has not come back after `DAEMON_VALIDITY_SAFETY_INTERVAL_MS` means the stream stopped: the daemon replies with an error
-tagged `daemonStartForbidden` (the client's "continue without this daemon in this process" tag), so the command goes on
-without a daemon at once (the client turns the daemon off for its own process, `disableDaemonForThisProcess`, so no
-later request of the command dials the stopping daemon), then logs `watcher stream stopped` and stops. It stops rather
-than restarts: a successor it spawned would inherit the cause. The next client, or the shed's keeper, starts one with a
-fresh stream. Later requests on the same connection are served as Nx always served them, so a write another process
-makes while a command runs is as visible as it was. Linux inotify has no daemon between the kernel and the watcher that
-can stop serving it, and Nx registers no watch under the hard-coded ignores where a probe could live; there the daemon
-only drains its watcher, as Nx did before serving a graph, and the inotify overflow (Rescan) path stays unproven.
+settles the watch until the probe comes back (`daemon/server/file-watching/watch-probe.js`). The probe lives in the
+first of the workspace data directory, `.git` and `node_modules` that lies physically inside the checkout (a cowshed
+shed links its workspace data onto another volume), and the daemon's watch admits its name there (`alwaysWatch`), which
+wins over Nx's hard-coded ignores and every ignore file: a workspace that ignores every dot path (`.*`, as this
+repository does) does not hide it. Where none qualifies (a linked workspace data and `node_modules` and no `.git`, say),
+nothing can prove the stream current: the daemon answers the first file-state request with the reason, tagged as below,
+and stops. Every write made before the nx command reached the daemon by then. Requests that arrive while a probe is out
+share the next one. A plugin worker's request, which its daemon client tags `fromPluginWorker`, makes no probe: a worker
+is no command, and its request nests in a daemon operation already current, the watcher's own recompute, which must read
+that recompute's files, or a command whose connection made its probe. Each worker connection's probe cost an isolated
+graph plugin a round trip through the stream (56 ms in the regression's fixture). The nx-plugin's producer census
+records `node_modules` membership without the probe (`packages/nx-plugin/README.md`, producer receipts), so a probe
+during a producer run is no tool change. A probe that has not come back after `DAEMON_VALIDITY_SAFETY_INTERVAL_MS` means
+the stream stopped: the daemon replies with an error tagged `daemonStartForbidden` (the client's "continue without this
+daemon in this process" tag), so the command goes on without a daemon at once (the client turns the daemon off for its
+own process, `disableDaemonForThisProcess`, so no later request of the command dials the stopping daemon), then logs
+`watcher stream stopped` and stops. It stops rather than restarts: a successor it spawned would inherit the cause. The
+next client, or the shed's keeper, starts one with a fresh stream. Later requests on the same connection are served as
+Nx always served them, so a write another process makes while a command runs is as visible as it was. Linux inotify has
+no daemon between the kernel and the watcher that can stop serving it, and Nx registers no watch under the hard-coded
+ignores where a probe could live; there the daemon only settles its watch, as Nx does before serving a graph, and an
+inotify overflow is Nx 24's own rescan.
 
-Measured on macOS, a 47-task chain of cache hits: stock 0.51–0.82 s per run; patched 0.79–0.96 s, one probe of 63–103 ms
-per command. A probe before every file-state request cost 51 probes of 65–78 ms, 3.3–3.9 s per run, and was dropped. A
-burst of 20000 gitignored and 2000 tracked file writes cost the daemon 810–910 ms of CPU against stock's 1040–1260 ms:
-one native stream instead of two.
+Measured on macOS under Nx 23.2.1, a 47-task chain of cache hits: stock 0.51–0.82 s per run; patched 0.79–0.96 s, one
+probe of 63–103 ms per command. A probe before every file-state request cost 51 probes of 65–78 ms, 3.3–3.9 s per run,
+and was dropped. A burst of 20000 gitignored and 2000 tracked file writes cost the daemon 810–910 ms of CPU against
+stock's 1040–1260 ms: one native stream instead of two. Not measured again on Nx 24, whose stock daemon has one stream.
 
 `packages/nx-plugin/src/nx-daemon-watch-stream-host.test.ts` runs in `nx-plugin:test-host`. On every platform a real
 fixture daemon rebuilds a target whose input was replaced by rename. On macOS a daemon started under a Seatbelt profile
 that denies FSEvents (which `sandbox_apply` refuses inside another sandbox) must tell the command
 `watcher stream stopped`, which continues without it, log it, and never call the changed input's target cached; a
-healthy daemon whose `.nxignore` hides every dot path must see its probe come back from a real `node_modules`; and one
-with nowhere to put a probe must answer `cannot be proven current` and never serve a stale verdict. An isolated graph
-plugin that asks the daemon for files must leave one probe in the daemon's log, its command's.
-`nx-daemon-watch-filter.test.ts` (an ordinary shard) holds a nested workspace whose `.gitignore` re-includes `keep.txt`
-under its parent repository's `*.txt`: a fresh walk indexes it, and the daemon must rebuild the target whose input it is
-once it changes. Drop these hunks only when the installed upstream watcher reports a stopped stream, retaining the
-regression.
+healthy daemon whose `.nxignore` hides every dot path must see its probe come back; and one whose workspace data and
+`node_modules` are linked from outside and has no `.git` must answer `cannot be proven current` and never serve a stale
+verdict. An isolated graph plugin that asks the daemon for files must leave one probe in the daemon's log, its
+command's. `nx-daemon-watch-filter.test.ts` (an ordinary shard) holds a nested workspace whose `.gitignore` re-includes
+`keep.txt` under its parent repository's `*.txt`: a fresh walk indexes it, and the daemon must rebuild the target whose
+input it is once it changes. Drop the probe hunk only when the installed upstream watch reports a stopped stream,
+retaining the regression.
 
 ## Can the daemon hunks be dropped?
 
@@ -717,8 +742,10 @@ lines (`P:727`, `P:766`). A job whose daemon stops would then fail its command, 
 (`loseDaemon`, `P:476-492`): a choice, not a free deletion.
 
 Every changed line (+3,133 −676, in 79 files) is counted once, under the purpose that decides whether it can go; a hunk
-that mixes purposes is split by function. `P:n` is line n of `patches/nx@23.2.1.patch` as last changed by `446e01de66`,
-and moves when the patch is regenerated.
+that mixes purposes is split by function. `P:n` is line n of `patches/nx@23.2.1.patch` as last changed by `446e01de66`
+(`git show 446e01de66:patches/nx@23.2.1.patch`); the counts are that patch's. `patches/nx@24.0.3.patch` carries the same
+purposes on Nx 24's modules (the stopped-watcher probe in `daemon/server/file-watching/watch-probe.js`, the validity
+checks merged into Nx 24's own `restart-checks.js`), without the hunks Nx 24 carries itself.
 
 | Purpose                           | Changed     | Serves                                                    |
 | --------------------------------- | ----------- | --------------------------------------------------------- |
@@ -813,11 +840,11 @@ daemon must take the branch that pulled `nx@latest`, pull nothing, and start no 
 Stock Nx's Nx Console check and its AI-agent configuration check run each editor's CLI from the daemon
 (`code --version`, `code --list-extensions`, the same for `cursor`). The daemon starts both as it starts, every client
 asks for the Nx Console status before its command and every `nx run` for the AI-agent status after its tasks, though
-only a client on a terminal shows what either finds. So a daemon that only ever served cowshed jobs, gates or tests
-forked editors, and one outlived the daemon it came from in its process group: a land gate's test shard held
-`code --version` past its daemon's stop. The `server.js` hunk starts neither check at daemon start, and the
-`init-local.js` and `run-command.js` hunks ask the daemon for them only when stdin and stdout (Nx Console) or stdout (AI
-agents) is a terminal.
+only a client on a terminal shows what either finds (Nx 24.0.3 skips both at daemon start only in CI). So a daemon that
+only ever served cowshed jobs, gates or tests forked editors, and one outlived the daemon it came from in its process
+group: a land gate's test shard held `code --version` past its daemon's stop. The `server.js` hunk starts neither check
+at daemon start, and the `init-local.js` and `run-command.js` hunks ask the daemon for them only when stdin and stdout
+(Nx Console) or stdout (AI agents) is a terminal.
 
 `nx-daemon-idle-policy.test.ts` starts a fixture daemon with `code` and `cursor` stand-ins on `PATH` that record any
 run, serves `nx show projects` and `nx run` from non-terminal clients, stops it, and requires no `[NX-CONSOLE]` daemon
@@ -859,11 +886,11 @@ upstream version contains its respective repair, retaining the regressions.
 
 ## A dependency's configuration
 
-Stock Nx 23.2.1 runs every task of a graph in the configuration the run asked for (a target's own `defaultConfiguration`
-aside): a `dependsOn` entry cannot say that its dependency runs in another. A land gate, `nx run-many -t gate` in the
-default configuration, therefore could not hold the host's production CLI and addon, and `tooling/land-host.sh` built
-them in a second Nx run after the gate, sequentially and outside the graph that schedules every other task: 501 s of an
-804 s SmoothBricks land (2026-10-31).
+Stock Nx (23.2.1 through 24.0.3) runs every task of a graph in the configuration the run asked for (a target's own
+`defaultConfiguration` aside): a `dependsOn` entry cannot say that its dependency runs in another. A land gate,
+`nx run-many -t gate` in the default configuration, therefore could not hold the host's production CLI and addon, and
+`tooling/land-host.sh` built them in a second Nx run after the gate, sequentially and outside the graph that schedules
+every other task: 501 s of an 804 s SmoothBricks land (2026-10-31).
 
 The `create-task-graph` hunk reads an optional `configuration` on a `dependsOn` object. The dependency runs in it, if
 its target has that configuration (otherwise in its own default, as for any configuration a run names), and passes it on
@@ -893,8 +920,9 @@ CLI and addon. Drop the hunk once the installed upstream version has the field, 
 
 Status: drafted, not opened. Written against nrwl/nx `master` at `a37b5ca4c6630bb9ea5df9ac0546edc3a186bc2f`, whose
 `findCycles`, `filterDummyTasks` and `getNonDummyDeps` have the logic of Nx 23.2.1's. This repository carries the fix as
-the `task-graph-utils` hunk of `nx@23.2.1.patch`; `packages/nx-plugin/src/nx-task-graph-cycles.test.ts` guards it here.
-Drop that patch hunk once the installed Nx contains the fix, retaining the regression.
+the `task-graph-utils` hunk of `nx@24.0.3.patch` (Nx 24's edges are objects, read by `edgeId`);
+`packages/nx-plugin/src/nx-task-graph-cycles.test.ts` guards it here. Drop that patch hunk once the installed Nx
+contains the fix, retaining the regression.
 
 ### Title
 

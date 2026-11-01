@@ -7,7 +7,7 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { isRunning } from './testing.js';
 
 /**
- * Guards the `DaemonClient.stop` hunk of `patches/nx@23.2.1.patch`. Stock 23.2.1 sent SIGTERM to the pid the daemon
+ * Guards the `DaemonClient.stop` hunk of `patches/nx@24.0.3.patch`. Stock 24.0.3 sends SIGTERM to the pid the daemon
  * record names and, whatever the kernel answered other than ESRCH, printed the error, deleted the daemon's socket
  * directory and let `nx daemon --stop` print "Daemon Server - Stopped" and exit 0. A cowshed job may signal only its
  * own sandbox's processes (`specs/cowshed/04_sandbox.md`, `(allow signal (target same-sandbox))`), so its stop of the

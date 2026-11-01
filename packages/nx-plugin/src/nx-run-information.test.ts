@@ -3,7 +3,7 @@ import type { Task } from 'nx/src/config/task-graph';
 import { StoreRunInformationLifeCycle } from 'nx/src/tasks-runner/life-cycles/store-run-information-life-cycle';
 
 /**
- * Guards the run-information hunk of patches/nx@23.2.1.patch. A discrete worker can fail hashing before startTasks:
+ * Guards the run-information hunk of patches/nx@24.0.3.patch. A discrete worker can fail hashing before startTasks:
  * the orchestrator still reports failure through endTasks, with endTime but no startTime. Stock Nx dereferences the
  * absent timing and crashes over the hash error. Keep the failed result, but never invent an execution start.
  * Drop the hunk only when upstream accepts this lifecycle ordering, retaining these regressions.

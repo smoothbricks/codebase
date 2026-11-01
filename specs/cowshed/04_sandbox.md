@@ -1085,7 +1085,7 @@ the command"). A daemon a job started would belong to that job's process tree an
 other jobs still used it through the shared record. A host shell's client, which has no such variable, that cannot reach
 the socket starts a daemon of its own, which overwrites the record and so retires the daemon it replaced; one whose
 daemon is lost under a request, with no successor within the wait, fails that request and every later one of the command
-at once (pinned Nx 23.2.1, `daemon/client/client.js` and `daemon/server/server.js`).
+at once (pinned Nx 24.0.3, `daemon/client/client.js` and `daemon/server/server.js`).
 
 One escape exists, for tests only: a test whose subject is a daemon's retirement must be able to create what it retires.
 A fixture `nx` spawned with the named `FIXTURE_STARTS_ITS_OWN_DAEMON` option
@@ -1152,7 +1152,7 @@ their own or overwriting its record, and a host client in a workspace uses the w
 breaking its plugin workers.
 
 A workspace's daemon executes the project-graph plugins of the workspace's checkout, which is unsigned code that runs
-only inside the sandbox, and stock Nx 23.2.1 has no setting that makes a client connect to a live daemon without ever
+only inside the sandbox, and stock Nx 24.0.3 has no setting that makes a client connect to a live daemon without ever
 starting one; the patched Nx's `NX_DAEMON_START=never` is that setting, and every job runs under it. A workspace's
 supervisor therefore keeps that daemon alive itself. At start, and every 5 s while it admits jobs, it probes the record:
 present, its process alive, its socket accepting. When the probe fails while the shed is in use (below) it runs
@@ -1200,7 +1200,7 @@ keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves the
 
 A kept daemon costs its host a resident Node process (about 0.65 GB RSS in a 56-project consumer's shed, its plugins
 loaded in it rather than in workers) and a file watcher that recomputes the project graph on every change in the tree,
-per shed. Stock Nx stops a daemon after three hours without a request or a file event; the patched Nx 23.2.1 uses five
+per shed. Stock Nx stops a daemon after three hours without a request or a file event; the patched Nx 24.0.3 uses five
 minutes at the same `daemon/server/shutdown-utils.js` boundary. Every file event of the tree restarts that timer, so a
 tree that keeps changing never reaches it. The keeper therefore also ends the daemon. A shed is in use while its
 supervisor's ledger holds a developer job (a `--host` job and a land's gate job are the shed's jobs like any other), and
@@ -1262,7 +1262,7 @@ then exercises a connected silent client past five minutes and the daemon's depa
 using its real kernel process and daemon log. It stays outside the ordinary bounded test shards.
 
 A known, accepted property: a host client that connects to a workspace's daemon sends it the client's environment, as
-every Nx client does with its first message (`getDaemonEnv`, pinned Nx 23.2.1 `daemon/client/daemon-environment.js`).
+every Nx client does with its first message (`getDaemonEnv`, pinned Nx 24.0.3 `daemon/client/daemon-environment.js`).
 The daemon applies that environment to its own process environment, which the workspace's project-graph plugins run
 under, so a host shell's variables reach code inside the workspace's sandbox. This is accepted for three reasons. A
 workspace is a clone of main for changing main in parallel. Main's environment holds no long-lived secrets: the
@@ -1271,11 +1271,11 @@ shell's. The acceptance holds only while no real secrets can reach a host shell 
 
 The same adoption decides what a runtime hash input sees. Nx runs a task's `runtime` inputs in the process that hashes
 the task, which for a workspace's clients is the daemon inside the sandbox, and lays the requesting client's environment
-over each command (pinned Nx 23.2.1, `native/tasks/hashers/hash_runtime.rs`; the client sends its whole environment as
+over each command (pinned Nx 24.0.3, `native/tasks/hashers/hash_runtime.rs`; the client sends its whole environment as
 the task's). An input a host client asks for therefore runs under the sandbox's filesystem authority with the host's
 `HOME` and without this job contract: no private `XDG_*` directories and no git isolation (`GIT_CONFIG_GLOBAL`,
 `GIT_CONFIG_NOSYSTEM`, the fetch-route include). Applying the client's environment also deletes those variables from the
-daemon's own process environment, and Nx 23.2.1 has no setting that keeps a daemon variable against a client. `git` with
+daemon's own process environment, and Nx 24.0.3 has no setting that keeps a daemon variable against a client. `git` with
 the host's `HOME` reads the host user's global configuration, the sandbox denies it (`EPERM`), and git dies on any error
 but a missing file. Cowshed does not widen the profile to the host's git configuration, which holds credential helpers
 and is exactly what the captured identity keeps out of every workspace (02_workspaces.md), and does not withhold the
@@ -1285,7 +1285,7 @@ So the contract sits on the input: **a runtime input reads only its checkout and
 operator's home.** A `git` command in one runs with `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1`, which also
 keeps the operator's `log` and `diff` settings out of the key. Such an input computes the same value through the
 sandboxed daemon, in a sandboxed client and in a daemonless host client. One that breaks the contract fails when a host
-client uses it, and Nx must report that failure as an error. Nx 23.2.1 ignores a runtime input's exit status and hashes
+client uses it, and Nx must report that failure as an error. Nx 24.0.3 ignores a runtime input's exit status and hashes
 its stdout and stderr, so a failed input would otherwise become a valid key: its error text, constant across every tree.
 Every runtime input therefore runs through `@smoothbricks/nx-plugin`'s `runtime-input.sh`, which keys on stdout alone
 and turns a nonzero exit into an Nx error. Nx's error names the tasks it was hashing and their runtime inputs (the
@@ -1310,13 +1310,14 @@ fixed connector address instead.
 ### Why cowshed keeps the daemon, not the first client
 
 **Could stock Nx start its own daemon, with cowshed only stopping the recorded pid at release?** No. A stock client that
-finds no daemon starts one detached, in a session of its own (`DaemonClient.startInBackground`, pinned Nx 23.2.1), and
+finds no daemon starts one detached, in a session of its own (`DaemonClient.startInBackground`, pinned Nx 24.0.3), and
 the record names it. Containment, the untrusted record and land adoption would each need a new mechanism in cowshed; the
 sandbox profile and held-lock commands keep `NX_DAEMON_START=never` for some clients; racing starters and the idle stop
 keep the patch's claim hunks and the keeper's stop. Letting stock Nx start the daemon moves work into cowshed instead of
 removing any, and the patch keeps its daemon hunks (`patches/README.md`, "Can the daemon hunks be dropped?"). Code paths
 are relative to `packages/cowshed/crates/cowshed-core/src/`, specs to `specs/cowshed/` and Nx files to `dist/src/` of
-the pinned 23.2.1; line numbers are those of commit `d2dc2aaef9`.
+the then pinned Nx 23.2.1; line numbers are those of commit `d2dc2aaef9`. Nx 24.0.3 moved some of that code, and its
+patch carries the same daemon hunks on it.
 
 - **Containment.** On macOS a job owns its held leader's group plus every life its process fold holds running, in the
   group or not (`runtime/process_events.rs:543-561`), and those lives "remain owned after setsid, reparenting, exec, or

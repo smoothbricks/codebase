@@ -9,22 +9,21 @@ import { whenChanged } from './__tests__/path-change.js';
 import { publishFixtureSocketDirectory, retireFixtureSocketDirectory } from './testing.js';
 
 /**
- * Guards the exit-status hunk of `patches/nx@23.2.1.patch`. When a task fails, Nx skips the tasks that depend on it,
- * and tells no life cycle about a skipped task, so the results `nx run` reads its exit status from had none for it.
- * `didCommandComplete` takes a discrete task without a result for one the run never finished, so an ordinary failure
- * exited 130, the status of an interrupted run, and a gate could not tell a failed test from a run someone stopped.
+ * Guards a failed run's exit status, which Nx 24.0.3 settles in `tasks-runner/run-outcome.js` (this repository carried
+ * it as a patch hunk on Nx 23.2.1). When a task fails, Nx skips the tasks that depend on it and tells no life cycle
+ * about a skipped task, so the results `nx run` reads have none for it. `didCommandComplete` also reads the runner's
+ * task statuses, where a skipped task is settled, so an ordinary failure exits 1, never 130, the status of an
+ * interrupted run; a gate must tell a failed test from a run someone stopped.
  *
- * The run now exits 1, and still lists the skipped task as not run. The task results everything else sees stay Nx's
- * own: `invokeTasksRunner` and the plugins' `postTasksExecution` hooks get no result for a skipped task, as they never
- * did, so a caller that replays Nx's skip rule over those results keeps counting it once.
- * Bail leaves pending tasks absent and can stop active tasks during cleanup; the CLI uses the orchestrator's own
- * bailout and interruption state to keep ordinary failure at 1 and a real SIGINT at 130.
- * Drop the hunk, and keep this test, once the Nx version in use exits 1 for failure and 130 only for interruption.
+ * The run lists the skipped task as not run. The task results everything else sees stay Nx's own: the plugins'
+ * `postTasksExecution` hooks get no result for a skipped task, so a caller that replays Nx's skip rule over those results
+ * keeps counting it once. With `--nx-bail=true` Nx starts nothing after a failure, settles every task it did not start
+ * as skipped, and lets a running task finish; a real SIGINT stops the running task and exits 130.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');
 const nxEntry = join(repositoryRoot, 'node_modules', '.bin', 'nx');
-// The fixture's failing task waits through the same waker, run by Bun from this checkout.
+// The fixture's failing and held tasks wait through the same waker, run by Bun from this checkout.
 const pathChange = join(import.meta.dir, '__tests__', 'path-change.ts');
 
 /** A local plugin whose `postTasksExecution` hook writes the task results it was handed. */
@@ -41,20 +40,24 @@ exports.postTasksExecution = async (options, context) => {
 const exitLabel = 'exits 1, not 130, when a failed task leaves a task that depends on it unrun';
 const interruptLabel = 'distinguishes parallel failure bailout from a real interrupt with pending tasks';
 
-/** The held task: it listens, writes `ready` to its workspace, and waits to be bailed out or interrupted. */
-const holdScript = `const { createServer } = require('node:net');
-const { writeFileSync } = require('node:fs');
-createServer().listen(0, '127.0.0.1', () => {
+/** The held task: it listens, writes `ready` to its workspace, and ends once `p:fail` has failed or is interrupted. */
+const holdScript = `import { createServer } from 'node:net';
+import { existsSync, writeFileSync } from 'node:fs';
+import { whenChanged } from ${JSON.stringify(pathChange)};
+const server = createServer().listen(0, '127.0.0.1', () => {
   writeFileSync('ready', '');
   console.log('nx-interrupt-ready');
 });
+await whenChanged('.', () => existsSync('failed'));
+server.close();
 `;
 
-/** Fails once the `release` file exists; a `release` that never appears leaves it pending. */
+/** Fails once the `release` file exists, marking `failed` first; a `release` that never appears leaves it pending. */
 function failScript(release: string): string {
-  return `import { existsSync } from 'node:fs';
+  return `import { existsSync, writeFileSync } from 'node:fs';
 import { whenChanged } from ${JSON.stringify(pathChange)};
 await whenChanged('.', () => existsSync(${JSON.stringify(release)}));
+writeFileSync('failed', '');
 process.exit(1);
 `;
 }
@@ -63,6 +66,7 @@ process.exit(1);
 async function clearStep(workspace: string): Promise<void> {
   await rm(join(workspace, 'task-results.json'), { force: true });
   await rm(join(workspace, 'ready'), { force: true });
+  await rm(join(workspace, 'failed'), { force: true });
 }
 
 /** A fixture workspace's `node_modules` link, Nx config, results hook and package. */
@@ -75,7 +79,8 @@ async function writeWorkspace(workspace: string, name: string): Promise<void> {
 
 /**
  * One step of the parallel walk: `run-many` of `held` and `after` with `--nx-bail=true`. Without an interrupt the step
- * bails out on the failing task; with one it sends SIGINT once `held` is listening, and must exit 130.
+ * bails out on the failing task, lets `held` finish and exits 1; with one it sends SIGINT once `held` is listening,
+ * and must exit 130.
  */
 async function runParallelStep(workspace: string, socketDirectory: string, interrupt: boolean): Promise<void> {
   const step = `${interruptLabel}, interrupt=${interrupt}`;
@@ -144,8 +149,10 @@ async function runParallelStep(workspace: string, socketDirectory: string, inter
     if (interrupt) {
       expect(results, step).toMatchObject({ 'p:held': 'stopped' });
     } else {
-      expect(results, step).toEqual({ 'p:held': 'stopped', 'p:fail': 'failure' });
-      expect(output, step).toContain('Tasks not run because their dependencies failed or --nx-bail=true:\n\n- p:after');
+      expect(results, step).toEqual({ 'p:held': 'success', 'p:fail': 'failure' });
+      expect(output, step).toContain(
+        'Tasks not run because their dependencies failed, --nx-bail=true, or their batch ended before reaching them:\n\n- p:after',
+      );
     }
   } finally {
     await retire();
@@ -180,7 +187,7 @@ it('exits 1 for a failed task and a parallel bailout, 130 only for a real interr
         const output = `${ran.stdout}${ran.stderr}`;
         expect(ran.status, `${step}\n${output}`).toBe(1);
         expect(output, step).toContain(
-          'Tasks not run because their dependencies failed or --nx-bail=true:\n\n- p:after',
+          'Tasks not run because their dependencies failed, --nx-bail=true, or their batch ended before reaching them:\n\n- p:after',
         );
         expect(output, step).toContain('Failed tasks:\n\n- p:fail');
         // Nx's own results: the failed task, and nothing for the task it skipped or bailed before.
@@ -195,13 +202,13 @@ it('exits 1 for a failed task and a parallel bailout, 130 only for a real interr
       const parallel = join(root, 'parallel');
       await mkdir(join(parallel, 'p'), { recursive: true });
       await writeWorkspace(parallel, 'bail-interrupt');
-      await writeFile(join(parallel, 'hold.cjs'), holdScript);
+      await writeFile(join(parallel, 'hold.ts'), holdScript);
       await writeFile(
         join(parallel, 'p', 'project.json'),
         JSON.stringify({
           name: 'p',
           targets: {
-            held: { executor: 'nx:run-commands', options: { command: 'node hold.cjs' } },
+            held: { executor: 'nx:run-commands', options: { command: 'bun hold.ts' } },
             fail: { executor: 'nx:run-commands', options: { command: 'bun fail.ts' } },
             after: { executor: 'nx:run-commands', dependsOn: ['fail'], options: { command: 'echo after' } },
           },

@@ -6,11 +6,11 @@ import { WorkspaceContext } from 'nx/src/native/index.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the workspace filter of the single-watcher hunk in `patches/nx@23.2.1.patch` (`daemon/server/watcher.js`). The
- * daemon's one native watcher reports every change but Nx's hard-coded ignores, and the daemon decides which reach the
- * workspace context with the ignore files Nx's own watcher read, in its order: the root .nxignore first, then each
- * directory's .gitignore nearest first, then the .gitignore files between a nested workspace and its git root. A file
- * the walker indexes but the filter drops leaves the daemon hashing its old bytes.
+ * Guards the daemon watch's workspace filter, which Nx 24 applies natively (`watch_filterer.rs`; this repository
+ * carried it in `daemon/server/watcher.js` on Nx 23.2.1). The daemon's one watch reports every change but Nx's
+ * hard-coded ignores, and decides which reach the workspace context with the ignore files the walk read, in its order:
+ * the root .nxignore first, then each directory's .gitignore nearest first, then the .gitignore files between a nested
+ * workspace and its git root. A file the walker indexes but the filter drops leaves the daemon hashing its old bytes.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');

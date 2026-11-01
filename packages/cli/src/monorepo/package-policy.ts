@@ -369,7 +369,7 @@ export function validateNxReleaseConfig(root: string): number {
 }
 
 /**
- * A cached target with no `inputs` anywhere in its resolved configuration is hashed by Nx 23.2.1's native planner
+ * A cached target with no `inputs` anywhere in its resolved configuration is hashed by Nx's native planner
  * over every file under its project root, whatever nx.json's `default` named input excludes: a README edit re-keyed
  * the project's tests and aggregates although `default` leaves Markdown out. Naming `default` (in the target, or in a
  * `targetDefaults` entry for its name) makes the planner honour the named input.

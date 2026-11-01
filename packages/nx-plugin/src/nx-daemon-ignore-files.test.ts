@@ -10,23 +10,21 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { isRunning, terminate } from './testing.js';
 
 /**
- * Guards the ignore-file hunk of `patches/nx@23.2.1.patch`. Nx 23.2.1's daemon stopped itself on every watcher event
- * for a `.gitignore` or `.nxignore`, whatever the file then held. A rewrite with the same bytes (a checkout, a
- * formatter) reports such an event, and so does FSEvents for a write made shortly before the daemon's stream started,
- * whenever fseventsd numbers it after that start. Stopping destroys every client socket at once, so a file-watcher
- * client lost the notification of the batch that carried the event, and a dev watcher waiting to judge an edit in that
- * batch waited for it forever. The patched daemon stops only when an ignore file's bytes may differ from those its
- * watcher's filter read.
+ * Guards the daemon's ignore-file stop. Nx 23.2.1's daemon stopped itself on every watcher event for a `.gitignore` or
+ * `.nxignore`, whatever the file then held. A rewrite with the same bytes (a checkout, a formatter) reports such an
+ * event, and so does FSEvents for a write made shortly before the daemon's stream started, whenever fseventsd numbers it
+ * after that start. Stopping destroys every client socket at once, so a file-watcher client lost the notification of
+ * the batch that carried the event, and a dev watcher waiting to judge an edit in that batch waited for it forever.
+ * This repository's patch stops the daemon only when an ignore file's bytes might differ from those its watch's filter
+ * read (`daemon/server/restart-checks.js` on Nx 24.0.3). Nx 24's content-filtered batches leave a same-bytes rewrite
+ * out, but its watch reads the ignore files once, as it starts and before its scan, so no batch shows a file rewritten
+ * between the two, and the filter would keep the old rules.
  *
- * A file-watcher client of the fixture's daemon sees a same-bytes `.gitignore` rewrite and a tracked edit after it.
- * Unpatched, the daemon closes the connection instead of notifying the edit; patched, the edit arrives on the same
- * connection and the same daemon still serves. A `.gitignore` with new bytes still stops it.
+ * A file-watcher client of the fixture's daemon sees a same-bytes `.gitignore` rewrite and a tracked edit after it: the
+ * edit arrives on the same connection and the same daemon still serves. A `.gitignore` with new bytes still stops it.
  *
- * The filter reads its ignore files in `watch()`; the workspace context the daemon compares against reads them later.
- * A `.gitignore` rewritten between the two reads must still stop the daemon, though the context holds its new bytes:
- * the filter keeps the old rules and would drop every event under a path they no longer ignore.
- *
- * Drop the hunk, and keep this test, once the Nx version in use compares an ignore file's bytes before it stops.
+ * A `.gitignore` rewritten after the daemon's walk read it must still stop the daemon: the filter keeps the old rules
+ * and would drop every event under a path they no longer ignore.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');

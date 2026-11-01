@@ -8041,7 +8041,7 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     let live = serde_json::json!({
         "processId": std::process::id(),
         "socketPath": socket,
-        "nxVersion": "23.2.1",
+        "nxVersion": "24.0.3",
     })
     .to_string();
     std::fs::write(&record, &live).unwrap();
@@ -8247,7 +8247,7 @@ impl LiveDaemon {
             serde_json::json!({
                 "processId": process.id(),
                 "socketPath": socket,
-                "nxVersion": "23.2.1",
+                "nxVersion": "24.0.3",
             })
             .to_string(),
         )

@@ -5,17 +5,18 @@ import { join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the incomplete-run summary hunk of `patches/nx@23.2.1.patch`. The default tasks runner ends its life cycle in
- * a `finally`, so the static summary also prints when the orchestrator throws part way through a run. That summary
- * printed "Successfully ran" whenever no task had failed or stopped, and counted every task the run never reported
- * as "skipped" under it: a run whose daemon socket died in the middle claimed success over the tasks it never ran.
+ * Guards the incomplete-run summary. The default tasks runner ends its life cycle in a `finally`, so the static summary
+ * also prints when the orchestrator throws part way through a run. Nx 23.2.1's summary printed "Successfully ran"
+ * whenever no task had failed or stopped, and counted every task the run never reported as "skipped" under it: a run
+ * whose daemon socket died in the middle claimed success over the tasks it never ran. Nx 24.0.3 prints success only
+ * when every discrete task was reported, as this repository's 23.2.1 hunk did, and lists the others as not run because
+ * their dependencies failed, --nx-bail=true, or their batch ended before reaching them. The hunk of
+ * `patches/nx@24.0.3.patch` keeps the rest: with no failure, nothing skipped them, so the summary names them as tasks the
+ * run ended without finishing.
  *
- * The orchestrator reports every task it finishes except one it skips, and it skips a task only behind a failed or
- * stopped one, so with neither, an unreported task is one the run did not finish. The summary now says the run did
- * not complete and names those tasks. Here the orchestrator throws while it hashes the second task, after the first
- * finished: the second's inputs name an external dependency the workspace does not have, and a task whose inputs
- * read its dependencies' outputs is hashed only once they finish. Drop the hunk, and keep this test, once the Nx
- * version in use prints no success for a run that threw.
+ * Here the orchestrator throws while it hashes the second task, after the first finished: the second's inputs name an
+ * external dependency the workspace does not have, and a task whose inputs read its dependencies' outputs is hashed
+ * only once they finish. Drop the hunk, and keep this test, once the Nx version in use names those tasks so.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');

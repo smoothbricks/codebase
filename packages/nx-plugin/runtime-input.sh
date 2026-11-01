@@ -6,7 +6,7 @@
 # The input's value is the command's stdout. A command that fails stops Nx with
 # an error; its failure never becomes a key.
 #
-# WHY the 0xFF byte. Nx 23.2.1 (`packages/nx/src/native/tasks/hashers/
+# WHY the 0xFF byte. Nx 24.0.3 (`packages/nx/src/native/tasks/hashers/
 # hash_runtime.rs`) runs a runtime input under `sh -c`, hashes its trimmed
 # stdout followed by its trimmed stderr, and never looks at the exit status. A
 # failed input is therefore a valid key: its error text, the same string for

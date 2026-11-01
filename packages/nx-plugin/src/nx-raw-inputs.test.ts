@@ -54,7 +54,7 @@ const normalize = (inputs) => Object.fromEntries(
       assert.deepEqual(observed[0].ids, [canonical], 'raw inputs must inspect only the requested canonical task');
       const allTasks = ['app:check:', 'common:build:', 'left:build:', 'right:build:'].map((id) => id + configuration).sort();
       assert.deepEqual(observed[0].tasks, allTasks, 'planning must retain the complete producer graph');
-      assert.deepEqual(observed[0].dependencies[canonical].slice().sort(), ['left:build:', 'right:build:'].map((id) => id + configuration));
+      assert.deepEqual(observed[0].dependencies[canonical].map(({ id }) => id).sort(), ['left:build:', 'right:build:'].map((id) => id + configuration));
 
       const inspector = new HashPlanInspector(projectGraph, root, nxJson);
       await inspector.init();

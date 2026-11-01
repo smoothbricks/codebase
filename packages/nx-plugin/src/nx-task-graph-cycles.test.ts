@@ -4,9 +4,9 @@ import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { findCycles } from 'nx/src/tasks-runner/task-graph-utils.js';
 
 /**
- * Guards the task-graph hunk of `patches/nx@23.2.1.patch`. A target that depends on `^build` through a project with
+ * Guards the task-graph hunk of `patches/nx@24.0.3.patch`. A target that depends on `^build` through a project with
  * no `build` target of its own gets a dummy task for that project, and Nx flattens each dummy into the real tasks
- * behind it, except a dummy it believes sits in a cycle, which contributes nothing. Nx 23.2.1 believed that of every
+ * behind it, except a dummy it believes sits in a cycle, which contributes nothing. Nx 24.0.3 believes that of every
  * task on the depth-first path that first reached a cycle, and only of cycles that traversal reached before another
  * had marked their tasks visited. Both depend on the order of the graph's keys, so the same task got different
  * dependencies, and, through `dependentTasksOutputFiles`, a different hash, according to which other tasks the run
@@ -52,8 +52,8 @@ const graph: ProjectGraph = {
 it('gives a task the same dependencies whether it is requested alone or through its aggregate', () => {
   const alone = createTaskGraph(graph, {}, ['app'], ['inner'], undefined, {});
   const through = createTaskGraph(graph, {}, ['app'], ['agg'], undefined, {});
-  expect(alone.dependencies['app:inner']).toEqual(['core:build']);
-  expect(through.dependencies['app:inner']).toEqual(['core:build']);
+  expect(alone.dependencies['app:inner']).toEqual([{ id: 'core:build' }]);
+  expect(through.dependencies['app:inner']).toEqual([{ id: 'core:build' }]);
 });
 
 it('finds the tasks on a cycle, not the tasks that lead to one, in any order of the graph', () => {
@@ -130,8 +130,8 @@ it('keeps real regular and continuous producer edges through the same project cy
   };
   const tasks = createTaskGraph(connected, {}, ['app'], ['inner'], undefined, {});
   expect(Object.keys(tasks.tasks).sort()).toEqual(['app:inner', 'leaf:build', 'leaf:serve']);
-  expect(tasks.dependencies['app:inner']).toEqual(['leaf:build']);
-  expect(tasks.continuousDependencies['app:inner']).toEqual(['leaf:serve']);
+  expect(tasks.dependencies['app:inner']).toEqual([{ id: 'leaf:build' }]);
+  expect(tasks.continuousDependencies['app:inner']).toEqual([{ id: 'leaf:serve' }]);
 });
 
 it('does not conceal a real cycle between requested task dependencies', () => {

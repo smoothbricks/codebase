@@ -12,12 +12,12 @@ use serde::Deserialize;
 use super::BuildVolumeState;
 use crate::api::dto::UnattributedRun;
 
-/// Where Nx keeps its daemon's record inside `workspace-data` (pinned Nx 23.2.1,
+/// Where Nx keeps its daemon's record inside `workspace-data` (pinned Nx 24.0.3,
 /// `daemon/tmp-dir.js`). It names one checkout's process and socket, so it never travels.
 pub const DAEMON_DIRECTORY: &str = "d";
 const DAEMON_RECORD: &str = "server-process.json";
 /// The run summary Nx's `StoreRunInformationLifeCycle` writes into its cache directory after
-/// every `run`/`run-many` (pinned Nx 23.2.1, `tasks-runner/life-cycles/store-run-information-life-cycle.js`).
+/// every `run`/`run-many` (pinned Nx 24.0.3, `tasks-runner/life-cycles/store-run-information-life-cycle.js`).
 pub const RUN_SUMMARY: &str = "run.json";
 /// How long a stopped daemon gets to exit after `SIGTERM`, as `nx daemon --stop` sends it.
 pub(crate) const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
@@ -132,8 +132,9 @@ pub fn discard_daemon_records(volume: &Path, state: &BuildVolumeState) -> io::Re
 /// Copy into the volume rooted at `into` the record of each live daemon the volume rooted at
 /// `from` names, when that daemon runs outside every sandbox, for a checkout whose build link
 /// moves from `from` to `into` with no task database of `from` open ([`held`], under
-/// [`hold_opens`]). Nx's daemon checks every 20 ms that the record names it and exits once it
-/// does not (pinned Nx 23.2.1, `daemon/server/server.js`), so a daemon the move left without
+/// [`hold_opens`]). Nx's daemon exits once the record no longer names it (stock Nx 24.0.3 checks
+/// every 20 ms, `daemon/server/server.js`; the pinned patch on the record's watch event, on each
+/// request and on a 5 s poll, `daemon/server/restart-checks.js`), so a daemon the move left without
 /// its record dies under its clients, and a client that writes to it then fails
 /// (`write EPIPE`). A host daemon with no task database open resolves every other path of its
 /// state through the link when it opens it, as its clients do, so it serves the checkout on
@@ -307,7 +308,7 @@ pub fn held(
 /// Nx's open locks on a volume's task databases, held by this process until dropped. Stock Nx
 /// opens a task database only while it holds that database's open lock: the database's path
 /// with the `lock` extension, locked exclusively (`flock`) before the database is opened and let
-/// go once it is (pinned Nx 23.2.1, `native/db/mod.rs` `connect_to_nx_db`,
+/// go once it is (pinned Nx 24.0.3, `native/db/mod.rs` `connect_to_nx_db`,
 /// `native/db/initialize.rs` `create_lock_file`). So while these are held no Nx process opens
 /// one of the databases: an opener waits on the lock, then opens the database by its path, so
 /// through whatever the checkout's build link names once they are let go. Fenced (`fork_lock`):
@@ -1719,7 +1720,7 @@ pub(crate) fn spelled_by(check: &str, command: &str) -> Option<Vec<String>> {
     Some(targets)
 }
 
-/// What `nx show target inputs <task> --json` prints (pinned Nx 23.2.1,
+/// What `nx show target inputs <task> --json` prints (pinned Nx 24.0.3,
 /// `command-line/show/show-target/inputs.js` `renderInputs`): the task's project and target and
 /// the raw hash inputs of its plan, by category.
 #[derive(Deserialize)]

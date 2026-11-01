@@ -23,7 +23,7 @@ inference.
    `@nx/devkit` publishes). A plugin carries no traversal of its own and no second `dependsOn` parser, and checks what
    Nx already ships before adding a dependency. `dependsOn` takes `^`, wildcards such as `^*-js`, `project:target` and
    object forms; a copy answers for the spellings its author thought of and drifts from the Nx that schedules the task,
-   and it never receives a repair of the pinned Nx ([Nx 23.2.1 Runtime Patch](#nx-2321-runtime-patch)).
+   and it never receives a repair of the pinned Nx ([Nx 24.0.3 Runtime Patch](#nx-2403-runtime-patch)).
 2. **Put each decision in the hook that sees its data.** `createNodesV2` infers targets for each project file it
    matches, before any graph exists. `createDependencies` adds project edges and has no dependency graph yet.
    `createMetadata` runs after both, with every project's merged targets and the edges the plugins added (Nx adds a
@@ -453,7 +453,7 @@ this repository once loaded it through one, and the land gate refused the graph)
 lock-scope node of the crates the target builds (`cargoClosure` carries it; a target that names neither gets the node of
 the directory it runs in). An entry naming only `cargo-lock:` nodes does not count as naming npm packages.
 
-No input declaration removes a project's own configuration from a task's key. Nx 23.2.1 adds `ProjectConfiguration` to
+No input declaration removes a project's own configuration from a task's key. Nx 24.0.3 adds `ProjectConfiguration` to
 every task (`hash_planner.rs` `gather_self_inputs`), and `hash_project_config.rs` hashes the executor, outputs, options,
 configurations and parallelism of every target in the project, plus its tags and named inputs (not `inputs`,
 `dependsOn`, `cache` or `//`). An edit to one target's command therefore re-keys every target of that project, including
@@ -475,7 +475,7 @@ Policy excludes incidental Markdown through `!{projectRoot}/**/*.md` in `default
 Markdown declares it through an input set without a matching negative: Nx exclusions win over positive paths in the same
 fileset, so a later explicit path cannot re-include it. Inferred Cargo package filesets remain broad for arbitrary
 compiled data, headers, schemas and build-script reads; incidental Markdown beneath a crate can therefore still
-invalidate those tasks conservatively. Nx 23.2.1 hashes a cached target that declares no `inputs` over every file under
+invalidate those tasks conservatively. Nx 24.0.3 hashes a cached target that declares no `inputs` over every file under
 its project root and ignores the `default` named input, so `smoo monorepo check` refuses such a target: declare its
 inputs, or give its target name a `targetDefaults` entry with `"inputs": ["default", "^default"]`.
 
@@ -553,7 +553,7 @@ command failures use the same fail-closed path. For example:
 { "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --version" }
 ```
 
-Nx 23.2.1 hashes a runtime input's stdout and stderr and ignores its exit status, so a failed input becomes a valid key:
+Nx 24.0.3 hashes a runtime input's stdout and stderr and ignores its exit status, so a failed input becomes a valid key:
 its error text, one string for every history, toolchain or file it could not read, and a result cached under it is
 replayed for all of them. The script keys on the command's stdout alone and turns a nonzero exit into an Nx error: it
 ends stdout with the byte 0xFF, and Nx refuses output that is not UTF-8
@@ -1698,15 +1698,15 @@ smoo-nx-exec my-cli:build --workspace-root "$root"
 A hit prints nothing, where `nx run` would replay every task's cached log. A miss prints Nx's run of the target on
 stderr.
 
-## Nx 23.2.1 Runtime Patch
+## Nx 24.0.3 Runtime Patch
 
-The repository installs Nx 23.2.1 as an ordinary Bun `patchedDependencies` entry: the root `package.json` lists
-`nx@23.2.1` and `@nx/js@23.2.1`, and applies [`patches/nx@23.2.1.patch`](../../patches/nx@23.2.1.patch) to the registry
+The repository installs Nx 24.0.3 as an ordinary Bun `patchedDependencies` entry: the root `package.json` lists
+`nx@24.0.3` and `@nx/js@24.0.3`, and applies [`patches/nx@24.0.3.patch`](../../patches/nx@24.0.3.patch) to the registry
 `nx` package. Bun installs a patched package project-local under `node_modules/.bun/`, so the `nx` the repository runs
 is the patched one.
 
-`@nx/js` imports `nx` (`nx/release`, `nx/src/…`) without declaring it
-([nrwl/nx#34087](https://github.com/nrwl/nx/issues/34087)). `patches/@nx%2Fjs@23.2.1.patch` declares the peer, so Bun
+`@nx/js` 24.0.3 still imports `nx` (`nx/release`, `nx/src/…`) without declaring it
+([nrwl/nx#34087](https://github.com/nrwl/nx/issues/34087)). `patches/@nx%2Fjs@24.0.3.patch` declares the peer, so Bun
 binds the same pinned Nx through the package's normal dependency namespace.
 
 Native APFS fixtures install this same pinned package and patch offline into their own checkout, using Bun's local
@@ -1746,23 +1746,12 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   keeps its full-closure default. The installed-product regression compares all root input buckets and configurations
   against closure inspection and rejects the old all-plan selection. See
   [root-only raw-input inspection](../../patches/README.md#root-only-raw-input-inspection).
-- **The default cache limit uses the cache's own filesystem.** It takes ten percent of `statfs(cacheDir)` capacity, or
-  its nearest existing ancestor when the directory has not been created. This avoids synchronously inventorying every
-  mounted disk. Explicit `NX_MAX_CACHE_SIZE` and `nx.json.maxCacheSize` retain their precedence; filesystem errors other
-  than a missing directory still fail the operation. See [upstream Nx #37269](https://github.com/nrwl/nx/pull/37269).
-  Cowshed exports an explicit caller-overridable default of configured build-volume capacity divided by ten for host
-  shells and jobs. The hosted setup action keeps its existing separate `20GB` ceiling.
 - **The daemon keeps graph plugin workers running.** Nx stops an isolated plugin worker after the last phase it has
   hooks for, which for a graph-only plugin is every graph; the daemon recomputes the graph on every tracked file change,
   so each change spawned and loaded every graph plugin's worker again (median 199 ms against 63 ms from edit to graph in
   a one-project fixture, 0.9–1.5 s per worker under a gate's load). On the daemon a worker with graph hooks now lives as
   long as the daemon; one-shot clients and task-only plugins keep the eager shutdown. See
   [upstream Nx #37271](https://github.com/nrwl/nx/pull/37271).
-- **Nx resolves typescript and release version actions from the workspace.** Nx 23.2.1 loads both with a plain `require`
-  from its own location. Where that location cannot see `typescript`, its dependency analysis skips every source import
-  without a warning (the first install that exposed this lost 12 of 44 graph edges), and `release version` cannot
-  resolve `@nx/js`'s version actions. The patch resolves both through `getNxRequirePaths` (the workspace first), falling
-  back to Nx's own location. See [upstream Nx #37272](https://github.com/nrwl/nx/pull/37272).
 - **A task's dependencies do not depend on which other tasks the run asks for.** A target that depends on `^build`
   through a project with no `build` target gets a dummy task for it, and Nx flattens each dummy into the real tasks
   behind it except a dummy it believes sits in a cycle. `findCycles` reported every task on the depth-first path that
@@ -1788,34 +1777,6 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   which untars the artifact with its stored mtimes and restores it with the same copy. Restoring one directory output of
   10,000 1 KiB files took a median 3.4 s for the native remove and copy and 0.79 s more for the stamp, on a machine at
   load average 70–120. Not yet proposed upstream.
-- **A file rewritten within the second it was hashed in is hashed again.** Every Nx context (each run without the
-  daemon, and the daemon when it starts) hashes the workspace's files through `<workspace-data>/nx_files.nxt`, which on
-  Unix keeps each file's hash beside its mtime in whole seconds, and reuses an archived hash while that second is
-  unchanged; size and nanoseconds are not compared. A file written again within the second it was hashed in keeps its
-  mtime and hashes as the bytes it replaced: a revert replays the cache entry of the edit it reverts. The patch applies
-  Git's racy-index rule before the native context reads the archive: when the archive holds an mtime from ten seconds
-  before its own write (the longest a hashing pass is assumed to run) or later, it is removed and every file is hashed
-  again. A full pass over 6,370 files measured 288–753 ms at load average 70–110. The check reads each entry's mtime
-  from the archive's rkyv layout as Nx 23.2.1's binary writes it (the root's entry count and entry pointer in the last
-  12 bytes, 24-byte entries with the i64 mtime at +8), in under 1 ms for 6,396 files. In 134 synthetic workspaces of 1
-  to 400 files dated 2001 it kept every archive, and it removed every one once a file was written in the pass. An
-  archive whose root does not fit is removed. A file dated ahead of the archive keeps it distrusted, so every run hashes
-  everything until the clock passes that date. The check cannot see a pass longer than ten seconds, nor an archive
-  another Nx process rewrites between the check and the native read; on Windows, whose native mtime is a FILETIME, it
-  does nothing. The native fix records every entry dated from the second its pass started on as racy and has none of
-  these limits. Not yet proposed upstream.
-- **A failed run exits 1, not 130, when it skips the tasks behind a failure.** Nx skips every task that depends on a
-  failed one, and tells no life cycle about a skipped task, so the results `nx` reads its exit status from had none for
-  it; `didCommandComplete` takes a discrete task without a result for one the run never finished, and `nx` exited 130,
-  the status of an interrupted run. A gate then reported `Failed to run "nx" due to exit code 130` for an ordinary test
-  failure. The patch has `didCommandComplete` also accept a task the runner reports skipped, so the exit status is 1.
-  With `--nx-bail=true`, pending tasks have no status and active tasks can be stopped by bailout cleanup; the CLI uses
-  the orchestrator's actual bailout and interruption flags, so a known failure still exits 1, but a signal or forced TUI
-  stop wins and exits 130. The terminal output's "Tasks not run" list is unchanged. Only that check sees the runner's
-  skipped tasks: `invokeTasksRunner` and the plugins' `postTasksExecution` hooks still get Nx's own results, with none
-  for a skipped task, so a caller that replays Nx's skip rule over them counts it once. (An earlier version of this hunk
-  added a skipped result to those results, and such a caller counted no task as skipped.) Not yet proposed upstream: Nx
-  `master` reports skipped tasks the same way.
 - **A workspace has one daemon, and a second one leaves it alone.** Every daemon overwrote `server-process.json` with
   its own pid, so two clients that each found no daemon started two, and the later one displaced the earlier. A client
   of the displaced daemon lost its socket mid-request (`EPIPE` on `RECORD_OUTPUTS_HASH_BATCH`) after the run had printed
@@ -1829,14 +1790,14 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   a path another daemon has bound alone, so that daemon's socket is not unlinked. A holder starts when it claims, so a
   live one that has not answered by the time its record is a minute old (a pid reused after a crash) is stale and
   replaced. On a filesystem without hard links the record is created exclusively instead. Not yet proposed upstream.
-- **A run that throws part way through does not report success.** The default tasks runner ends its life cycle in a
-  `finally`, so the static summary also prints when the orchestrator throws mid-run. It printed "Successfully ran"
-  whenever no task had failed or stopped, and counted each task the run never reported as skipped: a focused `run-many`
-  whose daemon socket died while recording output hashes printed success with "10 skipped", then `Error: write EPIPE`.
-  The orchestrator reports every task it finishes except one it skips, and it skips a task only behind a failed or
-  stopped one, so the patch prints success only when every task was reported. Otherwise the summary says the run did not
-  complete and names the unreported tasks: under "Tasks not run" after a failure, as before, and under "Tasks the run
-  ended without finishing" when none failed. Nx `master` prints the same summary. Not yet proposed upstream.
+- **A run that throws part way through names the tasks it never finished.** The default tasks runner ends its life cycle
+  in a `finally`, so the static summary also prints when the orchestrator throws mid-run. Nx 23.2.1 printed
+  "Successfully ran" whenever no task had failed or stopped, and counted each task the run never reported as skipped: a
+  focused `run-many` whose daemon socket died while recording output hashes printed success with "10 skipped", then
+  `Error: write EPIPE`. Nx 24.0.3 prints success only when every discrete task was reported, as this repository's 23.2.1
+  hunk did, and lists the others as not run "because their dependencies failed, --nx-bail=true, or their batch ended
+  before reaching them". When no task failed, nothing skipped them, so the patch lists them under "Tasks the run ended
+  without finishing" instead. Not yet proposed upstream.
 - **Nx refuses an environment set up for another workspace.** A shell that moves into another checkout keeps the
   `NX_WORKSPACE_ROOT_PATH`, `NX_WORKSPACE_DATA_DIRECTORY`, `NX_CACHE_DIRECTORY` and `NX_SOCKET_DIR` of the workspace it
   was set up for, and Nx takes `NX_WORKSPACE_ROOT_PATH` verbatim as its root: `nx daemon --stop` run in the second
@@ -1887,44 +1848,52 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   connection once its request queue drains now covers the daemon process too. A bounded regression runs a real daemon
   whose global sync generator globs through the daemon's own client and requires zero open connections once the
   generator finishes.
-- **A daemon whose workspace has gone stops instead of reading it.** Nx 23.2.1's native file worker reads an empty file
-  map as one it has not filled yet and waits on its condition variable for files (`FilesWorker::get_files`,
-  `while guard.len() == 0`). Once every file of a workspace is deleted under a running daemon, as when a checkout is
-  removed or unmounted before its daemon is stopped, the next glob blocks the daemon's only thread for good. It sits at
-  0% CPU in `WorkspaceContext::multi_glob`, no timer or request runs again, and SIGTERM does nothing because its handler
-  is JavaScript; only SIGKILL ends it. The daemon now stops itself when the workspace's `nx.json` is gone. It checks on
-  every watcher batch before applying it, on every request and on the 5 s safety poll, so the batch that would empty the
-  file map is never applied. A workspace without `nx.json` is no Nx workspace, and its client already runs without a
-  daemon. A bounded regression deletes every tracked file under a real daemon and requires it to exit with that reason;
-  against the unpatched daemon it hangs in that frame and survives its fixture's SIGTERM.
-- **The daemon stops for an ignore file only when its watcher's rules may be stale.** Nx's native watcher reads its
-  ignore files once, in `watch()`, and the daemon stopped itself on every watcher event for a `.gitignore` or
-  `.nxignore`, whatever the file then held. A rewrite with the same bytes (a checkout, a formatter) reports one, and so
-  does FSEvents for a write made shortly before the daemon's stream started, when fseventsd numbers it after that start.
-  The stop destroys every client socket at once, so a file-watcher client lost the notification of the batch that
-  carried the event, and a watcher waiting to judge an edit in that batch waited forever. The patch keeps the content
-  hash of each ignore file the workspace context read, but only where neither the file nor its directory changed since
-  just before the watcher's read (judged on the filesystem's own clock, by stamping a probe in the workspace data
-  directory): those are the bytes the watcher's rules came from. An event stops the daemon unless its file is one of
-  those and still hashes the same; a file changed between the watcher's read and the context's, or one the context never
-  held, stops it as before.
+- **A daemon whose workspace has gone stops.** Once every file of a workspace is deleted under a running daemon, as when
+  a checkout is removed or unmounted before its daemon is stopped, Nx 23.2.1's native file worker read the empty file
+  map as one it had not filled yet and waited on its condition variable for files (`FilesWorker::get_files`): the next
+  glob blocked the daemon's only thread for good, where no SIGTERM handler runs. Nx 24's file state waits only while a
+  scan runs (`FileState::wait_ready`). The daemon still stops itself when the workspace's `nx.json` is gone: a workspace
+  without it is no Nx workspace, and its client already runs without a daemon. It checks on every applied watcher batch
+  before recomputing from it, on every request and on the 5 s safety poll. A bounded regression deletes every tracked
+  file under a real daemon and requires it to exit with that reason.
+- **The daemon stops for an ignore file only when its watch's rules may be stale.** Nx 23.2.1's daemon stopped itself on
+  every watcher event for a `.gitignore` or `.nxignore`, whatever the file then held. A rewrite with the same bytes (a
+  checkout, a formatter) reports one, and the stop destroys every client socket at once, so a file-watcher client lost
+  the notification of the batch that carried the event, and a watcher waiting to judge an edit in that batch waited
+  forever. Nx 24 stops only for an ignore file in its content-filtered batches, but its watch reads the ignore files
+  once, as it starts and before its scan, so a file rewritten between the two is in no batch and the watch keeps the old
+  rules. The patch keeps the content hash of each ignore file the scan read, but only where neither the file nor its
+  directory changed since just before the watch started (judged on the filesystem's own clock, by stamping a probe in
+  the workspace data directory): those are the bytes the watch's rules came from. A watch event for an ignore file stops
+  the daemon when its bytes moved from those, or when it is a workspace file the patch holds no such hash for.
 - **A failure before execution does not crash a completion lifecycle.** The
   [run-information repair](../../patches/README.md#run-information-after-a-pre-start-failure) owns the completion,
   history and timing contract.
 
+Nx 24 carries four repairs this patch carried on 23.2.1, so their hunks are gone and their regressions stay: the default
+cache bound taken from the cache's own filesystem (`statfs`, through its nearest existing ancestor;
+[upstream Nx #37269](https://github.com/nrwl/nx/pull/37269), since 24.0.2), resolving `typescript` and release version
+actions from the workspace ([upstream Nx #37272](https://github.com/nrwl/nx/pull/37272), since 24.0.3), Git's racy-index
+rule for file hashes (the archive, `nx_files_v2.nxt`, records when its gather began, `gathered_at`, and reuses no entry
+dated that second or later), and a failed run's exit status 1, never 130, when it skips the tasks behind a failure
+(`tasks-runner/run-outcome.js`). Cowshed exports an explicit caller-overridable default cache bound of configured
+build-volume capacity divided by ten for host shells and jobs; the hosted setup action keeps its existing separate
+`20GB` ceiling.
+
 Publishing or installing `@smoothbricks/nx-plugin` alone does **not** change a consumer's Nx. `smoo monorepo update`
-distributes the managed `patches/nx@23.2.1.patch` and maintains the root registry override `nx = "23.2.1"` plus its
+distributes the managed `patches/nx@24.0.3.patch` and maintains the root registry override `nx = "24.0.3"` plus its
 matching `patchedDependencies` entry. Run ordinary `bun install`, commit its lock changes, then prove a frozen install
 and the affected normal Nx gates. Do not replace the registry dependency with a local link or hide a failure by
 resetting the database or disabling the daemon.
 
-The patch is keyed to `nx@23.2.1`; a different Nx version needs its own patch file. On an Nx upgrade, remove each hunk
-only when the installed upstream release contains that repair and the task-history namespace, cache-bound,
+The patch is keyed to `nx@24.0.3`; a different Nx version needs its own patch file, carried as
+[Activating a patch change](../../patches/README.md#activating-a-patch-change) describes. On an Nx upgrade, remove each
+hunk only when the installed upstream release contains that repair and the task-history namespace, cache-bound,
 resident-worker, store-resolution, task-graph, restore-time, racy-archive, skipped-task exit, daemon-claim,
 incomplete-run summary, foreign-environment, ignore-file and run-information regressions pass; preserve any repair not
 yet released. The restore-time regression fails without its hunk only on macOS, where the copy clones (on Linux
 `std::fs::copy` writes a fresh mtime), so run it on macOS before dropping the hunk. When every hunk is upstream, remove
-the `nx@23.2.1` and `@nx/js@23.2.1` entries from `patchedDependencies` and delete their patch files.
+the `nx@24.0.3` and `@nx/js@24.0.3` entries from `patchedDependencies` and delete their patch files.
 
 ## Bun Test Tracing Generator
 

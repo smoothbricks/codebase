@@ -188,7 +188,7 @@ in {
       # its own process. Measured on a 56-project consumer's shed (2026-10-22,
       # three restarts each): the same project graph and the same hash for all
       # 443 tasks of `nx run-many -t lint`; the daemon tree went from 8
-      # processes, about 1.75 GB RSS, to 1 process, about 0.65 GB. Nx 23.2.1
+      # processes, about 1.75 GB RSS, to 1 process, about 0.65 GB. Nx 24.0.3
       # reads only "false" as off (project-graph/plugins/isolation/enabled.js).
       NX_ISOLATE_PLUGINS = "false";
       SMOO_TYPECHECK_TSC = "${typecheckTsc}/bin/tsc";

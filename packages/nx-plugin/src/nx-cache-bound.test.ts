@@ -1,36 +1,24 @@
 import { expect, it } from 'bun:test';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { statfsSync } from 'node:fs';
 import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the cache-bound hunk of `patches/nx@23.2.1.patch`, the local build of
- * nrwl/nx#37269. When nx.json sets no `maxCacheSize`, Nx 23.2.1 bounds its
- * cache at a tenth of the disk holding it, and asks its native
- * `getDefaultMaxCacheSize`, which lists every mounted disk (`sysinfo`
- * `Disks::new_with_refreshed_list`). On macOS that is a `getfsstat` plus IOKit
- * and CacheDelete round trips per mount, on the client's main thread, between
- * hashing and the first task: about 80 ms on a quiet host, and up to 2.3 s
- * measured while disk images attach, detach or resize. Fixture `release pack`
- * runs stalled 16 s and 24 s in that same window with their daemon idle; that
- * this call was the stall is inferred, not captured. The patched bound asks
- * only the cache directory's filesystem (`statfs`).
+ * Guards the cache bound of nrwl/nx#37269, which Nx carries natively since 24.0.2 (this repository carried it as a
+ * patch hunk on 23.2.1). When nx.json sets no `maxCacheSize`, Nx bounds its cache at a tenth of the filesystem that
+ * holds it. Nx 23.2.1's native `getDefaultMaxCacheSize` found that filesystem by listing every mounted disk
+ * (`sysinfo` `Disks::new_with_refreshed_list`), on macOS a `getfsstat` plus IOKit and CacheDelete round trips per
+ * mount on the client's main thread: about 80 ms on a quiet host, and up to 2.3 s while disk images attach, detach or
+ * resize. Nx 24's asks only the cache directory's filesystem (`statfs`), through its nearest existing ancestor.
  *
- * The fixture's Nx runs with that native call replaced by one that throws, so
- * a run that still consults the host's disk inventory fails instead of passing
- * whenever the host happens to be quiet. Drop the hunk, and keep this test,
- * once the Nx version in use contains that fix.
+ * The run below takes the default bound with no cache directory yet, as on a checkout's first run; the installed native
+ * bound for a directory that does not exist must equal a tenth of its existing ancestor's filesystem.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');
-
-/** Loaded into every fixture Nx process before Nx itself. */
-const FORBID_DISK_INVENTORY = `require('nx/src/native').getDefaultMaxCacheSize = () => {
-  throw new Error('Nx enumerated the host disks to bound its cache');
-};
-`;
 
 async function runNx(root: string, env: Record<string, string>): Promise<{ code: number | null; output: string }> {
   const child = spawn(
@@ -70,7 +58,7 @@ async function runNx(root: string, env: Record<string, string>): Promise<{ code:
   }
 }
 
-it('bounds the default cache from its own filesystem without listing the host disks', async () => {
+it('bounds the default cache from its own filesystem, whose directory may not exist yet', async () => {
   await withNxFixture('nx-cache-bound-', async ({ workspace: root, socketDirectory }) => {
     await mkdir(join(root, 'app'));
     await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
@@ -93,17 +81,25 @@ it('bounds the default cache from its own filesystem without listing the host di
         },
       }),
     );
-    await writeFile(join(root, 'forbid-disk-inventory.cjs'), FORBID_DISK_INVENTORY);
     execFileSync('git', ['init', '--quiet', root], { stdio: 'pipe' });
 
     // The bound is taken by the client that runs the tasks, daemon or not.
     // The cache directory does not exist yet, as on a checkout's first run.
-    const { code, output } = await runNx(root, {
-      ...fixtureNxEnv(root, socketDirectory),
-      NODE_OPTIONS: `--require ${join(root, 'forbid-disk-inventory.cjs')}`,
-    });
-    expect(output).not.toContain('Nx enumerated the host disks');
+    const { code, output } = await runNx(root, fixtureNxEnv(root, socketDirectory));
     expect(code, output).toBe(0);
     expect(await readFile(join(root, 'app/result.txt'), 'utf8')).toBe('built');
+    // The native bound of a directory that does not exist is a tenth of the filesystem of its nearest existing ancestor.
+    const missing = join(root, 'not', 'created', 'cache');
+    const measured = spawnSync(
+      'node',
+      [
+        '-e',
+        `process.stdout.write(String(require('nx/src/native').getDefaultMaxCacheSize(${JSON.stringify(missing)})))`,
+      ],
+      { cwd: root, encoding: 'utf8' },
+    );
+    expect(measured.status, measured.stderr).toBe(0);
+    const { blocks, bsize } = statfsSync(root);
+    expect(Math.abs(Number(measured.stdout) - Math.floor((blocks * bsize) / 10))).toBeLessThanOrEqual(1);
   });
 });

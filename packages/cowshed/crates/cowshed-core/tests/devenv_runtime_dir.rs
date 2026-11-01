@@ -1492,7 +1492,8 @@ async fn host_controller_native_file_watching_observes_allowed_updates_without_p
         r#"
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { Watcher } = require(process.argv[2]);
+const path = require('node:path');
+const { WorkspaceContext } = require(process.argv[2]);
 assert.throws(
   () => fs.readFileSync('private/secret.txt'),
   error => error.code === 'EPERM' || error.code === 'EACCES',
@@ -1507,38 +1508,42 @@ const observed = new Promise((resolve, reject) => {
   acknowledge = resolve;
   refuse = reject;
 });
-function collect(events) {
-  for (const event of events) {
-    if (event.path.startsWith('private/')) {
+function collect(paths) {
+  for (const changed of paths) {
+    if (changed.startsWith('private/')) {
       failure = new Error('private path exposed by watcher');
       refuse(failure);
     }
-    if (event.path === 'own.txt' && fs.readFileSync('own.txt', 'utf8') === 'after') {
+    if (changed === 'own.txt' && fs.readFileSync('own.txt', 'utf8') === 'after') {
       callbackMilliseconds ??= Number(process.hrtime.bigint() - readyAt) / 1e6;
       sawAllowedUpdate = true;
       acknowledge();
     }
   }
 }
-const watcher = new Watcher(process.cwd(), [], false);
-watcher.watch((error, events) => {
+// Nx 24's daemon watches through its workspace context, which owns the watch and starts it before its walk.
+const data = path.join(process.cwd(), '.nx', 'watch-data');
+fs.mkdirSync(data, { recursive: true });
+const context = new WorkspaceContext(process.cwd(), data, { watch: true });
+context.onWatchEvents((error, events) => {
   if (error) {
-    failure = new Error(error);
+    failure = error;
     refuse(failure);
-  } else collect(events);
+  } else collect(events.map((event) => event.path));
 });
 readyAt = process.hrtime.bigint();
 process.stdout.write(`${process.argv[3]}watch-ready\n`);
 (async () => {
   try {
     await observed;
-    collect(watcher.forceFlushPending());
+    const settled = context.settle();
+    collect([...settled.createdFiles, ...settled.updatedFiles].map(({ file }) => file).concat(settled.deletedFiles));
   } finally {
-    await watcher.stop();
+    context.stopWatching();
   }
   assert.equal(failure, null);
   assert.ok(sawAllowedUpdate, 'the allowed source change must produce a notification');
-  console.error(`native watcher time-to-callback: ${callbackMilliseconds.toFixed(3)}ms`);
+  console.error(`native watch time-to-callback: ${callbackMilliseconds.toFixed(3)}ms`);
   process.stdout.write(`${process.argv[3]}source-observed\n`);
 })().catch((error) => {
   console.error(error);

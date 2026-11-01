@@ -95,7 +95,7 @@ async function commitInInterruptedFork(serve: (fork: string, root: string) => st
     const record = join(volume, 'nx/workspace-data/d/server-process.json');
     writeFileSync(
       record,
-      `${JSON.stringify({ processId: process.pid, socketPath: socket, nxVersion: '23.2.1', workspaceRoot: main })}\n`,
+      `${JSON.stringify({ processId: process.pid, socketPath: socket, nxVersion: '24.0.3', workspaceRoot: main })}\n`,
     );
     const recorded = readFileSync(record);
     const socketIdentity = statSync(socket).ino;

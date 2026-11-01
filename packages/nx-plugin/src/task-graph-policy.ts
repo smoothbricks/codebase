@@ -78,7 +78,7 @@ export function buildTestDependencies(inputGraph: ProjectGraph, workspaceRoot: s
             if (!from) throw new Error(`Nx task edge has no source: ${source}`);
             const fromTarget = graph.nodes[from.target.project]?.data.targets?.[from.target.target];
             if (!fromTarget || isTestWork(from.target.target, fromTarget)) continue;
-            for (const test of dependencies) {
+            for (const { id: test } of dependencies) {
               const to = tasks.tasks[test];
               if (!to) throw new Error(`Nx task edge has no dependency: ${test}`);
               const toTarget = graph.nodes[to.target.project]?.data.targets?.[to.target.target];

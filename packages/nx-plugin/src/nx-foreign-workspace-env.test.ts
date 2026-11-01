@@ -8,7 +8,7 @@ import { fixtureNxEnv, stopFixtureNxDaemon, withNxFixture } from './__tests__/fi
 import { NX_LONGEST_SOCKET_NAME, nxDaemonProcesses, ownedFixtureRoot, ownedSocketDirectory } from './testing.js';
 
 /**
- * Guards the foreign-environment hunk of `patches/nx@23.2.1.patch`. A shell set up for one workspace keeps its
+ * Guards the foreign-environment hunk of `patches/nx@24.0.3.patch`. A shell set up for one workspace keeps its
  * `NX_WORKSPACE_ROOT_PATH`, `NX_WORKSPACE_DATA_DIRECTORY`, `NX_CACHE_DIRECTORY` and `NX_SOCKET_DIR` when it moves into
  * another checkout. Nx takes `NX_WORKSPACE_ROOT_PATH` verbatim as its root, so `nx daemon --stop` run there stopped the
  * first workspace's daemon and deleted its socket directory.

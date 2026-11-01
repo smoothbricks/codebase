@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the critical-path hunks of `patches/nx@23.2.1.patch` (tasks-schedule.js and
+ * Guards the critical-path hunks of `patches/nx@24.0.3.patch` (tasks-schedule.js and
  * task-orchestrator.js). Stock Nx orders ready tasks by how many tasks depend on them directly and
  * starts no task while every slot is held, so a gate's critical chain started behind short leaves
  * and then waited for slots held by tests running at a tenth of a core. The patched scheduler
@@ -68,7 +68,7 @@ const path = require('node:path');
 const { TasksSchedule } = require(path.join(${JSON.stringify(nxRoot)}, 'tasks-runner/tasks-schedule.js'));
 const task = (id) => ({ id: 'p:' + id, target: { project: 'p', target: id }, overrides: {}, outputs: [], cache: false });
 const ids = ['x', 'a0', 'a1', 't1', 't2'];
-const dependencies = { 'p:x': [], 'p:a0': ['p:x'], 'p:a1': ['p:a0'], 'p:t1': [], 'p:t2': [] };
+const dependencies = { 'p:x': [], 'p:a0': [{ id: 'p:x' }], 'p:a1': [{ id: 'p:a0' }], 'p:t1': [], 'p:t2': [] };
 const taskGraph = {
   roots: ['p:x', 'p:t1', 'p:t2'],
   tasks: Object.fromEntries(ids.map((id) => ['p:' + id, task(id)])),

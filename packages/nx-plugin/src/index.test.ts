@@ -3705,19 +3705,21 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const graph: ProjectGraph = { nodes, dependencies: { [rootProject]: [], cowshed: [], lmao: [] } };
       const task = (project: string, target: string): string => `${project}:${target}`;
       // Every task `from` waits on, directly or through the tasks it waits on.
-      const reached = (dependencies: Record<string, string[]>, from: string): string[] => {
+      const reached = (dependencies: Record<string, readonly { readonly id: string }[]>, from: string): string[] => {
         const seen = new Set<string>();
         const pending = [from];
         while (pending.length > 0) {
           const next = pending.pop();
           if (next === undefined || seen.has(next)) continue;
           seen.add(next);
-          pending.push(...(dependencies[next] ?? []));
+          pending.push(...(dependencies[next] ?? []).map((edge) => edge.id));
         }
         return [...seen];
       };
-      const groupsReached = (dependencies: Record<string, string[]>, from: string): string[] =>
-        reached(dependencies, from).filter((id) => id.includes(':cargo-test-group-'));
+      const groupsReached = (
+        dependencies: Record<string, readonly { readonly id: string }[]>,
+        from: string,
+      ): string[] => reached(dependencies, from).filter((id) => id.includes(':cargo-test-group-'));
       const device = task(rootProject, 'cargo-test-group-real-apfs');
       const hosted = task(rootProject, 'cargo-test-group-real-apfs-host');
 
@@ -3737,7 +3739,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         undefined,
         {},
       );
-      expect(named.dependencies[hosted]).toContain(device);
+      expect(named.dependencies[hosted]?.map((edge) => edge.id)).toContain(device);
       expect(groupsReached(named.dependencies, device)).toEqual([device]);
       expect(groupsReached(named.dependencies, task(rootProject, 'test'))).toEqual([]);
     } finally {
@@ -4085,7 +4087,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // The task graph `nx run-many -t deploy --projects=a,b,c` runs: Nx starts a task only once
       // every task it depends on has finished, so this is the order.
       const tasks = createTaskGraph(graph, {}, ['a', 'b', 'c'], ['deploy'], undefined, { stage: 'staging' });
-      expect(tasks.dependencies).toEqual({ 'a:deploy': ['b:deploy'], 'b:deploy': ['c:deploy'], 'c:deploy': [] });
+      expect(tasks.dependencies).toEqual({
+        'a:deploy': [{ id: 'b:deploy' }],
+        'b:deploy': [{ id: 'c:deploy' }],
+        'c:deploy': [],
+      });
       expect(tasks.roots).toEqual(['c:deploy']);
     } finally {
       await workspace.cleanup();

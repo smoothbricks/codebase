@@ -18,7 +18,7 @@ import { whenFound } from './__tests__/path-change.js';
 import { awaitExit, isRunning, type ProcessEntry, processesOf, processTree, terminate } from './testing.js';
 
 /**
- * Guards the event-driven validity hunk of `patches/nx@23.2.1.patch` (upstream nrwl/nx#37113, fixing nrwl/nx#37112).
+ * Guards the event-driven validity hunk of `patches/nx@24.0.3.patch` (upstream nrwl/nx#37113, fixing nrwl/nx#37112).
  * The installed daemon judged its root lockfiles and installed nx version on a 20 ms timer. These regressions preserve
  * the existing socket and process ownership guards while moving lockfile checks to applied watcher events, request
  * boundaries, and a 5 s safety poll for events the watcher ignores or drops.
@@ -369,7 +369,7 @@ function openClient(socketPath: string): Promise<RawClient> {
         if (socket.destroyed) return Promise.resolve(gone('the connection was already closed'));
         const answer = Promise.withResolvers<Answer>();
         waiting = answer.resolve;
-        sendMessage(socket, message, 'json');
+        sendMessage(socket, message);
         return guardEvent(answer.promise, what, () => `socket ${socketPath}`);
       },
       close() {
@@ -759,7 +759,7 @@ it('awaits an answerable daemon after a closed PING without another socket-direc
       socket.once('data', () => {
         requests += 1;
         if (requests === 1) socket.end();
-        else sendMessage(socket, true, 'json');
+        else sendMessage(socket, true);
       });
     });
     const listening = Promise.withResolvers<void>();
@@ -1020,8 +1020,8 @@ it('stops each daemon as its state changes: an ignored lockfile, a replaced or r
         `${emptied}: the projects before the workspace was emptied`,
       ).toEqual(['p']);
       // Every tracked file goes, as when a checkout is removed or unmounted under its daemon; the daemon's own record
-      // under .nx stays, so only the workspace check can stop it. Reading the emptied file map instead would block
-      // the daemon's only thread for good, where no SIGTERM handler runs.
+      // under .nx stays, so only the workspace check can stop it. (Nx 23.2.1 read the emptied file map as one not filled
+      // yet and blocked the daemon's only thread for good, where no SIGTERM handler runs.)
       await rm(join(workspace, 'p'), { recursive: true });
       await unlink(join(workspace, 'package.json'));
       await unlink(join(workspace, 'nx.json'));

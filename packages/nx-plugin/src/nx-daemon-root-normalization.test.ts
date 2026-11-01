@@ -64,7 +64,7 @@ async function ping(socketPath: string, workspaceRoot: string): Promise<unknown>
     'data',
     consumeMessagesFromSocket((message) => resolve(parseMessage(message)), reject),
   );
-  socket.once('connect', () => sendMessage(socket, { type: 'PING', workspaceRoot }, 'json'));
+  socket.once('connect', () => sendMessage(socket, { type: 'PING', workspaceRoot }));
   try {
     return await guardEvent(
       promise,

@@ -9,7 +9,7 @@ import { whenChanged } from './__tests__/path-change.js';
 import { awaitExit, isRunning, ownedWorkspaceSocketDirectory, processesOf, terminate } from './testing.js';
 
 /**
- * Guards the daemon-claim hunk of `patches/nx@23.2.1.patch`. Every Nx 23.2.1 daemon overwrote the workspace's
+ * Guards the daemon-claim hunk of `patches/nx@24.0.3.patch`. Every stock Nx 24.0.3 daemon overwrites the workspace's
  * `server-process.json` with its own pid, so two clients that both found no daemon started two, and the later one
  * displaced the first: the first's clients lost their socket in the middle of a request (EPIPE on
  * `RECORD_OUTPUTS_HASH_BATCH`). Under a configured `NX_SOCKET_DIR` both daemons bind the same path, and closing a
