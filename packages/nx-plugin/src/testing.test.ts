@@ -1,10 +1,12 @@
 import { expect, it } from 'bun:test';
-import { existsSync, lstatSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { closeSync, constants, existsSync, lstatSync, openSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createConnection, createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import fc from 'fast-check';
+import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
 import {
   awaitExit,
@@ -257,6 +259,45 @@ it('stops a recorded daemon and its tree, and signals nothing it finds only by c
         }
         await awaitExit(await processTree(owned), `orphan probe of ${workspace}`);
       }
+    }
+  });
+});
+
+it('keeps its socket namespace out of the files a fixture daemon reads, though the workspace ignores nothing', async () => {
+  await withNxFixture('socket-namespace-fifo-', async ({ workspace, socketDirectory }) => {
+    // No .gitignore, as in task-results.test.ts: only the fixture keeps its .nx/sockets out of Nx's files.
+    await writeFile(join(workspace, 'package.json'), '{"name":"socket-namespace-fifo","private":true}\n');
+    await writeFile(join(workspace, 'nx.json'), '{}\n');
+    await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
+    const showProjects = async (what: string) => {
+      const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'show', 'projects', '--json'], {
+        cwd: workspace,
+        env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      let output = '';
+      const read = async (stream: ReadableStream<Uint8Array>) => {
+        for await (const chunk of stream) output += new TextDecoder().decode(chunk);
+      };
+      const code = await guardEvent(
+        Promise.all([child.exited, read(child.stdout), read(child.stderr)]).then(([exited]) => exited),
+        what,
+        () => output,
+      );
+      expect(code, output).toBe(0);
+    };
+    await showProjects('the daemon to start and answer');
+    // The run CPU pool's jobserver (executors/bounded-exec/cpu-pool.ts): a fifo in a directory of the socket namespace,
+    // its write end held open for the pool's life, so a reader of it blocks until the pool ends.
+    const pool = await mkdtemp(join(dirname(socketDirectory), 'cpu-pool-'));
+    execFileSync('mkfifo', ['-m', '600', join(pool, 'j')]);
+    const jobserver = openSync(join(pool, 'j'), constants.O_RDWR);
+    try {
+      await showProjects('the daemon to answer with a held jobserver fifo in its socket namespace');
+    } finally {
+      closeSync(jobserver);
     }
   });
 });

@@ -2680,9 +2680,15 @@ tests) owns those roots:
 - `publishFixtureSocketDirectory(workspace)` makes that alias and returns the leaf. The workspace must be a physical
   directory in a run this process holds (`ownedFixtureRoot`), so the run's sweep can reclaim the alias if the process
   dies; anything else is refused. The alias points at the fixture's own `.nx/sockets` (mode 0700, never through a
-  symlinked `.nx`); Nx makes the real `nx` leaf. This package's `withNxFixture` publishes its workspace and passes the
-  directory to the body, and the CLI's `runFixtureNx` publishes each root it runs in. Both `fixtureNxEnv`s take the
-  directory as an argument and publish nothing.
+  symlinked `.nx`); Nx makes the real `nx` leaf. The directory holds a `.gitignore` that ignores everything in it,
+  itself included, so nothing made there is a workspace file, as cowshed's git exclude keeps a shed's `.cowshed/run`
+  out: Nx 24's workspace context reads every path its watch reports created, and a jobserver fifo the run CPU pool makes
+  in the socket namespace (`executors/bounded-exec/cpu-pool.ts`) blocks that read, and with it the daemon's only thread,
+  until the pool ends. A `task-results.test.ts` daemon whose workspace ignored nothing hung that way in a land gate;
+  `testing.test.ts` holds such a fifo open under a daemon of a workspace that ignores nothing and requires the daemon to
+  answer. This package's `withNxFixture` publishes its workspace and passes the directory to the body, and the CLI's
+  `runFixtureNx` publishes each root it runs in. Both `fixtureNxEnv`s take the directory as an argument and publish
+  nothing.
 - `ownedWorkspaceSocketDirectory(workspace, slot)` creates the real leaf `a` or `b` beside `nx` below a published alias,
   for tests of multiple daemon socket directories. Its caller stops the daemon before removing the leaf.
 - `retireFixtureSocketDirectory(workspace)` unlinks only the verified parent alias after the daemon exits, named from

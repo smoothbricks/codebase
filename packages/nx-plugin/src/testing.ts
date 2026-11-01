@@ -742,6 +742,14 @@ export function fixtureSocketDirectory(workspace: string): string {
  * {@link retireFixtureSocketDirectory}. The alias points at the workspace's own
  * `.nx/sockets`, made mode 0700; a symlinked `.nx` or `.nx/sockets` is refused
  * before anything is written through it. Nx makes the `nx` leaf itself.
+ *
+ * `.nx/sockets` holds a `.gitignore` that ignores everything in it, itself
+ * included, so nothing the fixture's processes make there is a workspace file:
+ * Nx 24's workspace context reads every path its watch reports created, and a
+ * jobserver fifo the run CPU pool makes there (`executors/bounded-exec/cpu-pool.ts`)
+ * blocks that read, and the daemon's only thread with it, until the pool ends.
+ * In a cowshed shed the same namespace is `.cowshed/run`, which cowshed's git
+ * exclude keeps out the same way.
  */
 export async function publishFixtureSocketDirectory(workspace: string): Promise<string> {
   refuseWhileRetiring();
@@ -765,6 +773,11 @@ export async function publishFixtureSocketDirectory(workspace: string): Promise<
     if (!(await lstat(state)).isDirectory()) {
       throw new Error(`fixture socket target ${state} is not a real directory in its physical workspace`);
     }
+  }
+  try {
+    await writeFile(join(target, '.gitignore'), '*\n', { flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    if (errorCode(error) !== 'EEXIST') throw error;
   }
   try {
     await symlink(target, alias, 'dir');
