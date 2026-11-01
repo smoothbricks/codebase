@@ -5,8 +5,9 @@
 # Nix cc-wrapper and store-input keying, precompiled headers, more modeled compiler flags, the
 # refusal of host links a Nix wrapper shapes, edits counted against HEAD, LRU refresh for exposed
 # hits, per-target build-script predictions, nested Cargo targets, single-donor target seeding and
-# the pool rule that starts a reservation on the cores that are free (MBX_RESERVE_CPUS), from
-# smoothbricks/mr-boxington at the pinned revision.
+# the pool rule that starts a reservation on the cores that are free (MBX_RESERVE_CPUS), and one
+# reservation endpoint per Nx run (`mbx reservations`), from smoothbricks/mr-boxington at the pinned
+# revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
 #
@@ -18,7 +19,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/6a1741803cce7974df1ac391092512c8433029d6";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/3f84d92ac6d0a8eed7b8cd1a5cc97afc504f6753";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
