@@ -107,7 +107,7 @@ async function main() {
     if (done.has(id)) return done.get(id);
     const task = graph.tasks[id];
     let dependenciesRestored = true;
-    for (const dependency of [...graph.dependencies[id], ...(graph.continuousDependencies[id] ?? [])]) {
+    for (const { id: dependency } of [...graph.dependencies[id], ...(graph.continuousDependencies[id] ?? [])]) {
       if (!(await restore(dependency))) dependenciesRestored = false;
     }
     let reason;
