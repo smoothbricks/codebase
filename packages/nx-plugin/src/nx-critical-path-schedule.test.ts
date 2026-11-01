@@ -125,7 +125,8 @@ it('starts every continuous task of a run whose extra worker started past the sl
             executor: 'nx:run-commands',
             continuous: true,
             dependsOn: ['a1'],
-            options: { command: 'echo serve >> order.log && exec sleep 30' },
+            // Runs until the run's end stops it: no timer ends it.
+            options: { command: 'echo serve >> order.log && exec tail -f /dev/null' },
           },
           after: { ...append('after'), dependsOn: ['serve'] },
           ...chain('a2'),
@@ -141,7 +142,6 @@ it('starts every continuous task of a run whose extra worker started past the sl
         cwd: workspace,
         env: fixtureNxEnv(workspace, socketDirectory),
         encoding: 'utf8',
-        timeout: 60_000,
       },
     );
     expect(child.status, `${child.signal ?? ''} ${child.stdout}${child.stderr}`).toBe(0);
