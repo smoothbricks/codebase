@@ -146,7 +146,10 @@ it('starts every continuous task of a run whose extra worker started past the sl
     );
     expect(child.status, `${child.signal ?? ''} ${child.stdout}${child.stderr}`).toBe(0);
     const order = (await readFile(join(workspace, 'order.log'), 'utf8')).trim().split('\n');
+    // Nx starts a continuous task's dependents once its process starts, not once its command has written anything, so
+    // the two lines may come in either order. With the extra worker counted as a continuous task, `serve` never
+    // started and `after` never ran, and the run still exited 0.
     expect(order, order.join(' ')).toContain('serve');
-    expect(order.indexOf('after'), order.join(' ')).toBeGreaterThan(order.indexOf('serve'));
+    expect(order, order.join(' ')).toContain('after');
   });
 });

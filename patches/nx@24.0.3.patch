@@ -5131,10 +5131,19 @@ index f9f93ce62eab9448a72ad9d95b962067de113f1c..8657ded47a3b9df09d7a7ee8ed04490e
      }
      return cycles.size ? cycles : null;
 diff --git a/dist/src/tasks-runner/task-orchestrator.d.ts b/dist/src/tasks-runner/task-orchestrator.d.ts
-index b0d3c985bc330a54b43df557d3e247e1bf64e060..856ca410b3f12ef3e6f96e04c28a186da8f1c4ca 100644
+index b0d3c985bc330a54b43df557d3e247e1bf64e060..30dbf685a4b05ceb19e27b0b262d821bbdea4623 100644
 --- a/dist/src/tasks-runner/task-orchestrator.d.ts
 +++ b/dist/src/tasks-runner/task-orchestrator.d.ts
-@@ -58,6 +58,7 @@ export declare class TaskOrchestrator {
+@@ -49,6 +49,8 @@ export declare class TaskOrchestrator {
+     private pendingDiscreteWorkers;
+     private groups;
+     private continuousTasksStarted;
++    private criticalWorkersStarted;
++    private continuousGroupCount;
+     /**
+      * How many folds each batch id has rendered. A batch that reports a strict
+      * subset of its tasks is re-run under the same id, so one id can produce more
+@@ -58,6 +60,7 @@ export declare class TaskOrchestrator {
      private bailed;
      private resolveStopPromise;
      private stopRequested;
@@ -5142,7 +5151,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..856ca410b3f12ef3e6f96e04c28a186d
      private runningContinuousTasks;
      private runningRunCommandsTasks;
      private runningDiscreteTasks;
-@@ -73,6 +74,8 @@ export declare class TaskOrchestrator {
+@@ -73,6 +76,8 @@ export declare class TaskOrchestrator {
      private cleanupPromise;
      private signalHandlers;
      private tasksWithPersistedOutput;
@@ -5151,7 +5160,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..856ca410b3f12ef3e6f96e04c28a186d
      constructor(hasher: TaskHasher, initiatingProject: string | undefined, initiatingTasks: Task[], projectGraph: ProjectGraph, taskGraph: TaskGraph, nxJson: NxJsonConfiguration, options: NxArgs & DefaultTasksRunnerOptions, bail: boolean, daemon: DaemonClient, 
      /** What the user named; undefined means they named nothing. */
      specifiedOutputStyle: OutputStyle | undefined, 
-@@ -84,6 +87,7 @@ export declare class TaskOrchestrator {
+@@ -84,6 +89,7 @@ export declare class TaskOrchestrator {
      run(): Promise<{
          [k: string]: TaskStatus;
      }>;
@@ -5159,7 +5168,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..856ca410b3f12ef3e6f96e04c28a186d
      nextBatch(): Batch;
      /**
       * Coordinator loop. All batch operations (hashing, cache resolution)
-@@ -136,12 +140,9 @@ export declare class TaskOrchestrator {
+@@ -136,12 +142,9 @@ export declare class TaskOrchestrator {
       * cache fetch + lifecycle to the public method. Returns true if any
       * tasks were resolved.
       *
@@ -5175,7 +5184,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..856ca410b3f12ef3e6f96e04c28a186d
       */
      private resolveCachedTasksBulk;
      /**
-@@ -158,6 +159,7 @@ export declare class TaskOrchestrator {
+@@ -158,6 +161,7 @@ export declare class TaskOrchestrator {
      private applyBatchCachedResults;
      private hashBatchTasks;
      applyFromCacheOrRunBatch(doNotSkipCache: boolean, batch: Batch, groupId: number): Promise<TaskResult[]>;
@@ -5183,7 +5192,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..856ca410b3f12ef3e6f96e04c28a186d
      private runBatchWave;
      private runBatch;
      /**
-@@ -252,12 +254,11 @@ export declare class TaskOrchestrator {
+@@ -252,12 +256,11 @@ export declare class TaskOrchestrator {
       * don't actually compete for parallelism.
       */
      resolveCachedTasks(doNotSkipCache: boolean, tasks: Task[], groupId: number): Promise<TaskResult[]>;
@@ -5199,7 +5208,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..856ca410b3f12ef3e6f96e04c28a186d
       */
      private dispatchDiscreteWorker;
      /**
-@@ -269,11 +270,14 @@ export declare class TaskOrchestrator {
+@@ -269,11 +272,14 @@ export declare class TaskOrchestrator {
       */
      private handleDiscreteWorkerFailure;
      /**
