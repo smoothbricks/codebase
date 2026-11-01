@@ -6,6 +6,88 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+# The change feed's pass surface is driven by the consumer's RETE layer, which
+# owns the tracked mask, the pass boundaries and derived-fact recording
+# (specs/columine/07-change-feed.md §1).
+[[package.metadata.wiring.external]]
+item = "feed_bind"
+consumer = "rete"
+path = "crates/rete/src/pass.rs"
+
+[[package.metadata.wiring.external]]
+item = "feed_begin_pass"
+consumer = "rete"
+path = "crates/rete/src/pass.rs"
+
+[[package.metadata.wiring.external]]
+item = "feed_end_pass"
+consumer = "rete"
+path = "crates/rete/src/pass.rs"
+
+[[package.metadata.wiring.external]]
+item = "feed_record_fact"
+consumer = "rete"
+path = "crates/rete/src/derived_facts.rs"
+
+[[package.metadata.wiring.external]]
+item = "feed_work"
+consumer = "rete"
+path = "crates/rete/src/pass.rs"
+
+# The rule engine seeds keyed evaluation from the pass's entries, their chains and the
+# overflowed sources (specs/columine/07-change-feed.md §2, §5).
+[[package.metadata.wiring.external]]
+item = "feed"
+consumer = "rete"
+path = "crates/rete/src/seed.rs"
+
+[[package.metadata.wiring.external]]
+item = "entries"
+consumer = "rete"
+path = "crates/rete/src/seed.rs"
+
+[[package.metadata.wiring.external]]
+item = "chain"
+consumer = "rete"
+path = "crates/rete/src/seed.rs"
+
+[[package.metadata.wiring.external]]
+item = "overflow"
+consumer = "rete"
+path = "crates/rete/src/seed.rs"
+
+[[package.metadata.wiring.external]]
+item = "overflowed"
+consumer = "rete"
+path = "crates/rete/src/seed.rs"
+
+[[package.metadata.wiring.external]]
+item = "source"
+consumer = "rete"
+path = "crates/rete/src/seed.rs"
+
+[[package.metadata.wiring.external]]
+item = "key"
+consumer = "rete"
+path = "crates/rete/src/seed.rs"
+
+[[package.metadata.wiring.external]]
+item = "change"
+consumer = "rete"
+path = "crates/rete/src/seed.rs"
+
+[[package.metadata.wiring.external]]
+item = "prev"
+consumer = "rete"
+path = "crates/rete/src/seed.rs"
+
+# A host's bitmap export re-enters through the VM's own hooks, so an armed feed sees the
+# import (specs/columine/07-change-feed.md §4).
+[[package.metadata.wiring.external]]
+item = "bitmap_import"
+consumer = "superset-wasm"
+path = "crates/superset-wasm/src/lib.rs"
+
 [lib]
 path = "src/lib.rs"
 
