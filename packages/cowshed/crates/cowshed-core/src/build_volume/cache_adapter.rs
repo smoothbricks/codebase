@@ -75,7 +75,7 @@ mod tests {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("supports exactly Nx 24.0.3, not 24.0.4"),
+            stderr.contains("supports exactly Nx 23.2.1 or 24.0.3, not 24.0.4"),
             "{stderr}"
         );
         assert!(

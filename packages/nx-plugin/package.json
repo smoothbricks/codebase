@@ -318,6 +318,7 @@
           "default",
           "^dependencyDefault",
           "bunToolchain",
+          "{workspaceRoot}/packages/nx-23.2.1/package.json",
           {
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node --version"
           },

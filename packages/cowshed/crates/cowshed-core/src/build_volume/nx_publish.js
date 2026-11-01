@@ -32,7 +32,8 @@ async function publish() {
   let skipped = 0;
   for (const hash of hashes) {
     const result = getLocal(hash);
-    // A task Nx does not cache, or one that failed, has no complete entry to share.
+    // A task Nx does not cache, or one that failed, has no complete entry to share; nor has a row
+    // whose entry directory is gone, which Nx 23.2.1's lookup still answers.
     if (result?.code !== 0 || !fs.statSync(result.outputsPath, { throwIfNoEntry: false })?.isDirectory()) {
       skipped += 1;
       continue;
