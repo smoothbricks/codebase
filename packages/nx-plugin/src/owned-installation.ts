@@ -9,7 +9,7 @@
  * test reads it. A fixture must not take an input it does not own.
  *
  * So the closure is copied, exactly as the witness's own census resolves it from the workspace that names it: each
- * package once, with the census's own exclusions (`node_modules`, `.git`, `.nx`), each dependency edge relinked beside
+ * package once, without its `node_modules` and `.git`, each dependency edge relinked beside
  * its copy as Bun's isolated layout does, the top-level packages' bins in `.bin`. Every copy is a new inode, cloned
  * where the volume allows and written otherwise, so no link count is shared with anything outside its owner.
  *
@@ -307,7 +307,9 @@ function copyPackage(source: string, root: string, { place }: Placement): Promis
     recursive: true,
     verbatimSymlinks: true,
     mode: constants.COPYFILE_FICLONE,
-    filter: (path) => path === source || !['node_modules', '.git', '.nx'].includes(basename(path)),
+    // A package's own .nx is content, not Nx state: @nx/workspace 24.0.3 ships templates under one, and the census
+    // selects their directories through the package's `files` (expandOutputs), so a copy without them holds less.
+    filter: (path) => path === source || !['node_modules', '.git'].includes(basename(path)),
   });
 }
 

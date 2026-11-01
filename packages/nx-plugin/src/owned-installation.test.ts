@@ -155,4 +155,29 @@ describe('a kept fixture installation', () => {
       ['censuses.json', 'holders', 'lock', basename(dirname(elsewhere))].sort(),
     );
   });
+
+  it('copies a package’s own .nx directory, which its files select, so the next run proves and keeps the copy', async () => {
+    // @nx/workspace 24.0.3 ships dist/src/generators/ci-workflow/files/ci-config/.nx/ci-config.yaml__tmpl__, under
+    // `files` with a negation, which Nx's expandOutputs answers file by file.
+    const dependency = join(censusRoot, 'node_modules', 'dependency');
+    await writeFile(
+      join(dependency, 'package.json'),
+      JSON.stringify({
+        name: 'dependency',
+        version: '1.0.0',
+        main: 'dist/index.js',
+        files: ['dist', '!dist/skip.txt'],
+      }),
+    );
+    await mkdir(join(dependency, 'dist', 'ci-config', '.nx'), { recursive: true });
+    await writeFile(join(dependency, 'dist', 'index.js'), 'module.exports = "dependency";\n');
+    await writeFile(join(dependency, 'dist', 'skip.txt'), 'not published\n');
+    await writeFile(join(dependency, 'dist', 'ci-config', '.nx', 'ci-config.yaml__tmpl__'), 'ci: true\n');
+    const first = take('dot-nx');
+    expect(first.stderr).toBe('');
+    const index = join(first.modules, 'nx', 'index.js');
+    const made = (await stat(index)).ino;
+    expect(take('dot-nx')).toEqual({ modules: first.modules, stderr: '' });
+    expect((await stat(index)).ino).toBe(made);
+  });
 });
