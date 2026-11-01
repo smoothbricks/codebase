@@ -154,7 +154,7 @@ describe('only aggregates are uncached', () => {
     console.error = originalConsoleError;
   });
 
-  it('refuses an uncached target that runs work, and passes aggregates and cached targets', () => {
+  it('refuses an uncached target that runs work, and passes aggregates, deploys and cached targets', () => {
     const projects = projectTargetsFromNxProjects({
       app: {
         root: 'packages/app',
@@ -162,11 +162,6 @@ describe('only aggregates are uncached', () => {
           bench: { executor: 'nx:run-commands', cache: false, options: { command: 'cargo bench' } },
           build: { executor: 'nx:run-commands', cache: true, options: { command: 'tsc' } },
           'cli-native': { executor: 'nx:noop', cache: false, dependsOn: ['build'] },
-          deploy: {
-            executor: 'nx:run-commands',
-            cache: false,
-            options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' },
-          },
           clean: { executor: '@smoothbricks/nx-plugin:clean-outputs', cache: false },
           lint: { executor: 'nx:run-script', cache: false, options: { script: 'lint' } },
           serve: { executor: 'nx:run-commands', cache: false, options: { command: 'vite' } },
@@ -175,55 +170,32 @@ describe('only aggregates are uncached', () => {
       },
     });
     const errors = captureConsoleErrors();
-    expect(validateCacheOnlyAggregatesUncached(projects)).toBe(5);
+    expect(validateCacheOnlyAggregatesUncached(projects)).toBe(4);
     const refusal = (target: string, executor: string) =>
-      `app:${target}: "cache": false on a target that runs ${executor}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input; a deploy that must run every time states why in "metadata": { "liveDeploy": "<why>" }`;
+      `app:${target}: "cache": false on a target that runs ${executor}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input`;
     expect(errors).toEqual([
       refusal('bench', 'nx:run-commands'),
       refusal('clean', '@smoothbricks/nx-plugin:clean-outputs'),
-      // A wrangler deploy is no exception unless it states why it is live: the plugin's own is cached.
-      refusal('deploy', 'nx:run-commands'),
       refusal('lint', 'nx:run-script'),
       refusal('serve', 'nx:run-commands'),
     ]);
   });
 
-  it('passes an uncached deploy that states why it is live, and no other target the statement is put on', () => {
-    const deploy = 'smoo wrangler deploy-stage --stage {args.stage} && bun scripts/verify.ts --stage {args.stage}';
-    const why = 'its steps after deploy-stage read the stage live, and a rollback must never be answered from a cache';
+  it('passes a deploy uncached, stated or not, since deploy-stage answers whether its version is live', () => {
+    const command = 'smoo wrangler deploy-stage --stage {args.stage} && bun scripts/verify.ts --stage {args.stage}';
     const projects = projectTargetsFromNxProjects({
-      app: {
-        root: 'packages/app',
-        targets: {
-          bench: {
-            executor: 'nx:run-commands',
-            cache: false,
-            metadata: { liveDeploy: why },
-            options: { command: 'cargo bench' },
-          },
-          deploy: {
-            executor: 'nx:run-commands',
-            cache: false,
-            metadata: { liveDeploy: why, description: 'Deploy a stage' },
-            options: { command: deploy },
-          },
-        },
+      site: {
+        root: 'packages/site',
+        targets: { deploy: { executor: 'nx:run-commands', cache: false, options: { command } } },
       },
-      web: {
-        root: 'packages/web',
-        targets: {
-          deploy: {
-            executor: 'nx:run-commands',
-            cache: false,
-            metadata: { liveDeploy: ' ' },
-            options: { command: deploy },
-          },
-        },
+      backend: {
+        root: 'packages/backend',
+        targets: { deploy: { executor: 'nx:run-commands', options: { command: 'bun scripts/deploy.ts' } } },
       },
     });
     const errors = captureConsoleErrors();
-    expect(validateCacheOnlyAggregatesUncached(projects)).toBe(2);
-    expect(errors.map((error) => error.split(': ')[0])).toEqual(['app:bench', 'web:deploy']);
+    expect(validateCacheOnlyAggregatesUncached(projects)).toBe(0);
+    expect(errors).toEqual([]);
   });
 });
 

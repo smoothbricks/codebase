@@ -35,8 +35,6 @@ export interface ProjectTargets {
    */
   localTargetDependencies?: Map<string, string[]>;
   targetExecutors?: Map<string, string>;
-  /** Per-target `metadata.liveDeploy`: why a deploy runs on every request. */
-  targetLiveDeploy?: Map<string, string>;
   /** Per-target inputs, including runtime definitions needed by identity policies. */
   targetInputs?: Map<string, NonNullable<NxTargetConfig['inputs']>>;
   /** Project-local named inputs override workspace definitions. */
@@ -219,14 +217,6 @@ export function targetCacheFromNxProjectJson(value: NxProjectJson | null | undef
     }
   }
   return cache;
-}
-
-function targetLiveDeployFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string> {
-  const reasons = new Map<string, string>();
-  for (const [targetName, target] of Object.entries(value?.targets ?? {})) {
-    if (target.metadata?.liveDeploy !== undefined) reasons.set(targetName, target.metadata.liveDeploy);
-  }
-  return reasons;
 }
 
 export function targetScriptsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string> {
@@ -455,7 +445,6 @@ export function projectTargetsFromNxProjects(projects: NxProjects): ProjectTarge
         targetInputs: targetInputsFromNxProjectJson(metadata),
         namedInputs: metadata.namedInputs,
         targetExecutors: targetExecutorsFromNxProjectJson(metadata),
-        targetLiveDeploy: targetLiveDeployFromNxProjectJson(metadata),
         targetOptions: targetOptionsFromNxProjectJson(metadata),
         targetOutputs: targetOutputsFromNxProjectJson(metadata),
         targetScripts: targetScriptsFromNxProjectJson(metadata),

@@ -99,7 +99,6 @@ describe('Nx helper output formatting', () => {
             dependsOn: ['build'],
             inputs: ['default', { runtime: 'echo version' }],
             options: { command: 'bun test', timeoutMs: 120_000 },
-            metadata: { liveDeploy: 'reads the stage live', technologies: ['bun'] },
           },
           build: {
             outputs: ['{projectRoot}/{options.out}/'],
@@ -125,7 +124,6 @@ describe('Nx helper output formatting', () => {
         targetDependencies: new Map(),
         localTargetDependencies: new Map([['lint', []]]),
         targetExecutors: new Map(),
-        targetLiveDeploy: new Map(),
         targetInputs: new Map(),
         targetOptions: new Map(),
         targetOutputs: new Map(),
@@ -144,7 +142,6 @@ describe('Nx helper output formatting', () => {
           ['build', []],
         ]),
         targetExecutors: new Map([['test', '@smoothbricks/nx-plugin:bounded-exec']]),
-        targetLiveDeploy: new Map([['test', 'reads the stage live']]),
         targetInputs: new Map([['test', ['default', { runtime: 'echo version' }]]]),
         targetOptions: new Map([
           ['test', { command: 'bun test', timeoutMs: 120_000 }],

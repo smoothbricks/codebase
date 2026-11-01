@@ -415,23 +415,23 @@ export function validateAggregateMemberCache(projects: readonly ProjectTargets[]
 }
 
 /**
- * `"cache": false` belongs to an aggregate alone: `nx:noop`, or a target that runs nothing and only depends on others
- * (the owner's rule, 2026-10-30). Every target that runs something keys what it reads and writes, so a rerun with
- * unchanged inputs is a cache hit, and a miss is a missing declaration, never a feature. The reasons a target was left
- * uncached each have a declaration instead: a fetch keys on its lockfile, a long-running service is
- * `"continuous": true`, a measurement keys on the code and toolchain it measures, and the host state a target reads
- * is a runtime input. A target that deletes build state file by file (`clean`) has no place at all: build state is
- * removed whole (cowshed rm, mbx gc). The one target that runs work uncached is a `deploy` that states why in
- * `"metadata": { "liveDeploy": "<why>" }`: one whose steps around `smoo wrangler deploy-stage` read the stage live, so
- * the `wrangler-deploy` executor cannot run it, and a cache hit after a rollback would deploy nothing. It still runs
- * under Nx's own task hash, so `deploy-stage` tags the version with what the commit holds.
+ * `"cache": false` belongs to an aggregate, `nx:noop` or a target that runs nothing and only depends on others (the
+ * owner's rule, 2026-10-30), and to a `deploy` (below). Every other target that runs something keys what it reads and
+ * writes, so a rerun with unchanged inputs is a cache hit, and a miss is a missing declaration, never a feature. The
+ * reasons a target was left uncached each have a declaration instead: a fetch keys on its lockfile, a long-running
+ * service is `"continuous": true`, a measurement keys on the code and toolchain it measures, and the host state a target
+ * reads is a runtime input. A target that deletes build state file by file (`clean`) has no place at all: build state is
+ * removed whole (cowshed rm, mbx gc). `deploy` is the target `smoo github-ci nx-deploy` runs, and its question is
+ * whether its version is live, which `smoo wrangler deploy-stage` answers against the stage's live tag
+ * (`remote-cache-hit`) and Nx's key cannot ask. It still runs under Nx's task hash, so deploy-stage tags its version
+ * with what the commit holds.
  */
 export function validateCacheOnlyAggregatesUncached(projects: readonly ProjectTargets[]): number {
   let failures = 0;
   for (const project of projects) {
     for (const target of [...project.targets].sort()) {
       if (project.targetCache?.get(target) !== false) continue;
-      if (target === 'deploy' && (project.targetLiveDeploy?.get(target)?.trim() ?? '') !== '') continue;
+      if (target === 'deploy') continue;
       const executor = project.targetExecutors?.get(target);
       const options = project.targetOptions?.get(target);
       const runs =
@@ -444,7 +444,7 @@ export function validateCacheOnlyAggregatesUncached(projects: readonly ProjectTa
               : null;
       if (runs === null) continue;
       console.error(
-        `${project.project}:${target}: "cache": false on a target that runs ${runs}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input; a deploy that must run every time states why in "metadata": { "liveDeploy": "<why>" }`,
+        `${project.project}:${target}: "cache": false on a target that runs ${runs}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input`,
       );
       failures++;
     }

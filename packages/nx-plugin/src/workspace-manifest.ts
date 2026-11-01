@@ -373,11 +373,6 @@ export interface NxTargetConfig {
   defaultConfiguration?: TargetConfiguration['defaultConfiguration'];
   cache?: boolean;
   command?: string;
-  /**
-   * What `smoo monorepo check` reads of Nx's target `metadata`: `liveDeploy`, why a `deploy` must run on every request,
-   * which lets it state `"cache": false` (package-policy's validateCacheOnlyAggregatesUncached).
-   */
-  metadata?: { liveDeploy?: string; [key: string]: unknown };
 }
 
 export interface NxProjectJson {
