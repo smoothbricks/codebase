@@ -49,19 +49,33 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture(files: Record<string, string>): Promise<string> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-jactionlint-')));
-  roots.push(root);
-  const init = Bun.spawnSync(['git', 'init', '--quiet'], {
+function git(root: string, ...args: string[]): void {
+  const result = Bun.spawnSync(['git', ...args], {
     cwd: root,
     env: mergeEnv(undefined, ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR']),
   });
-  expect(init.exitCode).toBe(0);
+  expect(result.exitCode).toBe(0);
+}
+
+async function fixture(files: Record<string, string>): Promise<string> {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-jactionlint-')));
+  roots.push(root);
+  git(root, 'init', '--quiet');
   for (const [path, content] of Object.entries(files)) {
     await mkdir(dirname(join(root, path)), { recursive: true });
     await writeFile(join(root, path), content);
   }
   return root;
+}
+
+/** Narrows PATH to the fixture root, which then holds only the named tools of the current PATH. */
+async function pathWith(root: string, ...tools: string[]): Promise<void> {
+  for (const tool of tools) {
+    const resolved = Bun.which(tool);
+    if (!resolved) throw new Error(`test prerequisite ${tool} is missing from PATH`);
+    await symlink(resolved, join(root, tool));
+  }
+  process.env.PATH = root;
 }
 
 describe('GitHub Actions validation with the real jactionlint executable', () => {
@@ -146,6 +160,24 @@ describe('GitHub Actions validation with the real jactionlint executable', () =>
     expect(output).toContain('undefined_name');
   });
 
+  it('checks the files git tracks or would add that the working tree holds, never ones the repository ignores', async () => {
+    const path = 'cache/x/.github/actions/a/action.yml';
+    const root = await fixture({
+      '.gitignore': 'cache/\n',
+      '.github/workflows/validate.yml': workflow,
+      [path]: action.replace('shell: bash', 'shell-typo: bash'),
+    });
+    git(root, 'add', '.gitignore', '.github/workflows/validate.yml');
+    expect(await validateGitHubActions(root)).toBe(0);
+    git(root, 'add', '--force', path);
+    const logs = spyOn(console, 'log').mockImplementation(() => {});
+    spyOn(console, 'error').mockImplementation(() => {});
+    expect(await validateGitHubActions(root)).toBe(1);
+    expect(logs.mock.calls.flat().join('\n')).toContain(path);
+    await rm(join(root, path));
+    expect(await validateGitHubActions(root)).toBe(0);
+  });
+
   it.each(['.github/actions/fixture/action.yml', 'automation/fixture/action.yaml', 'action.yml'])(
     'checks valid and invalid composite action metadata at %s without a workflow',
     async (path) => {
@@ -176,29 +208,25 @@ describe('GitHub Actions validation with the real jactionlint executable', () =>
 
   it('skips only absent applicable inputs, with a verbose reason', async () => {
     const root = await fixture({
+      '.gitignore': 'node_modules/\n',
       '.github/workflows/nested/not-a-workflow.yml': 'not a workflow: [',
       'node_modules/dependency/action.yml': 'not an action: [',
-      'fixtures/action.yaml': 'not an action: [',
     });
     const logs = spyOn(console, 'log').mockImplementation(() => {});
-    process.env.PATH = root;
+    await pathWith(root, 'git');
     expect(await validateGitHubActions(root, true)).toBe(0);
     expect(logs.mock.calls.flat().join('\n')).toContain('no workflows, actions, or Dependabot configuration');
   });
 
-  it('does not turn an unreadable workflow directory or missing executable into a pass', async () => {
-    const malformed = await fixture({ '.github/workflows': 'not a directory' });
+  it('does not turn a failed input discovery or missing executable into a pass', async () => {
+    const malformed = await fixture({ '.github/workflows/validate.yml': workflow });
+    await rm(join(malformed, '.git'), { recursive: true });
+    await writeFile(join(malformed, '.git'), 'gitdir: missing\n');
     const errors = spyOn(console, 'error').mockImplementation(() => {});
     expect(await validateGitHubActions(malformed)).toBe(1);
     expect(errors.mock.calls.flat().join('\n')).toContain('input discovery failed');
     const root = await fixture({ '.github/workflows/validate.yml': workflow });
-    const shellcheck = Bun.which('shellcheck');
-    const pyflakes = Bun.which('pyflakes');
-    if (!shellcheck) throw new Error('test prerequisite shellcheck is missing from PATH');
-    if (!pyflakes) throw new Error('test prerequisite pyflakes is missing from PATH');
-    await symlink(shellcheck, join(root, 'shellcheck'));
-    await symlink(pyflakes, join(root, 'pyflakes'));
-    process.env.PATH = root;
+    await pathWith(root, 'git', 'shellcheck', 'pyflakes');
     expect(await validateGitHubActions(root)).toBe(1);
     expect(errors.mock.calls.flat().join('\n')).toContain('requires jactionlint on the managed shell/CI PATH');
   });
@@ -208,13 +236,7 @@ describe('GitHub Actions validation with the real jactionlint executable', () =>
     async (missing) => {
       const other = missing === 'shellcheck' ? 'pyflakes' : 'shellcheck';
       const root = await fixture({ '.github/workflows/validate.yml': workflow });
-      const jactionlint = Bun.which('jactionlint');
-      const otherPath = Bun.which(other);
-      if (!jactionlint) throw new Error('test prerequisite jactionlint is missing from PATH');
-      if (!otherPath) throw new Error(`test prerequisite ${other} is missing from PATH`);
-      await symlink(jactionlint, join(root, 'jactionlint'));
-      await symlink(otherPath, join(root, other));
-      process.env.PATH = root;
+      await pathWith(root, 'git', 'jactionlint', other);
       const errors = spyOn(console, 'error').mockImplementation(() => {});
       expect(await validateGitHubActions(root)).toBe(1);
       const output = errors.mock.calls.flat().join('\n');

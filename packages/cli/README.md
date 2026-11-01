@@ -224,11 +224,16 @@ User-global dotfiles therefore cannot weaken the gate. Repository config may cho
 rules, or enable an existing baseline. Smoo never requests fixes, baseline creation, or ignore flags, including in
 `smoo monorepo validate --fix` mode; `--no-online` also disables network checks requested by repository config.
 
-Normally jactionlint discovers its own inputs and local action callers. For standalone Dependabot or subdirectory-action
-repositories that jactionlint cannot recognize in repository mode, smoo passes the explicit input files. Only YAML files
-directly in `.github/workflows` are workflows; action discovery follows jactionlint's dependency/test-fixture
-exclusions. A repository with no applicable workflow, action metadata, or Dependabot configuration is skipped, with the
-reason printed under `--verbose`; applicable files are never treated as a successful empty check.
+Git decides the inputs, never a filesystem walk. Smoo lists the YAML files directly in `.github/workflows` (only those
+are workflows), `action.yml` and `action.yaml` at any depth, and `.github/dependabot.yml` or `.yaml` with
+`git ls-files --cached --others --exclude-standard`, and passes the ones the working tree holds to jactionlint as
+explicit files. Tracked files and new files not yet added are checked; a file the repository ignores, such as a
+dependency install or a tool cache inside the checkout (a Go module cache holds third-party actions), is never an input,
+while a tracked action is checked wherever it lives, test fixtures included. Smoo never runs jactionlint's repository
+mode, which walks the filesystem into ignored directories and lints what it finds there; given explicit files,
+jactionlint still detects the project and the local workflows that call each action. A repository with no applicable
+workflow, action metadata, or Dependabot configuration is skipped, with the reason printed under `--verbose`; applicable
+files are never treated as a successful empty check, and a failed `git ls-files` fails the check.
 
 `smoo monorepo validate --only-if-new-workspace-package` first checks the staged git diff for newly added workspace
 package manifests. If none are staged, it exits successfully without running the full validator. The generated
