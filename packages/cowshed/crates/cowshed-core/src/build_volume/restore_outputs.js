@@ -13,7 +13,7 @@ process.env.NX_CACHE_DIRECTORY = path.join(root, '.nx', 'cache');
 const requireNx = createRequire(path.join(root, 'package.json'));
 // A task graph's dependency entry in each Nx version this helper was read against (`TaskGraph`,
 // that version's `native/index.d.ts`): 23.2.1 lists the task's id, 24.0.3 a `TaskGraphEdge` naming
-// it in `id`. Any other version is refused by name before Nx is loaded: requalify the helper first.
+// it in `id`. Any other version is refused by name before Nx is loaded: requalify the helper against it.
 const DEPENDENCY_TASK = new Map([
   ['23.2.1', (taskId) => taskId],
   ['24.0.3', (edge) => edge.id],
@@ -22,7 +22,7 @@ const nxVersion = requireNx('nx/package.json').version;
 const dependencyTask = DEPENDENCY_TASK.get(nxVersion);
 if (!dependencyTask) {
   throw new Error(
-    `cache-only restoration supports exactly Nx ${[...DEPENDENCY_TASK.keys()].join(' or ')}, not ${nxVersion}; requalify it before upgrading`,
+    `cache-only restoration supports exactly Nx ${[...DEPENDENCY_TASK.keys()].join(' or ')}, not ${nxVersion}; requalify the helper against it`,
   );
 }
 const yargs = createRequire(requireNx.resolve('nx/package.json'))('yargs');

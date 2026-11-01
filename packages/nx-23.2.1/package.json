@@ -5,7 +5,7 @@
   "nx": {
     "name": "nx-23.2.1"
   },
-  "description": "Nx 23.2.1, installed for the tests that run cowshed's Nx boundaries against each Nx version they declare besides the repository's own.",
+  "description": "Nx 23.2.1, installed for the tests that run cowshed's Nx boundaries against each Nx version they declare besides the repository's own. The alias keeps the root overrides off it, and Bun's isolated linker keeps its nx bin inside this package.",
   "devDependencies": {
     "nx-23.2.1": "npm:nx@23.2.1"
   }
