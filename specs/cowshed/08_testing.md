@@ -503,6 +503,13 @@ and worktree metadata grants. The probe executes Git through the system-selected
 `/usr/bin/git` launcher: the launcher requires xcrun host-cache writes even for read-only operations. Publication
 fixtures provide the existing `.cowshed` directory that workspace creation owns.
 
+cowshed-core's tests run real Nx installs: the repository's own, patched by its carried `patches/nx@*.patch`, and each
+other version a cowshed Nx boundary declares (`packages/nx-23.2.1`). Their shards' cache key names both (nx.json
+`targetDefaults` `cargo-test-cowshed-core-*`: the lockfile nodes `npm:nx@24.0.3` and `npm:nx@23.2.1` with every package
+each reaches in bun.lock, and the carried patch files), so a change to either, a patch-only one included, reruns them.
+After an Nx bump that leaves a name in the list uninstalled, every run that hashes these shards fails with Nx's "The
+externalDependency 'nx@24.0.3' … could not be found" until the list follows.
+
 Nx-backed host-controller probes share `tests/support/nx_reads.rs`: it walks the checkout's pinned Bun-installed Nx
 package and its reachable package-private namespaces, admitting only the required external Bun-store payloads and
 namespaces. Patched packages remain local to the checkout; no generated release closure, binary copy, hoist or

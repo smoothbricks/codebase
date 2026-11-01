@@ -78,7 +78,12 @@
         { "projects": ["cowshed"], "target": "apfs-test-root" },
         { "projects": ["cowshed"], "target": "capability-probe" }
       ],
-      "inputs": ["...", { "dependentTasksOutputFiles": "**/capability-probe/diagnostics.json", "transitive": false }]
+      "inputs": [
+        "...",
+        { "dependentTasksOutputFiles": "**/capability-probe/diagnostics.json", "transitive": false },
+        { "externalDependencies": ["nx@24.0.3", "nx@23.2.1"] },
+        "{workspaceRoot}/patches/nx@*.patch"
+      ]
     },
     "cargo-test-group-real-apfs": {
       "dependsOn": [
