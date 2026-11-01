@@ -2041,15 +2041,16 @@ mod tests {
             .spawn_locked()
             .expect("spawn sleep");
         let pid = libc::pid_t::try_from(child.id()).expect("a pid");
-        let exit = ExitWatch::of(child.id())
-            .expect("watch sleep")
-            .expect("sleep runs");
         // The child is read the instant it has started: asleep in nanosleep once it has, and
         // until then running its start or in an uninterruptible kernel wait during it. Every state
         // is read before any is asserted, so a failed assertion leaves no sleeper running.
         let started = run_state(pid);
         child.kill().expect("kill sleep");
-        exit.wait().expect("sleep exits");
+        // waitid(WNOWAIT) answers once the child is waitable, i.e. a zombie, and leaves it unreaped.
+        // An exit watch is too early: xnu posts NOTE_EXIT in proc_exit before the process joins
+        // the zombie list, so a read right after it can find no process at all.
+        crate::test_backstop::waitid(libc::P_PID, child.id(), libc::WEXITED | libc::WNOWAIT)
+            .expect("sleep exits, unreaped");
         let exited = run_state(pid);
         child.wait_bounded().expect("reap sleep");
         let reaped = run_state(pid);
@@ -2078,13 +2079,12 @@ mod tests {
             .spawn_locked()
             .expect("spawn sleep");
         let pid = libc::pid_t::try_from(child.id()).expect("a pid");
-        let exit = ExitWatch::of(child.id())
-            .expect("watch sleep")
-            .expect("sleep runs");
         // Every read happens before any assertion, so a failed assertion leaves no sleeper.
         let started = lineage(pid);
         child.kill().expect("kill sleep");
-        exit.wait().expect("sleep exits");
+        // Waitable means zombie; see a_childs_run_state_follows_its_life for why an exit watch is too early.
+        crate::test_backstop::waitid(libc::P_PID, child.id(), libc::WEXITED | libc::WNOWAIT)
+            .expect("sleep exits, unreaped");
         let exited = lineage(pid);
         child.wait_bounded().expect("reap sleep");
         let reaped = lineage(pid);
