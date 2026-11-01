@@ -28,10 +28,13 @@ push = "codebase"
 # First main's built products: the ordinary compiler outputs, whose producer receipts consumers' snapshot captures read,
 # then exactly the build units developer links in other checkouts judge stale here (tooling/rebuild-linked.ts runs the
 # link judge's own rebuilds, so no unit a link reads is left out); Nx restores the outputs the gate cached for the same
-# tree, so both are cache hits. Then the install of a land that changed cowshed.
+# tree, so both are cache hits. Then, with the smoo that build produced, the Git repositories beside main, recorded in
+# main's git config: a fork's sandboxed commit hooks cannot list main's parent and judge the names its clone of that
+# config carries (packages/cli/README.md, "Formatting And Git Hooks"). Then the install of a land that changed cowshed.
 after = [
   ["bun", "nx", "run-many", "-t", "build", "--outputStyle=static-failures-only"],
   ["bun", "tooling/rebuild-linked.ts"],
+  ["smoo", "monorepo", "record-sibling-projects"],
   ["sh", "tooling/land-install.sh", "smoothbricks", "{before}", "{head}"],
 ]
 

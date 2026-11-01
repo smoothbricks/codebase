@@ -37,6 +37,7 @@ smoo monorepo validate-commit-msg <commit-msg-file>
 smoo monorepo check-public-denylist [--remote <name>] [revisions...]
 smoo monorepo check-public-denylist --staged
 smoo monorepo check-public-denylist --commit-message <commit-msg-file>
+smoo monorepo record-sibling-projects
 smoo monorepo sync-bun-lockfile-versions [--stage]
 smoo monorepo list-release-packages [--fail-empty] [--github-output <path>]
 smoo monorepo validate-public-tags
@@ -948,6 +949,17 @@ a stray one cannot refuse or fail a commit. A digits-only name's term would refu
 number that carries the number (`@@ -379,36 +384,111 @@` beside a sibling named `111`); a name of one or two characters
 is ordinary text. A name that mixes digits with other characters keeps its term, and an explicit
 `smoothbricks.publicDenylist` pattern that names a number still refuses it.
+
+A view that cannot list the siblings judges the names the host recorded for it. A cowshed sandbox withholds the adopted
+checkout and its parent from its jobs (`EPERM`), and a directory the user may not read withholds them the same way
+(`EACCES`). There the check reads `smoothbricks.siblingProjects` from the repository's own git config, which every
+copy-on-write clone of the checkout carries: one value, the names joined by `/`, which no directory name contains, and
+empty when no project sits beside the checkout. `smoo monorepo record-sibling-projects`, run on the host, discovers the
+siblings as the check does and writes that value when it differs. A checkout without a record refuses the commit and
+names that command, as `cowshed exec <workspace> --host -- smoo monorepo record-sibling-projects` in a cowshed
+workspace. SmoothBricks' land runs it in main after every land (`.cowshed.toml`, `[land] after`), so a fork judges the
+projects that sat beside main when it last landed, and a project cloned beside main since then is judged in a sandbox
+from the next land on. A view that lists the parent always discovers, whatever the record holds.
 
 Legitimate public references belong in the committed `tooling/public-denylist-allowlist.tsv`, read from that same index.
 Its tab-separated rules are `package-scope<TAB>@scope`, `repository<TAB>public-name`, or

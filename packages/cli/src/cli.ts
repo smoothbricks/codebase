@@ -205,6 +205,15 @@ function buildProgram(): Command {
       await checkPublicDenylist(root, revisions.length > 0 ? revisions : ['HEAD'], options.remote);
     });
   monorepo
+    .command('record-sibling-projects')
+    .description(
+      'record the Git repositories beside the project in its git config, for commit hooks whose view cannot list them; run on the host',
+    )
+    .action(async () => {
+      const { recordSiblingProjectsCommand } = await import('./monorepo/public-denylist.js');
+      await recordSiblingProjectsCommand(await findRepoRoot());
+    });
+  monorepo
     .command('sync-bun-lockfile-versions')
     .option('--stage', 'stage bun.lock when versions were resynced; quiet when clean')
     .action(async (options: { stage?: boolean }) => {

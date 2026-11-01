@@ -1,12 +1,13 @@
 /**
  * Pre-push judges published trees and messages using the clone's configured PCRE patterns.
  * Commit hooks use the same patterns and regex engine, plus locally discovered sibling projects
- * and HOME. Only added index lines are judged, so old private text can be removed incrementally.
- * A merge receiving a side proven public against the clone's declared tracking ref is judged on
- * the lines it introduces, not on the already-public lines it carries in.
+ * and HOME. A view that cannot list the sibling projects, such as a sandboxed job's, judges the ones the
+ * host recorded in the clone's git config. Only added index lines are judged, so old private text can be
+ * removed incrementally. A merge receiving a side proven public against the clone's declared tracking ref
+ * is judged on the lines it introduces, not on the already-public lines it carries in.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { type Dirent, existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -30,6 +31,16 @@ export const PUBLIC_TRACKING_REF_CONFIG_KEY = 'smoothbricks.publicTrackingRef';
 
 /** Environment source for the same list: one pattern per line. */
 export const PUBLIC_DENYLIST_ENV = 'SMOOTHBRICKS_PUBLIC_DENYLIST';
+
+/**
+ * Repository git config key: the sibling projects the host recorded for a view that cannot list them, as one value, the
+ * names joined by `/` (no directory name contains one) and empty when no project sits beside the checkout. Every
+ * copy-on-write clone of the checkout carries its repository config, and this record with it.
+ */
+export const SIBLING_PROJECTS_CONFIG_KEY = 'smoothbricks.siblingProjects';
+
+/** The command that writes {@link SIBLING_PROJECTS_CONFIG_KEY}, named by the refusal of a checkout that has none. */
+export const RECORD_SIBLING_PROJECTS_COMMAND = 'smoo monorepo record-sibling-projects';
 
 export type PublicDenylistScan =
   | { readonly outcome: 'unconfigured' }
@@ -212,7 +223,7 @@ export type Allowlist = {
   readonly lines: readonly { readonly path: string; readonly text: string }[];
 };
 
-const parseWorkspaceMarker = typia.json.createValidateParse<{ projectRoot: string }>();
+const parseWorkspaceMarker = typia.json.createValidateParse<{ projectRoot: string; workspace: string }>();
 
 function gitConfigPatterns(root: string, key: string, env: Environment): { patterns: string[] } | { failure: string } {
   const config = git(root, ['config', '--get-all', key], env);
@@ -307,45 +318,79 @@ export function siblingTerm(name: string): string | null {
   return `(?<!\\w)${escapeRegex(name)}(?!\\w)`;
 }
 
-async function siblingPatterns(root: string, env: Environment): Promise<{ patterns: string[] } | { failure: string }> {
+/** The project a checkout belongs to: the root and name its cowshed workspace marker adopted, or the checkout itself. */
+interface CheckoutProject {
+  readonly root: string;
+  readonly workspace: string | null;
+}
+
+async function checkoutProject(root: string): Promise<CheckoutProject | { failure: string }> {
   const markerPath = join(root, '.cowshed', 'workspace.json');
-  let anchor = root;
-  let markerText: string | undefined;
+  let markerText: string;
   try {
     markerText = await readFile(markerPath, 'utf8');
   } catch (error) {
-    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
-      return { failure: `${markerPath}: ${errorReason(error)}` };
-    }
+    if (errorCode(error) === 'ENOENT') return { root, workspace: null };
+    return { failure: `${markerPath}: ${errorReason(error)}` };
   }
-  if (markerText !== undefined) {
-    try {
-      const marker = parseWorkspaceMarker(markerText);
-      if (!marker.success || !isAbsolute(marker.data.projectRoot)) {
-        return { failure: `${markerPath}: expected an absolute projectRoot` };
-      }
-      anchor = marker.data.projectRoot;
-    } catch (error) {
-      return { failure: `${markerPath}: ${errorReason(error)}` };
+  try {
+    const marker = parseWorkspaceMarker(markerText);
+    if (!marker.success || !isAbsolute(marker.data.projectRoot)) {
+      return { failure: `${markerPath}: expected a workspace name and an absolute projectRoot` };
     }
+    return { root: marker.data.projectRoot, workspace: marker.data.workspace };
+  } catch (error) {
+    return { failure: `${markerPath}: ${errorReason(error)}` };
   }
-  anchor = await realpath(anchor);
-  if (!(await stat(anchor)).isDirectory()) return { failure: `${anchor}: projectRoot is not a directory` };
+}
+
+/**
+ * Whether `error` is a view withholding a path rather than the path's absence or breakage: a sandbox's denial (macOS
+ * Seatbelt answers EPERM) or a permission this user lacks (EACCES).
+ */
+function withheldFromView(error: unknown): boolean {
+  const code = errorCode(error);
+  return code === 'EPERM' || code === 'EACCES';
+}
+
+/** The project's resolved root and the entries beside it, or the denial of a view that withholds either. */
+async function listProjectParent(
+  projectRoot: string,
+): Promise<{ anchor: string; entries: Dirent[] } | { withheld: string } | { failure: string }> {
+  try {
+    const anchor = await realpath(projectRoot);
+    if (!(await stat(anchor)).isDirectory()) return { failure: `${anchor}: projectRoot is not a directory` };
+    return { anchor, entries: await readdir(dirname(anchor), { withFileTypes: true }) };
+  } catch (error) {
+    return withheldFromView(error) ? { withheld: errorReason(error) } : { failure: errorReason(error) };
+  }
+}
+
+/**
+ * The sibling projects beside `projectRoot`: each directory there, other than the project and dot-directories, whose
+ * name can be a project's and whose `.git` makes it a repository root. A view that cannot list them says so.
+ */
+async function discoverSiblingProjects(
+  projectRoot: string,
+  env: Environment,
+): Promise<{ names: string[] } | { withheld: string } | { failure: string }> {
+  const listed = await listProjectParent(projectRoot);
+  if (!('entries' in listed)) return listed;
+  const { anchor, entries } = listed;
   const parent = dirname(anchor);
   // Git supplies GIT_DIR and GIT_INDEX_FILE to hooks. They describe the committing repository,
   // not its siblings; never let a sibling probe accidentally query the current repository.
   const probeEnv = standaloneGitEnvironment(env);
-  const patterns: string[] = [];
-  for (const entry of await readdir(parent, { withFileTypes: true })) {
+  const names: string[] = [];
+  for (const entry of entries) {
     if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === basename(anchor)) continue;
     // A name that yields no term is never probed: a stray data directory cannot refuse or fail a commit.
-    const term = siblingTerm(entry.name);
-    if (term === null) continue;
+    if (siblingTerm(entry.name) === null) continue;
     const sibling = join(parent, entry.name);
     try {
       await stat(join(sibling, '.git'));
     } catch (error) {
-      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
+      if (errorCode(error) === 'ENOENT') continue;
       return { failure: `${sibling}/.git: ${errorReason(error)}` };
     }
     const probe = git(sibling, ['rev-parse', '--show-toplevel'], probeEnv);
@@ -355,9 +400,114 @@ async function siblingPatterns(root: string, env: Environment): Promise<{ patter
     if ((await realpath(probe.stdout.trimEnd())) !== (await realpath(sibling))) {
       return { failure: `${sibling}: .git does not identify this sibling as a repository root` };
     }
-    patterns.push(term);
+    names.push(entry.name);
   }
-  return { patterns };
+  return { names };
+}
+
+/** The values the checkout's own config records under the key, none when it is unset, or why git could not read them. */
+function readSiblingProjectRecord(root: string, env: Environment): { values: string[] } | { failure: string } {
+  const record = git(root, ['config', '--local', '--null', '--get-all', SIBLING_PROJECTS_CONFIG_KEY], env);
+  if (record.exitCode === 1) return { values: [] };
+  if (record.exitCode !== 0) {
+    return { failure: `git config --local --get-all ${SIBLING_PROJECTS_CONFIG_KEY}: ${record.stderr}` };
+  }
+  return { values: record.stdout.split('\0').slice(0, -1) };
+}
+
+/** The command that records the sibling projects on the host for `project`'s checkout at `root`. */
+function recordOnHost(root: string, project: CheckoutProject): string {
+  return project.workspace === null
+    ? `run \`${RECORD_SIBLING_PROJECTS_COMMAND}\` on the host in ${root}`
+    : `run \`cowshed exec ${project.workspace} --host -- ${RECORD_SIBLING_PROJECTS_COMMAND}\``;
+}
+
+/**
+ * The sibling projects the host recorded in the checkout's repository config, for a view that `withheld` them. A
+ * checkout without exactly one recorded value refuses, naming the command that records it on the host.
+ */
+function recordedSiblingProjects(
+  root: string,
+  project: CheckoutProject,
+  withheld: string,
+  env: Environment,
+): { names: string[] } | { failure: string } {
+  const record = readSiblingProjectRecord(root, env);
+  if ('failure' in record) return record;
+  const [value] = record.values;
+  if (value === undefined) {
+    return {
+      failure: `${withheld}: this view cannot list the projects beside ${project.root}, and git config ${SIBLING_PROJECTS_CONFIG_KEY} records none; ${recordOnHost(root, project)}`,
+    };
+  }
+  if (record.values.length > 1) {
+    return {
+      failure: `git config ${SIBLING_PROJECTS_CONFIG_KEY} holds ${record.values.length} values, not one record; ${recordOnHost(root, project)}`,
+    };
+  }
+  return { names: value === '' ? [] : value.split('/') };
+}
+
+async function siblingPatterns(root: string, env: Environment): Promise<{ patterns: string[] } | { failure: string }> {
+  const project = await checkoutProject(root);
+  if ('failure' in project) return project;
+  const view = await discoverSiblingProjects(project.root, env);
+  if ('failure' in view) return view;
+  const siblings = 'names' in view ? view : recordedSiblingProjects(root, project, view.withheld, env);
+  if ('failure' in siblings) return siblings;
+  return { patterns: siblings.names.flatMap((name) => siblingTerm(name) ?? []) };
+}
+
+/** What {@link recordSiblingProjects} recorded, and whether the checkout's config held another value before. */
+export interface SiblingProjectRecord {
+  readonly names: readonly string[];
+  readonly changed: boolean;
+}
+
+/**
+ * Discover the sibling projects as the commit hooks do and record them in the checkout's repository config, written
+ * only when it holds another value. It runs on the host: a view that cannot list them refuses rather than recording
+ * what it cannot see.
+ */
+export async function recordSiblingProjects(
+  root: string,
+  env: Environment = process.env,
+): Promise<SiblingProjectRecord | { failure: string }> {
+  try {
+    const project = await checkoutProject(root);
+    if ('failure' in project) return project;
+    const view = await discoverSiblingProjects(project.root, env);
+    if ('failure' in view) return view;
+    if ('withheld' in view) {
+      return {
+        failure: `${view.withheld}: this view cannot list the projects beside ${project.root}, so it records none; ${recordOnHost(root, project)}`,
+      };
+    }
+    const names = view.names.sort();
+    const value = names.join('/');
+    const record = readSiblingProjectRecord(root, env);
+    if ('failure' in record) return record;
+    if (record.values.length === 1 && record.values[0] === value) return { names, changed: false };
+    const written = git(root, ['config', '--local', '--replace-all', SIBLING_PROJECTS_CONFIG_KEY, value], env);
+    if (written.exitCode !== 0) {
+      return { failure: `git config --local --replace-all ${SIBLING_PROJECTS_CONFIG_KEY}: ${written.stderr}` };
+    }
+    return { names, changed: true };
+  } catch (error) {
+    return { failure: errorReason(error) };
+  }
+}
+
+/** The CLI face of {@link recordSiblingProjects}: names what it recorded, or why not with a nonzero exit status. */
+export async function recordSiblingProjectsCommand(root: string): Promise<void> {
+  const recorded = await recordSiblingProjects(root);
+  if ('failure' in recorded) {
+    console.error(`sibling projects were not recorded: ${recorded.failure.trimEnd()}`);
+    process.exitCode = 1;
+    return;
+  }
+  const names = recorded.names.length === 0 ? 'no project' : recorded.names.join(', ');
+  console.log(`${SIBLING_PROJECTS_CONFIG_KEY} ${recorded.changed ? 'recorded' : 'unchanged'}: ${names}`);
 }
 
 function readAllowlist(root: string, env: Environment): Allowlist | { failure: string } {
@@ -720,6 +870,10 @@ function standaloneGitEnvironment(env: Environment): Environment {
   return standalone;
 }
 
+/** The `code` a Node system error carries (`ENOENT`, `EACCES`, …), or undefined for any other error. */
+function errorCode(error: unknown): unknown {
+  return error instanceof Error && 'code' in error ? error.code : undefined;
+}
 function errorReason(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,8 @@ import { mergeEnv } from '../lib/run.js';
 import {
   PUBLIC_DENYLIST_ALLOWLIST_PATH,
   type PublicDenylistScan,
+  recordSiblingProjects,
+  type SiblingProjectRecord,
   scanPublicCommitDenylist,
   scanPublicDenylist,
 } from './public-denylist.js';
@@ -553,8 +555,127 @@ describe('commit-time public denylist', () => {
       await mkdir(marker(), { recursive: true });
       expect(failureOf(await scanStaged(ws))).toContain('workspace.json');
 
-      await writeMarker(JSON.stringify({ projectRoot: join(ws.container, 'missing') }));
+      await writeMarker(JSON.stringify({ projectRoot: join(ws.container, 'missing'), workspace: 'example' }));
       expect(failureOf(await scanStaged(ws))).toContain('missing');
+    });
+  });
+
+  describe('a view that denies the project root or its parent', () => {
+    // A cowshed sandbox withholds the checkout's surroundings from its jobs (EPERM on macOS); a directory this user may
+    // not read withholds them the same way (EACCES). There the scan cannot list the siblings, so it judges the names
+    // the host recorded in the repository's git config, which every copy-on-write clone of the checkout carries.
+    const notes = 'neutral\nSecret-Consumer\nOther-Consumer\n';
+    const restored: string[] = [];
+    let recorded: Workspace;
+    let written: Workspace;
+    let bare: Workspace;
+    let writtenRecord: SiblingProjectRecord | { failure: string };
+    let rewrittenRecord: SiblingProjectRecord | { failure: string };
+    let withheldRecord: SiblingProjectRecord | { failure: string };
+    let bareRecord: SiblingProjectRecord | { failure: string };
+    let unrecorded: Workspace;
+    let adopted: Workspace;
+    let adoptedUnrecorded: Workspace;
+    let host: Workspace;
+
+    /** Withhold `path`'s listing (`mode` 0o100) or the whole directory (0o000) from this user until the suite ends. */
+    async function deny(path: string, mode: number): Promise<void> {
+      await chmod(path, mode);
+      restored.push(path);
+    }
+
+    /** A copy of the template with two sibling projects beside it, `notes` staged and `record` as its record. */
+    async function checkout(record?: string): Promise<Workspace> {
+      const ws = await copyOf(template);
+      for (const name of ['secret-consumer', 'other-consumer']) await sibling(ws, name);
+      if (record !== undefined) git(ws, 'config', 'smoothbricks.siblingProjects', record);
+      await stage(ws, { 'notes.txt': notes });
+      return ws;
+    }
+
+    /** A checkout whose workspace marker adopts a project root this view cannot reach at all. */
+    async function adoptedCheckout(record?: string): Promise<Workspace> {
+      const ws = await checkout(record);
+      const adoptedParent = join(ws.container, 'adopted');
+      await mkdir(join(adoptedParent, 'repository'), { recursive: true });
+      await mkdir(join(ws.root, '.cowshed'));
+      await writeFile(
+        join(ws.root, '.cowshed', 'workspace.json'),
+        JSON.stringify({ projectRoot: join(adoptedParent, 'repository'), workspace: 'example' }),
+      );
+      await deny(adoptedParent, 0o000);
+      return ws;
+    }
+
+    beforeAll(async () => {
+      recorded = await checkout('secret-consumer/other-consumer');
+      unrecorded = await checkout();
+      // Recorded on the host, where the parent is listed; the second record finds the value already there.
+      written = await checkout();
+      writtenRecord = await recordSiblingProjects(written.root, environment());
+      rewrittenRecord = await recordSiblingProjects(written.root, environment());
+      bare = await copyOf(template);
+      await stage(bare, { 'notes.txt': notes });
+      bareRecord = await recordSiblingProjects(bare.root, environment());
+      for (const ws of [recorded, unrecorded, written, bare]) await deny(ws.container, 0o100);
+      withheldRecord = await recordSiblingProjects(written.root, environment());
+      adopted = await adoptedCheckout('secret-consumer');
+      adoptedUnrecorded = await adoptedCheckout();
+      // The host's view lists the parent: discovery decides there, never a record that names no project.
+      host = await checkout('');
+    });
+
+    afterAll(async () => {
+      await Promise.all(restored.map((path) => chmod(path, 0o755)));
+    });
+
+    it('judges the recorded sibling projects when the view cannot list the parent', async () => {
+      expect(await scanStaged(recorded)).toEqual({
+        outcome: 'denied',
+        matches: 'staged:notes.txt:2:Secret-Consumer\nstaged:notes.txt:3:Other-Consumer\n',
+      });
+    });
+
+    it('judges the recorded sibling projects when the view cannot reach the adopted project root', async () => {
+      expect(await scanStaged(adopted)).toEqual({ outcome: 'denied', matches: 'staged:notes.txt:2:Secret-Consumer\n' });
+    });
+
+    it('records on the host the projects beside the checkout, once, which a view that cannot list them judges', async () => {
+      const names = ['other-consumer', 'secret-consumer'];
+      expect(writtenRecord).toEqual({ names, changed: true });
+      expect(rewrittenRecord).toEqual({ names, changed: false });
+      expect(await scanStaged(written)).toEqual({
+        outcome: 'denied',
+        matches: 'staged:notes.txt:2:Secret-Consumer\nstaged:notes.txt:3:Other-Consumer\n',
+      });
+    });
+
+    it('records that no project sits beside the checkout, and then judges no sibling name, only HOME', async () => {
+      expect(bareRecord).toEqual({ names: [], changed: true });
+      expect(await scanStaged(bare)).toEqual({ outcome: 'clean', patterns: 1 });
+    });
+
+    it('refuses to record from a view that cannot list the parent, naming the denial and the host', () => {
+      if (!('failure' in withheldRecord))
+        throw new Error(`recorded from a denied view: ${JSON.stringify(withheldRecord)}`);
+      expect(withheldRecord.failure).toContain(written.container);
+      expect(withheldRecord.failure).toContain(
+        `run \`smoo monorepo record-sibling-projects\` on the host in ${written.root}`,
+      );
+    });
+
+    it('refuses without a record, naming the denial, the record and the command that writes it on the host', async () => {
+      const reason = failureOf(await scanStaged(unrecorded));
+      expect(reason).toContain(unrecorded.container);
+      expect(reason).toContain('smoothbricks.siblingProjects');
+      expect(reason).toContain(`run \`smoo monorepo record-sibling-projects\` on the host in ${unrecorded.root}`);
+      expect(failureOf(await scanStaged(adoptedUnrecorded))).toContain(
+        'run `cowshed exec example --host -- smoo monorepo record-sibling-projects`',
+      );
+    });
+
+    it('discovers the sibling projects wherever the view lists the parent, whatever the record holds', async () => {
+      expect((await scanStaged(host)).outcome).toBe('denied');
     });
   });
 
