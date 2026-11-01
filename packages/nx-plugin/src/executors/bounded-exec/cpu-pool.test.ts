@@ -114,11 +114,28 @@ async function grantedFor(parent: InheritedCpuPool, want: number): Promise<numbe
   return grant.tokens;
 }
 
-/** The pool directories in the socket namespace right now; a closed pool leaves none behind. */
-const cpuPoolDirectories = (): string[] =>
-  readdirSync(socketNamespace().directory)
-    .filter((name) => name.startsWith('cpu-pool-'))
-    .sort();
+/**
+ * `call`'s result, made with this process's socket namespace moved to `namespace`, as `testing.test.ts` moves it: with
+ * the Nx and Cowshed roots set aside, only the temp directory is left to fall back to. The shared namespace also holds
+ * every concurrent run's pools, so a listing of it says nothing about one call; a private one holds only that call's.
+ */
+async function inSocketNamespace<T>(namespace: string, call: () => Promise<T>): Promise<T> {
+  const outer = Object.fromEntries(
+    ['NX_SOCKET_DIR', 'COWSHED_RUNTIME_LINK', 'TMPDIR'].map((name) => [name, process.env[name]]),
+  );
+  delete process.env.NX_SOCKET_DIR;
+  delete process.env.COWSHED_RUNTIME_LINK;
+  process.env.TMPDIR = namespace;
+  try {
+    expect(socketNamespace().directory).toBe(namespace);
+    return await call();
+  } finally {
+    for (const [name, value] of Object.entries(outer)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
 
 /**
  * A raw child: connects, writes `request` as its one line, and reads the replies. The child's
@@ -521,10 +538,16 @@ describe('the parent-held CPU pool', () => {
   });
 
   it('makes no pool when its grant closes during setup, and refuses a non-positive count', async () => {
-    const before = cpuPoolDirectories();
-    const made = await createCpuPool(2, Promise.resolve());
-    expect(made.ok).toBe(false);
-    expect(cpuPoolDirectories()).toEqual(before);
+    // Made in the shared namespace, the private one keeps the pool's socket short and where the sandbox admits it.
+    const namespace = await ownedSocketDirectory('cpu-ns-', join('cpu-pool-XXXXXX', 'p.sock'));
+    directories.push(namespace);
+    const made = await inSocketNamespace(namespace, () => createCpuPool(2, Promise.resolve()));
+    // This refusal comes only after the pool listens, so the call made its directory, and it left nothing behind.
+    expect(made).toEqual({
+      ok: false,
+      error: 'the grant that lends this CPU pool closed while the pool was being made',
+    });
+    expect(readdirSync(namespace)).toEqual([]);
     await expect(createCpuPool(0, NEVER)).rejects.toBeInstanceOf(RangeError);
   });
 
