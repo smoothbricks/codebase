@@ -283,8 +283,9 @@ async fn watch(watch: Watch) {
     }
 }
 
-/// A granted hold's end. WHY unbounded: a granted hold lasts its job's life; the supervisor's
-/// release, or the hold's own end, ends this wait.
+/// A granted hold's end.
+// WHY unbounded: a granted hold lasts its job's life; the supervisor's release, or the hold's own
+// end, ends this wait.
 #[allow(clippy::disallowed_methods)]
 async fn held(child: &mut tokio::process::Child) -> io::Result<std::process::ExitStatus> {
     child.wait().await
