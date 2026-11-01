@@ -56,8 +56,9 @@ export type ReservedDemand = Extract<Demand, { kind: 'nextest' | 'bun-parallel' 
 export const CPU_TOKENS_ENV = 'BOUNDED_EXEC_CPU_TOKENS';
 
 /**
- * The cores mbx granted the reservation a leaf runs under: `mbx reserve --cpus N` names at most N to its command, as many
- * as were free once one was.
+ * The cores mbx granted the reservation a leaf runs under: its run's mbx reservation endpoint grants at most the N the
+ * leaf asks for, as many as were free once one was, and the leaf's shell reads that count into this variable
+ * (mbx-pool.ts, `reservation`), the one `mbx reserve --cpus N` names to its own command.
  */
 export const GRANTED_CPUS_ENV = 'MBX_RESERVE_CPUS';
 
@@ -369,13 +370,12 @@ export function sizeRunner(
 /**
  * The shell statements that run first in a reserved leaf's reservation and size its runner to the grant, which only
  * the command learns as it starts: `CPU_TOKENS_ENV` becomes the cores mbx granted (`GRANTED_CPUS_ENV`), never more
- * than the leaf asked for (`WANT_ENV`, set before it reserved), which also stands in under an mbx that grants a
- * reservation whole and names none. The test-thread variables a sizing sets follow from it, under their inherited
- * ceilings, outranking the target's own as a numeric grant's do (`sizeRunner`).
+ * than the leaf asked for (`WANT_ENV`, set before it reserved). The test-thread variables a sizing sets follow from it,
+ * under their inherited ceilings, outranking the target's own as a numeric grant's do (`sizeRunner`).
  */
 export function grantedSizing(demand: ReservedDemand): string {
   const asked = `$${WANT_ENV}`;
-  const named = `\${${GRANTED_CPUS_ENV}:-${asked}}`;
+  const named = `$${GRANTED_CPUS_ENV}`;
   const tokens = `$${CPU_TOKENS_ENV}`;
   const atMost = (ceiling: number | null): string =>
     ceiling === null ? `"${tokens}"` : `"$(( ${tokens} < ${ceiling} ? ${tokens} : ${ceiling} ))"`;

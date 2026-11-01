@@ -395,10 +395,10 @@ describe('runner sizing', () => {
 
 describe("a reserved leaf's runner on its mbx grant", () => {
   /**
-   * `demand`'s runner `command` as its reservation runs it, granted `granted` cores or under an mbx that names none,
-   * each runner a function that prints its arguments and the sizing variables it sees.
+   * `demand`'s runner `command` as its reservation runs it, granted `granted` cores, each runner a function that prints
+   * its arguments and the sizing variables it sees.
    */
-  const run = (demand: ReservedDemand, command: string, granted?: string): string => {
+  const run = (demand: ReservedDemand, command: string, granted: string): string => {
     const stub = (name: string): string =>
       `${name}() { printf '${name} %s | tokens=%s rust=%s nextest=%s\\n' "$*" "$BOUNDED_EXEC_CPU_TOKENS" "$RUST_TEST_THREADS" "$NEXTEST_TEST_THREADS"; }; `;
     const sized = grantedSizing(demand) + sizeRunnerToGrant(demand, command);
@@ -406,7 +406,7 @@ describe("a reserved leaf's runner on its mbx grant", () => {
       env: {
         PATH: process.env.PATH,
         BOUNDED_EXEC_CPU_WANT: String(demand.want),
-        ...(granted === undefined ? {} : { MBX_RESERVE_CPUS: granted }),
+        MBX_RESERVE_CPUS: granted,
       },
       encoding: 'utf8',
     });
@@ -432,12 +432,9 @@ describe("a reserved leaf's runner on its mbx grant", () => {
     expect(run(demand, 'script', '1')).toBe('script  | tokens=1 rust=1 nextest=1\n');
   });
 
-  it('runs on no more than it asked for, all of it under an mbx that names no count', () => {
-    // An enclosing reservation's count reaches a nested one's command from an mbx that names none of its own.
+  it('runs on no more than it asked for', () => {
+    // A count above the ask, as an enclosing grant's could be, never widens the runner past it.
     expect(run({ kind: 'bun-parallel', want: 8 }, 'bun test --parallel', '12')).toBe(
-      'bun test --parallel=8 | tokens=8 rust= nextest=\n',
-    );
-    expect(run({ kind: 'bun-parallel', want: 8 }, 'bun test --parallel')).toBe(
       'bun test --parallel=8 | tokens=8 rust= nextest=\n',
     );
   });

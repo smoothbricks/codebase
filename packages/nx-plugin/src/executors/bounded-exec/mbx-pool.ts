@@ -2,6 +2,7 @@ import { shellTokens } from '../../runtime-input-policy.js';
 import {
   CPU_TOKENS_ENV,
   type Demand,
+  GRANTED_CPUS_ENV,
   grantedSizing,
   invocationSpan,
   type ReservedDemand,
@@ -21,10 +22,11 @@ export interface MbxPool {
 
 /**
  * The pool the environment names, or `null` where the project has no mbx and cowshed's own pools apply unchanged, or
- * where this run is already inside an mbx reservation: `mbx reserve` hands its command `MBX_SCHED_DISABLE=1`, and nested
- * non-Cargo work shares the enclosing grant instead of reserving twice (specs/cowshed/05_gateway.md, "Parallelism
- * inside a job"). A second reservation would wait in the pool while its parent holds a grant, so under a full pool the
- * nested leaf queued behind the very work it belongs to.
+ * where this run is already inside an mbx reservation: whatever holds one hands its work `MBX_SCHED_DISABLE=1` (a
+ * reserved leaf's shell, `mbx reserve`, a held cowshed job), and nested non-Cargo work shares the enclosing grant
+ * instead of reserving twice (specs/cowshed/05_gateway.md, "Parallelism inside a job"). A second reservation would
+ * wait in the pool while its parent holds a grant, so under a full pool the nested leaf queued behind the very work it
+ * belongs to.
  */
 export function mbxPool(environment: Readonly<NodeJS.ProcessEnv>): MbxPool | null {
   if (environment.MBX_SCHEDULER !== '1' || !environment.MBX_CACHE_DIR || environment.MBX_SCHED_DISABLE === '1') {
@@ -35,9 +37,10 @@ export function mbxPool(environment: Readonly<NodeJS.ProcessEnv>): MbxPool | nul
 
 /**
  * How a leaf enters the pool once. A Cargo leaf that builds runs through mbx, which admits its compilers and supported
- * test work itself, so wrapping it would charge it twice. Any other leaf reserves for its whole run through
- * `mbx reserve --cpus <its runner's count>`, a maximum: mbx grants as many of those cores as are free once one is, and
- * the runner runs on the count it is granted (`sizeRunnerToGrant`). That includes a nextest run of test binaries
+ * test work itself, so wrapping it would charge it twice. Any other leaf reserves for its whole run, asking its Nx
+ * run's mbx reservation endpoint (mbx-reservations.ts) for at most its runner's count: mbx grants as many of those
+ * cores as are free once one is, and the runner runs on the count it is granted (`sizeRunnerToGrant`). That includes a
+ * nextest run of test binaries
  * already built (the inferred extracted-archive run, or one from `--archive-file`): it compiles nothing, and beneath a
  * reservation mbx schedules none of its test processes, so they run inside the one grant. Admitted one by one under
  * `MBX_SCHEDULER_TESTS=1`, each queued for a ticket of its own: in a downstream gate on 2026-10-30, codec tests of at
@@ -156,8 +159,9 @@ export function mbxIdleGated(leaf: MbxLeaf | null, command: string, environment:
 }
 
 /**
- * mbx writes one byte per admission (g) and permit drop (r). Cargo descendants inherit this descriptor through
- * MBX_GRANT_FD; reserve names it with --grant-fd and closes it on exec of the external command.
+ * The descriptor between a pooled leaf's shell and its executor. For a Cargo leaf mbx writes one byte on it per
+ * admission (g) and permit drop (r), every Cargo descendant inheriting it through MBX_GRANT_FD. A reserved leaf's shell
+ * writes the cores it asks for on it, one line, and reads back the count the pool granted (`reservation`).
  */
 export const MBX_GRANT_FD = 5;
 
@@ -185,11 +189,27 @@ export function withCountedReservation(fixture: string, command: string, leaf: R
 }
 
 /**
- * The reservation of `WANT_ENV` cores, set by the caller, that runs `command` once mbx grants it: the reservation sizes
- * the runner to what mbx granted (`grantedSizing`) and says so on stderr. `mbx` is the canonical environment's, whose
- * realpath cowshed's admission proved to be the host's pinned mbx; it writes the grant on this descriptor itself.
+ * The reservation of `WANT_ENV` cores, set by the caller, that runs `command` once mbx grants it. The shell asks its
+ * executor on `MBX_GRANT_FD`, one line naming the count; the executor asks its run's mbx reservation endpoint and
+ * answers the cores granted, one line, or ends the descriptor unanswered when mbx refused, so the read fails and
+ * nothing runs (executor.ts). The shell then closes the descriptor, which the command never inherits, gives the command
+ * what `mbx reserve` gives its own (`GRANTED_CPUS_ENV`, `MBX_SCHED_DISABLE=1` and an empty `MBX_SCHED_DIR`, so mbx work
+ * inside runs under the grant), sizes the runner to the grant (`grantedSizing`), says so on stderr and runs the command
+ * in the same shell: no process starts for the reservation.
  */
 function reservation(command: string, leaf: ReservedLeaf): string {
   const said = `printf 'cowshed: mbx reserve running cpus=%s asked=%s\\n' "$${CPU_TOKENS_ENV}" "$${WANT_ENV}" >&2; `;
-  return `export ${WANT_ENV} && mbx reserve --grant-fd ${MBX_GRANT_FD} --cpus "$${WANT_ENV}" --priority ${leaf.priority} -- /bin/sh -c ${shellQuote(`${grantedSizing(leaf.demand)}${said}${command}`)}`;
+  const ask = `printf '%s\\n' "$${WANT_ENV}" >&${MBX_GRANT_FD} && IFS= read -r ${GRANTED_CPUS_ENV} <&${MBX_GRANT_FD} && exec ${MBX_GRANT_FD}>&-`;
+  const held = `export ${GRANTED_CPUS_ENV} MBX_SCHED_DISABLE=1 MBX_SCHED_DIR=`;
+  return `export ${WANT_ENV} && ${ask} && ${held} && eval ${shellQuote(`${grantedSizing(leaf.demand)}${said}${command}`)}`;
+}
+
+/**
+ * The cores a reserved leaf's shell asked for on `MBX_GRANT_FD` (`reservation`): a whole count from one to `most`, the
+ * most its runner may ask for; anything else is `null`.
+ */
+export function askedCores(line: string, most: number): number | null {
+  if (!/^[1-9]\d{0,9}$/.test(line)) return null;
+  const cores = Number(line);
+  return cores <= most ? cores : null;
 }

@@ -481,11 +481,11 @@ daemon-state cleanup, so a clone never inherits a running or crashed session's s
 
 Host-global settings are read through the installed mbx's settings interface, not copied into a cowshed configuration or
 peak-memory ledger. The same resolved CPU/memory settings reach every pool participant, including the host's
-`mbx reserve`. A project `.mbx.toml`, a caller overlay or a devenv export cannot select another cache directory, pool
-budget or priority: the contribution's owned actions are reapplied after activation and caller overlays, and the served
-file restores them in the host shell. Per-job priority is applied at spawn, never saved into a reusable warm host or an
-inherited activation record. A Cargo job's `--want` ceiling belongs to 05_gateway.md, "Parallelism inside a job"; it is
-not another pool-size setting.
+`mbx reserve` and an Nx run's `mbx reservations`. A project `.mbx.toml`, a caller overlay or a devenv export cannot
+select another cache directory, pool budget or priority: the contribution's owned actions are reapplied after activation
+and caller overlays, and the served file restores them in the host shell. Per-job priority is applied at spawn, never
+saved into a reusable warm host or an inherited activation record. A Cargo job's `--want` ceiling belongs to
+05_gateway.md, "Parallelism inside a job"; it is not another pool-size setting.
 
 The route is mbx's own upstream automatic Cargo route, supplied by the host and never by the project. `cowshed setup`
 runs the installed mbx's `mbx setup`, which generates the Cargo shim and the one-line `mbx-target` sidecar naming the
@@ -532,13 +532,15 @@ that an inherited jobserver alone makes an arbitrary test runner consume mbx per
 
 A bounded leaf's hang clock follows this boundary too. A supported Cargo test execution known at spawn with
 `MBX_SCHEDULER_TESTS=1`, or a reserved external leaf, may suspend its no-progress clock while mbx holds no capacity. The
-grant descriptor carries every admission (`g`) and permit drop (`r`); overlapping holds are counted, zero-hold time
-spends no idle budget, and a finished test resets the budget. A signal-killed holder writes no release and stays counted
-until the command ends. The first admission starts total and fixture ceilings, except that a fixture run before its
-leaf's reservation, to count the leaf's units (05_gateway.md, "Parallelism inside a job"), starts its ceiling at spawn;
-later queue intervals do not pause those ceilings. EOF proves neither admission nor release.
+grant descriptor carries a Cargo leaf's every admission (`g`) and permit drop (`r`), and a reserved leaf's one grant is
+the answer to its own request on its run's reservation endpoint (05_gateway.md, "An Nx run serves its leaves one
+reservation endpoint"); overlapping holds are counted, zero-hold time spends no idle budget, and a finished test resets
+the budget. A signal-killed holder writes no release and stays counted until the command ends. The first admission
+starts total and fixture ceilings, except that a fixture run before its leaf's reservation, to count the leaf's units
+(05_gateway.md, "Parallelism inside a job"), starts its ceiling at spawn; later queue intervals do not pause those
+ceilings. EOF proves neither admission nor release.
 
-Independently, any live process of the bounded task explicitly queued for mbx admission pauses the remaining idle
+Independently, any live process of a bounded Cargo leaf explicitly queued for mbx admission pauses the remaining idle
 budget, including alongside a held grant and for an otherwise unsupported runner. Public
 `mbx stats --scheduler --json --activity` `scheduler.activity` rows supply `kind: "waiter"`, `live: true`, PID, ticket
 and the 1-based pending `queue_position`. The consumer corroborates the live PID's process-group or descendant
@@ -552,12 +554,13 @@ idle callback expires work it drains any existing poll and takes a fresh bounded
 remain armed. A snapshot failure is reported as an operational failure, not queue/admission proof or a wedge.
 Unidentifiable foreign legacy rows are diagnosed without granting them task membership. Live output names
 `queued for admission N s` and the public queue position; a failed or cancelled never-admitted command persists a
-distinct `queued` verdict with its observed wait and last public PID/ticket/position rows. This observation creates no
-queue deadline. Queue observations take effect at snapshot completion, never backdated across a finished test's budget
-reset. Observed wait duration freezes when the command settles or cancellation stops observation, before teardown or
-report reading. The observer consumes the version-2 activity-only projection. It does not load the full statistics
-document's cache, savings or memory histories and does not raise its control-plane or output limits to accommodate them.
-The host pin and this consumer cut over together (14_nix.md, "mbx").
+distinct `queued` verdict with its observed wait and last public PID/ticket/position rows, or, for a reserved leaf, its
+wait on its run's endpoint and no rows. This observation creates no queue deadline. Queue observations take effect at
+snapshot completion, never backdated across a finished test's budget reset. Observed wait duration freezes when the
+command settles or cancellation stops observation, before teardown or report reading. The observer consumes the
+version-2 activity-only projection. It does not load the full statistics document's cache, savings or memory histories
+and does not raise its control-plane or output limits to accommodate them. The host pin and this consumer cut over
+together (14_nix.md, "mbx").
 
 Plain `cargo test` may include doctests and keeps its lifecycle clock. Commands with unsupported overrides, direct
 binaries, other runners and archives whose target is unknown at spawn keep that same conservative hang protection, not
@@ -1620,11 +1623,12 @@ an external leaf's jobserver represents its reserve grant; without mbx the exist
 MAKEFLAGS/CARGO_MAKEFLAGS/MFLAGS and BOUNDED_EXEC_CPU_* do not override the admitted count.
 
 An external reservation covers the owned leaf's conclusion, including draining and native descendant retirement, not
-only its command leader's exit. The lifetime owner passed through `mbx reserve` therefore waits for that existing proof
-before it exits. mbx's documented reservation worker may retain the lease after the invoking reserve process ends;
-cancellation retires the leaf and that worker under the same job ownership, rather than assuming the invoking process's
-death returned the grant (05_gateway.md, "Parallelism inside a job";
-[external reservations](https://mr-boxington.jdx.dev/scheduling#reserve-capacity-for-external-work)).
+only its command leader's exit: `bounded-exec` gives a reserved leaf's grant back to its run's endpoint only after that
+retirement, and a held job's `mbx reserve` hold ends at its job's conclusion ("Held jobs"). Cancellation retires the
+leaf under the same job ownership. An executor that dies closes its connection, which releases what it held, and a
+command that outlives it runs on unheld (05_gateway.md, "Parallelism inside a job";
+[external reservations](https://mr-boxington.jdx.dev/scheduling#reserve-capacity-for-external-work),
+[reservations for many commands](https://mr-boxington.jdx.dev/scheduling#serve-reservations-to-many-commands)).
 
 Gate is trusted coordinator/operator only; workers default Background / Workspace, may ask Interactive, Resident or
 InteractiveResident, and cannot request Gate or HostGate. The owned command's place is its class's row of 05_gateway.md

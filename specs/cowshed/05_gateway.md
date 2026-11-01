@@ -1374,10 +1374,11 @@ before any job or spawn effect. Ordinary commands default to `background`. A cla
 transition moves a running job between classes. The table owns kernel placement and the non-mbx pressure policy. With
 mbx selected, all classes use its admission and pressure policy ("Memory pressure"); the land gate has
 `MBX_SCHEDULER_PRIORITY=normal`, and every other class has `low`, including interactive and resident work. The same
-mapping supplies `mbx reserve --priority`. The supervisor exports the job's value again as
-`COWSHED_MBX_SCHEDULER_PRIORITY`, which `.cowshed/env` restores after its own canonical `low`, so a shell activation
-inside a gate's command (a `direnv exec` in its script, say) keeps `normal`; on 2026-10-31 every reservation of a
-downstream land gate entered the pool at `low`. Kernel nice and cgroup placement do not create another pool.
+mapping supplies `mbx reserve --priority` and the priority of a leaf's request to its Nx run's reservation endpoint. The
+supervisor exports the job's value again as `COWSHED_MBX_SCHEDULER_PRIORITY`, which `.cowshed/env` restores after its
+own canonical `low`, so a shell activation inside a gate's command (a `direnv exec` in its script, say) keeps `normal`;
+on 2026-10-31 every reservation of a downstream land gate entered the pool at `low`. Kernel nice and cgroup placement do
+not create another pool.
 
 | Class                  | What runs in it                                                                                                       | Nice | Linux cgroup                                                                 | Without mbx: waits on memory pressure | Without mbx: ended at macOS Critical |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------ |
@@ -1514,8 +1515,8 @@ The policy it holds:
   grant made while the host was idle never shrank, for cowshed's ledger in both modes (enforced by
   `a_long_holder_admitted_on_an_idle_host_never_holds_a_later_start`). Inside an mbx project, mbx admits each rustc and,
   with `MBX_SCHEDULER_TESTS=1`, each test process of a Cargo run that builds, so a long `cargo nextest` gives its grant
-  back as each one exits. A non-Cargo leaf's `mbx reserve`, and so a nextest run of prebuilt test binaries ("Parallelism
-  inside a job"), holds its grant, at most `--cpus g`, until the leaf concludes ("Tradeoff" under "Status"). Such a
+  back as each one exits. A non-Cargo leaf's reservation, and so a nextest run of prebuilt test binaries ("Parallelism
+  inside a job"), holds its grant, at most `g` cores, until the leaf concludes ("Tradeoff" under "Status"). Such a
   holder no longer convoys the pool: mbx starts a waiting reservation on whatever cores are free, and lets later
   requests pass one that cannot start until it has waited 30 s (mbx's pool rule,
   [Machine-wide compile scheduling](https://mr-boxington.jdx.dev/scheduling#machine-wide-compile-scheduling)). A held
@@ -1621,20 +1622,43 @@ the job's `--want`, or `cores` when absent; every class uses the same rule and a
 job's priority, with `CARGO_BUILD_JOBS=g` as that build's CPU ceiling, not an enclosing resource reservation. It takes
 no cowshed host grant; mbx admits the actual compiler and supported test work. It keeps its job's jobserver fifo: the
 fifo bounds one build tree's own fan-out at the same `g`, never host capacity, so it is no second ledger, and Cargo
-reads `MAKEFLAGS` as well as `CARGO_MAKEFLAGS`, so withholding one would bound nothing. A non-Cargo leaf runs under
-`mbx reserve --cpus g --priority <job-priority> -- <command>`, the host's installed mbx invoked through its link beside
-the installed cowshed (14_nix.md, "mbx"), `g` being the job's own count from its `--want`, never a host figure. The
-grant is the job's admission: its command stays queued until mbx grants it, as soon as one core is free, as many of the
-`g` cores as are free then, and passes that count as `MBX_RESERVE_CPUS`. bounded-exec sizes the leaf's runner flags and
-thread variables to that count as the command starts, so the runner runs on what it holds (an mbx that names no count
-grants `g` whole). The memory request is the same task identity's last recorded resource peak from existing LMAO
-job/process spans (13_telemetry.md, "Job resource peaks"), passed as `--memory <bytes>`; no cowshed peak ledger or
-prediction table exists. [INFERENCE] The task-identity key needed to select that span is not verified for Nx leaves;
-until the span carries it, or when no prior peak exists, `--memory` is omitted. mbx defines an omitted memory request as
-a zero-byte charge, not a measurement or a memory guarantee. This open keying question does not authorize a second store
-(AGENTS.md, rule 8).
+reads `MAKEFLAGS` as well as `CARGO_MAKEFLAGS`, so withholding one would bound nothing. A non-Cargo leaf reserves at
+most `g` cores at its job's priority from its Nx run's mbx reservation endpoint, `g` being the job's own count from its
+`--want`, never a host figure. The grant is the leaf's admission: its command stays queued until mbx grants it, as soon
+as one core is free, as many of the `g` cores as are free then, and bounded-exec sizes the leaf's runner flags and
+thread variables to that count as the command starts, so the runner runs on what it holds. The memory request is the
+same task identity's last recorded resource peak from existing LMAO job/process spans (13_telemetry.md, "Job resource
+peaks"), passed as the request's `memory`; no cowshed peak ledger or prediction table exists. [INFERENCE] The
+task-identity key needed to select that span is not verified for Nx leaves; until the span carries it, or when no prior
+peak exists, `memory` is omitted. mbx defines an omitted memory request as a zero-byte charge, not a measurement or a
+memory guarantee. This open keying question does not authorize a second store (AGENTS.md, rule 8).
 
-**A Vitest or Go test leaf enters no pool.** It runs without `mbx reserve` and with its own default workers, uncapped
+**An Nx run serves its leaves one reservation endpoint.** The admission is `mbx reserve`'s: the same pool, priority and
+order, and each grant held until its leaf concludes. What changes is the process count. Run as
+`mbx reserve --cpus g -- /bin/sh -c <command>`, each leaf started two mbx processes, the CLI and the worker that held
+its lease; measured 2026-11-01 with `fs_usage`, mbx made 1.15M filesystem operations in 3 s, nearly all dynamic loading
+for those starts, and kept the host's vnode table recycling. So the plugin's `preTasksExecution`, in a run with mbx's
+pool (`MBX_SCHEDULER=1`, no enclosing reservation), starts one `mbx reservations <socket>`
+([Serve reservations to many commands](https://mr-boxington.jdx.dev/scheduling#serve-reservations-to-many-commands)) by
+its PATH name, the canonical mbx environment's, which leads with the installed mbx (14_nix.md, "mbx"), on a socket in an
+owned directory of the job's socket namespace, waits up to the control-plane bound for its `listening` line, and
+publishes the socket in `MBX_RESERVATIONS_SOCKET`, which every task inherits. Its `postTasksExecution` closes the
+endpoint's standard input, which ends it with every grant it still serves. Each task's `bounded-exec` opens one
+connection to it per process and asks on it for each reserved leaf, `{"type":"reserve","id":n,"cpus":c,"priority":p}`;
+the answer is the cores granted, and the leaf's end releases them (`{"type":"release","id":n}`) once its subtree is
+retired (11_shell.md, "Job admission and class placement"). A connection that closes, its executor dead, releases
+everything it held and withdraws what still waits. The leaf's shell asks its executor on descriptor 5, one line naming
+its count (`c`, at most `g`, the units below), says `cowshed: mbx reserve wait start cpus=<c> priority=<p>`, reads back
+the cores granted, closes the descriptor, and runs its command in the same shell with `MBX_RESERVE_CPUS` set to that
+count, `MBX_SCHED_DISABLE=1` and an empty `MBX_SCHED_DIR`, what `mbx reserve` gives its own command, so no process
+starts for the reservation. A refusal ends the descriptor unanswered and fails the leaf, naming mbx's error. A run whose
+endpoint did not start says why in its own output, and its reserved leaves refuse to run, naming
+`MBX_RESERVATIONS_SOCKET`: no reserved leaf runs beside the pool. A leaf ended before its grant records a `queued`
+verdict with its wait on the endpoint. Enforced by the stand-in endpoint cases of `executor.test.ts` (a run of reserved
+leaves starts no mbx process and asks over one connection, each runner on its grant), `mbx-reservations.test.ts` (the
+client and the run hook) and `mbx-pool.test.ts` (the leaf's shell), and by mbx's own suite for the endpoint.
+
+**A Vitest or Go test leaf enters no pool.** It reserves nothing and runs with its own default workers, uncapped
 (owner's ruling, 2026-10-31). Reserved at that default, which sizes to the host (Vitest one worker per core but one, Go
 one package per core), each held 17 or 18 of an 18-core pool, and mbx's ordered admission kept every reservation queued
 behind it waiting while the pool drained: a downstream gate on 2026-10-31 ran 4.9 of 18 cores busy while 25 of its tasks
@@ -1642,30 +1666,31 @@ queued a minute or more, and a gate's Go test leaf waited 401 s for all 18 cores
 
 **A nextest run of prebuilt test binaries is a reserved leaf.** The inferred extracted-archive run
 (`--binaries-metadata`), or one from `--archive-file`, builds nothing, so it enters the pool as a non-Cargo leaf does:
-`mbx reserve --cpus g` admits it once for its whole grant, and its test processes run inside that grant, mbx scheduling
-none of them beneath the reservation. Admitted one test process at a time under `MBX_SCHEDULER_TESTS=1`, each queued for
-a ticket of its own: a downstream gate on 2026-10-30 measured 73.5 s apiece for codec tests of at most 0.25 s, whose 121
+its run's endpoint admits it once for its whole grant, and its test processes run inside that grant, mbx scheduling none
+of them beneath the reservation. Admitted one test process at a time under `MBX_SCHEDULER_TESTS=1`, each queued for a
+ticket of its own: a downstream gate on 2026-10-30 measured 73.5 s apiece for codec tests of at most 0.25 s, whose 121
 tests run in 1.18 s unqueued (owner's ruling, 2026-10-30).
 
 **A reserved leaf asks for no more than its units.** A leaf whose target names a `unitsCommand` (the plugin's nextest
 pieces: the same `nextest list` of the piece's selection and partition, one line per test) runs that command at the end
 of its fixture segment, under the fixture's ceiling, so the fixture runs first and outside any reservation (its build's
-compilers mbx admits one by one), then `mbx reserve --cpus min(units, g)`, at least one. A piece of two slow tests
-reserves two cores, not every core its runner could use, so a grant mbx makes from the free cores is not held idle for
-the piece's whole run. Units count tests, not nextest's per-test thread slots, so a test with `threads-required` above
-one runs on fewer cores than it could use. A count that fails fails the leaf before anything is reserved. A leaf with no
+compilers mbx admits one by one), then asks for `min(units, g)` cores, at least one. A piece of two slow tests reserves
+two cores, not every core its runner could use, so a grant mbx makes from the free cores is not held idle for the
+piece's whole run. Units count tests, not nextest's per-test thread slots, so a test with `threads-required` above one
+runs on fewer cores than it could use. A count that fails fails the leaf before anything is reserved. A leaf with no
 units command, such as a cross-target archive run, asks for its runner's own count `g`, its fixture inside the
 reservation.
 
 The boundary of an unheld job is the actual leaf runner (`bounded-exec` and equivalent direct runners), not an enclosing
 orchestration command; a held job's boundary is the job itself ("Held jobs"). An Nx run mixing Cargo and non-Cargo
 leaves outside a hold holds no reservation of its own: Cargo leaves use mbx, non-Cargo leaves reserve, and local fan-out
-consumes only the admitted leaf's grant. `mbx reserve` does not discover Cargo children. Reserving around an
+consumes only the admitted leaf's grant. A reservation does not discover Cargo children. Reserving around an
 orchestrator and then letting its Cargo children acquire again would double-charge and can deadlock, so that path is not
 used. Nested non-Cargo work shares its enclosing grant instead of reserving twice. The seven unscheduled Cargo
 test-runner cases are an explicit exception with job-local bounds, not another hidden pool (11_shell.md, "Cargo
-test-runner boundaries" and "Open questions"). The external-work interface belongs to
-[mbx reserve](https://mr-boxington.jdx.dev/scheduling#reserve-capacity-for-external-work).
+test-runner boundaries" and "Open questions"). The external-work interface belongs to mbx:
+[mbx reserve](https://mr-boxington.jdx.dev/scheduling#reserve-capacity-for-external-work) for one command,
+[mbx reservations](https://mr-boxington.jdx.dev/scheduling#serve-reservations-to-many-commands) for many.
 
 **Without mbx, every job receives its own GNU make jobserver fifo**, served by its supervisor at the constant count `g`.
 The fifo bounds the compiler and test threads one build tree starts, not host-wide capacity. Two jobs may each hold

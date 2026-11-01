@@ -82,6 +82,7 @@ import {
   type AllVerdictsOptions,
   ESLINT_SOURCES_TOKEN,
 } from './executors/all-verdicts/schema.js';
+import { closeRunReservations, serveRunReservations } from './executors/bounded-exec/mbx-reservations.js';
 import { closeRunCpuPool, serveRunCpuPool } from './executors/bounded-exec/run-cpu-pool.js';
 import { ffiPathProblem } from './executors/scriptc-native/ffi-paths.js';
 import type { ScriptcNativeFfi } from './executors/scriptc-native/schema.js';
@@ -1219,7 +1220,7 @@ function isBuildOutputPackageJson(packageJsonPath: string): boolean {
  * hint and the opt-in producer completion receipts. Each sees the same options and run context; neither reads the
  * other's output. The hint is recorded first so a producer-receipt bug cannot cost the controller its evidence. The
  * pair also serves a run that inherits no CPU pool its own, which every task inherits (`run-cpu-pool.ts`), and closes
- * it when the run ends. Last, once every task has finished, the post hook starts the reclaim of the
+ * it when the run ends, and a run with mbx's pool its mbx reservation endpoint (`mbx-reservations.ts`), which it ends then too. Last, once every task has finished, the post hook starts the reclaim of the
  * superseded Cargo unit generations of each Cargo workspace the run built into, in a process of its own, never on
  * Nx's thread (`@smoothbricks/cargo-retain`).
  */
@@ -1230,11 +1231,13 @@ export const preTasksExecution: PreTasksExecution<ProducerReceiptsOptions> = asy
   preTaskResults(options, context);
   await preProducerReceipts(options, context);
   await serveRunCpuPool(context);
+  await serveRunReservations(context);
 };
 export const postTasksExecution: PostTasksExecution<ProducerReceiptsOptions> = async (options, context) => {
   await postTaskResults(options, context);
   await postProducerReceipts(options, context);
   await closeRunCpuPool(context);
+  await closeRunReservations(context);
   await postCargoRetention(options, context);
 };
 

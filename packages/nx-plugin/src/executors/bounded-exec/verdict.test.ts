@@ -229,6 +229,11 @@ describe('bounded-exec verdicts', () => {
     );
     expect(judgeRun({ ...end, exitCode: 0 })).toEqual({ outcome: 'passed' });
     expect(judgeRun({ ...end, admissionQueue: null })).toEqual({ outcome: 'failed', exitCode: 143, tests: [] });
+    // A reserved leaf's wait is its own request on its run's mbx endpoint, which names no public queue rows.
+    const reserved = judgeRun({ ...end, admissionQueue: { waitedMs: 4_000, requests: [] } });
+    expect(describeVerdict(reserved)).toBe(
+      "queued for admission 4.0 s; on its run's mbx reservation endpoint; exited 143 before first admission",
+    );
     const { context } = await workspace();
     const directory = context.record?.directory ?? '';
     await mkdir(directory, { recursive: true });

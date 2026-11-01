@@ -1964,31 +1964,43 @@ waiting for, however long a loaded host makes the work take; one that never retu
 `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that report no tests; a target names at least one of
 the two.
 
-With mbx admission, a reserved leaf and a supported Cargo/nextest test leaf inherit a private grant pipe. mbx writes `g`
-on every admission and `r` on permit drop (`MBX_GRANT_FD=5` for Cargo, `mbx reserve --grant-fd 5` for reservations). The
-executor counts overlapping holds: while no hold exists it pauses the test idle budget, resuming the remaining budget on
-admission; a finished test still resets that budget. Total and fixture ceilings start at the first `g` and do not pause
-after it. EOF is not a grant or a release; a holder killed without `r` remains counted until command exit.
+With mbx admission, a supported Cargo/nextest test leaf inherits a private grant pipe: mbx writes `g` on every admission
+and `r` on permit drop (`MBX_GRANT_FD=5`). The executor counts overlapping holds: while no hold exists it pauses the
+test idle budget, resuming the remaining budget on admission; a finished test still resets that budget. Total and
+fixture ceilings start at the first `g` and do not pause after it. EOF is not a grant or a release; a holder killed
+without `r` remains counted until command exit.
 
-Independently of that spawn-time zero-hold rule, **any live task process explicitly queued for mbx admission pauses
-idle**, even while another task process holds capacity or the runner is otherwise unsupported. The executor polls public
-`mbx stats --scheduler --json --activity` activity, accepting only `kind: "waiter"`, `live: true` rows whose PID is
-corroborated by bounded, scoped per-PID lineage reads through cowshed's native `processLineages` owner (libproc on
-macOS, procfs on Linux), never a spawned ps or a process-table census. Names, private waiter files and decision logs
-prove nothing. Public `queue_position` is preserved, never recomputed by the consumer. A successful snapshot with no
-task waiters resumes the remaining budget when the lifecycle and hold count permit it; a finished test resets the paused
-budget. An idle callback drains any in-flight poll and takes a fresh bounded snapshot before expiring. The stats read
-and every native lineage batch share one five-second monotonic control-plane budget, independent of the idle clock; late
-or cancelled snapshots never become queue or empty-membership evidence. Snapshot failures are reported operational
-failures, never manufactured queue/admission evidence or an idle wedge; an unidentifiable foreign legacy row is
-diagnosed without claiming task membership. Live diagnostics say `queued for admission N s` with the mbx queue position.
-A command that fails or is cancelled before its first admission records a distinct `queued` verdict with observed wait
-duration and its last public PID/ticket/position rows. Queue observation adds no deadline and changes neither total nor
-fixture ceilings. Queue observations take effect at snapshot completion, never backdated across a finished test's budget
-reset. Observed wait duration freezes when the command settles or cancellation stops observation, before teardown or
-report reading. The observer requires the version-2 activity-only report; the full statistics document's cache, savings
-and memory histories are not polling input. The activity projection omits those walks and encodings instead of raising
-the observer's output or control-plane limits.
+A reserved leaf takes its cores from its Nx run's mbx reservation endpoint, never from an `mbx reserve` process of its
+own (specs/cowshed/05_gateway.md, "An Nx run serves its leaves one reservation endpoint"). The plugin's
+`preTasksExecution` starts `mbx reservations <socket>` once for a run with mbx's pool and publishes the socket in
+`MBX_RESERVATIONS_SOCKET`; its `postTasksExecution` ends it. The leaf's shell writes the count it asks for on descriptor
+5 and reads back the cores granted. The executor asks the endpoint over its process's one connection, says
+`cowshed: mbx reserve wait start cpus=<asked> priority=<p>` and then
+`cowshed: mbx reserve granted elapsed=<ms> priority=<p>`, and gives the grant back once the leaf's subtree is retired;
+the grant starts the leaf's total and fixture ceilings as a first `g` does. The shell runs the command with
+`MBX_RESERVE_CPUS`, `MBX_SCHED_DISABLE=1` and an empty `MBX_SCHED_DIR`. A refusal fails the leaf, naming mbx's error,
+and a run with no endpoint refuses its reserved leaves.
+
+Independently of that spawn-time zero-hold rule, **any live process of a Cargo leaf explicitly queued for mbx admission
+pauses idle**, even while another of its processes holds capacity or the runner is otherwise unsupported. The executor
+polls public `mbx stats --scheduler --json --activity` activity, accepting only `kind: "waiter"`, `live: true` rows
+whose PID is corroborated by bounded, scoped per-PID lineage reads through cowshed's native `processLineages` owner
+(libproc on macOS, procfs on Linux), never a spawned ps or a process-table census. Names, private waiter files and
+decision logs prove nothing. Public `queue_position` is preserved, never recomputed by the consumer. A successful
+snapshot with no task waiters resumes the remaining budget when the lifecycle and hold count permit it; a finished test
+resets the paused budget. An idle callback drains any in-flight poll and takes a fresh bounded snapshot before expiring.
+The stats read and every native lineage batch share one five-second monotonic control-plane budget, independent of the
+idle clock; late or cancelled snapshots never become queue or empty-membership evidence. Snapshot failures are reported
+operational failures, never manufactured queue/admission evidence or an idle wedge; an unidentifiable foreign legacy row
+is diagnosed without claiming task membership. Live diagnostics say `queued for admission N s` with the mbx queue
+position. A command that fails or is cancelled before its first admission records a distinct `queued` verdict with
+observed wait duration and its last public PID/ticket/position rows, or, for a reserved leaf, its wait on its run's
+endpoint and no rows. Queue observation adds no deadline and changes neither total nor fixture ceilings. Queue
+observations take effect at snapshot completion, never backdated across a finished test's budget reset. Observed wait
+duration freezes when the command settles or cancellation stops observation, before teardown or report reading. The
+observer requires the version-2 activity-only report; the full statistics document's cache, savings and memory histories
+are not polling input. The activity projection omits those walks and encodings instead of raising the observer's output
+or control-plane limits.
 
 The decision to use zero-hold pausing is made before spawn, from the canonical scheduling switch and the supported
 command, never from silence on the pipe. The inferred in-place
@@ -2060,8 +2072,8 @@ and its ceiling does not apply.
 Under mbx, a reserved leaf whose target names a `unitsCommand` (a shell command printing one line per unit `command`
 runs; the plugin's nextest pieces name the same `nextest list -T oneline` of their selection and partition) runs that
 command at the end of its fixture segment, under the fixture's ceiling, which then starts at spawn, with the fixture's
-own output on stderr; the fixture runs before the reservation, not inside it. The leaf then reserves
-`--cpus min(units, its runner's count)`, at least one, and its reservation says
+own output on stderr; the fixture runs before the reservation, not inside it. The leaf then asks its run's endpoint for
+`min(units, its runner's count)` cores, at least one, and its reservation says
 `cowshed: mbx reserve running cpus=<granted> asked=<asked>`. A count that fails fails the run before anything is
 reserved, named as the fixture segment. `unitsCommand` is refused without `fixtureCommand`.
 

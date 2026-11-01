@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'bun:test';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { Duplex } from 'node:stream';
 import {
+  askedCores,
+  MBX_GRANT_FD,
   mbxIdleGated,
   mbxLeaf,
   mbxPool,
@@ -39,7 +43,7 @@ describe("mbx's one pool at the leaf", () => {
     expect(leaf).toMatchObject({ kind: 'reserve', priority: 'low', demand: { kind: 'process', want: 4 } });
     const reserved = withMbxLeaf("bun test 'a b'", leaf);
     expect(reserved).toStartWith(
-      'BOUNDED_EXEC_CPU_WANT=4 && export BOUNDED_EXEC_CPU_WANT && mbx reserve --grant-fd 5 --cpus "$BOUNDED_EXEC_CPU_WANT" --priority low -- /bin/sh -c \'export ',
+      "BOUNDED_EXEC_CPU_WANT=4 && export BOUNDED_EXEC_CPU_WANT && printf '%s\\n' \"$BOUNDED_EXEC_CPU_WANT\" >&5 && IFS= read -r MBX_RESERVE_CPUS <&5 && exec 5>&- && export MBX_RESERVE_CPUS MBX_SCHED_DISABLE=1 MBX_SCHED_DIR= && eval 'export ",
     );
     expect(reserved).toEndWith(">&2; bun test '\\''a b'\\'''");
     // A Vitest or Go test leaf enters no pool and runs its own default workers (owner's ruling, 2026-10-31).
@@ -69,7 +73,7 @@ describe("mbx's one pool at the leaf", () => {
         demand: { kind: 'nextest', want: 6 },
       });
       expect(withMbxLeaf(command, leafOf(command, 6))).toContain(
-        'mbx reserve --grant-fd 5 --cpus "$BOUNDED_EXEC_CPU_WANT" --priority low -- /bin/sh -c ',
+        'IFS= read -r MBX_RESERVE_CPUS <&5 && exec 5>&- && export MBX_RESERVE_CPUS MBX_SCHED_DISABLE=1 MBX_SCHED_DIR= && eval ',
       );
     }
     expect(leafOf('cargo nextest run --archive-file a.tar.zst', 4)).toMatchObject({
@@ -81,7 +85,7 @@ describe("mbx's one pool at the leaf", () => {
     expect(leafOf('cargo nextest run -p x', 8)).toEqual({ kind: 'cargo' });
   });
 
-  it('builds a reserved leaf’s fixture first, then asks for at most its units, at least one', () => {
+  it('builds a reserved leaf’s fixture first, then asks its executor for at most its units, at least one', async () => {
     // A gate on 2026-10-30: every cargo-test leaf reserved `--cpus 18` of an 18-core pool, so they ran one at a time
     // and the host sat 70% idle. mbx now grants a reservation the cores that are free, and a piece of two slow tests
     // asking for every core would hold the idle rest of its grant: it asks for its tests, counted after its fixture
@@ -92,40 +96,73 @@ describe("mbx's one pool at the leaf", () => {
     expect(runsPrebuiltNextest('cargo nextest run -p x')).toBe(false);
     const leaf = mbxLeaf(pool, runnerDemand(nextest, 6, 18, {}), nextest);
     if (leaf?.kind !== 'reserve') throw new Error('a prebuilt nextest leaf is reserved for');
-    // A stand-in mbx that says what it was asked for and runs the reservation's command on one granted core.
-    const mbx = `mbx() { while [ "$1" != -- ]; do if [ "$1" = --cpus ]; then printf 'reserve %s\\n' "$2"; fi; shift; done; shift; MBX_RESERVE_CPUS=1 "$@"; }; `;
     const fixture = 'echo built >&2';
-    const command = 'echo "ran $BOUNDED_EXEC_CPU_TOKENS"';
-    const run = (units: string | null) =>
-      spawnSync(
+    // What the command sees: its grant, mbx work inside it held under that grant, and no descriptor of its executor's.
+    const command =
+      'echo "ran $BOUNDED_EXEC_CPU_TOKENS $MBX_RESERVE_CPUS $MBX_SCHED_DISABLE [$MBX_SCHED_DIR]"; ' +
+      '{ true >&5; } 2>/dev/null && echo fd5-open || echo fd5-closed';
+    // The executor's side of the leaf's descriptor: it records what the shell asks for and grants one core.
+    const run = async (units: string | null) => {
+      const child = spawn(
         '/bin/sh',
         [
           '-c',
-          mbx +
-            (units === null
-              ? withMbxLeaf(`${fixture} && { ${command}; }`, leaf)
-              : withCountedReservation(`{ ${fixture}; } && ${units}`, command, leaf)),
+          units === null
+            ? withMbxLeaf(`${fixture} && { ${command}; }`, leaf)
+            : withCountedReservation(`{ ${fixture}; } && ${units}`, command, leaf),
         ],
-        { encoding: 'utf8' },
+        { stdio: ['ignore', 'pipe', 'pipe', 'ignore', 'ignore', 'pipe'] },
       );
+      const channel = child.stdio.at(MBX_GRANT_FD);
+      if (!(channel instanceof Duplex)) throw new Error('a reserved leaf has its mbx descriptor');
+      let asked = '';
+      channel.setEncoding('utf8');
+      channel.on('data', (text: string) => {
+        asked += text;
+        if (asked.endsWith('\n')) channel.end('1\n');
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout?.setEncoding('utf8').on('data', (text: string) => {
+        stdout += text;
+      });
+      child.stderr?.setEncoding('utf8').on('data', (text: string) => {
+        stderr += text;
+      });
+      const [status] = await once(child, 'close');
+      return { asked, stdout, stderr, status };
+    };
+    const ran = 'ran 1 1 1 []\nfd5-closed\n';
     // Uncounted, the fixture runs inside the reservation, as it always did.
-    expect(run(null)).toMatchObject({
-      stdout: 'reserve 6\nran 1\n',
+    expect(await run(null)).toMatchObject({
+      asked: '6\n',
+      stdout: ran,
       stderr: 'cowshed: mbx reserve running cpus=1 asked=6\nbuilt\n',
+      status: 0,
     });
     // Counted, it runs first, and the leaf asks for its units, at most its runner's count and at least one.
-    const counted = (units: string, asked: number) =>
-      expect(run(units)).toMatchObject({
-        stdout: `reserve ${asked}\nran 1\n`,
+    const counted = async (units: string, asked: number) =>
+      expect(await run(units)).toMatchObject({
+        asked: `${asked}\n`,
+        stdout: ran,
         stderr: `built\ncowshed: mbx reserve running cpus=1 asked=${asked}\n`,
+        status: 0,
       });
-    counted("printf 'a\\nb\\n'", 2);
-    counted("printf 'a\\nb\\nc\\nd\\ne\\nf\\ng\\nh\\n'", 6);
-    counted('true', 1);
-    // A count that fails fails the leaf before anything is reserved.
-    const failed = run('false');
-    expect(failed).toMatchObject({ stdout: '', stderr: 'built\n' });
+    await counted("printf 'a\\nb\\n'", 2);
+    await counted("printf 'a\\nb\\nc\\nd\\ne\\nf\\ng\\nh\\n'", 6);
+    await counted('true', 1);
+    // A count that fails fails the leaf before anything is asked for.
+    const failed = await run('false');
+    expect(failed).toMatchObject({ asked: '', stdout: '', stderr: 'built\n' });
     expect(failed.status).not.toBe(0);
+  });
+
+  it("reads the cores a reserved leaf's shell asks for: a whole count from one to its runner's most", () => {
+    expect(askedCores('1', 6)).toBe(1);
+    expect(askedCores('6', 6)).toBe(6);
+    for (const line of ['0', '7', '', ' 2', '2 ', '02', '-1', '1.5', 'six', '99999999999']) {
+      expect(askedCores(line, 6), line).toBeNull();
+    }
   });
 
   it.each<[string, string, boolean]>([

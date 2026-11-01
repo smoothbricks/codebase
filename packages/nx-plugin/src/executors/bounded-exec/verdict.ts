@@ -25,8 +25,9 @@ import { TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
  * - `no-space`: the run failed and its output said a write found no space (ENOSPC). Whatever its tests then reported,
  *   they failed on the disk, not on their own: the verdict names the line that said so and, when the task held one,
  *   its RAM temp volume as it stood when that line arrived.
- * - `queued`: the command failed before any admission after a live task PID was explicitly seen waiting in mbx.
- *   Its observed wait and public queue positions describe admission pressure, never a wedged test.
+ * - `queued`: the command failed before any admission after a live task PID was explicitly seen waiting in mbx, or
+ *   while its reserved leaf's request waited on its run's mbx reservation endpoint. Its observed wait, and any public
+ *   queue positions, describe admission pressure, never a wedged test.
  * - `failed`: anything else that did not pass. That includes an assertion named in the report,
  *   or a non-zero exit with no report to say why.
  */
@@ -672,9 +673,13 @@ export async function failedTasksOfRun(runJson: unknown, workspaceData: string):
 
 /** The same honest admission diagnostic in live output and a terminal verdict. */
 export function describeAdmissionQueue(wait: AdmissionQueueWait): string {
-  return `queued for admission ${(wait.waitedMs / 1_000).toFixed(1)} s; mbx ${wait.requests
-    .map((request) => `pid=${request.pid} ticket=${request.ticket} queue position=${request.queuePosition}`)
-    .join(', ')}`;
+  const where =
+    wait.requests.length === 0
+      ? "on its run's mbx reservation endpoint"
+      : `mbx ${wait.requests
+          .map((request) => `pid=${request.pid} ticket=${request.ticket} queue position=${request.queuePosition}`)
+          .join(', ')}`;
+  return `queued for admission ${(wait.waitedMs / 1_000).toFixed(1)} s; ${where}`;
 }
 export function describeVerdict(verdict: BoundedExecVerdict): string {
   switch (verdict.outcome) {

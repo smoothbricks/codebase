@@ -38,8 +38,17 @@ import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import type { CpuWaitRow } from './lease-wait.js';
 import type { LockWait } from './lock-wait.js';
-import { MBX_GRANT_FD, mbxIdleGated, mbxLeaf, mbxPool, withCountedReservation, withMbxLeaf } from './mbx-pool.js';
+import {
+  askedCores,
+  MBX_GRANT_FD,
+  mbxIdleGated,
+  mbxLeaf,
+  mbxPool,
+  withCountedReservation,
+  withMbxLeaf,
+} from './mbx-pool.js';
 import { MBX_QUEUE_POLL_MS, type MbxQueuedRequest, snapshotMbxQueue } from './mbx-queue.js';
+import { RESERVATIONS_ENV, type Reservation, reserveCores } from './mbx-reservations.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -568,8 +577,11 @@ export async function runBoundedExec(
     sized = sizeRunner(demand, requested, demand.want);
   }
   // The run's sub-pool and grant are given back exactly once, however the run ends. The sub-pool closes first, so no
-  // descendant still draws on tokens the grant has returned.
+  // descendant still draws on tokens the grant has returned. A reserved leaf's mbx grant covers the leaf's conclusion,
+  // its subtree's retirement included (11_shell.md), so it goes back after `releaseLease`.
   let pool: CpuPool | null = null;
+  let reservation: Reservation | null = null;
+  const releaseReservation = (): void => reservation?.release();
   let cpuReleased: Promise<void> | null = null;
   const releaseCpu = (): Promise<void> => {
     cpuReleased ??= (async () => {
@@ -596,8 +608,9 @@ export async function runBoundedExec(
   let unconfirmedAdmission: string | null = null;
   /** When the last successful snapshot completed (`Date.now()`): credit runs to it and no further. */
   let confirmedAdmissionAt: number | null = null;
+  // A reserved leaf's own request on its run's endpoint is its admission wait; a Cargo leaf's comes from mbx's report.
   const queueWait = (): AdmissionQueueWait | null =>
-    mbxAdmitted || lastQueueRequests.length === 0
+    mbxAdmitted || (lastQueueRequests.length === 0 && reservation === null)
       ? null
       : {
           waitedMs: admissionWaitMs(admissionWait, performance.now()),
@@ -679,6 +692,14 @@ export async function runBoundedExec(
   if (parentRefusal !== null) {
     return refuse(`cowshed: cpu-pool parent pool refused: ${parentRefusal}; refusing to run the command\n`);
   }
+  // A reserved leaf takes its cores from its Nx run's mbx reservation endpoint (mbx-reservations.ts). A run that serves
+  // none said why in its own output; the leaf does not run beside the pool.
+  const reserved = leaf?.kind === 'reserve' ? { leaf, endpoint: process.env[RESERVATIONS_ENV] ?? '' } : null;
+  if (reserved !== null && reserved.endpoint === '') {
+    return refuse(
+      `cowshed: a reserved leaf takes its cores from its Nx run's mbx reservation endpoint, and ${RESERVATIONS_ENV} names none (the run's preTasksExecution serves it); refusing to run the command\n`,
+    );
+  }
 
   // A granted run serves a sub-pool of its own grant, so its descendants draw from that and never from above it.
   // A pool that cannot be set up refuses the run: no granted command runs beside its grant.
@@ -730,7 +751,8 @@ export async function runBoundedExec(
       : withMbxLeaf(unadmitted, leaf);
   // Only leaves known to be scheduled can exclude zero-hold time. Others keep lifecycle hang protection.
   const queued = mbxIdleGated(leaf, sized.command, { ...process.env, ...env });
-  // fd 4 is unused without a subtree admission, so the grant takes fd 5 either way.
+  // fd 4 is unused without a subtree admission, so mbx's descriptor takes fd 5 either way: a Cargo leaf's admission
+  // stream, or a reserved leaf's ask for cores and their count (mbx-pool.ts, `MBX_GRANT_FD`).
   const grantSlots: IOType[] = leaf !== null ? ['ignore', 'pipe'] : [];
   const rootGrantSlot: IOType[] = leaf !== null ? ['pipe'] : [];
   const root = owner?.rootArgv(shellCommand);
@@ -740,7 +762,7 @@ export async function runBoundedExec(
   resultWriter = results?.ok ? results.writer : null;
   try {
     // fd 3 is the runner lifecycle's duplex socket when the command is hooked; the subtree admission takes fd 4, which
-    // cowshed closes fd 4 before exec; fd 5 carries mbx's admission/release stream, including Cargo descendants.
+    // cowshed closes fd 4 before exec; fd 5 is a Cargo leaf's mbx admission stream or a reserved leaf's ask and grant.
     child =
       root === undefined
         ? spawn(shellCommand, [], {
@@ -882,7 +904,7 @@ export async function runBoundedExec(
     if (state.settled || state.expiry !== null) return;
     const scheduled = earliestBound(checkingIdle ? { ...bounds, idle: null } : bounds);
     if (scheduled?.kind !== kind || scheduled.at !== at) return;
-    if (kind === 'idle' && leaf !== null) {
+    if (kind === 'idle' && leaf?.kind === 'cargo') {
       if (checkingIdle) return;
       checkingIdle = true;
       armBoundTimer();
@@ -937,8 +959,6 @@ export async function runBoundedExec(
   };
   const refreshQueue = async (fresh: boolean): Promise<void> => {
     if (fresh && queueSnapshot !== null) await queueSnapshot;
-    // A leaf that counts its units before reserving waits in no reservation queue while its fixture builds.
-    if (counted && !fixtureDone) return;
     if (state.settled || state.expiry !== null || queueAbort.signal.aborted || child.pid === undefined) return;
     const pid = child.pid;
     queueSnapshot ??= (async () => {
@@ -1079,13 +1099,14 @@ export async function runBoundedExec(
     clearTimeout(boundTimer);
     // Preserve explicit live membership before cancellation removes the queued process. A failed bounded observation
     // leaves the admission unconfirmed, never a manufactured queue or admission.
-    signalCleanup = (leaf === null ? Promise.resolve() : refreshQueue(false))
+    signalCleanup = (leaf?.kind !== 'cargo' ? Promise.resolve() : refreshQueue(false))
       .finally(() => {
         stopQueueObservation();
         return killChildTree();
       })
       .finally(releaseCpu)
       .finally(() => releaseLease(true))
+      .finally(releaseReservation)
       .finally(async () =>
         recordRun(
           signalToExitCode(signal),
@@ -1257,46 +1278,87 @@ export async function runBoundedExec(
     fixtureFirst: counted && lifecycle !== null,
     queued,
   });
-  // Read every byte after spawn accounting: a chunk can contain several grants and releases. EOF is neither.
   if (leaf !== null) {
     const channel = child.stdio.at(MBX_GRANT_FD);
-    if (!(channel instanceof Readable)) throw new Error('an mbx leaf requires its grant descriptor');
-    let said = false;
+    if (!(channel instanceof Duplex)) throw new Error('an mbx leaf requires its mbx descriptor');
     const failGrant = (detail: string): void => {
       if (lifecycleFailure !== null || state.expiry !== null || state.settled) return;
       lifecycleFailure ??= `mbx grant descriptor: ${detail}`;
       appendStderr(`bounded-exec: ${lifecycleFailure}\n`);
       termination = terminate();
     };
-    channel.on('data', (chunk: Buffer) => {
-      for (const byte of chunk) {
-        if (byte === 103) {
-          if (!said) {
-            mbxAdmitted = true;
-            said = true;
-            tell(
-              leaf.kind === 'reserve'
-                ? `cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms priority=${leaf.priority}\n`
-                : `cowshed: mbx cargo granted elapsed=${Date.now() - startedAt}ms\n`,
-            );
-          }
-          stepTo({ kind: 'granted', at: Date.now(), testing: isTesting(), fixture: !fixtureDone });
-        } else if (byte === 114) {
-          stepTo({ kind: 'released', at: Date.now() });
-        } else {
-          failGrant(`unexpected byte ${byte}`);
+    channel.on('error', (error) => failGrant(error.message));
+    if (reserved !== null) {
+      // The shell asks for its cores in one line and reads the count granted (mbx-pool.ts, `reservation`). A refusal
+      // ends the descriptor unanswered: the shell's read fails, and nothing runs.
+      const { leaf: reservedLeaf, endpoint } = reserved;
+      let asked = '';
+      channel.setEncoding('utf8');
+      channel.on('data', (text: string) => {
+        if (reservation !== null) {
+          failGrant(`the command asked for cores a second time: ${JSON.stringify(text)}`);
           return;
         }
-      }
-    });
-    channel.on('error', (error) => failGrant(error.message));
-  }
-
-  if (leaf !== null) {
-    queueTimer = setInterval(() => {
+        asked += text;
+        const end = asked.indexOf('\n');
+        if (end === -1) return;
+        const line = asked.slice(0, end);
+        const cpus = askedCores(line, reservedLeaf.demand.want);
+        if (cpus === null) {
+          failGrant(`the command asked for ${JSON.stringify(line)} cores, not 1 to ${reservedLeaf.demand.want}`);
+          channel.end();
+          return;
+        }
+        admissionWait = stepAdmissionWait(admissionWait, { kind: 'snapshot', at: performance.now(), waiting: true });
+        tell(`cowshed: mbx reserve wait start cpus=${cpus} priority=${reservedLeaf.priority}\n`);
+        const held = reserveCores(endpoint, cpus, reservedLeaf.priority);
+        reservation = held;
+        void held.granted.then((granted) => {
+          if (!granted.ok) {
+            failGrant(`mbx did not grant the reservation: ${granted.error}`);
+            channel.end();
+            return;
+          }
+          // A run that ended while it waited gives the grant back with its CPU (`releaseCpu`).
+          if (state.settled || state.expiry !== null) return;
+          mbxAdmitted = true;
+          tell(`cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms priority=${reservedLeaf.priority}\n`);
+          channel.end(`${granted.cpus}\n`);
+          stepTo({ kind: 'granted', at: Date.now(), testing: isTesting(), fixture: !fixtureDone });
+          void granted.lost.then((why) => {
+            if (state.settled || cpuReleased !== null) return;
+            appendStderr(
+              `cowshed: mbx reservation lost while the command ran (${why}); it runs on unheld until it ends\n`,
+            );
+          });
+        });
+      });
+    } else {
+      // Read every byte after spawn accounting: a chunk can contain several grants and releases. EOF is neither.
+      let said = false;
+      channel.on('data', (chunk: Buffer) => {
+        for (const byte of chunk) {
+          if (byte === 103) {
+            if (!said) {
+              mbxAdmitted = true;
+              said = true;
+              tell(`cowshed: mbx cargo granted elapsed=${Date.now() - startedAt}ms\n`);
+            }
+            stepTo({ kind: 'granted', at: Date.now(), testing: isTesting(), fixture: !fixtureDone });
+          } else if (byte === 114) {
+            stepTo({ kind: 'released', at: Date.now() });
+          } else {
+            failGrant(`unexpected byte ${byte}`);
+            return;
+          }
+        }
+      });
+      // Only mbx's activity report says whether a Cargo leaf's compiler or test waits in the pool.
+      queueTimer = setInterval(() => {
+        void refreshQueue(false);
+      }, MBX_QUEUE_POLL_MS);
       void refreshQueue(false);
-    }, MBX_QUEUE_POLL_MS);
-    void refreshQueue(false);
+    }
   }
 
   // A grant's connection is a ledger entry, not the command's owner: the lending parent's exit ends it, and what runs
@@ -1356,6 +1418,7 @@ export async function runBoundedExec(
     }
   }
   await releaseLease(code !== 0 || state.expiry !== null || state.poolCloseError !== null || lifecycleFailure !== null);
+  releaseReservation();
 
   // Broken resource ownership, a lost native lifecycle, or leftovers that could not be retired fail even if a shell
   // branch later exited 0: its verdict is an ordinary operational failure, never a successful or silently unbounded run.

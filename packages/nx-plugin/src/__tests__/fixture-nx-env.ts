@@ -38,7 +38,7 @@ exports.createNodesV2 = ['**/project.json', async () => {
  * Every inherited `MBX_*` variable is dropped too. A gate job of an mbx project
  * carries cowshed's canonical mbx environment (specs/cowshed/11_shell.md,
  * "Canonical mbx environment"), and a fixture is no such project: its Nx would
- * join the outer job's pool (each bounded-exec leaf inside `mbx reserve`), and
+ * join the outer job's pool (each bounded-exec leaf reserving from it), and
  * its Cargo retention hook would leave the fixture's targets to mbx.
  *
  * NX_DAEMON is then `false`: a daemonless Nx leaves nothing running once it

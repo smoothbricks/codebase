@@ -99,6 +99,7 @@
     "src/manifest-hash.test.ts": 49,
     "src/workspace-config-policy.test.ts": 47,
     "src/executors/wrangler-deploy/hasher.test.ts": 39,
+    "src/executors/bounded-exec/mbx-reservations.test.ts": 39,
     "src/generators/create-package/generator.test.ts": 33,
     "src/cargo-toolchain-paths.test.ts": 31,
     "src/eslint-sources.test.ts": 31,
