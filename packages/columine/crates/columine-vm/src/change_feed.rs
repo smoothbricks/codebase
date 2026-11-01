@@ -1,4 +1,4 @@
-//! The changed-key feed (contract §F5): which keys of which tracked sources
+//! The changed-key feed (`specs/columine/07-change-feed.md`): which keys of which tracked sources
 //! one RETE pass may have changed. The VM's key-scoped write kernels record
 //! their slots' keys; the RETE layer records its derived-fact writes through
 //! [`crate::vm::Vm::feed_record_fact`].

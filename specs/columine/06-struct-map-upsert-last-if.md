@@ -56,8 +56,9 @@ embedder's to do.
 
 ## 4. Mutation and recovery
 
-A refused element mutates nothing: no bitset clearing, arena write, journal record or change flag. An admitted element
-is the `0x80` row write: the same undo capture and delta redo, and the same `INSERTED` or `UPDATED` change flag.
+A refused element mutates nothing: no bitset clearing, arena write, journal record, change flag or change-feed entry
+([change feed](07-change-feed.md) §3). An admitted element is the `0x80` row write: the same undo capture and delta
+redo, the same `INSERTED` or `UPDATED` change flag, and the same change-feed entry.
 
 Capacity admission charges the destination like `0x80`. When its bounds cannot clear the batch, the dry run evaluates
 the predicates on a copy of the image and answers exactly. A `NEEDS_GROWTH` refusal therefore leaves the image as it

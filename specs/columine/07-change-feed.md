@@ -33,8 +33,9 @@ and not overflowed:
 - hash map upsert (an equal value rewrites nothing a rule binds and records nothing) and removal, with the prior value;
 - hash-set insertion of a member not held, and removal;
 - bitmap add and remove: every member the call asked for, because the patch reports counts, not members;
-- struct-map row writes: the upsert family, counts fold, guarded upsert (its row and the companion claim it consumes),
-  probe upsert, card-one scatter, guarded-scatter stamp, removal and stored-row sweep;
+- struct-map row writes: the upsert family, each recording only a row its pick writes (an upsert-last-if's predicate
+  decides, [upsert-last-if](06-struct-map-upsert-last-if.md) §3), counts fold, guarded upsert (its row and the companion
+  claim it consumes), probe upsert, card-one scatter, guarded-scatter stamp, removal and stored-row sweep;
 - two-key upsert-last and tuple upserts, exact-pair removal and prefix removal, with the prior value;
 - TTL eviction of a hash map (with its value), set or bitmap.
 
@@ -72,5 +73,6 @@ Tests write through each kind of site in §3 and require exactly its key, change
 sources and an unarmed feed record nothing; force a small capacity and require whole-source overflow with counted drops;
 require that a write made while unarmed, a set derived-facts flag and an unkeyable tracked kind overflow at the next
 begin; that an unchained fact overflows bit 0; that a rolled-back attempt leaves no entries and its retry records the
-same ones; that a counts fold whose admission dry-runs it records once; that removal-cut-skipped rows record nothing;
-and that a bound feed records warm passes with zero allocations.
+same ones; that a counts fold and an upsert-last-if whose admission dry-runs them each record once; that a row an
+upsert-last-if's predicate refuses records nothing; that removal-cut-skipped rows record nothing; and that a bound feed
+records warm passes with zero allocations.

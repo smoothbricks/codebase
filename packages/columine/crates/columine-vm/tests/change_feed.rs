@@ -18,6 +18,7 @@ use columine_vm::change_feed::{Change, Source};
 use columine_vm::hashmap_ops::{CmpType, Strategy};
 use columine_vm::key_index::Key;
 use columine_vm::meta::slot_meta_base;
+use columine_vm::row_exprs::StoredRow;
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::vm::{Vm, f64s_as_bytes, i64s_as_bytes, u32s_as_bytes};
 use common::memory::with_allocations;
@@ -601,6 +602,87 @@ fn a_guarded_upsert_records_its_row_and_the_claim_it_consumes() {
         [
             (slot(0), one(KEY), Change::Inserted),
             (slot(1), one(KEY), Change::Removed(None)),
+        ]
+    );
+}
+
+#[test]
+fn a_conditional_upsert_records_only_the_rows_its_predicate_admits() {
+    // 0x8f is a body instruction: FOR_EACH { 0x8f slot:0 ADD_K1 1 (VALUE, 0) no arrays, predicate VALUE2 }.
+    let mut upsert = struct_map_upsert(0, ADD_K1, VALUE).to_vec();
+    upsert[0] = Opcode::BatchStructMapUpsertLastIf as u8;
+    upsert.push(VALUE2);
+    let code = program(
+        1,
+        &struct_map(0, 16, &[StructFieldType::UInt32]),
+        &for_each(&upsert),
+    );
+    let mut state = image(&code);
+    let mut vm = Vm::default();
+    arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    // value2 is each row's predicate: KEY is written and then rewritten, 6 is
+    // refused while absent and stays absent, and KEY's last row is refused.
+    let log = [
+        add(KEY, 0, 1, 1),
+        add(6, 0, 2, 0),
+        add(KEY, 0, 3, 1),
+        add(KEY, 0, 4, 0),
+    ];
+    assert_eq!(OK, run(&mut vm, &mut state, &code, &batch(&log)));
+    assert_eq!(
+        entries(&vm),
+        [
+            (slot(0), one(KEY), Change::Inserted),
+            (slot(0), one(KEY), Change::Updated(None)),
+        ]
+    );
+    // What the entries claim is what the slot holds: 6 is absent, and KEY
+    // keeps its last admitted value.
+    assert!(
+        StoredRow::lookup(&state, 0, 6, None)
+            .expect("slot 0")
+            .is_none(),
+        "a refused absent key stays absent"
+    );
+    let row = StoredRow::lookup(&state, 0, KEY, None)
+        .expect("slot 0")
+        .expect("KEY was written");
+    assert_eq!(
+        row.field(0).expect("field 0"),
+        Some(3u32.to_le_bytes().as_slice()),
+        "a refused rewrite leaves the admitted value"
+    );
+}
+
+#[test]
+fn a_conditional_upsert_records_once_though_admission_dry_runs_it() {
+    let mut upsert = struct_map_upsert(0, ADD_K1, VALUE).to_vec();
+    upsert[0] = Opcode::BatchStructMapUpsertLastIf as u8;
+    upsert.push(VALUE2);
+    // A slot declared for four keys: fifty rows pass no bound, so admission
+    // dry-runs the batch, whose predicates refuse all but two.
+    let code = program(
+        1,
+        &struct_map(0, 4, &[StructFieldType::UInt32]),
+        &for_each(&upsert),
+    );
+    let mut state = image(&code);
+    let mut vm = Vm::default();
+    arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    let dry_runs = vm.capacity_counts().dry_run_fit;
+    let mut log: Vec<Row> = (100..148).map(|key| add(key, 0, 1, 0)).collect();
+    log.extend([add(KEY, 0, 2, 1), add(6, 0, 3, 1)]);
+    assert_eq!(OK, run(&mut vm, &mut state, &code, &batch(&log)));
+    assert_eq!(
+        vm.capacity_counts().dry_run_fit,
+        dry_runs + 1,
+        "admission dry-ran the batch"
+    );
+    assert_eq!(
+        entries(&vm),
+        [
+            (slot(0), one(KEY), Change::Inserted),
+            (slot(0), one(6), Change::Inserted),
         ]
     );
 }
