@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_POOL_ENV, readInheritedCpuPool, takeParentCpuTokens } from './cpu-pool.js';
 import { holdLease } from './gateway-lease.js';
+import { type RunMemoryError, RunMemoryUnreadable } from './host-memory.js';
 import { CONTROL_MS, CpuLeaseWait, HEARTBEAT_MS, HEARTBEAT_SILENCE_MS } from './lease-wait.js';
 import { closeRunCpuPool, runPoolTokens, serveRunCpuPool } from './run-cpu-pool.js';
 import { CPU_TOKENS_ENV } from './runner-sizing.js';
@@ -41,7 +42,7 @@ describe("an Nx run's own CPU pool", () => {
     expect(env.MAKEFLAGS).toBe(env.CARGO_MAKEFLAGS);
     // Nightly 477's shape: two mutation sweeps, each asking for the whole host. The first holds the run's cores;
     // the second queues for them instead of starting a second host's worth of workers beside it.
-    const first = await takeParentCpuTokens(pool, 31);
+    const first = await takeParentCpuTokens(pool, 31, null);
     expect(first.granted && first.tokens).toBe(4);
     const { promise: queued, resolve: queue } = Promise.withResolvers<void>();
     const second = holdLease(pool.socket, { op: 'cpu-pool', want: 31 }, 'the run CPU pool', new CpuLeaseWait(), queue);
@@ -58,7 +59,7 @@ describe("an Nx run's own CPU pool", () => {
 
     await closeRunCpuPool({ id: 'run-477' });
     // The run's end closes its pool: nothing is left to grant from it.
-    const late = await takeParentCpuTokens(pool, 1);
+    const late = await takeParentCpuTokens(pool, 1, null);
     expect(late.granted === false && late.cause).toBe('absent');
   });
 
@@ -66,6 +67,54 @@ describe("an Nx run's own CPU pool", () => {
     const env: NodeJS.ProcessEnv = { [CPU_POOL_ENV]: '/parent/pool.sock', [CPU_TOKENS_ENV]: '2' };
     await serveRunCpuPool({ id: 'nested' }, env, 4);
     expect(env).toEqual({ [CPU_POOL_ENV]: '/parent/pool.sock', [CPU_TOKENS_ENV]: '2' });
+  });
+
+  it("holds a leaf whose charge does not fit beside the holders' until a holder returns its memory", async () => {
+    const env: NodeJS.ProcessEnv = {};
+    // A run of 4 cores and 10 bytes: the 8-byte holder leaves room for no 4-byte leaf, however many cores are free.
+    await serveRunCpuPool({ id: 'run-memory' }, env, 4, () =>
+      Promise.resolve({ ok: true, memory: { bytes: 10, source: 'a test run' } }),
+    );
+    const pool = readInheritedCpuPool(env);
+    if (pool === null) {
+      throw new Error(`the run published no pool: ${JSON.stringify(env)}`);
+    }
+    const holder = await takeParentCpuTokens(pool, 1, 8);
+    expect(holder.granted && holder.tokens).toBe(1);
+    const { promise: queued, resolve: queue } = Promise.withResolvers<void>();
+    const leaf = holdLease(
+      pool.socket,
+      { op: 'cpu-pool', want: 1, memory: 4 },
+      'the run CPU pool',
+      new CpuLeaseWait(),
+      queue,
+    );
+    let leafSettled = false;
+    void leaf.then(() => {
+      leafSettled = true;
+    });
+    await queued;
+    // Three cores are free for it; the run's memory is not.
+    expect(leafSettled).toBe(false);
+    if (holder.granted) holder.release();
+    const granted = await leaf;
+    expect(granted.granted && granted.answer.tokens).toBe(1);
+    if (granted.granted) granted.release();
+    await closeRunCpuPool({ id: 'run-memory' });
+  });
+
+  it('does not start a run whose memory cannot be read: it is not shown to have room', async () => {
+    const env: NodeJS.ProcessEnv = {};
+    const error = {
+      operation: 'read-run-memory',
+      code: 'unreadable',
+      subject: '/sys/fs/cgroup/memory.max',
+      cause: 'EACCES: permission denied',
+    } satisfies RunMemoryError;
+    await expect(
+      serveRunCpuPool({ id: 'unread' }, env, 4, () => Promise.resolve({ ok: false, error })),
+    ).rejects.toThrow(new RunMemoryUnreadable(error).message);
+    expect(env).toEqual({});
   });
 });
 
@@ -220,7 +269,7 @@ it('accepts a CPU queue acknowledgement after the disk compatibility probe expir
   await listening;
   jest.useFakeTimers();
   try {
-    const pending = takeParentCpuTokens({ socket, tokens: 1 }, 1);
+    const pending = takeParentCpuTokens({ socket, tokens: 1 }, 1, null);
     const peer = await requested;
     jest.advanceTimersByTime(2_001);
     peer.write('{"ok":true,"progress":1}\n{"ok":true,"lease":"queued"}\n{"ok":true,"lease":"granted","tokens":1}\n');

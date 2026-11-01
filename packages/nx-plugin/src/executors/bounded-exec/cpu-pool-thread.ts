@@ -9,13 +9,14 @@ import { type CloseOutcome, createCpuPool } from './cpu-pool.js';
  * jobserver fifo and heartbeat share an event loop that runs nothing else, so the heartbeat proves that the actor which
  * admits and grants is turning.
  *
- * The thread is started with the pool's count. It says once that the pool serves, with the environment a task inherits,
+ * The thread is started with the pool's count and the run's memory. It says once that the pool serves, with the environment a task inherits,
  * or why it cannot; the host's one message is its close, after which the thread says how the pool closed.
  */
 
-/** What the thread is started with. */
+/** What the thread is started with: the run's count, and the run's memory in bytes its grants are charged against. */
 export interface CpuPoolThreadData {
   readonly tokens: number;
+  readonly memory: number;
 }
 
 /** What the thread says, in order: the pool serves or failed; after the host's close, how the pool closed. */
@@ -31,7 +32,7 @@ if (host === null) {
 const report = (message: CpuPoolThreadReport): void => host.postMessage(message);
 const data: CpuPoolThreadData = workerData;
 // The pool lives until its host closes it, or with the thread.
-const made = await createCpuPool(data.tokens, new Promise<void>(() => {}));
+const made = await createCpuPool(data.tokens, new Promise<void>(() => {}), data.memory);
 if (made.ok) {
   const { pool } = made;
   host.once('message', () => {

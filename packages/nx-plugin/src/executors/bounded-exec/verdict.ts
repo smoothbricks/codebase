@@ -101,6 +101,13 @@ export interface BoundedExecRecord {
    * expired; written for the reader of a refused run, never read back.
    */
   readonly cpuWait?: CpuWaitRow;
+  /**
+   * The command's memory peak in bytes when it ended (specs/cowshed/13_telemetry.md, "Job resource peaks"): its rusage
+   * `ru_maxrss`, the largest resident set any one process of its tree reached, as its waiter read it (`leaf-peak.ts`).
+   * Null when it was not measured: the command never ran, the waiter ended before it, or no Bun waited on it; never
+   * zero for that. The task's next run is charged it in its run's pool (`readLastPeak`).
+   */
+  readonly peakBytes: number | null;
 }
 
 /** The Nx task a run executes as. Nx gives an executor no task id, only its parts. */
@@ -488,6 +495,23 @@ export async function readRecord(directory: string): Promise<BoundedExecRecord |
   return parseRecord(JSON.parse(text));
 }
 
+/**
+ * The peak the task's last record in `directory` names: its charge in its run's pool. Null when the task has no record
+ * or its record no peak; a record that cannot be read is an error naming it, never a charge of nothing.
+ */
+export async function readLastPeak(
+  directory: string,
+): Promise<{ ok: true; peakBytes: number | null } | { ok: false; error: string }> {
+  try {
+    return { ok: true, peakBytes: (await readRecord(directory))?.peakBytes ?? null };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `the task's last record ${join(directory, VERDICT_FILE)} cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
 /** The JUnit report a command wrote into `directory`, or `null` when it wrote none. */
 export async function readJunitReport(
   directory: string,
@@ -511,7 +535,12 @@ function parseRecord(value: unknown): BoundedExecRecord {
   if (!isObject(value) || typeof value.task !== 'string' || !(typeof value.hash === 'string' || value.hash === null)) {
     throw new Error(`not a bounded-exec record: ${JSON.stringify(value)}`);
   }
-  return { task: value.task, hash: value.hash, verdict: parseVerdict(value.verdict) };
+  // A record written before peaks were recorded carries none.
+  const peakBytes = value.peakBytes ?? null;
+  if (!(peakBytes === null || (typeof peakBytes === 'number' && Number.isSafeInteger(peakBytes) && peakBytes >= 0))) {
+    throw new Error(`not a bounded-exec record: ${JSON.stringify(value)}`);
+  }
+  return { task: value.task, hash: value.hash, verdict: parseVerdict(value.verdict), peakBytes };
 }
 
 function parseVerdict(value: unknown): BoundedExecVerdict {

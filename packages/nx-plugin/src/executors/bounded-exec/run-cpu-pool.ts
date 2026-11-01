@@ -5,6 +5,7 @@ import { logger } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 import { type CloseOutcome, type CpuPool, readInheritedCpuPool } from './cpu-pool.js';
 import type { CpuPoolThreadData, CpuPoolThreadReport } from './cpu-pool-thread.js';
+import { type RunMemoryReading, RunMemoryUnreadable, readRunMemory } from './host-memory.js';
 import { mbxPool } from './mbx-pool.js';
 import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
 
@@ -22,6 +23,10 @@ import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
  * A run that inherits a pool (an enclosing executor's) takes from that one and serves none. Otherwise its pool holds
  * one token per core, or the inherited positive `BOUNDED_EXEC_CPU_TOKENS` when that is fewer: inside a cowshed job
  * that count is the job's own, so the job's `--want` bounds the run.
+ *
+ * The pool also charges memory: each leaf is charged its task's last recorded peak, and granted only while the charges
+ * of the leaves holding grants and its own fit the run's memory (`host-memory.ts`: the cgroup's `memory.max` on Linux,
+ * else the host's). A run whose memory cannot be read does not start.
  *
  * The pool runs on a thread of its own (`cpu-pool-thread.ts`). The process that serves it, the Nx daemon when installed
  * plugins load in it or the Nx CLI without one, hashes the run's tasks and builds its project graph in synchronous calls
@@ -67,20 +72,26 @@ export function runPoolTokens(env: Readonly<NodeJS.ProcessEnv>, cores: number): 
 }
 
 /**
- * Serve `context`'s run a pool of `runPoolTokens` and publish it in `env`, which every task inherits, unless the run
- * is served none. A pool that cannot be made is said, and the run's tasks are then sized only by the ceilings they
- * inherit.
+ * Serve `context`'s run a pool of `runPoolTokens`, charged against the run's memory `readMemory` reads, and publish it
+ * in `env`, which every task inherits, unless the run is served none. A run whose memory cannot be read throws
+ * `RunMemoryUnreadable`, which fails the run before any task starts: it is not shown to have room. A pool that cannot
+ * be made is said, and the run's tasks are then sized only by the ceilings they inherit.
  */
 export async function serveRunCpuPool(
   context: Pick<PreTasksExecutionContext, 'id'>,
   env: NodeJS.ProcessEnv = process.env,
   cores: number = availableParallelism(),
+  readMemory: () => Promise<RunMemoryReading> = readRunMemory,
 ): Promise<void> {
   const tokens = runPoolTokens(env, cores);
   if (tokens === null) {
     return;
   }
-  const served = await servePoolThread(tokens);
+  const memory = await readMemory();
+  if (!memory.ok) {
+    throw new RunMemoryUnreadable(memory.error);
+  }
+  const served = await servePoolThread(tokens, memory.memory.bytes);
   if (!served.ok) {
     logger.warn(
       `bounded-exec: this run's CPU pool failed (${served.error}); its tasks are sized only by the ceilings they inherit`,
@@ -99,8 +110,11 @@ export async function serveRunCpuPool(
  * has said how its pool closed fails whichever wait is open, a later close returns that failure, and a thread lost while
  * its pool serves is said at once.
  */
-function servePoolThread(tokens: number): Promise<ServedPool> {
-  const thread = new Worker(THREAD_ENTRY, { workerData: { tokens } satisfies CpuPoolThreadData, ...THREAD_PRELOAD });
+function servePoolThread(tokens: number, memory: number): Promise<ServedPool> {
+  const thread = new Worker(THREAD_ENTRY, {
+    workerData: { tokens, memory } satisfies CpuPoolThreadData,
+    ...THREAD_PRELOAD,
+  });
   return new Promise<ServedPool>((served) => {
     let state: ThreadState = { kind: 'starting', served };
     let closing: Promise<CloseOutcome> | undefined;

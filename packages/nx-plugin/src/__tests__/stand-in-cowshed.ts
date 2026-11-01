@@ -20,9 +20,11 @@ export interface StandInMode {
  * real verb does. The handle's `index` is the root's pid.
  *
  * Its tree is the one thing it cannot have: a supervisor observes forks, a script cannot. It stands
- * the root's process group in for that tree, which holds for a bounded-exec command (the executor
- * makes the root lead a group of its own) and its background children, and never for a process the
+ * the process group the root runs in for that tree, which holds for a bounded-exec command (the
+ * executor makes the root, or the peak waiter that runs the root, lead a group of its own; the waiter
+ * has ended before the executor retires) and its background children, and never for a process the
  * test starts elsewhere — which is exactly the line between owned and unowned the tests draw. A
+ * handle it never admitted names a root its test started to lead a group of its own. A
  * retirement signals those members with TERM, waits up to the grace for their exits, KILLs what is
  * left and waits again, so a success answer means they are gone, as the real one does. A handle
  * retires once; a replay is `spentHandle`.
@@ -51,6 +53,7 @@ subtree-root)
     line="{\\"kind\\":\\"refused\\",\\"reason\\":\\"$admission\\"}"
   fi
   eval "printf '%s\\n' \\"\\$line\\" >&$fd; exec $fd>&-"
+  ps -o pgid= -p $$ | tr -d ' ' > "$state/group-$$"
   exec "$@"
   ;;
 retire-descendants)
@@ -67,7 +70,11 @@ retire-descendants)
     exit 0
   fi
   : > "$state/spent-$root"
-  members=$(ps -A -o pid= -o pgid= | awk -v g="$root" '$2 == g { print $1 }')
+  if [ -e "$state/group-$root" ]; then group=$(cat "$state/group-$root"); else group=$root; fi
+  # The executor starts the leaf detached, so setsid made its leader lead both its process group and its session, and
+  # the group id it recorded is the session id too: ps -g selects the process group on macOS, the session in procps.
+  # ps answers 1 when no process is left in the group: that is the empty set, under set -e.
+  members=$(ps -o pid= -g "$group") || members=''
   images=''
   signalled=''
   for pid in $members; do

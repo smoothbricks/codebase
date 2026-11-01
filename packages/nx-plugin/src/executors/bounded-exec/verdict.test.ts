@@ -237,7 +237,7 @@ describe('bounded-exec verdicts', () => {
     const { context } = await workspace();
     const directory = context.record?.directory ?? '';
     await mkdir(directory, { recursive: true });
-    await writeRecord(directory, { task: 'app:test', hash: '42', verdict });
+    await writeRecord(directory, { task: 'app:test', hash: '42', verdict, peakBytes: null });
     expect((await readRecord(directory))?.verdict).toEqual(verdict);
     await writeFile(
       join(directory, VERDICT_FILE),
@@ -561,22 +561,30 @@ process.stdin.resume();
         return {
           async kill(pid, signal) {
             ownedProcessGroups.add(pid);
+            // The runner says its own pid once its handler is set. The executor signals its group, which the peak
+            // waiter leads: the runner is a live member of that group, not its leader.
             armed ??= readFile(ready, 'utf8').then((text) => {
+              const runner = Number(/^ready pid=(\d+)\n$/.exec(text)?.[1]);
               // Bare `ps` through PATH: NixOS has no /bin/ps, and a failed spawn leaves stdout null.
-              const observed = spawnSync('ps', ['-o', 'pid=,pgid=,stat=', '-p', String(pid)], {
+              const observed = spawnSync('ps', ['-o', 'pid=,pgid=,stat=', '-p', String(runner)], {
                 encoding: 'utf8',
               });
               const observedStdout = observed.stdout ?? '';
-              const detail = `abort-report handler pid=${pid} signal=${signal} ready=${JSON.stringify(text)} state=${observedStdout.trim()} status=${observed.status} stderr=${observed.stderr} error=${observed.error}`;
-              expect(text, detail).toBe(`ready pid=${pid}\n`);
+              const detail = `abort-report handler group=${pid} signal=${signal} ready=${JSON.stringify(text)} state=${observedStdout.trim()} status=${observed.status} stderr=${observed.stderr} error=${observed.error}`;
+              expect(Number.isSafeInteger(runner) && runner > 0, detail).toBe(true);
               expect(observed.status, detail).toBe(0);
               const [seenPid, pgid, state] = observedStdout.trim().split(/\s+/);
-              expect(Number(seenPid), detail).toBe(pid);
+              expect(Number(seenPid), detail).toBe(runner);
               expect(Number(pgid), detail).toBe(pid);
               expect(state !== undefined && !state.startsWith('Z'), detail).toBe(true);
             });
-            await armed;
-            await real.kill(pid, signal);
+            // The signal goes to the group whatever the judgement found, so a wrong judgement fails the case at its
+            // `await armed` rather than leaving the runner waiting on its stdin.
+            try {
+              await armed;
+            } finally {
+              await real.kill(pid, signal);
+            }
           },
         };
       },
@@ -642,7 +650,7 @@ process.stdin.resume();
     const record = async (task: string, hash: string, verdict: BoundedExecVerdict) => {
       const directory = taskDirectory(data, task);
       await mkdir(directory, { recursive: true });
-      await writeRecord(directory, { task, hash, verdict });
+      await writeRecord(directory, { task, hash, verdict, peakBytes: null });
     };
     await record('a:test-1', '1', { outcome: 'bound', bound: 'total', limitMs: 120_000, elapsedMs: 120_004 });
     await record('b:cargo-test', '2', { outcome: 'bound', bound: 'test', tests: ['b t::slow'] });

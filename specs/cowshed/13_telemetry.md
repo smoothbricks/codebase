@@ -352,22 +352,25 @@ new column. Program/path categories share dictionaries across repeated observati
 
 ### Job resource peaks
 
-One recorded peak answers "how much memory did this task last take", and it is read from the spans above, never from a
-ledger kept beside them. The native-field selection is exact:
+One recorded peak answers "how much memory did this job last take", read from the spans above, never from a ledger kept
+beside them; another answers "how much did this Nx task's leaf last take", read from the task's `bounded-exec` record
+(05_gateway.md, "Without mbx, every Nx run budgets itself"). The native-field selection is exact:
 
-| Host accounting source               | Peak field                                         | What it means                                                                                                                                                          |
-| ------------------------------------ | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS rusage (`macOsRusageChildren`) | the terminal sample's `rss_peak_bytes`             | the maximum simultaneously sampled resident sum of the job's process group (07_api.md, `JobResourceSample`)                                                            |
-| Linux cgroup v2 (`linuxCgroupV2`)    | the job span end row's `charged_memory_peak_bytes` | the cgroup's `memory.peak`: charged memory, cache and kernel charges included — what the host actually charged the job, never an RSS value in an RSS column's clothing |
+| Host accounting source                                        | Peak field                                         | What it means                                                                                                                                                                                                          |
+| ------------------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS rusage (`macOsRusageChildren`)                          | the terminal sample's `rss_peak_bytes`             | the maximum simultaneously sampled resident sum of the job's process group (07_api.md, `JobResourceSample`)                                                                                                            |
+| Linux cgroup v2 (`linuxCgroupV2`)                             | the job span end row's `charged_memory_peak_bytes` | the cgroup's `memory.peak`: charged memory, cache and kernel charges included — what the host actually charged the job, never an RSS value in an RSS column's clothing                                                 |
+| a `bounded-exec` leaf's rusage, Linux and macOS (`ru_maxrss`) | the task record's `peakBytes`                      | the exited leaf command's `ru_maxrss` in bytes, as its Bun waiter read it: the largest resident set any one process of the leaf's tree reached. A leaf has no cgroup of its own, so a `memory.peak` would be the job's |
 
 The per-process `rss_peak_bytes` on `process.run` rows is that one process's own observed peak. Process peaks are never
 summed into a job peak: processes reach theirs at different instants, so the sum is a number no instant ever held. A
 consumer that must charge a task's next run by its last one (05_gateway.md's external reservation) takes the last
 recorded terminal peak for the task identity it names (05_gateway.md owns that identity) from these job spans, in the
 field its host's accounting source selects above. A job whose terminal sample could not be taken records no peak: the
-field is null, never zero, and a reader with no recorded peak has no number to charge — it does not estimate one. These
-spans and the protected job records that carry the same terminal sample are the only record of peaks; no writer keeps a
-second, peak-only store for a reader to consult.
+field is null, never zero, and a reader with no recorded peak has no number to charge — it does not estimate one; a leaf
+whose peak could not be measured records `peakBytes` null the same way, and its next run is charged nothing. These
+spans, the protected job records that carry the same terminal sample, and each task's `bounded-exec` record for its leaf
+are the only records of peaks, one per subject; no writer keeps a second, peak-only store for a reader to consult.
 
 ## Attribution tiers
 

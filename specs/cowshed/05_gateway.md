@@ -1758,6 +1758,41 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   `cpu-pool.silence.ts`, which the `test-pool-silence` target runs, queues a runner in another process on a 1-token run
   pool and blocks the thread that served the run for the silence bound plus a heartbeat (20 s): the runner stays queued
   and is granted once the holder returns its token.
+
+  The run's pool also charges memory, since leaves whose peaks together exceed the run's memory must not start side by
+  side. Each leaf is charged its task's last recorded memory peak, and a leaf is granted only while the charged peaks of
+  the leaves holding grants plus its own fit the run's memory: CPU tokens and memory are both required for a grant, and
+  the head-of-line rule above holds both, so no request holds part of a grant. The run's memory is the least of the
+  host's memory, `MemTotal` from `/proc/meminfo` on Linux and `hw.memsize` on macOS, and, on Linux, every finite
+  `memory.max` of the cgroup v2 the run's process is in and of its ancestors up to the root of the mounted hierarchy:
+  the kernel holds a cgroup to its ancestors' limits, so a `background` job whose own `memory.max` is `max` has its
+  class's three quarters of the host ("Classes"). A run whose memory cannot be read does not start (`preTasksExecution`
+  throws its typed error, naming the file or sysctl and the cause): like a pressure reading that cannot be taken
+  ("Memory pressure"), it is not shown to have room. A task with no recorded peak is charged nothing until it has one,
+  as mbx's omitted `--memory` is a zero-byte charge. A leaf whose own charge alone exceeds the run's memory is granted
+  once nothing else holds memory, so it never starves, and its stderr says so, naming its charge and the run's memory. A
+  granted `bounded-exec`'s sub-pool charges no memory: its holder's charge covers its tree.
+
+  When a leaf ends, `bounded-exec` writes its peak into the task's record, the `verdict.json` of the task's
+  `bounded-exec` directory in the checkout's Nx workspace data, keyed by the task id Nx gives
+  (`project:target[:configuration]`) and already carrying the `cpu` grant: `peakBytes`, the exited command's rusage
+  `ru_maxrss` (13_telemetry.md, "Job resource peaks"), null when it could not be measured, never zero. The task's next
+  run reads that last record before it clears it, and is charged its peak. A leaf has no cgroup of its own, even under a
+  supervisor, whose subtree of the command is an observed fold inside the job's cgroup (07_api.md, `JobSubtreeHandle`),
+  so `memory.peak` there would be the whole job's: rusage is the leaf's peak on Linux as on macOS. Node, which runs the
+  executor, reaps a child without its rusage, so the command runs under a Bun waiter (`peak-waiter.ts`) that reads
+  `Subprocess.resourceUsage().maxRSS`, in bytes from Bun 1.4.0 and in the kernel's KiB on Linux before it, and reports
+  it on its own descriptor; the waiter passes the command its stdio and descriptors 3 to 5 and ends as the command did.
+  It leads the leaf's process group and names the command's pid on that descriptor when it starts it: the command is the
+  leaf's runner, the one a hang snapshot samples (08_testing.md), never the waiter. Measured on macOS arm64 with Bun
+  1.4.4: 17.4 MB resident and 10 to 20 ms per leaf. `ru_maxrss` is the largest resident set any one process of the
+  leaf's tree reached, not their simultaneous sum, so a leaf whose processes peak side by side is charged less than it
+  took. Measured on a downstream Linux CI runner (32 vCPU, cgroup `memory.max` 32 GiB, no mbx, no supervisor): a test
+  run across the repository with every target side by side started about 32 `bun test` leaves of 3 to 4 GB peak each on
+  CPU tokens alone, and the kernel OOM-killed them (exit 137) every run. `pool-admission.test.ts` holds the admission
+  rule in a table, `host-memory.linux.test.ts` the Linux reading, `run-cpu-pool.test.ts` a leaf held until a holder
+  returns its memory, and `executor.test.ts` a leaf that records its measured peak and whose next run is charged it.
+
 - **Runners are sized to the count.** The `bounded-exec` executor reads each runner's requested parallelism from the
   runner's own flag rather than assuming the core count, since a runner's flag and its actual concurrency can disagree:
   a `nextest run` names `--test-threads` or defaults to one per core, and one with `--no-capture` (`--nocapture` past

@@ -55,7 +55,7 @@ it("keeps a run pool's queue alive while the thread that serves the run is block
     await serveRunCpuPool(context, env, 1);
     const pool = readInheritedCpuPool(env);
     if (pool === null) throw new Error('the run published no CPU pool');
-    const holder = await takeParentCpuTokens(pool, 1);
+    const holder = await takeParentCpuTokens(pool, 1, null);
     if (!holder.granted) throw new Error(holder.reason);
     release = holder.release;
     const waiting = spawn(process.execPath, ['--preload', VALIDATION_PRELOAD, '--eval', runner(pool.socket)], {

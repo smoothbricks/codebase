@@ -8,6 +8,7 @@ import typia from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
 import { holdLease, type Unleased } from './gateway-lease.js';
 import { type CpuLeaseProgress, type CpuLeaseQueued, CpuLeaseWait, HEARTBEAT_MS } from './lease-wait.js';
+import { admit } from './pool-admission.js';
 import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
 
 /**
@@ -22,6 +23,11 @@ import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
  * answers `queued` at once and `granted` when the child reaches the head of its FIFO queue. A grant
  * lasts while its connection does, so a child that dies returns its tokens with its socket. A pool
  * grants only from its own count, and a pool whose upstream grant has gone grants nothing.
+ *
+ * A run's own pool also charges memory (`pool-admission.ts`; specs/cowshed/05_gateway.md, "Without mbx, every Nx run
+ * budgets itself"). A request names its task's last recorded peak as `memory`, in bytes, and is granted only while
+ * the charges of the leaves holding grants and its own fit the run's memory; a request that names none is charged
+ * nothing, as mbx's omitted `--memory` is. A sub-pool charges no memory: its holder's charge covers its tree.
  *
  * The same count is a GNU make jobserver fifo beside the socket, mode 0600, which Cargo, its build
  * scripts and every nested `cargo` read through `CARGO_MAKEFLAGS`/`MAKEFLAGS` (specs/cowshed/05_gateway.md,
@@ -55,17 +61,26 @@ export interface CpuPool {
 
 export type CloseOutcome = { ok: true } | { ok: false; error: string };
 
-/** The one line a child sends: a count of whole tokens, at least one. */
+/**
+ * The one line a child sends: a count of whole tokens, at least one, and the bytes it is charged, its task's last
+ * recorded memory peak. A child whose task has no recorded peak names none: it is charged nothing.
+ */
 interface CpuPoolRequest {
   op: 'cpu-pool';
   want: number & typia.tags.Type<'uint32'> & typia.tags.Minimum<1>;
+  memory?: number & typia.tags.Type<'uint64'>;
+}
+
+/** A grant whose charge alone exceeds the run's memory, made while nothing else held memory: the run's memory. */
+export interface Oversized {
+  readonly memory: number & typia.tags.Type<'uint64'>;
 }
 
 /** The pool's answers, in `holdLease`'s framing. */
 type CpuPoolReply =
   | CpuLeaseProgress
   | CpuLeaseQueued
-  | { ok: true; lease: 'granted'; tokens: number }
+  | { ok: true; lease: 'granted'; tokens: number; oversized?: Oversized }
   | { ok: false; code: 'invalid-request'; error: string };
 
 /** Exactly a request's fields: any other field is an invalid request. */
@@ -94,7 +109,7 @@ const run = promisify(execFile);
 type Phase =
   | { readonly kind: 'reading' }
   | { readonly kind: 'queued' }
-  | { readonly kind: 'holding'; readonly bytes: number; readonly slot: boolean }
+  | { readonly kind: 'holding'; readonly bytes: number; readonly slot: boolean; readonly memory: number }
   | { readonly kind: 'done' };
 
 /** A child connection and what the pool owes it. Its grant, or its place in line, ends with the connection. */
@@ -103,10 +118,11 @@ interface Child {
   phase: Phase;
 }
 
-/** A queued child and the count it asked for. */
+/** A queued child, the count it asked for and the bytes it is charged. */
 interface Waiter {
   readonly child: Child;
   readonly want: number;
+  readonly memory: number;
 }
 
 /** One framed reply line. The newline is the framing; every reply goes through here. */
@@ -127,20 +143,33 @@ export function readInheritedCpuPool(environment: Readonly<NodeJS.ProcessEnv>): 
 }
 
 /**
- * Tokens a parent pool lent, held until released, or why there are none. `closed` resolves when the grant's
- * connection closes, however it closes, so a sub-pool built on the grant ends with it.
+ * Tokens a parent pool lent, held until released, or why there are none. `oversized` names the run's memory when the
+ * child's charge alone exceeds it and it was granted because nothing else held memory. `closed` resolves when the
+ * grant's connection closes, however it closes, so a sub-pool built on the grant ends with it.
  */
-export type TokenGrant = { granted: true; tokens: number; release: () => void; closed: Promise<void> } | Unleased;
+export type TokenGrant =
+  | { granted: true; tokens: number; oversized: Oversized | null; release: () => void; closed: Promise<void> }
+  | Unleased;
+
+const isOversized = typia.createEquals<Oversized>();
 
 /**
- * Ask the immediate parent pool for `want` tokens. The inherited count does not bound the ask: a pool grants at
- * most what it holds. A granted lease is the child's local allocation: its connection is the grant, and closing it
- * returns only that allocation. An absent endpoint grants nothing and refuses nothing; a connected endpoint's refusal
- * or protocol failure must fail admission rather than run the child beside its parent's count.
+ * Ask the immediate parent pool for `want` tokens, charged `memory` bytes: the task's last recorded peak, or null when
+ * it has none. The inherited count does not bound the ask: a pool grants at most what it holds. A granted lease is the
+ * child's local allocation: its connection is the grant, and closing it returns only that allocation. An absent
+ * endpoint grants nothing and refuses nothing; a connected endpoint's refusal or protocol failure must fail admission
+ * rather than run the child beside its parent's count.
  */
-export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number): Promise<TokenGrant> {
+export async function takeParentCpuTokens(
+  parent: InheritedCpuPool,
+  want: number,
+  memory: number | null,
+): Promise<TokenGrant> {
   if (!Number.isSafeInteger(want) || want < 1) {
     throw new RangeError(`a child asks its parent pool for a positive count, not ${want} (pool ${parent.tokens})`);
+  }
+  if (memory !== null && (!Number.isSafeInteger(memory) || memory < 0)) {
+    throw new RangeError(`a child is charged a whole number of bytes, not ${memory}`);
   }
   if (parent.socket.length === 0 || parent.socket.includes('\0')) {
     return {
@@ -149,11 +178,12 @@ export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number
       reason: `the parent CPU pool's endpoint ${JSON.stringify(parent.socket)} is not a socket path`,
     };
   }
-  const lease = await holdLease(parent.socket, { op: 'cpu-pool', want }, 'the parent CPU pool', new CpuLeaseWait());
+  const request = memory === null ? { op: 'cpu-pool', want } : { op: 'cpu-pool', want, memory };
+  const lease = await holdLease(parent.socket, request, 'the parent CPU pool', new CpuLeaseWait());
   if (!lease.granted) {
     return lease;
   }
-  const tokens = lease.answer.tokens;
+  const { tokens, oversized } = lease.answer;
   if (typeof tokens !== 'number' || !Number.isInteger(tokens) || tokens < 1 || tokens > want) {
     lease.release();
     return {
@@ -162,7 +192,15 @@ export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number
       reason: `the parent CPU pool granted ${JSON.stringify(tokens)} tokens for ${want}`,
     };
   }
-  return { granted: true, tokens, release: lease.release, closed: lease.closed };
+  if (oversized !== undefined && !isOversized(oversized)) {
+    lease.release();
+    return {
+      granted: false,
+      cause: 'other',
+      reason: `the parent CPU pool named its memory ${JSON.stringify(oversized)} in a grant, which is no byte count`,
+    };
+  }
+  return { granted: true, tokens, oversized: oversized ?? null, release: lease.release, closed: lease.closed };
 }
 
 /** A thrown value's message. */
@@ -315,12 +353,14 @@ function watchFifo(
 
 /**
  * Make a pool of `tokens` that lives while `closed` does: when `closed` resolves the pool refuses
- * grants, ends its child connections, drains its jobserver fifo and removes its directory. Setup
- * failures are values; a non-positive or unsafe count is a programmer bug and throws.
+ * grants, ends its child connections, drains its jobserver fifo and removes its directory. A run's own
+ * pool charges its grants against `memory`, the run's memory in bytes; a sub-pool charges none (null).
+ * Setup failures are values; a non-positive or unsafe count is a programmer bug and throws.
  */
 export async function createCpuPool(
   tokens: number,
   closed: Promise<void>,
+  memory: number | null,
 ): Promise<{ ok: true; pool: CpuPool } | { ok: false; error: string }> {
   if (!Number.isSafeInteger(tokens) || tokens < 1) {
     throw new RangeError(`a CPU pool holds a positive safe integer of tokens, not ${tokens}`);
@@ -347,6 +387,8 @@ export async function createCpuPool(
   const scratch = Buffer.allocUnsafe(tokens);
   // The holder's implicit first token, while a socket child holds it.
   let slotLent = false;
+  // The bytes the children holding grants are charged, against `memory`.
+  let heldMemory = 0;
   // The readability wait while the queue's head finds no token, else undefined.
   let watch: FifoWatch | undefined;
   let closing = false;
@@ -404,46 +446,62 @@ export async function createCpuPool(
     }
   };
 
-  // FIFO: the head takes `min(want, available)` as one grant once any token is available, where available is the
-  // fifo bytes it can read without blocking plus the implicit slot while no child holds it. `arrived` is bytes the
-  // readability wait already took. A waiting child holds nothing, so no child waits while it holds tokens another
-  // child needs. Whatever bytes are in hand when no head can use them go straight back to the fifo.
+  // FIFO (`admit`): the head takes `min(want, available)` as one grant once any token is available and, in a run's
+  // pool, its charge fits beside the holders'; available is the fifo bytes it can read without blocking plus the
+  // implicit slot while no child holds it. `arrived` is bytes the readability wait already took. A waiting child holds
+  // nothing, so no child waits while it holds tokens another child needs. Whatever bytes are in hand when no head can
+  // use them go straight back to the fifo. A head that waits for memory watches the fifo for nothing: only a holder's
+  // close frees memory, and that close drains again.
   function drain(arrived: number): void {
+    if (closing) {
+      stopWatching();
+      return;
+    }
+    // A child that half-closed or failed while queued leaves the line. Its `close` finds it gone from the queue.
+    for (let at = queue.length - 1; at >= 0; at -= 1) {
+      if (queue[at]?.child.socket.writable === false) queue.splice(at, 1);
+    }
     let inHand = arrived;
-    while (!closing) {
-      const waiter = queue[0];
-      if (waiter === undefined) {
-        break;
-      }
-      if (!waiter.child.socket.writable) {
-        // A child that half-closed or failed while queued. Its `close` finds it gone from the queue.
-        queue.shift();
-        continue;
-      }
-      if (inHand < waiter.want) {
-        try {
-          inHand += readTokens(jobserver, scratch, waiter.want - inHand);
-        } catch (error) {
-          fail(`its jobserver fifo could not be read: ${describe(error)}`);
-          return;
-        }
-      }
-      const granted = Math.min(waiter.want, inHand + (slotLent ? 0 : 1));
-      if (granted === 0) {
-        watchForTokens();
+    const wanted = Math.min(
+      queue.reduce((sum, waiter) => sum + waiter.want, 0),
+      scratch.length,
+    );
+    if (inHand < wanted) {
+      try {
+        inHand += readTokens(jobserver, scratch, wanted - inHand);
+      } catch (error) {
+        fail(`its jobserver fifo could not be read: ${describe(error)}`);
         return;
       }
-      queue.shift();
+    }
+    const admission = admit(
+      queue,
+      inHand + (slotLent ? 0 : 1),
+      memory === null ? null : { capacity: memory, held: heldMemory },
+    );
+    queue.splice(0, admission.grants.length);
+    for (const { request, tokens: granted, oversized } of admission.grants) {
       // Fifo bytes first, the implicit slot last.
       const bytes = Math.min(granted, inHand);
       inHand -= bytes;
       const slot = granted > bytes;
       if (slot) slotLent = true;
-      waiter.child.phase = { kind: 'holding', bytes, slot };
-      waiter.child.socket.write(frame({ ok: true, lease: 'granted', tokens: granted }));
+      heldMemory += request.memory;
+      request.child.phase = { kind: 'holding', bytes, slot, memory: request.memory };
+      request.child.socket.write(
+        frame(
+          oversized && memory !== null
+            ? { ok: true, lease: 'granted', tokens: granted, oversized: { memory } }
+            : { ok: true, lease: 'granted', tokens: granted },
+        ),
+      );
     }
-    stopWatching();
-    if (!closing) returnTokens(inHand);
+    if (admission.waiting === 'cpu') {
+      watchForTokens();
+    } else {
+      stopWatching();
+    }
+    returnTokens(inHand);
   }
 
   const refuse = (child: Child, error: string): void => {
@@ -471,6 +529,7 @@ export async function createCpuPool(
       } else if (child.phase.kind === 'holding') {
         // A closing pool drains its fifo whole; until then the bytes go back for the next holder.
         if (child.phase.slot) slotLent = false;
+        heldMemory -= child.phase.memory;
         if (!closing) returnTokens(child.phase.bytes);
       }
       child.phase = { kind: 'done' };
@@ -523,12 +582,15 @@ export async function createCpuPool(
         parsed = undefined;
       }
       if (!isRequest(parsed)) {
-        refuse(child, 'a request is {"op":"cpu-pool","want":<a whole number of tokens, at least 1>}');
+        refuse(
+          child,
+          'a request is {"op":"cpu-pool","want":<a whole number of tokens, at least 1>,"memory"?:<bytes it is charged>}',
+        );
         return;
       }
       const request = parsed;
       child.phase = { kind: 'queued' };
-      queue.push({ child, want: request.want });
+      queue.push({ child, want: request.want, memory: request.memory ?? 0 });
       socket.write(frame({ ok: true, lease: 'queued', server: process.pid }));
       drain(0);
     });

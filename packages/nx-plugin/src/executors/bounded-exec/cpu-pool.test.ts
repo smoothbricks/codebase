@@ -79,7 +79,7 @@ afterEach(async () => {
 
 /** Make a pool of `tokens` and read its endpoint back through the same path a child uses. */
 async function openPool(tokens: number, closed: Promise<void> = NEVER): Promise<Opened> {
-  const made = await createCpuPool(tokens, closed);
+  const made = await createCpuPool(tokens, closed, null);
   if (!made.ok) {
     throw new Error(made.error);
   }
@@ -93,7 +93,7 @@ async function openPool(tokens: number, closed: Promise<void> = NEVER): Promise<
 
 /** A granted lease for a child that the pool must admit: a refusal here is a test failure. */
 async function takeOrThrow(parent: InheritedCpuPool, want: number): Promise<Granted> {
-  const grant = await takeParentCpuTokens(parent, want);
+  const grant = await takeParentCpuTokens(parent, want, null);
   if (!grant.granted) {
     throw new Error(`the pool refused ${want} tokens: ${grant.reason}`);
   }
@@ -105,7 +105,7 @@ async function takeOrThrow(parent: InheritedCpuPool, want: number): Promise<Gran
  * returning, so the next ask starts from the pool as this one left it.
  */
 async function grantedFor(parent: InheritedCpuPool, want: number): Promise<number> {
-  const grant = await takeParentCpuTokens(parent, want);
+  const grant = await takeParentCpuTokens(parent, want, null);
   if (!grant.granted) {
     throw new Error(`the pool refused ${want} tokens: ${grant.reason}`);
   }
@@ -386,18 +386,18 @@ describe('the parent-held CPU pool', () => {
   it('treats a dead or non-socket endpoint as absent, and a malformed endpoint as no pool', async () => {
     const { pool, parent } = await openPool(2);
     expect(await pool.close()).toEqual({ ok: true });
-    expect(await takeParentCpuTokens(parent, 1)).toMatchObject({ granted: false, cause: 'absent' });
+    expect(await takeParentCpuTokens(parent, 1, null)).toMatchObject({ granted: false, cause: 'absent' });
 
     const stale = await ownedSocketDirectory('cpu-stale-', 'p.sock');
     directories.push(stale);
     await writeFile(join(stale, 'p.sock'), 'not a socket');
-    expect(await takeParentCpuTokens({ socket: join(stale, 'p.sock'), tokens: 2 }, 1)).toMatchObject({
+    expect(await takeParentCpuTokens({ socket: join(stale, 'p.sock'), tokens: 2 }, 1, null)).toMatchObject({
       granted: false,
       cause: 'absent',
     });
 
     expect(readInheritedCpuPool({ [CPU_POOL_ENV]: 'a\0b', [CPU_TOKENS_ENV]: '2' })).toBeNull();
-    expect(await takeParentCpuTokens({ socket: 'a\0b', tokens: 2 }, 1)).toMatchObject({
+    expect(await takeParentCpuTokens({ socket: 'a\0b', tokens: 2 }, 1, null)).toMatchObject({
       granted: false,
       cause: 'other',
     });
@@ -407,7 +407,7 @@ describe('the parent-held CPU pool', () => {
   });
 
   it('names its endpoint, count and jobserver fifo in private owned paths, and removes them on close', async () => {
-    const made = await createCpuPool(3, NEVER);
+    const made = await createCpuPool(3, NEVER, null);
     if (!made.ok) {
       throw new Error(made.error);
     }
@@ -476,7 +476,7 @@ describe('the parent-held CPU pool', () => {
     const upstream = await openPool(4);
     const lent = await takeOrThrow(upstream.parent, 2);
     const sub = await openPool(lent.tokens, lent.closed);
-    const grandchild = await takeParentCpuTokens(sub.parent, 2);
+    const grandchild = await takeParentCpuTokens(sub.parent, 2, null);
     if (!grandchild.granted) {
       throw new Error(`the sub-pool refused its grandchild: ${grandchild.reason}`);
     }
@@ -488,8 +488,8 @@ describe('the parent-held CPU pool', () => {
     await grandchild.closed;
     expect(await sub.pool.close()).toEqual({ ok: true });
     expect(existsSync(dirname(sub.parent.socket))).toBe(false);
-    expect(await takeParentCpuTokens(sub.parent, 1)).toMatchObject({ granted: false, cause: 'absent' });
-    expect(await takeParentCpuTokens(upstream.parent, 1)).toMatchObject({ granted: false, cause: 'absent' });
+    expect(await takeParentCpuTokens(sub.parent, 1, null)).toMatchObject({ granted: false, cause: 'absent' });
+    expect(await takeParentCpuTokens(upstream.parent, 1, null)).toMatchObject({ granted: false, cause: 'absent' });
   });
 
   it('asks for its own want whatever count it inherited, and the grant follows that ask', async () => {
@@ -513,7 +513,7 @@ describe('the parent-held CPU pool', () => {
   });
 
   it('reports a teardown that cannot remove its directory, and reports the same outcome on every close', async () => {
-    const made = await createCpuPool(2, NEVER);
+    const made = await createCpuPool(2, NEVER, null);
     if (!made.ok) {
       throw new Error(made.error);
     }
@@ -541,14 +541,14 @@ describe('the parent-held CPU pool', () => {
     // Made in the shared namespace, the private one keeps the pool's socket short and where the sandbox admits it.
     const namespace = await ownedSocketDirectory('cpu-ns-', join('cpu-pool-XXXXXX', 'p.sock'));
     directories.push(namespace);
-    const made = await inSocketNamespace(namespace, () => createCpuPool(2, Promise.resolve()));
+    const made = await inSocketNamespace(namespace, () => createCpuPool(2, Promise.resolve(), null));
     // This refusal comes only after the pool listens, so the call made its directory, and it left nothing behind.
     expect(made).toEqual({
       ok: false,
       error: 'the grant that lends this CPU pool closed while the pool was being made',
     });
     expect(readdirSync(namespace)).toEqual([]);
-    await expect(createCpuPool(0, NEVER)).rejects.toBeInstanceOf(RangeError);
+    await expect(createCpuPool(0, NEVER, null)).rejects.toBeInstanceOf(RangeError);
   });
 
   it("lends a 1-token pool's implicit slot to a socket child, since its fifo holds no byte", async () => {

@@ -2276,9 +2276,9 @@ through its recorded handle, then archived whole, readonly tree and modes includ
 signalled), beside a dead lease that recorded no handle and one whose handle another live job holds (kept, then
 reclaimed once that job ends), a later dead lease whose archive rotates the oldest out and is deleted in the background,
 a failed run's own lease archived below the half-volume floor and so deleted with every other archive, and the final
-detach. Its supervisor is a stand-in speaking the subtree verbs' wire shapes, whose tree is the root's process group
-(`src/__tests__/stand-in-cowshed.ts`). Its volume uses a real private gateway served by `ram_fixture <ns>` on its
-namespace's socket, with `recordedRamAttach` capturing every attached identity and `disk-command --gateway-socket`
+detach. Its supervisor is a stand-in speaking the subtree verbs' wire shapes, whose tree is the process group its root
+runs in (`src/__tests__/stand-in-cowshed.ts`). Its volume uses a real private gateway served by `ram_fixture <ns>` on
+its namespace's socket, with `recordedRamAttach` capturing every attached identity and `disk-command --gateway-socket`
 routing native admission. The helper is closed only after exact-owned teardown, which then removes the namespace root;
 no test asks the installed gateway. External symlink targets and held directory modes stay unchanged, without duplicate
 provision and teardown; its 60 s case bound is unchanged and its target has the progress bound.
@@ -2415,6 +2415,14 @@ instead of each sizing its runner to the whole host. Its scope is one run. A com
 as configured, sized only by the ceilings it inherits, and nothing is said; a cowshed job's own jobserver fifo still
 reaches it by Cargo's own rule ("Cargo reads its holder's jobserver").
 
+The run's pool charges memory too. Each task is charged its last recorded peak (`peakBytes` in its `verdict.json`,
+below), nothing while it has none, and is granted only while the charges of the tasks holding grants plus its own fit
+the run's memory: the least finite `memory.max` of the run's cgroup and its ancestors and the host's `MemTotal` on
+Linux, `hw.memsize` on macOS (`host-memory.ts`). A run whose memory cannot be read fails in `preTasksExecution`, naming
+the file or sysctl. A task whose own peak exceeds the run's memory is granted once nothing else holds memory, and its
+stderr says so; the wait line names the charge as `memory=<bytes>` or `memory=none`. A granted executor's sub-pool
+charges no memory.
+
 The pool runs on a worker thread of its own (`cpu-pool-thread.ts`). The process that serves the run, the Nx daemon when
 installed plugins load in it or the Nx CLI without one, hashes tasks and builds the project graph in synchronous calls
 on its main thread; a pool on that thread wrote no heartbeat behind a 14.2 s `hashPlans`, and every runner queued on it
@@ -2479,6 +2487,15 @@ task id and the hash it ran at:
   a line passed.
 - `failed`: a test failed on its own, or the command exited non-zero with no report naming a timeout.
 - `passed`.
+
+The record also holds `peakBytes`, the command's memory peak: the exited command's rusage `ru_maxrss`, the largest
+resident set any one process of its tree reached, in bytes. Node reaps a child without its rusage, so the command runs
+under a Bun waiter (`peak-waiter.ts`, on the executor's Bun or the first `bun` on its PATH) that reads it, passes the
+command its stdio and descriptors 3 to 5, and exits as the command did. The waiter leads the command's process group and
+names the command's pid when it starts it: that command is the runner a hang snapshot samples, never the waiter.
+`peakBytes` is null when nothing was measured: the command never ran, the waiter was killed before it reported, or no
+Bun was found; stderr then says why. The task's next run reads it before clearing the directory, and its run's pool
+charges it.
 
 The report needs no target configuration. When the command runs exactly one `bun test` or `nextest run`, the executor
 asks that runner for a JUnit report in the task's directory: `bun test` through `--reporter=junit --reporter-outfile`,

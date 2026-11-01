@@ -36,6 +36,7 @@ import {
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
+import { type LeafPeak, PEAK_FD, peakWaiter, readWaiterReport, underWaiter } from './leaf-peak.js';
 import type { CpuWaitRow } from './lease-wait.js';
 import type { LockWait } from './lock-wait.js';
 import {
@@ -92,6 +93,7 @@ import {
   judgeRun,
   type NoSpaceSighting,
   readJunitReport,
+  readLastPeak,
   taskDirectory,
   withJunitReport,
   writeRecord,
@@ -319,6 +321,8 @@ export async function runBoundedExec(
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
   const directory = context.record?.directory ?? null;
+  // The task's last recorded peak is its charge in its parent's pool, read before the clear below removes it.
+  const lastPeak = directory !== null && inherited !== null ? await readLastPeak(directory) : null;
   // A previous run's verdict and report go first, so neither can be read as this run's.
   if (directory !== null) {
     await clearTaskDirectory(directory);
@@ -366,6 +370,20 @@ export async function runBoundedExec(
       // Nobody is left to tell.
     }
   };
+  // A run refused before its command exists says why and records an operational failure, and no peak: nothing ran.
+  const refuseUnstarted = async (message: string): Promise<BoundedExecResult> => {
+    appendStderr(message);
+    if (context.record !== undefined) {
+      const { task, directory: recordDirectory } = context.record;
+      await writeRecord(recordDirectory, {
+        task: task.id,
+        hash: task.hash,
+        verdict: judgeOperationalFailure(1, null),
+        peakBytes: null,
+      });
+    }
+    return { success: false, terminalOutput: outputChunks.join('') };
+  };
 
   // The fixture pair names one segment: a fixture with no build budget, or a budget with no fixture, is a
   // target that does not say what it runs, so it does not run. Units are counted at the end of that segment.
@@ -374,14 +392,9 @@ export async function runBoundedExec(
     (options.unitsCommand !== undefined && options.fixtureCommand === undefined) ||
     (fixture !== null && !(fixture.timeoutMs > 0))
   ) {
-    appendStderr(
+    return refuseUnstarted(
       'bounded-exec: fixtureCommand and a positive fixtureTimeoutMs must be named together, and unitsCommand only with them; refusing to run the command\n',
     );
-    if (context.record !== undefined) {
-      const { task, directory: recordDirectory } = context.record;
-      await writeRecord(recordDirectory, { task: task.id, hash: task.hash, verdict: judgeOperationalFailure(1, null) });
-    }
-    return { success: false, terminalOutput: outputChunks.join('') };
   }
 
   // A leg that runs bun runs the Bun its workspace declares, or it does not run. This comes before the RAM lease and the
@@ -394,13 +407,15 @@ export async function runBoundedExec(
     pathSource: options.env?.PATH === undefined ? 'the inherited environment' : "the target's env",
   });
   if (runtime !== null) {
-    appendStderr(describeRuntimePinRefusal(runtime, context.record?.task.id));
-    if (context.record !== undefined) {
-      const { task, directory: recordDirectory } = context.record;
-      await writeRecord(recordDirectory, { task: task.id, hash: task.hash, verdict: judgeOperationalFailure(1, null) });
-    }
-    return { success: false, terminalOutput: outputChunks.join('') };
+    return refuseUnstarted(describeRuntimePinRefusal(runtime, context.record?.task.id));
   }
+  if (lastPeak !== null && !lastPeak.ok) {
+    return refuseUnstarted(
+      `bounded-exec: ${lastPeak.error}; it is this task's memory charge, so the command does not run\n`,
+    );
+  }
+  // A task with no recorded peak is charged nothing (null) until it has one.
+  const charge = lastPeak?.ok === true ? lastPeak.peakBytes : null;
 
   let lease: RamTempLease | null = null;
   let ordinaryTemp: string | null = null;
@@ -548,7 +563,7 @@ export async function runBoundedExec(
   let parentRefusal: string | null = null;
   let parentWait: CpuWaitRow | undefined;
   if (inherited !== null) {
-    const fromParent = await takeParentCpuTokens(inherited, demand.want);
+    const fromParent = await takeParentCpuTokens(inherited, demand.want, charge);
     if (fromParent.granted) {
       grant = fromParent;
     } else if (fromParent.cause === 'absent') {
@@ -569,8 +584,13 @@ export async function runBoundedExec(
     sized = sizeRunner(demand, requested, grant.tokens);
     cpu = { tokens: grant.tokens, want: demand.want, waitedMs };
     appendStderr(
-      `cowshed: cpu-pool wait done elapsed=${waitedMs}ms status=ok tokens=${grant.tokens}/${demand.want} runner=${demand.kind}\n`,
+      `cowshed: cpu-pool wait done elapsed=${waitedMs}ms status=ok tokens=${grant.tokens}/${demand.want} runner=${demand.kind} memory=${charge ?? 'none'}\n`,
     );
+    if (grant.oversized !== null) {
+      appendStderr(
+        `cowshed: cpu-pool granted while nothing else holds memory: this task's last peak of ${charge} bytes alone exceeds the run's ${grant.oversized.memory} bytes\n`,
+      );
+    }
   } else if (leaf?.kind === 'reserve') {
     sized = { command: sizeRunnerToGrant(leaf.demand, requested), env: {} };
   } else if (leaf !== null) {
@@ -633,6 +653,7 @@ export async function runBoundedExec(
     operational: boolean,
     noSpace: NoSpaceSighting | null,
     lockWaits: readonly LockWait[],
+    peakBytes: number | null,
   ): Promise<void> => {
     if (context.record === undefined) {
       return;
@@ -678,6 +699,7 @@ export async function runBoundedExec(
       verdict,
       ...(cpu ? { cpu } : {}),
       ...(parentWait ? { cpuWait: parentWait } : {}),
+      peakBytes,
     });
   };
   // A run refused before its command starts says why, gives back its grant and RAM, and records the failure.
@@ -686,7 +708,7 @@ export async function runBoundedExec(
     await releaseCpu();
     // The command never started, so its lease holds nothing of its own to keep.
     await releaseLease(false);
-    await recordRun(1, null, Date.now() - asked, false, null, []);
+    await recordRun(1, null, Date.now() - asked, false, null, [], null);
     return { success: false, terminalOutput: outputChunks.join('') };
   };
   if (parentRefusal !== null) {
@@ -704,7 +726,7 @@ export async function runBoundedExec(
   // A granted run serves a sub-pool of its own grant, so its descendants draw from that and never from above it.
   // A pool that cannot be set up refuses the run: no granted command runs beside its grant.
   if (grant !== null) {
-    const created = await createCpuPool(grant.tokens, grant.closed);
+    const created = await createCpuPool(grant.tokens, grant.closed, null);
     if (!created.ok) {
       return refuse(`cowshed: cpu pool unavailable: ${created.error}; refusing to run the command\n`);
     }
@@ -756,38 +778,67 @@ export async function runBoundedExec(
   const grantSlots: IOType[] = leaf !== null ? ['ignore', 'pipe'] : [];
   const rootGrantSlot: IOType[] = leaf !== null ? ['pipe'] : [];
   const root = owner?.rootArgv(shellCommand);
+  // The command's own descriptors past stderr, from fd 3: the lifecycle channel, the subtree admission, mbx's grant.
+  const descriptors: IOType[] =
+    root === undefined
+      ? hooked === null && leaf === null
+        ? []
+        : [hooked === null ? 'ignore' : 'pipe', ...grantSlots]
+      : [hooked === null ? 'ignore' : 'pipe', 'pipe', ...rootGrantSlot];
+  // A run that records its verdict records its command's peak too: the command runs under a waiter that reports it.
+  const waiter = context.record === undefined ? null : peakWaiter();
+  const measured =
+    waiter?.kind === 'waiter'
+      ? underWaiter(waiter.runtime, root?.file ?? '/bin/sh', root?.args ?? ['-c', shellCommand], descriptors)
+      : null;
   let child: ChildProcess;
   const results = directory === null ? null : await createTestResultWriter(directory, { cwd, root: context.root });
   if (results !== null && !results.ok) return refuse(`bounded-exec: ${results.error}\n`);
   resultWriter = results?.ok ? results.writer : null;
   try {
     // fd 3 is the runner lifecycle's duplex socket when the command is hooked; the subtree admission takes fd 4, which
-    // cowshed closes fd 4 before exec; fd 5 is a Cargo leaf's mbx admission stream or a reserved leaf's ask and grant.
+    // cowshed closes fd 4 before exec; fd 5 is a Cargo leaf's mbx admission stream or a reserved leaf's ask and grant;
+    // the waiter, when there is one, passes them on and reports the command's peak on fd 6.
     child =
-      root === undefined
-        ? spawn(shellCommand, [], {
+      measured !== null
+        ? spawn(measured.file, measured.args, {
             cwd,
             env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
-            shell: true,
-            stdio:
-              hooked === null && leaf === null
-                ? 'pipe'
-                : ['pipe', 'pipe', 'pipe', hooked === null ? 'ignore' : 'pipe', ...grantSlots],
+            stdio: measured.stdio,
             detached: process.platform !== 'win32',
             windowsHide: true,
           })
-        : spawn(root.file, root.args, {
-            cwd,
-            env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
-            stdio: ['pipe', 'pipe', 'pipe', hooked === null ? 'ignore' : 'pipe', 'pipe', ...rootGrantSlot],
-            detached: process.platform !== 'win32',
-            windowsHide: true,
-          });
+        : root === undefined
+          ? spawn(shellCommand, [], {
+              cwd,
+              env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
+              shell: true,
+              stdio: descriptors.length === 0 ? 'pipe' : ['pipe', 'pipe', 'pipe', ...descriptors],
+              detached: process.platform !== 'win32',
+              windowsHide: true,
+            })
+          : spawn(root.file, root.args, {
+              cwd,
+              env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
+              stdio: ['pipe', 'pipe', 'pipe', ...descriptors],
+              detached: process.platform !== 'win32',
+              windowsHide: true,
+            });
   } catch (error) {
     // Nothing started, so nothing runs under the grant: it goes back here, with the RAM lease.
     return refuse(`cowshed: could not start the command: ${error instanceof Error ? error.message : String(error)}\n`);
   }
   subtreeRetired = false;
+  const reportChannel = child.stdio.at(PEAK_FD);
+  const waiterReport =
+    measured === null ? null : readWaiterReport(reportChannel instanceof Readable ? reportChannel : null);
+  // The leaf's runner is its command: under a waiter, which leads the group, the child the waiter names; else the
+  // group's leader itself. A hang snapshot names and samples it (specs/cowshed/08_testing.md).
+  const runnerPid: Promise<number | null> = waiterReport?.started ?? Promise.resolve(child.pid ?? null);
+  let runner: number | null = null;
+  void runnerPid.then((pid) => {
+    runner = pid;
+  });
   if (root !== undefined) {
     const channel = child.stdio[HANDLE_FD];
     const leased = lease;
@@ -847,22 +898,24 @@ export async function runBoundedExec(
     captureTimer = setTimeout(
       () => {
         if (state.settled || state.expiry !== null || idleCapture !== capture) return;
-        const pid = child.pid;
-        if (pid === undefined) {
+        const group = child.pid;
+        if (group === undefined) {
           idleCapture.result = { kind: 'failed', detail: 'runner PID unavailable; no holder conclusion' };
           return;
         }
         idleCapture.result = { kind: 'pending', startedAtMs: Date.now() };
-        void Promise.resolve()
-          .then(() =>
-            captureDiagnostics({
+        void runnerPid
+          .then((pid) => {
+            if (pid === null)
+              throw new Error('runner PID unavailable: its waiter named no command; no holder conclusion');
+            return captureDiagnostics({
               pid,
-              pgid: process.platform === 'win32' ? null : pid,
+              pgid: process.platform === 'win32' ? null : group,
               expiresAtMs: capture.expiresAtMs,
               deadlineMs: Math.max(0, Math.min(HANG_CAPTURE_MS, capture.expiresAtMs - Date.now())),
               signal: capture.controller.signal,
-            }),
-          )
+            });
+          })
           .then(
             (snapshot) => {
               if (idleCapture === capture) idleCapture.result = { kind: 'captured', snapshot };
@@ -1115,6 +1168,7 @@ export async function runBoundedExec(
           state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null,
           state.noSpace === null ? null : await state.noSpace,
           state.lockWaits,
+          null,
         ),
       )
       .finally(() => process.kill(process.pid, signal));
@@ -1183,7 +1237,7 @@ export async function runBoundedExec(
       const observed = idleCapture?.result;
       state.lockWaits = observed?.kind === 'captured' ? observed.snapshot.lockWaits : [];
       appendStderr(
-        `Hang diagnostics: runner pid=${child.pid ?? 'unavailable'} pgid=${
+        `Hang diagnostics: runner pid=${runner ?? 'unavailable'} pgid=${
           process.platform === 'win32' ? 'unavailable' : (child.pid ?? 'unavailable')
         } expiryAtMs=${Date.now()} scheduledExpiryAtMs=${idleCapture?.expiresAtMs ?? 'unavailable'}\n`,
       );
@@ -1420,10 +1474,18 @@ export async function runBoundedExec(
   await releaseLease(code !== 0 || state.expiry !== null || state.poolCloseError !== null || lifecycleFailure !== null);
   releaseReservation();
 
+  // The command's peak, as its waiter reported it once both ended; a peak that was not measured is said, never zero.
+  const reported: LeafPeak | null =
+    waiterReport === null ? (waiter?.kind === 'unmeasured' ? waiter : null) : await waiterReport.peak;
+  if (reported?.kind === 'unmeasured') {
+    appendStderr(`bounded-exec: this run's memory peak was not measured (${reported.reason}); its record names none\n`);
+  }
+  const peakBytes = reported?.kind === 'measured' ? reported.bytes : null;
+
   // Broken resource ownership, a lost native lifecycle, or leftovers that could not be retired fail even if a shell
   // branch later exited 0: its verdict is an ordinary operational failure, never a successful or silently unbounded run.
   const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null;
-  await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen, state.lockWaits);
+  await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen, state.lockWaits, peakBytes);
   return {
     success: !operationalFailure && resultFailure === null && state.expiry === null && code === 0,
     terminalOutput: outputChunks.join(''),

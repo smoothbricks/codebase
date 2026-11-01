@@ -444,6 +444,41 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
   });
 
+  it("names the command its peak waiter started as the runner a hang snapshot samples, in the waiter's group", async () => {
+    if (process.platform === 'win32') return;
+    const workspace = await createWorkspace();
+    // A run that records its verdict runs its command under the peak waiter, which leads the command's group.
+    const record = { task: { id: 'app:test', hash: null }, directory: join(workspace.root, 'snapshot') };
+    await workspace.write('snapshot-clock.js', "setInterval(() => console.log('snapshot-clock'), 20);\n");
+    let asked: { pid: number; pgid: number | null; parent: number | null; group: number | null } | undefined;
+    const { result } = await onProgressClock(
+      (chunk) => chunk.includes('snapshot-clock\n'),
+      HANG_CAPTURE_MS,
+      () =>
+        runBoundedExec(
+          { command: 'node snapshot-clock.js', idleTimeoutMs: 2 * HANG_CAPTURE_MS, killAfterMs: 0 },
+          { ...workspace.context, record },
+          createProcessTreeKiller(),
+          null,
+          null,
+          (request) => {
+            // Read while the runner runs: its parent and its group, as the kernel names them.
+            const observed = spawnSync('ps', ['-o', 'ppid=,pgid=', '-p', String(request.pid)], { encoding: 'utf8' });
+            const [parent = null, group = null] = (observed.stdout ?? '').trim().split(/\s+/).map(Number);
+            asked = { pid: request.pid, pgid: request.pgid, parent, group };
+            return new Promise<HangDiagnostics>(() => {});
+          },
+        ),
+    );
+    expect(result.success).toBe(false);
+    if (asked === undefined) throw new Error('the run asked for no hang snapshot');
+    // The runner is the waiter's child, in the group the waiter leads and the snapshot names, never the waiter itself.
+    expect(asked.pid).not.toBe(asked.pgid);
+    expect(asked.parent).toBe(asked.pgid);
+    expect(asked.group).toBe(asked.pgid);
+    expect(result.terminalOutput).toContain(`Hang diagnostics: runner pid=${asked.pid} pgid=${asked.pgid} `);
+  });
+
   it('samples the stack a command hung on a FIFO waits in before the progress bound force-kills it', async () => {
     if (process.platform === 'win32') {
       return;
@@ -1169,51 +1204,60 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain(`RAM temp volume: lease ${directory} archived by the scripted volume\n`);
   });
 
-  it("retires what the command left running through its supervisor, names a dead task's retired subtree, then ends the lease", async () => {
-    const workspace = await createWorkspace();
-    const directory = join(workspace.root, 'lease');
-    await mkdir(directory);
-    const volume = scriptedVolume({
-      ok: true,
-      value: {
-        kind: 'leased',
-        lease: leaseAt(directory),
-        held: [],
-        reaped: ['4242 (nx)'],
-        gaps: ['/v/9-abcdef: unobservedExit (pid 4243)'],
-        retained: [],
-      },
-    });
-    const leftover = join(workspace.root, 'leftover.pid');
+  it.each(['as asked', 'under its peak waiter'] as const)(
+    "retires what the command left running through its supervisor, names a dead task's retired subtree, then ends the lease: %s",
+    async (shape) => {
+      const workspace = await createWorkspace();
+      const directory = join(workspace.root, 'lease');
+      await mkdir(directory);
+      const volume = scriptedVolume({
+        ok: true,
+        value: {
+          kind: 'leased',
+          lease: leaseAt(directory),
+          held: [],
+          reaped: ['4242 (nx)'],
+          gaps: ['/v/9-abcdef: unobservedExit (pid 4243)'],
+          retained: [],
+        },
+      });
+      const leftover = join(workspace.root, 'leftover.pid');
 
-    const result = await runBoundedExec(
-      { command: `sleep 600 & echo $! > ${leftover}`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
-      workspace.context,
-      createProcessTreeKiller(),
-      volume,
-      null,
-      undefined,
-      await standInOwner(workspace.root),
-    );
+      const result = await runBoundedExec(
+        { command: `sleep 600 & echo $! > ${leftover}`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        // A run that records its verdict runs its command under the peak waiter, which leads the command's group.
+        shape === 'as asked'
+          ? workspace.context
+          : {
+              ...workspace.context,
+              record: { task: { id: 'app:test', hash: null }, directory: join(workspace.root, 'record') },
+            },
+        createProcessTreeKiller(),
+        volume,
+        null,
+        undefined,
+        await standInOwner(workspace.root),
+      );
 
-    const pid = Number(await readFile(leftover, 'utf8'));
-    expect(result.success, result.terminalOutput).toBe(true);
-    expect(result.terminalOutput).toContain(
-      `cowshed: the supervisor stopped ${pid} (sleep), which the command left running\n`,
-    );
-    expect(await live([pid])).toEqual([]);
-    expect(result.terminalOutput).toContain(
-      "RAM temp volume: the supervisor stopped 4242 (nx), which a dead task's command left running\n",
-    );
-    expect(result.terminalOutput).toContain(
-      "RAM temp volume: the supervisor's view of a dead task's command has a gap: /v/9-abcdef: unobservedExit (pid 4243)\n",
-    );
-    // The handle is recorded beside the lease once the supervisor admits the command, and the lease ends only after
-    // the subtree it names was retired.
-    expect(volume.order).toHaveLength(2);
-    expect(volume.order[0]?.startsWith(`record ${directory} {"jobId":1,"index":`)).toBe(true);
-    expect(volume.order[1]).toBe(`release ${directory}`);
-  });
+      const pid = Number(await readFile(leftover, 'utf8'));
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(result.terminalOutput).toContain(
+        `cowshed: the supervisor stopped ${pid} (sleep), which the command left running\n`,
+      );
+      expect(await live([pid])).toEqual([]);
+      expect(result.terminalOutput).toContain(
+        "RAM temp volume: the supervisor stopped 4242 (nx), which a dead task's command left running\n",
+      );
+      expect(result.terminalOutput).toContain(
+        "RAM temp volume: the supervisor's view of a dead task's command has a gap: /v/9-abcdef: unobservedExit (pid 4243)\n",
+      );
+      // The handle is recorded beside the lease once the supervisor admits the command, and the lease ends only after
+      // the subtree it names was retired.
+      expect(volume.order).toHaveLength(2);
+      expect(volume.order[0]?.startsWith(`record ${directory} {"jobId":1,"index":`)).toBe(true);
+      expect(volume.order[1]).toBe(`release ${directory}`);
+    },
+  );
 
   it("retires only the command's own subtree: a bystander working in its directory survives", async () => {
     const workspace = await createWorkspace();
@@ -1622,6 +1666,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       task: record.task.id,
       hash: 'h',
       verdict: { outcome: 'no-space', exitCode: 1, tests: [], line, volume: space },
+      peakBytes: expect.any(Number),
     });
     // Read while the lease was still the task's, before its subtree was retired and the lease released to be archived.
     // The handle's record lands whenever the admission does, which no output line orders.
@@ -2256,7 +2301,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain(`tokens=${lent}\n`);
     expect(result.terminalOutput).toMatch(
       new RegExp(
-        `^cowshed: cpu-pool wait done elapsed=\\d+ms status=ok tokens=${lent}/${nextestWant} runner=nextest$`,
+        `^cowshed: cpu-pool wait done elapsed=\\d+ms status=ok tokens=${lent}/${nextestWant} runner=nextest memory=none$`,
         'm',
       ),
     );
@@ -2303,6 +2348,43 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.success).toBe(true);
     const record: unknown = JSON.parse(await readFile(join(directory, VERDICT_FILE), 'utf8'));
     expect(record).toHaveProperty('cpu', { tokens: lent, want: nextestWant, waitedMs: expect.any(Number) });
+  });
+
+  it("records its command's memory peak, and its next run is charged that peak in its run's pool", async () => {
+    if (process.platform === 'win32') return;
+    const workspace = await createWorkspace();
+    const record = { task: { id: 'app:test', hash: null }, directory: join(workspace.root, 'peak') };
+    // The command's child holds 64 MiB resident: the peak is the largest process of the command's tree.
+    const allocated = 64 * 1024 * 1024;
+    const run = (): Promise<BoundedExecResult> =>
+      withPool(
+        2,
+        (pool) =>
+          runBoundedExec(
+            { command: `node -e "Buffer.alloc(${allocated}).fill(1)"`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+            { ...workspace.context, record },
+            createProcessTreeKiller(),
+            null,
+            inheritedFrom(pool),
+          ),
+        // Less than the command's peak: once charged that peak, the run is granted only while nothing else holds memory.
+        allocated / 2,
+      );
+
+    const first = await run();
+    expect(first.success).toBe(true);
+    // A task with no recorded peak is charged nothing.
+    expect(first.terminalOutput).toContain('memory=none');
+    const peak = (await readRecord(record.directory))?.peakBytes;
+    expect(peak).toBeGreaterThanOrEqual(allocated);
+
+    const second = await run();
+    expect(second.success).toBe(true);
+    expect(second.terminalOutput).toContain(`memory=${peak}`);
+    expect(second.terminalOutput).toContain(
+      `this task's last peak of ${peak} bytes alone exceeds the run's ${allocated / 2} bytes`,
+    );
+    expect((await readRecord(record.directory))?.peakBytes).toBeGreaterThanOrEqual(allocated);
   });
 
   it('keeps a command running when its borrowed grant closes, and judges it by its own exit', async () => {
@@ -2490,6 +2572,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         task: record.task.id,
         hash: 'h',
         verdict: { outcome: 'failed', exitCode: 1, tests: [] },
+        peakBytes: null,
       });
     });
 
@@ -2824,9 +2907,16 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-/** A parent's CPU pool of `tokens`, open while `body` runs. Its upstream never closes on its own. */
-async function withPool<T>(tokens: number, body: (pool: CpuPool) => Promise<T>): Promise<T> {
-  const created = await createCpuPool(tokens, new Promise<void>(() => {}));
+/**
+ * A parent's CPU pool of `tokens`, open while `body` runs. Its upstream never closes on its own. It charges its grants
+ * against `memory` bytes, as a run's own pool does, or none, as a sub-pool.
+ */
+async function withPool<T>(
+  tokens: number,
+  body: (pool: CpuPool) => Promise<T>,
+  memory: number | null = null,
+): Promise<T> {
+  const created = await createCpuPool(tokens, new Promise<void>(() => {}), memory);
   if (!created.ok) {
     throw new Error(`cpu pool: ${created.error}`);
   }
