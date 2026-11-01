@@ -648,11 +648,12 @@ toolchain inputs. With warm caches holding a valid entry for each key — the ch
 store behind it for tasks, the one mbx store for Cargo units (mbx, above), a land gate runs only the tasks whose key the
 landed commits (or a changed runtime or toolchain input) changed. Only an aggregate (`nx:noop`, or a target that runs
 nothing and only depends on others) states `"cache": false`, and `smoo monorepo check` refuses it anywhere else; the one
-exception is the inferred wrangler `deploy`, until its key names the stage and compares the live tag. Host and remote
-state a task reads is a runtime input, so a re-gate of an unchanged tree runs nothing. unreachable entry runs its task
-again, as a cache degrade does (Nx accepted-task artifact service, above). Six rules keep the key no wider than what a
-task observes, each learned from a measured miss (2026-10-22, the owner's report: twenty minutes of gate for a one-line
-change).
+exception is a `deploy` that states why it is live (`"metadata": { "liveDeploy": "<why>" }`): steps around
+`smoo wrangler deploy-stage` that read the stage, which the cached `wrangler-deploy` executor cannot run. Host and
+remote state a task reads is a runtime input, so a re-gate of an unchanged tree runs nothing. unreachable entry runs its
+task again, as a cache degrade does (Nx accepted-task artifact service, above). Six rules keep the key no wider than
+what a task observes, each learned from a measured miss (2026-10-22, the owner's report: twenty minutes of gate for a
+one-line change).
 
 - **A target split from a cached target states its own cache.** Nx caches a target only when its own configuration or a
   `targetDefaults` entry for its exact name says so; `targetDefaults.test` keys the target named `test` and no other.

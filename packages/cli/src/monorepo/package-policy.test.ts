@@ -177,15 +177,53 @@ describe('only aggregates are uncached', () => {
     const errors = captureConsoleErrors();
     expect(validateCacheOnlyAggregatesUncached(projects)).toBe(5);
     const refusal = (target: string, executor: string) =>
-      `app:${target}: "cache": false on a target that runs ${executor}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input`;
+      `app:${target}: "cache": false on a target that runs ${executor}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input; a deploy that must run every time states why in "metadata": { "liveDeploy": "<why>" }`;
     expect(errors).toEqual([
       refusal('bench', 'nx:run-commands'),
       refusal('clean', '@smoothbricks/nx-plugin:clean-outputs'),
-      // A wrangler deploy is no exception: the plugin's own is cached, keyed on its artifact and stage.
+      // A wrangler deploy is no exception unless it states why it is live: the plugin's own is cached.
       refusal('deploy', 'nx:run-commands'),
       refusal('lint', 'nx:run-script'),
       refusal('serve', 'nx:run-commands'),
     ]);
+  });
+
+  it('passes an uncached deploy that states why it is live, and no other target the statement is put on', () => {
+    const deploy = 'smoo wrangler deploy-stage --stage {args.stage} && bun scripts/verify.ts --stage {args.stage}';
+    const why = 'its steps after deploy-stage read the stage live, and a rollback must never be answered from a cache';
+    const projects = projectTargetsFromNxProjects({
+      app: {
+        root: 'packages/app',
+        targets: {
+          bench: {
+            executor: 'nx:run-commands',
+            cache: false,
+            metadata: { liveDeploy: why },
+            options: { command: 'cargo bench' },
+          },
+          deploy: {
+            executor: 'nx:run-commands',
+            cache: false,
+            metadata: { liveDeploy: why, description: 'Deploy a stage' },
+            options: { command: deploy },
+          },
+        },
+      },
+      web: {
+        root: 'packages/web',
+        targets: {
+          deploy: {
+            executor: 'nx:run-commands',
+            cache: false,
+            metadata: { liveDeploy: ' ' },
+            options: { command: deploy },
+          },
+        },
+      },
+    });
+    const errors = captureConsoleErrors();
+    expect(validateCacheOnlyAggregatesUncached(projects)).toBe(2);
+    expect(errors.map((error) => error.split(': ')[0])).toEqual(['app:bench', 'web:deploy']);
   });
 });
 

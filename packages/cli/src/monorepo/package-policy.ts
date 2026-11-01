@@ -421,13 +421,17 @@ export function validateAggregateMemberCache(projects: readonly ProjectTargets[]
  * uncached each have a declaration instead: a fetch keys on its lockfile, a long-running service is
  * `"continuous": true`, a measurement keys on the code and toolchain it measures, and the host state a target reads
  * is a runtime input. A target that deletes build state file by file (`clean`) has no place at all: build state is
- * removed whole (cowshed rm, mbx gc).
+ * removed whole (cowshed rm, mbx gc). The one target that runs work uncached is a `deploy` that states why in
+ * `"metadata": { "liveDeploy": "<why>" }`: one whose steps around `smoo wrangler deploy-stage` read the stage live, so
+ * the `wrangler-deploy` executor cannot run it, and a cache hit after a rollback would deploy nothing. It still runs
+ * under Nx's own task hash, so `deploy-stage` tags the version with what the commit holds.
  */
 export function validateCacheOnlyAggregatesUncached(projects: readonly ProjectTargets[]): number {
   let failures = 0;
   for (const project of projects) {
     for (const target of [...project.targets].sort()) {
       if (project.targetCache?.get(target) !== false) continue;
+      if (target === 'deploy' && (project.targetLiveDeploy?.get(target)?.trim() ?? '') !== '') continue;
       const executor = project.targetExecutors?.get(target);
       const options = project.targetOptions?.get(target);
       const runs =
@@ -440,7 +444,7 @@ export function validateCacheOnlyAggregatesUncached(projects: readonly ProjectTa
               : null;
       if (runs === null) continue;
       console.error(
-        `${project.project}:${target}: "cache": false on a target that runs ${runs}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input`,
+        `${project.project}:${target}: "cache": false on a target that runs ${runs}; only an aggregate (nx:noop, or a target that runs nothing and only depends on others) is uncached. Declare the inputs and outputs of what it runs and cache it: a long-running service is "continuous": true, a fetch keys on its lockfile, and what it reads of the host is a runtime input; a deploy that must run every time states why in "metadata": { "liveDeploy": "<why>" }`,
       );
       failures++;
     }
