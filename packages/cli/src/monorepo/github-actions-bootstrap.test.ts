@@ -28,6 +28,9 @@ export TTSC_CACHE_DIR="/home/runner/.cowshed/caches/ttsc"
 export MULTI_LINE_VALUE="first line
 second line"
 export CHANGED_BY_SHELL="inner-value"
+# The shell Python's package path: nixpkgs' sitecustomize (on PYTHONPATH) reads it to put
+# the withPackages site-packages on sys.path, so later steps' python3 needs it.
+export NIX_PYTHONPATH="/nix/store/test-python-env/lib/python3.14/site-packages"
 export NIX_SSL_CERT_FILE="/nix/store/test-cert"
 export DEVENV_ROOT="/somewhere/tooling/direnv"
 export DIRENV_DIFF="bookkeeping"
@@ -90,6 +93,10 @@ describe('github-actions-bootstrap build-shell environment persistence', () => {
     expect(run.githubEnv).toContain('LD_LIBRARY_PATH=/nix/store/test-gcc-lib/lib\n');
     expect(run.githubEnv).toContain('TTSC_TSGO_BINARY=/repo/node_modules/@typescript/native/bin/tsc\n');
     expect(run.githubEnv).toContain('TTSC_CACHE_DIR=/home/runner/.cowshed/caches/ttsc\n');
+
+    // The shell Python's package path is an interpreter input, not bookkeeping: without it a later
+    // step's python3 (a venv over the devenv Python) cannot import the packages the shell provides.
+    expect(run.githubEnv).toContain('NIX_PYTHONPATH=/nix/store/test-python-env/lib/python3.14/site-packages\n');
 
     // Changed by the shell → the shell's value wins.
     expect(run.githubEnv).toContain('CHANGED_BY_SHELL=inner-value\n');

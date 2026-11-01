@@ -251,6 +251,10 @@ persist_devenv_environment() {
       # The runner step owns these.
       PWD | OLDPWD | SHLVL | SHELL | HOME | USER | LOGNAME | HOSTNAME | TERM | TMPDIR | TMP | TEMP | _ | PS1) continue ;;
       GITHUB_* | RUNNER_* | ACTIONS_* | CI) continue ;;
+      # The shell Python's package path, not bookkeeping: nixpkgs' sitecustomize (which
+      # PYTHONPATH names) reads it to put the withPackages site-packages on sys.path, so a
+      # later step's python3 imports the packages the shell provides.
+      NIX_PYTHONPATH) ;;
       # Shell-session bookkeeping, meaningful only inside the shell itself.
       DIRENV_* | DEVENV_* | NIX_* | BASH* | XDG_* | IN_NIX_SHELL | SMOO_ENV_CAPTURE_OUT) continue ;;
     esac
