@@ -15,7 +15,11 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
  * (`gathered_at`) and reuses no entry whose mtime is that second or later.
  *
  * The case dates each input a minute ahead, so every gather below begins before the input's mtime second: the race,
- * without depending on the clock. Each rewrite within that second must hash the bytes written, never an entry.
+ * without depending on the clock. Each rewrite within that second must hash the bytes written, never an entry. The
+ * rule's boundary, an entry dated the very second its gather began (`files_hashing.rs` reuses an entry only while
+ * `file.mod_time < gathered_at`), is guarded by Nx's own native test
+ * `should_rehash_entries_read_during_the_gather_window`: a run from outside cannot make its gather begin in a chosen
+ * second without racing the clock, so it is not repeated here.
  */
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));

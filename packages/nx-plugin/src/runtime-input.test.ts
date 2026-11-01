@@ -235,11 +235,12 @@ describe('a planted runtime input failure through real Nx', () => {
 
 /**
  * Guards the hash-failure hunk of patches/nx@24.0.3.patch. Nx 24.0.3's native hasher fails a runtime input whose output
- * is not UTF-8 with `invalid utf-8 sequence of 1 bytes from index 0`, naming no task and no input. The patched
- * `hashTasks` rethrows it naming the tasks (ten, the rest counted) and the runtime inputs their plans hold, read from its
- * planner. When the planner cannot answer, the native message still leads and the native error stays the cause. The
- * table drives the installed `hashTasks` over stand-ins for Nx's native planner and hasher, faked at their published
- * methods; the planted failure above proves the same path through real Nx.
+ * is not UTF-8 with `invalid utf-8 sequence of 1 bytes from index 0`, naming no task and no input. The patched hasher
+ * rethrows a failure of each native hash call (`hashPlans`, Nx 24's up-front `hashPlansUpfront`, and `hashPlansFor`
+ * over the plans that pass kept) naming the tasks (ten, the rest counted) and the runtime inputs their plans hold, read
+ * from its planner. When the planner cannot answer, the native message still leads and the native error stays the
+ * cause. The table drives the installed hasher over stand-ins for Nx's native planner and hasher, faked at their
+ * published methods; the planted failure above proves the same path through real Nx.
  */
 describe("Nx's error for a failed hash", () => {
   const NATIVE = new Error('invalid utf-8 sequence of 1 bytes from index 0');
@@ -340,6 +341,70 @@ describe("Nx's error for a failed hash", () => {
     expect(actual).toEqual(
       rows.map((row) => ({ label: row.label, message: row.message.join('\n'), cause: row.error })),
     );
+  });
+
+  it('names the tasks of an up-front hash, and of a later hash over the plans it kept', async () => {
+    const PLANS: Record<string, string[]> = { 'a:build': [`runtime:${WRAPPED}`], 'b:test': ['runtime:echo b'] };
+    const planner = {
+      getPlansReference: () => 'plans',
+      getPlans: (ids: string[]) => Object.fromEntries(ids.map((id) => [id, PLANS[id] ?? []])),
+    };
+    const ids = ['b:test', 'a:build'];
+    const envs = Object.fromEntries(ids.map((id) => [id, {}]));
+    const settle = (pending: Promise<unknown>) =>
+      pending.then(
+        () => new Error('the hash resolved'),
+        (rejected: unknown) => rejected,
+      );
+    const failed = (settled: unknown) =>
+      settled instanceof Error ? { message: settled.message, cause: settled.cause } : { message: String(settled) };
+    // Nx 24's up-front pass plans every task and hashes those it can at once.
+    const upfront = Object.assign(Object.create(NativeTaskHasherImpl.prototype), {
+      upfrontPlans: null,
+      planner,
+      hasher: {
+        hashPlansUpfront: () => {
+          throw NATIVE;
+        },
+      },
+    });
+    const failedUpfront = await settle(
+      NativeTaskHasherImpl.prototype.hashTasksUpfront.call(upfront, ids.map(task), GRAPH, envs, repoRoot, false),
+    );
+    // A task the up-front pass deferred hashes later from the plans it kept.
+    const kept = Object.assign(Object.create(NativeTaskHasherImpl.prototype), {
+      upfrontPlans: null,
+      planner,
+      hasher: {
+        hashPlansUpfront: () => ({}),
+        hashPlansFor: () => {
+          throw NATIVE;
+        },
+      },
+    });
+    await NativeTaskHasherImpl.prototype.hashTasksUpfront.call(kept, ids.map(task), GRAPH, envs, repoRoot, false);
+    const failedLater = await settle(
+      NativeTaskHasherImpl.prototype.hashTasks.call(kept, [task('b:test')], GRAPH, envs, repoRoot, false),
+    );
+    expect([failed(failedUpfront), failed(failedLater)]).toEqual([
+      {
+        message: [
+          `Could not hash a:build, b:test: ${NATIVE.message}`,
+          'Runtime inputs of those tasks:',
+          '  echo b (b:test)',
+          `  ${WRAPPED} (a:build)`,
+        ].join('\n'),
+        cause: NATIVE,
+      },
+      {
+        message: [
+          `Could not hash b:test: ${NATIVE.message}`,
+          'Runtime inputs of those tasks:',
+          '  echo b (b:test)',
+        ].join('\n'),
+        cause: NATIVE,
+      },
+    ]);
   });
 });
 

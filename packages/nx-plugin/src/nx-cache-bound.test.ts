@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { statfsSync } from 'node:fs';
+import { existsSync, statfsSync } from 'node:fs';
 import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
@@ -14,11 +14,33 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
  * mount on the client's main thread: about 80 ms on a quiet host, and up to 2.3 s while disk images attach, detach or
  * resize. Nx 24's asks only the cache directory's filesystem (`statfs`), through its nearest existing ancestor.
  *
- * The run below takes the default bound with no cache directory yet, as on a checkout's first run; the installed native
- * bound for a directory that does not exist must equal a tenth of its existing ancestor's filesystem.
+ * The run below takes the default bound with no cache directory yet, as on a checkout's first run. The native bound of
+ * a directory that does not exist must then be a tenth of its nearest existing ancestor's filesystem, probed on one
+ * whose size differs from the root filesystem's, so a bound taken from the wrong filesystem cannot pass: this
+ * checkout's own volume in a cowshed shed, a tmpfs on Linux. Measured on a shed checkout's 100 GiB volume, Nx 23.2.1's
+ * native bound answered 799849922560 (a tenth of the 8 TB root) where Nx 24.0.3 answers 10737418240.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');
+
+/** Total bytes of the filesystem holding `path`. */
+function filesystemBytes(path: string): number {
+  const { blocks, bsize } = statfsSync(path);
+  return blocks * bsize;
+}
+
+/** A directory on a filesystem whose size differs from the root filesystem's, for a bound that can tell them apart. */
+function otherFilesystem(): string {
+  const candidates = [repositoryRoot, '/dev/shm', '/run'];
+  const root = filesystemBytes('/');
+  const found = candidates.find((path) => existsSync(path) && filesystemBytes(path) !== root);
+  if (found === undefined) {
+    throw new Error(
+      `no filesystem sized unlike the root one among ${candidates.join(', ')}: the bound cannot be told apart`,
+    );
+  }
+  return found;
+}
 
 async function runNx(root: string, env: Record<string, string>): Promise<{ code: number | null; output: string }> {
   const child = spawn(
@@ -88,8 +110,10 @@ it('bounds the default cache from its own filesystem, whose directory may not ex
     const { code, output } = await runNx(root, fixtureNxEnv(root, socketDirectory));
     expect(code, output).toBe(0);
     expect(await readFile(join(root, 'app/result.txt'), 'utf8')).toBe('built');
-    // The native bound of a directory that does not exist is a tenth of the filesystem of its nearest existing ancestor.
-    const missing = join(root, 'not', 'created', 'cache');
+    // The native bound of a directory that does not exist is a tenth of the filesystem of its nearest existing ancestor,
+    // on a filesystem sized unlike the root one.
+    const filesystem = otherFilesystem();
+    const missing = join(filesystem, `nx-cache-bound-missing-${process.pid}`, 'cache');
     const measured = spawnSync(
       'node',
       [
@@ -99,7 +123,11 @@ it('bounds the default cache from its own filesystem, whose directory may not ex
       { cwd: root, encoding: 'utf8' },
     );
     expect(measured.status, measured.stderr).toBe(0);
-    const { blocks, bsize } = statfsSync(root);
-    expect(Math.abs(Number(measured.stdout) - Math.floor((blocks * bsize) / 10))).toBeLessThanOrEqual(1);
+    const bound = Number(measured.stdout);
+    expect(
+      Math.abs(bound - Math.floor(filesystemBytes(filesystem) / 10)),
+      `${filesystem}: ${bound}`,
+    ).toBeLessThanOrEqual(1);
+    expect(Math.abs(bound - Math.floor(filesystemBytes('/') / 10)), `${filesystem}: ${bound}`).toBeGreaterThan(1);
   });
 });

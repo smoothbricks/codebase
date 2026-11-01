@@ -1872,10 +1872,12 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
 
 Nx 24 carries four repairs this patch carried on 23.2.1, so their hunks are gone and their regressions stay: the default
 cache bound taken from the cache's own filesystem (`statfs`, through its nearest existing ancestor;
-[upstream Nx #37269](https://github.com/nrwl/nx/pull/37269), since 24.0.2), resolving `typescript` and release version
-actions from the workspace ([upstream Nx #37272](https://github.com/nrwl/nx/pull/37272), since 24.0.3), Git's racy-index
-rule for file hashes (the archive, `nx_files_v2.nxt`, records when its gather began, `gathered_at`, and reuses no entry
-dated that second or later), and a failed run's exit status 1, never 130, when it skips the tasks behind a failure
+[upstream Nx #37269](https://github.com/nrwl/nx/pull/37269), since 24.0.2; where that filesystem cannot be read for
+another reason than a missing directory, Nx 24's `get_default_max_cache_size` logs it at debug level and bounds the
+cache at 100 GiB, where the 23.2.1 hunk failed the operation), resolving `typescript` and release version actions from
+the workspace ([upstream Nx #37272](https://github.com/nrwl/nx/pull/37272), since 24.0.3), Git's racy-index rule for
+file hashes (the archive, `nx_files_v2.nxt`, records when its gather began, `gathered_at`, and reuses no entry dated
+that second or later), and a failed run's exit status 1, never 130, when it skips the tasks behind a failure
 (`tasks-runner/run-outcome.js`). Cowshed exports an explicit caller-overridable default cache bound of configured
 build-volume capacity divided by ten for host shells and jobs; the hosted setup action keeps its existing separate
 `20GB` ceiling.
