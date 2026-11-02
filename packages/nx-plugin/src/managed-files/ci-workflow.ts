@@ -254,6 +254,14 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
  */
 export const CI_CONCURRENCY_GROUP = 'CI-${{ github.event.pull_request.number || github.ref }}';
 
+/**
+ * The CI workflow's name and its one job's id. A workflow whose tests are CI's (a release's) hands them to the
+ * setup-devenv action as `records-workflow` and `records-job`, so a task its Nx scope holds no record of is charged what
+ * CI's pushes last recorded of it (specs/cowshed/05_gateway.md, "Without mbx, every Nx run budgets itself").
+ */
+export const CI_WORKFLOW_NAME = 'CI';
+export const CI_JOB_ID = 'main';
+
 export function renderCiWorkflowYaml(options: CiWorkflowDefinitionOptions): string {
   const steps = defineCiWorkflow(options);
   return [
@@ -266,7 +274,7 @@ export function renderCiWorkflowYaml(options: CiWorkflowDefinitionOptions): stri
 }
 
 function renderCiWorkflowHeader(options: CiWorkflowDefinitionOptions): string {
-  return `name: CI
+  return `name: ${CI_WORKFLOW_NAME}
 
 on:
   push:
@@ -303,7 +311,7 @@ defaults:
     working-directory: tooling/direnv
 
 jobs:
-  main:
+  ${CI_JOB_ID}:
     name: Validate
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 45
@@ -867,8 +875,8 @@ export function cargoCredentialStepLines(step: CiWorkflowStep, config: PackageCa
     const mirrorUrl = new URL(origin.internalMirror);
     const mirrorBase = `${mirrorUrl.protocol}//${mirrorUrl.host}/`.replaceAll("'", "'\\''");
     for (const prefix of mirrorRewritePrefixes(origin)) {
-      lines.push('            echo "GIT_CONFIG_KEY_${idx}=url.' + mirrorBase + '.insteadOf"');
-      lines.push('            echo "GIT_CONFIG_VALUE_${idx}=' + prefix.replaceAll("'", "'\\''") + '"');
+      lines.push(`            echo "GIT_CONFIG_KEY_\${idx}=url.${mirrorBase}.insteadOf"`);
+      lines.push(`            echo "GIT_CONFIG_VALUE_\${idx}=${prefix.replaceAll("'", "'\\''")}"`);
       lines.push('            idx=$((idx + 1))');
     }
   }

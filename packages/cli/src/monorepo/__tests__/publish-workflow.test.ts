@@ -4,7 +4,12 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { githubActionPins } from '@smoothbricks/nx-plugin/managed-files/ci-workflow';
+import {
+  CI_JOB_ID,
+  CI_WORKFLOW_NAME,
+  githubActionPins,
+  renderCiWorkflowYaml,
+} from '@smoothbricks/nx-plugin/managed-files/ci-workflow';
 import { formatManagedContent } from '@smoothbricks/nx-plugin/managed-files/managed-format';
 import {
   definePublishWorkflow,
@@ -717,6 +722,34 @@ describe('publish workflow definition', () => {
     expect(finalJob.indexOf(bootstrap)).toBeLessThan(finalJob.indexOf('- name: 📦 Publish release'));
     // Consumers resolve the hook from the published package instead.
     expect(renderPublishWorkflowYaml({ repoName: '@acme/widgets' })).not.toContain('ttsc -p tsconfig.lib.json');
+  });
+
+  // A release's tests are CI's, and the pool charges each leaf its task's last recorded peak from its scope's records:
+  // a task whose record the scope lacks is charged nothing, so a release's first run of it admits the leaf on CPU
+  // tokens alone (specs/cowshed/05_gateway.md, "Without mbx, every Nx run budgets itself").
+  it("starts every job's task records from the scope CI's pushes run in", () => {
+    type SetupJob = { steps: Array<{ uses?: string; with?: Record<string, unknown> }> };
+    const ci = typia.assert<{ name: string; jobs: Record<string, unknown> }>(
+      Bun.YAML.parse(
+        renderCiWorkflowYaml({ deploy: false, browserTests: false, e2eDeployment: false, pushBranches: ['main'] }),
+      ),
+    );
+    expect(ci.name).toBe(CI_WORKFLOW_NAME);
+    expect(Object.keys(ci.jobs)).toContain(CI_JOB_ID);
+
+    for (const rendered of [
+      renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' }),
+      renderPublishWorkflowYaml(codebaseWorkflowOptions),
+    ]) {
+      const workflow = typia.assert<{ jobs: Record<string, SetupJob> }>(Bun.YAML.parse(rendered));
+      const setups = Object.values(workflow.jobs).flatMap((job) =>
+        job.steps.filter((step) => step.uses === './.github/actions/setup-devenv'),
+      );
+      expect(setups.length).toBeGreaterThan(0);
+      for (const setup of setups) {
+        expect(setup.with).toEqual({ 'records-workflow': CI_WORKFLOW_NAME, 'records-job': CI_JOB_ID });
+      }
+    }
   });
 
   it('tags only in the publishing job, after repair and before the npm publish', () => {

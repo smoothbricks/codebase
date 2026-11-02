@@ -1773,13 +1773,16 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   class's three quarters of the host ("Classes"). A run whose memory cannot be read does not start (`preTasksExecution`
   throws its typed error, naming the file or sysctl and the cause): like a pressure reading that cannot be taken
   ("Memory pressure"), it is not shown to have room. A task with no recorded peak is charged nothing until it has one,
-  as mbx's omitted `--memory` is a zero-byte charge. On a host CI runner a pull request's first run starts with its base
-  branch's records: the managed `setup-devenv` action gives a pull request's scope that holds no task records a copy of
-  each task's last `verdict.json` from the scope its base branch's pushes run in, so its leaves are charged the peaks
-  its base branch last recorded, and its own runs replace them; the copy is the record, never a second store. A leaf
-  whose own charge alone exceeds the run's memory is granted once nothing else holds memory, so it never starves, and
-  its stderr says so, naming its charge and the run's memory. A granted `bounded-exec`'s sub-pool charges no memory: its
-  holder's charge covers its tree.
+  as mbx's omitted `--memory` is a zero-byte charge. On a host CI runner a scope starts with the records of other
+  pushes: the managed `setup-devenv` action gives a scope a copy of each task's last `verdict.json` that the scope holds
+  no record of, from the scope its starting pushes run in, so its leaves are charged the peaks those pushes last
+  recorded, and its own runs replace them; the copy is the record, never a second store. A pull request starts from the
+  scope its base branch's pushes run in, in the same workflow and job; a workflow whose tests are another workflow's (a
+  release's are CI's) names that workflow and job to the action (`records-workflow`, `records-job`) and starts from the
+  scope the pushes to its own ref run in there. A scope that never held a record charged every leaf nothing, and its
+  first run admitted its leaves on CPU tokens alone. A leaf whose own charge alone exceeds the run's memory is granted
+  once nothing else holds memory, so it never starves, and its stderr says so, naming its charge and the run's memory. A
+  granted `bounded-exec`'s sub-pool charges no memory: its holder's charge covers its tree.
 
   When a leaf ends, `bounded-exec` writes its peak into the task's record, the `verdict.json` of the task's
   `bounded-exec` directory in the checkout's Nx workspace data, keyed by the task id Nx gives
@@ -1809,8 +1812,9 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   run. `pool-admission.test.ts` holds the admission rule in a table, `host-memory.linux.test.ts` the Linux reading,
   `host-memory.test.ts` a tree's sum, `run-cpu-pool.test.ts` a leaf held until a holder returns its memory,
   `executor.test.ts` a leaf that records its measured peak and whose next run is charged it, and one whose four children
-  held memory side by side, recorded at their sum, and `setup-devenv-task-records.test.ts` a pull request's first run
-  starting from its base branch's records.
+  held memory side by side, recorded at their sum, and `setup-devenv-task-records.test.ts` a pull request's and a
+  release workflow's first run starting from the records of the pushes they start from, and a later run taking the
+  record of each task its scope lacks.
 
 - **Runners are sized to the count.** The `bounded-exec` executor reads each runner's requested parallelism from the
   runner's own flag rather than assuming the core count, since a runner's flag and its actual concurrency can disagree:

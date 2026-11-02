@@ -5,6 +5,18 @@ description: >
   the store cache (host store). On ephemeral runners installs a single-user Nix and restores /nix itself from the
   actions cache: store paths and the Nix database come back as files, so no NAR is imported and no daemon is needed.
 
+inputs:
+  records-workflow:
+    description: >
+      The workflow whose pushes keep the bounded-exec task records this job's scope starts from, for a workflow whose
+      tests are another workflow's (a release's are CI's). Blank means this workflow.
+    required: false
+    default: ''
+  records-job:
+    description: The job of that workflow. Blank means this job.
+    required: false
+    default: ''
+
 outputs:
   devenv-cache-hit:
     description: Whether the devenv/direnv cache restored from the exact primary key.
@@ -84,15 +96,19 @@ runs:
     # and their metadata DB together, warm across runs of the same pull
     # request or ref and job.
     #
-    # A pull request's first run starts from its base branch's task records.
-    # Each bounded-exec leaf is charged its task's last recorded memory peak
+    # A scope starts from the task records of other pushes. Each bounded-exec
+    # leaf is charged its task's last recorded memory peak
     # (specs/cowshed/05_gateway.md, "Without mbx, every Nx run budgets
-    # itself"), and a scope that holds no records charges every leaf nothing,
-    # so a pull request's first run would admit every leaf on CPU tokens
-    # alone. Its base branch's pushes keep their records in the base's scope:
-    # a pull request's scope that holds none takes a copy of each task's last
-    # record (its verdict.json, nothing beside it) from there, and its own
-    # runs replace them. The copy is the record itself, never a second store.
+    # itself"), and a task whose record the scope lacks is charged nothing, so
+    # the scope's first run of it admits the leaf on CPU tokens alone. A pull
+    # request starts from its base branch's pushes, which the same workflow and
+    # job run in the base's scope. A workflow whose tests are another
+    # workflow's (a release's are CI's) names that workflow and job in
+    # records-workflow and records-job, and starts from the pushes to its own
+    # ref there. A scope that holds no record of a task takes a copy of the
+    # last one its starting scope holds (its verdict.json, nothing beside it),
+    # and its own runs replace it. The copy is the record itself, never a
+    # second store.
     - name: 📂 Locate the Nx cache on the shared bind
       if: steps.runner-kind.outputs.host == 'true'
       shell: bash
@@ -104,8 +120,14 @@ runs:
         # A pull request's base branch, whose pushes run under refs/heads/<it>;
         # empty for a push.
         BASE_REF: ${{ github.base_ref }}
+        # The workflow and job whose pushes keep the records this scope starts
+        # from, when they are not this workflow's and job's; empty for both.
+        RECORDS_WORKFLOW: ${{ inputs.records-workflow }}
+        RECORDS_JOB: ${{ inputs.records-job }}
       run: |
-        lane=$(printf '%s' "$NX_CACHE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
+        # A workflow's directory under the shared bind: its name, slugged.
+        lane_of() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-'; }
+        lane=$(lane_of "$NX_CACHE_LANE")
         # The cache root of the run identity SCOPE_REF names.
         scope_root() {
           scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
@@ -113,15 +135,30 @@ runs:
         }
         NX_CACHE_ROOT=$(scope_root)
         records="$NX_CACHE_ROOT/workspace-data/bounded-exec"
-        if [ -n "$BASE_REF" ] && [ ! -d "$records" ]; then
-          base="$(SCOPE_REF="refs/heads/$BASE_REF" scope_root)/workspace-data/bounded-exec"
-          for verdict in "$base"/*/verdict.json; do
+        # The cache root of the scope that job $2 of workflow $1 runs the pushes to ref $3 in.
+        scope_root_of() {
+          lane=$(lane_of "$1") GITHUB_WORKFLOW="$1" GITHUB_JOB="$2" SCOPE_REF="$3" scope_root
+        }
+        from_workflow=${RECORDS_WORKFLOW:-$GITHUB_WORKFLOW}
+        from_ref=${BASE_REF:+refs/heads/$BASE_REF}
+        from_ref=${from_ref:-$SCOPE_REF}
+        from=$(scope_root_of "$from_workflow" "${RECORDS_JOB:-$GITHUB_JOB}" "$from_ref")
+        if [ "$from" != "$NX_CACHE_ROOT" ]; then
+          copied=0
+          for verdict in "$from"/workspace-data/bounded-exec/*/verdict.json; do
             [ -e "$verdict" ] || continue
             task=$(basename "$(dirname "$verdict")")
+            [ -e "$records/$task/verdict.json" ] && continue
             mkdir -p "$records/$task"
-            cp "$verdict" "$records/$task/verdict.json"
+            # A task that starts again in the scope it came from clears its record first: one gone since the
+            # listing has none to give.
+            if cp "$verdict" "$records/$task/verdict.json"; then
+              copied=$((copied + 1))
+            elif [ -e "$verdict" ]; then
+              exit 1
+            fi
           done
-          if [ -d "$records" ]; then echo "task records: from the $BASE_REF scope"; fi
+          if [ "$copied" -gt 0 ]; then echo "task records: $copied from the $from_workflow scope of $from_ref"; fi
         fi
         mkdir -p "$NX_CACHE_ROOT/cache" "$NX_CACHE_ROOT/workspace-data"
         {

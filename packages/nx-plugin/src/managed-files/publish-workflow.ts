@@ -17,6 +17,8 @@ import type {
 import { isSmoothBricksCodebasePackageName } from '../workspace-package-policy.js';
 import {
   artifactStepLines,
+  CI_JOB_ID,
+  CI_WORKFLOW_NAME,
   CiWorkflowStepKind,
   cargoCredentialJobEnvLines,
   cargoCredentialStepLines,
@@ -578,6 +580,16 @@ function commentLinesForStep(step: PublishWorkflowStep): string[] {
   return [`      # Step ${step.number}`];
 }
 
+/** The setup-devenv step's `uses` and the scope its task records start from: a release's tests are CI's. */
+function setupDevenvUsesLines(): string[] {
+  return [
+    '        uses: ./.github/actions/setup-devenv',
+    '        with:',
+    `          records-workflow: ${CI_WORKFLOW_NAME}`,
+    `          records-job: ${CI_JOB_ID}`,
+  ];
+}
+
 function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDefinitionOptions): string[] {
   switch (step.kind) {
     case PublishWorkflowStepKind.Checkout:
@@ -598,7 +610,7 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
     case PublishWorkflowStepKind.CargoCredentials:
       return cargoCredentialsStepLines(options);
     case PublishWorkflowStepKind.SetupDevenv:
-      return [`      - name: ${step.name}`, '        id: setup', '        uses: ./.github/actions/setup-devenv'];
+      return [`      - name: ${step.name}`, '        id: setup', ...setupDevenvUsesLines()];
     case PublishWorkflowStepKind.ConfigureReleaseAuthor:
       return [
         `      - name: ${step.name}`,
@@ -1145,7 +1157,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '      # anchors; update these comments if top-level steps move.',
     '      - name: 🧱 Setup Nix/devenv',
     '        id: setup',
-    '        uses: ./.github/actions/setup-devenv',
+    ...setupDevenvUsesLines(),
   );
   if (isSmoothBricksCodebasePackageName(options.repoName)) {
     lines.push(
@@ -1279,7 +1291,7 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '        # verified artifacts are restored, so this job still needs the full',
     '        # toolchain even though current release publishing is prebuilt-only.',
     '        id: setup',
-    '        uses: ./.github/actions/setup-devenv',
+    ...setupDevenvUsesLines(),
     '',
     `      # Step ${stepNumber++}`,
     ...artifactStepLines(options.actionsProvider, '📥 Download candidate artifacts', 'download', [

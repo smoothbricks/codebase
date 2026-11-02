@@ -66,6 +66,9 @@ jobs:
       - name: 🧱 Setup Nix/devenv
         id: setup
         uses: ./.github/actions/setup-devenv
+        with:
+          records-workflow: CI
+          records-job: main
 
       # Step 4
       - name: 🤖 Configure release author
@@ -249,6 +252,9 @@ jobs:
       - name: 🧱 Setup Nix/devenv
         id: setup
         uses: ./.github/actions/setup-devenv
+        with:
+          records-workflow: CI
+          records-job: main
 
       # Step 4
       - name: 🏗️ Build smoo Nx version actions
@@ -349,6 +355,9 @@ jobs:
         # toolchain even though current release publishing is prebuilt-only.
         id: setup
         uses: ./.github/actions/setup-devenv
+        with:
+          records-workflow: CI
+          records-job: main
 
       # Step 4
       - name: 📥 Download candidate artifacts
