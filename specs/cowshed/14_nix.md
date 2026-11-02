@@ -93,10 +93,12 @@ action storage and restoration. That sysroot is keyed by the toolchain parts a c
 where it is installed: the compiler, its `rustc_driver` and what the sysroot holds for the compilation's own target. A
 unit built in a shed under the base shell therefore restores in a land gate under `devenv -P linux-cross`, whose added
 musl std only musl units use, while a different compiler, driver or standard library for the unit's target keys apart;
-arbitrary sysroot overrides gain no mapping. A Clippy reached through a profile link is run by its resolved path, so the
-`RUSTC_WORKSPACE_WRAPPER` Cargo hashes into every workspace member's `-C metadata` names the toolchain's own
-`clippy-driver`, the same path under every profile that links the toolchain; a lint after a profile rebuild, or through
-another profile of the same toolchain, still looks its members up. Reservation and compiler-admission waits block on
+arbitrary sysroot overrides gain no mapping. Clippy gets the bare name `clippy-driver` as its `RUSTC_WORKSPACE_WRAPPER`
+when the one on `PATH` is the driver `cargo-clippy` chose, so the name Cargo hashes into every workspace member's
+`-C metadata` is the same under every installation of a toolchain (a profile's link, that profile's next build, a second
+profile of it such as the land gate's `devenv -P linux-cross`) and a lint under one looks up the members another stored,
+each installation running its own driver, which mbx keys by its identity as before; a different driver, such as a rustup
+toolchain's behind a proxy, keeps the path `cargo-clippy` chose. Reservation and compiler-admission waits block on
 kqueue/inotify with domain-qualified, rate-limited shared rescue scans for crash recovery instead of per-waiter polling.
 The short session root is the canonical environment's (11_shell.md, "Canonical mbx environment"), not a new namespace or
 sandbox grant (04_sandbox.md, "Fixture roots under /tmp"; 08_testing.md, "Fixtures"; 01c_macos.md, "sun_path is 104
