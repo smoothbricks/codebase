@@ -115,7 +115,7 @@
     },
     "packages/columine": {
       "name": "@smoothbricks/columine",
-      "version": "0.3.5-next.0",
+      "version": "0.3.5",
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
         "@uwdata/flechette": "^2.7.0",
@@ -124,7 +124,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.4.7-next.0",
+      "version": "0.4.7",
       "bin": {
         "cowshed": "./bin/cowshed",
       },
