@@ -10055,11 +10055,11 @@ fn stdin_info(stdin: &StdinSource) -> StdinInfo {
             workspace_path: None,
             complete: false,
         },
-        StdinSource::Inline(bytes) => StdinInfo {
+        StdinSource::Inline(_) => StdinInfo {
             kind: StdinKind::Inline,
             bytes: 0,
             workspace_path: None,
-            complete: bytes.is_empty(),
+            complete: false,
         },
         StdinSource::Stream(_) | StdinSource::Open => StdinInfo {
             kind: StdinKind::Stream,

@@ -1254,6 +1254,19 @@ async fn host_controller_each_command_has_its_own_cwd_env_streams_status_and_std
     .await
     .ok();
     assert_eq!(echoed.stdout, "piped input");
+    let ended = run(
+        &handle,
+        ExecRequest {
+            stdin: StdinSource::Inline(bytes::Bytes::new()),
+            ..request(&["/bin/cat"])
+        },
+    )
+    .await
+    .ok();
+    assert_eq!(
+        ended.stdout, "",
+        "empty inline input is ended input: cat reads EOF and exits"
+    );
 
     // Proven absent before the spawn: the supervisor refuses it (not-found, wrapper code 102),
     // names the program, instead of the host's exec failing 127, and types it unlaunched.

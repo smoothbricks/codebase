@@ -4207,6 +4207,33 @@ async fn a_served_supervisor_runs_a_job_exactly_as_the_in_process_one_does() {
     );
 }
 
+/// Inline input that is all written is ended input (07_api.md `StdinInfo.complete`): an empty
+/// `Inline` source closes the child's stdin as an `Empty` one does, so a reader of it
+/// (`git hash-object --stdin`, `cat`) sees EOF instead of waiting forever.
+#[tokio::test]
+async fn an_empty_inline_stdin_ends_the_jobs_stdin_as_an_empty_one_does() {
+    let (mut h, _root) = harness(1, 1024, false, false);
+    for stdin in [StdinSource::Empty, StdinSource::Inline(Bytes::new())] {
+        let job = h
+            .handle
+            .exec(None, None, request(stdin), AdmissionSource::Worker)
+            .await
+            .unwrap();
+        let spawned = h.spawned.recv().await.unwrap();
+        assert_eq!(spawned.request.job_id, job);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), h.process.recv())
+                .await
+                .expect("the job's stdin closes once its input is written")
+                .unwrap(),
+            ProcessObservation::StdinClosed(job)
+        );
+        assert!(h.handle.info(job).await.unwrap().stdin.complete);
+        complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+        h.handle.wait(job).await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_served_supervisor_answers_a_tail_as_the_in_process_one_does() {
     let (mut h, _root) = harness(1, 1024, false, false);
