@@ -4222,11 +4222,9 @@ async fn an_empty_inline_stdin_ends_the_jobs_stdin_as_an_empty_one_does() {
         let spawned = h.spawned.recv().await.unwrap();
         assert_eq!(spawned.request.job_id, job);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), h.process.recv())
-                .await
-                .expect("the job's stdin closes once its input is written")
-                .unwrap(),
-            ProcessObservation::StdinClosed(job)
+            h.process.recv().await.unwrap(),
+            ProcessObservation::StdinClosed(job),
+            "the job's stdin closes once its input is written"
         );
         assert!(h.handle.info(job).await.unwrap().stdin.complete);
         complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
