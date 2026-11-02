@@ -2052,7 +2052,8 @@ fn resident(class: ExecClass) -> bool {
 /// One job's reads, as a client of a draining supervisor makes them, and who may still make them.
 #[derive(Default)]
 struct Owed {
-    /// A `wait`, `hold` or `sealed` answer carried the job's end.
+    /// A `wait`, `hold` or `sealed` answer, or a status answer whose state is terminal, carried the
+    /// job's end.
     end: bool,
     /// Per stream (stdout, stderr): a `logRead` was answered, and whether one answered EOF.
     /// A client that reads no stream owes none.
@@ -2754,6 +2755,7 @@ async fn serve_call(
         value,
         bytes,
         admitted,
+        ended,
     } = match heartbeating(
         &mut stream,
         || pulse(supervisor, reads.map(|(job, _)| job)),
@@ -2811,6 +2813,11 @@ async fn serve_call(
                 owed.eof[stream] |= eof;
             }
         });
+    }
+    if answered.is_ok()
+        && let Some(job) = ended
+    {
+        owed.record(job, |owed| owed.end = true);
     }
     answered.map(|()| Retirement::Serving)
 }
@@ -3042,6 +3049,9 @@ struct Answer {
     value: serde_json::Value,
     bytes: Bytes,
     admitted: Option<JobId>,
+    /// A job whose end this answer carried to its client: a status answer whose state is terminal
+    /// (11_shell.md "Draining a supervisor of another build").
+    ended: Option<JobId>,
 }
 
 async fn answer(
@@ -3054,6 +3064,7 @@ async fn answer(
         |wire: SessionWire| SessionToken::remote(supervisor.snapshot(), wire.identity, wire.name);
     let unit = || to_value(&());
     let mut admitted = None;
+    let mut ended = None;
     let (value, bytes) = match call {
         Call::OpenSession { name } => {
             let token = supervisor.open_session(name).await?;
@@ -3166,7 +3177,11 @@ async fn answer(
             }
             (unit()?, Bytes::new())
         }
-        Call::Info { job_id } => (to_value(&supervisor.info(job_id).await?)?, Bytes::new()),
+        Call::Info { job_id } => {
+            let info = supervisor.info(job_id).await?;
+            ended = info.state.is_terminal().then_some(job_id);
+            (to_value(&info)?, Bytes::new())
+        }
         Call::Sealed { job_id } => (to_value(&supervisor.sealed(job_id).await?)?, Bytes::new()),
         Call::Resources { job_id } => (
             to_value(&supervisor.resources(job_id).await?)?,
@@ -3256,6 +3271,7 @@ async fn answer(
         value,
         bytes,
         admitted,
+        ended,
     })
 }
 

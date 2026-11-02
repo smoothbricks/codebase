@@ -1405,12 +1405,15 @@ workspace's next supervisor is of another, whose protocol they cannot speak: mea
 replaced build came back for its job's end after the job had ended, found its supervisor retired, and was refused by the
 new build's daemon, so a job that succeeded reported failure. So once its last job has ended, a draining supervisor
 keeps answering its clients; it admits nothing, since `drain` closed admission. Each job running when it was asked to
-drain is owed until one of the processes it is owed to has read its end (a `wait`, `hold` or `sealed` answer carried it)
-and read to EOF every stream it was reading through `logRead`, or until every one of them has exited: a reader that is
-gone reads nothing, and a drain never waits on it. The supervisor retires once every owed job is read or owed to nobody,
-or once 30 minutes pass with no read of an owed job (the idle retirement's bound), so a live reader that never reads, or
-a reader whose exit cannot be seen, cannot keep it serving. A job no process asked about, such as the daemon the Nx
-keeper starts for the supervisor itself, is owed to nobody: once it has ended it holds the drain for nothing (measured
+drain is owed until one of the processes it is owed to has read its end (a `wait`, `hold` or `sealed` answer, or a
+status answer whose state is terminal, carried it) and read to EOF every stream it was reading through `logRead`, or
+until every one of them has exited: a reader that is gone reads nothing, and a drain never waits on it. The supervisor
+retires once every owed job is read or owed to nobody, or once 30 minutes pass with no read of an owed job (the idle
+retirement's bound), so a live reader that never reads, or a reader whose exit cannot be seen, cannot keep it serving. A
+client that polls a job's status reads its end as surely as one that waits on it: measured 2026-11-02, an embedder that
+reads every job's end from its status left each drained supervisor of its sheds serving out the full bound with that end
+unread, refusing every command of the shed meanwhile. A job no process asked about, such as the daemon the Nx keeper
+starts for the supervisor itself, is owed to nobody: once it has ended it holds the drain for nothing (measured
 2026-10-27: each shed whose keeper ran a daemon refused the new build's commands for the full bound after an install,
 its report waiting on that daemon's end). Only a read of an owed job starts that bound over: a `hello`, a `drain`, a
 refused command of another build or membership traffic reads nothing. Measured 2026-10-22: a drained supervisor whose

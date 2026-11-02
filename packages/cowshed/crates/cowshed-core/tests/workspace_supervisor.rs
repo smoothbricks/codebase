@@ -6161,6 +6161,57 @@ async fn a_drained_supervisor_serves_a_job_s_end_to_a_client_that_comes_back_for
         .unwrap();
 }
 
+/// Measured 2026-11-02: after an install, the drained supervisor of an embedder's shed served out the
+/// 30-minute bound with one job's end unread (`{"for":"reads","unread":[396]}`) and refused every
+/// command of that shed meanwhile: the embedder's executor reads a job's end from its status, never through
+/// `wait`, `hold` or `sealed`. A status answer whose state is terminal carries the end as much as a
+/// `wait` answer does, so the drain counts it as read.
+#[tokio::test]
+async fn a_drained_supervisor_retires_once_a_status_answer_carried_a_job_s_end() {
+    use cowshed_core::runtime::supervisor_socket;
+    let (mut h, _root, release) = harness_holding_first_spawn();
+    let path = SocketPath::new();
+    let listener = supervisor_socket::bind(&path).await.unwrap();
+    let server = tokio::spawn(supervisor_socket::serve(
+        listener,
+        h.handle.clone(),
+        None,
+        None,
+    ));
+    let remote = supervisor_socket::connect(path.clone(), authority());
+    let job = remote
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    // The actor holds the job's spawn turn from here until `release`.
+    let spawned = h.spawned.recv().await.unwrap();
+    supervisor_socket::drain(&path).await.unwrap();
+    complete(&spawned, b"done", b"", ExitStatus::Exited { code: 0 }).await;
+    release.send(()).expect("the actor holds its spawn turn");
+    let report = path.with_extension("drain");
+    let unread = publication::read_when(report, |report| report["waits"]["for"] == "reads").await;
+    assert_eq!(
+        unread["waits"]["unread"],
+        serde_json::json!([job.get()]),
+        "the job ended and no answer carried its end yet"
+    );
+
+    assert_eq!(
+        remote.info(job).await.expect("its status").state,
+        JobState::Exited
+    );
+    tokio::time::timeout(Duration::from_secs(60), server)
+        .await
+        .expect("whole-leg watchdog: it retires once a status answer carried the end, not after the idle bound")
+        .expect("the serving task")
+        .unwrap();
+}
+
 /// Measured 2026-10-21: a supervisor whose 17 jobs had all ended refused every exec as
 /// "quiescing or retired" for hours. A caller in another process had quiesced it and gone before
 /// it asked the retirement, which was a second request; nothing returns a supervisor to running,
