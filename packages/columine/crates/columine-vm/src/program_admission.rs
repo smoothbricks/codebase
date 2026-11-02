@@ -570,7 +570,7 @@ impl From<InvalidSource> for ProgramAdmissionError {
 #[cfg(test)]
 mod tests {
     use columine_types::PROGRAM_MAGIC;
-    use columine_types::types::ErrorCode;
+    use columine_types::types::{CmpType, ErrorCode};
     use columine_types::vo::{
         UnavailableVoAdmission, VoAdmissionError, VoFieldLink, VoMetadata, VoProfile,
         VoProgramMetadata, VoRefusal,
@@ -579,7 +579,7 @@ mod tests {
     use super::{AdmittedProgram, InputAdmissionError, ProgramScratch};
     use crate::program_inputs::InputPlan;
     use crate::row_exprs::{
-        BatchView, Binding, LiveColumns, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression,
+        BatchView, Binding, LiveColumns, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression,
     };
 
     /// The derived column the FOR_EACH reads its type from.
@@ -597,7 +597,12 @@ mod tests {
     struct Constant;
 
     impl RowExpression for Constant {
-        fn admit(&mut self, expr: &[u8], _: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+        fn admit(
+            &mut self,
+            expr: &[u8],
+            _: CmpType,
+            _: &BatchView<'_>,
+        ) -> Result<Binding, ErrorCode> {
             match expr {
                 [_] | [_, 1] => Ok(Binding::Bound),
                 [_, 0] => Ok(Binding::Live),
@@ -605,14 +610,22 @@ mod tests {
             }
         }
 
-        fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, _: u32) -> Result<u32, ErrorCode> {
+        fn eval(
+            &mut self,
+            expr: &[u8],
+            _: CmpType,
+            batch: &BatchView<'_>,
+            _: u32,
+        ) -> Result<RowCell, ErrorCode> {
             let state = batch.state.first().copied().unwrap_or(0);
-            Ok(u32::from(expr[0])
-                + if expr == [expr[0], 0] {
-                    u32::from(state)
-                } else {
-                    0
-                })
+            Ok(RowCell::U32(
+                u32::from(expr[0])
+                    + if expr == [expr[0], 0] {
+                        u32::from(state)
+                    } else {
+                        0
+                    },
+            ))
         }
     }
 

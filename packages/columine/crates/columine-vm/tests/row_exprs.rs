@@ -3,10 +3,10 @@
 //! spliced into the batch so dispatch reads the derived column like input.
 
 use columine_types::PROGRAM_MAGIC;
-use columine_types::types::{ChangeFlag, ErrorCode, StructFieldType};
+use columine_types::types::{ChangeFlag, CmpType, ErrorCode, StructFieldType};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
-    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression, bind_row_columns,
+    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::struct_map::StructMapSlot;
@@ -158,7 +158,12 @@ struct Threshold {
 }
 
 impl RowExpression for Threshold {
-    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+    fn admit(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+    ) -> Result<Binding, ErrorCode> {
         self.admitted += 1;
         if expr.len() != 5 {
             return Err(ErrorCode::InvalidProgram);
@@ -171,12 +176,18 @@ impl RowExpression for Threshold {
             .ok_or(ErrorCode::ColumnUnderrun)
     }
 
-    fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
+    fn eval(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+        row: u32,
+    ) -> Result<RowCell, ErrorCode> {
         self.evaluated += 1;
         let cells = col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
             .expect("admit proved coverage");
         let threshold = u32::from_le_bytes([expr[1], expr[2], expr[3], expr[4]]);
-        Ok(u32::from(cells[row as usize] > threshold))
+        Ok(RowCell::U32(u32::from(cells[row as usize] > threshold)))
     }
 }
 
@@ -509,24 +520,35 @@ struct Competes {
 }
 
 impl RowExpression for Competes {
-    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+    fn admit(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+    ) -> Result<Binding, ErrorCode> {
         if expr.len() != 2 || expr.iter().any(|&c| usize::from(c) >= batch.num_cols()) {
             return Err(ErrorCode::InvalidProgram);
         }
         Ok(Binding::Live)
     }
 
-    fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
+    fn eval(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+        row: u32,
+    ) -> Result<RowCell, ErrorCode> {
         self.evaluated += 1;
         let key = col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
             .expect("key column")[row as usize];
         let val = col_u32_exact(batch.column(u32::from(expr[1])), batch.batch_len)
             .expect("value column")[row as usize];
         let stored = CheckedMap::bind(batch.state, 0)?.get(key);
-        Ok(match stored {
+        Ok(RowCell::U32(match stored {
             None => 1,
             Some(stored) => u32::from(val > stored),
-        })
+        }))
     }
 }
 
@@ -942,18 +964,29 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
         competes: Competes,
     }
     impl RowExpression for Both {
-        fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+        fn admit(
+            &mut self,
+            expr: &[u8],
+            _: CmpType,
+            batch: &BatchView<'_>,
+        ) -> Result<Binding, ErrorCode> {
             if expr.len() == 5 {
-                self.threshold.admit(expr, batch)
+                self.threshold.admit(expr, CmpType::U32, batch)
             } else {
-                self.competes.admit(expr, batch)
+                self.competes.admit(expr, CmpType::U32, batch)
             }
         }
-        fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
+        fn eval(
+            &mut self,
+            expr: &[u8],
+            _: CmpType,
+            batch: &BatchView<'_>,
+            row: u32,
+        ) -> Result<RowCell, ErrorCode> {
             if expr.len() == 5 {
-                self.threshold.eval(expr, batch, row)
+                self.threshold.eval(expr, CmpType::U32, batch, row)
             } else {
-                self.competes.eval(expr, batch, row)
+                self.competes.eval(expr, CmpType::U32, batch, row)
             }
         }
     }
@@ -1038,7 +1071,12 @@ struct Copy {
 }
 
 impl RowExpression for Copy {
-    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+    fn admit(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+    ) -> Result<Binding, ErrorCode> {
         if expr.len() != 1 || usize::from(expr[0]) >= batch.num_cols() {
             return Err(ErrorCode::InvalidProgram);
         }
@@ -1047,10 +1085,16 @@ impl RowExpression for Copy {
             .ok_or(ErrorCode::ColumnUnderrun)
     }
 
-    fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
+    fn eval(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+        row: u32,
+    ) -> Result<RowCell, ErrorCode> {
         let cells = col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
             .expect("admit proved coverage");
-        Ok(cells[row as usize])
+        Ok(RowCell::U32(cells[row as usize]))
     }
 }
 
@@ -1272,7 +1316,12 @@ struct StoredRetention {
 }
 
 impl RowExpression for StoredRetention {
-    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+    fn admit(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+    ) -> Result<Binding, ErrorCode> {
         assert!(batch.stored_row().is_none());
         if expr != [0] {
             return Err(ErrorCode::InvalidProgram);
@@ -1285,9 +1334,10 @@ impl RowExpression for StoredRetention {
     fn eval(
         &mut self,
         _: &[u8],
+        _: CmpType,
         batch: &BatchView<'_>,
         logical_row: u32,
-    ) -> Result<u32, ErrorCode> {
+    ) -> Result<RowCell, ErrorCode> {
         self.evaluated += 1;
         if self.fail_after == Some(self.evaluated) {
             return Err(ErrorCode::InvalidCellValue);
@@ -1311,19 +1361,19 @@ impl RowExpression for StoredRetention {
                 .transpose()
         };
         if field(0)? != Some(1) {
-            return Ok(0);
+            return Ok(RowCell::U32(0));
         }
         let Some(at) = field(1)? else {
-            return Ok(0);
+            return Ok(RowCell::U32(0));
         };
         let clock = col_u32_exact(batch.column(u32::from(VAL_COL)), batch.batch_len)
             .ok_or(ErrorCode::ColumnUnderrun)?;
         let logical_row = usize::try_from(logical_row).map_err(|_| ErrorCode::InvalidProgram)?;
-        Ok(u32::from(
+        Ok(RowCell::U32(u32::from(
             clock[logical_row]
                 .checked_sub(at)
                 .is_some_and(|elapsed| elapsed >= 50),
-        ))
+        )))
     }
 }
 

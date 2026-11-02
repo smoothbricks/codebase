@@ -120,6 +120,11 @@ pub fn i64s_as_bytes(v: &[i64]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 8) }
 }
 
+pub(crate) fn u64s_as_bytes(v: &[u64]) -> &[u8] {
+    // SAFETY: as in `u32s_as_bytes`.
+    unsafe { core::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 8) }
+}
+
 /// View a batch column as i64 cells; see [`col_u32`] for extent rules.
 pub fn col_i64(col: &[u8], batch_len: u32) -> &[i64] {
     let usable = (col.len() & !7).min(batch_len as usize * 8);

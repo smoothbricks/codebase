@@ -17,11 +17,12 @@
 //! ## Table encoding (little-endian, immediately after the reduce section)
 //!
 //! ```text
-//! u32   magic "RXP1"
+//! u32   magic "RXP1" or "RXP2"
 //! u16   count
 //! index type_col          column holding each row's u32 event-type id
 //! count × {
 //!   index target_col      column the entry produces (replaced in the batch)
+//!   u8    lane            RXP2 only: the entry's cell lane, a `CmpType`
 //!   index match_count     ≥ 1
 //!   u32 × match_count     event-type ids whose rows are evaluated
 //!   u16 expr_len
@@ -38,6 +39,20 @@
 //! through [`BatchView::column`], so a derived value can feed a derived
 //! predicate. A program whose content ends with the reduce section carries
 //! no table and binds nothing.
+//!
+//! ## Cell lanes
+//!
+//! An entry's lane is the cell its column holds: a u32, or an f64 or an i64
+//! in eight little-endian bytes, spelled as the [`CmpType`] a comparing
+//! upsert names its input with. Every RXP1 entry is u32, and a compiler
+//! writes RXP2 only when an entry is wide. The evaluator answers each row in
+//! its entry's lane ([`RowCell`]); the bind refuses a cell of another lane
+//! with `InvalidCellValue`. The reduce section reads a wide column as it
+//! reads a host column of that lane: an f64 or i64 aggregate, a FLOAT64 or
+//! INT64 struct-map or struct-list field, a comparison or timestamp operand
+//! of that lane. A program that reads a wide column at any other lane is
+//! refused with `InvalidProgram` (see [`column_uses`]): a u32 operand would
+//! take half a cell as data. The table's type column is u32.
 //!
 //! ## Bound and live entries
 //!
@@ -68,17 +83,21 @@
 
 use columine_types::operand::Operands;
 use columine_types::types::{
-    ErrorCode, ProgramHeader, SlotType, StructFieldType, is_arena_field_type, struct_field_size,
+    CmpType, ErrorCode, ProgramHeader, SlotType, StructFieldType, is_arena_field_type,
+    struct_field_size,
 };
 
 use crate::bytes;
-use crate::column_uses::{ColumnUse, reduce_column_uses};
+use crate::column_uses::{ColumnUse, reduce_column_reads};
 use crate::key_index::{InternBytes, KeyCx, KeyIndex};
 use crate::struct_map::{StructMap2Slot, StructMapSlot, StructRows};
-use crate::vm::{col_at, col_u32, col_u32_exact, u32s_as_bytes};
+use crate::vm::{col_at, col_u32, col_u32_exact, u64s_as_bytes};
 
 /// ASCII `R X P 1` in little-endian wire order.
 pub const ROW_EXPRESSIONS_MAGIC: u32 = 0x3150_5852;
+
+/// ASCII `R X P 2`: the table whose entries name their cell lane.
+pub const LANED_ROW_EXPRESSIONS_MAGIC: u32 = 0x3250_5852;
 
 /// Magic and entry count: the fixed part of the table header.
 const TABLE_FIXED_BYTES: usize = 4 + 2;
@@ -215,9 +234,11 @@ pub struct BatchView<'a> {
     pub state: &'a [u8],
     pub batch_len: u32,
     cols: &'a [&'a [u8]],
-    /// Target column of each earlier entry, parallel to `derived`.
+    /// Target column of each earlier entry, parallel to `derived_lanes` and
+    /// `derived`.
     derived_targets: &'a [u32],
-    derived: &'a [Vec<u32>],
+    derived_lanes: &'a [CmpType],
+    derived: &'a [Vec<u64>],
     stored: StoredBinding<'a>,
 }
 
@@ -230,6 +251,7 @@ impl<'a> BatchView<'a> {
             batch_len,
             cols,
             derived_targets: &[],
+            derived_lanes: &[],
             derived: &[],
             stored: StoredBinding::Unbound,
         }
@@ -240,9 +262,16 @@ impl<'a> BatchView<'a> {
     /// host's count, like [`col_at`]).
     pub fn column(&self, col: u32) -> &'a [u8] {
         match self.derived_targets.iter().position(|&t| t == col) {
-            Some(i) => u32s_as_bytes(&self.derived[i]),
+            Some(i) => lane_bytes(&self.derived[i], self.derived_lanes[i], self.batch_len),
             None => col_at(self.cols, col as usize),
         }
+    }
+
+    /// The lane of column `col` when an earlier entry derived it; `None` for
+    /// a host column, whose lane only the program's readers name.
+    pub fn derived_lane(&self, col: u32) -> Option<CmpType> {
+        let i = self.derived_targets.iter().position(|&t| t == col)?;
+        Some(self.derived_lanes[i])
     }
 
     /// The stored row in scope, when there is one: absent during ordinary
@@ -287,6 +316,14 @@ pub enum Binding {
     Live,
 }
 
+/// One row's cell, in the lane of the entry it answers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RowCell {
+    U32(u32),
+    F64(f64),
+    I64(i64),
+}
+
 /// The embedder's expression evaluator. Its answer for an expression is a
 /// function of the expression bytes, the batch's columns and the state at
 /// the row: a resume over retained cells evaluates its deferred entries
@@ -295,14 +332,27 @@ pub enum Binding {
 pub trait RowExpression {
     /// Validate one entry's expression against the batch before any row is
     /// evaluated, and answer how it binds: every column it reads must cover
-    /// `batch_len`, so per-row evaluation is infallible on that axis. A
-    /// malformed expression is `InvalidProgram`; a short column is
+    /// `batch_len`, so per-row evaluation is infallible on that axis. `lane`
+    /// is the cell the entry's column holds. A malformed expression, or one
+    /// that cannot answer `lane`, is `InvalidProgram`; a short column is
     /// `ColumnUnderrun`.
-    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode>;
+    fn admit(
+        &mut self,
+        expr: &[u8],
+        lane: CmpType,
+        batch: &BatchView<'_>,
+    ) -> Result<Binding, ErrorCode>;
 
-    /// Evaluate the expression for one row and answer the u32 cell to store.
-    /// A value the cell cannot hold is `InvalidCellValue`.
-    fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode>;
+    /// Evaluate the expression for one row and answer the cell to store, in
+    /// `lane`. A value `lane` cannot hold is `InvalidCellValue`, and the bind
+    /// refuses a cell of another lane the same way.
+    fn eval(
+        &mut self,
+        expr: &[u8],
+        lane: CmpType,
+        batch: &BatchView<'_>,
+        row: u32,
+    ) -> Result<RowCell, ErrorCode>;
 }
 
 /// Storage for the derived columns of one batch. Owned by the embedder's
@@ -310,7 +360,11 @@ pub trait RowExpression {
 /// is wider or longer than every batch before it.
 #[derive(Debug)]
 pub struct RowColumns {
-    cells: Vec<Vec<u32>>,
+    /// Each entry's cells in 8-byte words, so an f64 or i64 column is
+    /// aligned for its typed view: two u32 cells to a word, or one wide cell.
+    cells: Vec<Vec<u64>>,
+    /// Each entry's lane, parallel to `cells` and `targets`.
+    lanes: Vec<CmpType>,
     targets: Vec<u32>,
     /// The entries the last bind deferred, in table order, parsed once at
     /// bind: the per-row read indexes them, it never re-parses the table.
@@ -345,6 +399,8 @@ struct LiveEntry {
     match_ids: Range,
     /// Program range of the expression bytes.
     expr: Range,
+    /// The entry's lane: a live cell is read as a u32 predicate.
+    lane: CmpType,
 }
 
 /// A `start..end` byte range, `Copy` so an entry stays a plain record.
@@ -364,6 +420,7 @@ impl RowColumns {
     pub const fn new() -> Self {
         Self {
             cells: Vec::new(),
+            lanes: Vec::new(),
             targets: Vec::new(),
             live: Vec::new(),
             live_index: Vec::new(),
@@ -430,10 +487,11 @@ impl RowColumns {
         (index != NOT_LIVE).then_some(index as usize)
     }
 
-    /// The derived column bound at table position `entry`, for tests and
-    /// diagnostics; the batch reads it through the spliced column set.
-    pub fn column(&self, entry: usize) -> Option<&[u32]> {
-        self.cells.get(entry).map(Vec::as_slice)
+    /// The lane of the wide entry whose cells column `col` holds after the
+    /// splice: the last entry targeting a column is the one spliced.
+    fn wide_lane(&self, col: u32) -> Option<CmpType> {
+        let entry = self.targets.iter().rposition(|&target| target == col)?;
+        Some(self.lanes[entry]).filter(|&lane| lane != CmpType::U32)
     }
 
     /// Replace every target column in `cols` with the cells the last bind
@@ -441,11 +499,12 @@ impl RowColumns {
     /// host that rebuilds its column set from the same batch (a resumed
     /// run must see the derived columns the run it resumes saw).
     pub fn splice<'a>(&'a self, cols: &mut [&'a [u8]]) -> Result<(), ErrorCode> {
-        for (cells, &target) in self.cells.iter().zip(&self.targets) {
+        let entries = self.cells.iter().zip(&self.lanes).zip(&self.targets);
+        for ((cells, &lane), &target) in entries {
             let col = cols
                 .get_mut(target as usize)
                 .ok_or(ErrorCode::InvalidProgram)?;
-            *col = u32s_as_bytes(cells);
+            *col = lane_bytes(cells, lane, self.batch_len);
         }
         Ok(())
     }
@@ -512,6 +571,12 @@ impl LiveColumns<'_, '_> {
     ) -> Option<Result<u32, ErrorCode>> {
         let rows = self.rows;
         let entry = rows.live[rows.live_entry(col)?];
+        // A live cell is a predicate's, read as a u32: the bind refuses a
+        // program that reads a wide live column, so only a direct read of
+        // one lands here.
+        if entry.lane != CmpType::U32 {
+            return Some(Err(ErrorCode::InvalidProgram));
+        }
         let type_cell = col_u32(col_at(cols, rows.type_col as usize), rows.batch_len)
             .get(row as usize)
             .copied();
@@ -524,7 +589,11 @@ impl LiveColumns<'_, '_> {
         let expr = &self.program[entry.expr.start..entry.expr.end];
         let mut batch = BatchView::host(state, cols, rows.batch_len);
         batch.stored = stored;
-        Some(self.eval.eval(expr, &batch, row))
+        Some(match self.eval.eval(expr, CmpType::U32, &batch, row) {
+            Ok(RowCell::U32(cell)) => Ok(cell),
+            Ok(RowCell::F64(_) | RowCell::I64(_)) => Err(ErrorCode::InvalidCellValue),
+            Err(code) => Err(code),
+        })
     }
 }
 
@@ -540,6 +609,7 @@ fn matches(match_ids: &[u8], type_id: u32) -> bool {
 
 struct Entry<'a> {
     target_col: u32,
+    lane: CmpType,
     /// Raw `u32le × match_count` bytes; decoded per comparison so the entry
     /// borrows the program instead of collecting the ids.
     match_ids: &'a [u8],
@@ -558,7 +628,7 @@ impl Entry<'_> {
 
 /// The row-expression table of `program`: `None` when the content ends with
 /// the reduce section. A program too short for its own header, or a trailer
-/// that does not open with the table magic, is `InvalidProgram`.
+/// that does not open with an RXP1 or RXP2 magic, is `InvalidProgram`.
 pub(crate) fn row_table(program: &[u8]) -> Result<Option<&[u8]>, ErrorCode> {
     let trailer = ProgramHeader::sections(program)
         .ok_or(ErrorCode::InvalidProgram)?
@@ -566,16 +636,30 @@ pub(crate) fn row_table(program: &[u8]) -> Result<Option<&[u8]>, ErrorCode> {
     if trailer.is_empty() {
         return Ok(None);
     }
-    if trailer.len() < TABLE_FIXED_BYTES || bytes::read_u32(trailer, 0) != ROW_EXPRESSIONS_MAGIC {
+    if trailer.len() < TABLE_FIXED_BYTES
+        || !matches!(
+            bytes::read_u32(trailer, 0),
+            ROW_EXPRESSIONS_MAGIC | LANED_ROW_EXPRESSIONS_MAGIC
+        )
+    {
         return Err(ErrorCode::InvalidProgram);
     }
     Ok(Some(trailer))
 }
 
-/// Parse one entry at `*pos`, advancing past it.
-fn parse_entry<'a>(table: &'a [u8], pos: &mut usize) -> Result<Entry<'a>, ErrorCode> {
+/// Parse one entry at `*pos`, advancing past it. An RXP2 entry (`laned`)
+/// names its lane after its target column; an RXP1 entry is u32.
+fn parse_entry<'a>(table: &'a [u8], pos: &mut usize, laned: bool) -> Result<Entry<'a>, ErrorCode> {
     let mut operands = Operands::at(table, *pos);
     let target_col = operands.index().ok_or(ErrorCode::InvalidProgram)?;
+    let lane = if laned {
+        operands
+            .byte()
+            .and_then(CmpType::from_u8)
+            .ok_or(ErrorCode::InvalidProgram)?
+    } else {
+        CmpType::U32
+    };
     let match_count = operands
         .index()
         .and_then(|count| usize::try_from(count).ok())
@@ -598,6 +682,7 @@ fn parse_entry<'a>(table: &'a [u8], pos: &mut usize) -> Result<Entry<'a>, ErrorC
     *pos = operands.pos();
     Ok(Entry {
         target_col,
+        lane,
         match_ids,
         expr,
         match_ids_at: Range {
@@ -621,27 +706,37 @@ impl Range {
     }
 }
 
-/// A live column holds zero placeholder cells; a per-element `*_IF`
-/// predicate or stored-row sweep resolves it through the handle.
-/// The table's type column and every plain read of the reduce section
-/// ([`ColumnUse::Read`]) would take
-/// the zeros as cells, so a program that reads a live column that way is
-/// refused before any column is spliced.
-fn refuse_plain_reads_of_live_columns(
+/// Refuse, before any column is spliced, a program whose reduce section
+/// reads a derived column its cells cannot answer:
+///
+/// - A live column holds zero placeholder cells, which a per-element `*_IF`
+///   predicate or a stored-row sweep resolves through the handle. The
+///   table's type column and every plain read ([`ColumnUse::Read`]) would
+///   take the zeros as cells.
+/// - A wide column holds 8-byte cells of its lane. An operand of another
+///   lane would take half a cell, or the other number type, as data, and
+///   the table's type column is u32. The handle answers u32 predicate cells,
+///   so a wide live column has no reader at all.
+fn refuse_unreadable_columns(
     program: &[u8],
     state: &[u8],
     out: &RowColumns,
 ) -> Result<(), ErrorCode> {
-    if out.live_entry(out.type_col).is_some() {
+    if out.live_entry(out.type_col).is_some() || out.wide_lane(out.type_col).is_some() {
         return Err(ErrorCode::InvalidProgram);
     }
-    let mut plain_read_of_live = false;
-    reduce_column_uses(program, state, &mut |col, use_| {
-        if use_ == ColumnUse::Read && out.live_entry(col).is_some() {
-            plain_read_of_live = true;
-        }
+    let init = ProgramHeader::sections(program)
+        .ok_or(ErrorCode::InvalidProgram)?
+        .init_code;
+    let mut unreadable = false;
+    reduce_column_reads(program, state, &mut |col, usage, lane| {
+        let plain_read_of_live = usage == ColumnUse::Read && out.live_entry(col).is_some();
+        let off_lane = out
+            .wide_lane(col)
+            .is_some_and(|wide| lane.resolve(init) != Some(wide));
+        unreadable |= plain_read_of_live || off_lane;
     })?;
-    if plain_read_of_live {
+    if unreadable {
         return Err(ErrorCode::InvalidProgram);
     }
     Ok(())
@@ -651,6 +746,27 @@ fn refuse_plain_reads_of_live_columns(
 fn room<T>(buf: &mut Vec<T>, additional: usize) -> Result<(), ErrorCode> {
     buf.try_reserve(additional)
         .map_err(|_| ErrorCode::OutOfMemory)
+}
+
+/// The first `batch_len` cells of an entry's words, in `lane`.
+fn lane_bytes(words: &[u64], lane: CmpType, batch_len: u32) -> &[u8] {
+    &u64s_as_bytes(words)[..batch_len as usize * lane.stride()]
+}
+
+/// Store `cell` as row `row` of an entry's words, which start zeroed and take
+/// each row once. A cell of another lane than the entry's is
+/// `InvalidCellValue`.
+fn store(words: &mut [u64], lane: CmpType, row: usize, cell: RowCell) -> Result<(), ErrorCode> {
+    match (lane, cell) {
+        // Two u32 cells to a little-endian word: the even row is its low half.
+        (CmpType::U32, RowCell::U32(value)) => {
+            words[row / 2] |= u64::from(value) << ((row % 2) * 32);
+        }
+        (CmpType::F64, RowCell::F64(value)) => words[row] = value.to_bits(),
+        (CmpType::I64, RowCell::I64(value)) => words[row] = value.cast_unsigned(),
+        _ => return Err(ErrorCode::InvalidCellValue),
+    }
+    Ok(())
 }
 
 /// Evaluate `program`'s row-expression table over the batch and replace each
@@ -676,6 +792,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     // `out` describes this bind only: a table-less program or an empty batch
     // must not leave the previous batch's targets or live entries behind.
     out.targets.clear();
+    out.lanes.clear();
     out.clear_live();
     out.bound = false;
     out.table.clear();
@@ -698,6 +815,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
         });
     }
     let count = usize::from(bytes::read_u16(table, 4));
+    let laned = bytes::read_u32(table, 0) == LANED_ROW_EXPRESSIONS_MAGIC;
     let mut header = Operands::at(table, TABLE_FIXED_BYTES);
     let type_col = header.index().ok_or(ErrorCode::InvalidProgram)?;
     if type_col as usize >= cols.len() {
@@ -715,6 +833,9 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     let have = out.targets.len();
     room(&mut out.targets, count.saturating_sub(have))?;
     out.targets.resize(count, 0);
+    let have = out.lanes.len();
+    room(&mut out.lanes, count.saturating_sub(have))?;
+    out.lanes.resize(count, CmpType::U32);
     out.type_col = type_col;
     out.batch_len = batch_len;
 
@@ -723,11 +844,12 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
         .ok_or(ErrorCode::ColumnUnderrun)?;
     let mut pos = header.pos();
     for i in 0..count {
-        let entry = parse_entry(table, &mut pos)?;
+        let entry = parse_entry(table, &mut pos, laned)?;
         if entry.target_col as usize >= view.len() {
             return Err(ErrorCode::InvalidProgram);
         }
         out.targets[i] = entry.target_col;
+        out.lanes[i] = entry.lane;
         // The entries before `i` are final; this entry reads them and writes
         // only its own cells.
         let (done, rest) = out.cells.split_at_mut(i);
@@ -736,14 +858,16 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
             batch_len,
             cols: view,
             derived_targets: &out.targets[..i],
+            derived_lanes: &out.lanes[..i],
             derived: done,
             stored: StoredBinding::Unbound,
         };
-        let binding = eval.admit(entry.expr, &batch)?;
+        let binding = eval.admit(entry.expr, entry.lane, &batch)?;
         let cells = &mut rest[0];
         cells.clear();
-        room(cells, batch_len as usize)?;
-        cells.resize(batch_len as usize, 0);
+        let words = (batch_len as usize * entry.lane.stride()).div_ceil(8);
+        room(cells, words)?;
+        cells.resize(words, 0);
         if binding == Binding::Live {
             // The zero cells stand in for the column the reduce section
             // reads live; they also keep the column covering the batch.
@@ -763,24 +887,30 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
             out.live.push(LiveEntry {
                 match_ids: entry.match_ids_at.shifted(table_start),
                 expr: entry.expr_at.shifted(table_start),
+                lane: entry.lane,
             });
             continue;
         }
-        for (row, cell) in cells.iter_mut().enumerate() {
-            if !entry.matches(type_cells[row]) {
+        for (row, &type_id) in type_cells.iter().enumerate() {
+            if !entry.matches(type_id) {
                 continue;
             }
             // `row < batch_len`, which is a u32.
             #[allow(clippy::cast_possible_truncation)]
-            let row = row as u32;
-            *cell = eval.eval(entry.expr, &batch, row)?;
+            let at = row as u32;
+            store(
+                cells,
+                entry.lane,
+                row,
+                eval.eval(entry.expr, entry.lane, &batch, at)?,
+            )?;
         }
     }
     if pos != table.len() {
         return Err(ErrorCode::InvalidProgram);
     }
-    if !out.live.is_empty() {
-        refuse_plain_reads_of_live_columns(program, state, out)?;
+    if !out.live.is_empty() || out.lanes.iter().any(|&lane| lane != CmpType::U32) {
+        refuse_unreadable_columns(program, state, out)?;
     }
 
     out.bound = true;

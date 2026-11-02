@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use columine_types::PROGRAM_MAGIC;
-use columine_types::types::ErrorCode;
+use columine_types::types::{CmpType, ErrorCode};
 use columine_vm::row_exprs::{
-    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression, bind_row_columns,
+    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::vm::{CheckedMap, Vm, col_u32_exact, u32s_as_bytes};
@@ -103,29 +103,40 @@ fn table(entries: &[Vec<u8>]) -> Vec<u8> {
 struct Exprs;
 
 impl RowExpression for Exprs {
-    fn admit(&mut self, expr: &[u8], _batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+    fn admit(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        _batch: &BatchView<'_>,
+    ) -> Result<Binding, ErrorCode> {
         match expr[0] {
             0 => Ok(Binding::Bound),
             _ => Ok(Binding::Live),
         }
     }
 
-    fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
+    fn eval(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+        row: u32,
+    ) -> Result<RowCell, ErrorCode> {
         if expr[0] == 0 {
             let cells =
                 col_u32_exact(batch.column(u32::from(expr[1])), batch.batch_len).expect("covered");
             let threshold = u32::from_le_bytes([expr[2], expr[3], expr[4], expr[5]]);
-            return Ok(u32::from(cells[row as usize] > threshold));
+            return Ok(RowCell::U32(u32::from(cells[row as usize] > threshold)));
         }
         let key = col_u32_exact(batch.column(u32::from(expr[1])), batch.batch_len)
             .expect("covered")[row as usize];
         let val = col_u32_exact(batch.column(u32::from(expr[2])), batch.batch_len)
             .expect("covered")[row as usize];
         let stored = CheckedMap::bind(batch.state, 0)?.get(key);
-        Ok(match stored {
+        Ok(RowCell::U32(match stored {
             None => 1,
             Some(stored) => u32::from(val > stored),
-        })
+        }))
     }
 }
 

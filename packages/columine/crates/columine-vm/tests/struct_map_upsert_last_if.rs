@@ -27,13 +27,13 @@ use std::collections::BTreeMap;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::operand::encode_index;
 use columine_types::types::{
-    ErrorCode, NO_PARENT_TS_COL, Opcode, SlotMetaOffset, SlotType, StructFieldType,
+    CmpType, ErrorCode, NO_PARENT_TS_COL, Opcode, SlotMetaOffset, SlotType, StructFieldType,
 };
 use columine_vm::key_index::NoStrings;
 use columine_vm::meta::slot_meta_base;
 use columine_vm::row_exprs::{
-    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression, StoredBinding, StoredRow,
-    bind_row_columns,
+    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression, StoredBinding,
+    StoredRow, bind_row_columns,
 };
 use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_grown_state_size, calculate_state_size, init_state,
@@ -312,7 +312,12 @@ struct LeaseWinner {
 }
 
 impl RowExpression for LeaseWinner {
-    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+    fn admit(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+    ) -> Result<Binding, ErrorCode> {
         if expr != [LEASE_WINNER] || !matches!(batch.stored(), StoredBinding::Unbound) {
             return Err(ErrorCode::InvalidProgram);
         }
@@ -325,7 +330,13 @@ impl RowExpression for LeaseWinner {
         Ok(Binding::Live)
     }
 
-    fn eval(&mut self, _: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
+    fn eval(
+        &mut self,
+        _: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+        row: u32,
+    ) -> Result<RowCell, ErrorCode> {
         self.evaluated += 1;
         let current = match batch.stored() {
             // A conditional upsert always binds `_`; an unbound one is a
@@ -356,7 +367,7 @@ impl RowExpression for LeaseWinner {
             // The predicate reads no incoming until.
             until: 0,
         };
-        Ok(u32::from(lease_winner(current, incoming)))
+        Ok(RowCell::U32(u32::from(lease_winner(current, incoming))))
     }
 }
 
