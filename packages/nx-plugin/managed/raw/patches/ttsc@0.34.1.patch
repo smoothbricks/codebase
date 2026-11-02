@@ -90,6 +90,48 @@ index f6ee81fb1af41deea022b92e838a7c4665eb9778..112faf913ce38b1f4624b38db3783937
  }
  
  // forceNoEmit sets noEmit so the program type-checks without writing files.
+diff --git a/driver/rewrite.go b/driver/rewrite.go
+index 79be74d24e879da216ad680d23ecfeb5f11a29db..fb57c1ac6ef61f72abe75fd118915c7b632c5bb6 100644
+--- a/driver/rewrite.go
++++ b/driver/rewrite.go
+@@ -317,22 +317,28 @@ func (p *Program) emitsBuildInfo() bool {
+ }
+ 
+ // DefaultWriteFile is the default disk writer used when EmitAll's caller does not
+-// supply a custom WriteFile callback. Existing files are normally truncated; a
+-// watch child setting TTSC_WATCH_WRITE_IF_CHANGED=1 preserves byte-identical
+-// regular output files instead. A failed write can leave partial output.
+-// Requested creation modes are subject to the native platform and umask, and
+-// do not replace existing file permissions.
++// supply a custom WriteFile callback. Existing files are normally truncated,
++// which a caller that finds stale outputs by file identity relies on: one that
++// removes each outDir file the emit did not touch (smoo's typescript-emit
++// executor through nx-plugin 0.7.9) would otherwise remove every unchanged
++// output. A watch child setting TTSC_WATCH_WRITE_IF_CHANGED=1, or a caller that
++// prunes its outDir by the emitted-file list and sets TTSC_WRITE_IF_CHANGED=1,
++// preserves byte-identical regular output files instead, inode and mtime
++// included: rewriting identical bytes is file churn every copy-on-write clone of
++// the output pays for. A failed write can leave partial output. Requested
++// creation modes are subject to the native platform and umask, and do not
++// replace existing file permissions.
+ //
+-// @evidence contracts/common.md#principled-implementation The watch-only opt-in compares an existing writable regular output before deciding whether native writing is needed; all other writes use the original directory and file operations.
++// @evidence contracts/common.md#principled-implementation An opted-in emit compares an existing writable regular output before deciding whether native writing is needed; all other writes use the original directory and file operations.
+ // @evidence contracts/common.md#clear-and-simple-design One opt-in decision selects the unchanged-output check or the original writer.
+ // @evidence contracts/common.md#prohibited-implementation-shortcuts Native file identity and bytes decide whether to skip; unknown state falls back to the original writer and its errors.
+-// @evidence contracts/common.md#meaningful-documentation Native prose states normal truncation, watch opt-in, partial failure and permission behavior.
++// @evidence contracts/common.md#meaningful-documentation Native prose states normal truncation, who relies on it, both opt-ins, partial failure and permission behavior.
+ // @evidence contracts/portability.md#os-neutral-implementation filepath.Dir, os.MkdirAll and os.WriteFile preserve native path and permission behavior; the optional check uses native file identity rather than path spelling.
+-// @evidence contracts/performance.md#efficient-algorithms Normal writes retain one directory creation and file write. Watch writes add metadata and streamed comparison of up to the existing output size, then write only when content differs or safe comparison fails; no prior-output cache is retained.
++// @evidence contracts/performance.md#efficient-algorithms Normal writes retain one directory creation and file write. Opted-in writes add metadata and streamed comparison of up to the existing output size, then write only when content differs or safe comparison fails; no prior-output cache is retained.
+ // @evidenceExclude contracts/performance.md#reuse-equivalent-work Each emit write is requested independently; this writer owns no cross-emit reuse coordinator.
+ // @evidence contracts/performance.md#bound-retention-and-release-resources The optional comparison closes its one read/write handle before return or fallback; os.WriteFile owns and closes the later write handle. No output buffer or handle survives this call, while created directories and partial or completed files remain on disk.
+ func DefaultWriteFile(fileName, text string) error {
+-  return writeFileWithWatchMode(fileName, text, os.Getenv("TTSC_WATCH_WRITE_IF_CHANGED") == "1")
++  return writeFileWithWatchMode(fileName, text, os.Getenv("TTSC_WATCH_WRITE_IF_CHANGED") == "1" || os.Getenv("TTSC_WRITE_IF_CHANGED") == "1")
+ }
+ 
+ func defaultWriteFile(fileName, text string) error {
 diff --git a/lib/internal/javascriptRuntimeCapabilities.js b/lib/internal/javascriptRuntimeCapabilities.js
 --- a/lib/internal/javascriptRuntimeCapabilities.js
 +++ b/lib/internal/javascriptRuntimeCapabilities.js

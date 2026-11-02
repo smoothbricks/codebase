@@ -125,12 +125,17 @@ export function buildInputRecord(
   };
 }
 
-/** Writes `record` into `outputDirectory`, replacing any earlier one whole. */
+/**
+ * Writes `record` into `outputDirectory`, replacing any earlier one whole. A record file that already holds exactly this
+ * record keeps its file, inode and mtime included: a rebuild of unchanged inputs rewrites nothing in its output.
+ */
 export function writeBuildInputs(outputDirectory: string, record: BuildInputRecord): void {
   const target = join(outputDirectory, BUILD_INPUTS_FILE);
+  const text = `${JSON.stringify(record, null, 2)}\n`;
+  if (existsSync(target) && readFileSync(target, 'utf8') === text) return;
   mkdirSync(outputDirectory, { recursive: true });
   const staged = `${target}.${process.pid}`;
-  writeFileSync(staged, `${JSON.stringify(record, null, 2)}\n`);
+  writeFileSync(staged, text);
   renameSync(staged, target);
 }
 
