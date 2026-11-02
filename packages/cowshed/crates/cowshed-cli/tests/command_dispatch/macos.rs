@@ -340,8 +340,8 @@ impl Project<'_> {
 /// A fixture checkout is a handful of git, Cargo and file writes that every test repeated; on
 /// the loaded gate each git process took 0.8 s against 75 ms alone. The tree holds no path of
 /// the scratch root it is cloned under, so one per run serves every test. Like the blank image
-/// template, it lives in the runner's template directory and is written aside and moved in
-/// whole, so the next run's sweep reclaims it and a writer killed halfway leaves no template.
+/// template, it lives in the run's template directory ([`checkout_template_directory`]) and is
+/// written aside and moved in whole, so a writer killed halfway leaves no template.
 fn checkout_template(project: Project<'_>) -> PathBuf {
     materialized_template(
         &checkout_template_directory(),
@@ -350,16 +350,99 @@ fn checkout_template(project: Project<'_>) -> PathBuf {
     )
 }
 
+/// This run's template directory, named for the run's process ([`run_process`]): every test
+/// process of the run writes and clones its templates there, and the lane setup's template sweep
+/// takes it by that pid, so only once the run has ended.
 fn checkout_template_directory() -> PathBuf {
-    // SAFETY: `getppid` has no preconditions and cannot fail.
-    let run = unsafe { libc::getppid() };
     let directory = PathBuf::from(format!(
-        "/private/tmp/{}{run}-templates",
-        scratch_directory::cleanup::ROOT_PREFIX
+        "/private/tmp/{}{}-templates",
+        scratch_directory::cleanup::ROOT_PREFIX,
+        run_process()
     ));
     fs::create_dir_all(&directory)
         .unwrap_or_else(|error| panic!("template directory {}: {error}", directory.display()));
     directory
+}
+
+/// The process whose life is this test run: every test process of the run descends from it, and it
+/// outlives them all. nextest names the run (`NEXTEST_RUN_ID`) and starts each test in a process
+/// group of its own, led by whatever wraps the test (its target runner, `mbx-test-runner`, or a run
+/// wrapper), which waits for it: the run's process is the nearest ancestor outside the test's
+/// group, never the test's parent. Outside nextest a run is this one process.
+fn run_process() -> libc::pid_t {
+    // SAFETY: `getpid` has no preconditions and cannot fail.
+    let this = unsafe { libc::getpid() };
+    if std::env::var_os("NEXTEST_RUN_ID").is_none() {
+        return this;
+    }
+    // SAFETY: `getpgrp` and `getppid` have no preconditions and cannot fail.
+    let (group, mut ancestor) = unsafe { (libc::getpgrp(), libc::getppid()) };
+    loop {
+        let info = scratch_namespace::bsd_info(ancestor).unwrap_or_else(|error| {
+            panic!("the run's process: ancestor {ancestor} of test process {this}: {error}")
+        });
+        if libc::pid_t::try_from(info.pbi_pgid).ok() != Some(group) {
+            return ancestor;
+        }
+        ancestor = libc::pid_t::try_from(info.pbi_ppid)
+            .unwrap_or_else(|error| panic!("the run's process: parent of {ancestor}: {error}"));
+    }
+}
+
+/// Every test process of one run clones from one template directory, whatever wraps each test.
+/// nextest starts each test in a process group of its own, led by its target runner
+/// (`mbx-test-runner`) or run wrapper, which waits for the test: a test's parent is its own
+/// wrapper, never the run. Two test processes of one run, each under a wrapper of its own, name
+/// the same directory, named for this process, which plays the run and outlives both; the lane
+/// setup's template sweep takes a directory by the pid its name records, so only after the run.
+#[test]
+fn checkout_templates_are_one_directory_per_run_whatever_wraps_each_test() {
+    use std::os::unix::process::CommandExt as _;
+
+    const PROBE: &str = "COWSHED_TEST_CHECKOUT_TEMPLATE_PROBE";
+    const MARK: &str = "template-directory=";
+    if std::env::var_os(PROBE).is_some() {
+        println!("{MARK}{}", checkout_template_directory().display());
+        return;
+    }
+    let probe = || {
+        // The shell leads the probe's process group and waits for it rather than exec it, as
+        // nextest's target runner does for each test, so it is the probe's parent.
+        let output = Command::new("/bin/sh")
+            .args(["-c", "\"$0\" --exact \"$1\" --nocapture --quiet; exit $?"])
+            .arg(std::env::current_exe().expect("test executable"))
+            .arg("macos::checkout_templates_are_one_directory_per_run_whatever_wraps_each_test")
+            .env(PROBE, "1")
+            .env("NEXTEST_RUN_ID", "one-run-two-wrapped-tests")
+            .process_group(0)
+            .output_bounded()
+            .expect("run a wrapped template probe");
+        let stdout = String::from_utf8(output.stdout).expect("probe stdout");
+        assert!(
+            output.status.success(),
+            "the probe failed\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(MARK))
+            .map(PathBuf::from)
+            .expect("the probe names its template directory")
+    };
+    let (first, second) = (probe(), probe());
+    assert_eq!(
+        first, second,
+        "two test processes of one run share one template directory"
+    );
+    assert_eq!(
+        first,
+        PathBuf::from(format!(
+            "/private/tmp/{}{}-templates",
+            scratch_directory::cleanup::ROOT_PREFIX,
+            std::process::id()
+        )),
+        "the directory is named for the run's process, which outlives every test of the run"
+    );
 }
 
 /// Publish one immutable tree for this runner, under the same lock used by its readers.

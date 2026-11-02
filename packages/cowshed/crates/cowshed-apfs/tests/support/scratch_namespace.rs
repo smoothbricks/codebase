@@ -271,9 +271,10 @@ fn record_owner(root: &Path) -> std::io::Result<()> {
         })
 }
 
-/// When the process `pid` started, as `proc_pidinfo(PROC_PIDTBSDINFO)` reads it; an error when the
-/// kernel will not say: the process is gone or a zombie, or this one may not inspect it.
-pub(super) fn born_at(pid: i32) -> std::io::Result<Born> {
+/// What the kernel says of the process `pid` (`proc_pidinfo(PROC_PIDTBSDINFO)`): its parent,
+/// process group and start among the rest; an error when it will not say: the process is gone or a
+/// zombie, or this one may not inspect it.
+pub(super) fn bsd_info(pid: i32) -> std::io::Result<libc::proc_bsdinfo> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
         .map_err(std::io::Error::other)?;
@@ -302,8 +303,12 @@ pub(super) fn born_at(pid: i32) -> std::io::Result<Born> {
         ));
     }
     // SAFETY: `proc_pidinfo` filled all `size` bytes.
-    let info = unsafe { info.assume_init() };
-    Ok(Born {
+    Ok(unsafe { info.assume_init() })
+}
+
+/// When the process `pid` started ([`bsd_info`]).
+pub(super) fn born_at(pid: i32) -> std::io::Result<Born> {
+    bsd_info(pid).map(|info| Born {
         seconds: info.pbi_start_tvsec,
         microseconds: info.pbi_start_tvusec,
     })

@@ -14,7 +14,7 @@ mod reclaim;
 
 #[path = "scratch_directory_cleanup.rs"]
 mod cleanup;
-use cleanup::{ROOT_PREFIX, reclaim};
+use cleanup::reclaim;
 
 /// Reclaim dead predecessors once before the lane starts fixtures. The setup process owns the
 /// whole pass synchronously; a killed setup records nothing and starts no tests. Another setup
@@ -145,21 +145,7 @@ fn sweep_dead_roots(sweeping: &SweepLock) -> std::io::Result<usize> {
     let mut removed = 0;
     for entry in fs::read_dir("/private/tmp")? {
         let entry = entry?;
-        let name = entry.file_name();
-        let Some(pid) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix(ROOT_PREFIX))
-            .and_then(|suffix| suffix.split('-').next())
-            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
-            .filter(|pid| *pid > 0)
-        else {
-            continue;
-        };
-        // SAFETY: signal zero checks one positive pid without delivering a signal.
-        if unsafe { libc::kill(pid, 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            && entry.file_type()?.is_dir()
-        {
+        if cleanup::dead_recorded_pid(&entry.file_name()).is_some() && entry.file_type()?.is_dir() {
             let path = entry.path();
             sweeping
                 .phase(

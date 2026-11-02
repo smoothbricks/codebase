@@ -360,4 +360,36 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn a_short_directory_is_the_sweeps_only_once_the_process_its_name_records_is_gone() {
+        let mut run = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let named = std::ffi::OsString::from(format!("{ROOT_PREFIX}{}-templates", run.id()));
+        assert_eq!(
+            cleanup::dead_recorded_pid(&named),
+            None,
+            "a live run keeps its directory"
+        );
+        // Its input's end ends `cat`.
+        drop(run.stdin.take());
+        assert!(run.wait_bounded().unwrap().success());
+        assert_eq!(
+            cleanup::dead_recorded_pid(&named),
+            libc::pid_t::try_from(run.id()).ok(),
+            "an ended run's directory is the sweep's"
+        );
+        for unclaimed in [
+            "cowshed-dtest-0-templates",
+            "cowshed-dtest-run-templates",
+            "cowshed-other-1-templates",
+        ] {
+            assert_eq!(
+                cleanup::dead_recorded_pid(std::ffi::OsStr::new(unclaimed)),
+                None
+            );
+        }
+    }
 }
