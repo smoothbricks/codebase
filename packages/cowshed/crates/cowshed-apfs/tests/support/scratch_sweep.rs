@@ -1,10 +1,12 @@
 //! The real-substrate lane's synchronous setup, never a fixture destructor.
 
 use super::scratch_namespace::processes::end_processes_in;
-use super::scratch_namespace::{USER_ROOT, dead_owner, detach_images};
+use super::scratch_namespace::{USER_ROOT, dead_owner, detach_images, tree};
 use cowshed_os::namespace::TestNamespace;
-use cowshed_os::test_backstop::lock_exclusive;
+use cowshed_os::test_backstop::FileBackstop as _;
 use std::fs;
+use std::os::unix::fs::FileExt as _;
+use std::path::Path;
 use std::time::Instant;
 
 #[path = "scratch_reclaim.rs"]
@@ -33,11 +35,15 @@ use cleanup::{ROOT_PREFIX, reclaim};
 /// from a deleted backing file, as a process keeps working in a deleted directory. Ending and
 /// detaching therefore select on the path the kernel still holds, not on what is on disk now.
 /// Processes go first: one working in a dead run's volume would hold that volume attached.
+///
+/// The pass says on stderr each step it starts and how long it took, each dead root by name, and
+/// records the step on the lock for a pass queued behind it ([`SweepLock`]): a setup the runner
+/// ends mid-pass names the work it was in, and a wait for the lock names its holder.
 pub(super) fn sweep_dead_runs(namespace: TestNamespace, run: &str) -> std::io::Result<()> {
     let lock = cowshed_os::scratch::macos_scratch_sweep_lock()?;
     // The completion record shares the canonical lock's directory, never a fixture's tree.
     let record = lock.with_file_name("sweep.run");
-    let _sweeping = lock_exclusive(&lock).inspect_err(|error| {
+    let sweeping = SweepLock::take(&lock, run).inspect_err(|error| {
         cowshed_os::eprintln!("abandoned scratch roots: lock {}: {error}", lock.display());
     })?;
     let recorded = match fs::read(&record) {
@@ -53,15 +59,26 @@ pub(super) fn sweep_dead_runs(namespace: TestNamespace, run: &str) -> std::io::R
         run,
         recorded.as_deref(),
         || {
-            let directory_roots = sweep_dead_roots()?;
-            end_processes_in(|path| dead_owner(path).is_some()).inspect_err(|error| {
-                cowshed_os::eprintln!("abandoned scratch roots: end workers: {error}");
-            })?;
-            let unreleased = detach_images(namespace, dead_owner).inspect_err(|error| {
-                cowshed_os::eprintln!(
-                    "abandoned scratch roots remain intact because image release could not be inventoried: {error}"
-                );
-            })?;
+            let directory_roots = sweeping.phase(
+                "removing dead directory fixtures and templates in /private/tmp",
+                || sweep_dead_roots(&sweeping),
+            )?;
+            sweeping
+                .phase("ending the processes working in dead roots", || {
+                    end_processes_in(|path| dead_owner(path).is_some())
+                })
+                .inspect_err(|error| {
+                    cowshed_os::eprintln!("abandoned scratch roots: end workers: {error}");
+                })?;
+            let unreleased = sweeping
+                .phase("releasing dead roots' images", || {
+                    detach_images(namespace, dead_owner)
+                })
+                .inspect_err(|error| {
+                    cowshed_os::eprintln!(
+                        "abandoned scratch roots remain intact because image release could not be inventoried: {error}"
+                    );
+                })?;
             let mut counts = reclaim::Reclaimed {
                 removed: directory_roots,
                 retained: 0,
@@ -87,7 +104,12 @@ pub(super) fn sweep_dead_runs(namespace: TestNamespace, run: &str) -> std::io::R
                 let root = reclaim::reclaim_dead_roots(
                     [path],
                     &unreleased,
-                    |path| fs::remove_dir_all(path),
+                    |path| {
+                        sweeping.phase(
+                            &format!("removing abandoned scratch root {}", path.display()),
+                            || tree::remove(path),
+                        )
+                    },
                     |path, error| {
                         cowshed_os::eprintln!(
                             "abandoned scratch root {} was not removed: {error}",
@@ -119,7 +141,7 @@ pub(super) fn sweep_dead_runs(namespace: TestNamespace, run: &str) -> std::io::R
     }
     Ok(())
 }
-fn sweep_dead_roots() -> std::io::Result<usize> {
+fn sweep_dead_roots(sweeping: &SweepLock) -> std::io::Result<usize> {
     let mut removed = 0;
     for entry in fs::read_dir("/private/tmp")? {
         let entry = entry?;
@@ -139,14 +161,125 @@ fn sweep_dead_roots() -> std::io::Result<usize> {
             && entry.file_type()?.is_dir()
         {
             let path = entry.path();
-            reclaim(&path).inspect_err(|error| {
-                cowshed_os::eprintln!(
-                    "abandoned directory fixture {} was not removed: {error}",
-                    path.display()
-                );
-            })?;
+            sweeping
+                .phase(
+                    &format!("removing abandoned directory fixture {}", path.display()),
+                    || reclaim(&path),
+                )
+                .inspect_err(|error| {
+                    cowshed_os::eprintln!(
+                        "abandoned directory fixture {} was not removed: {error}",
+                        path.display()
+                    );
+                })?;
             removed += 1;
         }
     }
     Ok(removed)
+}
+
+/// The sweep lock, held with its holder's record written on it: the pass's pid, its run and the
+/// step it is in, rewritten at each step ([`Self::phase`]). A pass that finds the lock taken says
+/// so on stderr, naming that holder, and names it again once per
+/// [`cowshed_os::flock::HOLDER_REPORT`] while it keeps its place in the kernel's queue. Dropping it
+/// empties the record before the lock goes.
+struct SweepLock {
+    file: fs::File,
+    run: String,
+}
+
+impl SweepLock {
+    fn take(lock: &Path, run: &str) -> std::io::Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock)?;
+        if !cowshed_os::flock::try_exclusive(&file)? {
+            let started = Instant::now();
+            cowshed_os::eprintln!(
+                "scratch lane setup {run}: waiting for {}, held by {}",
+                lock.display(),
+                holder(lock)
+            );
+            // Queued, not silent: the holder's release at the end of its pass, or the kernel's at
+            // its exit, ends the wait, and the test backstop bounds the lock call itself.
+            cowshed_os::flock::queued(lock, cowshed_os::flock::HOLDER_REPORT, holder, || {
+                file.lock_bounded()
+            })?;
+            cowshed_os::eprintln!(
+                "scratch lane setup {run}: took {} after {:?}",
+                lock.display(),
+                started.elapsed()
+            );
+        }
+        let held = Self {
+            file,
+            run: run.to_owned(),
+        };
+        held.doing("starting its pass");
+        Ok(held)
+    }
+
+    /// Rewrite the holder record to name `what` this pass is doing. One that cannot be written is
+    /// said and leaves the pass running.
+    fn doing(&self, what: &str) {
+        let record = format!(
+            "pid {} (cowshed-test-sweep, run {}): {what}\n",
+            std::process::id(),
+            self.run
+        );
+        if let Err(error) = self
+            .file
+            .set_len(0)
+            .and_then(|()| self.file.write_all_at(record.as_bytes(), 0))
+        {
+            cowshed_os::eprintln!(
+                "scratch lane setup {}: cannot record `{what}` on the sweep lock: {error}",
+                self.run
+            );
+        }
+    }
+
+    /// Say on stderr, and on the lock's holder record, that this pass starts `what`, then how it
+    /// ended and how long it took.
+    fn phase<T>(
+        &self,
+        what: &str,
+        work: impl FnOnce() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let started = Instant::now();
+        cowshed_os::eprintln!("scratch lane setup {}: {what}", self.run);
+        self.doing(what);
+        let result = work();
+        cowshed_os::eprintln!(
+            "scratch lane setup {}: {what}: {} after {:?}",
+            self.run,
+            if result.is_ok() { "done" } else { "failed" },
+            started.elapsed()
+        );
+        result
+    }
+}
+
+impl Drop for SweepLock {
+    fn drop(&mut self) {
+        // One left unemptied names this pass until the next holder rewrites it.
+        if let Err(error) = self.file.set_len(0) {
+            cowshed_os::eprintln!(
+                "scratch lane setup {}: cannot empty the sweep lock's holder record: {error}",
+                self.run
+            );
+        }
+    }
+}
+
+/// Who holds the sweep lock, as its holder's record names it.
+fn holder(lock: &Path) -> String {
+    match fs::read_to_string(lock) {
+        Ok(record) if !record.trim().is_empty() => record.trim().to_owned(),
+        Ok(_) => "a holder that wrote no record on it (a test holding the lock itself)".to_owned(),
+        Err(error) => format!("a holder whose record cannot be read: {error}"),
+    }
 }

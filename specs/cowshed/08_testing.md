@@ -299,13 +299,17 @@ shared-temp sweep reclaims a killed run's root by the pid its name records (01_s
 which it can read only from a claimable name.
 
 Large directory-backed lifecycle fixtures keep their literal short source path. Drop ends the root's workers, then
-retires its intact tree by one rename beneath an already-owned TestNamespace root, using the existing create_root and
-owner record. Synchronous recursive unlink of large cloned trees on a busy APFS host can exhaust the 180-second
-no-finish guard; it is not the test's subject. The dead-run sweep reclaims the retired namespace after its owner is
-gone, under its existing lock and run record, in the lane setup before fixtures start. That same setup owns the existing
-dead short-directory and template sweep, with its unchanged positive-pid, dead-process and directory-type selection; no
-fixture constructor scans those predecessors. No new t/trash selection, cleanup worker or grant is introduced. Ordinary
-TempRoot guards still remove their roots on return and panic; APFS image release and its refusal fences stay unchanged.
+removes its tree, several threads unlinking at once and read-only directories this user owns included, and then the
+TestNamespace root it minted with the existing create_root and owner record, which holds nothing else. The test that
+made a tree pays for its removal inside its own no-finish window: retiring every tree by rename for the lane setup to
+unlink put a whole gate's fixture trees, every cowshed-core and cowshed-cli shard's, into the first sweeping lane's one
+180-second window, and the real-image group's setup exhausted it in the land gate (2026-11-02: still unlinking, 80 dead
+roots of 122,089 entries left, at 179 seconds). Only a tree Drop cannot remove is retired, by one rename beneath that
+already-owned namespace root; the dead-run sweep reclaims it after its owner is gone, under its existing lock and run
+record, in the lane setup before fixtures start. That same setup owns the existing dead short-directory and template
+sweep, with its unchanged positive-pid, dead-process and directory-type selection; no fixture constructor scans those
+predecessors. No new t/trash selection, cleanup worker or grant is introduced. Ordinary TempRoot guards still remove
+their roots on return and panic; APFS image release and its refusal fences stay unchanged.
 
 A pure regression fixture runs inside an ordinary exec and covers both the HTTP and Unix-socket authentication cases. It
 is not a real APFS mount or cache cutover proof.
@@ -1113,9 +1117,13 @@ containing that image; the sweep reports every refusal and still removes other d
 An inventory failure retains every root, since no root's image-release safety can then be proved. Root-local refusal and
 continued reclamation have a pure, platform-independent regression; one unreleased image must not leave another run's
 already-detached files behind. No sweep selects a live pid's root. Child fixtures create only their own roots and never
-force a host-wide scan. The test lanes retain their unchanged 180-second no-finish guard; setup emits no synthetic test
-completions or progress. Ordinary sandboxed shards keep their existing root provisioning and do not acquire host-wide
-cleanup authority.
+force a host-wide scan. The test lanes retain their unchanged 180-second no-finish guard, and setup emits no synthetic
+test completions or progress: what it says is diagnosis, never a heartbeat. It says on stderr each step of its pass as
+it starts and how long it took, and each dead root and directory fixture by path as it removes it, so a setup the guard
+ends names the work it was in. It keeps a holder record on `t/sweep.lock` (its pid, its run and the step it is in), so a
+setup that finds the lock taken says so on stderr naming that holder, and names it again once per holder-report interval
+while it keeps its place in the kernel's queue (`cowshed_os::flock::queued`). Ordinary sandboxed shards keep their
+existing root provisioning and do not acquire host-wide cleanup authority.
 
 Pure regressions recycle a device to a RAM image during the storage-lease wait, recycle it between dissent attempts and
 before force, and repeat an image's whole-device view. They prove the guard runs after the grant, no child detaches a

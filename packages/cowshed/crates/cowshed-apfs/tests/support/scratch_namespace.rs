@@ -18,6 +18,8 @@ use processes::end_processes_in;
 
 #[path = "../../../cowshed-os/tests/support/scratch_processes.rs"]
 pub(crate) mod processes;
+#[path = "scratch_tree.rs"]
+pub(crate) mod tree;
 /// The per-user root `cowshed setup` makes, `/private/var/folders/cowshed/<euid>`: the parent of
 /// the shared t directory and every test namespace's directory, beside production's own entries
 /// (`mnt`, `ram<revision>`). Spotlight's `mds` admits no volume mounted below it, where one
@@ -126,11 +128,7 @@ pub(super) fn tear_down_root(namespace: TestNamespace, path: &Path) -> std::io::
             path.display()
         )));
     }
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
+    tree::remove(path)
 }
 /// The test namespace whose directory in the per-user root holds `path`, given that directory
 /// or any path below it. Only a name that parses as a test namespace (`TestNamespace::parse`:

@@ -1,15 +1,12 @@
-//! The directory fixture's existing exact-tree reclamation, shared with lane setup.
+//! The directory fixture's exact-tree reclamation: its own Drop's, and the lane setup's for what a
+//! killed run left.
 
-use super::super::scratch_namespace::processes;
-use std::fs;
+use super::super::scratch_namespace::{processes, tree};
 use std::path::Path;
 
 pub(crate) const ROOT_PREFIX: &str = "cowshed-dtest-";
+/// End the processes working in `path`, then remove it ([`tree::remove`]).
 pub(super) fn reclaim(path: &Path) -> std::io::Result<()> {
     processes::end_processes_in(|cwd| cwd.starts_with(path))?;
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
+    tree::remove(path)
 }

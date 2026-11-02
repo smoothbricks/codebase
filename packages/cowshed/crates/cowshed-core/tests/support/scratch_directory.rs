@@ -1,7 +1,8 @@
 //! Real filesystem roots for lifecycle tests that own no disk images.
 //!
-//! Cleanup ends the root's workers, then moves its intact tree under an existing owned test
-//! namespace. The lane setup's dead-run sweep owns eventual unlink; the live source stays short.
+//! Cleanup ends the root's workers, then removes its tree, several threads unlinking at once, and
+//! the namespace root minted beside it. Only a tree it cannot remove is moved whole under that
+//! namespace root, for the lane setup's dead-run sweep; the live source path stays short.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,17 +19,20 @@ use cleanup::{ROOT_PREFIX, reclaim};
 /// `sun_path` (104 bytes on macOS), so a root's length is fixed by its pid and counter alone.
 pub(crate) const LABEL_FILE: &str = "label";
 
+/// Where in its namespace root a fixture's tree is retired when its Drop cannot remove it.
+const RETIRED: &str = "directory";
+
 pub struct ScratchRoot {
     path: PathBuf,
-
-    retired_path: PathBuf,
+    /// The test namespace root minted with the fixture: the place its tree is retired to when Drop
+    /// cannot remove it, holding only its owner record until then.
+    namespace_root: PathBuf,
 }
 
 impl ScratchRoot {
     pub fn new(label: &str) -> std::io::Result<Self> {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let (_, mut retired_path) = super::scratch_namespace::create_owned_root(label)?;
-        retired_path.push("directory");
+        let (_, namespace_root) = super::scratch_namespace::create_owned_root(label)?;
         let path = PathBuf::from(format!(
             "/private/tmp/{ROOT_PREFIX}{}-{}",
             std::process::id(),
@@ -44,7 +48,10 @@ impl ScratchRoot {
             }
             Err(error) => return Err(error),
         }
-        let root = Self { path, retired_path };
+        let root = Self {
+            path,
+            namespace_root,
+        };
         fs::write(root.path.join(LABEL_FILE), label)?;
         Ok(root)
     }
@@ -99,20 +106,38 @@ impl Drop for ScratchRoot {
     fn drop(&mut self) {
         let started = std::time::Instant::now();
         cowshed_os::eprintln!("directory fixture {}: teardown start", self.path.display());
-        let result = processes::end_processes_in(|cwd| cwd.starts_with(&self.path))
-            .and_then(|()| retire_directory_tree(&self.path, &self.retired_path));
-        match result {
+        let Err(error) = reclaim(&self.path) else {
+            // Its namespace root holds nothing but its owner record: the fallback was not needed.
+            match super::scratch_namespace::tree::remove(&self.namespace_root) {
+                Ok(()) => cowshed_os::eprintln!(
+                    "directory fixture {}: removed elapsed={:?}",
+                    self.path.display(),
+                    started.elapsed()
+                ),
+                Err(error) => cowshed_os::eprintln!(
+                    "directory fixture {}: removed, but not its namespace root {}: {error}; the \
+                     dead-run sweep takes that once this run has ended elapsed={:?}",
+                    self.path.display(),
+                    self.namespace_root.display(),
+                    started.elapsed()
+                ),
+            }
+            return;
+        };
+        let retired = self.namespace_root.join(RETIRED);
+        match retire_directory_tree(&self.path, &retired) {
             Ok(()) => cowshed_os::eprintln!(
-                "directory fixture {}: retired under {} elapsed={:?}",
+                "directory fixture {}: {error}; retired what is left under {} for the dead-run \
+                 sweep elapsed={:?}",
                 self.path.display(),
-                self.retired_path.display(),
+                retired.display(),
                 started.elapsed()
             ),
-            Err(error) => cowshed_os::eprintln!(
-                "directory fixture {}: {error}; remaining state stays for the existing sweeps \
-                 (namespace {}) elapsed={:?}",
+            Err(retire) => cowshed_os::eprintln!(
+                "directory fixture {}: {error}; retiring it under {} failed too: {retire}; \
+                 remaining state stays for the existing sweeps elapsed={:?}",
                 self.path.display(),
-                self.retired_path.display(),
+                retired.display(),
                 started.elapsed()
             ),
         }
@@ -178,26 +203,85 @@ mod tests {
     use std::process::{Command, Stdio};
 
     #[test]
-    fn dropping_a_directory_root_preserves_a_symlinks_target() {
+    fn dropping_a_directory_root_removes_its_own_tree_and_preserves_a_symlinks_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let outside = ScratchRoot::new("outside").unwrap();
         fs::write(outside.path().join("kept"), "outside").unwrap();
         let root = ScratchRoot::new("links").unwrap();
         let path = root.path().to_path_buf();
         std::os::unix::fs::symlink(outside.path(), path.join("linked")).unwrap();
+        // Sealed as a tool seals its cache: the removal restores the owner's access first.
+        let sealed = path.join("sealed");
+        fs::create_dir_all(sealed.join("inner")).unwrap();
+        fs::write(sealed.join("inner/file"), "sealed").unwrap();
+        for directory in [sealed.join("inner"), sealed] {
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let namespace_root = root.namespace_root.clone();
 
-        let retired = root.retired_path.clone();
         let renames = retirement_rename_attempts();
         drop(root);
         assert!(!path.exists());
-
-        assert_eq!(retirement_rename_attempts() - renames, 1);
-        assert!(
-            fs::symlink_metadata(retired.join("linked"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
+        assert_eq!(
+            retirement_rename_attempts() - renames,
+            0,
+            "the fixture's Drop removes its tree itself and leaves nothing to the sweep"
         );
-        let namespace_root = retired.parent().unwrap();
+        assert!(
+            !namespace_root.exists(),
+            "the namespace root held only the fallback's place and goes with the tree"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("kept")).unwrap(),
+            "outside"
+        );
+    }
+
+    /// `chflags(2)` `path` to `flags`; `UF_IMMUTABLE` refuses its unlink with `EPERM`.
+    fn set_flags(path: &Path, flags: libc::c_uint) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is NUL-terminated and outlives the call, which reads nothing else.
+        let changed = unsafe { libc::chflags(name.as_ptr(), flags) };
+        assert_eq!(
+            changed,
+            0,
+            "chflags {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[test]
+    fn a_tree_its_drop_cannot_remove_is_retired_whole_under_its_namespace() {
+        let root = ScratchRoot::new("immutable").unwrap();
+        let path = root.path().to_path_buf();
+        set_flags(
+            &{
+                let pinned = path.join("pinned");
+                fs::write(&pinned, "pinned").unwrap();
+                pinned
+            },
+            libc::UF_IMMUTABLE,
+        );
+        let namespace_root = root.namespace_root.clone();
+        let retired = namespace_root.join(RETIRED);
+
+        let renames = retirement_rename_attempts();
+        drop(root);
+        // Lifted before any assertion, so a failed one leaves nothing the sweep cannot remove.
+        for pinned in [retired.join("pinned"), path.join("pinned")] {
+            if pinned.exists() {
+                set_flags(&pinned, 0);
+            }
+        }
+        assert!(!path.exists());
+        assert_eq!(retirement_rename_attempts() - renames, 1);
+        assert_eq!(
+            fs::read_to_string(retired.join("pinned")).unwrap(),
+            "pinned"
+        );
         let namespace = cowshed_os::namespace::TestNamespace::parse(
             namespace_root.file_name().unwrap().to_str().unwrap(),
         )
@@ -208,17 +292,13 @@ mod tests {
                 .unwrap()
                 .is_file()
         );
-        // No sweep takes a live owner's retiring tree, and it is no root a keeper reclaims.
+        // No sweep takes a live owner's retired tree, and it is no root a keeper reclaims.
         assert_eq!(
-            super::super::scratch_namespace::dead_owner(namespace_root),
+            super::super::scratch_namespace::dead_owner(&namespace_root),
             None
         );
         assert!(super::super::scratch_namespace::reclaim_kept_root(&retired).is_err());
-        assert!(retired.exists());
-        assert_eq!(
-            fs::read_to_string(outside.path().join("kept")).unwrap(),
-            "outside"
-        );
+        fs::remove_dir_all(namespace_root).unwrap();
     }
 
     #[test]
