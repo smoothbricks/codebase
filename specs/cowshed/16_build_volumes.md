@@ -326,14 +326,17 @@ without waiting for the delete, which runs in the background. A target directory
 deleting it. A background delete that finds another delete of the checkout running (a refresh's or `gc`'s) waits it out
 and then takes whatever is still pending, so what its own refresh moved aside never waits for a later one. A process
 that ends first, a crash included, leaves the rest pending. Every later refresh of the checkout resumes the delete, and
-`cowshed gc` finishes it, naming each directory it deletes. A refresh whose fingerprint moved first probes the hold its
-job must take on the linked volume: an exclusive claim (a release, a seed capture, a compaction move, a cache clear)
-refuses there, before discovery's shell activation is paid for an answer the refusal would discard. A discovery job that
-has not answered within 10 seconds says on stderr every 10 seconds what phase it is in: still preparing its sandbox
-environment, or running as a named process in a named kernel state. It names nothing inferred from other processes: a
-guessed cause printed beside a wait is read as fact. If the caller that asked for discovery ends first -- an interrupted
-command -- the discovery job's process group is ended and its leader reaped before the caller answers -- or, past the
-reap bound, collected later with that said -- so no activation tree outlives it.
+`cowshed gc` finishes it, naming each directory it deletes. State a build volume drops moves into that volume's own
+`.cowshed/discard`, since a rename never crosses volumes: a released path, and an mbx fork's rebuildable state (Fork
+step 4), whose delete the checkout's workspace supervisor resumes when it starts. A refresh whose fingerprint moved
+first probes the hold its job must take on the linked volume: an exclusive claim (a release, a seed capture, a
+compaction move, a cache clear) refuses there, before discovery's shell activation is paid for an answer the refusal
+would discard. A discovery job that has not answered within 10 seconds says on stderr every 10 seconds what phase it is
+in: still preparing its sandbox environment, or running as a named process in a named kernel state. It names nothing
+inferred from other processes: a guessed cause printed beside a wait is read as fact. If the caller that asked for
+discovery ends first -- an interrupted command -- the discovery job's process group is ended and its leader reaped
+before the caller answers -- or, past the reap bound, collected later with that said -- so no activation tree outlives
+it.
 
 Cargo discovery runs at most four queries concurrently within one activation of each selected workspace shell. Answers
 and failures retain manifest order; a failed manifest does not hide independent workspaces. The existing tracked-input
@@ -885,8 +888,12 @@ workspace. All sources use one mint path, carrying edits and untracked files war
    inherited `.cowshed/kept` into `.cowshed/discard`, deleted in the background: those are the source's kept
    directories, which the source still holds ("What a refresh does at each path"), and the fork's `rm` and land would
    refuse for them. An mbx fork's mount also empties every path that is not retained and drops clone-invalid files: the
-   clone was taken while the target's jobs may have been writing, and only retained state is crash-consistent. Nothing
-   is copied or hashed, and an mbx fork mints no seed of its own.
+   clone was taken while the target's jobs may have been writing, and only retained state is crash-consistent. It
+   empties each path with one rename into the volume's own `.cowshed/discard`, deleted in the background ("What a
+   refresh does at each path"), and the workspace supervisor the fork starts resumes that delete, since the fork's own
+   process exits first. Deleting them in the fork held every fork of a large project's main for the delete of its Nx and
+   compile caches, about 99,000 entries: 15 to 46 s of each fork's wall time (measured 2026-11-02). Nothing is copied or
+   hashed, and an mbx fork mints no seed of its own.
 
 The lock covers what reads the target: the clone of its image, its seed refresh and the capture of its seed, all one
 hold, so the clone's checkout and its build volume come from one state of the target that no land or reseed changes

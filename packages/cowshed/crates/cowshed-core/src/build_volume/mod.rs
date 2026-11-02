@@ -539,33 +539,40 @@ impl BuildVolumeState {
 
     /// Empty what an mbx fork's clone of its target's live volume must not inherit: every path
     /// not retained, captured while the target's jobs may have been writing it
-    /// (16_build_volumes.md, "Fork"). A rebuildable directory is left empty for its link; one
-    /// declared but not retained is left absent. A non-mbx volume is a seed's clone, captured
-    /// under its writers' exclusion, and keeps everything.
+    /// (16_build_volumes.md, "Fork"). Each is moved into the volume's discard directory in one
+    /// rename, so the fork never waits on deleting a target's caches (tens of thousands of Nx
+    /// cache files); the workspace's supervisor deletes them in the background once it starts,
+    /// since the fork's own process exits first. A rebuildable directory is left empty for its
+    /// link; one declared but not retained is left absent. A non-mbx volume is a seed's clone,
+    /// captured under its writers' exclusion, and keeps everything.
     pub fn discard_rebuildable(&self, volume_root: &Path) -> crate::Result<()> {
         if self.mbx.is_none() {
             return Ok(());
         }
-        for path in self.paths.iter().filter(|path| !path.retained()) {
-            let directory = volume_root.join(path.volume.as_path());
-            match fs::symlink_metadata(&directory) {
-                Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&directory),
-                Ok(_) => fs::remove_file(&directory),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            }
-            .map_err(|error| io_error("discard a fork's rebuildable state", &directory, &error))?;
-            if !path.is_declared() {
-                fs::create_dir_all(&directory).map_err(|error| {
-                    io_error(
-                        "recreate a fork's rebuildable directory",
-                        &directory,
-                        &error,
-                    )
+        cowshed_os::timing::timed("fork", format_args!("rebuildable"), || {
+            for path in self.paths.iter().filter(|path| !path.retained()) {
+                let relative = path.volume.as_path();
+                let directory = volume_root.join(relative);
+                match fs::symlink_metadata(&directory) {
+                    Ok(_) => discard::move_aside(volume_root, relative).map(drop),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                }
+                .map_err(|error| {
+                    io_error("move a fork's rebuildable state aside", &directory, &error)
                 })?;
+                if !path.is_declared() {
+                    fs::create_dir_all(&directory).map_err(|error| {
+                        io_error(
+                            "recreate a fork's rebuildable directory",
+                            &directory,
+                            &error,
+                        )
+                    })?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Every Nx `workspace-data` directory the volume holds, relative to its root: where Nx keeps
@@ -2023,6 +2030,53 @@ mod tests {
                 b"not owned by clone"
             );
         }
+    }
+
+    /// An mbx fork's clone empties its rebuildable state with one rename per path into the
+    /// volume's discard directory, deleted in the background (16_build_volumes.md, "Fork" step 4):
+    /// the fork never waits on deleting a target's tens of thousands of Nx cache files. The moved
+    /// tree waits aside until a reaper takes it, and retained state is untouched.
+    #[test]
+    fn discarding_rebuildable_state_moves_it_aside_without_deleting_it() {
+        let root = crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "cs-rebuildable");
+        let volume = root.join("volume");
+        for path in ["nx/cache/entry", "codegraph"] {
+            fs::create_dir_all(volume.join(path)).unwrap();
+        }
+        fs::write(volume.join("nx/cache/entry/output"), b"cached").unwrap();
+        fs::write(volume.join("codegraph/index.db"), b"index").unwrap();
+        let state = BuildVolumeState {
+            paths: vec![
+                BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+                BuildStatePath::new(".codegraph", "codegraph")
+                    .unwrap()
+                    .retain(),
+            ],
+            mbx: Some(PathBuf::from("/installed/mbx")),
+            ..Default::default()
+        };
+        state.discard_rebuildable(&volume).unwrap();
+        assert_eq!(
+            fs::read_dir(volume.join("nx/cache")).unwrap().count(),
+            0,
+            "the rebuildable directory stays, empty, for its link"
+        );
+        assert_eq!(
+            fs::read(volume.join("codegraph/index.db")).unwrap(),
+            b"index"
+        );
+        let pending = discard::pending(&volume).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the rebuildable tree waits aside: {pending:?}"
+        );
+        assert_eq!(
+            fs::read(pending[0].join("entry/output")).unwrap(),
+            b"cached"
+        );
+        discard::finish(&volume, |_| {}).unwrap();
+        assert!(discard::pending(&volume).unwrap().is_empty());
     }
 
     #[test]

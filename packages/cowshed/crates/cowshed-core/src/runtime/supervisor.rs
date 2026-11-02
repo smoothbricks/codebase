@@ -4842,6 +4842,11 @@ impl WorkspaceSupervisor {
         // Whatever the checkout's volumes were cloned from, they are named for it from here.
         let build = actor.policy.ceiling().build_volume_mount.clone();
         actor.relabel(true, build.as_deref());
+        // A fork moves its build volume's rebuildable state aside and exits before that delete
+        // could finish (16_build_volumes.md, "Fork" step 4): this long-lived process resumes it.
+        if let Some(build) = &build {
+            crate::build_volume::discard::reap(build);
+        }
         tokio::spawn(actor.run());
         Ok(handle)
     }
