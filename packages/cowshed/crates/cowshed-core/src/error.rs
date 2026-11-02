@@ -1165,6 +1165,37 @@ mod tests {
         assert_eq!(later.fence_source(), None);
     }
 
+    /// A retry reason is additive: one this build knows round-trips, and a later build's reason
+    /// decodes as no reason rather than losing the whole error, so a build that predates
+    /// `supervisorRetiring` reads that refusal as the plain `Conflict` it was before.
+    #[test]
+    fn a_retry_reason_round_trips_and_a_later_builds_decodes_as_none() {
+        use super::Retry;
+        let retiring = serde_json::to_value(CowshedError::retryable(
+            Retry::SupervisorRetiring,
+            "workspace supervisor is quiescing or retired",
+            "reattach an active workspace before starting work",
+        ))
+        .expect("the error serializes");
+        assert_eq!(
+            retiring["retry"],
+            serde_json::json!({ "reason": "supervisorRetiring" })
+        );
+        let decoded: CowshedError = serde_json::from_value(retiring).expect("error decodes");
+        assert_eq!(decoded.retry_source(), Some(Retry::SupervisorRetiring));
+
+        let later: CowshedError = serde_json::from_value(serde_json::json!({
+            "code": "conflict",
+            "message": "a later build's retry",
+            "hint": "retry",
+            "retry": { "reason": "somethingNew" },
+        }))
+        .expect("a later build's reason still decodes the error");
+        assert_eq!(later.code, ErrorCode::Conflict);
+        assert_eq!(later.message, "a later build's retry");
+        assert_eq!(later.retry_source(), None);
+    }
+
     /// A dirty tree can hold any number of paths, and the error must still fit one frame: the
     /// fence names a bounded prefix of the UTF-8 ones and counts all of them.
     #[test]

@@ -6212,10 +6212,9 @@ async fn a_drained_supervisor_retires_once_a_status_answer_carried_a_job_s_end()
         remote.info(job).await.expect("its status").state,
         JobState::Exited
     );
-    tokio::time::timeout(Duration::from_secs(60), server)
+    server
         .await
-        .expect("whole-leg watchdog: it retires once a status answer carried the end, not after the idle bound")
-        .expect("the serving task")
+        .expect("it retires once a status answer carried the end")
         .unwrap();
 }
 

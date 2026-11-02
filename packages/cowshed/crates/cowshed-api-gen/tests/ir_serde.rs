@@ -137,7 +137,9 @@ fn canonical_copy_enums_follow_tag_and_niche_layouts() {
             "{name}: tag and payload layout"
         );
     }
-    assert_eq!(model.api.records["Retry"].static_size, Some(0));
+    // Two fieldless arms: a one-byte tag. The zero-width tag of a one-arm enum is pinned on its
+    // fixture (`ir::tests::native_layout_tables_preserve_sizes_alignment_and_niches`, `Lone`).
+    assert_eq!(model.api.records["Retry"].static_size, Some(1));
 }
 
 #[test]

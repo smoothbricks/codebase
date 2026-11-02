@@ -532,6 +532,7 @@ mod layout_tests {
             #[derive(Serialize)] enum Payload { Empty, Data(u64) }
             #[derive(Serialize)] enum TwoPayloads { First(u8), Second(u64) }
             #[derive(Serialize)] enum One { Only(u16) }
+            #[derive(Serialize)] enum Lone { Only }
             #[derive(Serialize)] enum PaddedPayload { Empty, Data((u8, u32, u8)) }
             "#,
             &mut api,
@@ -565,6 +566,7 @@ mod layout_tests {
             ("NoArrayNiche", 1),
             ("Payload", 16),
             ("TwoPayloads", 16),
+            ("Lone", 0),
             ("One", 2),
             ("PaddedPayload", 12),
         ] {
