@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { checkPolicyFailures } from './index.js';
 import {
   applyDevenvPackageDefaults,
   applyRootDevDependencyDefaults,
@@ -506,6 +507,45 @@ ${extra}  ];
   });
 });
 
+// A consumer moved tooling's @smoothbricks/cli to 0.13.8, which uses nx-plugin 0.7.7 and through it cowshed 0.4.5, while
+// its root kept nx-plugin 0.7.3 and cowshed 0.4.4. Nx renders the managed-files sync generator from the root copy, so
+// `nx sync:check` in Publish's validate called the files cli 0.13.8 wrote out of sync, and the CI lane, which runs
+// `smoo monorepo check`, had passed the same commit.
+it('smoo monorepo check refuses a root @smoothbricks package bun.lock resolves to another version than the CLI uses', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
+  const errors = spyOn(console, 'error').mockImplementation(() => {});
+  const pinFindings = async (): Promise<string[]> => {
+    errors.mockClear();
+    await checkPolicyFailures(root, []);
+    return errors.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('@smoothbricks/cli 0.13.8'));
+  };
+  try {
+    await writeJson(join(root, 'package.json'), {
+      name: '@fixture/app',
+      version: '0.0.0',
+      private: true,
+      workspaces: ['tooling'],
+      devDependencies: { '@smoothbricks/cowshed': '^0.4.4', '@smoothbricks/nx-plugin': '^0.7.3' },
+    });
+    await writeJson(join(root, 'tooling/package.json'), {
+      name: '@fixture/tooling',
+      private: true,
+      dependencies: { '@smoothbricks/cli': '^0.13.8' },
+    });
+    await writeFile(join(root, 'bun.lock'), lockfileWithCliClosure({ nxPlugin: '0.7.3', cowshed: '0.4.4' }));
+    expect(await pinFindings()).toEqual([
+      expect.stringContaining('devDependencies.@smoothbricks/cowshed resolves 0.4.4'),
+      expect.stringContaining('devDependencies.@smoothbricks/nx-plugin resolves 0.7.3'),
+    ]);
+
+    await writeFile(join(root, 'bun.lock'), lockfileWithCliClosure({ nxPlugin: '0.7.7', cowshed: '0.4.5' }));
+    expect(await pinFindings()).toEqual([]);
+  } finally {
+    errors.mockRestore();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function currentCliRange(): Promise<string> {
   return `^${registryLatestTags['@smoothbricks/cli']}`;
 }
@@ -614,6 +654,34 @@ function lockfileWithTtsc(version: string): string {
   },
   "packages": {
     "ttsc": ["ttsc@${version}", "", {}, "sha512-fixture"]
+  }
+}
+`;
+}
+
+/**
+ * The bun.lock of a consumer whose tooling installs `@smoothbricks/cli` 0.13.8 (nx-plugin 0.7.7, cowshed 0.4.5) and
+ * whose root resolves the given versions: Bun nests the CLI's copies under its key when the root's differ, as it did.
+ */
+function lockfileWithCliClosure(rootResolves: { nxPlugin: string; cowshed: string }): string {
+  const nested = rootResolves.nxPlugin !== '0.7.7';
+  return `{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": { "name": "@fixture/app", "devDependencies": { "@smoothbricks/cowshed": "^${rootResolves.cowshed}", "@smoothbricks/nx-plugin": "^${rootResolves.nxPlugin}" } },
+    "tooling": { "name": "@fixture/tooling", "dependencies": { "@smoothbricks/cli": "^0.13.8" } },
+  },
+  "packages": {
+    "@smoothbricks/cli": ["@smoothbricks/cli@0.13.8", "", { "dependencies": { "@smoothbricks/nx-plugin": "0.7.7", "commander": "^14.0.3" } }, "sha512-fixture"],
+    "@smoothbricks/cowshed": ["@smoothbricks/cowshed@${rootResolves.cowshed}", "", { "dependencies": { "@smoothbricks/nx-cache-server": "0.1.4" } }, "sha512-fixture"],
+    "@smoothbricks/nx-cache-server": ["@smoothbricks/nx-cache-server@0.1.4", "", {}, "sha512-fixture"],
+    "@smoothbricks/nx-plugin": ["@smoothbricks/nx-plugin@${rootResolves.nxPlugin}", "", { "dependencies": { "@smoothbricks/cowshed": "${rootResolves.cowshed}" } }, "sha512-fixture"],${
+      nested
+        ? `
+    "@smoothbricks/cli/@smoothbricks/nx-plugin": ["@smoothbricks/nx-plugin@0.7.7", "", { "dependencies": { "@smoothbricks/cowshed": "0.4.5" } }, "sha512-fixture"],
+    "@smoothbricks/cli/@smoothbricks/nx-plugin/@smoothbricks/cowshed": ["@smoothbricks/cowshed@0.4.5", "", { "dependencies": { "@smoothbricks/nx-cache-server": "0.1.4" } }, "sha512-fixture"],`
+        : ''
+    }
   }
 }
 `;

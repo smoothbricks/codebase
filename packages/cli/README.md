@@ -186,7 +186,9 @@ It checks:
   `tooling/direnv/devenv.nix` owns shell-provided tools like `bun`, `git-format-staged`, and `fmt`. The check holds
   `tooling/package.json`'s `@smoothbricks/cli` range to `^<the version bun.lock resolved>` and never asks the registry,
   so a release published after a commit cannot refuse it; `smoo monorepo update` moves the pin to the latest stable
-  release and installs it.
+  release and installs it. Every `@smoothbricks/*` package the root declares must resolve in `bun.lock` to the version
+  the installed CLI uses through its dependency closure (cli → nx-plugin → cowshed …): Nx loads the root's copy, so
+  `nx sync` would render the managed files with another nx-plugin than `smoo` did.
 - Nx release policy, including project package release tags, project-level GitHub Release changelogs, and the temporary
   Bun lockfile versionActions hook.
 - `bun.lock` workspace versions match package manifests.
@@ -483,11 +485,11 @@ smoo monorepo diff
 ```
 
 `check` fails when a managed file is missing or stale, and when a package policy fails (the devenv profile's Go against
-the Go SDK ttsc vendors, root package, Nx names and release config, public tags and metadata, test locations, workspace
-dependencies, the devenv import and release lock, and the Cargo cache and toolchain policies). `check --warn` reports
-managed-file drift as warnings instead — CI runs it on every event and, on a default-branch push, dispatches the
-managed-files workflow to heal the drift — while a policy failure still fails it, because nothing heals one. `diff`
-reports drift without writing files.
+the Go SDK ttsc vendors, root package, the root's `@smoothbricks/*` packages against the versions the installed CLI
+uses, Nx names and release config, public tags and metadata, test locations, workspace dependencies, the devenv import
+and release lock, and the Cargo cache and toolchain policies). `check --warn` reports managed-file drift as warnings
+instead — CI runs it on every event and, on a default-branch push, dispatches the managed-files workflow to heal the
+drift — while a policy failure still fails it, because nothing heals one. `diff` reports drift without writing files.
 
 The Cargo toolchain policy resolves each cached target's named inputs through its project definitions first, then
 workspace definitions. A cached target must reach `cargoToolchain`, the toolchain identity (the devenv pin and the Nix
