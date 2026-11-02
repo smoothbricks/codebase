@@ -1652,11 +1652,15 @@ its count (`c`, at most `g`, the units below), says `cowshed: mbx reserve wait s
 the cores granted, closes the descriptor, and runs its command in the same shell with `MBX_RESERVE_CPUS` set to that
 count, `MBX_SCHED_DISABLE=1` and an empty `MBX_SCHED_DIR`, what `mbx reserve` gives its own command, so no process
 starts for the reservation. A refusal ends the descriptor unanswered and fails the leaf, naming mbx's error. A run whose
-endpoint did not start says why in its own output, and its reserved leaves refuse to run, naming
-`MBX_RESERVATIONS_SOCKET`: no reserved leaf runs beside the pool. A leaf ended before its grant records a `queued`
-verdict with its wait on the endpoint. Enforced by the stand-in endpoint cases of `executor.test.ts` (a run of reserved
-leaves starts no mbx process and asks over one connection, each runner on its grant), `mbx-reservations.test.ts` (the
-client and the run hook) and `mbx-pool.test.ts` (the leaf's shell), and by mbx's own suite for the endpoint.
+endpoint did not start says why in its own output and publishes the same reason to its tasks in
+`BOUNDED_EXEC_RESERVATIONS_UNSERVED`, and its reserved leaves refuse to run, naming `MBX_RESERVATIONS_SOCKET` and that
+reason: a gate's failures-only output shows each leaf's refusal, never the run's own warning. A leaf whose run published
+neither says so, since then its run's `preTasksExecution` never served it or its environment never reached the task. No
+reserved leaf runs beside the pool. A leaf ended before its grant records a `queued` verdict with its wait on the
+endpoint. Enforced by the stand-in endpoint cases of `executor.test.ts` (a run of reserved leaves starts no mbx process
+and asks over one connection, each runner on its grant; a leaf whose run serves none names why),
+`mbx-reservations.test.ts` (the client and the run hook) and `mbx-pool.test.ts` (the leaf's shell), and by mbx's own
+suite for the endpoint.
 
 **A Vitest or Go test leaf enters no pool.** It reserves nothing and runs with its own default workers, uncapped
 (owner's ruling, 2026-10-31). Reserved at that default, which sizes to the host (Vitest one worker per core but one, Go

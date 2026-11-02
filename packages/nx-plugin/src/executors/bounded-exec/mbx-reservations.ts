@@ -21,6 +21,34 @@ import { mbxPool } from './mbx-pool.js';
  */
 export const RESERVATIONS_ENV = 'MBX_RESERVATIONS_SOCKET';
 
+/**
+ * Why the run serves its tasks no endpoint, published beside {@link RESERVATIONS_ENV} when its endpoint did not start.
+ * Every task inherits it, so each reserved leaf's refusal names the cause: a gate's failures-only output shows the
+ * leaves' refusals, never the run's own warning.
+ */
+export const RESERVATIONS_UNSERVED_ENV = 'BOUNDED_EXEC_RESERVATIONS_UNSERVED';
+
+/** What a task's environment says of its run's reservation endpoint. */
+export type RunEndpoint =
+  | { readonly kind: 'served'; readonly socket: string }
+  | { readonly kind: 'unserved'; readonly reason: string }
+  | { readonly kind: 'unpublished' };
+
+/** The endpoint `env` names, else why its run serves none, else that its run published neither. */
+export function runEndpoint(env: Readonly<NodeJS.ProcessEnv>): RunEndpoint {
+  const socket = env[RESERVATIONS_ENV] ?? '';
+  if (socket !== '') return { kind: 'served', socket };
+  const reason = env[RESERVATIONS_UNSERVED_ENV] ?? '';
+  return reason === '' ? { kind: 'unpublished' } : { kind: 'unserved', reason };
+}
+
+/** Why a task's run serves it no endpoint, as its reserved leaf's refusal says it. */
+export function describeUnserved(endpoint: Exclude<RunEndpoint, { kind: 'served' }>): string {
+  return endpoint.kind === 'unserved'
+    ? `the run's endpoint did not start (${endpoint.reason})`
+    : `the run published neither an endpoint nor why it has none (${RESERVATIONS_UNSERVED_ENV} is unset too), so its preTasksExecution never served this run or its environment never reached this task`;
+}
+
 const ENDPOINT_DIRECTORY = 'mbx-r-';
 const ENDPOINT_SOCKET = 'r.sock';
 /** What is kept of the endpoint's stderr to say why it ended: its last bytes. */
@@ -55,10 +83,12 @@ export async function serveRunReservations(
     logger.warn(
       `bounded-exec: this run's mbx reservation endpoint did not start (${started.error}); its reserved leaves refuse to run`,
     );
+    env[RESERVATIONS_UNSERVED_ENV] = started.error;
     return;
   }
   endpoints.set(context.id, started.endpoint);
   env[RESERVATIONS_ENV] = started.socket;
+  delete env[RESERVATIONS_UNSERVED_ENV];
 }
 
 /** Close the endpoint `context`'s run was served, if it was served one: its standard input's end ends it. */

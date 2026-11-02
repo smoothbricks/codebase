@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { logger } from 'nx/src/devkit-exports.js';
 import { standInReservations } from '../../__tests__/stand-in-mbx-reservations.js';
-import { closeRunReservations, RESERVATIONS_ENV, reserveCores, serveRunReservations } from './mbx-reservations.js';
+import {
+  closeRunReservations,
+  RESERVATIONS_ENV,
+  RESERVATIONS_UNSERVED_ENV,
+  reserveCores,
+  serveRunReservations,
+} from './mbx-reservations.js';
 
 describe("a leaf's reservation on its run's mbx endpoint", () => {
   it('asks for many reservations over one connection, each granted its cores, and releases each once', async () => {
@@ -85,6 +91,7 @@ describe("an Nx run's mbx reservation endpoint", () => {
     try {
       await serveRunReservations({ id: 'run-1' }, mbx.env);
       const socket = mbx.env[RESERVATIONS_ENV];
+      expect(mbx.env).not.toHaveProperty(RESERVATIONS_UNSERVED_ENV);
       if (socket === undefined) throw new Error('the run published no endpoint');
       expect(await readFile(mbx.said, 'utf8')).toBe(`reservations ${socket}\n`);
 
@@ -118,6 +125,9 @@ describe("an Nx run's mbx reservation endpoint", () => {
     try {
       await serveRunReservations({ id: 'run-3' }, mbx.env);
       expect(mbx.env).not.toHaveProperty(RESERVATIONS_ENV);
+      expect(mbx.env[RESERVATIONS_UNSERVED_ENV]).toContain(
+        'ended with status 1: mbx: reservations need scheduler.enabled',
+      );
       expect(warn).toHaveBeenCalledWith(
         expect.stringContaining('ended with status 1: mbx: reservations need scheduler.enabled'),
       );

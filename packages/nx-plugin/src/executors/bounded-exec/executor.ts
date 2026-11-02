@@ -49,7 +49,7 @@ import {
   withMbxLeaf,
 } from './mbx-pool.js';
 import { MBX_QUEUE_POLL_MS, type MbxQueuedRequest, snapshotMbxQueue } from './mbx-queue.js';
-import { RESERVATIONS_ENV, type Reservation, reserveCores } from './mbx-reservations.js';
+import { describeUnserved, RESERVATIONS_ENV, type Reservation, reserveCores, runEndpoint } from './mbx-reservations.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -709,13 +709,15 @@ export async function runBoundedExec(
     return refuse(`cowshed: cpu-pool parent pool refused: ${parentRefusal}; refusing to run the command\n`);
   }
   // A reserved leaf takes its cores from its Nx run's mbx reservation endpoint (mbx-reservations.ts). A run that serves
-  // none said why in its own output; the leaf does not run beside the pool.
-  const reserved = leaf?.kind === 'reserve' ? { leaf, endpoint: process.env[RESERVATIONS_ENV] ?? '' } : null;
-  if (reserved !== null && reserved.endpoint === '') {
+  // none said why in its own output, which a gate's failures-only output never shows, so the refusal says it too; the
+  // leaf does not run beside the pool.
+  const endpoint = leaf?.kind === 'reserve' ? runEndpoint(process.env) : null;
+  if (endpoint !== null && endpoint.kind !== 'served') {
     return refuse(
-      `cowshed: a reserved leaf takes its cores from its Nx run's mbx reservation endpoint, and ${RESERVATIONS_ENV} names none (the run's preTasksExecution serves it); refusing to run the command\n`,
+      `cowshed: a reserved leaf takes its cores from its Nx run's mbx reservation endpoint, and ${RESERVATIONS_ENV} names none: ${describeUnserved(endpoint)}; refusing to run the command\n`,
     );
   }
+  const reserved = leaf?.kind === 'reserve' && endpoint?.kind === 'served' ? { leaf, endpoint: endpoint.socket } : null;
 
   // A granted run serves a sub-pool of its own grant, so its descendants draw from that and never from above it.
   // A pool that cannot be set up refuses the run: no granted command runs beside its grant.

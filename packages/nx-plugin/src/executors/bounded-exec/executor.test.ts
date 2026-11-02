@@ -28,7 +28,7 @@ import {
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS, type HangDiagnostics } from './hang-diagnostics.js';
 import { MBX_QUEUE_POLL_MS } from './mbx-queue.js';
-import { RESERVATIONS_ENV } from './mbx-reservations.js';
+import { RESERVATIONS_ENV, RESERVATIONS_UNSERVED_ENV } from './mbx-reservations.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { cowshedSubtreeOwner, type SubtreeOwner } from './owned-subtree.js';
 import {
@@ -65,7 +65,8 @@ const nextestWant = 8;
  * inside a grant (mbxPool), and the case about mbx's pool builds its
  * own. `MBX_SCHEDULER_PRIORITY` is the job's priority in that pool: a gate job carries `normal`, and the case about the
  * pool asserts the priority of a job that names none. `MBX_RESERVATIONS_SOCKET` is the endpoint of the Nx run that ran
- * this suite: a case about mbx's pool serves its own.
+ * this suite: a case about mbx's pool serves its own. `BOUNDED_EXEC_RESERVATIONS_UNSERVED` is why that run served none,
+ * which a case about a run without an endpoint sets itself.
  */
 const INHERITED_SIZING_ENV = [
   CPU_POOL_ENV,
@@ -80,6 +81,7 @@ const INHERITED_SIZING_ENV = [
   'MBX_SCHED_DISABLE',
   'MBX_SCHEDULER_PRIORITY',
   RESERVATIONS_ENV,
+  RESERVATIONS_UNSERVED_ENV,
 ] as const;
 const inheritedSizing = INHERITED_SIZING_ENV.map((name) => [name, process.env[name]] as const);
 
@@ -1832,6 +1834,49 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         else process.env[name] = value;
       }
       await endpoint.close();
+    }
+  });
+
+  it.each([
+    [
+      'its run published why its endpoint did not start',
+      'mbx reservations ended with status 1: mbx: reservations need scheduler.enabled',
+      "the run's endpoint did not start (mbx reservations ended with status 1: mbx: reservations need scheduler.enabled)",
+    ],
+    [
+      'its run published nothing',
+      undefined,
+      `the run published neither an endpoint nor why it has none (${RESERVATIONS_UNSERVED_ENV} is unset too)`,
+    ],
+  ] as const)('refuses a reserved leaf whose run serves no endpoint, naming why: %s', async (_case, unserved, why) => {
+    const workspace = await createWorkspace();
+    const saved = {
+      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+      [RESERVATIONS_ENV]: process.env[RESERVATIONS_ENV],
+      [RESERVATIONS_UNSERVED_ENV]: process.env[RESERVATIONS_UNSERVED_ENV],
+    };
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    delete process.env[RESERVATIONS_ENV];
+    if (unserved === undefined) delete process.env[RESERVATIONS_UNSERVED_ENV];
+    else process.env[RESERVATIONS_UNSERVED_ENV] = unserved;
+    try {
+      const result = await runBoundedExec(
+        { command: 'touch ran.marker', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.terminalOutput).toContain(`and ${RESERVATIONS_ENV} names none: ${why}`);
+      expect(existsSync(join(workspace.root, 'ran.marker'))).toBe(false);
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     }
   });
 
