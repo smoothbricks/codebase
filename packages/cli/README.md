@@ -410,9 +410,12 @@ before the next published its own. Only the same `current/` directory, by device
 found no valid generation is refused as malformed. ttsc's own go invocations run in workspace mode (`GOWORK=auto`),
 where go accepts only `-mod=readonly` or `-mod=vendor`, so the patch drops a caller's `-mod` flag from their `GOFLAGS`
 and keeps the rest: a host shell exporting `GOFLAGS=-mod=mod` failed its entry rebuilding a tool, "selecting Go packages
-for plugin `typia` failed". The packaged managed asset is the source, so clean managed installs receive the same repairs
-without a compiler fork or edits to the dependency cache. The registration applies only to that exact compiler version;
-the repository's lockfile continues to own its compiler pin.
+for plugin `typia` failed". A plugin source's link at or below a name the go tool passes over (`.`/`_`-prefixed, or
+`testdata`) is skipped like one in a pruned directory instead of refusing the module: go neither compiles nor embeds it,
+and cowshed's `.cache/lmao` build-state link inside a package that is also a Go plugin module cost that module its
+recorded source identity, so every load copied it and ran `go` 22 more times. The packaged managed asset is the source,
+so clean managed installs receive the same repairs without a compiler fork or edits to the dependency cache. The
+registration applies only to that exact compiler version; the repository's lockfile continues to own its compiler pin.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases

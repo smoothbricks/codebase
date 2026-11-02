@@ -189,3 +189,54 @@ describe("ttsc's go invocations", () => {
     }
   });
 });
+
+/**
+ * ttsc's collectPluginSourceFiles over the plugin module argv[-1], from the ttsc module argv[-2], printed as JSON, or
+ * its refusal on stderr with status 1.
+ */
+const COLLECT_PLUGIN_SOURCE_FILES = `const { collectPluginSourceFiles } = require(process.argv.at(-2));
+try {
+  process.stdout.write(JSON.stringify(collectPluginSourceFiles(process.argv.at(-1))));
+} catch (error) {
+  process.stderr.write(error.message);
+  process.exit(1);
+}`;
+
+describe("ttsc's plugin source files", () => {
+  it('pass over a link below a directory the go tool ignores, and refuse a link the build would read', () => {
+    // cowshed links each package's .cache/lmao onto its build volume (a repository's .cowshed.toml [build] state), a package's Go
+    // plugin module among them. ttsc refused that module's source identity for the link, so every load copied the
+    // module and asked go for its packages again: 30 process spawns per TtscCompiler.prepare() instead of 8.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'ttsc-source-links-')));
+    try {
+      const plugin = join(root, 'plugin');
+      mkdirSync(join(plugin, '.cache'), { recursive: true });
+      mkdirSync(join(root, 'volume'));
+      writeFileSync(join(plugin, 'go.mod'), 'module example.com/plugin\n\ngo 1.21\n');
+      writeFileSync(join(plugin, 'plugin.go'), 'package plugin\n');
+      symlinkSync(join(root, 'volume'), join(plugin, '.cache', 'lmao'));
+      const ttsc = dirname(createRequire(import.meta.url).resolve('ttsc/package.json'));
+      const collect = () =>
+        spawnSync(
+          process.execPath,
+          [
+            '-e',
+            COLLECT_PLUGIN_SOURCE_FILES,
+            join(ttsc, 'lib/plugin/internal/source/collectPluginSourceFiles.js'),
+            plugin,
+          ],
+          { encoding: 'utf8' },
+        );
+      const passed = collect();
+      expect(passed.stderr).toBe('');
+      expect(passed.status).toBe(0);
+      expect(JSON.parse(passed.stdout)).toEqual([join(plugin, 'go.mod'), join(plugin, 'plugin.go')]);
+      symlinkSync(join(root, 'volume'), join(plugin, 'linked'));
+      const refused = collect();
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain(`contains a link at ${join(plugin, 'linked')}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

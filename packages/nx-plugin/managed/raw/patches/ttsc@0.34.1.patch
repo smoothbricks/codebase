@@ -160,6 +160,65 @@ diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/
          worker = created;
          const retire = () => {
              if (worker === created)
+diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.d.ts b/lib/plugin/internal/source/collectPluginSourceFiles.d.ts
+--- a/lib/plugin/internal/source/collectPluginSourceFiles.d.ts
++++ b/lib/plugin/internal/source/collectPluginSourceFiles.d.ts
+@@ -21,7 +21,11 @@
+  * A link (a symbolic link or a Windows junction) outside those directories is
+  * refused rather than skipped. The build would compile what it names, which
+  * neither this list nor anything keyed on it covers; a Go module zip excludes
+- * links from a module's content for the same reason.
++ * links from a module's content for the same reason. A link at or below a name
++ * the go tool passes over (one beginning with `.` or `_`, or `testdata`; `go
++ * help packages`) is skipped like one in an excluded directory: Go neither
++ * compiles it nor embeds a link. Tools keep links there, as cowshed does for a
++ * package's `.cache/lmao`, and refusing one cost the module its source identity.
+  *
+  * @param root The source directory: a plugin's Go module root, an overlay
+  *   module, a contributor's source, or a `replace` target outside the module.
+diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.js b/lib/plugin/internal/source/collectPluginSourceFiles.js
+--- a/lib/plugin/internal/source/collectPluginSourceFiles.js
++++ b/lib/plugin/internal/source/collectPluginSourceFiles.js
+@@ -30,7 +30,11 @@
+  * A link (a symbolic link or a Windows junction) outside those directories is
+  * refused rather than skipped. The build would compile what it names, which
+  * neither this list nor anything keyed on it covers; a Go module zip excludes
+- * links from a module's content for the same reason.
++ * links from a module's content for the same reason. A link at or below a name
++ * the go tool passes over (one beginning with `.` or `_`, or `testdata`; `go
++ * help packages`) is skipped like one in an excluded directory: Go neither
++ * compiles it nor embeds a link. Tools keep links there, as cowshed does for a
++ * package's `.cache/lmao`, and refusing one cost the module its source identity.
+  *
+  * @param root The source directory: a plugin's Go module root, an overlay
+  *   module, a contributor's source, or a `replace` target outside the module.
+@@ -72,7 +76,8 @@
+             // list, the key, nor a watch covers, and a copy of the module cannot
+             // recreate a link without the symlink privilege on Windows.
+             if (GoSourceInputs_1.GoSourceInputs.shouldPruneDirectory(entry.name) ||
+-                GoSourceInputs_1.GoSourceInputs.shouldOmitSourceFile(entry.name))
++                GoSourceInputs_1.GoSourceInputs.shouldOmitSourceFile(entry.name) ||
++                goToolIgnores(root, full))
+                 continue;
+             throw new Error(`ttsc: plugin source ${root} contains a link at ${full}. A plugin's Go ` +
+                 `sources are its own files, as a Go module zip holds them: replace the ` +
+@@ -92,4 +97,15 @@
+         out.push(full);
+     }
+ }
++/**
++ * Whether the go tool passes over `full`: it ignores every directory and file
++ * whose name begins with "." or "_", and directories named "testdata" (`go help
++ * packages`), so nothing at or below such a name is compiled.
++ */
++function goToolIgnores(root, full) {
++    return node_path_1.default
++        .relative(root, full)
++        .split(node_path_1.default.sep)
++        .some((name) => name.startsWith(".") || name.startsWith("_") || name === "testdata");
++}
+ //# sourceMappingURL=collectPluginSourceFiles.js.map
+\ No newline at end of file
 diff --git a/lib/plugin/internal/source/inspectPluginBuildLock.js b/lib/plugin/internal/source/inspectPluginBuildLock.js
 --- a/lib/plugin/internal/source/inspectPluginBuildLock.js
 +++ b/lib/plugin/internal/source/inspectPluginBuildLock.js
