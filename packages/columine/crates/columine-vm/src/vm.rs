@@ -7523,6 +7523,18 @@ impl<I: KeyIndex> Vm<I> {
         self.undo.overflowed
     }
 
+    /// The open window's records in write order, each the bytes one write
+    /// replaced at its absolute offset: undoing them in reverse
+    /// ([`rollback_entry`]) over the written image restores the image the
+    /// window opened on, so they name every byte the window changed. A host
+    /// that keeps a fact derived from the image current reads them before it
+    /// ends the window, instead of rescanning the image. `None` while no
+    /// window is open, or once it overflowed: its writes since are covered by
+    /// the shadow, not by records.
+    pub fn undo_records(&self) -> Option<&[FlatUndoEntry]> {
+        (self.undo.enabled && !self.undo.overflowed).then_some(self.undo.entries.as_slice())
+    }
+
     /// The refusal the window holds, if the memory could not back its journal
     /// or shadow: `OutOfMemory`. A host names the operator's next move from it.
     pub fn undo_refusal(&self) -> Option<ErrorCode> {

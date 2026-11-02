@@ -14,7 +14,9 @@ use columine_vm::hashset_ops::bind_slot_set;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::undo_log::{FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp};
-use columine_vm::vm::{UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm, f64s_as_bytes, u32s_as_bytes};
+use columine_vm::vm::{
+    UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm, f64s_as_bytes, rollback_entry, u32s_as_bytes,
+};
 use proptest::prelude::*;
 use proptest::strategy::Strategy as PropStrategy;
 use std::collections::{BTreeMap, BTreeSet};
@@ -662,4 +664,70 @@ fn capture_past_the_record_budget_overflows_to_a_shadow_and_rolls_back_exactly()
             "the pre-fill savepoint restores every flag and byte"
         );
     }
+}
+
+/// A host that keeps a fact derived from the image (what the image
+/// references, say) current reads the window's records instead of rescanning
+/// the image: undoing them in reverse over the written image restores the
+/// opening image, so every byte the window changed is named with its prior
+/// value. Past the record budget the shadow covers the writes, and the window
+/// names none.
+#[test]
+fn undo_records_name_every_byte_a_window_wrote_until_it_overflows() {
+    let mut state = mk_slot_state(16, SlotType::HashMap);
+    let mut vm = Vm::default();
+    assert_eq!(vm.undo_records(), None, "no window is open");
+    vm.undo_enable(&state).expect("undo window opens");
+    assert_eq!(
+        vm.undo_records(),
+        Some(&[][..]),
+        "an open window wrote nothing"
+    );
+    let before = state.clone();
+    for (key, value) in [(42, 100), (42, 200), (7, 300)] {
+        assert_eq!(
+            map_upsert(&mut vm, &mut state, key, value, false),
+            ErrorCode::Ok
+        );
+    }
+    assert_eq!(map_remove(&mut vm, &mut state, 7, false), ErrorCode::Ok);
+    assert_ne!(state, before, "the window changed the image");
+    let records = vm
+        .undo_records()
+        .expect("a recording window names its writes")
+        .to_vec();
+    let mut undone = state.clone();
+    for record in records.iter().rev() {
+        rollback_entry(&mut undone, record).expect("an actual record");
+    }
+    assert_eq!(undone, before, "the records name every changed byte");
+    vm.undo_commit();
+    assert_eq!(vm.undo_records(), None, "an ended window names nothing");
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let byte = u32::try_from(state.len() - 1).expect("test image fits u32");
+    for _ in 0..UNDO_CAPACITY {
+        vm.capture_mutation(false, &mut state, &[(byte, 1)], |image| {
+            image[byte as usize] ^= 1;
+        })
+        .expect("actual prior-byte budget");
+    }
+    assert_eq!(
+        vm.undo_records().map(<[FlatUndoEntry]>::len),
+        Some(UNDO_CAPACITY as usize),
+        "a window at its budget still names every write"
+    );
+    vm.capture_mutation(false, &mut state, &[(byte, 1)], |image| {
+        image[byte as usize] ^= 1;
+    })
+    .expect("a capture past the budget succeeds");
+    assert!(vm.undo_has_overflow());
+    assert_eq!(
+        vm.undo_records(),
+        None,
+        "an overflowed window's writes are the shadow's, not records"
+    );
+    vm.undo_rollback(&mut state, 0)
+        .expect("the opening savepoint is exact");
+    vm.undo_commit();
 }
