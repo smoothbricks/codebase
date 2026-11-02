@@ -3018,7 +3018,7 @@ export type RetireDescendantsRequest = {
  * operation changed before it acted, and changed nothing itself. Retrying is the remedy; no
  * other repair is needed.
  */
-export type Retry = { readonly reason: 'gcPlanStale' };
+export type Retry = { readonly reason: 'gcPlanStale' } | { readonly reason: 'supervisorRetiring' };
 
 export type RevisionTarget = { readonly branch: BranchName } | { readonly ref: GitRef } | { readonly oid: GitOid };
 

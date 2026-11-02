@@ -10814,7 +10814,8 @@ fn unsealed_job(job_id: JobId) -> CowshedError {
 }
 
 fn retiring_error() -> CowshedError {
-    CowshedError::conflict(
+    CowshedError::retryable(
+        crate::error::Retry::SupervisorRetiring,
         "workspace supervisor is quiescing or retired",
         "reattach an active workspace before starting work",
     )

@@ -647,12 +647,13 @@ into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supe
   `retire`, saying when — now (running jobs stopped), after the running jobs end, or only if no job runs (a `Conflict`,
   changing nothing, while one does) — and the supervisor carries it out on its own. Closing admission without retiring
   (quiesce) is for the supervisor's own process alone, which retires it afterwards itself; the wire has no such request.
-  Measured 2026-10-21: a supervisor whose 17 jobs had all ended refused every exec as "quiescing or retired" for hours.
-  A caller had quiesced it and then failed to send the retire that was a second request; `attach` changed nothing, and
-  its idle retirement never fired either, because the Nx keeper probes only while the supervisor runs, so "idle", which
-  waits for the keeper to settle, never became true. Every caller in another process that stops a supervisor goes
-  through this one request: `detach`, `rm`, `grant` growing the port block, `doctor --repair` moving a colliding port
-  block, and re-adopting main.
+  Its refusal of new work is a `Conflict` typed `Retry::SupervisorRetiring` (07_api.md, "Errors"): it admitted nothing,
+  and the work belongs to the supervisor that replaces it. Measured 2026-10-21: a supervisor whose 17 jobs had all ended
+  refused every exec as "quiescing or retired" for hours. A caller had quiesced it and then failed to send the retire
+  that was a second request; `attach` changed nothing, and its idle retirement never fired either, because the Nx keeper
+  probes only while the supervisor runs, so "idle", which waits for the keeper to settle, never became true. Every
+  caller in another process that stops a supervisor goes through this one request: `detach`, `rm`, `grant` growing the
+  port block, `doctor --repair` moving a colliding port block, and re-adopting main.
 - Its opening waits for no image lock (07_api.md, "Authority model"): it finishes nothing. While a live lifecycle
   operation holds the workspace's lock (a fork of it, `main`'s included, its `rm` or its defragmentation), an already
   settled mount is served as it stands, and one that needs settling waits for the lock after saying once on its stderr,

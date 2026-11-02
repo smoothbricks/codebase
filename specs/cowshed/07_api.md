@@ -1711,13 +1711,14 @@ pub struct CowshedError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
-    /* otherBuild, fence, admission, stdin: optional structured sources, read through accessors */
+    /* otherBuild, fence, admission, stdin, retry: optional structured sources, read through accessors */
 }
 impl CowshedError {
     pub fn other_build_source(&self) -> Option<&OtherBuild>;
     pub fn fence_source(&self) -> Option<&FenceRefusal>;
     pub fn admission_source(&self) -> Option<&AdmissionRefusal>;
     pub fn stdin_source(&self) -> Option<StdinRefusal>;
+    pub fn retry_source(&self) -> Option<Retry>;
 }
 
 pub enum ErrorCode {
@@ -1739,6 +1740,15 @@ pub enum FenceRefusal {
     SourceDirty { paths: Vec<WorkspacePath>, total: u64 },
     TargetDirty { paths: Vec<WorkspacePath>, total: u64 },
     ReplayConflicted { rolled_back_to: GitOid },
+}
+
+/// Why a refused call is safe to make again: it changed nothing, against state another operation changed before it
+/// acted. Wire: `"retry": {"reason": "<camelCase variant>"}`, absent on every other error; a reason this build does
+/// not know decodes as none.
+pub enum Retry {
+    GcPlanStale,        // gc found the store changed between its plan and its execution and collected nothing
+    SupervisorRetiring, // the workspace's supervisor closed admission on its way to retirement and admitted nothing
+                        // (11_shell.md "Supervisor"): the work belongs to the supervisor that replaces it
 }
 ```
 

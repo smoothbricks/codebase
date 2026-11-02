@@ -21,7 +21,9 @@ use cowshed_core::api::{
 };
 #[cfg(target_os = "macos")]
 use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
-use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
+use cowshed_core::error::{
+    AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result, Retry,
+};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::job_groups::Birth;
@@ -6078,6 +6080,11 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
     }
     .await;
     assert_eq!(refused.code, ErrorCode::Conflict);
+    assert_eq!(
+        refused.retry_source(),
+        Some(Retry::SupervisorRetiring),
+        "the refusal says by type that it admitted nothing: {refused:?}"
+    );
     assert!(!server.is_finished(), "the running job holds it serving");
 
     // A wait already in flight is answered even as the supervisor stops serving.

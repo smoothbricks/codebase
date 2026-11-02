@@ -227,6 +227,11 @@ pub enum Retry {
     /// Garbage collection found the store changed between its plan and its execution (another
     /// process reclaiming or retiring an image) and collected nothing.
     GcPlanStale,
+    /// The workspace's supervisor closed admission on its way to retirement (a daemon of another
+    /// build drains it, it retires idle, or a caller asked it to retire) and admitted nothing.
+    /// Nothing reopens its admission (11_shell.md "Supervisor"): the work belongs to the
+    /// supervisor that replaces it.
+    SupervisorRetiring,
 }
 
 /// A part of an exec request a repeat under its admission key must carry unchanged, by its
