@@ -401,6 +401,141 @@ fn trailing_bytes_after_the_last_entry_are_refused() {
     );
 }
 
+/// An embedder's extension table: its magic, its length, its bytes.
+fn extension(magic: u32, bytes: &[u8]) -> Vec<u8> {
+    let mut out = magic.to_le_bytes().to_vec();
+    out.extend(
+        u32::try_from(bytes.len())
+            .expect("table length fits u32")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// ASCII `A X R B`, an embedder's table the VM never reads.
+const EMBEDDER_MAGIC: u32 = 0x4252_5841;
+
+#[test]
+fn an_extension_table_after_the_row_table_leaves_the_bind_unchanged() {
+    let row_table = table(
+        TYPE_COL,
+        &[entry(
+            PRED_COL,
+            &[ORDER_TYPE],
+            &threshold_expr(VAL_COL, 100),
+        )],
+    );
+    let mut trailer = row_table.clone();
+    trailer.extend(extension(EMBEDDER_MAGIC, b"the embedder's own bytes"));
+    let types = [ORDER_TYPE, ORDER_TYPE, 9];
+    let keys = [1u32, 2, 3];
+    let vals = [50u32, 150, 999];
+    let bound = |trailer: &[u8]| {
+        let prog = program(trailer);
+        let mut state = init(&prog);
+        let mut cols: Vec<&[u8]> = vec![
+            u32s_as_bytes(&types),
+            u32s_as_bytes(&keys),
+            u32s_as_bytes(&vals),
+            &[],
+        ];
+        let mut rows = RowColumns::new();
+        let mut eval = Threshold {
+            admitted: 0,
+            evaluated: 0,
+        };
+        bind_row_columns(&prog, &state, &mut cols, 3, &mut eval, &mut rows).expect("bind");
+        let derived = cols[3].to_vec();
+        let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
+        assert_eq!(vm.execute_batch(&mut state, &prog, &cols, 3), OK);
+        (derived, [1, 2, 3].map(|key| map_value(&state, key)))
+    };
+    assert_eq!(bound(&trailer), bound(&row_table));
+    assert_eq!(
+        bound(&trailer),
+        (
+            u32s_as_bytes(&[0u32, 1, 0]).to_vec(),
+            [None, Some(150), None]
+        )
+    );
+}
+
+#[test]
+fn a_tail_of_extension_tables_alone_binds_nothing() {
+    let prog = program(
+        &[
+            extension(EMBEDDER_MAGIC, &[1, 2, 3]),
+            extension(EMBEDDER_MAGIC + 1, &[]),
+        ]
+        .concat(),
+    );
+    let state = init(&prog);
+    let placeholder = [7u32, 7];
+    let mut cols: Vec<&[u8]> = vec![&[], &[], &[], u32s_as_bytes(&placeholder)];
+    let mut rows = RowColumns::new();
+    let mut eval = Threshold {
+        admitted: 0,
+        evaluated: 0,
+    };
+    bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+    assert_eq!(cols[3], u32s_as_bytes(&placeholder));
+    assert_eq!(eval.admitted, 0);
+}
+
+#[test]
+fn a_tail_that_is_not_whole_tables_of_distinct_magics_is_refused() {
+    let row_table = table(
+        TYPE_COL,
+        &[entry(PRED_COL, &[ORDER_TYPE], &threshold_expr(VAL_COL, 1))],
+    );
+    let cut = {
+        let mut table = extension(EMBEDDER_MAGIC, &[1, 2, 3, 4]);
+        table.pop();
+        table
+    };
+    let cases: [(&str, Vec<u8>); 5] = [
+        ("a cut extension table", [row_table.clone(), cut].concat()),
+        (
+            "a header shorter than its magic and length",
+            [row_table.clone(), vec![0x41, 0x58, 0x52]].concat(),
+        ),
+        (
+            "two tables of one magic",
+            [
+                row_table.clone(),
+                extension(EMBEDDER_MAGIC, &[1]),
+                extension(EMBEDDER_MAGIC, &[2]),
+            ]
+            .concat(),
+        ),
+        (
+            "an extension table under the row table's magic",
+            [row_table.clone(), extension(ROW_EXPRESSIONS_MAGIC, &[])].concat(),
+        ),
+        (
+            "a row table that runs past the tail",
+            row_table[..row_table.len() - 1].to_vec(),
+        ),
+    ];
+    for (name, trailer) in cases {
+        let prog = program(&trailer);
+        let types = [ORDER_TYPE];
+        let mut rows = RowColumns::new();
+        let mut cols: Vec<&[u8]> = vec![
+            u32s_as_bytes(&types),
+            u32s_as_bytes(&types),
+            u32s_as_bytes(&types),
+            &[],
+        ];
+        assert_eq!(
+            bind_err(&prog, &mut cols, 1, &mut rows),
+            ErrorCode::InvalidProgram,
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn a_later_entry_reads_an_earlier_entry_s_derived_column() {
     // Columns: 0 type, 1 key, 2 value, 3 derived (value > 100), 4 derived

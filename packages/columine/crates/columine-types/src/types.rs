@@ -60,7 +60,8 @@ pub struct ProgramSections<'a> {
     pub header: ProgramHeader,
     pub init_code: &'a [u8],
     pub reduce_code: &'a [u8],
-    /// Content after the reduce section (an embedder's extension tables).
+    /// Content after the reduce section: a row-expression table, then the
+    /// embedder's extension tables ([`ProgramTail`]).
     pub tail: &'a [u8],
 }
 
@@ -135,6 +136,139 @@ impl ProgramHeader {
             reduce_code: content.get(init_end..reduce_end)?,
             tail: content.get(reduce_end..)?,
         })
+    }
+}
+
+/// ASCII \`R X P 1\` in little-endian wire order: the row-expression table.
+pub const ROW_EXPRESSIONS_MAGIC: u32 = 0x3150_5852;
+
+/// ASCII \`R X P 2\`: the row-expression table whose entries name their lane.
+pub const LANED_ROW_EXPRESSIONS_MAGIC: u32 = 0x3250_5852;
+
+/// The magic and the length an extension table opens with.
+pub const EXTENSION_TABLE_HEADER: usize = 4 + 4;
+
+/// A program's tail split into its tables (columine 08): the row-expression
+/// table when the tail opens with one, then the embedder's extension tables,
+/// each a \`u32\` magic, a \`u32\` length and that many bytes. A magic names at
+/// most one table, and no extension table takes a row table's magic. The
+/// VM reads the row table alone; an extension table is opaque to it.
+#[derive(Clone, Copy, Debug)]
+pub struct ProgramTail<'a> {
+    /// The row-expression table, exactly its bytes.
+    pub row_table: Option<&'a [u8]>,
+    extensions: &'a [u8],
+    len: usize,
+}
+
+impl<'a> ProgramTail<'a> {
+    /// Split \`tail\`. \`None\` when a row table it opens with runs past the
+    /// tail, or the bytes after it are not whole extension tables of distinct
+    /// magics.
+    #[must_use]
+    pub fn parse(tail: &'a [u8]) -> Option<Self> {
+        let table_len = match tail.get(..4) {
+            Some(magic) => match u32::from_le_bytes(magic.try_into().ok()?) {
+                ROW_EXPRESSIONS_MAGIC => row_table_len(tail, false)?,
+                LANED_ROW_EXPRESSIONS_MAGIC => row_table_len(tail, true)?,
+                _ => 0,
+            },
+            None if tail.is_empty() => 0,
+            None => return None,
+        };
+        let parsed = Self {
+            row_table: (table_len != 0).then(|| &tail[..table_len]),
+            extensions: &tail[table_len..],
+            len: tail.len(),
+        };
+        for (seen, table) in parsed.walk().enumerate() {
+            let (magic, _) = table?;
+            if matches!(magic, ROW_EXPRESSIONS_MAGIC | LANED_ROW_EXPRESSIONS_MAGIC)
+                || parsed
+                    .walk()
+                    .take(seen)
+                    .any(|earlier| matches!(earlier, Some((m, _)) if m == magic))
+            {
+                return None;
+            }
+        }
+        Some(parsed)
+    }
+
+    /// The tail's length in bytes: the row table and every extension table.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the tail holds no table.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The bytes of the extension table \`magic\` names, when the tail holds it.
+    #[must_use]
+    pub fn extension(&self, magic: u32) -> Option<&'a [u8]> {
+        self.walk()
+            .find_map(|table| table.filter(|(found, _)| *found == magic))
+            .map(|(_, bytes)| bytes)
+    }
+
+    /// Each extension table's magic and bytes, in tail order; \`None\` where the
+    /// bytes stop being whole tables ([\`Self::parse\`] proved they never do).
+    fn walk(&self) -> impl Iterator<Item = Option<(u32, &'a [u8])>> {
+        let mut rest = self.extensions;
+        core::iter::from_fn(move || {
+            if rest.is_empty() {
+                return None;
+            }
+            let header = rest.get(..EXTENSION_TABLE_HEADER);
+            let table = header.and_then(|header| {
+                let magic = u32::from_le_bytes(header[..4].try_into().ok()?);
+                let len = usize::try_from(u32::from_le_bytes(header[4..].try_into().ok()?)).ok()?;
+                let end = EXTENSION_TABLE_HEADER.checked_add(len)?;
+                Some((magic, rest.get(EXTENSION_TABLE_HEADER..end)?, end))
+            });
+            Some(match table {
+                Some((magic, bytes, end)) => {
+                    rest = &rest[end..];
+                    Some((magic, bytes))
+                }
+                None => {
+                    rest = &[];
+                    None
+                }
+            })
+        })
+    }
+}
+
+/// The length of the row-expression table \`tail\` opens with: its header, its
+/// type column, then each entry's target column, lane (RXP2), match ids and
+/// expression. \`None\` when an entry runs past the tail.
+fn row_table_len(tail: &[u8], laned: bool) -> Option<usize> {
+    let count = u16::from_le_bytes(tail.get(4..6)?.try_into().ok()?);
+    let mut operands = crate::operand::Operands::at(tail, 6);
+    operands.index()?;
+    for _ in 0..count {
+        operands.index()?;
+        if laned {
+            operands.byte()?;
+        }
+        let matches = usize::try_from(operands.index()?).ok()?;
+        operands.bytes(matches.checked_mul(4)?)?;
+        let expr = usize::from(operands.u16()?);
+        operands.bytes(expr)?;
+    }
+    Some(operands.pos())
+}
+
+impl<'a> ProgramSections<'a> {
+    /// The tail's tables ([\`ProgramTail::parse\`]).
+    #[must_use]
+    pub fn tables(&self) -> Option<ProgramTail<'a>> {
+        ProgramTail::parse(self.tail)
     }
 }
 
@@ -1154,6 +1288,27 @@ pub fn struct_field_offset(num_fields: u8, field_types: &[u8], target_field: u8)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tail_names_its_row_table_and_each_extension_table_by_magic() {
+        let mut tail = ROW_EXPRESSIONS_MAGIC.to_le_bytes().to_vec();
+        tail.extend(0u16.to_le_bytes());
+        tail.push(0); // type column, no entries
+        let row_end = tail.len();
+        for (magic, bytes) in [(0x4252_5841u32, &b"binding"[..]), (7, &b""[..])] {
+            tail.extend(magic.to_le_bytes());
+            tail.extend(u32::try_from(bytes.len()).expect("fits").to_le_bytes());
+            tail.extend_from_slice(bytes);
+        }
+        let parsed = ProgramTail::parse(&tail).expect("a row table and two extension tables");
+        assert_eq!(parsed.row_table, Some(&tail[..row_end]));
+        assert_eq!(parsed.extension(0x4252_5841), Some(&b"binding"[..]));
+        assert_eq!(parsed.extension(7), Some(&b""[..]));
+        assert_eq!(parsed.extension(8), None);
+        assert_eq!(parsed.len(), tail.len());
+        let empty = ProgramTail::parse(&[]).expect("an empty tail");
+        assert_eq!(empty.row_table, None);
+        assert!(empty.is_empty());
+    }
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
 

@@ -93,11 +93,7 @@ use crate::key_index::{InternBytes, KeyCx, KeyIndex};
 use crate::struct_map::{StructMap2Slot, StructMapSlot, StructRows};
 use crate::vm::{col_at, col_u32, col_u32_exact, u64s_as_bytes};
 
-/// ASCII `R X P 1` in little-endian wire order.
-pub const ROW_EXPRESSIONS_MAGIC: u32 = 0x3150_5852;
-
-/// ASCII `R X P 2`: the table whose entries name their cell lane.
-pub const LANED_ROW_EXPRESSIONS_MAGIC: u32 = 0x3250_5852;
+pub use columine_types::types::{LANED_ROW_EXPRESSIONS_MAGIC, ROW_EXPRESSIONS_MAGIC};
 
 /// Magic and entry count: the fixed part of the table header.
 const TABLE_FIXED_BYTES: usize = 4 + 2;
@@ -459,7 +455,7 @@ impl RowColumns {
     /// expressions is refused. A batch with no rows binds nothing, and a
     /// program without a table needs no bind.
     fn bound_for(&self, program: &[u8], batch_len: u32) -> Result<(), ErrorCode> {
-        let table = match row_table(program)? {
+        let (table, table_start) = match row_table(program)? {
             None if self.targets.is_empty() => return Ok(()),
             Some(_) if batch_len == 0 && self.bound && self.targets.is_empty() => return Ok(()),
             Some(table) if batch_len != 0 => table,
@@ -467,7 +463,7 @@ impl RowColumns {
         };
         if !self.bound
             || self.batch_len != batch_len
-            || self.table_start != program.len() - table.len()
+            || self.table_start != table_start
             || self.table != table
         {
             return Err(ErrorCode::InvalidProgram);
@@ -626,25 +622,23 @@ impl Entry<'_> {
     }
 }
 
-/// The row-expression table of `program`: `None` when the content ends with
-/// the reduce section. A program too short for its own header, or a trailer
-/// that does not open with an RXP1 or RXP2 magic, is `InvalidProgram`.
-pub(crate) fn row_table(program: &[u8]) -> Result<Option<&[u8]>, ErrorCode> {
-    let trailer = ProgramHeader::sections(program)
-        .ok_or(ErrorCode::InvalidProgram)?
-        .tail;
-    if trailer.is_empty() {
+/// The row-expression table of \`program\` and its offset in the program:
+/// \`None\` when the tail opens with no row table (it ends with the reduce
+/// section, or carries only extension tables). A program too short for its
+/// own header, or a tail that is not a row table and whole extension tables
+/// ([\`ProgramTail\`]), is \`InvalidProgram\`.
+pub(crate) fn row_table(program: &[u8]) -> Result<Option<(&[u8], usize)>, ErrorCode> {
+    let tail = ProgramHeader::sections(program)
+        .and_then(|sections| sections.tables())
+        .ok_or(ErrorCode::InvalidProgram)?;
+    let Some(table) = tail.row_table else {
         return Ok(None);
-    }
-    if trailer.len() < TABLE_FIXED_BYTES
-        || !matches!(
-            bytes::read_u32(trailer, 0),
-            ROW_EXPRESSIONS_MAGIC | LANED_ROW_EXPRESSIONS_MAGIC
-        )
-    {
+    };
+    if table.len() < TABLE_FIXED_BYTES {
         return Err(ErrorCode::InvalidProgram);
     }
-    Ok(Some(trailer))
+    // The row table opens the tail, which runs to the program's end.
+    Ok(Some((table, program.len() - tail.len())))
 }
 
 /// Parse one entry at `*pos`, advancing past it. An RXP2 entry (`laned`)
@@ -796,7 +790,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     out.clear_live();
     out.bound = false;
     out.table.clear();
-    let Some(table) = row_table(program)? else {
+    let Some((table, table_start)) = row_table(program)? else {
         out.bound = true;
         return Ok(LiveColumns {
             rows: out,
@@ -821,9 +815,6 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     if type_col as usize >= cols.len() {
         return Err(ErrorCode::InvalidProgram);
     }
-    // The table is the program's tail: a table offset plus this is a
-    // program offset, which is what the live reads index.
-    let table_start = program.len() - table.len();
     room(&mut out.table, table.len())?;
     out.table.extend_from_slice(table);
     out.table_start = table_start;
