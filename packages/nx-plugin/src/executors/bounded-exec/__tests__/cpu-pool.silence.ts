@@ -3,6 +3,11 @@
  * never failed for being slow, and one that falls silent fails its waiter, naming itself. This file is not
  * `*.test.ts`, so the shards skip it: each case waits out the 15 s silence bound or more on the host's clock, and the
  * `test-pool-silence` target names it.
+ *
+ * It runs on the modules the target's `build` dependency emitted, without the package's bunfig and its ttsc preload,
+ * and so does its runner. Loaded through that preload, this file compiled the package's whole program first: 39.5 s on
+ * a quiet host, which a loaded land gate on 2026-11-02 stretched past the 180 s no-progress bound before the first case
+ * began. Compiling belongs to the build the target waits for, never to the test.
  */
 import { expect, it } from 'bun:test';
 import { type ChildProcess, spawn } from 'node:child_process';
@@ -12,18 +17,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../../bounded-test-policy.js';
-import { ownedSocketDirectory } from '../../../testing.js';
-import { readInheritedCpuPool, takeParentCpuTokens } from '../cpu-pool.js';
-import { createProcessTreeKiller, runBoundedExec } from '../executor.js';
-import { HEARTBEAT_MS, HEARTBEAT_SILENCE_MS } from '../lease-wait.js';
-import { closeRunCpuPool, serveRunCpuPool } from '../run-cpu-pool.js';
-import { VERDICT_FILE } from '../verdict.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../../../dist/bounded-test-policy.js';
+import { readInheritedCpuPool, takeParentCpuTokens } from '../../../../dist/executors/bounded-exec/cpu-pool.js';
+import { createProcessTreeKiller, runBoundedExec } from '../../../../dist/executors/bounded-exec/executor.js';
+import { HEARTBEAT_MS, HEARTBEAT_SILENCE_MS } from '../../../../dist/executors/bounded-exec/lease-wait.js';
+import { closeRunCpuPool, serveRunCpuPool } from '../../../../dist/executors/bounded-exec/run-cpu-pool.js';
+import { VERDICT_FILE } from '../../../../dist/executors/bounded-exec/verdict.js';
+import { ownedSocketDirectory } from '../../../../dist/testing.js';
 
-/** The runner loads this package's source outside its bunfig, so it takes the same transform preload as this test. */
-const VALIDATION_PRELOAD = fileURLToPath(import.meta.resolve('@smoothbricks/validation/bun/preload'));
-const LEASE_CLIENT = fileURLToPath(new URL('../gateway-lease.ts', import.meta.url));
-const LEASE_WAIT = fileURLToPath(new URL('../lease-wait.ts', import.meta.url));
+const LEASE_CLIENT = fileURLToPath(
+  new URL('../../../../dist/executors/bounded-exec/gateway-lease.js', import.meta.url),
+);
+const LEASE_WAIT = fileURLToPath(new URL('../../../../dist/executors/bounded-exec/lease-wait.js', import.meta.url));
 
 /**
  * A runner that asks the pool at `socket` for one token with the CPU lease client `takeParentCpuTokens` holds, and its
@@ -58,7 +63,7 @@ it("keeps a run pool's queue alive while the thread that serves the run is block
     const holder = await takeParentCpuTokens(pool, 1, null);
     if (!holder.granted) throw new Error(holder.reason);
     release = holder.release;
-    const waiting = spawn(process.execPath, ['--preload', VALIDATION_PRELOAD, '--eval', runner(pool.socket)], {
+    const waiting = spawn(process.execPath, ['--eval', runner(pool.socket)], {
       stdio: ['ignore', 'pipe', 'inherit'],
     });
     child = waiting;

@@ -470,7 +470,7 @@
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
         ],
         "options": {
-          "command": "bun test --timeout=0 ./src/executors/bounded-exec/__tests__/cpu-pool.silence.ts",
+          "command": "bun test --config=/dev/null --timeout=0 ./src/executors/bounded-exec/__tests__/cpu-pool.silence.ts",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
