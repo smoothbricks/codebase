@@ -104,9 +104,11 @@ The short session root is the canonical environment's (11_shell.md, "Canonical m
 sandbox grant (04_sandbox.md, "Fixture roots under /tmp"; 08_testing.md, "Fixtures"; 01c_macos.md, "sun_path is 104
 bytes"). Further changes key a Nix cc-wrapper's environment flags through the same model as argv and its store path, key
 inputs in the Nix store by their store path, cache compilations that use a Clang precompiled header (every one a chain
-loads keyed by its bytes), model more compiler and rustc flags as written, identify a macOS SDK from its own files while
-refusing host links a Nix wrapper shapes, record why a compiled result was not stored, and share build-script output
-under `mbx exec`. The latest count a crate's edit against the commit HEAD it last compiled under (16_build_volumes.md,
+loads keyed by its bytes, the module file dependencies asked of Clang's driver so every Clang release lists them), model
+more compiler and rustc flags as written, identify a macOS SDK from its own files while refusing host links a Nix
+wrapper shapes, record why a compiled result was not stored, and share build-script output under `mbx exec`, and with it
+any generated-source directory whose variable `MBX_SHARE_ENV` names, copied by content and mapped as `OUT_DIR` is, so a
+compiler that reads one at a checkout-specific path still restores at another. The latest count a crate's edit against
 "One Cargo environment on every path"), refresh the store's recency only for hits a build exposed, predict build scripts
 per target, map a nested Cargo's own target, and seed a managed target from one donor checkout only, so no target mixes
 two lineages of one crate. It is `smoothbricks/mr-boxington` at the revision `nix/mbx/flake.nix` names and its

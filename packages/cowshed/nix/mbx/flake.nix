@@ -7,8 +7,10 @@
 # hits, per-target build-script predictions, nested Cargo targets, single-donor target seeding and
 # the pool rule that starts a reservation on the cores that are free (MBX_RESERVE_CPUS), one
 # reservation endpoint per Nx run (`mbx reservations`), library compiles keyed without the
-# `-C linker` path they never run, and Clippy members keyed alike under every installation of a
-# toolchain, from smoothbricks/mr-boxington at the pinned revision.
+# `-C linker` path they never run, Clippy members keyed alike under every installation of a
+# toolchain, precompiled headers whose module file dependencies Clang's driver lists under every
+# Clang release, and generated-source directories shared under `mbx exec` as OUT_DIR is when
+# MBX_SHARE_ENV names their variable, from smoothbricks/mr-boxington at the pinned revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
 #
@@ -20,7 +22,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/41920f0084fd8fc34eb77b999f8ec90a3b5f6497";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/144efe81af09884271c45e1b2e78e89b3b13b580";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
