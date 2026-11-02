@@ -151,34 +151,26 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain('from-env');
   });
 
-  it('returns failure for a nonzero command', async () => {
-    const workspace = await createWorkspace();
-
-    const result = await runBoundedExec(
-      { command: 'node -e "process.exit(7)"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-    );
-
-    expect(result.success).toBe(false);
-    expect(result.terminalOutput).toContain('Command exited with status 7');
-  });
-
-  it('names the signal a command died of, with the status a shell gives it', async () => {
-    const workspace = await createWorkspace();
-
+  it.each([
+    ['exits nonzero', 'node -e "process.exit(7)"', 'Command exited with status 7: node -e "process.exit(7)"'],
     // No bound of this executor sends the kill: an outside killer (the kernel's OOM killer, say) ends the command.
-    const result = await runBoundedExec(
-      { command: 'kill -KILL $$', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-    );
+    ['dies of a signal', 'kill -KILL $$', 'Command was killed by SIGKILL (status 137): kill -KILL $$'],
+  ] as const)(
+    'fails a command that %s, naming how it ended with the status a shell gives it',
+    async (_how, command, said) => {
+      const workspace = await createWorkspace();
 
-    expect(result.success).toBe(false);
-    expect(result.terminalOutput).toContain('Command was killed by SIGKILL (status 137): kill -KILL $$');
-  });
+      const result = await runBoundedExec(
+        { command, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.terminalOutput).toContain(said);
+    },
+  );
 
   it('streams stdout and stderr while collecting terminal output', async () => {
     const workspace = await createWorkspace();
