@@ -180,7 +180,12 @@ async function rebuildWorkspaceToolsIfStale(): Promise<void> {
     if (program === 'process-lineage') {
       await runQuietly('tsc', ['--build', programConfiguration[program], '--force'], directory);
     } else {
-      await runQuietly('ttsc', ['-p', programConfiguration[program], '--emit', ...EMIT_OVERRIDES], directory);
+      // An output that already holds its bytes keeps its file (the managed ttsc patch): rewriting it moved every dist
+      // stamp, so the plugin's tsc-js then found its outputs changed and Nx restored its dist from the cache, removing
+      // the directory while concurrent tasks resolved their executor from it. This emit prunes nothing.
+      await runQuietly('ttsc', ['-p', programConfiguration[program], '--emit', ...EMIT_OVERRIDES], directory, {
+        TTSC_WRITE_IF_CHANGED: '1',
+      });
     }
     // A compiler run is not a change. ttsc is content-incremental, so an mtime-only change (a checkout, a revert, a
     // formatter rewriting a file identically) recompiles to the bytes the marker verified; clearing the daemon record
@@ -432,8 +437,17 @@ async function clearNxDaemonState(): Promise<void> {
   await Promise.all(pluginDerivedNxState.map((entry) => rm(path.join(data, entry), { recursive: true, force: true })));
 }
 
-async function runQuietly(command: string, args: readonly string[], cwd: string): Promise<void> {
-  const result = await $`${command} ${args}`.cwd(cwd).quiet(true).nothrow();
+async function runQuietly(
+  command: string,
+  args: readonly string[],
+  cwd: string,
+  env: Readonly<Record<string, string>> = {},
+): Promise<void> {
+  const result = await $`${command} ${args}`
+    .cwd(cwd)
+    .env({ ...process.env, ...env })
+    .quiet(true)
+    .nothrow();
   if (result.exitCode === 0) {
     return;
   }

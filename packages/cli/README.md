@@ -425,9 +425,12 @@ does: an emit after one source edit rewrote every `.js`, `.d.ts` and map in plac
 of the checkout pays for. It is an opt-in because a caller that finds stale outputs by which files the emit did not
 touch (the `typescript-emit` executor through nx-plugin 0.7.9, and any checkout whose plugin dist predates the patch,
 which `bun install` applies first) would remove every unchanged output. The executor sets it and prunes `outDir` by
-ttsc's `--verbose` emitted-file list instead. The packaged managed asset is the source, so clean managed installs
-receive the same repairs without a compiler fork or edits to the dependency cache. The registration applies only to that
-exact compiler version; the repository's lockfile continues to own its compiler pin.
+ttsc's `--verbose` emitted-file list instead. The bootstrap emits that build the plugin before Nx can run (the shell
+entry and `tooling/ttsc-emit.ts`) set it too: they prune nothing, and one that rewrote the plugin's dist moved every
+stamp Nx recorded for it, so the plugin's `tsc-js` restored its dist from the cache, removing the directory while other
+tasks resolved their executors from it. The packaged managed asset is the source, so clean managed installs receive the
+same repairs without a compiler fork or edits to the dependency cache. The registration applies only to that exact
+compiler version; the repository's lockfile continues to own its compiler pin.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases

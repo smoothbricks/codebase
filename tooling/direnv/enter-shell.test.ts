@@ -72,6 +72,7 @@ function staleCheckout() {
     join(bin, 'ttsc'),
     `#!/bin/sh
 printf '%s\\n' "$*" >> "$(dirname "$0")/../ttsc-calls"
+printf '%s\\n' "\${TTSC_WRITE_IF_CHANGED-unset}" >> "$(dirname "$0")/../ttsc-env"
 for dependency in node_modules/@smoothbricks/*; do
   [ -d "$dependency/src" ] || continue
   if ! cmp -s "$dependency/src/index.ts" "$dependency/dist/index.js"; then
@@ -185,6 +186,27 @@ it('the rebuild emits as the Nx emit does, writing no build info into dist', () 
         '-p tsconfig.lib.json --emit --composite false --declaration true --declarationMap true --emitDeclarationOnly false --incremental false',
       );
     }
+  } finally {
+    dispose();
+  }
+});
+
+/**
+ * The entry's rebuild asks ttsc to leave an output that already holds its bytes alone (`TTSC_WRITE_IF_CHANGED`), as
+ * the typescript-emit executor does. A rebuild of unchanged sources then keeps every dist file's stamps, so the
+ * plugin's `tsc-js` finds its outputs as Nx recorded them. One that rewrote them made Nx restore the plugin's dist from
+ * its cache, which removes the whole directory and copies it back, while other projects' `tsc-js` tasks resolved
+ * their executor from it: an SB land gate on 2026-11-03 failed four of them with "Could not resolve
+ * ./dist/executors/typescript-emit/executor.js".
+ */
+it('the rebuild asks ttsc to rewrite no output that already holds its bytes', () => {
+  const { root, enter, dispose } = staleCheckout();
+  try {
+    const entered = enter();
+    expect(entered.status, `${entered.stdout}${entered.stderr}`).toBe(0);
+    const optIns = readFileSync(join(root, 'ttsc-env'), 'utf8').trim().split('\n');
+    expect(optIns.length).toBeGreaterThan(0);
+    expect(new Set(optIns)).toEqual(new Set(['1']));
   } finally {
     dispose();
   }
