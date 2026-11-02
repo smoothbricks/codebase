@@ -1046,7 +1046,11 @@ Find the symptom in the left column and follow the link.
 - **Fact.** Libc's `posix_spawnp` calls `posix_spawn` once per `PATH` entry it tries
   ([`sys/posix_spawn.c`](https://github.com/apple-oss-distributions/Libc/blob/main/sys/posix_spawn.c)), the kernel makes
   a child for every try before it looks the program up, and a try that fails holds copies of the spawner's descriptors
-  until its own exit, after the call has returned (XNU `fdt_fork`; _owner text_).
+  until its own exit, after the call has returned (XNU `fdt_fork`; _owner text_). A forked child likewise reports its
+  `exec` before `exec` has closed every close-on-exec descriptor: XNU's
+  [`fdt_exec`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_descrip.c) closes them from the
+  highest number down, and the spawn returns on the end of the status pipe it made, so a descriptor numbered below that
+  pipe is still open in the child when the spawn returns (_measured_: 11_shell.md §Protocol).
 - **Rule.** A release is judged by a waiter's grant, never by the spawn's return: the descriptors whose release a peer
   observes (the supervisor's and the gateway's listeners and leases, the image lease and pin, the lifecycle locks) are
   fenced from creation by a process-wide fork lock that their close takes exclusively and that the spawns of

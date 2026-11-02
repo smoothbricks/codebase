@@ -48,7 +48,10 @@
 //! every try before it looks the program up (`fdt_fork`); a try that fails holds copies of the
 //! spawner's descriptors (a spawn's close-on-exec ones, an exec's inherited ones) until its own
 //! thread exits, after the call has returned. On Darwin a forked child also reports its `exec`
-//! before `exec` has closed every close-on-exec descriptor. These transient kernel copies reach no
+//! before `exec` has closed every close-on-exec descriptor: XNU's `fdt_exec`
+//! (`bsd/kern/kern_descrip.c`) closes them from the highest number down, so the spawn returns, on
+//! the end of the status pipe `std` made for it, before the child closes its copy of any
+//! descriptor numbered below that pipe, a lease among them. These transient kernel copies reach no
 //! command and have no owner: they close moments later on their own, so a peer can see a release
 //! lag its close by that teardown, and a waiter's grant, never a probe at the spawn's return,
 //! proves it. An authorized handoff differs: a command handed a descriptor across `exec`
@@ -183,8 +186,12 @@ impl RunAsync for tokio::process::Command {
 }
 
 /// A descriptor whose release a peer observes -- a listening socket a client connects to, a file
-/// holding an `flock` lease a peer tries -- closed under the exclusive fork lock, so no child
-/// still being spawned holds it once the drop returns.
+/// holding an `flock` lease a peer takes -- closed under the exclusive fork lock: the drop waits
+/// for the spawns in flight and for nothing else, so the close lands between spawns, never inside
+/// one, and a child forked before it has run `exec` once the drop returns. It does not wait out
+/// what a spawn's return leaves behind, a transient copy the kernel closes moments later or a copy
+/// handed across `exec` on purpose: a peer judges the release by a waiter's grant, never by a
+/// probe at the drop's return.
 pub struct Fenced<T>(ManuallyDrop<T>);
 
 impl<T: AsFd> Fenced<T> {
@@ -362,7 +369,9 @@ pub mod in_flight {
             Self { go, spawn }
         }
 
-        /// Let the parked child run `exec`, and the spawn return.
+        /// Let the parked child run `exec`, the spawn return, and the child exit: it is reaped, so
+        /// every copy it held is closed once this returns, which the spawn's return alone does not
+        /// promise.
         pub fn finish(mut self) {
             self.go.write_all(&[0]).unwrap();
             let mut child = self.spawn.join().unwrap().unwrap();
@@ -380,7 +389,7 @@ mod tests {
 
     use super::in_flight::InFlight;
     use super::*;
-    use crate::test_backstop::CommandBackstop as _;
+    use crate::test_backstop::{CommandBackstop as _, FileBackstop as _};
 
     fn lease_path() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -399,8 +408,18 @@ mod tests {
             .unwrap()
     }
 
-    /// A lease released while a spawn is in flight is free the moment its release returns: the
-    /// release waited for the child that copied it to run `exec`.
+    /// A release waits for the spawn in flight: it takes the fork lock exclusive, so its drop does
+    /// not return while a spawn that copied the lease is parked before `exec`, and the lease is the
+    /// waiter's once that spawn is done.
+    ///
+    /// No timer orders the race. The child is parked before the lease is dropped; the dropping
+    /// thread either returns first, having closed its descriptor without waiting (unfenced), or
+    /// is queued for the exclusive fork lock behind the parked spawn, which a reader then sees
+    /// refused ([`held_exclusive`]) -- only then is the child let go. Fenced, the release is judged
+    /// by a waiter's grant, never by a probe at the spawn's return: Darwin closes a child's
+    /// close-on-exec descriptors from the highest number down, and the spawn returns on the end of
+    /// the status pipe `std` made for it, which is numbered above the lease, so a probe there can
+    /// still find the child's copy of the lease (module docs).
     #[test]
     fn a_release_waits_for_the_spawn_in_flight() {
         let path = lease_path();
@@ -411,15 +430,29 @@ mod tests {
             matches!(FORK_LOCK.try_write(), Err(TryLockError::WouldBlock)),
             "a spawn in flight holds the fork lock"
         );
+        let (dropped, was_dropped) = std::sync::mpsc::channel();
         let release = std::thread::spawn(move || {
             drop(lease);
-            open(&path).try_lock().map(|()| path)
+            dropped.send(()).unwrap();
         });
+        let unfenced = loop {
+            if was_dropped.try_recv().is_ok() {
+                break true;
+            }
+            if held_exclusive() {
+                break false;
+            }
+            std::thread::yield_now();
+        };
         in_flight.finish();
-        let path = release
-            .join()
-            .unwrap()
-            .expect("the released lease is free when its drop returns");
+        release.join().unwrap();
+        assert!(
+            !unfenced,
+            "the release was not fenced: its drop returned before the spawn in flight did"
+        );
+        open(&path)
+            .lock_bounded()
+            .expect("a released lease is the waiter's once the spawn that copied it is done");
         std::fs::remove_file(path).unwrap();
     }
 
