@@ -113,6 +113,62 @@ diff --git a/lib/internal/javascriptRuntimeCapabilities.js b/lib/internal/javasc
      // Inside a ttsx run this is the user's NODE_OPTIONS, not ttsx's preloads,
      // which would refuse the cache and run in the probe (#1740).
      const effectiveEnv = TtsxNodeOptions_1.TtsxNodeOptions.forHelpers(SidecarEnvironment_1.SidecarEnvironment.merge(process.env, env));
+diff --git a/lib/plugin/internal/load/loadProjectPlugins.js b/lib/plugin/internal/load/loadProjectPlugins.js
+--- a/lib/plugin/internal/load/loadProjectPlugins.js
++++ b/lib/plugin/internal/load/loadProjectPlugins.js
+@@ -275,10 +275,14 @@
+         // With the witness of each such reading, so a build of a directory package
+         // selection already read keys on that reading instead of probing Go again.
+         const environmentWitnesses = new Map();
++        // And one walk of each SDK those readings key on, shared while the load runs
++        // synchronously. A watch delivery ends that batch: the owner may await, and
++        // time and edits pass, so the readings after it walk again.
+         const readings = {
+             sources: sourceDigests,
+             environments: environmentDigests,
+             witnesses: environmentWitnesses,
++            goRoots: new Map(),
+         };
+         // Records describing sources must never land inside one, so the store is
+         // admitted for source proofs only once every source of the load is known.
+@@ -314,6 +318,7 @@
+             // A worker owns the watch baseline now. Complete this handoff before Go
+             // metadata or source proof consumes the roots, preserving #1728 (#1758).
+             yield options.onWatchInputs([...interests].sort(), sourceIdentities);
++            readings.goRoots.clear();
+             const initialSize = interests.size;
+             for (const candidate of candidates) {
+                 // Nested source-only proposals replace the outer root manifests. Do not
+@@ -324,8 +329,10 @@
+                     if (reportsPluginSource(directory))
+                         interests.add(directory);
+             }
+-            if (interests.size !== initialSize)
++            if (interests.size !== initialSize) {
+                 yield options.onWatchInputs([...interests].sort(), sourceIdentities);
++                readings.goRoots.clear();
++            }
+         }
+         const proposals = NativeSourcePackages_1.NativeSourcePackages.propose(candidates.map((candidate) => ({
+             ...candidate,
+@@ -370,6 +377,8 @@
+         // Admission can now narrow the provisional interests without restamping the
+         // retained package/module baselines. Final host errors still keep these roots.
+         yield options.onWatchInputs?.(buildDirectories, sourceIdentities);
++        if (options.onWatchInputs !== undefined)
++            readings.goRoots.clear();
+         const keyedDirectories = new Set(buildDirectories);
+         const linkedContributors = records
+             .filter((record) => record.stage === "transform")
+@@ -564,7 +573,7 @@
+                     env: effectiveEnv,
+                     sourceDigest,
+                     environment: environmentDigests.get(directory) ??
+-                        (0, pluginBuildEnvironment_1.pluginBuildEnvironment)(directory, effectiveEnv, undefined, sourceIdentities),
++                        (0, pluginBuildEnvironment_1.pluginBuildEnvironment)(directory, effectiveEnv, undefined, sourceIdentities, readings.goRoots),
+                 }),
+             ])),
+             project,
 diff --git a/lib/plugin/internal/source/GoSourceInputs.js b/lib/plugin/internal/source/GoSourceInputs.js
 --- a/lib/plugin/internal/source/GoSourceInputs.js
 +++ b/lib/plugin/internal/source/GoSourceInputs.js
@@ -133,6 +189,40 @@ diff --git a/lib/plugin/internal/source/GoSourceInputs.js b/lib/plugin/internal/
          // Only the actual `go build` needs ttsc's GOCACHE; read-only metadata spawns
          // (`go mod edit`, `go env`, `go version`) call goBuildEnv with no cache root
          // and inherit ambient GOCACHE rather than receiving the managed build
+diff --git a/lib/plugin/internal/source/NativeSourcePackages.d.ts b/lib/plugin/internal/source/NativeSourcePackages.d.ts
+--- a/lib/plugin/internal/source/NativeSourcePackages.d.ts
++++ b/lib/plugin/internal/source/NativeSourcePackages.d.ts
+@@ -1,5 +1,6 @@
+ import { PluginBuildEnvironmentWitness } from "./PluginBuildEnvironmentWitness";
+ import { PluginContentIdentities } from "./PluginContentIdentities";
++import type { GoRootBatch } from "./hashPluginBuildEnvironment";
+ import { SourcePluginWorkspace } from "./SourcePluginWorkspace";
+ /**
+  * Observe Go-selected packages under the native builder's workspace policy.
+@@ -68,6 +69,11 @@
+          * directory keys on that reading instead of probing Go again.
+          */
+         witnesses?: Map<string, PluginBuildEnvironmentWitness.Record>;
++        /**
++         * The load's synchronous batch of SDK observations
++         * (`hashPluginBuildEnvironment`), cleared at each watch delivery.
++         */
++        goRoots?: GoRootBatch;
+     }
+     /**
+      * Observe entries together in a private module layout for their context.
+diff --git a/lib/plugin/internal/source/NativeSourcePackages.js b/lib/plugin/internal/source/NativeSourcePackages.js
+--- a/lib/plugin/internal/source/NativeSourcePackages.js
++++ b/lib/plugin/internal/source/NativeSourcePackages.js
+@@ -391,7 +391,7 @@
+         if (environment === undefined) {
+             const hash = node_crypto_1.default.createHash("sha256");
+             const witness = new Map();
+-            (0, hashPluginBuildEnvironment_1.hashPluginBuildEnvironment)(hash, goBinary, moduleRoot, env, { readFile: (location) => node_fs_1.default.readFileSync(location) }, witness, identities);
++            (0, hashPluginBuildEnvironment_1.hashPluginBuildEnvironment)(hash, goBinary, moduleRoot, env, { readFile: (location) => node_fs_1.default.readFileSync(location) }, witness, identities, readings.goRoots);
+             environment = hash.digest("hex");
+             readings.environments?.set(resolvedRoot, environment);
+             readings.witnesses?.set(resolvedRoot, witness);
 diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
 --- a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
 +++ b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
@@ -219,6 +309,186 @@ diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.js b/lib/plugin
 +}
  //# sourceMappingURL=collectPluginSourceFiles.js.map
 \ No newline at end of file
+diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.d.ts b/lib/plugin/internal/source/hashPluginBuildEnvironment.d.ts
+--- a/lib/plugin/internal/source/hashPluginBuildEnvironment.d.ts
++++ b/lib/plugin/internal/source/hashPluginBuildEnvironment.d.ts
+@@ -37,6 +37,10 @@
+  * @param identities Record store that lets a new process prove the GOROOT
+  *   corpus and executable bytes from their metadata (`PluginContentIdentities`,
+  *   #1722); without it every process reads them.
++ * @param goRoots The caller's synchronous batch of SDK observations, by
++ *   resolved GOROOT: readings passed the same map walk each SDK once and take
++ *   its witness entries from that walk. The caller clears it at any await,
++ *   delivery or publication boundary; without it the SDK is walked fresh.
+  * @evidence contracts/common.md#principled-implementation Fixed artifact flags, observed compiler bytes/version, selected reported-or-fallback build values, named command executables and selected SDK files enter the same framed identity used by source-state reporting. Fallback values and metadata-qualified reuse are explicit premises, not complete observation of arbitrary toolchain inputs. GOFLAGS enters without ttsc's own compiler-target tag, so the caller's environment reproduces a 7.1 load's digest; targets are separated by their overlay modules in the build key.
+  * @evidence contracts/common.md#clear-and-simple-design Private helpers separate compiler identity, Go-reported settings, external variables and SDK content while sharing one hash sink and optional pre-read witness.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts Cache signatures include real identity/change metadata and effective invocation context; failed SDK witnessing refuses reuse rather than accepting a VERSION-only proxy.
+@@ -48,4 +52,18 @@
+  */
+ export declare function hashPluginBuildEnvironment(hash: {
+     update(data: string): unknown;
+-}, goBinary: string | undefined, directory: string, env: NodeJS.ProcessEnv, filesystem: SourceBuildFilesystemOperations, witness?: PluginBuildEnvironmentWitness.Record, identities?: PluginContentIdentities.Store): void;
++}, goBinary: string | undefined, directory: string, env: NodeJS.ProcessEnv, filesystem: SourceBuildFilesystemOperations, witness?: PluginBuildEnvironmentWitness.Record, identities?: PluginContentIdentities.Store, goRoots?: GoRootBatch): void;
++/** One synchronous batch's SDK observations, by resolved GOROOT (`hashPluginBuildEnvironment`). */
++export type GoRootBatch = Map<string, GoRootObservation>;
++/** One SDK walk: the store references it was judged against, its witness entries and its snapshot. */
++export interface GoRootObservation {
++    readonly references: ReadonlyMap<bigint, bigint> | undefined;
++    readonly observations: PluginBuildEnvironmentWitness.Record;
++    readonly snapshot: {
++        readonly complete: boolean;
++        readonly files: readonly string[];
++        readonly topology: readonly string[];
++        readonly signature: string;
++        readonly separable: boolean;
++    };
++}
+diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plugin/internal/source/hashPluginBuildEnvironment.js
+--- a/lib/plugin/internal/source/hashPluginBuildEnvironment.js
++++ b/lib/plugin/internal/source/hashPluginBuildEnvironment.js
+@@ -50,6 +50,10 @@
+  * @param identities Record store that lets a new process prove the GOROOT
+  *   corpus and executable bytes from their metadata (`PluginContentIdentities`,
+  *   #1722); without it every process reads them.
++ * @param goRoots The caller's synchronous batch of SDK observations, by
++ *   resolved GOROOT: readings passed the same map walk each SDK once and take
++ *   its witness entries from that walk. The caller clears it at any await,
++ *   delivery or publication boundary; without it the SDK is walked fresh.
+  * @evidence contracts/common.md#principled-implementation Fixed artifact flags, observed compiler bytes/version, selected reported-or-fallback build values, named command executables and selected SDK files enter the same framed identity used by source-state reporting. Fallback values and metadata-qualified reuse are explicit premises, not complete observation of arbitrary toolchain inputs. GOFLAGS enters without ttsc's own compiler-target tag, so the caller's environment reproduces a 7.1 load's digest; targets are separated by their overlay modules in the build key.
+  * @evidence contracts/common.md#clear-and-simple-design Private helpers separate compiler identity, Go-reported settings, external variables and SDK content while sharing one hash sink and optional pre-read witness.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts Cache signatures include real identity/change metadata and effective invocation context; failed SDK witnessing refuses reuse rather than accepting a VERSION-only proxy.
+@@ -59,7 +63,7 @@
+  * @evidence contracts/performance.md#reuse-equivalent-work Compiler memo identity includes selected path/file metadata and invocation cwd/environment; SDK aggregate reuse requires matching complete ordered metadata/topology. With a record store, a new process reuses the SDK aggregate and executable digests only while their signatures match the recorded ones and every stamp is separable from a freshly minted reference (#1722); `go version` and `go env` stay live because they report toolchain selection no file metadata shows. All of this relies on native metadata distinguishability and sequential observation premises. Physical directories expand once per selection policy while aliases retain edges; optional caller witnesses receive reached selected dependencies.
+  * @evidence contracts/performance.md#bound-retention-and-release-resources Compiler, Go-environment-path and SDK maps retain historical distinct tool/context/root keys without eviction; persisted records belong to the single-file collector. SDK population/topology and full individual file reads contribute transient bytes; synchronous probes delegate process/capture lifetime to their owner and do not certify arbitrary descendants are gone. No independent entry/record/file/output byte ceiling is imposed here.
+  */
+-function hashPluginBuildEnvironment(hash, goBinary, directory, env, filesystem, witness, identities) {
++function hashPluginBuildEnvironment(hash, goBinary, directory, env, filesystem, witness, identities, goRoots) {
+     // Fixed artifact policy must invalidate binaries and reported source states
+     // together, including binaries cached before this policy was introduced.
+     hash.update(JSON.stringify(["source-build-flags", GoSourceInputs_1.GoSourceInputs.BUILD_FLAGS]));
+@@ -69,7 +73,7 @@
+             resolveGoCompilerIdentity(goBinary, env, directory, witness, identities),
+         ]));
+     }
+-    hashGoBuildEnvironment(hash, goBinary, directory, env, filesystem, witness, identities);
++    hashGoBuildEnvironment(hash, goBinary, directory, env, filesystem, witness, identities, goRoots);
+     hashExternalGoBuildEnvironment(hash, env);
+ }
+ // Go build environment values that can change the produced binary or decide
+@@ -296,8 +300,8 @@
+     hash.update(node_fs_1.default.readFileSync(file));
+     return hash.digest("hex");
+ }
+-function hashGoBuildEnvironment(hash, goBinary, cwd, env, filesystem, witness, identities) {
+-    const values = resolveGoBuildEnvironment(goBinary, cwd, env, filesystem, witness, identities);
++function hashGoBuildEnvironment(hash, goBinary, cwd, env, filesystem, witness, identities, goRoots) {
++    const values = resolveGoBuildEnvironment(goBinary, cwd, env, filesystem, witness, identities, goRoots);
+     for (const key of GO_BUILD_ENV_KEYS) {
+         const value = values.get(key);
+         if (value !== undefined && value !== "") {
+@@ -305,7 +309,7 @@
+         }
+     }
+ }
+-function resolveGoBuildEnvironment(goBinary, cwd, env, filesystem, witness, identities) {
++function resolveGoBuildEnvironment(goBinary, cwd, env, filesystem, witness, identities, goRoots) {
+     const values = new Map();
+     if (goBinary !== undefined) {
+         const parsed = GoEnvironmentReading_1.GoEnvironmentReading.read(goBinary, cwd, env, GO_BUILD_ENV_KEYS, witness, identities);
+@@ -314,7 +318,7 @@
+                 for (const key of GO_BUILD_ENV_KEYS) {
+                     const raw = parsed[key];
+                     if (typeof raw === "string" && raw !== "") {
+-                        values.set(key, normalizeGoBuildEnvValue(key, raw, env, filesystem, witness, identities));
++                        values.set(key, normalizeGoBuildEnvValue(key, raw, env, filesystem, witness, identities, goRoots));
+                     }
+                 }
+             }
+@@ -329,19 +333,19 @@
+             continue;
+         const value = env[key];
+         if (value !== undefined && value !== "") {
+-            values.set(key, normalizeGoBuildEnvValue(key, value, env, filesystem, witness, identities));
++            values.set(key, normalizeGoBuildEnvValue(key, value, env, filesystem, witness, identities, goRoots));
+         }
+     }
+     return values;
+ }
+-function normalizeGoBuildEnvValue(key, value, env, filesystem, witness, identities) {
++function normalizeGoBuildEnvValue(key, value, env, filesystem, witness, identities, goRoots) {
+     if (key === "GOROOT") {
+         // Root/version observations also cover a missing SDK. The complete SDK
+         // manifest below witnesses contributing files and directories, including
+         // nested content changes that do not move the root or VERSION metadata.
+         PluginBuildEnvironmentWitness_1.PluginBuildEnvironmentWitness.add(witness, value);
+         PluginBuildEnvironmentWitness_1.PluginBuildEnvironmentWitness.add(witness, node_path_1.default.join(value, "VERSION"));
+-        return resolveGoRootCacheIdentity(value, filesystem, witness, identities);
++        return resolveGoRootCacheIdentity(value, filesystem, witness, identities, goRoots);
+     }
+     if (key === "GOFLAGS") {
+         // ttsc's compiler-target tag is not the caller's Go environment. Omitting
+@@ -445,10 +449,12 @@
+     }
+ }
+ // GOROOT is usually stable but its selected source/tool payloads contribute to
+-// every plugin key. Retain only the final aggregate
+-// identity, guarded by a fresh metadata/topology manifest on every call. A
+-// changed or incomplete manifest falls through to the record store, then to a
+-// full content read.
++// every plugin key. Retain only the final aggregate identity, guarded by a
++// metadata/topology manifest observed once per synchronous batch: a caller's
++// `goRoots` map (one load between its watch deliveries, cleared at each) shares
++// one walk and its witness entries across the batch's readings, and a call with
++// no batch walks fresh. A changed or incomplete manifest falls through to the
++// record store, then to a full content read.
+ //
+ // WARNING (#1186, #1722): this map lives only as long as the process. #1186
+ // stopped at it, so every CLI launch, worker and bundler restart still read the
+@@ -456,12 +462,12 @@
+ // below is what carries the identity across processes; never drop it in favor
+ // of this memo alone.
+ const goRootIdentityCache = new Map();
+-function resolveGoRootCacheIdentity(goRoot, filesystem, witness, identities) {
++function resolveGoRootCacheIdentity(goRoot, filesystem, witness, identities, goRoots) {
+     const resolved = resolveRealPath(goRoot);
+     if (!node_fs_1.default.existsSync(resolved)) {
+         return `missing:${goRoot}`;
+     }
+-    const snapshot = collectGoRootIdentitySnapshot(resolved, witness, identities?.references);
++    const snapshot = observeGoRoot(resolved, witness, identities?.references, goRoots);
+     if (!snapshot.complete)
+         PluginBuildEnvironmentWitness_1.PluginBuildEnvironmentWitness.refuse(witness, resolved);
+     if (snapshot.complete) {
+@@ -502,6 +508,29 @@
+     }
+     return identity;
+ }
++// One SDK walk per synchronous batch. A reading the batch already walked this
++// root for takes that walk's snapshot and its first-observed witness entries,
++// which a later holds() compares against current metadata as it would its own.
++// A different record store's references make another walk.
++function observeGoRoot(resolved, witness, references, goRoots) {
++    let observed = goRoots?.get(resolved);
++    if (observed === undefined || observed.references !== references) {
++        if (goRoots === undefined)
++            return collectGoRootIdentitySnapshot(resolved, witness, references);
++        const observations = new Map();
++        observed = {
++            observations,
++            references,
++            snapshot: collectGoRootIdentitySnapshot(resolved, observations, references),
++        };
++        goRoots.set(resolved, observed);
++    }
++    if (witness !== undefined)
++        for (const [key, signature] of observed.observations)
++            if (!witness.has(key))
++                witness.set(key, signature);
++    return observed.snapshot;
++}
+ function collectGoRootIdentitySnapshot(root, witness, references) {
+     const out = [];
+     const state = { complete: true, separable: references !== undefined };
 diff --git a/lib/plugin/internal/source/inspectPluginBuildLock.js b/lib/plugin/internal/source/inspectPluginBuildLock.js
 --- a/lib/plugin/internal/source/inspectPluginBuildLock.js
 +++ b/lib/plugin/internal/source/inspectPluginBuildLock.js
@@ -263,6 +533,65 @@ diff --git a/lib/plugin/internal/source/inspectPluginBuildLock.js b/lib/plugin/i
  /**
   * Whether a path lookup proves absence. Permission and sharing failures are
   * inconclusive, never evidence of a released or old abandoned generation.
+diff --git a/lib/plugin/internal/source/pluginBuildEnvironment.d.ts b/lib/plugin/internal/source/pluginBuildEnvironment.d.ts
+--- a/lib/plugin/internal/source/pluginBuildEnvironment.d.ts
++++ b/lib/plugin/internal/source/pluginBuildEnvironment.d.ts
+@@ -1,5 +1,6 @@
+ import type { PluginBuildEnvironmentWitness } from "./PluginBuildEnvironmentWitness";
+ import type { PluginContentIdentities } from "./PluginContentIdentities";
++import type { GoRootBatch } from "./hashPluginBuildEnvironment";
+ /**
+  * The digest of the environment a plugin build in `directory` is keyed on: the
+  * Go compiler the build resolves there, the Go build environment `go env`
+@@ -23,6 +24,8 @@
+  *   carries (`hashPluginBuildEnvironment`).
+  * @param identities Record store that lets a new process prove the SDK and
+  *   executables from metadata (#1722).
++ * @param goRoots The caller's synchronous batch of SDK observations
++ *   (`hashPluginBuildEnvironment`), or `undefined` to walk the SDK fresh.
+  * @evidence contracts/common.md#principled-implementation The digest uses the same resolved compiler and environment serializer as the binary key, so reported toolchain state denotes the inputs actually used by the build.
+  * @evidence contracts/common.md#clear-and-simple-design Compiler selection, executable resolution and hashing each stay with their owning helper; this function only composes one environment reading.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts The result comes from real Go/environment inputs, not a fixed compiler version or a caller-specific substitute.
+@@ -30,7 +33,7 @@
+  * @evidence contracts/portability.md#os-neutral-implementation Executable identity is resolved before probing, and Node filesystem/process boundaries implement native spelling rather than assuming Windows or POSIX paths are interchangeable.
+  * @evidence contracts/performance.md#efficient-algorithms The wrapper resolves the compiler/tool under the supplied environment before delegating full environment hashing. Native resolution/probes, SDK metadata/name/path sorting and changed-manifest full content reads contribute cost; the final hash output is fixed-width but streamed identity/input text and full-file buffers are not. No independent duplicate source-directory digest scan is added here.
+  *
+- * @evidence contracts/performance.md#reuse-equivalent-work This is the fresh-reading boundary required by builds: the Go probes run on every call. Content digests of the SDK and executables are shared across processes only through the supplied record store's separable-signature proof; processPluginBuildEnvironment owns reuse of the whole reading when a consumer permits it.
++ * @evidence contracts/performance.md#reuse-equivalent-work This is the fresh-reading boundary required by builds: the Go probes run on every call. The SDK walk is fresh too, except inside the caller's synchronous batch (`goRoots`: one load between its watch deliveries, cleared at each), whose readings share one SDK observation as the witness contract allows. Content digests of the SDK and executables are shared across processes only through the supplied record store's separable-signature proof; processPluginBuildEnvironment owns reuse of the whole reading when a consumer permits it.
+  * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Its digest and filesystem adapter are call-local; retained compiler/content memo ownership belongs to the hasher.
+  */
+-export declare function pluginBuildEnvironment(directory: string, env?: NodeJS.ProcessEnv, witness?: PluginBuildEnvironmentWitness.Record, identities?: PluginContentIdentities.Store): string;
++export declare function pluginBuildEnvironment(directory: string, env?: NodeJS.ProcessEnv, witness?: PluginBuildEnvironmentWitness.Record, identities?: PluginContentIdentities.Store, goRoots?: GoRootBatch): string;
+diff --git a/lib/plugin/internal/source/pluginBuildEnvironment.js b/lib/plugin/internal/source/pluginBuildEnvironment.js
+--- a/lib/plugin/internal/source/pluginBuildEnvironment.js
++++ b/lib/plugin/internal/source/pluginBuildEnvironment.js
+@@ -32,6 +32,8 @@
+  *   carries (`hashPluginBuildEnvironment`).
+  * @param identities Record store that lets a new process prove the SDK and
+  *   executables from metadata (#1722).
++ * @param goRoots The caller's synchronous batch of SDK observations
++ *   (`hashPluginBuildEnvironment`), or `undefined` to walk the SDK fresh.
+  * @evidence contracts/common.md#principled-implementation The digest uses the same resolved compiler and environment serializer as the binary key, so reported toolchain state denotes the inputs actually used by the build.
+  * @evidence contracts/common.md#clear-and-simple-design Compiler selection, executable resolution and hashing each stay with their owning helper; this function only composes one environment reading.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts The result comes from real Go/environment inputs, not a fixed compiler version or a caller-specific substitute.
+@@ -39,13 +41,13 @@
+  * @evidence contracts/portability.md#os-neutral-implementation Executable identity is resolved before probing, and Node filesystem/process boundaries implement native spelling rather than assuming Windows or POSIX paths are interchangeable.
+  * @evidence contracts/performance.md#efficient-algorithms The wrapper resolves the compiler/tool under the supplied environment before delegating full environment hashing. Native resolution/probes, SDK metadata/name/path sorting and changed-manifest full content reads contribute cost; the final hash output is fixed-width but streamed identity/input text and full-file buffers are not. No independent duplicate source-directory digest scan is added here.
+  *
+- * @evidence contracts/performance.md#reuse-equivalent-work This is the fresh-reading boundary required by builds: the Go probes run on every call. Content digests of the SDK and executables are shared across processes only through the supplied record store's separable-signature proof; processPluginBuildEnvironment owns reuse of the whole reading when a consumer permits it.
++ * @evidence contracts/performance.md#reuse-equivalent-work This is the fresh-reading boundary required by builds: the Go probes run on every call. The SDK walk is fresh too, except inside the caller's synchronous batch (`goRoots`: one load between its watch deliveries, cleared at each), whose readings share one SDK observation as the witness contract allows. Content digests of the SDK and executables are shared across processes only through the supplied record store's separable-signature proof; processPluginBuildEnvironment owns reuse of the whole reading when a consumer permits it.
+  * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Its digest and filesystem adapter are call-local; retained compiler/content memo ownership belongs to the hasher.
+  */
+-function pluginBuildEnvironment(directory, env = process.env, witness, identities) {
++function pluginBuildEnvironment(directory, env = process.env, witness, identities, goRoots) {
+     const goBinary = GoToolResolution_1.GoToolResolution.resolveGoToolForBuild((0, resolveGoCompiler_1.resolveGoCompiler)(env).binary, env, directory, witness);
+     const hash = node_crypto_1.default.createHash("sha256");
+-    (0, hashPluginBuildEnvironment_1.hashPluginBuildEnvironment)(hash, goBinary, directory, env, { readFile: (location) => node_fs_1.default.readFileSync(location) }, witness, identities);
++    (0, hashPluginBuildEnvironment_1.hashPluginBuildEnvironment)(hash, goBinary, directory, env, { readFile: (location) => node_fs_1.default.readFileSync(location) }, witness, identities, goRoots);
+     return hash.digest("hex");
+ }
+ //# sourceMappingURL=pluginBuildEnvironment.js.map
+\ No newline at end of file
 diff --git a/lib/plugin/internal/source/waitForPluginBinary.js b/lib/plugin/internal/source/waitForPluginBinary.js
 --- a/lib/plugin/internal/source/waitForPluginBinary.js
 +++ b/lib/plugin/internal/source/waitForPluginBinary.js

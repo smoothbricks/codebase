@@ -206,7 +206,7 @@ describe("ttsc's plugin source files", () => {
   it('pass over a link below a directory the go tool ignores, and refuse a link the build would read', () => {
     // cowshed links each package's .cache/lmao onto its build volume (a repository's .cowshed.toml [build] state), a package's Go
     // plugin module among them. ttsc refused that module's source identity for the link, so every load copied the
-    // module and asked go for its packages again: 30 process spawns per TtscCompiler.prepare() instead of 8.
+    // module and asked go for its packages again: 31 process spawns per TtscCompiler.prepare() instead of 10.
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'ttsc-source-links-')));
     try {
       const plugin = join(root, 'plugin');
@@ -235,6 +235,68 @@ describe("ttsc's plugin source files", () => {
       const refused = collect();
       expect(refused.status).toBe(1);
       expect(refused.stderr).toContain(`contains a link at ${join(plugin, 'linked')}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Hash the build environment of the SDK argv[-1] (GOROOT, no go binary) three times in one batch and twice with none,
+ * through ttsc's hashPluginBuildEnvironment from argv[-2], counting the walks of the SDK root.
+ */
+const COUNT_SDK_WALKS = `const fs = require('node:fs');
+const { hashPluginBuildEnvironment } = require(process.argv.at(-2));
+const sdk = process.argv.at(-1);
+let walks = 0;
+const readdir = fs.readdirSync;
+fs.readdirSync = (path, options) => {
+  if (path === sdk) walks += 1;
+  return readdir(path, options);
+};
+const read = (goRoots) => {
+  const witness = new Map();
+  const hash = require('node:crypto').createHash('sha256');
+  hashPluginBuildEnvironment(hash, undefined, sdk, { GOROOT: sdk }, { readFile: (file) => fs.readFileSync(file) }, witness, undefined, goRoots);
+  return [...witness].sort();
+};
+const goRoots = new Map();
+const first = read(goRoots);
+read(goRoots);
+const third = read(goRoots);
+const batched = walks;
+walks = 0;
+read(undefined);
+read(undefined);
+process.stdout.write(JSON.stringify({ batched, fresh: walks, witnessed: first.length, same: JSON.stringify(first) === JSON.stringify(third) }));`;
+
+describe("ttsc's Go SDK observations", () => {
+  it('walk the SDK once for the readings of one synchronous batch, and once per reading without one', () => {
+    // Each TtscCompiler.prepare() walked the bundled Go SDK three times: two package selections and the build
+    // environment of one load, each a fresh walk of its ~4,600 entries (about 25k path lookups a call).
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'ttsc-sdk-walks-')));
+    try {
+      for (const directory of ['bin', 'src/runtime', 'src/internal/abi', 'pkg/tool']) {
+        mkdirSync(join(root, directory), { recursive: true });
+      }
+      writeFileSync(join(root, 'VERSION'), 'go1.26.0\n');
+      writeFileSync(join(root, 'go.env'), 'GOTOOLCHAIN=local\n');
+      writeFileSync(join(root, 'bin', 'go'), '');
+      writeFileSync(join(root, 'src', 'runtime', 'proc.go'), 'package runtime\n');
+      writeFileSync(join(root, 'src', 'internal', 'abi', 'abi.go'), 'package abi\n');
+      const ttsc = dirname(createRequire(import.meta.url).resolve('ttsc/package.json'));
+      const counted = spawnSync(
+        process.execPath,
+        ['-e', COUNT_SDK_WALKS, join(ttsc, 'lib/plugin/internal/source/hashPluginBuildEnvironment.js'), root],
+        { encoding: 'utf8' },
+      );
+      expect(counted.stderr).toBe('');
+      expect(counted.status).toBe(0);
+      const walks = JSON.parse(counted.stdout);
+      expect(walks.batched).toBe(1);
+      expect(walks.fresh).toBe(2);
+      expect(walks.witnessed).toBeGreaterThan(5);
+      expect(walks.same).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

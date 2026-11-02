@@ -413,9 +413,12 @@ and keeps the rest: a host shell exporting `GOFLAGS=-mod=mod` failed its entry r
 for plugin `typia` failed". A plugin source's link at or below a name the go tool passes over (`.`/`_`-prefixed, or
 `testdata`) is skipped like one in a pruned directory instead of refusing the module: go neither compiles nor embeds it,
 and cowshed's `.cache/lmao` build-state link inside a package that is also a Go plugin module cost that module its
-recorded source identity, so every load copied it and ran `go` 22 more times. The packaged managed asset is the source,
-so clean managed installs receive the same repairs without a compiler fork or edits to the dependency cache. The
-registration applies only to that exact compiler version; the repository's lockfile continues to own its compiler pin.
+recorded source identity, so every load copied it and ran `go` 21 more times. One load walks the Go SDK once: its
+package selections and build environments share that observation and its witness entries while the load runs
+synchronously, and a watch delivery ends the batch. Each `TtscCompiler.prepare()` walked the bundled SDK three times
+before, about 25k path lookups a call. The packaged managed asset is the source, so clean managed installs receive the
+same repairs without a compiler fork or edits to the dependency cache. The registration applies only to that exact
+compiler version; the repository's lockfile continues to own its compiler pin.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
