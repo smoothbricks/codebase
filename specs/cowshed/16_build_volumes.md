@@ -447,13 +447,17 @@ resolves its working directory (`getcwd`, `pwd -P`) gets `<mount-root>/.build/<o
 path changes when a land swaps the checkout's volume and differs in every fork, so state keyed on its own absolute
 location must compare against the resolved path, not the checkout spelling, and treat a different one as moved.
 
-**A path-baking build is warm only within the checkout that built it.** Bun's CMake/Ninja tree records the resolved
-path, so a fork of main and main after a land each reconfigure it from scratch. Cargo's target directory is relocatable
-and is not affected. Declaring such a tree is still worth it: its multi-GiB churn stays off the source image, and a
-patch-development workspace stays warm for its own life. A stable per-checkout mountpoint would keep only main warm
-across lands, and is rejected. An atomic swap at one path would need mount stacking, and on APFS a process whose working
-directory was entered under the covered volume reads the new one, and `diskutil unmount` of the covered device removes
-the top mount instead. The swap would therefore be an unmount and a mount, which must skip adoption whenever any process
+**A path-baking build relocates; it is never remade because its path moved.** A tool's tree that records its resolved
+absolute path (Bun's Ninja tree, its Cargo vendor configuration) reaches a fork, and main after a land, at another path.
+Its owner keeps the tree: it rewrites the few files that name the old path, drops the build tool's own logs so nothing
+is judged against the parent's files, and rebuilds what the regenerated build graph names. Deleting and unpacking the
+whole tree again instead rewrites every file of it on the volume the next fork clones: about 160,000 file events per
+fork and per land for one patch-development tree (measured 2026-11-02), the churn this volume exists to keep off main's
+source image (Why two volumes, item 1). Cargo's target directory is relocatable and is not affected. A patch-development
+workspace stays warm for its own life. A stable per-checkout mountpoint would keep only main warm across lands, and is
+rejected. An atomic swap at one path would need mount stacking, and on APFS a process whose working directory was
+entered under the covered volume reads the new one, and `diskutil unmount` of the covered device removes the top mount
+instead. The swap would therefore be an unmount and a mount, which must skip adoption whenever any process
 (rust-analyzer included) holds main's build volume, on every land.
 
 - **Enforced by**: a real-APFS test in which main's first touch moves a kept declared nested checkout aside and links
