@@ -2976,16 +2976,13 @@ async fn land_nx_project(
 
 /// A task output Nx is not told about is a 2b miss (16_build_volumes.md, Land step 7), and each
 /// miss is a durable `landAdoption` commitment naming the task (13_telemetry.md). Declaring the
-/// output makes the miss, and the record, disappear. The two projects are independent, each on
-/// its own scratch store, so they land side by side.
-// Admitted to the 60 s lifecycle class below its 3× rule and kept paired, because split halves
-// cost more; its samples are load-dependent (08_testing.md, Integration tests).
+/// output makes the miss, and the record, disappear:
+/// [`directory_a_declared_nx_output_restores_in_main_and_every_task_hits_substrate_lifecycle`],
+/// a land on a project of its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_substrate_lifecycle()
 {
-    let undeclared = tokio::spawn(land_nx_project(false));
-    let declared = tokio::spawn(land_nx_project(true));
-    let (rerun, adoptions, landed_head) = undeclared.await.expect("undeclared-output land");
+    let (rerun, adoptions, landed_head) = land_nx_project(false).await;
     assert_eq!(rerun.hits, 2, "{rerun:?}");
     assert_eq!(
         rerun
@@ -3023,8 +3020,14 @@ async fn directory_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_s
         adoptions[0].target_incarnation
     );
     assert!(!adoptions[0].task_hash.is_empty());
+}
 
-    let (rerun, adoptions, _) = declared.await.expect("declared-output land");
+/// The declared half of
+/// [`directory_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_substrate_lifecycle`]:
+/// declaring the output makes the miss, and the `landAdoption` record, disappear.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_nx_output_restores_in_main_and_every_task_hits_substrate_lifecycle() {
+    let (rerun, adoptions, _) = land_nx_project(true).await;
     assert_eq!(
         rerun,
         cowshed_core::api::dto::AdoptionCheck {
@@ -3489,39 +3492,33 @@ fn seeds_of_main(layout: &BuildVolumeLayout) -> Vec<(BuildVolumeId, BuildVolumeR
         .collect()
 }
 
-/// Review-gated delivery, then a land beside a stock detached Nx daemon, on one served build-nx
-/// project: the scenarios share their setup (08_testing.md, "Host limit"). Delivery runs first:
-/// it compares main's seeds, every build volume and the land commitments before and after, which
-/// only a project with no earlier land still reclaiming volumes behind it can promise. The daemon
-/// scenario ends the project.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_a_push_only_delivery_then_a_land_beside_a_stock_daemon_substrate_lifecycle() {
+/// The served build-nx project (Nx, no Rust) a test of a land, a delivery or main's seed runs on,
+/// and the repository's Nx and the Node that runs it ([`repository_nx`]). Each of those tests
+/// serves a project of its own: chained on one project, main's reseed and the keeper-held fork were
+/// still ending when a slow CI runner reached the 180 s the run allows without a finished test, the
+/// longest any one test may run (08_testing.md, "Integration tests (real substrate)").
+async fn build_nx_project() -> (Fixture, ActorBridge, PathBuf, PathBuf) {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    push_only_preserves_the_validated_head_without_landing_or_retiring(&fixture, &mut service)
-        .await;
-    land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
-        &mut fixture,
-        service,
-        &nx,
-        &node,
-    )
-    .await;
+    let service = serve_project(&mut fixture, &nx_reads).await;
+    (fixture, service, nx, node)
 }
+
 /// Review-gated delivery validates and preserves the head, but is not a land, even with
-/// retirement left at its default. The control then takes the ordinary landing path.
-async fn push_only_preserves_the_validated_head_without_landing_or_retiring(
-    fixture: &Fixture,
-    service: &mut ActorBridge,
-) {
-    let layout = build_volumes(fixture);
+/// retirement left at its default. The control then takes the ordinary landing path. Main's seeds,
+/// every build volume and the land commitments compare equal before and after the delivery, which
+/// only a project with no earlier land still reclaiming volumes behind it can promise.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_push_only_preserves_the_validated_head_without_landing_or_retiring_substrate_lifecycle()
+ {
+    let (mut fixture, mut service, ..) = build_nx_project().await;
+    let layout = build_volumes(&fixture);
     let main = fixture.checkout.clone();
-    let topic = new_workspace(service, "topic").await;
+    let topic = new_workspace(&mut service, "topic").await;
     fs::write(topic.join("a/src.txt"), b"reviewed source\\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "prepare reviewed source"]);
     let source_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
@@ -3550,7 +3547,7 @@ async fn push_only_preserves_the_validated_head_without_landing_or_retiring(
     };
     let commitments = land_commitments();
     let (stdout, _) = succeed(
-        service,
+        &mut service,
         [
             "--json",
             "land",
@@ -3601,7 +3598,7 @@ async fn push_only_preserves_the_validated_head_without_landing_or_retiring(
         topic.exists(),
         "the default retire=true must not retire a delivery"
     );
-    let (text, diagnostics) = succeed(service, ["land", "topic", "--push-only"]).await;
+    let (text, diagnostics) = succeed(&mut service, ["land", "topic", "--push-only"]).await;
     assert_eq!(
         text,
         format!("{preservation_ref}\t{source_head}\n").into_bytes()
@@ -3610,7 +3607,7 @@ async fn push_only_preserves_the_validated_head_without_landing_or_retiring(
         !diagnostics.contains("build volume"),
         "delivery has no adoption report: {diagnostics}"
     );
-    let landed = land(service, "topic", true, &[]).await;
+    let landed = land(&mut service, "topic", true, &[]).await;
     assert_eq!(landed.landed_head.as_str(), source_head);
     assert_eq!(git_stdout(&main, &["rev-parse", "HEAD"]), source_head);
     assert!(landed.retired, "ordinary land still retires by default");
@@ -3618,6 +3615,8 @@ async fn push_only_preserves_the_validated_head_without_landing_or_retiring(
     until_gone(&topic).await;
     assert!(!topic.exists());
     assert_land_outcome(fixture.storage.telemetry(), &landed);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
 }
 
 /// A land fences the target's head under the caller's ref lock (02_workspaces.md "`cowshed
@@ -4590,24 +4589,6 @@ fn write_declared_project(checkout: &Path) {
     fs::write(upstream.join("build/build.ninja"), b"before cowshed\n").unwrap();
 }
 
-/// What main runs after a land reaches its seed, then a fork of a keeper-held workspace, on one
-/// served build-nx project: the scenarios share their setup (08_testing.md, "Host limit"). The
-/// reseed runs first: it asserts main keeps exactly one seed and that the land reclaimed the volume
-/// main linked before it. The keeper-held fork shuts the runtime down to prove its kept daemons
-/// stop, so it ends the project.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_main_reseeds_after_a_land_then_a_keeper_held_fork_substrate_lifecycle() {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(&fixture, &mut service).await;
-    a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(&mut fixture, service).await;
-}
-
 /// A command that leaves `name` as an entry of the workspace's Nx cache, on its build volume: what
 /// a land, main or a source shed has produced, for the volume a fork gets to show or lack. Cowshed's
 /// contract is which volume holds the entry; running Nx itself to produce one re-tests Nx.
@@ -4626,21 +4607,21 @@ fn cached(checkout: &Path, name: &str) -> Option<Vec<u8>> {
 /// volume at the same tree, is behind; doctor says so, and the next `fork` reseeds main
 /// from its volume before it clones the seed, so the fork holds main's work. No command does it by hand.
 /// A keeper-held workspace takes the separate busy-skip path:
-/// [`a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed`], which follows it on its project.
-async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
-    fixture: &Fixture,
-    service: &mut ActorBridge,
-) {
-    let layout = build_volumes(fixture);
+/// [`directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_substrate_lifecycle`].
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
+ {
+    let (mut fixture, mut service, ..) = build_nx_project().await;
+    let layout = build_volumes(&fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
     let main = fixture.checkout.clone();
-    let topic = new_workspace(service, "topic").await;
+    let topic = new_workspace(&mut service, "topic").await;
     fs::write(topic.join("a/src.txt"), b"src, landed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "land a"]);
     let landing = linked_volume(&layout, &topic);
     assert_ne!(landing, previous);
     let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
-    let report = land(service, "topic", true, &[&cache_entry("landed")]).await;
+    let report = land(&mut service, "topic", true, &[&cache_entry("landed")]).await;
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
     assert!(report.retired, "{report:?}");
     assert!(
@@ -4686,7 +4667,7 @@ async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
         Some(&b"landed\n"[..]),
         "main adopted the landing volume, with what the land's check left on it"
     );
-    let warm = new_workspace(service, "warm").await;
+    let warm = new_workspace(&mut service, "warm").await;
     assert_eq!(
         cached(&warm, "landed").as_deref(),
         Some(&b"landed\n"[..]),
@@ -4698,10 +4679,10 @@ async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
     // Main's own work on the adopted volume, after the seed was frozen: an admitted job writes it.
     fs::write(main.join("a/src.txt"), b"src, changed in main\n").unwrap();
     git(&main, &["commit", "-q", "-am", "change a in main"]);
-    sh(service, "main", &cache_entry("main")).await;
+    sh(&mut service, "main", &cache_entry("main")).await;
 
     // Doctor exits 5 on any error finding the scratch host has; only its report matters here.
-    let (_, stdout, _) = run(service, ["--json", "doctor"]).await;
+    let (_, stdout, _) = run(&mut service, ["--json", "doctor"]).await;
     let doctor: serde_json::Value = serde_json::from_slice(&stdout).expect("doctor --json");
     let behind = doctor["result"]["findings"]
         .as_array()
@@ -4718,7 +4699,7 @@ async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
         "doctor reports main's seed behind its volume: {behind:?}"
     );
 
-    let w1 = new_workspace(service, "reseeded").await;
+    let w1 = new_workspace(&mut service, "reseeded").await;
     let [(seed, record)] = seeds_of_main(&layout).try_into().expect("one seed of main");
     assert_ne!(seed, landed_seed, "the fork reseeded main first");
     assert_eq!(
@@ -4731,6 +4712,8 @@ async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
         Some(&b"main\n"[..]),
         "a fork after main's work holds it: the fork reseeded main from its volume"
     );
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
 }
 
 /// A foreground keeper holds `w1`'s volume, so `cowshed fork` cannot refresh its seed.
@@ -4738,11 +4721,10 @@ async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
 /// what w1 wrote after it. The no-keeper main case above shows a fork that holds the newer work.
 /// Before either fork, doctor diagnoses main's displaced workspace-data link and an exec restores
 /// it, so the forks never inherit a real directory in place of the build-volume link.
-async fn a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(
-    fixture: &mut Fixture,
-    mut service: ActorBridge,
-) {
-    let layout = build_volumes(fixture);
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_substrate_lifecycle() {
+    let (mut fixture, mut service, ..) = build_nx_project().await;
+    let layout = build_volumes(&fixture);
     assert_eq!(build_link_findings(&mut service).await, [""; 0]);
 
     let data = fixture.checkout.join(".nx/workspace-data");
@@ -4938,13 +4920,7 @@ async fn build_link_findings(service: &mut ActorBridge) -> Vec<String> {
 /// An ungated lane fold on one served build-nx project.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_a_lane_fold_on_one_project_substrate_lifecycle() {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    let (mut fixture, mut service, ..) = build_nx_project().await;
     an_ungated_fold_into_a_lane_base_is_git_alone(&fixture, &mut service).await;
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
@@ -5088,25 +5064,19 @@ async fn an_ungated_fold_into_a_lane_base_is_git_alone(
     assert_land_outcome(fixture.storage.telemetry(), &landed);
 }
 
-/// Stock Nx's open lock fences the look-to-rename window: an opener skips the swap and is
-/// named, while the target keeps its volume and the landing tree still freezes its seed.
-/// Once the opener exits, a new commit on the same topic exercises a foreign database holder:
-/// the retiring land names that holder and freezes a new seed without swapping main's volume
-/// (16_build_volumes.md, "The adoption needs the target's Nx database closed").
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
- {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let layout = build_volumes(&fixture);
+/// A served build-nx project ([`build_nx_project`]) whose `topic` has `change` committed to
+/// `a/src.txt` and whose main has run `nx_check`, a `build test` run, so main holds its one Nx task
+/// database: what a land beside a foreign process on that database starts from
+/// (16_build_volumes.md, "The adoption needs the target's Nx database closed"). Answers the project,
+/// `nx_check` and the database. The opener and the holder are a test each on a project of their
+/// own: on one topic they were two checked lands in one test.
+async fn a_topic_beside_main_s_nx_database(
+    change: &[u8],
+) -> (Fixture, ActorBridge, String, PathBuf) {
+    let (fixture, mut service, _, node) = build_nx_project().await;
     let nx_check = nx_run_many(&node, "build test");
     let topic = new_workspace(&mut service, "topic").await;
-    fs::write(topic.join("a/src.txt"), b"src, changed\n").unwrap();
+    fs::write(topic.join("a/src.txt"), change).unwrap();
     git(&topic, &["commit", "-q", "-am", "change a"]);
     sh(&mut service, "main", &nx_check).await;
     let data = fixture.checkout.join(".nx/workspace-data");
@@ -5118,6 +5088,18 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
     let [database] = databases.as_slice() else {
         panic!("one task database in {}: {databases:?}", data.display());
     };
+    let database = database.clone();
+    (fixture, service, nx_check, database)
+}
+
+/// Stock Nx's open lock fences the look-to-rename window: an opener skips the swap and is
+/// named, while the target keeps its volume and the landing tree still freezes its seed.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
+ {
+    let (mut fixture, mut service, nx_check, database) =
+        a_topic_beside_main_s_nx_database(b"src, changed\n").await;
+    let layout = build_volumes(&fixture);
     let before = linked_volume(&layout, &fixture.checkout);
     let mut opening = Holder(
         Command::new("/usr/bin/lockf")
@@ -5174,32 +5156,34 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
         .wait_bounded()
         .expect("lockf exits with its command");
     drop(opening);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
 
-    // The first land retained topic and left main's database in place. Change the landing tree
-    // again before holding that database, so this is another checked land, not a no-op replay.
-    fs::write(
-        topic.join("a/src.txt"),
-        b"src, changed with a database holder\n",
-    )
-    .unwrap();
-    git(
-        &topic,
-        &["commit", "-q", "-am", "change a after the opener exits"],
-    );
+/// A foreign process holding main's Nx database: the retiring land names that holder and freezes
+/// a new seed without swapping main's volume (16_build_volumes.md, "The adoption needs the
+/// target's Nx database closed").
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_foreign_database_holder_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
+ {
+    let (mut fixture, mut service, nx_check, database) =
+        a_topic_beside_main_s_nx_database(b"src, changed with a database holder\n").await;
+    let layout = build_volumes(&fixture);
+    let before = linked_volume(&layout, &fixture.checkout);
     let holder = Holder(
         Command::new("/usr/bin/tail")
             .arg("-f")
-            .arg(database)
+            .arg(&database)
             // Open from its spawn, so it is a holder once `spawn` returns: `tail` opens its
             // argument only later.
-            .stdin(fs::File::open(database).expect("open the database for its holder"))
+            .stdin(fs::File::open(&database).expect("open the database for its holder"))
             .stdout(Stdio::null())
             .spawn()
             .expect("spawn a database holder"),
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
     assert!(
-        nx::holders(&fixture.storage.census(), database)
+        nx::holders(&fixture.storage.census(), &database)
             .expect("query the database's holders")
             .iter()
             .any(|holder| holder.pid == pid),
@@ -5245,13 +5229,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
 /// step 5.4). The real-APFS runtime proof owns block-atomic image and SQLite consistency coverage.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substrate_lifecycle() {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    let (mut fixture, mut service, _, node) = build_nx_project().await;
     let layout = build_volumes(&fixture);
     let nx_check = nx_run_many(&node, "build test");
     let topic = new_workspace(&mut service, "topic").await;
@@ -7305,16 +7283,14 @@ struct LandDaemonRecord {
 /// Land 4 (16_build_volumes.md): a landing daemon the job ledger does not prove the job's own is
 /// never signalled. A daemon started detached from the job, as stock Nx does, skips adoption as
 /// `LandingDaemonStayed` and is still running after the land.
-async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
-    fixture: &mut Fixture,
-    mut service: ActorBridge,
-    nx: &Path,
-    node: &Path,
-) {
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption_substrate_lifecycle()
+ {
+    let (mut fixture, mut service, nx, node) = build_nx_project().await;
     let topic = new_workspace(&mut service, "outputs").await;
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
-    sh(&mut service, "outputs", &nx_run_many(node, "build")).await;
+    sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
     // The keeper started the shed's daemon at the run's admission (04_sandbox.md, the kept
     // daemon), so its record may follow the run's end. The patched Nx
     // daemon claims the record when it starts and replaces one of another workspace root as
@@ -7326,7 +7302,7 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
     let foreign = fixture._scratch.path().join("foreign-daemon-checkout");
     clone_tree(
         &checkout_template(Project::Build {
-            nx: Some((nx, node)),
+            nx: Some((&nx, &node)),
             rust: None,
         }),
         &foreign,
@@ -7335,7 +7311,7 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
     let data = state.join("workspace-data");
     let socket = cowshed_core::sandbox::workspace_runtime_link(&foreign).join("nx");
     fs::create_dir_all(&socket).unwrap();
-    let mut command = Command::new(node);
+    let mut command = Command::new(&node);
     command
         .args(["node_modules/nx/dist/bin/nx.js", "daemon", "--start"])
         .current_dir(&foreign);
@@ -7400,7 +7376,7 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
         .expect("the real foreign daemon socket survives");
 
     // Cleanup belongs to the daemon's standalone owner, only after the survival proof.
-    let mut stop = Command::new(node);
+    let mut stop = Command::new(&node);
     stop.args(["node_modules/nx/dist/bin/nx.js", "daemon", "--stop"])
         .current_dir(&foreign);
     for (key, value) in command.get_envs() {
