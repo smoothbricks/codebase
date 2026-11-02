@@ -188,7 +188,8 @@ It checks:
   so a release published after a commit cannot refuse it; `smoo monorepo update` moves the pin to the latest stable
   release and installs it. Every `@smoothbricks/*` package the root declares must resolve in `bun.lock` to the version
   the installed CLI uses through its dependency closure (cli → nx-plugin → cowshed …): Nx loads the root's copy, so
-  `nx sync` would render the managed files with another nx-plugin than `smoo` did.
+  `nx sync` would render the managed files with another nx-plugin than `smoo` did. After its install,
+  `smoo monorepo update` pins each such package to the version the installed CLI uses and installs again when one moved.
 - Nx release policy, including project package release tags, project-level GitHub Release changelogs, and the temporary
   Bun lockfile versionActions hook.
 - `bun.lock` workspace versions match package manifests.

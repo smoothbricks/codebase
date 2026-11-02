@@ -45,7 +45,11 @@ import {
 } from './package-policy.js';
 import { resolvedTargetsByProject, runInitPacks, runValidatePacks } from './packs/index.js';
 import { syncRootRuntimeVersions } from './runtime.js';
-import { applyToolConfigDefaults, validateCliPinnedPackages } from './tool-validation.js';
+import {
+  applyCliPinnedPackageDefaults,
+  applyToolConfigDefaults,
+  validateCliPinnedPackages,
+} from './tool-validation.js';
 
 export interface InitOptions {
   runtimeOnly?: boolean;
@@ -141,7 +145,18 @@ export async function updateManagedFiles(root: string): Promise<void> {
   syncBunLockfileVersions(root);
   console.log('installing     workspace dependencies (bun install)');
   // Nx comes from the lockfile, so a developer link to a local Nx checkout gives way to it; every other link is kept.
-  await keepDeveloperLinks(root, () => run('bun', ['install', '--no-summary'], root), { relink: ['nx'] });
+  await keepDeveloperLinks(
+    root,
+    async () => {
+      await run('bun', ['install', '--no-summary'], root);
+      // The install resolved the CLI release applyToolConfigDefaults just pinned; the root's @smoothbricks/* packages
+      // follow the versions that release uses, in this same update.
+      if (applyCliPinnedPackageDefaults(root)) {
+        await run('bun', ['install', '--no-summary'], root);
+      }
+    },
+    { relink: ['nx'] },
+  );
 }
 
 /**
