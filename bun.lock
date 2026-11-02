@@ -51,7 +51,7 @@
     },
     "packages/build-inputs": {
       "name": "@smoothbricks/build-inputs",
-      "version": "0.0.3",
+      "version": "0.0.4-next.0",
       "bin": {
         "smoo-nx-build-inputs": "./dist/ts/bin/smoo-nx-build-inputs.js",
       },
@@ -88,7 +88,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.13.10",
+      "version": "0.13.11-next.0",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -115,7 +115,7 @@
     },
     "packages/columine": {
       "name": "@smoothbricks/columine",
-      "version": "0.3.6",
+      "version": "0.3.7-next.0",
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
         "@uwdata/flechette": "^2.7.0",
@@ -307,7 +307,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.7.9",
+      "version": "0.7.10-next.0",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
