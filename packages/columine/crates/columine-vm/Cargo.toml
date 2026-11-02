@@ -9,6 +9,12 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# A private consumer calls `Vm::undo_records` (AGENTS.md rule 7, "Done").
+[[package.metadata.wiring.external]]
+item = "undo_records"
+consumer = "private"
+why = "a host keeps a fact derived from the state image current from each pass's journal records instead of rescanning the image"
+
 [dependencies]
 bitmosaic = { workspace = true }
 columine-types = { workspace = true }
