@@ -505,6 +505,32 @@ ${extra}  ];
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  // `smoo monorepo update` moved tooling's CLI to 0.13.8 but left the root's nx-plugin at ^0.7.3 and cowshed at ^0.4.4:
+  // both satisfied a ">= minimum" policy, and cowshed had none. The update holds them to what the CLI uses instead.
+  it('pins every root @smoothbricks package to the version the installed CLI uses', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@fixture/app',
+        version: '0.0.0',
+        private: true,
+        workspaces: ['tooling'],
+        devDependencies: { '@smoothbricks/cowshed': '^0.4.4', '@smoothbricks/nx-plugin': '^0.7.3' },
+      });
+      await writeFile(join(root, 'bun.lock'), lockfileWithCliClosure({ nxPlugin: '0.7.3', cowshed: '0.4.4' }));
+
+      await applyToolConfigDefaults(root);
+
+      const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+      expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe('0.7.7');
+      expect(rootPackage.devDependencies['@smoothbricks/cowshed']).toBe('0.4.5');
+      // Not declared by the root, so nothing to hold.
+      expect(rootPackage.devDependencies['@smoothbricks/nx-cache-server']).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // A consumer moved tooling's @smoothbricks/cli to 0.13.8, which uses nx-plugin 0.7.7 and through it cowshed 0.4.5, while

@@ -127,8 +127,29 @@ function obsoleteTtscPatchKeys(patches: Record<string, string> | undefined): str
 export async function applyToolConfigDefaults(root: string): Promise<void> {
   const context = readToolContext(root);
   await applyRootPackageToolDefaults(root, context);
+  applyCliPinnedPackageDefaults(root);
   await applyToolingPackageDefaults(root, context.policy);
   applyDevenvPackageDefaults(root);
+}
+
+/**
+ * Pins each root-declared `@smoothbricks/*` package to the version the CLI bun.lock installs uses, so Nx loads the
+ * nx-plugin smoo renders with. True when package.json changed, which the next install has to resolve.
+ */
+export function applyCliPinnedPackageDefaults(root: string): boolean {
+  const { rootPackage, policy } = readToolContext(root);
+  const skew = cliPinnedPackageSkew(root, rootPackage, policy.toolingPackageName);
+  if (!rootPackage || skew.length === 0) {
+    return false;
+  }
+  for (const { field, name, required } of skew) {
+    setDependencyVersion(rootPackage, ensureDependencyMap(rootPackage, field), name, required);
+  }
+  writeJsonObject(join(root, 'package.json'), rootPackage);
+  console.log(
+    `updated        package.json @smoothbricks packages to the versions @smoothbricks/cli ${skew[0]?.cli} uses`,
+  );
+  return true;
 }
 
 export function validateToolConfig(root: string): number {
@@ -634,6 +655,7 @@ const isBunLockPackageMetadata = typia.createIs<BunLockPackageMetadata>();
 /** A root-declared `@smoothbricks/*` package bun.lock resolves to another version than the installed CLI uses. */
 interface CliPinnedPackageSkew {
   name: string;
+  field: 'dependencies' | 'devDependencies';
   /** Where the root manifest writes the version, as `dependencyVersion` names it. */
   path: string;
   /** The version the root resolves, which Nx loads; undefined when bun.lock resolves none. */
@@ -688,7 +710,7 @@ function cliPinnedPackageSkew(
       const version = required.get(name);
       const resolved = lockedVersion(lock, name, name);
       if (declared !== undefined && version !== undefined && resolved !== version) {
-        skew.push({ name, path: declared.path, resolved, required: version, cli });
+        skew.push({ name, field, path: declared.path, resolved, required: version, cli });
       }
     }
   }
