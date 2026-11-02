@@ -137,6 +137,10 @@ enum LocalCause {
     /// A wait on another process that expired (05_gateway.md, "Deadlines"), for the boundary that
     /// owns the wait to record as its span (13_telemetry.md, "Wait spans").
     Wait(crate::runtime::wait_spans::WaitFailure),
+    /// A membership retirement whose every life it left running it had sent SIGKILL (11_shell.md):
+    /// each ends once its kernel call returns, so its exit, not this refusal, answers a supervisor
+    /// quiesce or retirement waiting on the job.
+    SurvivedSigkill,
 }
 
 /// Canonical wire fields remain flat; only the private storage groups these exclusive causes.
@@ -570,6 +574,16 @@ impl CowshedError {
         }
     }
 
+    /// A membership retirement's refusal whose every surviving life it sent SIGKILL: a `Conflict`
+    /// that says so to the supervisor, whose quiesce and retirement wait for those exits
+    /// (11_shell.md).
+    pub(crate) fn survived_sigkill(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            local_cause: Some(Box::new(LocalCause::SurvivedSigkill)),
+            ..Self::conflict(message, hint)
+        }
+    }
+
     /// The daemon's refusal of another build's request: a `Conflict` that names both builds in its
     /// sentence and carries them as [`OtherBuild`].
     pub fn other_build(other: OtherBuild) -> Self {
@@ -859,7 +873,9 @@ impl CowshedError {
     pub fn lifecycle_conflict_source(&self) -> Option<&crate::storage::lifecycle::Conflict> {
         match self.local_cause.as_deref()? {
             LocalCause::LifecycleConflict(conflict) => Some(conflict),
-            LocalCause::ImageLocksHeld(_) | LocalCause::Wait(_) => None,
+            LocalCause::ImageLocksHeld(_) | LocalCause::Wait(_) | LocalCause::SurvivedSigkill => {
+                None
+            }
         }
     }
 
@@ -867,8 +883,19 @@ impl CowshedError {
     pub fn image_locks_held_source(&self) -> Option<&[std::path::PathBuf]> {
         match self.local_cause.as_deref()? {
             LocalCause::ImageLocksHeld(locks) => Some(locks),
-            LocalCause::LifecycleConflict(_) | LocalCause::Wait(_) => None,
+            LocalCause::LifecycleConflict(_)
+            | LocalCause::Wait(_)
+            | LocalCause::SurvivedSigkill => None,
         }
+    }
+
+    /// Whether this is a membership retirement's refusal whose every surviving life it sent
+    /// SIGKILL ([`Self::survived_sigkill`]).
+    pub(crate) fn survivors_were_killed(&self) -> bool {
+        matches!(
+            self.local_cause.as_deref(),
+            Some(LocalCause::SurvivedSigkill)
+        )
     }
 
     /// This error, carrying the wait that expired when `failure` is one, in place of any other
@@ -895,7 +922,9 @@ impl CowshedError {
     pub fn wait_source(&self) -> Option<&crate::runtime::wait_spans::WaitFailure> {
         match self.local_cause.as_deref()? {
             LocalCause::Wait(failure) => Some(failure),
-            LocalCause::LifecycleConflict(_) | LocalCause::ImageLocksHeld(_) => None,
+            LocalCause::LifecycleConflict(_)
+            | LocalCause::ImageLocksHeld(_)
+            | LocalCause::SurvivedSigkill => None,
         }
     }
     /// The two builds, when this is the daemon's refusal of another build's request.
@@ -965,7 +994,9 @@ impl std::error::Error for CowshedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.local_cause.as_deref()? {
             LocalCause::LifecycleConflict(conflict) => Some(conflict),
-            LocalCause::ImageLocksHeld(_) | LocalCause::Wait(_) => None,
+            LocalCause::ImageLocksHeld(_) | LocalCause::Wait(_) | LocalCause::SurvivedSigkill => {
+                None
+            }
         }
     }
 }

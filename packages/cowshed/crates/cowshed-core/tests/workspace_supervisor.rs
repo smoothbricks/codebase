@@ -3214,6 +3214,213 @@ async fn an_unidentified_leader_never_enters_the_ledger() {
     h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
+/// Hands its one job a leader the test spawned and traces, observed by a real process monitor.
+/// Traced, the leader stops at its exec and outlives SIGKILL until the test detaches it, as a
+/// member in an uninterruptible kernel wait outlives it until that call returns (07_api.md).
+#[cfg(target_os = "macos")]
+struct TracedLeaderSpawner {
+    spawned: mpsc::UnboundedSender<Spawned>,
+    leaders: mpsc::UnboundedSender<std::process::Child>,
+}
+
+#[cfg(target_os = "macos")]
+#[async_trait]
+impl SpawnSink for TracedLeaderSpawner {
+    async fn spawn(
+        &mut self,
+        request: ProcessSpawnRequest,
+        events: mpsc::Sender<ProcessEvent>,
+    ) -> Result<Box<dyn RunningProcess>> {
+        use std::os::unix::process::CommandExt as _;
+        let monitor = cowshed_core::runtime::process_monitor::ProcessMonitor::prepare(
+            cowshed_core::runtime::process_tree::TreeOwner::Job(request.job_id),
+        )?;
+        // This test binary, which never runs here: traced, it stops at its exec, before its
+        // first instruction.
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        // SAFETY: PT_TRACE_ME takes no pointer; it marks this child traced by its parent, this
+        // test, and touches nothing else before the exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::ptrace(libc::PT_TRACE_ME, 0, std::ptr::null_mut(), 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let (leader, _) = monitor
+            .spawn_root(command)
+            .expect("a traced leader under observation");
+        let pid = i32::try_from(leader.id()).unwrap();
+        let (answered, status) = cowshed_os::test_backstop::waitpid(pid, libc::WUNTRACED)
+            .expect("the traced leader's stop");
+        assert_eq!(answered, pid);
+        assert!(
+            libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGTRAP,
+            "the traced leader stops at its exec: {status:#x}"
+        );
+        self.spawned
+            .send(Spawned {
+                request: request.clone(),
+                events,
+            })
+            .expect("spawn observer");
+        let birth = Birth::of(leader.id());
+        self.leaders.send(leader).expect("leader observer");
+        Ok(Box::new(TracedLeader {
+            process: OwnedProcess {
+                birth,
+                spawned: Instant::now(),
+                host: cowshed_core::host_load::read_host_load(),
+            },
+            monitor,
+        }))
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct TracedLeader {
+    process: OwnedProcess,
+    monitor: cowshed_core::runtime::process_monitor::ProcessMonitor,
+}
+
+#[cfg(target_os = "macos")]
+impl RunningProcess for TracedLeader {
+    fn process(&self) -> Option<&OwnedProcess> {
+        Some(&self.process)
+    }
+
+    fn nice(&self) -> Option<i32> {
+        None
+    }
+
+    fn observations(&self) -> Option<&cowshed_core::runtime::process_monitor::ProcessMonitor> {
+        Some(&self.monitor)
+    }
+
+    // The leader takes no input: it never runs past its exec.
+    fn try_write_stdin(&mut self, _: Bytes) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn close_stdin(&mut self) -> bool {
+        true
+    }
+
+    fn end_stdin(&mut self) {}
+
+    fn signal_process_tree(&mut self, _: ProcessSignal) -> Result<()> {
+        panic!("membership retirement signals the observed leader, never this process tree")
+    }
+}
+
+/// A supervisor retirement (16_build_volumes.md, Land step 4) waits for the exit of a member
+/// SIGKILL has not ended within the bounded wait, rather than taking that wait's refusal as its
+/// answer: the member ends once its kernel call returns, and its exit concludes the job
+/// (11_shell.md). The job's own `wait` still gets the refusal at once. Land gates refused on the
+/// keeper's Nx daemon and its plugin workers still running 2 s after SIGKILL under load.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_supervisor_retirement_waits_for_the_exit_of_a_member_sigkill_has_not_yet_ended() {
+    use std::future::Future as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let (supervisor_config, _root) =
+        isolated_config(&temp_parent::scratch_parent(), "killed-survivor");
+    let (spawn_tx, mut spawns) = mpsc::unbounded_channel();
+    let (leader_tx, mut leaders) = mpsc::unbounded_channel();
+    let (artifact_tx, _artifacts) = mpsc::unbounded_channel();
+    let (commitment_tx, _commitments) = mpsc::unbounded_channel();
+    let (order_tx, _order) = mpsc::unbounded_channel();
+    let artifact_authority = supervisor_config.authority.clone();
+    let handle = WorkspaceSupervisor::start_with_sinks(
+        supervisor_config,
+        Box::new(TracedLeaderSpawner {
+            spawned: spawn_tx,
+            leaders: leader_tx,
+        }),
+        Box::new(FakeArtifactSink {
+            sealed_stdout: None,
+            next: JobId::new(1).unwrap(),
+            quota: 1024,
+            jobs: BTreeMap::new(),
+            terminals: BTreeMap::new(),
+            authority: artifact_authority,
+            observations: artifact_tx,
+            order: order_tx.clone(),
+        }),
+        Box::new(FakeCommitments {
+            next_order: 1,
+            observations: commitment_tx,
+            order: order_tx,
+        }),
+    )
+    .unwrap();
+    let job = handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = spawns.recv().await.unwrap();
+    let mut leader = leaders.recv().await.unwrap();
+
+    let retirement = handle.retire(NxDaemonRetirement::ControllerOwned);
+    tokio::pin!(retirement);
+    assert!(
+        std::future::poll_fn(|context| {
+            std::task::Poll::Ready(retirement.as_mut().poll(context).is_pending())
+        })
+        .await,
+        "the retirement is under way"
+    );
+    let refused = handle
+        .wait(job)
+        .await
+        .expect_err("SIGKILL did not end the traced leader within the bounded wait");
+    assert!(refused.message.contains("after SIGKILL"), "{refused}");
+    assert!(
+        std::future::poll_fn(|context| {
+            std::task::Poll::Ready(retirement.as_mut().poll(context).is_pending())
+        })
+        .await,
+        "the bounded wait's refusal is not the retirement's answer"
+    );
+
+    // Its tracer lets it go, as a member's kernel call returns: the SIGKILL it holds ends it.
+    let pid = i32::try_from(leader.id()).unwrap();
+    // SAFETY: `pid` is this test's traced, stopped child; detaching resumes it with no signal of
+    // its own, at the address it stopped at.
+    assert_eq!(
+        unsafe { libc::ptrace(libc::PT_DETACH, pid, std::ptr::without_provenance_mut(1), 0,) },
+        0
+    );
+    assert_eq!(leader.wait_bounded().unwrap().signal(), Some(libc::SIGKILL));
+    complete(
+        &spawned,
+        b"",
+        b"",
+        ExitStatus::Signaled {
+            signal: libc::SIGKILL,
+            core_dumped: false,
+        },
+    )
+    .await;
+    retirement
+        .await
+        .expect("the leader's exit concludes the job, which answers the retirement");
+}
+
 /// The groups a lost predecessor left unresolved neither stop the next supervisor from serving
 /// nor fall out of its ledger: each rewrite carries them while processes hold their ids, and drops
 /// one only once nothing does. Never signalled throughout.

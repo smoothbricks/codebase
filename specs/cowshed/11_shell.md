@@ -183,8 +183,12 @@ the nonterminal job and its client's hold, and reaches every waiter as its typed
 current end included, since nothing ends that stream on its own any more. An explicit cancellation or retirement retries
 it, a holder's close among them. On Darwin a refusal that came while the job's observer held running lives (survivors
 still exiting past the bounded wait after SIGKILL, a root member the kernel will not let it signal) also re-runs once
-that observer holds none: their exits, not a clock, conclude the job. A re-run refused in turn stands until an explicit
-retry. The durable `containment`, `outlived` and `outlivedIncomplete` receipt names the proof, the live members
+that observer holds none: their exits, not a clock, conclude the job. When every life still running is one retirement
+sent SIGKILL, that refusal does not answer a supervisor quiesce or retirement waiting on the job (16_build_volumes.md,
+Land step 4): SIGKILL ends each once its kernel call returns (07_api.md), so those waiters take the re-run's outcome.
+The job's own waiters still get the refusal at once, and it is still said on stderr. A refusal with a member retirement
+could not signal answers every waiter at once. A re-run refused in turn stands until an explicit retry, and answers
+every waiter. The durable `containment`, `outlived` and `outlivedIncomplete` receipt names the proof, the live members
 retirement signalled (including a live leader on cancellation), and whether native retirement may have ended members it
 could not name. Rows preserve each known observed-tree index, pid, image and last signal; a successful receipt leaves no
 scoped survivors. The marker defaults false and is omitted on the wire when false. Empty rows prove no member was ended

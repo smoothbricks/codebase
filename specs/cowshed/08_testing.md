@@ -338,6 +338,14 @@ parked `wait` and stdout follower both get that refusal, the job stays draining 
 the file lsof watches, their exits re-run the retirement, which seals the job. It needs the same passwordless sudo grant
 for `/usr/sbin/lsof`.
 
+A member SIGKILL has not ended within the bounded wait is waited for, not refused, by a supervisor retirement (Land step
+4). `a_supervisor_retirement_waits_for_the_exit_of_a_member_sigkill_has_not_yet_ended` gives a real supervisor job a
+leader the test traces: stopped under its tracer, it outlives SIGKILL until the test detaches it, as a member in an
+uninterruptible kernel wait outlives it until that call returns (07_api.md). The job's `wait` gets the refusal while the
+retirement stays pending; once detached, the leader's exit re-runs the retirement and answers it. Land gates on
+2026-10-28, 11-01 and 11-02 refused on the keeper's Nx daemon and its plugin workers still running 2 s after SIGKILL,
+the daemon seen in an uninterruptible wait (`UN`).
+
 The exit-watch fallback is proven on the real kernel in the ordinary lane: registering launchd (pid 1, which no user may
 SIGKILL) yields the withheld watch and the observer's own child the status watch. A scripted withheld exit folds no
 status and the `UnreadExitStatus` gap. The host-controller lane's

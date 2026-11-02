@@ -1068,7 +1068,7 @@ impl Writer {
         if survivors.is_empty() {
             return Ok(self.retired(scope));
         }
-        Err(CowshedError::conflict(
+        Err(CowshedError::survived_sigkill(
             format!(
                 "{}'s processes {:?} still run {:?} after SIGKILL",
                 self.job_id,

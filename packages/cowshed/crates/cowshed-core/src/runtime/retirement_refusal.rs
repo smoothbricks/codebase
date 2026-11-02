@@ -1,7 +1,9 @@
 //! What a job's membership retirement does after a refusal (11_shell.md, "Shell activation and
 //! process reuse"): the decisions the supervisor actor executes, apart from the I/O that feeds
-//! them. A refusal keeps the job's claims and reaches every waiter, log followers included, as
-//! the typed error; the job's own observer seeing its running lives end re-runs it.
+//! them. A refusal keeps the job's claims and reaches the job's own waiters, log followers
+//! included, as the typed error; the job's own observer seeing its running lives end re-runs it.
+//! A supervisor quiesce or retirement waiting on the job takes that re-run's outcome instead when
+//! every survivor was sent SIGKILL ([`Refusal::answers_lifecycle_waiters`]).
 
 use crate::error::CowshedError;
 
@@ -14,7 +16,7 @@ pub(super) enum RetirementRun {
     EmptyMembership,
 }
 
-/// A refused retirement: the typed error every waiter is answered with, and the run it ended.
+/// A refused retirement: the typed error its waiters are answered with, and the run it ended.
 #[derive(Clone, Debug)]
 pub(super) struct Refusal {
     error: CowshedError,
@@ -37,6 +39,15 @@ impl Refusal {
     /// alike again, so it stands until a cancellation or retirement retries it.
     pub(super) fn reruns(&self, running: Option<usize>) -> bool {
         self.run == RetirementRun::Requested && running == Some(0)
+    }
+
+    /// Whether this refusal answers a supervisor quiesce or retirement waiting on the job
+    /// (16_build_volumes.md, Land step 4). A run refused only because lives it sent SIGKILL still
+    /// ran does not: SIGKILL ends each once its kernel call returns, and their exits re-run it
+    /// ([`Self::reruns`]), whose outcome answers those waiters. Any other refusal answers them at
+    /// once, and so does a re-run's, which stands until a cancellation or retirement retries it.
+    pub(super) fn answers_lifecycle_waiters(&self) -> bool {
+        self.run != RetirementRun::Requested || !self.error.survivors_were_killed()
     }
 }
 
@@ -71,6 +82,33 @@ mod tests {
             CowshedError::conflict("job 7's processes [9] still run", "retry the retirement"),
             run,
         )
+    }
+
+    #[test]
+    fn a_waiting_quiesce_or_retirement_takes_only_the_rerun_of_survivors_sent_sigkill() {
+        let killed = |run| {
+            Refusal::new(
+                CowshedError::survived_sigkill(
+                    "job 7's processes [9] still run 1s after SIGKILL",
+                    "retry the retirement",
+                ),
+                run,
+            )
+        };
+        assert!(
+            !killed(RetirementRun::Requested).answers_lifecycle_waiters(),
+            "their exits re-run it, and that re-run answers the waiters"
+        );
+        assert!(
+            killed(RetirementRun::EmptyMembership).answers_lifecycle_waiters(),
+            "a re-run's refusal stands, so nothing else would answer them"
+        );
+        for run in [RetirementRun::Requested, RetirementRun::EmptyMembership] {
+            assert!(
+                refusal(run).answers_lifecycle_waiters(),
+                "{run:?}: a refusal of anything but survivors sent SIGKILL answers at once"
+            );
+        }
     }
 
     #[test]

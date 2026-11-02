@@ -7044,7 +7044,9 @@ impl SupervisorActor {
                 } else if self.lifecycle == ActorLifecycle::Retired {
                     let _ = reply.send(Ok(()));
                 } else if let Some(error) = self.jobs.values().find_map(|job| {
-                    if let RetirementState::Refused(refusal) = &job.retirement {
+                    if let RetirementState::Refused(refusal) = &job.retirement
+                        && refusal.answers_lifecycle_waiters()
+                    {
                         Some(refusal.error().clone())
                     } else {
                         None
@@ -9421,9 +9423,11 @@ impl SupervisorActor {
         true
     }
 
-    /// A refused retirement keeps the job's claims and reaches every waiter as its typed error,
-    /// a log follower included: nothing ends its stream on its own any more (11_shell.md). Its
-    /// observer's running lives ending re-runs it ([`Self::rerun_refused`]), at once if none runs.
+    /// A refused retirement keeps the job's claims and reaches the job's waiters as its typed
+    /// error, a log follower included: nothing ends its stream on its own any more (11_shell.md).
+    /// Its observer's running lives ending re-runs it ([`Self::rerun_refused`]), at once if none
+    /// runs. A supervisor quiesce or retirement waiting on the job is answered too, unless every
+    /// survivor was sent SIGKILL: that re-run answers it ([`Refusal::answers_lifecycle_waiters`]).
     fn refuse_membership(&mut self, job_id: JobId, error: CowshedError, run: RetirementRun) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
@@ -9442,13 +9446,16 @@ impl SupervisorActor {
         for waiter in job.log_waiters.drain(..) {
             let _ = waiter.reply.send(Err(error.clone()));
         }
-        for waiter in self.retire_waiters.drain(..) {
-            let _ = waiter.send(Err(error.clone()));
+        let refusal = Refusal::new(error, run);
+        if refusal.answers_lifecycle_waiters() {
+            for waiter in self.retire_waiters.drain(..) {
+                let _ = waiter.send(Err(refusal.error().clone()));
+            }
+            for waiter in self.quiesce_waiters.drain(..) {
+                let _ = waiter.send(Err(refusal.error().clone()));
+            }
         }
-        for waiter in self.quiesce_waiters.drain(..) {
-            let _ = waiter.send(Err(error.clone()));
-        }
-        job.retirement = RetirementState::Refused(Refusal::new(error, run));
+        job.retirement = RetirementState::Refused(refusal);
         // Its lives may have ended while the refusal was on its way here.
         self.rerun_refused();
     }
