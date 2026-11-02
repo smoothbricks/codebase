@@ -9,6 +9,12 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# A private consumer reads its own extension table out of a program (specs/columine/08).
+[[package.metadata.wiring.external]]
+item = "extension"
+consumer = "private"
+why = "an embedder reads the table it compiled into a program's tail, by its magic, as part of the program's identity"
+
 [features]
 # Test-support surface for the ABI audits: the frozen registry snapshots, the
 # source scraper they harvest with, and the wasm export-section reader. Off by
