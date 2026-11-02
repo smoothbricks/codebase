@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { posix } from 'node:path';
+import { childPids } from '../../process-children.linux.js';
 import type { HostMemory, RunMemory, RunMemoryError, RunMemoryReading } from './host-memory.js';
 
 /**
@@ -112,4 +113,35 @@ function peakBytes(maxRss: number, bunVersion: string): number {
   return major < 1 || (major === 1 && minor < 4) ? maxRss * 1024 : maxRss;
 }
 
-export const linuxMemory: HostMemory = { readRunMemory: () => linuxRunMemory(readText), peakBytes };
+/** What the tree rooted at `root` holds resident: each member's `VmRSS`, the tree walked by the kernel's child links. */
+async function treeResidentBytes(root: number): Promise<number> {
+  const seen = new Set<number>();
+  let level = [root];
+  let total = 0;
+  while (level.length > 0) {
+    const members = level.filter((pid) => !seen.has(pid));
+    for (const pid of members) seen.add(pid);
+    const [resident, children] = await Promise.all([Promise.all(members.map(residentBytes)), childPids(members)]);
+    total += resident.reduce((sum, bytes) => sum + bytes, 0);
+    level = children;
+  }
+  return total;
+}
+
+/**
+ * `VmRSS` from `/proc/<pid>/status`: what the process holds resident, anonymous, file-backed and shared memory together.
+ * A process that has exited (`ENOENT`, `ESRCH`) holds nothing, and so does a zombie, whose status names no `VmRSS`.
+ */
+async function residentBytes(pid: number): Promise<number> {
+  let status: string;
+  try {
+    status = await readFile(`/proc/${pid}/status`, 'utf8');
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ESRCH')) return 0;
+    throw error;
+  }
+  const kib = /^VmRSS:\s+(\d+) kB$/m.exec(status)?.[1];
+  return kib === undefined ? 0 : Number(kib) * 1024;
+}
+
+export const linuxMemory: HostMemory = { readRunMemory: () => linuxRunMemory(readText), peakBytes, treeResidentBytes };

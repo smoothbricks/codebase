@@ -83,17 +83,46 @@ runs:
     # Hash the exact identity (not a lossy path slug); keep cache artifacts
     # and their metadata DB together, warm across runs of the same pull
     # request or ref and job.
+    #
+    # A pull request's first run starts from its base branch's task records.
+    # Each bounded-exec leaf is charged its task's last recorded memory peak
+    # (specs/cowshed/05_gateway.md, "Without mbx, every Nx run budgets
+    # itself"), and a scope that holds no records charges every leaf nothing,
+    # so a pull request's first run would admit every leaf on CPU tokens
+    # alone. Its base branch's pushes keep their records in the base's scope:
+    # a pull request's scope that holds none takes a copy of each task's last
+    # record (its verdict.json, nothing beside it) from there, and its own
+    # runs replace them. The copy is the record itself, never a second store.
     - name: 📂 Locate the Nx cache on the shared bind
       if: steps.runner-kind.outputs.host == 'true'
       shell: bash
       env:
+        NX_CACHE_BIND: /var/cache/ci/nx
         NX_CACHE_REPO: ${{ github.repository }}
         NX_CACHE_LANE: ${{ github.workflow }}
         SCOPE_REF: ${{ github.event.pull_request.number || github.ref }}
+        # A pull request's base branch, whose pushes run under refs/heads/<it>;
+        # empty for a push.
+        BASE_REF: ${{ github.base_ref }}
       run: |
         lane=$(printf '%s' "$NX_CACHE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
-        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
-        NX_CACHE_ROOT="/var/cache/ci/nx/$NX_CACHE_REPO/${lane:-default}/$scope"
+        # The cache root of the run identity SCOPE_REF names.
+        scope_root() {
+          scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
+          printf '%s' "$NX_CACHE_BIND/$NX_CACHE_REPO/${lane:-default}/$scope"
+        }
+        NX_CACHE_ROOT=$(scope_root)
+        records="$NX_CACHE_ROOT/workspace-data/bounded-exec"
+        if [ -n "$BASE_REF" ] && [ ! -d "$records" ]; then
+          base="$(SCOPE_REF="refs/heads/$BASE_REF" scope_root)/workspace-data/bounded-exec"
+          for verdict in "$base"/*/verdict.json; do
+            [ -e "$verdict" ] || continue
+            task=$(basename "$(dirname "$verdict")")
+            mkdir -p "$records/$task"
+            cp "$verdict" "$records/$task/verdict.json"
+          done
+          if [ -d "$records" ]; then echo "task records: from the $BASE_REF scope"; fi
+        fi
         mkdir -p "$NX_CACHE_ROOT/cache" "$NX_CACHE_ROOT/workspace-data"
         {
           echo "NX_CACHE_DIRECTORY=$NX_CACHE_ROOT/cache"

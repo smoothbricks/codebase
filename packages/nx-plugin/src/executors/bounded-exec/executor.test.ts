@@ -2402,6 +2402,26 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect((await readRecord(record.directory))?.peakBytes).toBeGreaterThanOrEqual(allocated);
   });
 
+  it("records its command tree's resident sum when the tree's processes hold memory side by side", async () => {
+    if (process.platform === 'win32') return;
+    const workspace = await createWorkspace();
+    const record = { task: { id: 'app:test', hash: null }, directory: join(workspace.root, 'tree-peak') };
+    // Four children hold 64 MiB each at once, for twelve of the waiter's sampling periods: the tree held four times
+    // what its largest process did, and the task's next run is charged what the tree held, not what one process did.
+    const allocated = 64 * 1024 * 1024;
+    const holders = 4;
+    const hold = `node -e "const held = Buffer.alloc(${allocated}, 1); setTimeout(() => held.length, 3000)"`;
+    const result = await runBoundedExec(
+      { command: `for i in 1 2 3 4; do ${hold} & done; wait`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+      { ...workspace.context, record },
+      createProcessTreeKiller(),
+      null,
+    );
+
+    expect(result.success).toBe(true);
+    expect((await readRecord(record.directory))?.peakBytes).toBeGreaterThanOrEqual(holders * allocated);
+  });
+
   it('keeps a command running when its borrowed grant closes, and judges it by its own exit', async () => {
     if (process.platform === 'win32') return;
     const workspace = await createWorkspace();

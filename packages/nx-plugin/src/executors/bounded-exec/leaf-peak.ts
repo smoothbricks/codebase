@@ -7,10 +7,11 @@ import { resolveOnPath } from './runtime-pin.js';
 
 /**
  * A leaf's memory peak (specs/cowshed/05_gateway.md, "Without mbx, every Nx run budgets itself"; 13_telemetry.md, "Job
- * resource peaks"): the exited command's rusage `ru_maxrss`, which its waiter (`peak-waiter.ts`) reads. The leaf runs
- * no cgroup of its own, even under a cowshed supervisor, whose subtree of the command is an observed fold inside the
- * job's cgroup (07_api.md, `JobSubtreeHandle`), so the peak is the rusage on Linux and macOS alike. The executor writes
- * it into the task's record, and the task's next run is charged it in its run's pool.
+ * resource peaks"): the largest sum of what the exited command's process tree held side by side, as its waiter
+ * (`peak-waiter.ts`) sampled it, never less than the command's rusage `ru_maxrss`, which the waiter also reads. The
+ * leaf runs no cgroup of its own, even under a cowshed supervisor, whose subtree of the command is an observed fold
+ * inside the job's cgroup (07_api.md, `JobSubtreeHandle`), so the peak is read from the leaf's own tree on Linux and
+ * macOS alike. The executor writes it into the task's record, and the task's next run is charged it in its run's pool.
  */
 
 /** The descriptor the waiter reports on: past the lifecycle channel (3), the subtree admission (4) and mbx's grant (5). */

@@ -34,7 +34,7 @@ function scope(overrides: Record<string, string> = {}): string {
 describe('host CI mutable cache isolation', () => {
   test('Nx and devenv use the same exact workflow/pull request or ref/job/platform identity', () => {
     expect(assignments).toHaveLength(2);
-    expect(assignments[0]).toBe(assignments[1]);
+    expect(assignments[0]?.trim()).toBe(assignments[1]?.trim());
     expect(action).toContain('/${lane:-default}/$scope');
     expect(action).toContain('/${lane:-default}/$DEVENV_STATE_JOB/$scope');
     expect(action).toContain('NX_CACHE_DIRECTORY=$NX_CACHE_ROOT/cache');

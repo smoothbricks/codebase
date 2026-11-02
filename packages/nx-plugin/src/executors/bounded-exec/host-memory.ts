@@ -14,6 +14,13 @@ export interface HostMemory {
    * it: the exited leaf's `ru_maxrss`.
    */
   peakBytes(maxRss: number, bunVersion: string): number;
+  /**
+   * What the process tree rooted at `root` holds resident at this instant: the sum over `root` and every descendant the
+   * kernel links to it, each process's footprint where the platform keeps one (macOS `ri_phys_footprint`, which counts
+   * its compressed pages) and its resident set where it does not (Linux `VmRSS`). A process that exits between the
+   * listing and its read adds nothing, and a root that has exited holds nothing.
+   */
+  treeResidentBytes(root: number): Promise<number>;
 }
 
 /** The run's memory in bytes, and where it was read: the file or sysctl that holds it. */

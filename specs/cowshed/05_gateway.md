@@ -1769,29 +1769,44 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   class's three quarters of the host ("Classes"). A run whose memory cannot be read does not start (`preTasksExecution`
   throws its typed error, naming the file or sysctl and the cause): like a pressure reading that cannot be taken
   ("Memory pressure"), it is not shown to have room. A task with no recorded peak is charged nothing until it has one,
-  as mbx's omitted `--memory` is a zero-byte charge. A leaf whose own charge alone exceeds the run's memory is granted
-  once nothing else holds memory, so it never starves, and its stderr says so, naming its charge and the run's memory. A
-  granted `bounded-exec`'s sub-pool charges no memory: its holder's charge covers its tree.
+  as mbx's omitted `--memory` is a zero-byte charge. On a host CI runner a pull request's first run starts with its base
+  branch's records: the managed `setup-devenv` action gives a pull request's scope that holds no task records a copy of
+  each task's last `verdict.json` from the scope its base branch's pushes run in, so its leaves are charged the peaks
+  its base branch last recorded, and its own runs replace them; the copy is the record, never a second store. A leaf
+  whose own charge alone exceeds the run's memory is granted once nothing else holds memory, so it never starves, and
+  its stderr says so, naming its charge and the run's memory. A granted `bounded-exec`'s sub-pool charges no memory: its
+  holder's charge covers its tree.
 
   When a leaf ends, `bounded-exec` writes its peak into the task's record, the `verdict.json` of the task's
   `bounded-exec` directory in the checkout's Nx workspace data, keyed by the task id Nx gives
-  (`project:target[:configuration]`) and already carrying the `cpu` grant: `peakBytes`, the exited command's rusage
+  (`project:target[:configuration]`) and already carrying the `cpu` grant: `peakBytes`, the largest sum of what the
+  leaf's process tree held side by side as its waiter sampled it, never less than the exited command's rusage
   `ru_maxrss` (13_telemetry.md, "Job resource peaks"), null when it could not be measured, never zero. The task's next
   run reads that last record before it clears it, and is charged its peak. A leaf has no cgroup of its own, even under a
   supervisor, whose subtree of the command is an observed fold inside the job's cgroup (07_api.md, `JobSubtreeHandle`),
-  so `memory.peak` there would be the whole job's: rusage is the leaf's peak on Linux as on macOS. Node, which runs the
-  executor, reaps a child without its rusage, so the command runs under a Bun waiter (`peak-waiter.ts`) that reads
-  `Subprocess.resourceUsage().maxRSS`, in bytes from Bun 1.4.0 and in the kernel's KiB on Linux before it, and reports
-  it on its own descriptor; the waiter passes the command its stdio and descriptors 3 to 5 and ends as the command did.
-  It leads the leaf's process group and names the command's pid on that descriptor when it starts it: the command is the
-  leaf's runner, the one a hang snapshot samples (08_testing.md), never the waiter. Measured on macOS arm64 with Bun
-  1.4.4: 17.4 MB resident and 10 to 20 ms per leaf. `ru_maxrss` is the largest resident set any one process of the
-  leaf's tree reached, not their simultaneous sum, so a leaf whose processes peak side by side is charged less than it
-  took. Measured on a downstream Linux CI runner (32 vCPU, cgroup `memory.max` 32 GiB, no mbx, no supervisor): a test
-  run across the repository with every target side by side started about 32 `bun test` leaves of 3 to 4 GB peak each on
-  CPU tokens alone, and the kernel OOM-killed them (exit 137) every run. `pool-admission.test.ts` holds the admission
-  rule in a table, `host-memory.linux.test.ts` the Linux reading, `run-cpu-pool.test.ts` a leaf held until a holder
-  returns its memory, and `executor.test.ts` a leaf that records its measured peak and whose next run is charged it.
+  so `memory.peak` there would be the whole job's: the leaf's peak is read from its own process tree, on Linux as on
+  macOS. The command runs under a Bun waiter (`peak-waiter.ts`). Every 250 ms while the command runs, the waiter sums
+  what the command and each descendant the kernel links to it hold: on macOS each process's `ri_phys_footprint` from
+  `proc_pid_rusage`, which counts its compressed pages, the tree walked by `proc_listchildpids`; on Linux each process's
+  `VmRSS` from `/proc/<pid>/status`, the tree walked by each task's `children`. It keeps the largest sum. At the exit it
+  takes the larger of that and `Subprocess.resourceUsage().maxRSS` (in bytes from Bun 1.4.0, in the kernel's KiB on
+  Linux before it), which a spike between two samples still reaches; Node, which runs the executor, reaps a child
+  without its rusage. A tree it could not read is said on the command's stderr, and its peak is then the larger of what
+  was read and `ru_maxrss`. The waiter reports the peak on its own descriptor, passes the command its stdio and
+  descriptors 3 to 5, and ends as the command did. It leads the leaf's process group and names the command's pid on that
+  descriptor when it starts it: the command is the leaf's runner, the one a hang snapshot samples (08_testing.md), never
+  the waiter. Measured on macOS arm64 with Bun 1.4.4: 17.4 MB resident and 10 to 20 ms per leaf. A descendant that
+  leaves the tree (a daemon that reparents itself) is no longer the leaf's. `ru_maxrss` alone is the largest resident
+  set any one process of the tree reached, which charged a leaf whose processes held memory side by side less than it
+  took: measured on macOS arm64, a shell whose four `node` children each held 64 MiB at once recorded 123.7 MB by
+  `ru_maxrss` and records 357.2 MB by the sampled sum. Measured on a downstream Linux CI runner (32 vCPU, cgroup
+  `memory.max` 32 GiB, no mbx, no supervisor): a test run across the repository with every target side by side started
+  about 32 `bun test` leaves of 3 to 4 GB peak each on CPU tokens alone, and the kernel OOM-killed them (exit 137) every
+  run. `pool-admission.test.ts` holds the admission rule in a table, `host-memory.linux.test.ts` the Linux reading,
+  `host-memory.test.ts` a tree's sum, `run-cpu-pool.test.ts` a leaf held until a holder returns its memory,
+  `executor.test.ts` a leaf that records its measured peak and whose next run is charged it, and one whose four children
+  held memory side by side, recorded at their sum, and `setup-devenv-task-records.test.ts` a pull request's first run
+  starting from its base branch's records.
 
 - **Runners are sized to the count.** The `bounded-exec` executor reads each runner's requested parallelism from the
   runner's own flag rather than assuming the core count, since a runner's flag and its actual concurrency can disagree:
