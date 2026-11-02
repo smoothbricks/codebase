@@ -895,8 +895,12 @@ export function validateCargoCachePolicy(root: string, options: CargoPolicyOptio
   return failures;
 }
 
-/** A command that compiles or checks Rust, whichever driver spells it. */
-const RUNS_CARGO = /(?:^|[\s;&|])cargo[\s-]|\bnapi build\b/;
+/**
+ * A command that compiles or checks Rust, whichever driver spells it: the word `cargo` or a `cargo-<subcommand>`
+ * program, each a whole shell word. A file argument that merely begins with `cargo-` (`bun test cargo-git-pins.test.ts`)
+ * runs no Rust tool.
+ */
+const RUNS_CARGO = /(?:^|[\s;&|])cargo(?:-[\w-]+)?(?=$|[\s;&|])|\bnapi build\b/;
 
 const CARGO_TOOLCHAIN_FIX = `Add "${CARGO_TOOLCHAIN_NAMED_INPUT}" to its inputs, or to the named input it uses`;
 

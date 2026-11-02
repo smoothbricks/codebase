@@ -686,6 +686,19 @@ describe('cargo toolchain identity policy', () => {
     expect(await checkToolchain({ 'nx.json': '{}\n' }, [uncached, notCargo])).toMatchObject({ failures: 0 });
   });
 
+  // A cargo program is the word `cargo` or a `cargo-<subcommand>` executable, as a whole shell word. A file argument
+  // that merely begins with `cargo-` (a test named for the Cargo pins it reads) runs no Rust tool, so it has no
+  // toolchain to key.
+  it.each([
+    { command: 'bun test --timeout=0 cargo-git-pins.test.ts', failures: 0 },
+    { command: 'node cargo-metadata-report.mjs --json', failures: 0 },
+    { command: 'cargo nextest run --workspace', failures: 1 },
+    { command: 'bun install && cargo-zigbuild build --release', failures: 1 },
+  ])('reads `$command` as a cargo run only when a cargo program runs', async ({ command, failures }) => {
+    const target: ProjectTargets = { ...cargoLint([]), targetOptions: new Map([['cargo-lint', { command }]]) };
+    expect(await checkToolchain({ 'nx.json': '{}\n' }, [target])).toMatchObject({ failures });
+  });
+
   // A cyclic named input is a repository mistake, not a reason to hang the
   // whole validation run before it can report anything at all.
   it('terminates on a named input that references itself', async () => {
