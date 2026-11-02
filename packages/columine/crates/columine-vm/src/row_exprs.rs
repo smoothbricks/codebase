@@ -89,7 +89,8 @@ use columine_types::types::{
 
 use crate::bytes;
 use crate::column_uses::{ColumnUse, reduce_column_reads};
-use crate::key_index::{InternBytes, KeyCx, KeyIndex};
+use crate::key_index::{InternBytes, KeyCx, KeyIndex, NoStrings};
+use crate::logical_export::Interner;
 use crate::struct_map::{StructMap2Slot, StructMapSlot, StructRows};
 use crate::vm::{col_at, col_u32, col_u32_exact, u64s_as_bytes};
 
@@ -341,13 +342,17 @@ pub trait RowExpression {
 
     /// Evaluate the expression for one row and answer the cell to store, in
     /// `lane`. A value `lane` cannot hold is `InvalidCellValue`, and the bind
-    /// refuses a cell of another lane the same way.
+    /// refuses a cell of another lane the same way. `strings` names the text
+    /// of an id cell and interns a string the expression builds, answered as
+    /// its u32 id (specs/columine/09-row-interning.md); a live evaluation is
+    /// handed [`NoStrings`].
     fn eval(
         &mut self,
         expr: &[u8],
         lane: CmpType,
         batch: &BatchView<'_>,
         row: u32,
+        strings: &mut dyn Interner,
     ) -> Result<RowCell, ErrorCode>;
 }
 
@@ -585,11 +590,16 @@ impl LiveColumns<'_, '_> {
         let expr = &self.program[entry.expr.start..entry.expr.end];
         let mut batch = BatchView::host(state, cols, rows.batch_len);
         batch.stored = stored;
-        Some(match self.eval.eval(expr, CmpType::U32, &batch, row) {
-            Ok(RowCell::U32(cell)) => Ok(cell),
-            Ok(RowCell::F64(_) | RowCell::I64(_)) => Err(ErrorCode::InvalidCellValue),
-            Err(code) => Err(code),
-        })
+        Some(
+            match self
+                .eval
+                .eval(expr, CmpType::U32, &batch, row, &mut NoStrings)
+            {
+                Ok(RowCell::U32(cell)) => Ok(cell),
+                Ok(RowCell::F64(_) | RowCell::I64(_)) => Err(ErrorCode::InvalidCellValue),
+                Err(code) => Err(code),
+            },
+        )
     }
 }
 
@@ -775,12 +785,18 @@ fn store(words: &mut [u64], lane: CmpType, row: usize, cell: RowCell) -> Result<
 /// computed before the first splice. `out` grows to the widest and longest
 /// batch it has bound and keeps that storage; memory that cannot back it
 /// refuses with `OutOfMemory`.
+///
+/// `strings` is the caller's interner: every bound entry's evaluation may
+/// read an id's text and intern the strings it builds, and the bind is the
+/// table's only writer (specs/columine/09-row-interning.md). A refusal of the
+/// table refuses the bind with its code, before any splice.
 pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     program: &'a [u8],
     state: &[u8],
     cols: &mut [&'a [u8]],
     batch_len: u32,
     eval: &'e mut E,
+    strings: &mut dyn Interner,
     out: &'a mut RowColumns,
 ) -> Result<LiveColumns<'a, 'e>, ErrorCode> {
     // `out` describes this bind only: a table-less program or an empty batch
@@ -893,7 +909,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
                 cells,
                 entry.lane,
                 row,
-                eval.eval(entry.expr, entry.lane, &batch, at)?,
+                eval.eval(entry.expr, entry.lane, &batch, at, strings)?,
             )?;
         }
     }

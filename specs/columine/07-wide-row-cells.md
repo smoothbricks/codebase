@@ -34,11 +34,11 @@ so every program written before stays byte-identical and binds as before.
 
 ## 3. Evaluation and storage
 
-`RowExpression::admit(expr, lane, batch)` and `RowExpression::eval(expr, lane, batch, row)` receive the entry's lane. An
-evaluator refuses at admission, with `InvalidProgram`, an expression that cannot answer the lane, such as a predicate in
-a wide lane. It answers each row with a `RowCell` (`U32`, `F64` or `I64`). The bind stores a cell only in its entry's
-lane. A cell of another lane, or a value the lane cannot hold, refuses the bind with `InvalidCellValue` before any
-column is spliced.
+`RowExpression::admit(expr, lane, batch)` and `RowExpression::eval(expr, lane, batch, row, strings)`
+([row interning](09-row-interning.md)) receive the entry's lane. An evaluator refuses at admission, with
+`InvalidProgram`, an expression that cannot answer the lane, such as a predicate in a wide lane. It answers each row
+with a `RowCell` (`U32`, `F64` or `I64`). The bind stores a cell only in its entry's lane. A cell of another lane, or a
+value the lane cannot hold, refuses the bind with `InvalidCellValue` before any column is spliced.
 
 `RowColumns` keeps each entry's cells in 8-byte words, two u32 cells or one wide cell to a word, so a wide column is
 aligned for its typed view. The splice hands an entry's column to the reduce section as `batch_len` cells of the lane's

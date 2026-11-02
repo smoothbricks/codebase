@@ -4,6 +4,7 @@
 
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{ChangeFlag, CmpType, ErrorCode, StructFieldType};
+use columine_vm::key_index::NoStrings;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
     BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression, bind_row_columns,
@@ -182,6 +183,7 @@ impl RowExpression for Threshold {
         _: CmpType,
         batch: &BatchView<'_>,
         row: u32,
+        _: &mut dyn columine_vm::logical_export::Interner,
     ) -> Result<RowCell, ErrorCode> {
         self.evaluated += 1;
         let cells = col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
@@ -228,7 +230,16 @@ fn derived_predicate_gates_the_upsert_and_unmatched_rows_stay_zero() {
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(&prog, &state, &mut cols, 4, &mut eval, &mut rows).expect("bind");
+    bind_row_columns(
+        &prog,
+        &state,
+        &mut cols,
+        4,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind");
     assert_eq!(cols[3], u32s_as_bytes(&[0u32, 1, 0, 1]));
     assert_eq!(eval.admitted, 1);
     assert_eq!(
@@ -255,7 +266,16 @@ fn a_program_without_a_table_binds_nothing() {
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+    bind_row_columns(
+        &prog,
+        &state,
+        &mut cols,
+        2,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind");
     assert_eq!(cols[3], u32s_as_bytes(&placeholder));
     assert_eq!(eval.admitted, 0);
 }
@@ -277,7 +297,16 @@ fn an_empty_batch_binds_nothing_even_without_column_pointers() {
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(&prog, &state, &mut cols, 0, &mut eval, &mut rows).expect("bind");
+    bind_row_columns(
+        &prog,
+        &state,
+        &mut cols,
+        0,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind");
     assert!(cols.is_empty());
     assert_eq!(eval.admitted, 0);
 }
@@ -293,9 +322,17 @@ fn bind_err<'a>(
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(prog, &state, cols, batch_len, &mut eval, rows)
-        .map(|_| ())
-        .expect_err("bind must refuse")
+    bind_row_columns(
+        prog,
+        &state,
+        cols,
+        batch_len,
+        &mut eval,
+        &mut NoStrings,
+        rows,
+    )
+    .map(|_| ())
+    .expect_err("bind must refuse")
 }
 
 #[test]
@@ -445,7 +482,16 @@ fn an_extension_table_after_the_row_table_leaves_the_bind_unchanged() {
             admitted: 0,
             evaluated: 0,
         };
-        bind_row_columns(&prog, &state, &mut cols, 3, &mut eval, &mut rows).expect("bind");
+        bind_row_columns(
+            &prog,
+            &state,
+            &mut cols,
+            3,
+            &mut eval,
+            &mut NoStrings,
+            &mut rows,
+        )
+        .expect("bind");
         let derived = cols[3].to_vec();
         let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
         assert_eq!(vm.execute_batch(&mut state, &prog, &cols, 3), OK);
@@ -478,7 +524,16 @@ fn a_tail_of_extension_tables_alone_binds_nothing() {
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+    bind_row_columns(
+        &prog,
+        &state,
+        &mut cols,
+        2,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind");
     assert_eq!(cols[3], u32s_as_bytes(&placeholder));
     assert_eq!(eval.admitted, 0);
 }
@@ -569,7 +624,16 @@ fn a_later_entry_reads_an_earlier_entry_s_derived_column() {
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+    bind_row_columns(
+        &prog,
+        &state,
+        &mut cols,
+        2,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind");
     assert_eq!(cols[3], u32s_as_bytes(&[0u32, 1]));
     assert_eq!(cols[4], u32s_as_bytes(&[0u32, 1]));
 }
@@ -610,12 +674,30 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
     let mut cold = RowColumns::new();
     assert_eq!(
         without_memory(|| {
-            bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut cold).err()
+            bind_row_columns(
+                &prog,
+                &state,
+                &mut cols,
+                2,
+                &mut eval,
+                &mut NoStrings,
+                &mut cold,
+            )
+            .err()
         }),
         Some(ErrorCode::OutOfMemory)
     );
     assert!(cols[3].is_empty() && cols[4].is_empty());
-    bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+    bind_row_columns(
+        &prog,
+        &state,
+        &mut cols,
+        2,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind");
     assert_eq!(cols[3], u32s_as_bytes(&[0u32, 1]));
     assert_eq!(cols[4], u32s_as_bytes(&[1u32, 1]));
     // A batch no wider or longer than one already bound binds in the
@@ -623,7 +705,16 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
     let mut again: Vec<&[u8]> = vec![u32s_as_bytes(&types), &[], u32s_as_bytes(&vals), &[], &[]];
     assert_eq!(
         without_memory(|| {
-            bind_row_columns(&prog, &state, &mut again, 2, &mut eval, &mut rows).err()
+            bind_row_columns(
+                &prog,
+                &state,
+                &mut again,
+                2,
+                &mut eval,
+                &mut NoStrings,
+                &mut rows,
+            )
+            .err()
         }),
         None
     );
@@ -640,7 +731,16 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
     ];
     assert_eq!(
         without_memory(|| {
-            bind_row_columns(&prog, &state, &mut longer, 64, &mut eval, &mut rows).err()
+            bind_row_columns(
+                &prog,
+                &state,
+                &mut longer,
+                64,
+                &mut eval,
+                &mut NoStrings,
+                &mut rows,
+            )
+            .err()
         }),
         Some(ErrorCode::OutOfMemory)
     );
@@ -673,6 +773,7 @@ impl RowExpression for Competes {
         _: CmpType,
         batch: &BatchView<'_>,
         row: u32,
+        _: &mut dyn columine_vm::logical_export::Interner,
     ) -> Result<RowCell, ErrorCode> {
         self.evaluated += 1;
         let key = col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
@@ -709,6 +810,7 @@ fn run_live(prog: &[u8], state: &mut [u8], keys: &[u32], vals: &[u32]) -> Vec<Op
             &mut cols,
             keys.len() as u32,
             &mut eval,
+            &mut NoStrings,
             &mut rows,
         )
         .expect("bind");
@@ -776,8 +878,16 @@ fn a_live_entry_gates_on_the_type_column_and_re_binds_per_batch() {
     let mut eval = Competes { evaluated: 0 };
     let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
     {
-        let mut live =
-            bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+        let mut live = bind_row_columns(
+            &prog,
+            &state,
+            &mut cols,
+            2,
+            &mut eval,
+            &mut NoStrings,
+            &mut rows,
+        )
+        .expect("bind");
         assert_eq!(
             vm.execute_batch_live(&mut state, &prog, &cols, 2, &mut live),
             OK
@@ -794,8 +904,16 @@ fn a_live_entry_gates_on_the_type_column_and_re_binds_per_batch() {
     // entry forward.
     let plain = program(&[]);
     let mut plain_cols: Vec<&[u8]> = vec![&[], &[], &[], &[]];
-    let live =
-        bind_row_columns(&plain, &state, &mut plain_cols, 1, &mut eval, &mut rows).expect("bind");
+    let live = bind_row_columns(
+        &plain,
+        &state,
+        &mut plain_cols,
+        1,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind");
     assert!(live.is_empty());
 }
 
@@ -826,8 +944,16 @@ fn splice_repeats_the_bound_columns_over_a_rebuilt_column_set() {
         evaluated: 0,
     };
     let bound: Vec<Vec<u8>> = {
-        let live =
-            bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+        let live = bind_row_columns(
+            &prog,
+            &state,
+            &mut cols,
+            2,
+            &mut eval,
+            &mut NoStrings,
+            &mut rows,
+        )
+        .expect("bind");
         assert!(live.is_empty());
         cols.iter().map(|c| c.to_vec()).collect()
     };
@@ -887,7 +1013,16 @@ fn live_bind_refusal(body: &[u8]) -> Option<ErrorCode> {
     ];
     let mut rows = RowColumns::new();
     let mut eval = Competes { evaluated: 0 };
-    let outcome = bind_row_columns(&prog, &state, &mut cols, 1, &mut eval, &mut rows).map(|_| ());
+    let outcome = bind_row_columns(
+        &prog,
+        &state,
+        &mut cols,
+        1,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .map(|_| ());
     let refusal = outcome.err();
     if refusal.is_some() {
         assert_eq!(
@@ -1089,7 +1224,16 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
             u32s_as_bytes(&vals),
             &[],
         ];
-        bind_row_columns(&live_on_3, &state, &mut cols, 1, &mut eval, &mut rows).expect("bind");
+        bind_row_columns(
+            &live_on_3,
+            &state,
+            &mut cols,
+            1,
+            &mut eval,
+            &mut NoStrings,
+            &mut rows,
+        )
+        .expect("bind");
     }
 
     // The threshold entry needs the Threshold evaluator; a combined one
@@ -1117,11 +1261,12 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
             _: CmpType,
             batch: &BatchView<'_>,
             row: u32,
+            strings: &mut dyn columine_vm::logical_export::Interner,
         ) -> Result<RowCell, ErrorCode> {
             if expr.len() == 5 {
-                self.threshold.eval(expr, CmpType::U32, batch, row)
+                self.threshold.eval(expr, CmpType::U32, batch, row, strings)
             } else {
-                self.competes.eval(expr, CmpType::U32, batch, row)
+                self.competes.eval(expr, CmpType::U32, batch, row, strings)
             }
         }
     }
@@ -1140,8 +1285,16 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
         &[],
         &[],
     ];
-    let mut live =
-        bind_row_columns(&live_on_4, &state, &mut cols, 1, &mut both, &mut rows).expect("bind");
+    let mut live = bind_row_columns(
+        &live_on_4,
+        &state,
+        &mut cols,
+        1,
+        &mut both,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind");
     assert_eq!(cols[3], u32s_as_bytes(&[1u32]), "column 3 is bound now");
     assert!(
         live.cell(3, 0, &state, &cols).is_none(),
@@ -1226,6 +1379,7 @@ impl RowExpression for Copy {
         _: CmpType,
         batch: &BatchView<'_>,
         row: u32,
+        _: &mut dyn columine_vm::logical_export::Interner,
     ) -> Result<RowCell, ErrorCode> {
         let cells = col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
             .expect("admit proved coverage");
@@ -1271,8 +1425,16 @@ fn a_bound_derived_guard_column_plans_and_orders_the_scatter() {
     };
     let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
     {
-        let mut live =
-            bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+        let mut live = bind_row_columns(
+            &prog,
+            &state,
+            &mut cols,
+            2,
+            &mut eval,
+            &mut NoStrings,
+            &mut rows,
+        )
+        .expect("bind");
         assert!(live.is_empty());
         assert_eq!(
             vm.execute_batch_live(&mut state, &prog, &cols, 2, &mut live),
@@ -1316,9 +1478,17 @@ fn a_live_derived_guard_column_is_refused_before_any_element_runs() {
         binding: Binding::Live,
     };
     assert_eq!(
-        bind_row_columns(&prog, &state, &mut cols, 1, &mut eval, &mut rows)
-            .err()
-            .map(|e| e as u32),
+        bind_row_columns(
+            &prog,
+            &state,
+            &mut cols,
+            1,
+            &mut eval,
+            &mut NoStrings,
+            &mut rows
+        )
+        .err()
+        .map(|e| e as u32),
         Some(ErrorCode::InvalidProgram as u32),
         "a guard read through a live column would see placeholder zeros"
     );
@@ -1397,8 +1567,16 @@ fn a_live_element_predicate_binds_beside_a_guarded_scatter() {
     };
     let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
     {
-        let mut live = bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows)
-            .expect("a guarded scatter must not refuse an unrelated live predicate");
+        let mut live = bind_row_columns(
+            &prog,
+            &state,
+            &mut cols,
+            2,
+            &mut eval,
+            &mut NoStrings,
+            &mut rows,
+        )
+        .expect("a guarded scatter must not refuse an unrelated live predicate");
         assert!(!live.is_empty());
         assert_eq!(
             vm.execute_batch_live(&mut state, &prog, &cols, 2, &mut live),
@@ -1472,6 +1650,7 @@ impl RowExpression for StoredRetention {
         _: CmpType,
         batch: &BatchView<'_>,
         logical_row: u32,
+        _: &mut dyn columine_vm::logical_export::Interner,
     ) -> Result<RowCell, ErrorCode> {
         self.evaluated += 1;
         if self.fail_after == Some(self.evaluated) {
@@ -1523,8 +1702,16 @@ fn run_stored(
     let batch_len = u32::try_from(types.len()).expect("batch length fits");
     let mut cols = [u32s_as_bytes(types), &[], u32s_as_bytes(clocks), &[]];
     let mut rows = RowColumns::new();
-    let mut live = bind_row_columns(program, state, &mut cols, batch_len, eval, &mut rows)
-        .expect("admitted stored predicate");
+    let mut live = bind_row_columns(
+        program,
+        state,
+        &mut cols,
+        batch_len,
+        eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("admitted stored predicate");
     vm.execute_batch_delta_live(state, program, &cols, batch_len, &mut live)
 }
 
@@ -1799,8 +1986,16 @@ fn warmed_stored_sweep_evaluates_and_mutates_with_allocation_refused() {
     let clocks = [300];
     let mut cols = [u32s_as_bytes(&types), &[], u32s_as_bytes(&clocks), &[]];
     let mut rows = RowColumns::new();
-    let mut live = bind_row_columns(&program, &state, &mut cols, 1, &mut eval, &mut rows)
-        .expect("bind before allocator refusal");
+    let mut live = bind_row_columns(
+        &program,
+        &state,
+        &mut cols,
+        1,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind before allocator refusal");
     assert_eq!(
         without_memory(|| vm.execute_batch_delta_live(&mut state, &program, &cols, 1, &mut live)),
         OK
@@ -1828,8 +2023,16 @@ fn cold_stored_sweep_allocation_refusal_precedes_writes() {
     let mut cols = [u32s_as_bytes(&types), &[], u32s_as_bytes(&clocks), &[]];
     let mut rows = RowColumns::new();
     let mut eval = StoredRetention::default();
-    let mut live = bind_row_columns(&program, &state, &mut cols, 1, &mut eval, &mut rows)
-        .expect("bind before allocator refusal");
+    let mut live = bind_row_columns(
+        &program,
+        &state,
+        &mut cols,
+        1,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind before allocator refusal");
     let mut vm = Vm::default();
     assert_eq!(
         without_memory(|| vm.execute_batch_live(&mut state, &program, &cols, 1, &mut live)),

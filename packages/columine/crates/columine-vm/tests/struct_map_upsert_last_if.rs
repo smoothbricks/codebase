@@ -336,6 +336,7 @@ impl RowExpression for LeaseWinner {
         _: CmpType,
         batch: &BatchView<'_>,
         row: u32,
+        _: &mut dyn columine_vm::logical_export::Interner,
     ) -> Result<RowCell, ErrorCode> {
         self.evaluated += 1;
         let current = match batch.stored() {
@@ -423,7 +424,7 @@ fn execute(
     let batch = Batch::of(rows);
     let mut cols = batch.cols();
     let len = batch.len();
-    let mut live = bind_row_columns(program, state, &mut cols, len, eval, store)
+    let mut live = bind_row_columns(program, state, &mut cols, len, eval, &mut NoStrings, store)
         .expect("bind the lease predicate");
     vm.execute_batch_delta_live(state, program, &cols, len, &mut live)
 }
@@ -972,8 +973,16 @@ fn a_warmed_batch_binds_evaluates_and_writes_without_allocating() {
     let mut cols = batch.cols();
     let len = batch.len();
     let status = with_allocations(0, || {
-        let mut live = bind_row_columns(&program, &state, &mut cols, len, &mut eval, &mut store)
-            .expect("a warmed bind allocates nothing");
+        let mut live = bind_row_columns(
+            &program,
+            &state,
+            &mut cols,
+            len,
+            &mut eval,
+            &mut NoStrings,
+            &mut store,
+        )
+        .expect("a warmed bind allocates nothing");
         vm.execute_batch_delta_live(&mut state, &program, &cols, len, &mut live)
     });
     assert_eq!(status, OK);
@@ -1089,9 +1098,17 @@ fn top_level_upsert_last_if_is_refused() {
     let mut eval = LeaseWinner::default();
     let mut store = RowColumns::new();
     assert_eq!(
-        bind_row_columns(&live, &state, &mut cols, 1, &mut eval, &mut store)
-            .err()
-            .map(|e| e as u32),
+        bind_row_columns(
+            &live,
+            &state,
+            &mut cols,
+            1,
+            &mut eval,
+            &mut NoStrings,
+            &mut store
+        )
+        .err()
+        .map(|e| e as u32),
         Some(INVALID_PROGRAM)
     );
 }

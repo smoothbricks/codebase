@@ -235,14 +235,30 @@ impl<'k, I: KeyIndex, S: InternBytes + ?Sized> KeyCx<'k, I, S> {
     }
 }
 
-/// The resolver the [`HashIndex`] entry points pass, which take none: it
-/// resolves no id, so a family that must read an interned lane refuses.
+/// The resolver of a state with no string table: it resolves no id, so a
+/// family that must read an interned lane refuses, and as an interner it
+/// names no text and refuses to make one with `InvalidProgram`
+/// (specs/columine/09-row-interning.md §2). The [`HashIndex`] entry points,
+/// which take no resolver, pass it, and a live row-expression entry evaluates
+/// with it, since only the bind writes the table.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoStrings;
 
 impl InternBytes for NoStrings {
     fn bytes(&self, _id: u32) -> Option<&[u8]> {
         None
+    }
+}
+
+impl crate::logical_export::InternLookup for NoStrings {
+    fn text(&self, _id: u32) -> Option<&str> {
+        None
+    }
+}
+
+impl crate::logical_export::Interner for NoStrings {
+    fn intern(&mut self, _text: &str) -> Result<u32, ErrorCode> {
+        Err(ErrorCode::InvalidProgram)
     }
 }
 

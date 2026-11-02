@@ -19,6 +19,7 @@ use columine_types::vo::{
 use crate::counts_fold::CountsFoldOp;
 use crate::element_body::{InvalidSource, SourceOp, visit_source_ops};
 use crate::key_index::{HashIndex, InternBytes, KeyIndex, NoStrings};
+use crate::logical_export::Interner;
 use crate::program_inputs::InputPlan;
 use crate::row_exprs::{LiveColumns, RowColumns, RowExpression, bind_row_columns, row_table};
 use crate::state_init;
@@ -316,29 +317,36 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
     /// what admission sees. Binding reads `state` and writes only `rows` and
     /// `cols`; every refusal happens before `execute` runs. A program without
     /// a table binds nothing and its live columns are empty.
+    ///
+    /// `strings` is the caller's interner: the bind interns through it, then
+    /// `execute` reads it shared, so the reduce section's key lanes resolve
+    /// against a table nothing writes while they run
+    /// (specs/columine/09-row-interning.md §3).
     #[allow(clippy::too_many_arguments)]
-    pub fn execute_bound<'a, E: RowExpression>(
+    pub fn execute_bound<'a, E: RowExpression, S: Interner>(
         &'a self,
         state: &mut [u8],
         cols: &mut [&'a [u8]],
         batch_len: u32,
         scratch: &mut ProgramScratch,
         eval: &mut E,
+        strings: &mut S,
         rows: &'a mut RowColumns,
-        execute: impl FnOnce(&[u8], &mut [u8], &[&[u8]], &mut LiveColumns<'_, '_>) -> u32,
+        execute: impl FnOnce(&[u8], &mut [u8], &[&[u8]], &mut LiveColumns<'_, '_>, &S) -> u32,
     ) -> Result<u32, InputAdmissionError> {
-        let mut live = bind_row_columns(&self.bytecode, state, cols, batch_len, eval, rows)
-            .map_err(InputAdmissionError::Rows)?;
+        let mut live =
+            bind_row_columns(&self.bytecode, state, cols, batch_len, eval, strings, rows)
+                .map_err(InputAdmissionError::Rows)?;
+        let strings: &S = strings;
         self.inputs.admit_and_execute(
             &self.metadata,
             &self.admission,
             cols,
             batch_len,
             scratch,
-            |cols| execute(&self.bytecode, state, cols, &mut live),
+            |cols| execute(&self.bytecode, state, cols, &mut live, strings),
         )
     }
-
     /// Re-admit a batch that resumes after its bind: splice the derived
     /// cells `rows` retained from this program's last bind over this batch
     /// into `cols`, admit the selected VO frames over that spliced set, then
@@ -577,6 +585,7 @@ mod tests {
     };
 
     use super::{AdmittedProgram, InputAdmissionError, ProgramScratch};
+    use crate::key_index::NoStrings;
     use crate::program_inputs::InputPlan;
     use crate::row_exprs::{
         BatchView, Binding, LiveColumns, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression,
@@ -616,6 +625,7 @@ mod tests {
             _: CmpType,
             batch: &BatchView<'_>,
             _: u32,
+            _: &mut dyn crate::logical_export::Interner,
         ) -> Result<RowCell, ErrorCode> {
             let state = batch.state.first().copied().unwrap_or(0);
             Ok(RowCell::U32(
@@ -751,8 +761,9 @@ mod tests {
             1,
             &mut scratch,
             &mut Constant,
+            &mut NoStrings,
             &mut rows,
-            |_, _, _, _| {
+            |_, _, _, _, _| {
                 ran = true;
                 0
             },
@@ -778,8 +789,9 @@ mod tests {
             1,
             &mut scratch,
             &mut Constant,
+            &mut NoStrings,
             &mut rows,
-            |bytecode, _, cols, live| {
+            |bytecode, _, cols, live, _| {
                 assert!(core::ptr::eq(bytecode, program.bytecode()));
                 assert!(live.is_empty());
                 assert_eq!(cols[usize::from(DERIVED)], cells(&[0]).as_slice());
@@ -814,8 +826,9 @@ mod tests {
                 1,
                 &mut scratch,
                 &mut Constant,
+                &mut NoStrings,
                 &mut rows,
-                |_, _, _, _| unreachable!("never run"),
+                |_, _, _, _, _| unreachable!("never run"),
             ),
             Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram))
         );
@@ -847,8 +860,9 @@ mod tests {
             1,
             &mut scratch,
             &mut Constant,
+            &mut NoStrings,
             &mut rows,
-            |_, _, _, _| unreachable!("refused at admission"),
+            |_, _, _, _, _| unreachable!("refused at admission"),
         );
         assert_eq!(bound, frame_refusal);
         let mut resumed: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
@@ -876,8 +890,9 @@ mod tests {
                 1,
                 &mut scratch,
                 &mut Constant,
+                &mut NoStrings,
                 &mut rows,
-                |_, _, _, _| 1,
+                |_, _, _, _, _| 1,
             ),
             Ok(1)
         );
@@ -911,8 +926,9 @@ mod tests {
                 1,
                 &mut scratch,
                 &mut Constant,
+                &mut NoStrings,
                 &mut rows,
-                |_, state, cols, live| {
+                |_, state, cols, live, _| {
                     assert_eq!(cols[usize::from(LIVE)], cells(&[0]).as_slice());
                     assert_eq!(live.cell(u32::from(LIVE), 0, state, cols), Some(Ok(5)));
                     3
@@ -976,8 +992,9 @@ mod tests {
                 1,
                 &mut scratch,
                 &mut Constant,
+                &mut NoStrings,
                 &mut rows,
-                |_, _, _, _| 0,
+                |_, _, _, _, _| 0,
             ),
             Ok(0)
         );
@@ -1006,8 +1023,9 @@ mod tests {
                 1,
                 &mut scratch,
                 &mut Constant,
+                &mut NoStrings,
                 &mut rows,
-                |_, _, _, _| unreachable!("bind refused"),
+                |_, _, _, _, _| unreachable!("bind refused"),
             ),
             Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram))
         );
@@ -1038,8 +1056,9 @@ mod tests {
                 1,
                 &mut scratch,
                 &mut Constant,
+                &mut NoStrings,
                 &mut rows,
-                |_, _, _, _| 0,
+                |_, _, _, _, _| 0,
             ),
             Ok(0)
         );
@@ -1076,8 +1095,9 @@ mod tests {
                 1,
                 &mut scratch,
                 &mut Constant,
+                &mut NoStrings,
                 &mut rows,
-                |_, _, _, _| 0,
+                |_, _, _, _, _| 0,
             ),
             Ok(0)
         );
@@ -1114,8 +1134,9 @@ mod tests {
                 1,
                 &mut scratch,
                 &mut Constant,
+                &mut NoStrings,
                 &mut rows,
-                |_, _, _, _| 0,
+                |_, _, _, _, _| 0,
             ),
             Ok(0)
         );

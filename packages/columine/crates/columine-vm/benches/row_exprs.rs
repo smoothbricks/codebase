@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{CmpType, ErrorCode};
+use columine_vm::key_index::NoStrings;
 use columine_vm::row_exprs::{
     BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression, bind_row_columns,
 };
@@ -121,6 +122,7 @@ impl RowExpression for Exprs {
         _: CmpType,
         batch: &BatchView<'_>,
         row: u32,
+        _: &mut dyn columine_vm::logical_export::Interner,
     ) -> Result<RowCell, ErrorCode> {
         if expr[0] == 0 {
             let cells =
@@ -221,9 +223,16 @@ fn main() {
             let a0 = ALLOCS.load(Ordering::Relaxed);
             let b0 = BYTES.load(Ordering::Relaxed);
             let t0 = Instant::now();
-            let mut live =
-                bind_row_columns(&prog, &state, &mut cols, n as u32, &mut eval, &mut rows)
-                    .expect("bind");
+            let mut live = bind_row_columns(
+                &prog,
+                &state,
+                &mut cols,
+                n as u32,
+                &mut eval,
+                &mut NoStrings,
+                &mut rows,
+            )
+            .expect("bind");
             let status = vm.execute_batch_live(&mut state, &prog, &cols, n as u32, &mut live);
             let dt = t0.elapsed().as_nanos();
             let allocs = ALLOCS.load(Ordering::Relaxed) - a0;

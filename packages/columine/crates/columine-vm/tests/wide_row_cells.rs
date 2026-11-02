@@ -9,6 +9,7 @@ mod common;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{AggType, CmpType, ErrorCode, StructFieldType};
 use columine_vm::aggregates::{agg_value_f64, agg_value_i64};
+use columine_vm::key_index::NoStrings;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
     BatchView, Binding, LANED_ROW_EXPRESSIONS_MAGIC, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns,
@@ -84,6 +85,7 @@ impl RowExpression for Wide {
         _: CmpType,
         batch: &BatchView<'_>,
         row: u32,
+        _: &mut dyn columine_vm::logical_export::Interner,
     ) -> Result<RowCell, ErrorCode> {
         let column = batch.column(u32::from(expr[1]));
         let row = row as usize;
@@ -226,8 +228,16 @@ fn fold(prog: &[u8], state: &mut [u8], keys: &[u32], ns: &[u32]) {
     let len = u32::try_from(ns.len()).expect("batch fits u32");
     let mut rows = RowColumns::new();
     let mut eval = Wide;
-    let mut live =
-        bind_row_columns(prog, state, &mut cols, len, &mut eval, &mut rows).expect("bind");
+    let mut live = bind_row_columns(
+        prog,
+        state,
+        &mut cols,
+        len,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind");
     assert_eq!(
         Vm::default().execute_batch_live(state, prog, &cols, len, &mut live),
         OK
@@ -329,8 +339,16 @@ fn a_later_entry_reads_an_earlier_wide_column_at_its_lane() {
     ];
     let mut rows = RowColumns::new();
     let mut eval = Wide;
-    let mut live =
-        bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+    let mut live = bind_row_columns(
+        &prog,
+        &state,
+        &mut cols,
+        2,
+        &mut eval,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("bind");
     assert_eq!(
         cols[usize::from(DERIVED)],
         i64s_as_bytes(&[TWO_53 + 1, TWO_53 + 2])
@@ -367,7 +385,16 @@ fn an_rxp1_table_binds_the_u32_cells_an_rxp2_u32_entry_binds() {
             &[],
         ];
         let mut rows = RowColumns::new();
-        bind_row_columns(&prog, &state, &mut cols, 3, &mut Wide, &mut rows).expect("bind");
+        bind_row_columns(
+            &prog,
+            &state,
+            &mut cols,
+            3,
+            &mut Wide,
+            &mut NoStrings,
+            &mut rows,
+        )
+        .expect("bind");
         assert_eq!(cols[usize::from(DERIVED)], u32s_as_bytes(&ns));
     }
 }
@@ -386,9 +413,17 @@ fn refusal(prog: &[u8]) -> ErrorCode {
         u32s_as_bytes(&placeholder),
     ];
     let mut rows = RowColumns::new();
-    let code = bind_row_columns(prog, &state, &mut cols, 1, &mut Wide, &mut rows)
-        .map(|_| ())
-        .expect_err("the bind refuses");
+    let code = bind_row_columns(
+        prog,
+        &state,
+        &mut cols,
+        1,
+        &mut Wide,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .map(|_| ())
+    .expect_err("the bind refuses");
     for col in [DERIVED, DERIVED_2] {
         assert_eq!(cols[usize::from(col)], u32s_as_bytes(&placeholder));
     }
@@ -508,10 +543,28 @@ fn a_warmed_wide_bind_allocates_nothing() {
     };
     let mut rows = RowColumns::new();
     let mut cold = host();
-    bind_row_columns(&prog, &state, &mut cold, 3, &mut Wide, &mut rows).expect("cold bind");
+    bind_row_columns(
+        &prog,
+        &state,
+        &mut cold,
+        3,
+        &mut Wide,
+        &mut NoStrings,
+        &mut rows,
+    )
+    .expect("cold bind");
     let mut warm = host();
     let bound = with_allocations(0, || {
-        bind_row_columns(&prog, &state, &mut warm, 3, &mut Wide, &mut rows).map(|_| ())
+        bind_row_columns(
+            &prog,
+            &state,
+            &mut warm,
+            3,
+            &mut Wide,
+            &mut NoStrings,
+            &mut rows,
+        )
+        .map(|_| ())
     });
     assert_eq!(bound, Ok(()));
 }
