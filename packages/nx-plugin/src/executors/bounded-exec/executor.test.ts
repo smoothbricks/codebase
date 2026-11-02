@@ -165,6 +165,21 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain('Command exited with status 7');
   });
 
+  it('names the signal a command died of, with the status a shell gives it', async () => {
+    const workspace = await createWorkspace();
+
+    // No bound of this executor sends the kill: an outside killer (the kernel's OOM killer, say) ends the command.
+    const result = await runBoundedExec(
+      { command: 'kill -KILL $$', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('Command was killed by SIGKILL (status 137): kill -KILL $$');
+  });
+
   it('streams stdout and stderr while collecting terminal output', async () => {
     const workspace = await createWorkspace();
     const stdout: string[] = [];

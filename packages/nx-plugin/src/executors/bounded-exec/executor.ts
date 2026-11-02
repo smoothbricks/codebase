@@ -1,7 +1,7 @@
 import { type ChildProcess, type IOType, spawn } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { availableParallelism, userInfo } from 'node:os';
+import { availableParallelism, constants as osConstants, userInfo } from 'node:os';
 import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Duplex, Readable } from 'node:stream';
@@ -105,12 +105,6 @@ type IdleDiagnosticResult =
   | { kind: 'pending'; startedAtMs: number | null }
   | { kind: 'captured'; snapshot: HangDiagnostics }
   | { kind: 'failed'; detail: string };
-const EXIT_CODE_BY_SIGNAL: Partial<Record<NodeJS.Signals, number>> = {
-  SIGHUP: 129,
-  SIGINT: 130,
-  SIGTERM: 143,
-};
-
 /** The pool descriptor: only a grant may give it, so neither the target's nor the inherited environment passes it on. */
 const POOL_ENV = [CPU_TOKENS_ENV, CPU_POOL_ENV];
 /**
@@ -1448,10 +1442,16 @@ export async function runBoundedExec(
 
   const code = exitCode ?? signalToExitCode(exitSignal);
   if (code !== 0 && state.expiry === null) {
+    // No bound of this executor ended it, so a signal it died of came from outside (the kernel's OOM killer sends
+    // SIGKILL): the signal is named, never folded into a bare status.
+    const ended =
+      exitCode === null && exitSignal !== null
+        ? `was killed by ${exitSignal} (status ${code})`
+        : `exited with status ${code}`;
     appendStderr(
       fixture !== null && !mainStarted
-        ? `Fixture command exited with status ${code}: ${segment ?? fixture.command}\n`
-        : `Command exited with status ${code}: ${command}\n`,
+        ? `Fixture command ${ended}: ${segment ?? fixture.command}\n`
+        : `Command ${ended}: ${command}\n`,
     );
   }
 
@@ -1550,11 +1550,9 @@ function targetEnv(env: Record<string, string> | undefined, say: (text: string) 
   return kept;
 }
 
+/** The status a shell gives a command a signal ended: 128 plus the signal's number (SIGKILL 137, SIGTERM 143). */
 function signalToExitCode(signal: NodeJS.Signals | null): number {
-  if (!signal) {
-    return 1;
-  }
-  return EXIT_CODE_BY_SIGNAL[signal] ?? 1;
+  return signal === null ? 1 : 128 + osConstants.signals[signal];
 }
 
 /** Resolves when `promise` settles or `ms` passes, whichever is first, leaving no timer behind. */
