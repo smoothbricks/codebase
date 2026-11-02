@@ -275,11 +275,12 @@ cowshed: host storage is partially set up: 1 volume lives outside this host's co
 
 `setup` installs **cowshed's pinned mbx** (specs/cowshed/14_nix.md, "mbx") on every run once storage is up and the
 invoking build is the installed cowshed. It builds the flake the package ships at `nix/mbx` (mbx v1.29.0 plus compact
-predictions, scheduler admission, grant descriptors, short session roots, Cargo shim-chain selection and selected
-default sysroots, from `smoothbricks/mr-boxington` at the pinned revision, with mbx's own locked nixpkgs), roots the
-result with a nix GC root at `~/Library/Application Support/dev.cowshed/nix/mbx`, and links `mbx` in cowshed's `bin`
-beside the installed `cowshed` to the rooted executable: a link, never a copy, so its realpath is the pinned build's
-store path. It then runs that mbx's own `mbx setup` to generate its Cargo shim and `mbx-target` sidecar into
+predictions, scheduler admission, grant descriptors, short session roots, Cargo shim-chain selection, selected default
+sysroots and Clippy member keys that stay stable across profile links, from `smoothbricks/mr-boxington` at the pinned
+revision, with mbx's own locked nixpkgs), roots the result with a nix GC root at
+`~/Library/Application Support/dev.cowshed/nix/mbx`, and links `mbx` in cowshed's `bin` beside the installed `cowshed`
+to the rooted executable: a link, never a copy, so its realpath is the pinned build's store path. It then runs that
+mbx's own `mbx setup` to generate its Cargo shim and `mbx-target` sidecar into
 `~/Library/Application Support/dev.cowshed/mbx-shim/`, beside `bin`. The link and the shim directory are all a Cargo
 project needs for mbx: projects need not pin, provide or opt in to anything, and a project that still pins its own mbx
 is built with the installed one. No agent, plist or socket is written for it:
