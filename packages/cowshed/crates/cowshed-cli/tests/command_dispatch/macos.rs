@@ -7427,15 +7427,14 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
 
 /// A default land cannot turn Land 4's unproven nominee into signal authority at retirement.
 /// A live socket makes the record-nominated close capable of signalling the foreign process.
-async fn default_land_never_signals_a_foreign_nominee_during_retirement(
-    fixture: &mut Fixture,
-    mut service: ActorBridge,
-    node: &Path,
-) {
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_default_land_never_signals_a_foreign_nominee_during_retirement_substrate_lifecycle()
+ {
+    let (mut fixture, mut service, node) = emit_producer_project().await;
     let topic = new_workspace(&mut service, "outputs").await;
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
-    sh(&mut service, "outputs", &nx_run_many(node, "build")).await;
+    sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
     // The run put the shed in use at its admission, and the keeper started its daemon alongside
     // it (04_sandbox.md, the kept daemon), so its record may follow the
     // run's end. The patched Nx daemon claims the record when it starts and replaces one that
@@ -7504,11 +7503,12 @@ async fn default_land_never_signals_a_foreign_nominee_during_retirement(
     fixture.stop_gateway().await;
 }
 
-/// Unverifiable daemon records, then a forged nominee, at land on one served project with the emit
-/// producer: the scenarios share their setup (08_testing.md, "Host limit"). The unverifiable
-/// records run first, since they count every land outcome the project has recorded.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_unverifiable_then_forged_landing_daemon_records_substrate_lifecycle() {
+/// The served build-nx project with the emit producer that the landing-daemon record tests land
+/// on, and the Node that runs its Nx. Each of those tests serves a project of its own: chained on
+/// one project, the malformed, unreadable and forged walks were still landing the third when a slow
+/// CI runner reached the 180 s the run allows without a finished test, the longest any one test may
+/// run (08_testing.md, "Integration tests (real substrate)").
+async fn emit_producer_project() -> (Fixture, ActorBridge, PathBuf) {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
@@ -7521,11 +7521,47 @@ async fn directory_unverifiable_then_forged_landing_daemon_records_substrate_lif
         &["commit", "-q", "-m", "add emit producer"],
     );
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    land_skips_an_unverifiable_daemon_record_before_quiesce(&fixture, &mut service, &node).await;
-    default_land_never_signals_a_foreign_nominee_during_retirement(&mut fixture, service, &node)
-        .await;
+    let service = serve_project(&mut fixture, &nx_reads).await;
+    (fixture, service, node)
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_land_skips_a_malformed_daemon_record_before_quiesce_substrate_lifecycle() {
+    let (mut fixture, mut service, node) = emit_producer_project().await;
+    land_skips_an_unverifiable_daemon_record_before_quiesce(
+        &fixture,
+        &mut service,
+        &node,
+        UnverifiableRecord::Malformed,
+    )
+    .await;
+    drop(service);
+    fixture.stop_gateway().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_land_skips_an_unreadable_daemon_record_before_quiesce_substrate_lifecycle() {
+    let (mut fixture, mut service, node) = emit_producer_project().await;
+    land_skips_an_unverifiable_daemon_record_before_quiesce(
+        &fixture,
+        &mut service,
+        &node,
+        UnverifiableRecord::Unreadable,
+    )
+    .await;
+    drop(service);
+    fixture.stop_gateway().await;
+}
+
+/// How a test makes the run's daemon record unverifiable.
+#[derive(Clone, Copy)]
+enum UnverifiableRecord {
+    /// Bytes that do not parse as a record.
+    Malformed,
+    /// A directory in the record's place, which cannot be read as a file.
+    Unreadable,
+}
+
 /// An unreadable or malformed landing daemon record cannot authorize retirement or adoption.
 ///
 /// The run started a host Nx daemon on the checkout, then its record was made unverifiable. Stock
@@ -7541,108 +7577,103 @@ async fn directory_unverifiable_then_forged_landing_daemon_records_substrate_lif
 /// daemon and every worker it had to exit, and a stand-in host process holds the mount in their
 /// place. Once nothing holds it the landed workspace retires.
 ///
-/// Both unverifiable shapes, a malformed record and one that cannot be read, run on one served
-/// project, each in a workspace of its own: the setup is the same, and the second land starts
-/// from the main the first one moved, which an unverifiable record's skip never reads.
+/// Each shape, a malformed record and one that cannot be read, is a test of its own on a served
+/// project of its own ([`emit_producer_project`]).
 async fn land_skips_an_unverifiable_daemon_record_before_quiesce(
     fixture: &Fixture,
     service: &mut ActorBridge,
     node: &Path,
+    shape: UnverifiableRecord,
 ) {
-    for (landed, (workspace, unreadable)) in
-        [("malformed-record", false), ("unreadable-record", true)]
-            .into_iter()
-            .enumerate()
-    {
-        let topic = new_workspace(service, workspace).await;
-        fs::write(topic.join("a/src.txt"), format!("{workspace}\n")).unwrap();
-        git(&topic, &["commit", "-q", "-am", "change output input"]);
-        sh(service, workspace, &nx_run_many(node, "build")).await;
-        let record = topic.join(".nx/workspace-data/d/server-process.json");
-        // The run put the shed in use at its admission, and the keeper started its daemon alongside
-        // it; a supervisor's own start is no use (04_sandbox.md, the kept daemon), so the record
-        // may follow the run's end.
-        until_daemon_recorded(&topic).await;
-        let recorded: serde_json::Value =
-            serde_json::from_slice(&fs::read(&record).expect("the run's daemon record"))
-                .expect("a daemon record");
-        let daemon = i32::try_from(
-            recorded["processId"]
-                .as_i64()
-                .expect("the record names its daemon"),
-        )
-        .expect("a pid");
-        // Listed while they are still the daemon's children: once it exits launchd adopts them.
-        let plugin_workers = children_of(daemon);
-        fs::remove_file(&record).unwrap();
-        if unreadable {
-            fs::create_dir(&record).unwrap();
-        } else {
+    let workspace = match shape {
+        UnverifiableRecord::Malformed => "malformed-record",
+        UnverifiableRecord::Unreadable => "unreadable-record",
+    };
+    let topic = new_workspace(service, workspace).await;
+    fs::write(topic.join("a/src.txt"), format!("{workspace}\n")).unwrap();
+    git(&topic, &["commit", "-q", "-am", "change output input"]);
+    sh(service, workspace, &nx_run_many(node, "build")).await;
+    let record = topic.join(".nx/workspace-data/d/server-process.json");
+    // The run put the shed in use at its admission, and the keeper started its daemon alongside
+    // it; a supervisor's own start is no use (04_sandbox.md, the kept daemon), so the record
+    // may follow the run's end.
+    until_daemon_recorded(&topic).await;
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record).expect("the run's daemon record"))
+            .expect("a daemon record");
+    let daemon = i32::try_from(
+        recorded["processId"]
+            .as_i64()
+            .expect("the record names its daemon"),
+    )
+    .expect("a pid");
+    // Listed while they are still the daemon's children: once it exits launchd adopts them.
+    let plugin_workers = children_of(daemon);
+    fs::remove_file(&record).unwrap();
+    match shape {
+        UnverifiableRecord::Malformed => {
             fs::write(&record, b"{not a daemon record").unwrap();
         }
-        // The daemon exits once its record does not name it, and each plugin worker once it reads
-        // the end of its socket to it: their exits are the events, so no worker of this run still
-        // holds the mount when land or rm takes its census.
-        await_exit(daemon);
-        await_exits(&plugin_workers);
-        let mut workers = HostProcesses(Vec::new());
-        let worker = workers.start(&topic, None);
-        let (kept, _, stderr) = run(service, ["--json", "land", workspace]).await;
-        let kept = kept.expect_err(&format!(
-            "a process cowshed does not run holds the mount; {}",
-            String::from_utf8_lossy(&stderr)
-        ));
-        assert_eq!(kept.code, ErrorCode::Conflict, "{kept}");
-        assert!(
-            kept.message
-                .contains(&format!("but workspace {workspace} was kept"))
-                && kept.message.contains("cowshed does not run")
-                && kept.message.contains(&format!("pid {worker} (")),
-            "{}",
-            kept.message
-        );
-        let outcomes = controller_commitments(fixture.storage.telemetry())
-            .into_iter()
-            .filter_map(|value| match value {
-                cowshed_core::api::dto::ControllerCommitment::LandOutcome(value) => {
-                    Some((value.skip, value.seeded))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            outcomes.len(),
-            landed + 1,
-            "one outcome per land: {outcomes:?}"
-        );
-        let this_land = outcomes
-            .iter()
-            .filter(|(skip, _)| {
-                matches!(
-                    skip,
-                    Some(AdoptionSkip::LandingDaemonUnverifiable { record: skipped, .. })
-                        if skipped == &record
-                )
-            })
-            .collect::<Vec<_>>();
-        match this_land.as_slice() {
-            [(Some(AdoptionSkip::LandingDaemonUnverifiable { reason, .. }), seeded)] => {
-                assert!(!reason.is_empty());
-                assert!(!seeded, "an unverifiable record freezes no seed");
-            }
-            other => {
-                panic!("an unverifiable daemon record skips adoption: {other:?} of {outcomes:?}")
-            }
-        }
-        workers.end();
-        let (retired, _, stderr) = run(service, ["rm", "--force", workspace]).await;
-        retired.unwrap_or_else(|error| {
-            panic!(
-                "retire once nothing holds it: {error}; {}",
-                String::from_utf8_lossy(&stderr)
-            )
-        });
+        UnverifiableRecord::Unreadable => fs::create_dir(&record).unwrap(),
     }
+    // The daemon exits once its record does not name it, and each plugin worker once it reads
+    // the end of its socket to it: their exits are the events, so no worker of this run still
+    // holds the mount when land or rm takes its census.
+    await_exit(daemon);
+    await_exits(&plugin_workers);
+    let mut workers = HostProcesses(Vec::new());
+    let worker = workers.start(&topic, None);
+    let (kept, _, stderr) = run(service, ["--json", "land", workspace]).await;
+    let kept = kept.expect_err(&format!(
+        "a process cowshed does not run holds the mount; {}",
+        String::from_utf8_lossy(&stderr)
+    ));
+    assert_eq!(kept.code, ErrorCode::Conflict, "{kept}");
+    assert!(
+        kept.message
+            .contains(&format!("but workspace {workspace} was kept"))
+            && kept.message.contains("cowshed does not run")
+            && kept.message.contains(&format!("pid {worker} (")),
+        "{}",
+        kept.message
+    );
+    let outcomes = controller_commitments(fixture.storage.telemetry())
+        .into_iter()
+        .filter_map(|value| match value {
+            cowshed_core::api::dto::ControllerCommitment::LandOutcome(value) => {
+                Some((value.skip, value.seeded))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 1, "one outcome for the land: {outcomes:?}");
+    let this_land = outcomes
+        .iter()
+        .filter(|(skip, _)| {
+            matches!(
+                skip,
+                Some(AdoptionSkip::LandingDaemonUnverifiable { record: skipped, .. })
+                    if skipped == &record
+            )
+        })
+        .collect::<Vec<_>>();
+    match this_land.as_slice() {
+        [(Some(AdoptionSkip::LandingDaemonUnverifiable { reason, .. }), seeded)] => {
+            assert!(!reason.is_empty());
+            assert!(!seeded, "an unverifiable record freezes no seed");
+        }
+        other => {
+            panic!("an unverifiable daemon record skips adoption: {other:?} of {outcomes:?}")
+        }
+    }
+    workers.end();
+    let (retired, _, stderr) = run(service, ["rm", "--force", workspace]).await;
+    retired.unwrap_or_else(|error| {
+        panic!(
+            "retire once nothing holds it: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )
+    });
 }
 
 /// Every job admission the controller committed under `telemetry`: its workspace incarnation and

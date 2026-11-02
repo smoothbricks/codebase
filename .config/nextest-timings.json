@@ -28,7 +28,6 @@
     "macos::directory_parity_operations_answer_through_the_controller": 6511,
     "macos::directory_plain_git_repository_adopts_clones_executes_and_lands_without_shell_hooks": 8359,
     "macos::directory_rm_stops_the_checkouts_nx_daemon_before_removal": 6392,
-    "macos::directory_unverifiable_then_forged_landing_daemon_records_substrate_lifecycle": 68943,
     "macos::workspace_isolation::directory_workspace_jobs_ignore_corrupt_and_missing_sibling_grants": 6304,
     "release_provenance_follows_a_warm_clone_not_its_donor": 6856
   },
