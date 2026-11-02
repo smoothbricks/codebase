@@ -46,8 +46,16 @@ impl Refusal {
     /// ran does not: SIGKILL ends each once its kernel call returns, and their exits re-run it
     /// ([`Self::reruns`]), whose outcome answers those waiters. Any other refusal answers them at
     /// once, and so does a re-run's, which stands until a cancellation or retirement retries it.
+    #[cfg(target_os = "macos")]
     pub(super) fn answers_lifecycle_waiters(&self) -> bool {
         self.run != RetirementRun::Requested || !self.error.survivors_were_killed()
+    }
+
+    /// Every refusal answers them off Darwin: no observer re-runs a refused retirement there
+    /// (11_shell.md), so nothing else would.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn answers_lifecycle_waiters(&self) -> bool {
+        true
     }
 }
 
@@ -84,6 +92,7 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_waiting_quiesce_or_retirement_takes_only_the_rerun_of_survivors_sent_sigkill() {
         let killed = |run| {
