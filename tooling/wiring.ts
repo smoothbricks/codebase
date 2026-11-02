@@ -26,6 +26,16 @@
 // naming one of its crates against its tree (through `cargo metadata`, which carries each dependency's
 // `package.metadata`) and fails when the named path no longer calls the item. Such an item lands in the same round as
 // its consumer's call.
+//
+// A private repository's consumer stays out of this public tree: its declaration names no crate and no path, only the
+// capability it calls the item for, on one line, and passes here by declaration:
+//
+//   [[package.metadata.wiring.external]]
+//   item = "undo_records"
+//   consumer = "private"
+//   why = "a host keeps a fact derived from the state image current from each pass's records"
+//
+// The private repository's own lint holds the call.
 //   op      a `*_OP` wire-op constant: a send site, i.e. a non-test use that is not a dispatch (`case X:`, `X =>`,
 //           `[X]:`, a comparison), by its constant or its string value.
 //   verb    a CLI verb (a clap `Subcommand` variant, a typer `@….command`): a non-test file outside the CLI's own
@@ -512,12 +522,16 @@ function rebased(path: string, from: string, to: string): string | undefined {
 /** A manifest the verdict cannot read: the run fails naming it instead of judging a tree with a hole in it. */
 class WiringInputError extends Error {}
 
-/** A crate outside this tree that calls one of this crate's `pub` items, from `[[package.metadata.wiring.external]]`. */
-export interface ExternalConsumer {
-  readonly item: string;
-  readonly consumer: string;
-  readonly path: string;
-}
+/** The consumer a declaration names when the calling repository is private: it names the capability, never the repo. */
+export const PRIVATE_CONSUMER = 'private';
+
+/**
+ * Who outside this tree calls one of this crate's `pub` items, from `[[package.metadata.wiring.external]]`: a crate by
+ * its name and calling path, or a private repository by the capability it calls the item for.
+ */
+export type ExternalConsumer =
+  | { readonly kind: 'crate'; readonly item: string; readonly consumer: string; readonly path: string }
+  | { readonly kind: 'private'; readonly item: string; readonly why: string };
 
 /** The external consumers `manifest` (a `Cargo.toml`'s text) declares; a malformed declaration is refused, never skipped. */
 export function externalConsumers(manifestPath: string, manifest: string): ExternalConsumer[] {
@@ -536,16 +550,24 @@ export function externalConsumers(manifestPath: string, manifest: string): Exter
   if (declared === undefined) return [];
   if (!Array.isArray(declared))
     throw new WiringInputError(`${manifestPath}: package.metadata.wiring.external is not an array of tables`);
-  return declared.map((entry: unknown, index) => {
+  return declared.map((entry: unknown, index): ExternalConsumer => {
+    const where = `${manifestPath}: package.metadata.wiring.external[${index}]`;
     const field = (key: string): string => {
       const value = at(entry, key);
       if (typeof value !== 'string' || value === '')
         throw new WiringInputError(
-          `${manifestPath}: package.metadata.wiring.external[${index}] names no ${key} (item, consumer and path are required)`,
+          `${where} names no ${key} (item and consumer are required; a crate consumer names its calling path, a private one why it calls the item)`,
         );
       return value;
     };
-    return { item: field('item'), consumer: field('consumer'), path: field('path') };
+    const item = field('item');
+    const consumer = field('consumer');
+    if (consumer !== PRIVATE_CONSUMER) return { kind: 'crate', item, consumer, path: field('path') };
+    if (at(entry, 'path') !== undefined)
+      throw new WiringInputError(`${where} names a path: a private consumer's files stay out of this tree`);
+    const why = field('why');
+    if (why.includes('\n')) throw new WiringInputError(`${where}: why is one line naming the capability`);
+    return { kind: 'private', item, why };
   });
 }
 
@@ -1547,8 +1569,9 @@ class Judge {
         return package_ === undefined ? [] : [package_];
       }),
     );
-    // A consumer of this tree is wired here or not at all: its declaration vouches for nothing.
-    return declared.some((d) => !local.has(d.consumer));
+    // A consumer of this tree is wired here or not at all: its declaration vouches for nothing. A private consumer is
+    // outside this tree by declaration; its repository's lint holds the call.
+    return declared.some((d) => d.kind === 'private' || !local.has(d.consumer));
   }
 
   /** A send site of a wire op: a non-test use of its constant or its string value that is not a dispatch. */

@@ -208,16 +208,46 @@ expectFindings(
   ['pub feed_end@crates/core/src/lib.rs:3', 'pub feed_work@crates/core/src/lib.rs:5'],
 );
 
-try {
-  externalConsumers(
-    'crates/core/Cargo.toml',
-    `${CRATE('core')}\n[[package.metadata.wiring.external]]\nitem = "feed_bind"\n`,
-  );
-  fail('a declaration without its consumer and path is refused', 'a WiringInputError', 'no error');
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  if (!message.includes('names no consumer'))
-    fail('a declaration without its consumer and path is refused', 'names no consumer', message);
+const PRIVATE = (item: string, why: string): string =>
+  `\n[[package.metadata.wiring.external]]\nitem = "${item}"\nconsumer = "private"\nwhy = "${why}"\n`;
+
+expectFindings(
+  'a pub fn its crate declares for a private consumer, with why it calls it, passes; an undeclared one is still refused',
+  {
+    'crates/core/Cargo.toml': CRATE('core') + PRIVATE('feed_records', 'a host keeps an image-derived fact current'),
+    'crates/core/src/lib.rs': 'pub fn feed_records() {}\n\npub fn feed_work() {}\n',
+  },
+  ['pub feed_work@crates/core/src/lib.rs:3'],
+);
+
+for (const [what, declaration, refusal] of [
+  ['a declaration without its consumer and path is refused', 'item = "feed_bind"\n', 'names no consumer'],
+  [
+    'a private consumer without why it calls the item is refused',
+    'item = "feed_bind"\nconsumer = "private"\n',
+    'names no why',
+  ],
+  [
+    'a private consumer that names a path is refused',
+    'item = "feed_bind"\nconsumer = "private"\nwhy = "x"\npath = "src/a.rs"\n',
+    'names a path',
+  ],
+  [
+    'a private consumer whose why spans lines is refused',
+    'item = "feed_bind"\nconsumer = "private"\nwhy = """\na\nb"""\n',
+    'why is one line',
+  ],
+] as const) {
+  try {
+    externalConsumers(
+      'crates/core/Cargo.toml',
+      `${CRATE('core')}\n[[package.metadata.wiring.external]]\n${declaration}`,
+    );
+    fail(what, 'a WiringInputError', 'no error');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes(refusal)) fail(what, refusal, message);
+  }
 }
 // --- Wire ops -------------------------------------------------------------------------------------------------------
 
