@@ -135,6 +135,7 @@ export function validateToolConfig(root: string): number {
   const context = readToolContext(root);
   return (
     validateRootDevDependencies(context.policy, context.rootPackage) +
+    validateCliPinnedPackages(root) +
     validateTtscPatch(context.rootPackage) +
     validateToolingPackage(root, context.policy) +
     validateToolingWorkspace(context.rootPackage) +
@@ -617,6 +618,122 @@ function readLockedToolVersions(root: string): Record<string, string> {
     }
   }
   return locked;
+}
+
+interface BunLockfile {
+  packages: Record<string, unknown[]>;
+}
+
+interface BunLockPackageMetadata {
+  dependencies?: Record<string, string>;
+}
+
+const isBunLockfile = typia.createIs<BunLockfile>();
+const isBunLockPackageMetadata = typia.createIs<BunLockPackageMetadata>();
+
+/** A root-declared `@smoothbricks/*` package bun.lock resolves to another version than the installed CLI uses. */
+interface CliPinnedPackageSkew {
+  name: string;
+  /** Where the root manifest writes the version, as `dependencyVersion` names it. */
+  path: string;
+  /** The version the root resolves, which Nx loads; undefined when bun.lock resolves none. */
+  resolved: string | undefined;
+  /** The version the CLI's dependency closure resolves. */
+  required: string;
+  /** The installed CLI's version. */
+  cli: string;
+}
+
+/**
+ * Each `@smoothbricks/*` package the root manifest declares whose bun.lock root resolution differs from the copy the
+ * installed `@smoothbricks/cli` uses (cli → nx-plugin → cowshed …). Nx loads the root's copy: the managed-files sync
+ * generator `nx sync:check` runs, and the executors. The CLI renders managed files with its own, so a root behind it
+ * calls the files `smoo monorepo update` wrote out of sync. The codebase's workspace CLI has no closure to hold to.
+ */
+function cliPinnedPackageSkew(
+  root: string,
+  rootPackage: PackageJson | null,
+  toolingPackage: string,
+): CliPinnedPackageSkew[] {
+  const lockfilePath = join(root, 'bun.lock');
+  if (!rootPackage || !existsSync(lockfilePath)) {
+    return [];
+  }
+  const lock: unknown = Bun.JSONC.parse(readFileSync(lockfilePath, 'utf8'));
+  if (!isBunLockfile(lock)) {
+    throw new Error(`${lockfilePath} has no packages map of bun lock entries`);
+  }
+  const cliKey = resolveLockKey(lock, toolingPackage, cliPackageName);
+  const cli = cliKey === undefined ? undefined : lockedVersion(lock, cliKey, cliPackageName);
+  if (cliKey === undefined || cli === undefined) {
+    return [];
+  }
+  const required = new Map<string, string>();
+  const pending = [cliKey];
+  for (let key = pending.shift(); key !== undefined; key = pending.shift()) {
+    const metadata = lock.packages[key]?.[2];
+    for (const name of Object.keys(isBunLockPackageMetadata(metadata) ? (metadata.dependencies ?? {}) : {})) {
+      const dependencyKey = name.startsWith('@smoothbricks/') ? resolveLockKey(lock, key, name) : undefined;
+      const version = dependencyKey === undefined ? undefined : lockedVersion(lock, dependencyKey, name);
+      if (dependencyKey !== undefined && version !== undefined && !required.has(name)) {
+        required.set(name, version);
+        pending.push(dependencyKey);
+      }
+    }
+  }
+  const skew: CliPinnedPackageSkew[] = [];
+  for (const field of ['dependencies', 'devDependencies'] as const) {
+    for (const name of Object.keys(rootPackage[field] ?? {}).sort()) {
+      const declared = dependencyVersion(rootPackage, field, rootPackage[field], name);
+      const version = required.get(name);
+      const resolved = lockedVersion(lock, name, name);
+      if (declared !== undefined && version !== undefined && resolved !== version) {
+        skew.push({ name, path: declared.path, resolved, required: version, cli });
+      }
+    }
+  }
+  return skew;
+}
+
+/** Node resolution over bun.lock keys: `name` from the package at `from` is its nearest nested copy, else the hoisted one. */
+function resolveLockKey(lock: BunLockfile, from: string, name: string): string | undefined {
+  const scopes = lockKeyPackageNames(from);
+  for (let depth = scopes.length; depth >= 0; depth--) {
+    const key = [...scopes.slice(0, depth), name].join('/');
+    if (key in lock.packages) {
+      return key;
+    }
+  }
+  return undefined;
+}
+
+/** The package names a bun.lock key nests, outermost first: `@a/b/c/@d/e` is `@a/b`, `c`, `@d/e`. */
+function lockKeyPackageNames(key: string): string[] {
+  const segments = key === '' ? [] : key.split('/');
+  const names: string[] = [];
+  for (let index = 0; index < segments.length; index++) {
+    const segment = segments[index] ?? '';
+    names.push(segment.startsWith('@') ? `${segment}/${segments[++index] ?? ''}` : segment);
+  }
+  return names;
+}
+
+/** The registry version of `name` the entry at `key` resolves, as bun writes it: `"<name>@<version>"` first. */
+function lockedVersion(lock: BunLockfile, key: string, name: string): string | undefined {
+  const ident = lock.packages[key]?.[0];
+  const version = typeof ident === 'string' && ident.startsWith(`${name}@`) ? ident.slice(name.length + 1) : undefined;
+  return version !== undefined && parseVersion(version) !== null ? version : undefined;
+}
+
+export function validateCliPinnedPackages(root: string): number {
+  const { rootPackage, policy } = readToolContext(root);
+  const skew = cliPinnedPackageSkew(root, rootPackage, policy.toolingPackageName);
+  for (const { path, resolved, required, cli } of skew) {
+    console.error(
+      `package.json ${path} resolves ${resolved ?? 'nothing'} in bun.lock, but @smoothbricks/cli ${cli} uses ${required}: Nx loads the root copy, so nx sync renders managed files with another version than smoo does. Run: smoo monorepo update`,
+    );
+  }
+  return skew.length;
 }
 
 function expectedPinnedVersion(policy: ToolPolicy, dependency: RequiredDependency): string {

@@ -45,7 +45,7 @@ import {
 } from './package-policy.js';
 import { resolvedTargetsByProject, runInitPacks, runValidatePacks } from './packs/index.js';
 import { syncRootRuntimeVersions } from './runtime.js';
-import { applyToolConfigDefaults } from './tool-validation.js';
+import { applyToolConfigDefaults, validateCliPinnedPackages } from './tool-validation.js';
 
 export interface InitOptions {
   runtimeOnly?: boolean;
@@ -180,6 +180,9 @@ export async function checkPolicyFailures(root: string, projectTargets: ProjectT
     // cache keys and a GOROOT crossing between them fails the build.
     (await validateGoToolchainAgreement(root)) +
     validateRootPackagePolicy(root) +
+    // Nx renders managed files with the root's nx-plugin, smoo with its own: Publish's `nx sync:check` fails the
+    // skew, so the CI lane refuses it here.
+    validateCliPinnedPackages(root) +
     validateNxProjectNames(root) +
     validateExplicitTaskInputs(projectTargets) +
     validateAggregateMemberCache(projectTargets) +
