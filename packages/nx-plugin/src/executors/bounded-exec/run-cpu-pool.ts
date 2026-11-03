@@ -3,10 +3,11 @@ import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { logger } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
-import { type CloseOutcome, type CpuPool, readInheritedCpuPool } from './cpu-pool.js';
+import { type CloseOutcome, type CpuPool } from './cpu-pool.js';
 import type { CpuPoolThreadData, CpuPoolThreadReport } from './cpu-pool-thread.js';
 import { type RunMemory, type RunMemoryReading, RunMemoryUnreadable, readRunMemory } from './host-memory.js';
 import { mbxPool } from './mbx-pool.js';
+import { readInheritedCpuPool } from './pool-environment.js';
 import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
 
 /**

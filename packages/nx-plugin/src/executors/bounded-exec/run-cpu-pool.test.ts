@@ -3,10 +3,11 @@ import { rm } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { ownedSocketDirectory } from '../../testing.js';
-import { CPU_POOL_ENV, readInheritedCpuPool, takeParentCpuTokens } from './cpu-pool.js';
+import { takeParentCpuTokens } from './cpu-pool.js';
 import { holdLease } from './gateway-lease.js';
 import { type RunMemoryError, RunMemoryUnreadable } from './host-memory.js';
 import { CONTROL_MS, CpuLeaseWait, HEARTBEAT_MS, HEARTBEAT_SILENCE_MS } from './lease-wait.js';
+import { CPU_POOL_ENV, readInheritedCpuPool } from './pool-environment.js';
 import { closeRunCpuPool, runPoolTokens, serveRunCpuPool } from './run-cpu-pool.js';
 import { CPU_TOKENS_ENV } from './runner-sizing.js';
 

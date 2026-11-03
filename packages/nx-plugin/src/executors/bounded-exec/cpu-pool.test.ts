@@ -18,16 +18,9 @@ import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import typia from 'typia';
 import { ownedSocketDirectory, socketNamespace } from '../../testing.js';
-import {
-  CPU_POOL_ENV,
-  type CpuPool,
-  createCpuPool,
-  type InheritedCpuPool,
-  readInheritedCpuPool,
-  type TokenGrant,
-  takeParentCpuTokens,
-} from './cpu-pool.js';
+import { type CpuPool, createCpuPool, type TokenGrant, takeParentCpuTokens } from './cpu-pool.js';
 import { type CpuLeaseProgress, type CpuLeaseQueued, HEARTBEAT_MS } from './lease-wait.js';
+import { CPU_POOL_ENV, type InheritedCpuPool, readInheritedCpuPool } from './pool-environment.js';
 import { CPU_TOKENS_ENV } from './runner-sizing.js';
 
 /** The pool's replies as the wire carries them, one line each. */

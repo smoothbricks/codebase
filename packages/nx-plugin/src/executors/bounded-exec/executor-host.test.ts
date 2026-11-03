@@ -7,9 +7,10 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from '../../bounded-test-policy.js';
-import { CPU_POOL_ENV, type CpuPool, createCpuPool } from './cpu-pool.js';
+import { type CpuPool, createCpuPool } from './cpu-pool.js';
 import { resolveCowshedExecutable } from './executor.js';
 import { COWSHED_EXECUTABLE_ENV, SUPERVISOR_SOCKET_ENV } from './owned-subtree.js';
+import { CPU_POOL_ENV } from './pool-environment.js';
 import {
   attachedDisks,
   detachOwned,

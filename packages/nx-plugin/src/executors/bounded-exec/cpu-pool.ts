@@ -10,7 +10,7 @@ import { holdLease, type Unleased } from './gateway-lease.js';
 import { type LiveUsageReading, type RunMemory, readLiveUsage } from './host-memory.js';
 import { type CpuLeaseProgress, type CpuLeaseQueued, CpuLeaseWait, HEARTBEAT_MS } from './lease-wait.js';
 import { admit } from './pool-admission.js';
-import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
+import { type InheritedCpuPool, poolEnvironment } from './pool-environment.js';
 
 /**
  * A CPU pool: the tokens a process lends the runners it starts, held live rather than inherited as a
@@ -37,16 +37,6 @@ import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
  * which the holder is not using while it waits on the child it lends it to; release writes the bytes back and
  * frees the slot. A Cargo reading the fifo and a nested runner holding a socket grant so share one count.
  */
-
-/** The environment name a child reads its parent's pool endpoint from; its count is `CPU_TOKENS_ENV`. */
-export const CPU_POOL_ENV = 'BOUNDED_EXEC_CPU_POOL';
-
-/** An inherited pool descriptor; only a grant from its endpoint proves a live allocation. */
-export interface InheritedCpuPool {
-  readonly socket: string;
-  /** The count the parent names beside its endpoint. */
-  readonly tokens: number;
-}
 
 /** A running pool: the environment a child inherits to reach it, and how to close it. */
 export interface CpuPool {
@@ -141,20 +131,6 @@ interface Waiter {
 
 /** One framed reply line. The newline is the framing; every reply goes through here. */
 const frame = (reply: CpuPoolReply): string => `${stringifyReply(reply)}\n`;
-
-/**
- * The inherited descriptor, or null when malformed or absent. A missing or bare count, or an empty
- * or NUL-bearing endpoint, proves no allocation; the count is a positive whole number. A valid
- * descriptor still needs a live endpoint grant.
- */
-export function readInheritedCpuPool(environment: Readonly<NodeJS.ProcessEnv>): InheritedCpuPool | null {
-  const socket = environment[CPU_POOL_ENV];
-  const tokens = parseInheritedTokens(environment[CPU_TOKENS_ENV]);
-  if (socket === undefined || socket.length === 0 || socket.includes('\0') || tokens === null) {
-    return null;
-  }
-  return { socket, tokens };
-}
 
 /**
  * Tokens a parent pool lent, held until released, or why there are none. `charged` is the bytes the pool charged the
@@ -791,17 +767,10 @@ export async function createCpuPool(
   if (closing) {
     return abort(CLOSED_WHILE_MADE);
   }
-  // Cargo and make read the fifo from here; `-j` with a jobserver names no count of its own.
-  const jobserverFlags = `-j --jobserver-auth=fifo:${fifoPath}`;
   return {
     ok: true,
     pool: {
-      environment: {
-        [CPU_POOL_ENV]: socketPath,
-        [CPU_TOKENS_ENV]: String(tokens),
-        CARGO_MAKEFLAGS: jobserverFlags,
-        MAKEFLAGS: jobserverFlags,
-      },
+      environment: poolEnvironment(socketPath, tokens, fifoPath),
       close: shutdown,
     },
   };

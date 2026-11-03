@@ -24,15 +24,7 @@ import {
   stepBounds,
   UNARMED,
 } from './bounds.js';
-import {
-  CPU_POOL_ENV,
-  type CpuPool,
-  createCpuPool,
-  type InheritedCpuPool,
-  readInheritedCpuPool,
-  type TokenGrant,
-  takeParentCpuTokens,
-} from './cpu-pool.js';
+import { type CpuPool, createCpuPool, type TokenGrant, takeParentCpuTokens } from './cpu-pool.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
@@ -60,6 +52,7 @@ import {
   type SubtreeAdmission,
   type SubtreeOwner,
 } from './owned-subtree.js';
+import { CPU_POOL_ENV, type InheritedCpuPool, readInheritedCpuPool } from './pool-environment.js';
 import { createRunProgress, withProgressReport, withTestResultReport } from './progress.js';
 import {
   createHostCommands,

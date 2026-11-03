@@ -15,7 +15,7 @@ import { standInReservations } from '../../__tests__/stand-in-mbx-reservations.j
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processGroupHasMembers } from '../../process-group.js';
 import { ownedSocketDirectory, processesOf } from '../../testing.js';
-import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readInheritedCpuPool } from './cpu-pool.js';
+import { type CpuPool, createCpuPool } from './cpu-pool.js';
 import {
   type BoundedExecContext,
   type BoundedExecResult,
@@ -31,6 +31,7 @@ import { MBX_QUEUE_POLL_MS } from './mbx-queue.js';
 import { RESERVATIONS_ENV, RESERVATIONS_UNSERVED_ENV } from './mbx-reservations.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { cowshedSubtreeOwner, type SubtreeOwner } from './owned-subtree.js';
+import { CPU_POOL_ENV, type InheritedCpuPool, readInheritedCpuPool } from './pool-environment.js';
 import {
   createHostCommands,
   describeRamTempError,

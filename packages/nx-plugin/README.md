@@ -2677,8 +2677,14 @@ to the command, which the keyed modules decide. Each entry, and what the executo
   the run or are said on stderr. The variable naming the cowshed executable, which the command does see, lives in the
   core `owned-subtree.ts`.
 - `gateway-lease.js`: the lease protocol the gateway's disk lease and a parent CPU pool speak, the gateway's socket path
-  and the grant it reads from an answer. A CPU grant reaches the command only through `cpu-pool.js` and
-  `runner-sizing.js`, as a token count; an absent endpoint leaves the command unsized, and a refusal fails the run.
+  and the grant it reads from an answer. A CPU grant reaches the command only through `runner-sizing.js`, as a token
+  count; an absent endpoint leaves the command unsized, and a refusal fails the run.
+- `cpu-pool.js`, with `pool-admission.js`, `host-memory.js` and `lease-wait.js`: the CPU pool a run serves and the grant
+  a task asks its parent's for. They decide how many tokens a run is lent and when: the queue order, the memory a task's
+  recorded peak is charged and the live memory it is held against, the heartbeat of a wait. A grant reaches the command
+  as a token count and nothing else; a pool that cannot be made or refuses fails the run.
+- `mbx-queue.js`: the snapshot of mbx's admission queue a Cargo or reserved leaf waits in. Its text is said on stderr
+  and its waiting decides whether the idle bound is credited, which can fail a run and never changes one that passes.
 - `hang-diagnostics.js`: the snapshot taken shortly before the no-progress bound fires. It probes with `ps`, `lsof` and
   `sample`, which suspends the runner for about a second, and signals nothing but its own probes. Its text and lock
   waits are read only once the bound has expired the run, which fails it.
@@ -2686,11 +2692,13 @@ to the command, which the keyed modules decide. Each entry, and what the executo
   the host census the executor quotes when a lease release fails, and the directory a CPU pool binds its socket in. A
   directory that cannot be made refuses the run.
 
-`runner-sizing.js`, `cpu-pool.js` and `progress.js` are not output-neutral although they schedule: `sizeRunner` decides
-what a token count does to the command's parallelism flags and test-thread variables, `cpu-pool.js` writes the jobserver
-flags into `MAKEFLAGS` and `CARGO_MAKEFLAGS`, and `withProgressReport` adds `--dots` to `bun test` and `-json` to
-`go test`. They stay keyed until those functions move into modules of their own. A module that comes to decide what a
-value does to the command, its environment or a passing verdict leaves `outputNeutral` in the same commit.
+`runner-sizing.js`, `pool-environment.js` and `progress.js` are not output-neutral although they schedule: `sizeRunner`
+decides what a token count does to the command's parallelism flags and test-thread variables, `pool-environment.js`
+writes the pool endpoint, its count and the jobserver flags into `MAKEFLAGS` and `CARGO_MAKEFLAGS` (`cpu-pool.js` serves
+the pool and writes none of them), and `withProgressReport` adds `--dots` to `bun test` and `-json` to `go test`. They
+stay keyed until those functions move into modules of their own. A module that comes to decide what a value does to the
+command, its environment or a passing verdict leaves `outputNeutral` in the same commit; `executor-key.test.ts` names
+the keyed modules and refuses a neutral one that writes those variables.
 
 ## Test Fixtures That Run Nx
 
