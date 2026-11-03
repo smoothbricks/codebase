@@ -14,6 +14,7 @@ import {
   validateCommitMessage,
 } from './commit-msg.js';
 import { keepDeveloperLinks } from './developer-links.js';
+import { recordDevenvRelease, recordingResult, validateDevenvReleaseLock } from './devenv-release.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { validateGoToolchainAgreement } from './go-toolchain.js';
 import { syncBunLockfileVersions } from './lockfile.js';
@@ -21,7 +22,6 @@ import {
   applyManagedFiles,
   printResults,
   validateDevenvModuleImport,
-  validateDevenvReleaseLock,
   warnOnManagedFileDrift,
 } from './managed-files.js';
 import {
@@ -157,6 +157,12 @@ export async function updateManagedFiles(root: string): Promise<void> {
     },
     { relink: ['nx'] },
   );
+  // The release verdict of devenv.lock's devenv rev is asked of its remote here, where the network is already
+  // needed, and only for a rev no recorded verdict covers: `check` verifies the record offline.
+  const recording = recordingResult(await recordDevenvRelease(root));
+  if (recording !== null) {
+    printResults([recording]);
+  }
 }
 
 /**
@@ -210,7 +216,7 @@ export async function checkPolicyFailures(root: string, projectTargets: ProjectT
     validateNoStaleTestOutput(root) +
     validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargetsByProject(projectTargets) }) +
     validateDevenvModuleImport(root) +
-    (await validateDevenvReleaseLock(root)) +
+    validateDevenvReleaseLock(root) +
     validateCargoCachePolicy(root) +
     validateCargoToolchainInputs(root, projectTargets)
   );

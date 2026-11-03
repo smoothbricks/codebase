@@ -58,7 +58,7 @@
     "show:tree": "tree --gitignore -d",
     "unlink:all": "for pkg in packages/*; do (cd $pkg && bun unlink); done",
     "update:cargo-lock": "cargo update",
-    "update:devenv": "cd tooling/direnv; devenv update"
+    "update:devenv": "smoo devenv update"
   },
   "sherif": {
     "ignoreDependency": [

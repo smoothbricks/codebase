@@ -448,14 +448,24 @@ function buildProgram(): Command {
     );
 
   const devenv = program.command('devenv').description('Manage the repository devenv shell');
-  devenv.command('update').action(async () => {
-    const { updateDevenv } = await import('./devenv/index.js');
-    await updateDevenv(await findRepoRoot());
-  });
+  devenv
+    .command('update')
+    .description('Update the devenv inputs, then record the release verdict of the devenv rev devenv.lock locks')
+    .action(async () => {
+      const { updateDevenv } = await import('./devenv/index.js');
+      await updateDevenv(await findRepoRoot());
+    });
   devenv.command('reload').action(async () => {
     const { reloadDevenv } = await import('./devenv/index.js');
     await reloadDevenv(await findRepoRoot());
   });
+  devenv
+    .command('record-release')
+    .description('Record whether the devenv rev devenv.lock locks is a release (asks its remote once per rev)')
+    .action(async () => {
+      const { recordDevenvReleaseVerdict } = await import('./devenv/index.js');
+      await recordDevenvReleaseVerdict(await findRepoRoot());
+    });
 
   const nixpkgsOverlay = program.command('nixpkgs-overlay').description('Manage the repository nixpkgs overlay');
   nixpkgsOverlay.command('update').action(async () => {

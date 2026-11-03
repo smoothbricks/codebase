@@ -257,6 +257,42 @@ describe('monorepo validation pack phases', () => {
     }
   });
 
+  it('verifies the recorded devenv release verdict in pre-build validation, asking no remote', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-validate-devenv-record-'));
+    try {
+      await mkdir(join(root, 'tooling/direnv'), { recursive: true });
+      await writeFile(join(root, 'tooling/direnv/devenv.nix'), '{...}: { imports = [./devenv.smoo.nix]; }\n');
+      // A remote nothing answers for: only the record can pass this lock.
+      const remote = 'file:///nonexistent/devenv';
+      const rev = '190959a9a4bb52d4802f076a90c3c4e3aa2e6fa2';
+      const locked = { type: 'git', url: remote, rev };
+      await writeFile(
+        join(root, 'tooling/direnv/devenv.lock'),
+        JSON.stringify({
+          nodes: { devenv: { locked, original: locked }, root: { inputs: { devenv: 'devenv' } } },
+          root: 'root',
+          version: 7,
+        }),
+      );
+      const devenvPack = packsForTest.find((pack) => pack.name === 'devenv');
+      if (!devenvPack) {
+        throw new Error('devenv validation pack not found');
+      }
+      const validate = () =>
+        runValidatePacks({ root, syncRuntime: false }, { failFast: true }, { packs: [devenvPack], runBuild: () => 0 });
+
+      // A bump without its record fails, offline.
+      expect(await validate()).toEqual({ failures: 1, failedChecks: 1 });
+
+      await writeFile(
+        join(root, 'tooling/direnv/devenv-release.json'),
+        `${JSON.stringify({ remote, rev, tag: 'v2.4.0' })}\n`,
+      );
+      expect(await validate()).toEqual({ failures: 0, failedChecks: 0 });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it('validates and fixes cargo workspace feature unification through its own pack', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-validate-cargo-'));
     try {

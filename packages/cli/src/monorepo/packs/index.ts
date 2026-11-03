@@ -8,9 +8,10 @@ import {
   validateCargoToolchainInputs,
 } from '../cargo-policy.js';
 import { validateConsumedScopedDependenciesExist, validateNoMachineLocalSpecifiers } from '../consumed-scope.js';
+import { validateDevenvReleaseLock } from '../devenv-release.js';
 import { validateGitHubActions } from '../github-actions.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
-import { validateDevenvModuleImport, validateDevenvReleaseLock, warnOnManagedFileDrift } from '../managed-files.js';
+import { validateDevenvModuleImport, warnOnManagedFileDrift } from '../managed-files.js';
 import { fixNxSync, validateNxSync } from '../nx-sync.js';
 import { fixPackageHygiene, validatePackageHygiene } from '../package-hygiene.js';
 import {
@@ -140,8 +141,8 @@ const packs: MonorepoPack[] = [
   },
   {
     name: 'devenv',
-    async validatePreBuild(ctx) {
-      return validateDevenvModuleImport(ctx.root) + (await validateDevenvReleaseLock(ctx.root));
+    validatePreBuild(ctx) {
+      return validateDevenvModuleImport(ctx.root) + validateDevenvReleaseLock(ctx.root);
     },
   },
   {

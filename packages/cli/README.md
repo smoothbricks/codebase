@@ -1178,11 +1178,19 @@ The bootstrap script is intentionally small. It only handles work required befor
 
 - Install `devenv`, held to `devenv.lock`'s rev on an ephemeral runner. `check` requires that rev to be a devenv release
   whose build the binary cache keeps: the lock's `devenv` node must name its remote (a `github` input's owner and repo,
-  or a `git` input's url) and a commit that one of that remote's tags from `v2.0.4` on names. `check` asks the remote
-  with `git ls-remote --tags` on every run and keeps no copy of its tags, so a remote it cannot list, offline included,
-  fails the check rather than passes it. How `devenv.yaml` declared the input does not matter to the check, but
-  declaring it at a tag, `inputs.devenv.url: github:cachix/devenv/v2.3.1?dir=src/modules` (a `git+https` URL names the
-  tag `ref=refs/tags/v2.3.1`), or at `latest` keeps every re-lock on a release. devenv.cachix.org has pinned the
+  or a `git` input's url) and a commit that one of that remote's tags from `v2.0.4` on names. Whether a tag names the
+  commit is a fact about the commit, not about the run, so it is asked of the remote once per locked rev, with
+  `git ls-remote --tags`, and recorded in `tooling/direnv/devenv-release.json` (`{ "remote", "rev", "tag" }`: the lowest
+  tag from `v2.0.4` on that names the commit), which is committed beside `devenv.lock`. `check` only verifies that
+  record against the lock: its remote and rev must be the lock's and its tag a release from `v2.0.4` on. It asks no
+  remote, so it passes or fails the same in a sandbox or on a runner with no route to GitHub. `smoo devenv update` (the
+  bump: it runs `devenv update`) and `smoo monorepo update` write the record, and skip the remote when it already holds
+  the locked rev; `smoo devenv record-release` writes it alone. A bump whose record was not written (a `devenv update`
+  run by hand, a merge that kept the other side's lock) fails `check` offline and names that command; a rev no release
+  names, or a remote that cannot be listed, is refused when recording and writes nothing. How `devenv.yaml` declared the
+  input does not matter to the check, but declaring it at a tag,
+  `inputs.devenv.url: github:cachix/devenv/v2.3.1?dir=src/modules` (a `git+https` URL names the tag
+  `ref=refs/tags/v2.3.1`), or at `latest` keeps every re-lock on a release. devenv.cachix.org has pinned the
   `aarch64-darwin`, `aarch64-linux` and `x86_64-linux` builds of every release from `v2.0.4` on for good, and the
   `x86_64-darwin` builds up to `v2.1.2`: from `v2.2` on devenv builds nothing for `x86_64-darwin`, so an Intel macOS
   runner cannot install those releases at all. Some older tags, such as `v2.0.3`, have no pin, and their builds are

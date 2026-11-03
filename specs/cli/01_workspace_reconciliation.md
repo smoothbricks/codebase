@@ -64,6 +64,33 @@ installer's explicit sync is the sole writer of editable mappings and normalizes
 - `smoo monorepo update` resolves an upgrade, installs the compatible toolset, and then synchronizes using that new
   toolset.
 
+## Policy checks do not use the network
+
+`smoo monorepo check` reads the repository and nothing else: it lists no remote and asks no registry. A sandbox, a
+runner with no route to a host and a flaky link must not decide whether a repository passes, and an unanswered network
+call must not hold a run open. A policy that needs a fact only a remote knows is split in two: a step that has the
+network, run when the pinned input moves, computes the fact once and records it in a committed file, and `check`
+verifies that record against the pinned input.
+
+The devenv release verdict is the one such split today. `tooling/direnv/devenv.lock` pins the commit install-devenv
+installs, and devenv.cachix.org keeps the builds of release tags from `v2.0.4` on for good and drops every other
+commit's after about six weeks, so a tag of the remote the lock names (a `github` input's owner and repo, or a `git`
+input's url) from `v2.0.4` on must name the commit. A pushed tag is permanent, so whether a tag names a commit is a fact
+about the commit, not about the run. `smoo devenv record-release` asks the remote once, with `git ls-remote --tags`, and
+writes `tooling/direnv/devenv-release.json`:
+
+```json
+{ "remote": "https://github.com/cachix/devenv", "rev": "<the locked commit>", "tag": "v2.4.0" }
+```
+
+`tag` is the lowest tag from `v2.0.4` on that names the commit. `smoo devenv update`, which bumps the lock, and
+`smoo monorepo update` write the record too, and skip the remote when the record already holds the locked rev. `check`
+accepts the lock when the record's remote and rev are the lock's and its tag is a release from `v2.0.4` on; the floor is
+applied to the recorded tag, so a record written under an older floor is refused as well. A bump whose record was not
+written, a record for another rev or remote, and a record that does not parse fail `check` offline and name
+`smoo devenv record-release`. A commit no release names, or a remote that cannot be listed, is refused when recording
+and leaves the record as it was.
+
 ## Update resolves one release manifest
 
 An update resolves a release manifest once. The manifest records the compatible CLI and plugin versions, the tested Nx

@@ -17,8 +17,10 @@ ttsc_cache_dir_default="${TTSC_CACHE_DIR:-$repo_root/.cache/ttsc-plugins}"
 # locked to, so this installs the commit devenv.lock's `devenv` node names and
 # nothing here restates it. `smoo monorepo check` holds that node to a release:
 # it must name its remote and a commit that one of that remote's tags from
-# v2.0.4 on names, which `git ls-remote` answers on every run. devenv.yaml
-# declares such a lock as `github:cachix/devenv/v2.3.1?dir=src/modules`.
+# v2.0.4 on names. `git ls-remote` answers that once per locked commit, when
+# `smoo devenv update` or `smoo monorepo update` writes the answer to
+# tooling/direnv/devenv-release.json; `check` only verifies that record, offline.
+# devenv.yaml declares such a lock as `github:cachix/devenv/v2.3.1?dir=src/modules`.
 # devenv.cachix.org has pinned the aarch64-darwin, aarch64-linux and
 # x86_64-linux builds of every release from v2.0.4 on for good, so on those
 # three systems the install substitutes rather than compiles. From v2.2 on
