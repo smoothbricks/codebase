@@ -75,16 +75,16 @@ job's own make jobserver fifo, and the test-thread counts. A Cargo no job starte
 ([03 Caches](../../../specs/cowshed/03_caches.md), "Cargo reads its budget from its holder";
 [05 Gateway](../../../specs/cowshed/05_gateway.md#parallelism-inside-a-job)).
 
-From a checkout of this repository, build the host's release CLI with `nx run cowshed:cli-<platform>:production`
-(`cli-arm64-macos` on Apple silicon), which writes `dist/bin/<platform>/cowshed`, then install it by running that
-build's own setup, `packages/cowshed/dist/bin/<platform>/cowshed setup`. A checkout's `bin/cowshed` runs its development
-build, `.cache/bin/<platform>/cowshed` (`nx run cowshed:cli-native`), which setup refuses. After that, `cowshed` on
-`PATH` is the installed copy, not the checkout: a later rebuild changes nothing there until you run the release build's
-`setup` again. Do not put a link to the checkout's `bin/cowshed` on `PATH` — it would run whatever the checkout last
-built, under a daemon still running the build setup installed, and the daemon refuses another build's commands. The
-default `cli-*` configuration builds cargo's dev profile, which is for tests and local iteration, and setup refuses to
-install it; setup also refuses a build that does not contain the installed one — its commit must be on `main` and hold
-every installed commit — unless you pass `--downgrade`.
+From a checkout of this repository, build the host's release CLI with `nx run cowshed:cli-native:production`, which
+writes `dist/bin/<platform>/cowshed` and, beside it, the release record `cowshed.build` that names the commit setup
+installs it as, then install it by running that build, `.cache/bin/<platform>/cowshed` (`nx run cowshed:cli-native`),
+which setup refuses. After that, `cowshed` on `PATH` is the installed copy, not the checkout: a later rebuild changes
+nothing there until you run the release build's `setup` again. Do not put a link to the checkout's `bin/cowshed` on
+`PATH` — it would run whatever the checkout last built, under a daemon still running the build setup installed, and the
+daemon refuses another build's commands. The default `cli-*` configuration builds cargo's dev profile, which is for
+tests and local iteration, and setup refuses to install it, as it refuses a release binary whose record beside it
+describes other bytes; setup also refuses a build that does not contain the installed one — its commit must be on `main`
+and hold every installed commit — unless you pass `--downgrade`.
 
 A daemon/caller “the cowshed daemon is build X; this cowshed is build Y” refusal (exit 4) is a build-identity conflict,
 not workspace corruption; install the intended build with its own setup before retrying

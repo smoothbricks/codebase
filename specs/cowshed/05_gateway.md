@@ -460,19 +460,22 @@ and lists each repository's tickets, the holder first, and the tickets abandoned
 read without taking a turn; a gateway that does not answer `land-turns` lists none, and status says why
 (`landTurnsError`). A gateway that is not running holds no turn.
 
-**Build records and the basis.** A release build records the commit `HEAD` names and that commit's committer time
-(`build.rs`: `COWSHED_BUILD_COMMIT`, `COWSHED_BUILD_COMMIT_TIME`); the time is read from that one commit, so a shallow
-clone records it too. Its Git HEAD/reflog watch paths are emitted relative to the build-script manifest directory, so a
-warm Cargo target clone follows its own repository rather than retaining an absolute watch on its donor. The owner
-script directive control and a real warm Cargo clone pin this boundary. A debug build, and a build made where git cannot
-answer (a source archive, a nix build), records nothing. Because the record names HEAD, every platform CLI target
-(`cowshed:cli-<platform>`, whose production configuration is the release build) keys its Nx cache on HEAD as a runtime
-input: keyed on its sources alone, a release built at one commit was replayed for later commits whose sources it shared,
-recording a commit the installed build already contained, and the install refused it (`build_provenance.rs`,
-`every_release_cli_cache_key_names_the_commit_it_records`). The installing build writes its record beside its stored
-copy, so the installed build's record is read from a file and nothing is executed to learn it; a record that cannot be
-written is said on stderr and does not fail the install. The time describes a build to a person and never orders two
-builds: two sibling commits are ordered by clock, and the later one carries none of the earlier one's fixes.
+**Build records and the basis.** A release distribution carries its record beside its binary, `<binary>.build`: the JSON
+`{"commit","commitTime","sha256"}`, the commit `HEAD` names, that commit's committer time (read from that one commit, so
+a shallow clone records it too) and the SHA-256 of the binary it describes. Nothing is compiled into the binary, so
+`cowshed:cli-<platform>` is cached by its sources alone and its release build is replayed for every commit that left
+them unchanged; the commit is the record's alone. `cowshed:cli-record-<platform>` writes it
+(`scripts/release-record.ts`) after that build, keyed on `HEAD` (read with no git configuration, which the sandboxed Nx
+daemon cannot open) and on the binary's bytes, so every commit gets its own record in milliseconds while the binary
+replays. Its name ends in the platform, so `cli-native`, the aggregate build and the publish jobs run it beside the
+binary in the same configuration; `nx run cowshed:cli-native:production` builds this host's release and its record.
+Setup reads the record beside the invoking binary (`BuildRecord::beside`) and refuses one whose `sha256` is not the
+binary's: it names a commit, just not this build's. A binary with no record beside it — a debug build, a `cargo build`,
+a nix build — records nothing. A stored copy in the install slot is described by the record its install wrote beside it
+instead, named after its digest. The installing build writes its record beside its stored copy, so the installed build's
+record is read from a file and nothing is executed to learn it; a record that cannot be written is said on stderr and
+does not fail the install. The time describes a build to a person and never orders two builds: two sibling commits are
+ordered by clock, and the later one carries none of the earlier one's fixes.
 
 An install that would replace the installed build is judged by containment. Nothing is judged, and the install proceeds,
 when nothing is installed, when the stable name is the plain binary of the old layout, when the installed copy has no
