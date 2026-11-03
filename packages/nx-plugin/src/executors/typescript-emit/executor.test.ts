@@ -79,6 +79,55 @@ async function utilityPluginFixture(): Promise<string> {
   return root;
 }
 
+/**
+ * A project whose linked plugin (`src/__tests__/side-output-plugin`) writes `side-output.json` into outDir, beside the
+ * compiler's outputs, as a census-writing lint plugin writes its census. ttsc links the plugin into its utility host,
+ * or into typia's host when the project uses typia.
+ */
+async function sideOutputFixture(host: 'utility' | 'typia'): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-side-output-'));
+  await mkdir(join(root, 'src'));
+  await mkdir(join(root, 'node_modules'));
+  await symlink(
+    join(import.meta.dir, '../../__tests__/side-output-plugin'),
+    join(root, 'node_modules/side-output-plugin'),
+    'dir',
+  );
+  await writeFile(
+    join(root, 'package.json'),
+    JSON.stringify(host === 'typia' ? { type: 'module', dependencies: { typia: '*' } } : { type: 'module' }),
+  );
+  if (host === 'typia') {
+    await symlink(
+      dirname(createRequire(import.meta.url).resolve('typia/package.json')),
+      join(root, 'node_modules/typia'),
+      'dir',
+    );
+  }
+  await writeFile(
+    join(root, 'tsconfig.lib.json'),
+    JSON.stringify({
+      compilerOptions: {
+        target: 'ES2022',
+        module: 'NodeNext',
+        rootDir: 'src',
+        outDir: 'dist',
+        types: [],
+        skipLibCheck: true,
+        plugins: [{ transform: 'side-output-plugin' }],
+      },
+      include: ['src/**/*.ts'],
+    }),
+  );
+  await writeFile(
+    join(root, 'src/index.ts'),
+    host === 'typia'
+      ? "import typia from 'typia';\nexport const validate = typia.createValidate<{ value: number }>();\n"
+      : 'export const index = 1;\n',
+  );
+  return root;
+}
+
 /** Every file under `directory` with what a write changes: its inode, modification time and status-change time. */
 async function fileIdentities(directory: string): Promise<Record<string, readonly bigint[]>> {
   const identities: Record<string, readonly bigint[]> = {};
@@ -176,6 +225,24 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
     }
   });
 
+  it.each(['utility', 'typia'] as const)(
+    'keeps a side output a linked plugin writes into outDir across emits, in the %s host',
+    async (host) => {
+      const root = await sideOutputFixture(host);
+      try {
+        const emit = () => typescriptEmitExecutor({ cwd: root, tsConfig: 'tsconfig.lib.json' }, { root });
+        for (const run of [1, 2, 3]) {
+          expect(await emit(), `emit ${String(run)}`).toEqual({ success: true });
+          expect(
+            await readFile(join(root, 'dist/side-output.json'), 'utf8').catch(() => 'absent'),
+            `emit ${String(run)}`,
+          ).toBe('{"side":true}\n');
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
   it("reads the emitted files of ttsc's utility-plugin lane, keeps its unchanged outputs and prunes a deleted module's", async () => {
     const root = await utilityPluginFixture();
     try {

@@ -73,6 +73,130 @@ index 0000000000000000000000000000000000000000..97d1522f7979b488dc62b86cc1d78d72
 +		t.Fatalf("forced emit did not rewrite the runtime import: %s", output["index.js"])
 +	}
 +}
+diff --git a/driver/emit_plugin.go b/driver/emit_plugin.go
+index 3793b3a406c2bf2643567a755d34e66a26eac5c8..3c690ac3d9a99be7914ad9aed76e5890d236ea9b 100644
+--- a/driver/emit_plugin.go
++++ b/driver/emit_plugin.go
+@@ -427,7 +427,13 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+       return diagnostics, err
+     }
+   }
+-  return diagnostics, output.flush()
++  if err := output.flush(); err != nil {
++    return diagnostics, err
++  }
++  // Files linked plugins reported writing beside these outputs follow them
++  // through the host's writer, so the host lists them too (ReportHostOutput).
++  _, err = p.writeHostOutputs(writeFile)
++  return diagnostics, err
+ }
+ 
+ // writePluginEmitOutput writes one artifact of the hand-assembled emit, passing
+diff --git a/driver/plugins.go b/driver/plugins.go
+index 1778e250d80d1316e108f1f36b6e1a38724922d5..da2ec288afa9a4ae8ceebc1728f6119bae676c4a 100644
+--- a/driver/plugins.go
++++ b/driver/plugins.go
+@@ -169,6 +169,7 @@ type PluginContext struct {
+   reportFileDependencyRejected   func(string)
+   reportFileComplete             func(string)
+   reportEveryFileComplete        func()
++  reportHostOutput               func(string)
+ }
+ 
+ // ReportObservationIncomplete declares that this hook's input population could
+@@ -195,6 +196,24 @@ func (ctx PluginContext) ReportObservationIncomplete() {
+   }
+ }
+ 
++// ReportHostOutput declares a file this hook wrote beside the compiler's
++// outputs, such as a census or a manifest in outDir. A later emit of this
++// generation hands the file's bytes as they are then to the host's writer,
++// after the compiler's own outputs, so every host lists it with them: a caller
++// that keeps exactly the files an emit lists (a build that prunes its outDir by
++// that list) keeps it too. A relative file is resolved against Cwd. An emit
++// fails when a reported file cannot be read. A context without a driver
++// callback ignores the report.
++func (ctx PluginContext) ReportHostOutput(file string) {
++  if ctx.reportHostOutput == nil || strings.TrimSpace(file) == "" {
++    return
++  }
++  if !filepath.IsAbs(file) {
++    file = filepath.Join(ctx.Cwd, file)
++  }
++  ctx.reportHostOutput(filepath.Clean(file))
++}
++
+ // ReportHostInputHash declares the exact file state consumed by a native
+ // plugin. hash is a lowercase SHA-256 digest for an observed file and nil for
+ // a missing candidate. Conflicting observations are retained as host inputs
+@@ -511,6 +530,7 @@ type linkedPluginState struct {
+   declarations *pluginFileDeclarations
+   entries      []PluginEntry
+   inputs       *pluginHostInputScopes
++  outputs      *pluginHostOutputs
+   tsconfig     string
+ }
+ 
+@@ -800,6 +820,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
+       cwd:          cwd,
+       declarations: newPluginFileDeclarations(),
+       inputs:       newPluginHostInputScopes(),
++      outputs:      newPluginHostOutputs(),
+       tsconfig:     tsconfigPath,
+     }, nil
+   }
+@@ -812,6 +833,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
+     declarations: newPluginFileDeclarations(),
+     entries:      entries,
+     inputs:       newPluginHostInputScopes(),
++    outputs:      newPluginHostOutputs(),
+     tsconfig:     tsconfigPath,
+   }, nil
+ }
+@@ -931,7 +953,43 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
+     reportFileDependencyRejected:   declaration.rejectDependency,
+     reportFileComplete:             declaration.addComplete,
+     reportEveryFileComplete:        declaration.completeEveryFile,
++    reportHostOutput:               state.outputs.add,
++  }
++}
++
++// pluginHostOutputs keeps the files linked plugins reported writing beside the
++// compiler's outputs in this generation (ReportHostOutput), each once, in the
++// order first reported.
++type pluginHostOutputs struct {
++  mu    sync.Mutex
++  seen  map[string]struct{}
++  files []string
++}
++
++func newPluginHostOutputs() *pluginHostOutputs {
++  return &pluginHostOutputs{seen: map[string]struct{}{}}
++}
++
++func (outputs *pluginHostOutputs) add(file string) {
++  if outputs == nil {
++    return
++  }
++  outputs.mu.Lock()
++  defer outputs.mu.Unlock()
++  if _, ok := outputs.seen[file]; ok {
++    return
++  }
++  outputs.seen[file] = struct{}{}
++  outputs.files = append(outputs.files, file)
++}
++
++func (outputs *pluginHostOutputs) list() []string {
++  if outputs == nil {
++    return nil
+   }
++  outputs.mu.Lock()
++  defer outputs.mu.Unlock()
++  return append([]string(nil), outputs.files...)
+ }
+ 
+ // hostInputs returns the exact native configuration inputs reported in this
 diff --git a/driver/program.go b/driver/program.go
 index f6ee81fb1af41deea022b92e838a7c4665eb9778..112faf913ce38b1f4624b38db37839370b9c5e8b 100644
 --- a/driver/program.go
@@ -91,10 +215,73 @@ index f6ee81fb1af41deea022b92e838a7c4665eb9778..112faf913ce38b1f4624b38db3783937
  
  // forceNoEmit sets noEmit so the program type-checks without writing files.
 diff --git a/driver/rewrite.go b/driver/rewrite.go
-index 79be74d24e879da216ad680d23ecfeb5f11a29db..fb57c1ac6ef61f72abe75fd118915c7b632c5bb6 100644
+index 79be74d24e879da216ad680d23ecfeb5f11a29db..6db9dddba05bd50e13ed92535ca442c3a4f0b28a 100644
 --- a/driver/rewrite.go
 +++ b/driver/rewrite.go
-@@ -317,22 +317,28 @@ func (p *Program) emitsBuildInfo() bool {
+@@ -204,6 +204,9 @@ func (p *Program) EmitAllRaw(writeFile shimcompiler.WriteFile) (*shimcompiler.Em
+   result := p.emitProgram(shimcompiler.EmitOptions{
+     WriteFile: wf,
+   })
++  if err := p.listHostOutputs(result, writeFile); err != nil {
++    return result, p.convertProgramDiagnostics(result.Diagnostics), err
++  }
+   return result, p.convertProgramDiagnostics(result.Diagnostics), nil
+ }
+ 
+@@ -271,9 +274,52 @@ func (p *Program) emit(rs *RewriteSet, target *ast.SourceFile, writeFile shimcom
+   }
+ 
+   result := p.emitProgram(shimcompiler.TargetedEmitOptions(target, wf))
++  if target == nil {
++    if err := p.listHostOutputs(result, writeFile); err != nil {
++      return result, p.convertProgramDiagnostics(result.Diagnostics), err
++    }
++  }
+   return result, p.convertProgramDiagnostics(result.Diagnostics), nil
+ }
+ 
++// listHostOutputs hands the files linked plugins reported writing beside a
++// whole-program emit's outputs to writeFile and lists them among the result's
++// EmittedFiles, unless the emit wrote nothing (noEmit, or noEmitOnError
++// withholding a failed program).
++func (p *Program) listHostOutputs(result *shimcompiler.EmitResult, writeFile shimcompiler.WriteFile) error {
++  if result == nil || result.EmitSkipped || p.TSProgram.Options().NoEmit.IsTrue() {
++    return nil
++  }
++  handed, err := p.writeHostOutputs(writeFile)
++  result.EmittedFiles = append(result.EmittedFiles, handed...)
++  return err
++}
++
++// writeHostOutputs hands each file a linked plugin reported writing beside the
++// compiler's outputs (PluginContext.ReportHostOutput) to writeFile, with its
++// bytes as they are now, after the compiler's own outputs, so a host lists it
++// with them. It answers the files handed, and fails on one it cannot read: a
++// plugin reported an output it did not leave.
++func (p *Program) writeHostOutputs(writeFile shimcompiler.WriteFile) ([]string, error) {
++  var handed []string
++  for _, file := range p.plugins.outputs.list() {
++    text, err := os.ReadFile(file)
++    if err != nil {
++      return handed, fmt.Errorf("ttsc driver: a linked plugin reported the host output %s, which cannot be read: %w", file, err)
++    }
++    if writeFile != nil {
++      err = writeFile(shimtspath.RootedFilePathFromAbsolute(file), string(text), nil)
++    } else {
++      err = DefaultWriteFile(file, string(text))
++    }
++    if err != nil {
++      return handed, err
++    }
++    handed = append(handed, file)
++  }
++  return handed, nil
++}
++
+ // emitProgram runs one whole-program or single-file emit, taking tsgo's
+ // incremental lane when the resolved compiler options ask for build
+ // information.
+@@ -317,22 +363,28 @@ func (p *Program) emitsBuildInfo() bool {
  }
  
  // DefaultWriteFile is the default disk writer used when EmitAll's caller does not

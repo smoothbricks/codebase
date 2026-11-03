@@ -432,9 +432,13 @@ tasks resolved their executors from it. ttsc's utility-plugin host, which links 
 consumer's lint plugins), printed only `// ttsc utility: plugins=N emit=true` and a count under `--verbose`, so the
 executor refused its emits; the patch makes it print the build lane's header (`tsconfig=… cwd=… emit=…`) and one
 `  + <path>` line per emitted file (`utility/host.go` `RunBuildWithIO`), and it writes through the same
-`DefaultWriteFile`. The packaged managed asset is the source, so clean managed installs receive the same repairs without
-a compiler fork or edits to the dependency cache. The registration applies only to that exact compiler version; the
-repository's lockfile continues to own its compiler pin.
+`DefaultWriteFile`. A linked plugin that writes a file beside the compiler's outputs (a census in outDir) reports it
+with `PluginContext.ReportHostOutput(file string)`; each emit then hands the file's bytes to the host's writer after the
+compiler's own outputs (`driver/plugins.go`, `driver/rewrite.go`, `driver/emit_plugin.go`), so ttsc's build lane, its
+utility host and a plugin's own host such as typia's list it, and the executor keeps it. An unreported one is pruned as
+a file this emit did not produce. The packaged managed asset is the source, so clean managed installs receive the same
+repairs without a compiler fork or edits to the dependency cache. The registration applies only to that exact compiler
+version; the repository's lockfile continues to own its compiler pin.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
