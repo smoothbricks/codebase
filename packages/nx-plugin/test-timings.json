@@ -25,6 +25,7 @@
     "src/typecheck-test-policy.test.ts": 5606,
     "src/bounded-test-policy.test.ts": 5412,
     "src/nx-daemon-start-never.test.ts": 5356,
+    "src/nx-local-plugin-hook-env.test.ts": 5300,
     "src/executors/bounded-exec/ram-temp.test.ts": 5259,
     "src/task-results.test.ts": 5234,
     "src/nx-dot-input-policy.test.ts": 5127,

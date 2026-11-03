@@ -4000,6 +4000,22 @@ index 2000bbcd5d707c5435c2bc47573528d7a31ae606..524a82cae46a6028baceaa985097fe59
  }
  function setErrorTimeout(timeoutMs, errorMessage) {
      if (environment.NX_PLUGIN_NO_TIMEOUTS === 'true') {
+diff --git a/dist/src/project-graph/plugins/loaded-nx-plugin.js b/dist/src/project-graph/plugins/loaded-nx-plugin.js
+index 9fa6b993ac4dbe918c163092c12f77f87eaccb27..d93538310c4dc2622cde88cd9da983bcc1e3e63c 100644
+--- a/dist/src/project-graph/plugins/loaded-nx-plugin.js
++++ b/dist/src/project-graph/plugins/loaded-nx-plugin.js
+@@ -85,7 +85,10 @@ class LoadedNxPlugin {
+             this.preTasksExecution = async (context) => {
+                 const updates = {};
+                 let originalEnv = process.env;
+-                if ((0, enabled_1.isIsolationEnabled)() || (0, client_1.isDaemonEnabled)()) {
++                // A plugin worker records the hook's writes whatever the isolation setting and the daemon say: the
++                // patched Nx loads a local plugin in one under every setting, and these recorded writes are how the
++                // hook's environment reaches the client that applies it.
++                if ((0, enabled_1.isIsolationEnabled)() || (0, client_1.isDaemonEnabled)() || global.NX_PLUGIN_WORKER) {
+                     process.env = new Proxy(originalEnv, {
+                         set: (target, key, value) => {
+                             target[key] = value;
 diff --git a/dist/src/project-graph/plugins/local-plugin-source.d.ts b/dist/src/project-graph/plugins/local-plugin-source.d.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..1a84106509d0e05a2f0d6c595b79ecc781ff21d1

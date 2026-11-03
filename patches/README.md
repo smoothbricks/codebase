@@ -435,6 +435,17 @@ Bun has no module customization hooks, so a daemon whose CLI runs under Bun spaw
 rather than its own executable. `nx-daemon-validity.test.ts` walks the reload end to end in one daemon: a CJS and an ESM
 local plugin whose helpers change, and a third local plugin that must not reload.
 
+A local plugin's `preTasksExecution` runs in that worker whenever the client computes the run itself, and publishes its
+environment the way Nx expects: by setting `process.env`. Stock Nx's `LoadedNxPlugin` wraps `process.env` in a proxy
+that records those writes and returns them to the client, which applies them to the task processes, only when plugin
+isolation is on or a daemon is enabled. A worker the patch forces under `NX_ISOLATE_PLUGINS=false`, in a client with no
+daemon (one that never started it under `NX_DAEMON_START=never`, or whose daemon stopped under it), saw neither, so it
+installed no proxy: the hook set the worker's own environment and returned nothing, and every task of the run ran
+without the endpoints the hook had published (a reserved bounded-exec leaf refused to start for want of
+`MBX_RESERVATIONS_SOCKET`). The patch installs the proxy whenever the process is a plugin worker
+(`global.NX_PLUGIN_WORKER`). `nx-local-plugin-hook-env.test.ts` runs a real `nx run` under the job rule with no daemon
+against a local plugin whose hook sets a variable and requires its task to see it.
+
 A `REQUEST_PROJECT_GRAPH` failure, including a plugin that fails to load, is a nonterminal error value: the daemon
 answers it with the shared `respondWithError` helper and keeps serving. A developer correcting a local plugin must not
 pay a daemon restart or discard peers' graphs. A later source change retries graph preparation; the failed load never
