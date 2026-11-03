@@ -239,23 +239,12 @@ export function simulate(policy: Policy, world: SimWorld): Outcome {
       end: now + request.leaf.work / tokens,
     });
   };
-  const ledger = (): { capacity: number; held: number } | null =>
-    policy.charges ? { capacity: world.capacity * policy.budget, held } : null;
+  const ledger = (retry: boolean): { capacity: number; held: number } | null =>
+    policy.charges || retry ? { capacity: world.capacity * policy.budget, held: policy.charges ? held : 0 } : null;
   const drain = (): void => {
-    // Nothing is admitted while a leaf run again alone runs.
-    if (running.some((leaf) => leaf.queued.alone)) return;
-    const head = queue[0];
-    if (head?.alone) {
-      // A leaf the kernel killed runs again alone, and nothing is admitted behind it until it does.
-      if (running.length > 0) return;
-      const [again] = admit([head], free, ledger()).grants;
-      if (again !== undefined) {
-        grant(head, again.tokens, again.charge);
-        queue.shift();
-      }
-      return;
-    }
-    if (policy.live) {
+    // Who holds a grant, as the pool counts it: a leaf run again alone is admitted by the pool's own decision.
+    const holding = { holders: running.length, alone: running.some((leaf) => leaf.queued.alone) };
+    if (policy.live && queue[0]?.alone !== true && !holding.alone) {
       const resident = live();
       let granted = 0;
       let charged = 0;
@@ -272,7 +261,7 @@ export function simulate(policy: Policy, world: SimWorld): Outcome {
       }
       return;
     }
-    const admission = admit(queue, free, ledger());
+    const admission = admit(queue, free, ledger(queue[0]?.alone === true), holding);
     for (const { request, tokens, charge } of admission.grants) grant(request, tokens, charge);
     queue.splice(0, admission.grants.length);
   };

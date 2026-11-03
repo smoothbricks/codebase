@@ -223,3 +223,58 @@ it('sizes a grant to the memory it needs: a peak scales up with the parallelism 
     expect({ grants, waiting: admission.waiting }, check.name).toEqual(check.admission);
   }
 });
+
+it('grants a leaf the kernel killed only while nothing holds a grant, ahead of the leaves behind it, and grants nothing beside it', () => {
+  const again: PoolAsk = { want: 4, memory: 0, alone: true };
+  const other: PoolAsk = { want: 1, memory: 0 };
+  const cases = [
+    {
+      name: 'with nothing held it is granted, and the leaf behind it waits for it',
+      queue: [again, other],
+      held: { holders: 0, alone: false },
+      grants: [4],
+      waiting: 'alone',
+    },
+    {
+      name: 'beside a holder it waits, and so does everything behind it',
+      queue: [again, other],
+      held: { holders: 1, alone: false },
+      grants: [],
+      waiting: 'alone',
+    },
+    {
+      name: 'while a leaf runs alone nothing is granted',
+      queue: [other],
+      held: { holders: 1, alone: true },
+      grants: [],
+      waiting: 'alone',
+    },
+    {
+      name: 'a leaf granted ahead of it in the same pass is a holder: it waits',
+      queue: [other, again],
+      held: { holders: 0, alone: false },
+      grants: [1],
+      waiting: 'alone',
+    },
+    {
+      name: 'granted with no leaf behind it, nothing is left waiting',
+      queue: [again],
+      held: { holders: 0, alone: false },
+      grants: [4],
+      waiting: null,
+    },
+  ] satisfies {
+    name: string;
+    queue: PoolAsk[];
+    held: { holders: number; alone: boolean };
+    grants: number[];
+    waiting: Admission<PoolAsk>['waiting'];
+  }[];
+  for (const check of cases) {
+    const admission = admit(check.queue, 8, null, check.held);
+    expect({ grants: admission.grants.map(({ tokens }) => tokens), waiting: admission.waiting }, check.name).toEqual({
+      grants: check.grants,
+      waiting: check.waiting,
+    });
+  }
+});

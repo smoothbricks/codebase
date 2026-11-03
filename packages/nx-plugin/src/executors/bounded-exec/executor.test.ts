@@ -2438,6 +2438,99 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain(`status=ok tokens=2/${nextestWant} runner=nextest memory=4 charged=8`);
   });
 
+  describe('a command the kernel killed', () => {
+    const task = { id: 'app:test', hash: null };
+
+    it('runs once more, alone in its pool, and says so', async () => {
+      const workspace = await createWorkspace();
+      const marker = join(workspace.root, 'killed-once');
+      const pool = await fakePool();
+      try {
+        const result = await runBoundedExec(
+          {
+            command: `if [ -e '${marker}' ]; then echo second; else : > '${marker}'; kill -9 $$; fi`,
+            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          },
+          { ...workspace.context, record: { task, directory: join(workspace.root, 'oom') } },
+          createProcessTreeKiller(),
+          null,
+          pool.inherited,
+        );
+        expect(result.success).toBe(true);
+        expect(result.terminalOutput).toContain('second');
+        expect(result.terminalOutput).toContain('the kernel killed the command for memory');
+        expect(pool.requests.map((request) => request.alone)).toEqual([undefined, true]);
+      } finally {
+        await pool.close();
+      }
+    });
+
+    it('is read from a 137 that no signal of the executor caused, which a shell reports for a killed child', async () => {
+      const workspace = await createWorkspace();
+      const marker = join(workspace.root, 'exited-137');
+      const pool = await fakePool();
+      try {
+        const result = await runBoundedExec(
+          {
+            command: `if [ -e '${marker}' ]; then echo second; else : > '${marker}'; exit 137; fi`,
+            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          },
+          { ...workspace.context, record: { task, directory: join(workspace.root, 'oom') } },
+          createProcessTreeKiller(),
+          null,
+          pool.inherited,
+        );
+        expect(result.success).toBe(true);
+        expect(pool.requests.map((request) => request.alone)).toEqual([undefined, true]);
+      } finally {
+        await pool.close();
+      }
+    });
+
+    it("is not run again when this executor's own bound killed it, or it failed in its own way", async () => {
+      const workspace = await createWorkspace();
+      const pool = await fakePool();
+      try {
+        const expired = await runBoundedExec(
+          {
+            command: 'node -e "process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 1000)"',
+            timeoutMs: 50,
+            killAfterMs: 0,
+          },
+          { ...workspace.context, record: { task, directory: join(workspace.root, 'expired') } },
+          createProcessTreeKiller(),
+          null,
+          pool.inherited,
+        );
+        expect(expired.success).toBe(false);
+        expect(expired.terminalOutput).not.toContain('the kernel killed the command for memory');
+        const failed = await runBoundedExec(
+          { command: 'exit 3', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+          { ...workspace.context, record: { task, directory: join(workspace.root, 'failed') } },
+          createProcessTreeKiller(),
+          null,
+          pool.inherited,
+        );
+        expect(failed.success).toBe(false);
+        // One request for each run: neither was asked again.
+        expect(pool.requests.map((request) => request.alone)).toEqual([undefined, undefined]);
+      } finally {
+        await pool.close();
+      }
+    });
+
+    it('is not run again where no pool lends it a place to run alone', async () => {
+      const workspace = await createWorkspace();
+      const result = await runBoundedExec(
+        { command: 'kill -9 $$', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        { ...workspace.context, record: { task, directory: join(workspace.root, 'unpooled') } },
+        createProcessTreeKiller(),
+        null,
+      );
+      expect(result.success).toBe(false);
+      expect(result.terminalOutput).not.toContain('the kernel killed the command for memory');
+    });
+  });
   it("records its command's memory peak, and its next run is charged that peak in its run's pool", async () => {
     if (process.platform === 'win32') return;
     const workspace = await createWorkspace();
@@ -3054,6 +3147,40 @@ function inheritedFrom(pool: CpuPool): InheritedCpuPool {
     throw new Error('the pool environment names no endpoint');
   }
   return parent;
+}
+
+/**
+ * A pool that grants every request one token at once and keeps the requests it was sent, in order: what a leaf asks of
+ * its parent pool, read from the other side of the socket.
+ */
+async function fakePool(): Promise<{
+  inherited: InheritedCpuPool;
+  requests: { alone?: boolean }[];
+  close: () => Promise<void>;
+}> {
+  const directory = await ownedSocketDirectory('fake-pool-', 'p.sock');
+  const socket = join(directory, 'p.sock');
+  const requests: { alone?: boolean }[] = [];
+  const connections = new Set<Socket>();
+  const server = createServer((connection) => {
+    connections.add(connection);
+    connection.on('close', () => connections.delete(connection));
+    connection.on('error', () => connection.destroy());
+    connection.once('data', (chunk) => {
+      requests.push(JSON.parse(chunk.toString()));
+      connection.write('{"ok":true,"lease":"queued","server":1}\n{"ok":true,"lease":"granted","tokens":1}\n');
+    });
+  });
+  await new Promise<void>((listening) => server.listen(socket, listening));
+  return {
+    inherited: { socket, tokens: 1 },
+    requests,
+    close: async () => {
+      for (const connection of connections) connection.destroy();
+      await new Promise<void>((closed) => server.close(() => closed()));
+      await rm(directory, { recursive: true, force: true });
+    },
+  };
 }
 
 /** The count a pool of `tokens` lends a run that wants `want`: min(want, tokens). */

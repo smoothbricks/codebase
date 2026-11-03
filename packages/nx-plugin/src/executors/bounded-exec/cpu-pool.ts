@@ -73,6 +73,7 @@ interface CpuPoolRequest {
   memory?: number & typia.tags.Type<'uint64'>;
   parallelism?: number & typia.tags.Type<'uint32'> & typia.tags.Minimum<1>;
   task?: string & typia.tags.MaxLength<256>;
+  alone?: boolean;
 }
 
 /** A grant whose charge alone exceeds the run's memory, made while nothing else held memory: the run's memory. */
@@ -113,7 +114,13 @@ const run = promisify(execFile);
 type Phase =
   | { readonly kind: 'reading' }
   | { readonly kind: 'queued' }
-  | { readonly kind: 'holding'; readonly bytes: number; readonly slot: boolean; readonly memory: number }
+  | {
+      readonly kind: 'holding';
+      readonly bytes: number;
+      readonly slot: boolean;
+      readonly memory: number;
+      readonly alone: boolean;
+    }
   | { readonly kind: 'done' };
 
 /** A child connection and what the pool owes it. Its grant, or its place in line, ends with the connection. */
@@ -129,6 +136,7 @@ interface Waiter {
   readonly memory: number;
   readonly parallelism?: number | undefined;
   readonly task?: string | undefined;
+  readonly alone?: boolean | undefined;
 }
 
 /** One framed reply line. The newline is the framing; every reply goes through here. */
@@ -173,6 +181,8 @@ export interface AskContext {
   readonly parallelism?: number | undefined;
   /** The Nx task the leaf runs, named in the pool's line for the grant. */
   readonly task?: string | undefined;
+  /** The kernel killed the command for memory: it is run again, granted only while nothing else holds a grant. */
+  readonly alone?: boolean | undefined;
 }
 
 /**
@@ -190,7 +200,7 @@ export async function takeParentCpuTokens(
   memory: number | null,
   context: AskContext = {},
 ): Promise<TokenGrant> {
-  const { parallelism, task } = context;
+  const { parallelism, task, alone } = context;
   if (!Number.isSafeInteger(want) || want < 1) {
     throw new RangeError(`a child asks its parent pool for a positive count, not ${want} (pool ${parent.tokens})`);
   }
@@ -212,6 +222,7 @@ export async function takeParentCpuTokens(
     want,
     ...(memory === null ? {} : { memory, ...(parallelism === undefined ? {} : { parallelism }) }),
     ...(task === undefined ? {} : { task }),
+    ...(alone === true ? { alone: true } : {}),
   };
   const lease = await holdLease(parent.socket, request, 'the parent CPU pool', new CpuLeaseWait());
   if (!lease.granted) {
@@ -440,6 +451,9 @@ export async function createCpuPool(
   let slotLent = false;
   // The bytes the children holding grants are charged, against `memory`.
   let heldMemory = 0;
+  // The children holding a grant, and whether one of them runs alone.
+  let holders = 0;
+  let aloneHolder = false;
   // The readability wait while the queue's head finds no token, else undefined.
   let watch: FifoWatch | undefined;
   let closing = false;
@@ -529,6 +543,7 @@ export async function createCpuPool(
       queue,
       inHand + (slotLent ? 0 : 1),
       memory === null ? null : { capacity: memory.bytes, held: heldMemory },
+      { holders, alone: aloneHolder },
     );
     queue.splice(0, admission.grants.length);
     for (const { request, tokens: granted, charge, oversized } of admission.grants) {
@@ -538,7 +553,9 @@ export async function createCpuPool(
       const slot = granted > bytes;
       if (slot) slotLent = true;
       heldMemory += charge;
-      request.child.phase = { kind: 'holding', bytes, slot, memory: charge };
+      holders += 1;
+      if (request.alone === true) aloneHolder = true;
+      request.child.phase = { kind: 'holding', bytes, slot, memory: charge, alone: request.alone === true };
       request.child.socket.write(
         frame(
           memory === null
@@ -593,6 +610,8 @@ export async function createCpuPool(
         // A closing pool drains its fifo whole; until then the bytes go back for the next holder.
         if (child.phase.slot) slotLent = false;
         heldMemory -= child.phase.memory;
+        holders -= 1;
+        if (child.phase.alone) aloneHolder = false;
         if (!closing) returnTokens(child.phase.bytes);
       }
       child.phase = { kind: 'done' };
@@ -653,13 +672,21 @@ export async function createCpuPool(
       }
       const request = parsed;
       child.phase = { kind: 'queued' };
-      queue.push({
+      const waiter: Waiter = {
         child,
         want: request.want,
         memory: request.memory ?? 0,
         parallelism: request.parallelism,
         task: request.task,
-      });
+        alone: request.alone,
+      };
+      if (request.alone === true) {
+        // A leaf the kernel killed has waited once already: it goes ahead of the leaves that have not run.
+        const at = queue.findIndex((waiting) => waiting.alone !== true);
+        queue.splice(at === -1 ? queue.length : at, 0, waiter);
+      } else {
+        queue.push(waiter);
+      }
       socket.write(frame({ ok: true, lease: 'queued', server: process.pid }));
       drain(0);
     });

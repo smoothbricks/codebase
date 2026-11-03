@@ -13,6 +13,9 @@
  * it has makes a smaller grant no cheaper. When its whole ask does not fit, the head is lent the most tokens whose
  * charge does. A leaf whose own charge alone exceeds the run's memory could never fit, so it is granted once nothing
  * else holds memory, on one token when its peak names the parallelism it was measured under, and the grant says so.
+ *
+ * A leaf the kernel killed for memory, run again (`alone`), is granted only while nothing holds a grant, ahead of the
+ * leaves behind it, and while it runs nothing else is granted: a leaf that was killed beside others runs by itself.
  */
 
 /**
@@ -23,8 +26,17 @@ export interface PoolAsk {
   readonly want: number;
   readonly memory: number;
   readonly parallelism?: number | undefined;
+  /** A leaf the kernel killed for memory, run again: granted while nothing else holds a grant, and alone. */
+  readonly alone?: boolean | undefined;
 }
 
+/** Who holds a grant when the pool decides: how many leaves, and whether one of them runs alone. */
+export interface Holding {
+  readonly holders: number;
+  readonly alone: boolean;
+}
+
+const NOTHING_HELD: Holding = { holders: 0, alone: false };
 /** The run's memory a pool charges against, and the bytes its holders are charged; null for a pool that charges none. */
 export interface MemoryLedger {
   readonly capacity: number;
@@ -44,11 +56,11 @@ export interface PoolGrant<Ask extends PoolAsk> {
 
 /**
  * The grants of the queue's first requests, in its order, and what the first request left waiting waits for: free
- * tokens (`cpu`) or the run's memory (`memory`). `waiting` is null when every request was granted.
+ * tokens (`cpu`), the run's memory (`memory`) or the grants others hold (`alone`). `waiting` is null when every request was granted.
  */
 export interface Admission<Ask extends PoolAsk> {
   readonly grants: readonly PoolGrant<Ask>[];
-  readonly waiting: 'cpu' | 'memory' | null;
+  readonly waiting: 'cpu' | 'memory' | 'alone' | null;
 }
 
 /** The bytes `ask` is charged when it is lent `tokens`: its peak, scaled up when that is more than it was measured under. */
@@ -73,11 +85,18 @@ export function admit<Ask extends PoolAsk>(
   queue: readonly Ask[],
   available: number,
   memory: MemoryLedger | null,
+  holding: Holding = NOTHING_HELD,
 ): Admission<Ask> {
   const grants: PoolGrant<Ask>[] = [];
+  if (holding.alone) {
+    return { grants, waiting: queue.length === 0 ? null : 'alone' };
+  }
   let free = available;
   let held = memory?.held ?? 0;
   for (const request of queue) {
+    if (request.alone === true && holding.holders + grants.length > 0) {
+      return { grants, waiting: 'alone' };
+    }
     const oversized = memory !== null && request.memory > memory.capacity;
     const room = memory === null ? Number.POSITIVE_INFINITY : memory.capacity - held;
     if (request.memory > room && !(oversized && held === 0)) {
@@ -92,6 +111,9 @@ export function admit<Ask extends PoolAsk>(
     free -= tokens;
     held += charge;
     grants.push({ request, tokens, charge, oversized });
+    if (request.alone === true) {
+      return { grants, waiting: grants.length < queue.length ? 'alone' : null };
+    }
   }
   return { grants, waiting: null };
 }

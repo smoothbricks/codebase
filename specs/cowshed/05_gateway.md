@@ -1808,6 +1808,23 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   none, say so (`live anon+shmem unread (<reason>)`). What the other holders were charged, what lies outside the leaves
   and what a suite holds beyond its record are therefore measured, not inferred.
 
+  **A leaf the kernel killed for memory runs once more, alone.** Records cannot make admission safe alone: a leaf with
+  no record is charged nothing, a suite that has grown holds more than its record, and what lies outside the leaves is
+  charged to no one (`pool-sim.property.test.ts` judges each over runs shaped like the downstream test step). The
+  executor therefore reads how its command ended. A command that died of a SIGKILL (the signal, or status 137, which a
+  shell reports for a killed child) that this executor did not send, and that no bound of its own ended, was killed from
+  outside, and in a run's cgroup the one that does is the kernel's OOM killer. What the executor sent is what tells it
+  from its own force-kill, which also ends in 137: the executor notes every signal it sends to the command's group
+  (`sentSignal`), and a run a bound ended is judged by that bound. The status is never read alone. The run says
+  `cowshed: the kernel killed the command for memory (…); running it once more, alone in its run's pool`, gives its
+  grant back and asks its parent pool again with `"alone":true`, charged by the record the killed run replaced, not by
+  the peak it reached before it died. The pool queues such a request ahead of the leaves that have not run (after others
+  killed before it), grants it only while no leaf holds a grant, and grants nothing beside it until it ends. The command
+  runs once more: killed again, or ended any other way, its status is its verdict. A run with no parent pool has no
+  place to run alone and fails as before. In the simulation this ends every failing run on missing, stale or outside
+  memory, at 1.6 to 2.8 times the per-worker makespan, and the kernel still kills one leaf in every such run: the retry
+  recovers from an OOM kill, it does not prevent one.
+
   When a leaf ends, `bounded-exec` writes its peak into the task's record, the `verdict.json` of the task's
   `bounded-exec` directory in the checkout's Nx workspace data, keyed by the task id Nx gives
   (`project:target[:configuration]`) and already carrying the `cpu` grant: `peakBytes`, the largest sum of what the

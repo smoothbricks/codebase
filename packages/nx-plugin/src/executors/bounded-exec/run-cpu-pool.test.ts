@@ -136,6 +136,43 @@ describe("an Nx run's own CPU pool", () => {
     if (granted.granted) granted.release();
     await closeRunCpuPool({ id: 'run-scaled' });
   });
+  it('runs a leaf the kernel killed alone: ahead of the leaves that wait, once nothing holds a grant, and nothing beside it', async () => {
+    const env: NodeJS.ProcessEnv = {};
+    await serveRunCpuPool({ id: 'run-alone' }, env, 4, () =>
+      Promise.resolve({ ok: true, memory: { bytes: 10, source: 'a test run' } }),
+    );
+    const pool = readInheritedCpuPool(env);
+    if (pool === null) {
+      throw new Error(`the run published no pool: ${JSON.stringify(env)}`);
+    }
+    const holder = await takeParentCpuTokens(pool, 4, null);
+    expect(holder.granted && holder.tokens).toBe(4);
+    const asked = (request: Record<string, unknown>) => {
+      const { promise: queued, resolve } = Promise.withResolvers<void>();
+      const lease = holdLease(pool.socket, request, 'the run CPU pool', new CpuLeaseWait(), resolve);
+      return { queued, lease };
+    };
+    // A leaf that has not run waits for the holder; the killed leaf, asked after it, goes ahead of it.
+    const waiting = asked({ op: 'cpu-pool', want: 1 });
+    await waiting.queued;
+    const again = asked({ op: 'cpu-pool', want: 4, alone: true });
+    await again.queued;
+    if (holder.granted) holder.release();
+    const granted = await again.lease;
+    expect(granted.granted && granted.answer.tokens).toBe(4);
+    // Nothing is granted beside it: the leaf that was ahead of it in time is still queued after the pool's turn.
+    let waitingSettled = false;
+    void waiting.lease.then(() => {
+      waitingSettled = true;
+    });
+    await new Promise((turn) => setImmediate(turn));
+    expect(waitingSettled).toBe(false);
+    if (granted.granted) granted.release();
+    const last = await waiting.lease;
+    expect(last.granted && last.answer.tokens).toBe(1);
+    if (last.granted) last.release();
+    await closeRunCpuPool({ id: 'run-alone' });
+  });
   it('does not start a run whose memory cannot be read: it is not shown to have room', async () => {
     const env: NodeJS.ProcessEnv = {};
     const error = {

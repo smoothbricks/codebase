@@ -134,12 +134,19 @@ export interface NxTaskContext {
 export interface BoundedExecResult {
   success: boolean;
   terminalOutput: string;
+  /**
+   * The command died of a SIGKILL that no bound of this executor and no signal it sent caused: the kernel's OOM killer,
+   * which sends it to a leaf in a run's cgroup. Set on the last run of the command only when it was killed again.
+   */
+  killedForMemory?: boolean;
 }
 
 interface RunState {
   settled: boolean;
   expiry: ExpiredBound | null;
   forceKillNeeded: boolean;
+  /** This executor sent the command's process group a signal: a SIGKILL it died of is not from outside. */
+  sentSignal: boolean;
   /** The sub-pool's close error when it did not close cleanly: the run fails. */
   poolCloseError: string | null;
   /** Why the command's subtree could not be retired, when the supervisor's client failed: the run fails. */
@@ -313,11 +320,55 @@ export async function runBoundedExec(
   owner: SubtreeOwner | null = null,
   queueHost?: Parameters<typeof snapshotMbxQueue>[3],
 ): Promise<BoundedExecResult> {
-  const cwd = resolveCwd(options.cwd, context.root);
   const directory = context.record?.directory ?? null;
   // The task's last recorded peak, and the tokens it was lent when the peak was measured, are its charge in its parent's
-  // pool, read before the clear below removes them.
+  // pool, read once before a run's clear removes them: a command run again after a kill is charged by the record the
+  // killed run replaced, not by the peak it reached before it was killed.
   const lastPeak = directory !== null && inherited !== null ? await readLastPeak(directory) : null;
+  const run = (alone: boolean): Promise<BoundedExecResult> =>
+    runCommand(options, context, killer, tempVolume, inherited, captureDiagnostics, owner, queueHost, {
+      lastPeak,
+      alone,
+    });
+  const first = await run(false);
+  if (first.killedForMemory !== true || inherited === null) {
+    return first;
+  }
+  // The kernel killed the leaf: a SIGKILL this executor did not send. It runs once more, alone in its run's pool, so
+  // what it was killed beside is not there to be killed with it.
+  const note = `cowshed: the kernel killed the command for memory (a SIGKILL this executor did not send${
+    context.record === undefined ? '' : `: ${context.record.task.id}`
+  }); running it once more, alone in its run's pool\n`;
+  process.stderr.write(note);
+  const again = await run(true);
+  return {
+    success: again.success,
+    terminalOutput: `${first.terminalOutput}${note}${again.terminalOutput}`,
+    ...(again.killedForMemory === true ? { killedForMemory: true } : {}),
+  };
+}
+
+/** What a run of the command is told that the run before it was not: the task's charge, and whether it runs alone. */
+interface Attempt {
+  readonly lastPeak: Awaited<ReturnType<typeof readLastPeak>> | null;
+  readonly alone: boolean;
+}
+
+/** One run of the command, from the pool's grant to its record. */
+async function runCommand(
+  options: BoundedExecOptions,
+  context: BoundedExecContext,
+  killer: ProcessTreeKiller,
+  tempVolume: TempVolume | null,
+  inherited: InheritedCpuPool | null,
+  captureDiagnostics: typeof captureHangDiagnostics,
+  owner: SubtreeOwner | null,
+  queueHost: Parameters<typeof snapshotMbxQueue>[3] | undefined,
+  attempt: Attempt,
+): Promise<BoundedExecResult> {
+  const cwd = resolveCwd(options.cwd, context.root);
+  const directory = context.record?.directory ?? null;
+  const { lastPeak } = attempt;
   // A previous run's verdict and report go first, so neither can be read as this run's.
   if (directory !== null) {
     await clearTaskDirectory(directory);
@@ -337,6 +388,7 @@ export async function runBoundedExec(
     settled: false,
     expiry: null,
     forceKillNeeded: false,
+    sentSignal: false,
     poolCloseError: null,
     retireError: null,
     noSpace: null,
@@ -562,6 +614,7 @@ export async function runBoundedExec(
   if (inherited !== null) {
     const fromParent = await takeParentCpuTokens(inherited, demand.want, charge, {
       parallelism: chargeParallelism ?? undefined,
+      alone: attempt.alone ? true : undefined,
       task: context.record?.task.id,
     });
     if (fromParent.granted) {
@@ -1137,6 +1190,7 @@ export async function runBoundedExec(
       return;
     }
     try {
+      state.sentSignal = true;
       await killer.kill(pid, 'SIGTERM');
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -1286,6 +1340,7 @@ export async function runBoundedExec(
   // cannot end is said, and a failure of the probe or of a signal is shown.
   const forceKill = async (pid: number): Promise<void> => {
     try {
+      state.sentSignal = true;
       if (await killProcessGroup(pid, DEADLINE_PATIENCE, (group) => killer.kill(group, 'SIGKILL'))) {
         tell(`${describeMembersLeft(pid)}\n`);
       }
@@ -1494,9 +1549,14 @@ export async function runBoundedExec(
   // branch later exited 0: its verdict is an ordinary operational failure, never a successful or silently unbounded run.
   const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null;
   await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen, state.lockWaits, peakBytes);
+  // A SIGKILL this executor did not send, to a command that no bound of this executor ended, came from outside it. In a
+  // run's cgroup the one that sends it to a leaf is the kernel's OOM killer. The exit code alone says nothing of who
+  // sent it: a bound's own force-kill ends in 137 too, and is why `sentSignal` is read first.
+  const killedForMemory = !state.sentSignal && state.expiry === null && (exitSignal === 'SIGKILL' || code === 137);
   return {
     success: !operationalFailure && resultFailure === null && state.expiry === null && code === 0,
     terminalOutput: outputChunks.join(''),
+    ...(killedForMemory ? { killedForMemory: true } : {}),
   };
 }
 

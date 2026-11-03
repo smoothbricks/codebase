@@ -2435,10 +2435,13 @@ peak was measured under, and the pool charges the peak in proportion to the toke
 (`ceil(peak × tokens ÷ measured)`, never less than the peak). A task whose whole ask does not fit is lent the most
 tokens that do, and its wait line names the bytes charged (`memory=<peak> charged=<bytes>`) when they differ from the
 peak. Each grant is said on the pool's stderr with the task, its charge, what the holders are charged of the run's
-memory and what the run's bound holds live (anonymous plus shared memory). A host CI scope's first run of a task it
-holds no record of is the `memory=none` case: the managed `setup-devenv` action starts a scope from the records of the
-pushes it follows (a pull request's base branch's, a release workflow's CI's) and takes, at each run, the record of
-every task the scope lacks (`specs/cowshed/05_gateway.md`, "Without mbx, every Nx run budgets itself").
+memory and what the run's bound holds live (anonymous plus shared memory). A command that died of a SIGKILL this
+executor did not send, with no bound of its own ended, was killed by the kernel for memory: it runs once more, alone in
+its run's pool (`"alone":true` in the request), which grants it only while no leaf holds a grant and nothing beside it,
+and says so. A host CI scope's first run of a task it holds no record of is the `memory=none` case: the managed
+`setup-devenv` action starts a scope from the records of the pushes it follows (a pull request's base branch's, a
+release workflow's CI's) and takes, at each run, the record of every task the scope lacks
+(`specs/cowshed/05_gateway.md`, "Without mbx, every Nx run budgets itself").
 
 The pool runs on a worker thread of its own (`cpu-pool-thread.ts`). The process that serves the run, the Nx daemon when
 installed plugins load in it or the Nx CLI without one, hashes tasks and builds the project graph in synchronous calls
