@@ -681,9 +681,7 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
         "{RELEASE_CLI_TARGET}'s default configuration is a debug build, as the hint says: {target}"
     );
     assert!(
-        error
-            .hint
-            .contains(&format!("nx run cowshed:cli-native:production")),
+        error.hint.contains("nx run cowshed:cli-native:production"),
         "{}",
         error.hint
     );

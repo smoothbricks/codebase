@@ -46,10 +46,17 @@ const manifest: Manifest = JSON.parse(readFileSync(new URL('../package.json', im
 
 const ZIGBUILD_EXECUTOR = '@smoothbricks/nx-plugin:cargo-zigbuild';
 const ZIGBUILD_CLI_OUTPUT = /^\{projectRoot\}\/((?:\.cache|dist)\/bin\/[^/]+)\/cowshed$/;
-/** A cargo-zigbuild CLI declares the directory its `output` file sits in, so the tree is restored whole. */
-const ZIGBUILD_CLI_OUTPUTS = ['{options.output}/../'];
-/** A napi CLI declares the tree its `outputDir` names, which napi and the receipt both write into. */
-const NAPI_CLI_OUTPUTS = ['{projectRoot}/{options.outputDir}/'];
+/**
+ * A cargo-zigbuild CLI declares its binary and the input record beside it by name. The directory
+ * they sit in is not its own: the release record `cli-record-<platform>` writes there too
+ * (scripts/release-record.ts), and an output path has one producing task.
+ */
+const ZIGBUILD_CLI_OUTPUTS = ['{options.output}', '{options.output}/../.build-inputs.json'];
+/** A napi CLI declares the binary napi writes and the receipt beside it, in the tree its `outputDir` names. */
+const NAPI_CLI_OUTPUTS = [
+  '{projectRoot}/{options.outputDir}/cowshed',
+  '{projectRoot}/{options.outputDir}/.build-inputs.json',
+];
 
 /**
  * The CLI a target builds under one configuration (`undefined`: its default options), as the triple

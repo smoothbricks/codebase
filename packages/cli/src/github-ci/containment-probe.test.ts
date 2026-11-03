@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { expandNxTargetDependencyRuns, expandNxTargetRuns } from './index.js';
@@ -623,7 +623,8 @@ describe('profile-separated outputs', () => {
 });
 
 /**
- * Plant one file inside every output the given runs declare under `configuration`, under `root`.
+ * Plant every output the given runs declare under `configuration`, under `root`: a file inside a
+ * declared directory (an output ending in `/`), and a declared file as itself.
  *
  * The probe needs the REAL inferred graph but must not need the real build's
  * artifacts: `dist/bin/darwin-arm64` only exists on a macOS host, so collecting
@@ -647,9 +648,10 @@ async function plantDeclaredOutputs(
         // The collector's own resolution, so every placeholder a declaration
         // may use (`{workspaceRoot}` and the options a configuration sets included) lands where it will look.
         const resolved = resolveDeclaredOutput(output, project, run.target, configuration);
-        const directory = join(root, expectPlanned(resolved));
-        await mkdir(directory, { recursive: true });
-        const file = join(directory, run.target);
+        const declared = expectPlanned(resolved);
+        // A declared directory gets a file named for its target inside it; a declared file is planted as itself.
+        const file = declared.endsWith('/') ? join(root, declared, run.target) : join(root, declared);
+        await mkdir(dirname(file), { recursive: true });
         // 0o755 because `applyCollectedOutputs` must carry the executable bit
         // of a platform binary through the collect tree.
         await writeFile(file, `${run.target} artifact`, { mode: 0o755 });
@@ -732,9 +734,7 @@ describe('publish collect containment probe against the resolved graph', () => {
 
       await mkdir(applyRoot, { recursive: true });
       await applyCollectedOutputs(applyRoot, [buildArtifact, macosArtifact], SOURCE_SHA, projects);
-      expect((await stat(join(applyRoot, 'packages/cowshed/dist/bin/darwin-arm64/cli-arm64-macos'))).mode & 0o777).toBe(
-        0o755,
-      );
+      expect((await stat(join(applyRoot, 'packages/cowshed/dist/bin/darwin-arm64/cowshed'))).mode & 0o777).toBe(0o755);
     } finally {
       await rm(temp, { recursive: true, force: true });
     }
