@@ -112,9 +112,10 @@ not stored, and share build-script output under `mbx exec`, and with it any gene
 `MBX_SHARE_ENV` names, copied by content and mapped as `OUT_DIR` is, so a compiler that reads one at a checkout-specific
 path still restores at another. The latest count a crate's edit against the commit HEAD it last compiled under
 (16_build_volumes.md, "One Cargo environment on every path"), refresh the store's recency only for hits a build exposed,
-predict build scripts per target, map a nested Cargo's own target, and seed a managed target from one donor checkout
-only, so no target mixes two lineages of one crate. It is `smoothbricks/mr-boxington` at the revision
-`nix/mbx/flake.nix` names and its `flake.lock` locks; no Rust source restates it, and setup refuses a lock that
+predict build scripts per target, map a nested Cargo's own target, seed a managed target from one donor checkout only,
+so no target mixes two lineages of one crate, and place a managed target again when collection removed it from under a
+build that names its own directory at or below `target/` (03_caches.md, "mbx"). It is `smoothbricks/mr-boxington` at the
+revision `nix/mbx/flake.nix` names and its `flake.lock` locks; no Rust source restates it, and setup refuses a lock that
 disagrees with the flake. No project needs to pin it: the host's mbx serves every Cargo project, which reaches it
 through the Cargo shim that `cowshed setup` generates from it, below (the capability is 15_capabilities.md's, its route
 11_shell.md's). The installed mbx is never spelled as a Nix store path or a host path where a command is spawned; its

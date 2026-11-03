@@ -513,6 +513,12 @@ each path they added; an adoption whose write fails is still done, says so and n
 managed target is collected while main's survives an over-budget sweep; and a cowshed garbage-collection run leaves
 every byte under `<bc>/mbx` untouched.
 
+Collecting a live checkout's managed target leaves mbx's `target` link naming the removed directory, and cowshed repairs
+nothing (16_build_volumes.md, "One link per checkout"): mbx places the target again at the checkout's next Cargo build,
+including a build that names its own `--target-dir` at or below `target/`, as the cross-compile lint gate's
+`target/cargo-lint-cross` does, so no build in that checkout fails creating a directory through a link to nothing. The
+pinned mbx's `a_build_naming_a_directory_below_target_replaces_the_view_collection_removed` enforces it.
+
 The volume mounts `noatime` (01a_apfs.md). What that costs mbx, and whether the volume keeps `noatime` under that cost,
 is 16_build_volumes.md, "Open questions", not a choice made here.
 

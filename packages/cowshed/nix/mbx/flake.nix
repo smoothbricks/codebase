@@ -10,8 +10,10 @@
 # reservation endpoint per Nx run (`mbx reservations`), library compiles keyed without the
 # `-C linker` path they never run, Clippy members keyed alike under every installation of a
 # toolchain, precompiled headers whose module file dependencies Clang's driver lists under every
-# Clang release, and generated-source directories shared under `mbx exec` as OUT_DIR is when
-# MBX_SHARE_ENV names their variable, from smoothbricks/mr-boxington at the pinned revision.
+# Clang release, generated-source directories shared under `mbx exec` as OUT_DIR is when
+# MBX_SHARE_ENV names their variable, and the managed target a collection removed, placed again for a
+# build that names its own directory below `target/`, from smoothbricks/mr-boxington at the pinned
+# revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
 #
@@ -23,7 +25,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/affe13e4d843587557cff467a3f9ccd696ec8f8b";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/df1359a6bb759201880f0c6f4909745d25e2a9df";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
