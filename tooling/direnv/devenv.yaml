@@ -18,7 +18,7 @@ inputs:
   # pin. `smoo monorepo check` refuses a lock that is not such a release; the tag
   # moves when someone bumps it.
   devenv:
-    url: github:cachix/devenv/v2.3.1?dir=src/modules
+    url: github:cachix/devenv/v2.4.0?dir=src/modules
   # Go for devenv.smoo.nix, pinned to the patch release ttsc vendors inside its
   # native package (0.34.1 -> go1.27.3); `smoo monorepo check` fails when the two
   # disagree. Our curated channel above cannot supply it — rolling has no Go 1.27 —
