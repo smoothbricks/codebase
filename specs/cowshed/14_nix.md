@@ -115,13 +115,14 @@ path still restores at another. The latest count a crate's edit against the comm
 predict build scripts per target, map a nested Cargo's own target, seed a managed target from one donor checkout only,
 so no target mixes two lineages of one crate, key a build script's declared dependency on a variable `MBX_SHARE_ENV`
 shares as the build gave it rather than as the stable copy the shim swaps in, identify a host link with no Nix wrapper
-in it (an unwrapped driver and an absolute unwrapped `-fuse-ld` linker) while a Nix shell's link variables are set, and
-place a managed target again when collection removed it from under a build that names its own directory at or below
-`target/` (03_caches.md, "mbx"). It is `smoothbricks/mr-boxington` at the revision `nix/mbx/flake.nix` names and its
-`flake.lock` locks; no Rust source restates it, and setup refuses a lock that disagrees with the flake. No project needs
-to pin it: the host's mbx serves every Cargo project, which reaches it through the Cargo shim that `cowshed setup`
-generates from it, below (the capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never
-spelled as a Nix store path or a host path where a command is spawned; its store path is only what the link resolves to.
+in it (an unwrapped driver and an absolute unwrapped `-fuse-ld` linker) while a Nix shell's link variables are set,
+share every variable `MBX_SHARE_ENV` lists for each compilation it is set for, and place a managed target again when
+collection removed it from under a build that names its own directory at or below `target/` (03_caches.md, "mbx"). It is
+`smoothbricks/mr-boxington` at the revision `nix/mbx/flake.nix` names and its `flake.lock` locks; no Rust source
+restates it, and setup refuses a lock that disagrees with the flake. No project needs to pin it: the host's mbx serves
+every Cargo project, which reaches it through the Cargo shim that `cowshed setup` generates from it, below (the
+capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store path or
+a host path where a command is spawned; its store path is only what the link resolves to.
 
 Managed-target seeding installs a profile's build-script shim pins before publishing a copied unit and rejects damaged
 donors, so cancellation cannot leave a fresh launcher without its executable. For unmeasured Cargo test binaries, the
