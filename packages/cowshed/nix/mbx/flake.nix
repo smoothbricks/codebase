@@ -1,5 +1,6 @@
 # The mbx cowshed setup installs beside the installed cowshed (specs/cowshed/14_nix.md, "mbx"): mbx
-# v1.29.0 plus compact predictions, scheduler admission, grant descriptors, short session roots,
+# v1.29.1 and upstream's later fixes, plus compact predictions, scheduler admission, grant
+# descriptors, short session roots,
 # Cargo shim-chain selection, selected default sysroots keyed by the toolchain parts a compilation
 # uses, version-2 activity-only admission reports,
 # Nix cc-wrapper and store-input keying, precompiled headers, more modeled compiler flags, the
@@ -22,7 +23,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/144efe81af09884271c45e1b2e78e89b3b13b580";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/affe13e4d843587557cff467a3f9ccd696ec8f8b";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
