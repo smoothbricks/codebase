@@ -17,13 +17,13 @@ const { join } = require('node:path');
 const GIT_ENVIRONMENT_THAT_REDIRECTS_THE_REPOSITORY = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'];
 
 function fail(message, status = 1) {
-  process.stderr.write(`forgejo-artifact: ${message}\n`);
+  process.stderr.write('forgejo-artifact: ' + message + '\n');
   process.exitCode = status;
 }
 function describeExit(result) {
-  if (result.error) return `could not start: ${result.error.message}`;
-  if (result.signal) return `was killed by signal ${result.signal}`;
-  return `exited with status ${result.status}`;
+  if (result.error) return 'could not start: ' + result.error.message;
+  if (result.signal) return 'was killed by signal ' + result.signal;
+  return 'exited with status ' + result.status;
 }
 
 function gitEnvironment() {
@@ -40,7 +40,7 @@ function git(directory, args, captureStdout = false) {
     stdio: ['ignore', captureStdout ? 'pipe' : 'inherit', 'inherit'],
   });
   if (result.error || result.status !== 0) {
-    fail(`git ${args.join(' ')} ${describeExit(result)}`);
+    fail('git ' + args.join(' ') + ' ' + describeExit(result));
     return null;
   }
   return captureStdout ? result.stdout : '';
@@ -58,7 +58,7 @@ function checkout(directory, pin) {
   if (revision === null) return false;
   const head = revision.trim();
   if (head !== pin.commit) {
-    fail(`checked out HEAD ${head} is not the pinned commit ${pin.commit}`);
+    fail('checked out HEAD ' + head + ' is not the pinned commit ' + pin.commit);
     return false;
   }
   return true;
@@ -69,7 +69,7 @@ function run(pin) {
   process.exitCode = 0;
   const runnerTemp = process.env.RUNNER_TEMP;
   if (!runnerTemp) {
-    fail(`RUNNER_TEMP is not set, so there is nowhere private to fetch ${pin.repository}`);
+    fail('RUNNER_TEMP is not set, so there is nowhere private to fetch ' + pin.repository);
     return;
   }
   let directory;
@@ -79,7 +79,7 @@ function run(pin) {
     const result = spawnSync(process.execPath, [join(directory, pin.entry)], { stdio: 'inherit' });
     if (result.error || result.status !== 0) {
       fail(
-        `${pin.repository}@${pin.commit} ${pin.entry} ${describeExit(result)}`,
+        pin.repository + '@' + pin.commit + ' ' + pin.entry + ' ' + describeExit(result),
         result.error || result.status === null ? 1 : result.status,
       );
     }
@@ -90,7 +90,7 @@ function run(pin) {
       try {
         rmSync(directory, { recursive: true, force: true });
       } catch (error) {
-        fail(`could not remove ${directory}: ${String(error)}`, process.exitCode || 1);
+        fail('could not remove ' + directory + ': ' + String(error), process.exitCode || 1);
       }
     }
   }
