@@ -68,7 +68,7 @@ function entered(result: Entered): Entered {
 }
 
 describe('apple-developer.sh', () => {
-  it('drops a store SDKROOT and DEVELOPER_DIR and the nix compilers, announcing each SDK drop', () => {
+  it('drops a store SDKROOT and DEVELOPER_DIR and the nix compilers and archivers, announcing each SDK drop', () => {
     withScratch((scratch) => {
       const sdk = join(scratch.store, '22222222222222222222222222222222-apple-sdk-14.4');
       const result = entered(
@@ -78,14 +78,16 @@ describe('apple-developer.sh', () => {
             PATH: '/usr/bin:/bin',
             CC: 'clang',
             CXX: 'clang++',
+            AR: 'ar',
+            RANLIB: 'ranlib',
             SDKROOT: join(sdk, 'Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk'),
             DEVELOPER_DIR: sdk,
             NIX_APPLE_SDK_VERSION: '14.4',
           },
-          `printf '%s|%s|%s|%s|%s\\n' "\${CC-unset}" "\${CXX-unset}" "\${SDKROOT-unset}" "\${DEVELOPER_DIR-unset}" "\${NIX_APPLE_SDK_VERSION-unset}"`,
+          `printf '%s|%s|%s|%s|%s|%s|%s\\n' "\${CC-unset}" "\${CXX-unset}" "\${AR-unset}" "\${RANLIB-unset}" "\${SDKROOT-unset}" "\${DEVELOPER_DIR-unset}" "\${NIX_APPLE_SDK_VERSION-unset}"`,
         ),
       );
-      expect(result.stdout).toBe('unset|unset|unset|unset|unset\n');
+      expect(result.stdout).toBe('unset|unset|unset|unset|unset|unset|unset\n');
       expect(result.stderr).toContain('dropping nix-store SDKROOT');
       expect(result.stderr).toContain('dropping nix-store DEVELOPER_DIR');
     });

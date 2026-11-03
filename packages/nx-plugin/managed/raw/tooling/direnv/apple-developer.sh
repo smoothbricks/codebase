@@ -16,6 +16,13 @@
 # xcodebuild reads, which is why they go rather than being pointed somewhere
 # else.
 #
+# AR/RANLIB go with them. An outer stdenv exports AR=ar and RANLIB=ranlib,
+# which resolve on PATH into the store; cc-rs runs them for every build script
+# and the cargo targets key on their store objects (nx-plugin's cargo toolchain
+# input). A shell that kept them keyed every cargo task differently from the
+# land gate, whose cleared environment never had them, and missed the gate's
+# cache entries for the same tree.
+#
 # The Apple SDK is the same boundary, and dropping CC/CXX alone does not hold
 # it. An outer nix stdenv exports SDKROOT and DEVELOPER_DIR pointing at
 # nixpkgs' RECONSTRUCTED apple-sdk, so Xcode's own clang goes on to compile
@@ -49,7 +56,7 @@
 # so under direnv the dropped directory comes back behind /usr/bin, where its
 # xcrun is never the one that answers.
 smoo_apple_store="$1"
-unset CC CXX
+unset CC CXX AR RANLIB
 case "${SDKROOT:-}" in
   "$smoo_apple_store"/*)
     echo "devenv: dropping nix-store SDKROOT ($SDKROOT); Xcode holds the licensed macOS SDK" >&2

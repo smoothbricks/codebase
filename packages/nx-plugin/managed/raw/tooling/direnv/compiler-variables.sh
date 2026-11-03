@@ -20,7 +20,7 @@
 # direnv sources after this shell.
 #
 # The generic tool names stay where they are: on Linux the stdenv sets CC, CXX,
-# AR and RANLIB, and on Darwin apple-developer.sh drops CC and CXX.
+# AR and RANLIB, and on Darwin apple-developer.sh drops CC, CXX, AR and RANLIB.
 smoo_compiler_declared=" $* "
 for smoo_compiler_name in ${!CC_@} ${!CXX_@} ${!AR_@} ${!RANLIB_@} ${!CFLAGS@} ${!CXXFLAGS@} ${!ARFLAGS@} ${!RANLIBFLAGS@} ${!HOST_@} ${!TARGET_@}; do
   # A target names a lowercase architecture; CC_ENABLE_DEBUG_OUTPUT and its

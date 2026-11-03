@@ -658,11 +658,11 @@ nothing when nothing changed:
   another checkout is refused, never given a socket dir of the shell's own. `tooling/direnv/repo-path` runs first and
   serves an unserved workspace with `cowshed exec <ws> -- true`, refusing by name only when that fails (cowshed
   `specs/cowshed/02_workspaces.md`, "Workspace environment").
-- On Darwin, `tooling/direnv/apple-developer.sh` hands the Apple toolchain to Xcode: it unsets `CC`/`CXX`, drops a
-  `/nix/store` `SDKROOT` or `DEVELOPER_DIR`, and removes every `/nix/store` `PATH` entry that carries nixpkgs xcbuild's
-  `xcrun`, which answers `unable to find sdk: 'macosx'` once the nix developer directory is gone. `xcrun` is then
-  Apple's `/usr/bin/xcrun`, so `xcrun --sdk macosx --show-sdk-path` names the selected Xcode or Command Line Tools SDK
-  in host shells and sandboxed jobs alike. Each drop is announced; values outside the store stay as given.
+- On Darwin, `tooling/direnv/apple-developer.sh` hands the Apple toolchain to Xcode: it unsets `CC`/`CXX`/`AR`/`RANLIB`,
+  drops a `/nix/store` `SDKROOT` or `DEVELOPER_DIR`, and removes every `/nix/store` `PATH` entry that carries nixpkgs
+  xcbuild's `xcrun`, which answers `unable to find sdk: 'macosx'` once the nix developer directory is gone. `xcrun` is
+  then Apple's `/usr/bin/xcrun`, so `xcrun --sdk macosx --show-sdk-path` names the selected Xcode or Command Line Tools
+  SDK in host shells and sandboxed jobs alike. Each drop is announced; values outside the store stay as given.
   - `tooling/direnv/compiler-variables.sh` makes cc-rs's compiler variables the shell's own: `CC_<target>`,
     `CXX_<target>`, `AR_<target>` and `RANLIB_<target>`, their `HOST_` and `TARGET_` forms, and `CFLAGS`, `CXXFLAGS`,
     `ARFLAGS` and `RANLIBFLAGS` in all of those forms and generic. It keeps the ones the shell's `env` declares, which
