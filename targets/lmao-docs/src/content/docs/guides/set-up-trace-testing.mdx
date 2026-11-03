@@ -56,5 +56,9 @@ This is the procedural checklist for wiring trace-testing into a package. For th
 
 </Steps>
 
+The run's whole trace is written once, when the run ends. A sink that cannot take it fails the run: the harness prints
+`[lmao/testing] SQLite flush error: trace_id: <id> -> <sink path>` followed by the SQLite error, closes the tracer and
+rethrows, so a passing suite never hides a lost trace.
+
 :::note On **vitest**, swap the preload for a `vi.mock('vitest', ...)` bridge using `createVitestMock`, import from
 `@smoothbricks/lmao/testing/vitest`, and pass `createDatabase: createNodeSQLiteDatabase` in the `sqlite` options. :::

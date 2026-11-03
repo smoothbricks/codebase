@@ -316,6 +316,47 @@ async function closeTracer<B extends OpContextBinding>(tracer: Tracer<B>): Promi
   }
 }
 
+/** Where a run's trace is written, for the lines that report on it. */
+interface TraceSink {
+  readonly path: string;
+  readonly traceId: string;
+}
+
+/**
+ * Ends a test run: lets the root `test-run` span end, flushes the tracer and always closes it.
+ *
+ * A persisting tracer writes the whole run's trace when the root span ends, so a sink that cannot take it fails the
+ * `await rootTrace`, not the later `flush()`. Either failure is reported with its sink and trace id, then thrown: the
+ * run must not pass with its trace lost (the Vitest harness holds the same contract), and the tracer is closed either
+ * way. `scope` only names the diagnostics of the entry that owns the run.
+ */
+async function endTestRun<B extends OpContextBinding>(
+  scope: 'instance' | 'global',
+  tracer: Tracer<B>,
+  rootTrace: Promise<unknown> | null,
+  sink: TraceSink | undefined,
+): Promise<void> {
+  try {
+    if (rootTrace) {
+      cleanupDebug(`${scope}.rootTrace:await:start`);
+      await rootTrace;
+      cleanupDebug(`${scope}.rootTrace:await:end`);
+    }
+    cleanupDebug(`${scope}.tracer.flush:start`, { tracer: tracer.constructor.name });
+    await tracer.flush();
+    cleanupDebug(`${scope}.tracer.flush:end`, { tracer: tracer.constructor.name });
+    if (sink) console.log(`\n[trace] trace_id: ${sink.traceId} -> ${sink.path}`);
+  } catch (error) {
+    const where = sink ? ` trace_id: ${sink.traceId} -> ${sink.path}` : '';
+    console.error(`[lmao/testing] SQLite flush error:${where}`, error);
+    throw error;
+  } finally {
+    await closeTracer(tracer);
+    cleanupDebugActiveHandles(`${scope}.afterAll:handles:end`);
+    cleanupDebug(`${scope}.afterAll:end`);
+  }
+}
+
 export interface BunTestTracerInstance<B extends OpContextBinding> {
   setup(): void;
   useTestSpan(): HarnessSpanContext<B>;
@@ -497,30 +538,14 @@ function createTestTracerInstance<
           resolveTestRun = null;
         }
 
-        if (rootTracePromise) {
-          cleanupDebug('instance.rootTrace:await:start');
-          await rootTracePromise;
-          cleanupDebug('instance.rootTrace:await:end');
-          rootTracePromise = null;
-        }
-
+        const rootTrace = rootTracePromise;
+        rootTracePromise = null;
         if (tracer) {
-          try {
-            cleanupDebug('instance.tracer.flush:start', { tracer: tracer.constructor.name });
-            await tracer.flush();
-            cleanupDebug('instance.tracer.flush:end', { tracer: tracer.constructor.name });
-            if (options?.sqlite && rootCtx) {
-              const traceId = rootCtx.buffer.trace_id;
-              const dbPath = options.sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH;
-              console.log(`\n[trace] trace_id: ${traceId} -> ${dbPath}`);
-            }
-          } catch (e) {
-            console.error('[lmao/testing] SQLite flush error:', e);
-          } finally {
-            await closeTracer(tracer);
-            cleanupDebugActiveHandles('instance.afterAll:handles:end');
-            cleanupDebug('instance.afterAll:end');
-          }
+          const sink =
+            options?.sqlite && rootCtx
+              ? { path: options.sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH, traceId: rootCtx.buffer.trace_id }
+              : undefined;
+          await endTestRun('instance', tracer, rootTrace, sink);
         }
       });
     },
@@ -605,31 +630,15 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
       _resolveTestRun();
       _resolveTestRun = null;
     }
-    // Await the trace promise so span-end is written to the buffer before flushing
-    if (_rootTracePromise) {
-      cleanupDebug('global.rootTrace:await:start');
-      await _rootTracePromise;
-      cleanupDebug('global.rootTrace:await:end');
-      _rootTracePromise = null;
-    }
+    const rootTrace = _rootTracePromise;
+    _rootTracePromise = null;
 
     if (isTracerInstance(_tracer)) {
-      try {
-        cleanupDebug('global.tracer.flush:start', { tracer: _tracer.constructor.name });
-        await _tracer.flush();
-        cleanupDebug('global.tracer.flush:end', { tracer: _tracer.constructor.name });
-        if (options?.sqlite && isSpanContext(_rootCtx)) {
-          const traceId = _rootCtx.buffer.trace_id;
-          const dbPath = options.sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH;
-          console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
-        }
-      } catch (e) {
-        console.error('[lmao/testing] SQLite flush error:', e);
-      } finally {
-        await closeTracer(_tracer);
-        cleanupDebugActiveHandles('global.afterAll:handles:end');
-        cleanupDebug('global.afterAll:end');
-      }
+      const sink =
+        options?.sqlite && isSpanContext(_rootCtx)
+          ? { path: options.sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH, traceId: _rootCtx.buffer.trace_id }
+          : undefined;
+      await endTestRun('global', _tracer, rootTrace, sink);
     }
   });
 }
