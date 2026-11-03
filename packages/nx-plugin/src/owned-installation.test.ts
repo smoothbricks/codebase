@@ -32,14 +32,18 @@ afterEach(async () => {
   await rm(censusRoot, { recursive: true, force: true });
 });
 
-/** The argv of a process of its own that takes the copy kept as `name`, prints its `node_modules`, then runs `rest`. */
+/**
+ * The argv of a process of its own that takes the copy kept as `name`, prints its `node_modules`, then runs `rest`. It
+ * runs the module the shards' `build` dependency emitted, outside any bunfig, as the pool-silence cases do: loading the
+ * source would load ttsc's runtime transform, and its plugin cache's notices (a build, an abandoned lock reclaimed) would
+ * reach this process's stderr, which is the copy's to speak on.
+ */
 function taker(name: string, rest: string): string[] {
   return [
     process.execPath,
-    '--preload',
-    '@smoothbricks/validation/bun/preload',
+    '--config=/dev/null',
     '-e',
-    `const { ownedInstallation } = await import(${JSON.stringify(join(import.meta.dir, 'owned-installation.ts'))});
+    `const { ownedInstallation } = await import(${JSON.stringify(join(import.meta.dir, '..', 'dist', 'owned-installation.js'))});
 const installation = ownedInstallation(${JSON.stringify(censusRoot)}, ${JSON.stringify(name)});
 process.stdout.write(await installation.nodeModules());
 ${rest}
@@ -51,8 +55,11 @@ await installation.retire();`,
  * Take the copy kept as `name` and retire it in a process of its own, as one run of a test file does: a process
  * resolves each module once, so a take that shares this one's resolutions would not stand for the next run.
  */
-function take(name: string): { readonly modules: string; readonly stderr: string } {
-  const run = Bun.spawnSync(taker(name, ''), { cwd: dirname(import.meta.dir) });
+function take(
+  name: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { readonly modules: string; readonly stderr: string } {
+  const run = Bun.spawnSync(taker(name, ''), { cwd: dirname(import.meta.dir), env });
   const stderr = run.stderr.toString();
   expect(run.exitCode, stderr).toBe(0);
   return { modules: run.stdout.toString(), stderr };
@@ -76,6 +83,20 @@ describe('a kept fixture installation', () => {
     const made = (await stat(index)).ino;
     expect(take('fresh')).toEqual({ modules, stderr: '' });
     expect((await stat(index)).ino).toBe(made);
+  });
+
+  /**
+   * A take is about the copy, so its stderr is the copy's alone. A CI run on 2026-11-03 failed the case below with ttsc
+   * reclaiming an abandoned plugin cache lock that a killed earlier run had left in the runner's shared cache: the taking
+   * process loaded ttsc's runtime transform, and with it whatever state that cache was in. Here the cache is empty.
+   */
+  it("says nothing on stderr whatever state ttsc's plugin cache is in", async () => {
+    const cache = await mkdtemp(join(tmpdir(), 'owned-installation-ttsc-'));
+    try {
+      expect(take('cacheless', { ...process.env, TTSC_CACHE_DIR: cache }).stderr).toBe('');
+    } finally {
+      await rm(cache, { recursive: true, force: true });
+    }
   });
 
   it('makes again, elsewhere, a kept copy whose census would resolve a package from the host, and says why', async () => {
