@@ -1,5 +1,4 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { totalmem } from 'node:os';
 import type { HostMemory, RunMemoryReading } from './host-memory.js';
 
 /**
@@ -7,38 +6,27 @@ import type { HostMemory, RunMemoryReading } from './host-memory.js';
  * its own. Bun reports a leaf's `ru_maxrss` in bytes, as macOS does.
  */
 
-const run = promisify(execFile);
 const HW_MEMSIZE = 'hw.memsize';
 
-async function readRunMemory(): Promise<RunMemoryReading> {
-  let stdout: string;
-  try {
-    ({ stdout } = await run('sysctl', ['-n', HW_MEMSIZE]));
-  } catch (error) {
-    return {
-      ok: false,
-      error: {
-        operation: 'read-run-memory',
-        code: 'unreadable',
-        subject: HW_MEMSIZE,
-        cause: error instanceof Error ? error.message : String(error),
-      },
-    };
-  }
-  const value = stdout.trim();
-  const bytes = Number(value);
-  if (!/^\d+$/.test(value) || !Number.isSafeInteger(bytes) || bytes === 0) {
-    return {
+/**
+ * `hw.memsize`, read in this process: `os.totalmem()` is that sysctl under Node (libuv) and Bun alike. A child `sysctl`
+ * cost each run a process, and under `bun test` its exit sometimes never settled, so the pool a run serves never
+ * started: eight concurrent runs of the pool-silence cases at load ~50 hung there 6 times out of 24.
+ */
+function readRunMemory(): Promise<RunMemoryReading> {
+  const bytes = totalmem();
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) {
+    return Promise.resolve({
       ok: false,
       error: {
         operation: 'read-run-memory',
         code: 'malformed',
         subject: HW_MEMSIZE,
-        cause: `sysctl printed ${JSON.stringify(value)}, not a byte count`,
+        cause: `os.totalmem() answered ${String(bytes)}, not a byte count`,
       },
-    };
+    });
   }
-  return { ok: true, memory: { bytes, source: HW_MEMSIZE } };
+  return Promise.resolve({ ok: true, memory: { bytes, source: HW_MEMSIZE } });
 }
 
 /**
