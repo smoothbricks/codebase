@@ -1141,7 +1141,12 @@ Managed CI setup is split across local composite actions:
   root's, where the first `~/.cache/smoo` stamp would die with EACCES), enables [Cachix], installs [devenv] at
   `devenv.lock`'s rev, restores `node_modules` and the ttsc plugins, and builds the shell. A host-nix runner
   (`NIX_REMOTE=daemon` with `/var/cache/ci`) skips the install and every store cache: it already has the store and keeps
-  its caches on the shared bind.
+  its caches on the shared bind. In a Cargo workspace that includes `target/`: a directory under
+  `/var/cache/ci/cargo-target`, scoped like the Nx cache (workflow, pull request or ref, job, platform), is bind-mounted
+  at the workspace path tasks see, and the job judges freshness by file checksums
+  (`CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true`), since a fresh checkout gives every source a new mtime. A publish and a CI
+  run never share one target; two overlapping runs of one scope take turns on Cargo's build-directory lock. An ephemeral
+  runner keeps no target: its native outputs come from the remote cache when their inputs did not change.
 - `save-nix-devenv` runs under `always()`. It saves the `.devenv`/`.direnv` eval-cache segment when setup missed it and
   the shell produced `nix-eval-cache.db`, and the ttsc plugins the job used when setup's restore of them was not an
   exact hit. The store cache saves itself in `setup-devenv`'s post phase, which collects garbage down to the live

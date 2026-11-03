@@ -32,20 +32,21 @@ function scope(overrides: Record<string, string> = {}): string {
 }
 
 describe('host CI mutable cache isolation', () => {
-  test('Nx and devenv use the same exact workflow/pull request or ref/job/platform identity', () => {
-    expect(assignments).toHaveLength(2);
-    expect(assignments[0]?.trim()).toBe(assignments[1]?.trim());
+  test('Nx, devenv and the Cargo target use the same exact workflow/pull request or ref/job/platform identity', () => {
+    expect(assignments).toHaveLength(3);
+    for (const assignment of assignments) expect(assignment.trim()).toBe(assignments[0]?.trim());
     expect(action).toContain('/${lane:-default}/$scope');
     expect(action).toContain('/${lane:-default}/$DEVENV_STATE_JOB/$scope');
     expect(action).toContain('NX_CACHE_DIRECTORY=$NX_CACHE_ROOT/cache');
     expect(action).toContain('NX_WORKSPACE_DATA_DIRECTORY=$NX_CACHE_ROOT/workspace-data');
+    expect(action).toContain('root="$CARGO_TARGET_BIND/$CARGO_TARGET_REPO/${lane:-default}/$scope"');
   });
 
   // A merged close carries the base branch's ref, so hashing github.ref gave two
   // pull requests' cleanups one scope while they ran in different concurrency
   // groups: two writers on one workspace-data, one .devenv and one bind target.
-  test('both scopes hash what the CI concurrency group is named after, never the ref alone', () => {
-    expect(scopedSteps).toHaveLength(2);
+  test('every scope hashes what the CI concurrency group is named after, never the ref alone', () => {
+    expect(scopedSteps).toHaveLength(3);
     for (const step of scopedSteps) {
       expect(step).toContain(`\n        SCOPE_REF: ${concurrencyIdentity}\n`);
     }

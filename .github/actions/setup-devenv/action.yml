@@ -235,6 +235,34 @@ runs:
           echo "devenv state: $root (workspace at $GITHUB_WORKSPACE)"
         fi
 
+    # Host runners keep the Cargo target directory on the shared bind as well, so a job reuses every unit its scope's
+    # last job compiled instead of building the dependency graph again. The scope is the Nx cache's (workflow, pull
+    # request or ref, job, platform): a publish and a CI run never share a mutable target, and two runs of one scope
+    # that overlap take turns on Cargo's own build-directory lock. The bind lands on the workspace path tasks see
+    # (DEVENV_WORKDIR, set above), not the checkout under it: a bind of the checkout carries no submount, so a target
+    # bound beneath it would be invisible at the stable path. A fresh checkout gives every source a new mtime, which
+    # Cargo's mtime freshness reads as changed, so a reused target is judged by file checksums instead
+    # (CARGO_UNSTABLE_CHECKSUM_FRESHNESS, a nightly key the managed toolchain carries). A refused bind leaves the job
+    # its checkout's own target/, built cold.
+    - name: 📂 Locate the Cargo target on the shared bind
+      if: steps.runner-kind.outputs.host == 'true' && hashFiles('Cargo.lock') != ''
+      shell: bash
+      env:
+        CARGO_TARGET_BIND: /var/cache/ci/cargo-target
+        CARGO_TARGET_REPO: ${{ github.repository }}
+        CARGO_TARGET_LANE: ${{ github.workflow }}
+        SCOPE_REF: ${{ github.event.pull_request.number || github.ref }}
+      run: |
+        lane=$(printf '%s' "$CARGO_TARGET_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
+        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
+        root="$CARGO_TARGET_BIND/$CARGO_TARGET_REPO/${lane:-default}/$scope"
+        target="$DEVENV_WORKDIR/target"
+        if mkdir -p "$root" "$target" && sudo mount --bind "$root" "$target"; then
+          echo "CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true" >> "$GITHUB_ENV"
+          echo "cargo target: $root (bound at $target)"
+        else
+          echo "::warning::cargo target bind refused; this job builds $target from cold"
+        fi
     - name: 📂 Devenv runs in the checkout
       if: steps.runner-kind.outputs.host != 'true'
       shell: bash
