@@ -498,6 +498,9 @@
       "cli-record-arm64-macos": {
         "executor": "nx:run-commands",
         "cache": true,
+        "metadata": {
+          "ownedBy": "cowshed:cli-native"
+        },
         "//": "The release record beside cli-arm64-macos's binary, <outputDir>/cowshed.build: the commit HEAD names, its commit time and the binary's SHA-256 (scripts/release-record.ts; specs/cowshed/05_gateway.md, Build records and the basis). Keyed on HEAD and on the binary's bytes, so the binary itself stays cached by its sources while every commit gets its own record; it runs in milliseconds. Its name ends in the platform, so cli-native, the aggregate build and the publish jobs run it beside cli-arm64-macos, in the same configuration.",
         "dependsOn": [
           "cli-arm64-macos"
@@ -530,6 +533,9 @@
       "cli-record-x64-macos": {
         "executor": "nx:run-commands",
         "cache": true,
+        "metadata": {
+          "ownedBy": "cowshed:cli-native"
+        },
         "//": "cli-record-arm64-macos for cli-x64-macos.",
         "dependsOn": [
           "cli-x64-macos"
@@ -562,6 +568,9 @@
       "cli-record-arm64-linux": {
         "executor": "nx:run-commands",
         "cache": true,
+        "metadata": {
+          "ownedBy": "cowshed:cli-native"
+        },
         "//": "cli-record-arm64-macos for cli-arm64-linux.",
         "dependsOn": [
           "cli-arm64-linux"
@@ -594,6 +603,9 @@
       "cli-record-x64-linux": {
         "executor": "nx:run-commands",
         "cache": true,
+        "metadata": {
+          "ownedBy": "cowshed:cli-native"
+        },
         "//": "cli-record-arm64-macos for cli-x64-linux.",
         "dependsOn": [
           "cli-x64-linux"
