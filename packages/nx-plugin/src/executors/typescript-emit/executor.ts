@@ -283,8 +283,9 @@ export interface VerboseEmit {
 
 /**
  * Reads the emitted-file list of ttsc's `--verbose` summary. ttsc's own host and its direct-tsgo lane
- * (cmd/ttsc/build.go, BuildExecution `verboseBuildSummary`) and a plugin's transform host (typia's
- * `ttsc-typia`) all print it in one shape under their own label: a header `// <label>: tsconfig=<config> cwd=<cwd>
+ * (cmd/ttsc/build.go, BuildExecution `verboseBuildSummary`), its utility-plugin host (utility/host.go, given the
+ * header and list by the managed ttsc patch) and a plugin's own transform host (typia's `ttsc-typia`) all print it
+ * in one shape under their own label: a header `// <label>: tsconfig=<config> cwd=<cwd>
  * … emit=true …`, then `// <label>: emitted=<count> files`, then one `  + <path>` line per file, relative to that
  * cwd. Pruning trusts this list, so output without one, or a list longer or shorter than its count, is refused rather
  * than read as an emit that produced nothing.

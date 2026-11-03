@@ -686,3 +686,46 @@ diff --git a/lib/plugin/internal/source/waitForPluginBinary.js b/lib/plugin/inte
          if (clock - startedAt >= opts.timeoutMs) {
              throw new Error(`ttsc: timed out after ${(0, formatDuration_1.formatDuration)(clock - startedAt)} waiting for ` +
                  `${opts.lockInfo.label} "${opts.lockInfo.pluginName}" at ${opts.lockDir}; ` +
+diff --git a/utility/host.go b/utility/host.go
+index fab9fcc72897ec54540a5f5e93dfe115bba102a5..9d72bb780e5e104f6a41889a712efe677bdfe3d8 100644
+--- a/utility/host.go
++++ b/utility/host.go
+@@ -7,6 +7,7 @@ import (
+   "io"
+   "os"
+   "path/filepath"
++  "sort"
+   "strings"
+ 
+   shimcompiler "github.com/microsoft/typescript-go/shim/compiler"
+@@ -234,7 +235,10 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
+     opts.quiet = false // --verbose overrides the default --quiet=true
+   }
+   if !opts.quiet {
+-    fmt.Fprintf(opts.stdout, "// ttsc utility: plugins=%d emit=%v\n", len(entries), !opts.noEmit)
++    // The header and the "  + <path>" list below are the summary shape ttsc's
++    // build lane (cmd/ttsc/build.go) and ttsc-typia print, so a caller that
++    // reads the emitted files from --verbose reads this lane the same way.
++    fmt.Fprintf(opts.stdout, "// ttsc utility: tsconfig=%s cwd=%s emit=%v plugins=%d\n", opts.tsconfig, opts.cwd, !opts.noEmit, len(entries))
+   }
+   writeFile, finishPreamble := makeSourcePreambleWriteFile(prog)
+   var snapshot func() map[string][]string
+@@ -284,6 +288,18 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
+   }
+   if !opts.quiet {
+     fmt.Fprintf(opts.stdout, "// ttsc utility: emitted=%d files\n", len(emittedFiles))
++    listed := make([]string, 0, len(emittedFiles))
++    for fileName := range emittedFiles {
++      listed = append(listed, fileName)
++    }
++    sort.Strings(listed)
++    for _, fileName := range listed {
++      rel := fileName
++      if relative, err := filepath.Rel(opts.cwd, fileName); err == nil {
++        rel = relative
++      }
++      fmt.Fprintln(opts.stdout, "  +", rel)
++    }
+   }
+   return 0
+ }

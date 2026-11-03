@@ -509,6 +509,7 @@
           "^dependencyDefault",
           "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs",
+          "{workspaceRoot}/packages/lmao-ttsc/plugin.cjs",
           {
             "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
             "transitive": false
@@ -536,6 +537,7 @@
           "^dependencyDefault",
           "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs",
+          "{workspaceRoot}/packages/lmao-ttsc/plugin.cjs",
           {
             "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
             "transitive": false
@@ -563,6 +565,7 @@
           "^dependencyDefault",
           "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs",
+          "{workspaceRoot}/packages/lmao-ttsc/plugin.cjs",
           {
             "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
             "transitive": false
@@ -590,6 +593,7 @@
           "^dependencyDefault",
           "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs",
+          "{workspaceRoot}/packages/lmao-ttsc/plugin.cjs",
           {
             "dependentTasksOutputFiles": "**/test-stream/archive.tar.zst",
             "transitive": false

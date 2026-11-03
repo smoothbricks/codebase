@@ -428,9 +428,13 @@ which `bun install` applies first) would remove every unchanged output. The exec
 ttsc's `--verbose` emitted-file list instead. The bootstrap emits that build the plugin before Nx can run (the shell
 entry and `tooling/ttsc-emit.ts`) set it too: they prune nothing, and one that rewrote the plugin's dist moved every
 stamp Nx recorded for it, so the plugin's `tsc-js` restored its dist from the cache, removing the directory while other
-tasks resolved their executors from it. The packaged managed asset is the source, so clean managed installs receive the
-same repairs without a compiler fork or edits to the dependency cache. The registration applies only to that exact
-compiler version; the repository's lockfile continues to own its compiler pin.
+tasks resolved their executors from it. ttsc's utility-plugin host, which links a plugin's Go library (lmao-ttsc's, a
+consumer's lint plugins), printed only `// ttsc utility: plugins=N emit=true` and a count under `--verbose`, so the
+executor refused its emits; the patch makes it print the build lane's header (`tsconfig=… cwd=… emit=…`) and one
+`  + <path>` line per emitted file (`utility/host.go` `RunBuildWithIO`), and it writes through the same
+`DefaultWriteFile`. The packaged managed asset is the source, so clean managed installs receive the same repairs without
+a compiler fork or edits to the dependency cache. The registration applies only to that exact compiler version; the
+repository's lockfile continues to own its compiler pin.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases

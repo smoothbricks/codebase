@@ -45,6 +45,40 @@ async function fixture(source: string) {
   return root;
 }
 
+/**
+ * A project whose transform runs in ttsc's utility-plugin lane: lmao-ttsc's descriptor names a linked Go library, which
+ * ttsc links into its utility host (a project with typia links it into typia's host instead). The lane is what this
+ * fixture is for, not lmao's rewrite; the shards' inputs name that descriptor.
+ */
+async function utilityPluginFixture(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-utility-'));
+  await mkdir(join(root, 'src'));
+  await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
+  await symlink(
+    join(import.meta.dir, '../../../../lmao-ttsc'),
+    join(root, 'node_modules/@smoothbricks/lmao-ttsc'),
+    'dir',
+  );
+  await writeFile(join(root, 'package.json'), JSON.stringify({ type: 'module' }));
+  await writeFile(
+    join(root, 'tsconfig.lib.json'),
+    JSON.stringify({
+      compilerOptions: {
+        target: 'ES2022',
+        module: 'NodeNext',
+        rootDir: 'src',
+        outDir: 'dist',
+        types: [],
+        skipLibCheck: true,
+        plugins: [{ transform: '@smoothbricks/lmao-ttsc/ttsc-plugin' }],
+      },
+      include: ['src/**/*.ts'],
+    }),
+  );
+  await writeFile(join(root, 'src/index.ts'), 'export const index = 1;\n');
+  return root;
+}
+
 /** Every file under `directory` with what a write changes: its inode, modification time and status-change time. */
 async function fileIdentities(directory: string): Promise<Record<string, readonly bigint[]>> {
   const identities: Record<string, readonly bigint[]> = {};
@@ -119,6 +153,40 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
     );
     try {
       await writeFile(join(root, 'src/gone.ts'), 'export const gone = 1;\n');
+      const emit = () => typescriptEmitExecutor({ cwd: root, tsConfig: 'tsconfig.lib.json' }, { root });
+      expect(await emit()).toEqual({ success: true });
+      const before = await fileIdentities(join(root, 'dist'));
+      expect(Object.keys(before).sort()).toEqual([
+        'gone.d.ts',
+        'gone.d.ts.map',
+        'gone.js',
+        'index.d.ts',
+        'index.d.ts.map',
+        'index.js',
+      ]);
+      await rm(join(root, 'src/gone.ts'));
+      expect(await emit()).toEqual({ success: true });
+      expect(await fileIdentities(join(root, 'dist'))).toEqual({
+        'index.d.ts': before['index.d.ts'],
+        'index.d.ts.map': before['index.d.ts.map'],
+        'index.js': before['index.js'],
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reads the emitted files of ttsc's utility-plugin lane, keeps its unchanged outputs and prunes a deleted module's", async () => {
+    const root = await utilityPluginFixture();
+    try {
+      await writeFile(join(root, 'src/gone.ts'), 'export const gone = 1;\n');
+      // The lane this case holds: ttsc's utility host prints the --verbose summary under its own label.
+      const lane = spawnSync('ttsc', ['-p', 'tsconfig.lib.json', '--emit', '--verbose', ...EMIT_OVERRIDES], {
+        cwd: root,
+        encoding: 'utf8',
+      });
+      expect(lane.status, lane.stderr).toBe(0);
+      expect(lane.stdout).toContain('// ttsc utility: ');
       const emit = () => typescriptEmitExecutor({ cwd: root, tsConfig: 'tsconfig.lib.json' }, { root });
       expect(await emit()).toEqual({ success: true });
       const before = await fileIdentities(join(root, 'dist'));
