@@ -465,10 +465,14 @@ read without taking a turn; a gateway that does not answer `land-turns` lists no
 clone records it too. Its Git HEAD/reflog watch paths are emitted relative to the build-script manifest directory, so a
 warm Cargo target clone follows its own repository rather than retaining an absolute watch on its donor. The owner
 script directive control and a real warm Cargo clone pin this boundary. A debug build, and a build made where git cannot
-answer (a source archive, a nix build), records nothing. The installing build writes its record beside its stored copy,
-so the installed build's record is read from a file and nothing is executed to learn it; a record that cannot be written
-is said on stderr and does not fail the install. The time describes a build to a person and never orders two builds: two
-sibling commits are ordered by clock, and the later one carries none of the earlier one's fixes.
+answer (a source archive, a nix build), records nothing. Because the record names HEAD, every platform CLI target
+(`cowshed:cli-<platform>`, whose production configuration is the release build) keys its Nx cache on HEAD as a runtime
+input: keyed on its sources alone, a release built at one commit was replayed for later commits whose sources it shared,
+recording a commit the installed build already contained, and the install refused it (`build_provenance.rs`,
+`every_release_cli_cache_key_names_the_commit_it_records`). The installing build writes its record beside its stored
+copy, so the installed build's record is read from a file and nothing is executed to learn it; a record that cannot be
+written is said on stderr and does not fail the install. The time describes a build to a person and never orders two
+builds: two sibling commits are ordered by clock, and the later one carries none of the earlier one's fixes.
 
 An install that would replace the installed build is judged by containment. Nothing is judged, and the install proceeds,
 when nothing is installed, when the stable name is the plain binary of the old layout, when the installed copy has no

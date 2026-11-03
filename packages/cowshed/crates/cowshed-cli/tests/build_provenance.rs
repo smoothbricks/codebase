@@ -183,3 +183,47 @@ fn release_provenance_follows_a_warm_clone_not_its_donor() {
     );
     assert_eq!(stamp(&donor), first, "the donor artifact is untouched");
 }
+
+/// A release build records the commit HEAD names, so a cached one may be replayed only for that
+/// commit. Keyed on its sources alone, the release CLI built at one commit was replayed for every
+/// later commit that left them unchanged, recording a commit the installed build already
+/// contained, and setup refused it as a downgrade. Every platform CLI target therefore keys on
+/// HEAD, read the way every runtime input is.
+#[test]
+fn every_release_cli_cache_key_names_the_commit_it_records() {
+    // Resolved at run time, as the release-target test does: a cached test archive replayed into
+    // another checkout must read that checkout's package.json.
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
+    let package: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(Path::new(&manifest).join("../../package.json"))
+            .expect("cowshed package.json"),
+    )
+    .expect("package.json is JSON");
+    let head = serde_json::json!({
+        "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh git rev-parse HEAD"
+    });
+    let targets = package["nx"]["targets"]
+        .as_object()
+        .expect("cowshed declares Nx targets");
+    let releases = targets
+        .iter()
+        .filter(|(_, target)| {
+            target["configurations"]["production"].is_object()
+                && target.to_string().contains("cowshed-cli")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        releases.len() >= 4,
+        "every platform's CLI target builds cowshed-cli in production: {releases:?}"
+    );
+    for (name, target) in releases {
+        let inputs = target["inputs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} declares its inputs"));
+        assert!(
+            inputs.contains(&head),
+            "{name}'s production build records HEAD, so its cache key must hold it: {inputs:?}"
+        );
+    }
+}
