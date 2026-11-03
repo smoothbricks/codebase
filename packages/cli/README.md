@@ -1478,6 +1478,13 @@ Versioning:
   selection comes from `--projects`: blank selects the package-local changed set (the same filter `--bump auto` uses),
   whatever the bump mode is. `--projects <a,b,...>` releases exactly those owned Nx projects without change detection,
   and `--projects all` is the deliberate whole-fleet opt-in that versions every owned release package.
+- A change that only TypeScript consumers need, in the Nx plugin or the CLI, is released alone by naming those projects
+  in `publish.yml`'s `projects` input (`projects: nx-plugin,cli`). Their `workspace:*` dependencies pack at each
+  dependency's last stable tag (below), so nothing else is released with them. The macOS legs' `build-platform-outputs`
+  builds only the named projects' platform outputs, which for these is none, so the release does not wait on native
+  builds. A full release follows when a native package changes. Releases of one ref share a concurrency group without
+  `cancel-in-progress`: a dispatch made while a release runs waits for it, and GitHub keeps one waiting run per group,
+  so a newer dispatch replaces an older waiting one.
 - Release packages are discovered from `npm:public` packages whose `repository.url` exactly matches the root package.
 - [Nx Release][nx-release] config must use `currentVersionResolver: "git-tag"` with
   `fallbackCurrentVersionResolver: "disk"`. Conventional-commit versioning requires git tags as the primary source,
