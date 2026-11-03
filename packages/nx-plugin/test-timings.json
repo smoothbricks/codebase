@@ -10,6 +10,7 @@
     "src/owned-installation.test.ts": 28757,
     "src/index.test.ts": 26774,
     "src/executors/bounded-exec/executor.test.ts": 25285,
+    "src/executors/bounded-exec/pool-sim.property.test.ts": 23356,
     "src/ensure-built-receipt.test.ts": 21873,
     "src/nx-daemon-idle-policy.test.ts": 18587,
     "src/cargo-retention.test.ts": 16827,
