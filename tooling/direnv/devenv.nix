@@ -138,6 +138,13 @@ in {
     # with the same driver over the patched lld.
     // lib.optionalAttrs (pkgs.stdenv.hostPlatform.rust.rustcTarget == "x86_64-unknown-linux-gnu") {
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = lib.mkForce "${rustLinker}";
+    }
+    # Every native link on a Mac goes through smoothbricks-macos-linker (.cargo/config.toml): Xcode's clang with its ld
+    # and SDK. mbx refuses a -C linker it does not know by name, so test binaries, proc macros and build scripts were
+    # compiled again in every fresh checkout (unportable-native-link). Named here, the pinned mbx identifies the wrapper
+    # by its bytes and by probing the driver through it, and caches those links (specs/cowshed/14_nix.md, "mbx").
+    // lib.optionalAttrs pkgs.stdenv.isDarwin {
+      MBX_LINK_WRAPPERS = "smoothbricks-macos-linker";
     };
 
   # Use system Xcode for iOS simulator, signing, and instruments.
