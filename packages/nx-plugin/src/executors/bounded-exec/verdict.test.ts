@@ -14,6 +14,7 @@ import {
   type ProcessTreeKiller,
   runBoundedExec,
 } from './executor.js';
+import { readLastPeak } from './peak-charge.js';
 import type { BoundedExecBounds } from './schema.js';
 import {
   type BoundedExecVerdict,
@@ -24,7 +25,6 @@ import {
   judgeRun,
   junitCaseTimes,
   junitFailures,
-  readLastPeak,
   readRecord,
   taskDirectory,
   VERDICT_FILE,

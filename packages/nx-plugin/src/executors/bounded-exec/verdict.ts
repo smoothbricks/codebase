@@ -1,6 +1,8 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import typia from 'typia';
+import type { CpuGrantRecord } from './cpu-grant.js';
+import { parseCpuGrant } from './cpu-grant.js';
 import type { CpuWaitRow } from './lease-wait.js';
 import { describeHolders, type LockWait, type Opener } from './lock-wait.js';
 import type { MbxQueuedRequest } from './mbx-queue.js';
@@ -88,14 +90,10 @@ export interface BoundedExecRecord {
   /**
    * The parent CPU pool's grant the run started under: tokens granted of those asked for, and
    * how long it waited for the pool. Absent when it ran ungranted. Its tokens are the parallelism the run's
-   * `peakBytes` was measured under, which the task's next run reads (`readLastPeak`) to charge that peak in proportion
+   * `peakBytes` was measured under, which the task's next run reads (`readLastPeak`, peak-charge.ts) to charge that peak in proportion
    * to the parallelism it is lent.
    */
-  readonly cpu?: {
-    readonly tokens: number;
-    readonly want: number;
-    readonly waitedMs: number;
-  };
+  readonly cpu?: CpuGrantRecord;
   /**
    * The parent CPU pool's wait that expired and refused the run: its code, bound and elapsed time, the last heartbeat
    * sequence it read, and the pool's socket and pid (specs/cowshed/05_gateway.md, "Deadlines"). Absent when no wait
@@ -496,24 +494,6 @@ export async function readRecord(directory: string): Promise<BoundedExecRecord |
   return parseRecord(JSON.parse(text));
 }
 
-/**
- * The peak the task's last record in `directory` names: its charge in its run's pool. Null when the task has no record
- * or its record no peak; a record that cannot be read is an error naming it, never a charge of nothing.
- */
-export async function readLastPeak(
-  directory: string,
-): Promise<{ ok: true; peakBytes: number | null; parallelism: number | null } | { ok: false; error: string }> {
-  try {
-    const record = await readRecord(directory);
-    return { ok: true, peakBytes: record?.peakBytes ?? null, parallelism: record?.cpu?.tokens ?? null };
-  } catch (error) {
-    return {
-      ok: false,
-      error: `the task's last record ${join(directory, VERDICT_FILE)} cannot be read: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-}
-
 /** The JUnit report a command wrote into `directory`, or `null` when it wrote none. */
 export async function readJunitReport(
   directory: string,
@@ -542,23 +522,15 @@ function parseRecord(value: unknown): BoundedExecRecord {
   if (!(peakBytes === null || (typeof peakBytes === 'number' && Number.isSafeInteger(peakBytes) && peakBytes >= 0))) {
     throw new Error(`not a bounded-exec record: ${JSON.stringify(value)}`);
   }
-  const cpu = value.cpu;
-  if (cpu === undefined) {
-    return { task: value.task, hash: value.hash, verdict: parseVerdict(value.verdict), peakBytes };
-  }
-  if (
-    !isObject(cpu) ||
-    !(typeof cpu.tokens === 'number' && Number.isSafeInteger(cpu.tokens) && cpu.tokens >= 1) ||
-    !(typeof cpu.want === 'number' && Number.isSafeInteger(cpu.want) && cpu.want >= 1) ||
-    !(typeof cpu.waitedMs === 'number' && Number.isFinite(cpu.waitedMs) && cpu.waitedMs >= 0)
-  ) {
+  const cpu = parseCpuGrant(value.cpu);
+  if (cpu === 'malformed') {
     throw new Error(`not a bounded-exec record: ${JSON.stringify(value)}`);
   }
   return {
     task: value.task,
     hash: value.hash,
     verdict: parseVerdict(value.verdict),
-    cpu: { tokens: cpu.tokens, want: cpu.want, waitedMs: cpu.waitedMs },
+    ...(cpu === undefined ? {} : { cpu }),
     peakBytes,
   };
 }

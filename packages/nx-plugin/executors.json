@@ -5,6 +5,8 @@
       "schema": "./src/executors/bounded-exec/schema.json",
       "description": "Run a command with bounded timeout and force-kill behavior",
       "outputNeutral": [
+        "./dist/executors/bounded-exec/admission-queue.js",
+        "./dist/executors/bounded-exec/cpu-grant.js",
         "./dist/executors/bounded-exec/cpu-pool.js",
         "./dist/executors/bounded-exec/disk-lease.js",
         "./dist/executors/bounded-exec/gateway-lease.js",
@@ -12,6 +14,9 @@
         "./dist/executors/bounded-exec/host-memory.js",
         "./dist/executors/bounded-exec/lease-wait.js",
         "./dist/executors/bounded-exec/mbx-queue.js",
+        "./dist/executors/bounded-exec/memory-retry.js",
+        "./dist/executors/bounded-exec/parent-grant.js",
+        "./dist/executors/bounded-exec/peak-charge.js",
         "./dist/executors/bounded-exec/pool-admission.js",
         "./dist/executors/bounded-exec/ram-attach.js",
         "./dist/executors/bounded-exec/ram-detach.js",

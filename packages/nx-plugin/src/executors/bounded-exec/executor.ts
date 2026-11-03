@@ -13,23 +13,13 @@ import {
   processGroupHasMembers,
   signalProcessGroup,
 } from '../../process-group.js';
-import {
-  admissionWaitMs,
-  type BoundEvent,
-  type BoundKind,
-  type Bounds,
-  earliestBound,
-  NO_ADMISSION_WAIT,
-  stepAdmissionWait,
-  stepBounds,
-  UNARMED,
-} from './bounds.js';
-import { type CpuPool, createCpuPool, type TokenGrant, takeParentCpuTokens } from './cpu-pool.js';
+import { AdmissionObservation, type QueueHost } from './admission-queue.js';
+import { type BoundEvent, type BoundKind, type Bounds, earliestBound, stepBounds, UNARMED } from './bounds.js';
+import { type CpuPool, createCpuPool } from './cpu-pool.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import { type LeafPeak, PEAK_FD, peakWaiter, readWaiterReport, underWaiter } from './leaf-peak.js';
-import type { CpuWaitRow } from './lease-wait.js';
 import type { LockWait } from './lock-wait.js';
 import {
   askedCores,
@@ -40,8 +30,8 @@ import {
   withCountedReservation,
   withMbxLeaf,
 } from './mbx-pool.js';
-import { MBX_QUEUE_POLL_MS, type MbxQueuedRequest, snapshotMbxQueue } from './mbx-queue.js';
 import { describeUnserved, RESERVATIONS_ENV, type Reservation, reserveCores, runEndpoint } from './mbx-reservations.js';
+import { killedFromOutside, type RunOutcome, runUntilNotKilledForMemory } from './memory-retry.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -52,6 +42,8 @@ import {
   type SubtreeAdmission,
   type SubtreeOwner,
 } from './owned-subtree.js';
+import { askParentPool, describeGrant } from './parent-grant.js';
+import { type LastPeak, readLastPeak } from './peak-charge.js';
 import { CPU_POOL_ENV, type InheritedCpuPool, readInheritedCpuPool } from './pool-environment.js';
 import { createRunProgress, withProgressReport, withTestResultReport } from './progress.js';
 import {
@@ -72,12 +64,10 @@ import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import type { BoundedExecOptions } from './schema.js';
 import { createTestResultWriter, type TestResultWriter } from './test-result-writer.js';
 import {
-  type AdmissionQueueWait,
   type BoundedExecRecord,
   type BoundedExecTask,
   BUN_TEST,
   clearTaskDirectory,
-  describeAdmissionQueue,
   describeNoSpace,
   type ExpiredBound,
   JUNIT_FILE,
@@ -86,7 +76,6 @@ import {
   judgeRun,
   type NoSpaceSighting,
   readJunitReport,
-  readLastPeak,
   taskDirectory,
   withJunitReport,
   writeRecord,
@@ -124,15 +113,7 @@ export interface NxTaskContext {
   taskGraph?: { tasks: Record<string, { hash?: string }> };
 }
 
-export interface BoundedExecResult {
-  success: boolean;
-  terminalOutput: string;
-  /**
-   * The command died of a SIGKILL that no bound of this executor and no signal it sent caused: the kernel's OOM killer,
-   * which sends it to a leaf in a run's cgroup. Set on the last run of the command only when it was killed again.
-   */
-  killedForMemory?: boolean;
-}
+export type BoundedExecResult = RunOutcome;
 
 interface RunState {
   settled: boolean;
@@ -149,8 +130,6 @@ interface RunState {
   /** The lock waits the expiry's snapshot named: empty unless that capture completed. Judged with the expiry. */
   lockWaits: readonly LockWait[];
 }
-
-type GrantedTokens = Extract<TokenGrant, { granted: true }>;
 
 export interface ProcessTreeKiller {
   kill(pid: number, signal: NodeJS.Signals): Promise<void>;
@@ -311,39 +290,27 @@ export async function runBoundedExec(
   inherited: InheritedCpuPool | null = null,
   captureDiagnostics: typeof captureHangDiagnostics = captureHangDiagnostics,
   owner: SubtreeOwner | null = null,
-  queueHost?: Parameters<typeof snapshotMbxQueue>[3],
+  queueHost?: QueueHost,
 ): Promise<BoundedExecResult> {
   const directory = context.record?.directory ?? null;
   // The task's last recorded peak, and the tokens it was lent when the peak was measured, are its charge in its parent's
   // pool, read once before a run's clear removes them: a command run again after a kill is charged by the record the
   // killed run replaced, not by the peak it reached before it was killed.
   const lastPeak = directory !== null && inherited !== null ? await readLastPeak(directory) : null;
-  const run = (alone: boolean): Promise<BoundedExecResult> =>
-    runCommand(options, context, killer, tempVolume, inherited, captureDiagnostics, owner, queueHost, {
-      lastPeak,
-      alone,
-    });
-  const first = await run(false);
-  if (first.killedForMemory !== true || inherited === null) {
-    return first;
-  }
-  // The kernel killed the leaf: a SIGKILL this executor did not send. It runs once more, alone in its run's pool, so
-  // what it was killed beside is not there to be killed with it.
-  const note = `cowshed: the kernel killed the command for memory (a SIGKILL this executor did not send${
-    context.record === undefined ? '' : `: ${context.record.task.id}`
-  }); running it once more, alone in its run's pool\n`;
-  process.stderr.write(note);
-  const again = await run(true);
-  return {
-    success: again.success,
-    terminalOutput: `${first.terminalOutput}${note}${again.terminalOutput}`,
-    ...(again.killedForMemory === true ? { killedForMemory: true } : {}),
-  };
+  return runUntilNotKilledForMemory(
+    (alone) =>
+      runCommand(options, context, killer, tempVolume, inherited, captureDiagnostics, owner, queueHost, {
+        lastPeak,
+        alone,
+      }),
+    inherited !== null,
+    context.record?.task.id,
+  );
 }
 
 /** What a run of the command is told that the run before it was not: the task's charge, and whether it runs alone. */
 interface Attempt {
-  readonly lastPeak: Awaited<ReturnType<typeof readLastPeak>> | null;
+  readonly lastPeak: LastPeak | null;
   readonly alone: boolean;
 }
 
@@ -356,7 +323,7 @@ async function runCommand(
   inherited: InheritedCpuPool | null,
   captureDiagnostics: typeof captureHangDiagnostics,
   owner: SubtreeOwner | null,
-  queueHost: Parameters<typeof snapshotMbxQueue>[3] | undefined,
+  queueHost: QueueHost | undefined,
   attempt: Attempt,
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
@@ -601,24 +568,15 @@ async function runCommand(
   const asked = Date.now();
   // A pool that answered and refused is a live budget, and running beside it would count the run twice: the run fails
   // instead. A pool whose endpoint is gone (its holder exited) lends nothing, and the run goes on as asked.
-  let grant: GrantedTokens | null = null;
-  let parentRefusal: string | null = null;
-  let parentWait: CpuWaitRow | undefined;
-  if (inherited !== null) {
-    const fromParent = await takeParentCpuTokens(inherited, demand.want, charge, {
-      parallelism: chargeParallelism ?? undefined,
-      alone: attempt.alone ? true : undefined,
-      task: context.record?.task.id,
-    });
-    if (fromParent.granted) {
-      grant = fromParent;
-    } else if (fromParent.cause === 'absent') {
-      appendStderr(`cowshed: cpu-pool parent pool absent: ${fromParent.reason}; running the command as asked\n`);
-    } else {
-      parentRefusal = fromParent.reason;
-      parentWait = fromParent.wait;
-    }
-  }
+  const parent = await askParentPool(inherited, {
+    want: demand.want,
+    charge,
+    parallelism: chargeParallelism,
+    alone: attempt.alone,
+    task: context.record?.task.id,
+  });
+  for (const said of parent.said) appendStderr(said);
+  const { grant, refusal: parentRefusal, wait: parentWait } = parent;
   const waitedMs = Date.now() - asked;
   let cpu: BoundedExecRecord['cpu'];
   let sized: { command: string; env: Record<string, string> } = { command: requested, env: {} };
@@ -629,13 +587,8 @@ async function runCommand(
   if (grant !== null) {
     sized = sizeRunner(demand, requested, grant.tokens);
     cpu = { tokens: grant.tokens, want: demand.want, waitedMs };
-    appendStderr(
-      `cowshed: cpu-pool wait done elapsed=${waitedMs}ms status=ok tokens=${grant.tokens}/${demand.want} runner=${demand.kind} memory=${charge ?? 'none'}${grant.charged !== null && grant.charged !== charge ? ` charged=${grant.charged}` : ''}\n`,
-    );
-    if (grant.oversized !== null) {
-      appendStderr(
-        `cowshed: cpu-pool granted while nothing else holds memory: this task's last peak of ${charge} bytes alone exceeds the run's ${grant.oversized.memory} bytes\n`,
-      );
+    for (const said of describeGrant(grant, { waitedMs, want: demand.want, runner: demand.kind, charge })) {
+      appendStderr(said);
     }
   } else if (leaf?.kind === 'reserve') {
     sized = { command: sizeRunnerToGrant(leaf.demand, requested), env: {} };
@@ -663,33 +616,15 @@ async function runCommand(
     })();
     return cpuReleased;
   };
-  let mbxAdmitted = false;
-  let admissionWait = NO_ADMISSION_WAIT;
-  let lastQueueRequests: readonly MbxQueuedRequest[] = [];
-  /**
-   * Why the last admission snapshot failed, while the one after it has not succeeded; null otherwise. A snapshot only
-   * decides whether waiting on mbx admission is credited against the idle bound, so a failed one withholds that credit
-   * and ends nothing: the bounds decide, and an idle expiry names it.
-   */
-  let unconfirmedAdmission: string | null = null;
-  /** When the last successful snapshot completed (`Date.now()`): credit runs to it and no further. */
-  let confirmedAdmissionAt: number | null = null;
-  // A reserved leaf's own request on its run's endpoint is its admission wait; a Cargo leaf's comes from mbx's report.
-  const queueWait = (): AdmissionQueueWait | null =>
-    mbxAdmitted || (lastQueueRequests.length === 0 && reservation === null)
-      ? null
-      : {
-          waitedMs: admissionWaitMs(admissionWait, performance.now()),
-          requests: lastQueueRequests,
-        };
-  const queueAbort = new AbortController();
-  let queueTimer: NodeJS.Timeout | undefined;
-  let queueSnapshot: Promise<void> | null = null;
-  const stopQueueObservation = (): void => {
-    admissionWait = stepAdmissionWait(admissionWait, { kind: 'stop', at: performance.now() });
-    clearInterval(queueTimer);
-    queueAbort.abort();
-  };
+  const queue = new AdmissionObservation({
+    over: () => state.settled || state.expiry !== null,
+    pid: () => child.pid,
+    environment: () => mergeEnv(lease?.directory ?? ordinaryTemp, env),
+    tell,
+    step: (event) => stepTo(event),
+    testing: () => isTesting(),
+    queueHost,
+  });
   // Records the run's verdict when it has a task to record as. An `expiry` is set only when a bound ended the run.
   // Observation and ownership failures remain operational even after valid queue evidence; cancellation alone does not.
   const recordRun = async (
@@ -723,7 +658,7 @@ async function runCommand(
         appendStderr(`bounded-exec: ${error}\n`);
       }
     });
-    const admissionQueue = queueWait();
+    const admissionQueue = queue.queueWait(reservation !== null);
     const verdict =
       operational || resultFailure !== null
         ? judgeOperationalFailure(exitCode, report)
@@ -1012,7 +947,7 @@ async function runCommand(
       try {
         // Drain an older poll, then take a fresh bounded snapshot before idle can end queued work. Total and fixture
         // ceilings remain armed while this observation runs.
-        await refreshQueue(true);
+        await queue.refresh(true);
       } finally {
         checkingIdle = false;
       }
@@ -1040,74 +975,6 @@ async function runCommand(
       if (bounds.idle !== null) scheduleCapture(bounds.idle);
     }
     armBoundTimer();
-  };
-
-  let lastQueueDiagnostic = '';
-  let lastQueueDiagnosticAt: number | null = null;
-  let lastSnapshotDiagnostics = '';
-  const unconfirmAdmission = (detail: string): void => {
-    if (state.settled || state.expiry !== null || queueAbort.signal.aborted) return;
-    if (unconfirmedAdmission !== detail) {
-      tell(
-        `bounded-exec: mbx admission snapshot failed: ${detail}; admission is unconfirmed, so this wait earns no idle credit until a snapshot succeeds\n`,
-      );
-    }
-    unconfirmedAdmission = detail;
-    lastQueueRequests = [];
-    admissionWait = stepAdmissionWait(admissionWait, { kind: 'snapshot', at: performance.now(), waiting: false });
-    // The wait since the last confirmed snapshot is unconfirmed: the idle bound resumes from that snapshot.
-    stepTo({ kind: 'admission-queue', at: confirmedAdmissionAt ?? Date.now(), waiting: false, testing: isTesting() });
-  };
-  const refreshQueue = async (fresh: boolean): Promise<void> => {
-    if (fresh && queueSnapshot !== null) await queueSnapshot;
-    if (state.settled || state.expiry !== null || queueAbort.signal.aborted || child.pid === undefined) return;
-    const pid = child.pid;
-    queueSnapshot ??= (async () => {
-      const snapshot = await snapshotMbxQueue(
-        pid,
-        mergeEnv(lease?.directory ?? ordinaryTemp, env),
-        queueAbort.signal,
-        queueHost,
-      );
-      if (state.settled || state.expiry !== null || queueAbort.signal.aborted) return;
-      if (!snapshot.ok) {
-        unconfirmAdmission(snapshot.detail);
-        return;
-      }
-      const diagnostics = snapshot.diagnostics?.join('; ') ?? '';
-      if (diagnostics !== '' && diagnostics !== lastSnapshotDiagnostics) tell(`bounded-exec: ${diagnostics}\n`);
-      lastSnapshotDiagnostics = diagnostics;
-      const waiting = snapshot.requests.length > 0;
-      const observedAt = Date.now();
-      const observedWaitAt = performance.now();
-      admissionWait = stepAdmissionWait(admissionWait, { kind: 'snapshot', at: observedWaitAt, waiting });
-      unconfirmedAdmission = null;
-      confirmedAdmissionAt = observedAt;
-      if (waiting) {
-        lastQueueRequests = snapshot.requests;
-        const positions = JSON.stringify(snapshot.requests);
-        if (
-          positions !== lastQueueDiagnostic ||
-          lastQueueDiagnosticAt === null ||
-          Date.now() - lastQueueDiagnosticAt >= HANG_CAPTURE_MS
-        ) {
-          const waitedMs = admissionWaitMs(admissionWait, observedWaitAt);
-          tell(`cowshed: mbx ${describeAdmissionQueue({ waitedMs, requests: snapshot.requests })}\n`);
-          lastQueueDiagnostic = positions;
-          lastQueueDiagnosticAt = Date.now();
-        }
-      } else {
-        lastQueueDiagnostic = '';
-      }
-      stepTo({ kind: 'admission-queue', at: observedAt, waiting, testing: isTesting() });
-    })()
-      .catch((error: unknown) => {
-        unconfirmAdmission(error instanceof Error ? error.message : String(error));
-      })
-      .finally(() => {
-        queueSnapshot = null;
-      });
-    await queueSnapshot;
   };
 
   // Only the CHILD's own output is read for progress. The diagnostics below go
@@ -1201,9 +1068,9 @@ async function runCommand(
     clearTimeout(boundTimer);
     // Preserve explicit live membership before cancellation removes the queued process. A failed bounded observation
     // leaves the admission unconfirmed, never a manufactured queue or admission.
-    signalCleanup = (leaf?.kind !== 'cargo' ? Promise.resolve() : refreshQueue(false))
+    signalCleanup = (leaf?.kind !== 'cargo' ? Promise.resolve() : queue.refresh(false))
       .finally(() => {
-        stopQueueObservation();
+        queue.stop();
         return killChildTree();
       })
       .finally(releaseCpu)
@@ -1245,12 +1112,12 @@ async function runCommand(
     child.once('error', (error) => {
       appendStderr(`${error.message}\n`);
       state.settled = true;
-      stopQueueObservation();
+      queue.stop();
       resolve({ code: 1, signal: null });
     });
     child.once(hooked === null ? 'exit' : 'close', (code: number | null, signal: NodeJS.Signals | null) => {
       state.settled = true;
-      stopQueueObservation();
+      queue.stop();
       resolve({ code, signal });
     });
   });
@@ -1274,9 +1141,9 @@ async function runCommand(
               ? `still running: ${bound.tests.join(', ')}`
               : 'the runner named no test still running'
           } (cwd=${cwd}): ${command}\n${
-            unconfirmedAdmission === null
+            queue.unconfirmed === null
               ? ''
-              : `The last mbx admission snapshot failed (${unconfirmedAdmission}), so the wait it could not confirm earned no idle credit\n`
+              : `The last mbx admission snapshot failed (${queue.unconfirmed}), so the wait it could not confirm earned no idle credit\n`
           }`
         : bound.kind === 'fixture'
           ? `\nFixture command timed out after ${elapsedMs}ms (fixtureTimeoutMs=${bound.limitMs}, cwd=${cwd}): ${segment ?? command}\n`
@@ -1413,7 +1280,7 @@ async function runCommand(
           channel.end();
           return;
         }
-        admissionWait = stepAdmissionWait(admissionWait, { kind: 'snapshot', at: performance.now(), waiting: true });
+        queue.waiting();
         tell(`cowshed: mbx reserve wait start cpus=${cpus} priority=${reservedLeaf.priority}\n`);
         const held = reserveCores(endpoint, cpus, reservedLeaf.priority);
         reservation = held;
@@ -1425,7 +1292,7 @@ async function runCommand(
           }
           // A run that ended while it waited gives the grant back with its CPU (`releaseCpu`).
           if (state.settled || state.expiry !== null) return;
-          mbxAdmitted = true;
+          queue.admitted = true;
           tell(`cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms priority=${reservedLeaf.priority}\n`);
           channel.end(`${granted.cpus}\n`);
           stepTo({ kind: 'granted', at: Date.now(), testing: isTesting(), fixture: !fixtureDone });
@@ -1444,7 +1311,7 @@ async function runCommand(
         for (const byte of chunk) {
           if (byte === 103) {
             if (!said) {
-              mbxAdmitted = true;
+              queue.admitted = true;
               said = true;
               tell(`cowshed: mbx cargo granted elapsed=${Date.now() - startedAt}ms\n`);
             }
@@ -1458,10 +1325,7 @@ async function runCommand(
         }
       });
       // Only mbx's activity report says whether a Cargo leaf's compiler or test waits in the pool.
-      queueTimer = setInterval(() => {
-        void refreshQueue(false);
-      }, MBX_QUEUE_POLL_MS);
-      void refreshQueue(false);
+      queue.poll();
     }
   }
 
@@ -1486,8 +1350,8 @@ async function runCommand(
     await signalCleanup;
     return { success: false, terminalOutput: outputChunks.join('') };
   }
-  stopQueueObservation();
-  await queueSnapshot;
+  queue.stop();
+  await queue.idle();
   await termination;
   clearTimeout(boundTimer);
   cancelCapture();
@@ -1542,10 +1406,12 @@ async function runCommand(
   // branch later exited 0: its verdict is an ordinary operational failure, never a successful or silently unbounded run.
   const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null;
   await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen, state.lockWaits, peakBytes);
-  // A SIGKILL this executor did not send, to a command that no bound of this executor ended, came from outside it. In a
-  // run's cgroup the one that sends it to a leaf is the kernel's OOM killer. The exit code alone says nothing of who
-  // sent it: a bound's own force-kill ends in 137 too, and is why `sentSignal` is read first.
-  const killedForMemory = !state.sentSignal && state.expiry === null && (exitSignal === 'SIGKILL' || code === 137);
+  const killedForMemory = killedFromOutside({
+    sentSignal: state.sentSignal,
+    bounded: state.expiry !== null,
+    exitSignal,
+    code,
+  });
   return {
     success: !operationalFailure && resultFailure === null && state.expiry === null && code === 0,
     terminalOutput: outputChunks.join(''),

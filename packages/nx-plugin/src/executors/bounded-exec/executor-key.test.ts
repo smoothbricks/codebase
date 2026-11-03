@@ -98,12 +98,17 @@ const KEYED = [
 
 /** What only decides when and on what resources the command runs: a change to one re-keys no task. */
 const SCHEDULING = [
+  'executors/bounded-exec/admission-queue.ts',
+  'executors/bounded-exec/cpu-grant.ts',
   'executors/bounded-exec/cpu-pool.ts',
   'executors/bounded-exec/host-memory.darwin.ts',
   'executors/bounded-exec/host-memory.linux.ts',
   'executors/bounded-exec/host-memory.ts',
   'executors/bounded-exec/lease-wait.ts',
   'executors/bounded-exec/mbx-queue.ts',
+  'executors/bounded-exec/memory-retry.ts',
+  'executors/bounded-exec/parent-grant.ts',
+  'executors/bounded-exec/peak-charge.ts',
   'executors/bounded-exec/pool-admission.ts',
 ];
 

@@ -2679,12 +2679,18 @@ to the command, which the keyed modules decide. Each entry, and what the executo
 - `gateway-lease.js`: the lease protocol the gateway's disk lease and a parent CPU pool speak, the gateway's socket path
   and the grant it reads from an answer. A CPU grant reaches the command only through `runner-sizing.js`, as a token
   count; an absent endpoint leaves the command unsized, and a refusal fails the run.
-- `cpu-pool.js`, with `pool-admission.js`, `host-memory.js` and `lease-wait.js`: the CPU pool a run serves and the grant
-  a task asks its parent's for. They decide how many tokens a run is lent and when: the queue order, the memory a task's
-  recorded peak is charged and the live memory it is held against, the heartbeat of a wait. A grant reaches the command
-  as a token count and nothing else; a pool that cannot be made or refuses fails the run.
-- `mbx-queue.js`: the snapshot of mbx's admission queue a Cargo or reserved leaf waits in. Its text is said on stderr
-  and its waiting decides whether the idle bound is credited, which can fail a run and never changes one that passes.
+- `cpu-pool.js`, with `pool-admission.js`, `host-memory.js` and `lease-wait.js`: the CPU pool a run serves. It decides
+  how many tokens a run is lent and when: the queue order, the memory a task's recorded peak is charged and the live
+  memory it is held against, the heartbeat of a wait. A pool that cannot be made or refuses fails the run.
+- `parent-grant.js`: what a run asks its parent's pool for and says of the answer, `peak-charge.js` and `cpu-grant.js`:
+  the charge the task's last record names and the grant a record states. A grant reaches the command as a token count
+  and nothing else, through `runner-sizing.js`; a record that cannot be read refuses the run.
+- `memory-retry.js`: whether a command the kernel killed for memory (a SIGKILL this executor did not send, to a command
+  no bound of it ended) runs once more, alone in its run's pool, and how the two runs' output joins. The second run is
+  the same command; only the pool it is lent from differs, and a pass after it is a pass of that command.
+- `mbx-queue.js`, with `admission-queue.js`: the snapshot of mbx's admission queue a Cargo or reserved leaf waits in and
+  the run's view of it. Its text is said on stderr and its waiting decides whether the idle bound is credited, which can
+  fail a run and never changes one that passes. `bounds.js` stays keyed: it decides when a bound fires.
 - `hang-diagnostics.js`: the snapshot taken shortly before the no-progress bound fires. It probes with `ps`, `lsof` and
   `sample`, which suspends the runner for about a second, and signals nothing but its own probes. Its text and lock
   waits are read only once the bound has expired the run, which fails it.
