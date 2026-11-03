@@ -7,6 +7,8 @@ import {
   EXACT,
   GiB,
   judge,
+  liveHeadroom,
+  liveHeadroomRetry,
   MiB,
   type Policy,
   type Regime,
@@ -14,6 +16,7 @@ import {
   type SimLeaf,
   type SimWorld,
   scaled,
+  scaledRetry,
   scaledWith,
   simulate,
   today,
@@ -182,6 +185,36 @@ describe('a run pool over the simulation', () => {
         overCommitted(scaled, { ...EXACT, baseline: 2 * GiB }),
       );
     });
+
+    const ramped = (regime: Regime): SimWorld[] =>
+      Array.from({ length: 40 }, (_, seed) => downstreamWorld(seed + 1, regime, 20));
+
+    it('does not see a leaf that has not ramped: live-headroom admission alone holds the leaves past the run on exact records', () => {
+      expect(judge(scaled, ramped(EXACT)).overCommitted).toBe(0);
+      expect(judge(liveHeadroom, ramped(EXACT)).overCommitted).toBe(1);
+    });
+
+    it('sees what lies outside the leaves, when the leaves are resident at the instant it decides', () => {
+      expect(judge(liveHeadroom, worlds({ ...EXACT, baseline: 2 * GiB })).overCommitted).toBe(0);
+    });
+
+    it('ends no run in failure when a killed leaf runs again alone, but the kernel still kills one in every run', () => {
+      const exact = judge(scaled, ramped(EXACT)).meanMakespan;
+      for (const regime of [
+        { ...EXACT, missing: 0.3 },
+        { ...EXACT, stale: 1.3 },
+        { ...EXACT, baseline: 2 * GiB },
+      ]) {
+        const plain = judge(scaled, ramped(regime));
+        expect(plain.failed).toBe(1);
+        for (const retried of [judge(scaledRetry, ramped(regime)), judge(liveHeadroomRetry, ramped(regime))]) {
+          expect(retried.killed).toBe(1);
+          expect(retried.failed).toBe(0);
+          // Alone means nothing else runs: the run takes much longer than on exact records.
+          expect(retried.meanMakespan).toBeGreaterThan(1.3 * exact);
+        }
+      }
+    });
   });
 
   describe('whatever the records say', () => {
@@ -191,7 +224,7 @@ describe('a run pool over the simulation', () => {
       { missing: 0, stale: 1.5, baseline: 0 },
       { missing: 0, stale: 1, baseline: 2 * GiB },
     ];
-    const policies = [cpuOnly, today, scaled, cap(4), cap(8)];
+    const policies = [cpuOnly, today, scaled, cap(4), cap(8), liveHeadroom, scaledRetry, liveHeadroomRetry];
     for (const policy of policies) {
       it(`${policy.name}: every leaf runs, in the order it asked`, () => {
         for (const regime of regimes) {

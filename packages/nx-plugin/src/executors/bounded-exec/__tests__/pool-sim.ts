@@ -8,8 +8,12 @@ import { admit, type PoolAsk } from '../pool-admission.js';
  * Nx's `--parallel` slots, which a leaf holds while it waits in the pool's queue, the tokens a grant lends, and the
  * memory the granted leaves truly hold, which is what the kernel judges and the pool only estimates.
  *
- * A policy is a value over this one engine (`cpuOnly`, `today`, `scaled`, `cap`), as the candidates of
+ * A policy is a value over this one engine (`cpuOnly`, `today`, `scaled`, `cap`, `liveHeadroom`, `scaledRetry`), as the candidates of
  * `packages/cowshed/crates/cowshed-admission-sim` are, so every candidate is judged on the same worlds.
+ *
+ * The kernel is modelled too: while the leaves and what lies outside them hold more than the run's memory it kills the
+ * largest, and a policy may run a killed leaf again once, alone. Leaves may reach their peak over `ramp` seconds, which is
+ * what a decision that samples live memory sees.
  */
 
 export const MiB = 1024 ** 2;
@@ -44,6 +48,8 @@ export interface SimWorld {
   /** Bytes held by what no leaf is charged for: Nx itself, the runner, a tmpfs. */
   readonly baseline: number;
   readonly leaves: readonly SimLeaf[];
+  /** Seconds a granted leaf takes to reach its peak, from nothing; 0 (the default): it holds its peak from its start. */
+  readonly ramp?: number;
 }
 
 /** What a leaf truly holds when it is lent `workers`. */
@@ -63,6 +69,10 @@ export interface Policy {
   readonly charges: boolean;
   /** The share of the run's memory the pool admits against; the leaves are judged against all of it. */
   readonly budget: number;
+  /** Admit by what the run holds live, not by the charges of the leaves holding grants. */
+  readonly live?: boolean;
+  /** A leaf the kernel killed runs again once, alone, instead of failing the run. */
+  readonly retry?: boolean;
   readonly ask: (leaf: SimLeaf) => PoolAsk;
 }
 
@@ -120,34 +130,69 @@ export const cap = (slots: number): Policy => ({
   ask: (leaf) => ({ want: leaf.want, memory: 0 }),
 });
 
+/**
+ * Live-headroom admission: a leaf is admitted while its charge, per worker, fits under the run's memory less what the run
+ * holds when the pool decides (the cgroup's \`memory.current\`, or its anonymous and shared memory). Records give the
+ * charge; the live reading catches what lies outside the leaves and what a suite holds that its record does not say. A
+ * leaf granted earlier in the same decision is not yet resident, so it counts by its charge; one granted before it is
+ * seen only as far as it has ramped. When nothing runs the head is admitted whatever it is charged.
+ */
+export const liveHeadroom: Policy = {
+  name: 'live headroom',
+  slots: (cores) => cores,
+  charges: false,
+  budget: 1,
+  live: true,
+  ask: scaled.ask,
+};
+
+/** The per-worker charge, and a leaf the kernel killed runs again once, alone, instead of failing the run. */
+export const scaledRetry: Policy = { ...scaled, name: 'per worker + a killed leaf runs again alone', retry: true };
+
+/** Live-headroom admission, and a leaf the kernel killed runs again once, alone. */
+export const liveHeadroomRetry: Policy = {
+  ...liveHeadroom,
+  name: 'live headroom + a killed leaf runs again alone',
+  retry: true,
+};
+
 /** What a run came to. */
 export interface Outcome {
-  /** The most bytes the leaves and the baseline held beyond the run's memory at any instant; 0 when they never did. */
+  /** The most bytes the leaves and the baseline held beyond the run's memory at any instant, before the kernel acted. */
   readonly overshoot: number;
-  /** The most bytes they held at any instant. */
+  /** The most bytes they held at any instant, before the kernel acted. */
   readonly peak: number;
-  /** Virtual seconds until the last leaf ended. */
+  /** Virtual seconds until the last leaf ended or was killed for good. */
   readonly makespan: number;
   /** A leaf waited for ever: the pool's queue held it while nothing ran. */
   readonly starved: boolean;
-  /** Every grant went to the leaf that had waited longest. */
+  /** Every grant went to the leaf that had waited longest, a leaf run again aside. */
   readonly fifo: boolean;
+  /** Leaves the kernel killed for memory, a leaf killed again counted again. */
+  readonly kills: number;
+  /** Leaves that ended killed with no run left: the run fails. */
+  readonly failed: number;
 }
 
 interface Queued extends PoolAsk {
   readonly leaf: SimLeaf;
   readonly order: number;
+  /** A leaf the kernel killed, run again: granted ahead of everything, and only when nothing else runs. */
+  readonly alone: boolean;
 }
 
 interface Running {
+  readonly queued: Queued;
   readonly tokens: number;
   readonly charge: number;
   readonly truth: number;
+  readonly start: number;
   readonly end: number;
 }
 
 /** Run `world` under `policy`. */
 export function simulate(policy: Policy, world: SimWorld): Outcome {
+  const ramp = world.ramp ?? 0;
   const pending = [...world.leaves];
   const queue: Queued[] = [];
   let running: Running[] = [];
@@ -159,48 +204,127 @@ export function simulate(policy: Policy, world: SimWorld): Outcome {
   let lastGranted = -1;
   let fifo = true;
   let peak = 0;
+  let kills = 0;
+  let failed = 0;
   const slots = policy.slots(world.cores);
 
-  const sample = (): void => {
-    peak = Math.max(peak, world.baseline + running.reduce((sum, leaf) => sum + leaf.truth, 0));
-  };
+  // What a running leaf holds now: its peak, reached in a straight line over `ramp` seconds from its start.
+  const heldNow = (leaf: Running): number =>
+    ramp === 0 ? leaf.truth : Math.round(leaf.truth * Math.min(1, (now - leaf.start) / ramp));
+  const live = (): number => world.baseline + running.reduce((sum, leaf) => sum + heldNow(leaf), 0);
+
   // Nx starts a target while it has a slot, and the target holds its slot while it waits in the pool's queue.
   const start = (): void => {
     while (slotsUsed < slots) {
       const leaf = pending.shift();
       if (leaf === undefined) return;
       slotsUsed += 1;
-      queue.push({ ...policy.ask(leaf), leaf, order: arrived });
+      queue.push({ ...policy.ask(leaf), leaf, order: arrived, alone: false });
       arrived += 1;
     }
   };
-  const drain = (): void => {
-    const admission = admit(queue, free, policy.charges ? { capacity: world.capacity * policy.budget, held } : null);
-    for (const { request, tokens, charge } of admission.grants) {
+  const grant = (request: Queued, tokens: number, charge: number): void => {
+    if (!request.alone) {
       if (request.order < lastGranted) fifo = false;
       lastGranted = request.order;
-      free -= tokens;
-      held += charge;
-      running.push({ tokens, charge, truth: truthAt(request.leaf, tokens), end: now + request.leaf.work / tokens });
     }
+    free -= tokens;
+    held += charge;
+    running.push({
+      queued: request,
+      tokens,
+      charge,
+      truth: truthAt(request.leaf, tokens),
+      start: now,
+      end: now + request.leaf.work / tokens,
+    });
+  };
+  const ledger = (): { capacity: number; held: number } | null =>
+    policy.charges ? { capacity: world.capacity * policy.budget, held } : null;
+  const drain = (): void => {
+    // Nothing is admitted while a leaf run again alone runs.
+    if (running.some((leaf) => leaf.queued.alone)) return;
+    const head = queue[0];
+    if (head?.alone) {
+      // A leaf the kernel killed runs again alone, and nothing is admitted behind it until it does.
+      if (running.length > 0) return;
+      const [again] = admit([head], free, ledger()).grants;
+      if (again !== undefined) {
+        grant(head, again.tokens, again.charge);
+        queue.shift();
+      }
+      return;
+    }
+    if (policy.live) {
+      const resident = live();
+      let granted = 0;
+      let charged = 0;
+      for (let next = queue[0]; next !== undefined && !next.alone; next = queue[0]) {
+        const room = world.capacity - resident - charged;
+        const alone = running.length === 0 && granted === 0;
+        if (next.memory > room && !alone) return;
+        const [fit] = admit([next], free, { capacity: next.memory > room ? world.capacity : room, held: 0 }).grants;
+        if (fit === undefined) return;
+        grant(next, fit.tokens, fit.charge);
+        queue.shift();
+        granted += 1;
+        charged += fit.charge;
+      }
+      return;
+    }
+    const admission = admit(queue, free, ledger());
+    for (const { request, tokens, charge } of admission.grants) grant(request, tokens, charge);
     queue.splice(0, admission.grants.length);
-    sample();
+  };
+  // The kernel's judgement at this instant: while the leaves hold more than the run's memory it kills the largest.
+  const settle = (): boolean => {
+    let total = live();
+    peak = Math.max(peak, total);
+    let killed = false;
+    while (total > world.capacity) {
+      let victim: Running | undefined;
+      for (const leaf of running) {
+        if (victim === undefined || heldNow(leaf) > heldNow(victim)) victim = leaf;
+      }
+      if (victim === undefined) break;
+      const dead = victim;
+      running = running.filter((leaf) => leaf !== dead);
+      free += dead.tokens;
+      held -= dead.charge;
+      kills += 1;
+      killed = true;
+      if (policy.retry && !dead.queued.alone) {
+        queue.unshift({ ...dead.queued, alone: true });
+      } else {
+        failed += 1;
+        slotsUsed -= 1;
+      }
+      total = live();
+    }
+    return killed;
+  };
+  const step = (): void => {
+    do {
+      start();
+      drain();
+    } while (settle());
   };
 
-  start();
-  drain();
+  step();
   while (running.length > 0) {
-    const next = Math.min(...running.map((leaf) => leaf.end));
+    // The next change: a leaf ends, or a leaf reaches its peak.
+    const next = Math.min(
+      ...running.flatMap((leaf) => [leaf.end, ...(leaf.start + ramp > now ? [leaf.start + ramp] : [])]),
+    );
     now = next;
-    const ended = running.filter((leaf) => leaf.end === next);
-    running = running.filter((leaf) => leaf.end !== next);
+    const ended = running.filter((leaf) => leaf.end <= next);
+    running = running.filter((leaf) => leaf.end > next);
     for (const leaf of ended) {
       free += leaf.tokens;
       held -= leaf.charge;
       slotsUsed -= 1;
     }
-    start();
-    drain();
+    step();
   }
   return {
     overshoot: Math.max(0, peak - world.capacity),
@@ -208,6 +332,8 @@ export function simulate(policy: Policy, world: SimWorld): Outcome {
     makespan: now,
     starved: queue.length > 0 || pending.length > 0,
     fifo,
+    kills,
+    failed,
   };
 }
 
@@ -239,7 +365,7 @@ function random(seed: number): () => number {
  * worker holds is not in the logs: 0.1 to 0.4 GiB a worker over 0.5 to 1.5 GiB is an assumption, as are the work
  * figures. Each leaf's record was made when it was lent one of 1, 2, 4, 8, 22 or 31 workers.
  */
-export function downstreamWorld(seed: number, regime: Regime): SimWorld {
+export function downstreamWorld(seed: number, regime: Regime, ramp = 0): SimWorld {
   const next = random(seed);
   const between = (low: number, high: number): number => low + next() * (high - low);
   const leaves: SimLeaf[] = [];
@@ -278,17 +404,21 @@ export function downstreamWorld(seed: number, regime: Regime): SimWorld {
       leaves[swap] = held;
     }
   }
-  return { capacity: 32 * GiB, cores: 32, baseline: regime.baseline, leaves };
+  return { capacity: 32 * GiB, cores: 32, baseline: regime.baseline, ramp, leaves };
 }
 
 /** What a policy came to over many runs. */
 export interface Judgement {
   readonly policy: string;
-  /** The share of runs in which the leaves held more than the run's memory at some instant. */
+  /** The share of runs in which the leaves held more than the run's memory at some instant, before the kernel acted. */
   readonly overCommitted: number;
   /** In those runs, the most they held beyond it, in GiB, on average. */
   readonly meanOvershootGiB: number;
-  /** The most they held at any instant, in GiB, on average over all runs. */
+  /** The share of runs in which the kernel killed a leaf. */
+  readonly killed: number;
+  /** The share of runs that ended with a leaf killed and not run again, or killed again: the run fails. */
+  readonly failed: number;
+  /** The most they held at any instant before the kernel acted, in GiB, on average over all runs. */
   readonly meanPeakGiB: number;
   /** Virtual seconds until the last leaf ended, on average. */
   readonly meanMakespan: number;
@@ -299,12 +429,15 @@ export interface Judgement {
 export function judge(policy: Policy, worlds: readonly SimWorld[]): Judgement {
   const outcomes = worlds.map((world) => simulate(policy, world));
   const over = outcomes.filter((outcome) => outcome.overshoot > 0);
+  const share = (count: number): number => count / outcomes.length;
   const mean = (values: readonly number[]): number =>
     values.length === 0 ? 0 : values.reduce((sum, value) => sum + value, 0) / values.length;
   return {
     policy: policy.name,
-    overCommitted: over.length / outcomes.length,
+    overCommitted: share(over.length),
     meanOvershootGiB: mean(over.map((outcome) => outcome.overshoot / GiB)),
+    killed: share(outcomes.filter((outcome) => outcome.kills > 0).length),
+    failed: share(outcomes.filter((outcome) => outcome.failed > 0).length),
     meanPeakGiB: mean(outcomes.map((outcome) => outcome.peak / GiB)),
     meanMakespan: mean(outcomes.map((outcome) => outcome.makespan)),
     starved: outcomes.filter((outcome) => outcome.starved).length,
