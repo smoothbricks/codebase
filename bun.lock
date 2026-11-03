@@ -88,7 +88,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.13.11",
+      "version": "0.13.12-next.0",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -124,7 +124,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.4.8",
+      "version": "0.4.9-next.0",
       "bin": {
         "cowshed": "./bin/cowshed",
       },
@@ -183,7 +183,7 @@
     },
     "packages/lmao": {
       "name": "@smoothbricks/lmao",
-      "version": "0.6.1",
+      "version": "0.6.2-next.0",
       "dependencies": {
         "@msgpack/msgpack": "^3.1.3",
         "@neophi/sieve-cache": "^1.5.0",
@@ -228,7 +228,7 @@
     },
     "packages/lmao-inspector": {
       "name": "@smoothbricks/lmao-inspector",
-      "version": "0.1.17",
+      "version": "0.1.18-next.0",
       "dependencies": {
         "@duckdb/duckdb-wasm": "1.33.1-dev20.0",
         "@smoothbricks/lmao": "workspace:*",
@@ -307,7 +307,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.7.10",
+      "version": "0.7.11-next.0",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
