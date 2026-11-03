@@ -347,7 +347,7 @@
           },
           "cargoToolchain",
           {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh git rev-parse HEAD"
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
           }
         ],
         "//": "outputDir is the tree this configuration writes: .cache/bin/<platform> by default, dist/bin/<platform> in production (specs/cowshed/06_cli.md, Launcher). One option feeds the declared output, napi's --output-dir and the receipt's --output, so the three cannot name different trees. HEAD is an input because the production build records the commit HEAD names (build.rs; specs/cowshed/05_gateway.md, Build records and the basis): keyed on its sources alone, a release CLI built at one commit was replayed for later commits, recording a commit the installed build already contained, and setup refused it as a downgrade.",
@@ -392,7 +392,7 @@
           },
           "cargoToolchain",
           {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh git rev-parse HEAD"
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
           }
         ],
         "//": "outputDir is the tree this configuration writes: .cache/bin/<platform> by default, dist/bin/<platform> in production (specs/cowshed/06_cli.md, Launcher). One option feeds the declared output, napi's --output-dir and the receipt's --output, so the three cannot name different trees.",
@@ -436,7 +436,7 @@
           },
           "cargoToolchain",
           {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh git rev-parse HEAD"
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
           }
         ],
         "//": "output is the file this configuration writes: .cache/bin/<platform>/cowshed by default, dist/bin/<platform>/cowshed in production (specs/cowshed/06_cli.md, Launcher). The declared output is its directory, which {options.output}/.. resolves to, so the tree is restored whole and reads the same option the executor writes through.",
@@ -482,7 +482,7 @@
           },
           "cargoToolchain",
           {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh git rev-parse HEAD"
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
           }
         ],
         "//": "output is the file this configuration writes: .cache/bin/<platform>/cowshed by default, dist/bin/<platform>/cowshed in production (specs/cowshed/06_cli.md, Launcher). The declared output is its directory, which {options.output}/.. resolves to, so the tree is restored whole and reads the same option the executor writes through.",

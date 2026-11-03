@@ -201,7 +201,7 @@ fn every_release_cli_cache_key_names_the_commit_it_records() {
     )
     .expect("package.json is JSON");
     let head = serde_json::json!({
-        "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh git rev-parse HEAD"
+        "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
     });
     let targets = package["nx"]["targets"]
         .as_object()
