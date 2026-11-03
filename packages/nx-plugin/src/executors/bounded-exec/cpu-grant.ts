@@ -18,7 +18,9 @@ export function parseCpuGrant(value: unknown): CpuGrantRecord | undefined | 'mal
   if (typeof value !== 'object' || value === null) {
     return 'malformed';
   }
-  const { tokens, want, waitedMs } = value as Record<string, unknown>;
+  const tokens: unknown = Reflect.get(value, 'tokens');
+  const want: unknown = Reflect.get(value, 'want');
+  const waitedMs: unknown = Reflect.get(value, 'waitedMs');
   if (
     !(typeof tokens === 'number' && Number.isSafeInteger(tokens) && tokens >= 1) ||
     !(typeof want === 'number' && Number.isSafeInteger(want) && want >= 1) ||
