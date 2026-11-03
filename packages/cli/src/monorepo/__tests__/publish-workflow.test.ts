@@ -57,6 +57,13 @@ const codebaseWorkflowOptions: PublishWorkflowDefinitionOptions = {
     internalServer: 'http://10.89.0.1:8765',
     tokenSecret: 'NX_REMOTE_CACHE_TOKEN',
   },
+  mbxRemote: {
+    serverVariable: 'MBX_REMOTE_SERVER',
+    internalServer: 'http://127.0.0.1:8766',
+    namespace: 'smoothbricks',
+    writeTokenSecret: 'MBX_REMOTE_TOKEN',
+    readTokenSecret: 'MBX_REMOTE_READ_TOKEN',
+  },
 };
 
 type ProducerStep = {
