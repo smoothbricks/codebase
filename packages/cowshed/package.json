@@ -345,14 +345,12 @@
               "bun-lock:packages/cowshed"
             ]
           },
-          "cargoToolchain",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
-          }
+          "cargoToolchain"
         ],
-        "//": "outputDir is the tree this configuration writes: .cache/bin/<platform> by default, dist/bin/<platform> in production (specs/cowshed/06_cli.md, Launcher). One option feeds the declared output, napi's --output-dir and the receipt's --output, so the three cannot name different trees. HEAD is an input because the production build records the commit HEAD names (build.rs; specs/cowshed/05_gateway.md, Build records and the basis): keyed on its sources alone, a release CLI built at one commit was replayed for later commits, recording a commit the installed build already contained, and setup refused it as a downgrade.",
+        "//": "outputDir is the tree this configuration writes: .cache/bin/<platform> by default, dist/bin/<platform> in production (specs/cowshed/06_cli.md, Launcher). One option feeds the declared output, napi's --output-dir and the receipt's --output, so the three cannot name different trees. The binary is cached by its sources alone and replayed for every commit that left them unchanged; the commit it is installed as is cli-record-arm64-macos's record beside it (specs/cowshed/05_gateway.md, Build records and the basis), so this target's outputs are the binary and its input record by name, never the directory the record shares.",
         "outputs": [
-          "{projectRoot}/{options.outputDir}/"
+          "{projectRoot}/{options.outputDir}/cowshed",
+          "{projectRoot}/{options.outputDir}/.build-inputs.json"
         ],
         "options": {
           "cwd": "packages/cowshed",
@@ -390,14 +388,12 @@
               "bun-lock:packages/cowshed"
             ]
           },
-          "cargoToolchain",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
-          }
+          "cargoToolchain"
         ],
         "//": "outputDir is the tree this configuration writes: .cache/bin/<platform> by default, dist/bin/<platform> in production (specs/cowshed/06_cli.md, Launcher). One option feeds the declared output, napi's --output-dir and the receipt's --output, so the three cannot name different trees.",
         "outputs": [
-          "{projectRoot}/{options.outputDir}/"
+          "{projectRoot}/{options.outputDir}/cowshed",
+          "{projectRoot}/{options.outputDir}/.build-inputs.json"
         ],
         "options": {
           "cwd": "packages/cowshed",
@@ -434,14 +430,12 @@
               "bun-lock:packages/cowshed"
             ]
           },
-          "cargoToolchain",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
-          }
+          "cargoToolchain"
         ],
         "//": "output is the file this configuration writes: .cache/bin/<platform>/cowshed by default, dist/bin/<platform>/cowshed in production (specs/cowshed/06_cli.md, Launcher). The declared output is its directory, which {options.output}/.. resolves to, so the tree is restored whole and reads the same option the executor writes through.",
         "outputs": [
-          "{options.output}/../"
+          "{options.output}",
+          "{options.output}/../.build-inputs.json"
         ],
         "options": {
           "target": "aarch64-unknown-linux-musl",
@@ -480,14 +474,12 @@
               "bun-lock:packages/cowshed"
             ]
           },
-          "cargoToolchain",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
-          }
+          "cargoToolchain"
         ],
         "//": "output is the file this configuration writes: .cache/bin/<platform>/cowshed by default, dist/bin/<platform>/cowshed in production (specs/cowshed/06_cli.md, Launcher). The declared output is its directory, which {options.output}/.. resolves to, so the tree is restored whole and reads the same option the executor writes through.",
         "outputs": [
-          "{options.output}/../"
+          "{options.output}",
+          "{options.output}/../.build-inputs.json"
         ],
         "options": {
           "target": "x86_64-unknown-linux-musl",
@@ -501,6 +493,151 @@
             "release": true,
             "output": "{projectRoot}/dist/bin/linux-x64/cowshed"
           }
+        }
+      },
+      "cli-record-arm64-macos": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "//": "The release record beside cli-arm64-macos's binary, <outputDir>/cowshed.build: the commit HEAD names, its commit time and the binary's SHA-256 (scripts/release-record.ts; specs/cowshed/05_gateway.md, Build records and the basis). Keyed on HEAD and on the binary's bytes, so the binary itself stays cached by its sources while every commit gets its own record; it runs in milliseconds. Its name ends in the platform, so cli-native, the aggregate build and the publish jobs run it beside cli-arm64-macos, in the same configuration.",
+        "dependsOn": [
+          "cli-arm64-macos"
+        ],
+        "inputs": [
+          "{projectRoot}/scripts/release-record.ts",
+          "bunToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
+          },
+          {
+            "dependentTasksOutputFiles": "**/cowshed",
+            "transitive": false
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/cowshed.build"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "outputDir": ".cache/bin/darwin-arm64",
+          "command": "bun scripts/release-record.ts {args.outputDir}/cowshed"
+        },
+        "configurations": {
+          "production": {
+            "outputDir": "dist/bin/darwin-arm64"
+          }
+        }
+      },
+      "cli-record-x64-macos": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "//": "cli-record-arm64-macos for cli-x64-macos.",
+        "dependsOn": [
+          "cli-x64-macos"
+        ],
+        "inputs": [
+          "{projectRoot}/scripts/release-record.ts",
+          "bunToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
+          },
+          {
+            "dependentTasksOutputFiles": "**/cowshed",
+            "transitive": false
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/cowshed.build"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "outputDir": ".cache/bin/darwin-x64",
+          "command": "bun scripts/release-record.ts {args.outputDir}/cowshed"
+        },
+        "configurations": {
+          "production": {
+            "outputDir": "dist/bin/darwin-x64"
+          }
+        }
+      },
+      "cli-record-arm64-linux": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "//": "cli-record-arm64-macos for cli-arm64-linux.",
+        "dependsOn": [
+          "cli-arm64-linux"
+        ],
+        "inputs": [
+          "{projectRoot}/scripts/release-record.ts",
+          "bunToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
+          },
+          {
+            "dependentTasksOutputFiles": "**/cowshed",
+            "transitive": false
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/cowshed.build"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "outputDir": ".cache/bin/linux-arm64",
+          "command": "bun scripts/release-record.ts {args.outputDir}/cowshed"
+        },
+        "configurations": {
+          "production": {
+            "outputDir": "dist/bin/linux-arm64"
+          }
+        }
+      },
+      "cli-record-x64-linux": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "//": "cli-record-arm64-macos for cli-x64-linux.",
+        "dependsOn": [
+          "cli-x64-linux"
+        ],
+        "inputs": [
+          "{projectRoot}/scripts/release-record.ts",
+          "bunToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git rev-parse HEAD"
+          },
+          {
+            "dependentTasksOutputFiles": "**/cowshed",
+            "transitive": false
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/cowshed.build"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "outputDir": ".cache/bin/linux-x64",
+          "command": "bun scripts/release-record.ts {args.outputDir}/cowshed"
+        },
+        "configurations": {
+          "production": {
+            "outputDir": "dist/bin/linux-x64"
+          }
+        }
+      },
+      "release-record-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/scripts/release-record.ts",
+          "{projectRoot}/scripts/release-record.test.ts",
+          "bunToolchain"
+        ],
+        "outputs": [],
+        "//": "Unit tests of release-record.ts against temporary git repositories. Runs from the project root on an explicit path, with an empty Bun config, as apfs-test-root-test does: the package bunfig.toml preloads LMAO's hooks, which a script test has no use for.",
+        "options": {
+          "command": "bun test --config=/dev/null --timeout=0 ./scripts/release-record.test.ts",
+          "cwd": "{projectRoot}",
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
         }
       },
       "host-napi-test": {
@@ -824,6 +961,7 @@
           "wire-fixtures-test",
           "capability-probe-test",
           "apfs-test-root-test",
+          "release-record-test",
           "wire-test",
           "declaration-model-test"
         ]

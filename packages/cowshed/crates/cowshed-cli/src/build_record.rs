@@ -1,23 +1,32 @@
-//! Which build a cowshed binary is, as the binary itself records it, and what that says about
-//! replacing one build with another (05_gateway.md "The installed cowshed").
+//! Which build a cowshed binary is, as the record beside it says, and what that says about
+//! replacing one build with another (05_gateway.md "The installed cowshed", "Build records and the
+//! basis").
 //!
-//! Every release build carries the commit it was made from and when that commit was committed
-//! (`build.rs`). The commit is what an install is judged by: a build may replace the installed
-//! one only when it holds every installed commit, by ancestry or patch identity
+//! A release distribution carries its record beside its binary, `<binary>.build`: the commit it
+//! was made from, when that commit was committed, and the SHA-256 of the binary it describes. The
+//! package's `cli-record-<platform>` target writes it after the binary is built
+//! (`scripts/release-record.ts`). Nothing is compiled in, so the binary is cached by its sources
+//! alone and replayed for every commit that left them unchanged; only the record names the commit,
+//! and the digest binds it to exactly those bytes. A record whose digest is not the binary's is
+//! refused, never read as absent: it describes some other build.
+//!
+//! The commit is what an install is judged by: a build may replace the installed one only when it
+//! holds every installed commit, by ancestry or patch identity
 //! (`GitRepository::commits_not_held`). The time only describes a build to a person. It never
 //! orders two builds: two sibling commits are ordered by clock, and the later one carries none of
-//! the earlier one's fixes. A build made without git, or made in the debug profile, records
-//! nothing.
+//! the earlier one's fixes. A binary with no record beside it records nothing.
 //!
-//! The installing build writes its own record beside the stored copy it installs
-//! (`gateway_service`), so the installed build's record is read from a file rather than from a
-//! process: nothing is executed to learn it, and a copy installed before records existed simply
-//! has none.
+//! The installing build writes its record beside the stored copy it installs
+//! (`gateway_service`), named after the copy's digest, so the installed build's record is read
+//! from a file rather than from a process: nothing is executed to learn it, and a copy installed
+//! before records existed simply has none.
 
+use crate::launchd::ExecutableDigest;
 use cowshed_core::CowshedError;
 use cowshed_core::git::CommitSubject;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 /// The build a release binary says it is.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -30,14 +39,65 @@ pub struct BuildRecord {
     pub commit_time: u64,
 }
 
+/// What a release record beside a binary holds: the build, and the bytes it describes.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReleaseRecord {
+    commit: String,
+    commit_time: u64,
+    sha256: String,
+}
+
+/// Where the release record of `binary` is: beside it, its file name and `.build`.
+pub fn release_record_path(binary: &Path) -> PathBuf {
+    let mut path = binary.as_os_str().to_owned();
+    path.push(".build");
+    PathBuf::from(path)
+}
+
 impl BuildRecord {
-    /// The record this binary was built with; `None` for a debug build and for one made without
-    /// git.
-    pub fn running() -> Option<Self> {
-        Some(Self {
-            commit: option_env!("COWSHED_BUILD_COMMIT")?.to_owned(),
-            commit_time: option_env!("COWSHED_BUILD_COMMIT_TIME")?.parse().ok()?,
-        })
+    /// The build the distribution binary at `binary`, whose bytes hash to `digest`, says it is:
+    /// the release record beside it, or `None` when there is none. A record that cannot be read,
+    /// or that describes other bytes, is refused: it names a commit, just not this binary's.
+    pub fn beside(binary: &Path, digest: &ExecutableDigest) -> Result<Option<Self>, CowshedError> {
+        let path = release_record_path(binary);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(CowshedError::internal(format!(
+                    "could not read {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let rebuild = "rebuild the release with `nx run cowshed:cli-native:production`, which \
+                       writes the binary and its record together";
+        let record: ReleaseRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "the release record {} is unreadable: {error}",
+                    path.display()
+                ),
+                rebuild,
+            )
+        })?;
+        if record.sha256 != digest.as_str() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "the release record {} describes the binary with SHA-256 {}, but {} hashes to \
+                     {digest}: it is the record of another build",
+                    path.display(),
+                    record.sha256,
+                    binary.display(),
+                ),
+                rebuild,
+            ));
+        }
+        Ok(Some(Self {
+            commit: record.commit,
+            commit_time: record.commit_time,
+        }))
     }
 
     /// The commit, as short as a person can use it.
@@ -175,6 +235,71 @@ mod tests {
     use super::*;
     use cowshed_core::api::GitOid;
 
+    const DIGEST: &str = "5c1e2f6c51b8e1d3a17c2b9d8e8e8b0b0f3d2c1a9e8f7a6b5c4d3e2f1a0b9c8d";
+
+    /// A binary in a scratch directory with `record` beside it, and its path.
+    fn distribution(label: &str, record: Option<&str>) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "cowshed-release-record-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let binary = directory.join("cowshed");
+        std::fs::write(&binary, b"a release binary").unwrap();
+        let path = release_record_path(&binary);
+        match record {
+            Some(record) => std::fs::write(&path, record).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        binary
+    }
+
+    #[test]
+    fn a_release_record_whose_digest_is_the_binarys_names_its_build() {
+        let binary = distribution(
+            "match",
+            Some(&format!(
+                "{{\"commit\":\"{}\",\"commitTime\":1793731024,\"sha256\":\"{DIGEST}\"}}",
+                "8".repeat(40)
+            )),
+        );
+        let digest = ExecutableDigest::parse(DIGEST).unwrap();
+        assert_eq!(
+            BuildRecord::beside(&binary, &digest).unwrap(),
+            Some(BuildRecord {
+                commit: "8".repeat(40),
+                commit_time: 1_793_731_024,
+            })
+        );
+    }
+
+    #[test]
+    fn a_release_record_of_other_bytes_is_refused() {
+        let binary = distribution(
+            "mismatch",
+            Some(&format!(
+                "{{\"commit\":\"{}\",\"commitTime\":1,\"sha256\":\"{}\"}}",
+                "a".repeat(40),
+                "0".repeat(64)
+            )),
+        );
+        let digest = ExecutableDigest::parse(DIGEST).unwrap();
+        let error = BuildRecord::beside(&binary, &digest).unwrap_err();
+        assert!(
+            error.message.contains("the record of another build"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_binary_with_no_record_beside_it_records_nothing() {
+        let binary = distribution("absent", None);
+        let digest = ExecutableDigest::parse(DIGEST).unwrap();
+        assert_eq!(BuildRecord::beside(&binary, &digest).unwrap(), None);
+    }
     const SOURCE: &str = "/Users/dev/checkout/dist/bin/darwin-arm64/cowshed";
 
     fn record(commit: &str, commit_time: u64) -> BuildRecord {

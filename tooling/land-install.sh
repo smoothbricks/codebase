@@ -63,7 +63,7 @@ gateway_readiness() {
 # Runs under the repository's land turn, so main stands still. Exit 3 means it said why in a status line of its own.
 build_release() {
   stage=$(bun "$here/land-install.ts" stage-dir "$main" "$head")
-  if [ -x "$stage/dist/bin/$platform/cowshed" ] && [ -f "$stage/$server" ] && [ -f "$stage/nix/mbx/flake.nix" ]; then
+  if [ -x "$stage/dist/bin/$platform/cowshed" ] && [ -f "$stage/dist/bin/$platform/cowshed.build" ] && [ -f "$stage/$server" ] && [ -f "$stage/nix/mbx/flake.nix" ]; then
     say "the production build for $head is already staged in $stage"
     return 0
   fi
@@ -77,8 +77,8 @@ build_release() {
   fi
   built=$main/packages/cowshed/dist/bin/$platform/cowshed
   bundle=$main/packages/nx-cache-server/dist/server/nx-cache-server.js
-  if [ ! -x "$built" ] || [ ! -f "$bundle" ]; then
-    record failed "the production build left no $built or no $bundle"
+  if [ ! -x "$built" ] || [ ! -f "$built.build" ] || [ ! -f "$bundle" ]; then
+    record failed "the production build left no $built, no release record $built.build or no $bundle"
     return 3
   fi
   # A stage is whole or absent: it is assembled beside its name and renamed into it. This runs under the land turn, so a
@@ -88,6 +88,7 @@ build_release() {
   rm -rf "$root"/*.partial "$stage"
   mkdir -p "$stage.partial/dist/bin/$platform" "$stage.partial/$(dirname "$server")" "$stage.partial/nix/mbx"
   cp -p "$built" "$stage.partial/dist/bin/$platform/cowshed"
+  cp -p "$built.build" "$stage.partial/dist/bin/$platform/cowshed.build"
   cp -p "$bundle" "$stage.partial/$server"
   cp -p "$main/packages/cowshed/nix/mbx/flake.nix" "$main/packages/cowshed/nix/mbx/flake.lock" "$stage.partial/nix/mbx/"
   mv "$stage.partial" "$stage"

@@ -11,7 +11,7 @@ import { join } from 'node:path';
 
 /** A release CLI this host can install, and where its build writes it. */
 export interface CliTarget {
-  /** The Nx target whose production configuration builds it. */
+  /** The Nx target whose production configuration builds it and writes its release record beside it. */
   readonly target: string;
   /** The dist/bin directory that build writes: the platform part of a binary's place in a distribution. */
   readonly platform: string;
@@ -22,9 +22,9 @@ export function cliTarget(system: string, machine: string): CliTarget | undefine
   if (system !== 'Darwin') return undefined;
   switch (machine) {
     case 'arm64':
-      return { target: 'cli-arm64-macos', platform: 'darwin-arm64' };
+      return { target: 'cli-record-arm64-macos', platform: 'darwin-arm64' };
     case 'x86_64':
-      return { target: 'cli-x64-macos', platform: 'darwin-x64' };
+      return { target: 'cli-record-x64-macos', platform: 'darwin-x64' };
     default:
       return undefined;
   }

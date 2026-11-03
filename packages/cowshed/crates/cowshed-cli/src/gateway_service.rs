@@ -849,9 +849,9 @@ where
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     // The candidate path is derived first because the plist has to name it before the agent can be
     // activated, and the install-then-activate pair is what has to be undoable as a whole.
-    let candidate = Candidate::of(supervisable_running_executable()?, BuildRecord::running())?;
     let executable =
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let candidate = Candidate::of(supervisable_running_executable()?, &executable)?;
     check_basis(&executable, &candidate, downgrade, async || {
         adopted_mains(&home).await
     })
@@ -2241,10 +2241,19 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    pub fn of(source: PathBuf, record: Option<BuildRecord>) -> Result<Self> {
+    /// The build at `source`, and the record that says which build it is: a copy the install
+    /// slot of `installed` holds is described by the record its install wrote beside it, and any
+    /// other build, a distribution, by the release record beside it ([`BuildRecord::beside`]).
+    pub fn of(source: PathBuf, installed: &HostStableExecutable) -> Result<Self> {
+        let digest = executable_digest(&source)?;
+        let record = if source.parent() == Some(installed.directory()) {
+            installed_record(installed, &digest)?
+        } else {
+            BuildRecord::beside(&source, &digest)?
+        };
         Ok(Self {
-            digest: executable_digest(&source)?,
             source,
+            digest,
             record,
         })
     }
@@ -2585,8 +2594,8 @@ pub fn refuse_unsupervisable_build(source: PathBuf, debug_build: bool) -> Result
                 source.display()
             ),
             format!(
-                "build a release binary with `nx run cowshed:{RELEASE_CLI_TARGET}:production` \
-                 (or `cargo build --release -p cowshed-cli`) and run this from it; \
+                "build a release binary and its record with \
+                 `nx run cowshed:cli-native:production` and run this from it; \
                  `nx run cowshed:cli-native` and `{RELEASE_CLI_TARGET}`'s default configuration \
                  build a debug one"
             ),
@@ -2689,9 +2698,19 @@ fn installed_build(executable: &HostStableExecutable) -> Result<Option<Installed
     else {
         return Ok(None);
     };
-    let path = build_record_path(executable, &digest);
-    let record = match fs::read(&path) {
-        Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|error| {
+    let record = installed_record(executable, &digest)?;
+    Ok(Some(InstalledBuild { digest, record }))
+}
+
+/// The record the install of the stored copy of `digest` wrote beside it; `None` for a copy
+/// installed before records existed, or from a build that records nothing.
+fn installed_record(
+    executable: &HostStableExecutable,
+    digest: &ExecutableDigest,
+) -> Result<Option<BuildRecord>> {
+    let path = build_record_path(executable, digest);
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|error| {
             CowshedError::integrity(
                 format!(
                     "the installed cowshed's build record {} is unreadable: {error}",
@@ -2700,16 +2719,13 @@ fn installed_build(executable: &HostStableExecutable) -> Result<Option<Installed
                 "rewrite it as the installed build's {\"commit\",\"commitTime\"}, or run `cowshed \
                  setup --downgrade` from the build to install it without judging it",
             )
-        })?),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(CowshedError::internal(format!(
-                "could not read {}: {error}",
-                path.display()
-            )));
-        }
-    };
-    Ok(Some(InstalledBuild { digest, record }))
+        })?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CowshedError::internal(format!(
+            "could not read {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 /// Take the install slot for `home`: one install at a time (`install_basis`). Every caller takes
@@ -3064,8 +3080,8 @@ pub async fn refresh_gateway_binary(
     home: &Path,
     downgrade: Downgrade,
 ) -> Result<Option<ServiceBinaryRefresh>> {
-    let candidate = Candidate::of(running_executable()?, BuildRecord::running())?;
     let (executable, target) = gateway_launch_agent(roots.namespace(), home)?;
+    let candidate = Candidate::of(running_executable()?, &executable)?;
     let basis = check_basis(&executable, &candidate, downgrade, async || {
         adopted_mains(home).await
     })
@@ -3271,8 +3287,8 @@ pub async fn install_cli(
     downgrade: Downgrade,
     path: &std::ffi::OsStr,
 ) -> Result<CliInstall> {
-    let candidate = Candidate::of(running_executable()?, BuildRecord::running())?;
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let candidate = Candidate::of(running_executable()?, &executable)?;
     let basis = check_basis(&executable, &candidate, downgrade, async || {
         adopted_mains(home).await
     })
@@ -3649,7 +3665,21 @@ mod tests {
         let companion = distribution_companion(home);
         fs::create_dir_all(companion.parent().unwrap()).expect("companion directory");
         fs::write(&companion, b"the packaged nx cache server").expect("companion");
-        Candidate::of(path, record).expect("candidate")
+        if let Some(record) = &record {
+            let digest = executable_digest(&path).expect("digest");
+            fs::write(
+                crate::build_record::release_record_path(&path),
+                serde_json::json!({
+                    "commit": record.commit,
+                    "commitTime": record.commit_time,
+                    "sha256": digest.as_str(),
+                })
+                .to_string(),
+            )
+            .expect("release record");
+        }
+        let installed = HostStableExecutable::new(home, COWSHED_BINARY_NAME).expect("executable");
+        Candidate::of(path, &installed).expect("candidate")
     }
 
     /// Where [`build_recording`]'s distributions find `@smoothbricks/nx-cache-server`'s bundle.
@@ -3868,7 +3898,7 @@ mod tests {
             candidate.source.clone(),
             executable.stored(&candidate.digest),
         ] {
-            let candidate = Candidate::of(source, None).unwrap();
+            let candidate = Candidate::of(source, &executable).unwrap();
             let refreshed = refresh_gateway_from(
                 HostNamespace::Production,
                 &home,

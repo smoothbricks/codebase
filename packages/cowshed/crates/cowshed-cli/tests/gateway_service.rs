@@ -643,10 +643,11 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
         "the refusal must name the build it refused; got {}",
         error.message
     );
-    assert!(error.hint.contains("--release"), "{}", error.hint);
-    // The remedy must name a build that this guard accepts. `nx run cowshed:cli-native` builds the
-    // platform `cli-*` target in its default configuration, which is a debug build: a hint
-    // naming it sent the operator straight back here.
+    // The remedy must name a build that this guard accepts and that carries its release record:
+    // `cli-native:production` builds this host's platform `cli-*` target in its production
+    // configuration and the `cli-record-*` target that writes the record beside it. Plain
+    // `nx run cowshed:cli-native` is the default configuration, a debug build: a hint naming it
+    // sent the operator straight back here.
     // Resolved at run time: `env!` would compile the building checkout's path into the binary,
     // and an archive replayed from the cache into another checkout reads a path that is gone.
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
@@ -682,7 +683,7 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
     assert!(
         error
             .hint
-            .contains(&format!("nx run cowshed:{RELEASE_CLI_TARGET}:production")),
+            .contains(&format!("nx run cowshed:cli-native:production")),
         "{}",
         error.hint
     );

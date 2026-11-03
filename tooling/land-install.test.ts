@@ -43,8 +43,8 @@ const HEAD = 'a1'.repeat(20);
 
 describe('cliTarget', () => {
   it('names the release CLI target and dist/bin directory of a macOS host by architecture', () => {
-    expect(cliTarget('Darwin', 'arm64')).toEqual({ target: 'cli-arm64-macos', platform: 'darwin-arm64' });
-    expect(cliTarget('Darwin', 'x86_64')).toEqual({ target: 'cli-x64-macos', platform: 'darwin-x64' });
+    expect(cliTarget('Darwin', 'arm64')).toEqual({ target: 'cli-record-arm64-macos', platform: 'darwin-arm64' });
+    expect(cliTarget('Darwin', 'x86_64')).toEqual({ target: 'cli-record-x64-macos', platform: 'darwin-x64' });
   });
 
   it('has none for another architecture or another system', () => {
@@ -432,12 +432,13 @@ run)
     mkdir -p packages/nx-cache-server/dist/server
     echo "server bundle" >packages/nx-cache-server/dist/server/nx-cache-server.js
     ;;
-  cowshed:cli-*-macos:production)
+  cowshed:cli-record-*-macos:production)
     [ ! -f "$FIX_STATE/build-fails" ] || exit 1
-    arch=$(echo "$2" | cut -d- -f2)
+    arch=$(echo "$2" | cut -d- -f3)
     mkdir -p "packages/cowshed/dist/bin/darwin-$arch"
     cp "$FIX_STATE/staged.sh" "packages/cowshed/dist/bin/darwin-$arch/cowshed"
     chmod +x "packages/cowshed/dist/bin/darwin-$arch/cowshed"
+    echo "release record" >"packages/cowshed/dist/bin/darwin-$arch/cowshed.build"
     ;;
   *) exit 97 ;;
   esac
@@ -596,7 +597,7 @@ function fixture(changed: readonly string[] = [COWSHED_CHANGE]): Install {
 const NX_SHOW = (install: Install): string =>
   `show projects --affected --base=${install.before} --head=${install.head} --json [turn free]`;
 const NX_BUNDLE = 'run nx-cache-server:bundle --outputStyle=static-failures-only [turn held]';
-const NX_PRODUCTION = 'run cowshed:cli-arm64-macos:production --outputStyle=static-failures-only [turn held]';
+const NX_PRODUCTION = 'run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only [turn held]';
 
 /** The one status line a run wrote, split into its timestamp, commit and the outcome text. */
 function onlyLine(stdout: string): { readonly timestamp: string; readonly commit: string; readonly text: string } {
@@ -636,6 +637,8 @@ describe('land-install.sh', () => {
     // The stage is a distribution, so setup finds the Nx cache server where it looks for a package's dependency.
     const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
     expect(statSync(binary).mode & 0o111).not.toBe(0);
+    // Setup judges the install by the release record beside the binary, so the stage carries it.
+    expect(readFileSync(`${binary}.build`, 'utf8')).toBe('release record\n');
     expect(
       readFileSync(
         join(install.stage, 'node_modules/@smoothbricks/nx-cache-server/dist/server/nx-cache-server.js'),
@@ -649,7 +652,7 @@ describe('land-install.sh', () => {
     expect(install.log('direnv.log')).toEqual([
       `exec ${install.main} bun nx show projects --affected --base=${install.before} --head=${install.head} --json`,
       `exec ${install.main} bun nx run nx-cache-server:bundle --outputStyle=static-failures-only`,
-      `exec ${install.main} bun nx run cowshed:cli-arm64-macos:production --outputStyle=static-failures-only`,
+      `exec ${install.main} bun nx run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only`,
       `exec ${install.main} ${binary} --json setup`,
     ]);
   });
@@ -660,7 +663,7 @@ describe('land-install.sh', () => {
     expect(run.status, run.stderr).toBe(0);
     expect(onlyLine(run.stdout).text).toBe('installed');
     expect(install.log('nx.log')[2]).toBe(
-      'run cowshed:cli-x64-macos:production --outputStyle=static-failures-only [turn held]',
+      'run cowshed:cli-record-x64-macos:production --outputStyle=static-failures-only [turn held]',
     );
     expect(existsSync(join(install.stage, 'dist/bin/darwin-x64/cowshed'))).toBe(true);
   });
@@ -839,7 +842,7 @@ describe('land-install.sh', () => {
     install.set('build-fails', '');
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
-    expect(onlyLine(run.stdout).text).toBe('failed: the production build of cowshed:cli-arm64-macos exited 1');
+    expect(onlyLine(run.stdout).text).toBe('failed: the production build of cowshed:cli-record-arm64-macos exited 1');
     expect(existsSync(join(install.main, '.cache'))).toBe(false);
     expect(install.log('staged.log')).toEqual([]);
   });
@@ -849,7 +852,7 @@ describe('land-install.sh', () => {
     install.set('bundle-fails', '');
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
-    expect(onlyLine(run.stdout).text).toBe('failed: the production build of cowshed:cli-arm64-macos exited 1');
+    expect(onlyLine(run.stdout).text).toBe('failed: the production build of cowshed:cli-record-arm64-macos exited 1');
     expect(install.log('nx.log')).toEqual([NX_SHOW(install), NX_BUNDLE]);
   });
 
@@ -859,6 +862,8 @@ describe('land-install.sh', () => {
     mkdirSync(dirname(binary), { recursive: true });
     writeFileSync(binary, STAGED_STUB);
     chmodSync(binary, 0o755);
+    // A stage is whole only with the release record setup judges the binary by.
+    writeFileSync(`${binary}.build`, 'staged earlier\n');
     const server = join(install.stage, 'node_modules/@smoothbricks/nx-cache-server/dist/server/nx-cache-server.js');
     mkdirSync(dirname(server), { recursive: true });
     writeFileSync(server, 'staged earlier\n');
