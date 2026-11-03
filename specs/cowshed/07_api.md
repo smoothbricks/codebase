@@ -1202,12 +1202,14 @@ result. Its status is absent only when the kernel withheld it, and `UnreadExitSt
 stands in for it. A gap is absorbing and names the first missed observation. `UncountedFork.pid` is the observed forking
 member, not an invented child PID or a missing-child count; `UnreadImage.pid` is the member whose new image was not
 read, whether it exited before the read or the read failed, not an invented program or argv. A failed read is also
-returned as an observation error with its call and errno; the gap keeps the tree from claiming Complete, and does not
-replace the error. Both gaps retain their evidence through the generated controller and N-API records. Blocker detail
-fields are valid only for their observed blocker kind; an unobserved blocker is absence or an observation error, never
-an assertion that the process is unblocked. A lock observation identifies its path and, when kernel evidence resolves
-it, the holder PID and that holder's job. Its optional `program` is present only after an identity-fenced image read; no
-program-name guess supplies it.
+returned as an observation error with its call and errno, to the step that drained it and in the event stream; the gap
+keeps the tree from claiming Complete, and does not replace the error. A running job's status read returns that tree,
+gap included, and never the failed read: the observer folded everything it saw and stays usable. Both gaps retain their
+evidence through the generated controller and N-API records. Blocker detail fields are valid only for their observed
+blocker kind; an unobserved blocker is absence or an observation error, never an assertion that the process is
+unblocked. A lock observation identifies its path and, when kernel evidence resolves it, the holder PID and that
+holder's job. Its optional `program` is present only after an identity-fenced image read; no program-name guess supplies
+it.
 
 `usage` is a process's own counters as last read. It is absent, never zero, for a process whose counters were never
 read: one reaped before the sampler reached it, or on macOS one that exited before its first read could be proven its

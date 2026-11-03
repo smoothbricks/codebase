@@ -26,7 +26,7 @@ use tokio::sync::oneshot;
 use super::job_attribution::{Attribution, AttributionSummary};
 use super::job_groups::Birth;
 use super::job_spans::{JobSpanPublisher, job_span_thread};
-use super::process_events::{KqueueObserver, ObserveError};
+use super::process_events::{Darwin, KqueueObserver, ObserveError, ProcessReads};
 use super::process_spans::{ProcessSpanProjection, RetainedProcessEvent};
 use super::process_tree::{ProcessIdentity, TreeOwner};
 use super::supervisor::{LeafCoverage, utc_now};
@@ -242,7 +242,16 @@ impl std::fmt::Debug for ProcessMonitor {
 impl ProcessMonitor {
     /// Prepare before the spawn. A failed source is a failed observation fence, not polling.
     pub fn prepare(job_id: TreeOwner) -> Result<Self> {
-        let observer = KqueueObserver::prepare().map_err(observation_error)?;
+        Self::prepare_with(job_id, Darwin)
+    }
+
+    /// [`ProcessMonitor::prepare`] over `reads`, the kernel's per-process reads, which a test
+    /// replaces to make the kernel fail the way it does under load.
+    pub(crate) fn prepare_with<P: ProcessReads + Send + 'static>(
+        job_id: TreeOwner,
+        reads: P,
+    ) -> Result<Self> {
+        let observer = KqueueObserver::prepare_with(reads).map_err(observation_error)?;
         control(observer.as_raw_fd(), libc::EV_ADD | libc::EV_CLEAR, 0).map_err(|error| {
             CowshedError::internal(format!(
                 "cannot prepare the process observer's control event: {error}"
@@ -619,8 +628,8 @@ struct TerminalSignal {
     subtree_reported: bool,
 }
 
-struct Writer {
-    observer: KqueueObserver,
+struct Writer<P> {
+    observer: KqueueObserver<P>,
     snapshot: Arc<ArcSwap<Snapshot>>,
     journal: Vec<RetainedEntry>,
     subscribers: HashMap<u64, Subscriber>,
@@ -642,10 +651,10 @@ struct Writer {
     ledger_changes: Option<Arc<tokio::sync::Notify>>,
 }
 
-impl Writer {
+impl<P: ProcessReads> Writer<P> {
     fn new(
         job_id: TreeOwner,
-        observer: KqueueObserver,
+        observer: KqueueObserver<P>,
         snapshot: Arc<ArcSwap<Snapshot>>,
         attempts: Arc<AtomicU64>,
     ) -> Self {
@@ -668,6 +677,30 @@ impl Writer {
     }
 
     fn publish(&mut self, outcome: Result<()>) {
+        self.publish_with(outcome, None);
+    }
+
+    /// Publish what draining the kernel's events left, and answer with it. The drain folded every
+    /// event either way, so a failure that only names reads the fold recorded as coverage gaps
+    /// leaves the tree readable: it is journalled for the event stream and returned to the step
+    /// that drained, and a status read still gets the tree, gap included. Any other failure is
+    /// what a reader of the tree is told.
+    fn publish_drained(&mut self, drained: std::result::Result<(), ObserveError>) -> Result<()> {
+        let readable = drained
+            .as_ref()
+            .err()
+            .is_some_and(ObserveError::leaves_tree_readable);
+        let result = drained.map_err(observation_error);
+        match &result {
+            Err(error) if readable => self.publish_with(Ok(()), Some(error.clone())),
+            _ => self.publish(result.clone()),
+        }
+        result
+    }
+
+    /// Publish the tree `outcome` allows. `recorded` is a failure the fold already holds as a
+    /// coverage gap: journalled for the event stream beside the tree, not in its place.
+    fn publish_with(&mut self, outcome: Result<()>, recorded: Option<CowshedError>) {
         let at = SystemTime::now();
         let first = self.journal.len();
         for (event, identity, parent) in self.observer.drain_retained_events() {
@@ -699,7 +732,8 @@ impl Writer {
         let error = match &tree {
             SnapshotTree::Job(result) => result.as_ref().err(),
             SnapshotTree::Spare => outcome.as_ref().err(),
-        };
+        }
+        .or(recorded.as_ref());
         if let Some(error) = error {
             self.journal.push(RetainedEntry {
                 event: Err(error.clone()),
@@ -748,12 +782,12 @@ impl Writer {
 
     fn run(mut self, receiver: mpsc::Receiver<Request>) {
         loop {
-            if let Err(error) = self.observer.drain() {
-                self.publish(Err(observation_error(error)));
-            } else if self.observer.has_events()
+            let drained = self.observer.drain();
+            if drained.is_err()
+                || self.observer.has_events()
                 || (self.finished && !self.observer.watching() && !self.ended)
             {
-                self.publish(Ok(()));
+                let _ = self.publish_drained(drained);
             }
             while let Ok(request) = receiver.try_recv() {
                 match request {
@@ -785,8 +819,8 @@ impl Writer {
                     }
                     Request::Finish { reply } => {
                         self.finished = true;
-                        let result = self.observer.drain().map_err(observation_error);
-                        self.publish(result.clone());
+                        let drained = self.observer.drain();
+                        let result = self.publish_drained(drained);
                         let _ = reply.send(result);
                     }
                     Request::Retire {
@@ -2124,5 +2158,115 @@ os._exit(0)
             "{window:?} is on a clock that started at the origin it was told"
         );
         monitor.finish().unwrap();
+    }
+
+    /// Darwin's reads, except that an image read fails with the kernel's own `EINVAL` once
+    /// `refused` is set: what `KERN_PROCARGS2` answers for a process caught between two images,
+    /// as one is under load.
+    struct ImagesRefused {
+        refused: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ProcessReads for ImagesRefused {
+        fn record(
+            &self,
+            pid: u32,
+        ) -> io::Result<Option<crate::runtime::job_groups::ProcessRecord>> {
+            Darwin.record(pid)
+        }
+
+        fn image(&self, pid: u32) -> io::Result<crate::runtime::process_tree::ProcessImage> {
+            if self.refused.load(Ordering::SeqCst) {
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            } else {
+                Darwin.image(pid)
+            }
+        }
+
+        fn children(&self, pid: u32) -> io::Result<Vec<u32>> {
+            Darwin.children(pid)
+        }
+
+        fn reader_uid(&self) -> u32 {
+            Darwin.reader_uid()
+        }
+
+        fn usage(
+            &self,
+            process: ProcessIdentity,
+            start: Option<crate::runtime::process_usage::StartStamp>,
+            at: Instant,
+        ) -> std::result::Result<
+            crate::runtime::process_usage::Sampled,
+            crate::runtime::process_usage::SampleError,
+        > {
+            Darwin.usage(process, start, at)
+        }
+
+        fn group(
+            &self,
+            leader: &Birth,
+        ) -> io::Result<Vec<crate::runtime::job_groups::ProcessRecord>> {
+            Darwin.group(leader)
+        }
+
+        fn signal(&self, process: ProcessIdentity, signal: libc::c_int) -> io::Result<bool> {
+            Darwin.signal(process, signal)
+        }
+    }
+
+    /// An exec whose image the kernel will not read is a coverage gap of the tree, and the failed
+    /// read is returned beside it to whoever follows the events (07_api.md, "Process-tree
+    /// observations"). It is no reason for a running job's status read to fail: the observer
+    /// folded everything it saw and stays usable.
+    #[tokio::test]
+    async fn an_unreadable_image_is_a_gap_a_running_jobs_status_read_still_returns() {
+        use cowshed_os::fork_lock::Spawn as _;
+        use std::io::Write as _;
+
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let monitor = ProcessMonitor::prepare_with(
+            TreeOwner::Job(JobId::new(1).unwrap()),
+            ImagesRefused {
+                refused: Arc::clone(&refused),
+            },
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read go; exec /bin/cat"])
+            .stdin(std::process::Stdio::piped())
+            .spawn_locked()
+            .expect("spawn the observed life");
+        let pid = child.id();
+        monitor.watch(pid).unwrap();
+        let mut events = monitor.subscribe(Duration::from_millis(20)).await.unwrap();
+
+        refused.store(true, Ordering::SeqCst);
+        let mut input = child.stdin.take().expect("the child's stdin is piped");
+        input.write_all(b"go\n").unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match events.next().await {
+                    Some(Err(error)) => return error,
+                    Some(Ok(_)) => {}
+                    None => panic!("the events ended before the failed read was reported"),
+                }
+            }
+        })
+        .await
+        .expect("the exec's failed image read is reported");
+        assert!(failure.to_string().contains("KERN_PROCARGS2"), "{failure}");
+
+        let tree = monitor.tree().expect(
+            "a running job's status read returns its status when an image could not be read",
+        );
+        assert_eq!(
+            tree.coverage,
+            ProcessCoverage::Gap {
+                reason: ProcessCoverageGap::UnreadImage { pid }
+            }
+        );
+        drop(input);
+        assert!(child.wait_bounded().unwrap().success());
     }
 }

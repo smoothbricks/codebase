@@ -29,7 +29,10 @@
 //!   `is_procargs_content_read_permitted`: a reader whose effective uid is neither 0 nor the
 //!   process's is refused ([`ObserveError::ImageNotPermitted`], keeping the `EINVAL`). Every
 //!   other failed read is [`ObserveError::Kernel`] with its call and errno, whether or not the
-//!   life still ran; a child list in particular never fails because its parent exited.
+//!   life still ran; a child list in particular never fails because its parent exited. An
+//!   exec's or adoption's failed image read leaves the fold as [`ObserveError::ImageUnread`]
+//!   around that error: its gap is recorded, so the tree stays a readable answer and only those
+//!   who follow the failures (the drain's caller, the event stream) are told.
 //! - xnu grants `NOTE_EXITSTATUS` only for a child or a life this observer may SIGKILL
 //!   (`filt_procattach`) and refuses any other with `EACCES`: a root command a member ran
 //!   through sudo, for one. The one registration path then watches that life for
@@ -111,12 +114,36 @@ pub enum ObserveError {
     Usage(#[from] SampleError),
     #[error(transparent)]
     Cowshed(#[from] CowshedError),
+    /// An image read that failed after the fold recorded the image as unread
+    /// ([`ProcessCoverageGap::UnreadImage`]): the tree stays readable, gap included, and the
+    /// failure is returned beside the gap with its call and errno.
+    #[error(transparent)]
+    ImageUnread(Box<ObserveError>),
     /// More than one event of one batch failed; every event of it was folded all the same.
     #[error("{first}; {} more in the same batch: {}", .rest.len(), Listed(.rest))]
     Several {
         first: Box<ObserveError>,
         rest: Vec<ObserveError>,
     },
+}
+
+impl ObserveError {
+    /// Whether the fold holds everything this failure names as a coverage gap, so that its tree is
+    /// still a true, incomplete answer: a failed image read it recorded as unread. Any other
+    /// failure may leave the tree without an observation that no gap records.
+    pub fn leaves_tree_readable(&self) -> bool {
+        match self {
+            Self::ImageUnread(_) => true,
+            Self::Several { first, rest } => {
+                first.leaves_tree_readable() && rest.iter().all(Self::leaves_tree_readable)
+            }
+            Self::Kernel { .. }
+            | Self::ImageNotPermitted { .. }
+            | Self::Contradiction(_)
+            | Self::Usage(_)
+            | Self::Cowshed(_) => false,
+        }
+    }
 }
 
 struct Listed<'a>(&'a [ObserveError]);
@@ -326,7 +353,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
         Ok(observer)
     }
 
-    fn prepare_with(reads: P) -> Result<Self, ObserveError> {
+    pub(crate) fn prepare_with(reads: P) -> Result<Self, ObserveError> {
         // SAFETY: kqueue takes nothing and returns a new descriptor.
         let queue = unsafe { libc::kqueue() };
         if queue < 0 {
@@ -823,7 +850,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
             Ok(Some(image)) => Some(ProcessObservation::Exec { process, image }),
             Ok(None) => Some(unread),
             Err(error) => {
-                failures.note(Err(error));
+                failures.note(Err(ObserveError::ImageUnread(Box::new(error))));
                 Some(unread)
             }
         };
@@ -2141,6 +2168,7 @@ wait $!";
     fn failed(error: &ObserveError) -> (&'static str, u32, Option<i32>) {
         match error {
             ObserveError::Kernel { call, pid, source } => (*call, *pid, source.raw_os_error()),
+            ObserveError::ImageUnread(cause) => failed(cause),
             other => panic!("not a kernel error: {other}"),
         }
     }
