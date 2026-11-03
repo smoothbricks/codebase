@@ -1794,14 +1794,14 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   whose charge does, and waits for memory only when one token's charge does not fit; the grant carries the bytes it
   charged (`charged`), and the leaf's wait line adds `charged=<bytes>` to `memory=<peak>` when they differ. A peak with
   no recorded parallelism (a record from a run that was lent none) is charged flat, and a leaf whose peak alone exceeds
-  the run's memory runs alone on no more tokens than it was measured under. The record the cut run leaves names the
-  tokens it was cut to, so the next run charges that peak per worker again: the charge corrects itself as runs are
-  measured. Measured on a downstream Linux CI runner (32 vCPU, one 32 GiB container per job, no mbx), 2026-11-02 and 03:
-  three runs lost `bun test` leaves to SIGKILL (exit 137), two to four of them within one second of each other, while a
-  Vitest leaf of the same repository ran beside them; in the one run whose pool lines survive, that leaf was lent 22 of
-  31 tokens on a charge of 3.4 GB taken from a record, and the `bun test` leaves killed beside it were each charged 3 to
-  5 GB from records. A run in which the Vitest leaves ended before the `bun test` leaves began lost none. A run prints
-  the pool line of a failed leaf only, so what the other holders were charged is not in those logs.
+  the run's memory runs alone on one token. The record the cut run leaves names the tokens it was cut to, so the next
+  run charges that peak per worker again: the charge corrects itself as runs are measured. Measured on a downstream
+  Linux CI runner (32 vCPU, one 32 GiB container per job, no mbx), 2026-11-02 and 03: three runs lost `bun test` leaves
+  to SIGKILL (exit 137), two to four of them within one second of each other, while a Vitest leaf of the same repository
+  ran beside them; in the one run whose pool lines survive, that leaf was lent 22 of 31 tokens on a charge of 3.4 GB
+  taken from a record, and the `bun test` leaves killed beside it were each charged 3 to 5 GB from records. A run in
+  which the Vitest leaves ended before the `bun test` leaves began lost none. A run prints the pool line of a failed
+  leaf only, so what the other holders were charged is not in those logs.
 
   When a leaf ends, `bounded-exec` writes its peak into the task's record, the `verdict.json` of the task's
   `bounded-exec` directory in the checkout's Nx workspace data, keyed by the task id Nx gives

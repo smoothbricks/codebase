@@ -185,11 +185,11 @@ it('sizes a grant to the memory it needs: a peak scales up with the parallelism 
       admission: { grants: [{ tokens: 31, charge: 4 * GiB, oversized: false }], waiting: null },
     },
     {
-      name: 'a leaf that exceeds the run on one worker runs alone on no more workers than it was measured on',
+      name: 'a leaf that exceeds the run on the workers it was measured on runs alone on one worker',
       queue: [{ want: 31, memory: 40 * GiB, parallelism: 8 }],
       available: 31,
       memory: { capacity: 32 * GiB, held: 0 },
-      admission: { grants: [{ tokens: 8, charge: 40 * GiB, oversized: true }], waiting: null },
+      admission: { grants: [{ tokens: 1, charge: 40 * GiB, oversized: true }], waiting: null },
     },
     {
       name: 'the second leaf of a pass is charged beside the first, at the tokens it is granted',

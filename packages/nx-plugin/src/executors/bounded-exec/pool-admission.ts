@@ -12,7 +12,7 @@
  * proportion to the tokens it is lent now when that is more, never less: the baseline a leaf holds however few workers
  * it has makes a smaller grant no cheaper. When its whole ask does not fit, the head is lent the most tokens whose
  * charge does. A leaf whose own charge alone exceeds the run's memory could never fit, so it is granted once nothing
- * else holds memory, on no more tokens than its peak was measured under, and the grant says so.
+ * else holds memory, on one token when its peak names the parallelism it was measured under, and the grant says so.
  */
 
 /**
@@ -87,7 +87,7 @@ export function admit<Ask extends PoolAsk>(
     if (most === 0) {
       return { grants, waiting: 'cpu' };
     }
-    const tokens = oversized ? Math.min(most, request.parallelism ?? most) : tokensFitting(request, most, room);
+    const tokens = oversized ? (request.parallelism === undefined ? most : 1) : tokensFitting(request, most, room);
     const charge = chargeAt(request, tokens);
     free -= tokens;
     held += charge;
