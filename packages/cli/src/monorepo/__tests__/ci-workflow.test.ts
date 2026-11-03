@@ -107,7 +107,7 @@ describe('CI workflow definition', () => {
         }
       }
       const expected = defineCiWorkflow(definition);
-      for (const step of expected) expect(rendered).toContain('- name: ' + step.name);
+      for (const step of expected) expect(rendered).toContain(`- name: ${step.name}`);
     }
   });
 

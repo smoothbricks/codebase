@@ -179,8 +179,8 @@ function setupRun(root: string, cargoHome: string, args: readonly string[]): She
     cmd: ['bun', join(root, 'tooling', 'direnv', 'setup-environment.ts'), ...args],
     cwd: root,
     env: {
-      PATH: `${join(scratch, 'bin')}:${process.env['PATH'] ?? ''}`,
-      HOME: process.env['HOME'],
+      PATH: `${join(scratch, 'bin')}:${process.env.PATH ?? ''}`,
+      HOME: process.env.HOME,
       TMPDIR: scratch,
       CARGO_HOME: cargoHome,
       XDG_CACHE_HOME: join(scratch, 'xdg-cache'),
@@ -396,13 +396,13 @@ describe('a published payload installed in a checkout', () => {
               payload: { ...broken.payload, 'lib/middle.js': PUBLISHED_MIDDLE },
             });
             const report = protocol(repaired.stdout);
-            expect(report['operation']).toBe('repair-missing-payload');
-            expect(report['package']).toBe('@acme/payload@1.0.0');
-            expect(report['requestedPath']).toBe(installed);
-            expect(report['publishedComplete']).toBe(true);
-            expect(report['lockedHashesUnchanged']).toBe(true);
-            expect(report['restoredFiles']).toBe(1);
-            expect(report['publishedFiles']).toBe(4);
+            expect(report.operation).toBe('repair-missing-payload');
+            expect(report.package).toBe('@acme/payload@1.0.0');
+            expect(report.requestedPath).toBe(installed);
+            expect(report.publishedComplete).toBe(true);
+            expect(report.lockedHashesUnchanged).toBe(true);
+            expect(report.restoredFiles).toBe(1);
+            expect(report.publishedFiles).toBe(4);
           });
 
           await step('retains alias links, package metadata and developer links across a repair', async () => {
@@ -417,7 +417,7 @@ describe('a published payload installed in a checkout', () => {
             const installs = count('install');
             const again = await repair();
             expect(again.exitCode).toBe(0);
-            expect(protocol(again.stdout)['operation']).toBe('repair-missing-payload');
+            expect(protocol(again.stdout).operation).toBe('repair-missing-payload');
             expect(evidence(root)).toEqual(whole);
             expect(count('install')).toBe(installs);
           });
