@@ -12,14 +12,15 @@ MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }
 # the dev shell installs this program in the immutable store on Darwin.
 # A target's rustflags replace build.rustflags, so they repeat the cwd remap. With split-debuginfo = "unpacked" the
 # Mach-O debug map names each object by its absolute path in the checkout's target; ld64's `-oso_prefix .` strips the
-# linker's working directory (the workspace root) from those names, so a linked artifact is the same in every shed.
+# linker's working directory (the workspace root) from those names, and `-Zosx-rpath-install-name` names a dylib
+# `@rpath/<name>` instead of its absolute path, so a linked artifact is the same in every shed.
 [target.aarch64-apple-darwin]
 linker = "smoothbricks-macos-linker"
-rustflags = ["-Zremap-cwd-prefix=.", "-Clink-arg=-Wl,-oso_prefix,."]
+rustflags = ["-Zremap-cwd-prefix=.", "-Clink-arg=-Wl,-oso_prefix,.", "-Zosx-rpath-install-name"]
 
 [target.x86_64-apple-darwin]
 linker = "smoothbricks-macos-linker"
-rustflags = ["-Zremap-cwd-prefix=.", "-Clink-arg=-Wl,-oso_prefix,."]
+rustflags = ["-Zremap-cwd-prefix=.", "-Clink-arg=-Wl,-oso_prefix,.", "-Zosx-rpath-install-name"]
 
 # One feature resolution for the whole workspace. Without it every per-crate
 # cargo invocation resolves features for its own selection, so one shared
