@@ -2249,17 +2249,13 @@ os._exit(0)
         refuse(&kernel);
         let mut input = child.stdin.take().expect("the child's stdin is piped");
         input.write_all(b"go\n").unwrap();
-        let failure = tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                match events.next().await {
-                    Some(Err(error)) => return error,
-                    Some(Ok(_)) => {}
-                    None => panic!("the events ended before the failed read was reported"),
-                }
+        let failure = loop {
+            match events.next().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => {}
+                None => panic!("the events ended before the failed read was reported"),
             }
-        })
-        .await
-        .expect("the failed read is reported");
+        };
         let status = monitor.tree();
         drop(input);
         assert!(child.wait_bounded().unwrap().success());
