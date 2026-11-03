@@ -1925,8 +1925,12 @@ in `build_volume/` (cowshed-storage), fork, land, reseed and clear coordination 
   alternative (the daemon's exit) is preferred if Nx exposes one.
 - **`noatime` on the build-cache volume.** mbx reads access times to collect unused build units inside a managed target
   and to seed a new checkout with only the units the other checkout last read; under `noatime` it skips the first and
-  copies every unit for the second (mbx docs, "Managed target directories"). Whether the volume keeps `noatime` is the
-  owner's decision, informed by the A/B's `mbx doctor` reading.
+  copies every unit for the second (mbx docs, "Managed target directories"). The action store no longer depends on it:
+  the pinned mbx writes the access time of every store object and result a build stores or uses itself, at most hourly,
+  so eviction keeps what builds read. Before it did, eviction under `noatime` ran oldest-stored first, and a blob cloned
+  from a checkout file carried that file's access time, weeks old; measured 2026-11-03, a gate's builds restored results
+  whose blobs a sweep had just evicted ("cached action is missing blob") and compiled them again. Whether the volume
+  keeps `noatime` for the managed-target costs is the owner's decision, informed by the A/B's `mbx doctor` reading.
 - **A detached shed's managed target.** Whether mbx's "checkout is gone" test treats an unmounted shed's path as gone,
   so its target is collected while the shed exists. Its next build then restores from the store.
 - **Seed growth without Cargo churn.** With Cargo's `target/` out of the build image, whether a seed's extents still
