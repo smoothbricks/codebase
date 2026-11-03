@@ -103,6 +103,39 @@ describe("an Nx run's own CPU pool", () => {
     await closeRunCpuPool({ id: 'run-memory' });
   });
 
+  it("cuts a grant to the workers the run's memory holds, and names the bytes it charged", async () => {
+    const env: NodeJS.ProcessEnv = {};
+    // 4 cores and 10 bytes: a leaf measured at 4 bytes on one worker, asking for all four, is lent two.
+    await serveRunCpuPool({ id: 'run-scaled' }, env, 4, () =>
+      Promise.resolve({ ok: true, memory: { bytes: 10, source: 'a test run' } }),
+    );
+    const pool = readInheritedCpuPool(env);
+    if (pool === null) {
+      throw new Error(`the run published no pool: ${JSON.stringify(env)}`);
+    }
+    const first = await takeParentCpuTokens(pool, 4, 4, 1);
+    expect(first.granted && [first.tokens, first.charged]).toEqual([2, 8]);
+    const { promise: queued, resolve: queue } = Promise.withResolvers<void>();
+    const second = holdLease(
+      pool.socket,
+      { op: 'cpu-pool', want: 4, memory: 4, parallelism: 1 },
+      'the run CPU pool',
+      new CpuLeaseWait(),
+      queue,
+    );
+    let settled = false;
+    void second.then(() => {
+      settled = true;
+    });
+    await queued;
+    // Two cores are free; the run's two bytes are not enough for one more worker of four.
+    expect(settled).toBe(false);
+    if (first.granted) first.release();
+    const granted = await second;
+    expect(granted.granted && granted.answer.tokens).toBe(2);
+    if (granted.granted) granted.release();
+    await closeRunCpuPool({ id: 'run-scaled' });
+  });
   it('does not start a run whose memory cannot be read: it is not shown to have room', async () => {
     const env: NodeJS.ProcessEnv = {};
     const error = {

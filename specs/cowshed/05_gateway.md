@@ -1784,6 +1784,25 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   once nothing else holds memory, so it never starves, and its stderr says so, naming its charge and the run's memory. A
   granted `bounded-exec`'s sub-pool charges no memory: its holder's charge covers its tree.
 
+  **A leaf's memory grows with the parallelism it is lent, so its charge does too.** A Vitest run lent 22 tokens runs 22
+  workers, each a process of its own, and a charge of the peak that same task reached on one worker would admit it
+  beside leaves that fill the run's memory. The record's `cpu.tokens` is the parallelism its `peakBytes` was measured
+  under, and the task's next run asks the pool for the peak together with it (`parallelism` in the request). The pool
+  charges the peak in proportion to the tokens it lends, `ceil(peak × tokens ÷ measured)`, when that is more than the
+  tokens the peak was measured under, and the peak itself otherwise: a leaf's baseline stays however few workers it has,
+  so fewer tokens are never charged less than measured. A head whose whole ask does not fit is lent the most tokens
+  whose charge does, and waits for memory only when one token's charge does not fit; the grant carries the bytes it
+  charged (`charged`), and the leaf's wait line adds `charged=<bytes>` to `memory=<peak>` when they differ. A peak with
+  no recorded parallelism (a record from a run that was lent none) is charged flat, and a leaf whose peak alone exceeds
+  the run's memory runs alone on no more tokens than it was measured under. The record the cut run leaves names the
+  tokens it was cut to, so the next run charges that peak per worker again: the charge corrects itself as runs are
+  measured. Measured on a downstream Linux CI runner (32 vCPU, one 32 GiB container per job, no mbx), 2026-11-02 and 03:
+  three runs lost `bun test` leaves to SIGKILL (exit 137), two to four of them within one second of each other, while a
+  Vitest leaf of the same repository ran beside them; in the one run whose pool lines survive, that leaf was lent 22 of
+  31 tokens on a charge of 3.4 GB taken from a record, and the `bun test` leaves killed beside it were each charged 3 to
+  5 GB from records. A run in which the Vitest leaves ended before the `bun test` leaves began lost none. A run prints
+  the pool line of a failed leaf only, so what the other holders were charged is not in those logs.
+
   When a leaf ends, `bounded-exec` writes its peak into the task's record, the `verdict.json` of the task's
   `bounded-exec` directory in the checkout's Nx workspace data, keyed by the task id Nx gives
   (`project:target[:configuration]`) and already carrying the `cpu` grant: `peakBytes`, the largest sum of what the
@@ -1810,11 +1829,12 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   `memory.max` 32 GiB, no mbx, no supervisor): a test run across the repository with every target side by side started
   about 32 `bun test` leaves of 3 to 4 GB peak each on CPU tokens alone, and the kernel OOM-killed them (exit 137) every
   run. `pool-admission.test.ts` holds the admission rule in a table, `host-memory.linux.test.ts` the Linux reading,
-  `host-memory.test.ts` a tree's sum, `run-cpu-pool.test.ts` a leaf held until a holder returns its memory,
-  `executor.test.ts` a leaf that records its measured peak and whose next run is charged it, and one whose four children
-  held memory side by side, recorded at their sum, and `setup-devenv-task-records.test.ts` a pull request's and a
-  release workflow's first run starting from the records of the pushes they start from, and a later run taking the
-  record of each task its scope lacks.
+  `host-memory.test.ts` a tree's sum, `run-cpu-pool.test.ts` a leaf held until a holder returns its memory and a leaf
+  lent fewer workers than it asked for when its peak, measured on one worker, is charged per worker, `executor.test.ts`
+  a leaf that records its measured peak and whose next run is charged it, and one whose four children held memory side
+  by side, recorded at their sum, and `setup-devenv-task-records.test.ts` a pull request's and a release workflow's
+  first run starting from the records of the pushes they start from, and a later run taking the record of each task its
+  scope lacks.
 
 - **Runners are sized to the count.** The `bounded-exec` executor reads each runner's requested parallelism from the
   runner's own flag rather than assuming the core count, since a runner's flag and its actual concurrency can disagree:

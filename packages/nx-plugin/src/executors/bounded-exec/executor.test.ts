@@ -44,7 +44,7 @@ import {
   ramTempPaths,
 } from './ram-temp.js';
 import { CPU_TOKENS_ENV } from './runner-sizing.js';
-import { readRecord, type TempVolumeSpace, VERDICT_FILE } from './verdict.js';
+import { readRecord, type TempVolumeSpace, VERDICT_FILE, writeRecord } from './verdict.js';
 
 const workspaces: string[] = [];
 const ownedProcessGroups = new Set<number>();
@@ -2400,6 +2400,42 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.success).toBe(true);
     const record: unknown = JSON.parse(await readFile(join(directory, VERDICT_FILE), 'utf8'));
     expect(record).toHaveProperty('cpu', { tokens: lent, want: nextestWant, waitedMs: expect.any(Number) });
+  });
+
+  it('sizes a runner to the memory its recorded peak needs at the parallelism it is lent, not at the parallelism that peak was measured under', async () => {
+    // Vitest's peak was measured when it ran on one worker (4 bytes); lent more workers it holds more, in proportion.
+    const workspace = await createWorkspace();
+    const directory = join(workspace.root, 'scaled');
+    await mkdir(directory, { recursive: true });
+    await writeRecord(directory, {
+      task: 'app:test',
+      hash: null,
+      verdict: { outcome: 'passed' },
+      cpu: { tokens: 1, want: nextestWant, waitedMs: 0 },
+      peakBytes: 4,
+    });
+
+    // The run has 8 tokens and 10 bytes: 4 bytes a worker leaves room for two.
+    const result = await withPool(
+      8,
+      (pool) =>
+        runBoundedExec(
+          {
+            command: 'node -e "console.log(\'tokens=\' + process.env.BOUNDED_EXEC_CPU_TOKENS)" # nextest run',
+            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+            parallelism: 8,
+          },
+          { ...workspace.context, record: { task: { id: 'app:test', hash: null }, directory } },
+          createProcessTreeKiller(),
+          null,
+          inheritedFrom(pool),
+        ),
+      10,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toContain('tokens=2\n');
+    expect(result.terminalOutput).toContain(`status=ok tokens=2/${nextestWant} runner=nextest memory=4 charged=8`);
   });
 
   it("records its command's memory peak, and its next run is charged that peak in its run's pool", async () => {

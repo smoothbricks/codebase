@@ -87,8 +87,9 @@ export interface BoundedExecRecord {
   readonly verdict: BoundedExecVerdict;
   /**
    * The parent CPU pool's grant the run started under: tokens granted of those asked for, and
-   * how long it waited for the pool. Absent when it ran ungranted; written for the reader of a slow
-   * run, never read back.
+   * how long it waited for the pool. Absent when it ran ungranted. Its tokens are the parallelism the run's
+   * `peakBytes` was measured under, which the task's next run reads (`readLastPeak`) to charge that peak in proportion
+   * to the parallelism it is lent.
    */
   readonly cpu?: {
     readonly tokens: number;
@@ -501,9 +502,10 @@ export async function readRecord(directory: string): Promise<BoundedExecRecord |
  */
 export async function readLastPeak(
   directory: string,
-): Promise<{ ok: true; peakBytes: number | null } | { ok: false; error: string }> {
+): Promise<{ ok: true; peakBytes: number | null; parallelism: number | null } | { ok: false; error: string }> {
   try {
-    return { ok: true, peakBytes: (await readRecord(directory))?.peakBytes ?? null };
+    const record = await readRecord(directory);
+    return { ok: true, peakBytes: record?.peakBytes ?? null, parallelism: record?.cpu?.tokens ?? null };
   } catch (error) {
     return {
       ok: false,
@@ -540,7 +542,25 @@ function parseRecord(value: unknown): BoundedExecRecord {
   if (!(peakBytes === null || (typeof peakBytes === 'number' && Number.isSafeInteger(peakBytes) && peakBytes >= 0))) {
     throw new Error(`not a bounded-exec record: ${JSON.stringify(value)}`);
   }
-  return { task: value.task, hash: value.hash, verdict: parseVerdict(value.verdict), peakBytes };
+  const cpu = value.cpu;
+  if (cpu === undefined) {
+    return { task: value.task, hash: value.hash, verdict: parseVerdict(value.verdict), peakBytes };
+  }
+  if (
+    !isObject(cpu) ||
+    !(typeof cpu.tokens === 'number' && Number.isSafeInteger(cpu.tokens) && cpu.tokens >= 1) ||
+    !(typeof cpu.want === 'number' && Number.isSafeInteger(cpu.want) && cpu.want >= 1) ||
+    !(typeof cpu.waitedMs === 'number' && Number.isFinite(cpu.waitedMs) && cpu.waitedMs >= 0)
+  ) {
+    throw new Error(`not a bounded-exec record: ${JSON.stringify(value)}`);
+  }
+  return {
+    task: value.task,
+    hash: value.hash,
+    verdict: parseVerdict(value.verdict),
+    cpu: { tokens: cpu.tokens, want: cpu.want, waitedMs: cpu.waitedMs },
+    peakBytes,
+  };
 }
 
 function parseVerdict(value: unknown): BoundedExecVerdict {

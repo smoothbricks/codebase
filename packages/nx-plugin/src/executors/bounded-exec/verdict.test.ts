@@ -24,6 +24,7 @@ import {
   judgeRun,
   junitCaseTimes,
   junitFailures,
+  readLastPeak,
   readRecord,
   taskDirectory,
   VERDICT_FILE,
@@ -244,6 +245,25 @@ describe('bounded-exec verdicts', () => {
       JSON.stringify({ task: 'app:test', hash: '42', verdict: { ...verdict, requests: 'not rows' } }),
     );
     await expect(readRecord(directory)).rejects.toThrow('not a bounded-exec verdict');
+  });
+  it("names the parallelism a task's peak was measured under: the tokens its last run was lent", async () => {
+    const { context } = await workspace();
+    const directory = context.record?.directory ?? '';
+    await mkdir(directory, { recursive: true });
+    const verdict = { outcome: 'passed' } as const;
+    await writeRecord(directory, {
+      task: 'app:test',
+      hash: null,
+      verdict,
+      cpu: { tokens: 22, want: 31, waitedMs: 3 },
+      peakBytes: 3_420_061_696,
+    });
+    expect(await readLastPeak(directory)).toEqual({ ok: true, peakBytes: 3_420_061_696, parallelism: 22 });
+    // A record of a run that was lent nothing, or none, names no parallelism: its charge is flat.
+    await writeRecord(directory, { task: 'app:test', hash: null, verdict, peakBytes: 7 });
+    expect(await readLastPeak(directory)).toEqual({ ok: true, peakBytes: 7, parallelism: null });
+    await rm(join(directory, VERDICT_FILE));
+    expect(await readLastPeak(directory)).toEqual({ ok: true, peakBytes: null, parallelism: null });
   });
   it('copies the lock waits the snapshot named into the wedged verdict', () => {
     const cache = '/Users/dev/.cargo/.package-cache';

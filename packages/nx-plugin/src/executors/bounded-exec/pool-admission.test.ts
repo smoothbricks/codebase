@@ -145,3 +145,81 @@ it('grants a request only while CPU tokens are free and the charges of the holde
     ).toBe(true);
   }
 });
+
+it('sizes a grant to the memory it needs: a peak scales up with the parallelism granted beyond the parallelism it was measured under', () => {
+  const cases = [
+    {
+      // A vitest leaf recorded on one worker (4 GiB), asking for 31 beside a 32 GiB run: 8 workers fit.
+      name: 'a peak measured on one worker is charged per worker, and the grant is cut to what fits',
+      queue: [{ want: 31, memory: 4 * GiB, parallelism: 1 }],
+      available: 31,
+      memory: { capacity: 32 * GiB, held: 0 },
+      admission: { grants: [{ tokens: 8, charge: 32 * GiB, oversized: false }], waiting: null },
+    },
+    {
+      name: 'a peak measured on 22 workers is the charge of 22 workers, and of fewer: it never scales down',
+      queue: [{ want: 31, memory: 22 * GiB, parallelism: 22 }],
+      available: 4,
+      memory: { capacity: 32 * GiB, held: 0 },
+      admission: { grants: [{ tokens: 4, charge: 22 * GiB, oversized: false }], waiting: null },
+    },
+    {
+      name: 'the holders count: 8 GiB of room fits two workers of 4 GiB',
+      queue: [{ want: 31, memory: 4 * GiB, parallelism: 1 }],
+      available: 31,
+      memory: { capacity: 32 * GiB, held: 24 * GiB },
+      admission: { grants: [{ tokens: 2, charge: 8 * GiB, oversized: false }], waiting: null },
+    },
+    {
+      name: 'one worker that does not fit waits for memory, whatever tokens are free',
+      queue: [{ want: 31, memory: 4 * GiB, parallelism: 1 }],
+      available: 31,
+      memory: { capacity: 32 * GiB, held: 29 * GiB },
+      admission: { grants: [], waiting: 'memory' },
+    },
+    {
+      name: 'a charge with no measured parallelism is flat: the grant is never cut for it',
+      queue: [{ want: 31, memory: 4 * GiB }],
+      available: 31,
+      memory: { capacity: 32 * GiB, held: 24 * GiB },
+      admission: { grants: [{ tokens: 31, charge: 4 * GiB, oversized: false }], waiting: null },
+    },
+    {
+      name: 'a leaf that exceeds the run on one worker runs alone on no more workers than it was measured on',
+      queue: [{ want: 31, memory: 40 * GiB, parallelism: 8 }],
+      available: 31,
+      memory: { capacity: 32 * GiB, held: 0 },
+      admission: { grants: [{ tokens: 8, charge: 40 * GiB, oversized: true }], waiting: null },
+    },
+    {
+      name: 'the second leaf of a pass is charged beside the first, at the tokens it is granted',
+      queue: [
+        { want: 4, memory: 4 * GiB, parallelism: 1 },
+        { want: 4, memory: 4 * GiB, parallelism: 1 },
+      ],
+      available: 8,
+      memory: { capacity: 24 * GiB, held: 0 },
+      admission: {
+        grants: [
+          { tokens: 4, charge: 16 * GiB, oversized: false },
+          { tokens: 2, charge: 8 * GiB, oversized: false },
+        ],
+        waiting: null,
+      },
+    },
+  ] satisfies {
+    name: string;
+    queue: PoolAsk[];
+    available: number;
+    memory: MemoryLedger;
+    admission: {
+      grants: Pick<PoolGrant<PoolAsk>, 'tokens' | 'charge' | 'oversized'>[];
+      waiting: Admission<PoolAsk>['waiting'];
+    };
+  }[];
+  for (const check of cases) {
+    const admission = admit(check.queue, check.available, check.memory);
+    const grants = admission.grants.map(({ tokens, charge, oversized }) => ({ tokens, charge, oversized }));
+    expect({ grants, waiting: admission.waiting }, check.name).toEqual(check.admission);
+  }
+});

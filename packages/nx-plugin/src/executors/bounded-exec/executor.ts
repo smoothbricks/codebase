@@ -315,7 +315,8 @@ export async function runBoundedExec(
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
   const directory = context.record?.directory ?? null;
-  // The task's last recorded peak is its charge in its parent's pool, read before the clear below removes it.
+  // The task's last recorded peak, and the tokens it was lent when the peak was measured, are its charge in its parent's
+  // pool, read before the clear below removes them.
   const lastPeak = directory !== null && inherited !== null ? await readLastPeak(directory) : null;
   // A previous run's verdict and report go first, so neither can be read as this run's.
   if (directory !== null) {
@@ -408,8 +409,10 @@ export async function runBoundedExec(
       `bounded-exec: ${lastPeak.error}; it is this task's memory charge, so the command does not run\n`,
     );
   }
-  // A task with no recorded peak is charged nothing (null) until it has one.
+  // A task with no recorded peak is charged nothing (null) until it has one. A peak is charged in proportion to the
+  // tokens the run is lent when that is more than the run that measured it was lent.
   const charge = lastPeak?.ok === true ? lastPeak.peakBytes : null;
+  const chargeParallelism = lastPeak?.ok === true ? lastPeak.parallelism : null;
 
   let lease: RamTempLease | null = null;
   let ordinaryTemp: string | null = null;
@@ -557,7 +560,7 @@ export async function runBoundedExec(
   let parentRefusal: string | null = null;
   let parentWait: CpuWaitRow | undefined;
   if (inherited !== null) {
-    const fromParent = await takeParentCpuTokens(inherited, demand.want, charge);
+    const fromParent = await takeParentCpuTokens(inherited, demand.want, charge, chargeParallelism);
     if (fromParent.granted) {
       grant = fromParent;
     } else if (fromParent.cause === 'absent') {
@@ -578,7 +581,7 @@ export async function runBoundedExec(
     sized = sizeRunner(demand, requested, grant.tokens);
     cpu = { tokens: grant.tokens, want: demand.want, waitedMs };
     appendStderr(
-      `cowshed: cpu-pool wait done elapsed=${waitedMs}ms status=ok tokens=${grant.tokens}/${demand.want} runner=${demand.kind} memory=${charge ?? 'none'}\n`,
+      `cowshed: cpu-pool wait done elapsed=${waitedMs}ms status=ok tokens=${grant.tokens}/${demand.want} runner=${demand.kind} memory=${charge ?? 'none'}${grant.charged !== null && grant.charged !== charge ? ` charged=${grant.charged}` : ''}\n`,
     );
     if (grant.oversized !== null) {
       appendStderr(

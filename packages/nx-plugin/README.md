@@ -2430,10 +2430,14 @@ the run's memory: the least finite `memory.max` of the run's cgroup and its ance
 Linux, `hw.memsize` on macOS (`host-memory.ts`). A run whose memory cannot be read fails in `preTasksExecution`, naming
 the file or sysctl. A task whose own peak exceeds the run's memory is granted once nothing else holds memory, and its
 stderr says so; the wait line names the charge as `memory=<bytes>` or `memory=none`. A granted executor's sub-pool
-charges no memory. A host CI scope's first run of a task it holds no record of is the `memory=none` case: the managed
-`setup-devenv` action starts a scope from the records of the pushes it follows (a pull request's base branch's, a
-release workflow's CI's) and takes, at each run, the record of every task the scope lacks
-(`specs/cowshed/05_gateway.md`, "Without mbx, every Nx run budgets itself").
+charges no memory. The charge follows the parallelism the task is lent: its record's `cpu.tokens` is the parallelism its
+peak was measured under, and the pool charges the peak in proportion to the tokens it lends when that is more
+(`ceil(peak × tokens ÷ measured)`, never less than the peak). A task whose whole ask does not fit is lent the most
+tokens that do, and its wait line names the bytes charged (`memory=<peak> charged=<bytes>`) when they differ from the
+peak. A host CI scope's first run of a task it holds no record of is the `memory=none` case: the managed `setup-devenv`
+action starts a scope from the records of the pushes it follows (a pull request's base branch's, a release workflow's
+CI's) and takes, at each run, the record of every task the scope lacks (`specs/cowshed/05_gateway.md`, "Without mbx,
+every Nx run budgets itself").
 
 The pool runs on a worker thread of its own (`cpu-pool-thread.ts`). The process that serves the run, the Nx daemon when
 installed plugins load in it or the Nx CLI without one, hashes tasks and builds the project graph in synchronous calls

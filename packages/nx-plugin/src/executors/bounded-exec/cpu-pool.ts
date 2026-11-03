@@ -63,12 +63,14 @@ export type CloseOutcome = { ok: true } | { ok: false; error: string };
 
 /**
  * The one line a child sends: a count of whole tokens, at least one, and the bytes it is charged, its task's last
- * recorded memory peak. A child whose task has no recorded peak names none: it is charged nothing.
+ * recorded memory peak, with the tokens it was lent when that peak was measured. A child whose task has no recorded peak
+ * names none: it is charged nothing. A peak with no tokens is charged flat.
  */
 interface CpuPoolRequest {
   op: 'cpu-pool';
   want: number & typia.tags.Type<'uint32'> & typia.tags.Minimum<1>;
   memory?: number & typia.tags.Type<'uint64'>;
+  parallelism?: number & typia.tags.Type<'uint32'> & typia.tags.Minimum<1>;
 }
 
 /** A grant whose charge alone exceeds the run's memory, made while nothing else held memory: the run's memory. */
@@ -80,7 +82,7 @@ export interface Oversized {
 type CpuPoolReply =
   | CpuLeaseProgress
   | CpuLeaseQueued
-  | { ok: true; lease: 'granted'; tokens: number; oversized?: Oversized }
+  | { ok: true; lease: 'granted'; tokens: number; oversized?: Oversized; charged?: number }
   | { ok: false; code: 'invalid-request'; error: string };
 
 /** Exactly a request's fields: any other field is an invalid request. */
@@ -118,11 +120,12 @@ interface Child {
   phase: Phase;
 }
 
-/** A queued child, the count it asked for and the bytes it is charged. */
+/** A queued child, the count it asked for, the bytes it is charged, and the tokens that charge was measured under. */
 interface Waiter {
   readonly child: Child;
   readonly want: number;
   readonly memory: number;
+  readonly parallelism?: number | undefined;
 }
 
 /** One framed reply line. The newline is the framing; every reply goes through here. */
@@ -143,33 +146,47 @@ export function readInheritedCpuPool(environment: Readonly<NodeJS.ProcessEnv>): 
 }
 
 /**
- * Tokens a parent pool lent, held until released, or why there are none. `oversized` names the run's memory when the
- * child's charge alone exceeds it and it was granted because nothing else held memory. `closed` resolves when the
- * grant's connection closes, however it closes, so a sub-pool built on the grant ends with it.
+ * Tokens a parent pool lent, held until released, or why there are none. `charged` is the bytes the pool charged the
+ * grant, null from a pool that charges none. `oversized` names the run's memory when the child's charge alone exceeds
+ * it and it was granted because nothing else held memory. `closed` resolves when the grant's connection closes, however
+ * it closes, so a sub-pool built on the grant ends with it.
  */
 export type TokenGrant =
-  | { granted: true; tokens: number; oversized: Oversized | null; release: () => void; closed: Promise<void> }
+  | {
+      granted: true;
+      tokens: number;
+      charged: number | null;
+      oversized: Oversized | null;
+      release: () => void;
+      closed: Promise<void>;
+    }
   | Unleased;
 
 const isOversized = typia.createEquals<Oversized>();
 
 /**
  * Ask the immediate parent pool for `want` tokens, charged `memory` bytes: the task's last recorded peak, or null when
- * it has none. The inherited count does not bound the ask: a pool grants at most what it holds. A granted lease is the
- * child's local allocation: its connection is the grant, and closing it returns only that allocation. An absent
- * endpoint grants nothing and refuses nothing; a connected endpoint's refusal or protocol failure must fail admission
- * rather than run the child beside its parent's count.
+ * it has none. `parallelism` is the tokens the task was lent when that peak was measured; the pool charges the peak in
+ * proportion to the tokens it lends now when that is more, and lends fewer when the run's memory holds no more. The
+ * inherited count does not bound the ask: a pool grants at most what it holds. A granted lease is the child's local
+ * allocation: its connection is the grant, and closing it returns only that allocation. An absent endpoint grants
+ * nothing and refuses nothing; a connected endpoint's refusal or protocol failure must fail admission rather than run
+ * the child beside its parent's count.
  */
 export async function takeParentCpuTokens(
   parent: InheritedCpuPool,
   want: number,
   memory: number | null,
+  parallelism: number | null = null,
 ): Promise<TokenGrant> {
   if (!Number.isSafeInteger(want) || want < 1) {
     throw new RangeError(`a child asks its parent pool for a positive count, not ${want} (pool ${parent.tokens})`);
   }
   if (memory !== null && (!Number.isSafeInteger(memory) || memory < 0)) {
     throw new RangeError(`a child is charged a whole number of bytes, not ${memory}`);
+  }
+  if (parallelism !== null && (!Number.isSafeInteger(parallelism) || parallelism < 1)) {
+    throw new RangeError(`a child's charge is measured under a positive count of tokens, not ${parallelism}`);
   }
   if (parent.socket.length === 0 || parent.socket.includes('\0')) {
     return {
@@ -178,12 +195,17 @@ export async function takeParentCpuTokens(
       reason: `the parent CPU pool's endpoint ${JSON.stringify(parent.socket)} is not a socket path`,
     };
   }
-  const request = memory === null ? { op: 'cpu-pool', want } : { op: 'cpu-pool', want, memory };
+  const request =
+    memory === null
+      ? { op: 'cpu-pool', want }
+      : parallelism === null
+        ? { op: 'cpu-pool', want, memory }
+        : { op: 'cpu-pool', want, memory, parallelism };
   const lease = await holdLease(parent.socket, request, 'the parent CPU pool', new CpuLeaseWait());
   if (!lease.granted) {
     return lease;
   }
-  const { tokens, oversized } = lease.answer;
+  const { tokens, oversized, charged } = lease.answer;
   if (typeof tokens !== 'number' || !Number.isInteger(tokens) || tokens < 1 || tokens > want) {
     lease.release();
     return {
@@ -200,7 +222,22 @@ export async function takeParentCpuTokens(
       reason: `the parent CPU pool named its memory ${JSON.stringify(oversized)} in a grant, which is no byte count`,
     };
   }
-  return { granted: true, tokens, oversized: oversized ?? null, release: lease.release, closed: lease.closed };
+  if (charged !== undefined && !(typeof charged === 'number' && Number.isSafeInteger(charged) && charged >= 0)) {
+    lease.release();
+    return {
+      granted: false,
+      cause: 'other',
+      reason: `the parent CPU pool charged ${JSON.stringify(charged)} in a grant, which is no byte count`,
+    };
+  }
+  return {
+    granted: true,
+    tokens,
+    charged: charged ?? null,
+    oversized: oversized ?? null,
+    release: lease.release,
+    closed: lease.closed,
+  };
 }
 
 /** A thrown value's message. */
@@ -480,19 +517,21 @@ export async function createCpuPool(
       memory === null ? null : { capacity: memory, held: heldMemory },
     );
     queue.splice(0, admission.grants.length);
-    for (const { request, tokens: granted, oversized } of admission.grants) {
+    for (const { request, tokens: granted, charge, oversized } of admission.grants) {
       // Fifo bytes first, the implicit slot last.
       const bytes = Math.min(granted, inHand);
       inHand -= bytes;
       const slot = granted > bytes;
       if (slot) slotLent = true;
-      heldMemory += request.memory;
-      request.child.phase = { kind: 'holding', bytes, slot, memory: request.memory };
+      heldMemory += charge;
+      request.child.phase = { kind: 'holding', bytes, slot, memory: charge };
       request.child.socket.write(
         frame(
-          oversized && memory !== null
-            ? { ok: true, lease: 'granted', tokens: granted, oversized: { memory } }
-            : { ok: true, lease: 'granted', tokens: granted },
+          memory === null
+            ? { ok: true, lease: 'granted', tokens: granted }
+            : oversized
+              ? { ok: true, lease: 'granted', tokens: granted, charged: charge, oversized: { memory } }
+              : { ok: true, lease: 'granted', tokens: granted, charged: charge },
         ),
       );
     }
@@ -590,7 +629,7 @@ export async function createCpuPool(
       }
       const request = parsed;
       child.phase = { kind: 'queued' };
-      queue.push({ child, want: request.want, memory: request.memory ?? 0 });
+      queue.push({ child, want: request.want, memory: request.memory ?? 0, parallelism: request.parallelism });
       socket.write(frame({ ok: true, lease: 'queued', server: process.pid }));
       drain(0);
     });
