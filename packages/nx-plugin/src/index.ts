@@ -25,6 +25,7 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { refuseOverlappingOutputs } from './build-state-output-policy.js';
+import { builtOutputLockfileDependencies, builtOutputLockfileNodes } from './built-output-packages.js';
 import { bunLockDependencies, bunLockInput, bunLockNode } from './bun-lock-scope.js';
 import {
   CARGO_CLOSURE_INPUT,
@@ -1131,12 +1132,13 @@ function supportsJsonInputs(): boolean {
 type CreateNodesHandler = CreateNodesV2[1];
 
 function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandler {
-  return async (projectConfigurationFiles, _options, context) => {
+  return async (projectConfigurationFiles, options, context) => {
     const results: CreateNodesResultV2 = [];
     const errors: Array<[file: string | null, error: Error]> = [];
     let cargoWorkspaces: CargoWorkspace[];
     let eslint: EslintWorkspace | null;
     let nativeTools: NativeTools | null;
+    let lockfileNodes: Record<string, ProjectGraphExternalNode>;
     try {
       cargoWorkspaces = await resolveCargoWorkspaces(projectConfigurationFiles, context.workspaceRoot, hostPlatform);
       eslint = await eslintWorkspace(context.workspaceRoot);
@@ -1149,6 +1151,7 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
               EXECUTABLE_PLATFORM_DIRECTORY[hostPlatform.targetFamily][hostPlatform.architecture],
               scriptcTargetName(hostPlatform),
             );
+      lockfileNodes = builtOutputLockfileNodes(options, context);
     } catch (error) {
       throw new AggregateCreateNodesError([[null, error instanceof Error ? error : new Error(String(error))]], results);
     }
@@ -1185,6 +1188,20 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
       }),
     );
 
+    // The root manifest's result carries the lockfile's package nodes, as it carries the root's lock-scope node.
+    if (Object.keys(lockfileNodes).length > 0) {
+      const rootIndex = results.findIndex(([file]) => file === 'package.json');
+      const rootResult = results[rootIndex];
+      if (rootResult === undefined) {
+        errors.push([
+          null,
+          new Error('builtOutputPackages needs a root package.json to publish the lockfile nodes on'),
+        ]);
+      } else {
+        const [file, result] = rootResult;
+        results[rootIndex] = [file, { ...result, externalNodes: { ...lockfileNodes, ...result.externalNodes } }];
+      }
+    }
     if (errors.length > 0) {
       throw new AggregateCreateNodesError(errors, results);
     }
@@ -1241,8 +1258,14 @@ export const postTasksExecution: PostTasksExecution<ProducerReceiptsOptions> = a
   await postCargoRetention(options, context);
 };
 
-/** The lock-scope nodes' edges: each bun node's to the packages and members its manifest resolves. */
-export const createDependencies: CreateDependencies = (_options, context) => bunLockDependencies(context);
+/**
+ * The lock-scope nodes' edges: each bun node's to the packages and members its manifest resolves; and, for a workspace
+ * that names built-output packages, the lockfile's package edges (`built-output-packages.ts`).
+ */
+export const createDependencies: CreateDependencies = (options, context) => [
+  ...bunLockDependencies(context),
+  ...builtOutputLockfileDependencies(options, context),
+];
 
 /** Nx invokes this only after merging inferred/declarative targets and every plugin's project dependencies. */
 export const createMetadata: CreateMetadata = (graph, _options, context) => {

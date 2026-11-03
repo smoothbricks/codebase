@@ -11,6 +11,7 @@
     "src/executors/bounded-exec/run-cpu-pool.test.ts": 24908,
     "src/index.test.ts": 23964,
     "src/ensure-built-receipt.test.ts": 16577,
+    "src/built-output-packages.test.ts": 15805,
     "src/linked-snapshots.nx.test.ts": 15029,
     "src/cargo-retention.test.ts": 12864,
     "src/nx-use-local.test.ts": 12512,

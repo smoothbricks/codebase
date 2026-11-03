@@ -882,6 +882,35 @@ target that names no `externalDependencies` at all is still keyed on every packa
 The root project owns the lockfiles, so its `default` fileset holds them. Its versionless check inputs exclude
 `bun.lock`, `bun.lockb` and `Cargo.lock`; the nodes key what they decide.
 
+### Built-output packages
+
+Nx keys a task on an npm package through the package's node, by the integrity the lockfile records for it. A `^` input
+adds the node of every package a dependency project declares or imports, from any of its files, so a version bump of one
+package re-keys every task whose dependency closure reaches an importer of it. A workspace that already keys a package
+by its bytes where a task runs them (a consumer keys this plugin per executor and module closure) names it in the
+plugin's `builtOutputPackages` option, and turns Nx's own lockfile analysis off:
+
+```json
+{
+  "pluginsConfig": { "@nx/js": { "analyzeLockfile": false } },
+  "plugins": [
+    { "plugin": "@smoothbricks/nx-plugin", "options": { "builtOutputPackages": ["@smoothbricks/nx-plugin"] } }
+  ]
+}
+```
+
+The plugin then publishes the lockfile's package nodes and the edges between them, both from Nx's own parser
+(`getLockFileNodes`, `getLockFileDependencies`), on the root manifest's result. Each node of a named package has the
+`data.hash` `built-output:<name>`; every other node, every version and every edge is Nx's. A task that reaches a named
+package therefore keeps its key across that package's version bumps, and still keys each of its dependencies by its own
+integrity. Nx merges its default plugin's lockfile nodes after every configured plugin's, so while `analyzeLockfile` is
+on they would replace these: the plugin refuses the option then, and refuses a name the lockfile installs nowhere
+(`src/built-output-packages.ts`, `src/built-output-packages.test.ts`).
+
+The option covers the lockfile only. A manifest that declares a named package's version is still an input wherever its
+project's files are; a workspace keeps the version out of member manifests by declaring it once, in the root manifest's
+`catalog`, and `catalog:` in each member.
+
 ### Manifest versions and validation inputs
 
 A release rewrites `version` in every package manifest it publishes and in the lockfile entries mirroring them. Those
