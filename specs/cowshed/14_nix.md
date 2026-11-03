@@ -113,13 +113,14 @@ not stored, and share build-script output under `mbx exec`, and with it any gene
 path still restores at another. The latest count a crate's edit against the commit HEAD it last compiled under
 (16_build_volumes.md, "One Cargo environment on every path"), refresh the store's recency only for hits a build exposed,
 predict build scripts per target, map a nested Cargo's own target, seed a managed target from one donor checkout only,
-so no target mixes two lineages of one crate, and place a managed target again when collection removed it from under a
-build that names its own directory at or below `target/` (03_caches.md, "mbx"). It is `smoothbricks/mr-boxington` at the
-revision `nix/mbx/flake.nix` names and its `flake.lock` locks; no Rust source restates it, and setup refuses a lock that
-disagrees with the flake. No project needs to pin it: the host's mbx serves every Cargo project, which reaches it
-through the Cargo shim that `cowshed setup` generates from it, below (the capability is 15_capabilities.md's, its route
-11_shell.md's). The installed mbx is never spelled as a Nix store path or a host path where a command is spawned; its
-store path is only what the link resolves to.
+so no target mixes two lineages of one crate, key a build script's declared dependency on a variable `MBX_SHARE_ENV`
+shares as the build gave it rather than as the stable copy the shim swaps in, and place a managed target again when
+collection removed it from under a build that names its own directory at or below `target/` (03_caches.md, "mbx"). It is
+`smoothbricks/mr-boxington` at the revision `nix/mbx/flake.nix` names and its `flake.lock` locks; no Rust source
+restates it, and setup refuses a lock that disagrees with the flake. No project needs to pin it: the host's mbx serves
+every Cargo project, which reaches it through the Cargo shim that `cowshed setup` generates from it, below (the
+capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store path or
+a host path where a command is spawned; its store path is only what the link resolves to.
 
 Managed-target seeding installs a profile's build-script shim pins before publishing a copied unit and rejects damaged
 donors, so cancellation cannot leave a fresh launcher without its executable. For unmeasured Cargo test binaries, the
