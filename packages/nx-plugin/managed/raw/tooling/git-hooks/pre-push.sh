@@ -17,15 +17,21 @@
 # ran, builds them. A refusal names the one command that fixes it; any other
 # failure is said as that, never as a cache miss.
 #
-# Nx runs in this checkout's environment, `direnv exec <checkout>`, which is the
-# environment the land gate runs in, never in the environment of whatever shell
-# ran `git push`. devenv declares this checkout's tooling and the environment it
-# builds with (the macOS SDK it links against among it), and tasks key on that
-# environment as well as on the tree: a push from a shell carrying another
-# directory's devenv keyed the gate's tasks on that shell's SDKROOT and
-# DEVELOPER_DIR, missed every one of them, and then built them against the wrong
-# SDK. Under the checkout's environment the keys are the gate's, and a dependency
-# that does miss builds the way the gate builds it.
+# Nx runs in the environment the land gate runs in, never in the environment of
+# whatever shell ran `git push`: cowshed clears a declared command's environment,
+# keeping HOME, USER, LOGNAME, TERM, LANG and SSH_AUTH_SOCK and a PATH, and enters
+# the checkout's devenv over it (specs/cowshed/02_workspaces.md, "The declared
+# commands' environment"). The probe does the same: `env -i` with those
+# variables and repo-path's PATH, then `direnv exec <checkout>`. devenv declares
+# this checkout's tooling and the environment it builds with, and tasks key on
+# that environment as well as on the tree. `direnv exec` alone only lays the
+# checkout's variables over the caller's: a variable the checkout does not
+# declare passes through. A push from a shell carrying another directory's
+# devenv keyed the gate's tasks on that shell's SDKROOT and DEVELOPER_DIR; one
+# from an agent shell carrying AR=ar and RANLIB=ranlib keyed every cargo task's
+# toolchain input on them, so the probe missed the entry the gate wrote for the
+# same tree. Under the gate's environment the keys are the gate's, and a
+# dependency that does miss builds the way the gate builds it.
 #
 # Why the cross target never compiles here. Every checkout shell carries zig,
 # cargo-zigbuild and the Linux rust-std the cross clippy needs, so a miss would
@@ -95,7 +101,11 @@ cross_gate() {
   output=$(mktemp "${TMPDIR:-/tmp}/pre-push-cross.XXXXXX") || return 1
   trap 'rm -f "$output"' EXIT
   set -o pipefail
-  SMOO_CROSS_LINT_REPLAY_ONLY=1 direnv exec "$PWD" nx run-many -t cargo-lint-cross --output-style=static 2>&1 | tee "$output"
+  pure=(PATH="$PATH" SMOO_CROSS_LINT_REPLAY_ONLY=1)
+  for name in HOME USER LOGNAME TERM LANG SSH_AUTH_SOCK; do
+    [ -z "${!name+set}" ] || pure+=("$name=${!name}")
+  done
+  env -i "${pure[@]}" direnv exec "$PWD" nx run-many -t cargo-lint-cross --output-style=static 2>&1 | tee "$output"
   status=$?
   [ "$status" -eq 0 ] && return 0
 

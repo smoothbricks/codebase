@@ -192,16 +192,29 @@ export const CARGO_LINT_CLIPPY_COMMAND = cargoFrozen(
 export const CROSS_CHECK_SCRIPT_NAME = 'check:linux';
 
 /**
+ * The caller variables a declared command keeps: cowshed clears the environment of every command a land runs, its
+ * gate and its push among them, and passes these on when the caller has them, with a `PATH`
+ * (specs/cowshed/02_workspaces.md, "The declared commands' environment"). The managed pre-push hook spells the same
+ * list in shell, and a test holds the two equal.
+ */
+export const DECLARED_COMMAND_IDENTITY = ['HOME', 'USER', 'LOGNAME', 'TERM', 'LANG', 'SSH_AUTH_SOCK'] as const;
+
+/**
  * The developer entry point: one command on macOS that reports what CI's Linux
  * job would. A plain Nx run, because every managed devenv shell carries the
  * cross toolchain; the land gate's Nx graph holds the same target.
+ *
+ * It runs from the environment the land gate and the pre-push probe run in: the identity variables and `PATH` alone,
+ * with the checkout's devenv entered over them. Run in the caller's shell, it keyed every cargo task on whatever that
+ * shell carried and the checkout does not declare (an `AR=ar` from a parent directory's devenv moved the toolchain
+ * input), so its verdict was one the probe never asks for.
  *
  * Deliberately NOT `--quiet`. The pre-push gate is a probe: it consults the Nx
  * cache and refuses a push that has no hit, never starting a compile of its own.
  * The clippy behind this script is unbounded, so a silent terminal is
  * indistinguishable from a hang.
  */
-export const CROSS_CHECK_SCRIPT_COMMAND = `nx run-many -t ${CARGO_CROSS_LINT_TARGET}`;
+export const CROSS_CHECK_SCRIPT_COMMAND = `env -i ${DECLARED_COMMAND_IDENTITY.map((name) => `${name}="$${name}"`).join(' ')} PATH="$PATH" direnv exec "$PWD" nx run-many -t ${CARGO_CROSS_LINT_TARGET}`;
 
 /**
  * A cross-built test archive and the target that EXECUTES it, per foreign

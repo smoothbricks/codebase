@@ -8,6 +8,7 @@ import {
   BOUNDED_TEST_KILL_AFTER_MS,
   BUN_TEST_TIMEOUT_FLAG as TIMEOUT_FLAG,
 } from '@smoothbricks/nx-plugin/bounded-test-policy';
+import { CROSS_CHECK_SCRIPT_COMMAND } from '@smoothbricks/nx-plugin/cross-check-policy';
 import { generateManagedFiles } from '@smoothbricks/nx-plugin/managed-files/generator';
 import { FsTree } from 'nx/src/generators/tree.js';
 import { listPublicPackages, listPublishablePackages } from '../lib/workspace.js';
@@ -211,7 +212,7 @@ describe('root smoo monorepo policy', () => {
       const rootPackage = await readJson(join(root, 'package.json'));
       const nxJson = await readJson(join(root, 'nx.json'));
       expect(rootPackage.scripts).toEqual({
-        'check:linux': 'nx run-many -t cargo-lint-cross',
+        'check:linux': CROSS_CHECK_SCRIPT_COMMAND,
         'clean:node_modules':
           'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
         'format:changed': 'git-format-staged --config .git-format-staged.yml --also-unstaged',

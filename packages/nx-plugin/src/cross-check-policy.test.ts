@@ -15,6 +15,7 @@ import {
   CROSS_CHECK_SCRIPT_COMMAND,
   CROSS_CHECK_SCRIPT_NAME,
   cargoFrozen,
+  DECLARED_COMMAND_IDENTITY,
   runsFrozenCargo,
 } from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
@@ -221,11 +222,18 @@ describe('Linux cross-check policy', () => {
     expect(runsFrozenCargo('cargo clippy --workspace')).toBe(false);
   });
 
-  it('runs the Nx target from the root script in the checkout shell', () => {
+  it('runs the Nx target from the root script in the land gate environment', async () => {
     expect(CROSS_CHECK_SCRIPT_NAME).toBe('check:linux');
     // Nx rather than cargo directly, so caching and project discovery stay Nx's
     // job, and no profile: every managed shell carries the cross toolchain.
-    expect(CROSS_CHECK_SCRIPT_COMMAND).toBe(`nx run-many -t ${CARGO_CROSS_LINT_TARGET}`);
+    expect(CROSS_CHECK_SCRIPT_COMMAND).toEndWith(`direnv exec "$PWD" nx run-many -t ${CARGO_CROSS_LINT_TARGET}`);
+    // The gate's environment: cleared, the identity variables and PATH kept, the checkout's devenv entered over it.
+    expect(CROSS_CHECK_SCRIPT_COMMAND).toStartWith(
+      `env -i HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" TERM="$TERM" LANG="$LANG" SSH_AUTH_SOCK="$SSH_AUTH_SOCK" PATH="$PATH" `,
+    );
+    // The hook keeps the same variables, so a verdict this script writes is one the probe asks for.
+    const hook = await Bun.file(join(import.meta.dir, '../managed/raw/tooling/git-hooks/pre-push.sh')).text();
+    expect(hook).toContain(`for name in ${DECLARED_COMMAND_IDENTITY.join(' ')}; do`);
     // The pre-push gate never compiles, so a human runs this, and an unbounded
     // clippy must show its progress.
     expect(CROSS_CHECK_SCRIPT_COMMAND).not.toContain('--quiet');
@@ -235,8 +243,9 @@ describe('Linux cross-check policy', () => {
 /**
  * The managed pre-push hook, run for real in a fixture repository whose `tooling/direnv/repo-path` puts stand-ins
  * first on PATH: `uname` says Darwin, `smoo` passes the denylist, `direnv` enters the checkout's environment, and `nx`
- * prints what a cross run printed and exits with its status, refusing to run in any environment but the checkout's.
- * The hook must ask in the checkout's environment and call a miss a miss and every other failure what it is.
+ * prints what a cross run printed and exits with its status, refusing to run in any environment but the land gate's:
+ * the checkout's devenv over cowshed's cleared declared-command environment (specs/cowshed/02_workspaces.md, "The
+ * declared commands' environment"). The hook must ask there and call a miss a miss and every other failure what it is.
  */
 describe('managed pre-push cross probe', () => {
   const hook = join(import.meta.dir, '../managed/raw/tooling/git-hooks/pre-push.sh');
@@ -262,10 +271,12 @@ describe('managed pre-push cross probe', () => {
       };
       await stub('uname', 'echo Darwin');
       await stub('smoo', 'exit 0');
-      // Nx keys on the environment it runs in: outside the checkout's, it is not the gate's run.
+      // Nx keys on the environment it runs in: outside the checkout's, it is not the gate's run. `AR` stands for any
+      // variable the caller's shell carries and the checkout does not declare, which `direnv exec` alone lets through:
+      // the cargo toolchain input keys on it, and the land gate, which starts from a cleared environment, never sees it.
       await stub(
         'nx',
-        `[ "$SDKROOT" = '${CHECKOUT_SDK}' ] || { echo "nx stub: keyed on the caller's SDKROOT $SDKROOT" >&2; exit 1; }\n[ "$${CARGO_CROSS_LINT_REPLAY_ONLY_ENV}" = 1 ] || { echo "nx stub: the probe would let the cross target compile" >&2; exit 1; }\nprintf '%s\\n' "$NX_STUB_OUTPUT"; exit ${nxStatus}`,
+        `[ "$SDKROOT" = '${CHECKOUT_SDK}' ] || { echo "nx stub: keyed on the caller's SDKROOT $SDKROOT" >&2; exit 1; }\n[ -z "\${AR+set}" ] || { echo "nx stub: keyed on the caller's AR $AR, which the checkout does not declare" >&2; exit 1; }\n[ "$${CARGO_CROSS_LINT_REPLAY_ONLY_ENV}" = 1 ] || { echo "nx stub: the probe would let the cross target compile" >&2; exit 1; }\nprintf '%s\\n' '${nxOutput.replaceAll("'", "'\\''")}'; exit ${nxStatus}`,
       );
       if (direnv) {
         // The checkout's .envrc: `direnv exec <checkout>` enters the environment that checkout declares.
@@ -283,8 +294,9 @@ describe('managed pre-push cross probe', () => {
       expect(spawnSync('git', ['init', '-q', join(root, 'repo')]).status).toBe(0);
       const run = spawnSync('bash', [hook, 'origin'], {
         cwd: join(root, 'repo'),
-        // The caller's shell carries another directory's SDK, as a shell inside a parent directory's devenv does.
-        env: { ...process.env, NX_STUB_OUTPUT: nxOutput, SDKROOT: '/nix/store/caller-apple-sdk/MacOSX.sdk' },
+        // The caller's shell carries another directory's SDK and an archiver the checkout does not declare, as a shell
+        // inside a parent directory's devenv does.
+        env: { ...process.env, SDKROOT: '/nix/store/caller-apple-sdk/MacOSX.sdk', AR: 'ar' },
         input: '',
         encoding: 'utf8',
       });
@@ -296,7 +308,7 @@ describe('managed pre-push cross probe', () => {
 
   it("passes a hit, asked in the checkout's environment rather than the caller's", async () => {
     const { status, stderr } = await push({ nxOutput: 'Successfully ran target cargo-lint-cross', nxStatus: 0 });
-    expect(stderr).not.toContain("keyed on the caller's SDKROOT");
+    expect(stderr).not.toContain("keyed on the caller's");
     expect(status).toBe(0);
   });
 
