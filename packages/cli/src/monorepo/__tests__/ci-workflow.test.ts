@@ -647,6 +647,53 @@ describe('CI workflow definition', () => {
     ).toThrow('serverVariable');
   });
 
+  it('gives every job the mbx remote cache, with the write token only on the default branch own runs', () => {
+    const lane =
+      "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)";
+    const mbxRemote = {
+      serverVariable: 'MBX_REMOTE_SERVER',
+      internalServer: 'http://127.0.0.1:8766',
+      namespace: 'acme',
+      writeTokenSecret: 'MBX_REMOTE_TOKEN',
+      readTokenSecret: 'MBX_REMOTE_READ_TOKEN',
+    };
+    const env = {
+      MBX_REMOTE_NAMESPACE: 'acme',
+      MBX_REMOTE_TOKEN: `\${{ ${lane} && secrets.MBX_REMOTE_TOKEN || secrets.MBX_REMOTE_READ_TOKEN }}`,
+      MBX_REMOTE_TRUST_WRITES: `\${{ ${lane} }}`,
+    };
+    const rendered = renderCiWorkflowYaml(
+      options({
+        mbxRemote,
+        crossTestArchives: [
+          { triple: 'aarch64-apple-darwin', path: '.cache/nextest/archive-aarch64-apple-darwin.tar.zst' },
+        ],
+      }),
+    );
+
+    expect(Bun.YAML.parse(rendered)).toMatchObject({
+      jobs: {
+        main: {
+          // The repository's runners forward the cache to their own loopback; mbx sends a token only there or over TLS.
+          env: { ...env, MBX_REMOTE_URL: 'http://127.0.0.1:8766' },
+          // A fork PR receives no secrets, so it cannot read the cache either.
+          if: "${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
+        },
+        'macos-cross-tests': { env: { ...env, MBX_REMOTE_URL: '${{ vars.MBX_REMOTE_SERVER }}' } },
+      },
+    });
+    expect(renderCiWorkflowYaml(options())).not.toContain('MBX_REMOTE');
+    expect(() =>
+      renderCiWorkflowYaml(options({ mbxRemote: { ...mbxRemote, internalServer: 'http://10.89.0.1:8766' } })),
+    ).toThrow('non-loopback');
+    expect(() =>
+      renderCiWorkflowYaml(options({ mbxRemote: { ...mbxRemote, readTokenSecret: 'MBX_REMOTE_TOKEN' } })),
+    ).toThrow('untrusted jobs would hold the write token');
+    expect(() => renderCiWorkflowYaml(options({ mbxRemote: { ...mbxRemote, namespace: '/acme' } }))).toThrow(
+      'namespace',
+    );
+  });
+
   it('refuses missing registry secrets before setup and skips private Cargo jobs for fork PRs', () => {
     const definition = options({ cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN'] } });
     const steps = defineCiWorkflow(definition);

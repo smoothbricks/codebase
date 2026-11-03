@@ -1415,6 +1415,43 @@ internal address its own runners reach.
 unreachable secret provider loses the cache rather than the install. `op read` being unavailable in a sandboxed
 workspace therefore costs the cache, not the shell. See the section below for what a group is.
 
+### mbx remote cache configuration (`package.json` → `smoo.mbxRemote`)
+
+One [mbx] remote cache of compiler actions for every Cargo build in managed CI:
+
+```json
+{
+  "smoo": {
+    "mbxRemote": {
+      "serverVariable": "MBX_REMOTE_SERVER",
+      "internalServer": "http://127.0.0.1:8766",
+      "namespace": "acme",
+      "writeTokenSecret": "MBX_REMOTE_TOKEN",
+      "readTokenSecret": "MBX_REMOTE_READ_TOKEN"
+    }
+  }
+}
+```
+
+- `server` / `serverVariable`: the public origin, declared exactly as for `smoo.remoteCache`. mbx sends its token only
+  over HTTPS or to a loopback address, so a plain-HTTP origin to any other host is refused at render time.
+- `internalServer`: the origin the repository's own runners reach, under the same rule — an `https://` origin, or a
+  loopback one the runner forwards to the cache host. A container-bridge address such as `http://10.89.0.1:8766` is
+  refused, because mbx would refuse it.
+- `namespace`: `MBX_REMOTE_NAMESPACE`. Repositories that declare the same namespace reuse each other's compilations.
+- `writeTokenSecret`: the read+write token. Only the default branch's own runs get it — a push to the default branch, or
+  a workflow dispatched on it (a release) — together with `MBX_REMOTE_TRUST_WRITES=true`, since mbx's own write policy
+  needs `GITHUB_REF_PROTECTED` (which Forgejo Actions never sets) and reads a dispatched release as untrusted.
+- `readTokenSecret`: the read-only token every other job gets. The server's grant on it, not mbx's client-side policy,
+  is what keeps a pull request from publishing.
+
+Both generated workflows put `MBX_REMOTE_URL`, `MBX_REMOTE_NAMESPACE`, `MBX_REMOTE_TOKEN` and `MBX_REMOTE_TRUST_WRITES`
+in every job env, and setup-devenv then puts mbx's Cargo shim first on `PATH` for a job with a `Cargo.lock`, so every
+`cargo` the job runs goes through mbx. The shim is the devenv shell's `mbx`; setup-devenv fails the job when the shell
+has none. A declared cache puts the same-repository gate on Validate that a private dependency install does.
+
+[mbx]: https://mr-boxington.jdx.dev
+
 ### Local secret commands and groups (`package.json` → `smoo.secrets`)
 
 ```json

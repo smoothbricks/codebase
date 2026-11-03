@@ -4,6 +4,7 @@ import { managedAssetsRoot } from '../managed-assets.js';
 import type {
   NonEmptyArray,
   PackageCargoCredentialsConfig,
+  PackageMbxRemoteConfig,
   PackagePrivateNpmConfig,
   PackageRemoteCacheConfig,
   PackageSmooGithub,
@@ -59,6 +60,8 @@ export interface ManagedFileContext {
   cargoCredentials?: PackageCargoCredentialsConfig;
   /** Declared self-hosted Nx remote cache from the root smoo config; absent means local caching only. */
   remoteCache?: PackageRemoteCacheConfig;
+  /** Declared mbx remote cache from the root smoo config; absent means Cargo builds without mbx. */
+  mbxRemote?: PackageMbxRemoteConfig;
   /**
    * Cross-built test archives the graph can produce, one per foreign target
    * triple the cargo workspace declares. Empty for a repository that declares
@@ -380,6 +383,7 @@ function getManagedContent(file: ManagedFileDescriptor, context: ManagedFileCont
         sourceCheckouts: context.sourceCheckouts,
         cargoCredentials: context.cargoCredentials,
         remoteCache: context.remoteCache,
+        mbxRemote: context.mbxRemote,
         environments: context.ciEnvironments,
         deploySecrets: context.ciDeploySecrets,
         e2eSecrets: context.ciE2eSecrets,
@@ -407,6 +411,7 @@ function getManagedContent(file: ManagedFileDescriptor, context: ManagedFileCont
         sourceCheckouts: context.sourceCheckouts,
         cargoCredentials: context.cargoCredentials,
         remoteCache: context.remoteCache,
+        mbxRemote: context.mbxRemote,
         deploySecrets: context.ciDeploySecrets,
       });
     }

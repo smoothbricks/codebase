@@ -93,6 +93,9 @@ in {
       just # Task runner for packages/columine (mirrors the lmao justfile)
       cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
       cargo-fuzz # bitmosaic:fuzz drives packages/bitmosaic's libFuzzer targets
+      # Cargo's cache in managed CI: setup-devenv puts this mbx's Cargo shim first on PATH when smoo.mbxRemote
+      # is declared. On a cowshed host the installed mbx serves Cargo instead (specs/cowshed/05_gateway.md).
+      inputs.mbx.packages.${pkgs.stdenv.hostPlatform.system}.mbx
       # Go comes from ./devenv.smoo.nix (languages.go), one version for every
       # repository for the same reason as the Rust toolchain: a compiler is part
       # of a cache key. packages/lmao-ttsc/plugin builds against it.

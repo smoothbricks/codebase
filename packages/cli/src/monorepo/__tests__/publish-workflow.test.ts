@@ -472,6 +472,35 @@ describe('publish workflow definition', () => {
     await expect(formattedPublishWorkflow(platform)).resolves.toBe(platform);
   });
 
+  it('gives every publish job the mbx remote cache, in bytes Prettier keeps', async () => {
+    const mbxRemote = {
+      server: 'https://mbx-cache.example.net',
+      internalServer: 'http://127.0.0.1:8766',
+      namespace: 'acme',
+      writeTokenSecret: 'MBX_REMOTE_TOKEN',
+      readTokenSecret: 'MBX_REMOTE_READ_TOKEN',
+    };
+    const platform = await formattedPublishWorkflow(
+      renderPublishWorkflowYaml({ ...codebaseWorkflowOptions, mbxRemote }),
+    );
+    const lane =
+      "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)";
+    // A release is dispatched: on the default branch it publishes what it compiles, which mbx's own policy refuses.
+    const token = {
+      MBX_REMOTE_TOKEN: `\${{ ${lane} && secrets.MBX_REMOTE_TOKEN || secrets.MBX_REMOTE_READ_TOKEN }}`,
+      MBX_REMOTE_TRUST_WRITES: `\${{ ${lane} }}`,
+    };
+
+    expect(Bun.YAML.parse(platform)).toMatchObject({
+      jobs: {
+        'linux-release-candidate': { env: { MBX_REMOTE_URL: 'http://127.0.0.1:8766', ...token } },
+        'macos-platform': { env: { MBX_REMOTE_URL: 'https://mbx-cache.example.net', ...token } },
+        'publish-on-linux': { env: { MBX_REMOTE_URL: 'https://mbx-cache.example.net', ...token } },
+      },
+    });
+    await expect(formattedPublishWorkflow(platform)).resolves.toBe(platform);
+  });
+
   it('pins Rust span provenance in every publishing job', async () => {
     const provenanceEnv = { LMAO_GIT_REVISION: '${{ github.sha }}' };
     const platform = await formattedPublishWorkflow(renderPublishWorkflowYaml(codebaseWorkflowOptions));

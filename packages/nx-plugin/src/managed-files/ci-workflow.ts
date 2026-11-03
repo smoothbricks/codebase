@@ -9,14 +9,17 @@ import {
 } from '../cross-check-policy.js';
 import { PRODUCTION_PUSH_DEPLOY_TAG } from '../deploy-policy.js';
 import type {
+  LiteralCacheOrigin,
   NonEmptyArray,
   PackageCargoCredentialsConfig,
   PackageCargoGitOrigin,
+  PackageMbxRemoteConfig,
   PackagePrivateNpmConfig,
   PackageRemoteCacheConfig,
   PackageSmooGithub,
   PackageSmooGithubEnvironments,
   PackageSourceCheckoutConfig,
+  VariableCacheOrigin,
 } from '../workspace-manifest.js';
 import { renderRunsOnLine } from './github-runs-on.js';
 
@@ -146,6 +149,11 @@ export interface CiWorkflowDefinitionOptions extends DeployStepSecretConfig {
    * cache serves the whole fleet. Absent means each runner caches locally.
    */
   remoteCache?: PackageRemoteCacheConfig;
+  /**
+   * Declared mbx remote cache (package.json `smoo.mbxRemote`). Every job carries mbx's remote settings, which is
+   * what makes setup-devenv route Cargo through mbx. Absent means Cargo builds without mbx.
+   */
+  mbxRemote?: PackageMbxRemoteConfig;
   /** GitHub Environments: staging for the validate/e2e jobs, production for the production-on-push job. */
   environments?: PackageSmooGithubEnvironments;
   /** Secrets for the e2e-deployment step, env var name → repository secret name. */
@@ -316,7 +324,10 @@ jobs:
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 45
 ${
-  options.privateNpm?.readTokenEnv || options.cargoCredentials !== undefined || options.remoteCache !== undefined
+  options.privateNpm?.readTokenEnv ||
+  options.cargoCredentials !== undefined ||
+  options.remoteCache !== undefined ||
+  options.mbxRemote !== undefined
     ? `    # Fork PRs receive no secrets, so neither a private dependency install nor an
     # authenticated remote cache read can run there.
     if: \${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -330,7 +341,7 @@ ${
     : ''
 }    env:
       GH_TOKEN: ${githubExpression('github.token')}
-${remoteCacheJobEnvLines(options.remoteCache, 'internal')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache, 'internal')}${mbxRemoteJobEnvLines(options.mbxRemote, 'internal')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 `;
 }
 
@@ -709,7 +720,7 @@ export type CacheReach = 'internal' | 'public';
  * The public origin as a job env value: the declared origin, or the expression that reads the repository variable
  * naming it.
  */
-function publicCacheOrigin(config: PackageRemoteCacheConfig): string {
+function publicCacheOrigin(config: LiteralCacheOrigin | VariableCacheOrigin): string {
   return 'serverVariable' in config ? githubExpression(`vars.${config.serverVariable}`) : config.server;
 }
 
@@ -720,14 +731,14 @@ export function normalizeRemoteCache(config: PackageRemoteCacheConfig): PackageR
     throw new Error('smoo.remoteCache names its public origin twice; declare server or serverVariable, not both');
   }
   if (literal !== undefined) {
-    assertCacheOrigin('server', literal);
+    assertCacheOrigin('smoo.remoteCache', 'server', literal);
   } else if (!('serverVariable' in config) || !/^[A-Z_][A-Z0-9_]*$/.test(config.serverVariable)) {
     throw new Error(
       `smoo.remoteCache needs server, or an upper-case repository variable name for serverVariable, got ${JSON.stringify(config)}`,
     );
   }
   if (config.internalServer !== undefined) {
-    assertCacheOrigin('internalServer', config.internalServer);
+    assertCacheOrigin('smoo.remoteCache', 'internalServer', config.internalServer);
     if (config.internalServer === literal) {
       throw new Error(
         `smoo.remoteCache internalServer repeats server ${literal}; drop internalServer or point it at the address internal runners reach`,
@@ -748,7 +759,7 @@ export function normalizeRemoteCache(config: PackageRemoteCacheConfig): PackageR
  * slash the server routes nowhere, and a path or credential would be dropped
  * or leaked rather than honored.
  */
-function assertCacheOrigin(field: 'server' | 'internalServer', value: string): void {
+function assertCacheOrigin(declaration: string, field: 'server' | 'internalServer', value: string): void {
   let url: URL | null = null;
   try {
     url = new URL(value);
@@ -766,7 +777,95 @@ function assertCacheOrigin(field: 'server' | 'internalServer', value: string): v
     url.hash !== ''
   ) {
     throw new Error(
-      `smoo.remoteCache ${field} needs a credential-free http(s) origin with no path and no trailing slash, got ${JSON.stringify(value)}`,
+      `${declaration} ${field} needs a credential-free http(s) origin with no path and no trailing slash, got ${JSON.stringify(value)}`,
+    );
+  }
+}
+
+/**
+ * The default branch's own runs: a push to it, or a workflow dispatched on it (a release). These are the only lanes
+ * given the mbx write token. A pull request's ref is never the default branch, and `pull_request_target` is left out
+ * because its ref is the base branch while the code it runs is not.
+ */
+const DEFAULT_BRANCH_LANE =
+  "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)";
+
+/**
+ * Job env lines carrying the declared mbx remote cache (`smoo.mbxRemote`). setup-devenv routes Cargo through mbx's
+ * Cargo shim when `MBX_REMOTE_URL` is set, so these lines are what turn mbx on for the job; `reach` picks the origin
+ * exactly as for the Nx cache. The token is chosen by lane: the write token and `MBX_REMOTE_TRUST_WRITES` on the
+ * default branch's own runs, the read-only token everywhere else. mbx's own write policy cannot make that call here:
+ * it requires `GITHUB_REF_PROTECTED`, which Forgejo Actions never sets, and it reads a release's `workflow_dispatch`
+ * as untrusted. The server's grant on the token is what stops any other job publishing.
+ * Mechanism errors surface at managed-file render time, never inside CI.
+ */
+export function mbxRemoteJobEnvLines(config: PackageMbxRemoteConfig | undefined, reach: CacheReach): string {
+  if (config === undefined) {
+    return '';
+  }
+  const normalized = normalizeMbxRemote(config);
+  const server =
+    reach === 'internal' ? (normalized.internalServer ?? publicCacheOrigin(normalized)) : publicCacheOrigin(normalized);
+  const token = `${DEFAULT_BRANCH_LANE} && secrets.${normalized.writeTokenSecret} || secrets.${normalized.readTokenSecret}`;
+  return [
+    `      MBX_REMOTE_URL: ${server}\n`,
+    `      MBX_REMOTE_NAMESPACE: ${normalized.namespace}\n`,
+    // One expression per line: a folded scalar would split the lane condition, and Prettier refolds it otherwise.
+    '      # prettier-ignore\n',
+    `      MBX_REMOTE_TOKEN: ${githubExpression(token)}\n`,
+    '      # prettier-ignore\n',
+    `      MBX_REMOTE_TRUST_WRITES: ${githubExpression(DEFAULT_BRANCH_LANE)}\n`,
+  ].join('');
+}
+
+/** Mechanism errors surface at managed-file render time, never inside CI. */
+export function normalizeMbxRemote(config: PackageMbxRemoteConfig): PackageMbxRemoteConfig {
+  if ('server' in config && 'serverVariable' in config) {
+    throw new Error('smoo.mbxRemote names its public origin twice; declare server or serverVariable, not both');
+  }
+  if ('server' in config) {
+    assertMbxOrigin('server', config.server);
+  } else if (!/^[A-Z_][A-Z0-9_]*$/.test(config.serverVariable)) {
+    throw new Error(
+      `smoo.mbxRemote needs server, or an upper-case repository variable name for serverVariable, got ${JSON.stringify(config)}`,
+    );
+  }
+  if (config.internalServer !== undefined) {
+    assertMbxOrigin('internalServer', config.internalServer);
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(config.namespace)) {
+    throw new Error(
+      `smoo.mbxRemote namespace must be slash-separated segments of letters, digits, '.', '_' and '-', got ${JSON.stringify(config.namespace)}`,
+    );
+  }
+  for (const [field, name] of [
+    ['writeTokenSecret', config.writeTokenSecret],
+    ['readTokenSecret', config.readTokenSecret],
+  ] as const) {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) {
+      throw new Error(`smoo.mbxRemote needs an upper-case secret name for ${field}, got ${JSON.stringify(name)}`);
+    }
+  }
+  if (config.writeTokenSecret === config.readTokenSecret) {
+    throw new Error(
+      `smoo.mbxRemote writeTokenSecret and readTokenSecret both name ${config.writeTokenSecret}; untrusted jobs would hold the write token`,
+    );
+  }
+  return config;
+}
+
+/**
+ * An mbx origin is a cache origin mbx will send its token to: HTTPS, or plain HTTP to a loopback address only, which
+ * is mbx's own rule (it refuses the remote otherwise), checked here so a bad declaration fails at render time.
+ */
+function assertMbxOrigin(field: 'server' | 'internalServer', value: string): void {
+  assertCacheOrigin('smoo.mbxRemote', field, value);
+  const url = new URL(value);
+  const loopback =
+    url.hostname === 'localhost' || url.hostname === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(url.hostname);
+  if (url.protocol === 'http:' && !loopback) {
+    throw new Error(
+      `smoo.mbxRemote ${field} ${JSON.stringify(value)} is plain HTTP to a non-loopback host; mbx sends its token only over HTTPS or to loopback`,
     );
   }
 }
@@ -1296,7 +1395,7 @@ ${options.macosRunsOn === undefined ? '    runs-on: macos-latest' : renderRunsOn
     if: \${{ needs.main.result == 'success' }}
     env:
       GH_TOKEN: \${{ github.token }}
-${remoteCacheJobEnvLines(options.remoteCache, 'public')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache, 'public')}${mbxRemoteJobEnvLines(options.mbxRemote, 'public')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 ${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
 ${renderCiWorkflowSteps(middleSteps, options)}
 ${renderCiWorkflowSteps(followUpCleanupStep(numbers), options)}`;
@@ -1394,7 +1493,7 @@ ${renderRunsOnLine(options.runsOn)}
 ${environmentLine(options.environments?.staging)}    if: \${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}
     env:
       GH_TOKEN: \${{ github.token }}
-${remoteCacheJobEnvLines(options.remoteCache, 'internal')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache, 'internal')}${mbxRemoteJobEnvLines(options.mbxRemote, 'internal')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 ${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
       # Step ${numbers.middle}
       - name: E2E Tests (Deployed Stage)
@@ -1426,7 +1525,7 @@ ${renderRunsOnLine(options.runsOn)}
     if: \${{ !cancelled() && github.event_name == 'push' && github.ref == ${stagingRefLiteral(options)} && needs.main.result == 'success'${e2eGate} }}
 ${environmentLine(options.environments?.production)}    env:
       GH_TOKEN: \${{ github.token }}
-${remoteCacheJobEnvLines(options.remoteCache, 'internal')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache, 'internal')}${mbxRemoteJobEnvLines(options.mbxRemote, 'internal')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 ${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
       # Step ${numbers.middle}
       - name: 🚀 Deploy Production

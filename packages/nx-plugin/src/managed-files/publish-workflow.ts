@@ -9,6 +9,7 @@ import {
 } from '../platform-targets.js';
 import type {
   PackageCargoCredentialsConfig,
+  PackageMbxRemoteConfig,
   PackagePrivateNpmConfig,
   PackageRemoteCacheConfig,
   PackageSmooGithub,
@@ -26,6 +27,7 @@ import {
   type DeployStepSecretConfig,
   deployStepSecretEnvLines,
   githubActionPins,
+  mbxRemoteJobEnvLines,
   remoteCacheJobEnvLines,
   sourceCheckoutsStepLines,
   TRACE_DB_ARTIFACT_GLOB,
@@ -128,6 +130,11 @@ export interface PublishWorkflowDefinitionOptions extends DeployStepSecretConfig
    * built for the same hashes.
    */
   remoteCache?: PackageRemoteCacheConfig;
+  /**
+   * Declared mbx remote cache. Every job here may build Cargo, so each carries mbx's remote settings; a release
+   * dispatched on the default branch publishes what it compiles.
+   */
+  mbxRemote?: PackageMbxRemoteConfig;
 }
 
 export interface PublishWorkflowInputs {
@@ -822,13 +829,16 @@ function cargoCredentialsJobEnv(options: PublishWorkflowDefinitionOptions): stri
 }
 
 /**
- * The remote cache is job env for the same reason: every Nx target in the job
- * reads it, and a release build that missed the cache would rebuild what CI
- * already built for the identical hashes. Only `${{ secrets.NAME }}` is
- * rendered for the token. Malformed declarations throw here, not in CI.
+ * The remote caches are job env for the same reason: every Nx target in the job
+ * reads the Nx cache and every Cargo build the mbx one, and a release build
+ * that missed them would rebuild what CI already built for the identical
+ * inputs. Only `${{ secrets.NAME }}` is rendered for a token. Malformed
+ * declarations throw here, not in CI.
  */
 function remoteCacheJobEnv(options: PublishWorkflowDefinitionOptions, reach: CacheReach): string {
-  const rendered = remoteCacheJobEnvLines(options.remoteCache, reach).trimEnd();
+  const rendered = (
+    remoteCacheJobEnvLines(options.remoteCache, reach) + mbxRemoteJobEnvLines(options.mbxRemote, reach)
+  ).trimEnd();
   return rendered === '' ? '' : `\n${rendered}`;
 }
 

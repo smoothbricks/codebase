@@ -230,6 +230,38 @@ export interface RemoteCacheDeclaration {
 }
 
 /**
+ * Declared mbx remote cache (`smoo.mbxRemote`): the compiler-action cache every Cargo build under mbx reads and the
+ * default branch's own runs publish into. Managed CI puts mbx's remote settings in each job's environment, and
+ * setup-devenv routes Cargo through mbx's Cargo shim whenever they are set, so a crate any runner already compiled is a
+ * download for every other runner and a one-crate change recompiles that crate. Absent means CI builds Cargo without
+ * mbx.
+ *
+ * Two tokens because the server's grants, not mbx's client-side write policy, are the access boundary: a job on the
+ * default branch (a push to it, or a release dispatched on it) gets `writeTokenSecret` and is trusted to publish
+ * (`MBX_REMOTE_TRUST_WRITES`); every other job gets `readTokenSecret`, which the server refuses to write with.
+ */
+export type PackageMbxRemoteConfig = MbxRemoteDeclaration & (LiteralCacheOrigin | VariableCacheOrigin);
+
+/** What every mbx remote declaration carries, whichever way it names the public origin. */
+export interface MbxRemoteDeclaration {
+  /**
+   * Origin the repository's own runners reach instead of the public one. mbx sends a token over plain HTTP only to a
+   * loopback address, so this is an `https://` origin or a loopback one such as `http://127.0.0.1:8766` that each
+   * runner forwards to the cache host.
+   */
+  internalServer?: string;
+  /** Cache namespace (`MBX_REMOTE_NAMESPACE`); repositories that declare the same one reuse each other's compilations. */
+  namespace: MbxNamespace;
+  /** Repository secret holding the read+write token, given only to the default branch's own runs. */
+  writeTokenSecret: RepositorySecretName;
+  /** Repository secret holding the read-only token every other job gets. */
+  readTokenSecret: RepositorySecretName;
+}
+
+/** `name` or `owner/name`: slash-separated segments of letters, digits, `.`, `_` and `-`, each starting alphanumeric. */
+export type MbxNamespace = string & typia.tags.Pattern<'^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$'>;
+
+/**
  * A `smoo.secrets` group: which operation resolves the credential. One argv
  * word of `smoo secrets run <group> <command...>`, so whitespace would make
  * that command unwritable. Only the shape is validated — the values are the
@@ -291,6 +323,8 @@ export interface PackageSmooConfig {
   privateNpm?: PackagePrivateNpmConfig;
   /** Declared self-hosted Nx remote cache; absent means local caching only. */
   remoteCache?: PackageRemoteCacheConfig;
+  /** Declared mbx remote cache for Cargo builds; absent means CI builds Cargo without mbx. */
+  mbxRemote?: PackageMbxRemoteConfig;
   /** Provider-neutral local secret commands. CI supplies these variables externally. */
   secrets?: Record<string, PackageSecretCommand>;
   /**

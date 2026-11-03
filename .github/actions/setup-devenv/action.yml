@@ -440,3 +440,28 @@ runs:
       env:
         SMOO_ROOT_BUILD_INPUTS: ${{ steps.runner-kind.outputs.host != 'true' }}
       run: ./github-actions-bootstrap.sh build-shell
+
+    # smoo.mbxRemote: the job env names the mbx remote cache, and Cargo reaches it only through mbx's Cargo shim, so the
+    # shim goes first on PATH for every later step. mbx setup runs under a scratch HOME, where Linux's XDG_DATA_HOME and
+    # macOS's Application Support name the same directory, so it writes none of the runner's editor or mise
+    # configuration and the shim's path is known rather than parsed from its output. The shim records the shell's mbx.
+    - name: 🦀 Route Cargo through mbx
+      if: env.MBX_REMOTE_URL != '' && hashFiles('Cargo.lock') != ''
+      shell: bash
+      run: |
+        if ! mbx=$(command -v mbx); then
+          echo "::error::smoo.mbxRemote is declared but the devenv shell provides no mbx; add mbx to tooling/direnv/devenv.nix"
+          exit 1
+        fi
+        home="$RUNNER_TEMP/mbx-setup"
+        data="$home/Library/Application Support"
+        mkdir -p "$data"
+        HOME="$home" XDG_DATA_HOME="$data" XDG_CONFIG_HOME="$home/config" XDG_CACHE_HOME="$home/cache" \
+          MBX_CACHE_DIR="$home/cache/mbx" "$mbx" setup --yes
+        shim="$data/mbx/bin"
+        if [ ! -x "$shim/cargo" ]; then
+          echo "::error::$mbx setup --yes wrote no Cargo shim at $shim/cargo"
+          exit 1
+        fi
+        echo "$shim" >> "$GITHUB_PATH"
+        echo "Cargo runs through mbx ($mbx), remote $MBX_REMOTE_URL, namespace $MBX_REMOTE_NAMESPACE"

@@ -49,3 +49,8 @@ inputs:
   rust-overlay:
     url: github:oxalica/rust-overlay
     flake: true
+  # mbx for managed CI's Cargo shim (smoo.mbxRemote): the revision cowshed pins and installs beside itself
+  # (specs/cowshed/14_nix.md, "mbx"), so a CI runner and a developer machine compile through the same mbx.
+  mbx:
+    url: path:../../packages/cowshed/nix/mbx
+    flake: true

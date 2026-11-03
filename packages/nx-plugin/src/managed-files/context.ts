@@ -77,6 +77,7 @@ export function deriveManagedFileContext(
     sourceCheckouts,
     cargoCredentials,
     remoteCache: manifest?.smoo?.remoteCache,
+    mbxRemote: manifest?.smoo?.mbxRemote,
     macosPlatformArchitectures: MACOS_PLATFORM_TARGET_GLOBS.some((glob) => releasePlatformTargetGlobs.includes(glob))
       ? macosPlatformArchitecturesForTest(targetNames)
       : [],
