@@ -1,7 +1,8 @@
+import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { posix } from 'node:path';
 import { childPids } from '../../process-children.linux.js';
-import type { HostMemory, RunMemory, RunMemoryError, RunMemoryReading } from './host-memory.js';
+import type { HostMemory, LiveUsageReading, RunMemory, RunMemoryError, RunMemoryReading } from './host-memory.js';
 
 /**
  * Linux's memory mechanisms. The run's memory is the least of the host's `MemTotal` and every finite `memory.max` of
@@ -103,6 +104,40 @@ async function readText(path: string): Promise<FileRead> {
   }
 }
 
+/** The memory a bound holds live: `memory.stat`'s `anon` and `shmem` beside a cgroup's `memory.max`, meminfo's `AnonPages` and `Shmem` for the host's. */
+export function linuxLiveUsage(read: (path: string) => FileRead, bound: string): LiveUsageReading {
+  const cgroupLimit = '/memory.max';
+  if (bound.endsWith(cgroupLimit)) {
+    const file = `${bound.slice(0, -cgroupLimit.length)}/memory.stat`;
+    const stat = read(file);
+    if (!stat.ok) return { ok: false, reason: `${file}: ${stat.code}: ${stat.message}` };
+    const [anon, shmem] = [/^anon (\d+)$/m.exec(stat.text)?.[1], /^shmem (\d+)$/m.exec(stat.text)?.[1]];
+    return anon === undefined || shmem === undefined
+      ? { ok: false, reason: `${file} names no anon and shmem in bytes` }
+      : { ok: true, usage: { anon: Number(anon), shmem: Number(shmem), source: file } };
+  }
+  if (bound === `${MEMINFO} MemTotal`) {
+    const info = read(MEMINFO);
+    if (!info.ok) return { ok: false, reason: `${MEMINFO}: ${info.code}: ${info.message}` };
+    const [anon, shmem] = [
+      /^AnonPages:\s+(\d+) kB$/m.exec(info.text)?.[1],
+      /^Shmem:\s+(\d+) kB$/m.exec(info.text)?.[1],
+    ];
+    return anon === undefined || shmem === undefined
+      ? { ok: false, reason: `${MEMINFO} names no AnonPages and Shmem in kB` }
+      : { ok: true, usage: { anon: Number(anon) * 1024, shmem: Number(shmem) * 1024, source: MEMINFO } };
+  }
+  return { ok: false, reason: `${bound} is no cgroup memory.max or meminfo bound` };
+}
+
+function readTextSync(path: string): FileRead {
+  try {
+    return { ok: true, text: readFileSync(path, 'utf8') };
+  } catch (error) {
+    const code = error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : 'EIO';
+    return { ok: false, code, message: error instanceof Error ? error.message : String(error) };
+  }
+}
 /** Bun before 1.4.0 reports Linux's `ru_maxrss` as the kernel does, in KiB; from 1.4.0 it reports bytes. */
 function peakBytes(maxRss: number, bunVersion: string): number {
   const version = /^(\d+)\.(\d+)\./.exec(bunVersion);
@@ -144,4 +179,9 @@ async function residentBytes(pid: number): Promise<number> {
   return kib === undefined ? 0 : Number(kib) * 1024;
 }
 
-export const linuxMemory: HostMemory = { readRunMemory: () => linuxRunMemory(readText), peakBytes, treeResidentBytes };
+export const linuxMemory: HostMemory = {
+  readRunMemory: () => linuxRunMemory(readText),
+  peakBytes,
+  treeResidentBytes,
+  liveUsage: (bound) => linuxLiveUsage(readTextSync, bound),
+};

@@ -3024,7 +3024,11 @@ async function withPool<T>(
   body: (pool: CpuPool) => Promise<T>,
   memory: number | null = null,
 ): Promise<T> {
-  const created = await createCpuPool(tokens, new Promise<void>(() => {}), memory);
+  const created = await createCpuPool(
+    tokens,
+    new Promise<void>(() => {}),
+    memory === null ? null : { bytes: memory, source: 'a test run' },
+  );
   if (!created.ok) {
     throw new Error(`cpu pool: ${created.error}`);
   }

@@ -132,4 +132,10 @@ async function treeResidentBytes(root: number): Promise<number> {
   return total;
 }
 
-export const darwinMemory: HostMemory = { readRunMemory, peakBytes: (maxRss) => maxRss, treeResidentBytes };
+export const darwinMemory: HostMemory = {
+  readRunMemory,
+  peakBytes: (maxRss) => maxRss,
+  treeResidentBytes,
+  // macOS has no cgroup, and its anonymous and shared pages are not read from a file the pool may open.
+  liveUsage: () => ({ ok: false, reason: 'macOS keeps no anonymous and shared memory of a run to read' }),
+};

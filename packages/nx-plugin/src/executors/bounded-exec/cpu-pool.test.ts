@@ -600,3 +600,74 @@ describe('the parent-held CPU pool', () => {
     expect(await grantedFor(parent, 3)).toBe(3);
   });
 });
+
+describe("a run's CPU pool says what it grants", () => {
+  /** Every stderr line this process writes while `body` runs. */
+  async function stderrDuring(body: () => Promise<void>): Promise<string> {
+    const write = process.stderr.write;
+    let said = '';
+    process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+      said += String(chunk);
+      return Reflect.apply(write, process.stderr, [chunk, ...rest]);
+    }) as typeof process.stderr.write;
+    try {
+      await body();
+    } finally {
+      process.stderr.write = write;
+    }
+    return said;
+  }
+
+  it('names the leaf, its charge, what the holders are charged of the run, and what the bound holds live', async () => {
+    const made = await createCpuPool(2, NEVER, { bytes: 100, source: 'a test run' }, () => ({
+      ok: true,
+      usage: { anon: 30, shmem: 5, source: 'a test cgroup' },
+    }));
+    if (!made.ok) throw new Error(made.error);
+    pools.push(made.pool);
+    const parent = readInheritedCpuPool(made.pool.environment);
+    if (parent === null) throw new Error('the pool environment names no endpoint');
+    const said = await stderrDuring(async () => {
+      const first = await takeParentCpuTokens(parent, 1, 40, { task: 'app:test' });
+      const second = await takeParentCpuTokens(parent, 1, 25);
+      expect(first.granted && second.granted).toBe(true);
+      if (first.granted) first.release();
+      if (second.granted) second.release();
+    });
+    expect(said).toContain(
+      'granted app:test 1 of 1 tokens charged 40 bytes: holders charged 40 of 100 bytes, live anon+shmem 35 bytes (anon 30, shmem 5, a test cgroup)',
+    );
+    expect(said).toContain('granted a leaf 1 of 1 tokens charged 25 bytes: holders charged 65 of 100 bytes');
+  });
+
+  it('says that the live memory could not be read, and why, rather than leaving it out', async () => {
+    const made = await createCpuPool(2, NEVER, { bytes: 100, source: 'a test run' }, () => ({
+      ok: false,
+      reason: 'EACCES: permission denied',
+    }));
+    if (!made.ok) throw new Error(made.error);
+    pools.push(made.pool);
+    const parent = readInheritedCpuPool(made.pool.environment);
+    if (parent === null) throw new Error('the pool environment names no endpoint');
+    const said = await stderrDuring(async () => {
+      const grant = await takeParentCpuTokens(parent, 1, 40, { task: 'app:test' });
+      expect(grant.granted).toBe(true);
+      if (grant.granted) grant.release();
+    });
+    expect(said).toContain('live anon+shmem unread (EACCES: permission denied)');
+  });
+
+  it('says nothing of a sub-pool, which charges no memory', async () => {
+    const made = await createCpuPool(2, NEVER, null);
+    if (!made.ok) throw new Error(made.error);
+    pools.push(made.pool);
+    const parent = readInheritedCpuPool(made.pool.environment);
+    if (parent === null) throw new Error('the pool environment names no endpoint');
+    const said = await stderrDuring(async () => {
+      const grant = await takeParentCpuTokens(parent, 1, null, { task: 'app:test' });
+      expect(grant.granted).toBe(true);
+      if (grant.granted) grant.release();
+    });
+    expect(said).not.toContain('granted');
+  });
+});

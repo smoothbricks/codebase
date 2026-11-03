@@ -1,5 +1,6 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { type CloseOutcome, createCpuPool } from './cpu-pool.js';
+import type { RunMemory } from './host-memory.js';
 
 /**
  * The thread an Nx run's CPU pool runs on (`run-cpu-pool.ts`; specs/cowshed/05_gateway.md, "Every Nx run budgets
@@ -9,14 +10,14 @@ import { type CloseOutcome, createCpuPool } from './cpu-pool.js';
  * jobserver fifo and heartbeat share an event loop that runs nothing else, so the heartbeat proves that the actor which
  * admits and grants is turning.
  *
- * The thread is started with the pool's count and the run's memory. It says once that the pool serves, with the environment a task inherits,
- * or why it cannot; the host's one message is its close, after which the thread says how the pool closed.
+ * The thread is started with the pool's count and the run's memory. It says once that the pool serves, with the environment a
+ * task inherits, or why it cannot; the host's one message is its close, after which the thread says how the pool closed.
  */
 
-/** What the thread is started with: the run's count, and the run's memory in bytes its grants are charged against. */
+/** What the thread is started with: the run's count, and the run's memory its grants are charged against. */
 export interface CpuPoolThreadData {
   readonly tokens: number;
-  readonly memory: number;
+  readonly memory: RunMemory;
 }
 
 /** What the thread says, in order: the pool serves or failed; after the host's close, how the pool closed. */

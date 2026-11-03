@@ -5,7 +5,7 @@ import { logger } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 import { type CloseOutcome, type CpuPool, readInheritedCpuPool } from './cpu-pool.js';
 import type { CpuPoolThreadData, CpuPoolThreadReport } from './cpu-pool-thread.js';
-import { type RunMemoryReading, RunMemoryUnreadable, readRunMemory } from './host-memory.js';
+import { type RunMemory, type RunMemoryReading, RunMemoryUnreadable, readRunMemory } from './host-memory.js';
 import { mbxPool } from './mbx-pool.js';
 import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
 
@@ -91,7 +91,7 @@ export async function serveRunCpuPool(
   if (!memory.ok) {
     throw new RunMemoryUnreadable(memory.error);
   }
-  const served = await servePoolThread(tokens, memory.memory.bytes);
+  const served = await servePoolThread(tokens, memory.memory);
   if (!served.ok) {
     logger.warn(
       `bounded-exec: this run's CPU pool failed (${served.error}); its tasks are sized only by the ceilings they inherit`,
@@ -110,7 +110,7 @@ export async function serveRunCpuPool(
  * has said how its pool closed fails whichever wait is open, a later close returns that failure, and a thread lost while
  * its pool serves is said at once.
  */
-function servePoolThread(tokens: number, memory: number): Promise<ServedPool> {
+function servePoolThread(tokens: number, memory: RunMemory): Promise<ServedPool> {
   const thread = new Worker(THREAD_ENTRY, {
     workerData: { tokens, memory } satisfies CpuPoolThreadData,
     ...THREAD_PRELOAD,

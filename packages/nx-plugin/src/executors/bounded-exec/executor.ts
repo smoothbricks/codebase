@@ -560,7 +560,10 @@ export async function runBoundedExec(
   let parentRefusal: string | null = null;
   let parentWait: CpuWaitRow | undefined;
   if (inherited !== null) {
-    const fromParent = await takeParentCpuTokens(inherited, demand.want, charge, chargeParallelism);
+    const fromParent = await takeParentCpuTokens(inherited, demand.want, charge, {
+      parallelism: chargeParallelism ?? undefined,
+      task: context.record?.task.id,
+    });
     if (fromParent.granted) {
       grant = fromParent;
     } else if (fromParent.cause === 'absent') {

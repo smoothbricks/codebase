@@ -113,7 +113,7 @@ describe("an Nx run's own CPU pool", () => {
     if (pool === null) {
       throw new Error(`the run published no pool: ${JSON.stringify(env)}`);
     }
-    const first = await takeParentCpuTokens(pool, 4, 4, 1);
+    const first = await takeParentCpuTokens(pool, 4, 4, { parallelism: 1 });
     expect(first.granted && [first.tokens, first.charged]).toEqual([2, 8]);
     const { promise: queued, resolve: queue } = Promise.withResolvers<void>();
     const second = holdLease(

@@ -1800,8 +1800,13 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   to SIGKILL (exit 137), two to four of them within one second of each other, while a Vitest leaf of the same repository
   ran beside them; in the one run whose pool lines survive, that leaf was lent 22 of 31 tokens on a charge of 3.4 GB
   taken from a record, and the `bun test` leaves killed beside it were each charged 3 to 5 GB from records. A run in
-  which the Vitest leaves ended before the `bun test` leaves began lost none. A run prints the pool line of a failed
-  leaf only, so what the other holders were charged is not in those logs.
+  which the Vitest leaves ended before the `bun test` leaves began lost none. Those logs held the pool line of a failed
+  leaf only. The pool now says every grant on its own stderr, in the Nx run's log:
+  `granted <task> <tokens> of <asked> tokens charged <bytes> bytes: holders charged <bytes> of <capacity> bytes, live anon+shmem <bytes> (anon <bytes>, shmem <bytes>, <file>)`.
+  The live figure is read from the run's bound: the `memory.stat` beside the cgroup's `memory.max`, or meminfo's
+  `AnonPages` and `Shmem` when the host's memory is the bound; a reading that cannot be taken, and macOS, which keeps
+  none, say so (`live anon+shmem unread (<reason>)`). What the other holders were charged, what lies outside the leaves
+  and what a suite holds beyond its record are therefore measured, not inferred.
 
   When a leaf ends, `bounded-exec` writes its peak into the task's record, the `verdict.json` of the task's
   `bounded-exec` directory in the checkout's Nx workspace data, keyed by the task id Nx gives

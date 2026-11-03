@@ -21,7 +21,25 @@ export interface HostMemory {
    * listing and its read adds nothing, and a root that has exited holds nothing.
    */
   treeResidentBytes(root: number): Promise<number>;
+  /**
+   * What the run's bound holds that the kernel cannot take back, read now: its anonymous and shared memory. `bound` is
+   * the `source` of the run's memory (`RunMemory`): the cgroup's `memory.max`, whose `memory.stat` is read, or the
+   * host's `MemTotal`, whose `AnonPages` and `Shmem` are. The pool says it on every grant, so what the leaves are not
+   * charged for (the baseline, a tmpfs) and what a suite holds beyond its record are measured, not guessed.
+   */
+  liveUsage(bound: string): LiveUsageReading;
 }
+
+/** What a bound holds live, in bytes, and the file it was read from. */
+export interface LiveUsage {
+  readonly anon: number;
+  readonly shmem: number;
+  readonly source: string;
+}
+
+export type LiveUsageReading =
+  | { readonly ok: true; readonly usage: LiveUsage }
+  | { readonly ok: false; readonly reason: string };
 
 /** The run's memory in bytes, and where it was read: the file or sysctl that holds it. */
 export interface RunMemory {
@@ -74,4 +92,11 @@ export function readRunMemory(): Promise<RunMemoryReading> {
     });
   }
   return HOST_MEMORY.readRunMemory();
+}
+
+/** The run's bound live on this platform, or why it cannot be read: a pool says it, never leaves it out. */
+export function readLiveUsage(bound: string): LiveUsageReading {
+  return HOST_MEMORY === null
+    ? { ok: false, reason: `${process.platform} has no reader of live memory` }
+    : HOST_MEMORY.liveUsage(bound);
 }

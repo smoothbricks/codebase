@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
-import type { RunMemoryReading } from './host-memory.js';
-import { type FileRead, linuxMemory, linuxRunMemory } from './host-memory.linux.js';
+import type { LiveUsageReading, RunMemoryReading } from './host-memory.js';
+import { type FileRead, linuxLiveUsage, linuxMemory, linuxRunMemory } from './host-memory.linux.js';
 
 const GiB = 1024 ** 3;
 const MEMINFO = `MemTotal:       ${64 * 1024 * 1024} kB\nMemFree:         1024 kB\n`;
@@ -150,4 +150,50 @@ it("reads a leaf's peak in bytes whichever unit its Bun reports Linux's ru_maxrs
   expect(linuxMemory.peakBytes(4096, '1.3.13')).toBe(4 * 1024 * 1024);
   expect(linuxMemory.peakBytes(4 * 1024 * 1024, '1.4.0')).toBe(4 * 1024 * 1024);
   expect(linuxMemory.peakBytes(4 * 1024 * 1024, '1.4.4')).toBe(4 * 1024 * 1024);
+});
+
+it("reads what the run's bound holds that the kernel cannot take back: the cgroup's anonymous and shared memory, or the host's", () => {
+  const sync =
+    (files: Record<string, string | FileRead>) =>
+    (path: string): FileRead => {
+      const file = files[path];
+      return file === undefined ? absent : typeof file === 'string' ? { ok: true, text: file } : file;
+    };
+  const stat = 'anon 100\nfile 5000\nkernel 7\nshmem 20\nfile_mapped 3\n';
+  const cases: { name: string; bound: string; files: Record<string, string | FileRead>; reading: LiveUsageReading }[] =
+    [
+      {
+        name: "a cgroup's own bound: the memory.stat beside its memory.max",
+        bound: '/sys/fs/cgroup/ci.slice/memory.max',
+        files: { '/sys/fs/cgroup/ci.slice/memory.stat': stat },
+        reading: { ok: true, usage: { anon: 100, shmem: 20, source: '/sys/fs/cgroup/ci.slice/memory.stat' } },
+      },
+      {
+        name: "the host's bound: AnonPages and Shmem of meminfo, in kB",
+        bound: '/proc/meminfo MemTotal',
+        files: { '/proc/meminfo': 'MemTotal: 9 kB\nAnonPages:      1000 kB\nShmem:           200 kB\n' },
+        reading: { ok: true, usage: { anon: 1_024_000, shmem: 204_800, source: '/proc/meminfo' } },
+      },
+      {
+        name: 'a memory.stat the run may not read',
+        bound: '/sys/fs/cgroup/a/memory.max',
+        files: { '/sys/fs/cgroup/a/memory.stat': { ok: false, code: 'EACCES', message: 'permission denied' } },
+        reading: { ok: false, reason: '/sys/fs/cgroup/a/memory.stat: EACCES: permission denied' },
+      },
+      {
+        name: 'a memory.stat that names no shared memory',
+        bound: '/sys/fs/cgroup/a/memory.max',
+        files: { '/sys/fs/cgroup/a/memory.stat': 'anon 1\n' },
+        reading: { ok: false, reason: '/sys/fs/cgroup/a/memory.stat names no anon and shmem in bytes' },
+      },
+      {
+        name: 'a bound this reader does not know',
+        bound: 'hw.memsize',
+        files: {},
+        reading: { ok: false, reason: 'hw.memsize is no cgroup memory.max or meminfo bound' },
+      },
+    ];
+  for (const check of cases) {
+    expect(linuxLiveUsage(sync(check.files), check.bound), check.name).toEqual(check.reading);
+  }
 });
