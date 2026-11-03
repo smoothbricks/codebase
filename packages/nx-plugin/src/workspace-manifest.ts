@@ -187,7 +187,10 @@ export interface PackagePrivateNpmConfig {
  * miss, but a server without a working credential fails every task with 401
  * rather than missing quietly.
  */
-export interface PackageRemoteCacheConfig {
+export type PackageRemoteCacheConfig = RemoteCacheDeclaration & (LiteralCacheOrigin | VariableCacheOrigin);
+
+/** The public origin written out, for a cache whose address may be published. */
+export interface LiteralCacheOrigin {
   /**
    * Origin every runner and developer machine can reach, e.g.
    * `https://nx-cache.example.net`. Credential-free, no path, and no trailing
@@ -195,12 +198,26 @@ export interface PackageRemoteCacheConfig {
    * `//v1/cache/<hash>`, which is a different route and answers 404 forever.
    */
   server: string;
+}
+
+/**
+ * The public origin named by a repository variable, for a public repository whose cache address is private: managed
+ * CI reads it as `${{ vars.<serverVariable> }}`, and a developer shell that wants the cache exports the same name.
+ */
+export interface VariableCacheOrigin {
+  /** Repository variable (and shell variable) holding the public origin, in the shape `server` takes. */
+  serverVariable: RepositorySecretName;
+}
+
+/** What every declaration carries, whichever way it names the public origin. */
+export interface RemoteCacheDeclaration {
   /**
-   * Origin an internal runner reaches instead of `server`, e.g.
+   * Origin the repository's own runners reach instead of the public one, e.g.
    * `http://10.89.0.1:8765` across a container bridge. Same declaration as a
-   * git origin's `internalMirror`: declaring it says this repository's managed
-   * runners are inside that network, so managed CI uses it and shells outside
-   * keep `server`. Omitted means CI uses `server` too.
+   * git origin's `internalMirror`: declaring it says those runners are inside
+   * that network, so managed CI jobs on them use it, and jobs on other runners
+   * and shells outside keep the public origin. Omitted means CI uses the public
+   * origin too.
    */
   internalServer?: string;
   /**

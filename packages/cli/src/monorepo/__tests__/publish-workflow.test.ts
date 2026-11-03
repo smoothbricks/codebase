@@ -52,6 +52,11 @@ const codebaseWorkflowOptions: PublishWorkflowDefinitionOptions = {
   platformTargetGlobs: ['*-macos', '*-linux'],
   macosPlatformArchitectures: ['arm64', 'x64'],
   runsOn: [...nixosRunsOn],
+  remoteCache: {
+    serverVariable: 'NX_REMOTE_CACHE_SERVER',
+    internalServer: 'http://10.89.0.1:8765',
+    tokenSecret: 'NX_REMOTE_CACHE_TOKEN',
+  },
 };
 
 type ProducerStep = {
@@ -433,16 +438,17 @@ describe('publish workflow definition', () => {
     await expect(formattedPublishWorkflow(formatted)).resolves.toBe(formatted);
   });
 
-  it('gives every publish job the declared remote cache, in bytes Prettier keeps', async () => {
+  it('gives every publish job the declared remote cache at an origin its runner reaches, in bytes Prettier keeps', async () => {
     const remoteCache = {
       server: 'https://nx-cache.example.net',
       internalServer: 'http://10.89.0.1:8765',
       tokenSecret: 'NX_REMOTE_CACHE_TOKEN',
     };
-    const cacheEnv = {
-      NX_SELF_HOSTED_REMOTE_CACHE_SERVER: 'http://10.89.0.1:8765',
-      NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: '${{ secrets.NX_REMOTE_CACHE_TOKEN }}',
-    };
+    const token = { NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: '${{ secrets.NX_REMOTE_CACHE_TOKEN }}' };
+    // The release candidate runs on the repository's own runners, inside the network internalServer names; the
+    // macOS legs and the npm publisher run on GitHub-hosted runners, which reach only the public server.
+    const internalEnv = { NX_SELF_HOSTED_REMOTE_CACHE_SERVER: 'http://10.89.0.1:8765', ...token };
+    const publicEnv = { NX_SELF_HOSTED_REMOTE_CACHE_SERVER: 'https://nx-cache.example.net', ...token };
     const platform = await formattedPublishWorkflow(
       renderPublishWorkflowYaml({ ...codebaseWorkflowOptions, remoteCache }),
     );
@@ -452,13 +458,15 @@ describe('publish workflow definition', () => {
 
     expect(Bun.YAML.parse(platform)).toMatchObject({
       jobs: {
-        'linux-release-candidate': { env: cacheEnv },
-        'macos-platform': { env: cacheEnv },
-        'publish-on-linux': { env: cacheEnv },
+        'linux-release-candidate': { env: internalEnv },
+        'macos-platform': { env: publicEnv },
+        'publish-on-linux': { env: publicEnv },
       },
     });
-    expect(Bun.YAML.parse(single)).toMatchObject({ jobs: { publish: { env: cacheEnv } } });
-    expect(renderPublishWorkflowYaml(codebaseWorkflowOptions)).not.toContain('NX_SELF_HOSTED');
+    expect(Bun.YAML.parse(single)).toMatchObject({ jobs: { publish: { env: publicEnv } } });
+    expect(renderPublishWorkflowYaml({ ...codebaseWorkflowOptions, remoteCache: undefined })).not.toContain(
+      'NX_SELF_HOSTED',
+    );
     // A workflow the repository Prettier config would rewrite drifts on the
     // first commit hook, so the cache lines must already be its output.
     await expect(formattedPublishWorkflow(platform)).resolves.toBe(platform);

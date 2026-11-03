@@ -1377,9 +1377,15 @@ One Nx self-hosted remote cache shared by every runner and every developer shell
 - `server`: the origin every developer machine reaches. Credential-free, no path, and no trailing slash — Nx appends
   `/v1/cache/<hash>`, so a trailing slash asks for a doubled-slash route that answers 404 forever. Such a declaration is
   refused at render time rather than trimmed, because managed CI and the developer shell read the same field.
-- `internalServer`: the origin managed runners reach instead, such as a container-bridge address. Same declaration as a
-  git origin's `internalMirror` — it says this repository's runners sit inside that network — so every generated job
-  takes it while shells outside keep `server`. Omitted means CI uses `server` too.
+- `serverVariable`: instead of `server`, the name of a repository variable holding that origin, for a public repository
+  whose cache address is private and so must not be committed. Managed CI reads it as `${{ vars.<serverVariable> }}`
+  wherever it would write `server`, and a developer shell that wants the cache exports the same name. A declaration
+  names its public origin one way: `server` and `serverVariable` together are refused, as is a name that is not an
+  upper-case variable name.
+- `internalServer`: the origin the repository's own runners (`smoo.github.runsOn`) reach instead, such as a
+  container-bridge address. Same declaration as a git origin's `internalMirror` — it says those runners sit inside that
+  network — so every generated job on them takes it, while a job on any other runner (the GitHub-hosted macOS legs and
+  npm publisher, a macOS cross-test job) and shells outside keep `server`. Omitted means CI uses `server` too.
 - `tokenSecret`: the repository secret holding the cache token, and the variable name a developer shell resolves locally
   (an ambient value, or a `smoo.secrets` entry). A read-only token is the honest choice for an untrusted context: it
   reads the cache and cannot publish into it.

@@ -330,7 +330,7 @@ ${
     : ''
 }    env:
       GH_TOKEN: ${githubExpression('github.token')}
-${remoteCacheJobEnvLines(options.remoteCache)}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache, 'internal')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 `;
 }
 
@@ -679,30 +679,58 @@ export function normalizeSourceCheckout(config: PackageSourceCheckoutConfig): Pa
  * fail every task on 401, which is why the job carries the same fork-PR gate
  * as a private dependency install (see `renderCiWorkflowHeader`).
  *
- * A declared `internalServer` is the address managed runners use, exactly as a
- * git origin's `internalMirror` is: both say this repository's runners sit
- * inside that network, and shells outside it keep the public origin.
+ * A declared `internalServer` is the address the repository's own runners use, exactly as a git origin's
+ * `internalMirror` is: both say those runners sit inside that network. A job on any other runner — a GitHub-hosted
+ * one, a macOS label — sits outside it and reaches the public `server`, as a developer shell does. Each job names
+ * its reach, so no job is pointed at an address its runner cannot route to.
  * Mechanism errors surface at managed-file render time, never inside CI.
  */
-export function remoteCacheJobEnvLines(config: PackageRemoteCacheConfig | undefined): string {
+export function remoteCacheJobEnvLines(config: PackageRemoteCacheConfig | undefined, reach: CacheReach): string {
   if (config === undefined) {
     return '';
   }
   const normalized = normalizeRemoteCache(config);
+  const server =
+    reach === 'internal' ? (normalized.internalServer ?? publicCacheOrigin(normalized)) : publicCacheOrigin(normalized);
   return [
-    `      NX_SELF_HOSTED_REMOTE_CACHE_SERVER: ${normalized.internalServer ?? normalized.server}\n`,
+    `      NX_SELF_HOSTED_REMOTE_CACHE_SERVER: ${server}\n`,
     `      NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: ${githubExpression(`secrets.${normalized.tokenSecret}`)}\n`,
   ].join('');
 }
 
+/**
+ * Which origin of a declared remote cache a job reaches: `internal` for a job on the repository's own runners
+ * (`smoo.github.runsOn`), inside the network `internalServer` names; `public` for any other runner, which reaches
+ * only `server`.
+ */
+export type CacheReach = 'internal' | 'public';
+
+/**
+ * The public origin as a job env value: the declared origin, or the expression that reads the repository variable
+ * naming it.
+ */
+function publicCacheOrigin(config: PackageRemoteCacheConfig): string {
+  return 'serverVariable' in config ? githubExpression(`vars.${config.serverVariable}`) : config.server;
+}
+
 /** Mechanism errors surface at managed-file render time, never inside CI. */
 export function normalizeRemoteCache(config: PackageRemoteCacheConfig): PackageRemoteCacheConfig {
-  assertCacheOrigin('server', config.server);
+  const literal = 'server' in config ? config.server : undefined;
+  if ('server' in config && 'serverVariable' in config) {
+    throw new Error('smoo.remoteCache names its public origin twice; declare server or serverVariable, not both');
+  }
+  if (literal !== undefined) {
+    assertCacheOrigin('server', literal);
+  } else if (!('serverVariable' in config) || !/^[A-Z_][A-Z0-9_]*$/.test(config.serverVariable)) {
+    throw new Error(
+      `smoo.remoteCache needs server, or an upper-case repository variable name for serverVariable, got ${JSON.stringify(config)}`,
+    );
+  }
   if (config.internalServer !== undefined) {
     assertCacheOrigin('internalServer', config.internalServer);
-    if (config.internalServer === config.server) {
+    if (config.internalServer === literal) {
       throw new Error(
-        `smoo.remoteCache internalServer repeats server ${config.server}; drop internalServer or point it at the address internal runners reach`,
+        `smoo.remoteCache internalServer repeats server ${literal}; drop internalServer or point it at the address internal runners reach`,
       );
     }
   }
@@ -1268,7 +1296,7 @@ ${options.macosRunsOn === undefined ? '    runs-on: macos-latest' : renderRunsOn
     if: \${{ needs.main.result == 'success' }}
     env:
       GH_TOKEN: \${{ github.token }}
-${remoteCacheJobEnvLines(options.remoteCache)}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache, 'public')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 ${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
 ${renderCiWorkflowSteps(middleSteps, options)}
 ${renderCiWorkflowSteps(followUpCleanupStep(numbers), options)}`;
@@ -1366,7 +1394,7 @@ ${renderRunsOnLine(options.runsOn)}
 ${environmentLine(options.environments?.staging)}    if: \${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}
     env:
       GH_TOKEN: \${{ github.token }}
-${remoteCacheJobEnvLines(options.remoteCache)}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache, 'internal')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 ${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
       # Step ${numbers.middle}
       - name: E2E Tests (Deployed Stage)
@@ -1398,7 +1426,7 @@ ${renderRunsOnLine(options.runsOn)}
     if: \${{ !cancelled() && github.event_name == 'push' && github.ref == ${stagingRefLiteral(options)} && needs.main.result == 'success'${e2eGate} }}
 ${environmentLine(options.environments?.production)}    env:
       GH_TOKEN: \${{ github.token }}
-${remoteCacheJobEnvLines(options.remoteCache)}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache, 'internal')}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 ${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
       # Step ${numbers.middle}
       - name: 🚀 Deploy Production

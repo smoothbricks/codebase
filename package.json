@@ -370,6 +370,11 @@
     "sharp"
   ],
   "smoo": {
+    "remoteCache": {
+      "serverVariable": "NX_REMOTE_CACHE_SERVER",
+      "internalServer": "http://10.89.0.1:8765",
+      "tokenSecret": "NX_REMOTE_CACHE_TOKEN"
+    },
     "github": {
       "runsOn": [
         "nixos-latest-x64",

@@ -317,6 +317,33 @@ describe('group derivation', () => {
     );
   });
 
+  it('derives nx-cache for the token of a cache whose public origin a variable names, and refuses one naming both', async () => {
+    await withFixture(
+      {
+        secrets: { NX_REMOTE_CACHE_TOKEN: { command: emit('x') } },
+        remoteCache: { serverVariable: 'NX_REMOTE_CACHE_SERVER', tokenSecret: 'NX_REMOTE_CACHE_TOKEN' },
+      },
+      async (root) => {
+        expect(await groupsOf(root)).toEqual([
+          { name: 'NX_REMOTE_CACHE_TOKEN', group: 'nx-cache', derivedGroup: 'nx-cache' },
+        ]);
+      },
+    );
+    await withFixture(
+      {
+        secrets: { NX_REMOTE_CACHE_TOKEN: { command: emit('x') } },
+        remoteCache: {
+          server: 'https://nx-cache.example.net',
+          serverVariable: 'NX_REMOTE_CACHE_SERVER',
+          tokenSecret: 'NX_REMOTE_CACHE_TOKEN',
+        },
+      },
+      async (root) => {
+        await expect(groupsOf(root)).rejects.toThrow('names its public origin twice');
+      },
+    );
+  });
+
   it('a declared group wins, and the derivation it overrode stays visible', async () => {
     await withFixture(
       {

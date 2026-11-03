@@ -290,10 +290,12 @@ function parseSecretSpec(name: string, spec: unknown): SecretSpec {
  * The declared remote cache as a local shell needs it. `internalServer` is
  * deliberately absent: it is the address a managed runner reaches inside its
  * own network, and a shell that loads this file is by definition outside it,
- * so a developer machine always takes the public `server`.
+ * so a developer machine always takes the public origin: `server`, or the
+ * value of the variable `serverVariable` names, which a public repository
+ * declares so its cache address is never committed.
  */
 export interface RemoteCacheSpec {
-  readonly server: string;
+  readonly origin: { readonly server: string } | { readonly serverVariable: string };
   /** Variable holding the cache token: an ambient value, or a `smoo.secrets` entry in group `nx-cache`. */
   readonly tokenSecret: string;
 }
@@ -310,23 +312,35 @@ export function parseSmooRemoteCache(packageJson: unknown): RemoteCacheSpec | nu
   const remoteCache = smoo.remoteCache;
   if (remoteCache === undefined) return null;
   if (!isRecord(remoteCache)) {
-    throw new Error('smoo.remoteCache must be an object with { server, tokenSecret }');
+    throw new Error('smoo.remoteCache must be an object with { server or serverVariable, tokenSecret }');
   }
   const server = remoteCache.server;
+  const serverVariable = remoteCache.serverVariable;
   const tokenSecret = remoteCache.tokenSecret;
+  if (server !== undefined && serverVariable !== undefined) {
+    throw new Error('smoo.remoteCache names its public origin twice; declare server or serverVariable, not both');
+  }
   // A trailing slash is refused rather than trimmed: Nx appends
   // `/v1/cache/<hash>`, so the doubled slash is a route that answers 404
   // forever, and silently repairing the manifest here would leave managed CI
   // — which reads the same field — disagreeing with this shell.
-  if (typeof server !== 'string' || server.length === 0 || server.endsWith('/')) {
+  let origin: RemoteCacheSpec['origin'];
+  if (serverVariable !== undefined) {
+    if (typeof serverVariable !== 'string' || !ENV_NAME.test(serverVariable)) {
+      throw new Error('smoo.remoteCache.serverVariable must name the variable holding the public origin');
+    }
+    origin = { serverVariable };
+  } else if (typeof server !== 'string' || server.length === 0 || server.endsWith('/')) {
     throw new Error(
       'smoo.remoteCache.server must be an origin with no trailing slash, e.g. https://nx-cache.example.net',
     );
+  } else {
+    origin = { server };
   }
   if (typeof tokenSecret !== 'string' || !ENV_NAME.test(tokenSecret)) {
     throw new Error('smoo.remoteCache.tokenSecret must name the environment variable holding the cache token');
   }
-  return { server, tokenSecret };
+  return { origin, tokenSecret };
 }
 
 /** Every `${VAR}` referenced from `.npmrc` text; an absent file contributes nothing. */

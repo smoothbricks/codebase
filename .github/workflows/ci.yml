@@ -32,8 +32,13 @@ jobs:
       ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}
     timeout-minutes: 45
+    # Fork PRs receive no secrets, so neither a private dependency install nor an
+    # authenticated remote cache read can run there.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     env:
       GH_TOKEN: ${{ github.token }}
+      NX_SELF_HOSTED_REMOTE_CACHE_SERVER: http://10.89.0.1:8765
+      NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: ${{ secrets.NX_REMOTE_CACHE_TOKEN }}
     steps:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2

@@ -532,6 +532,9 @@ describe('CI workflow definition', () => {
     const definition = options({
       deploy: true,
       e2eDeployment: true,
+      crossTestArchives: [
+        { triple: 'aarch64-apple-darwin', path: '.cache/nextest/archive-aarch64-apple-darwin.tar.zst' },
+      ],
       productionOnPush: true,
       remoteCache: {
         server: 'https://nx-cache.example.net',
@@ -555,11 +558,13 @@ describe('CI workflow definition', () => {
         },
         'e2e-deployment': { env: cacheEnv },
         'deploy-production': { env: cacheEnv },
+        // The macOS job runs outside the runner network the internal address
+        // names, so it reaches the public origin a developer shell uses.
+        'macos-cross-tests': {
+          env: { ...cacheEnv, NX_SELF_HOSTED_REMOTE_CACHE_SERVER: 'https://nx-cache.example.net' },
+        },
       },
     });
-    // The public origin belongs to shells outside the runner network; a job
-    // that took it would leave the internal address unused.
-    expect(rendered).not.toContain('https://nx-cache.example.net');
   });
 
   it('takes the public server without an internal runner, and emits nothing without the declaration', () => {
@@ -599,6 +604,47 @@ describe('CI workflow definition', () => {
     expect(() =>
       renderCiWorkflowYaml(options({ remoteCache: { server, tokenSecret: 'nx_remote_cache_token' } })),
     ).toThrow('tokenSecret');
+  });
+
+  it('reads a public origin a repository variable names, so a public repository commits no cache address', () => {
+    const remoteCache = {
+      serverVariable: 'NX_REMOTE_CACHE_SERVER',
+      internalServer: 'http://10.89.0.1:8765',
+      tokenSecret: 'NX_REMOTE_CACHE_TOKEN',
+    };
+    const rendered = renderCiWorkflowYaml(
+      options({
+        remoteCache,
+        crossTestArchives: [
+          { triple: 'aarch64-apple-darwin', path: '.cache/nextest/archive-aarch64-apple-darwin.tar.zst' },
+        ],
+      }),
+    );
+
+    expect(Bun.YAML.parse(rendered)).toMatchObject({
+      jobs: {
+        main: { env: { NX_SELF_HOSTED_REMOTE_CACHE_SERVER: 'http://10.89.0.1:8765' } },
+        'macos-cross-tests': { env: { NX_SELF_HOSTED_REMOTE_CACHE_SERVER: '${{ vars.NX_REMOTE_CACHE_SERVER }}' } },
+      },
+    });
+    const { internalServer: _internal, ...publicOnly } = remoteCache;
+    expect(Bun.YAML.parse(renderCiWorkflowYaml(options({ remoteCache: publicOnly })))).toMatchObject({
+      jobs: { main: { env: { NX_SELF_HOSTED_REMOTE_CACHE_SERVER: '${{ vars.NX_REMOTE_CACHE_SERVER }}' } } },
+    });
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({
+          remoteCache: {
+            server: 'https://nx-cache.example.net',
+            serverVariable: 'NX_REMOTE_CACHE_SERVER',
+            tokenSecret: 'TOKEN',
+          },
+        }),
+      ),
+    ).toThrow('names its public origin twice');
+    expect(() =>
+      renderCiWorkflowYaml(options({ remoteCache: { serverVariable: 'nx_cache_server', tokenSecret: 'TOKEN' } })),
+    ).toThrow('serverVariable');
   });
 
   it('refuses missing registry secrets before setup and skips private Cargo jobs for fork PRs', () => {

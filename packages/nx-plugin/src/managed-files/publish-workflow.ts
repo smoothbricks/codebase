@@ -17,6 +17,7 @@ import type {
 import { isSmoothBricksCodebasePackageName } from '../workspace-package-policy.js';
 import {
   artifactStepLines,
+  type CacheReach,
   CI_JOB_ID,
   CI_WORKFLOW_NAME,
   CiWorkflowStepKind,
@@ -527,7 +528,7 @@ ${options.release === false ? renderRunsOnLine(options.runsOn) : publishJobRunsO
     timeout-minutes: ${options.platformTargetGlobs?.length ? 90 : 45}
     env:
       LMAO_GIT_REVISION: ${githubExpression('github.sha')}
-      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options, options.release === false ? 'internal' : publisherReach(options))}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 `;
 }
@@ -826,8 +827,8 @@ function cargoCredentialsJobEnv(options: PublishWorkflowDefinitionOptions): stri
  * already built for the identical hashes. Only `${{ secrets.NAME }}` is
  * rendered for the token. Malformed declarations throw here, not in CI.
  */
-function remoteCacheJobEnv(options: PublishWorkflowDefinitionOptions): string {
-  const rendered = remoteCacheJobEnvLines(options.remoteCache).trimEnd();
+function remoteCacheJobEnv(options: PublishWorkflowDefinitionOptions, reach: CacheReach): string {
+  const rendered = remoteCacheJobEnvLines(options.remoteCache, reach).trimEnd();
   return rendered === '' ? '' : `\n${rendered}`;
 }
 
@@ -946,7 +947,7 @@ ${renderRunsOnLine(options.runsOn)}
       release-sha: ${githubExpression('steps.release-state.outputs.sha')}
     env:
       LMAO_GIT_REVISION: ${githubExpression('github.sha')}
-      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options, 'internal')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderLinuxReleaseCandidateSteps(steps, options)}
 
@@ -958,7 +959,7 @@ ${renderMacosJobHeaderLines(options)}
       id-token: none
     env:
       LMAO_GIT_REVISION: ${githubExpression('github.sha')}
-      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options, options.platformProducer?.kind === 'linux-cross' ? 'internal' : 'public')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderMacosPlatformSteps(options)}
 
@@ -972,7 +973,7 @@ ${publishJobRunsOnLine(options)}
     env:
       LMAO_GIT_REVISION: ${githubExpression('github.sha')}
       TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
-      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options, publisherReach(options))}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderFinalLinuxPublishSteps(options)}
 `;
@@ -1542,6 +1543,11 @@ function hasLinuxPlatformTargets(options: PublishWorkflowDefinitionOptions): boo
  */
 function publishJobRunsOnLine(options: PublishWorkflowDefinitionOptions): string {
   return renderRunsOnLine(options.actionsProvider === 'forgejo' ? options.runsOn : GITHUB_HOSTED_LINUX_RUNNER);
+}
+
+/** The remote-cache reach of the runner publishJobRunsOnLine picks: Forgejo's own runners, or a GitHub-hosted one. */
+function publisherReach(options: PublishWorkflowDefinitionOptions): CacheReach {
+  return options.actionsProvider === 'forgejo' ? 'internal' : 'public';
 }
 
 function githubExpression(expression: string): string {
