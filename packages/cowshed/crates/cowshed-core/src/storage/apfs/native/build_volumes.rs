@@ -607,12 +607,13 @@ where
     /// seed held, then the live volume mounted without the seed's Nx daemon record: a daemon
     /// record names another checkout's process. A failure after publication releases the live
     /// volume and a seed already made. The caller points a checkout's link at the answered
-    /// mountpoint.
+    /// mountpoint. An mbx fork keeps of its target's Nx state what `nx` says.
     pub fn ready_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
+        nx: crate::build_volume::ForkNx,
     ) -> Result<(BuildVolumeId, PathBuf, Option<Duration>), ApfsStorageError> {
         let live = captured.id.clone();
         let capture_elapsed = captured.capture_elapsed;
@@ -635,7 +636,7 @@ where
                     |error| io_error("discard the seed's Nx daemon record", &mount, error),
                 )?;
                 state.discard_clone_invalid(&mount).map_err(host_error)?;
-                state.discard_rebuildable(&mount).map_err(host_error)?;
+                state.discard_rebuildable(&mount, nx).map_err(host_error)?;
                 Ok((mount, capture_elapsed.max(elapsed)))
             });
         match mounted {
@@ -1045,7 +1046,12 @@ where
                     },
                 ),
             )?;
-            let (_, mount, _) = self.ready_fork_build_volume(layout, captured, None)?;
+            let (_, mount, _) = self.ready_fork_build_volume(
+                layout,
+                captured,
+                None,
+                crate::build_volume::ForkNx::Inherit,
+            )?;
             link::point(checkout, &mount).map_err(host)
         };
         match layout.resolve_link(workspace, linked).map_err(host)? {

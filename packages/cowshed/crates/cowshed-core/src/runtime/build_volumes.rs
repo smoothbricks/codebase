@@ -25,7 +25,7 @@ use crate::api::held_lock::{LockHolding, LockOperation};
 use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
     BuildStateRefresh, BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord,
-    BuildVolumeRole, BuildVolumeStage, BuildVolumeState, CapturedBuildVolume, Registrant,
+    BuildVolumeRole, BuildVolumeStage, BuildVolumeState, CapturedBuildVolume, ForkNx, Registrant,
     Registration, ReleaseClaim, SeedRecords, TrackedBuildStateRefusal, cargo, link, nx,
 };
 use crate::capabilities::{BuildStatePath, SeedRetention};
@@ -168,6 +168,9 @@ pub(crate) struct CapturedFork {
     started: Instant,
     /// Whether the fork gets a seed of its own, so others fork from it: a non-mbx fork does.
     own_seed: bool,
+    /// What the fork keeps of its source's Nx state: everything for a seed's clone, and for an mbx
+    /// live capture what its Nx guards allowed (16_build_volumes.md, "Fork" step 4).
+    nx: ForkNx,
 }
 
 /// A fork's live volume, published and mounted beside its own image's attach and mount, after its
@@ -1330,6 +1333,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     captured,
                     started,
                     own_seed: true,
+                    nx: ForkNx::Inherit,
                 }))
             })
             .await;
@@ -1338,8 +1342,11 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
 
     /// An mbx fork's capture (16_build_volumes.md, "Fork" step 3): the target's live volume itself,
     /// cloned under the shared hold its jobs take, so they keep running. No seed is refreshed or
-    /// minted and nothing is copied: [`Self::ready_fork`]'s mount deletes what is not the fork's
-    /// ([`crate::build_volume::BuildVolumeState::discard_rebuildable`]).
+    /// minted and nothing is copied: [`Self::ready_fork`]'s mount moves aside what is not the
+    /// fork's ([`crate::build_volume::BuildVolumeState::discard_rebuildable`]). The clone is taken
+    /// under the Nx guards a seed's capture takes ([`hold_nx`]), so when no Nx process holds the
+    /// target's task database the fork keeps the target's Nx cache and the database that indexes
+    /// it; when one does, the fork starts without them and says why on stderr.
     async fn capture_live_fork(
         &self,
         source: Owner,
@@ -1351,6 +1358,20 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let held = HeldVolume::for_seed(host, layout, live)?;
             let record = layout.read_record(held.id())?;
             let started = Instant::now();
+            let (mount, _) = host
+                .mount_build_volume(layout, held.id())
+                .map_err(storage)?;
+            let state = BuildVolumeState::read(&mount)?;
+            let guards = match hold_nx(host.census(), &mount, &state)? {
+                Ok(guards) => Some(guards),
+                Err(skip) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: {destination} starts without {}'s Nx cache and task database: {skip}; its tasks read the project's Nx cache instead",
+                        source.name
+                    );
+                    None
+                }
+            };
             let captured = host
                 .capture_fork_build_volume(
                     layout,
@@ -1377,6 +1398,11 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 captured,
                 started,
                 own_seed: false,
+                nx: if guards.is_some() {
+                    ForkNx::Inherit
+                } else {
+                    ForkNx::Discard
+                },
             }))
         })
         .await
@@ -1403,6 +1429,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             source,
             operation_elapsed,
             own_seed,
+            nx,
         }) = captured?
         else {
             return Ok(None);
@@ -1430,6 +1457,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     own_seed
                         .as_ref()
                         .map(|(seed, registration)| (seed, registration)),
+                    nx,
                 )
                 .map_err(storage)?;
             Ok(Some(PreparedFork {
@@ -2101,7 +2129,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         let Refork { captured, checkout } = refork;
         self.blocking(move |host, layout| {
             let (live, mount, _) = host
-                .ready_fork_build_volume(layout, captured, None)
+                .ready_fork_build_volume(layout, captured, None, ForkNx::Inherit)
                 .map_err(storage)?;
             if let Err(error) = link::point(&checkout, &mount) {
                 match host.release_build_volume(layout, &live) {
@@ -3634,21 +3662,9 @@ fn capture(
         Ok(claim) => claim,
         Err(reason) => return Ok(Err(reason)),
     };
-    if let Err(busy) = nx::close(host.census(), &mount, &state)
-        .map_err(|error| io("close the volume's Nx state", &mount, &error))?
-    {
-        return Ok(Err(capture_skip(busy)));
-    }
-    let _opens = match nx::hold_opens(host.census(), &mount, &state, &mount)
-        .map_err(|error| io("lock the volume's Nx opens", &mount, &error))?
-    {
+    let _opens = match hold_nx(host.census(), &mount, &state)? {
         Ok(opens) => opens,
-        Err(opening) => {
-            return Ok(Err(CaptureSkip::Opening {
-                database: opening.database,
-                holders: opening.holders.into_iter().map(database_holder).collect(),
-            }));
-        }
+        Err(skip) => return Ok(Err(skip)),
     };
     let _builds = match cargo::hold(&mount, &state)
         .map_err(|error| io("take the volume's Cargo build locks", &mount, &error))?
@@ -3664,11 +3680,6 @@ fn capture(
         }
     };
     let previous = seeds_of(layout, target)?;
-    if let Err(busy) = nx::held(host.census(), &mount, &state)
-        .map_err(|error| io("look at the volume's Nx state", &mount, &error))?
-    {
-        return Ok(Err(capture_skip(busy)));
-    }
     let capture_elapsed = match host.clone_claimed_build_volume(
         layout,
         &claim,
@@ -3779,6 +3790,39 @@ fn database_holder(holder: cowshed_os::process::Holder) -> DatabaseHolder {
     }
 }
 
+/// The Nx guards a capture of a mounted volume holds until its clone is fixed
+/// (16_build_volumes.md, "A non-mbx reseed excludes the named non-transactional writers" step 2):
+/// the volume's daemon stopped when nothing else holds a task database open, every task
+/// database's open lock taken so no Nx process opens one, and a last look that none holds one.
+/// While the answered locks live, no Nx process writes the volume's Nx cache or task databases.
+fn hold_nx(
+    census: &crate::census::CensusScope,
+    mount: &Path,
+    state: &BuildVolumeState,
+) -> Result<std::result::Result<nx::Opens, CaptureSkip>> {
+    if let Err(busy) = nx::close(census, mount, state)
+        .map_err(|error| io("close the volume's Nx state", mount, &error))?
+    {
+        return Ok(Err(capture_skip(busy)));
+    }
+    let opens = match nx::hold_opens(census, mount, state, mount)
+        .map_err(|error| io("lock the volume's Nx opens", mount, &error))?
+    {
+        Ok(opens) => opens,
+        Err(opening) => {
+            return Ok(Err(CaptureSkip::Opening {
+                database: opening.database,
+                holders: opening.holders.into_iter().map(database_holder).collect(),
+            }));
+        }
+    };
+    if let Err(busy) = nx::held(census, mount, state)
+        .map_err(|error| io("look at the volume's Nx state", mount, &error))?
+    {
+        return Ok(Err(capture_skip(busy)));
+    }
+    Ok(Ok(opens))
+}
 fn capture_skip(busy: nx::Busy) -> CaptureSkip {
     match busy {
         nx::Busy::Held { database, holders } => CaptureSkip::Held {
@@ -7287,6 +7331,138 @@ fn main() {
         mbx_fork_clones_the_live_volume(Scratch::new("mbx-fork-live-native")).await;
     }
 
+    /// An mbx fork of a target whose task database no Nx process holds inherits the target's Nx
+    /// cache and task database (16_build_volumes.md, "Fork" step 4): its capture takes the guards
+    /// a seed's capture takes, so a hash the target cached replays in the fork without a remote
+    /// read or a rerun. A process holding the database leaves the fork's Nx state empty, as every
+    /// other unguarded rebuildable path, and the target keeps what it had.
+    #[cfg(target_os = "macos")]
+    async fn mbx_fork_inherits_quiet_nx_state<H: RuntimeStorageHost>(scratch: Scratch<H>) {
+        use cowshed_os::fork_lock::Spawn as _;
+
+        async fn fork_of<H: RuntimeStorageHost>(
+            scratch: &Scratch<H>,
+            target: &Owner,
+            checkout: &Path,
+            fork: &str,
+            digit: char,
+        ) -> PreparedFork {
+            let locked = scratch.lock(target).await;
+            let (captured, _) = scratch
+                .volumes
+                .capture_fork(
+                    target.clone(),
+                    checkout.to_owned(),
+                    name(fork),
+                    Aim {
+                        tree: GitOid::new("a".repeat(40)).unwrap(),
+                        landed: Vec::new(),
+                    },
+                )
+                .await;
+            drop(locked);
+            scratch
+                .volumes
+                .ready_fork(captured, owner(fork, digit))
+                .await
+                .expect("the fork readies")
+                .expect("the fork has a build volume")
+        }
+
+        let (checkout, _, mount) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        BuildVolumeState {
+            paths: vec![
+                BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+                BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
+                BuildStatePath::new(".discarded", "discarded").unwrap(),
+            ],
+            mbx: Some(PathBuf::from("/installed/mbx")),
+            ..Default::default()
+        }
+        .write(&mount)
+        .unwrap();
+        let database = mount.join("nx/workspace-data/T-v6.db");
+        for (path, bytes) in [
+            (
+                mount.join("nx/cache/1234/packages/p/dist/out.js"),
+                b"cached".as_slice(),
+            ),
+            (database.clone(), b"rows"),
+            (mount.join("discarded/marker"), b"live"),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+
+        let quiet = fork_of(&scratch, &target, &checkout, "quiet", '1').await;
+        assert_eq!(
+            fs::read(quiet.mount.join("nx/cache/1234/packages/p/dist/out.js")).unwrap(),
+            b"cached",
+            "the target's cached outputs are the fork's"
+        );
+        assert_eq!(
+            fs::read(quiet.mount.join("nx/workspace-data/T-v6.db")).unwrap(),
+            b"rows",
+            "the task database that indexes them comes with them"
+        );
+        assert!(
+            !quiet.mount.join("discarded/marker").exists(),
+            "other rebuildable state is still not the fork's"
+        );
+
+        let mut holder = std::process::Command::new("/usr/bin/tail")
+            .arg("-f")
+            .arg(&database)
+            .stdout(std::process::Stdio::null())
+            .spawn_locked()
+            .unwrap();
+        let pid = i32::try_from(holder.id()).expect("a pid fits i32");
+        while !nx::holders(&crate::census::this_test(), &database)
+            .unwrap()
+            .iter()
+            .any(|held| held.pid == pid)
+        {
+            if let Some(status) = holder.try_wait().unwrap() {
+                panic!(
+                    "tail exited ({status}) before it opened {}",
+                    database.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let held = fork_of(&scratch, &target, &checkout, "held", '2').await;
+        holder.kill().unwrap();
+        holder.wait_bounded().unwrap();
+        assert!(
+            held.mount.join("nx/cache").is_dir(),
+            "the Nx cache directory stays for its link"
+        );
+        assert!(
+            !held.mount.join("nx/cache/1234").exists(),
+            "a fork captured while an Nx process held the task database inherits no Nx cache"
+        );
+        assert!(!held.mount.join("nx/workspace-data/T-v6.db").exists());
+        assert_eq!(
+            fs::read(mount.join("nx/cache/1234/packages/p/dist/out.js")).unwrap(),
+            b"cached",
+            "the target keeps its cache"
+        );
+        scratch.release_all();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_mbx_fork_inherits_quiet_nx_state() {
+        mbx_fork_inherits_quiet_nx_state(Scratch::directory("mbx-fork-nx")).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_mbx_fork_inherits_quiet_nx_state() {
+        mbx_fork_inherits_quiet_nx_state(Scratch::new("mbx-fork-nx-native")).await;
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_fork_refuses_an_exclusive_lifecycle_source_claim_without_fallback() {
@@ -9235,6 +9411,7 @@ fn main() {
                     },
                 )),
             )),
+            ForkNx::Inherit,
         )
         .expect("the new readies its capture");
         assert!(

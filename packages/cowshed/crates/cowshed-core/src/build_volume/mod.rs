@@ -289,6 +289,19 @@ pub struct CapturedBuildVolume {
     pub creating: BuildVolumeHold,
 }
 
+/// What an mbx fork's clone of its target's live volume keeps of the target's Nx state
+/// (16_build_volumes.md, "Fork" step 4). Every clone keeps it on a non-mbx volume and on a seed:
+/// both are captured under the Nx guards, so the variant only decides an mbx live capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForkNx {
+    /// The capture held the Nx guards: no Nx process had a task database open or could open one,
+    /// so the cache and the database that indexes it are one consistent state the fork replays.
+    Inherit,
+    /// An Nx process could have been writing the cache or the database: the fork starts without
+    /// them, as without every other unguarded rebuildable path.
+    Discard,
+}
+
 /// The build-state paths a volume holds, as written at its root ([`STATE_FILE`]), the
 /// fingerprint of the tracked build inputs they were discovered from
 /// (`capabilities::tracked_manifest_fingerprint`): while it matches, nothing is rediscovered, and
@@ -538,19 +551,24 @@ impl BuildVolumeState {
     }
 
     /// Empty what an mbx fork's clone of its target's live volume must not inherit: every path
-    /// not retained, captured while the target's jobs may have been writing it
-    /// (16_build_volumes.md, "Fork"). Each is moved into the volume's discard directory in one
-    /// rename, so the fork never waits on deleting a target's caches (tens of thousands of Nx
-    /// cache files); the workspace's supervisor deletes them in the background once it starts,
-    /// since the fork's own process exits first. A rebuildable directory is left empty for its
-    /// link; one declared but not retained is left absent. A non-mbx volume is a seed's clone,
-    /// captured under its writers' exclusion, and keeps everything.
-    pub fn discard_rebuildable(&self, volume_root: &Path) -> crate::Result<()> {
+    /// not retained, captured while the target's jobs may have been writing it, except the Nx
+    /// state when the capture held its guards (`nx`, 16_build_volumes.md, "Fork"). Each is moved
+    /// into the volume's discard directory in one rename, so the fork never waits on deleting a
+    /// target's caches (tens of thousands of Nx cache files); the workspace's supervisor deletes
+    /// them in the background once it starts, since the fork's own process exits first. A
+    /// rebuildable directory is left empty for its link; one declared but not retained is left
+    /// absent. A non-mbx volume is a seed's clone, captured under its writers' exclusion, and keeps
+    /// everything.
+    pub fn discard_rebuildable(&self, volume_root: &Path, nx: ForkNx) -> crate::Result<()> {
         if self.mbx.is_none() {
             return Ok(());
         }
+        let kept = |path: &BuildStatePath| {
+            path.retained()
+                || (nx == ForkNx::Inherit && BuildStateTool::of(path) == BuildStateTool::Nx)
+        };
         cowshed_os::timing::timed("fork", format_args!("rebuildable"), || {
-            for path in self.paths.iter().filter(|path| !path.retained()) {
+            for path in self.paths.iter().filter(|path| !kept(path)) {
                 let relative = path.volume.as_path();
                 let directory = volume_root.join(relative);
                 match fs::symlink_metadata(&directory) {
@@ -2055,7 +2073,7 @@ mod tests {
             mbx: Some(PathBuf::from("/installed/mbx")),
             ..Default::default()
         };
-        state.discard_rebuildable(&volume).unwrap();
+        state.discard_rebuildable(&volume, ForkNx::Discard).unwrap();
         assert_eq!(
             fs::read_dir(volume.join("nx/cache")).unwrap().count(),
             0,

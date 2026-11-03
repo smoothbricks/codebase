@@ -112,13 +112,15 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         registration: &Registration,
     ) -> Result<CapturedBuildVolume, ApfsStorageError>;
     /// The captured live volume proven and published, then `own_seed` cloned from it when one is
-    /// asked for, then the live volume mounted without the seed's Nx daemon record, once the
-    /// source's image lock is let go: its id and mountpoint. A failure releases what it made.
+    /// asked for, then the live volume mounted without the seed's Nx daemon record and, for an mbx
+    /// fork, with the rebuildable state `nx` says it does not keep moved aside, once the source's
+    /// image lock is let go: its id and mountpoint. A failure releases what it made.
     fn ready_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
+        nx: crate::build_volume::ForkNx,
     ) -> Result<(BuildVolumeId, PathBuf, Option<std::time::Duration>), ApfsStorageError>;
     /// Release a capture its failed fork never readies.
     fn abandon_captured_build_volume(

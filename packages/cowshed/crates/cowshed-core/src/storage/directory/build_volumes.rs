@@ -637,12 +637,14 @@ impl DirectoryExecutionHost {
 
     /// The captured live volume published, then `own_seed`, when one is asked for, copied from it
     /// before anything binds it, then the live volume bound without the seed's Nx daemon record.
-    /// A failure after publication releases the live volume and a seed already made.
+    /// A failure after publication releases the live volume and a seed already made. An mbx fork
+    /// keeps of its target's Nx state what `nx` says.
     pub fn ready_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
+        nx: crate::build_volume::ForkNx,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
         let live = captured.id.clone();
         self.finish_captured_build_volume(layout, captured)?;
@@ -660,7 +662,7 @@ impl DirectoryExecutionHost {
             crate::build_volume::nx::discard_daemon_records(&mount, &state)
                 .map_err(|error| io_error("discard the seed's Nx daemon record", &mount, error))?;
             state.discard_clone_invalid(&mount).map_err(host_error)?;
-            state.discard_rebuildable(&mount).map_err(host_error)?;
+            state.discard_rebuildable(&mount, nx).map_err(host_error)?;
             Ok(mount)
         });
         match mounted {
@@ -1022,7 +1024,12 @@ impl DirectoryExecutionHost {
                     },
                 ),
             )?;
-            let (_, mount) = self.ready_fork_build_volume(layout, captured, None)?;
+            let (_, mount) = self.ready_fork_build_volume(
+                layout,
+                captured,
+                None,
+                crate::build_volume::ForkNx::Inherit,
+            )?;
             link::point(checkout, &mount).map_err(host_error)
         };
         match layout.resolve_link(workspace, linked).map_err(host_error)? {

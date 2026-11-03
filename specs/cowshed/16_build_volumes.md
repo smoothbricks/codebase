@@ -482,12 +482,13 @@ Everything below holds for every target alike; main is the target at the root.
 
 A **seed** is a build volume nobody writes. **Each target has its own latest seed.** Every non-mbx fork clones that
 seed, never an unguarded live build volume; an mbx fork clones its target's live volume under the shared hold its jobs
-take (Fork) and reads no seed. In a project with mbx, a seed carries only build state whose capability marks it
-retained: the CodeGraph index and declared state such as sealed snapshot pins and patch-development checkouts.
-Everything else starts empty, including Cargo target output, Nx cache and task databases, and package tool caches.
-Retention belongs to the build-state contribution, not a storage-side list of tool names. The declared-state contributor
-marks its paths retained; other capabilities opt in explicitly. Legacy records without a retention mark require
-canonical rediscovery before seeding, rather than guessing from path spelling.
+take (Fork) and reads no seed, keeping the target's Nx cache and task databases when it captured them under the Nx
+guards (Fork step 4). In a project with mbx, a seed carries only build state whose capability marks it retained: the
+CodeGraph index and declared state such as sealed snapshot pins and patch-development checkouts. Everything else starts
+empty, including Cargo target output, Nx cache and task databases, and package tool caches. Retention belongs to the
+build-state contribution, not a storage-side list of tool names. The declared-state contributor marks its paths
+retained; other capabilities opt in explicitly. Legacy records without a retention mark require canonical rediscovery
+before seeding, rather than guessing from path spelling.
 
 No fork reads an mbx seed; a land or re-adoption still mints one as follows. A retained seed starts as a blank image at
 the live volume's capacity. Its retained subtrees are copied whole from one atomic CoW image snapshot of the source.
@@ -885,19 +886,25 @@ workspace. All sources use one mint path, carrying edits and untracked files war
    forkable, publish and attach it, and point the workspace's `.cowshed/build` at it. Clones preserve every file's bytes
    and mtime; Cargo freshness depends on that (rule "Clones preserve mtimes"). An mbx fork captures **the target's live
    build volume** the same way instead, live from its mount, under the shared hold the target's jobs take, so they
-   neither refuse nor stop.
+   neither refuse nor stop. It takes that clone under the Nx guards of a reseed's step 2 ("A non-mbx reseed excludes the
+   named non-transactional writers"): when nothing but the target's daemon holds a task database, the daemon is stopped,
+   every task database's open lock is held and a last look finds no holder, so no Nx process writes the target's Nx
+   cache or task databases until the clone is fixed. A holder, or a process opening a database, is said on stderr, and
+   the fork starts without them.
 4. Delete `nx/workspace-data/d` in the new build volume: a daemon record names another checkout's process and socket
    (rule "One Nx state per checkout"). Delete the checkout's inherited `target` link when it names an mbx managed
    target: it names the source checkout's managed target, and the fork's first build places its own. Move the checkout's
    inherited `.cowshed/kept` into `.cowshed/discard`, deleted in the background: those are the source's kept
    directories, which the source still holds ("What a refresh does at each path"), and the fork's `rm` and land would
    refuse for them. An mbx fork's mount also empties every path that is not retained and drops clone-invalid files: the
-   clone was taken while the target's jobs may have been writing, and only retained state is crash-consistent. It
-   empties each path with one rename into the volume's own `.cowshed/discard`, deleted in the background ("What a
-   refresh does at each path"), and the workspace supervisor the fork starts resumes that delete, since the fork's own
-   process exits first. Deleting them in the fork held every fork of a large project's main for the delete of its Nx and
-   compile caches, about 99,000 entries: 15 to 46 s of each fork's wall time (measured 2026-11-02). Nothing is copied or
-   hashed, and an mbx fork mints no seed of its own.
+   clone was taken while the target's jobs may have been writing, and only retained state is crash-consistent. Nx state
+   captured under the Nx guards is crash-consistent too and stays: the fork replays every task the target cached, at the
+   hash the target computed, without a rerun or a read of the project's Nx cache. It empties each path with one rename
+   into the volume's own `.cowshed/discard`, deleted in the background ("What a refresh does at each path"), and the
+   workspace supervisor the fork starts resumes that delete, since the fork's own process exits first. Deleting them in
+   the fork held every fork of a large project's main for the delete of its Nx and compile caches, about 99,000 entries:
+   15 to 46 s of each fork's wall time (measured 2026-11-02). Nothing is copied or hashed, and an mbx fork mints no seed
+   of its own.
 
 The lock covers what reads the target: the clone of its image, its seed refresh and the capture of its seed, all one
 hold, so the clone's checkout and its build volume come from one state of the target that no land or reseed changes
@@ -916,13 +923,16 @@ that never stages, or whose mount fails after publication, releases the volumes 
 
 Without mbx, the fork is warm for everything its full seed held when last frozen: at the latest land, after an external
 land, or at the latest admitted reseed. If its tree has moved past the seed's, it builds the difference incrementally,
-as an edit would. An mbx fork inherits only retained paths, as its target's live volume held them at the capture:
-rebuildable Nx/package state starts empty, and Cargo restores compiled actions from the host's mbx store. Existing
-source jobs neither refuse nor stop the capture.
+as an edit would. An mbx fork inherits the retained paths, as its target's live volume held them at the capture, and the
+target's Nx cache and task databases when the capture held the Nx guards: other rebuildable package state starts empty,
+and Cargo restores compiled actions from the host's mbx store. Existing source jobs neither refuse nor stop the capture.
 
 - **Enforced by**: `directory_mbx_fork_clones_the_live_volume_and_mints_no_seed` and its real-APFS twin: two forks of an
   mbx target with no land between them mint no seed and no volume but their own, and hold the retained state without the
   rebuildable state or clone-invalid files while the target's job keeps writing.
+- **Nx inheritance enforced by**: `directory_mbx_fork_inherits_quiet_nx_state` and its real-APFS twin: a fork of an mbx
+  target whose task database nothing holds holds the target's cached outputs and task database, and a fork taken while a
+  process holds that database holds neither while the target keeps both.
 
 ## Land: `cowshed land`
 

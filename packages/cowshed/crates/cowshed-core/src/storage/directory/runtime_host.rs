@@ -144,8 +144,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
+        nx: crate::build_volume::ForkNx,
     ) -> Result<(BuildVolumeId, PathBuf, Option<std::time::Duration>), ApfsStorageError> {
-        DirectoryExecutionHost::ready_fork_build_volume(self, layout, captured, own_seed)
+        DirectoryExecutionHost::ready_fork_build_volume(self, layout, captured, own_seed, nx)
             .map(|(id, mount)| (id, mount, None))
     }
 
