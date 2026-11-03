@@ -2160,14 +2160,17 @@ os._exit(0)
         monitor.finish().unwrap();
     }
 
-    /// Darwin's reads, except that an image read fails with the kernel's own `EINVAL` once
-    /// `refused` is set: what `KERN_PROCARGS2` answers for a process caught between two images,
-    /// as one is under load.
-    struct ImagesRefused {
-        refused: Arc<std::sync::atomic::AtomicBool>,
+    /// Darwin's reads, except that the kernel refuses the read a flag names once it is set, as a
+    /// loaded host answers: an image read with `EINVAL`, what `KERN_PROCARGS2` says of a process
+    /// caught between two images, and a child list with `ESRCH`, a parent that vanished under the
+    /// read.
+    #[derive(Clone, Default)]
+    struct KernelRefuses {
+        images: Arc<std::sync::atomic::AtomicBool>,
+        children: Arc<std::sync::atomic::AtomicBool>,
     }
 
-    impl ProcessReads for ImagesRefused {
+    impl ProcessReads for KernelRefuses {
         fn record(
             &self,
             pid: u32,
@@ -2176,7 +2179,7 @@ os._exit(0)
         }
 
         fn image(&self, pid: u32) -> io::Result<crate::runtime::process_tree::ProcessImage> {
-            if self.refused.load(Ordering::SeqCst) {
+            if self.images.load(Ordering::SeqCst) {
                 Err(io::Error::from_raw_os_error(libc::EINVAL))
             } else {
                 Darwin.image(pid)
@@ -2184,7 +2187,11 @@ os._exit(0)
         }
 
         fn children(&self, pid: u32) -> io::Result<Vec<u32>> {
-            Darwin.children(pid)
+            if self.children.load(Ordering::SeqCst) {
+                Err(io::Error::from_raw_os_error(libc::ESRCH))
+            } else {
+                Darwin.children(pid)
+            }
         }
 
         fn reader_uid(&self) -> u32 {
@@ -2215,25 +2222,23 @@ os._exit(0)
         }
     }
 
-    /// An exec whose image the kernel will not read is a coverage gap of the tree, and the failed
-    /// read is returned beside it to whoever follows the events (07_api.md, "Process-tree
-    /// observations"). It is no reason for a running job's status read to fail: the observer
-    /// folded everything it saw and stays usable.
-    #[tokio::test]
-    async fn an_unreadable_image_is_a_gap_a_running_jobs_status_read_still_returns() {
+    /// Run `script` as the observed job's only life, let the kernel refuse as `refuse` says once
+    /// the life runs, release the script, and answer the first failure the event stream reports,
+    /// the status read that follows it, and the life's pid. The script starts by reading a line
+    /// and ends when its stdin does.
+    async fn status_after_the_first_failure(
+        script: &str,
+        refuse: impl FnOnce(&KernelRefuses),
+    ) -> (CowshedError, Result<JobProcessTree>, u32) {
         use cowshed_os::fork_lock::Spawn as _;
         use std::io::Write as _;
 
-        let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let monitor = ProcessMonitor::prepare_with(
-            TreeOwner::Job(JobId::new(1).unwrap()),
-            ImagesRefused {
-                refused: Arc::clone(&refused),
-            },
-        )
-        .unwrap();
+        let kernel = KernelRefuses::default();
+        let monitor =
+            ProcessMonitor::prepare_with(TreeOwner::Job(JobId::new(1).unwrap()), kernel.clone())
+                .unwrap();
         let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "read go; exec /bin/cat"])
+            .args(["-c", script])
             .stdin(std::process::Stdio::piped())
             .spawn_locked()
             .expect("spawn the observed life");
@@ -2241,7 +2246,7 @@ os._exit(0)
         monitor.watch(pid).unwrap();
         let mut events = monitor.subscribe(Duration::from_millis(20)).await.unwrap();
 
-        refused.store(true, Ordering::SeqCst);
+        refuse(&kernel);
         let mut input = child.stdin.take().expect("the child's stdin is piped");
         input.write_all(b"go\n").unwrap();
         let failure = tokio::time::timeout(Duration::from_secs(60), async {
@@ -2254,10 +2259,27 @@ os._exit(0)
             }
         })
         .await
-        .expect("the exec's failed image read is reported");
+        .expect("the failed read is reported");
+        let status = monitor.tree();
+        drop(input);
+        assert!(child.wait_bounded().unwrap().success());
+        (failure, status, pid)
+    }
+
+    /// An exec whose image the kernel will not read is a coverage gap of the tree, and the failed
+    /// read is returned beside it to whoever follows the events (07_api.md, "Process-tree
+    /// observations"). It is no reason for a running job's status read to fail: the observer
+    /// folded everything it saw and stays usable.
+    #[tokio::test]
+    async fn an_unreadable_image_is_a_gap_a_running_jobs_status_read_still_returns() {
+        let (failure, status, pid) =
+            status_after_the_first_failure("read go; exec /bin/cat", |kernel| {
+                kernel.images.store(true, Ordering::SeqCst);
+            })
+            .await;
         assert!(failure.to_string().contains("KERN_PROCARGS2"), "{failure}");
 
-        let tree = monitor.tree().expect(
+        let tree = status.expect(
             "a running job's status read returns its status when an image could not be read",
         );
         assert_eq!(
@@ -2266,7 +2288,31 @@ os._exit(0)
                 reason: ProcessCoverageGap::UnreadImage { pid }
             }
         );
-        drop(input);
-        assert!(child.wait_bounded().unwrap().success());
+    }
+
+    /// A member's fork whose children the kernel will not list is the fork's gap, which the
+    /// observer records before it reads the list; the failed read is returned beside it, and a
+    /// running job's status read still returns the tree.
+    #[tokio::test]
+    async fn an_unlistable_child_list_is_a_gap_a_running_jobs_status_read_still_returns() {
+        let (failure, status, pid) =
+            status_after_the_first_failure("read go; /usr/bin/true; read rest; exit 0", |kernel| {
+                kernel.children.store(true, Ordering::SeqCst);
+            })
+            .await;
+        assert!(
+            failure.to_string().contains("proc_listchildpids"),
+            "{failure}"
+        );
+
+        let tree = status.expect(
+            "a running job's status read returns its status when a child list could not be read",
+        );
+        assert_eq!(
+            tree.coverage,
+            ProcessCoverage::Gap {
+                reason: ProcessCoverageGap::UncountedFork { pid }
+            }
+        );
     }
 }

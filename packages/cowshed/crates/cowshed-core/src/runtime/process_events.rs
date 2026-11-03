@@ -29,10 +29,12 @@
 //!   `is_procargs_content_read_permitted`: a reader whose effective uid is neither 0 nor the
 //!   process's is refused ([`ObserveError::ImageNotPermitted`], keeping the `EINVAL`). Every
 //!   other failed read is [`ObserveError::Kernel`] with its call and errno, whether or not the
-//!   life still ran; a child list in particular never fails because its parent exited. An
-//!   exec's or adoption's failed image read leaves the fold as [`ObserveError::ImageUnread`]
-//!   around that error: its gap is recorded, so the tree stays a readable answer and only those
-//!   who follow the failures (the drain's caller, the event stream) are told.
+//!   life still ran; a child list in particular never fails because its parent exited. A failed
+//!   read of an exec's or adoption's image, or of the children a fork left, leaves the fold as
+//!   [`ObserveError::Unread`] around that error: the fold recorded the gap
+//!   ([`ProcessCoverageGap::UnreadImage`], [`ProcessCoverageGap::UncountedFork`]), so the tree
+//!   stays a readable answer and only those who follow the failures (the drain's caller, the
+//!   event stream) are told.
 //! - xnu grants `NOTE_EXITSTATUS` only for a child or a life this observer may SIGKILL
 //!   (`filt_procattach`) and refuses any other with `EACCES`: a root command a member ran
 //!   through sudo, for one. The one registration path then watches that life for
@@ -114,11 +116,14 @@ pub enum ObserveError {
     Usage(#[from] SampleError),
     #[error(transparent)]
     Cowshed(#[from] CowshedError),
-    /// An image read that failed after the fold recorded the image as unread
-    /// ([`ProcessCoverageGap::UnreadImage`]): the tree stays readable, gap included, and the
-    /// failure is returned beside the gap with its call and errno.
-    #[error(transparent)]
-    ImageUnread(Box<ObserveError>),
+    /// A read that failed after the fold recorded `gap` for what it would have shown: an exec's
+    /// image, or the children a fork left. The tree stays readable, gap included, and the failure
+    /// is returned beside the gap with its call and errno.
+    #[error("{cause}")]
+    Unread {
+        gap: ProcessCoverageGap,
+        cause: Box<ObserveError>,
+    },
     /// More than one event of one batch failed; every event of it was folded all the same.
     #[error("{first}; {} more in the same batch: {}", .rest.len(), Listed(.rest))]
     Several {
@@ -129,11 +134,11 @@ pub enum ObserveError {
 
 impl ObserveError {
     /// Whether the fold holds everything this failure names as a coverage gap, so that its tree is
-    /// still a true, incomplete answer: a failed image read it recorded as unread. Any other
-    /// failure may leave the tree without an observation that no gap records.
+    /// still a true, incomplete answer: a failed read it recorded as an [`ObserveError::Unread`]
+    /// gap. Any other failure may leave the tree without an observation that no gap records.
     pub fn leaves_tree_readable(&self) -> bool {
         match self {
-            Self::ImageUnread(_) => true,
+            Self::Unread { .. } => true,
             Self::Several { first, rest } => {
                 first.leaves_tree_readable() && rest.iter().all(Self::leaves_tree_readable)
             }
@@ -850,7 +855,10 @@ impl<P: ProcessReads> KqueueObserver<P> {
             Ok(Some(image)) => Some(ProcessObservation::Exec { process, image }),
             Ok(None) => Some(unread),
             Err(error) => {
-                failures.note(Err(ObserveError::ImageUnread(Box::new(error))));
+                failures.note(Err(ObserveError::Unread {
+                    gap: ProcessCoverageGap::UnreadImage { pid: process.pid },
+                    cause: Box::new(error),
+                }));
                 Some(unread)
             }
         };
@@ -932,7 +940,11 @@ impl<P: ProcessReads> KqueueObserver<P> {
             unlisted => {
                 self.missed
                     .push(ProcessCoverageGap::UncountedFork { pid: parent.pid });
-                unlisted.map(|_| ())
+                // The gap is already recorded above: a failed list is returned beside it.
+                unlisted.map(|_| ()).map_err(|cause| ObserveError::Unread {
+                    gap: ProcessCoverageGap::UncountedFork { pid: parent.pid },
+                    cause: Box::new(cause),
+                })
             }
         }
     }
@@ -2168,7 +2180,7 @@ wait $!";
     fn failed(error: &ObserveError) -> (&'static str, u32, Option<i32>) {
         match error {
             ObserveError::Kernel { call, pid, source } => (*call, *pid, source.raw_os_error()),
-            ObserveError::ImageUnread(cause) => failed(cause),
+            ObserveError::Unread { cause, .. } => failed(cause),
             other => panic!("not a kernel error: {other}"),
         }
     }
