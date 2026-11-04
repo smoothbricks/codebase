@@ -350,6 +350,54 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('typechecks through ttsc a project whose direct dependency declares a dialect, after the targets it names', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","dependencies":{"dialect":"1.0.0"},"devDependencies":{"plain":"1.0.0"}}\n',
+      );
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+      await workspace.write('packages/example/tsconfig.test.json', '{}\n');
+      await workspace.write(
+        'packages/example/node_modules/dialect/package.json',
+        '{"name":"dialect","smoo":{"typecheck":{"compiler":"ttsc","dependsOn":["tools:plugins"]}}}\n',
+      );
+      await workspace.write('packages/example/node_modules/plain/package.json', '{"name":"plain"}\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
+
+      expect(targets.typecheck?.options).toMatchObject({ command: 'ttsc -p tsconfig.lib.json --noEmit' });
+      expect(targets.typecheck?.dependsOn).toEqual(['^*-js', 'tools:plugins']);
+      expect(targets.typecheck?.inputs).not.toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
+      expect(targets['typecheck-tests']?.options).toMatchObject({ command: 'ttsc -p tsconfig.test.json --noEmit' });
+      expect(targets['typecheck-tests']?.dependsOn).toEqual(['tsc-js', 'typecheck', 'tools:plugins']);
+      expect(targets['typecheck-tests:watch']?.options).toMatchObject({
+        command: 'ttsc -p tsconfig.test.json --noEmit --watch',
+      });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('refuses a dependency whose dialect declaration has another shape, by its manifest', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/example/package.json', '{"name":"example","dependencies":{"dialect":"1.0.0"}}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+      await workspace.write(
+        'packages/example/node_modules/dialect/package.json',
+        '{"name":"dialect","smoo":{"typecheck":{"compiler":"tsc","dependsOn":[]}}}\n',
+      );
+
+      await expect(inferProjectTargets(workspace, 'packages/example/package.json')).rejects.toThrow(
+        /node_modules\/dialect\/package\.json: smoo\.typecheck must be .*\$input\.smoo\.typecheck\.compiler expected "ttsc"/,
+      );
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('makes executable only the bins its own emit writes', async () => {
     const workspace = await createWorkspace();
     try {

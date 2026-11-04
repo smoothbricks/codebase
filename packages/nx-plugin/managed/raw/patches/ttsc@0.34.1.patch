@@ -93,10 +93,19 @@ index 3793b3a406c2bf2643567a755d34e66a26eac5c8..3c690ac3d9a99be7914ad9aed76e5890
  
  // writePluginEmitOutput writes one artifact of the hand-assembled emit, passing
 diff --git a/driver/plugins.go b/driver/plugins.go
-index 1778e250d80d1316e108f1f36b6e1a38724922d5..da2ec288afa9a4ae8ceebc1728f6119bae676c4a 100644
+index 1778e250d80d1316e108f1f36b6e1a38724922d5..2964783d058000080d987044e1fe1db581bde3d2 100644
 --- a/driver/plugins.go
 +++ b/driver/plugins.go
-@@ -169,6 +169,7 @@ type PluginContext struct {
+@@ -8,6 +8,8 @@ import (
+   "sort"
+   "strings"
+   "sync"
++
++  "github.com/microsoft/typescript-go/shim/ast"
+ )
+ 
+ // LinkedPluginsEnv is the environment variable ttsc sets to pass the JSON
+@@ -169,6 +171,7 @@ type PluginContext struct {
    reportFileDependencyRejected   func(string)
    reportFileComplete             func(string)
    reportEveryFileComplete        func()
@@ -104,7 +113,7 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..da2ec288afa9a4ae8ceebc1728f6119b
  }
  
  // ReportObservationIncomplete declares that this hook's input population could
-@@ -195,6 +196,24 @@ func (ctx PluginContext) ReportObservationIncomplete() {
+@@ -195,6 +198,24 @@ func (ctx PluginContext) ReportObservationIncomplete() {
    }
  }
  
@@ -129,7 +138,29 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..da2ec288afa9a4ae8ceebc1728f6119b
  // ReportHostInputHash declares the exact file state consumed by a native
  // plugin. hash is a lowercase SHA-256 digest for an observed file and nil for
  // a missing candidate. Conflicting observations are retained as host inputs
-@@ -511,6 +530,7 @@ type linkedPluginState struct {
+@@ -506,11 +527,29 @@ type EmitTransformPlugin interface {
+   EmitTransform(PluginContext) (PluginTransform, error)
+ }
+ 
++// DiagnosticPlugin is a linked plugin whose ProgramPlugin lowers a construct
++// the stock checker refuses, a dialect its compiles admit: a source spelling
++// the plugin rewrites before emit or a transform's output, which TypeScript has
++// no grammar for. The checker judges the parse tree before any ProgramPlugin
++// applies, so its refusal of such a construct names nothing the output holds,
++// and every lane that gates on the program's diagnostics (check, emit, a
++// transform) would refuse the dialect it was built to compile.
++// LoweredDiagnostics names those refusals among the diagnostics it is given;
++// the driver drops exactly the ones it names that it gave, and reports every
++// other diagnostic as it would without the plugin.
++type DiagnosticPlugin interface {
++  // LoweredDiagnostics returns the diagnostics, among those given, whose cause
++  // this plugin's ProgramPlugin removes. It reads the parse tree the checker
++  // judged, before any ProgramPlugin applies.
++  LoweredDiagnostics(*Program, PluginContext, []*ast.Diagnostic) []*ast.Diagnostic
++}
++
+ type linkedPluginState struct {
+   cwd          string
    declarations *pluginFileDeclarations
    entries      []PluginEntry
    inputs       *pluginHostInputScopes
@@ -137,7 +168,7 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..da2ec288afa9a4ae8ceebc1728f6119b
    tsconfig     string
  }
  
-@@ -800,6 +820,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
+@@ -800,6 +839,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
        cwd:          cwd,
        declarations: newPluginFileDeclarations(),
        inputs:       newPluginHostInputScopes(),
@@ -145,7 +176,7 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..da2ec288afa9a4ae8ceebc1728f6119b
        tsconfig:     tsconfigPath,
      }, nil
    }
-@@ -812,6 +833,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
+@@ -812,6 +852,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
      declarations: newPluginFileDeclarations(),
      entries:      entries,
      inputs:       newPluginHostInputScopes(),
@@ -153,7 +184,50 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..da2ec288afa9a4ae8ceebc1728f6119b
      tsconfig:     tsconfigPath,
    }, nil
  }
-@@ -931,7 +953,43 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
+@@ -896,6 +937,42 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
+   return out, nil
+ }
+ 
++// dropLoweredDiagnostics removes from in every diagnostic a registered
++// DiagnosticPlugin names as lowered. Each plugin is asked, in registration
++// order, about what the plugins before it kept; a diagnostic it names that it
++// was not given is ignored, so a plugin can only withdraw a diagnostic, never
++// add one. An entry with no registration is skipped here: apply reports it.
++func (state linkedPluginState) dropLoweredDiagnostics(prog *Program, in []*ast.Diagnostic) []*ast.Diagnostic {
++  for index, entry := range state.entries {
++    if len(in) == 0 {
++      return in
++    }
++    plugin, ok := registeredPlugin(index)
++    if !ok {
++      continue
++    }
++    judge, ok := plugin.(DiagnosticPlugin)
++    if !ok {
++      continue
++    }
++    lowered := map[*ast.Diagnostic]struct{}{}
++    for _, diagnostic := range judge.LoweredDiagnostics(prog, state.contextAt(index, entry), in) {
++      lowered[diagnostic] = struct{}{}
++    }
++    if len(lowered) == 0 {
++      continue
++    }
++    kept := make([]*ast.Diagnostic, 0, len(in))
++    for _, diagnostic := range in {
++      if _, drop := lowered[diagnostic]; !drop {
++        kept = append(kept, diagnostic)
++      }
++    }
++    in = kept
++  }
++  return in
++}
++
+ // registeredPlugin returns the plugin registered at position index, or
+ // (nil, false) when the index is out of range. Registration order matches
+ // the order of linked Go init() calls.
+@@ -931,7 +1008,43 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
      reportFileDependencyRejected:   declaration.rejectDependency,
      reportFileComplete:             declaration.addComplete,
      reportEveryFileComplete:        declaration.completeEveryFile,
@@ -198,7 +272,7 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..da2ec288afa9a4ae8ceebc1728f6119b
  
  // hostInputs returns the exact native configuration inputs reported in this
 diff --git a/driver/program.go b/driver/program.go
-index f6ee81fb1af41deea022b92e838a7c4665eb9778..112faf913ce38b1f4624b38db37839370b9c5e8b 100644
+index f6ee81fb1af41deea022b92e838a7c4665eb9778..6dc6b4d77b7cde5051782478cdc527a1e9c29c7f 100644
 --- a/driver/program.go
 +++ b/driver/program.go
 @@ -738,6 +738,12 @@ func forceEmit(parsed *tsoptions.ParsedCommandLine) {
@@ -214,6 +288,17 @@ index f6ee81fb1af41deea022b92e838a7c4665eb9778..112faf913ce38b1f4624b38db3783937
  }
  
  // forceNoEmit sets noEmit so the program type-checks without writing files.
+@@ -1124,6 +1130,10 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
+     }
+   }
+   raw = filterDiagnostics(raw)
++  // A linked DiagnosticPlugin withdraws the checker's refusals of the dialect
++  // its ProgramPlugin lowers. It asks about the tree the checker judged, which
++  // the hooks have not mutated yet on every lane that gates on diagnostics.
++  raw = p.plugins.dropLoweredDiagnostics(p, raw)
+   // filterDiagnostics runs first because it resolves a node from the position
+   // tsgo recorded, which only makes sense against the tree tsgo parsed. The
+   // preamble correction happens inside convertProgramDiagnostics, once the
 diff --git a/driver/rewrite.go b/driver/rewrite.go
 index 79be74d24e879da216ad680d23ecfeb5f11a29db..6db9dddba05bd50e13ed92535ca442c3a4f0b28a 100644
 --- a/driver/rewrite.go

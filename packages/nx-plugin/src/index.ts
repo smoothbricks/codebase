@@ -105,6 +105,7 @@ import {
 } from './test-timings.js';
 import { assertUpstreamBasePrecondition } from './test-walk-policy.js';
 import { type NativeTools, nativeToolCommand, nativeToolDependsOn, resolveNativeTools } from './tool-bins.js';
+import { typecheckRoute } from './typecheck-route.js';
 import {
   isBuildOutputTargetName,
   isTestNamespaceTargetName,
@@ -131,20 +132,42 @@ const TYPESCRIPT_PATCH_INPUTS = ['{workspaceRoot}/patches/**/*', '!{workspaceRoo
 const WORKSPACE_TSCONFIG_BASE_INPUT = '{workspaceRoot}/tsconfig.base.json';
 
 /**
- * The native compiler a typecheck runs, apart from the one emit runs: devenv.smoo.nix builds it
- * from a pinned source revision and exports its path. The typecheck targets run it directly,
- * not through ttsc: ttsc auto-loads a dependency's transform plugin (typia) and then checks
- * inside that plugin's host, which links ttsc's own compiler and never runs the pinned one.
- * Transform diagnostics stay enforced where the transform runs: for the lib program in `tsc-js`'s
- * emit, for test files when the test runner transforms them. A test file no test executes has
- * its types checked here but its transform calls checked nowhere. Hashed by the store path,
- * which carries the revision, so a compiler bump misses the cache. The command refuses an unset
- * variable: falling back would check with another compiler under the same key.
+ * The native compiler a typecheck runs unless a dependency declares a dialect (typecheck-route.ts), apart from the one
+ * emit runs: devenv.smoo.nix builds it from a pinned source revision and exports its path. The typecheck targets run it
+ * directly, not through ttsc: ttsc auto-loads a dependency's transform plugin (typia) and then checks inside that
+ * plugin's host, which links ttsc's own compiler and never runs the pinned one. Transform diagnostics stay enforced
+ * where the transform runs: for the lib program in `tsc-js`'s emit, for test files when the test runner transforms
+ * them. A test file no test executes has its types checked here but its transform calls checked nowhere. Hashed by the
+ * store path, which carries the revision, so a compiler bump misses the cache. The command refuses an unset variable:
+ * falling back would check with another compiler under the same key.
  */
 const TYPECHECK_COMPILER_ENV = 'SMOO_TYPECHECK_TSC';
 const TYPECHECK_COMPILER_INPUT = { env: TYPECHECK_COMPILER_ENV };
 function typecheckCommand(args: string): string {
   return `"\${${TYPECHECK_COMPILER_ENV}:?is unset, enter the devenv shell (devenv.smoo.nix builds the typecheck compiler)}" ${args}`;
+}
+
+/** How one project's typecheck targets run: their command, the compiler input they hash, and what they wait for. */
+interface TypecheckTargets {
+  readonly command: (args: string) => string;
+  readonly inputs: readonly NonNullable<TargetConfiguration['inputs']>[number][];
+  readonly dependsOn: readonly string[];
+}
+
+/**
+ * A project's typecheck targets. A project whose direct dependency declares a dialect typechecks through ttsc, whose
+ * linked plugin lowers the dialect and withdraws the checker's refusals of it; its compiler is the installed ttsc,
+ * which bun.lock and the patches in its check inputs already key, and it waits for the targets the declaring package
+ * names to prepare the plugin binaries ttsc loads. Every other project runs the pinned native compiler.
+ */
+function typecheckTargets(packageJsonPath: string, packageJson: PackageJson): TypecheckTargets {
+  const route = typecheckRoute(packageJsonPath, [
+    ...Object.keys(packageJson.dependencies ?? {}),
+    ...Object.keys(packageJson.devDependencies ?? {}),
+  ]);
+  return route.declaredBy.length === 0
+    ? { command: typecheckCommand, inputs: [TYPECHECK_COMPILER_INPUT], dependsOn: [] }
+    : { command: (args) => `ttsc ${args}`, inputs: [], dependsOn: route.dependsOn };
 }
 
 /**
@@ -1278,6 +1301,7 @@ export default { createNodesV2, createDependencies, createMetadata, postTasksExe
 
 interface PackageJson {
   bin?: unknown;
+  dependencies?: Record<string, unknown>;
   devDependencies?: Record<string, unknown>;
   name?: string;
   napi?: Record<string, unknown>;
@@ -1582,6 +1606,7 @@ async function createProjectTargets(
   const projectRoot = dirname(packageJsonPath);
   const absoluteProjectRoot = join(workspaceRoot, projectRoot);
   const packageJson = await readPackageJson(join(workspaceRoot, packageJsonPath));
+  const typecheck = typecheckTargets(join(workspaceRoot, packageJsonPath), packageJson);
   const projectName = packageJson.nx?.name ?? packageJson.name;
   if (typeof projectName !== 'string' || projectName.length === 0) {
     throw new Error(`${packageJsonPath} must declare a non-empty package or nx project name`);
@@ -1692,13 +1717,13 @@ async function createProjectTargets(
         selfProduction,
         dependencyProduction,
         ...checkInputs,
-        TYPECHECK_COMPILER_INPUT,
+        ...typecheck.inputs,
         '{projectRoot}/tsconfig.lib.json',
       ],
       outputs: [],
-      dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
+      dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : []), ...typecheck.dependsOn],
       options: {
-        command: typecheckCommand('-p tsconfig.lib.json --noEmit'),
+        command: typecheck.command('-p tsconfig.lib.json --noEmit'),
         cwd: projectRoot,
       },
     };
@@ -1716,12 +1741,12 @@ async function createProjectTargets(
         selfDefault,
         dependencyProduction,
         ...checkInputs,
-        TYPECHECK_COMPILER_INPUT,
+        ...typecheck.inputs,
         '{projectRoot}/tsconfig.test.json',
       ],
-      dependsOn: ['typecheck'],
+      dependsOn: ['typecheck', ...typecheck.dependsOn],
       options: {
-        command: typecheckCommand('-p tsconfig.test.json --noEmit'),
+        command: typecheck.command('-p tsconfig.test.json --noEmit'),
         cwd: projectRoot,
       },
     };
@@ -1729,7 +1754,7 @@ async function createProjectTargets(
       executor: 'nx:run-commands',
       continuous: true,
       options: {
-        command: typecheckCommand('-p tsconfig.test.json --noEmit --watch'),
+        command: typecheck.command('-p tsconfig.test.json --noEmit --watch'),
         cwd: projectRoot,
       },
     };
@@ -2319,9 +2344,9 @@ async function createProjectTargets(
       // Test configs may resolve the package's own `./index.js` through dist, so the
       // current-project declaration output is rebuilt first, not only the
       // dependency-project outputs reached through typecheck.
-      targets['typecheck-tests'].dependsOn = ['tsc-js', 'typecheck'];
+      targets['typecheck-tests'].dependsOn = ['tsc-js', 'typecheck', ...typecheck.dependsOn];
     } else if (targets.build) {
-      targets['typecheck-tests'].dependsOn = ['build'];
+      targets['typecheck-tests'].dependsOn = ['build', ...typecheck.dependsOn];
     }
   }
 
@@ -2936,6 +2961,7 @@ async function readPackageJson(packageJsonPath: string): Promise<PackageJson> {
   const rawNx = isRecord(parsed.nx) ? parsed.nx : undefined;
   return {
     ...('bin' in parsed ? { bin: parsed.bin } : {}),
+    ...(isRecord(parsed.dependencies) ? { dependencies: parsed.dependencies } : {}),
     ...(isRecord(parsed.devDependencies) ? { devDependencies: parsed.devDependencies } : {}),
     ...(typeof parsed.name === 'string' ? { name: parsed.name } : {}),
     ...(isRecord(parsed.napi) ? { napi: parsed.napi } : {}),

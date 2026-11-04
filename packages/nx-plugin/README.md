@@ -1257,7 +1257,18 @@ Concrete targets come from concrete files:
   it.
 - `typecheck` is inferred from `tsconfig.lib.json` and runs the native compiler `SMOO_TYPECHECK_TSC` names (built by
   `devenv.smoo.nix` from a pinned TypeScript revision) as `-p tsconfig.lib.json --noEmit`, directly rather than through
-  `ttsc`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them.
+  `ttsc`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them. A project whose direct dependency
+  (`dependencies` or `devDependencies`, the ones ttsc discovers plugins on) declares a dialect runs
+  `ttsc -p tsconfig.lib.json --noEmit` instead. A dialect is a construct the stock checker refuses and the package's
+  ttsc plugin lowers before emit; its refusal is withdrawn through the driver's `DiagnosticPlugin` seam (the managed
+  ttsc patch: `LoweredDiagnostics` names the checker diagnostics whose cause the plugin's `ProgramPlugin` removes, and
+  every lane that gates on the program's diagnostics drops exactly those). The pinned compiler cannot judge such a
+  project. The declaring package says so in its manifest,
+  `"smoo": { "typecheck": { "compiler": "ttsc", "dependsOn": ["<project>:<target>"] } }`, where `dependsOn` names the
+  targets that prepare the plugin binaries ttsc loads. The routed typecheck depends on them, so it loads built plugins
+  and never compiles one, and the inference guesses no workspace target. A declaration of another shape refuses the
+  inference by its manifest path. Its compiler is the installed ttsc, which `bun.lock` and the patches in the check
+  inputs already key. A project that depends only on typia stays on the pinned compiler.
 - `typecheck-tests` is inferred from `tsconfig.test.json` and runs the same compiler on
   `-p tsconfig.test.json --noEmit`. It first rebuilds the current package's `tsc-js` output (or its non-TypeScript
   `build`) so self-imports resolve from its own outputs. Transform calls in test files are checked when the test runner

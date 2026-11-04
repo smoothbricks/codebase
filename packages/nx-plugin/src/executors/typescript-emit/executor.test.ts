@@ -128,6 +128,54 @@ async function sideOutputFixture(host: 'utility' | 'typia'): Promise<string> {
   return root;
 }
 
+/**
+ * A project whose linked plugin (`src/__tests__/dialect-plugin`) admits `for await (… of lowered)` in a generator and
+ * lowers it to the sync loop. The checker refuses every `for await` in a generator (TS1103); the plugin withdraws the
+ * refusal of its own dialect through the driver's DiagnosticPlugin seam (the managed ttsc patch), on ttsc's utility
+ * host, or on typia's when the project uses typia.
+ */
+async function dialectFixture(host: 'utility' | 'typia', iterated: 'lowered' | 'kept'): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-dialect-'));
+  await mkdir(join(root, 'src'));
+  await mkdir(join(root, 'node_modules'));
+  await symlink(
+    join(import.meta.dir, '../../__tests__/dialect-plugin'),
+    join(root, 'node_modules/dialect-plugin'),
+    'dir',
+  );
+  await writeFile(
+    join(root, 'package.json'),
+    JSON.stringify(host === 'typia' ? { type: 'module', dependencies: { typia: '*' } } : { type: 'module' }),
+  );
+  if (host === 'typia') {
+    await symlink(
+      dirname(createRequire(import.meta.url).resolve('typia/package.json')),
+      join(root, 'node_modules/typia'),
+      'dir',
+    );
+  }
+  await writeFile(
+    join(root, 'tsconfig.lib.json'),
+    JSON.stringify({
+      compilerOptions: {
+        target: 'ES2022',
+        module: 'NodeNext',
+        rootDir: 'src',
+        outDir: 'dist',
+        types: [],
+        skipLibCheck: true,
+        plugins: [{ transform: 'dialect-plugin' }],
+      },
+      include: ['src/**/*.ts'],
+    }),
+  );
+  await writeFile(
+    join(root, 'src/index.ts'),
+    `declare const ${iterated}: Iterable<number>;\nexport function* values() {\n  for await (const value of ${iterated}) yield value;\n}\n`,
+  );
+  return root;
+}
+
 /** Every file under `directory` with what a write changes: its inode, modification time and status-change time. */
 async function fileIdentities(directory: string): Promise<Record<string, readonly bigint[]>> {
   const identities: Record<string, readonly bigint[]> = {};
@@ -240,6 +288,32 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
         }
       } finally {
         await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+  it.each(['utility', 'typia'] as const)(
+    "emits a dialect loop its linked plugin lowers and withdraws the checker's refusal of, in the %s host",
+    async (host) => {
+      const lowered = await dialectFixture(host, 'lowered');
+      const kept = await dialectFixture(host, 'kept');
+      try {
+        expect(
+          await typescriptEmitExecutor({ cwd: lowered, tsConfig: 'tsconfig.lib.json' }, { root: lowered }),
+        ).toEqual({ success: true });
+        expect(await readFile(join(lowered, 'dist/index.js'), 'utf8')).toContain('for (const value of lowered)');
+        // ttsc's check, which a typecheck routed through ttsc runs, admits it too.
+        const admitted = spawnSync('ttsc', ['-p', 'tsconfig.lib.json', '--noEmit'], { cwd: lowered, encoding: 'utf8' });
+        expect(admitted.status, admitted.stderr).toBe(0);
+        // The same loop over another iterable is no dialect: the checker's TS1103 stands and the emit fails.
+        expect(await typescriptEmitExecutor({ cwd: kept, tsConfig: 'tsconfig.lib.json' }, { root: kept })).toEqual({
+          success: false,
+        });
+        const check = spawnSync('ttsc', ['-p', 'tsconfig.lib.json', '--noEmit'], { cwd: kept, encoding: 'utf8' });
+        expect(check.status).not.toBe(0);
+        expect(`${check.stdout}${check.stderr}`).toContain('TS1103');
+      } finally {
+        await rm(lowered, { recursive: true, force: true });
+        await rm(kept, { recursive: true, force: true });
       }
     },
   );
