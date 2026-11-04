@@ -2820,22 +2820,22 @@ its root. A daemon that outlives the stop keeps the alias and the root, so the n
 
 A fixture workspace that runs real Nx with this plugin links an installation it owns, never the host's.
 `@smoothbricks/nx-plugin/owned-installation`'s `ownedInstallation(censusRoot, name)` copies the closure the graph
-witness's installation census resolves from `censusRoot` (Nx, this plugin and TypeScript, each package with its
-dependency edges relinked beside it and the top-level bins in `.bin`), and keeps the copy as `name` in `censusRoot`'s
-tool cache, `node_modules/.cache/smoothbricks-nx-plugin/owned-installations/<name>`. Nothing sweeps that directory: a
-cowshed fork clones it with the build volume and main adopts it at land (specs/cowshed/16_build_volumes.md), so it is
-cold only after `node_modules` is reinstalled or the build volume reseeded. Making the copy is most of what a test file
-costs (about 21,000 files: a 59 s copy and a 31–119 s removal per run on a loaded host), and clonefile cannot share it,
-since Bun's global store and every directory a cowshed job may write lie on different volumes. On the first
-`nodeModules()` of a run the census of the host closure and the proven census of the copy are compared package by
-package, by what each holds: resolution edges, node types and modes, and file bytes. A package whose copy no longer
-holds what the host's holds is copied again, and every package when the edges moved or the copy is unproved; a copy that
-was there and failed its proof is named on stderr with the reason. Both censuses take unmoved files' hashes from the
-ones recorded beside the copy, so a run that changes nothing reads no file bytes. `retire()` fails, naming the changed
-nodes, if a fixture wrote into the copy, and leaves it for the next run to prove. The host's closure moves under a
-fixture that reads it: a shared Bun store relinked by another install, or, in a workspace that developer-links this
-plugin, the checkout its author is editing and rebuilding. Either fails the producer receipt's installation proof for
-work that is not the test's.
+witness's installation census resolves from `censusRoot` (Nx, this plugin and TypeScript, each package as the nodes the
+census holds of it, so a workspace package's `.cache` its own tests write is never read, with its dependency edges
+relinked beside it and the top-level bins in `.bin`), and keeps the copy as `name` in `censusRoot`'s tool cache,
+`node_modules/.cache/smoothbricks-nx-plugin/owned-installations/<name>`. Nothing sweeps that directory: a cowshed fork
+clones it with the build volume and main adopts it at land (specs/cowshed/16_build_volumes.md), so it is cold only after
+`node_modules` is reinstalled or the build volume reseeded. Making the copy is most of what a test file costs (about
+21,000 files: a 59 s copy and a 31–119 s removal per run on a loaded host), and clonefile cannot share it, since Bun's
+global store and every directory a cowshed job may write lie on different volumes. On the first `nodeModules()` of a run
+the census of the host closure and the proven census of the copy are compared package by package, by what each holds:
+resolution edges, node types and modes, and file bytes. A package whose copy no longer holds what the host's holds is
+copied again, and every package when the edges moved or the copy is unproved; a copy that was there and failed its proof
+is named on stderr with the reason. Both censuses take unmoved files' hashes from the ones recorded beside the copy, so
+a run that changes nothing reads no file bytes. `retire()` fails, naming the changed nodes, if a fixture wrote into the
+copy, and leaves it for the next run to prove. The host's closure moves under a fixture that reads it: a shared Bun
+store relinked by another install, or, in a workspace that developer-links this plugin, the checkout its author is
+editing and rebuilding. Either fails the producer receipt's installation proof for work that is not the test's.
 
 Test files that name one copy share it. Bun runs many test files in one process, which takes the copy once, on the first
 `nodeModules()` of any of them, and each file's `retire()` proves that no fixture wrote into it since that take.

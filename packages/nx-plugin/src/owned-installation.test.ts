@@ -177,6 +177,32 @@ describe('a kept fixture installation', () => {
     );
   });
 
+  it('copies only what a package publishes, never the tool state its own tests write beside it', async () => {
+    // A workspace package's root holds its tests' scratch (cowshed's `.cache/api-generation-*`, made and removed
+    // while another package's fixture copies the closure): content of no installation, and racy to read.
+    const dependency = join(censusRoot, 'node_modules', 'dependency');
+    await writeFile(
+      join(dependency, 'package.json'),
+      JSON.stringify({ name: 'dependency', version: '1.0.0', main: 'dist/index.js', files: ['dist'] }),
+    );
+    await mkdir(join(dependency, 'dist'), { recursive: true });
+    await writeFile(join(dependency, 'dist', 'index.js'), 'module.exports = "dependency";\n');
+    await mkdir(join(dependency, '.cache', 'api-generation-scratch'), { recursive: true });
+    await writeFile(join(dependency, '.cache', 'api-generation-scratch', 'tsconfig.json'), '{}\n');
+    const { modules, stderr } = take('published-only');
+    expect(stderr).toBe('');
+    const copied: string[] = [];
+    for (const store of await readdir(join(modules, '.store'))) {
+      const root = join(modules, '.store', store, 'node_modules', 'dependency');
+      // A store that holds another package has no dependency entry: the one failure expected here.
+      const entry = await lstat(root).catch((error: unknown) => {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (entry?.isDirectory()) copied.push(...(await readdir(root, { recursive: true })));
+    }
+    expect(copied.sort()).toEqual(['dist', 'dist/index.js', 'package.json']);
+  });
   it('copies a package’s own .nx directory, which its files select, so the next run proves and keeps the copy', async () => {
     // @nx/workspace 24.0.3 ships dist/src/generators/ci-workflow/files/ci-config/.nx/ci-config.yaml__tmpl__, under
     // `files` with a negation, which Nx's expandOutputs answers file by file.

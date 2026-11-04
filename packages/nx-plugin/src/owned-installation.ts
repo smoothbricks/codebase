@@ -9,7 +9,8 @@
  * test reads it. A fixture must not take an input it does not own.
  *
  * So the closure is copied, exactly as the witness's own census resolves it from the workspace that names it: each
- * package once, without its `node_modules` and `.git`, each dependency edge relinked beside
+ * package once, as the nodes the census holds of it (what it publishes, never its tools' state beside it), each
+ * dependency edge relinked beside
  * its copy as Bun's isolated layout does, the top-level packages' bins in `.bin`. Every copy is a new inode, cloned
  * where the volume allows and written otherwise, so no link count is shared with anything outside its owner.
  *
@@ -35,7 +36,21 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { constants, rmSync } from 'node:fs';
-import { cp, mkdir, readdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  copyFile,
+  cp,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  readlink,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { expandOutputs } from 'nx/src/native';
 import { readModulePackageJson } from 'nx/src/utils/package-json';
@@ -301,16 +316,49 @@ async function sweep(kept: string, keep: ReadonlySet<string>): Promise<void> {
   }
 }
 
-/** Copy the host package root `source` to its place under `root`, with the census's own exclusions. */
-function copyPackage(source: string, root: string, { place }: Placement): Promise<void> {
-  return cp(source, join(root, place), {
-    recursive: true,
-    verbatimSymlinks: true,
-    mode: constants.COPYFILE_FICLONE,
-    // A package's own .nx is content, not Nx state: @nx/workspace 24.0.3 ships templates under one, and the census
-    // selects their directories through the package's `files` (expandOutputs), so a copy without them holds less.
-    filter: (path) => path === source || !['node_modules', '.git'].includes(basename(path)),
-  });
+/**
+ * Make the copy of the host package root `source` at its place under `root` from exactly the nodes the host census
+ * holds for it (`censused`, every node of the closure in the census's walk order, a directory before what it holds):
+ * for a package declaring `files`, what it publishes, never `node_modules` or `.git`. A censused directory's `.nx` is
+ * copied whole: @nx/workspace 24.0.3 ships templates under one, which the census does not walk, but what its `files`
+ * select there (expandOutputs) selects the directory that holds it, so a copy without it censuses less. Nothing else of the package root
+ * is content of the closure, and a workspace package's root also holds its own tools' state (a `.cache/` its tests
+ * write and remove while this copy reads), which a copy of the whole root would race. A link is copied as it reads;
+ * the nodes it reaches are the census's own. A file is cloned where the volume allows.
+ */
+async function copyPackage(
+  source: string,
+  root: string,
+  { place }: Placement,
+  censused: readonly string[],
+): Promise<void> {
+  const target = join(root, place);
+  for (const path of censused) {
+    if (path !== source && !path.startsWith(`${source}/`)) continue;
+    const destination = join(target, relative(source, path));
+    const stats = await lstat(path);
+    if (stats.isSymbolicLink()) {
+      await symlink(await readlink(path), destination);
+    } else if (stats.isDirectory()) {
+      await mkdir(destination, { recursive: true });
+      await chmod(destination, stats.mode & 0o7777);
+      // The one absence expected here: most directories hold no .nx.
+      const dotNx = join(path, '.nx');
+      const held = await lstat(dotNx).catch((error: unknown) => {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (held?.isDirectory()) {
+        await cp(dotNx, join(destination, '.nx'), {
+          recursive: true,
+          verbatimSymlinks: true,
+          mode: constants.COPYFILE_FICLONE,
+        });
+      }
+    } else {
+      await copyFile(path, destination, constants.COPYFILE_FICLONE);
+    }
+  }
 }
 
 /** Link every resolution edge of `host` beside its copy under `root`, and the top-level packages' bins in `.bin`. */
@@ -388,6 +436,7 @@ async function proveOrCopy(censusRoot: string, kept: string, inUse: ReadonlySet<
   );
   if (host === null) throw new Error(`the Nx installation closure of ${censusRoot} cannot be read: ${unread}`);
   const placed = await placements(host);
+  const censused = host.nodes.map(({ path }) => path);
   const wanted = holdings(host, censusRoot, new Map([...placed].map(([source, { place }]) => [source, place])));
   const placesIn = (root: string) => new Map([...placed.values()].map(({ place }) => [join(root, place), place]));
   // Only a recorded copy is censused: a census of none would resolve the host's packages through the ancestor lookup.
@@ -435,10 +484,10 @@ async function proveOrCopy(censusRoot: string, kept: string, inUse: ReadonlySet<
       : join(kept, `installation-${randomUUID()}`);
   if (root === current && stale !== null) {
     for (const [, { place }] of stale) await rm(join(root, place), { recursive: true, force: true });
-    await Promise.all(stale.map(([source, placement]) => copyPackage(source, root, placement)));
+    await Promise.all(stale.map(([source, placement]) => copyPackage(source, root, placement, censused)));
   } else {
     await sweep(kept, inUse);
-    await Promise.all([...placed].map(([source, placement]) => copyPackage(source, root, placement)));
+    await Promise.all([...placed].map(([source, placement]) => copyPackage(source, root, placement, censused)));
     await linkCopies(censusRoot, root, host, placed);
   }
   const census = copyCensus(root, root === current ? (found ?? undefined) : undefined, (detail) => {
