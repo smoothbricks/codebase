@@ -769,6 +769,12 @@ physical resizing and read-only mounts remain native-host tests. Their scratch r
 socket a store binds beneath one fits macOS's 104-byte `sun_path` whatever the test is called. They share process
 cleanup with the image fixtures, but neither their setup nor their cleanup enumerates or releases disk images.
 
+The clone-intent publication-handoff oracle waits for the supervisor hello after the image becomes `Active`, then reads
+its own process's TCP listeners through `cowshed-os::process::listening_ports` and filters them to the published block
+(05_gateway.md, "Placement and identity"). It never probes released ports or calls `getsockname` on every descriptor:
+non-IP sockets, including Darwin's `AF_SYSTEM` control sockets, need not implement that operation and are unrelated to
+the allocator's TCP listener claims.
+
 Cargo lifecycle fixtures run the real Cargo that drives the test: canonical `CARGO`, never a `cargo` found on `PATH`,
 where an earlier install's link may still answer to the name. `rustc` and `rustdoc` resolve by Cargo's own rule
 (`RUSTC`/`RUSTDOC`, else the first executable on an absolute `PATH` entry, canonicalized), since a Nix toolchain's Cargo

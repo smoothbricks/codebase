@@ -1144,9 +1144,9 @@ impl Fixture {
     /// Stands at `workspace`'s supervisor socket until a lifecycle verb asks who serves it, which
     /// the verb does only once the workspace's image is published. At that moment a gateway
     /// reconcile in another process may install the workspace's session on the published block,
-    /// so the block must hold no kernel claim of the verb's: it answers the block's ports any
-    /// socket of this process -- the runtime's -- is still bound to. Then it lets go of the
-    /// socket, so the verb serves its own supervisor there.
+    /// so the block must hold no kernel claim of the verb's: it answers the block's TCP ports
+    /// this process -- the runtime -- still listens on. Then it lets go of the socket, so the
+    /// verb serves its own supervisor there.
     ///
     /// It never binds the block to find out: the host's port space is shared with every other
     /// store (each concurrent test has its own) and program, whose allocator takes the lowest
@@ -1167,7 +1167,9 @@ impl Fixture {
             let published = DetachedWorkspaceMetadata::read_for_image(&image).expect("sidecar");
             assert_eq!(published.publication_state, PublicationState::Active);
             let block = published.grants.port_block.expect("a port block");
-            let held = own_tcp_ports()
+            let pid = libc::pid_t::try_from(std::process::id()).expect("this process's pid");
+            let held = cowshed_os::process::listening_ports(pid)
+                .expect("read this process's TCP listeners")
                 .into_iter()
                 .filter(|port| block.ports().expect("block ports").contains(port))
                 .collect();
@@ -1176,50 +1178,6 @@ impl Fixture {
             held
         }))
     }
-}
-
-/// Every local TCP port a socket of this process is bound to, from the descriptors it has open.
-fn own_tcp_ports() -> Vec<u16> {
-    let mut ports = Vec::new();
-    for entry in fs::read_dir("/dev/fd").expect("list this process's descriptors") {
-        let entry = entry.expect("descriptor entry");
-        let fd: libc::c_int = entry
-            .file_name()
-            .to_str()
-            .and_then(|fd| fd.parse().ok())
-            .expect("a descriptor number");
-        // SAFETY: an all-zero `sockaddr_storage` is a valid value of the plain C struct.
-        let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
-        let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
-            .expect("sockaddr_storage size");
-        // SAFETY: `address` is writable storage of `length` bytes.
-        let named = unsafe {
-            libc::getsockname(fd, (&raw mut address).cast::<libc::sockaddr>(), &mut length)
-        };
-        if named != 0 {
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                // Not a socket; or the listing's own descriptor, closed since it was listed.
-                Some(libc::ENOTSOCK | libc::EBADF) => continue,
-                _ => panic!("getsockname({fd}): {error}"),
-            }
-        }
-        let port = match libc::c_int::from(address.ss_family) {
-            libc::AF_INET => {
-                // SAFETY: the kernel wrote a `sockaddr_in` for an AF_INET socket.
-                let address = unsafe { *(&raw const address).cast::<libc::sockaddr_in>() };
-                address.sin_port
-            }
-            libc::AF_INET6 => {
-                // SAFETY: the kernel wrote a `sockaddr_in6` for an AF_INET6 socket.
-                let address = unsafe { *(&raw const address).cast::<libc::sockaddr_in6>() };
-                address.sin6_port
-            }
-            _ => continue,
-        };
-        ports.push(u16::from_be(port));
-    }
-    ports
 }
 
 /// Reservation markers this test holds on behalf of an imaginary concurrent creator.
