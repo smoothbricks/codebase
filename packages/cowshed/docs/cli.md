@@ -281,13 +281,12 @@ precompiled-header dependencies listed under every Clang release, generated-sour
 when `MBX_SHARE_ENV` names their variable, with a build script's declared dependency on such a variable keyed as the
 build gave it and shared for every compilation it is set for, precompiled headers built under mbx recorded so their
 users key by that build, each use of a store object or result recorded by mbx itself so eviction keeps what builds read
-under `noatime`, native links through a linker wrapper a project names in `MBX_LINK_WRAPPERS`, host links through an
-unwrapped driver and an absolute unwrapped `-fuse-ld` linker cached while a Nix shell's link variables are set, and a
-managed target a collection removed, placed again for a build that names its own directory below `target/`, from
-`smoothbricks/mr-boxington` at the pinned revision, with mbx's own locked nixpkgs), roots the result with a nix GC root
-at `~/Library/Application Support/dev.cowshed/nix/mbx`, and links `mbx` in cowshed's `bin` beside the installed
-`cowshed` to the rooted executable: a link, never a copy, so its realpath is the pinned build's store path. It then runs
-that mbx's own `mbx setup` to generate its Cargo shim and `mbx-target` sidecar into
+under `noatime`, host links through an unwrapped driver and an absolute unwrapped `-fuse-ld` linker cached while a Nix
+shell's link variables are set, and a managed target a collection removed, placed again for a build that names its own
+directory below `target/`, from `smoothbricks/mr-boxington` at the pinned revision, with mbx's own locked nixpkgs),
+roots the result with a nix GC root at `~/Library/Application Support/dev.cowshed/nix/mbx`, and links `mbx` in cowshed's
+`bin` beside the installed `cowshed` to the rooted executable: a link, never a copy, so its realpath is the pinned
+build's store path. It then runs that mbx's own `mbx setup` to generate its Cargo shim and `mbx-target` sidecar into
 `~/Library/Application Support/dev.cowshed/mbx-shim/`, beside `bin`. The link and the shim directory are all a Cargo
 project needs for mbx: projects need not pin, provide or opt in to anything, and a project that still pins its own mbx
 is built with the installed one. No agent, plist or socket is written for it:

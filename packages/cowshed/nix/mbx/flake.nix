@@ -18,11 +18,10 @@
 # link variables are set, every variable MBX_SHARE_ENV lists shared for each compilation it is
 # set for, a precompiled header built under mbx recorded so its users key by that build, and each
 # use of a store object or result recorded by mbx itself, so eviction keeps what builds read on a
-# noatime volume and frees a result with its descriptor blob, and a linker wrapper a project names
-# in MBX_LINK_WRAPPERS identified by its bytes and the driver it forwards to, so the native links
-# made through it cache, and every target path a native link reads spelled physically so one
-# -oso_prefix strips them all from a macOS debug map, and -Zosx-rpath-install-name keyed as written
-# rather than bypassing every compilation that carries it, from
+# noatime volume and frees a result with its descriptor blob, and every target path a native link
+# reads spelled physically so one -oso_prefix strips them all from a macOS debug map, and
+# -Zosx-rpath-install-name keyed as written rather than bypassing every compilation that carries
+# it, from
 # smoothbricks/mr-boxington at the pinned revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
@@ -35,7 +34,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/f079f737a5503ebc7c3dd5c20397778f086d567d";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/8cd8f6b23d0984192a86befbb4cb1bdd3ffac8e2";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
