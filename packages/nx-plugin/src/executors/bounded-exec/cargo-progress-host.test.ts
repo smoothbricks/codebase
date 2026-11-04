@@ -76,7 +76,10 @@ describe('Cargo test progress host proofs', () => {
     try {
       for (const name of ['first', 'second']) {
         await writeCargoPackage(root, name, `#[test]\nfn ${name}_terminal() { assert_eq!(2 + 2, 4); }\n`);
-        await writeFile(join(root, name, 'build.rs'), BUILD_BARRIER);
+        // The run's own root makes the script new to any build cache (mbx's cargo route keeps
+        // build-script results across sessions): a cached script never connects, and no build
+        // is held.
+        await writeFile(join(root, name, 'build.rs'), `${BUILD_BARRIER}// ${root}\n`);
       }
       await listen(server, join(root, 'runner.sock'));
       process.stdout.write = (chunk) => {
