@@ -742,7 +742,32 @@ impl fmt::Display for UsageError {
 
 impl std::error::Error for UsageError {}
 
+/// The environment variable `exec` falls back to for `--want` when its line names none, so a
+/// shell that always runs heavy work sets it once and every `exec` it starts declares its hold
+/// (05_gateway.md "Held jobs"). The line's own `--want` outranks it, and an empty value is no
+/// default, which leaves a brief command in such a shell a way to run unheld.
+pub const EXEC_WANT_ENV: &str = "COWSHED_EXEC_WANT";
+
+/// What the parser may read of the process's environment: a variable's value, when it is set.
+type Environment<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+
+/// Parses a command line as typed, reading no environment: every default a line leaves out is the
+/// command's own. The process's environment enters through [`parse_args_in`], so what a test
+/// asserts never depends on the shell that runs it.
 pub fn parse_args<I, T>(args: I) -> Result<Cli, UsageError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    parse_args_in(args, |_| None)
+}
+
+/// Parses a command line, reading `environment` for the defaults a line leaves to it
+/// ([`EXEC_WANT_ENV`]).
+pub fn parse_args_in<I, T>(
+    args: I,
+    environment: impl Fn(&str) -> Option<OsString>,
+) -> Result<Cli, UsageError>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
@@ -752,7 +777,7 @@ where
         return Ok(cli);
     }
     match cli_command().try_get_matches_from(&args) {
-        Ok(matches) => cli_from_matches(matches),
+        Ok(matches) => cli_from_matches(matches, &environment),
         Err(error) if error.kind() == ErrorKind::DisplayVersion => Ok(Cli {
             global: GlobalOptions::default(),
             command: Command::Version,
@@ -1233,7 +1258,7 @@ fn positional(name: &'static str, _range: std::ops::RangeInclusive<usize>) -> Ar
         .num_args(1)
 }
 
-fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
+fn cli_from_matches(matches: ArgMatches, environment: Environment<'_>) -> Result<Cli, UsageError> {
     let Some((name, leaf)) = matches.subcommand() else {
         return Err(UsageError::missing_command());
     };
@@ -1246,7 +1271,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "ls" => parse_list(leaf)?,
         "path" => parse_path(leaf)?,
         "build-state" => Command::BuildState,
-        "exec" => parse_exec(leaf)?,
+        "exec" => parse_exec(leaf, environment)?,
         "grant" => parse_grant(leaf)?,
         "revoke" => parse_revoke(leaf)?,
         "rm" => parse_remove(leaf)?,
@@ -2897,7 +2922,7 @@ const EXEC: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--want <n>",
-            meaning: "the slots of the job's own jobserver, which its build and test runners share (default and ceiling: the host's cores); in a project with mbx it also holds up to that many of the pool's cores for the job's life",
+            meaning: "the slots of the job's own jobserver, which its build and test runners share (default and ceiling: the host's cores); in a project with mbx it also holds up to that many of the pool's cores for the job's life; a line that names none takes the COWSHED_EXEC_WANT environment variable when it is set and not empty",
         },
         Opt {
             spelling: "--class <background|interactive|gate|resident|interactive-resident>",
@@ -2910,7 +2935,7 @@ const EXEC: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
+fn parse_exec(matches: &ArgMatches, environment: Environment<'_>) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &EXEC;
     let mut stdin = None;
     if flagged(matches, "stdin") {
@@ -2971,14 +2996,7 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
             }
         },
     };
-    let want = positive_count(matches, "want", USAGE)?
-        .map(|count| {
-            usize::try_from(count)
-                .ok()
-                .and_then(NonZeroUsize::new)
-                .ok_or_else(|| UsageError::new("--want is too large for this platform", USAGE))
-        })
-        .transpose()?;
+    let want = exec_want(matches, environment, USAGE)?;
     let host = flagged(matches, "host");
     if host && session.is_some() {
         return Err(UsageError::new(
@@ -3015,24 +3033,43 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
-/// `--<flag> n`: a positive whole number, refused as usage when it is zero or not a number.
-fn positive_count(
+/// `exec`'s `--want`: the line's own, else `EXEC_WANT_ENV`, else none. The line outranks the
+/// environment before either is checked, so a good `--want` runs under any environment, and a
+/// value that is not a positive whole number is refused by the spelling that carried it.
+fn exec_want(
     matches: &ArgMatches,
-    flag: &str,
+    environment: Environment<'_>,
     usage: &'static CommandSpec,
-) -> Result<Option<u64>, UsageError> {
-    let Some(value) = os(matches, flag) else {
-        return Ok(None);
+) -> Result<Option<NonZeroUsize>, UsageError> {
+    let (spelling, value) = match os(matches, "want") {
+        Some(value) => ("--want", value),
+        None => match environment(EXEC_WANT_ENV).filter(|value| !value.is_empty()) {
+            Some(value) => (EXEC_WANT_ENV, value),
+            None => return Ok(None),
+        },
     };
+    usize::try_from(positive_count(spelling, &value, usage)?)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .map(Some)
+        .ok_or_else(|| UsageError::new(format!("{spelling} is too large for this platform"), usage))
+}
+
+/// A positive whole number as `spelling` (`--want`, or an environment variable) carried it,
+/// refused as usage when it is zero or not a number.
+fn positive_count(
+    spelling: &str,
+    value: &OsStr,
+    usage: &'static CommandSpec,
+) -> Result<u64, UsageError> {
     value
         .to_str()
         .and_then(|text| text.parse::<u64>().ok())
         .filter(|count| *count > 0)
-        .map(Some)
         .ok_or_else(|| {
             UsageError::new(
                 format!(
-                    "--{flag} must be a positive whole number, got `{}`",
+                    "{spelling} must be a positive whole number, got `{}`",
                     value.to_string_lossy()
                 ),
                 usage,
@@ -4960,6 +4997,77 @@ mod tests {
             );
             assert_eq!(error.exit_code(), 2, "{argv:?}");
         }
+    }
+
+    #[test]
+    fn exec_takes_its_want_from_the_line_then_the_environment() {
+        // (the line's `--want`, `COWSHED_EXEC_WANT`, the want exec names or the refusal it gets)
+        let table = [
+            (None, None, Ok(None)),
+            (Some("12"), None, Ok(Some(12))),
+            (None, Some("4"), Ok(Some(4))),
+            (Some("12"), Some("4"), Ok(Some(12))),
+            (Some("12"), Some("lots"), Ok(Some(12))),
+            (None, Some(""), Ok(None)),
+            (
+                None,
+                Some("lots"),
+                Err("COWSHED_EXEC_WANT must be a positive whole number, got `lots`"),
+            ),
+            (
+                None,
+                Some("0"),
+                Err("COWSHED_EXEC_WANT must be a positive whole number, got `0`"),
+            ),
+            (
+                Some("0"),
+                Some("4"),
+                Err("--want must be a positive whole number, got `0`"),
+            ),
+            (
+                Some("lots"),
+                None,
+                Err("--want must be a positive whole number, got `lots`"),
+            ),
+        ];
+        for (flag, environment, expected) in table {
+            let mut line = vec!["exec", "raven"];
+            if let Some(count) = flag {
+                line.extend(["--want", count]);
+            }
+            line.extend(["--", "nextest"]);
+            let parsed = parse_args_in(line.clone(), |name| {
+                assert_eq!(name, EXEC_WANT_ENV, "exec reads no other variable");
+                environment.map(OsString::from)
+            });
+            match (parsed, expected) {
+                (
+                    Ok(Cli {
+                        command: Command::Exec(exec),
+                        ..
+                    }),
+                    Ok(want),
+                ) => assert_eq!(
+                    exec.want.map(NonZeroUsize::get),
+                    want,
+                    "{line:?} under {environment:?}"
+                ),
+                (Err(error), Err(mention)) => {
+                    assert!(
+                        error.message.contains(mention),
+                        "{line:?} under {environment:?}: {}",
+                        error.message
+                    );
+                    assert_eq!(error.exit_code(), 2, "{line:?} under {environment:?}");
+                }
+                (parsed, expected) => {
+                    panic!("{line:?} under {environment:?}: {parsed:?}, expected {expected:?}")
+                }
+            }
+        }
+
+        // Only exec reads the variable: a bad value there never keeps another command from parsing.
+        parse_args_in(["ls"], |_| Some(OsString::from("lots"))).expect("ls reads no environment");
     }
 
     #[test]

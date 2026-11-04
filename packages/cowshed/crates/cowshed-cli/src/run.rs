@@ -211,7 +211,7 @@ fn parse_then_prepare<F, T>(arguments: &[OsString], prepare: F) -> Result<T, arg
 where
     F: FnOnce(args::Cli) -> T,
 {
-    let parsed = args::parse_args(arguments)?;
+    let parsed = args::parse_args_in(arguments, |name| std::env::var_os(name))?;
     Ok(prepare(parsed))
 }
 

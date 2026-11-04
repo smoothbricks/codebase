@@ -1567,8 +1567,11 @@ host's load.
   while it does. Without mbx a hold declares nothing, and a named want keeps its meaning, the jobserver count alone.
 - **What an agent declares.** Every build, test suite, Nx run or gate task an agent starts names `--want n`, `n` being
   the cores it should hold: 4 for a focused suite or one project's targets, up to the host's cores for a run across the
-  repository. A brief command (a git query, one file's lint, a status read) names none. Agents do not read the host's
-  load, wait for a quiet host, or hold work back for a gate: admission does that.
+  repository. A brief command (a git query, one file's lint, a status read) names none. `cowshed exec` takes
+  `COWSHED_EXEC_WANT` as the `--want` a line leaves out, so an agent's shell sets it once: a `--want` on the line wins,
+  an empty value is no default (a brief command runs unheld with `COWSHED_EXEC_WANT=`), and a value that is not a
+  positive whole number is refused by name. Agents do not read the host's load, wait for a quiet host, or hold work back
+  for a gate: admission does that.
 - **The budget.** The pool's own budget, CPU cores and memory bytes, never a load average: mbx's `scheduler.cpus` less
   `scheduler.reserve_cpus`, and `scheduler.memory`. A hold asks `--cpus g` and is charged the cores it is granted. Its
   memory charge is the job identity's last recorded terminal peak (13_telemetry.md, "Job resource peaks") once
