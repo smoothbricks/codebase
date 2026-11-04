@@ -5021,15 +5021,12 @@ async fn a_pending_gc_holds_no_exec() {
         "coordinator.exec",
         main_exec(&repo, &incarnation, json!({})),
     );
-    let exec = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        tokio::select! {
-            biased;
-            collected = &mut gc => panic!("the gc answered before its sweep: {collected:?}"),
-            exec = exec => exec,
-        }
-    })
-    .await
-    .expect("the exec waited behind the gc's sweep");
+    // An exec queued behind the gc's sweep never answers: the leg's no-progress bound names it.
+    let exec = tokio::select! {
+        biased;
+        collected = &mut gc => panic!("the gc answered before its sweep: {collected:?}"),
+        exec = exec => exec,
+    };
     exec.expect("the exec answers while the gc waits");
     gate.notify_one();
     gc.await.expect("the gc answers once its sweep does");
