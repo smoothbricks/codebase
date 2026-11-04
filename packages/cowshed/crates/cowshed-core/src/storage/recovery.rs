@@ -21,6 +21,24 @@ pub const TRASH_NAMESPACE: &str = ".trash";
 /// by patch identity; only a sweep explicitly authorized for them reclaims the rest.
 pub const ABANDON_BUNDLE_EXTENSION: &str = "bundle";
 
+/// The patch-id sidecar a removal writes beside an abandon bundle (`<bundle>.patch-ids`), which
+/// lets a plain `gc` measure the bundle without reading its pack. Its extension is not
+/// [`ABANDON_BUNDLE_EXTENSION`], so no bundle listing names it; it goes with its bundle.
+pub fn abandon_bundle_sidecar(bundle: &Path) -> PathBuf {
+    let mut name = bundle.file_name().unwrap_or_default().to_owned();
+    name.push(".patch-ids");
+    bundle.with_file_name(name)
+}
+
+/// Delete [`abandon_bundle_sidecar`] of `bundle`, which goes with its bundle; one already gone,
+/// or never written by an earlier build, is no error.
+pub fn remove_abandon_bundle_sidecar(bundle: &Path) -> io::Result<()> {
+    match std::fs::remove_file(abandon_bundle_sidecar(bundle)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
 /// What a project's trash keeps of `rm --abandon`: its abandon bundles, recovery files for the
 /// work each removal gave up, which only an explicit `gc --abandoned` deletes while main lacks any
 /// of it. The surfaces that never otherwise show the trash — `ls --all`, plain `gc`, `doctor` —

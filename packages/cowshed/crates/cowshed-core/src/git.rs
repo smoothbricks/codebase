@@ -474,6 +474,28 @@ impl Drop for StagedBundle {
     }
 }
 
+impl StagedBundle {
+    /// A staging name beside `destination`, unique to this write: `.<name>.<uuid>.partial`.
+    fn beside(destination: &Path) -> Result<Self> {
+        let file_name = destination.file_name().ok_or_else(|| {
+            CowshedError::integrity(
+                format!(
+                    "abandonment bundle has no file name: {}",
+                    destination.display()
+                ),
+                "repair the cowshed store and retry removal",
+            )
+        })?;
+        let mut staged_name = OsString::from(".");
+        staged_name.push(file_name);
+        staged_name.push(format!(".{}.partial", uuid::Uuid::new_v4().simple()));
+        Ok(Self {
+            path: destination.with_file_name(staged_name),
+            settled: false,
+        })
+    }
+}
+
 impl GitRepository {
     /// Resolve the standalone repository containing `path`, for a controller serving `store_root`.
     pub async fn discover(store_root: &Arc<Path>, path: impl AsRef<Path>) -> Result<Self> {
@@ -1533,15 +1555,167 @@ impl GitRepository {
     }
 
     /// Measure the abandon bundle at `bundle` against this repository's `target_tip`, for
-    /// [`bundle_is_held`]: each tip the bundle advertises, with the commits it carries beyond
-    /// `target_tip` and which of them this repository holds by patch identity
-    /// ([`Self::held_commits`]). The bundle is fetched into a scratch bare repository beside it
-    /// with this repository's objects attached read-only, so neither this repository nor the
-    /// bundle changes, and the scratch is removed before answering.
+    /// [`bundle_is_held`]: the commits the bundle carries beyond `target_tip` and which of them
+    /// this repository holds by patch identity. The bundle's header is read
+    /// ([`read_bundle_header`]); its pack is read only when no cheaper proof applies:
+    ///
+    /// 1. Every tip the header advertises is a commit this repository holds: each is measured
+    ///    here, in place ([`Self::measure_tips`]).
+    /// 2. The bundle's patch-identity sidecar names exactly the advertised tips and a target
+    ///    `target_tip` descends from: the bundle is measured from the sidecar
+    ///    ([`Self::measure_by_patch_ids`]).
+    /// 3. Otherwise (a bundle written before sidecars, or one whose sidecar no longer applies)
+    ///    the bundle is fetched to measure it ([`Self::measure_fetched`]).
     #[cfg(any(target_os = "macos", test))]
     pub(crate) async fn measure_bundle(
         &self,
         bundle: &Path,
+        target_tip: &str,
+    ) -> Result<Vec<BundleTip>> {
+        let header = read_bundle_header(bundle).await?;
+        if header.tips.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tips: Vec<&str> = header.tips.iter().map(|tip| tip.oid.as_str()).collect();
+        if self.holds_commits(&tips).await? {
+            return self.measure_tips(target_tip, &tips).await;
+        }
+        let sidecar = crate::storage::recovery::abandon_bundle_sidecar(bundle);
+        if let Some(patch_ids) = read_patch_ids(&sidecar).await?
+            && patch_ids.describes(&header)
+            && self
+                .commit_is_ancestor(patch_ids.target.as_str(), target_tip)
+                .await?
+        {
+            return self.measure_by_patch_ids(&patch_ids, target_tip).await;
+        }
+        self.measure_fetched(bundle, &header, target_tip).await
+    }
+
+    /// Whether every one of `oids` is a commit in this repository's object store, asked of one
+    /// `git cat-file --batch-check` that reads them all on its stdin.
+    #[cfg(any(target_os = "macos", test))]
+    async fn holds_commits(&self, oids: &[&str]) -> Result<bool> {
+        let mut input = Vec::with_capacity(oids.iter().map(|oid| oid.len() + 1).sum());
+        for oid in oids {
+            input.extend_from_slice(oid.as_bytes());
+            input.push(b'\n');
+        }
+        let output = self
+            .run_input(
+                ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                input,
+            )
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("look up abandon bundle tips", &output));
+        }
+        let answers = parse_lines(&output.stdout, "object lookup")?;
+        if answers.len() != oids.len() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "git answered {} object lookups for {} abandon bundle tips",
+                    answers.len(),
+                    oids.len()
+                ),
+                "repair the git installation",
+            ));
+        }
+        let mut held = true;
+        for (answer, oid) in answers.iter().zip(oids) {
+            match answer.split_once(' ') {
+                Some((name, kind)) if name == *oid => held &= kind == "commit",
+                _ => {
+                    return Err(CowshedError::integrity(
+                        format!("git answered the lookup of {oid} with {answer:?}"),
+                        "repair the git installation",
+                    ));
+                }
+            }
+        }
+        Ok(held)
+    }
+
+    /// Each of `tips`, commits this repository holds, measured against `target_tip`: the commits
+    /// it carries beyond the target and which of them this repository holds by patch identity
+    /// ([`Self::held_commits`]).
+    #[cfg(any(target_os = "macos", test))]
+    async fn measure_tips(&self, target_tip: &str, tips: &[&str]) -> Result<Vec<BundleTip>> {
+        let mut measured = Vec::with_capacity(tips.len());
+        for tip in tips {
+            let range = format!("{target_tip}..{tip}");
+            let listed = self.run(["rev-list", range.as_str()]).await?;
+            if !listed.status.success() {
+                return Err(git_internal(
+                    "list an abandon bundle tip's commits",
+                    &listed,
+                ));
+            }
+            measured.push(BundleTip {
+                commits: parse_lines(&listed.stdout, "abandon bundle commit")?,
+                held: self.held_commits(target_tip, tip).await?,
+            });
+        }
+        Ok(measured)
+    }
+
+    /// The abandon bundle `patch_ids` describes, measured against `target_tip` from its sidecar
+    /// alone, as one [`BundleTip`] carrying every commit the sidecar lists. `target_tip` descends
+    /// from the sidecar's target, so what that target reaches this repository holds by ancestry.
+    /// A merge that authors nothing is held. A commit with no patch to identify is never held and
+    /// keeps the bundle, so nothing is read for it. Otherwise this repository's commits beyond the
+    /// sidecar's base are streamed through `git patch-id` ([`Self::stream_patch_ids`]) until every
+    /// identity the bundle carries has been seen, and a commit is held once its identity is.
+    #[cfg(any(target_os = "macos", test))]
+    async fn measure_by_patch_ids(
+        &self,
+        patch_ids: &AbandonPatchIds,
+        target_tip: &str,
+    ) -> Result<Vec<BundleTip>> {
+        let mut held = std::collections::BTreeSet::new();
+        let mut wanted: std::collections::HashMap<&str, Vec<&GitOid>> =
+            std::collections::HashMap::new();
+        let mut opaque = false;
+        for (commit, carried) in &patch_ids.commits {
+            match carried {
+                CarriedCommit::Patch(id) => wanted.entry(id.as_str()).or_default().push(commit),
+                CarriedCommit::ContentFreeMerge => {
+                    held.insert(commit.as_str().to_owned());
+                }
+                CarriedCommit::Opaque => opaque = true,
+            }
+        }
+        if !opaque && !wanted.is_empty() {
+            let exclude = patch_ids.base.as_ref().map(|base| format!("^{base}"));
+            let revisions: Vec<&str> = exclude.as_deref().into_iter().chain([target_tip]).collect();
+            self.stream_patch_ids(&revisions, |id, _| {
+                if let Some(commits) = wanted.remove(id) {
+                    held.extend(commits.into_iter().map(|commit| commit.as_str().to_owned()));
+                }
+                !wanted.is_empty()
+            })
+            .await?;
+        }
+        Ok(vec![BundleTip {
+            commits: patch_ids
+                .commits
+                .iter()
+                .map(|(commit, _)| commit.as_str().to_owned())
+                .collect(),
+            held,
+        }])
+    }
+
+    /// [`Self::measure_bundle`] for a bundle no cheaper proof covers: it is fetched into a scratch
+    /// bare repository beside it, with this repository's objects attached read-only, so neither
+    /// this repository nor the bundle changes, and each tip its header advertises is measured
+    /// there. The scratch is removed before answering. A bundle requiring commits this
+    /// repository lacks is refused before anything is fetched: no fetch could measure it.
+    #[cfg(any(target_os = "macos", test))]
+    async fn measure_fetched(
+        &self,
+        bundle: &Path,
+        header: &BundleHeader,
         target_tip: &str,
     ) -> Result<Vec<BundleTip>> {
         let parent = bundle.parent().ok_or_else(|| {
@@ -1553,6 +1727,16 @@ impl GitRepository {
                 "repair the cowshed store, then cowshed gc",
             )
         })?;
+        let prerequisites: Vec<&str> = header.prerequisites.iter().map(GitOid::as_str).collect();
+        if !prerequisites.is_empty() && !self.holds_commits(&prerequisites).await? {
+            return Err(CowshedError::integrity(
+                format!(
+                    "abandon bundle {} requires commits this repository lacks",
+                    bundle.display()
+                ),
+                "inspect the bundle, then cowshed gc",
+            ));
+        }
         let target_objects = self.object_directory().await?;
         let scratch = GitScratch::create(parent, ScratchUse::BundleVerification)?;
         let measured = async {
@@ -1569,30 +1753,7 @@ impl GitRepository {
                     &output,
                 ));
             }
-            let listed = run_git_bundle_at(
-                &scratch.path,
-                None,
-                [
-                    OsStr::new("bundle"),
-                    OsStr::new("list-heads"),
-                    bundle.as_os_str(),
-                ],
-            )
-            .await?;
-            if !listed.status.success() {
-                return Err(bundle_artifact_error(
-                    "list the abandon bundle's tips",
-                    &listed,
-                ));
-            }
-            let tips: Vec<String> = parse_lines(&listed.stdout, "abandon bundle tip")?
-                .into_iter()
-                .filter_map(|line| line.split_once(' ').map(|(_, name)| name.to_owned()))
-                .collect();
-            if tips.is_empty() {
-                return Ok(Vec::new());
-            }
-            let fetched: Vec<String> = (0..tips.len())
+            let fetched: Vec<String> = (0..header.tips.len())
                 .map(|index| format!("refs/measured/{index}"))
                 .collect();
             let mut fetch = vec![
@@ -1602,9 +1763,11 @@ impl GitRepository {
                 bundle.as_os_str().to_owned(),
             ];
             fetch.extend(
-                tips.iter()
+                header
+                    .tips
+                    .iter()
                     .zip(&fetched)
-                    .map(|(tip, local)| OsString::from(format!("{tip}:{local}"))),
+                    .map(|(tip, local)| OsString::from(format!("{}:{local}", tip.refname))),
             );
             let output = run_git_bundle_at(&scratch.path, Some(&target_objects), fetch).await?;
             if !output.status.success() {
@@ -1615,22 +1778,8 @@ impl GitRepository {
             }
             let measuring = Self::from_root(&self.store_root, &scratch.path)
                 .with_alternate_objects(target_objects.clone())?;
-            let mut measured = Vec::with_capacity(fetched.len());
-            for tip in &fetched {
-                let range = format!("{target_tip}..{tip}");
-                let listed = measuring.run(["rev-list", range.as_str()]).await?;
-                if !listed.status.success() {
-                    return Err(git_internal(
-                        "list an abandon bundle tip's commits",
-                        &listed,
-                    ));
-                }
-                measured.push(BundleTip {
-                    commits: parse_lines(&listed.stdout, "abandon bundle commit")?,
-                    held: measuring.held_commits(target_tip, tip).await?,
-                });
-            }
-            Ok(measured)
+            let fetched: Vec<&str> = fetched.iter().map(String::as_str).collect();
+            measuring.measure_tips(target_tip, &fetched).await
         }
         .await;
         let cleanup = scratch.cleanup().await;
@@ -1662,6 +1811,11 @@ impl GitRepository {
     /// and keeps it: the artifact is written once. A new bundle is written beside its final name
     /// and renamed into place once verified, so no attempt shares git's lock file with another
     /// writer of the same name, and the final name never holds a partial bundle.
+    ///
+    /// With a target, the bundle's patch-identity sidecar ([`AbandonPatchIds`], at
+    /// [`crate::storage::recovery::abandon_bundle_sidecar`]) is published the same way and before
+    /// the bundle, so `gc` measures the bundle without reading its pack. A retry that keeps its
+    /// bundle writes the sidecar the bundle lacks.
     pub async fn bundle_commits(
         &self,
         destination: &Path,
@@ -1686,12 +1840,30 @@ impl GitRepository {
                 "repair the cowshed store and retry removal",
             )
         })?;
+        let sidecar = crate::storage::recovery::abandon_bundle_sidecar(destination);
         if existing {
             match self
                 .verify_bundle(destination, heads, &expected_heads, target, commit_count)
                 .await
             {
-                Ok(()) => return Ok(commit_count),
+                Ok(()) => {
+                    if let Some(target) = target {
+                        let present = tokio::fs::try_exists(&sidecar).await.map_err(|error| {
+                            CowshedError::environment_missing(
+                                format!(
+                                    "cannot inspect abandonment bundle sidecar {}: {error}",
+                                    sidecar.display()
+                                ),
+                                "repair the cowshed store and retry removal",
+                            )
+                        })?;
+                        if !present {
+                            let patch_ids = self.abandon_patch_ids(target, &expected_heads).await?;
+                            publish_patch_ids(&sidecar, &patch_ids).await?;
+                        }
+                    }
+                    return Ok(commit_count);
+                }
                 Err(error) => cowshed_os::eprintln!(
                     "cowshed: replacing {}, which does not hold this range: {}",
                     destination.display(),
@@ -1699,22 +1871,7 @@ impl GitRepository {
                 ),
             }
         }
-        let file_name = destination.file_name().ok_or_else(|| {
-            CowshedError::integrity(
-                format!(
-                    "abandonment bundle has no file name: {}",
-                    destination.display()
-                ),
-                "repair the cowshed store and retry removal",
-            )
-        })?;
-        let mut staged_name = OsString::from(".");
-        staged_name.push(file_name);
-        staged_name.push(format!(".{}.partial", uuid::Uuid::new_v4().simple()));
-        let mut staged = StagedBundle {
-            path: destination.with_file_name(staged_name),
-            settled: false,
-        };
+        let mut staged = StagedBundle::beside(destination)?;
         let mut args = vec![
             OsString::from("bundle"),
             OsString::from("create"),
@@ -1724,12 +1881,20 @@ impl GitRepository {
         if let Some(target) = target {
             args.push(OsString::from(target));
         }
+        let mut sidecar_published = false;
         let written = async {
             let output =
                 run_git_bundle_at(&self.root, self.alternate_objects.as_deref(), args).await?;
             ensure_git_success("write commit bundle", output)?;
             self.verify_bundle(&staged.path, heads, &expected_heads, target, commit_count)
                 .await?;
+            // The sidecar goes into place before its bundle, so the bundle never stands at its
+            // final name without the sidecar measured for it.
+            if let Some(target) = target {
+                let patch_ids = self.abandon_patch_ids(target, &expected_heads).await?;
+                publish_patch_ids(&sidecar, &patch_ids).await?;
+                sidecar_published = true;
+            }
             tokio::fs::rename(&staged.path, destination)
                 .await
                 .map_err(|error| {
@@ -1745,22 +1910,229 @@ impl GitRepository {
         .await;
         let result = match written {
             Ok(()) => Ok(commit_count),
-            Err(error) => Err(match tokio::fs::remove_file(&staged.path).await {
-                Ok(()) => error,
-                Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
-                Err(cleanup) => CowshedError::new(
-                    error.code,
-                    format!(
-                        "{}; the partial bundle {} could not be removed either: {cleanup}",
-                        error.message,
-                        staged.path.display()
-                    ),
-                    error.hint,
-                ),
-            }),
+            Err(error) => {
+                let error = discard_partial(&staged.path, "the partial bundle", error).await;
+                Err(if sidecar_published {
+                    discard_partial(&sidecar, "its sidecar", error).await
+                } else {
+                    error
+                })
+            }
         };
         staged.settled = true;
         result
+    }
+
+    /// What each commit `heads` carry beyond `target` is, for the patch-identity sidecar of their
+    /// abandon bundle: a patch identity, a merge that authors nothing, or opaque
+    /// ([`CarriedCommit`]); with the target and the base the identities are later compared above.
+    /// `heads` are commit oids; `target` is any revision of a commit.
+    async fn abandon_patch_ids(&self, target: &str, heads: &[String]) -> Result<AbandonPatchIds> {
+        let target_commit = format!("{target}^{{commit}}");
+        let target = parse_oid(
+            self.read_one(
+                ["rev-parse", target_commit.as_str()],
+                "read abandonment target",
+            )
+            .await?,
+            "abandonment target",
+        )?;
+        let mut base_args = vec!["merge-base", "--octopus", target.as_str()];
+        base_args.extend(heads.iter().map(String::as_str));
+        let based = self.run(&base_args).await?;
+        let base = match based.status.code() {
+            Some(0) => Some(parse_oid(
+                parse_one_string(&based.stdout, "abandonment base")?,
+                "abandonment base",
+            )?),
+            // Exit 1 with no answer is git's: the target and the heads share no history.
+            Some(1) if based.stdout.is_empty() => None,
+            _ => return Err(git_internal("find the abandonment's common base", &based)),
+        };
+        let exclude = format!("^{target}");
+        let mut revisions = vec![exclude.as_str()];
+        revisions.extend(heads.iter().map(String::as_str));
+        let listed = self.run(["rev-list"].iter().chain(&revisions)).await?;
+        if !listed.status.success() {
+            return Err(git_internal("list the abandoned commits", &listed));
+        }
+        let merges_listed = self
+            .run(["rev-list", "--merges"].iter().chain(&revisions))
+            .await?;
+        if !merges_listed.status.success() {
+            return Err(git_internal("list the abandoned merges", &merges_listed));
+        }
+        let merges: std::collections::BTreeSet<String> =
+            parse_lines(&merges_listed.stdout, "abandoned merge")?
+                .into_iter()
+                .collect();
+        let mut content_free = std::collections::BTreeSet::new();
+        if !merges.is_empty() {
+            for head in heads {
+                content_free.extend(self.content_free_merges(target.as_str(), head).await?);
+            }
+        }
+        let mut identities = std::collections::HashMap::new();
+        self.stream_patch_ids(&revisions, |id, commit| {
+            identities.insert(commit.to_owned(), id.to_owned());
+            true
+        })
+        .await?;
+        let commits = parse_lines(&listed.stdout, "abandoned commit")?
+            .into_iter()
+            .map(|commit| -> Result<(GitOid, CarriedCommit)> {
+                let carried = if !merges.contains(&commit) {
+                    identities
+                        .remove(&commit)
+                        .map_or(CarriedCommit::Opaque, CarriedCommit::Patch)
+                } else if content_free.contains(&commit) {
+                    CarriedCommit::ContentFreeMerge
+                } else {
+                    CarriedCommit::Opaque
+                };
+                Ok((parse_oid(commit, "abandoned commit")?, carried))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let heads = heads
+            .iter()
+            .map(|head| parse_oid(head.clone(), "abandoned head"))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AbandonPatchIds {
+            target,
+            base,
+            heads,
+            commits,
+        })
+    }
+
+    /// `git log --patch` of the non-merge commits `revisions` select, piped straight into
+    /// `git patch-id --stable`: each `(patch id, commit)` patch-id prints goes to `visit` as it
+    /// arrives, and `visit` answers whether to read on. Answering `false` kills both gits, so a
+    /// caller that has seen everything it looks for reads no more history. The diff options are
+    /// pinned ([`PATCH_ID_LOG`]), never read from the repository's config, so a commit's identity
+    /// does not depend on the repository that computed it: a workspace writes a sidecar of them
+    /// and main's are compared with it.
+    // WHY unbounded: two gits with hooks off and drivers off or confined by the workspace Git
+    // sandbox (`git_command_with_objects`): `git log` waits on nothing but the pipe `git patch-id`
+    // drains, and `git patch-id` on nothing but that pipe, which ends when `git log` exits. A read
+    // that stops early kills both, and each is reaped once its pipes are drained.
+    #[allow(clippy::disallowed_methods)]
+    async fn stream_patch_ids(
+        &self,
+        revisions: &[&str],
+        mut visit: impl FnMut(&str, &str) -> bool,
+    ) -> Result<()> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+        let git = || {
+            git_command_with_objects(
+                #[cfg(target_os = "macos")]
+                &self.store_root,
+                &self.root,
+                self.alternate_objects.as_deref(),
+                #[cfg(target_os = "macos")]
+                None,
+            )
+        };
+        let mut log = git()?
+            .args(PATCH_ID_LOG)
+            .args(revisions)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()
+            .map_err(|error| git_spawn_error(&error))?;
+        let patches: std::process::Stdio = log
+            .stdout
+            .take()
+            .ok_or_else(|| CowshedError::internal("git log started without its stdout"))?
+            .try_into()
+            .map_err(|error: std::io::Error| git_spawn_error(&error))?;
+        let mut ids = git()?
+            .args(["patch-id", "--stable"])
+            .stdin(patches)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()
+            .map_err(|error| git_spawn_error(&error))?;
+        let (Some(log_stderr), Some(ids_stdout), Some(ids_stderr)) =
+            (log.stderr.take(), ids.stdout.take(), ids.stderr.take())
+        else {
+            return Err(CowshedError::internal(
+                "git log and git patch-id started without their pipes",
+            ));
+        };
+        let read = async {
+            let mut lines = tokio::io::BufReader::new(ids_stdout).lines();
+            let read: Result<bool> = loop {
+                match lines.next_line().await {
+                    Ok(None) => break Ok(true),
+                    Ok(Some(line)) => match line.split_once(' ') {
+                        Some((id, commit)) if is_object_name(id) && is_object_name(commit) => {
+                            if !visit(id, commit) {
+                                break Ok(false);
+                            }
+                        }
+                        _ => {
+                            break Err(CowshedError::integrity(
+                                format!("git patch-id printed an unreadable line: {line:?}"),
+                                "repair the git installation",
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        break Err(CowshedError::internal(format!(
+                            "cannot read git patch-id's answers: {error}"
+                        )));
+                    }
+                }
+            };
+            if !matches!(read, Ok(true)) {
+                // A read that stopped leaves both gits blocked on pipes nobody drains: kill them,
+                // so their stderr ends and they can be reaped.
+                for child in [&mut log, &mut ids] {
+                    if let Err(error) = child.start_kill() {
+                        return Err(git_spawn_error(&error));
+                    }
+                }
+            }
+            read
+        };
+        let drain = |mut stream: tokio::process::ChildStderr| async move {
+            let mut said = Vec::new();
+            stream.read_to_end(&mut said).await.map(|_| said)
+        };
+        let (read, log_said, ids_said) = tokio::join!(read, drain(log_stderr), drain(ids_stderr));
+        let ids_status = ids.wait().await.map_err(|error| git_spawn_error(&error))?;
+        let log_status = log.wait().await.map_err(|error| git_spawn_error(&error))?;
+        if !read? {
+            return Ok(());
+        }
+        let said = |stream: std::io::Result<Vec<u8>>| {
+            stream.map_err(|error| {
+                CowshedError::internal(format!("cannot read what git said: {error}"))
+            })
+        };
+        if !ids_status.success() {
+            return Err(git_internal(
+                "compute patch identities",
+                &Output {
+                    status: ids_status,
+                    stdout: Vec::new(),
+                    stderr: said(ids_said)?,
+                },
+            ));
+        }
+        if !log_status.success() {
+            return Err(git_internal(
+                "list the patches to identify",
+                &Output {
+                    status: log_status,
+                    stdout: Vec::new(),
+                    stderr: said(log_said)?,
+                },
+            ));
+        }
+        Ok(())
     }
 
     /// Prove the artifact works in the environment its promise names: a repository with no
@@ -5363,8 +5735,9 @@ pub fn is_hidden_path(path: &[u8]) -> bool {
         .any(|component| component.first() == Some(&b'.'))
 }
 
-/// One tip an abandon bundle advertises, measured by [`GitRepository::measure_bundle`]: the
-/// commits it carries beyond the target, and those of them the target holds by patch identity.
+/// One tip an abandon bundle advertises, measured by [`GitRepository::measure_bundle`] (or, when
+/// measured from its sidecar, all of them at once): the commits it carries beyond the target, and
+/// those of them the target holds by patch identity.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BundleTip {
@@ -5383,6 +5756,381 @@ pub(crate) fn bundle_is_held(tips: &[BundleTip]) -> bool {
         && tips
             .iter()
             .all(|tip| tip.commits.iter().all(|commit| tip.held.contains(commit)))
+}
+
+/// The longest header [`read_bundle_header`] reads: a bundle cowshed writes advertises a handful
+/// of refs, so a header past this is refused rather than read on.
+#[cfg(any(target_os = "macos", test))]
+const BUNDLE_HEADER_LIMIT: u64 = 1 << 20;
+
+/// The longest line [`read_bundle_header`] accepts in a bundle's header.
+#[cfg(any(target_os = "macos", test))]
+const BUNDLE_HEADER_LINE_LIMIT: usize = 64 << 10;
+
+/// One ref a bundle's header advertises: the object it names and the ref's name.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BundleHeaderTip {
+    oid: GitOid,
+    refname: String,
+}
+
+/// What a git bundle's header declares (`gitformat-bundle(5)`): the commits it requires but does
+/// not carry, and the refs it advertises, in the bundle's order.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BundleHeader {
+    prerequisites: Vec<GitOid>,
+    tips: Vec<BundleHeaderTip>,
+}
+
+/// The signature a bundle's header starts with.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BundleVersion {
+    V2,
+    /// A v3 header may declare capabilities (`@<key>[=<value>]`) after its signature.
+    V3,
+}
+
+/// Read the header of the git bundle at `path`, line by line: its signature (`# v2 git bundle` or
+/// `# v3 git bundle`, whose `@capability` lines are skipped), its prerequisites
+/// (`-<oid>[ <comment>]`) and its refs (`<oid> <refname>`), up to the empty line that ends it.
+/// Nothing after that line is read, so the pack never is. A header longer than
+/// [`BUNDLE_HEADER_LIMIT`] or a line longer than [`BUNDLE_HEADER_LINE_LIMIT`] is refused, and so
+/// are an unknown signature, an unreadable line and a file that ends inside its header.
+#[cfg(any(target_os = "macos", test))]
+async fn read_bundle_header(path: &Path) -> Result<BundleHeader> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+    let refused = |reason: String| {
+        CowshedError::integrity(
+            format!(
+                "abandon bundle {} has an unreadable header: {reason}",
+                path.display()
+            ),
+            "inspect the bundle, then cowshed gc",
+        )
+    };
+    let unreadable = |error: std::io::Error| {
+        CowshedError::environment_missing(
+            format!("cannot read abandon bundle {}: {error}", path.display()),
+            "check controller storage permissions, then cowshed gc",
+        )
+    };
+    let object = |oid: &str| {
+        GitOid::new(oid)
+            .map_err(|error| refused(format!("{oid:?} is not a git object id: {error}")))
+    };
+    let file = tokio::fs::File::open(path).await.map_err(unreadable)?;
+    let mut reader = tokio::io::BufReader::new(file.take(BUNDLE_HEADER_LIMIT));
+    let mut header = BundleHeader::default();
+    let mut version = None;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        reader
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(unreadable)?;
+        if line.pop() != Some(b'\n') {
+            return Err(refused(if reader.get_ref().limit() == 0 {
+                format!("it is longer than {BUNDLE_HEADER_LIMIT} bytes")
+            } else {
+                "the file ends inside it".to_owned()
+            }));
+        }
+        if line.len() > BUNDLE_HEADER_LINE_LIMIT {
+            return Err(refused(format!(
+                "a line is longer than {BUNDLE_HEADER_LINE_LIMIT} bytes"
+            )));
+        }
+        let text =
+            std::str::from_utf8(&line).map_err(|_| refused("a line is not UTF-8".to_owned()))?;
+        let Some(known) = version else {
+            version = Some(match text {
+                "# v2 git bundle" => BundleVersion::V2,
+                "# v3 git bundle" => BundleVersion::V3,
+                other => return Err(refused(format!("unknown signature {other:?}"))),
+            });
+            continue;
+        };
+        if text.is_empty() {
+            return Ok(header);
+        }
+        if known == BundleVersion::V3 && text.starts_with('@') {
+            // A capability (`@object-format=sha256`, `@filter=...`) changes nothing measured here.
+            continue;
+        }
+        if let Some(prerequisite) = text.strip_prefix('-') {
+            let oid = prerequisite
+                .split_once(' ')
+                .map_or(prerequisite, |(oid, _)| oid);
+            header.prerequisites.push(object(oid)?);
+        } else {
+            let (oid, refname) = text
+                .split_once(' ')
+                .ok_or_else(|| refused(format!("unreadable line {text:?}")))?;
+            header.tips.push(BundleHeaderTip {
+                oid: object(oid)?,
+                refname: refname.to_owned(),
+            });
+        }
+    }
+}
+
+/// Whether `text` spells a full object name (an oid, or a patch identity) in either of git's
+/// hashes: 40 or 64 lowercase hex digits.
+fn is_object_name(text: &str) -> bool {
+    matches!(text.len(), 40 | 64)
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The `git log` [`GitRepository::stream_patch_ids`] pipes into `git patch-id --stable`, before
+/// its revisions. Every option that changes a commit's patch is pinned rather than left to the
+/// repository's config, so the workspace that writes a sidecar and main that reads it agree on
+/// every commit's identity.
+const PATCH_ID_LOG: &[&str] = &[
+    "log",
+    "--no-merges",
+    "--patch",
+    "--format=commit %H",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+    "--no-relative",
+    "--diff-algorithm=myers",
+    "--unified=3",
+    "--submodule=short",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--end-of-options",
+];
+
+/// The first line of an abandon bundle's patch-identity sidecar: its format and version.
+const PATCH_IDS_SIGNATURE: &str = "cowshed-abandon-patch-ids 1";
+
+/// What one commit an abandon bundle carries beyond its target is to `gc`, which drops the bundle
+/// only when main holds every one (02_workspaces.md, `rm` step 1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CarriedCommit {
+    /// An ordinary commit that changes something, held once main has a commit of this
+    /// `git patch-id --stable`.
+    Patch(String),
+    /// A merge that authors nothing of its own, held by its parents alone.
+    ContentFreeMerge,
+    /// A commit that changes nothing, or a merge carrying a resolution of its own: no identity
+    /// proves main holds it, so it is never held.
+    Opaque,
+}
+
+/// An abandon bundle's patch-identity sidecar, at
+/// [`crate::storage::recovery::abandon_bundle_sidecar`], written by
+/// [`GitRepository::bundle_commits`] so `gc` measures the bundle without reading its pack. As
+/// text, one record per line:
+///
+/// ```text
+/// cowshed-abandon-patch-ids 1
+/// target <oid>
+/// base <oid> | base none
+/// head <oid>                one per head
+/// patch <oid> <patch-id>    one per commit, in rev-list order: an ordinary commit,
+/// held <oid>                a merge that authors nothing,
+/// opaque <oid>              or a commit no identity proves held
+/// end <number of commit lines>
+/// ```
+///
+/// The `end` line makes a sidecar cut short unreadable, never one that is missing commits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AbandonPatchIds {
+    /// The target the bundle was written against. Once main descends from it, main reaches
+    /// everything it reaches, so only the commits below need proof.
+    target: GitOid,
+    /// The common ancestor of the target and every head (`git merge-base --octopus`), or none when
+    /// they share no history: main's commits beyond it are the ones the commits below are
+    /// compared with.
+    base: Option<GitOid>,
+    /// The commits the bundle advertises, so a sidecar is used only for the bundle it describes.
+    heads: Vec<GitOid>,
+    /// Each commit the heads carry beyond the target, in `git rev-list` order.
+    commits: Vec<(GitOid, CarriedCommit)>,
+}
+
+impl AbandonPatchIds {
+    fn render(&self) -> String {
+        let mut text = String::with_capacity(160 * (self.heads.len() + self.commits.len() + 4));
+        let mut line = |words: &[&str]| {
+            for (index, word) in words.iter().enumerate() {
+                if index > 0 {
+                    text.push(' ');
+                }
+                text.push_str(word);
+            }
+            text.push('\n');
+        };
+        line(&[PATCH_IDS_SIGNATURE]);
+        line(&["target", self.target.as_str()]);
+        line(&["base", self.base.as_ref().map_or("none", GitOid::as_str)]);
+        for head in &self.heads {
+            line(&["head", head.as_str()]);
+        }
+        for (commit, carried) in &self.commits {
+            match carried {
+                CarriedCommit::Patch(id) => line(&["patch", commit.as_str(), id.as_str()]),
+                CarriedCommit::ContentFreeMerge => line(&["held", commit.as_str()]),
+                CarriedCommit::Opaque => line(&["opaque", commit.as_str()]),
+            }
+        }
+        line(&["end", self.commits.len().to_string().as_str()]);
+        text
+    }
+
+    /// The sidecar `text` spells, or why it spells none.
+    #[cfg(any(target_os = "macos", test))]
+    fn parse(text: &str) -> std::result::Result<Self, String> {
+        let oid = |value: &str| {
+            GitOid::new(value).map_err(|error| format!("{value:?} is not a git object id: {error}"))
+        };
+        let mut lines = text.lines();
+        if lines.next() != Some(PATCH_IDS_SIGNATURE) {
+            return Err(format!("it does not start with `{PATCH_IDS_SIGNATURE}`"));
+        }
+        let target = match lines.next().and_then(|line| line.strip_prefix("target ")) {
+            Some(target) => oid(target)?,
+            None => return Err("its second line names no target".to_owned()),
+        };
+        let base = match lines.next().and_then(|line| line.strip_prefix("base ")) {
+            Some("none") => None,
+            Some(base) => Some(oid(base)?),
+            None => return Err("its third line names no base".to_owned()),
+        };
+        let mut heads = Vec::new();
+        let mut commits: Vec<(GitOid, CarriedCommit)> = Vec::new();
+        let mut end = None;
+        for line in lines {
+            if end.is_some() {
+                return Err(format!("a line follows its end: {line:?}"));
+            }
+            let unreadable = || format!("unreadable line {line:?}");
+            let (kind, rest) = line.split_once(' ').ok_or_else(unreadable)?;
+            match kind {
+                "head" if commits.is_empty() => heads.push(oid(rest)?),
+                "patch" => {
+                    let (commit, id) = rest.split_once(' ').ok_or_else(unreadable)?;
+                    if !is_object_name(id) {
+                        return Err(unreadable());
+                    }
+                    commits.push((oid(commit)?, CarriedCommit::Patch(id.to_owned())));
+                }
+                "held" => commits.push((oid(rest)?, CarriedCommit::ContentFreeMerge)),
+                "opaque" => commits.push((oid(rest)?, CarriedCommit::Opaque)),
+                "end" => end = Some(rest.parse::<usize>().map_err(|_| unreadable())?),
+                _ => return Err(unreadable()),
+            }
+        }
+        match end {
+            None => Err("it has no end line: it was cut short".to_owned()),
+            Some(count) if count != commits.len() => Err(format!(
+                "it ends after {count} commits but lists {}",
+                commits.len()
+            )),
+            Some(_) if heads.is_empty() => Err("it names no head".to_owned()),
+            Some(_) => Ok(Self {
+                target,
+                base,
+                heads,
+                commits,
+            }),
+        }
+    }
+
+    /// Whether this sidecar was written for a bundle whose header is `header`: one that
+    /// advertises exactly its heads.
+    #[cfg(any(target_os = "macos", test))]
+    fn describes(&self, header: &BundleHeader) -> bool {
+        let advertised: std::collections::BTreeSet<&GitOid> =
+            header.tips.iter().map(|tip| &tip.oid).collect();
+        let heads: std::collections::BTreeSet<&GitOid> = self.heads.iter().collect();
+        advertised == heads
+    }
+}
+
+/// The patch-identity sidecar at `sidecar`, or `None` when its bundle has none: one written before
+/// sidecars, or without a target. A sidecar that does not parse is refused, never ignored.
+#[cfg(any(target_os = "macos", test))]
+async fn read_patch_ids(sidecar: &Path) -> Result<Option<AbandonPatchIds>> {
+    let text = match tokio::fs::read_to_string(sidecar).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "cannot read abandon bundle sidecar {}: {error}",
+                    sidecar.display()
+                ),
+                "check controller storage permissions, then cowshed gc",
+            ));
+        }
+    };
+    AbandonPatchIds::parse(&text).map(Some).map_err(|reason| {
+        CowshedError::integrity(
+            format!(
+                "abandon bundle sidecar {} is unreadable: {reason}",
+                sidecar.display()
+            ),
+            "delete the sidecar so gc measures its bundle by fetching it, then cowshed gc",
+        )
+    })
+}
+
+/// Publish `patch_ids` at `sidecar`, the patch-identity sidecar of an abandon bundle: written and
+/// synced beside its final name, then renamed into place, so the final name never holds a partial
+/// sidecar.
+async fn publish_patch_ids(sidecar: &Path, patch_ids: &AbandonPatchIds) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let failed = |error: std::io::Error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot write abandonment bundle sidecar {}: {error}",
+                sidecar.display()
+            ),
+            "repair the cowshed store and retry removal",
+        )
+    };
+    let mut staged = StagedBundle::beside(sidecar)?;
+    let mut file = tokio::fs::File::create(&staged.path)
+        .await
+        .map_err(failed)?;
+    file.write_all(patch_ids.render().as_bytes())
+        .await
+        .map_err(failed)?;
+    file.sync_all().await.map_err(failed)?;
+    drop(file);
+    tokio::fs::rename(&staged.path, sidecar)
+        .await
+        .map_err(failed)?;
+    staged.settled = true;
+    Ok(())
+}
+
+/// `error`, once the file a failed write left at `path` is removed; a removal that fails too is
+/// said in it.
+async fn discard_partial(path: &Path, what: &str, error: CowshedError) -> CowshedError {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => error,
+        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup) => CowshedError::new(
+            error.code,
+            format!(
+                "{}; {what} {} could not be removed either: {cleanup}",
+                error.message,
+                path.display()
+            ),
+            error.hint,
+        ),
+    }
 }
 
 /// The ref [`GitRepository::commit_uncommitted`] points at the commit of a work tree's
@@ -6949,10 +7697,337 @@ mod tests {
         let tips = repo.measure_bundle(&bundle, &main).await.expect("measure");
         assert!(!bundle_is_held(&tips), "{tips:?}");
         assert_eq!(
-            fs::read_dir(&trash).expect("trash").count(),
-            2,
+            entry_names(&trash),
+            [
+                "work-picked.bundle",
+                "work-picked.bundle.patch-ids",
+                "work-unheld.bundle",
+                "work-unheld.bundle.patch-ids",
+            ],
             "measuring leaves no scratch behind"
         );
+    }
+
+    /// The names in `directory`, sorted: what measuring left there.
+    fn entry_names(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory)
+            .expect("read directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Cut the bundle at `path` right after the empty line that ends its header, dropping its
+    /// pack: whatever measures it afterwards can have read nothing but the header.
+    fn cut_to_header(path: &Path) {
+        let bytes = fs::read(path).expect("read bundle");
+        let end = bytes
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .expect("the bundle's header ends")
+            + 2;
+        assert!(
+            end < bytes.len(),
+            "the bundle carries a pack after its header"
+        );
+        fs::write(path, &bytes[..end]).expect("cut the bundle's pack off");
+    }
+
+    /// A standalone clone of `main` beside it, on branch `cowshed/<name>`, as a forked workspace
+    /// is: the commits it makes are in its own object store, never in main's.
+    fn workspace_of(main: &Path, name: &str) -> PathBuf {
+        let workspace = main.with_extension(name);
+        let status = Command::new("git")
+            .args(["clone", "-q"])
+            .arg(main)
+            .arg(&workspace)
+            .status_bounded()
+            .expect("clone workspace");
+        assert!(status.success());
+        git(&workspace, &["config", "user.name", "Cowshed Test"]);
+        git(
+            &workspace,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git(&workspace, &["switch", "-qc", &format!("cowshed/{name}")]);
+        workspace
+    }
+
+    /// A bundle whose every tip main holds is measured in main's repository from its header
+    /// alone: with its pack cut off and its sidecar gone, the picked work is still held and more
+    /// work still is not. Fetching the bundle, as measuring once did, reads the missing pack.
+    #[tokio::test]
+    async fn an_abandon_bundle_main_holds_the_tips_of_is_measured_from_its_header_alone() {
+        use super::bundle_is_held;
+        let store = crate::temp_root::FixtureStore::new();
+        let root = repository();
+        let repo = GitRepository::from_root(store.shared(), &root);
+        git(&root, &["checkout", "-q", "-b", "work"]);
+        let picked = commit_on(&root, "picked");
+        git(&root, &["checkout", "-q", "main"]);
+        commit_on(&root, "main-moves");
+        git(&root, &["cherry-pick", picked.as_str()]);
+        let main = git_stdout(&root, &["rev-parse", "main"]).trim().to_owned();
+        git(&root, &["checkout", "-q", "work"]);
+        let trash = root.parent().expect("scratch").join("trash");
+        fs::create_dir_all(&trash).expect("trash");
+
+        for (name, held) in [("picked", true), ("unheld", false)] {
+            if !held {
+                commit_on(&root, "unheld");
+            }
+            let bundle = trash.join(format!("work-{name}.bundle"));
+            repo.bundle_commits(&bundle, Some(main.as_str()), &["HEAD"])
+                .await
+                .expect("bundle the work");
+            cut_to_header(&bundle);
+            fs::remove_file(crate::storage::recovery::abandon_bundle_sidecar(&bundle))
+                .expect("drop the sidecar");
+            let tips = repo
+                .measure_bundle(&bundle, &main)
+                .await
+                .expect("measure from the header");
+            assert_eq!(bundle_is_held(&tips), held, "{name}: {tips:?}");
+        }
+        assert_eq!(
+            entry_names(&trash),
+            ["work-picked.bundle", "work-unheld.bundle"],
+            "measuring leaves no scratch behind"
+        );
+    }
+
+    /// A bundle of work main's store lacks is measured from its sidecar: once main takes the
+    /// abandoned commit's change as a commit of its own, the bundle is held; with uncommitted work
+    /// main lacks beside it, it is not. Both bundles have their packs cut off, so neither was
+    /// fetched, and measuring leaves nothing but the bundles and their sidecars in the trash.
+    #[tokio::test]
+    async fn an_abandon_bundle_main_lacks_the_tips_of_is_measured_from_its_sidecar() {
+        use super::{UNCOMMITTED_REF, bundle_is_held};
+        let store = crate::temp_root::FixtureStore::new();
+        let main_root = repository();
+        let main_repo = GitRepository::from_root(store.shared(), &main_root);
+        let workspace = workspace_of(&main_root, "abandoned");
+        let main_objects = main_repo
+            .object_directory()
+            .await
+            .expect("locate main object store");
+        let workspace_repo = GitRepository::from_root(store.shared(), &workspace)
+            .with_alternate_objects(main_objects)
+            .expect("attach main objects");
+        let forked_from = main_repo.head_oid().await.expect("read main");
+        commit_on(&workspace, "picked");
+        let trash = main_root.parent().expect("scratch").join("trash");
+        fs::create_dir_all(&trash).expect("trash");
+        let picked = trash.join("picked.bundle");
+        workspace_repo
+            .bundle_commits(&picked, Some(forked_from.as_str()), &["HEAD"])
+            .await
+            .expect("bundle the committed work");
+        fs::write(workspace.join("uncommitted"), "uncommitted\n").expect("uncommitted work");
+        let dirt = workspace_repo.dirty_paths_by(None).await.expect("dirt");
+        workspace_repo
+            .commit_uncommitted(&dirt, "abandoned")
+            .await
+            .expect("commit the dirt");
+        let abandoned = trash.join("abandoned.bundle");
+        workspace_repo
+            .bundle_commits(
+                &abandoned,
+                Some(forked_from.as_str()),
+                &["HEAD", UNCOMMITTED_REF],
+            )
+            .await
+            .expect("bundle the committed and uncommitted work");
+
+        // Main makes the abandoned commit's change itself: patch-equivalent, and never in main's
+        // store.
+        commit_on(&main_root, "main-moves");
+        commit_on(&main_root, "picked");
+        let main = main_repo.head_oid().await.expect("read main");
+        cut_to_header(&picked);
+        cut_to_header(&abandoned);
+
+        let tips = main_repo
+            .measure_bundle(&picked, main.as_str())
+            .await
+            .expect("measure from the sidecar");
+        assert!(bundle_is_held(&tips), "{tips:?}");
+        let tips = main_repo
+            .measure_bundle(&abandoned, main.as_str())
+            .await
+            .expect("measure from the sidecar");
+        assert!(!bundle_is_held(&tips), "{tips:?}");
+        assert_eq!(
+            entry_names(&trash),
+            [
+                "abandoned.bundle",
+                "abandoned.bundle.patch-ids",
+                "picked.bundle",
+                "picked.bundle.patch-ids",
+            ],
+            "measuring creates no verification scratch"
+        );
+    }
+
+    /// A bundle without a sidecar, as one written before sidecars is, whose tips main's store
+    /// lacks is still measured, by fetching it into a scratch the measurement removes: held once
+    /// main makes its change itself, not held while main lacks it.
+    #[tokio::test]
+    async fn an_abandon_bundle_without_a_sidecar_is_measured_by_fetching_it() {
+        use super::bundle_is_held;
+        let store = crate::temp_root::FixtureStore::new();
+        let main_root = repository();
+        let main_repo = GitRepository::from_root(store.shared(), &main_root);
+        let workspace = workspace_of(&main_root, "legacy");
+        let main_objects = main_repo
+            .object_directory()
+            .await
+            .expect("locate main object store");
+        let workspace_repo = GitRepository::from_root(store.shared(), &workspace)
+            .with_alternate_objects(main_objects)
+            .expect("attach main objects");
+        let forked_from = main_repo.head_oid().await.expect("read main");
+        let trash = main_root.parent().expect("scratch").join("trash");
+        fs::create_dir_all(&trash).expect("trash");
+        let mut bundles = Vec::new();
+        for (name, held) in [("picked", true), ("unheld", false)] {
+            commit_on(&workspace, name);
+            let bundle = trash.join(format!("{name}.bundle"));
+            workspace_repo
+                .bundle_commits(&bundle, Some(forked_from.as_str()), &["HEAD"])
+                .await
+                .expect("bundle the work");
+            fs::remove_file(crate::storage::recovery::abandon_bundle_sidecar(&bundle))
+                .expect("drop the sidecar");
+            bundles.push((bundle, held));
+        }
+        commit_on(&main_root, "main-moves");
+        commit_on(&main_root, "picked");
+        let main = main_repo.head_oid().await.expect("read main");
+
+        for (bundle, held) in &bundles {
+            let tips = main_repo
+                .measure_bundle(bundle, main.as_str())
+                .await
+                .expect("measure by fetching");
+            assert_eq!(
+                bundle_is_held(&tips),
+                *held,
+                "{}: {tips:?}",
+                bundle.display()
+            );
+        }
+        assert_eq!(
+            entry_names(&trash),
+            ["picked.bundle", "unheld.bundle"],
+            "measuring removes its scratch"
+        );
+    }
+
+    /// A bundle's header is read up to the empty line that ends it and never past it: v2 and v3
+    /// (its capabilities skipped), prerequisites with and without a comment, refs in order. An
+    /// unknown signature, a file that ends inside its header, and an oversized line or header are
+    /// refused.
+    #[tokio::test]
+    async fn a_bundle_header_is_read_up_to_its_end_and_no_further() {
+        use super::{
+            BUNDLE_HEADER_LIMIT, BUNDLE_HEADER_LINE_LIMIT, BundleHeader, BundleHeaderTip,
+            read_bundle_header,
+        };
+        use crate::api::dto::GitOid;
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-bundle-header",
+        );
+        let write = |name: &str, bytes: Vec<u8>| -> PathBuf {
+            let path = scratch.join(name);
+            fs::write(&path, bytes).expect("write bundle");
+            path
+        };
+        let oid = |digit: char| GitOid::new(digit.to_string().repeat(40)).expect("oid");
+        let (a, b, c) = (oid('a'), oid('b'), oid('c'));
+        let pack: &[u8] = b"PACK\0\0\0\x02\xff\xfe not a header line\n";
+        let tip = |oid: &GitOid, refname: &str| BundleHeaderTip {
+            oid: oid.clone(),
+            refname: refname.to_owned(),
+        };
+
+        let v2 = write(
+            "v2.bundle",
+            [
+                format!("# v2 git bundle\n-{a} the prerequisite's subject\n{b} refs/heads/work\n{c} HEAD\n\n")
+                    .as_bytes(),
+                pack,
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            read_bundle_header(&v2).await.expect("v2 header"),
+            BundleHeader {
+                prerequisites: vec![a.clone()],
+                tips: vec![tip(&b, "refs/heads/work"), tip(&c, "HEAD")],
+            }
+        );
+
+        let v3 = write(
+            "v3.bundle",
+            [
+                format!("# v3 git bundle\n@object-format=sha1\n@filter=blob:none\n-{a}\n{b} refs/heads/work\n\n")
+                    .as_bytes(),
+                pack,
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            read_bundle_header(&v3).await.expect("v3 header"),
+            BundleHeader {
+                prerequisites: vec![a.clone()],
+                tips: vec![tip(&b, "refs/heads/work")],
+            }
+        );
+
+        let long_header_lines =
+            usize::try_from(BUNDLE_HEADER_LIMIT).expect("the limit fits in usize") / 40;
+        for (name, bytes, refusal) in [
+            (
+                "unknown.bundle",
+                format!("# v4 git bundle\n{b} HEAD\n\n"),
+                "unknown signature",
+            ),
+            (
+                "cut.bundle",
+                format!("# v2 git bundle\n{b} HEAD\n"),
+                "the file ends inside it",
+            ),
+            (
+                "long-line.bundle",
+                format!(
+                    "# v2 git bundle\n{b} refs/heads/{}\n\n",
+                    "x".repeat(BUNDLE_HEADER_LINE_LIMIT)
+                ),
+                "a line is longer than",
+            ),
+            (
+                "long-header.bundle",
+                format!(
+                    "# v2 git bundle\n{}\n",
+                    format!("{b} HEAD\n").repeat(long_header_lines)
+                ),
+                "it is longer than",
+            ),
+        ] {
+            let error = read_bundle_header(&write(name, bytes.into_bytes()))
+                .await
+                .expect_err(name);
+            assert!(error.message.contains(refusal), "{name}: {error:?}");
+        }
     }
 
     /// An abandonment commits the work tree's dirt as one commit on top of HEAD through a private
@@ -9466,6 +10541,10 @@ mod tests {
             .await
             .expect("a lock at the bundle's name cannot fail the removal");
         let first = fs::metadata(&bundle).expect("bundle written").ino();
+        let sidecar = crate::storage::recovery::abandon_bundle_sidecar(&bundle);
+        assert!(sidecar.is_file(), "the bundle is written with its sidecar");
+        fs::remove_file(&sidecar)
+            .expect("drop the sidecar, as a bundle written before them lacks one");
         let retried = repo
             .bundle_commits(&bundle, Some(base.as_str()), &["HEAD"])
             .await
@@ -9476,6 +10555,10 @@ mod tests {
             fs::metadata(&bundle).expect("bundle kept").ino(),
             first,
             "a retry keeps the verified bundle rather than writing a second one over it"
+        );
+        assert!(
+            sidecar.is_file(),
+            "a retry that keeps its bundle writes the sidecar the bundle lacks"
         );
     }
 

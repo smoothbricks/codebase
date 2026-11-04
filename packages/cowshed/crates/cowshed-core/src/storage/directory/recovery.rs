@@ -1081,6 +1081,11 @@ impl DirectoryExecutionHost {
                 StorageGcReason::AbandonedBundle => fs::remove_file(path)
                     .map_err(|error| io_error("remove abandon bundle", path, error))
                     .and_then(|()| {
+                        crate::storage::recovery::remove_abandon_bundle_sidecar(path).map_err(
+                            |error| io_error("remove abandon bundle patch-ids", path, error),
+                        )
+                    })
+                    .and_then(|()| {
                         deletion_log::log_deletion(
                             project,
                             DeletionOp::RemoveAbandonedBundle,

@@ -145,3 +145,22 @@ Both arms serialized byte-identical `AbandonedRefs`. Two earlier before-runs too
 Two costs remain. `git cherry` recomputes main's patch-ids for every tip: 12.2 s summed over the 36 tips, unsandboxed.
 The 599 merges cost about 30 ms each, about 18 s. Keying a stored per-file verdict by the base, head and target blob ids
 would skip only the merges of files main has not touched since the previous gc. It is not built.
+
+## Held-bundle sweep: header and patch-ids, beside the router
+
+`gc`'s held-bundle measurement (`cowshed-core/src/git.rs` `measure_bundle`, formerly lines 1535–1646) fetched every
+abandon bundle in the trash whole into a `.bundle-verify` scratch, on every plain `gc`, inside the project's serial
+router route (`runtime/project.rs` `drop_held_bundles`, formerly line 3737, called from `gc` at 15781). Abandon bundles
+are self-contained by design, about 146 MB each. One of them, measured 2026-11-04 at load average 10: the fetch took
+6.78 s real, 14.7 s user and 943 MB maximum RSS (index-pack resolving the whole pack, 152 MB copied into the scratch);
+init, `bundle list-heads`, `rev-list`, `cherry` and `log --merges` took about 10 ms each. A coordinator retiring ten
+sheds over a trash of 19 such bundles ran ten such gcs back to back, about two minutes each at load 55, and every exec,
+info and provision of the project waited behind them in the router.
+
+Now the router reads only the trash listing and main's tip; the sweep runs in its own task (`runtime/held_bundles.rs`),
+and requests queued while one runs are answered by the next one. A bundle measured unheld is recorded by file identity
+and main's tip and not measured again until either changes. The measurement reads the header up to its blank line (0.01
+s, 7.5 MB), measures tips main's store holds in place, and otherwise compares the `<bundle>.patch-ids` sidecar the
+removal wrote with `git log -p --no-merges ^<base> main | git patch-id --stable`, streamed and stopped once every wanted
+id is found: 0.09 s and 58 MB over 15 commits past a retired shed's base. A bundle written before the sidecar is
+measured by the old fetch once per file and main tip.

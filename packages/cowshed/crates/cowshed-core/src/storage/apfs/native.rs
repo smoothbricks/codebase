@@ -3255,6 +3255,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         fs::remove_file(candidate.path()).map_err(|error| {
                             io_error("remove abandon bundle", candidate.path(), error)
                         })?;
+                        crate::storage::recovery::remove_abandon_bundle_sidecar(candidate.path())
+                            .map_err(|error| {
+                            io_error("remove abandon bundle patch-ids", candidate.path(), error)
+                        })?;
                         deletion_log::log_deletion(
                             project,
                             DeletionOp::RemoveAbandonedBundle,

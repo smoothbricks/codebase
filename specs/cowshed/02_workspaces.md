@@ -1444,18 +1444,25 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    the workspace's own index, HEAD and branches are untouched. An in-progress operation's own state (`MERGE_HEAD`, a
    rebase's plan) is not kept; its work tree is. No image is kept (step 5). The bundle is written beside that name and
    renamed into place once verified; a retried removal that finds a bundle verifying for the same range keeps it instead
-   of writing another. The bundle is the only copy: nothing is written into main's repository, whose refs are the
-   branches people check out and the ones `push` writes, never a namespace per abandonment that nobody reads. It stays
-   in the trash until main holds every commit it carries by patch identity, when a plain `gc` drops it as `heldBundle`:
-   each commit a tip carries beyond main is one `git cherry` marks `-` (and changes something) or a merge that authors
-   nothing, and a tip carrying nothing beyond main is held by ancestry; a bundle that advertises no tip is kept.
-   `gc --abandoned` releases every bundle (01_storage.md, "Retention"). The report names it (`AbandonedWork.bundle`),
-   and `AbandonedWork.preserved` says what else keeps the tips: absent (`bundleOnly`) for every session abandonment;
-   `nothingToPreserve` for main's own `--restore --abandon` (below), where main is what is being restored and its bundle
-   is the copy; or `preserved` with each ref, in a record an earlier build wrote when abandonments also wrote refs into
-   main's repository, which no build writes or reads now. A measurement's files (`unlandedPaths`) are `named`, or
-   `predatesPaths` for a record from a build that counted commits by patch identity and named no file. A command
-   reporting a predating record warns once on stderr, naming what it does not record (00_overview.md).
+   of writing another. The bundle is self-contained: the target it was measured against travels in it as a positive
+   revision, never as a prerequisite, so restoring it needs nothing main keeps, since a main rewritten past that target
+   would orphan a thin bundle's prerequisites. Beside it the removal writes `<bundle>.patch-ids`, which names the
+   target, the merge base, and each commit the bundle carries beyond the target with its stable patch-id (a merge that
+   authors nothing is marked held, anything else opaque). A plain `gc` reads the bundle's header and this file and never
+   the bundle's pack; it runs beside the project's serial router, not in its route, and a bundle it found unheld is
+   measured again only once the file or main's tip changes. The bundle is the only copy: nothing is written into main's
+   repository, whose refs are the branches people check out and the ones `push` writes, never a namespace per
+   abandonment that nobody reads. It stays in the trash until main holds every commit it carries by patch identity, when
+   a plain `gc` drops it as `heldBundle`: each commit a tip carries beyond main is one `git cherry` marks `-` (and
+   changes something) or a merge that authors nothing, and a tip carrying nothing beyond main is held by ancestry; a
+   bundle that advertises no tip is kept. `gc --abandoned` releases every bundle (01_storage.md, "Retention"). The
+   report names it (`AbandonedWork.bundle`), and `AbandonedWork.preserved` says what else keeps the tips: absent
+   (`bundleOnly`) for every session abandonment; `nothingToPreserve` for main's own `--restore --abandon` (below), where
+   main is what is being restored and its bundle is the copy; or `preserved` with each ref, in a record an earlier build
+   wrote when abandonments also wrote refs into main's repository, which no build writes or reads now. A measurement's
+   files (`unlandedPaths`) are `named`, or `predatesPaths` for a record from a build that counted commits by patch
+   identity and named no file. A command reporting a predating record warns once on stderr, naming what it does not
+   record (00_overview.md).
 
    Every retirement, abandoned or not, appends a `retire-workspace` line to the project's `deletion-log.jsonl`
    (01_storage.md) once the source release is committed: the head and every local branch tip read before the image went,

@@ -275,7 +275,9 @@ pub trait ProjectRuntimeHost: Send + 'static {
         workspace: WorkspaceName,
         options: RemoveOptions,
     ) -> Result<RemoveReport>;
-    async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
+    /// Its answer may arrive after the route ends: a plain sweep's held-bundle measurement runs
+    /// beside the router actor, which serves the next call meanwhile.
+    async fn gc(&mut self, options: GcOptions) -> Result<JobAnswer<GcReport>>;
     /// The session workspaces a listing does not show: clones whose create or fork never
     /// published them. `remove` retires them like any other.
     async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>>;
@@ -1555,7 +1557,10 @@ impl ProjectActor {
             }
             Op::CoordinatorGc(params) => {
                 self.require_repo(&params.repo_id)?;
-                respond::<operations::CoordinatorGc>(&self.host.gc(params.options).await?)
+                let collected = self.host.gc(params.options).await?;
+                return Ok(Routed::Later(Box::pin(async move {
+                    respond::<operations::CoordinatorGc>(&collected.await?)
+                })));
             }
             Op::CoordinatorRemoveProject(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -2396,7 +2401,7 @@ async fn remove_project(
         let report = host.remove(workspace.clone(), session_removal).await?;
         removed.push(RemovedWorkspace { workspace, report });
     }
-    let collected = host.gc(GcOptions::default()).await?;
+    let collected = host.gc(GcOptions::default()).await?.await?;
     let deleted_bundles = if options.abandon {
         host.delete_abandon_bundles().await?
     } else {
@@ -2645,6 +2650,8 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     /// Retirement may archive this project's storage only after every actor and healer releases it.
     /// The unbinding that ends a main restore removes it ([`Self::remove_unbound_lease`]).
     retirement_lease: crate::project_retirement::ProjectReadLease,
+    /// The plain `gc`'s held-bundle sweeper, started by the first sweep with bundles to measure.
+    held_bundles: Option<super::held_bundles::HeldBundles>,
 }
 
 /// Who runs a workspace's supervisor.
@@ -3729,19 +3736,11 @@ fn plan_empty_directories_on(path: &Path, device: u64, plan: &mut Vec<PathBuf>) 
 }
 #[cfg(target_os = "macos")]
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
-    /// Drop every abandon bundle in the trash that main holds every commit of by patch identity
-    /// (02_workspaces.md, `rm` step 1): it keeps nothing main lacks
-    /// ([`crate::git::bundle_is_held`]). Each deletion is journaled as `remove-abandoned-bundle`;
-    /// with `dry_run` the bundles are only named. A bundle that cannot be measured is kept and said
-    /// on stderr, and a detached main measures none.
-    async fn drop_held_bundles(
-        &mut self,
-        dry_run: bool,
-    ) -> Result<Vec<crate::api::dto::GcCandidate>> {
-        use sha2::Digest as _;
-        use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::fs::MetadataExt as _;
-
+    /// What a plain `gc`'s held-bundle sweep measures (02_workspaces.md, `rm` step 1), read in the
+    /// actor: the abandon bundles in the trash and main's tip. The measurement runs beside the
+    /// actor ([`super::held_bundles`]). `None` when the trash keeps no bundle, main has no landing
+    /// branch, or main is detached, whose repository is what has to hold their commits.
+    async fn held_bundle_sweep(&mut self) -> Result<Option<super::held_bundles::Sweep>> {
         let trash = self
             .layout
             .project()
@@ -3754,7 +3753,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     CowshedError::internal(format!("abandon bundle task failed: {error}"))
                 })??;
         if bundles.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let main = self.current(&main_name()).await?;
         if !matches!(
@@ -3765,7 +3764,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 "cowshed: gc measured no abandon bundle: main is detached, and its repository is \
                  what has to hold their commits"
             );
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let store_root = std::sync::Arc::clone(self.git.store_root());
         let main_root = self.workspace_mount_path(&main_name())?;
@@ -3776,73 +3775,21 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         )
         .await?
         else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
-        let main_git = crate::git::GitRepository::from_root(&store_root, &main_root);
-        let project_root = self.layout.project().project_root.clone();
-        let mut held = Vec::new();
-        for bundle in bundles {
-            let tips = match main_git.measure_bundle(&bundle, tip.as_str()).await {
-                Ok(tips) => tips,
-                Err(error) => {
-                    cowshed_os::eprintln!(
-                        "cowshed: kept abandon bundle {}: cannot measure it against main: {}",
-                        bundle.display(),
-                        error.message
-                    );
-                    continue;
-                }
-            };
-            if !crate::git::bundle_is_held(&tips) {
-                continue;
-            }
-            let metadata = tokio::fs::symlink_metadata(&bundle)
-                .await
-                .map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot inspect the abandon bundle {}: {error}",
-                            bundle.display()
-                        ),
-                        "check controller storage permissions, then cowshed gc",
-                    )
-                })?;
-            let bytes = metadata.blocks().saturating_mul(512);
-            let mut identity = sha2::Sha256::new();
-            identity.update(bundle.as_os_str().as_bytes());
-            identity.update(metadata.len().to_le_bytes());
-            if !dry_run {
-                tokio::fs::remove_file(&bundle).await.map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot delete the abandon bundle {}: {error}",
-                            bundle.display()
-                        ),
-                        "check controller storage permissions, then cowshed gc",
-                    )
-                })?;
-                let workspace = bundle
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(|stem| stem.rsplit_once('-'))
-                    .map_or("", |(workspace, _)| workspace);
-                crate::storage::deletion_log::log_deletion(
-                    &project_root,
-                    crate::storage::deletion_log::DeletionOp::RemoveAbandonedBundle,
-                    crate::storage::deletion_log::DeletionKind::Other,
-                    workspace,
-                    None,
-                    &bundle,
-                );
-            }
-            held.push(crate::api::dto::GcCandidate {
-                identity: crate::api::dto::Sha256Digest::from_bytes(identity.finalize().into()),
-                path: bundle,
-                bytes,
-                reason: crate::api::dto::GcReason::HeldBundle,
-            });
-        }
-        Ok(held)
+        Ok(Some(super::held_bundles::Sweep {
+            bundles,
+            tip: tip.as_str().to_owned(),
+            main: crate::git::GitRepository::from_root(&store_root, &main_root),
+            project_root: self.layout.project().project_root.clone(),
+        }))
+    }
+
+    /// The project's held-bundle sweeper, started by the first sweep that needs it.
+    fn held_bundles(&mut self) -> &super::held_bundles::HeldBundles {
+        self.held_bundles.get_or_insert_with(|| {
+            super::held_bundles::HeldBundles::spawn(super::held_bundles::measure_against_main())
+        })
     }
 
     #[allow(
@@ -4350,6 +4297,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             binding_remote_validation: validation,
             recovery_scope,
             retirement_lease,
+            held_bundles: None,
         })
     }
     /// Apply `change` to the journal on disk under its lock and adopt the result, which also
@@ -15758,7 +15706,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         .await
     }
 
-    async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
+    async fn gc(&mut self, options: GcOptions) -> Result<JobAnswer<GcReport>> {
         use crate::storage::lifecycle::{StorageGcOptions, StorageGcReason, Substrate};
 
         self.validate_binding().await?;
@@ -15774,18 +15722,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         .map_err(|error| CowshedError::internal(format!("scratch reaper task failed: {error}")))?;
         self.retire_abandoned_pending_workspaces(options.dry_run)
             .await?;
-        // `--abandoned` deletes every bundle below; a plain sweep drops those main holds.
-        let held = if options.abandoned {
-            Vec::new()
-        } else {
-            self.drop_held_bundles(options.dry_run).await?
-        };
-        let held_count =
-            u64::try_from(held.len()).map_err(|_| CowshedError::internal("GC count overflow"))?;
-        let held_bytes = held
-            .iter()
-            .try_fold(0_u64, |sum, bundle| sum.checked_add(bundle.bytes))
-            .ok_or_else(|| CowshedError::internal("GC candidate byte accounting overflow"))?;
+        // `--abandoned` deletes every bundle below; a plain sweep drops those main holds, measured
+        // beside this actor while the route answers what else it collected.
+        let held = match options.abandoned {
+            true => None,
+            false => self.held_bundle_sweep().await?,
+        }
+        .map(|sweep| self.held_bundles().sweep(sweep, options.dry_run));
         let plan = self
             .substrate
             .preview_gc(
@@ -15798,29 +15741,21 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .map_err(native_storage_error)?;
         // A plain sweep keeps abandon bundles by design, so it says so instead of leaving them
         // in a dot-directory nothing lists: the `--abandoned` preview names them, deleting none.
-        if !options.abandoned {
-            let bundles = self
-                .substrate
-                .preview_gc(
-                    &self.descriptor.repo_id,
-                    StorageGcOptions {
-                        abandoned_bundles: true,
-                    },
-                )
-                .await
-                .map_err(native_storage_error)?;
-            let kept = bundles
-                .candidates()
-                .iter()
-                .filter(|candidate| !held.iter().any(|bundle| bundle.path == candidate.path()));
-            if let Some(kept) = crate::storage::recovery::KeptAbandonBundles::named_by(kept)? {
-                cowshed_os::eprintln!(
-                    "cowshed: {kept}; {}",
-                    crate::storage::recovery::KeptAbandonBundles::HINT
-                );
-            }
-        }
-        let mut candidates = plan
+        let kept = match options.abandoned {
+            true => None,
+            false => Some(
+                self.substrate
+                    .preview_gc(
+                        &self.descriptor.repo_id,
+                        StorageGcOptions {
+                            abandoned_bundles: true,
+                        },
+                    )
+                    .await
+                    .map_err(native_storage_error)?,
+            ),
+        };
+        let candidates = plan
             .candidates()
             .iter()
             .map(|candidate| crate::api::dto::GcCandidate {
@@ -15850,8 +15785,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 },
             })
             .collect::<Vec<_>>();
-
-        candidates.extend(held);
+        let held_at = candidates.len();
         let (images, links) = self.build_volume_links().await?;
         let build = timed_async(
             "gc",
@@ -15865,11 +15799,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 .iter()
                 .try_fold(0_u64, |sum, candidate| sum.checked_add(candidate.bytes))
                 .ok_or_else(|| CowshedError::internal("GC candidate byte accounting overflow"))?;
-            return Ok(GcReport {
+            let report = GcReport {
                 examined: u64::try_from(plan.examined())
                     .map_err(|_| CowshedError::internal("GC count overflow"))?
-                    + build.examined
-                    + held_count,
+                    + build.examined,
                 reclaimed: 0,
                 retained_active: u64::try_from(plan.retained_active())
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
@@ -15882,7 +15815,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .chain(plan.root_held_mountpoints().iter().map(root_held_deferred))
                     .collect(),
                 candidates: candidates.into_iter().chain(build.candidates).collect(),
-            });
+            };
+            return Ok(Box::pin(super::held_bundles::folded(
+                report, held_at, held, kept,
+            )));
         }
         // Old build state a refresh moved aside and did not live to delete (`discard`): gc is
         // the verb that waits for it, saying what it deletes.
@@ -15958,21 +15894,16 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 crate::exec::profile_directory(&store_root).display()
             ),
         }
-        Ok(GcReport {
+        let report = GcReport {
             examined: u64::try_from(report.examined)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?
-                + build.examined
-                + held_count,
+                + build.examined,
             reclaimed: u64::try_from(report.reclaimed)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?
-                + build.reclaimed
-                + held_count,
+                + build.reclaimed,
             retained_active: u64::try_from(report.retained_active)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?,
-            released_bytes: report
-                .released_bytes
-                .saturating_add(build.released_bytes)
-                .saturating_add(held_bytes),
+            released_bytes: report.released_bytes.saturating_add(build.released_bytes),
             dry_run: false,
             candidates: candidates.into_iter().chain(build.candidates).collect(),
             deferred: report
@@ -15985,7 +15916,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 .chain(build.deferred.into_iter().map(Into::into))
                 .chain(report.root_held_mountpoints.iter().map(root_held_deferred))
                 .collect(),
-        })
+        };
+        Ok(Box::pin(super::held_bundles::folded(
+            report, held_at, held, kept,
+        )))
     }
 
     async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>> {
@@ -16026,6 +15960,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         "check controller storage permissions and retry",
                     )
                 })?;
+                crate::storage::recovery::remove_abandon_bundle_sidecar(bundle).map_err(
+                    |error| {
+                        CowshedError::environment_missing(
+                            format!(
+                                "cannot delete the patch-ids of abandon bundle {}: {error}",
+                                bundle.display()
+                            ),
+                            "check controller storage permissions and retry",
+                        )
+                    },
+                )?;
             }
             Ok(bundles)
         })

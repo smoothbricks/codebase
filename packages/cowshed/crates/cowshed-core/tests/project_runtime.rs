@@ -281,6 +281,8 @@ struct FakeHost {
     stdin_gate: Option<Arc<Notify>>,
     /// When set, a create holds inside its clone step until this is notified.
     create_gate: Option<Arc<Notify>>,
+    /// When set, a gc's answer waits for this, as its held-bundle sweep would.
+    gc_gate: Option<Arc<Notify>>,
     /// Abandon bundles removals left in the trash, for `delete_abandon_bundles`.
     bundles: Vec<PathBuf>,
     /// What the router admitted, in order: the route that decoded each exec and its scheduling.
@@ -331,6 +333,7 @@ impl FakeHost {
             supervisors: std::collections::BTreeMap::new(),
             stdin_gate: None,
             create_gate: None,
+            gc_gate: None,
             bundles: Vec::new(),
             admitted: Arc::default(),
         }
@@ -973,7 +976,7 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(RemoveReport { abandoned })
     }
 
-    async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
+    async fn gc(&mut self, options: GcOptions) -> Result<JobAnswer<GcReport>> {
         self.events.send(Event::Gc).ok();
         if std::mem::take(&mut self.removal.gc_stale_once) {
             return Err(CowshedError::retryable(
@@ -982,7 +985,7 @@ impl ProjectRuntimeHost for FakeHost {
                 "retry",
             ));
         }
-        Ok(GcReport {
+        let report = GcReport {
             examined: u64::try_from(self.state.workspaces.len()).expect("test length"),
             reclaimed: 0,
             retained_active: 0,
@@ -990,7 +993,14 @@ impl ProjectRuntimeHost for FakeHost {
             dry_run: options.dry_run,
             candidates: Vec::new(),
             deferred: Vec::new(),
-        })
+        };
+        let gate = self.gc_gate.clone();
+        Ok(Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            Ok(report)
+        }))
     }
 
     async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>> {
@@ -4980,6 +4990,49 @@ async fn a_pending_stdin_write_holds_no_other_call() {
         }
     }
     panic!("the host never took the write");
+}
+
+/// Every retirement a coordinator makes ends in a `gc`, whose held-bundle sweep may take seconds
+/// per bundle in the trash. The router hands the gc's answer to the sweep and serves the next
+/// call: while a gc waits, an exec is admitted and answered, and the gc answers once its sweep
+/// does.
+#[tokio::test]
+async fn a_pending_gc_holds_no_exec() {
+    let root = test_root();
+    let (events, _observed) = mpsc::unbounded_channel();
+    let gate = Arc::new(Notify::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
+    host.gc_gate = Some(Arc::clone(&gate));
+    let repo = host.descriptor.repo_id.clone();
+    let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+    let router = runtime.router();
+    let adopted = adopt(&router, &repo).await;
+    let incarnation = adopted["info"]["workspaceIncarnation"].clone();
+    let gc = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.gc",
+        json!({ "repoId": repo, "options": { "dryRun": false, "abandoned": false } }),
+    );
+    tokio::pin!(gc);
+    let exec = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.exec",
+        main_exec(&repo, &incarnation, json!({})),
+    );
+    let exec = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::select! {
+            biased;
+            collected = &mut gc => panic!("the gc answered before its sweep: {collected:?}"),
+            exec = exec => exec,
+        }
+    })
+    .await
+    .expect("the exec waited behind the gc's sweep");
+    exec.expect("the exec answers while the gc waits");
+    gate.notify_one();
+    gc.await.expect("the gc answers once its sweep does");
 }
 
 /// Over one client connection: a job admitted with open stdin is fed through its attachment, and

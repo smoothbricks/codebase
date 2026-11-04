@@ -5,6 +5,8 @@ mod command_start;
 pub mod commitment_feed;
 #[cfg(target_os = "macos")]
 pub(crate) mod daemon_watch;
+#[cfg(target_os = "macos")]
+pub(crate) mod held_bundles;
 mod host_hold;
 #[cfg(target_os = "macos")]
 pub mod job_accounting;
