@@ -170,7 +170,7 @@ describe('Cargo cache policy', () => {
         (await check({ '.cargo/config.toml': `[target.aarch64-apple-darwin]\nlinker = "${linker}"\n` })).failures,
       ).toBe(1);
     }
-    for (const linker of ['smoothbricks-macos-linker', '/nix/store/immutable-clang/bin/clang']) {
+    for (const linker of ['clang', '/nix/store/immutable-clang/bin/clang']) {
       expect(
         (await check({ '.cargo/config.toml': `[target.aarch64-apple-darwin]\nlinker = "${linker}"\n` })).failures,
       ).toBe(0);

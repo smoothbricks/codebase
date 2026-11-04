@@ -8,18 +8,16 @@ rustflags = ["-Zremap-cwd-prefix=."]
 [env]
 MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }
 
-# Cargo hashes the linker spelling into every unit. Keep it checkout-independent;
-# the dev shell installs this program in the immutable store on Darwin.
+# The macOS targets' linker is Apple's clang driver, which the dev shell names as CARGO_TARGET_<triple>_LINKER: the
+# tracked config names no system path, and Cargo hashes the linker spelling into every unit.
 # A target's rustflags replace build.rustflags, so they repeat the cwd remap. `-Zosx-rpath-install-name` names a dylib
 # `@rpath/<name>` instead of its absolute path in the shed's target. The Mach-O debug map's object paths are mbx's: it
 # spells every target input of a native link by the target's physical root and strips that root with its own
 # `-oso_prefix`, which a caller's prefix would override. So a linked artifact is the same in every shed.
 [target.aarch64-apple-darwin]
-linker = "smoothbricks-macos-linker"
 rustflags = ["-Zremap-cwd-prefix=.", "-Zosx-rpath-install-name"]
 
 [target.x86_64-apple-darwin]
-linker = "smoothbricks-macos-linker"
 rustflags = ["-Zremap-cwd-prefix=.", "-Zosx-rpath-install-name"]
 
 # One feature resolution for the whole workspace. Without it every per-crate

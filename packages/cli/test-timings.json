@@ -53,7 +53,6 @@
     "src/lib/nx-tools.test.ts": 160,
     "src/monorepo/packed-package.test.ts": 154,
     "src/monorepo/developer-links-declared.test.ts": 132,
-    "src/monorepo/macos-linker.test.ts": 130,
     "src/wrangler/deploy-stage.test.ts": 129,
     "src/monorepo/developer-links.property.test.ts": 126,
     "src/release/private-npm-install.test.ts": 92,

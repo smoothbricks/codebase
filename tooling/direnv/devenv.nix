@@ -104,10 +104,6 @@ in {
       jq # Used in pre-commit hook and generally useful
       alejandra # Nix formatter
     ])
-    ++ lib.optionals pkgs.stdenv.isDarwin [
-      (pkgs.writeShellScriptBin "smoothbricks-macos-linker"
-        (builtins.readFile ../../packages/cowshed/scripts/macos-linker.sh))
-    ]
     # GARM/Linux CI: rustc needs host linker `cc` (-Zbuild-std, native crates).
     ++ lib.optionals pkgs.stdenv.isLinux [
       pkgs.stdenv.cc
@@ -139,12 +135,15 @@ in {
     // lib.optionalAttrs (pkgs.stdenv.hostPlatform.rust.rustcTarget == "x86_64-unknown-linux-gnu") {
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = lib.mkForce "${rustLinker}";
     }
-    # Every native link on a Mac goes through smoothbricks-macos-linker (.cargo/config.toml): Xcode's clang with its ld
-    # and SDK. mbx refuses a -C linker it does not know by name, so test binaries, proc macros and build scripts were
-    # compiled again in every fresh checkout (unportable-native-link). Named here, the pinned mbx identifies the wrapper
-    # by its bytes and by probing the driver through it, and caches those links (specs/cowshed/14_nix.md, "mbx").
+    # Rust's macOS linker is Apple's clang driver, named here because the tracked Cargo config may not name a system
+    # path. The driver takes the SDK from SDKROOT (its xcrun shim asks Xcode only when it is unset) and links with its
+    # own toolchain's ld, whatever PATH holds, and Nix's NIX_* link flags never reach it. mbx identifies a -C linker
+    # named clang and caches the links it makes; a wrapper script in its place bypassed every test binary, proc macro
+    # and build script link as unportable-native-link (specs/cowshed/16_build_volumes.md, "One Cargo environment on
+    # every path").
     // lib.optionalAttrs pkgs.stdenv.isDarwin {
-      MBX_LINK_WRAPPERS = "smoothbricks-macos-linker";
+      CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER = "/usr/bin/clang";
+      CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER = "/usr/bin/clang";
     };
 
   # Use system Xcode for iOS simulator, signing, and instruments.

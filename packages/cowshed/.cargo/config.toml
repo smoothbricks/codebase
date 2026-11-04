@@ -1,11 +1,2 @@
 [env]
 MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }
-
-# Use the same checkout-independent linker as the root Cargo workspace. The dev
-# shell installs it in the immutable store; exported SDKROOT avoids discovery,
-# and Apple's clang links without Nix wrapper flags.
-[target.aarch64-apple-darwin]
-linker = "smoothbricks-macos-linker"
-
-[target.x86_64-apple-darwin]
-linker = "smoothbricks-macos-linker"

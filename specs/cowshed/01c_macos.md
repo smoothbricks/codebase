@@ -187,8 +187,8 @@ Find the symptom in the left column and follow the link.
   text_).
 - **Rule.** Controller Git execs the developer directory's `usr/bin/git` directly with `/var/select` readable, the
   supervisor takes the developer directory of its sandbox `PATH` from a fixed system install, never from the
-  `DEVELOPER_DIR` it started with, and the repository's linker wrapper takes `SDKROOT` from the environment and asks
-  `xcrun` only when it is absent.
+  `DEVELOPER_DIR` it started with, and the macOS Rust linker, Apple's clang driver, takes `SDKROOT` from the environment
+  and asks `xcrun` only when it is absent.
 - **Owners.**
   [04_sandbox.md §Trusted supervisor and child profiles](./04_sandbox.md#trusted-supervisor-and-child-profiles) (the Git
   role);
@@ -197,7 +197,7 @@ Find the symptom in the left column and follow the link.
   developer directory);
   [16_build_volumes.md §One Cargo environment on every path](./16_build_volumes.md#one-cargo-environment-on-every-path)
   (the linker). Code: [`cowshed-core/src/sandbox.rs`] `GIT_DEVELOPER_DIR`; [`cowshed-core/src/runtime/supervisor.rs`]
-  `developer_directory`; [`packages/cowshed/scripts/macos-linker.sh`].
+  `developer_directory`; `tooling/direnv/devenv.nix` `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER`.
 
 ## Images and clones
 
@@ -1344,7 +1344,6 @@ Find the symptom in the left column and follow the link.
 [`cowshed-os/src/scratch.rs`]: ../../packages/cowshed/crates/cowshed-os/src/scratch.rs
 [`cowshed-shell/src/script.rs`]: ../../packages/cowshed/crates/cowshed-shell/src/script.rs
 [`cowshed-shell/tests/script_host.rs`]: ../../packages/cowshed/crates/cowshed-shell/tests/script_host.rs
-[`packages/cowshed/scripts/macos-linker.sh`]: ../../packages/cowshed/scripts/macos-linker.sh
 [`packages/nx-plugin/src/executors/bounded-exec/ram-attach.ts`]:
   ../../packages/nx-plugin/src/executors/bounded-exec/ram-attach.ts
 [`packages/nx-plugin/src/executors/bounded-exec/ram-detach.ts`]:

@@ -1646,24 +1646,25 @@ Concretely:
   `-Zremap-cwd-prefix` (relative), or no remap.
 - **No checkout-resolved linker paths.** `target.<triple>.linker` and `host.linker` are a bare PATH program or an
   immutable store path, never a checkout-relative path: Cargo hashes the resolved linker into every unit. On macOS the
-  repository's store-installed linker wrapper uses exported `SDKROOT` without discovery and executes `/usr/bin/clang`
-  with `-fuse-ld=/usr/bin/ld`, selecting Apple's linker independently of PATH; only an absent SDK invokes `xcrun`.
-  **Under mbx the wrapper links but is never cached.** mbx identifies a `-C linker` only when its file name is `clang`
-  or `clang++`, and any other bypasses the link cache while the link still runs (mbx limits, "Linker overrides and link
-  arguments"); it models `-C link-arg=-fuse-ld=<absolute path>` and keys that linker's path and version. The form mbx
-  caches is Apple's clang driver as the macOS target's Rust linker (`/usr/bin/clang`), with no wrapper and no
-  `MBX_LINKER`: the driver picks its own toolchain `ld`, and the dev shell's `SDKROOT` selects the SDK. A repository
-  whose tracked config may not name a system path exports it from its dev shell as
-  `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER`, beside its compiler variables. Measured 2026-10-27: the wrapper bypasses
-  as `unportable-native-link`, and in the cached form a native test link restores from the store with no compiler run.
-  An mbx project switches to the cached form only on the link measurement in Migration. The Darwin dev shell disables
-  devenv's C tools, uses a compiler-free stdenv, and removes only the Rust toolchain's propagated Nix compiler while
-  retaining the pinned components and their runtime dependencies. Linux retains its existing C tools, stdenv and
-  toolchain propagation. Its Rust linker, devenv's clang driver, links with a patched LLD 21 that sizes ELF relocation
-  shards from the actual LLVM executor, whose worker indices address them. The driver's earlier CPU-affinity snapshot
-  cannot size those shards: an Incus cpuset can grow before the pool starts. The serial path keeps one shard without
-  creating a pool. Only that linker is patched, as local derivations in `tooling/direnv/devenv.nix` rather than an
-  overlay on `llvmPackages`, which would rebuild every package that links with the LLVM stdenv (Chromium, which no
+  Rust linker is Apple's clang driver, `/usr/bin/clang`, which takes the exported `SDKROOT` without discovery (its
+  `xcrun` shim asks only when the SDK is absent), runs its own toolchain's `ld` whatever PATH holds, and reads none of a
+  Nix shell's link variables. **Under mbx a linker wrapper links but is never cached.** mbx identifies a `-C linker`
+  only when its file name is `clang` or `clang++`, and any other bypasses the link cache while the link still runs (mbx
+  limits, "Linker overrides and link arguments"); it models `-C link-arg=-fuse-ld=<absolute path>` and keys that
+  linker's path and version. The form mbx caches is Apple's clang driver as the macOS target's Rust linker
+  (`/usr/bin/clang`), with no wrapper and no `MBX_LINKER`: the driver picks its own toolchain `ld`, and the dev shell's
+  `SDKROOT` selects the SDK. A repository whose tracked config may not name a system path exports it from its dev shell
+  as `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER`, beside its compiler variables. Measured 2026-10-27: the wrapper
+  bypasses as `unportable-native-link`, and in the cached form a native test link restores from the store with no
+  compiler run. Each mbx project switched to the cached form on the link measurement in Migration, and a wrapper that
+  only forwards to the driver is removed rather than made cacheable: it adds nothing the driver lacks. The Darwin dev
+  shell disables devenv's C tools, uses a compiler-free stdenv, and removes only the Rust toolchain's propagated Nix
+  compiler while retaining the pinned components and their runtime dependencies. Linux retains its existing C tools,
+  stdenv and toolchain propagation. Its Rust linker, devenv's clang driver, links with a patched LLD 21 that sizes ELF
+  relocation shards from the actual LLVM executor, whose worker indices address them. The driver's earlier CPU-affinity
+  snapshot cannot size those shards: an Incus cpuset can grow before the pool starts. The serial path keeps one shard
+  without creating a pool. Only that linker is patched, as local derivations in `tooling/direnv/devenv.nix` rather than
+  an overlay on `llvmPackages`, which would rebuild every package that links with the LLVM stdenv (Chromium, which no
   binary cache holds): `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` names devenv's driver over the patched wrapper.
   LLVM 23 removes implicit thread-index shards in
   [905f654bb721](https://github.com/llvm/llvm-project/commit/905f654bb721f1df119bd2cfaa23736e30838e90); the local patch
@@ -1919,7 +1920,10 @@ A host moves to this model in one release, in this order:
    | clang driver via mbx (of 6) | 12.7 / 8.3 | 2.5 / 2.7  |
 
    About four times faster on the hit, and the misses within each other's ranges (+3% / −2%): that project removed its
-   wrapper. SmoothBricks measures its own at its cutover.
+   wrapper. SmoothBricks, measured 2026-11-03 in one session, `cargo test --no-run -p cowshed-core --lib` in fresh
+   checkouts: 88 s with its two native links bypassed through its wrapper; with the same links cached (mbx then
+   identified that wrapper by name, the driver it ran being this form's), 84 s on the miss and 29 s on the hit, the 61.5
+   s test-binary link restored. It removed its wrapper on 2026-11-04.
 
 **Overlap with the cowshed-core crate split.** The split moves the code this model changes (00_overview.md, "Crate
 map"). The model's code lands in the existing module at each item's planned crate, so the split later moves it
