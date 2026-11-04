@@ -21,7 +21,8 @@
 # noatime volume and frees a result with its descriptor blob, and a linker wrapper a project names
 # in MBX_LINK_WRAPPERS identified by its bytes and the driver it forwards to, so the native links
 # made through it cache, and every target path a native link reads spelled physically so one
-# -oso_prefix strips them all from a macOS debug map, from
+# -oso_prefix strips them all from a macOS debug map, and -Zosx-rpath-install-name keyed as written
+# rather than bypassing every compilation that carries it, from
 # smoothbricks/mr-boxington at the pinned revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
@@ -34,7 +35,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/5fd231bb04724b6d6df158238b2b9b7ac877f8e9";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/f079f737a5503ebc7c3dd5c20397778f086d567d";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
