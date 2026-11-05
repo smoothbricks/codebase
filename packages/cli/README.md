@@ -1287,7 +1287,9 @@ when there is nothing to do:
   falsifies: the workspace is unchanged, so the hash is unchanged. So the executor's hasher asks
   `smoo wrangler deployed-version --stage <stage> --refresh` which tag serves the stage, and answers the artifact hash
   only while that tag is the artifact's. Otherwise it adds a nonce, the run misses, and `deploy-stage` deploys, still
-  tagging the artifact's version, so the next hash, with that version live, is the artifact's own.
+  tagging the artifact's version, so the next hash, with that version live, is the artifact's own. A hand-written
+  `deploy` instead states `"cache": false`, the one target besides an aggregate that `smoo monorepo check` lets run work
+  uncached: every run then reaches `deploy-stage`, which answers below whether its version is already live.
 - `smoo wrangler deploy-stage` reads live state first. If the version tagged with this task's hash is already the one
   serving 100% of traffic, it returns `remote-cache-hit` after two API calls: no upload, no migration, no traffic shift.
 - The expensive, purely file-derived half belongs in a sibling `deploy-build` target (build the artifact, register it,
