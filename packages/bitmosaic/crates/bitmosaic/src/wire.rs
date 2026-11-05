@@ -28,6 +28,7 @@
 
 use crate::ef::{self, EfLayout, EfRange, EfView};
 use crate::patch::PatchError;
+use crate::{AdmissionClass, AdmissionError};
 use crate::{
     BLOCK_WORDS, Bitmosaic, Bitmosaic64, CHUNK_WORDS, Container, DIR_STRIDE, DRIVE_RATIO_KEYS,
     DRIVE_RATIO_MEMBERS, Range, SUMMARY_WORDS, charge_key_positions, charge_linear,
@@ -57,13 +58,38 @@ pub struct ImageHeader {
 
 /// Check identification and canonical length framing without scanning the body.
 pub fn image_header(bytes: &[u8]) -> Option<ImageHeader> {
-    let id = bytes.get(..IMAGE_ID_LEN)?;
-    if &id[..3] != b"BMS" || id[3] >> 3 != FORMAT_VERSION {
-        return None;
+    parse_header(bytes).ok()
+}
+
+fn parse_header(bytes: &[u8]) -> Result<ImageHeader, AdmissionError> {
+    let id = bytes.get(..IMAGE_ID_LEN).ok_or_else(|| {
+        AdmissionError::new(
+            AdmissionClass::Extent,
+            0,
+            "image identification is truncated",
+        )
+    })?;
+    if &id[..3] != b"BMS" {
+        return Err(AdmissionError::new(
+            AdmissionClass::Magic,
+            0,
+            "image identification is not BMS",
+        ));
+    }
+    if id[3] >> 3 != FORMAT_VERSION {
+        return Err(AdmissionError::new(
+            AdmissionClass::Kind,
+            3,
+            "unsupported image version",
+        ));
     }
     let mode = id[3] & 7;
     if matches!(mode, 3 | 6 | 7) {
-        return None;
+        return Err(AdmissionError::new(
+            AdmissionClass::Kind,
+            3,
+            "unsupported image root mode",
+        ));
     }
     let width = if mode & 1 == 0 {
         KeyWidth::U32
@@ -74,14 +100,25 @@ pub fn image_header(bytes: &[u8]) -> Option<ImageHeader> {
     let encoded_len = if mode & 4 != 0 {
         IMAGE_ID_LEN
     } else {
-        let body_bytes = read_uleb(bytes, &mut body_offset, u32::MAX)? as usize;
-        let total = body_offset.checked_add(body_bytes)?;
+        let body_bytes =
+            read_uleb_checked(bytes, &mut body_offset, u32::MAX, AdmissionClass::Extent)? as usize;
+        let total = body_offset.checked_add(body_bytes).ok_or_else(|| {
+            AdmissionError::new(
+                AdmissionClass::Extent,
+                IMAGE_ID_LEN,
+                "image length overflows the address space",
+            )
+        })?;
         if total > u32::MAX as usize || total > bytes.len() {
-            return None;
+            return Err(AdmissionError::new(
+                AdmissionClass::Extent,
+                IMAGE_ID_LEN,
+                "image body exceeds its available u32 extent",
+            ));
         }
         total
     };
-    Some(ImageHeader {
+    Ok(ImageHeader {
         width,
         encoded_len,
         root: if mode & 2 == 0 { ROOT_FOREST } else { ROOT_EF },
@@ -89,20 +126,60 @@ pub fn image_header(bytes: &[u8]) -> Option<ImageHeader> {
     })
 }
 
+// Queries that inspect framing without certifying it retain nullable probe semantics;
+// every parser uses the same canonical ULEB reader as full admission.
 pub(crate) fn read_uleb(bytes: &[u8], at: &mut usize, max: u32) -> Option<u32> {
+    read_uleb_checked(bytes, at, max, AdmissionClass::Count).ok()
+}
+
+pub(crate) fn read_uleb_checked(
+    bytes: &[u8],
+    at: &mut usize,
+    max: u32,
+    class: AdmissionClass,
+) -> Result<u32, AdmissionError> {
+    let start = *at;
     let mut value = 0u32;
     for index in 0..5 {
-        let byte = *bytes.get(*at)?;
+        let Some(&byte) = bytes.get(*at) else {
+            return Err(AdmissionError::new(
+                class,
+                start,
+                "unsigned LEB128 is truncated",
+            ));
+        };
         *at += 1;
         if index == 4 && byte > 0x0f {
-            return None;
+            return Err(AdmissionError::new(
+                class,
+                start,
+                "unsigned LEB128 overflows u32",
+            ));
         }
         value |= u32::from(byte & 0x7f) << (index * 7);
         if byte & 0x80 == 0 {
-            return (value <= max && (index == 0 || byte != 0)).then_some(value);
+            if value > max {
+                return Err(AdmissionError::new(
+                    class,
+                    start,
+                    "unsigned LEB128 exceeds its declared bound",
+                ));
+            }
+            if index != 0 && byte == 0 {
+                return Err(AdmissionError::new(
+                    class,
+                    start,
+                    "unsigned LEB128 is not shortest form",
+                ));
+            }
+            return Ok(value);
         }
     }
-    None
+    Err(AdmissionError::new(
+        class,
+        start,
+        "unsigned LEB128 has no terminator",
+    ))
 }
 
 pub(crate) const fn uleb_len(value: u32) -> usize {
@@ -1017,13 +1094,19 @@ pub(crate) struct RunsView<'a> {
 }
 
 impl<'a> RunsView<'a> {
-    fn open(bytes: &'a [u8], len: u32) -> Option<Self> {
+    fn open(bytes: &'a [u8], len: u32) -> Result<Self, AdmissionError> {
         let mut at = 0;
-        let count = read_uleb(bytes, &mut at, 32_767)? as usize + 1;
+        let count = read_uleb_checked(bytes, &mut at, 32_767, AdmissionClass::Count)? as usize + 1;
         if bytes.len() != runs_payload_len(count) {
-            return None;
+            return Err(AdmissionError::new(
+                AdmissionClass::Extent,
+                0,
+                "Runs extent differs from its derived record count",
+            ));
         }
-        let bounds = bytes.get(at..at + 4 * count)?;
+        let bounds = bytes.get(at..at + 4 * count).ok_or_else(|| {
+            AdmissionError::new(AdmissionClass::Extent, at, "Runs bounds are truncated")
+        })?;
         let view = Self {
             bounds,
             prefixes: &bytes[at + 4 * count..],
@@ -1033,18 +1116,46 @@ impl<'a> RunsView<'a> {
         for i in 0..count {
             let start = view.start(i);
             let end = view.end(i);
-            if start > end || (i != 0 && view.end(i - 1) + 1 >= start) {
-                return None;
+            if start > end {
+                return Err(AdmissionError::new(
+                    AdmissionClass::PlaneRange,
+                    at + 4 * i,
+                    "run starts after its inclusive end",
+                ));
+            }
+            if i != 0 && view.end(i - 1) + 1 >= start {
+                return Err(AdmissionError::new(
+                    AdmissionClass::MapOrder,
+                    at + 4 * i,
+                    "runs overlap, touch or are not ascending",
+                ));
             }
             if i != 0
                 && i + 1 != count
                 && u32::from(read_u16_at(view.prefixes, 2 * (i - 1))) != before
             {
-                return None;
+                return Err(AdmissionError::new(
+                    AdmissionClass::Count,
+                    at + 4 * count + 2 * (i - 1),
+                    "Runs exclusive prefix differs from its intervals",
+                ));
             }
-            before = before.checked_add(end - start + 1)?;
+            before = before.checked_add(end - start + 1).ok_or_else(|| {
+                AdmissionError::new(
+                    AdmissionClass::Count,
+                    at + 4 * i,
+                    "Runs cardinality overflows",
+                )
+            })?;
         }
-        (before == len).then_some(view)
+        if before != len {
+            return Err(AdmissionError::new(
+                AdmissionClass::Count,
+                0,
+                "Runs cardinality differs from its parent prefix",
+            ));
+        }
+        Ok(view)
     }
 
     /// After attachment proved the count/extent, invert its exact size instead
@@ -1171,19 +1282,38 @@ fn and_runs_view(runs: RunsView<'_>, other: &CView<'_>) -> u32 {
 impl<'a> CView<'a> {
     /// `card` comes from the directory's prefix plane, which is why no
     /// container stores its own length.
-    pub(crate) fn open(rest: &'a [u8], kind: u32, card: u32) -> Option<CView<'a>> {
-        // An occupied chunk always holds a member; a zero here is a directory
-        // that disagrees with itself, and the stride arm's `card - 1` would
-        // otherwise be the first thing to notice.
+    pub(crate) fn open(
+        rest: &'a [u8],
+        kind: u32,
+        card: u32,
+        origin: usize,
+        kind_at: usize,
+        card_at: usize,
+    ) -> Result<CView<'a>, AdmissionError> {
+        let error = |class, offset, what| AdmissionError::new(class, origin + offset, what);
         if card == 0 || card > 65_536 {
-            return None;
+            return Err(AdmissionError::new(
+                AdmissionClass::Count,
+                card_at,
+                "chunk cardinality is outside 1..=65536",
+            ));
         }
         let view = match kind {
             K_STRIDE => {
-                let first = read_u16_at(rest.get(..4)?, 0);
-                let stride = read_u16_at(rest, 2);
-                if stride == 0 || u32::from(first) + (card - 1) * u32::from(stride) > 65_535 {
-                    return None;
+                let head = rest.get(..4).ok_or_else(|| {
+                    error(AdmissionClass::Extent, 0, "Stride payload is truncated")
+                })?;
+                let first = read_u16_at(head, 0);
+                let stride = read_u16_at(head, 2);
+                if stride == 0 {
+                    return Err(error(AdmissionClass::PlaneRange, 2, "Stride step is zero"));
+                }
+                if u32::from(first) + (card - 1) * u32::from(stride) > 65_535 {
+                    return Err(error(
+                        AdmissionClass::PlaneRange,
+                        0,
+                        "Stride final member exceeds u16",
+                    ));
                 }
                 CView::Stride {
                     first,
@@ -1192,45 +1322,81 @@ impl<'a> CView<'a> {
                 }
             }
             K_CONE => {
-                let head = rest.get(..11 + card as usize)?;
+                let head = rest.get(..11 + card as usize).ok_or_else(|| {
+                    error(
+                        AdmissionClass::Extent,
+                        0,
+                        "Cone model or residual plane is truncated",
+                    )
+                })?;
                 let scale = read_u64_at(head, 3);
-                // Every probe multiplies an index below `card` by the model
-                // scale; a scale that overflows that product is refused here
-                // so no probe carries the check.
-                u64::from(card).checked_mul(scale)?;
+                u64::from(card).checked_mul(scale).ok_or_else(|| {
+                    error(
+                        AdmissionClass::PlaneRange,
+                        3,
+                        "Cone model multiplication overflows u64",
+                    )
+                })?;
                 CView::Cone {
                     first: read_u16_at(head, 0),
                     eps: head[2],
                     scale,
-                    residuals: &rest[11..11 + card as usize],
+                    residuals: &head[11..],
                 }
             }
-            K_RUNS => CView::Runs(RunsView::open(rest, card)?),
-            K_ARRAY => CView::Array(rest.get(..2 * card as usize)?),
+            K_RUNS => {
+                CView::Runs(RunsView::open(rest, card).map_err(|error| error.shifted(origin))?)
+            }
+            K_ARRAY => CView::Array(rest.get(..2 * card as usize).ok_or_else(|| {
+                error(AdmissionClass::Extent, 0, "Array member plane is truncated")
+            })?),
             K_WORDS => {
-                let head = rest.get(..WORDS_AT)?;
+                let head = rest.get(..WORDS_AT).ok_or_else(|| {
+                    error(AdmissionClass::Extent, 0, "Words metadata is truncated")
+                })?;
                 let base_word = u32::from(read_u16_at(head, 16));
                 let word_count = u32::from(read_u16_at(head, 18));
                 let wc = word_count as usize;
-                // The window is whole summary blocks inside the chunk: the
-                // select walk and the block summary index by that shape.
                 if wc == 0
                     || !wc.is_multiple_of(BLOCK_WORDS)
                     || !(base_word as usize).is_multiple_of(BLOCK_WORDS)
                     || base_word as usize + wc > CHUNK_WORDS
                 {
-                    return None;
+                    return Err(error(
+                        AdmissionClass::Count,
+                        16,
+                        "Words window is not whole blocks within its u16 chunk",
+                    ));
                 }
                 CView::Words {
-                    payload: rest.get(..words_payload_len(wc))?,
+                    payload: rest.get(..words_payload_len(wc)).ok_or_else(|| {
+                        error(
+                            AdmissionClass::Extent,
+                            0,
+                            "Words data or directory is truncated",
+                        )
+                    })?,
                     base_word,
                     word_count,
                     len: card,
                 }
             }
-            _ => return None,
+            _ => {
+                return Err(AdmissionError::new(
+                    AdmissionClass::Kind,
+                    kind_at,
+                    "unknown chunk container kind",
+                ));
+            }
         };
-        (view.payload_len() == rest.len()).then_some(view)
+        if view.payload_len() != rest.len() {
+            return Err(error(
+                AdmissionClass::Extent,
+                0,
+                "container does not exactly cover its payload extent",
+            ));
+        }
+        Ok(view)
     }
 
     /// Query construction reads only the selected payload's query fields.
@@ -1270,53 +1436,63 @@ impl<'a> CView<'a> {
         }
     }
 
-    /// Content verification run once by [`BitmosaicView::open_verified`] so
-    /// that every probe afterwards is arithmetic over bytes that agree with
-    /// each other: members are real `u16`s in strictly ascending order, and
-    /// the planes a `Words` chunk derives from its words — directory, block
-    /// summary, member bounds — say what the words say. Same-crate bytes
-    /// always pass; this is the reader's half of the "refused rather than
-    /// trusted" contract for everyone else's, priced once per plane.
-    fn verify(&self, card: u32) -> bool {
+    /// Verify payload-derived metadata once, retaining the image-relative violation byte.
+    fn verify(&self, card: u32, origin: usize) -> Result<(), AdmissionError> {
+        let error = |class, offset, what| AdmissionError::new(class, origin + offset, what);
         match self {
-            CView::Runs(_) => true,
-            CView::Stride { first, stride, len } => {
-                let (first, stride, len) = (u32::from(*first), u32::from(*stride), u32::from(*len));
-                (len == 0 || stride != 0) && first + stride * len <= u32::from(u16::MAX)
-            }
+            CView::Runs(_) | CView::Stride { .. } => Ok(()),
             CView::Cone {
                 first,
                 scale,
                 residuals,
-                ..
+                eps,
             } => {
-                // `open` proved `card * scale` fits, so every `i * scale` does.
                 let mut prev: Option<u16> = None;
                 for (i, r) in residuals.iter().enumerate() {
                     let raw = i64::from(*first)
                         + ((i as u64 * *scale) >> 32) as i64
                         + i64::from(*r as i8);
                     if !(0..=i64::from(u16::MAX)).contains(&raw) {
-                        return false;
+                        return Err(error(
+                            AdmissionClass::PlaneRange,
+                            11 + i,
+                            "Cone member exceeds its u16 chunk",
+                        ));
                     }
                     let v = raw as u16;
                     if prev.is_some_and(|p| p >= v) {
-                        return false;
+                        return Err(error(
+                            AdmissionClass::MapOrder,
+                            11 + i,
+                            "Cone members are not strictly ascending",
+                        ));
+                    }
+                    let (lo, hi) = cone_window(*first, *scale, *eps, residuals.len(), v);
+                    if i < lo || i >= hi {
+                        return Err(error(
+                            AdmissionClass::PlaneRange,
+                            2,
+                            "Cone query window excludes its member",
+                        ));
                     }
                     prev = Some(v);
                 }
-                true
+                Ok(())
             }
             CView::Array(values) => {
                 let mut prev: Option<u16> = None;
                 for i in 0..values.len() / 2 {
                     let v = read_u16_at(values, 2 * i);
                     if prev.is_some_and(|p| p >= v) {
-                        return false;
+                        return Err(error(
+                            AdmissionClass::MapOrder,
+                            2 * i,
+                            "Array members are not strictly ascending",
+                        ));
                     }
                     prev = Some(v);
                 }
-                true
+                Ok(())
             }
             CView::Words {
                 payload,
@@ -1331,7 +1507,17 @@ impl<'a> CView<'a> {
                     if w.is_multiple_of(DIR_STRIDE)
                         && u32::from(Self::dir_entry(payload, *word_count, w / DIR_STRIDE)) != total
                     {
-                        return false;
+                        let group = w / DIR_STRIDE;
+                        let at = if group == 0 {
+                            0
+                        } else {
+                            WORDS_AT + wc * 8 + (group - 1) * 2
+                        };
+                        return Err(error(
+                            AdmissionClass::PlaneRange,
+                            at,
+                            "Words rank directory disagrees with its words",
+                        ));
                     }
                     let word = read_u64_at(payload, WORDS_AT + w * 8);
                     if word != 0 {
@@ -1342,7 +1528,11 @@ impl<'a> CView<'a> {
                     total += word.count_ones();
                 }
                 if total != card {
-                    return false;
+                    return Err(error(
+                        AdmissionClass::Count,
+                        0,
+                        "Words cardinality differs from its parent prefix",
+                    ));
                 }
                 for block in 0..CHUNK_WORDS / BLOCK_WORDS {
                     let first = block * BLOCK_WORDS;
@@ -1351,11 +1541,29 @@ impl<'a> CView<'a> {
                         && (0..BLOCK_WORDS)
                             .any(|k| read_u64_at(payload, WORDS_AT + (first - base + k) * 8) != 0);
                     if (summary[block / 64] >> (block % 64) & 1 == 1) != occupied {
-                        return false;
+                        return Err(error(
+                            AdmissionClass::PlaneRange,
+                            (block / 64) * 8,
+                            "Words block summary disagrees with its words",
+                        ));
                     }
                 }
                 let (lo, hi) = Self::member_bounds(payload);
-                min == Some(usize::from(lo)) && max == Some(usize::from(hi))
+                if min != Some(usize::from(lo)) {
+                    return Err(error(
+                        AdmissionClass::PlaneRange,
+                        BOUNDS_AT,
+                        "Words lower bound differs from its first member",
+                    ));
+                }
+                if max != Some(usize::from(hi)) {
+                    return Err(error(
+                        AdmissionClass::PlaneRange,
+                        BOUNDS_AT + 2,
+                        "Words upper bound differs from its last member",
+                    ));
+                }
+                Ok(())
             }
         }
     }
@@ -1885,10 +2093,6 @@ impl<'a> Forest<'a> {
     }
 
     pub(crate) fn container(&self, i: usize) -> Option<CView<'a>> {
-        self.container_with::<false>(i)
-    }
-
-    fn container_with<const CHECK: bool>(&self, i: usize) -> Option<CView<'a>> {
         let at = self.payload_at(i);
         let end = if i + 1 == self.chunks as usize {
             self.bytes.len()
@@ -1897,12 +2101,82 @@ impl<'a> Forest<'a> {
         };
         let card = u32::try_from(self.after(i).checked_sub(u64::from(self.before(i)))?).ok()?;
         let payload = self.bytes.get(at..end)?;
-        let kind = read_kind(self.bytes, self.geometry.kinds_at, i);
-        if CHECK {
-            CView::open(payload, kind, card)
+        Some(CView::from_validated(
+            payload,
+            read_kind(self.bytes, self.geometry.kinds_at, i),
+            card,
+        ))
+    }
+
+    fn container_with(&self, i: usize, count_at: usize) -> Result<CView<'a>, AdmissionError> {
+        let offset_at = if i == 0 {
+            self.geometry.desc_at
         } else {
-            Some(CView::from_validated(payload, kind, card))
-        }
+            self.geometry.desc_at + (i - 1) * 4
+        };
+        let relative = if i == 0 {
+            0
+        } else {
+            read_u32_at(self.bytes, offset_at) as usize
+        };
+        let at = self
+            .geometry
+            .payload_at
+            .checked_add(relative)
+            .ok_or_else(|| {
+                AdmissionError::new(
+                    AdmissionClass::Extent,
+                    offset_at,
+                    "container offset overflows the address space",
+                )
+            })?;
+        let end = if i + 1 == self.chunks as usize {
+            self.bytes.len()
+        } else {
+            let next_at = self.geometry.desc_at + i * 4;
+            self.geometry
+                .payload_at
+                .checked_add(read_u32_at(self.bytes, next_at) as usize)
+                .ok_or_else(|| {
+                    AdmissionError::new(
+                        AdmissionClass::Extent,
+                        next_at,
+                        "container end overflows the address space",
+                    )
+                })?
+        };
+        let card_at = if i + 1 == self.chunks as usize {
+            count_at
+        } else {
+            self.geometry.before_at + i * 4
+        };
+        let card = self
+            .after(i)
+            .checked_sub(u64::from(self.before(i)))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                AdmissionError::new(
+                    AdmissionClass::Count,
+                    card_at,
+                    "chunk exclusive cardinalities are not ascending",
+                )
+            })?;
+        let payload = self.bytes.get(at..end).ok_or_else(|| {
+            AdmissionError::new(
+                AdmissionClass::Placement,
+                offset_at,
+                "container offsets are not adjacent within the payload plane",
+            )
+        })?;
+        let kind_at = self.geometry.kinds_at + i * 3 / 8;
+        CView::open(
+            payload,
+            read_kind(self.bytes, self.geometry.kinds_at, i),
+            card,
+            at,
+            kind_at,
+            card_at,
+        )
     }
 
     /// Chunk index for `key`, or `None`.
@@ -1969,54 +2243,75 @@ impl<'a> Forest<'a> {
         lo
     }
 
-    /// The slot plane must map EVERY key to its own chunk and nothing else:
-    /// each occupied slot names a chunk whose key is the slot's tag, exactly
-    /// `chunks` slots are occupied, and a probe from each key's home slot
-    /// reaches its slot before it meets a hole. With all three, `locate`'s
-    /// no-verify tag compare (see [`slot_of`]) is exact for any key, and a
-    /// probe can never step onto payload bytes. One pass over the plane and
-    /// one bounded probe per key, at open only.
-    fn verify_slot_plane(&self) -> bool {
+    /// Validate the tagged key-probe plane once, retaining the failing slot byte.
+    fn verify_slot_plane(&self) -> Result<(), AdmissionError> {
         let bits = self.geometry.slot_bits;
         if bits == 0 {
-            return true;
+            return Ok(());
         }
         let n = self.chunks as usize;
         let slots = 1usize << bits;
         let mask = slots - 1;
         let mut occupied = 0usize;
         for s in 0..slots {
-            let slot = read_u64_at(self.bytes, self.geometry.slot_at + s * 8);
+            let slot_at = self.geometry.slot_at + s * 8;
+            let slot = read_u64_at(self.bytes, slot_at);
             if slot == 0 {
                 continue;
             }
             let (tag, at) = (slot >> 32, slot as u32 as usize);
-            if tag > u64::from(u16::MAX) || at == 0 || at > n || u64::from(self.key(at - 1)) != tag
-            {
-                return false;
+            if tag > u64::from(u16::MAX) {
+                return Err(AdmissionError::new(
+                    AdmissionClass::PlaneRange,
+                    slot_at + 4,
+                    "key-probe tag exceeds u16",
+                ));
+            }
+            if at == 0 || at > n || u64::from(self.key(at - 1)) != tag {
+                return Err(AdmissionError::new(
+                    AdmissionClass::Placement,
+                    slot_at,
+                    "key-probe entry does not name its tagged chunk",
+                ));
             }
             occupied += 1;
         }
         if occupied != n {
-            return false;
+            return Err(AdmissionError::new(
+                AdmissionClass::Count,
+                self.geometry.slot_at,
+                "key-probe occupancy differs from the chunk count",
+            ));
         }
-        // Keys are distinct, so a slot tagged with this key is this key's
-        // slot; the probe must find it inside one lap and before any hole.
-        (0..n).all(|i| {
+        for i in 0..n {
             let key = self.key(i);
             let mut s = slot_of(key, bits);
+            let mut found = false;
             for _ in 0..slots {
-                let slot = read_u64_at(self.bytes, self.geometry.slot_at + s * 8);
+                let slot_at = self.geometry.slot_at + s * 8;
+                let slot = read_u64_at(self.bytes, slot_at);
                 if slot == 0 {
-                    return false;
+                    return Err(AdmissionError::new(
+                        AdmissionClass::Placement,
+                        slot_at,
+                        "key probe reaches a hole before its tagged chunk",
+                    ));
                 }
                 if (slot >> 32) as u16 == key {
-                    return true;
+                    found = true;
+                    break;
                 }
                 s = (s + 1) & mask;
             }
-            false
-        })
+            if !found {
+                return Err(AdmissionError::new(
+                    AdmissionClass::Placement,
+                    self.geometry.slot_at + slot_of(key, bits) * 8,
+                    "key probe cannot reach its tagged chunk",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Chunk holding the `k`-th member, with the count before it.
@@ -2078,7 +2373,7 @@ impl<'a> BitmosaicView<'a> {
     /// never bounds. A trust boundary that must refuse those too opens with
     /// [`Self::open_verified`], once, and keeps the view.
     pub fn open(bytes: &'a [u8]) -> Option<BitmosaicView<'a>> {
-        Self::open_with(bytes, false)
+        Self::open_with(bytes, false).ok()
     }
 
     /// [`Self::open`] plus one pass over every container payload and the
@@ -2088,18 +2383,22 @@ impl<'a> BitmosaicView<'a> {
     /// says what the members say. After this every answer is the writer's.
     /// Linear in the string, allocation-free; for bytes that crossed a
     /// trust boundary, and once per plane rather than per probe.
-    pub fn open_verified(bytes: &'a [u8]) -> Option<BitmosaicView<'a>> {
+    pub fn open_verified(bytes: &'a [u8]) -> Result<BitmosaicView<'a>, AdmissionError> {
         Self::open_with(bytes, true)
     }
 
-    fn open_with(bytes: &'a [u8], verify: bool) -> Option<BitmosaicView<'a>> {
-        let header = image_header(bytes)?;
+    fn open_with(bytes: &'a [u8], verify: bool) -> Result<BitmosaicView<'a>, AdmissionError> {
+        let header = parse_header(bytes)?;
         if header.width != KeyWidth::U32 {
-            return None;
+            return Err(AdmissionError::new(
+                AdmissionClass::Kind,
+                3,
+                "image key width is not u32",
+            ));
         }
         let bytes = &bytes[..header.encoded_len];
         if header.encoded_len == IMAGE_ID_LEN {
-            return Some(Self {
+            return Ok(Self {
                 root: Root::Forest(Forest {
                     bytes,
                     len: 0,
@@ -2112,38 +2411,61 @@ impl<'a> BitmosaicView<'a> {
         Self::open_body::<true>(bytes, header.body_offset, header.root, verify)
     }
 
-    /// Attach one body, whether framed standalone or bounded by a u64 directory.
+    /// Attach one bounded body; trusted child probes skip already-admitted directory checks.
     fn open_body<const CHECK: bool>(
         bytes: &'a [u8],
         mut at: usize,
         root: u8,
         verify: bool,
-    ) -> Option<Self> {
-        let len = u64::from(read_uleb(bytes, &mut at, u32::MAX)?) + 1;
+    ) -> Result<Self, AdmissionError> {
         let root = match root {
-            ROOT_EF => {
-                let base = read_uleb(bytes, &mut at, u32::MAX)?;
-                let span = read_uleb(bytes, &mut at, u32::MAX)?;
-                let ef = EfView::new(bytes.get(at..)?, base, span, len)?;
-                if verify && !ef.verify() {
-                    return None;
-                }
-                Root::Ef(ef)
-            }
+            ROOT_EF => Root::Ef(EfView::admit_body(bytes, at, verify)?),
             ROOT_FOREST => {
-                let chunks = read_uleb(bytes, &mut at, u32::from(u16::MAX))? + 1;
+                let count_at = at;
+                let len = u64::from(read_uleb_checked(
+                    bytes,
+                    &mut at,
+                    u32::MAX,
+                    AdmissionClass::Count,
+                )?) + 1;
+                let chunks =
+                    read_uleb_checked(bytes, &mut at, u32::from(u16::MAX), AdmissionClass::Count)?
+                        + 1;
                 let c = chunks as usize;
-                let keys = bytes.get(at..at.checked_add(2 * c)?)?;
+                let key_end = at.checked_add(2 * c).ok_or_else(|| {
+                    AdmissionError::new(
+                        AdmissionClass::Extent,
+                        at,
+                        "chunk-key plane overflows the address space",
+                    )
+                })?;
+                let keys = bytes.get(at..key_end).ok_or_else(|| {
+                    AdmissionError::new(AdmissionClass::Extent, at, "chunk-key plane is truncated")
+                })?;
                 let first = read_u16_at(keys, 0);
                 let last = read_u16_at(keys, 2 * (c - 1));
                 if last < first {
-                    return None;
+                    return Err(AdmissionError::new(
+                        AdmissionClass::MapOrder,
+                        at + 2 * (c - 1),
+                        "chunk-key endpoints are not ascending",
+                    ));
                 }
                 let geometry = Geometry::new(chunks, slot_bits_for_span(chunks, first, last), at);
-                bytes.get(..geometry.payload_at)?;
+                if bytes.get(..geometry.payload_at).is_none() {
+                    return Err(AdmissionError::new(
+                        AdmissionClass::Extent,
+                        at,
+                        "forest directory planes are truncated",
+                    ));
+                }
                 let used = (3 * c) % 8;
                 if used != 0 && bytes[geometry.kinds_at + 3 * c / 8] >> used != 0 {
-                    return None;
+                    return Err(AdmissionError::new(
+                        AdmissionClass::BitPad,
+                        geometry.kinds_at + 3 * c / 8,
+                        "container-kind plane tail bits are not zero",
+                    ));
                 }
                 let forest = Forest {
                     bytes,
@@ -2154,26 +2476,30 @@ impl<'a> BitmosaicView<'a> {
                 if CHECK {
                     for i in 0..c {
                         if i != 0 && forest.key(i) <= forest.key(i - 1) {
-                            return None;
+                            return Err(AdmissionError::new(
+                                AdmissionClass::MapOrder,
+                                geometry.keys_at + 2 * i,
+                                "chunk keys are not strictly ascending",
+                            ));
                         }
-                        let card = u32::try_from(
-                            forest.after(i).checked_sub(u64::from(forest.before(i)))?,
-                        )
-                        .ok()?;
-                        let container = forest.container_with::<true>(i)?;
-                        if container.cardinality() != card || (verify && !container.verify(card)) {
-                            return None;
+                        let container = forest.container_with(i, count_at)?;
+                        if verify {
+                            container.verify(container.cardinality(), forest.payload_at(i))?;
                         }
                     }
-                    if !forest.verify_slot_plane() {
-                        return None;
-                    }
+                    forest.verify_slot_plane()?;
                 }
                 Root::Forest(forest)
             }
-            _ => return None,
+            _ => {
+                return Err(AdmissionError::new(
+                    AdmissionClass::Kind,
+                    at,
+                    "unknown u32 body root kind",
+                ));
+            }
         };
-        Some(Self {
+        Ok(Self {
             root,
             encoded_len: bytes.len(),
         })
@@ -2430,30 +2756,59 @@ pub struct Bitmosaic64View<'a> {
 
 impl<'a> Bitmosaic64View<'a> {
     pub fn open(bytes: &'a [u8]) -> Option<Bitmosaic64View<'a>> {
-        Self::open_with(bytes, false)
+        Self::open_with(bytes, false).ok()
     }
 
-    pub fn open_verified(bytes: &'a [u8]) -> Option<Bitmosaic64View<'a>> {
+    pub fn open_verified(bytes: &'a [u8]) -> Result<Bitmosaic64View<'a>, AdmissionError> {
         Self::open_with(bytes, true)
     }
 
-    fn open_with(bytes: &'a [u8], verify: bool) -> Option<Self> {
-        let header = image_header(bytes)?;
+    fn open_with(bytes: &'a [u8], verify: bool) -> Result<Self, AdmissionError> {
+        let header = parse_header(bytes)?;
         if header.width != KeyWidth::U64 {
-            return None;
+            return Err(AdmissionError::new(
+                AdmissionClass::Kind,
+                3,
+                "image key width is not u64",
+            ));
         }
         let bytes = &bytes[..header.encoded_len];
         let mut at = header.body_offset;
+        let count_at = at;
         let forests = if header.encoded_len == IMAGE_ID_LEN {
             0
         } else {
-            read_uleb(bytes, &mut at, u32::MAX)?.checked_add(1)?
+            read_uleb_checked(bytes, &mut at, u32::MAX, AdmissionClass::Count)?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    AdmissionError::new(
+                        AdmissionClass::Count,
+                        count_at,
+                        "u64 directory count overflows u32",
+                    )
+                })?
         };
         let n = forests as usize;
-        let geometry = Geometry64::new(n, at)?;
-        bytes.get(..geometry.payload_at)?;
+        let geometry = Geometry64::new(n, at).ok_or_else(|| {
+            AdmissionError::new(
+                AdmissionClass::Extent,
+                at,
+                "u64 directory geometry overflows the address space",
+            )
+        })?;
+        if bytes.get(..geometry.payload_at).is_none() {
+            return Err(AdmissionError::new(
+                AdmissionClass::Extent,
+                at,
+                "u64 directory planes are truncated",
+            ));
+        }
         if !n.is_multiple_of(8) && bytes[geometry.roots_at + n / 8] >> (n % 8) != 0 {
-            return None;
+            return Err(AdmissionError::new(
+                AdmissionClass::BitPad,
+                geometry.roots_at + n / 8,
+                "u64 child-root plane tail bits are not zero",
+            ));
         }
         let mut view = Self {
             bytes,
@@ -2465,22 +2820,33 @@ impl<'a> Bitmosaic64View<'a> {
         };
         for i in 0..n {
             if i != 0 && view.high(i) <= view.high(i - 1) {
-                return None;
+                return Err(AdmissionError::new(
+                    AdmissionClass::MapOrder,
+                    geometry.keys_at + 4 * i,
+                    "u64 high keys are not strictly ascending",
+                ));
             }
             if i != 0 && i + 1 != n && view.before(i) != view.len {
-                return None;
+                return Err(AdmissionError::new(
+                    AdmissionClass::Count,
+                    geometry.before_at + 8 * (i - 1),
+                    "u64 exclusive prefix differs from preceding children",
+                ));
             }
             let child = view.forest_with(i, verify)?;
-            if child.is_empty() {
-                return None;
-            }
             view.last_before = view.len;
-            view.len = view.len.checked_add(child.len())?;
+            view.len = view.len.checked_add(child.len()).ok_or_else(|| {
+                AdmissionError::new(
+                    AdmissionClass::Count,
+                    count_at,
+                    "u64 total cardinality overflows",
+                )
+            })?;
             if n == 1 {
                 view.single = Some(child);
             }
         }
-        Some(view)
+        Ok(view)
     }
 
     pub fn serialized_len(&self) -> usize {
@@ -2512,15 +2878,52 @@ impl<'a> Bitmosaic64View<'a> {
             }
     }
 
-    fn forest_with(&self, i: usize, verify: bool) -> Option<BitmosaicView<'a>> {
-        let at = self.child_at(i);
+    fn forest_with(&self, i: usize, verify: bool) -> Result<BitmosaicView<'a>, AdmissionError> {
+        let offset_at = if i == 0 {
+            self.geometry.offsets_at
+        } else {
+            self.geometry.offsets_at + (i - 1) * 4
+        };
+        let relative = if i == 0 {
+            0
+        } else {
+            read_u32_at(self.bytes, offset_at) as usize
+        };
+        let at = self
+            .geometry
+            .payload_at
+            .checked_add(relative)
+            .ok_or_else(|| {
+                AdmissionError::new(
+                    AdmissionClass::Extent,
+                    offset_at,
+                    "u64 child offset overflows the address space",
+                )
+            })?;
         let end = if i + 1 == self.forests as usize {
             self.bytes.len()
         } else {
-            self.child_at(i + 1)
+            let next_at = self.geometry.offsets_at + i * 4;
+            self.geometry
+                .payload_at
+                .checked_add(read_u32_at(self.bytes, next_at) as usize)
+                .ok_or_else(|| {
+                    AdmissionError::new(
+                        AdmissionClass::Extent,
+                        next_at,
+                        "u64 child end overflows the address space",
+                    )
+                })?
         };
+        let body = self.bytes.get(at..end).ok_or_else(|| {
+            AdmissionError::new(
+                AdmissionClass::Placement,
+                offset_at,
+                "u64 child offsets are not adjacent within their payload plane",
+            )
+        })?;
         let root = (self.bytes[self.geometry.roots_at + i / 8] >> (i % 8)) & 1;
-        BitmosaicView::open_body::<true>(self.bytes.get(at..end)?, 0, root, verify)
+        BitmosaicView::open_body::<true>(body, 0, root, verify).map_err(|error| error.shifted(at))
     }
 
     fn forest(&self, i: usize) -> Option<BitmosaicView<'a>> {
@@ -2534,7 +2937,7 @@ impl<'a> Bitmosaic64View<'a> {
             self.child_at(i + 1)
         };
         let root = (self.bytes[self.geometry.roots_at + i / 8] >> (i % 8)) & 1;
-        BitmosaicView::open_body::<false>(self.bytes.get(at..end)?, 0, root, false)
+        BitmosaicView::open_body::<false>(self.bytes.get(at..end)?, 0, root, false).ok()
     }
 
     #[inline(always)]
@@ -3718,6 +4121,203 @@ mod refuter {
             cursor.next(),
             None,
             "cross-chunk seek ignored a falsified max - refuter unrouted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::Bitmosaic;
+
+    #[test]
+    fn verified_ef_low_tail_is_not_an_ignored_bit() {
+        for width in [KeyWidth::U32, KeyWidth::U64] {
+            let mut bytes = match width {
+                KeyWidth::U32 => Bitmosaic::from_sorted((0..17u32).map(|i| i * 65_537)).to_bytes(),
+                KeyWidth::U64 => {
+                    Bitmosaic64::from_sorted((0..17u64).map(|i| (7u64 << 32) | (i * 65_537)))
+                        .to_bytes()
+                }
+            };
+            let (last_low, used) = {
+                let ef = match width {
+                    KeyWidth::U32 => {
+                        let Root::Ef(ef) = BitmosaicView::open(&bytes)
+                            .expect("native image attaches")
+                            .root
+                        else {
+                            panic!("fixture must select EF")
+                        };
+                        ef
+                    }
+                    KeyWidth::U64 => {
+                        let view =
+                            Bitmosaic64View::open(&bytes).expect("native directory attaches");
+                        let Root::Ef(ef) = view.forest(0).expect("one child").root else {
+                            panic!("fixture child must select EF")
+                        };
+                        ef
+                    }
+                };
+                let used = (ef.len * u64::from(ef.layout.low_bits)) % 8;
+                assert_ne!(used, 0, "fixture must contain low-plane tail bits");
+                (
+                    ef.bytes.as_ptr().addr() - bytes.as_ptr().addr()
+                        + ef.layout.low_at()
+                        + ef.layout.low_bytes
+                        - 1,
+                    used,
+                )
+            };
+            bytes[last_low] |= 1 << used;
+            let error = match width {
+                KeyWidth::U32 => BitmosaicView::open_verified(&bytes).expect_err("low bits refuse"),
+                KeyWidth::U64 => {
+                    Bitmosaic64View::open_verified(&bytes).expect_err("child low bits refuse")
+                }
+            };
+            assert_eq!(error.class, AdmissionClass::BitPad);
+            assert_eq!(
+                error.offset, last_low,
+                "u64 child errors stay image-relative"
+            );
+        }
+    }
+
+    fn refusal32(bytes: &[u8], class: AdmissionClass, offset: usize) {
+        let error = BitmosaicView::open_verified(bytes).expect_err("damaged image must refuse");
+        assert_eq!((error.class, error.offset), (class, offset), "{error}");
+        assert!(!error.what.is_empty());
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains(class.as_str()) && diagnostic.contains(&offset.to_string()),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn verified_admission_keeps_each_rule_and_its_field_byte() {
+        let array = Bitmosaic::from_sorted([1, 9, 22]).to_forest_bytes();
+        let (array_at, kinds_at) = {
+            let Root::Forest(f) = BitmosaicView::open(&array).expect("native forest").root else {
+                panic!("forest fixture")
+            };
+            (f.payload_at(0), f.geometry.kinds_at)
+        };
+        let mut bad = array.clone();
+        bad[0] ^= 1;
+        refusal32(&bad, AdmissionClass::Magic, 0);
+        let mut bad = array.clone();
+        bad[3] = (FORMAT_VERSION << 3) | 3;
+        refusal32(&bad, AdmissionClass::Kind, 3);
+        refusal32(
+            &array[..array.len() - 1],
+            AdmissionClass::Extent,
+            IMAGE_ID_LEN,
+        );
+        let mut bad = array.clone();
+        bad[kinds_at] = K_RUNS as u8 + 1;
+        refusal32(&bad, AdmissionClass::Kind, kinds_at);
+        let mut bad = array.clone();
+        bad[kinds_at] |= 0x80;
+        refusal32(&bad, AdmissionClass::BitPad, kinds_at);
+        let mut bad = array.clone();
+        bad[array_at + 2..array_at + 4].copy_from_slice(&1u16.to_le_bytes());
+        refusal32(&bad, AdmissionClass::MapOrder, array_at + 2);
+
+        let stride = Bitmosaic::from_sorted([2, 4, 6]).to_forest_bytes();
+        let payload = {
+            let Root::Forest(f) = BitmosaicView::open(&stride).expect("native stride").root else {
+                panic!("stride fixture")
+            };
+            f.payload_at(0)
+        };
+        let mut bad = stride;
+        bad[payload + 2..payload + 4].fill(0);
+        refusal32(&bad, AdmissionClass::PlaneRange, payload + 2);
+
+        let words = Bitmosaic::from_sorted((0..9000u32).filter(|v| v % 3 != 0)).to_forest_bytes();
+        let header = image_header(&words).expect("native header");
+        let payload = {
+            let Root::Forest(f) = BitmosaicView::open(&words).expect("native words").root else {
+                panic!("words fixture")
+            };
+            f.payload_at(0)
+        };
+        let mut bad = words;
+        bad[header.body_offset] ^= 1;
+        refusal32(&bad, AdmissionClass::Count, payload);
+
+        let chunks = Bitmosaic::from_sorted([1, 65_545, 131_094]).to_forest_bytes();
+        let descriptor_at = {
+            let Root::Forest(f) = BitmosaicView::open(&chunks).expect("native chunks").root else {
+                panic!("chunk fixture")
+            };
+            f.geometry.desc_at
+        };
+        let mut bad = chunks;
+        bad[descriptor_at..descriptor_at + 4].copy_from_slice(&9999u32.to_le_bytes());
+        refusal32(&bad, AdmissionClass::Placement, descriptor_at);
+    }
+
+    #[test]
+    fn verified_u64_directory_errors_remain_image_relative() {
+        let bytes = Bitmosaic64::from_sorted([1, (7u64 << 32) | 2, (8u64 << 32) | 3]).to_bytes();
+        let view = Bitmosaic64View::open(&bytes).expect("native directory");
+        let (keys_at, before_at) = (view.geometry.keys_at, view.geometry.before_at);
+        let mut bad = bytes.clone();
+        bad[keys_at + 4..keys_at + 8].copy_from_slice(&0u32.to_le_bytes());
+        let error = Bitmosaic64View::open_verified(&bad).expect_err("high keys must ascend");
+        assert_eq!(
+            (error.class, error.offset),
+            (AdmissionClass::MapOrder, keys_at + 4)
+        );
+        let mut bad = bytes;
+        bad[before_at..before_at + 8].copy_from_slice(&2u64.to_le_bytes());
+        let error =
+            Bitmosaic64View::open_verified(&bad).expect_err("prefix must count preceding child");
+        assert_eq!(
+            (error.class, error.offset),
+            (AdmissionClass::Count, before_at)
+        );
+    }
+
+    #[test]
+    fn verified_cone_window_cannot_exclude_its_own_members() {
+        let mut bytes =
+            Bitmosaic::from_sorted((0..1024u32).map(|i| i * 8 + i % 3)).to_forest_bytes();
+        let (eps_at, count) = {
+            let Root::Forest(forest) = BitmosaicView::open(&bytes).expect("native forest").root
+            else {
+                panic!("forest fixture")
+            };
+            let CView::Cone { eps, residuals, .. } = forest.container(0).expect("one chunk") else {
+                panic!("fixture must select Cone")
+            };
+            assert_ne!(eps, 0, "fixture needs a model window margin");
+            (forest.payload_at(0) + 2, residuals.len())
+        };
+        // Keep members ordered and in u16, but make the unchanged hint exclude them.
+        for i in 0..count {
+            let lane = i % 32;
+            bytes[eps_at + 9 + i] = (if lane <= 16 { lane } else { 32 - lane }) as u8 * 7;
+        }
+        let error = match BitmosaicView::open_verified(&bytes) {
+            Err(error) => error,
+            Ok(view) => {
+                for member in view.range() {
+                    assert!(
+                        view.contains(member),
+                        "certified Cone window misses member {member}"
+                    );
+                }
+                panic!("understated Cone hint must refuse");
+            }
+        };
+        assert_eq!(
+            (error.class, error.offset),
+            (AdmissionClass::PlaneRange, eps_at)
         );
     }
 }

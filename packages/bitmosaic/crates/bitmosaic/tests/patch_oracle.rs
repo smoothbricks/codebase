@@ -467,8 +467,9 @@ fn canonical(oracle: &BTreeSet<u32>, slot_is_ef: bool) -> Option<Vec<u8>> {
 }
 
 fn check_reads(name: &str, step: usize, bytes: &[u8], oracle: &BTreeSet<u32>, rng: &mut Rng) {
-    let view = BitmosaicView::open_verified(bytes)
-        .unwrap_or_else(|| panic!("{name}/{step}: the patched string does not verify"));
+    let view = BitmosaicView::open_verified(bytes).unwrap_or_else(|error| {
+        panic!("{name}/{step}: the patched string does not verify: {error}")
+    });
     assert_eq!(view.len(), oracle.len() as u64, "{name}/{step}: len");
     let members: Vec<u32> = oracle.iter().copied().collect();
     for _ in 0..64 {

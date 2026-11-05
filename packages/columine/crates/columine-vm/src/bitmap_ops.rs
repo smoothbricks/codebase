@@ -859,7 +859,7 @@ fn verified_bitmap_view(data: &[u8]) -> Result<Option<BitmosaicView<'_>>, ErrorC
     if data.is_empty() {
         return Ok(None);
     }
-    let view = BitmosaicView::open_verified(data).ok_or(ErrorCode::InvalidState)?;
+    let view = BitmosaicView::open_verified(data).map_err(|_| ErrorCode::InvalidState)?;
     Ok((!view.is_empty()).then_some(view))
 }
 
@@ -1138,22 +1138,12 @@ pub fn bitmap_import(
     let storage = get_bitmap_storage(meta);
     let payload = storage.payload_offset() as usize;
     let capacity = storage.payload_capacity as usize;
-    let Some(header) = image_header(input) else {
+    let Ok(view) = BitmosaicView::open_verified(input) else {
         env.last_error = 102;
         return ErrorCode::InvalidState;
     };
-    if header.width != KeyWidth::U32 {
-        env.last_error = 102;
-        return ErrorCode::InvalidState;
-    }
-    // The header delimits the image: trailing bytes in the caller's buffer
-    // are not part of it and must not reach the slot, whose tail is zero by
-    // contract.
-    let image = &input[..header.encoded_len];
-    let Some(view) = BitmosaicView::open_verified(image) else {
-        env.last_error = 102;
-        return ErrorCode::InvalidState;
-    };
+    // The verified reader owns framing too; unused caller capacity never reaches the slot.
+    let image = &input[..view.serialized_len()];
     let Ok(card) = u32::try_from(view.len()) else {
         return ErrorCode::CapacityExceeded;
     };
@@ -1200,13 +1190,13 @@ pub fn cardinality_serialized(data: &[u8]) -> u32 {
     BitmosaicView::open(data).map_or(0, |view| u32::try_from(view.len()).unwrap_or(u32::MAX))
 }
 
-/// Verify a serialized native image in full and return its cardinality. A
-/// `None` result distinguishes malformed bytes from an empty bitmap: only
-/// the canonical empty image verifies to zero, zero-length bytes verify to
-/// nothing.
-pub fn cardinality_validated(data: &[u8]) -> Option<u32> {
-    let view = BitmosaicView::open_verified(data)?;
-    u32::try_from(view.len()).ok()
+/// Fully certify a native image and return its exact cardinality, including 2^32 members.
+/// The canonical empty image is zero; zero-length input is not an image.
+///
+/// # Errors
+/// Preserves the bitmap owner's admission class, image-relative offset and cause.
+pub fn cardinality_validated(data: &[u8]) -> Result<u64, bitmosaic::AdmissionError> {
+    BitmosaicView::open_verified(data).map(|view| view.len())
 }
 /// Extract ascending values into `out`, capped at its length; return the count.
 pub fn extract_serialized(data: &[u8], out: &mut [u32]) -> u32 {

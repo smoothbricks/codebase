@@ -84,7 +84,7 @@ fn ordinary_attach_rejects_zero_stride_and_nonzero_ef_tail_bits() {
 fn runs_validate_stored_and_implicit_cardinality_prefixes() {
     let bytes = Bitmosaic::from_sorted((0..4).chain(10..14).chain(20..24)).to_forest_bytes();
     assert_eq!(bytes.len(), 25);
-    assert!(BitmosaicView::open_verified(&bytes).is_some());
+    assert!(BitmosaicView::open_verified(&bytes).is_ok());
     // One-byte framing/counts, then one key/kind: payload at 10.
     // Three bounds consume 12 bytes after the count; the one prefix is at 23.
     let mut bad_prefix = bytes.clone();
@@ -99,7 +99,7 @@ fn runs_validate_stored_and_implicit_cardinality_prefixes() {
 fn u64_directory_rejects_inconsistent_prefixes_offsets_and_child_bodies() {
     let bytes = Bitmosaic64::from_sorted([1, (1u64 << 32) | 3, (2u64 << 32) | 5]).to_bytes();
     assert_eq!(bytes.len(), 56);
-    assert!(Bitmosaic64View::open_verified(&bytes).is_some());
+    assert!(Bitmosaic64View::open_verified(&bytes).is_ok());
     // Three children: keys at 6, interior prefix at 18, offsets at 26,
     // root bits at 34, tightly packed seven-byte singleton bodies at 35.
     for (at, value) in [(6, 2u8), (18, 2), (26, 8), (34, 0x80), (35, 1)] {
@@ -856,7 +856,7 @@ fn truncated_and_corrupt_planes_are_refused_not_trusted() {
 /// 2. **Single-byte damage anywhere in the string.** Whatever byte flips:
 ///    `open` returns `None` or a view every read path of which terminates
 ///    inside the string (exercised, not asserted — a panic or an
-///    out-of-range read is the failure); `open_verified` returns `None` or
+///    out-of-range read is the failure); `open_verified` returns a structured error or
 ///    a view whose walk is strictly ascending, whose `len` is the walk's
 ///    length, and whose `contains` / `rank` / `select` / cursor agree with
 ///    that walk. A flip inside a container payload may describe a different
@@ -926,7 +926,7 @@ fn forged_headers_are_refused_and_damaged_planes_never_lie() {
                 if let Some(view) = BitmosaicView::open(&damaged) {
                     exercise(view);
                 }
-                if let Some(view) = BitmosaicView::open_verified(&damaged) {
+                if let Ok(view) = BitmosaicView::open_verified(&damaged) {
                     self_consistent(name, &format!("byte {at} ^ {flip:#04x}"), view);
                 }
             }
@@ -1287,7 +1287,7 @@ fn write_into_slice_lands_the_canonical_bytes_and_refuses_a_short_slot() {
             "{name}: bytes past the string are untouched"
         );
         assert!(
-            BitmosaicView::open_verified(&slot).is_some(),
+            BitmosaicView::open_verified(&slot).is_ok(),
             "{name}: the slot opens (the view bounds itself by the header's total)"
         );
 

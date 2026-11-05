@@ -231,7 +231,7 @@ fn canonical(oracle: &BTreeSet<u32>, slot_is_ef: bool) -> Option<Vec<u8>> {
 /// plus values the input names; seeks visit the same probes in order.
 fn check_reads(step: usize, bytes: &[u8], oracle: &BTreeSet<u32>, input: &mut Input<'_>) {
     let view = BitmosaicView::open_verified(bytes)
-        .unwrap_or_else(|| panic!("step {step}: the image does not verify"));
+        .unwrap_or_else(|error| panic!("step {step}: the image does not verify: {error}"));
     let members: Vec<u32> = oracle.iter().copied().collect();
     let owned = Bitmosaic::from_sorted(members.iter().copied());
     let n = members.len();

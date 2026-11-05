@@ -15,7 +15,8 @@
 //! construction, because `low_bits` is chosen so the high plane holds about
 //! as many zeros as ones. No binary search appears on any read path.
 
-use crate::wire::{read_u32_at, read_u64_at};
+use crate::wire::{read_u32_at, read_u64_at, read_uleb_checked};
+use crate::{AdmissionClass, AdmissionError};
 
 /// One sample every 64 ones and every 64 zeros. The samples are absolute
 /// BIT POSITIONS, not word indices: a word index would leave the running
@@ -178,29 +179,78 @@ pub struct EfView<'a> {
 }
 
 impl<'a> EfView<'a> {
-    /// `bytes` is the payload alone. `None` when the geometry and the byte
-    /// length disagree — the one check that makes every later index safe.
-    pub(crate) fn new(bytes: &'a [u8], base: u32, span: u32, len: u64) -> Option<EfView<'a>> {
-        base.checked_add(span)?;
-        let layout = EfLayout::new(len, u64::from(span))?;
-        if bytes.len() != layout.payload_bytes() {
-            return None;
+    /// Admit one framed body's EF header and plane without allocating.
+    pub(crate) fn admit_body(
+        bytes: &'a [u8],
+        mut at: usize,
+        verify: bool,
+    ) -> Result<Self, AdmissionError> {
+        let count_at = at;
+        let len = u64::from(read_uleb_checked(
+            bytes,
+            &mut at,
+            u32::MAX,
+            AdmissionClass::Count,
+        )?) + 1;
+        let base = read_uleb_checked(bytes, &mut at, u32::MAX, AdmissionClass::PlaneRange)?;
+        let span_at = at;
+        let span = read_uleb_checked(bytes, &mut at, u32::MAX, AdmissionClass::PlaneRange)?;
+        if base.checked_add(span).is_none() {
+            return Err(AdmissionError::new(
+                AdmissionClass::PlaneRange,
+                span_at,
+                "EF base plus span overflows u32",
+            ));
+        }
+        if len > u64::from(span) + 1 {
+            return Err(AdmissionError::new(
+                AdmissionClass::Count,
+                count_at,
+                "EF cardinality exceeds its member span",
+            ));
+        }
+        let layout = EfLayout::new(len, u64::from(span)).ok_or_else(|| {
+            AdmissionError::new(
+                AdmissionClass::Extent,
+                at,
+                "EF geometry exceeds its position domain",
+            )
+        })?;
+        let payload = &bytes[at..];
+        if payload.len() != layout.payload_bytes() {
+            return Err(AdmissionError::new(
+                AdmissionClass::Extent,
+                at,
+                "EF plane extent differs from its derived geometry",
+            ));
         }
         let high_used = layout.high_bits % 64;
-        if high_used != 0 && read_u64_at(bytes, (layout.high_words - 1) * 8) >> high_used != 0 {
-            return None;
+        if high_used != 0 && read_u64_at(payload, (layout.high_words - 1) * 8) >> high_used != 0 {
+            return Err(AdmissionError::new(
+                AdmissionClass::BitPad,
+                at + (layout.high_words - 1) * 8 + high_used as usize / 8,
+                "EF high-plane tail bits are not zero",
+            ));
         }
         let low_used = (len * u64::from(layout.low_bits)) % 8;
-        if low_used != 0 && bytes[layout.low_at() + layout.low_bytes - 1] >> low_used != 0 {
-            return None;
+        if low_used != 0 && payload[layout.low_at() + layout.low_bytes - 1] >> low_used != 0 {
+            return Err(AdmissionError::new(
+                AdmissionClass::BitPad,
+                at + layout.low_at() + layout.low_bytes - 1,
+                "EF low-plane tail bits are not zero",
+            ));
         }
-        Some(EfView {
-            bytes,
+        let view = Self {
+            bytes: payload,
             layout,
             base,
             span,
             len,
-        })
+        };
+        if verify {
+            view.verify_members().map_err(|error| error.shifted(at))?;
+        }
+        Ok(view)
     }
 
     #[inline(always)]
@@ -390,73 +440,108 @@ impl<'a> EfView<'a> {
         p < self.layout.high_bits && self.high_word((p / 64) as usize) >> (p % 64) & 1 == 1
     }
 
-    /// Content verification run once by `BitmosaicView::open_verified`: the high
-    /// plane holds exactly `len` ones and `zeros` zeros inside `high_bits`
-    /// (nothing set past the end), every sample names the position of the
-    /// one or zero it stands for, and the decoded sequence is strictly
-    /// ascending from `base` to exactly `base + span`. With these, every
-    /// sample-seeded scan in `select_one`/`select_zero` terminates inside
-    /// the plane and every decoded member is the writer's. One pass over
-    /// the high plane; no allocation.
-    pub(crate) fn verify(&self) -> bool {
-        let Some(last) = self.base.checked_add(self.span) else {
-            return false;
-        };
+    /// Verify every member and sample once after the derived planes were bounded.
+    fn verify_members(&self) -> Result<(), AdmissionError> {
+        let last = self.base + self.span;
         let stride = u64::from(SAMPLE_STRIDE);
         let (mut ones, mut zeros) = (0u64, 0u64);
         let mut prev: Option<u32> = None;
         for w in 0..self.layout.high_words {
             let word = self.high_word(w);
             let base_pos = (w as u64) * 64;
-            // Bits at or past `high_bits` must be clear.
             let live = self.layout.high_bits.saturating_sub(base_pos).min(64);
-            if live < 64 && word >> live != 0 {
-                return false;
-            }
             for b in 0..live {
                 let p = base_pos + b;
                 if word >> b & 1 == 1 {
                     if ones >= self.len {
-                        return false;
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Count,
+                            w * 8,
+                            "EF high plane has too many members",
+                        ));
                     }
-                    if (ones == 0 && p != 0)
-                        || (ones != 0
-                            && ones.is_multiple_of(stride)
-                            && u64::from(read_u32_at(
-                                self.bytes,
-                                self.layout.ones_at() + (ones / stride - 1) as usize * 4,
-                            )) != p)
-                    {
-                        return false;
+                    if ones == 0 && p != 0 {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Placement,
+                            0,
+                            "EF first member position is not zero",
+                        ));
+                    }
+                    if ones != 0 && ones.is_multiple_of(stride) {
+                        let sample_at = self.layout.ones_at() + (ones / stride - 1) as usize * 4;
+                        if u64::from(read_u32_at(self.bytes, sample_at)) != p {
+                            return Err(AdmissionError::new(
+                                AdmissionClass::Placement,
+                                sample_at,
+                                "EF member sample names the wrong bit",
+                            ));
+                        }
                     }
                     let high = p - ones;
                     let value = (high << self.layout.low_bits) | self.low(ones);
+                    let value_at = self.member_byte(ones, p);
                     if value > u64::from(self.span) {
-                        return false;
+                        return Err(AdmissionError::new(
+                            AdmissionClass::PlaneRange,
+                            value_at,
+                            "EF member exceeds its declared span",
+                        ));
                     }
                     let value = self.base + value as u32;
                     if prev.is_some_and(|q| q >= value) {
-                        return false;
+                        return Err(AdmissionError::new(
+                            AdmissionClass::MapOrder,
+                            value_at,
+                            "EF members are not strictly ascending",
+                        ));
                     }
                     prev = Some(value);
                     ones += 1;
                 } else {
                     if zeros >= self.layout.zeros {
-                        return false;
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Count,
+                            w * 8,
+                            "EF high plane has too many buckets",
+                        ));
                     }
-                    if zeros.is_multiple_of(stride)
-                        && u64::from(read_u32_at(
-                            self.bytes,
-                            self.layout.zeros_at() + (zeros / stride) as usize * 4,
-                        )) != p
-                    {
-                        return false;
+                    if zeros.is_multiple_of(stride) {
+                        let sample_at = self.layout.zeros_at() + (zeros / stride) as usize * 4;
+                        if u64::from(read_u32_at(self.bytes, sample_at)) != p {
+                            return Err(AdmissionError::new(
+                                AdmissionClass::Placement,
+                                sample_at,
+                                "EF bucket sample names the wrong bit",
+                            ));
+                        }
                     }
                     zeros += 1;
                 }
             }
         }
-        ones == self.len && zeros == self.layout.zeros && prev == Some(last)
+        if ones != self.len || zeros != self.layout.zeros {
+            return Err(AdmissionError::new(
+                AdmissionClass::Count,
+                0,
+                "EF high-plane counts disagree with the header",
+            ));
+        }
+        if prev != Some(last) {
+            return Err(AdmissionError::new(
+                AdmissionClass::PlaneRange,
+                self.member_byte(self.len - 1, self.layout.high_bits - 1),
+                "EF final member differs from base plus span",
+            ));
+        }
+        Ok(())
+    }
+
+    fn member_byte(&self, ordinal: u64, high_position: u64) -> usize {
+        if self.layout.low_bits == 0 {
+            (high_position / 8) as usize
+        } else {
+            self.layout.low_at() + (ordinal * u64::from(self.layout.low_bits) / 8) as usize
+        }
     }
 
     /// Ascending walk, allocation-free: one pass over the high plane rather

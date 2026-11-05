@@ -7,6 +7,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/smoothbricks/codebase"
 publish = ["crates-io"]
 
+[[package.metadata.wiring.external]]
+item = "as_str"
+consumer = "private"
+why = "an embedder reports the bitmap admission rule beside its image-relative offset without reparsing the image"
+
 [dependencies]
 
 [features]

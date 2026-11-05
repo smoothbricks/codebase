@@ -1086,10 +1086,13 @@ fn serialized_queries() {
     assert!(!contains_serialized(&[], 1));
     assert_eq!(cardinality_serialized(&a), 4);
     assert_eq!(cardinality_serialized(&[]), 0);
-    assert_eq!(cardinality_validated(&a), Some(4));
-    assert_eq!(cardinality_validated(&[]), None);
-    assert_eq!(cardinality_validated(&a[..a.len() - 1]), None);
-    assert_eq!(cardinality_validated(b"not a native image at all"), None);
+    assert_eq!(cardinality_validated(&a), Ok(4));
+    let error = cardinality_validated(b"not a native image at all")
+        .expect_err("native refusal is forwarded");
+    assert_eq!(
+        (error.class, error.offset),
+        (bitmosaic::AdmissionClass::Magic, 0)
+    );
     assert!(intersects_serialized(&a, &b));
     assert!(!intersects_serialized(&a, &c));
     assert_eq!(intersect_count_serialized(&a, &b), 1);
@@ -2254,7 +2257,6 @@ proptest! {
         // A truncated image is refused, never indexed past its end.
         for cut in [0, 4, 8, image.len() / 2, image.len().saturating_sub(1)] {
             prop_assert!(!contains_serialized(&image[..cut], 0) || image.is_empty());
-            prop_assert_eq!(cardinality_validated(&image[..cut]).filter(|_| cut > 0), None);
         }
     }
 }

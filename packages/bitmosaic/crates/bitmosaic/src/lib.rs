@@ -25,6 +25,7 @@
 // the BTreeSet differential oracle in tests and the roaring-rs oracle in
 // benches/ops.rs.
 
+mod admission;
 mod array;
 mod ef;
 #[cfg(any(test, feature = "bench-internals"))]
@@ -33,6 +34,7 @@ mod patch;
 mod range;
 mod wire;
 
+pub use admission::{AdmissionClass, AdmissionError};
 pub use ef::EfView;
 pub use patch::{
     BatchOutcome, PatchError, PatchReport, PatchScratch, PreparedPatch, Witness, patch,

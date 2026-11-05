@@ -109,9 +109,15 @@ available extent, **not body topology**. Use it to find an embedded image's boun
 expected `KeyWidth`.
 
 Both views expose `serialized_len()` separately from cardinality `len()`. Capacity after the encoded extent is allowed.
-`open` checks directory geometry, legal kinds, adjacent payload extents, canonical counts, and Runs records and
-prefixes. `open_verified` additionally verifies Array/Cone ordering, Words metadata, and EF samples/member content,
-including u64 children. Neither attachment allocates or expands the bitmap.
+`open` remains an `Option` structural probe: it checks directory geometry, legal kinds, adjacent payload extents,
+canonical counts, and Runs records and prefixes. `open_verified` returns `Result<View, AdmissionError>` and additionally
+verifies Array/Cone ordering and query hints, Words metadata, and EF samples/member content, including u64 children.
+Neither attachment allocates or expands the bitmap.
+
+`AdmissionError` retains the typed `class`, image-relative byte `offset`, and static `what` cause. A child refusal in a
+u64 directory is shifted to the complete image. `AdmissionClass::as_str()` names the stable rules: `magic`, `extent`,
+`kind`, `count`, `map-order`, `plane-range`, `bit-pad`, and `placement`. Framing, topology, and payload admission share
+one checked parser; there is no second Boolean validator or verified `Option` entry point.
 
 All mapped reads are byte-backed. Words and balanced Array intersection retain their NEON byte-load kernels at odd
 offsets; unsupported targets use the portable little-endian scalar implementation rather than a realignment copy.

@@ -870,7 +870,7 @@ fn export_slot_inner<I: KeyIndex>(
                 .map_err(LogicalExportCause::Vm)?;
             if data.len() > IMAGE_ID_LEN {
                 let view = BitmosaicView::open_verified(data)
-                    .ok_or(LogicalExportCause::Vm(ErrorCode::InvalidState))?;
+                    .map_err(|_| LogicalExportCause::Vm(ErrorCode::InvalidState))?;
                 for member in view.range() {
                     out.rows.push(LogicalRow {
                         key: decode_u32(member, enc.value, lookup)?,

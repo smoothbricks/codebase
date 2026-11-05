@@ -501,7 +501,7 @@ fn payload_corruption_accepted_by_bounded_open_is_refused_by_checked_membership(
     );
     let storage = columine_vm::bitmap_ops::get_bitmap_storage(&meta);
     let image = storage.serialized_data(&state).expect("real kernel image");
-    assert!(bitmosaic::BitmosaicView::open_verified(image).is_some());
+    assert!(bitmosaic::BitmosaicView::open_verified(image).is_ok());
     let mut damaged = None;
     for at in 4..image.len() {
         for bit in 0..8 {
@@ -509,7 +509,7 @@ fn payload_corruption_accepted_by_bounded_open_is_refused_by_checked_membership(
             candidate[at] ^= 1 << bit;
             if let Some(view) = bitmosaic::BitmosaicView::open(&candidate)
                 && view.len() == u64::from(meta.size(&state))
-                && bitmosaic::BitmosaicView::open_verified(&candidate).is_none()
+                && bitmosaic::BitmosaicView::open_verified(&candidate).is_err()
             {
                 damaged = Some(candidate);
                 break;

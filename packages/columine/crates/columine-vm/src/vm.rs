@@ -8783,7 +8783,8 @@ impl<'a> CheckedSet<'a> {
             SlotType::HashSet => SetMembers::Keys { lane: meta.offset },
             SlotType::Bitmap => {
                 let bytes = get_bitmap_storage(&meta).serialized_data(state)?;
-                let image = BitmosaicView::open_verified(bytes).ok_or(ErrorCode::InvalidState)?;
+                let image =
+                    BitmosaicView::open_verified(bytes).map_err(|_| ErrorCode::InvalidState)?;
                 let cardinality = meta.size(state);
                 if image.len() != u64::from(cardinality) || cardinality > meta.capacity {
                     return Err(ErrorCode::InvalidState);
