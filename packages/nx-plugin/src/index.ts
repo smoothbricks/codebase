@@ -180,17 +180,36 @@ function typecheckTargets(packageJsonPath: string, packageJson: PackageJson): Ty
  * node and the project's through its `^` input, so a release's rewrite of the
  * lockfile's `workspaces` mirror re-keys nothing.
  *
- * The root manifest drops `scripts`, `smoo` and `nx`. No lint or
- * typecheck reads them: `scripts` are commands a developer runs, `smoo` holds
- * the developer links whose linked bytes reach the hash only through their own
- * inputs, and the root project's `nx` configuration is hashed as that
- * project's configuration. Hashing them made a root `postinstall` edit or a
- * developer-link edit re-key every lint task (74, measured in a consumer
- * workspace). The dependency fields, `overrides`, `patchedDependencies` and
- * `workspaces` stay hashed.
+ * No check reads the root's scripts, developer-link configuration or Nx
+ * configuration; Nx already hashes the resolved project configuration. Nor
+ * does a check read install-only dependency ranges, overrides or catalogs:
+ * the bun lock-scope nodes key the installed packages they resolve to, and
+ * patch files key the patch bytes. Keeping those pins here would re-key every
+ * check on a catalog bump even when a built-output package's bytes agree.
+ * Resolution fields (type, imports, exports) and workspace member patterns
+ * remain inputs; only the catalogs nested beside those patterns are dropped.
  */
 const VERSIONLESS_TOOLCHAIN_MANIFEST_INPUTS = [
-  { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
+  {
+    json: '{workspaceRoot}/package.json',
+    excludeFields: [
+      'version',
+      'scripts',
+      'smoo',
+      'nx',
+      'dependencies',
+      'devDependencies',
+      'optionalDependencies',
+      'peerDependencies',
+      'overrides',
+      'resolutions',
+      'patchedDependencies',
+      'catalog',
+      'catalogs',
+      'workspaces.catalog',
+      'workspaces.catalogs',
+    ],
+  },
 ];
 
 /** A path segment Nx's workspace file map never carries, so a fileset naming it hashes nothing. */
@@ -1639,7 +1658,13 @@ async function createProjectTargets(
   const versionlessProjectInputs =
     versionless === null
       ? []
-      : [...VERSIONLESS_PACKAGE_INPUTS, ...crateInputs, ...(projectRoot === '.' ? ROOT_LOCKFILE_EXCLUSIONS : [])];
+      : [
+          ...(projectRoot === '.'
+            ? ['!{projectRoot}/package.json', ...VERSIONLESS_TOOLCHAIN_MANIFEST_INPUTS]
+            : VERSIONLESS_PACKAGE_INPUTS),
+          ...crateInputs,
+          ...(projectRoot === '.' ? ROOT_LOCKFILE_EXCLUSIONS : []),
+        ];
   // The options a TypeScript task's answer really depends on, which is the
   // whole `extends` chain of the configs its commands name and not just those
   // two files. Resolved once per project: every target below shares it.

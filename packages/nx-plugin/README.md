@@ -907,9 +907,10 @@ integrity. Nx merges its default plugin's lockfile nodes after every configured 
 on they would replace these: the plugin refuses the option then, and refuses a name the lockfile installs nowhere
 (`src/built-output-packages.ts`, `src/built-output-packages.test.ts`).
 
-The option covers the lockfile only. A manifest that declares a named package's version is still an input wherever its
-project's files are; a workspace keeps the version out of member manifests by declaring it once, in the root manifest's
-`catalog`, and `catalog:` in each member.
+The option covers the lockfile only. A member manifest that declares a named package's version is still an input
+wherever its project's files are; a workspace keeps the version out of member manifests by declaring it once, in the
+root manifest's `catalog`, and `catalog:` in each member. Inferred validation inputs omit the root's install-only pins
+as described below; targets producing shipped artifacts retain the raw manifests.
 
 ### Manifest versions and validation inputs
 
@@ -918,13 +919,22 @@ files are inputs of `lint`, `typecheck` and `typecheck-tests`, so a publish run 
 over a change that alters no code. Those three targets therefore leave the raw manifests out of their filesets and hash
 them by field instead: a `json` input with `excludeFields` for `package.json#version`. The lockfile is no file input
 (see Lockfile scope), so the release's rewrite of its `workspaces` mirror re-keys nothing. Nx hashes the field input in
-its native hasher, so this costs no process. Everything else still counts: a dependency range, an export map, and every
+its native hasher, so this costs no process. A member's dependency range and export map still count, as does every
 locked package the project reaches.
 
 The workspace root manifest also drops `scripts`, `smoo` and `nx` from these three targets' hash. No check reads them:
 scripts are commands a developer runs, `smoo.developerLinks` names links whose linked bytes reach a hash only through
-their own inputs, and the root project's `nx` configuration is hashed as that project's configuration. Hashing them made
-a root `postinstall` or developer-link edit re-key every lint and typecheck in the workspace.
+their own inputs, and the root project's `nx` configuration is hashed as that project's configuration. The same root
+field input is used in the root project's versionless named inputs, so its own manifest cannot reintroduce the fields.
+
+The root's install-only fields are excluded too: `dependencies`, `devDependencies`, `optionalDependencies`,
+`peerDependencies`, `overrides`, `resolutions`, `patchedDependencies`, `catalog` and `catalogs`, including
+`workspaces.catalog` and `workspaces.catalogs` in the object form. Checks load installed packages, not these pins: the
+bun lock-scope nodes still key those packages, and the patch files still key patch bytes. A pin-only edit therefore
+keeps a check's key; a changed installed dependency still re-keys the tasks that reach it (subject to Built-output
+packages above). Resolution fields such as `type`, `imports` and `exports`, workspace member patterns, and other root
+fields remain hashed: an edit to something a check reads must still miss. Artifact-producing targets retain their raw
+manifest inputs.
 
 Crate manifests are the one kind Nx cannot hash by field, because TOML has no such input. The plugin hashes them itself,
 in the process that builds the graph and is already reading them: a single forward scan over the bytes feeds the hasher

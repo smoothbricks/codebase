@@ -297,7 +297,26 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/patches/**/*',
         '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
+        {
+          json: '{workspaceRoot}/package.json',
+          excludeFields: [
+            'version',
+            'scripts',
+            'smoo',
+            'nx',
+            'dependencies',
+            'devDependencies',
+            'optionalDependencies',
+            'peerDependencies',
+            'overrides',
+            'resolutions',
+            'patchedDependencies',
+            'catalog',
+            'catalogs',
+            'workspaces.catalog',
+            'workspaces.catalogs',
+          ],
+        },
         { externalDependencies: ['bun-lock:packages/example'] },
       ];
       // The compiler's store path names its pinned revision, so a compiler bump misses the cache.
@@ -740,9 +759,28 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/tsconfig.base.json',
         // Hashed by Nx itself: a `json` input costs no process, and neither
         // does the crate digest that replaces the manifests below.
-        // The root manifest's scripts, smoo and nx sections are read by no check: an
+        // The root manifest's install pins, scripts, smoo and nx sections are read by no check: an
         // edit to a script or a developer link must not re-key every lint and typecheck.
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
+        {
+          json: '{workspaceRoot}/package.json',
+          excludeFields: [
+            'version',
+            'scripts',
+            'smoo',
+            'nx',
+            'dependencies',
+            'devDependencies',
+            'optionalDependencies',
+            'peerDependencies',
+            'overrides',
+            'resolutions',
+            'patchedDependencies',
+            'catalog',
+            'catalogs',
+            'workspaces.catalog',
+            'workspaces.catalogs',
+          ],
+        },
         { externalDependencies: ['bun-lock:packages/example'] },
       ];
 
@@ -810,6 +848,69 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('excludes root install pins from checks, but retains fields their resolvers read', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('package.json', '{"name":"root"}\n');
+      await workspace.write('tsconfig.lib.json', '{}\n');
+      await workspace.write('tsconfig.test.json', '{}\n');
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+      await workspace.write('packages/example/tsconfig.test.json', '{}\n');
+      // Nx owns JSON field hashing. Exercise the inferred closure, not a second implementation of its hasher.
+      const installOnly = [
+        'version',
+        'scripts',
+        'smoo',
+        'nx',
+        'dependencies',
+        'devDependencies',
+        'optionalDependencies',
+        'peerDependencies',
+        'overrides',
+        'resolutions',
+        'patchedDependencies',
+        'catalog',
+        'catalogs',
+        'workspaces.catalog',
+        'workspaces.catalogs',
+      ];
+      const readByChecks = ['type', 'imports', 'exports', 'workspaces', 'workspaces.packages', 'packageManager'];
+      for (const path of ['package.json', 'packages/example/package.json']) {
+        const project = await inferProjectWithNxJson(workspace, path, {});
+        for (const name of ['lint', 'typecheck', 'typecheck-tests']) {
+          const inputs = project?.targets?.[name]?.inputs ?? [];
+          expect(inputs).not.toContain('{workspaceRoot}/package.json');
+          const manifest = inputs.find(
+            (input) => typeof input === 'object' && 'json' in input && input.json === '{workspaceRoot}/package.json',
+          );
+          if (manifest === undefined || typeof manifest !== 'object' || !('excludeFields' in manifest)) {
+            throw new Error(`${path}:${name} has no field-scoped root manifest input`);
+          }
+          for (const field of installOnly) expect(manifest.excludeFields, `${path}:${name}:${field}`).toContain(field);
+          for (const field of readByChecks)
+            expect(manifest.excludeFields, `${path}:${name}:${field}`).not.toContain(field);
+        }
+        // The root's own default/production would otherwise reintroduce the same pin through its project manifest.
+        if (path === 'package.json') {
+          for (const name of ['versionlessDefault', 'versionlessProduction']) {
+            const manifests = (project?.namedInputs?.[name] ?? []).filter(
+              (input) => typeof input === 'object' && 'json' in input,
+            );
+            expect(manifests).toHaveLength(1);
+            const manifest = manifests[0];
+            if (manifest === undefined || !('excludeFields' in manifest)) {
+              throw new Error(`${name} has no field-scoped root manifest input`);
+            }
+            for (const field of installOnly) expect(manifest.excludeFields, `${name}:${field}`).toContain(field);
+            for (const field of readByChecks) expect(manifest.excludeFields, `${name}:${field}`).not.toContain(field);
+          }
+        }
+      }
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   it('keeps the lockfiles out of the root versionless inputs, and names none in a member', async () => {
     const workspace = await createWorkspace();
     try {
@@ -894,7 +995,26 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/patches/**/*',
         '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
+        {
+          json: '{workspaceRoot}/package.json',
+          excludeFields: [
+            'version',
+            'scripts',
+            'smoo',
+            'nx',
+            'dependencies',
+            'devDependencies',
+            'optionalDependencies',
+            'peerDependencies',
+            'overrides',
+            'resolutions',
+            'patchedDependencies',
+            'catalog',
+            'catalogs',
+            'workspaces.catalog',
+            'workspaces.catalogs',
+          ],
+        },
         { externalDependencies: ['bun-lock:packages/example'] },
         { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
@@ -933,7 +1053,26 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/patches/**/*',
         '!{workspaceRoot}/patches/**/*.md',
         ...configChain,
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
+        {
+          json: '{workspaceRoot}/package.json',
+          excludeFields: [
+            'version',
+            'scripts',
+            'smoo',
+            'nx',
+            'dependencies',
+            'devDependencies',
+            'optionalDependencies',
+            'peerDependencies',
+            'overrides',
+            'resolutions',
+            'patchedDependencies',
+            'catalog',
+            'catalogs',
+            'workspaces.catalog',
+            'workspaces.catalogs',
+          ],
+        },
         { externalDependencies: ['bun-lock:packages/example'] },
       ];
       expect(targets.typecheck?.inputs).toEqual([
@@ -1026,7 +1165,26 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/tsconfig.base.json',
         '{workspaceRoot}/packages/example/tsconfig.cycle.json',
         '{workspaceRoot}/packages/example/tsconfig.lib.json',
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
+        {
+          json: '{workspaceRoot}/package.json',
+          excludeFields: [
+            'version',
+            'scripts',
+            'smoo',
+            'nx',
+            'dependencies',
+            'devDependencies',
+            'optionalDependencies',
+            'peerDependencies',
+            'overrides',
+            'resolutions',
+            'patchedDependencies',
+            'catalog',
+            'catalogs',
+            'workspaces.catalog',
+            'workspaces.catalogs',
+          ],
+        },
         { externalDependencies: ['bun-lock:packages/example'] },
         { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
@@ -1070,7 +1228,26 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         '{workspaceRoot}/packages/tsconfig/base.json',
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
+        {
+          json: '{workspaceRoot}/package.json',
+          excludeFields: [
+            'version',
+            'scripts',
+            'smoo',
+            'nx',
+            'dependencies',
+            'devDependencies',
+            'optionalDependencies',
+            'peerDependencies',
+            'overrides',
+            'resolutions',
+            'patchedDependencies',
+            'catalog',
+            'catalogs',
+            'workspaces.catalog',
+            'workspaces.catalogs',
+          ],
+        },
         { externalDependencies: ['bun-lock:packages/example'] },
         { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
@@ -1107,7 +1284,26 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/patches/**/*',
         '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
+        {
+          json: '{workspaceRoot}/package.json',
+          excludeFields: [
+            'version',
+            'scripts',
+            'smoo',
+            'nx',
+            'dependencies',
+            'devDependencies',
+            'optionalDependencies',
+            'peerDependencies',
+            'overrides',
+            'resolutions',
+            'patchedDependencies',
+            'catalog',
+            'catalogs',
+            'workspaces.catalog',
+            'workspaces.catalogs',
+          ],
+        },
         { externalDependencies: ['bun-lock:packages/example'] },
         { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
