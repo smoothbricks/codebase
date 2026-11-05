@@ -115,7 +115,7 @@
     },
     "packages/columine": {
       "name": "@smoothbricks/columine",
-      "version": "0.3.8",
+      "version": "0.3.9-next.0",
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
         "@uwdata/flechette": "^2.7.0",
