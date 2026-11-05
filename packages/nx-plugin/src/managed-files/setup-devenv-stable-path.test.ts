@@ -62,6 +62,7 @@ function locateDevenvState(host: Host) {
           SCOPE_REF: 'refs/heads/main',
           GITHUB_WORKFLOW: 'CI',
           GITHUB_JOB: 'main',
+          CACHE_SCOPE: 'main',
           RUNNER_OS: host.os,
           RUNNER_ARCH: 'X64',
           GITHUB_WORKSPACE: checkout,

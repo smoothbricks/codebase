@@ -271,6 +271,7 @@ jobs:
         with:
           records-workflow: CI
           records-job: main
+          cache-scope: macos-platform-${{ matrix.arch }}
 
       # Step 4
       - name: 🏗️ Build smoo Nx version actions

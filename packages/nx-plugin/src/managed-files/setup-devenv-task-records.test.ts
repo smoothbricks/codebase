@@ -32,7 +32,8 @@ interface Event {
   readonly base: string;
   readonly workflow?: string;
   readonly job?: string;
-  readonly records?: { readonly workflow: string; readonly job: string };
+  readonly cacheScope?: string;
+  readonly records?: { readonly workflow: string; readonly job?: string };
 }
 
 /**
@@ -56,6 +57,7 @@ function locateNxCache(bind: string, event: Event): string {
       RECORDS_JOB: event.records?.job ?? '',
       GITHUB_WORKFLOW: workflow,
       GITHUB_JOB: event.job ?? 'main',
+      CACHE_SCOPE: event.cacheScope || event.job || 'main',
       RUNNER_OS: 'Linux',
       RUNNER_ARCH: 'X64',
       GITHUB_ENV: githubEnv,
@@ -188,10 +190,61 @@ describe('a later run on the shared bind', () => {
   });
 });
 
+describe('matrix starting-push task records', () => {
+  test('each shard takes only its matching push records, then replaces them with its own measurements', () => {
+    const bind = sharedBind();
+    const firstPush = locateNxCache(bind, { ...push, job: 'matrix', cacheScope: 'test-first' });
+    const secondPush = locateNxCache(bind, { ...push, job: 'matrix', cacheScope: 'test-second' });
+    writeRecord(firstPush, 'app:test', GIB);
+    writeRecord(secondPush, 'app:test', 3 * GIB);
+    const first = locateNxCache(bind, { ...pullRequest, job: 'matrix', cacheScope: 'test-first' });
+    const second = locateNxCache(bind, { ...pullRequest, job: 'matrix', cacheScope: 'test-second' });
+    expect(first).not.toBe(second);
+    expect(peakOf(first, 'app:test')).toBe(GIB);
+    expect(peakOf(second, 'app:test')).toBe(3 * GIB);
+    writeRecord(first, 'app:test', 5 * GIB);
+    writeRecord(firstPush, 'app:test', 2 * GIB);
+    writeRecord(firstPush, 'lib:test', GIB);
+    expect(locateNxCache(bind, { ...pullRequest, job: 'matrix', cacheScope: 'test-first' })).toBe(first);
+    expect(peakOf(first, 'app:test')).toBe(5 * GIB);
+    expect(peakOf(first, 'lib:test')).toBe(GIB);
+    expect(peakOf(second, 'app:test')).toBe(3 * GIB);
+  });
+
+  test('a records-workflow override keeps the shard identity unless records-job selects another one', () => {
+    const bind = sharedBind();
+    const matching = locateNxCache(bind, { ...push, cacheScope: 'test-first' });
+    const other = locateNxCache(bind, { ...push, cacheScope: 'test-second' });
+    writeRecord(matching, 'app:test', GIB);
+    writeRecord(other, 'app:test', 3 * GIB);
+    const own = { ...release, cacheScope: 'test-first', records: { workflow: 'CI' } };
+    const seeded = locateNxCache(bind, own);
+    expect(peakOf(seeded, 'app:test')).toBe(GIB);
+    const selected = locateNxCache(bind, {
+      ...release,
+      cacheScope: 'test-third',
+      records: { workflow: 'CI', job: 'test-second' },
+    });
+    expect(peakOf(selected, 'app:test')).toBe(3 * GIB);
+    expect(locateNxCache(bind, { ...own, records: undefined })).toBe(seeded);
+  });
+
+  test('an explicit records-job still selects the original nonmatrix job scope', () => {
+    const bind = sharedBind();
+    const main = locateNxCache(bind, push);
+    writeRecord(main, 'app:test', 3 * GIB);
+    const shard = locateNxCache(bind, { ...release, cacheScope: 'test-first' });
+    expect(peakOf(shard, 'app:test')).toBe(3 * GIB);
+    expect(locateNxCache(bind, { ...push, cacheScope: '' })).toBe(main);
+    expect(locateNxCache(bind, { ...push, cacheScope: 'main' })).toBe(main);
+  });
+});
+
 describe('the inputs that name the scope a run starts from', () => {
   test('the action declares them and hands them to the step that copies the records', () => {
-    expect(setupDevenvInputNames()).toEqual(['records-workflow', 'records-job']);
+    expect(setupDevenvInputNames()).toEqual(['cache-scope', 'records-workflow', 'records-job']);
     expect(locate?.get('env')).toMatchObject({
+      CACHE_SCOPE: '${{ inputs.cache-scope || github.job }}',
       RECORDS_WORKFLOW: '${{ inputs.records-workflow }}',
       RECORDS_JOB: '${{ inputs.records-job }}',
     });

@@ -791,7 +791,7 @@ describe('publish workflow definition', () => {
       );
       expect(setups.length).toBeGreaterThan(0);
       for (const setup of setups) {
-        expect(setup.with).toEqual({ 'records-workflow': CI_WORKFLOW_NAME, 'records-job': CI_JOB_ID });
+        expect(setup.with).toMatchObject({ 'records-workflow': CI_WORKFLOW_NAME, 'records-job': CI_JOB_ID });
       }
     }
   });
@@ -1287,6 +1287,8 @@ describe('publish workflow definition', () => {
 
     expect(macosPlatform).toContain('      fail-fast: false');
     expect(macosPlatform).toContain('        arch: [arm64, x64]');
+    expect(macosPlatform).toContain('cache-scope: macos-platform-${{ matrix.arch }}');
+    expect(finalJob).not.toContain('cache-scope:');
     expect(foldedRunCommand(macosPlatform, '🍎 Build selected macOS and iOS release outputs')).toBe(
       'smoo release build-platform-outputs --bump "${{ inputs.bump }}" --projects "$SMOO_RELEASE_PROJECTS" --ref "${{ github.sha }}" ' +
         '--targets "*-${{ matrix.arch }}-macos,*-${{ matrix.arch }}-ios" ' +
@@ -1315,6 +1317,7 @@ describe('publish workflow definition', () => {
     });
     const singleMacos = single.slice(single.indexOf('  macos-platform:'), single.indexOf('  publish-on-linux:'));
     expect(singleMacos).not.toContain('strategy:');
+    expect(singleMacos).not.toContain('cache-scope:');
     expect(singleMacos).toContain('name: publish-macos-outputs-${{ github.run_id }}');
     expect(singleMacos).toContain("if: steps.platform-outputs.outputs.projects != ''");
   });

@@ -6,6 +6,13 @@ description: >
   actions cache: store paths and the Nix database come back as files, so no NAR is imported and no daemon is needed.
 
 inputs:
+  cache-scope:
+    description: >
+      The job identity for mutable host caches and stable workspace paths. Set a distinct stable identity per matrix
+      leg. Blank means github.job, preserving existing paths. Starting push records use the same identity unless
+      records-job names another one.
+    required: false
+    default: ''
   records-workflow:
     description: >
       The workflow whose pushes keep the bounded-exec task records this job's scope starts from, for a workflow whose
@@ -13,7 +20,7 @@ inputs:
     required: false
     default: ''
   records-job:
-    description: The job of that workflow. Blank means this job.
+    description: The job or cache-scope identity of that workflow. Blank means this job's cache scope.
     required: false
     default: ''
 
@@ -115,7 +122,7 @@ runs:
       env:
         NX_CACHE_BIND: /var/cache/ci/nx
         NX_CACHE_REPO: ${{ github.repository }}
-        NX_CACHE_LANE: ${{ github.workflow }}
+        CACHE_SCOPE: ${{ inputs.cache-scope || github.job }}
         SCOPE_REF: ${{ github.event.pull_request.number || github.ref }}
         # A pull request's base branch, whose pushes run under refs/heads/<it>;
         # empty for a push.
@@ -127,22 +134,18 @@ runs:
       run: |
         # A workflow's directory under the shared bind: its name, slugged.
         lane_of() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-'; }
-        lane=$(lane_of "$NX_CACHE_LANE")
-        # The cache root of the run identity SCOPE_REF names.
+        # The cache root of workflow $1, job or matrix identity $2, and ref $3.
         scope_root() {
-          scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
+          lane=$(lane_of "$1")
+          scope=$(printf '%s\0%s\0%s\0%s\0%s' "$1" "$3" "$2" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
           printf '%s' "$NX_CACHE_BIND/$NX_CACHE_REPO/${lane:-default}/$scope"
         }
-        NX_CACHE_ROOT=$(scope_root)
+        NX_CACHE_ROOT=$(scope_root "$GITHUB_WORKFLOW" "$CACHE_SCOPE" "$SCOPE_REF")
         records="$NX_CACHE_ROOT/workspace-data/bounded-exec"
-        # The cache root of the scope that job $2 of workflow $1 runs the pushes to ref $3 in.
-        scope_root_of() {
-          lane=$(lane_of "$1") GITHUB_WORKFLOW="$1" GITHUB_JOB="$2" SCOPE_REF="$3" scope_root
-        }
         from_workflow=${RECORDS_WORKFLOW:-$GITHUB_WORKFLOW}
         from_ref=${BASE_REF:+refs/heads/$BASE_REF}
         from_ref=${from_ref:-$SCOPE_REF}
-        from=$(scope_root_of "$from_workflow" "${RECORDS_JOB:-$GITHUB_JOB}" "$from_ref")
+        from=$(scope_root "$from_workflow" "${RECORDS_JOB:-$CACHE_SCOPE}" "$from_ref")
         if [ "$from" != "$NX_CACHE_ROOT" ]; then
           copied=0
           for verdict in "$from"/workspace-data/bounded-exec/*/verdict.json; do
@@ -212,10 +215,11 @@ runs:
         DEVENV_STATE_REPO: ${{ github.repository }}
         DEVENV_STATE_LANE: ${{ github.workflow }}
         DEVENV_STATE_JOB: ${{ github.job }}
+        CACHE_SCOPE: ${{ inputs.cache-scope || github.job }}
         SCOPE_REF: ${{ github.event.pull_request.number || github.ref }}
       run: |
         lane=$(printf '%s' "$DEVENV_STATE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
-        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
+        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$CACHE_SCOPE" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
         root="/var/cache/ci/devenv/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB/$scope"
         mkdir -p "$root/.devenv" "$root/.direnv"
         rm -rf tooling/direnv/.devenv tooling/direnv/.direnv
@@ -251,10 +255,11 @@ runs:
         CARGO_TARGET_BIND: /var/cache/ci/cargo-target
         CARGO_TARGET_REPO: ${{ github.repository }}
         CARGO_TARGET_LANE: ${{ github.workflow }}
+        CACHE_SCOPE: ${{ inputs.cache-scope || github.job }}
         SCOPE_REF: ${{ github.event.pull_request.number || github.ref }}
       run: |
         lane=$(printf '%s' "$CARGO_TARGET_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
-        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
+        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$CACHE_SCOPE" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
         root="$CARGO_TARGET_BIND/$CARGO_TARGET_REPO/${lane:-default}/$scope"
         target="$DEVENV_WORKDIR/target"
         if mkdir -p "$root" "$target" && sudo mount --bind "$root" "$target"; then

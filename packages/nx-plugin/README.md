@@ -2909,6 +2909,16 @@ profile directory containing its Cargo shim before launching real Cargo, so the 
 remain available for declared tools such as the macOS linker (`specs/cowshed/16_build_volumes.md`, "One Cargo
 environment on every path").
 
+For host CI matrix jobs, pass `cache-scope` to `./.github/actions/setup-devenv`, for example
+`cache-scope: test-${{ matrix.id }}`. Use the same stable identity in the workflow's push and pull-request legs. A blank
+input preserves `github.job` and every existing nonmatrix path. The identity isolates Nx artifacts and metadata,
+devenv/direnv state, the stable work root and Cargo target; it is hashed, not used as a filesystem path. The generated
+macOS architecture matrix passes `macos-platform-${{ matrix.arch }}`. Task records seed from that same identity in the
+starting push scope, including when `records-workflow` selects another workflow; an explicit `records-job` selects a
+different source identity without changing this job's paths. Each scope keeps its own records once measured
+([CI cache ownership](../../specs/cowshed/10_ci.md#cache-and-setup-ownership-in-the-workflow),
+[host scheduling](../../specs/cowshed/05_gateway.md#host-scheduling)).
+
 ### Workflow security and bounded execution
 
 Managed action references use full commit SHAs with their release tags in comments. Read-only jobs explicitly set

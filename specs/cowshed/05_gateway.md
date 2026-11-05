@@ -1789,10 +1789,12 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   recorded, and its own runs replace them; the copy is the record, never a second store. A pull request starts from the
   scope its base branch's pushes run in, in the same workflow and job; a workflow whose tests are another workflow's (a
   release's are CI's) names that workflow and job to the action (`records-workflow`, `records-job`) and starts from the
-  scope the pushes to its own ref run in there. A scope that never held a record charged every leaf nothing, and its
-  first run admitted its leaves on CPU tokens alone. A leaf whose own charge alone exceeds the run's memory is granted
-  once nothing else holds memory, so it never starves, and its stderr says so, naming its charge and the run's memory. A
-  granted `bounded-exec`'s sub-pool charges no memory: its holder's charge covers its tree.
+  scope the pushes to its own ref run in there. The optional `cache-scope` replaces the job identity for matrix
+  isolation: absent an explicit `records-job`, a shard starts from the same identity in the starting push workflow. A
+  scope that never held a record charged every leaf nothing, and its first run admitted its leaves on CPU tokens alone.
+  A leaf whose own charge alone exceeds the run's memory is granted once nothing else holds memory, so it never starves,
+  and its stderr says so, naming its charge and the run's memory. A granted `bounded-exec`'s sub-pool charges no memory:
+  its holder's charge covers its tree.
 
   **A leaf's memory grows with the parallelism it is lent, so its charge does too.** A Vitest run lent 22 tokens runs 22
   workers, each a process of its own, and a charge of the peak that same task reached on one worker would admit it

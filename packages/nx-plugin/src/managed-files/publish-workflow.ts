@@ -1169,6 +1169,9 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '      - name: 🧱 Setup Nix/devenv',
     '        id: setup',
     ...setupDevenvUsesLines(),
+    ...(macosPlatformArchitectures(options).length >= 2
+      ? [`          cache-scope: macos-platform-${githubExpression('matrix.arch')}`]
+      : []),
   );
   if (isSmoothBricksCodebasePackageName(options.repoName)) {
     lines.push(
