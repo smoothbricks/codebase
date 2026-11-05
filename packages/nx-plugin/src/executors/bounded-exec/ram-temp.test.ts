@@ -98,6 +98,18 @@ describe('RAM temp volume output parsing', () => {
     expect(ramDisksIn('', table)).toEqual({ ok: true, value: [] });
   });
 
+  it('ignores an unregistered RAM drive even when its retained tree still names a recycled disk', () => {
+    const retired = registryRamDisk({ entry: '0x17', uid: 501, sectors: 131_072, device: 'disk278' }).replace(
+      'id 0x17, registered,',
+      'id 0x17, !registered,',
+    );
+    const live = registryRamDisk({ entry: '0x18', uid: 501, sectors: 131_072, device: 'disk279' });
+    const parsed = ramDisksIn(retired + live, '/dev/disk278s1 on /foreign/shed (apfs, local)');
+    expect(parsed).toEqual({
+      ok: true,
+      value: [{ entry: '0x18', physical: '/dev/disk279', sectors: 131_072, uid: 501, mountpoints: [], volumes: [] }],
+    });
+  });
   it('refuses a registry read it cannot read whole, never reporting a disk absent', () => {
     const registry = capturedRegistry();
     // Cut inside the second disk's own properties, then inside its APFS volume: each leaves a property list open.

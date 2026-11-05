@@ -2391,9 +2391,10 @@ named in the task's error instead. The task finds these disks, and the one it de
 Registry (an `IOHDIXHDDriveOutKernel` entry per RAM disk, with its size, its owner uid and the `FullName` of each of its
 volumes) and their mounts in the mount table, never in `hdiutil info`: measured 2026-10-22, `hdiutil info` left an
 attached RAM disk out of 2 of 10 listings while other images attached and detached, and a disk left out would read as
-absent. A registry read that does not parse whole fails the task instead. A BSD name passes to the next disk once its
-disk goes, so every RAM detach is gateway-owned and bound to an exact device and registry entry: a provisioning rollback
-releases its `ram-lease`, or, when a gateway restart lost that lease, sends the typed `ram-detach` every other detach is
+absent. Only registered drive entries count: a departed entry and its retained BSD names authorize no cleanup. A
+registry read that does not parse whole fails the task instead. A BSD name passes to the next disk once its disk goes,
+so every RAM detach is gateway-owned and bound to an exact device and registry entry: a provisioning rollback releases
+its `ram-lease`, or, when a gateway restart lost that lease, sends the typed `ram-detach` every other detach is
 (specs/cowshed/05_gateway.md, "RAM disks"). The gateway revalidates that identity inside its own lease before spawning
 the native tool. It uses no force; a busy owned staging volume stays in place with its named refusal. A requester or its
 job ending cannot kill this protected mutation. Authoritative terminal, proven not-started and unknown outcomes remain

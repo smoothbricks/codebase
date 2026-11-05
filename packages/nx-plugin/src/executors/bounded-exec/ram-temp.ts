@@ -2612,6 +2612,10 @@ export function ramDisksIn(registry: string, table: string): Result<RamDisk[], s
     if (!header.startsWith('+-o ') || entryId === undefined) {
       return { ok: false, error: `not an IOHDIXHDDriveOutKernel entry: ${header.slice(0, 160)}` };
     }
+    if (/, !registered,/.test(header)) continue;
+    if (!/, registered,/.test(header)) {
+      return { ok: false, error: `an entry has no registration state: ${header.slice(0, 160)}` };
+    }
     // The entry's own properties end at its first child; only they name its image and owner.
     const firstChild = entry.indexOf('+-o ', header.length);
     const own = entry.slice(header.length, firstChild === -1 ? undefined : firstChild);
