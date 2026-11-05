@@ -159,9 +159,58 @@ pub struct ChangeFeed {
     slots: usize,
     armed: bool,
     work: FeedWork,
+    row_keys: Vec<(u32, u32)>,
+    row_slots: Vec<u32>,
+    // Row-local capture shares each kernel's existing feed/index mutation authority.
+    row_recording: bool,
+    row_ttl_written: bool,
 }
 
 impl ChangeFeed {
+    pub(crate) fn reserve_row_keys(
+        &mut self,
+        slots: impl ExactSizeIterator<Item = u32>,
+        count: usize,
+    ) -> Result<(), ErrorCode> {
+        self.row_ttl_written = false;
+        self.row_recording = false;
+        self.row_keys.clear();
+        self.row_keys
+            .try_reserve(count)
+            .map_err(|_| ErrorCode::OutOfMemory)?;
+        self.row_slots.clear();
+        self.row_slots
+            .try_reserve(slots.len())
+            .map_err(|_| ErrorCode::OutOfMemory)?;
+        self.row_slots.extend(slots);
+        Ok(())
+    }
+
+    pub(crate) fn note_ttl_write(&mut self) {
+        if self.row_recording {
+            self.row_ttl_written = true;
+        }
+    }
+    pub(crate) fn row_ttl_written(&self) -> bool {
+        self.row_ttl_written
+    }
+    pub(crate) fn begin_row(&mut self) {
+        self.row_keys.clear();
+        self.row_recording = true;
+        self.row_ttl_written = false;
+    }
+
+    pub(crate) fn finish_row(&mut self) -> usize {
+        // Index writes are tracked even when a TTL refresh leaves the bindable value unchanged.
+        self.row_recording = false;
+        self.row_keys.sort_unstable();
+        self.row_keys.dedup();
+        self.row_keys.len()
+    }
+
+    pub(crate) fn row_key(&self, index: usize) -> (u32, u32) {
+        self.row_keys[index]
+    }
     /// Track the sources `tracked` names (change-plane layout), with chains
     /// for every tracked slot and, when the derived-facts bit is tracked, for
     /// fact indices below `facts`, and room for `cap` entries per pass. The
@@ -336,6 +385,13 @@ impl ChangeFeed {
     /// `u16` is never tracked, so it records nothing.
     #[inline]
     pub(crate) fn record_slot(&mut self, slot: u32, key: Key, change: Change) {
+        if self.row_recording && self.row_slots.binary_search(&slot).is_ok() {
+            assert!(
+                self.row_keys.len() < self.row_keys.capacity(),
+                "temporal admission backs every changed key"
+            );
+            self.row_keys.push((slot, key.k1));
+        }
         if let Ok(slot) = u16::try_from(slot) {
             self.record(Source::Slot(slot), key, change);
         }

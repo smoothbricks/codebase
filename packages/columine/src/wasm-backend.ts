@@ -143,6 +143,26 @@ interface VmExports {
     numCols: number,
     batchLen: number,
   ): number;
+  vm_execute_mutations(
+    stateBase: number,
+    stateLen: number,
+    programPtr: number,
+    programLen: number,
+    colPtrsPtr: number,
+    colLengthsPtr: number,
+    numCols: number,
+    batchLen: number,
+  ): number;
+  vm_execute_mutations_delta(
+    stateBase: number,
+    stateLen: number,
+    programPtr: number,
+    programLen: number,
+    colPtrsPtr: number,
+    colLengthsPtr: number,
+    numCols: number,
+    batchLen: number,
+  ): number;
   vm_evict_all_expired(stateBase: number, stateLen: number, now: number, deltaMode: number): number;
   vm_get_evicted_count(): number;
   vm_map_get(stateBase: number, stateLen: number, slot: number, key: number, outPtr: number): number;
@@ -228,6 +248,8 @@ const VM_EXPORT_NAMES = [
   'vm_grow_state',
   'vm_execute_batch',
   'vm_execute_batch_delta',
+  'vm_execute_mutations',
+  'vm_execute_mutations_delta',
   'vm_evict_all_expired',
   'vm_get_evicted_count',
   'vm_map_get',
@@ -515,32 +537,29 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
     columns: ColumnInput[],
     batchLen: number,
     delta: boolean,
+    eventRows: boolean,
   ): number => {
     const state = assertWasmStateHandle(stateHandle);
+    const execute = eventRows
+      ? delta
+        ? wasmInstance.exports.vm_execute_batch_delta
+        : wasmInstance.exports.vm_execute_batch
+      : delta
+        ? wasmInstance.exports.vm_execute_mutations_delta
+        : wasmInstance.exports.vm_execute_mutations;
     for (;;) {
       const { statePtr, programPtr, colPtrsPtr, colLengthsPtr } = prepareExecution(state, program, columns);
       const attemptCheckpoint = wasmInstance.exports.vm_undo_checkpoint(statePtr) >>> 0;
-      const result = delta
-        ? wasmInstance.exports.vm_execute_batch_delta(
-            statePtr,
-            state.size,
-            programPtr,
-            program.bytecode.length,
-            colPtrsPtr,
-            colLengthsPtr,
-            columns.length,
-            batchLen,
-          )
-        : wasmInstance.exports.vm_execute_batch(
-            statePtr,
-            state.size,
-            programPtr,
-            program.bytecode.length,
-            colPtrsPtr,
-            colLengthsPtr,
-            columns.length,
-            batchLen,
-          );
+      const result = execute(
+        statePtr,
+        state.size,
+        programPtr,
+        program.bytecode.length,
+        colPtrsPtr,
+        colLengthsPtr,
+        columns.length,
+        batchLen,
+      );
 
       if (result !== ErrorCode.OK) {
         // With undo enabled, the failed attempt's image exists only in WASM memory:
@@ -704,11 +723,19 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
     },
 
     executeBatch(state, program, columns, batchLen) {
-      return executeWithGrowth(state, program, columns, batchLen, false);
+      return executeWithGrowth(state, program, columns, batchLen, false, true);
     },
 
     executeBatchDelta(state, program, columns, batchLen) {
-      return executeWithGrowth(state, program, columns, batchLen, true);
+      return executeWithGrowth(state, program, columns, batchLen, true, true);
+    },
+
+    executeMutations(state, program, columns, batchLen) {
+      return executeWithGrowth(state, program, columns, batchLen, false, false);
+    },
+
+    executeMutationsDelta(state, program, columns, batchLen) {
+      return executeWithGrowth(state, program, columns, batchLen, true, false);
     },
 
     getMapSize(stateHandle, _program, slot) {

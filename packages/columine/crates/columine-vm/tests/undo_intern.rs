@@ -13,9 +13,11 @@ use columine_vm::hashmap_ops::{CmpType, Strategy, bind_slot_map};
 use columine_vm::hashset_ops::bind_slot_set;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
+use columine_vm::temporal::TEMPORAL_MAGIC;
 use columine_vm::undo_log::{FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp};
 use columine_vm::vm::{
-    UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm, f64s_as_bytes, rollback_entry, u32s_as_bytes,
+    UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm, f64s_as_bytes, i64s_as_bytes, rollback_entry,
+    u32s_as_bytes,
 };
 use proptest::prelude::*;
 use proptest::strategy::Strategy as PropStrategy;
@@ -352,7 +354,12 @@ fn ttl_map_program() -> Vec<u8> {
     init.extend(10.0f32.to_le_bytes());
     init.extend(0.0f32.to_le_bytes());
     init.extend([2, 0]);
-    program(1, 3, &init, &[0x20, 0, 0, 1, 2, 1])
+    let mut prog = program(1, 4, &init, &[0x20, 0, 0, 1, 2, 1]);
+    prog.extend(TEMPORAL_MAGIC.to_le_bytes());
+    prog.extend(8u32.to_le_bytes());
+    prog.extend(3u32.to_le_bytes()); // the fixture explicitly evicts; its row clock stays at MIN
+    prog.extend(0u32.to_le_bytes());
+    prog
 }
 
 /// Program sections are length-prefixed and terminated exactly as the dispatch
@@ -410,6 +417,7 @@ fn mixed_lane_ttl_window_refuses_full_export_and_keeps_the_previous_one() {
         u32s_as_bytes(&keys),
         u32s_as_bytes(&values),
         f64s_as_bytes(&timestamps),
+        i64s_as_bytes(&[i64::MIN]),
     ];
 
     let mut state = init_ttl_state(&prog);

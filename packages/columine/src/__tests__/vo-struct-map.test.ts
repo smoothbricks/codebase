@@ -14,7 +14,6 @@ import {
   type StateHandle,
   StructFieldType,
   type StructMapArenaField,
-  ValueType,
 } from '../types.js';
 import { VoProgramAdmissionUnavailableError } from '../vo-program-metadata.js';
 import { createColumineWasmBackend, VmStateAdmissionError } from '../wasm-backend.js';
@@ -58,10 +57,10 @@ function voBatch(rows: readonly (readonly [number, number, readonly number[]])[]
   const offsets = new Uint32Array(rows.length + 1);
   for (const [row, [, , bytes]] of rows.entries()) offsets[row + 1] = offsets[row] + bytes.length;
   return [
-    { data: Uint32Array.from(rows, ([key]) => key), type: ValueType.UINT32 },
-    { data: Uint32Array.from(rows, ([, value]) => value), type: ValueType.UINT32 },
-    { data: offsets, type: ValueType.UINT32 },
-    { data: Uint8Array.from(rows.flatMap(([, , bytes]) => bytes)), type: ValueType.UINT32 },
+    { data: Uint32Array.from(rows, ([key]) => key) },
+    { data: Uint32Array.from(rows, ([, value]) => value) },
+    { data: offsets },
+    { data: Uint8Array.from(rows.flatMap(([, , bytes]) => bytes)) },
   ];
 }
 
@@ -239,10 +238,10 @@ describe('STRUCT_MAP VO fields through the built WASM VM', () => {
     expect(backend.executeBatch(state, upsert, voBatch([[1, 10, EDGE_BYTES]]), 1)).toBe(ErrorCode.OK);
     const image = backend.serialize(state, upsert);
     const csr = (keys: readonly number[], offsets: readonly number[], values: readonly number[]): ColumnInput[] => [
-      { data: Uint32Array.from(keys), type: ValueType.UINT32 },
-      { data: Uint32Array.from(keys, (key) => key * 10), type: ValueType.UINT32 },
-      { data: Uint32Array.from(offsets), type: ValueType.UINT32 },
-      { data: Uint8Array.from(values), type: ValueType.UINT32 },
+      { data: Uint32Array.from(keys) },
+      { data: Uint32Array.from(keys, (key) => key * 10) },
+      { data: Uint32Array.from(offsets) },
+      { data: Uint8Array.from(values) },
     ];
     const malformed = [
       // The offsets column ends before row 0's end boundary.

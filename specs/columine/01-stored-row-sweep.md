@@ -2,17 +2,37 @@
 
 ## 1. Scope
 
-A struct-map sweep evaluates a predicate against the rows the map already stores. It is not an incoming-key remove: a
-row is eligible even when the current batch contains no event carrying its key. Expression semantics remain the
-embedder's existing `RowExpression` semantics. The VM adds no predicate language and does not copy stored rows into
-synthetic batch columns.
+A struct-map expiry evaluates the values the map stores, not only incoming values. One batch folds exactly as its rows
+one batch per row, in log order. Before each row, TTL evicts against that row's event clock. After all that row's
+writes, stored-row expiry runs, including when the row is inactive or its type writes no slot. The clock is the event's
+own i64 timestamp in microseconds, never a batch maximum, a slot's custom age column, or the wall clock. A batch crosses
+the embedder boundary once; the VM borrows its original columns throughout the row fold.
 
-The compiler places the sweep after the writes whose resulting rows it examines. One instruction scans one unary
-struct-map slot once, in its key index's iteration order ([key index](04-key-index.md)), evaluating every predicate
-before any row changes. A sweep with an empty batch changes nothing: there is no new logical event row. With a nonempty
-batch, the last input row is the predicate's logical input row. A retention predicate reads its clock from that row's
-deterministic event time or the embedder's equivalent logical-time binding, never the wall clock. A compiler that needs
-expiry on every reducer wake covers every admitted event type in the predicate entry's match set.
+The embedder classifies stored predicates. A time-independent predicate is evaluated only on changed stored keys. A
+time-independent guard conjoined with a monotone field deadline schedules a hidden HASHMAP companion identified by its
+owner and the role `expiry`. Its comparison lane and the existing TTL expiry index hold exact i64 microseconds. After
+each row's writes, the next-deadline minimum is compared once with that row's clock; only due entries are drained. An
+expiry remains an erasure if a later row has an earlier timestamp. Other time-dependent predicates are refused by the
+embedder's compiler: they never fall back to a full stored-row scan per row.
+
+`Vm::execute_batch*` executes logical event rows. A TTL reducer must bind its event clock explicitly; a missing binding
+is `InvalidProgram`, never inferred from an age column. `Vm::execute_mutations_in` is the separate entry for
+already-explicit non-row writers, including RETE relation and closure programs compiled from the same slot declarations.
+It executes the same mutation kernels, without advancing time, running expiry or clearing the event batch's evicted
+buffer. Such a program carries no `TMP1` table or sweep instruction. It is a transition of its own, not a fake event.
+`Vm::execute_mutations_delta_in` is its paired-recording counterpart, following the event batch API's existing `_delta`
+convention; both retain the same non-row semantics. The matching `execute_mutations_live_in` and
+`execute_mutations_delta_live_in` entries preserve a caller's already-bound live columns, exactly as the event-batch
+entries do, without granting a clock to the mutation program. The generic WASM ABI exposes the same distinction as
+`vm_execute_batch[_delta]` and `vm_execute_mutations[_delta]`; `ColumineBackend.executeBatch[Delta]` and
+`executeMutations[Delta]` forward explicitly to their matching entry. Neither chooses a lane from missing metadata.
+Algebra-only and explicit-eviction writers use the mutation entry, preserving even unordered f64 expiry values until an
+explicit eviction.
+
+The existing evicted buffer is cleared once per nonempty logical event batch and appends each row's evictions in row
+order. The batch's capacity admission bounds its room; overflow refuses rather than dropping an observation. A scalar
+eviction alpha binds the first buffered observation. No second queue or per-row embedder callback is introduced. Empty
+and refire invocations preserve current observations and perform no temporal transition.
 
 ## 2. Encoding and predicate binding
 
@@ -20,6 +40,26 @@ expiry on every reducer wake covers every admitted event type in the predicate e
 `Opcode::StructMapSweep` and the TypeScript registry names it `Opcode.STRUCT_MAP_SWEEP`; the frozen ABI fixture includes
 the same byte and dispatch membership. Each index is the same unsigned LEB128 `u32` used by the other instruction
 operands. The opcode is a reduce-section instruction, not an init declaration or a per-element body instruction.
+
+### Integer deadline index
+
+On a TTL HASHMAP slot, flag `0x80` declares `integer_deadline`: both its comparison lane and each expiry entry's first
+eight bytes are little-endian i64 microseconds. Other TTL slots retain their existing f64 timestamp lane. The existing
+TTL tail remains present; an expiry companion declares zero TTL and grace. `TtlMutation::UpsertI64` supplies an exact
+integer timestamp, and a mutation of the wrong lane is `InvalidCellValue` before any write. Remove-only plans select the
+lane from the slot flag. Integer and floating timestamps share the existing retained placement planner, captures and
+index geometry; there is no second schedule. Raw integer bytes are never interpreted through f64.
+
+### Temporal program table
+
+The `TMP1` extension (`0x31504d54`) carries `clock_col:u32le, count:u32le`, then `count` fixed 24-byte entries:
+`slot:u32le, predicate_col:u32le, companion:u32le, field:u8, field_unit:u8, reserved:u16le=0, age_micros:i64le`. The
+clock column is always i64 microseconds. `companion=0xffffffff` means a time-independent predicate; otherwise it names
+the owner's integer-deadline HASHMAP. `field_unit=0` converts a millisecond field to microseconds; `1` reads a
+microsecond field directly. The predicate is the static guard for an indexed expiry, or the whole static predicate.
+Constants must convert exactly to an i64 age; checked field scaling and deadline addition refuse `InvalidCellValue` on
+nonintegral, nonfinite or overflowing values. `STRUCT_MAP_SWEEP` names the table's slot/predicate pair, once at the
+reduce section's top level, after its writes. The table, not a second host clock argument, binds the row clock.
 
 The predicate column uses the existing row-expression table and live-column binding. A live expression receives the
 unchanged input batch and a borrowed `StoredRow` view of one live row through
@@ -32,11 +72,10 @@ row; `field_type(field: u8) -> Result<StructFieldType, ErrorCode>` names a field
 is `None` and an invalid field ordinal is `InvalidProgram`. The view borrows the slot's validated geometry and is valid
 only during that evaluation. No expression can mutate the stored row or retain a reference beyond the borrow.
 
-A bound predicate does not read a stored row and applies its logical input row's existing cell to every stored row. A
-live predicate evaluates once for each live stored row at the instruction's apply point; it sees prior instructions'
-writes. Existing event-type match gating is preserved. A zero predicate keeps the row; a nonzero predicate removes it.
-Malformed geometry, an invalid slot, unavailable columns or a predicate failure are reported with the existing typed VM
-error codes rather than silently treated as a false predicate.
+A live predicate evaluates against a borrowed changed stored row after that logical row's writes; a zero predicate keeps
+the row (and removes an indexed schedule), a nonzero static predicate erases it, and a nonzero deadline guard refreshes
+the key's schedule. A removed key removes its schedule. Predicate match gating includes every admitted row. Malformed
+geometry, invalid slots, unavailable columns and predicate failures use existing typed VM errors.
 
 ## 3. Mutation and recovery
 
@@ -46,13 +85,14 @@ removal is one capture, under the same sparse `UndoState` authority as other str
 bytes the index plan names. Undo restores the removed keys, size and change flags; the delta mutation lane retains
 physical redo for the same bytes. An idle sweep sets no removal flag.
 
-The instruction borrows the slot geometry once for its scan and holds the selected keys in VM working memory reserved at
-the VM's existing batch-admission boundary, not allocated per stored row. Predicate evaluation does not construct row
-objects or column arrays. State readers remain immutable borrows and introduce no lock.
+The VM reuses the changed-key feed's mutation authority and reserves changed-key storage at batch admission. It sorts
+and deduplicates each row's changed keys, never scanning every stored row to discover changes. Predicate evaluation
+constructs no row objects or column arrays; state readers stay immutable borrows and introduce no lock. Index planning,
+growth, exact rollback, paired delta redo and logical export/import preserve each owner's schedule.
 
 ## 4. Behavioral acceptance
 
-Tests exercise rows whose keys are absent from the incoming batch, selective removal from mixed eligible and ineligible
-rows, deterministic logical-time boundaries, empty batches, absent optional fields, invalid slot/predicate inputs, exact
-undo and delta redo, and a repeated idle sweep. A row whose predicate returns zero remains present regardless of its
-age. The tests assert state and typed failures, not diagnostic wording.
+Owner-boundary property tests compare a whole batch with singleton rows, including nonmonotone event times, repeated
+keep-last writes, inactive and irrelevant rows, changed guards, absent optional deadline fields and inclusive deadlines.
+They assert the no-expiry path's one minimum comparison per row without visiting stored rows, exact rollback and delta
+continuation, and typed refusal before mutation for invalid lane, constant conversion and deadline overflow.

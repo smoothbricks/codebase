@@ -40,6 +40,7 @@ use crate::struct_map::{
     ArenaRegion, StructMap2Slot, StructMapSlot, scalar_cell_encoded, scalar_cell_order_key,
     scalar_order_key,
 };
+use crate::temporal::{NO_COMPANION, Temporal};
 use crate::ttl_plan::{TtlBatchPlan, TtlBatchScratch, consume_ttl_batch, prepare_ttl_batch};
 use crate::undo_log::{FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp};
 use bitmosaic::BitmosaicView;
@@ -425,9 +426,17 @@ pub(crate) fn evict_expired(
             .checked_mul(EVICTION_ENTRY_SIZE)
             .ok_or(ErrorCode::InvalidState)?
     };
+    let buffer_start = if meta.has_evict_trigger() {
+        meta.evicted_count(state)
+    } else {
+        0
+    };
+    if buffer_start > state_init::EVICTED_BUFFER_CAP {
+        return Err(ErrorCode::InvalidState);
+    }
     let buffer_len = if meta.has_evict_trigger() {
         expired
-            .min(state_init::EVICTED_BUFFER_CAP)
+            .min(state_init::EVICTED_BUFFER_CAP - buffer_start)
             .checked_mul(EVICTION_ENTRY_SIZE)
             .ok_or(ErrorCode::InvalidState)?
     } else {
@@ -453,7 +462,7 @@ pub(crate) fn evict_expired(
                 if buffer_len == 0 {
                     0
                 } else {
-                    meta.evicted_buffer_offset(state)
+                    meta.evicted_buffer_offset(state) + buffer_start * EVICTION_ENTRY_SIZE
                 },
                 buffer_len,
             ),
@@ -461,7 +470,6 @@ pub(crate) fn evict_expired(
     };
     undo.prepare_redo(delta_mode)?;
     let capture = undo.begin_capture(state, ranges)?;
-    meta.set_evicted_count(state, 0);
     let mut processed = 0u32;
     let mut removed = 0u32;
     let mut error = None;
@@ -471,7 +479,7 @@ pub(crate) fn evict_expired(
             processed += 1;
             continue;
         }
-        if meta.has_evict_trigger() && removed == state_init::EVICTED_BUFFER_CAP {
+        if meta.has_evict_trigger() && buffer_start + removed == state_init::EVICTED_BUFFER_CAP {
             error = Some(ErrorCode::CapacityExceeded);
             break;
         }
@@ -482,8 +490,8 @@ pub(crate) fn evict_expired(
                     let buffer = meta.evicted_buffer_offset(state);
                     let timestamp = evict_ts(state, base, processed);
                     let value = evict_value(state, base, processed);
-                    evict_write(state, buffer, removed, timestamp, key, value);
-                    meta.set_evicted_count(state, removed + 1);
+                    evict_write(state, buffer, buffer_start + removed, timestamp, key, value);
+                    meta.set_evicted_count(state, buffer_start + removed + 1);
                 }
                 removed += 1;
             }
@@ -1064,8 +1072,6 @@ pub struct Vm<I: KeyIndex = HashIndex> {
     /// The changed-key feed of the running RETE pass (`change_feed`): bound
     /// once per program, recorded by the key-scoped kernels.
     feed: ChangeFeed,
-    /// The keys a stored-row sweep selected, retained across batches.
-    sweep_keys: Vec<u32>,
     /// The running batch's removal cuts (`removal_cut`), retained across
     /// batches.
     removal_cuts: RemovalCuts,
@@ -1080,6 +1086,7 @@ pub struct Vm<I: KeyIndex = HashIndex> {
     /// `None` when it did not ask for growth. Each VM owns its register, so
     /// VMs that run on different threads never read each other's refusals.
     needs_growth_slot: Option<u32>,
+    row_code: Vec<u8>,
 }
 
 impl Vm {
@@ -1109,13 +1116,13 @@ impl<I: KeyIndex> Vm<I> {
             element_struct_map2_tuple: StructMap2TupleOperands::EMPTY,
             element_list_vals: ScalarOperands::EMPTY,
             nested_scratch: nested::NestedScratch::default(),
-            sweep_keys: Vec::new(),
             feed: ChangeFeed::default(),
             removal_cuts: RemovalCuts::default(),
             keys: KeyScratch::default(),
             capacity: CapacityScratch::default(),
             scratch_sealed: false,
             needs_growth_slot: None,
+            row_code: Vec::new(),
         }
     }
 }
@@ -1233,10 +1240,6 @@ impl<I: KeyIndex> Vm<I> {
 
     /// Reserve the working memory `demand` names before any write.
     fn reserve_scratch(&mut self, demand: &ScratchDemand) -> Result<(), ErrorCode> {
-        self.sweep_keys.clear();
-        self.sweep_keys
-            .try_reserve(demand.sweep_keys)
-            .map_err(|_| ErrorCode::OutOfMemory)?;
         self.removal_cuts.reserve_for(demand.removal_cuts)?;
         self.undo.ttl_batch_scratch.reserve_for(demand.ttl)?;
         if let Some(nested) = demand.nested {
@@ -1272,7 +1275,6 @@ impl<I: KeyIndex> Vm<I> {
         ScratchDemand {
             ttl: crate::ttl_plan::plan_demand(state, meta, u64::try_from(rows).unwrap_or(u64::MAX)),
             nested: None,
-            sweep_keys: 0,
             removal_cuts: 0,
             // A slot whose image cannot be read refuses in the call itself.
             bitmap: (meta.slot_type() == SlotType::Bitmap)
@@ -1613,6 +1615,7 @@ impl VmHooks for VmCtx<'_> {
         plan: TtlBatchPlan,
     ) {
         consume_ttl_batch(state, meta, plan, &mut self.undo.ttl_batch_scratch);
+        self.feed.note_ttl_write();
     }
 }
 
@@ -4271,91 +4274,74 @@ impl Vm {
 }
 
 impl<I: KeyIndex> Vm<I> {
-    /// Remove every stored row the sweep predicate selects. Every predicate
-    /// is evaluated, in index order, before any row changes; then each
-    /// selected row leaves the index in its own capture of the size and the
-    /// index plan's writes. The rows' bytes stay as they stand.
-    #[allow(clippy::too_many_arguments)]
-    fn sweep_stored_rows<S: InternBytes + ?Sized>(
+    /// Execute an explicit non-row mutation program without advancing an event clock or running expiry.
+    /// RETE relation programs use this entry; event reducers use `execute_batch_in` with their clock binding.
+    pub fn execute_mutations_in<S: InternBytes + ?Sized>(
         &mut self,
-        delta_mode: bool,
         state: &mut [u8],
-        (slot, predicate_col): (u32, u32),
+        program: &[u8],
         cols: &[&[u8]],
         batch_len: u32,
-        mut live: Option<&mut LiveColumns<'_, '_>>,
-        cx: &mut KeyCx<'_, I, S>,
-    ) -> Result<(), ErrorCode> {
-        let map = CheckedStructMap::<I>::bind_in(state, slot)?.view;
-        if batch_len == 0 {
-            return Ok(());
-        }
-        let predicate_col_index =
-            usize::try_from(predicate_col).map_err(|_| ErrorCode::InvalidProgram)?;
-        let bound = col_u32_exact(col_at(cols, predicate_col_index), batch_len)
-            .ok_or(ErrorCode::ColumnUnderrun)?;
-        let logical_row = batch_len - 1;
-        let logical_index = usize::try_from(logical_row).map_err(|_| ErrorCode::InvalidProgram)?;
-        self.sweep_keys.clear();
-        let rows = usize::try_from(map.size(state)).map_err(|_| ErrorCode::OutOfMemory)?;
-        if self.scratch_sealed {
-            debug_assert!(
-                self.sweep_keys.capacity() >= rows,
-                "batch admission must back the stored-row sweep plan"
-            );
-        } else {
-            self.sweep_keys
-                .try_reserve(rows)
-                .map_err(|_| ErrorCode::OutOfMemory)?;
-        }
-        let mut cursor = I::first(state, map.index(), cx)?;
-        while let Some(position) = cursor {
-            let key = map.key_at(state, position).ok_or(ErrorCode::InvalidState)?;
-            let predicate = match live.as_deref_mut().and_then(|live| {
-                live.stored_cell(
-                    predicate_col,
-                    logical_row,
-                    state,
-                    cols,
-                    StoredBinding::Row(StoredRow::new(state, map.rows(), position, key, None)),
-                )
-            }) {
-                Some(result) => result?,
-                None => bound[logical_index],
-            };
-            if predicate != 0 {
-                if self.sweep_keys.len() == rows {
-                    return Err(ErrorCode::InvalidState);
-                }
-                self.sweep_keys.push(key);
-            }
-            cursor = I::next(state, map.index(), position, cx)?;
-        }
-        if self.sweep_keys.is_empty() {
-            return Ok(());
-        }
-        let flags = usize::try_from(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS)
-            .map_err(|_| ErrorCode::InvalidState)?;
-        for index in 0..self.sweep_keys.len() {
-            let key = self.sweep_keys[index];
-            let plan = map
-                .plan_remove(state, key, cx)?
-                .ok_or(ErrorCode::InvalidState)?;
-            let capture = self.undo.begin_capture(state, || {
-                CaptureRanges::new()
-                    .push((map.size_off, 4))
-                    .writes(&plan.writes)
-            })?;
-            let removed = map.apply_remove(state, &plan, cx);
-            self.undo.finish_capture(delta_mode, state, capture);
-            removed?;
-            self.feed
-                .record_slot(slot, Key::one(key), Change::Removed(None));
-        }
-        state[flags] |= ChangeFlag::REMOVED;
-        Ok(())
+        strings: &S,
+    ) -> u32 {
+        self.execute_impl(false, false, state, program, cols, batch_len, None, strings)
     }
 
+    /// The paired-recording counterpart of [`Self::execute_mutations_in`], without advancing an event clock.
+    pub fn execute_mutations_delta_in<S: InternBytes + ?Sized>(
+        &mut self,
+        state: &mut [u8],
+        program: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        strings: &S,
+    ) -> u32 {
+        self.execute_impl(true, false, state, program, cols, batch_len, None, strings)
+    }
+
+    /// Explicit non-row mutation with the caller's admitted live-column bindings; no temporal advance.
+    pub fn execute_mutations_live_in<S: InternBytes + ?Sized>(
+        &mut self,
+        state: &mut [u8],
+        program: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        live: &mut LiveColumns<'_, '_>,
+        strings: &S,
+    ) -> u32 {
+        self.execute_impl(
+            false,
+            false,
+            state,
+            program,
+            cols,
+            batch_len,
+            Some(live),
+            strings,
+        )
+    }
+
+    /// The paired-recording counterpart of [`Self::execute_mutations_live_in`].
+    pub fn execute_mutations_delta_live_in<S: InternBytes + ?Sized>(
+        &mut self,
+        state: &mut [u8],
+        program: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        live: &mut LiveColumns<'_, '_>,
+        strings: &S,
+    ) -> u32 {
+        self.execute_impl(
+            true,
+            false,
+            state,
+            program,
+            cols,
+            batch_len,
+            Some(live),
+            strings,
+        )
+    }
     /// [`Vm::execute_batch`] for key-index family `I`, resolving interned key
     /// lanes through `strings`.
     pub fn execute_batch_in<S: InternBytes + ?Sized>(
@@ -4366,7 +4352,7 @@ impl<I: KeyIndex> Vm<I> {
         batch_len: u32,
         strings: &S,
     ) -> u32 {
-        self.execute_impl(false, state, program, cols, batch_len, None, strings)
+        self.execute_impl(false, true, state, program, cols, batch_len, None, strings)
     }
 
     /// [`Vm::execute_batch_delta`] for key-index family `I`.
@@ -4378,7 +4364,7 @@ impl<I: KeyIndex> Vm<I> {
         batch_len: u32,
         strings: &S,
     ) -> u32 {
-        self.execute_impl(true, state, program, cols, batch_len, None, strings)
+        self.execute_impl(true, true, state, program, cols, batch_len, None, strings)
     }
 
     /// [`Vm::execute_batch_live`] for key-index family `I`.
@@ -4391,7 +4377,16 @@ impl<I: KeyIndex> Vm<I> {
         live: &mut LiveColumns<'_, '_>,
         strings: &S,
     ) -> u32 {
-        self.execute_impl(false, state, program, cols, batch_len, Some(live), strings)
+        self.execute_impl(
+            false,
+            true,
+            state,
+            program,
+            cols,
+            batch_len,
+            Some(live),
+            strings,
+        )
     }
 
     /// [`Vm::execute_batch_delta_live`] for key-index family `I`.
@@ -4404,7 +4399,30 @@ impl<I: KeyIndex> Vm<I> {
         live: &mut LiveColumns<'_, '_>,
         strings: &S,
     ) -> u32 {
-        self.execute_impl(true, state, program, cols, batch_len, Some(live), strings)
+        self.execute_impl(
+            true,
+            true,
+            state,
+            program,
+            cols,
+            batch_len,
+            Some(live),
+            strings,
+        )
+    }
+    fn clear_evicted_buffers(&mut self, delta: bool, state: &mut [u8]) -> Result<(), ErrorCode> {
+        for slot in 0..state_num_slots(state) {
+            let meta = SlotMetaView::read(state, slot);
+            if !meta.has_ttl() || !meta.has_evict_trigger() || meta.evicted_count(state) == 0 {
+                continue;
+            }
+            let capture = self.undo.begin_capture(state, || {
+                [(meta.meta_base + SlotMetaOffset::EVICTED_COUNT, 4)]
+            })?;
+            meta.set_evicted_count(state, 0);
+            self.undo.finish_capture(delta, state, capture);
+        }
+        Ok(())
     }
     /// Evict expired entries on the selected lane. A delta operation retains
     /// complete paired physical redo; an undo-only operation does not.
@@ -4424,7 +4442,15 @@ impl<I: KeyIndex> Vm<I> {
         // before eviction trusts the slot metadata it reads.
         state_init::validate_layout::<I>(state)?;
         let slots = state_num_slots(state);
+        if (0..slots).any(|slot| {
+            SlotMetaView::read(state, slot)
+                .type_flags
+                .integer_deadline()
+        }) {
+            return Err(ErrorCode::InvalidCellValue);
+        }
         self.change_flag_boundary(delta_mode, state, |vm, state| {
+            vm.clear_evicted_buffers(delta_mode, state)?;
             let mut total = 0u32;
             for slot in 0..slots {
                 let meta = SlotMetaView::read(state, slot);
@@ -4452,6 +4478,7 @@ impl<I: KeyIndex> Vm<I> {
     fn execute_impl<S: InternBytes + ?Sized>(
         &mut self,
         delta_mode: bool,
+        clock_required: bool,
         state: &mut [u8],
         program: &[u8],
         cols: &[&[u8]],
@@ -4462,6 +4489,7 @@ impl<I: KeyIndex> Vm<I> {
         let mut scratch = core::mem::take(&mut self.keys.index);
         let result = self.execute_checked(
             delta_mode,
+            clock_required,
             state,
             program,
             cols,
@@ -4477,6 +4505,7 @@ impl<I: KeyIndex> Vm<I> {
     fn execute_checked<S: InternBytes + ?Sized>(
         &mut self,
         delta_mode: bool,
+        clock_required: bool,
         state: &mut [u8],
         program: &[u8],
         cols: &[&[u8]],
@@ -4527,6 +4556,7 @@ impl<I: KeyIndex> Vm<I> {
             if self.validated.try_reserve(code.len()).is_err() {
                 return OUT_OF_MEMORY;
             }
+            self.row_code.clear();
             self.validated.clear();
             self.validated.extend_from_slice(code);
         }
@@ -4538,9 +4568,73 @@ impl<I: KeyIndex> Vm<I> {
             Ok(false) => return INVALID_PROGRAM,
             Err(error) => return error as u32,
         }
+        let temporal = match Temporal::parse(&sections) {
+            Ok(table) => table,
+            Err(error) => return error as u32,
+        };
+        if !clock_required && temporal.is_some() {
+            return INVALID_PROGRAM;
+        }
+        if clock_required
+            && temporal.is_none()
+            && (0..state_num_slots(state)).any(|slot| SlotMetaView::read(state, slot).has_ttl())
+        {
+            return INVALID_PROGRAM;
+        }
+        if temporal.is_none() {
+            let mut pc = 0;
+            while pc < sections.reduce_code.len() {
+                if Opcode::from_u8(sections.reduce_code[pc]) == Some(Opcode::StructMapSweep) {
+                    return INVALID_PROGRAM;
+                }
+                let Some(len) = body_op_len(sections.reduce_code, pc) else {
+                    return INVALID_PROGRAM;
+                };
+                pc += len;
+            }
+        }
+        if let Some(table) = temporal {
+            if col_i64_exact(col_at(cols, table.clock as usize), batch_len).is_none() {
+                return ErrorCode::ColumnUnderrun as u32;
+            }
+            if self.row_code.is_empty() {
+                if self
+                    .row_code
+                    .try_reserve(sections.reduce_code.len().saturating_mul(4))
+                    .is_err()
+                {
+                    return OUT_OF_MEMORY;
+                }
+                if crate::element_body::widen_row_body(sections.reduce_code, &mut self.row_code)
+                    .is_none()
+                {
+                    return INVALID_PROGRAM;
+                }
+            }
+            for expiry in table.iter() {
+                if state_init::bind_struct_map_in::<I>(state, expiry.slot).is_err() {
+                    return INVALID_PROGRAM;
+                }
+                if expiry.companion != NO_COMPANION {
+                    let Ok(meta) = state_init::bind_slot_in::<I>(state, expiry.companion) else {
+                        return INVALID_PROGRAM;
+                    };
+                    if meta.slot_type() != SlotType::HashMap
+                        || !meta.has_ttl()
+                        || !meta.type_flags.integer_deadline()
+                    {
+                        return INVALID_PROGRAM;
+                    }
+                    let owner = SlotMetaView::read(state, expiry.slot);
+                    if meta.capacity < owner.capacity.saturating_mul(2) {
+                        return self.signal_growth(expiry.companion, ErrorCode::CapacityExceeded);
+                    }
+                }
+            }
+        }
         self.change_flag_boundary(delta_mode, state, |vm, state| {
             let mut live = live;
-            let admission = vm.capacity.admit(
+            let mut admission = vm.capacity.admit(
                 state,
                 sections.reduce_code,
                 cols,
@@ -4548,8 +4642,45 @@ impl<I: KeyIndex> Vm<I> {
                 &vm.bitmap_env,
                 cx,
             );
+            if admission != Admission::OutOfMemory && temporal.is_some() {
+                let writes = vm
+                    .capacity
+                    .row_change_bound(cols, batch_len)
+                    .unwrap_or(usize::MAX);
+                if (0..state_num_slots(state)).any(|slot| {
+                    let meta = SlotMetaView::read(state, slot);
+                    meta.has_ttl()
+                        && meta.has_evict_trigger()
+                        && (meta.eviction_index_size(state) as usize).saturating_add(writes)
+                            > state_init::EVICTED_BUFFER_CAP as usize
+                }) {
+                    admission = Admission::DryRun;
+                }
+            }
             if admission == Admission::OutOfMemory {
                 return OUT_OF_MEMORY;
+            }
+            if let Some(table) = temporal {
+                let Some(count) = vm.capacity.row_change_bound(cols, batch_len) else {
+                    return OUT_OF_MEMORY;
+                };
+                if let Err(error) = vm
+                    .feed
+                    .reserve_row_keys(table.iter().map(|expiry| expiry.slot), count)
+                {
+                    return error as u32;
+                }
+                // A companion may be updated even when no bytecode instruction addresses it directly.
+                for expiry in table
+                    .iter()
+                    .filter(|expiry| expiry.companion != NO_COMPANION)
+                {
+                    let meta = SlotMetaView::read(state, expiry.companion);
+                    if let Err(error) = vm.reserve_scratch(&Self::call_demand(state, &meta, count))
+                    {
+                        return error as u32;
+                    }
+                }
             }
             if admission == Admission::Fits {
                 let demand = vm.capacity.scratch;
@@ -4561,9 +4692,12 @@ impl<I: KeyIndex> Vm<I> {
                 let result = vm.dry_run(
                     state,
                     sections.reduce_code,
-                    cols,
-                    batch_len,
+                    BatchColumns {
+                        cols,
+                        len: batch_len,
+                    },
                     live.as_deref_mut(),
+                    temporal,
                     cx,
                 );
                 if result != OK {
@@ -4577,17 +4711,15 @@ impl<I: KeyIndex> Vm<I> {
             // Tiers 1 and 2 reserved the batch's working memory; a dry run
             // grew it running the same batch. Execution grows none.
             vm.seal_scratch();
-            let result = vm.execute_ops(
-                delta_mode,
-                state,
-                sections.reduce_code,
-                BatchColumns {
-                    cols,
-                    len: batch_len,
-                },
-                live,
-                cx,
-            );
+            let batch = BatchColumns {
+                cols,
+                len: batch_len,
+            };
+            let result = if let Some(table) = temporal {
+                vm.execute_temporal(delta_mode, state, table, batch, live, cx)
+            } else {
+                vm.execute_ops(delta_mode, state, sections.reduce_code, batch, live, cx)
+            };
             vm.unseal_scratch();
             debug_assert!(
                 result != NEEDS_GROWTH && result != ErrorCode::CapacityExceeded as u32,
@@ -4607,9 +4739,9 @@ impl<I: KeyIndex> Vm<I> {
         &mut self,
         state: &[u8],
         code: &[u8],
-        cols: &[&[u8]],
-        batch_len: u32,
+        batch: BatchColumns<'_>,
         live: Option<&mut LiveColumns<'_, '_>>,
+        temporal: Option<Temporal<'_>>,
         cx: &mut KeyCx<'_, I, S>,
     ) -> u32 {
         // The image is the journal's buffer: while the window is overflowed
@@ -4629,11 +4761,11 @@ impl<I: KeyIndex> Vm<I> {
             image.extend_from_slice(state);
             let enabled = core::mem::replace(&mut self.undo.enabled, false);
             let armed = self.feed.suspend();
-            let batch = BatchColumns {
-                cols,
-                len: batch_len,
+            let result = if let Some(table) = temporal {
+                self.execute_temporal(false, &mut image, table, batch, live, cx)
+            } else {
+                self.execute_ops(false, &mut image, code, batch, live, cx)
             };
-            let result = self.execute_ops(false, &mut image, code, batch, live, cx);
             self.undo.enabled = enabled;
             self.feed.resume(armed);
             result
@@ -4691,6 +4823,327 @@ impl<I: KeyIndex> Vm<I> {
         self.feed.work()
     }
 
+    fn temporal_minimum(&self, state: &[u8], table: Temporal<'_>) -> Option<i64> {
+        let mut next = None;
+        for slot in 0..state_num_slots(state) {
+            let meta = SlotMetaView::read(state, slot);
+            if !meta.has_ttl() || meta.eviction_index_size(state) == 0 {
+                continue;
+            }
+            let base = meta.eviction_index_offset(state);
+            let deadline = if meta.type_flags.integer_deadline() {
+                if !table.iter().any(|expiry| expiry.companion == slot) {
+                    continue;
+                }
+                Some(bytes::read_i64(state, base))
+            } else {
+                // Explicit legacy f64 age lanes retain their strict cutoff. Only the row clock is i64.
+                let threshold = (evict_ts(state, base, 0)
+                    + f64::from(bytes::read_f32(
+                        state,
+                        meta.meta_base + SlotMetaOffset::TTL_SECONDS,
+                    ))
+                    + f64::from(bytes::read_f32(
+                        state,
+                        meta.meta_base + SlotMetaOffset::GRACE_SECONDS,
+                    )))
+                    * 1_000_000.0;
+                if threshold.is_nan() || threshold < i64::MIN as f64 {
+                    Some(i64::MIN)
+                } else if threshold >= 9_223_372_036_854_775_808.0 {
+                    None
+                } else {
+                    (threshold.floor() as i64).checked_add(1)
+                }
+            };
+            if let Some(deadline) = deadline {
+                next = Some(next.map_or(deadline, |held: i64| held.min(deadline)));
+            }
+        }
+        next
+    }
+
+    fn stored_deadline(
+        stored: &StoredRow<'_>,
+        expiry: crate::temporal::Expiry,
+    ) -> Result<Option<i64>, ErrorCode> {
+        let Some(cell) = stored.field(expiry.field)? else {
+            return Ok(None);
+        };
+        let scale = if expiry.micros { 1 } else { 1000 };
+        let value = match stored.field_type(expiry.field)? {
+            StructFieldType::Int64 => bytes::read_i64(cell, 0).checked_mul(scale),
+            StructFieldType::UInt32 => i64::from(bytes::read_u32(cell, 0)).checked_mul(scale),
+            StructFieldType::Float64 => {
+                let value = bytes::read_f64(cell, 0);
+                let scaled = value * scale as f64;
+                if !scaled.is_finite()
+                    || scaled.fract() != 0.0
+                    || scaled < i64::MIN as f64
+                    || scaled >= 9_223_372_036_854_775_808.0
+                    || scaled / scale as f64 != value
+                {
+                    return Err(ErrorCode::InvalidCellValue);
+                }
+                Some(scaled as i64)
+            }
+            _ => return Err(ErrorCode::InvalidProgram),
+        }
+        .ok_or(ErrorCode::InvalidCellValue)?;
+        value
+            .checked_add(expiry.age)
+            .map(Some)
+            .ok_or(ErrorCode::InvalidCellValue)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn refresh_expiry<S: InternBytes + ?Sized>(
+        &mut self,
+        delta: bool,
+        state: &mut [u8],
+        expiry: crate::temporal::Expiry,
+        key: u32,
+        row: u32,
+        cols: &[&[u8]],
+        live: Option<&mut LiveColumns<'_, '_>>,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> u32 {
+        let verdict = {
+            let stored = match StoredRow::lookup_in::<I, S>(state, expiry.slot, key, None, cx) {
+                Ok(value) => value,
+                Err(error) => return error as u32,
+            };
+            match stored {
+                None => None,
+                Some(stored) => {
+                    let pred = match live.and_then(|live| {
+                        live.stored_cell(
+                            expiry.predicate,
+                            row,
+                            state,
+                            cols,
+                            StoredBinding::Row(stored),
+                        )
+                    }) {
+                        Some(Ok(value)) => value,
+                        Some(Err(error)) => return error as u32,
+                        None => {
+                            let Some(pred) =
+                                col_u32_exact(col_at(cols, expiry.predicate as usize), row + 1)
+                            else {
+                                return ErrorCode::ColumnUnderrun as u32;
+                            };
+                            pred[row as usize]
+                        }
+                    };
+                    if pred == 0 {
+                        None
+                    } else if expiry.companion == NO_COMPANION {
+                        Some(None)
+                    } else {
+                        let stored =
+                            match StoredRow::lookup_in::<I, S>(state, expiry.slot, key, None, cx) {
+                                Ok(Some(value)) => value,
+                                Ok(None) => return INVALID_STATE,
+                                Err(error) => return error as u32,
+                            };
+                        match Self::stored_deadline(&stored, expiry) {
+                            Ok(Some(deadline)) => Some(Some(deadline)),
+                            Ok(None) => None,
+                            Err(error) => return error as u32,
+                        }
+                    }
+                }
+            }
+        };
+        if expiry.companion == NO_COMPANION {
+            if verdict.is_some() {
+                let result = single_struct_map_remove(
+                    &mut self.undo,
+                    &mut self.feed,
+                    delta,
+                    state,
+                    expiry.slot,
+                    key,
+                    cx,
+                );
+                if result != ErrorCode::Ok {
+                    return result as u32;
+                }
+            }
+            return OK;
+        }
+        let meta = SlotMetaView::read(state, expiry.companion);
+        let result = match verdict.flatten() {
+            Some(deadline) => hashmap_ops::single_map_upsert(
+                Strategy::Last,
+                delta,
+                state,
+                &meta,
+                expiry.companion,
+                key,
+                0,
+                u64::from_le_bytes(deadline.to_le_bytes()),
+                CmpType::I64,
+                &mut self.ctx(),
+            ),
+            None => hashmap_ops::single_map_remove(
+                delta,
+                state,
+                &meta,
+                expiry.companion,
+                key,
+                &mut self.ctx(),
+            ),
+        };
+        if result == ErrorCode::Ok {
+            OK
+        } else {
+            self.signal_growth(expiry.companion, result)
+        }
+    }
+
+    fn drain_expiry<S: InternBytes + ?Sized>(
+        &mut self,
+        delta: bool,
+        state: &mut [u8],
+        table: Temporal<'_>,
+        now: i64,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> u32 {
+        for expiry in table
+            .iter()
+            .filter(|expiry| expiry.companion != NO_COMPANION)
+        {
+            let meta = SlotMetaView::read(state, expiry.companion);
+            while meta.eviction_index_size(state) != 0 {
+                let base = meta.eviction_index_offset(state);
+                if bytes::read_i64(state, base) > now {
+                    break;
+                }
+                let key = evict_key(state, base, 0);
+                let result = hashmap_ops::single_map_remove(
+                    delta,
+                    state,
+                    &meta,
+                    expiry.companion,
+                    key,
+                    &mut self.ctx(),
+                );
+                if result != ErrorCode::Ok {
+                    return result as u32;
+                }
+                let result = single_struct_map_remove(
+                    &mut self.undo,
+                    &mut self.feed,
+                    delta,
+                    state,
+                    expiry.slot,
+                    key,
+                    cx,
+                );
+                if result != ErrorCode::Ok {
+                    return result as u32;
+                }
+            }
+        }
+        OK
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_temporal<S: InternBytes + ?Sized>(
+        &mut self,
+        delta: bool,
+        state: &mut [u8],
+        table: Temporal<'_>,
+        batch: BatchColumns<'_>,
+        mut live: Option<&mut LiveColumns<'_, '_>>,
+        cx: &mut KeyCx<'_, I, S>,
+    ) -> u32 {
+        let code = core::mem::take(&mut self.row_code);
+        let result = (|| {
+            let Some(clocks) = col_i64_exact(col_at(batch.cols, table.clock as usize), batch.len)
+            else {
+                return ErrorCode::ColumnUnderrun as u32;
+            };
+            if batch.len != 0
+                && let Err(error) = self.clear_evicted_buffers(delta, state)
+            {
+                return error as u32;
+            }
+            self.removal_cuts.clear();
+            let mut next = self.temporal_minimum(state, table);
+            for (row, &now) in (0..batch.len).zip(clocks) {
+                let due = next.is_some_and(|deadline| now >= deadline);
+                if due {
+                    for slot in 0..state_num_slots(state) {
+                        let meta = SlotMetaView::read(state, slot);
+                        if meta.has_ttl()
+                            && !meta.type_flags.integer_deadline()
+                            && let Err(error) = evict_expired(
+                                delta,
+                                &mut self.undo,
+                                &mut self.feed,
+                                &mut self.bitmap_env,
+                                state,
+                                &meta,
+                                now as f64 / 1_000_000.0,
+                            )
+                        {
+                            return error as u32;
+                        }
+                    }
+                }
+                self.feed.begin_row();
+                let folded = self.execute_element_opcodes(
+                    delta,
+                    state,
+                    &code,
+                    batch.cols,
+                    row,
+                    row,
+                    row,
+                    NO_PARENT_TS_COL,
+                    live.as_deref_mut(),
+                    cx,
+                );
+                let changed = self.feed.finish_row();
+                let schedule_changed = self.feed.row_ttl_written();
+                if folded != OK {
+                    return folded;
+                }
+                for index in 0..changed {
+                    let (slot, key) = self.feed.row_key(index);
+                    let Some(expiry) = table.get(slot) else {
+                        return INVALID_PROGRAM;
+                    };
+                    let result = self.refresh_expiry(
+                        delta,
+                        state,
+                        expiry,
+                        key,
+                        row,
+                        batch.cols,
+                        live.as_deref_mut(),
+                        cx,
+                    );
+                    if result != OK {
+                        return result;
+                    }
+                }
+                if due || changed != 0 || schedule_changed {
+                    let result = self.drain_expiry(delta, state, table, now, cx);
+                    if result != OK {
+                        return result;
+                    }
+                    next = self.temporal_minimum(state, table);
+                }
+            }
+            OK
+        })();
+        self.row_code = code;
+        result
+    }
     fn execute_ops<S: InternBytes + ?Sized>(
         &mut self,
         delta_mode: bool,
@@ -4721,21 +5174,7 @@ impl<I: KeyIndex> Vm<I> {
             match op {
                 Opcode::Halt => break,
 
-                Opcode::StructMapSweep => {
-                    let operands = (operand!(r.index()), operand!(r.index()));
-                    pc = r.pos();
-                    if let Err(error) = self.sweep_stored_rows(
-                        delta_mode,
-                        state,
-                        operands,
-                        cols,
-                        batch_len,
-                        live.as_deref_mut(),
-                        cx,
-                    ) {
-                        return error as u32;
-                    }
-                }
+                Opcode::StructMapSweep => return INVALID_PROGRAM,
 
                 Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => {
                     let (slot, key_col, val_col, ts_col) = (
@@ -5840,6 +6279,190 @@ impl<I: KeyIndex> Vm<I> {
             let mut r = WideOperands::at(body, bpc + 1);
 
             match op {
+                Opcode::Halt => break,
+                Opcode::StructMapSweep => {
+                    operand!(r.index());
+                    operand!(r.index());
+                    bpc = r.pos();
+                }
+                Opcode::ForEach => {
+                    let col = operand!(r.index());
+                    let count = operand!(r.index()) as usize;
+                    let ids = operand!(r.bytes(count * 4));
+                    let len = operand!(r.u32()) as usize;
+                    let inner = operand!(r.bytes(len));
+                    bpc = r.pos();
+                    let value = cell_u32(cols, col, child_idx);
+                    if ids
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|id| u32::from_le_bytes(*id) == value)
+                    {
+                        let result = self.execute_element_opcodes(
+                            delta_mode,
+                            state,
+                            inner,
+                            cols,
+                            child_idx,
+                            parent_idx,
+                            row,
+                            parent_ts_col,
+                            live.as_deref_mut(),
+                            cx,
+                        );
+                        if result != OK {
+                            return result;
+                        }
+                    }
+                }
+                Opcode::BatchAggCount | Opcode::BatchAggCountIf => {
+                    let slot = operand!(r.index());
+                    let pred = if op == Opcode::BatchAggCountIf {
+                        Some(operand!(r.index()))
+                    } else {
+                        None
+                    };
+                    bpc = r.pos();
+                    if let Some(pred) = pred {
+                        predicate!(pred);
+                    }
+                    let result = exec_agg_count(&mut self.undo, delta_mode, state, slot, 1);
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
+                }
+                Opcode::BatchAggSum
+                | Opcode::BatchAggMin
+                | Opcode::BatchAggMax
+                | Opcode::BatchAggSumIf
+                | Opcode::BatchAggMinIf
+                | Opcode::BatchAggMaxIf => {
+                    let slot = operand!(r.index());
+                    let col = operand!(r.index());
+                    let pred = if matches!(
+                        op,
+                        Opcode::BatchAggSumIf | Opcode::BatchAggMinIf | Opcode::BatchAggMaxIf
+                    ) {
+                        Some(operand!(r.index()))
+                    } else {
+                        None
+                    };
+                    bpc = r.pos();
+                    if let Some(pred) = pred {
+                        predicate!(pred);
+                    }
+                    let kind = match op {
+                        Opcode::BatchAggSum | Opcode::BatchAggSumIf => AggKind::Sum,
+                        Opcode::BatchAggMin | Opcode::BatchAggMinIf => AggKind::Min,
+                        _ => AggKind::Max,
+                    };
+                    let result = exec_agg_f64(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        slot,
+                        kind,
+                        &[cell_f64(cols, col, child_idx)],
+                        None,
+                        None,
+                    );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
+                }
+                Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => {
+                    let slot = operand!(r.index());
+                    let col = operand!(r.index());
+                    bpc = r.pos();
+                    let kind = match op {
+                        Opcode::BatchAggSumI64 => AggKind::Sum,
+                        Opcode::BatchAggMinI64 => AggKind::Min,
+                        _ => AggKind::Max,
+                    };
+                    let result = exec_agg_i64(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        slot,
+                        kind,
+                        &[bytes::read_i64(col_at(cols, col as usize), child_idx * 8)],
+                        None,
+                        None,
+                    );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
+                }
+                Opcode::BatchScalarLatest => {
+                    let slot = operand!(r.index());
+                    let val = operand!(r.index());
+                    let cmp = operand!(r.index());
+                    bpc = r.pos();
+                    if !is_scalar_latest_slot(state, slot) {
+                        return INVALID_PROGRAM;
+                    }
+                    let meta = SlotMetaView::read(state, slot);
+                    let width = if meta.agg_type_byte(state) == AggType::ScalarU32 as u8 {
+                        4
+                    } else {
+                        8
+                    };
+                    let start = child_idx as usize * width;
+                    let Some(value) = col_at(cols, val as usize).get(start..start + width) else {
+                        return ErrorCode::ColumnUnderrun as u32;
+                    };
+                    let result = exec_scalar_latest(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        slot,
+                        value,
+                        &[cell_f64(cols, cmp, child_idx)],
+                        1,
+                        None,
+                    );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
+                }
+                Opcode::BatchBitmapAnd
+                | Opcode::BatchBitmapOr
+                | Opcode::BatchBitmapAndNot
+                | Opcode::BatchBitmapXor
+                | Opcode::BatchBitmapAndScratch
+                | Opcode::BatchBitmapOrScratch
+                | Opcode::BatchBitmapAndNotScratch
+                | Opcode::BatchBitmapXorScratch => {
+                    let target = operand!(r.index());
+                    let scratch = matches!(
+                        op,
+                        Opcode::BatchBitmapAndScratch
+                            | Opcode::BatchBitmapOrScratch
+                            | Opcode::BatchBitmapAndNotScratch
+                            | Opcode::BatchBitmapXorScratch
+                    );
+                    let source = if scratch {
+                        BitmapSource::Scratch
+                    } else {
+                        BitmapSource::Slot(operand!(r.index()))
+                    };
+                    bpc = r.pos();
+                    let kind = match op {
+                        Opcode::BatchBitmapAnd | Opcode::BatchBitmapAndScratch => {
+                            BitmapAlgebraOp::And
+                        }
+                        Opcode::BatchBitmapOr | Opcode::BatchBitmapOrScratch => BitmapAlgebraOp::Or,
+                        Opcode::BatchBitmapAndNot | Opcode::BatchBitmapAndNotScratch => {
+                            BitmapAlgebraOp::AndNot
+                        }
+                        _ => BitmapAlgebraOp::Xor,
+                    };
+                    let result = self.bitmap_algebra(delta_mode, kind, state, target, source);
+                    if result != ErrorCode::Ok {
+                        return self.signal_growth(target, result);
+                    }
+                }
                 Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => {
                     let (slot, key_col, val_col, ts_col) = (
                         operand!(r.index()),

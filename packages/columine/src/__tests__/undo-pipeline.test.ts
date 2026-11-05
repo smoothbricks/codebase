@@ -24,7 +24,6 @@ import {
   PROGRAM_MAGIC,
   SlotType,
   UNDO_POSITION_OVERFLOWED,
-  ValueType,
 } from '../index.js';
 import { loadColumineWasm } from '../wasm-backend.js';
 
@@ -142,10 +141,7 @@ describe('Pipeline undo integration', () => {
     // Insert entries
     const keys = new Uint32Array([10, 20, 30]);
     const values = new Uint32Array([100, 200, 300]);
-    const columns: ColumnInput[] = [
-      { data: keys, type: ValueType.UINT32 },
-      { data: values, type: ValueType.UINT32 },
-    ];
+    const columns: ColumnInput[] = [{ data: keys }, { data: values }];
     expect(stages.reduce.executeBatch(state, program, columns, 3)).toBe(ErrorCode.OK);
 
     // Commit — changes should be permanent
@@ -176,17 +172,9 @@ describe('Pipeline undo integration', () => {
     // Insert initial entries
     const initKeys = new Uint32Array([1, 2]);
     const initValues = new Uint32Array([10, 20]);
-    expect(
-      stages.reduce.executeBatch(
-        state,
-        program,
-        [
-          { data: initKeys, type: ValueType.UINT32 },
-          { data: initValues, type: ValueType.UINT32 },
-        ],
-        2,
-      ),
-    ).toBe(ErrorCode.OK);
+    expect(stages.reduce.executeBatch(state, program, [{ data: initKeys }, { data: initValues }], 2)).toBe(
+      ErrorCode.OK,
+    );
 
     // Snapshot initial state
     expect(backend.getMapSize(state, program, 0)).toBe(2);
@@ -201,17 +189,9 @@ describe('Pipeline undo integration', () => {
     // Speculative batch: insert new key 3, update existing key 1
     const specKeys = new Uint32Array([3, 1]);
     const specValues = new Uint32Array([30, 999]);
-    expect(
-      stages.reduce.executeBatch(
-        state,
-        program,
-        [
-          { data: specKeys, type: ValueType.UINT32 },
-          { data: specValues, type: ValueType.UINT32 },
-        ],
-        2,
-      ),
-    ).toBe(ErrorCode.OK);
+    expect(stages.reduce.executeBatch(state, program, [{ data: specKeys }, { data: specValues }], 2)).toBe(
+      ErrorCode.OK,
+    );
 
     // Verify speculative state
     expect(backend.getMapSize(state, program, 0)).toBe(3);
@@ -246,9 +226,7 @@ describe('Pipeline undo integration', () => {
 
     // First batch: sum = 10 + 20 + 30 = 60
     const batch1 = new Float64Array([10, 20, 30]);
-    expect(stages.reduce.executeBatch(state, program, [{ data: batch1, type: ValueType.FLOAT64 }], 3)).toBe(
-      ErrorCode.OK,
-    );
+    expect(stages.reduce.executeBatch(state, program, [{ data: batch1 }], 3)).toBe(ErrorCode.OK);
     expect(backend.getAggregateValue(state, program, 0)).toBe(60);
 
     // Checkpoint
@@ -258,9 +236,7 @@ describe('Pipeline undo integration', () => {
 
     // Speculative batch: sum should be 60 + 100 + 200 = 360
     const batch2 = new Float64Array([100, 200]);
-    expect(stages.reduce.executeBatch(state, program, [{ data: batch2, type: ValueType.FLOAT64 }], 2)).toBe(
-      ErrorCode.OK,
-    );
+    expect(stages.reduce.executeBatch(state, program, [{ data: batch2 }], 2)).toBe(ErrorCode.OK);
     expect(backend.getAggregateValue(state, program, 0)).toBe(360);
 
     // Rollback: should restore to 60
@@ -286,9 +262,7 @@ describe('Pipeline undo integration', () => {
 
     // Insert initial elements
     const elems1 = new Uint32Array([100, 200, 300]);
-    expect(stages.reduce.executeBatch(state, program, [{ data: elems1, type: ValueType.UINT32 }], 3)).toBe(
-      ErrorCode.OK,
-    );
+    expect(stages.reduce.executeBatch(state, program, [{ data: elems1 }], 3)).toBe(ErrorCode.OK);
 
     expect(backend.getSetSize(state, program, 0)).toBe(3);
     expect(backend.setContains(state, program, 0, 100)).toStrictEqual({ ok: true, value: true });
@@ -302,9 +276,7 @@ describe('Pipeline undo integration', () => {
 
     // Speculative batch: insert more elements
     const elems2 = new Uint32Array([400, 500]);
-    expect(stages.reduce.executeBatch(state, program, [{ data: elems2, type: ValueType.UINT32 }], 2)).toBe(
-      ErrorCode.OK,
-    );
+    expect(stages.reduce.executeBatch(state, program, [{ data: elems2 }], 2)).toBe(ErrorCode.OK);
 
     expect(backend.getSetSize(state, program, 0)).toBe(5);
     expect(backend.setContains(state, program, 0, 400)).toStrictEqual({ ok: true, value: true });
@@ -345,17 +317,7 @@ describe('Pipeline undo integration', () => {
 
     const keys1 = new Uint32Array([1, 2]);
     const vals1 = new Uint32Array([10, 20]);
-    expect(
-      stages.reduce.executeBatch(
-        state,
-        program,
-        [
-          { data: keys1, type: ValueType.UINT32 },
-          { data: vals1, type: ValueType.UINT32 },
-        ],
-        2,
-      ),
-    ).toBe(ErrorCode.OK);
+    expect(stages.reduce.executeBatch(state, program, [{ data: keys1 }, { data: vals1 }], 2)).toBe(ErrorCode.OK);
 
     stages.undo.commit(state, token1);
 
@@ -371,17 +333,7 @@ describe('Pipeline undo integration', () => {
 
     const keys2 = new Uint32Array([3, 1]);
     const vals2 = new Uint32Array([30, 99]);
-    expect(
-      stages.reduce.executeBatch(
-        state,
-        program,
-        [
-          { data: keys2, type: ValueType.UINT32 },
-          { data: vals2, type: ValueType.UINT32 },
-        ],
-        2,
-      ),
-    ).toBe(ErrorCode.OK);
+    expect(stages.reduce.executeBatch(state, program, [{ data: keys2 }, { data: vals2 }], 2)).toBe(ErrorCode.OK);
 
     // Before rollback: 3 keys, key 1 updated to 99
     expect(backend.getMapSize(state, program, 0)).toBe(3);
@@ -434,9 +386,9 @@ describe('Pipeline undo integration', () => {
         state,
         program,
         [
-          { data: new Uint32Array([1, 2]), type: ValueType.UINT32 },
-          { data: new Uint32Array([100, 200]), type: ValueType.UINT32 },
-          { data: new Float64Array([10, 20]), type: ValueType.FLOAT64 },
+          { data: new Uint32Array([1, 2]) },
+          { data: new Uint32Array([100, 200]) },
+          { data: new Float64Array([10, 20]) },
         ],
         2,
       ),
@@ -448,9 +400,9 @@ describe('Pipeline undo integration', () => {
         state,
         program,
         [
-          { data: new Uint32Array([3, 1]), type: ValueType.UINT32 },
-          { data: new Uint32Array([300, 150]), type: ValueType.UINT32 },
-          { data: new Float64Array([30, 40]), type: ValueType.FLOAT64 },
+          { data: new Uint32Array([3, 1]) },
+          { data: new Uint32Array([300, 150]) },
+          { data: new Float64Array([30, 40]) },
         ],
         2,
       ),
@@ -489,17 +441,9 @@ describe('Pipeline undo integration', () => {
     // Initial entries land before any window opens, so they are not journaled.
     const initKeys = new Uint32Array([1, 2, 3]);
     const initValues = new Uint32Array([10, 20, 30]);
-    expect(
-      stages.reduce.executeBatch(
-        state,
-        program,
-        [
-          { data: initKeys, type: ValueType.UINT32 },
-          { data: initValues, type: ValueType.UINT32 },
-        ],
-        3,
-      ),
-    ).toBe(ErrorCode.OK);
+    expect(stages.reduce.executeBatch(state, program, [{ data: initKeys }, { data: initValues }], 3)).toBe(
+      ErrorCode.OK,
+    );
     expect(backend.getMapSize(state, program, 0)).toBe(3);
     expect(backend.mapGet(state, program, 0, 1)).toStrictEqual({ ok: true, value: 10 });
 
@@ -518,17 +462,9 @@ describe('Pipeline undo integration', () => {
       keys[j] = 100 + j;
       values[j] = 1000 + j;
     }
-    expect(
-      stages.reduce.executeBatch(
-        state,
-        program,
-        [
-          { data: keys, type: ValueType.UINT32 },
-          { data: values, type: ValueType.UINT32 },
-        ],
-        OVERFLOW_COUNT,
-      ),
-    ).toBe(ErrorCode.OK);
+    expect(stages.reduce.executeBatch(state, program, [{ data: keys }, { data: values }], OVERFLOW_COUNT)).toBe(
+      ErrorCode.OK,
+    );
 
     // The window is overflowed: its checkpoint is the u32::MAX sentinel, and every row landed in the shadow.
     expect(backend.undoHasOverflow()).toBe(true);
@@ -566,10 +502,7 @@ describe('Pipeline undo integration', () => {
         stages.reduce.executeBatch(
           state,
           program,
-          [
-            { data: keys.slice(start, end), type: ValueType.UINT32 },
-            { data: values.slice(start, end), type: ValueType.UINT32 },
-          ],
+          [{ data: keys.slice(start, end) }, { data: values.slice(start, end) }],
           end - start,
         ),
       ).toBe(ErrorCode.OK);
@@ -607,15 +540,7 @@ describe('Pipeline undo integration', () => {
     const fromPos = getUndoPosition(begun.value);
 
     expect(
-      backend.executeBatchDelta(
-        state,
-        program,
-        [
-          { data: new Uint32Array([42]), type: ValueType.UINT32 },
-          { data: new Uint32Array([900]), type: ValueType.UINT32 },
-        ],
-        1,
-      ),
+      backend.executeBatchDelta(state, program, [{ data: new Uint32Array([42]) }, { data: new Uint32Array([900]) }], 1),
     ).toBe(ErrorCode.OK);
 
     expect(backend.getMapSize(state, program, 0)).toBe(1);
@@ -649,10 +574,7 @@ describe('Pipeline undo integration', () => {
     const state = backend.createState(program);
     const keys = Uint32Array.from({ length: 12 }, (_, index) => index + 1);
     const values = Uint32Array.from(keys, (key) => key * 100);
-    const columns: ColumnInput[] = [
-      { data: keys, type: ValueType.UINT32 },
-      { data: values, type: ValueType.UINT32 },
-    ];
+    const columns: ColumnInput[] = [{ data: keys }, { data: values }];
 
     // Capacity 4 cannot hold the batch. An active undo window refuses growth, so the owner rolls back the whole
     // window, ends it, grows the committed image, and retries the whole batch under a newly enabled window.
@@ -739,15 +661,7 @@ describe('Pipeline undo integration', () => {
 
     // Production profile: executes mutations but does NOT record redo deltas.
     expect(
-      stages.reduce.executeBatch(
-        state,
-        program,
-        [
-          { data: new Uint32Array([7]), type: ValueType.UINT32 },
-          { data: new Uint32Array([77]), type: ValueType.UINT32 },
-        ],
-        1,
-      ),
+      stages.reduce.executeBatch(state, program, [{ data: new Uint32Array([7]) }, { data: new Uint32Array([77]) }], 1),
     ).toBe(ErrorCode.OK);
 
     expect(backend.getMapSize(state, program, 0)).toBe(1);
@@ -789,15 +703,7 @@ describe('Pipeline undo integration', () => {
 
     // A paired delta write gives the open window an export selection that a refused begin must not move.
     expect(
-      backend.executeBatchDelta(
-        state,
-        program,
-        [
-          { data: new Uint32Array([42]), type: ValueType.UINT32 },
-          { data: new Uint32Array([900]), type: ValueType.UINT32 },
-        ],
-        1,
-      ),
+      backend.executeBatchDelta(state, program, [{ data: new Uint32Array([42]) }, { data: new Uint32Array([900]) }], 1),
     ).toBe(ErrorCode.OK);
     const toPos = backend.undoCheckpoint(state);
     const imageMid = backend.serialize(state, program);

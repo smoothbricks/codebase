@@ -50,8 +50,11 @@ admission. After warm-up a bind allocates nothing: an entry's words grow to the 
 
 ## 4. Readers
 
-The reduce section reads a wide derived column exactly as it reads a host column of the same lane. The operand walk
-(`column_uses`) names the lane of every column operand:
+A host `ColumnInput` carries its raw typed-array view only. It has no duplicate element-type label: the bytecode's
+operand and slot declarations are the authority for interpreting those bytes, including the temporal table's i64
+microsecond clock. An integer clock is never labeled as a float to satisfy a host wrapper. The reduce section reads a
+wide derived column exactly as it reads a host column of the same lane. The operand walk (`column_uses`) names the lane
+of every column operand:
 
 - **Fixed by the instruction.** `BATCH_AGG_SUM`, `BATCH_AGG_MIN`, `BATCH_AGG_MAX` and their `_IF` forms read f64 values.
   `BATCH_AGG_SUM_I64`, `BATCH_AGG_MIN_I64` and `BATCH_AGG_MAX_I64` read i64 values. A TTL timestamp, whether a TTL

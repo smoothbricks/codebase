@@ -15,11 +15,6 @@
 // Value Types
 // =============================================================================
 
-export enum ValueType {
-  UINT32 = 3,
-  FLOAT64 = 10,
-}
-
 /**
  * Aggregate/scalar slot subtype, stored in slot metadata byte 13.
  * Audited against `columine_types::AggType` by
@@ -80,6 +75,7 @@ export enum SlotTypeFlag {
   HAS_TTL = 0x10,
   HAS_EVICT_TRIGGER = 0x20,
   NO_HASHMAP_TIMESTAMPS = 0x40,
+  INTEGER_DEADLINE = 0x80,
   STRUCT_KEY1_INTERNED = 0x20,
   STRUCT_KEY2_INTERNED = 0x40,
 }
@@ -201,7 +197,13 @@ export interface ReducerProgram {
 
 /** TTL is admitted only on HASHMAP, HASHSET and BITMAP. */
 export type SlotDef =
-  | { type: SlotType.HASHMAP; capacity: number; storesTimestamps: boolean; ttl?: SlotTtlMetadata }
+  | {
+      type: SlotType.HASHMAP;
+      capacity: number;
+      storesTimestamps: boolean;
+      ttl?: SlotTtlMetadata;
+      integerDeadline?: boolean;
+    }
   | { type: SlotType.HASHSET; capacity: number; ttl?: SlotTtlMetadata }
   | { type: SlotType.BITMAP; capacity: number; ttl?: SlotTtlMetadata }
   | { type: SlotType.AGGREGATE; aggType: AggType }
@@ -243,8 +245,6 @@ export interface ColumnInput {
    * a `Uint8Array` carries the raw byte values of a CSR array/VO field, addressed by a u32 offsets column.
    */
   data: Uint32Array | Float64Array | BigInt64Array | Uint8Array;
-  /** Element type */
-  type: ValueType;
 }
 
 /** Public low-level reference to a live exact-pair struct-map row. */
@@ -599,6 +599,12 @@ export interface ColumineBackend {
    * Emits mutation deltas for rollback/rollforward navigation.
    */
   executeBatchDelta(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number;
+
+  /** Execute explicit non-row writes without temporal advance or clearing event eviction observations. */
+  executeMutations(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number;
+
+  /** Paired-recording counterpart of executeMutations. */
+  executeMutationsDelta(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number;
 
   // ===========================================================================
   // State Reading

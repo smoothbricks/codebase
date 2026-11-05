@@ -16,9 +16,9 @@ use columine_vm::hooks::NoVm;
 use columine_vm::logical_export::{
     CellEncoding, ExprEvaluator, FieldTransform, InternLookup, Interner, LogicalAggregate,
     LogicalCondition, LogicalConditionCell, LogicalEvictionEntry, LogicalExportCause, LogicalInner,
-    LogicalNestedEntry, LogicalRow, LogicalScalar, LogicalSlot, LogicalValue, SlotEncoding,
-    SlotTransfer, TransformPlan, TransformRowView, apply_transform, export_slot, import_slot,
-    rewrite_slot_set,
+    LogicalNestedEntry, LogicalRow, LogicalScalar, LogicalSlot, LogicalTimestamp, LogicalValue,
+    SlotEncoding, SlotTransfer, TransformPlan, TransformRowView, apply_transform, export_slot,
+    import_slot, rewrite_slot_set,
 };
 use columine_vm::meta::SlotMetaView;
 use columine_vm::removal_cut::SlotCuts;
@@ -162,7 +162,7 @@ fn row<'text>(
         key,
         key2: None,
         fields,
-        cmp_ts,
+        cmp_ts: cmp_ts.map(LogicalTimestamp::F64),
     }
 }
 
@@ -319,16 +319,46 @@ fn hashmap_round_trip_with_timestamps_ttl_and_encodings() {
         ),
     ];
     logical.eviction = vec![LogicalEvictionEntry {
-        timestamp: 102.5,
+        timestamp: LogicalTimestamp::F64(102.5),
         key: LogicalValue::Text("alpha".into()),
         value: LogicalValue::Bool(true),
     }];
     logical.evicted = vec![LogicalEvictionEntry {
-        timestamp: 10.0,
+        timestamp: LogicalTimestamp::F64(10.0),
         key: LogicalValue::Text("gone".into()),
         value: LogicalValue::Bool(false),
     }];
     round_trip(&prog, &logical, &enc, &mut interner);
+}
+
+#[test]
+fn integer_deadline_comparison_and_index_round_trip_exact_micros() {
+    let mut init = slot_def(0, SlotType::HashMap as u8 | 0x90, 8);
+    init.extend(0.0f32.to_le_bytes());
+    init.extend(0.0f32.to_le_bytes());
+    init.extend([1, 0]);
+    let prog = program(1, &halt(init));
+    let mut logical = base_slot(0, SlotType::HashMap);
+    let deadline = (1i64 << 53) + 1;
+    logical.rows = vec![LogicalRow {
+        key: LogicalValue::U32(7),
+        key2: None,
+        fields: vec![Some(LogicalValue::U32(0))],
+        cmp_ts: Some(LogicalTimestamp::I64(deadline)),
+    }];
+    logical.eviction = vec![LogicalEvictionEntry {
+        timestamp: LogicalTimestamp::I64(deadline),
+        key: LogicalValue::U32(7),
+        value: LogicalValue::U32(0),
+    }];
+    let mut interner = TestInterner::default();
+    round_trip(&prog, &logical, &SlotEncoding::RAW, &mut interner);
+    let float_prog = program(1, &halt(slot_def_ttl(0, SlotType::HashMap as u8, 8)));
+    let mut wrong_lane = fresh_image(&float_prog);
+    assert!(
+        matches!(import_slot(&mut wrong_lane, &logical, &SlotEncoding::RAW, &mut interner),
+        Err(error) if matches!(error.cause, LogicalExportCause::InvalidRow(_)))
+    );
 }
 
 #[test]

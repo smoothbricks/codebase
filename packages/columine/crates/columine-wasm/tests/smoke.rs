@@ -11,6 +11,7 @@ use columine_types::types::{
     ErrorCode, Opcode, PROGRAM_HASH_PREFIX, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset,
     SlotType, SlotTypeFlags, StructFieldType,
 };
+use columine_vm::temporal::TEMPORAL_MAGIC;
 use columine_wasm::{
     __register_region, vm_calculate_state_size, vm_delta_export_entry_size,
     vm_delta_export_len_bytes, vm_delta_export_redo_ptr, vm_delta_export_segment,
@@ -404,14 +405,28 @@ fn mixed_ttl_export_refusal_preserves_native_extern_selection_and_output() {
     init.extend_from_slice(&0f32.to_le_bytes());
     init.extend_from_slice(&[2, 0, Opcode::Halt as u8]);
     let reduce = [Opcode::BatchMapUpsertLast as u8, 0, 0, 1];
-    let program = program(1, 3, &init, &reduce);
+    let mut program = program(1, 4, &init, &reduce);
+    program.extend(TEMPORAL_MAGIC.to_le_bytes());
+    program.extend(8u32.to_le_bytes());
+    program.extend(3u32.to_le_bytes()); // explicit evict API owns time in this fixture
+    program.extend(0u32.to_le_bytes());
     let mut state = init_state(&program);
     let size = state.len() as u32;
-    let columns = [u32s(&[7]), u32s(&[30]), 1f64.to_le_bytes().to_vec()];
+    let columns = [
+        u32s(&[7]),
+        u32s(&[30]),
+        1f64.to_le_bytes().to_vec(),
+        i64::MIN.to_le_bytes().to_vec(),
+    ];
     assert_eq!(execute_batch(&mut state, &program, &columns, 1, false), OK);
     assert_eq!(unsafe { vm_undo_enable(state.as_mut_ptr(), size) }, OK);
     let checkpoint = unsafe { vm_undo_checkpoint(state.as_mut_ptr()) };
-    let updates = [u32s(&[7]), u32s(&[70]), 1f64.to_le_bytes().to_vec()];
+    let updates = [
+        u32s(&[7]),
+        u32s(&[70]),
+        1f64.to_le_bytes().to_vec(),
+        i64::MIN.to_le_bytes().to_vec(),
+    ];
     assert_eq!(execute_batch(&mut state, &program, &updates, 1, true), OK);
     let paired_end = unsafe { vm_undo_checkpoint(state.as_mut_ptr()) };
     let mut output = [0xa5; 4];

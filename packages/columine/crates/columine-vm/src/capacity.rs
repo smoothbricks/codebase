@@ -110,8 +110,6 @@ struct Demand {
     rows: bool,
     /// Neither bound applies; only a dry run decides.
     opaque: bool,
-    /// A stored-row sweep needs a sparse plan but adds no slot units.
-    swept: bool,
 }
 
 /// Collects one instruction's operands in wire order; raw spans are skipped.
@@ -566,6 +564,33 @@ impl CapacityScratch {
         }
     }
 
+    /// Bound keyed writes from the effects already decoded for capacity admission. This reserves once for the
+    /// whole batch; the row collector retains and reuses it, including for a capacity dry run.
+    pub(crate) fn row_change_bound(&self, cols: &[&[u8]], batch_len: u32) -> Option<usize> {
+        let largest = cols.iter().map(|col| col.len() / 4).max().unwrap_or(0);
+        let mut total = 0usize;
+        for &(effect, whole) in &self.effects {
+            let col = match effect {
+                Effect::Key { col, .. }
+                | Effect::Arena { col, .. }
+                | Effect::Cut { col, .. }
+                | Effect::Routed { col, .. } => Some(col),
+                Effect::Pair { col1, .. } => Some(col1),
+                Effect::Opaque { .. } => None,
+                _ => continue,
+            };
+            let rows = if whole {
+                usize::try_from(batch_len).ok()?
+            } else if let Some(col) = col {
+                usize::try_from(cells(cols, col)).ok()?
+            } else {
+                largest
+            };
+            total = total.checked_add(rows)?;
+        }
+        Some(total)
+    }
+
     /// Back `additional` more elements of `buf`; a failure is remembered so
     /// the batch is refused as out of memory, not left to a dry run.
     fn room<T>(out_of_memory: &mut bool, buf: &mut Vec<T>, additional: usize) -> Option<()> {
@@ -644,13 +669,6 @@ impl CapacityScratch {
                 return Some(Admission::DryRun);
             }
             let meta = slot_meta(state, slot)?;
-            if d.swept && batch_len != 0 {
-                let rows = u64::from(meta.size(state))
-                    .saturating_add(d.units)
-                    .min(u64::from(meta.capacity));
-                let rows = usize::try_from(rows).ok()?;
-                self.scratch.sweep_keys = self.scratch.sweep_keys.max(rows);
-            }
             if meta.slot_type() == SlotType::Bitmap {
                 if d.rows {
                     return Some(Admission::DryRun);
@@ -1162,7 +1180,7 @@ impl Tier1<'_> {
         let d = &mut demand[usize::try_from(slot).ok()?];
         mark(touched, d, slot);
         match (effect, bound) {
-            (Effect::Sweep { .. }, _) => d.swept = true,
+            (Effect::Sweep { .. }, _) => {}
             (Effect::Opaque { .. }, _) => d.opaque = true,
             // Rehash allocations depend on each container's capacity.
             (Effect::Nested { .. }, _) => d.rows = true,

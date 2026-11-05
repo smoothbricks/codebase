@@ -44,6 +44,7 @@
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{ErrorCode, STATE_HEADER_SIZE};
 use columine_vm::bytes;
+use columine_vm::key_index::NoStrings;
 use columine_vm::state_init::{self, SIZING_RECORD_LEN, sizing_record};
 use columine_vm::vm::{CheckedMap, CheckedSet, CheckedStructMap2, Vm};
 
@@ -415,6 +416,41 @@ pub unsafe extern "C" fn vm_grow_state(
 // Batch execution exports
 // =============================================================================
 
+struct ExecutionInputs<'a> {
+    state: &'a mut [u8],
+    program: &'a [u8],
+    cols: Vec<&'a [u8]>,
+}
+
+unsafe fn execution_inputs<'a>(
+    state_base: *mut u8,
+    state_len: u32,
+    program_ptr: *const u8,
+    program_len: u32,
+    col_ptrs_ptr: *const *const u8,
+    col_lengths_ptr: *const u32,
+    num_cols: u32,
+) -> Result<ExecutionInputs<'a>, ErrorCode> {
+    if !disjoint(state_base, state_len, program_ptr, program_len) {
+        return Err(ErrorCode::InvalidState);
+    }
+    let program =
+        unsafe { bounded_buf(program_ptr, program_len) }.map_err(|_| ErrorCode::InvalidProgram)?;
+    let cols = unsafe { cols_vec(col_ptrs_ptr, col_lengths_ptr, num_cols) }?;
+    for col in &cols {
+        let len = u32::try_from(col.len()).map_err(|_| ErrorCode::ColumnUnderrun)?;
+        if !disjoint(state_base, state_len, col.as_ptr(), len) {
+            return Err(ErrorCode::InvalidState);
+        }
+    }
+    let state = unsafe { bounded_state_mut(state_base, state_len) }?;
+    Ok(ExecutionInputs {
+        state,
+        program,
+        cols,
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vm_execute_batch(
     state_base: *mut u8,
@@ -426,27 +462,22 @@ pub unsafe extern "C" fn vm_execute_batch(
     num_cols: u32,
     batch_len: u32,
 ) -> u32 {
-    if !disjoint(state_base, state_len, program_ptr, program_len) {
-        return ErrorCode::InvalidState as u32;
-    }
-    let program = match unsafe { bounded_buf(program_ptr, program_len) } {
-        Ok(program) => program,
-        Err(_) => return ErrorCode::InvalidProgram as u32,
-    };
-    let cols = match unsafe { cols_vec(col_ptrs_ptr, col_lengths_ptr, num_cols) } {
-        Ok(cols) => cols,
-        Err(error) => return error as u32,
-    };
-    for col in &cols {
-        let Ok(len) = u32::try_from(col.len()) else {
-            return ErrorCode::ColumnUnderrun as u32;
-        };
-        if !disjoint(state_base, state_len, col.as_ptr(), len) {
-            return ErrorCode::InvalidState as u32;
-        }
-    }
-    let state = match unsafe { bounded_state_mut(state_base, state_len) } {
-        Ok(state) => state,
+    let ExecutionInputs {
+        state,
+        program,
+        cols,
+    } = match unsafe {
+        execution_inputs(
+            state_base,
+            state_len,
+            program_ptr,
+            program_len,
+            col_ptrs_ptr,
+            col_lengths_ptr,
+            num_cols,
+        )
+    } {
+        Ok(inputs) => inputs,
         Err(error) => return error as u32,
     };
     rt().vm.execute_batch(state, program, &cols, batch_len)
@@ -463,31 +494,92 @@ pub unsafe extern "C" fn vm_execute_batch_delta(
     num_cols: u32,
     batch_len: u32,
 ) -> u32 {
-    if !disjoint(state_base, state_len, program_ptr, program_len) {
-        return ErrorCode::InvalidState as u32;
-    }
-    let program = match unsafe { bounded_buf(program_ptr, program_len) } {
-        Ok(program) => program,
-        Err(_) => return ErrorCode::InvalidProgram as u32,
-    };
-    let cols = match unsafe { cols_vec(col_ptrs_ptr, col_lengths_ptr, num_cols) } {
-        Ok(cols) => cols,
-        Err(error) => return error as u32,
-    };
-    for col in &cols {
-        let Ok(len) = u32::try_from(col.len()) else {
-            return ErrorCode::ColumnUnderrun as u32;
-        };
-        if !disjoint(state_base, state_len, col.as_ptr(), len) {
-            return ErrorCode::InvalidState as u32;
-        }
-    }
-    let state = match unsafe { bounded_state_mut(state_base, state_len) } {
-        Ok(state) => state,
+    let ExecutionInputs {
+        state,
+        program,
+        cols,
+    } = match unsafe {
+        execution_inputs(
+            state_base,
+            state_len,
+            program_ptr,
+            program_len,
+            col_ptrs_ptr,
+            col_lengths_ptr,
+            num_cols,
+        )
+    } {
+        Ok(inputs) => inputs,
         Err(error) => return error as u32,
     };
     rt().vm
         .execute_batch_delta(state, program, &cols, batch_len)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vm_execute_mutations(
+    state_base: *mut u8,
+    state_len: u32,
+    program_ptr: *const u8,
+    program_len: u32,
+    col_ptrs_ptr: *const *const u8,
+    col_lengths_ptr: *const u32,
+    num_cols: u32,
+    batch_len: u32,
+) -> u32 {
+    let ExecutionInputs {
+        state,
+        program,
+        cols,
+    } = match unsafe {
+        execution_inputs(
+            state_base,
+            state_len,
+            program_ptr,
+            program_len,
+            col_ptrs_ptr,
+            col_lengths_ptr,
+            num_cols,
+        )
+    } {
+        Ok(inputs) => inputs,
+        Err(error) => return error as u32,
+    };
+    rt().vm
+        .execute_mutations_in(state, program, &cols, batch_len, &NoStrings)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vm_execute_mutations_delta(
+    state_base: *mut u8,
+    state_len: u32,
+    program_ptr: *const u8,
+    program_len: u32,
+    col_ptrs_ptr: *const *const u8,
+    col_lengths_ptr: *const u32,
+    num_cols: u32,
+    batch_len: u32,
+) -> u32 {
+    let ExecutionInputs {
+        state,
+        program,
+        cols,
+    } = match unsafe {
+        execution_inputs(
+            state_base,
+            state_len,
+            program_ptr,
+            program_len,
+            col_ptrs_ptr,
+            col_lengths_ptr,
+            num_cols,
+        )
+    } {
+        Ok(inputs) => inputs,
+        Err(error) => return error as u32,
+    };
+    rt().vm
+        .execute_mutations_delta_in(state, program, &cols, batch_len, &NoStrings)
 }
 
 #[unsafe(no_mangle)]

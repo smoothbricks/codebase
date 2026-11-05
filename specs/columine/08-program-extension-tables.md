@@ -2,12 +2,11 @@
 
 ## 1. Scope
 
-A program's content ends with its reduce section, then its tail. The VM reads one table there, the row-expression table
-([stored-row sweep](01-stored-row-sweep.md) §2, [wide row cells](07-wide-row-cells.md) §2). An embedder also compiles
-tables of its own into a program: a reducer carries its input binding, the instructions that fill its input columns from
-an event schema's columns. Carried in the program, such a table is part of the program's bytes and so of every identity
-taken over them: a change to it alone is a program change. The VM never reads an embedder's table, and an embedder never
-reads the row table through this framing.
+A program's content ends with its reduce section, then its tail. The VM reads the row-expression table
+([stored-row sweep](01-stored-row-sweep.md) §2, [wide row cells](07-wide-row-cells.md) §2) and the optional `TMP1`
+temporal table (01 §Temporal program table). An embedder also compiles tables of its own into a program, such as input
+bindings. Every table is part of the program's bytes and every identity taken over them: changing a table changes the
+program. The VM never reads an embedder-owned table; `TMP1` is VM-owned and uses the same extension framing.
 
 ## 2. Encoding
 
@@ -28,8 +27,8 @@ one extension table's bytes. A program with no tables, or with only a row table,
 
 A tail that does not split is `InvalidProgram` wherever the VM reads the row table (`bind_row_columns`, program
 admission): a row table that runs past the tail, bytes after it that end inside an extension table's header or bytes,
-two extension tables of one magic, or an extension table under a row table's magic. Nothing in an extension table's
-bytes is validated by columine; its embedder validates its own table.
+two extension tables of one magic, or an extension table under a row table's magic. Columine validates its `TMP1`
+temporal table before execution; the embedder validates the bytes of every embedder-owned table.
 
 ## 4. Behavioral acceptance
 

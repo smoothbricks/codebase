@@ -19,6 +19,7 @@ use columine_vm::hashmap_ops::{
 };
 use columine_vm::hashset_ops::{batch_set_insert, batch_set_remove, bind_slot_set};
 use columine_vm::hooks::NoVm;
+use columine_vm::key_index::NoStrings;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::removal_cut::SlotCuts;
 use columine_vm::slot_growth::slot_data_size;
@@ -2892,9 +2893,9 @@ fn execute_one_map_element(
         columine_vm::vm::f64s_as_bytes(&timestamps),
     ];
     let result = if delta {
-        vm.execute_batch_delta(state, program, &columns, 1)
+        vm.execute_mutations_delta_in(state, program, &columns, 1, &NoStrings)
     } else {
-        vm.execute_batch(state, program, &columns, 1)
+        vm.execute_mutations_in(state, program, &columns, 1, &NoStrings)
     };
     ErrorCode::from_u32(result).expect("real VM returns a registered status")
 }

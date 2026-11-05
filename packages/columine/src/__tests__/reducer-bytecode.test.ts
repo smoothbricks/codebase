@@ -96,6 +96,29 @@ describe('parseReducerProgram', () => {
     });
   });
 
+  it('retains the exact integer-deadline lane and refuses it outside a TTL hashmap', () => {
+    const flags = SlotType.HASHMAP | SlotTypeFlag.HAS_TTL | SlotTypeFlag.INTEGER_DEADLINE;
+    const parsed = parseReducerProgram(
+      buildProgram([Opcode.SLOT_DEF, 0, flags, 32, 0, ...ttlBytes(0, 0, 3, TtlStartOf.NONE), Opcode.HALT], 1),
+    );
+    expect(parsed.slotDefs[0]).toEqual({
+      type: SlotType.HASHMAP,
+      capacity: 32,
+      storesTimestamps: true,
+      integerDeadline: true,
+      ttl: { ttlSeconds: 0, graceSeconds: 0, timestampFieldIndex: 3, startOf: TtlStartOf.NONE, hasEvictTrigger: false },
+    });
+    for (const invalid of [
+      SlotType.HASHMAP | SlotTypeFlag.INTEGER_DEADLINE,
+      SlotType.HASHSET | SlotTypeFlag.HAS_TTL | SlotTypeFlag.INTEGER_DEADLINE,
+      SlotType.BITMAP | SlotTypeFlag.HAS_TTL | SlotTypeFlag.INTEGER_DEADLINE,
+    ]) {
+      expect(() => parseReducerProgram(buildProgram([Opcode.SLOT_DEF, 0, invalid, 4, 0, Opcode.HALT], 1))).toThrow(
+        'integer deadlines require a TTL HASHMAP',
+      );
+    }
+  });
+
   it('refuses TTL on both struct-map declarations before decoding their metadata', () => {
     const structMap = [
       Opcode.SLOT_STRUCT_MAP,

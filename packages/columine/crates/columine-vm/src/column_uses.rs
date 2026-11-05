@@ -239,13 +239,34 @@ enum TimestampSource<'a> {
 
 impl TimestampSource<'_> {
     /// The timestamp column of `slot` when the slot has a TTL.
-    fn timestamp_col(self, slot: u32) -> Result<Option<u32>, ErrorCode> {
+    fn timestamp_col(self, slot: u32) -> Result<Option<(u32, OperandLane)>, ErrorCode> {
         match self {
             Self::State(state) => {
                 let meta = SlotMetaView::read(state, slot);
-                Ok(meta.has_ttl().then(|| meta.timestamp_col(state)))
+                Ok(meta.has_ttl().then(|| {
+                    (
+                        meta.timestamp_col(state),
+                        if meta.type_flags.integer_deadline() {
+                            I64
+                        } else {
+                            F64
+                        },
+                    )
+                }))
             }
-            Self::Init(init) => Ok(slot_record(init, slot)?.timestamp_col),
+            Self::Init(init) => {
+                let record = slot_record(init, slot)?;
+                Ok(record.timestamp_col.map(|col| {
+                    (
+                        col,
+                        if record.flags.integer_deadline() {
+                            I64
+                        } else {
+                            F64
+                        },
+                    )
+                }))
+            }
         }
     }
 }
@@ -334,8 +355,8 @@ fn walk_op(
     };
     // A TTL slot's timestamp column, named by the slot, not the instruction.
     let ttl = |slot: u32, visit: &mut dyn FnMut(ColumnOperand)| -> Result<(), ErrorCode> {
-        if let Some(column) = source.timestamp_col(slot)? {
-            cell(visit, column, ColumnUse::Read, F64);
+        if let Some((column, lane)) = source.timestamp_col(slot)? {
+            cell(visit, column, ColumnUse::Read, lane);
         }
         Ok(())
     };

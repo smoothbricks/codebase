@@ -70,6 +70,7 @@ pub mod seal;
 pub mod slot_growth;
 pub mod state_init;
 pub mod struct_map;
+pub mod temporal;
 pub mod ttl_plan;
 pub mod undo_log;
 pub mod vm;

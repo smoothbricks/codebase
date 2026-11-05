@@ -27,6 +27,7 @@ use columine_vm::key_index::NoStrings;
 use columine_vm::meta::slot_meta_base;
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
+use columine_vm::temporal::TEMPORAL_MAGIC;
 use columine_vm::vm::{CheckedMap, Vm, f64s_as_bytes, i64s_as_bytes, u32s_as_bytes};
 use common::memory::with_allocations;
 
@@ -74,7 +75,9 @@ const ONES: u8 = 15;
 /// `1000 * key + value`: the probe source row an add reads.
 const PROBE_ID: u8 = 16;
 const GUARD: u8 = 17;
-const COLUMNS: usize = 18;
+/// Logical row clock in i64 microseconds, not the element-sized f64 comparison lane.
+const CLOCK: u8 = 18;
+const COLUMNS: usize = 19;
 
 /// A fresh counts frame: prefix `P`, a zero count, the ref word naming the
 /// histogram region (origin-relative 8), and that region: one bin, zero.
@@ -877,6 +880,7 @@ fn batch(shape: Shape, log: &[(Op, u32)], first: u32) -> Batch {
     cols[usize::from(ONES)] = u32s_as_bytes(&vec![1; units]).to_vec();
     cols[usize::from(PROBE_ID)] = u32s_as_bytes(&probe_ids).to_vec();
     cols[usize::from(GUARD)] = u32s_as_bytes(&vec![GUARD_KEY; units]).to_vec();
+    cols[usize::from(CLOCK)] = i64s_as_bytes(&vec![0; log.len()]).to_vec();
     Batch {
         cols,
         rows: u32::try_from(log.len()).unwrap(),
@@ -942,7 +946,13 @@ fn expected(expect: Expect, pick: Pick) -> Option<u32> {
 /// earlier batch seeded.
 fn seeded(target: Target, pick: Pick, shape: Shape) -> (Vec<u8>, Vec<u8>, Vm) {
     let declared = init(target, pick);
-    let code = program(&declared, slots(pick), &reduce(target, pick, shape));
+    let mut code = program(&declared, slots(pick), &reduce(target, pick, shape));
+    if matches!(pick, Pick::LatestTtl | Pick::LastTtl) {
+        code.extend(TEMPORAL_MAGIC.to_le_bytes());
+        code.extend(8u32.to_le_bytes());
+        code.extend(u32::from(CLOCK).to_le_bytes());
+        code.extend(0u32.to_le_bytes());
+    }
     let mut state = image(&code);
     let mut vm = Vm::default();
     if let Some(aux) = aux_seed(pick) {
@@ -1114,7 +1124,13 @@ fn a_removal_after_a_producer_of_its_slot_refuses_the_program_before_any_write()
             if place == "at top level" && element_only(target, pick) {
                 continue;
             }
-            let code = program(&init(target, pick), slots(pick), &reduce);
+            let mut code = program(&init(target, pick), slots(pick), &reduce);
+            if matches!(pick, Pick::LatestTtl | Pick::LastTtl) {
+                code.extend(TEMPORAL_MAGIC.to_le_bytes());
+                code.extend(8u32.to_le_bytes());
+                code.extend(u32::from(CLOCK).to_le_bytes());
+                code.extend(0u32.to_le_bytes());
+            }
             let mut state = image(&code);
             let before = state.clone();
             let log = batch(Shape::FlatMap, &[(Op::Add(1), KEY), (Op::Remove, KEY)], 0);

@@ -1,17 +1,20 @@
 import { describe, expect, it } from 'bun:test';
 import { encodeProgramHeader } from '../reducer-bytecode.js';
-import type { ColumineBackend, DeltaSegmentExport, ReducerProgram, StateHandle } from '../types.js';
 import {
   AggType,
+  type ColumineBackend,
+  type ColumnInput,
+  type DeltaSegmentExport,
   ErrorCode,
   HEADER_SIZE,
   Opcode,
   PROGRAM_HASH_PREFIX,
   PROGRAM_MAGIC,
+  type ReducerProgram,
   SlotType,
   SlotTypeFlag,
+  type StateHandle,
   UNDO_POSITION_OVERFLOWED,
-  ValueType,
 } from '../types.js';
 import { loadColumineWasm, VmProgramAdmissionError } from '../wasm-backend.js';
 
@@ -31,6 +34,9 @@ const TRIGGER_CAPACITY = 1024;
 const ENTRY_SIZE = 16;
 const UPDATED = 0x02;
 const JOURNAL_CAPACITY = 16384;
+
+// Algebra and explicit eviction are non-row mutations; no logical event clock is supplied.
+const noColumns: ColumnInput[] = [];
 
 const ALGEBRA = [Opcode.BATCH_BITMAP_OR, Opcode.BATCH_BITMAP_AND, Opcode.BATCH_BITMAP_ANDNOT, Opcode.BATCH_BITMAP_XOR];
 
@@ -74,14 +80,14 @@ function initCode(capacity = 64, sourceTtl = true, trigger = false): number[] {
   return init;
 }
 
-function program(init: readonly number[], reduce: readonly number[], numInputs = 2): Uint8Array {
+function program(init: readonly number[], reduce: readonly number[]): Uint8Array {
   const body = [...reduce, Opcode.HALT];
   const bytecode = new Uint8Array(PROGRAM_HASH_PREFIX + HEADER_SIZE + init.length + body.length);
   bytecode.set(
     encodeProgramHeader({
       magic: PROGRAM_MAGIC,
       numSlots: 3,
-      numInputs,
+      numInputs: 2,
       initCodeLength: init.length,
       reduceCodeLength: body.length,
     }),
@@ -161,13 +167,10 @@ async function seed(
     // Missing timestamps are explicitly absent rows in the later checkpoint.
     const stamps = timestamps(members.map((member) => member.expiry ?? bits(123)));
     expect(
-      backend.executeBatch(
+      backend.executeMutations(
         state,
         insert,
-        [
-          { data: Uint32Array.from(members, (member) => member.key), type: ValueType.UINT32 },
-          { data: stamps, type: ValueType.FLOAT64 },
-        ],
+        [{ data: Uint32Array.from(members, (member) => member.key) }, { data: stamps }],
         members.length,
       ),
     ).toBe(ErrorCode.OK);
@@ -293,8 +296,8 @@ describe('real WASM bitmap TTL algebra', () => {
         const before = backend.serialize(state, reducer);
         expect(backend.undoEnable(state)).toStrictEqual({ ok: true, value: undefined });
         const from = backend.undoCheckpoint(state);
-        const run = delta ? backend.executeBatchDelta.bind(backend) : backend.executeBatch.bind(backend);
-        expect(run(state, algebra, [], 1)).toBe(ErrorCode.OK);
+        const run = delta ? backend.executeMutationsDelta.bind(backend) : backend.executeMutations.bind(backend);
+        expect(run(state, algebra, noColumns, 1)).toBe(ErrorCode.OK);
         assertModel(backend, state, reducer, model(op, a, b));
         const after = backend.serialize(state, reducer);
         const segment = delta ? exportSegment(backend, state, from, backend.undoCheckpoint(state)) : undefined;
@@ -319,8 +322,8 @@ describe('real WASM bitmap TTL algebra', () => {
         const before = backend.serialize(state, reducer);
         expect(backend.undoEnable(state)).toStrictEqual({ ok: true, value: undefined });
         const from = backend.undoCheckpoint(state);
-        const run = delta ? backend.executeBatchDelta.bind(backend) : backend.executeBatch.bind(backend);
-        expect(run(state, algebra, [], 1)).toBe(ErrorCode.OK);
+        const run = delta ? backend.executeMutationsDelta.bind(backend) : backend.executeMutations.bind(backend);
+        expect(run(state, algebra, noColumns, 1)).toBe(ErrorCode.OK);
         assertModel(backend, state, reducer, expected);
         const merged = backend.serialize(state, reducer);
         const middle = backend.undoCheckpoint(state);
@@ -376,7 +379,7 @@ describe('real WASM bitmap TTL algebra', () => {
       const reducer = seeded.reducer;
       const state = backend.deserialize(reducer, seededImage);
       const algebra = await backend.loadProgram(program(init, [Opcode.BATCH_BITMAP_OR, 0, 1]));
-      expect(backend.executeBatch(state, algebra, [], 1)).toBe(ErrorCode.OK);
+      expect(backend.executeMutations(state, algebra, noColumns, 1)).toBe(ErrorCode.OK);
       assertModel(backend, state, reducer, model(Opcode.BATCH_BITMAP_OR, a, b));
       const image = backend.serialize(state, reducer);
       expect(image[META_BASE + CHANGE_FLAGS]).toBe(sourceTtl ? UPDATED : 0);
@@ -397,8 +400,8 @@ describe('real WASM bitmap TTL algebra', () => {
       const before = backend.serialize(state, reducer);
       expect(backend.undoEnable(state)).toStrictEqual({ ok: true, value: undefined });
       const checkpoint = backend.undoCheckpoint(state);
-      const run = delta ? backend.executeBatchDelta.bind(backend) : backend.executeBatch.bind(backend);
-      expect(run(state, algebra, [], 1)).toBe(ErrorCode.NEEDS_GROWTH);
+      const run = delta ? backend.executeMutationsDelta.bind(backend) : backend.executeMutations.bind(backend);
+      expect(run(state, algebra, noColumns, 1)).toBe(ErrorCode.NEEDS_GROWTH);
       expect(backend.undoCheckpoint(state)).toBe(checkpoint);
       expect(backend.serialize(state, reducer)).toEqual(before);
       expect(backend.undoHasOverflow()).toBe(false);
@@ -413,15 +416,15 @@ describe('real WASM bitmap TTL algebra', () => {
       const a = Array.from({ length: 12 }, (_, index) => ({ key: index + 1, expiry: bits(index + 1) }));
       const b = a.map((member) => ({ key: member.key, expiry: bits(timestamp(member.expiry) + 100) }));
       const { state, reducer } = await seed(backend, init, a, b);
-      const count = await backend.loadProgram(program(init, [Opcode.BATCH_AGG_COUNT, 2], 0));
+      const count = await backend.loadProgram(program(init, [Opcode.BATCH_AGG_COUNT, 2]));
       const algebra = await backend.loadProgram(program(init, [Opcode.BATCH_BITMAP_OR, 0, 1]));
       const before = backend.serialize(state, reducer);
       expect(backend.undoEnable(state)).toStrictEqual({ ok: true, value: undefined });
       const from = backend.undoCheckpoint(state);
-      const run = delta ? backend.executeBatchDelta.bind(backend) : backend.executeBatch.bind(backend);
+      const run = delta ? backend.executeMutationsDelta.bind(backend) : backend.executeMutations.bind(backend);
       let checkpoint = from;
       while (checkpoint < JOURNAL_CAPACITY - 8) {
-        expect(run(state, count, [], 1)).toBe(ErrorCode.OK);
+        expect(run(state, count, noColumns, 1)).toBe(ErrorCode.OK);
         const next = backend.undoCheckpoint(state);
         expect(next).toBeGreaterThan(checkpoint);
         expect(next).toBeLessThan(JOURNAL_CAPACITY);
@@ -429,7 +432,7 @@ describe('real WASM bitmap TTL algebra', () => {
       }
       const prefix = backend.serialize(state, reducer);
       const segment = delta ? exportSegment(backend, state, from, checkpoint) : undefined;
-      expect(run(state, algebra, [], 1)).toBe(ErrorCode.OK);
+      expect(run(state, algebra, noColumns, 1)).toBe(ErrorCode.OK);
       expect(backend.undoHasOverflow()).toBe(true);
       expect(backend.undoCheckpoint(state)).toBe(UNDO_POSITION_OVERFLOWED);
       // The overflow lands the algebra's writes in the shadow.
@@ -442,7 +445,7 @@ describe('real WASM bitmap TTL algebra', () => {
       backend.undoRollback(state, from);
       expect(backend.serialize(state, reducer)).toEqual(before);
       // The rollback emptied the journal, so the same capture fits and journals again.
-      expect(run(state, algebra, [], 1)).toBe(ErrorCode.OK);
+      expect(run(state, algebra, noColumns, 1)).toBe(ErrorCode.OK);
       expect(backend.undoHasOverflow()).toBe(false);
       expect(backend.undoCheckpoint(state)).toBeGreaterThan(from);
       backend.undoRollback(state, from);

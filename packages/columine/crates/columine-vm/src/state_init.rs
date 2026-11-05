@@ -396,6 +396,11 @@ fn check_init_code(
                 if type_flags.has_ttl() && !supports_ttl(slot_type) {
                     return Err(ProgramInvalidCause::MalformedProgram);
                 }
+                if type_flags.integer_deadline()
+                    && (slot_type != SlotType::HashMap || !type_flags.has_ttl())
+                {
+                    return Err(ProgramInvalidCause::MalformedProgram);
+                }
                 if matches!(
                     slot_type,
                     SlotType::StructMap
@@ -1683,6 +1688,9 @@ fn validate_slot_geometry<I: KeyIndex>(
         return Err(ErrorCode::InvalidState);
     }
     if flags.has_ttl() && !supports_ttl(kind) {
+        return Err(ErrorCode::InvalidState);
+    }
+    if flags.integer_deadline() && (kind != SlotType::HashMap || !flags.has_ttl()) {
         return Err(ErrorCode::InvalidState);
     }
     let primary = checked_primary_size::<I>(state, meta, &m, m.capacity)?;

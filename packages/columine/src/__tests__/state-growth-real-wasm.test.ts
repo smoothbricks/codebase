@@ -13,17 +13,26 @@ import {
   SlotTypeFlag,
   StructFieldType,
   UNDO_POSITION_OVERFLOWED,
-  ValueType,
 } from '../types.js';
 import { loadColumineWasm, VmStateAdmissionError } from '../wasm-backend.js';
 import { WasmHostRegion } from '../wasm-memory-contract.js';
+import { MANUAL_EVICTION_CLOCK_MICROS, rowClockTable } from './temporal-program-fixture.js';
 
 const WASM_PATH = new URL('../../.cache/wasm-dev/columine.wasm', import.meta.url);
 
-function program(init: readonly number[], reduce: readonly number[], numSlots: number, numInputs: number): Uint8Array {
+function program(
+  init: readonly number[],
+  reduce: readonly number[],
+  numSlots: number,
+  numInputs: number,
+  rowClockColumn?: number,
+): Uint8Array {
   const initCode = new Uint8Array([...init, Opcode.HALT]);
   const reduceCode = new Uint8Array([...reduce, Opcode.HALT]);
-  const bytes = new Uint8Array(PROGRAM_HASH_PREFIX + HEADER_SIZE + initCode.length + reduceCode.length);
+  const temporal = rowClockColumn === undefined ? undefined : rowClockTable(rowClockColumn);
+  const bytes = new Uint8Array(
+    PROGRAM_HASH_PREFIX + HEADER_SIZE + initCode.length + reduceCode.length + (temporal?.length ?? 0),
+  );
   bytes.set(
     encodeProgramHeader({
       magic: PROGRAM_MAGIC,
@@ -36,6 +45,8 @@ function program(init: readonly number[], reduce: readonly number[], numSlots: n
   );
   bytes.set(initCode, PROGRAM_HASH_PREFIX + HEADER_SIZE);
   bytes.set(reduceCode, PROGRAM_HASH_PREFIX + HEADER_SIZE + initCode.length);
+  if (temporal !== undefined)
+    bytes.set(temporal, PROGRAM_HASH_PREFIX + HEADER_SIZE + initCode.length + reduceCode.length);
   return bytes;
 }
 
@@ -66,24 +77,13 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     );
     const state = backend.createState(reducer);
     expect(
-      backend.executeBatch(
-        state,
-        reducer,
-        [
-          { data: new Uint32Array([7]), type: ValueType.UINT32 },
-          { data: new Uint32Array([70]), type: ValueType.UINT32 },
-        ],
-        1,
-      ),
+      backend.executeBatch(state, reducer, [{ data: new Uint32Array([7]) }, { data: new Uint32Array([70]) }], 1),
     ).toBe(ErrorCode.OK);
     const original = backend.serialize(state, reducer);
     let committed = original;
     const keys = Uint32Array.from({ length: 160 }, (_, index) => index + 1);
     const values = Uint32Array.from(keys, (key) => key * 10);
-    const columns = [
-      { data: keys, type: ValueType.UINT32 },
-      { data: values, type: ValueType.UINT32 },
-    ];
+    const columns = [{ data: keys }, { data: values }];
     let checkpoint = 0;
     let growths = 0;
     for (;;) {
@@ -94,10 +94,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
         backend.executeBatchDelta(
           state,
           reducer,
-          [
-            { data: new Uint32Array([1000]), type: ValueType.UINT32 },
-            { data: new Uint32Array([10000]), type: ValueType.UINT32 },
-          ],
+          [{ data: new Uint32Array([1000]) }, { data: new Uint32Array([10000]) }],
           1,
         ),
       ).toBe(ErrorCode.OK);
@@ -165,29 +162,13 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     );
     const state = backend.createState(reducer);
     expect(
-      backend.executeBatch(
-        state,
-        reducer,
-        [
-          { data: new Uint32Array([7]), type: ValueType.UINT32 },
-          { data: new Uint32Array([30]), type: ValueType.UINT32 },
-        ],
-        1,
-      ),
+      backend.executeBatch(state, reducer, [{ data: new Uint32Array([7]) }, { data: new Uint32Array([30]) }], 1),
     ).toBe(ErrorCode.OK);
     const beforeBegin = backend.serialize(state, reducer);
     expect(backend.undoEnable(state)).toStrictEqual({ ok: true, value: undefined });
     const checkpoint = backend.undoCheckpoint(state);
     expect(
-      backend.executeBatchDelta(
-        state,
-        reducer,
-        [
-          { data: new Uint32Array([7]), type: ValueType.UINT32 },
-          { data: new Uint32Array([70]), type: ValueType.UINT32 },
-        ],
-        1,
-      ),
+      backend.executeBatchDelta(state, reducer, [{ data: new Uint32Array([7]) }, { data: new Uint32Array([70]) }], 1),
     ).toBe(ErrorCode.OK);
     const updated = backend.serialize(state, reducer);
     const exported = backend.deltaExportSegment(state, checkpoint, backend.undoCheckpoint(state));
@@ -215,10 +196,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
       backend.executeBatch(
         state,
         reducer,
-        [
-          { data: keys, type: ValueType.UINT32 },
-          { data: Uint32Array.from(keys, (key) => key * 10), type: ValueType.UINT32 },
-        ],
+        [{ data: keys }, { data: Uint32Array.from(keys, (key) => key * 10) }],
         keys.length,
       ),
     ).toBe(ErrorCode.OK);
@@ -228,10 +206,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     expect(backend.undoEnable(state)).toStrictEqual({ ok: true, value: undefined });
     const checkpoint = backend.undoCheckpoint(state);
     const more = Uint32Array.from({ length: 440 }, (_, index) => index + 161);
-    const columns = [
-      { data: more, type: ValueType.UINT32 },
-      { data: Uint32Array.from(more, (key) => key * 10), type: ValueType.UINT32 },
-    ];
+    const columns = [{ data: more }, { data: Uint32Array.from(more, (key) => key * 10) }];
     expect(backend.executeBatch(state, reducer, columns, more.length)).toBe(ErrorCode.NEEDS_GROWTH);
     expect(backend.undoCheckpoint(state)).toBe(checkpoint);
     expect(backend.serialize(state, reducer)).toEqual(committed);
@@ -253,28 +228,12 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     const untouched = backend.createState(reducer);
     const selectedBefore = backend.serialize(selected, reducer);
     expect(
-      backend.executeBatch(
-        untouched,
-        reducer,
-        [
-          { data: new Uint32Array([99]), type: ValueType.UINT32 },
-          { data: new Uint32Array([990]), type: ValueType.UINT32 },
-        ],
-        1,
-      ),
+      backend.executeBatch(untouched, reducer, [{ data: new Uint32Array([99]) }, { data: new Uint32Array([990]) }], 1),
     ).toBe(ErrorCode.OK);
     expect(backend.undoEnable(selected)).toStrictEqual({ ok: true, value: undefined });
     const checkpoint = backend.undoCheckpoint(selected);
     expect(
-      backend.executeBatch(
-        selected,
-        reducer,
-        [
-          { data: new Uint32Array([7]), type: ValueType.UINT32 },
-          { data: new Uint32Array([70]), type: ValueType.UINT32 },
-        ],
-        1,
-      ),
+      backend.executeBatch(selected, reducer, [{ data: new Uint32Array([7]) }, { data: new Uint32Array([70]) }], 1),
     ).toBe(ErrorCode.OK);
     const untouchedBefore = backend.serialize(untouched, reducer);
     expect(backend.mapGet(untouched, reducer, 0, 7)).toStrictEqual({ ok: true, value: undefined });
@@ -313,15 +272,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     );
     const state = backend.createState(scalarOnly);
     expect(
-      backend.executeBatch(
-        state,
-        scalarOnly,
-        [
-          { data: new Uint32Array([7]), type: ValueType.UINT32 },
-          { data: new Uint32Array([70]), type: ValueType.UINT32 },
-        ],
-        1,
-      ),
+      backend.executeBatch(state, scalarOnly, [{ data: new Uint32Array([7]) }, { data: new Uint32Array([70]) }], 1),
     ).toBe(ErrorCode.OK);
     const unset = backend.structMapArenaField(state, scalarOnly, 0, 7, 1);
     expect(unset.kind).toBe('unset');
@@ -340,11 +291,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
       backend.executeBatch(
         emptyState,
         emptyArray,
-        [
-          { data: new Uint32Array([7]), type: ValueType.UINT32 },
-          { data: new Uint32Array([0, 0]), type: ValueType.UINT32 },
-          { data: new Uint32Array(), type: ValueType.UINT32 },
-        ],
+        [{ data: new Uint32Array([7]) }, { data: new Uint32Array([0, 0]) }, { data: new Uint32Array() }],
         1,
       ),
     ).toBe(ErrorCode.OK);
@@ -424,15 +371,17 @@ describe('real wasm state geometry and committed-boundary growth', () => {
           [Opcode.SLOT_DEF, 0, SlotType.HASHMAP | SlotTypeFlag.HAS_TTL, 8, 0, ...ttl, 2, 0],
           [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
           1,
+          4,
           3,
         ),
       );
       const state = backend.createState(reducer);
       const execute = (values: Uint32Array) => {
         const columns = [
-          { data: new Uint32Array(values.length).fill(7), type: ValueType.UINT32 },
-          { data: values, type: ValueType.UINT32 },
-          { data: new Float64Array(values.length).fill(1), type: ValueType.FLOAT64 },
+          { data: new Uint32Array(values.length).fill(7) },
+          { data: values },
+          { data: new Float64Array(values.length).fill(1) },
+          { data: new BigInt64Array(values.length).fill(MANUAL_EVICTION_CLOCK_MICROS) },
         ];
         return delta
           ? backend.executeBatchDelta(state, reducer, columns, values.length)
@@ -498,20 +447,23 @@ describe('real wasm state geometry and committed-boundary growth', () => {
           [Opcode.SLOT_DEF, 0, SlotType.HASHMAP | SlotTypeFlag.HAS_TTL, 8, 0, ...ttl, 2, 0],
           [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
           1,
+          4,
           3,
         ),
       );
       const state = backend.createState(reducer);
       // One TTL row at key 7 with timestamp 1, which expires before now = 100.
       const insertColumns = [
-        { data: new Uint32Array([7]), type: ValueType.UINT32 },
-        { data: new Uint32Array([30]), type: ValueType.UINT32 },
-        { data: new Float64Array([1]), type: ValueType.FLOAT64 },
+        { data: new Uint32Array([7]) },
+        { data: new Uint32Array([30]) },
+        { data: new Float64Array([1]) },
+        { data: new BigInt64Array([MANUAL_EVICTION_CLOCK_MICROS]) },
       ];
       const updateColumns = [
-        { data: new Uint32Array([7]), type: ValueType.UINT32 },
-        { data: new Uint32Array([70]), type: ValueType.UINT32 },
-        { data: new Float64Array([1]), type: ValueType.FLOAT64 },
+        { data: new Uint32Array([7]) },
+        { data: new Uint32Array([70]) },
+        { data: new Float64Array([1]) },
+        { data: new BigInt64Array([MANUAL_EVICTION_CLOCK_MICROS]) },
       ];
       expect(backend.executeBatch(state, reducer, insertColumns, 1)).toBe(ErrorCode.OK);
       const beforeBegin = backend.serialize(state, reducer);
@@ -578,6 +530,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
       [Opcode.SLOT_DEF, 0, SlotType.HASHMAP | SlotTypeFlag.HAS_TTL, 8, 0, ...ttl, 2, 0],
       [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
       1,
+      4,
       3,
     );
     new Uint8Array(memory.buffer).set(bytecode, programPtr);
@@ -586,7 +539,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     new Uint8Array(memory.buffer, statePtr, size).fill(0);
     expect(invoke(exports, 'vm_init_state', statePtr, programPtr, bytecode.length)).toBe(ErrorCode.OK);
 
-    // Columns follow the program's indexes (key, value, TTL timestamp); each starts on an 8-byte boundary.
+    // Columns are key, value, f64 TTL age and i64-micros row clock; each starts on an 8-byte boundary.
     const execute = (delta: boolean, columns: readonly ArrayBufferView[], batchLen: number) => {
       const view = new DataView(memory.buffer);
       let at = dataStart;
@@ -610,10 +563,32 @@ describe('real wasm state geometry and committed-boundary growth', () => {
         batchLen,
       );
     };
-    expect(execute(false, [new Uint32Array([7]), new Uint32Array([30]), new Float64Array([1])], 1)).toBe(ErrorCode.OK);
+    expect(
+      execute(
+        false,
+        [
+          new Uint32Array([7]),
+          new Uint32Array([30]),
+          new Float64Array([1]),
+          new BigInt64Array([MANUAL_EVICTION_CLOCK_MICROS]),
+        ],
+        1,
+      ),
+    ).toBe(ErrorCode.OK);
     expect(invoke(exports, 'vm_undo_enable', statePtr, size)).toBe(ErrorCode.OK);
     const checkpoint = invoke(exports, 'vm_undo_checkpoint', statePtr);
-    expect(execute(true, [new Uint32Array([7]), new Uint32Array([70]), new Float64Array([1])], 1)).toBe(ErrorCode.OK);
+    expect(
+      execute(
+        true,
+        [
+          new Uint32Array([7]),
+          new Uint32Array([70]),
+          new Float64Array([1]),
+          new BigInt64Array([MANUAL_EVICTION_CLOCK_MICROS]),
+        ],
+        1,
+      ),
+    ).toBe(ErrorCode.OK);
     const middle = invoke(exports, 'vm_undo_checkpoint', statePtr);
     expect(middle).toBeGreaterThan(checkpoint);
 
@@ -721,10 +696,10 @@ describe('real wasm state geometry and committed-boundary growth', () => {
         state,
         reducer,
         [
-          { data: new Uint32Array([7]), type: ValueType.UINT32 },
-          { data: new Uint32Array([0xffff_ffff]), type: ValueType.UINT32 },
-          { data: new Uint32Array([41]), type: ValueType.UINT32 },
-          { data: new Uint32Array([99]), type: ValueType.UINT32 },
+          { data: new Uint32Array([7]) },
+          { data: new Uint32Array([0xffff_ffff]) },
+          { data: new Uint32Array([41]) },
+          { data: new Uint32Array([99]) },
         ],
         1,
       ),

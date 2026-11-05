@@ -28,9 +28,9 @@ import {
   type ReducerProgram,
   SlotType,
   SlotTypeFlag,
-  ValueType,
 } from '../index.js';
 import { loadColumineWasm, VmStateAdmissionError } from '../wasm-backend.js';
+import { MANUAL_EVICTION_CLOCK_MICROS, rowClockTable } from './temporal-program-fixture.js';
 
 // =============================================================================
 // WASM Binary
@@ -56,6 +56,8 @@ function createMockColumineBackend(overrides: Partial<ColumineBackend> = {}): Co
     growState: () => ErrorCode.OK,
     executeBatch: () => ErrorCode.OK,
     executeBatchDelta: () => ErrorCode.OK,
+    executeMutations: () => ErrorCode.OK,
+    executeMutationsDelta: () => ErrorCode.OK,
     getMapSize: () => 0,
     getSetSize: () => 0,
     getAggregateValue: () => 0,
@@ -108,6 +110,7 @@ function buildProgram(opts: {
     | { type: 'condition-tree' }
   >;
   numInputs: number;
+  rowClockColumn?: number;
   magic?: number;
   reduceOps: number[];
 }): Uint8Array {
@@ -148,7 +151,8 @@ function buildProgram(opts: {
   initCode.push(Opcode.HALT);
 
   const reduceCode = [...opts.reduceOps, Opcode.HALT];
-  const contentLen = HEADER_SIZE + initCode.length + reduceCode.length;
+  const temporal = opts.rowClockColumn === undefined ? undefined : rowClockTable(opts.rowClockColumn);
+  const contentLen = HEADER_SIZE + initCode.length + reduceCode.length + (temporal?.length ?? 0);
   const program = new Uint8Array(PROGRAM_HASH_PREFIX + contentLen);
   // [0..31] hash prefix (zeros - filled by fillProgramHash at async use)
   // [32..] content header + init + reduce
@@ -170,6 +174,7 @@ function buildProgram(opts: {
 
   // Reduce section
   program.set(reduceCode, base + HEADER_SIZE + initCode.length);
+  if (temporal !== undefined) program.set(temporal, base + HEADER_SIZE + initCode.length + reduceCode.length);
 
   return program;
 }
@@ -230,10 +235,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     const keys = new Uint32Array([1, 2, 3, 1]);
     const values = new Uint32Array([10, 20, 30, 40]);
 
-    const columns: ColumnInput[] = [
-      { data: keys, type: ValueType.UINT32 },
-      { data: values, type: ValueType.UINT32 },
-    ];
+    const columns: ColumnInput[] = [{ data: keys }, { data: values }];
 
     const result = backend.executeBatch(state, program, columns, 4);
     expect(result).toBe(ErrorCode.OK);
@@ -259,7 +261,7 @@ describe('SC1: Reduce stage for aggregation', () => {
 
     // SUM reads Float64 values from the column
     const values = new Float64Array([10.0, 20.0, 30.0, 40.0]);
-    const columns: ColumnInput[] = [{ data: values, type: ValueType.FLOAT64 }];
+    const columns: ColumnInput[] = [{ data: values }];
 
     const result = backend.executeBatch(state, program, columns, 4);
     expect(result).toBe(ErrorCode.OK);
@@ -280,7 +282,7 @@ describe('SC1: Reduce stage for aggregation', () => {
 
     // COUNT ignores values, just counts rows
     const values = new Float64Array([1, 2, 3, 4, 5, 6, 7]);
-    const columns: ColumnInput[] = [{ data: values, type: ValueType.FLOAT64 }];
+    const columns: ColumnInput[] = [{ data: values }];
 
     const result = backend.executeBatch(state, program, columns, 7);
     expect(result).toBe(ErrorCode.OK);
@@ -313,11 +315,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     const keys = new Uint32Array([1, 2, 1, 3]);
     const values = new Uint32Array([100, 200, 150, 300]);
     const amounts = new Float64Array([10.0, 20.0, 30.0, 40.0]);
-    const columns: ColumnInput[] = [
-      { data: keys, type: ValueType.UINT32 },
-      { data: values, type: ValueType.UINT32 },
-      { data: amounts, type: ValueType.FLOAT64 },
-    ];
+    const columns: ColumnInput[] = [{ data: keys }, { data: values }, { data: amounts }];
 
     const result = backend.executeBatch(state, program, columns, 4);
     expect(result).toBe(ErrorCode.OK);
@@ -349,16 +347,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     const mapState = backend.createState(mapProgram);
 
     expect(
-      backend.executeBatch(
-        mapState,
-        mapProgram,
-        [
-          { data: keys, type: ValueType.UINT32 },
-          { data: values, type: ValueType.UINT32 },
-          { data: amounts, type: ValueType.FLOAT64 },
-        ],
-        keys.length,
-      ),
+      backend.executeBatch(mapState, mapProgram, [{ data: keys }, { data: values }, { data: amounts }], keys.length),
     ).toBe(ErrorCode.OK);
     expect(backend.getMapSize(mapState, mapProgram, 0)).toBe(keys.length);
     expect(backend.getAggregateValue(mapState, mapProgram, 1)).toBe(78);
@@ -376,9 +365,7 @@ describe('SC1: Reduce stage for aggregation', () => {
       }),
     );
     const setState = backend.createState(setProgram);
-    expect(backend.executeBatch(setState, setProgram, [{ data: keys, type: ValueType.UINT32 }], keys.length)).toBe(
-      ErrorCode.OK,
-    );
+    expect(backend.executeBatch(setState, setProgram, [{ data: keys }], keys.length)).toBe(ErrorCode.OK);
     expect(backend.getSetSize(setState, setProgram, 0)).toBe(keys.length);
     for (const key of keys) {
       const read = backend.setContains(setState, setProgram, 0, key);
@@ -423,10 +410,10 @@ describe('SC1: Reduce stage for aggregation', () => {
         state,
         scalarProgram,
         [
-          { data: new Uint32Array([0xffff_fffe]), type: ValueType.UINT32 },
-          { data: new Float64Array([Math.PI]), type: ValueType.FLOAT64 },
-          { data: new BigInt64Array([exactI64]), type: ValueType.UINT32 },
-          { data: new Float64Array([100]), type: ValueType.FLOAT64 },
+          { data: new Uint32Array([0xffff_fffe]) },
+          { data: new Float64Array([Math.PI]) },
+          { data: new BigInt64Array([exactI64]) },
+          { data: new Float64Array([100]) },
         ],
         1,
       ),
@@ -440,7 +427,8 @@ describe('SC1: Reduce stage for aggregation', () => {
     const program = await backend.loadProgram(
       buildProgram({
         slots: [{ type: 'hashmap', capacity: 8, ttl: { seconds: 10, trigger: true, timestampField: 2 } }],
-        numInputs: 3,
+        numInputs: 4,
+        rowClockColumn: 3,
         reduceOps: [Opcode.BATCH_MAP_UPSERT_LATEST, 0, 0, 1, 2, 1],
       }),
     );
@@ -453,9 +441,10 @@ describe('SC1: Reduce stage for aggregation', () => {
         state,
         program,
         [
-          { data: keys, type: ValueType.UINT32 },
-          { data: values, type: ValueType.UINT32 },
-          { data: timestamps, type: ValueType.FLOAT64 },
+          { data: keys },
+          { data: values },
+          { data: timestamps },
+          { data: new BigInt64Array(4).fill(MANUAL_EVICTION_CLOCK_MICROS) },
         ],
         4,
       ),
@@ -519,7 +508,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(stateView.getUint32(conditionTreeOffset + 4, true)).toBe(0xffffffff);
 
     // Verify the state can execute and round-trip with CONDITION_TREE metadata intact.
-    const result = backend.executeBatch(state, program, [{ data: new Float64Array([1]), type: ValueType.FLOAT64 }], 1);
+    const result = backend.executeBatch(state, program, [{ data: new Float64Array([1]) }], 1);
     expect(result).toBe(ErrorCode.OK);
 
     const restored = backend.deserialize(program, serialized);
@@ -561,7 +550,7 @@ describe('SC2: Undo stage for event cancellation', () => {
 
     // First batch: sum = 100
     const batch1 = new Float64Array([10, 20, 30, 40]);
-    stages.reduce.executeBatch(state, program, [{ data: batch1, type: ValueType.FLOAT64 }], 4);
+    stages.reduce.executeBatch(state, program, [{ data: batch1 }], 4);
     expect(backend.getAggregateValue(state, program, 0)).toBe(100);
 
     // Checkpoint before speculative batch
@@ -571,7 +560,7 @@ describe('SC2: Undo stage for event cancellation', () => {
 
     // Speculative batch: sum should be 100 + 500 = 600
     const batch2 = new Float64Array([100, 200, 200]);
-    stages.reduce.executeBatch(state, program, [{ data: batch2, type: ValueType.FLOAT64 }], 3);
+    stages.reduce.executeBatch(state, program, [{ data: batch2 }], 3);
     expect(backend.getAggregateValue(state, program, 0)).toBe(600);
 
     // Rollback: should restore to 100
@@ -593,7 +582,7 @@ describe('SC2: Undo stage for event cancellation', () => {
 
     // First batch: sum = 50
     const batch1 = new Float64Array([20, 30]);
-    stages.reduce.executeBatch(state, program, [{ data: batch1, type: ValueType.FLOAT64 }], 2);
+    stages.reduce.executeBatch(state, program, [{ data: batch1 }], 2);
 
     // Checkpoint
     const begun = stages.undo.checkpoint(state);
@@ -602,7 +591,7 @@ describe('SC2: Undo stage for event cancellation', () => {
 
     // Second batch: sum = 50 + 100 = 150
     const batch2 = new Float64Array([100]);
-    stages.reduce.executeBatch(state, program, [{ data: batch2, type: ValueType.FLOAT64 }], 1);
+    stages.reduce.executeBatch(state, program, [{ data: batch2 }], 1);
     expect(backend.getAggregateValue(state, program, 0)).toBe(150);
 
     // Commit: changes become permanent
@@ -746,15 +735,15 @@ describe('SC4: Streaming processing', () => {
     const state = backend.createState(program);
 
     // Batch 1: sum = 10 + 20 = 30 (SUM reads Float64 values)
-    backend.executeBatch(state, program, [{ data: new Float64Array([10, 20]), type: ValueType.FLOAT64 }], 2);
+    backend.executeBatch(state, program, [{ data: new Float64Array([10, 20]) }], 2);
     expect(backend.getAggregateValue(state, program, 0)).toBe(30);
 
     // Batch 2: sum = 30 + 30 + 40 = 100
-    backend.executeBatch(state, program, [{ data: new Float64Array([30, 40]), type: ValueType.FLOAT64 }], 2);
+    backend.executeBatch(state, program, [{ data: new Float64Array([30, 40]) }], 2);
     expect(backend.getAggregateValue(state, program, 0)).toBe(100);
 
     // Batch 3: sum = 100 + 50 = 150
-    backend.executeBatch(state, program, [{ data: new Float64Array([50]), type: ValueType.FLOAT64 }], 1);
+    backend.executeBatch(state, program, [{ data: new Float64Array([50]) }], 1);
     expect(backend.getAggregateValue(state, program, 0)).toBe(150);
   });
 
@@ -769,27 +758,11 @@ describe('SC4: Streaming processing', () => {
     const state = backend.createState(program);
 
     // Batch 1: key 1 -> 100, key 2 -> 200
-    backend.executeBatch(
-      state,
-      program,
-      [
-        { data: new Uint32Array([1, 2]), type: ValueType.UINT32 },
-        { data: new Uint32Array([100, 200]), type: ValueType.UINT32 },
-      ],
-      2,
-    );
+    backend.executeBatch(state, program, [{ data: new Uint32Array([1, 2]) }, { data: new Uint32Array([100, 200]) }], 2);
     expect(backend.getMapSize(state, program, 0)).toBe(2);
 
     // Batch 2: key 3 -> 300, key 1 -> 150 (overwrite)
-    backend.executeBatch(
-      state,
-      program,
-      [
-        { data: new Uint32Array([3, 1]), type: ValueType.UINT32 },
-        { data: new Uint32Array([300, 150]), type: ValueType.UINT32 },
-      ],
-      2,
-    );
+    backend.executeBatch(state, program, [{ data: new Uint32Array([3, 1]) }, { data: new Uint32Array([300, 150]) }], 2);
     expect(backend.getMapSize(state, program, 0)).toBe(3);
     expect(backend.mapGet(state, program, 0, 1)).toStrictEqual({ ok: true, value: 150 }); // Updated
     expect(backend.mapGet(state, program, 0, 2)).toStrictEqual({ ok: true, value: 200 }); // Unchanged
@@ -807,7 +780,7 @@ describe('SC4: Streaming processing', () => {
     const state = backend.createState(program);
 
     // Accumulate some state (SUM reads Float64 values)
-    backend.executeBatch(state, program, [{ data: new Float64Array([10, 20, 30]), type: ValueType.FLOAT64 }], 3);
+    backend.executeBatch(state, program, [{ data: new Float64Array([10, 20, 30]) }], 3);
     expect(backend.getAggregateValue(state, program, 0)).toBe(60);
 
     // Serialize and deserialize
@@ -818,7 +791,7 @@ describe('SC4: Streaming processing', () => {
     expect(backend.getAggregateValue(restored, program, 0)).toBe(60);
 
     // Continue accumulating on restored state
-    backend.executeBatch(restored, program, [{ data: new Float64Array([40]), type: ValueType.FLOAT64 }], 1);
+    backend.executeBatch(restored, program, [{ data: new Float64Array([40]) }], 1);
     expect(backend.getAggregateValue(restored, program, 0)).toBe(100);
   });
 });

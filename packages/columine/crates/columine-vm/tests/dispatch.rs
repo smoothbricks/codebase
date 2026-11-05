@@ -9,11 +9,13 @@ use columine_types::types::{
     SlotMetaOffset, SlotType,
 };
 use columine_vm::bytes;
+use columine_vm::hashmap_ops::{CmpType, Strategy};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{
     EVICTION_ENTRY_SIZE, calculate_grown_state_size, calculate_state_size, grow_state, init_state,
 };
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
+use columine_vm::temporal::TEMPORAL_MAGIC;
 use columine_vm::vm::{
     CheckedMap, CheckedSet, CheckedStructMap, UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm,
     f64s_as_bytes, i64s_as_bytes, u32s_as_bytes,
@@ -90,14 +92,24 @@ fn build_ttl_map_program(cap_lo: u8, cap_hi: u8, has_evict_trigger: bool) -> Vec
     let evict_flag = if has_evict_trigger { 0x20 } else { 0 };
     let init = slot_def_ttl(0, 0x10 | evict_flag, cap_lo, cap_hi, 10.0, 0.0, 2);
     let reduce = [0x20, 0, 0, 1, 2, 1]; // slot, key, val, ts, cmp_type=f64
-    program(1, 3, &init, &reduce)
+    let mut prog = program(1, 4, &init, &reduce);
+    prog.extend(TEMPORAL_MAGIC.to_le_bytes());
+    prog.extend(8u32.to_le_bytes());
+    prog.extend(3u32.to_le_bytes()); // explicit i64-micros event clock, separate from f64 age
+    prog.extend(0u32.to_le_bytes());
+    prog
 }
 
 ///  `buildTTLSetProgram` — TTL HASHSET + BATCH_SET_INSERT.
 fn build_ttl_set_program(cap_lo: u8, cap_hi: u8) -> Vec<u8> {
     let init = slot_def_ttl(0, 0x01 | 0x10, cap_lo, cap_hi, 10.0, 0.0, 1);
     let reduce = [0x30, 0, 0];
-    program(1, 2, &init, &reduce)
+    let mut prog = program(1, 3, &init, &reduce);
+    prog.extend(TEMPORAL_MAGIC.to_le_bytes());
+    prog.extend(8u32.to_le_bytes());
+    prog.extend(2u32.to_le_bytes()); // explicit i64-micros event clock, separate from f64 age
+    prog.extend(0u32.to_le_bytes());
+    prog
 }
 
 ///  `buildForEachTestProgramMulti` — FOR_EACH { MAP_UPSERT_LAST + AGG_COUNT }.
@@ -518,7 +530,13 @@ fn ttl_hashmap_insert_and_evict_through_live_reducer_path() {
     let key = [42u32];
     let val = [7u32];
     let ts = [100.0f64];
-    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&key), u32s_as_bytes(&val), f64s_as_bytes(&ts)];
+    // These fixtures exercise explicit evict_all_expired, not implicit row eviction.
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&key),
+        u32s_as_bytes(&val),
+        f64s_as_bytes(&ts),
+        i64s_as_bytes(&[i64::MIN]),
+    ];
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
 
     assert_eq!(Some(7), map_get(&state, 0, 42));
@@ -542,6 +560,7 @@ fn ttl_eviction_result_distinguishes_four_rows_from_invalid_state() {
         u32s_as_bytes(&keys),
         u32s_as_bytes(&vals),
         f64s_as_bytes(&timestamps),
+        i64s_as_bytes(&[i64::MIN; 4]),
     ];
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 4));
     assert_eq!(Ok(4), vm.evict_all_expired(false, &mut state, 114.0));
@@ -569,6 +588,7 @@ fn ttl_hashmap_stale_eviction_entries_do_not_evict_newer_values() {
             u32s_as_bytes(&key),
             u32s_as_bytes(&vals),
             f64s_as_bytes(&tss),
+            i64s_as_bytes(&[i64::MIN]),
         ];
         assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
     }
@@ -587,7 +607,11 @@ fn ttl_hashset_reinsertion_refreshes_ttl_and_evicts_deterministically() {
     for ts in [100.0f64, 200.0] {
         let elem = [77u32];
         let tss = [ts];
-        let cols: Vec<&[u8]> = vec![u32s_as_bytes(&elem), f64s_as_bytes(&tss)];
+        let cols: Vec<&[u8]> = vec![
+            u32s_as_bytes(&elem),
+            f64s_as_bytes(&tss),
+            i64s_as_bytes(&[i64::MIN]),
+        ];
         assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
     }
 
@@ -612,6 +636,7 @@ fn ttl_eviction_index_overflow_returns_needs_growth_instead_of_dropping() {
         u32s_as_bytes(&keys),
         u32s_as_bytes(&vals),
         f64s_as_bytes(&tss),
+        i64s_as_bytes(&[i64::MIN]),
     ];
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
 
@@ -636,6 +661,7 @@ fn ttl_eviction_index_overflow_returns_needs_growth_instead_of_dropping() {
         u32s_as_bytes(&keys),
         u32s_as_bytes(&vals),
         f64s_as_bytes(&tss),
+        i64s_as_bytes(&[i64::MIN]),
     ];
     let before = state.clone();
     assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 1));
@@ -665,6 +691,7 @@ fn ttl_eviction_index_overflow_returns_needs_growth_instead_of_dropping() {
         u32s_as_bytes(&keys),
         u32s_as_bytes(&vals),
         f64s_as_bytes(&tss),
+        i64s_as_bytes(&[i64::MIN; 3]),
     ];
     assert_eq!(OK, Vm::default().execute_batch(&mut whole, &prog, &cols, 3));
     let cut = whole[..whole.len() - 16].to_vec();
@@ -4014,8 +4041,20 @@ fn an_eviction_overflowing_inside_its_loop_rolls_back_byte_exact() {
     let mut vm = Vm::default();
     let run = |vm: &mut Vm, state: &mut Vec<u8>, keys: &[u32], ts: &[f64]| {
         let vals: Vec<u32> = keys.iter().map(|k| k * 10).collect();
-        let cols: Vec<&[u8]> = vec![u32s_as_bytes(keys), u32s_as_bytes(&vals), f64s_as_bytes(ts)];
-        assert_eq!(OK, vm.execute_batch(state, &prog, &cols, keys.len() as u32));
+        // Seeding is a non-row mutation: retain the preceding explicit eviction's observation buffer.
+        assert_eq!(
+            ErrorCode::Ok,
+            vm.map_upsert(
+                Strategy::Last,
+                false,
+                state,
+                0,
+                keys,
+                &vals,
+                Some(f64s_as_bytes(ts)),
+                CmpType::F64,
+            )
+        );
     };
     run(
         &mut vm,
@@ -4068,6 +4107,7 @@ fn a_ttl_upsert_batch_overflowing_at_every_position_rolls_back_byte_exact() {
         u32s_as_bytes(&keys[..6]),
         u32s_as_bytes(&vals[..6]),
         f64s_as_bytes(&ts[..6]),
+        i64s_as_bytes(&[i64::MIN; 6]),
     ];
     assert_eq!(
         OK,
@@ -4078,6 +4118,7 @@ fn a_ttl_upsert_batch_overflowing_at_every_position_rolls_back_byte_exact() {
         u32s_as_bytes(&keys),
         u32s_as_bytes(&vals),
         f64s_as_bytes(&later),
+        i64s_as_bytes(&[i64::MIN; 12]),
     ];
 
     let mut expected = pristine.clone();

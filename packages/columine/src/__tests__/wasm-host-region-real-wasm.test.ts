@@ -3,7 +3,7 @@ import { tableFromArrays, tableFromIPC, tableToIPC, utf8 } from '@uwdata/flechet
 import { loadParseBackend } from '../parse-backend.js';
 import type { CompactBatch, EncodedArrowSchema } from '../pipeline.js';
 import { encodeProgramHeader } from '../reducer-bytecode.js';
-import { ErrorCode, HEADER_SIZE, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_MAGIC, SlotType, ValueType } from '../types.js';
+import { ErrorCode, HEADER_SIZE, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_MAGIC, SlotType } from '../types.js';
 import { createColumineWasmBackend } from '../wasm-backend.js';
 import { WASM_PAGE_BYTES, WasmHostRegion, WasmMemoryContractError } from '../wasm-memory-contract.js';
 
@@ -196,17 +196,7 @@ describe('host-owned WASM region on the real artifacts', () => {
 
     const keys = new Uint32Array([1, 2, 3_000_000_000]);
     const values = new Uint32Array([10, 20, 0xffffffff]);
-    expect(
-      backend.executeBatch(
-        state,
-        reducer,
-        [
-          { data: keys, type: ValueType.UINT32 },
-          { data: values, type: ValueType.UINT32 },
-        ],
-        keys.length,
-      ),
-    ).toBe(ErrorCode.OK);
+    expect(backend.executeBatch(state, reducer, [{ data: keys }, { data: values }], keys.length)).toBe(ErrorCode.OK);
     for (let slot = 0; slot < maps; slot++) {
       expect(backend.getMapSize(state, reducer, slot)).toBe(keys.length);
       for (let i = 0; i < keys.length; i++) {
@@ -258,17 +248,7 @@ describe('host-owned WASM region on the real artifacts', () => {
       const base = round * perRound;
       const keys = Uint32Array.from({ length: perRound }, (_, index) => base + index + 1);
       const values = Uint32Array.from(keys, (key) => key * 2);
-      expect(
-        backend.executeBatch(
-          state,
-          reducer,
-          [
-            { data: keys, type: ValueType.UINT32 },
-            { data: values, type: ValueType.UINT32 },
-          ],
-          perRound,
-        ),
-      ).toBe(ErrorCode.OK);
+      expect(backend.executeBatch(state, reducer, [{ data: keys }, { data: values }], perRound)).toBe(ErrorCode.OK);
     }
 
     expect(backend.getMapSize(state, reducer, 0)).toBe(total);

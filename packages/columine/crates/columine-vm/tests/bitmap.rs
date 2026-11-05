@@ -17,9 +17,11 @@ use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE,
     calculate_grown_state_size, calculate_state_size, grow_state, init_state,
 };
+use columine_vm::temporal::TEMPORAL_MAGIC;
 use columine_vm::undo_log::{FlatUndoEntry, FlatUndoOp};
 use columine_vm::vm::{
     UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm, find_latest_eviction_timestamp_for_key,
+    i64s_as_bytes,
 };
 use proptest::prelude::*;
 
@@ -118,7 +120,12 @@ fn ttl_bitmap_program_flags(requested: u16, flags: u8) -> Vec<u8> {
     def.extend(0.0f32.to_le_bytes()); // grace_seconds
     def.push(1); // timestamp column index
     def.push(0); // DurationUnit::NONE
-    program(1, 2, &def, &[Opcode::BatchSetInsert as u8, 0, 0])
+    let mut prog = program(1, 3, &def, &[Opcode::BatchSetInsert as u8, 0, 0]);
+    prog.extend(TEMPORAL_MAGIC.to_le_bytes());
+    prog.extend(8u32.to_le_bytes());
+    prog.extend(2u32.to_le_bytes()); // i64 micros, independent of timestamp column 1
+    prog.extend(0u32.to_le_bytes());
+    prog
 }
 
 fn init_program_state(prog: &[u8]) -> Vec<u8> {
@@ -2716,7 +2723,12 @@ fn ttl_algebra_program_reducing(source_ttl: bool, target_flags: u8, reduce: &[u8
             init.extend([1, 0]);
         }
     }
-    program(2, 2, &init, reduce)
+    let mut prog = program(2, 3, &init, reduce);
+    prog.extend(TEMPORAL_MAGIC.to_le_bytes());
+    prog.extend(8u32.to_le_bytes());
+    prog.extend(2u32.to_le_bytes()); // algebra fixtures retain timestamps and evict explicitly
+    prog.extend(0u32.to_le_bytes());
+    prog
 }
 
 /// Checkpoint setup uses actual bitmosaic owned-byte primitives and the given
@@ -2897,7 +2909,7 @@ fn timestamp_only_algebra_overflow_preserves_the_real_accepted_prefix_and_redo()
         &[(1, 50.0f64.to_bits()), (2, 60.0f64.to_bits())],
     );
     assert_eq!(
-        vm.execute_batch(&mut state, &and, &[], 1),
+        vm.execute_batch(&mut state, &and, &[&[], &[], i64s_as_bytes(&[i64::MIN])], 1),
         ErrorCode::Ok as u32
     );
     let target_meta = SlotMetaView::read(&state, 0);
@@ -2936,7 +2948,12 @@ fn timestamp_only_algebra_overflow_preserves_the_real_accepted_prefix_and_redo()
     let stamps: Vec<u8> = fresh.iter().flat_map(|_| 5.0f64.to_le_bytes()).collect();
     let mut vm = Vm::default();
     assert_eq!(
-        vm.execute_batch(&mut state, &insert_then_or, &[&column(&fresh), &stamps], 6),
+        vm.execute_batch(
+            &mut state,
+            &insert_then_or,
+            &[&column(&fresh), &stamps, i64s_as_bytes(&[i64::MIN; 6])],
+            6
+        ),
         ErrorCode::Ok as u32
     );
     let target_meta = SlotMetaView::read(&state, 0);

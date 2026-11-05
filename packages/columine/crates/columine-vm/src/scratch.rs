@@ -17,8 +17,6 @@ pub(crate) struct ScratchDemand {
     pub(crate) nested: Option<NestedPlanDemand>,
     /// The largest bitmap patch; `None` when the batch patches no bitmap.
     pub(crate) bitmap: Option<BitmapPatchDemand>,
-    /// Keys the largest stored-row sweep can select.
-    pub(crate) sweep_keys: usize,
     /// Cuts the batch's removals can record (`removal_cut`): one per
     /// execution of a removal opcode.
     pub(crate) removal_cuts: usize,

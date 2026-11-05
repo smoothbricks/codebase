@@ -226,7 +226,7 @@ enum TtlCommand {
     },
     Write {
         position: u32,
-        timestamp: f64,
+        timestamp: [u8; 8],
         key: u32,
         value: u32,
     },
@@ -248,8 +248,51 @@ impl TtlBatchPlan {
     }
 }
 
-fn entry_ts(state: &[u8], base: u32, i: u32) -> f64 {
-    bytes::read_f64(state, base + i * EVICTION_ENTRY_SIZE)
+/// The slot selects its timestamp lane once; placement specializes without converting integer deadlines to floats.
+trait TtlLane {
+    type Timestamp: Copy + PartialOrd;
+    const FIRST: Self::Timestamp;
+    fn read(state: &[u8], offset: u32) -> Self::Timestamp;
+    fn upsert(mutation: &TtlMutation) -> Option<Self::Timestamp>;
+}
+
+struct FloatLane;
+struct IntegerLane;
+
+impl TtlLane for FloatLane {
+    type Timestamp = f64;
+    const FIRST: f64 = f64::NEG_INFINITY;
+
+    fn read(state: &[u8], offset: u32) -> f64 {
+        bytes::read_f64(state, offset)
+    }
+
+    fn upsert(mutation: &TtlMutation) -> Option<f64> {
+        match *mutation {
+            TtlMutation::Upsert { timestamp, .. } => Some(timestamp),
+            TtlMutation::UpsertI64 { .. } | TtlMutation::Remove { .. } => None,
+        }
+    }
+}
+
+impl TtlLane for IntegerLane {
+    type Timestamp = i64;
+    const FIRST: i64 = i64::MIN;
+
+    fn read(state: &[u8], offset: u32) -> i64 {
+        bytes::read_i64(state, offset)
+    }
+
+    fn upsert(mutation: &TtlMutation) -> Option<i64> {
+        match *mutation {
+            TtlMutation::UpsertI64 { timestamp, .. } => Some(timestamp),
+            TtlMutation::Upsert { .. } | TtlMutation::Remove { .. } => None,
+        }
+    }
+}
+
+fn entry_ts<L: TtlLane>(state: &[u8], base: u32, i: u32) -> L::Timestamp {
+    L::read(state, base + i * EVICTION_ENTRY_SIZE)
 }
 
 fn entry_key(state: &[u8], base: u32, i: u32) -> u32 {
@@ -258,16 +301,15 @@ fn entry_key(state: &[u8], base: u32, i: u32) -> u32 {
 
 fn mutation_key(mutation: &TtlMutation) -> u32 {
     match *mutation {
-        TtlMutation::Upsert { key, .. } | TtlMutation::Remove { key } => key,
+        TtlMutation::Upsert { key, .. }
+        | TtlMutation::UpsertI64 { key, .. }
+        | TtlMutation::Remove { key } => key,
     }
 }
 
 /// The timestamp of an upsert; a remove is never placed.
-fn upsert_ts(mutation: &TtlMutation) -> f64 {
-    match *mutation {
-        TtlMutation::Upsert { timestamp, .. } => timestamp,
-        TtlMutation::Remove { .. } => unreachable!("only upserts are placed"),
-    }
+fn upsert_ts<L: TtlLane>(mutation: &TtlMutation) -> L::Timestamp {
+    L::upsert(mutation).expect("only validated upserts of the slot's timestamp lane are placed")
 }
 
 pub(crate) fn prepare_ttl_batch(
@@ -281,7 +323,11 @@ pub(crate) fn prepare_ttl_batch(
     let initial_size = meta.eviction_index_size(state);
     let capacity = meta.eviction_index_capacity(state);
     scratch.reset();
-    plan_order(state, base, initial_size, capacity, mutations, scratch)?;
+    if meta.type_flags.integer_deadline() {
+        plan_order::<IntegerLane>(state, base, initial_size, capacity, mutations, scratch)?;
+    } else {
+        plan_order::<FloatLane>(state, base, initial_size, capacity, mutations, scratch)?;
+    }
     let (first, last) = emit_commands(scratch);
     let final_size = u32::try_from(scratch.order.len()).map_err(|_| ErrorCode::InvalidState)?;
     let touched = if first == u32::MAX {
@@ -363,7 +409,7 @@ fn apply_commands(state: &mut [u8], base: u32, commands: &[TtlCommand]) {
                 value,
             } => {
                 let at = base + position * EVICTION_ENTRY_SIZE;
-                bytes::write_f64(state, at, timestamp);
+                state[at as usize..at as usize + 8].copy_from_slice(&timestamp);
                 bytes::write_u32(state, at + 8, key);
                 bytes::write_u32(state, at + 12, value);
             }
@@ -373,7 +419,7 @@ fn apply_commands(state: &mut [u8], base: u32, commands: &[TtlCommand]) {
 
 /// Fill `scratch.order` with the final live index, or refuse with the first
 /// capacity failure the in-order application would hit.
-fn plan_order(
+fn plan_order<L: TtlLane>(
     state: &[u8],
     base: u32,
     size: u32,
@@ -383,6 +429,9 @@ fn plan_order(
 ) -> Result<(), ErrorCode> {
     s.mutations.clear();
     for mutation in mutations {
+        if !matches!(mutation, TtlMutation::Remove { .. }) && L::upsert(&mutation).is_none() {
+            return Err(ErrorCode::InvalidCellValue);
+        }
         s.mutations
             .try_reserve(1)
             .map_err(|_| ErrorCode::OutOfMemory)?;
@@ -416,12 +465,12 @@ fn plan_order(
     let mut sorted = s
         .mutations
         .iter()
-        .all(|m| !matches!(m, TtlMutation::Upsert { timestamp, .. } if timestamp.is_nan()));
-    let mut previous = f64::NEG_INFINITY;
+        .all(|m| L::upsert(m).is_none_or(|timestamp| timestamp >= L::FIRST));
+    let mut previous = L::FIRST;
     s.links.clear();
     s.links.resize(size as usize, SURVIVOR);
     for i in 0..size {
-        let ts = entry_ts(state, base, i);
+        let ts = entry_ts::<L>(state, base, i);
         sorted &= ts >= previous;
         previous = ts;
         let key = entry_key(state, base, i);
@@ -444,7 +493,7 @@ fn plan_order(
             live_size -= 1;
             k.live = NIL;
         }
-        if matches!(s.mutations[j as usize], TtlMutation::Upsert { .. }) {
+        if L::upsert(&s.mutations[j as usize]).is_some() {
             if live_size >= capacity {
                 return Err(ErrorCode::CapacityExceeded);
             }
@@ -455,24 +504,24 @@ fn plan_order(
 
     s.order.clear();
     if sorted {
-        merge_order(state, base, size, s);
+        merge_order::<L>(state, base, size, s);
     } else {
-        replay_order(state, base, size, s);
+        replay_order::<L>(state, base, size, s);
     }
     debug_assert_eq!(s.order.len(), live_size as usize);
     Ok(())
 }
 
 /// Sorted, NaN-free plan: survivors merged with the effective upserts.
-fn merge_order(state: &[u8], base: u32, size: u32, s: &mut TtlBatchScratch) {
+fn merge_order<L: TtlLane>(state: &[u8], base: u32, size: u32, s: &mut TtlBatchScratch) {
     s.inserts.clear();
     s.inserts
         .extend(s.keys.iter().filter(|k| k.live != NIL).map(|k| k.live));
     let mutations = &s.mutations;
     s.inserts.sort_unstable_by(|&a, &b| {
         let (ta, tb) = (
-            upsert_ts(&mutations[a as usize]),
-            upsert_ts(&mutations[b as usize]),
+            upsert_ts::<L>(&mutations[a as usize]),
+            upsert_ts::<L>(&mutations[b as usize]),
         );
         if ta < tb {
             Ordering::Less
@@ -487,9 +536,9 @@ fn merge_order(state: &[u8], base: u32, size: u32, s: &mut TtlBatchScratch) {
         if s.links[i as usize] != SURVIVOR {
             continue;
         }
-        let ts = entry_ts(state, base, i);
+        let ts = entry_ts::<L>(state, base, i);
         while let Some(&j) = s.inserts.get(next) {
-            if ts < upsert_ts(&s.mutations[j as usize]) {
+            if ts < upsert_ts::<L>(&s.mutations[j as usize]) {
                 break;
             }
             s.order.push(TtlSource::Inserted(j));
@@ -502,7 +551,7 @@ fn merge_order(state: &[u8], base: u32, size: u32, s: &mut TtlBatchScratch) {
 }
 
 /// Exact replay of the in-order application on an implicit treap.
-fn replay_order(state: &[u8], base: u32, size: u32, s: &mut TtlBatchScratch) {
+fn replay_order<L: TtlLane>(state: &[u8], base: u32, size: u32, s: &mut TtlBatchScratch) {
     let count = s.mutations.len() as u32;
     for k in &mut s.keys {
         k.seen = false;
@@ -539,13 +588,13 @@ fn replay_order(state: &[u8], base: u32, size: u32, s: &mut TtlBatchScratch) {
             rope.erase(size + s.keys[k].live);
             s.keys[k].live = NIL;
         }
-        if let TtlMutation::Upsert { timestamp, .. } = s.mutations[j as usize] {
+        if let Some(timestamp) = L::upsert(&s.mutations[j as usize]) {
             let (mut left, mut right) = (0u32, rope.len());
             while left < right {
                 let middle = left + (right - left) / 2;
                 let probe = match rope.nodes[rope.select(middle) as usize].source {
-                    TtlSource::Original(i) => entry_ts(state, base, i),
-                    TtlSource::Inserted(m) => upsert_ts(&s.mutations[m as usize]),
+                    TtlSource::Original(i) => entry_ts::<L>(state, base, i),
+                    TtlSource::Inserted(m) => upsert_ts::<L>(&s.mutations[m as usize]),
                 };
                 if probe < timestamp {
                     left = middle + 1;
@@ -607,19 +656,27 @@ fn emit_commands(s: &mut TtlBatchScratch) -> (u32, u32) {
                 flush(open.take(), s);
                 first = first.min(position);
                 last = last.max(position + 1);
-                if let TtlMutation::Upsert {
-                    key,
-                    timestamp,
-                    mapped_value,
-                } = s.mutations[j as usize]
-                {
-                    s.writes.push(TtlCommand::Write {
-                        position,
-                        timestamp,
+                let (key, timestamp, value) = match s.mutations[j as usize] {
+                    TtlMutation::Upsert {
                         key,
-                        value: mapped_value,
-                    });
-                }
+                        timestamp,
+                        mapped_value,
+                    } => (key, timestamp.to_le_bytes(), mapped_value),
+                    TtlMutation::UpsertI64 {
+                        key,
+                        timestamp,
+                        mapped_value,
+                    } => (key, timestamp.to_le_bytes(), mapped_value),
+                    TtlMutation::Remove { .. } => {
+                        unreachable!("only upserts have index destinations")
+                    }
+                };
+                s.writes.push(TtlCommand::Write {
+                    position,
+                    timestamp,
+                    key,
+                    value,
+                });
             }
         }
     }
@@ -918,7 +975,7 @@ pub(crate) mod tests {
         let size = u32::try_from(entries.len()).unwrap();
         let state = image(entries, capacity);
         let plan = |s: &mut TtlBatchScratch| {
-            plan_order(&state, 0, size, capacity, mutations.iter().copied(), s)?;
+            plan_order::<FloatLane>(&state, 0, size, capacity, mutations.iter().copied(), s)?;
             emit_commands(s);
             Ok::<(), ErrorCode>(())
         };
@@ -952,8 +1009,8 @@ pub(crate) mod tests {
             TtlSource::Inserted(j) => mutation_key(&mutations[j as usize]),
         };
         let ts = |source: TtlSource| match source {
-            TtlSource::Original(i) => entry_ts(state, 0, i),
-            TtlSource::Inserted(j) => upsert_ts(&mutations[j as usize]),
+            TtlSource::Original(i) => entry_ts::<FloatLane>(state, 0, i),
+            TtlSource::Inserted(j) => upsert_ts::<FloatLane>(&mutations[j as usize]),
         };
         for (j, mutation) in mutations.iter().enumerate() {
             let k = mutation_key(mutation);
@@ -993,7 +1050,8 @@ pub(crate) mod tests {
         let state = image(entries, capacity);
         let expected = oracle(&state, size, capacity, mutations);
         let mut s = TtlBatchScratch::default();
-        let planned = plan_order(&state, 0, size, capacity, mutations.iter().copied(), &mut s);
+        let planned =
+            plan_order::<FloatLane>(&state, 0, size, capacity, mutations.iter().copied(), &mut s);
         match expected {
             Err(code) => assert_eq!(planned, Err(code)),
             Ok(order) => {
@@ -1126,5 +1184,131 @@ pub(crate) mod tests {
             .collect();
         check(&entries, 1100, &mutations);
         plans_in_reserved_storage(&entries, 1100, &mutations);
+    }
+
+    fn integer_image(entries: &[(i64, u32, u32)], capacity: u32) -> Vec<u8> {
+        let mut state = vec![0xa5; capacity as usize * EVICTION_ENTRY_SIZE as usize];
+        for (index, &(timestamp, key, value)) in entries.iter().enumerate() {
+            let offset = index as u32 * EVICTION_ENTRY_SIZE;
+            bytes::write_i64(&mut state, offset, timestamp);
+            bytes::write_u32(&mut state, offset + 8, key);
+            bytes::write_u32(&mut state, offset + 12, value);
+        }
+        state
+    }
+
+    fn integer_entries(state: &[u8], size: u32) -> Vec<(i64, u32, u32)> {
+        (0..size)
+            .map(|index| {
+                let offset = index * EVICTION_ENTRY_SIZE;
+                (
+                    bytes::read_i64(state, offset),
+                    bytes::read_u32(state, offset + 8),
+                    bytes::read_u32(state, offset + 12),
+                )
+            })
+            .collect()
+    }
+
+    fn apply_integer_plan(
+        state: &mut [u8],
+        size: u32,
+        capacity: u32,
+        mutations: &[TtlMutation],
+    ) -> u32 {
+        let mut scratch = TtlBatchScratch::default();
+        plan_order::<IntegerLane>(
+            state,
+            0,
+            size,
+            capacity,
+            mutations.iter().copied(),
+            &mut scratch,
+        )
+        .expect("integer plan fits its reserved capacity");
+        emit_commands(&mut scratch);
+        apply_commands(state, 0, &scratch.commands);
+        scratch.order.len() as u32
+    }
+
+    #[test]
+    fn integer_deadlines_preserve_adjacent_micros_beyond_float_precision() {
+        let base = 1i64 << 53;
+        let entries = [(base + 1, 1, 10), (base + 3, 3, 30)];
+        let mutations = [TtlMutation::UpsertI64 {
+            key: 2,
+            timestamp: base + 2,
+            mapped_value: 20,
+        }];
+        let mut state = integer_image(&entries, 3);
+        let size = apply_integer_plan(&mut state, 2, 3, &mutations);
+        assert_eq!(
+            integer_entries(&state, size),
+            [(base + 1, 1, 10), (base + 2, 2, 20), (base + 3, 3, 30)]
+        );
+    }
+
+    #[test]
+    fn a_wrong_timestamp_lane_refuses_before_an_index_write() {
+        let state = integer_image(&[(i64::MIN, 1, 0)], 3);
+        let before = state.clone();
+        let mut scratch = TtlBatchScratch::default();
+        let float = TtlMutation::Upsert {
+            key: 2,
+            timestamp: 1.0,
+            mapped_value: 0,
+        };
+        assert_eq!(
+            plan_order::<IntegerLane>(&state, 0, 1, 3, [float], &mut scratch),
+            Err(ErrorCode::InvalidCellValue)
+        );
+        let integer = TtlMutation::UpsertI64 {
+            key: 2,
+            timestamp: i64::MAX,
+            mapped_value: 0,
+        };
+        assert_eq!(
+            plan_order::<FloatLane>(&state, 0, 1, 3, [integer], &mut scratch),
+            Err(ErrorCode::InvalidCellValue)
+        );
+        assert_eq!(state, before, "a refused plan leaves every byte unchanged");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        #[test]
+        fn integer_deadline_placement_is_split_invariant(
+            mut entries in prop::collection::vec((any::<i64>(), 0u32..12, any::<u32>()), 0..24),
+            sorted in any::<bool>(),
+            changes in prop::collection::vec((0u32..12, any::<i64>(), any::<u32>(), any::<bool>()), 0..24),
+        ) {
+            if sorted { entries.sort_by_key(|entry| entry.0); }
+            let capacity = (entries.len() + changes.len()) as u32;
+            let mutations: Vec<_> = changes.iter().map(|&(key, timestamp, mapped_value, remove)| {
+                if remove { TtlMutation::Remove { key } } else { TtlMutation::UpsertI64 { key, timestamp, mapped_value } }
+            }).collect();
+            let mut expected = entries.clone();
+            for &(key, timestamp, value, remove) in &changes {
+                expected.retain(|entry| entry.1 != key);
+                if !remove {
+                    let (mut left, mut right) = (0, expected.len());
+                    while left < right {
+                        let middle = left + (right - left) / 2;
+                        if expected[middle].0 < timestamp { left = middle + 1; } else { right = middle; }
+                    }
+                    expected.insert(left, (timestamp, key, value));
+                }
+            }
+            let mut whole = integer_image(&entries, capacity);
+            let whole_size = apply_integer_plan(&mut whole, entries.len() as u32, capacity, &mutations);
+            let mut split = integer_image(&entries, capacity);
+            let mut split_size = entries.len() as u32;
+            for mutation in &mutations {
+                split_size = apply_integer_plan(&mut split, split_size, capacity, core::slice::from_ref(mutation));
+            }
+            prop_assert_eq!(integer_entries(&whole, whole_size), expected);
+            prop_assert_eq!(integer_entries(&split, split_size), integer_entries(&whole, whole_size));
+        }
     }
 }

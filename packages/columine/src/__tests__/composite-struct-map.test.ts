@@ -11,7 +11,6 @@ import {
   PROGRAM_MAGIC,
   SlotType,
   StructFieldType,
-  ValueType,
 } from '../types.js';
 import { createColumineWasmBackend } from '../wasm-backend.js';
 
@@ -47,7 +46,7 @@ function reducer(
 }
 
 function columns(...values: readonly Uint32Array[]): ColumnInput[] {
-  return values.map((data) => ({ data, type: ValueType.UINT32 }));
+  return values.map((data) => ({ data }));
 }
 
 describe('StructMap2 public WASM readers', () => {
@@ -140,11 +139,11 @@ describe('StructMap2 public WASM readers', () => {
       );
       const state = backend.createState(program);
       const candidates: ColumnInput[] = [
-        { data: new Uint32Array([7, 7, 7]), type: ValueType.UINT32 },
-        { data: new Uint32Array([40, 40, 40]), type: ValueType.UINT32 },
-        { data: new Uint32Array([10, 20, 30]), type: ValueType.UINT32 },
-        { data: new BigInt64Array([-5n, -5n, -4n]), type: ValueType.UINT32 },
-        { data: new BigInt64Array([10n, 10n, -(1n << 63n)]), type: ValueType.UINT32 },
+        { data: new Uint32Array([7, 7, 7]) },
+        { data: new Uint32Array([40, 40, 40]) },
+        { data: new Uint32Array([10, 20, 30]) },
+        { data: new BigInt64Array([-5n, -5n, -4n]) },
+        { data: new BigInt64Array([10n, 10n, -(1n << 63n)]) },
       ];
       expect(backend.executeBatch(state, program, candidates, 3)).toBe(ErrorCode.OK);
 

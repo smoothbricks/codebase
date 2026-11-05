@@ -16,6 +16,7 @@ use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal, calculate_state_size,
     init_state,
 };
+use columine_vm::temporal::TEMPORAL_MAGIC;
 
 const HASH_PREFIX: usize = PROGRAM_HASH_PREFIX as usize;
 
@@ -48,7 +49,7 @@ fn program(num_slots: u32, init: &[u8], reduce: &[u8]) -> Vec<u8> {
             num_callbacks: 0,
             flags: 0,
             num_slots,
-            num_inputs: 0,
+            num_inputs: 3, // key column 0, f64 age column 1, i64-micros clock column 2
             init_code_len: init.len() as u32,
             reduce_code_len: reduce.len() as u32,
         }
@@ -56,6 +57,10 @@ fn program(num_slots: u32, init: &[u8], reduce: &[u8]) -> Vec<u8> {
     );
     prog.extend(init);
     prog.extend_from_slice(reduce);
+    prog.extend(TEMPORAL_MAGIC.to_le_bytes());
+    prog.extend(8u32.to_le_bytes());
+    prog.extend(2u32.to_le_bytes());
+    prog.extend(0u32.to_le_bytes());
     prog
 }
 

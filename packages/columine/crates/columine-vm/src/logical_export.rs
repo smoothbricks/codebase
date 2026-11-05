@@ -161,12 +161,52 @@ fn cmp_logical(a: &LogicalValue, b: &LogicalValue) -> Ordering {
     }
 }
 
+/// A comparison or eviction timestamp in the lane the slot actually stores. Float equality preserves IEEE bits.
+#[derive(Clone, Copy, Debug)]
+pub enum LogicalTimestamp {
+    F64(f64),
+    I64(i64),
+}
+
+impl PartialEq for LogicalTimestamp {
+    fn eq(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (Self::F64(a), Self::F64(b)) => a.to_bits() == b.to_bits(),
+            (Self::I64(a), Self::I64(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for LogicalTimestamp {}
+
+impl LogicalTimestamp {
+    fn read(state: &[u8], offset: u32, integer: bool) -> Self {
+        if integer {
+            Self::I64(bytes::read_i64(state, offset))
+        } else {
+            Self::F64(bytes::read_f64(state, offset))
+        }
+    }
+
+    fn write(self, state: &mut [u8], offset: u32, integer: bool) -> CauseResult<()> {
+        match (self, integer) {
+            (Self::I64(value), true) => bytes::write_i64(state, offset, value),
+            (Self::F64(value), false) => bytes::write_f64(state, offset, value),
+            _ => {
+                return Err(LogicalExportCause::InvalidRow(
+                    "timestamp lane differs from the target slot",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 /// One live row. For a hash map, fields holds exactly the value. For sets
 /// and bitmaps fields is empty. For an array slot the key is the stored
 /// index and fields holds the indexed value. cmp_ts is the comparison
 /// timestamp lane the fold keeps for latest-wins kinds, when the slot has
 /// one; without it a rebuilt slot would let a stale row win.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalRow<'text> {
     pub key: LogicalValue<'text>,
     /// The second key lane of a StructMap2 row.
@@ -175,21 +215,8 @@ pub struct LogicalRow<'text> {
     /// set (its presence bit is clear), which a reader decodes by its own
     /// wrapper, exactly as in the image.
     pub fields: Vec<Option<LogicalValue<'text>>>,
-    pub cmp_ts: Option<f64>,
+    pub cmp_ts: Option<LogicalTimestamp>,
 }
-
-impl PartialEq for LogicalRow<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        let ts_eq = match (self.cmp_ts, other.cmp_ts) {
-            (Some(a), Some(b)) => a.to_bits() == b.to_bits(),
-            (None, None) => true,
-            _ => false,
-        };
-        self.key == other.key && self.key2 == other.key2 && self.fields == other.fields && ts_eq
-    }
-}
-
-impl Eq for LogicalRow<'_> {}
 
 /// An aggregate's continuation: its accumulated value and its count. An
 /// average stores its sum as the value, so value and count together are
@@ -220,22 +247,12 @@ impl Eq for LogicalScalar<'_> {}
 /// One TTL eviction entry, decoded through the slot's encodings. For hash
 /// maps the value is the mapped value at eviction tracking time; for sets
 /// and bitmaps it is the key itself, as the TTL index stores it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalEvictionEntry<'text> {
-    pub timestamp: f64,
+    pub timestamp: LogicalTimestamp,
     pub key: LogicalValue<'text>,
     pub value: LogicalValue<'text>,
 }
-
-impl PartialEq for LogicalEvictionEntry<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.timestamp.to_bits() == other.timestamp.to_bits()
-            && self.key == other.key
-            && self.value == other.value
-    }
-}
-
-impl Eq for LogicalEvictionEntry<'_> {}
 
 /// A condition-tree slot's continuation: its lifecycle state and every
 /// occupied derived-facts cell (live and tombstone identities alike, so
@@ -583,7 +600,7 @@ fn export_eviction(
         for i in 0..count {
             let at = base + i * state_init::EVICTION_ENTRY_SIZE;
             entries.push(LogicalEvictionEntry {
-                timestamp: bytes::read_f64(state, at),
+                timestamp: LogicalTimestamp::read(state, at, meta.type_flags.integer_deadline()),
                 key: decode_u32(bytes::read_u32(state, at + 8), key_enc, lookup)?,
                 value: decode_u32(bytes::read_u32(state, at + 12), value_enc, lookup)?,
             });
@@ -778,7 +795,13 @@ fn export_slot_inner<I: KeyIndex>(
                         enc.value,
                         lookup,
                     )?)],
-                    cmp_ts: has_ts.then(|| bytes::read_f64(state, timestamps + pos * 8)),
+                    cmp_ts: has_ts.then(|| {
+                        LogicalTimestamp::read(
+                            state,
+                            timestamps + pos * 8,
+                            meta.type_flags.integer_deadline(),
+                        )
+                    }),
                 });
             }
             sort_rows(&mut out.rows);
@@ -833,7 +856,10 @@ fn export_slot_inner<I: KeyIndex>(
                     key: LogicalValue::U32(pos),
                     key2: None,
                     fields: vec![Some(decode_u32(value, enc.value, lookup)?)],
-                    cmp_ts: Some(bytes::read_f64(state, timestamps + pos * 8)),
+                    cmp_ts: Some(LogicalTimestamp::F64(bytes::read_f64(
+                        state,
+                        timestamps + pos * 8,
+                    ))),
                 });
             }
         }
@@ -903,7 +929,9 @@ fn export_slot_inner<I: KeyIndex>(
                     key: decode_u32(key, enc.key, lookup)?,
                     key2: None,
                     fields,
-                    cmp_ts: has_ts.then(|| bytes::read_f64(state, timestamps + pos * 8)),
+                    cmp_ts: has_ts.then(|| {
+                        LogicalTimestamp::F64(bytes::read_f64(state, timestamps + pos * 8))
+                    }),
                 });
             }
             sort_rows(&mut out.rows);
@@ -1194,7 +1222,7 @@ fn require_empty(image: &[u8], meta: &SlotMetaView) -> CauseResult<()> {
 /// The comparison timestamp a target with a timestamp lane must store
 /// for this row. A missing one refuses: inventing a value would make
 /// the row lose every latest-wins comparison after import.
-fn required_cmp_ts(row: &LogicalRow) -> CauseResult<f64> {
+fn required_cmp_ts(row: &LogicalRow) -> CauseResult<LogicalTimestamp> {
     row.cmp_ts.ok_or(LogicalExportCause::InvalidRow(
         "row is missing the comparison timestamp the target slot stores",
     ))
@@ -1464,7 +1492,9 @@ fn write_eviction(
      -> CauseResult<()> {
         for (i, entry) in entries.iter().enumerate() {
             let at = base + i as u32 * state_init::EVICTION_ENTRY_SIZE;
-            bytes::write_f64(state, at, entry.timestamp);
+            entry
+                .timestamp
+                .write(state, at, meta.type_flags.integer_deadline())?;
             bytes::write_u32(state, at + 8, encode_u32(&entry.key, key_enc, interner)?);
             bytes::write_u32(
                 state,
@@ -1552,7 +1582,11 @@ fn import_slot_inner<I: KeyIndex>(
                 let size = table.size(image);
                 table.set_size(image, size + 1);
                 if has_ts {
-                    bytes::write_f64(image, timestamps + probe.pos * 8, required_cmp_ts(row)?);
+                    required_cmp_ts(row)?.write(
+                        image,
+                        timestamps + probe.pos * 8,
+                        meta.type_flags.integer_deadline(),
+                    )?;
                 } else {
                     no_cmp_ts(row)?;
                 }
@@ -1678,7 +1712,7 @@ fn import_slot_inner<I: KeyIndex>(
                     return Err(LogicalExportCause::DuplicateKey);
                 }
                 bytes::write_u32(image, meta.offset + pos * 4, value);
-                bytes::write_f64(image, timestamps + pos * 8, required_cmp_ts(row)?);
+                required_cmp_ts(row)?.write(image, timestamps + pos * 8, false)?;
                 live += 1;
             }
             meta.set_size(image, live);
@@ -1785,7 +1819,7 @@ fn import_slot_inner<I: KeyIndex>(
                     interner,
                 )?;
                 if has_ts {
-                    bytes::write_f64(image, timestamps + plan.ordinal * 8, required_cmp_ts(row)?);
+                    required_cmp_ts(row)?.write(image, timestamps + plan.ordinal * 8, false)?;
                 } else {
                     no_cmp_ts(row)?;
                 }
@@ -2229,7 +2263,7 @@ pub struct TransformRowView<'a, 'text> {
     pub key: Option<&'a LogicalValue<'text>>,
     pub key2: Option<&'a LogicalValue<'text>>,
     pub fields: &'a [Option<LogicalValue<'text>>],
-    pub cmp_ts: Option<f64>,
+    pub cmp_ts: Option<LogicalTimestamp>,
     pub basis: &'a [LogicalSlot<'text>],
 }
 
@@ -2502,7 +2536,7 @@ fn apply_transform_inner<'text>(
             key: None,
             key2: None,
             fields: &fields,
-            cmp_ts: Some(scalar.cmp_ts),
+            cmp_ts: Some(LogicalTimestamp::F64(scalar.cmp_ts)),
             basis,
         };
         let value = eval_field_transform(&plan.fields[0], &view, target, 0, eval)?.ok_or(

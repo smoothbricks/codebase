@@ -216,6 +216,12 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
           );
         }
 
+        if (
+          (typeFlags & SlotTypeFlag.INTEGER_DEADLINE) !== 0 &&
+          (slotType !== SlotType.HASHMAP || (typeFlags & HAS_TTL_FLAG) === 0)
+        ) {
+          throw new Error('Invalid program: integer deadlines require a TTL HASHMAP');
+        }
         const ttlParsed = parseTtlIfPresent(initCode, pc, typeFlags);
         if (ttlParsed) {
           pc = ttlParsed.nextPc;
@@ -232,6 +238,7 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
               capacity,
               storesTimestamps: (typeFlags & NO_HASHMAP_TIMESTAMPS_FLAG) === 0,
               ttl,
+              ...((typeFlags & SlotTypeFlag.INTEGER_DEADLINE) !== 0 ? { integerDeadline: true } : {}),
             };
             break;
           case SlotType.HASHSET:

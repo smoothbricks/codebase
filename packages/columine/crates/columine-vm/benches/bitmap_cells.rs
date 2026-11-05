@@ -36,7 +36,8 @@ use columine_vm::bitmap_ops::{
 use columine_vm::hooks::NoVm;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
-use columine_vm::vm::{Vm, f64s_as_bytes, u32s_as_bytes};
+use columine_vm::temporal::TEMPORAL_MAGIC;
+use columine_vm::vm::{Vm, f64s_as_bytes, i64s_as_bytes, u32s_as_bytes};
 
 struct Counting;
 
@@ -458,11 +459,15 @@ fn ttl_bitmaps_program(capacity: u16, reduce: &[u8]) -> Vec<u8> {
     program.extend(PROGRAM_MAGIC.to_le_bytes());
     program.extend([2, 0, 0, 0]);
     program.extend(2u32.to_le_bytes());
-    program.extend(2u32.to_le_bytes());
+    program.extend(3u32.to_le_bytes()); // keys, f64 ages, independent i64-micros event clock
     program.extend((init.len() as u32).to_le_bytes());
     program.extend((reduce.len() as u32).to_le_bytes());
     program.extend(init);
     program.extend_from_slice(reduce);
+    program.extend(TEMPORAL_MAGIC.to_le_bytes());
+    program.extend(8u32.to_le_bytes());
+    program.extend(2u32.to_le_bytes());
+    program.extend(0u32.to_le_bytes());
     program
 }
 
@@ -476,10 +481,15 @@ fn ttl_pair(n: u32, target: &[f64], source: &[f64]) -> Vec<u8> {
     let mut state = vec![0u8; size as usize];
     init_state(&mut state, &layout, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("init");
     let keys: Vec<u32> = (0..n).collect();
+    let clocks = vec![i64::MIN; keys.len()]; // seeding measures no implicit expiry
     let mut vm = Vm::default();
     for (slot, stamps) in [(0u8, target), (1u8, source)] {
         let insert = ttl_bitmaps_program(capacity, &[Opcode::BatchSetInsertTtl as u8, slot, 0, 1]);
-        let cols = [u32s_as_bytes(&keys), f64s_as_bytes(stamps)];
+        let cols = [
+            u32s_as_bytes(&keys),
+            f64s_as_bytes(stamps),
+            i64s_as_bytes(&clocks),
+        ];
         assert_eq!(
             vm.execute_batch(&mut state, &insert, &cols, n),
             ErrorCode::Ok as u32

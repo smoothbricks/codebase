@@ -476,21 +476,21 @@ impl SlotTypeFlags {
     const HAS_TTL_MASK: u8 = 0x10;
     const HAS_EVICT_TRIGGER_MASK: u8 = 0x20;
     const NO_HASHMAP_TIMESTAMPS_MASK: u8 = 0x40;
-    const RESERVED_MASK: u8 = 0x80;
+    pub const INTEGER_DEADLINE: u8 = 0x80;
 
     pub const fn new(
         slot_type: SlotType,
         has_ttl: bool,
         has_evict_trigger: bool,
         no_hashmap_timestamps: bool,
-        reserved: bool,
+        integer_deadline: bool,
     ) -> Self {
         Self {
             bits: (slot_type as u8)
                 | ((has_ttl as u8) << 4)
                 | ((has_evict_trigger as u8) << 5)
                 | ((no_hashmap_timestamps as u8) << 6)
-                | ((reserved as u8) << 7),
+                | ((integer_deadline as u8) << 7),
         }
     }
 
@@ -508,6 +508,11 @@ impl SlotTypeFlags {
 
     pub const fn has_ttl(self) -> bool {
         self.bits & Self::HAS_TTL_MASK != 0
+    }
+
+    /// A TTL HASHMAP whose comparison and expiry timestamps are exact i64 microseconds.
+    pub const fn integer_deadline(self) -> bool {
+        self.bits & Self::INTEGER_DEADLINE != 0
     }
 
     pub const fn has_evict_trigger(self) -> bool {
@@ -551,10 +556,6 @@ impl SlotTypeFlags {
         Self {
             bits: self.bits & !Self::STRUCT_KEY_LANES,
         }
-    }
-
-    pub const fn reserved(self) -> bool {
-        self.bits & Self::RESERVED_MASK != 0
     }
 }
 
@@ -1325,7 +1326,7 @@ mod tests {
         assert!(flags.has_ttl());
         assert!(flags.has_evict_trigger());
         assert!(flags.no_hashmap_timestamps());
-        assert!(flags.reserved());
+        assert!(flags.integer_deadline());
         assert_eq!(SlotTypeFlags::from_byte(flags.to_byte()), flags);
     }
 
@@ -1386,7 +1387,7 @@ mod tests {
             assert_eq!(flags.has_ttl(), bits & 0x10 != 0);
             assert_eq!(flags.has_evict_trigger(), bits & 0x20 != 0);
             assert_eq!(flags.no_hashmap_timestamps(), bits & 0x40 != 0);
-            assert_eq!(flags.reserved(), bits & 0x80 != 0);
+            assert_eq!(flags.integer_deadline(), bits & 0x80 != 0);
         }
     }
 

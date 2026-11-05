@@ -225,10 +225,21 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
             match hooks.plan_ttl_batch(
                 state,
                 meta,
-                core::iter::once(TtlMutation::Upsert {
-                    key,
-                    timestamp: cmp_to_f64(new_cmp, cmp_type),
-                    mapped_value: val,
+                core::iter::once(if meta.type_flags.integer_deadline() {
+                    if cmp_type != CmpType::I64 {
+                        return ErrorCode::InvalidCellValue;
+                    }
+                    TtlMutation::UpsertI64 {
+                        key,
+                        timestamp: new_cmp as i64,
+                        mapped_value: val,
+                    }
+                } else {
+                    TtlMutation::Upsert {
+                        key,
+                        timestamp: cmp_to_f64(new_cmp, cmp_type),
+                        mapped_value: val,
+                    }
                 }),
             ) {
                 Ok(plan) => Some(plan),

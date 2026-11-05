@@ -32,6 +32,8 @@ pub const COLUMINE_VM_EXPORTS: &[&str] = &[
     "vm_evict_all_expired",
     "vm_execute_batch",
     "vm_execute_batch_delta",
+    "vm_execute_mutations",
+    "vm_execute_mutations_delta",
     "vm_get_evicted_count",
     "vm_get_needs_growth_slot",
     "vm_grow_state",

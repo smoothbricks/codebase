@@ -811,24 +811,45 @@ fn a_guarded_scatter_records_its_stamped_row() {
 }
 
 #[test]
-fn a_sweep_records_every_row_it_removes() {
+fn static_expiry_records_only_changed_keys_it_removes() {
     let init = struct_map(0, 16, &[StructFieldType::UInt32]);
     let seed = program(1, &init, &struct_map_upsert(0, ADD_K1, VALUE));
-    let sweep = program(1, &init, &[Opcode::StructMapSweep as u8, 0, PREDICATE]);
+    let mut code = struct_map_upsert(0, ADD_K1, VALUE).to_vec();
+    code.extend([Opcode::StructMapSweep as u8, 0, PREDICATE]);
+    let mut sweep = program(1, &init, &code);
+    sweep.extend(columine_vm::temporal::TEMPORAL_MAGIC.to_le_bytes());
+    sweep.extend(32u32.to_le_bytes());
+    for value in [u32::from(ZERO_I64), 1, 0, u32::from(PREDICATE), u32::MAX] {
+        sweep.extend(value.to_le_bytes());
+    }
+    sweep.extend([0; 12]);
     let mut state = image(&seed);
     let mut vm = Vm::default();
-    let rows = batch(&[add(KEY, 0, 1, 0), add(6, 0, 1, 0)]);
-    assert_eq!(OK, run(&mut vm, &mut state, &seed, &rows));
-    arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
-    assert_eq!(OK, run(&mut vm, &mut state, &sweep, &rows));
-    let mut swept = entries(&vm);
-    swept.sort_by_key(|&(_, key, _)| key);
     assert_eq!(
-        swept,
+        OK,
+        run(
+            &mut vm,
+            &mut state,
+            &seed,
+            &batch(&[add(KEY, 0, 1, 0), add(6, 0, 1, 0)])
+        )
+    );
+    arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    assert_eq!(
+        OK,
+        run(&mut vm, &mut state, &sweep, &batch(&[add(KEY, 0, 2, 0)]))
+    );
+    assert_eq!(
+        entries(&vm),
         [
+            (slot(0), one(KEY), Change::Updated(None)),
             (slot(0), one(KEY), Change::Removed(None)),
-            (slot(0), one(6), Change::Removed(None)),
         ]
+    );
+    assert!(
+        StoredRow::lookup(&state, 0, 6, None)
+            .expect("stored key")
+            .is_some()
     );
 }
 

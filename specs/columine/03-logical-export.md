@@ -30,6 +30,12 @@ logical-key order, list and array rows in stored order, and floats compare by bi
 slots. Metadata byte 13 is exported as agg_type only where it is a subtype (aggregate, scalar, and a nested slot's inner
 aggregate from its prefix); on struct kinds the byte counts fields and is not a subtype.
 
+Keyed comparison timestamps and TTL eviction timestamps carry `LogicalTimestamp::F64` or `LogicalTimestamp::I64`. The
+integer-deadline flag selects exact i64 microseconds for a HASHMAP's comparison lane and its existing eviction index;
+other current timestamp lanes remain f64 and preserve IEEE bits. Import refuses a lane mismatch rather than converting,
+rounding or inferring units. A field transform carries the timestamp variant unchanged. Scalar comparison timestamps
+retain their existing f64 contract.
+
 Import writes into a freshly initialized image the caller owns exclusively, with the same unjournaled raw writers
 init_state and grow_state use. It never runs on an image inside a speculation window: there is no undo log for these
 writes because the imported image is a new snapshot, not a mutation of a live one. The target slot must be empty

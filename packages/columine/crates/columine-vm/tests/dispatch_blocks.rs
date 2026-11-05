@@ -13,8 +13,9 @@ use columine_vm::state_init::{
     ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
     calculate_grown_state_size, calculate_state_size, grow_state, init_state, struct_field_offset,
 };
+use columine_vm::temporal::TEMPORAL_MAGIC;
 use columine_vm::vm::{
-    CheckedStructMap, UNDO_POSITION_OVERFLOWED, Vm, f64s_as_bytes, u32s_as_bytes,
+    CheckedStructMap, UNDO_POSITION_OVERFLOWED, Vm, f64s_as_bytes, i64s_as_bytes, u32s_as_bytes,
 };
 
 const OK: u32 = ErrorCode::Ok as u32;
@@ -1349,10 +1350,17 @@ fn element_refusal_programs(
     } else {
         for_each(TYPE_A, body)
     };
-    (
-        program(2, 6, &init_sec, &reduce),
-        program(2, 6, &init_sec, &[Opcode::BatchAggCount as u8, 1]),
-    )
+    let mut target = program(2, 7, &init_sec, &reduce);
+    let mut count = program(2, 7, &init_sec, &[Opcode::BatchAggCount as u8, 1]);
+    if ttl {
+        for prog in [&mut target, &mut count] {
+            prog.extend(TEMPORAL_MAGIC.to_le_bytes());
+            prog.extend(8u32.to_le_bytes());
+            prog.extend(6u32.to_le_bytes()); // logical parent-row clock, not child comparison column 3
+            prog.extend(0u32.to_le_bytes());
+        }
+    }
+    (target, count)
 }
 
 fn execute_element_lane(
@@ -1381,7 +1389,14 @@ fn fill_element_journal(
     while vm.undo_checkpoint() < target {
         assert_eq!(
             OK,
-            execute_element_lane(vm, state, count_prog, &[], 1, delta)
+            execute_element_lane(
+                vm,
+                state,
+                count_prog,
+                &[&[], &[], &[], &[], &[], &[], i64s_as_bytes(&[i64::MIN])],
+                1,
+                delta
+            )
         );
     }
     assert_eq!(target, vm.undo_checkpoint());
@@ -1410,6 +1425,7 @@ fn execute_element_rows(
     let batch_len = if flattened { 1 } else { rows };
     let types = vec![TYPE_A; usize::try_from(batch_len).expect("test batch fits memory")];
     let offsets = [0u32, rows];
+    let clocks = vec![i64::MIN; types.len()];
     let cols = [
         u32s_as_bytes(&types),
         u32s_as_bytes(input.keys),
@@ -1417,6 +1433,7 @@ fn execute_element_rows(
         f64s_as_bytes(input.comparisons),
         u32s_as_bytes(input.predicates),
         u32s_as_bytes(&offsets),
+        i64s_as_bytes(&clocks),
     ];
     execute_element_lane(vm, state, prog, &cols, batch_len, delta)
 }

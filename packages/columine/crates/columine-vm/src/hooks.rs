@@ -94,6 +94,12 @@ pub enum TtlMutation {
         timestamp: f64,
         mapped_value: u32,
     },
+    /// An exact microsecond deadline; admitted only by an integer-deadline slot.
+    UpsertI64 {
+        key: u32,
+        timestamp: i64,
+        mapped_value: u32,
+    },
     Remove {
         key: u32,
     },

@@ -549,28 +549,38 @@ fn scan_body(
 /// scanned, into `plan.wide`.
 pub(crate) fn widen_element_body(body: &[u8], plan: &mut BodyPlan) -> Option<()> {
     plan.wide.clear();
-    widen_body(body, &mut plan.wide)
+    widen_body(body, &mut plan.wide, false)
 }
 
-fn widen_body(body: &[u8], out: &mut Vec<u8>) -> Option<()> {
+fn widen_body(body: &[u8], out: &mut Vec<u8>, rows: bool) -> Option<()> {
     let mut pc = 0;
     while pc < body.len() {
         let op = Opcode::from_u8(body[pc])?;
-        if is_aggregate_op(op) {
+        if !rows && is_aggregate_op(op) {
             pc = pc.checked_add(body_op_len(body, pc)?)?;
             continue;
         }
         out.push(body[pc]);
         let mut r = Operands::at(body, pc.checked_add(1)?);
-        if op == Opcode::FlatMap {
+        if op == Opcode::FlatMap || (rows && op == Opcode::ForEach) {
             let mut sink = Widen(out);
             index(&mut r, &mut sink)?;
-            index(&mut r, &mut sink)?;
+            if op == Opcode::ForEach {
+                let count = r.index()?;
+                sink.index(count);
+                raw(
+                    &mut r,
+                    &mut sink,
+                    usize::try_from(count).ok()?.checked_mul(4)?,
+                )?;
+            } else {
+                index(&mut r, &mut sink)?;
+            }
             let inner_len = usize::from(r.u16()?);
             let inner = r.bytes(inner_len)?;
             let len_at = out.len();
             out.extend_from_slice(&[0; 4]);
-            widen_body(inner, out)?;
+            widen_body(inner, out, rows)?;
             let inner_wide = u32::try_from(out.len() - len_at - 4).ok()?;
             out[len_at..len_at + 4].copy_from_slice(&inner_wide.to_le_bytes());
         } else {
@@ -579,6 +589,12 @@ fn widen_body(body: &[u8], out: &mut Vec<u8>) -> Option<()> {
         pc = r.pos();
     }
     Some(())
+}
+
+/// The same operand walk, retaining aggregates and FOR_EACH envelopes for one logical row at a time.
+pub(crate) fn widen_row_body(body: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    out.clear();
+    widen_body(body, out, true)
 }
 
 /// Container nesting a source program may reach: a `FOR_EACH` or `FLAT_MAP`

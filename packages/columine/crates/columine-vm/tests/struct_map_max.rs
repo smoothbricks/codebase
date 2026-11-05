@@ -521,8 +521,17 @@ fn plain_batch_struct_map_upsert_stamps_change_flags() {
     assert_eq!(change_flags(&state) & ChangeFlag::INSERTED, 0);
 }
 
+fn static_expiry(mut program: Vec<u8>) -> Vec<u8> {
+    program.extend(columine_vm::temporal::TEMPORAL_MAGIC.to_le_bytes());
+    program.extend(32u32.to_le_bytes());
+    for value in [2u32, 1, 0, 1, u32::MAX] {
+        program.extend(value.to_le_bytes());
+    }
+    program.extend([0; 12]);
+    program
+}
 #[test]
-fn stored_row_sweep_removes_keys_absent_from_the_input_batch() {
+fn stored_row_sweep_does_not_rejudge_unchanged_keys() {
     let seed = program(2, &[0], &upsert(0x80, 0, &[(1, 0)], &[], None));
     let mut state = init(&seed);
     let mut vm = Vm::default();
@@ -537,21 +546,25 @@ fn stored_row_sweep_removes_keys_absent_from_the_input_batch() {
         ),
         OK,
     );
-    let sweep = program(2, &[0], &[0x8a, 0, 1]);
+    let sweep = static_expiry(program(3, &[0], &[0x8a, 0, 1]));
     let incoming_keys = [999];
     let predicates = [1];
     assert_eq!(
         vm.execute_batch_delta(
             &mut state,
             &sweep,
-            &[u32s_as_bytes(&incoming_keys), u32s_as_bytes(&predicates)],
+            &[
+                u32s_as_bytes(&incoming_keys),
+                u32s_as_bytes(&predicates),
+                columine_vm::vm::i64s_as_bytes(&[0])
+            ],
             1,
         ),
         OK,
     );
     let stored = CheckedStructMap::bind(&state, 0).expect("valid stored map");
-    assert_eq!(stored.row(10), None);
-    assert_eq!(stored.row(20), None);
+    assert!(stored.row(10).is_some());
+    assert!(stored.row(20).is_some());
     assert_eq!(stored.row(999), None);
 }
 
@@ -559,7 +572,7 @@ fn stored_row_sweep_removes_keys_absent_from_the_input_batch() {
 fn stored_row_sweep_reserves_for_rows_inserted_by_preceding_instructions() {
     let mut reduce = upsert(0x80, 0, &[(1, 0)], &[], None);
     reduce.extend([0x8a, 0, 1]);
-    let program = program(2, &[0], &reduce);
+    let program = static_expiry(program(3, &[0], &reduce));
     let mut state = init(&program);
     let mut vm = Vm::default();
     let keys = [10, 20];
@@ -568,7 +581,11 @@ fn stored_row_sweep_reserves_for_rows_inserted_by_preceding_instructions() {
         vm.execute_batch(
             &mut state,
             &program,
-            &[u32s_as_bytes(&keys), u32s_as_bytes(&values)],
+            &[
+                u32s_as_bytes(&keys),
+                u32s_as_bytes(&values),
+                columine_vm::vm::i64s_as_bytes(&[0, 0])
+            ],
             2,
         ),
         OK,
