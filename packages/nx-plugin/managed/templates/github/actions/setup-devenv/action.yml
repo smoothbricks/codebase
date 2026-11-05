@@ -10,7 +10,8 @@ inputs:
     description: >
       The job identity for mutable host caches and stable workspace paths. Set a distinct stable identity per matrix
       leg. Blank means github.job, preserving existing paths. Starting push records use the same identity unless
-      records-job names another one.
+      records-job names another one. Identities contain only ASCII letters, digits, underscores, dots, slashes and
+      hyphens.
     required: false
     default: ''
   records-workflow:
@@ -132,6 +133,10 @@ runs:
         RECORDS_WORKFLOW: ${{ inputs.records-workflow }}
         RECORDS_JOB: ${{ inputs.records-job }}
       run: |
+        if [[ ! "$CACHE_SCOPE" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+          printf '%s\n' 'cache-scope must be a single-line job or matrix identity (letters, digits, _ . / -)' >&2
+          exit 2
+        fi
         # A workflow's directory under the shared bind: its name, slugged.
         lane_of() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-'; }
         # The cache root of workflow $1, job or matrix identity $2, and ref $3.
@@ -218,6 +223,10 @@ runs:
         CACHE_SCOPE: ${{ inputs.cache-scope || github.job }}
         SCOPE_REF: ${{ github.event.pull_request.number || github.ref }}
       run: |
+        if [[ ! "$CACHE_SCOPE" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+          printf '%s\n' 'cache-scope must be a single-line job or matrix identity (letters, digits, _ . / -)' >&2
+          exit 2
+        fi
         lane=$(printf '%s' "$DEVENV_STATE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
         scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$CACHE_SCOPE" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
         root="/var/cache/ci/devenv/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB/$scope"
@@ -258,6 +267,10 @@ runs:
         CACHE_SCOPE: ${{ inputs.cache-scope || github.job }}
         SCOPE_REF: ${{ github.event.pull_request.number || github.ref }}
       run: |
+        if [[ ! "$CACHE_SCOPE" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+          printf '%s\n' 'cache-scope must be a single-line job or matrix identity (letters, digits, _ . / -)' >&2
+          exit 2
+        fi
         lane=$(printf '%s' "$CARGO_TARGET_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
         scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$CACHE_SCOPE" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
         root="$CARGO_TARGET_BIND/$CARGO_TARGET_REPO/${lane:-default}/$scope"

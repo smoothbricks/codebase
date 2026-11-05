@@ -174,6 +174,16 @@ describe('host CI mutable cache isolation', () => {
     expect(scope({ CACHE_SCOPE: 'test/first' })).not.toBe(scope({ CACHE_SCOPE: 'test-first' }));
     expect(scope({ CACHE_SCOPE: '../../other' })).toMatch(/^[a-f0-9]{40}$/);
   });
+  test('unsafe cache identities refuse before a mutable path or environment write', () => {
+    for (const step of scopedSteps) {
+      const run = step.slice(step.indexOf('      run: |\n') + '      run: |\n'.length);
+      for (const identity of ['test\nNODE_OPTIONS=bad', 'test\rbreak', 'test with space', '$(command)']) {
+        const result = Bun.spawnSync(['bash', '-ceu', run], { env: { CACHE_SCOPE: identity } });
+        expect(result.exitCode).toBe(2);
+        expect(result.stderr.toString()).toContain('cache-scope must be a single-line job or matrix identity');
+      }
+    }
+  });
 
   test('blank scope preserves the exact nonmatrix Nx, devenv, work and Cargo paths', () => {
     const identity = ['CI', '10', 'main', 'Linux', 'X64'].join('\0');
