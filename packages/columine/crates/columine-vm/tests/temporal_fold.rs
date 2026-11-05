@@ -433,6 +433,7 @@ fn explicit_mutation_program_writes_without_advancing_due_deadlines() {
             &mutation,
             &[u32s_as_bytes(&[9]), u32s_as_bytes(&[99])],
             1,
+            None,
             &NoStrings
         ),
         0

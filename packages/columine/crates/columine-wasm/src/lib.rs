@@ -546,7 +546,7 @@ pub unsafe extern "C" fn vm_execute_mutations(
         Err(error) => return error as u32,
     };
     rt().vm
-        .execute_mutations_in(state, program, &cols, batch_len, &NoStrings)
+        .execute_mutations_in(state, program, &cols, batch_len, None, &NoStrings)
 }
 
 #[unsafe(no_mangle)]
@@ -579,7 +579,7 @@ pub unsafe extern "C" fn vm_execute_mutations_delta(
         Err(error) => return error as u32,
     };
     rt().vm
-        .execute_mutations_delta_in(state, program, &cols, batch_len, &NoStrings)
+        .execute_mutations_delta_in(state, program, &cols, batch_len, None, &NoStrings)
 }
 
 #[unsafe(no_mangle)]

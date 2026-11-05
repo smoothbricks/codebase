@@ -4282,9 +4282,10 @@ impl<I: KeyIndex> Vm<I> {
         program: &[u8],
         cols: &[&[u8]],
         batch_len: u32,
+        live: Option<&mut LiveColumns<'_, '_>>,
         strings: &S,
     ) -> u32 {
-        self.execute_impl(false, false, state, program, cols, batch_len, None, strings)
+        self.execute_impl(false, false, state, program, cols, batch_len, live, strings)
     }
 
     /// The paired-recording counterpart of [`Self::execute_mutations_in`], without advancing an event clock.
@@ -4294,54 +4295,12 @@ impl<I: KeyIndex> Vm<I> {
         program: &[u8],
         cols: &[&[u8]],
         batch_len: u32,
+        live: Option<&mut LiveColumns<'_, '_>>,
         strings: &S,
     ) -> u32 {
-        self.execute_impl(true, false, state, program, cols, batch_len, None, strings)
+        self.execute_impl(true, false, state, program, cols, batch_len, live, strings)
     }
 
-    /// Explicit non-row mutation with the caller's admitted live-column bindings; no temporal advance.
-    pub fn execute_mutations_live_in<S: InternBytes + ?Sized>(
-        &mut self,
-        state: &mut [u8],
-        program: &[u8],
-        cols: &[&[u8]],
-        batch_len: u32,
-        live: &mut LiveColumns<'_, '_>,
-        strings: &S,
-    ) -> u32 {
-        self.execute_impl(
-            false,
-            false,
-            state,
-            program,
-            cols,
-            batch_len,
-            Some(live),
-            strings,
-        )
-    }
-
-    /// The paired-recording counterpart of [`Self::execute_mutations_live_in`].
-    pub fn execute_mutations_delta_live_in<S: InternBytes + ?Sized>(
-        &mut self,
-        state: &mut [u8],
-        program: &[u8],
-        cols: &[&[u8]],
-        batch_len: u32,
-        live: &mut LiveColumns<'_, '_>,
-        strings: &S,
-    ) -> u32 {
-        self.execute_impl(
-            true,
-            false,
-            state,
-            program,
-            cols,
-            batch_len,
-            Some(live),
-            strings,
-        )
-    }
     /// [`Vm::execute_batch`] for key-index family `I`, resolving interned key
     /// lanes through `strings`.
     pub fn execute_batch_in<S: InternBytes + ?Sized>(

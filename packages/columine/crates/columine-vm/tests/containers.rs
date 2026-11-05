@@ -2893,9 +2893,9 @@ fn execute_one_map_element(
         columine_vm::vm::f64s_as_bytes(&timestamps),
     ];
     let result = if delta {
-        vm.execute_mutations_delta_in(state, program, &columns, 1, &NoStrings)
+        vm.execute_mutations_delta_in(state, program, &columns, 1, None, &NoStrings)
     } else {
-        vm.execute_mutations_in(state, program, &columns, 1, &NoStrings)
+        vm.execute_mutations_in(state, program, &columns, 1, None, &NoStrings)
     };
     ErrorCode::from_u32(result).expect("real VM returns a registered status")
 }

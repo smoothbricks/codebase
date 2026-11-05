@@ -21,13 +21,12 @@ already-explicit non-row writers, including RETE relation and closure programs c
 It executes the same mutation kernels, without advancing time, running expiry or clearing the event batch's evicted
 buffer. Such a program carries no `TMP1` table or sweep instruction. It is a transition of its own, not a fake event.
 `Vm::execute_mutations_delta_in` is its paired-recording counterpart, following the event batch API's existing `_delta`
-convention; both retain the same non-row semantics. The matching `execute_mutations_live_in` and
-`execute_mutations_delta_live_in` entries preserve a caller's already-bound live columns, exactly as the event-batch
-entries do, without granting a clock to the mutation program. The generic WASM ABI exposes the same distinction as
-`vm_execute_batch[_delta]` and `vm_execute_mutations[_delta]`; `ColumineBackend.executeBatch[Delta]` and
-`executeMutations[Delta]` forward explicitly to their matching entry. Neither chooses a lane from missing metadata.
-Algebra-only and explicit-eviction writers use the mutation entry, preserving even unordered f64 expiry values until an
-explicit eviction.
+convention; both retain the same non-row semantics and take an optional borrowed live-column binding. Unlike the batch
+API's separate live wrappers, the mutation pair exposes that existing Option directly; no unused public live wrappers
+are added. The generic WASM ABI exposes the same distinction as `vm_execute_batch[_delta]` and
+`vm_execute_mutations[_delta]`; `ColumineBackend.executeBatch[Delta]` and `executeMutations[Delta]` forward explicitly
+to their matching entry. Neither chooses a lane from missing metadata. Algebra-only and explicit-eviction writers use
+the mutation entry, preserving even unordered f64 expiry values until an explicit eviction.
 
 The existing evicted buffer is cleared once per nonempty logical event batch and appends each row's evictions in row
 order. The batch's capacity admission bounds its room; overflow refuses rather than dropping an observation. A scalar
