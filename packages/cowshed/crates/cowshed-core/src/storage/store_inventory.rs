@@ -70,7 +70,8 @@ macro_rules! store_artifacts {
 }
 
 store_artifacts! {
-    /// `<name>.lock` at the project root: main's image lock and the journal's lock.
+    /// `main.dmg.lock` and `lifecycle-intents.json.lock` at the project root: main's image
+    /// lock and the journal's lock.
     ProjectLock,
     /// `sessions/<ws>.dmg`: a session workspace's image. The unbinding comes after every
     /// session's own removal, which retires each one whose work main holds.
@@ -182,7 +183,11 @@ impl StoreArtifact {
             depth += 1;
         }
         match (&parts[..depth], directory) {
-            ([name], false) => name.ends_with(".lock").then_some(Self::ProjectLock),
+            ([name], false) => matches!(
+                name.strip_suffix(".lock"),
+                Some("main.dmg" | crate::storage::recovery::LIFECYCLE_INTENTS_FILE)
+            )
+            .then_some(Self::ProjectLock),
             ([SESSIONS_DIRECTORY, name], false) => session_file(name),
             ([SESSIONS_DIRECTORY, TRASH_NAMESPACE, name], false) => trash_file(name),
             ([SESSIONS_DIRECTORY, TRASH_NAMESPACE, name], true) => name
@@ -372,9 +377,12 @@ mod tests {
         }
 
         #[test]
-        fn unknown_files_are_not_inventory_in_any_terminal_namespace(name in "[a-z]{1,24}") {
+        fn unknown_files_are_not_inventory_in_any_terminal_namespace(
+            name in "[a-z]{1,24}",
+            extension in "(txt|lock)",
+        ) {
             for namespace in ["", "sessions", "sessions/.trash", "sessions/.deleting", "build", "build/.compacting", "build/.collecting", "build/.deleting", ".staging", "tmp"] {
-                let path = Path::new(namespace).join(format!("user-{name}.txt"));
+                let path = Path::new(namespace).join(format!("user-{name}.{extension}"));
                 prop_assert_eq!(StoreArtifact::of(&path, false), None, "{}", path.display());
             }
         }

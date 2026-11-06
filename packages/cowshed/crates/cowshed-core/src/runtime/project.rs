@@ -29243,15 +29243,17 @@ mod terminal_project_cleanup_tests {
         #[test]
         fn the_unbinding_discards_derived_state_and_refuses_the_rest_by_name(
             chosen in proptest::sample::subsequence(StoreArtifact::ALL.to_vec(), 0..=StoreArtifact::ALL.len()),
-            foreign in proptest::bool::ANY,
+            foreign in proptest::option::of(proptest::sample::select(vec![
+                "build/.compacting/notes.txt", "user-notes.lock",
+            ])),
         ) {
             let (root, paths) = project("inventory-property");
             let written = chosen
                 .iter()
                 .map(|&artifact| (artifact, write_artifact(artifact, &paths)))
                 .collect::<Vec<_>>();
-            let foreign = foreign.then(|| {
-                let path = paths.project_root.join("build/.compacting/notes.txt");
+            let foreign = foreign.map(|relative| {
+                let path = paths.project_root.join(relative);
                 std::fs::create_dir_all(path.parent().expect("parent")).expect("parent");
                 std::fs::write(&path, b"notes").expect("foreign");
                 path
