@@ -310,15 +310,14 @@ fn put_i64(out: &mut [u8], at: usize, value: i64) {
 /// `output` from its start, or `0` when the buffer is too small.
 ///
 /// Layout: `[continuation 0xFFFFFFFF][metadata_size u32][FlatBuffer][body]`.
-/// When the body is already at its final IPC position inside `output`, the
-/// final body copy is skipped by the range comparison.
+/// Some(body) copies borrowed bytes; None means the caller has already placed
+/// body_length bytes at 8 + record_batch_metadata_size(..., custom_metadata).
 pub fn encode_record_batch_dynamic(
     output: &mut [u8],
     row_count: i64,
-    body_builder_output_offset: Option<usize>,
     field_nodes: &[FieldNode],
     buffer_descs: &[BufferDesc],
-    body: &[u8],
+    body: Option<&[u8]>,
     body_length: usize,
     custom_metadata: &[(&str, &str)],
 ) -> usize {
@@ -330,8 +329,13 @@ pub fn encode_record_batch_dynamic(
     let metadata_size = record_batch_metadata_size(field_count, buffer_count, custom_metadata);
 
     // 8 = continuation + metadata_size prefix.
-    let total_size = 8 + metadata_size + body_length;
-    if output.len() < total_size {
+    let Some(total_size) = 8_usize
+        .checked_add(metadata_size)
+        .and_then(|size| size.checked_add(body_length))
+    else {
+        return 0;
+    };
+    if output.len() < total_size || body.is_some_and(|bytes| bytes.len() < body_length) {
         return 0;
     }
 
@@ -445,10 +449,7 @@ pub fn encode_record_batch_dynamic(
 
     write_offset += metadata_size;
 
-    // The body may already sit at its final IPC position (the caller built
-    // it at `body_builder_output_offset` inside this same output buffer).
-    let in_place = body_builder_output_offset == Some(write_offset);
-    if !in_place {
+    if let Some(body) = body {
         output[write_offset..write_offset + body_length].copy_from_slice(&body[..body_length]);
     }
     write_offset + body_length
@@ -681,10 +682,9 @@ mod tests {
         let result = encode_record_batch_dynamic(
             &mut output,
             1,
-            None,
             &nodes,
             &descs,
-            &body,
+            Some(&body),
             body_length,
             &[],
         );
@@ -758,17 +758,9 @@ mod tests {
             )
         };
 
-        // Body already occupies its final region: pass the in-place offset.
-        let result = encode_record_batch_dynamic(
-            &mut output,
-            1,
-            Some(body_start),
-            &nodes,
-            &descs,
-            &[],
-            body_length,
-            &[],
-        );
+        // None means the body already occupies its metadata-derived final region.
+        let result =
+            encode_record_batch_dynamic(&mut output, 1, &nodes, &descs, None, body_length, &[]);
         assert_eq!(
             u32::from_le_bytes(output[0..4].try_into().unwrap()),
             0xFFFF_FFFF
@@ -776,6 +768,96 @@ mod tests {
         let metadata_size = u32::from_le_bytes(output[4..8].try_into().unwrap());
         assert!(metadata_size > 100 && metadata_size < 400);
         assert_eq!(8 + metadata_size as usize + body_length, result);
+    }
+
+    #[test]
+    fn borrowed_and_in_place_bodies_match_with_message_metadata() {
+        let nodes = [FieldNode {
+            length: 4,
+            null_count: 0,
+        }];
+        let buffers = [BufferDesc {
+            offset: 0,
+            length: 32,
+        }];
+        let body = [
+            0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 127, 0, 255, 0, 255, 0,
+            255, 0, 255, 255, 0, 255, 0, 255, 0, 255, 0,
+        ];
+        let pairs = [("batch.source", "α𐐀"), ("", "")];
+        for metadata in [&[][..], &pairs[..]] {
+            let body_start = 8 + record_batch_metadata_size(1, 1, metadata);
+            let required = body_start + body.len();
+            let mut borrowed = vec![0xaa; required];
+            let mut in_place = vec![0xbb; required];
+            in_place[body_start..].copy_from_slice(&body);
+            assert_eq!(
+                encode_record_batch_dynamic(
+                    &mut borrowed,
+                    4,
+                    &nodes,
+                    &buffers,
+                    Some(&body),
+                    body.len(),
+                    metadata,
+                ),
+                required
+            );
+            assert_eq!(
+                encode_record_batch_dynamic(
+                    &mut in_place,
+                    4,
+                    &nodes,
+                    &buffers,
+                    None,
+                    body.len(),
+                    metadata,
+                ),
+                required
+            );
+            assert_eq!(in_place, borrowed);
+            assert_eq!(&in_place[body_start..], &body);
+            let mut refused = vec![0xcc; required];
+            assert_eq!(
+                encode_record_batch_dynamic(
+                    &mut refused,
+                    4,
+                    &nodes,
+                    &buffers,
+                    Some(&body[..31]),
+                    body.len(),
+                    metadata,
+                ),
+                0
+            );
+            assert!(refused.iter().all(|byte| *byte == 0xcc));
+            assert_eq!(
+                encode_record_batch_dynamic(
+                    &mut refused[..required - 1],
+                    4,
+                    &nodes,
+                    &buffers,
+                    None,
+                    body.len(),
+                    metadata,
+                ),
+                0
+            );
+            assert!(refused.iter().all(|byte| *byte == 0xcc));
+            assert_eq!(
+                encode_record_batch_dynamic(
+                    &mut refused,
+                    4,
+                    &nodes,
+                    &buffers,
+                    None,
+                    usize::MAX,
+                    metadata,
+                ),
+                0
+            );
+            assert!(refused.iter().all(|byte| *byte == 0xcc));
+        }
     }
 
     #[test]
@@ -792,10 +874,9 @@ mod tests {
         let written = encode_record_batch_dynamic(
             &mut output,
             1,
-            None,
             &nodes,
             &buffers,
-            &42_i64.to_le_bytes(),
+            Some(&42_i64.to_le_bytes()),
             8,
             &[],
         );

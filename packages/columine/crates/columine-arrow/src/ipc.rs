@@ -113,7 +113,6 @@ where
 
 #[derive(Clone, Copy)]
 struct BuiltBody {
-    start: usize,
     length: usize,
     node_count: usize,
     desc_count: usize,
@@ -131,10 +130,9 @@ fn finish_stream(
     let rb_written = encode_record_batch_dynamic(
         &mut output[write_offset..],
         row_count,
-        Some(body.start - write_offset),
         &metadata.field_nodes[..body.node_count],
         &metadata.buffer_descs[..body.desc_count],
-        &[],
+        None,
         body.length,
         custom_metadata,
     );
@@ -216,7 +214,6 @@ where
             }
         }
         BuiltBody {
-            start: body_start,
             length: builder.body_length(),
             node_count: builder.field_nodes().len(),
             desc_count: builder.buffer_descs().len(),
