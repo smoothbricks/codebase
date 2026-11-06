@@ -20,13 +20,15 @@ pub const TRASH_NAMESPACE: &str = ".trash";
 /// what it holds (02_workspaces.md, `rm` step 1). A plain sweep drops one main holds every commit of
 /// by patch identity; only a sweep explicitly authorized for them reclaims the rest.
 pub const ABANDON_BUNDLE_EXTENSION: &str = "bundle";
+/// The suffix of [`abandon_bundle_sidecar`]: `<bundle>.patch-ids`.
+pub const PATCH_IDS_SUFFIX: &str = ".patch-ids";
 
 /// The patch-id sidecar a removal writes beside an abandon bundle (`<bundle>.patch-ids`), which
 /// lets a plain `gc` measure the bundle without reading its pack. Its extension is not
 /// [`ABANDON_BUNDLE_EXTENSION`], so no bundle listing names it; it goes with its bundle.
 pub fn abandon_bundle_sidecar(bundle: &Path) -> PathBuf {
     let mut name = bundle.file_name().unwrap_or_default().to_owned();
-    name.push(".patch-ids");
+    name.push(PATCH_IDS_SUFFIX);
     bundle.with_file_name(name)
 }
 

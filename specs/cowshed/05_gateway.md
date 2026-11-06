@@ -2271,10 +2271,11 @@ runs in-process; `DirectoryExecutionHost::finish_build_releases` can finish buil
 still holds (16_build_volumes.md, "Garbage collection").
 
 A project's final unbinding (`rm main --restore`, 02_workspaces.md, "Checkout layouts") frees nothing either. Its store
-tree goes with it, so before it plans terminal storage it moves each released image of its project, from
-`build/.deleting` and `sessions/.deleting`, into `<store>/.deleting/<fresh id>.dmg` and nudges like any release. A cut
-the gateway is making moves with its entry, which the cleanup holds open, and the next pass lists it under its new name;
-a stray left in those directories still refuses the plan.
+tree goes with it, so it moves each image its terminal storage holds, released images from `build/.deleting` and
+`sessions/.deleting` among them, into `<store>/.deleting/<fresh id>.dmg` and nudges like any release, once the whole of
+that storage is judged by the store inventory (02_workspaces.md, "Checkout layouts"). A cut the gateway is making moves
+with its entry, which the cleanup holds open, and the next pass lists it under its new name; anything there cowshed does
+not write refuses the unbinding before anything moves.
 
 ## Availability and offline behavior
 

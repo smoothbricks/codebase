@@ -79,7 +79,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     main.dmg.grants.json             # controller-owned grants + detached metadata
     main.dmg.ca.key                  # main's workspace CA private key, 0600
     main.dmg.lock                    # flock target for lifecycle operations
-    .staging/                        # re-adoption stages, never enumerated
+    .staging/                        # stages of unfinished lifecycle transactions: <ws>-<inc>.dmg (+ sidecars), readopt-<inc>-build.dmg
     sessions/
       <workspace>.dmg                # one image per workspace
       <workspace>.dmg.grants.json    # grants + detached metadata (see 04_sandbox.md)
@@ -87,7 +87,8 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
       <workspace>.dmg.lock           # flock target for lifecycle operations
       <workspace>.intent.lock        # flock the process executing <workspace>'s lifecycle intent holds
       <workspace>.land.lock          # flock a land or an rm of <workspace> holds for its run (02 "A land and an rm of one workspace exclude each other")
-      .trash/                        # abandon bundles of rm --abandon (and images an earlier build kept as recovery, which gc releases)
+      .trash/                        # abandon bundles of rm --abandon (<ws>-<tip>.bundle + .patch-ids), a bundle being written (.<name>.<id>.partial), the bare repository one is verified in (.bundle-verify-<id>/), and images an earlier build kept as recovery, which gc releases
+      .<name>.tmp.<id>               # a publication a crash cut (`fsio::temp_name`), here and in build/
       .deleting/<name>.dmg           # committed releases of the project's other images (a removed workspace's as <ws>-<inc>.dmg, any other as reclaimed-<fresh 32-hex>.dmg), each waiting for the gateway's cleanup
     build/
       <id>.dmg                       # one build volume (16_build_volumes.md owns what it holds)

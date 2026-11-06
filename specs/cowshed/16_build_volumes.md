@@ -1341,11 +1341,11 @@ seed the lane base already had and builds the folded delta incrementally, as an 
   `--restore --purge`): its unbinding collects once main's image is retired, so main's linked volume and seed are
   released with every volume an earlier collection left, and a volume that stays refuses the unbinding while the project
   is still bound (02_workspaces.md, "Checkout layouts"). The unbinding is the project's last act and its store tree goes
-  with it, so before it plans what it deletes it moves each released image of its project, from `build/.deleting` and
-  `sessions/.deleting`, into `<store>/.deleting/<fresh id>.dmg` and nudges the gateway for each one; it frees nothing
-  itself, and a cut the gateway is making moves with its entry, which the cleanup holds open. Anything there that is not
-  a released image stays, and the terminal plan then refuses, naming it. With no volume left, the unbinding deletes
-  `build/` (then only empty directories and zero-length holds) and the project's `.build/<owner>/<repo>` mount tree.
+  with it: it discards `build/` with the rest of terminal storage by the store inventory, moving each image there (a
+  released volume in `build/.deleting`, a compaction's working image) into `<store>/.deleting/<fresh id>.dmg` with a
+  nudge to the gateway, and removing everything else; it frees nothing itself, and a cut the gateway is making moves
+  with its entry, which the cleanup holds open. Anything cowshed does not write refuses, named, before one entry is
+  touched. It then removes the project's `.build/<owner>/<repo>` mount tree.
 - GC also enumerates sidecars whose images are already gone: every seed's, and every other record collection would
   release with its image: one recorded superseded, registered and interrupted, or naming a checkout that no longer links
   it. An image that does not exist cannot be waiting for anything, so deferring its record would defer it on every pass

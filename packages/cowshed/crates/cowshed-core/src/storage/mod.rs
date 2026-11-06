@@ -22,6 +22,8 @@ pub mod host_config;
 pub mod job_artifact;
 pub mod lifecycle;
 pub mod recovery;
+#[cfg(target_os = "macos")]
+pub(crate) mod store_inventory;
 pub mod trace_columns;
 pub mod trace_segment;
 

@@ -3432,7 +3432,7 @@ pub(crate) fn retired_image_below(
 /// `<sessions>/.deleting/<name>-<incarnation>.dmg`: where a workspace image's release is committed
 /// and waits for the gateway's cleanup (02_workspaces.md, `rm` step 5;
 /// [`release::DELETING_DIRECTORY`]). Named like its trash entry, so an incarnation names one.
-pub(super) fn deleting_image_below(
+pub(crate) fn deleting_image_below(
     sessions: &Path,
     workspace: &WorkspaceName,
     incarnation: &WorkspaceIncarnation,

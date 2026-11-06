@@ -349,6 +349,10 @@ pub struct GitRepository {
     alternate_objects: Option<PathBuf>,
 }
 
+/// The name prefix of the bare repository an abandonment bundle is verified in, beside it.
+pub(crate) const BUNDLE_VERIFICATION_PREFIX: &str = ".bundle-verify";
+/// The suffix of a bundle (or its patch identities) being written: `.<name>.<id>.partial`.
+pub(crate) const STAGED_BUNDLE_SUFFIX: &str = ".partial";
 /// What a [`GitScratch`] holds, which names it and its directory in every report about it.
 #[derive(Clone, Copy)]
 enum ScratchUse {
@@ -362,7 +366,7 @@ enum ScratchUse {
 impl ScratchUse {
     fn prefix(self) -> &'static str {
         match self {
-            Self::BundleVerification => ".bundle-verify",
+            Self::BundleVerification => BUNDLE_VERIFICATION_PREFIX,
             Self::MergeObjects => "cowshed-merge-objects",
         }
     }
@@ -488,7 +492,10 @@ impl StagedBundle {
         })?;
         let mut staged_name = OsString::from(".");
         staged_name.push(file_name);
-        staged_name.push(format!(".{}.partial", uuid::Uuid::new_v4().simple()));
+        staged_name.push(format!(
+            ".{}{STAGED_BUNDLE_SUFFIX}",
+            uuid::Uuid::new_v4().simple()
+        ));
         Ok(Self {
             path: destination.with_file_name(staged_name),
             settled: false,

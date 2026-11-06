@@ -3076,167 +3076,150 @@ async fn reserve_grown_port_grants(
     ))
 }
 
-/// One entry an unbinding may delete from terminal project storage.
+/// What the unbinding does with one entry of a project's terminal storage, by the store
+/// inventory ([`StoreArtifact`]); planned whole before anything is done.
 #[cfg(target_os = "macos")]
 enum TerminalEntry {
-    Lock(PathBuf),
+    /// A derived file, removed.
+    File(PathBuf),
+    /// A derived directory (a workspace's TMPDIR, a scratch repository), removed whole.
+    Tree(PathBuf),
+    /// A directory the inventory names no artifact for, removed once its entries are.
     Directory(PathBuf),
+    /// A derived image, renamed into the store's `.deleting` for the gateway's cleanup.
+    Release(PathBuf),
 }
 
-/// Plans the removal of a terminal storage tree, children before their directory: only empty
-/// directories and the zero-length locks retired workspaces and released build volumes leave
-/// behind (`.lock`, `.hold`) qualify. Anything else is refused before a single entry is removed.
+/// An entry the unbinding cannot discard, because it is not cowshed's derived state.
 #[cfg(target_os = "macos")]
-fn plan_terminal_storage_tree(path: &Path, plan: &mut Vec<TerminalEntry>) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(CowshedError::environment_missing(
-                format!(
-                    "cannot inspect terminal project storage {}: {error}",
-                    path.display()
-                ),
-                "check controller storage permissions and retry",
-            ));
-        }
-    };
-    if metadata.file_type().is_dir() {
-        let entries = std::fs::read_dir(path).map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot enumerate terminal project storage {}: {error}",
-                    path.display()
-                ),
-                "check controller storage permissions and retry",
-            )
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot read terminal project storage {}: {error}",
-                        path.display()
-                    ),
-                    "check controller storage permissions and retry",
-                )
-            })?;
-            plan_terminal_storage_tree(&entry.path(), plan)?;
-        }
-        plan.push(TerminalEntry::Directory(path.to_owned()));
-        Ok(())
-    } else if metadata.file_type().is_file()
-        && path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                // A lifecycle lease or an image lock is a lock whatever record it holds
-                // (`lease_holder::is_lease`, `storage::is_image_lock`).
-                crate::lease_holder::is_lease(name)
-                    || crate::storage::is_image_lock(name)
-                    || (metadata.len() == 0
-                        && (name.ends_with(".lock")
-                            || name.ends_with(crate::build_volume::HOLD_SUFFIX)))
-            })
-    {
-        plan.push(TerminalEntry::Lock(path.to_owned()));
-        Ok(())
-    } else {
-        Err(CowshedError::integrity(
-            format!(
-                "terminal project storage contains an unexpected retained artifact: {}",
+enum Kept {
+    /// User work, and why it is.
+    UserWork(PathBuf, &'static str),
+    /// A build volume's image or record the unbinding's release left: a job holds it, or its
+    /// release failed.
+    Volume(PathBuf),
+    /// Something cowshed does not write.
+    Foreign(PathBuf),
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for Kept {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UserWork(path, why) => write!(formatter, "{} ({why})", path.display()),
+            Self::Volume(path) => write!(
+                formatter,
+                "{} (a build volume a job holds, or whose release failed)",
                 path.display()
             ),
-            "run cowshed doctor --json before removing the project binding",
-        ))
+            Self::Foreign(path) => write!(
+                formatter,
+                "{} (not something cowshed writes)",
+                path.display()
+            ),
+        }
     }
 }
 
-/// Removes what [`plan_terminal_storage_tree`] planned, in its order.
+/// A project's terminal storage, judged entry by entry: what the unbinding does with every
+/// derived entry, children before their directory, and what it cannot discard.
 #[cfg(target_os = "macos")]
-fn remove_planned_terminal_storage(plan: Vec<TerminalEntry>) -> Result<()> {
-    for entry in plan {
-        let (removed, path) = match &entry {
-            TerminalEntry::Lock(path) => (std::fs::remove_file(path), path),
-            TerminalEntry::Directory(path) => (std::fs::remove_dir(path), path),
-        };
-        removed.map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot remove terminal project storage {}: {error}",
-                    path.display()
-                ),
-                "check controller storage permissions and retry",
-            )
-        })?;
+#[derive(Default)]
+struct TerminalSurvey {
+    plan: Vec<TerminalEntry>,
+    kept: Vec<Kept>,
+}
+
+/// The trees an unbinding deletes (02_workspaces.md, "Checkout layouts"), beside the project
+/// root's own locks.
+#[cfg(target_os = "macos")]
+const TERMINAL_STORAGE_TREES: [&str; 4] = [
+    crate::storage::recovery::STAGING_NAMESPACE,
+    crate::repository::SESSIONS_DIRECTORY,
+    crate::repository::EXEC_TEMP_DIRECTORY,
+    crate::build_volume::IMAGES_DIRECTORY,
+];
+
+#[cfg(target_os = "macos")]
+fn terminal_storage_error(what: &str, path: &Path, error: std::io::Error) -> CowshedError {
+    CowshedError::environment_missing(
+        format!(
+            "cannot {what} terminal project storage {}: {error}",
+            path.display()
+        ),
+        "check controller storage permissions and retry",
+    )
+}
+
+/// Judge every entry of the project's terminal storage trees and its root's `*.lock` files by
+/// the store inventory. Reads only; nothing is moved or removed.
+#[cfg(target_os = "macos")]
+fn survey_terminal_storage(project_root: &Path) -> Result<TerminalSurvey> {
+    let mut survey = TerminalSurvey::default();
+    for tree in TERMINAL_STORAGE_TREES {
+        survey_terminal_entry(project_root, Path::new(tree), &mut survey)?;
+    }
+    let entries = std::fs::read_dir(project_root)
+        .map_err(|error| terminal_storage_error("enumerate", project_root, error))?;
+    for entry in entries {
+        let name = entry
+            .map_err(|error| terminal_storage_error("read", project_root, error))?
+            .file_name();
+        if name.to_str().is_some_and(|name| name.ends_with(".lock")) {
+            survey_terminal_entry(project_root, Path::new(&name), &mut survey)?;
+        }
+    }
+    Ok(survey)
+}
+
+#[cfg(target_os = "macos")]
+fn survey_terminal_entry(
+    project_root: &Path,
+    relative: &Path,
+    survey: &mut TerminalSurvey,
+) -> Result<()> {
+    use crate::storage::store_inventory::{Class, Disposal, StoreArtifact};
+    let path = project_root.join(relative);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(terminal_storage_error("inspect", &path, error)),
+    };
+    let directory = metadata.file_type().is_dir();
+    match StoreArtifact::of(relative, directory).map(StoreArtifact::class) {
+        Some(Class::Derived(Disposal::Remove)) if directory => {
+            survey.plan.push(TerminalEntry::Tree(path));
+        }
+        Some(Class::Derived(Disposal::Remove)) => survey.plan.push(TerminalEntry::File(path)),
+        Some(Class::Derived(Disposal::Release)) => survey.plan.push(TerminalEntry::Release(path)),
+        Some(Class::Derived(Disposal::VolumeRelease)) => survey.kept.push(Kept::Volume(path)),
+        Some(Class::UserWork(why)) => survey.kept.push(Kept::UserWork(path, why)),
+        None if directory => {
+            let entries = std::fs::read_dir(&path)
+                .map_err(|error| terminal_storage_error("enumerate", &path, error))?;
+            for entry in entries {
+                let name = entry
+                    .map_err(|error| terminal_storage_error("read", &path, error))?
+                    .file_name();
+                survey_terminal_entry(project_root, &relative.join(name), survey)?;
+            }
+            survey.plan.push(TerminalEntry::Directory(path));
+        }
+        None => survey.kept.push(Kept::Foreign(path)),
     }
     Ok(())
 }
 
-/// What is gone from a terminal storage tree before the unbinding deletes it, so the restore's
-/// check before main retires lets it stand.
+/// Does what [`survey_terminal_storage`] planned, in its order: every derived image is renamed
+/// into the store's own `.deleting` under a fresh name and handed to the gateway's cleanup at
+/// `cleanup` (05_gateway.md, "Deleting released images"), since the unbinding frees nothing
+/// itself; every other derived entry is removed.
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-enum ReleasedFirst {
-    /// Nothing: the tree may hold only empty directories and locks already.
-    Nothing,
-    /// Main's own entry, which main's retirement reclaims with its image.
-    MainsOwn,
-    /// Every build volume's image and record, which the unbinding releases once main is retired,
-    /// main's linked volume and seed included.
-    BuildVolumes,
-    /// Only its deleting directories, whose entries the unbinding moves out first
-    /// ([`move_terminal_releases`]).
-    Deleting,
-}
-
-#[cfg(target_os = "macos")]
-impl ReleasedFirst {
-    fn exempts(self, tree: &str, entry: &std::ffi::OsStr) -> bool {
-        let deleting = TERMINAL_DELETING
-            .iter()
-            .any(|deleting| deleting.tree == tree && entry == deleting.directory);
-        deleting
-            || match self {
-                Self::Nothing | Self::Deleting => false,
-                Self::MainsOwn => entry == main_name().as_str(),
-                Self::BuildVolumes => crate::build_volume::VolumeFile::of(entry).is_some(),
-            }
-    }
-}
-
-/// Every directory of a project's store tree that released images wait in, with the names of
-/// those images (05_gateway.md, "Deleting released images").
-#[cfg(target_os = "macos")]
-const TERMINAL_DELETING: [DeletingDirectory; 2] = [
-    DeletingDirectory {
-        tree: crate::build_volume::IMAGES_DIRECTORY,
-        directory: crate::storage::apfs::release::DELETING_DIRECTORY,
-        is_entry: crate::build_volume::is_image_name,
-    },
-    DeletingDirectory {
-        tree: crate::repository::SESSIONS_DIRECTORY,
-        directory: crate::storage::apfs::release::DELETING_DIRECTORY,
-        is_entry: crate::storage::apfs::is_deleting_image_name,
-    },
-];
-
-/// One directory released images wait in: the terminal storage tree it is in, its name there, and
-/// which of its entries are released images.
-#[cfg(target_os = "macos")]
-struct DeletingDirectory {
-    tree: &'static str,
-    directory: &'static str,
-    is_entry: fn(&str) -> bool,
-}
-
-/// Move every released image the project's tree still holds into the store's own `.deleting`
-/// under a fresh name, and hand each one to the gateway's cleanup at `cleanup` (05_gateway.md,
-/// "Deleting released images"): the unbinding deletes these trees, and frees nothing itself. One
-/// the cleanup is freeing moves with it: it holds the open file, not the name. Anything there that
-/// is not a released image stays, for the terminal plan to refuse naming it.
-#[cfg(target_os = "macos")]
-fn move_terminal_releases(project_root: &Path, cleanup: Option<&Path>) -> Result<()> {
+fn discard_terminal_storage(
+    project_root: &Path,
+    plan: Vec<TerminalEntry>,
+    cleanup: Option<&Path>,
+) -> Result<()> {
     let store = project_root
         .parent()
         .and_then(Path::parent)
@@ -3247,29 +3230,18 @@ fn move_terminal_releases(project_root: &Path, cleanup: Option<&Path>) -> Result
             ))
         })?;
     let target = crate::storage::apfs::deleter::store_deleting(store);
-    for deleting in TERMINAL_DELETING {
-        let directory = project_root.join(deleting.tree).join(deleting.directory);
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(release_failed("list released images in", &directory, error));
+    for entry in plan {
+        let (removed, path) = match &entry {
+            TerminalEntry::Release(image) => {
+                let directory = image.parent().unwrap_or(project_root);
+                move_terminal_release(image, directory, &target, cleanup)?;
+                continue;
             }
+            TerminalEntry::File(path) => (std::fs::remove_file(path), path),
+            TerminalEntry::Tree(path) => (cowshed_os::fsio::remove_owned_tree(path), path),
+            TerminalEntry::Directory(path) => (std::fs::remove_dir(path), path),
         };
-        for entry in entries {
-            let entry = entry
-                .map_err(|error| release_failed("list released images in", &directory, error))?;
-            let released = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| (deleting.is_entry)(name))
-                && entry
-                    .file_type()
-                    .is_ok_and(|kind| kind.is_file() || kind.is_dir());
-            if released {
-                move_terminal_release(&entry.path(), &directory, &target, cleanup)?;
-            }
-        }
+        removed.map_err(|error| terminal_storage_error("remove", path, error))?;
     }
     Ok(())
 }
@@ -3324,134 +3296,55 @@ fn release_failed(what: &str, path: &Path, error: std::io::Error) -> CowshedErro
     )
 }
 
-/// The project store trees an unbinding deletes once main is retired and its build volumes are
-/// released; they may hold nothing but empty directories and zero-length locks by then. In
-/// 02_workspaces.md's order, which puts `sessions/` before the temp dirs its images own, so a
-/// refusal names a live workspace's image rather than what that image keeps.
-#[cfg(target_os = "macos")]
-const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 4] = [
-    (
-        crate::storage::recovery::STAGING_NAMESPACE,
-        ReleasedFirst::Nothing,
-    ),
-    (
-        crate::repository::SESSIONS_DIRECTORY,
-        ReleasedFirst::Deleting,
-    ),
-    (
-        crate::repository::EXEC_TEMP_DIRECTORY,
-        ReleasedFirst::MainsOwn,
-    ),
-    (
-        crate::build_volume::IMAGES_DIRECTORY,
-        ReleasedFirst::BuildVolumes,
-    ),
-];
-
-/// Refuses a main restore whose terminal storage the unbinding could not delete: a live
-/// workspace's image, grants or temp dir, an unreclaimed retired image, a staged image, an
-/// `rm --abandon` bundle kept for its owner, or anything in `build/` that is not a build
-/// volume's image, record or hold (a legacy payload, a stray file). Main's own temp dir is exempt:
-/// main's retirement reclaims it with its image. So are build volumes: the unbinding releases them
-/// all before it deletes `build/`, and refuses while the project is still bound if one stays. The
-/// restore checks this before it retires main, because the same refusal after it leaves a binding
-/// only a retry of the restore removes.
+/// Refuses a main restore whose terminal storage holds what the unbinding cannot discard: user
+/// work (a session workspace whose removal kept it, an `rm --abandon` bundle) or something cowshed
+/// does not write, every one named. Cowshed's derived state passes: the unbinding discards it.
+/// So do build volumes, which the unbinding releases before it plans, refusing while the
+/// project is still bound if one stays. The restore checks this before it retires main, because
+/// the same refusal after it leaves a binding only a retry of the restore removes.
 #[cfg(target_os = "macos")]
 fn require_terminal_storage(project_root: &Path) -> Result<()> {
-    let mut plan = Vec::new();
-    let planned = TERMINAL_STORAGE_TREES
-        .into_iter()
-        .try_for_each(|(name, released)| {
-            let tree = project_root.join(name);
-            if matches!(released, ReleasedFirst::Nothing) {
-                return plan_terminal_storage_tree(&tree, &mut plan);
-            }
-            let entries = match std::fs::read_dir(&tree) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => {
-                    return Err(CowshedError::environment_missing(
-                        format!(
-                            "cannot enumerate terminal project storage {}: {error}",
-                            tree.display()
-                        ),
-                        "check controller storage permissions and retry",
-                    ));
-                }
-            };
-            for entry in entries {
-                let entry = entry.map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot read terminal project storage {}: {error}",
-                            tree.display()
-                        ),
-                        "check controller storage permissions and retry",
-                    )
-                })?;
-                if !released.exempts(name, &entry.file_name()) {
-                    plan_terminal_storage_tree(&entry.path(), &mut plan)?;
-                }
-            }
-            Ok(())
-        });
-    planned.map_err(|error| match error.code {
-        ErrorCode::Integrity => CowshedError::conflict(
-            format!(
-                "main cannot be restored while the project's storage holds more than locks: {}",
-                error.message
-            ),
-            "remove every session workspace (cowshed rm <ws>), run cowshed gc to release what their \
-             retirements left, and cowshed gc --abandoned for the rm --abandon bundles, then retry",
+    let survey = survey_terminal_storage(project_root)?;
+    let kept = survey
+        .kept
+        .iter()
+        .filter(|kept| !matches!(kept, Kept::Volume(_)))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if kept.is_empty() {
+        return Ok(());
+    }
+    Err(CowshedError::conflict(
+        format!(
+            "main cannot be restored while the project's storage holds what cowshed cannot discard: {}",
+            kept.join("; ")
         ),
-        _ => error,
-    })
+        "discard abandoned work with --abandon, and move anything cowshed did not write out of the \
+         project's store, then retry",
+    ))
 }
 
-/// Deletes every terminal storage tree and the project root's own locks. The whole of it is
-/// planned before one entry is removed, so a refusal names what blocks it and leaves the rest as
-/// it found it.
+/// Discards the project's terminal storage, the derived state of its trees and its root's
+/// locks. The whole of it is surveyed before one entry is touched, so a refusal names everything
+/// that blocks it and leaves the storage as it found it.
 #[cfg(target_os = "macos")]
-fn clean_terminal_project_storage(
-    project_root: &Path,
-    binding: &Path,
-    cleanup: Option<&Path>,
-) -> Result<()> {
-    move_terminal_releases(project_root, cleanup)?;
-    let mut plan = Vec::new();
-    for (name, _) in TERMINAL_STORAGE_TREES {
-        plan_terminal_storage_tree(&project_root.join(name), &mut plan)?;
-    }
-    for entry in std::fs::read_dir(project_root).map_err(|error| {
-        CowshedError::environment_missing(
+fn clean_terminal_project_storage(project_root: &Path, cleanup: Option<&Path>) -> Result<()> {
+    let survey = survey_terminal_storage(project_root)?;
+    if !survey.kept.is_empty() {
+        return Err(CowshedError::integrity(
             format!(
-                "cannot enumerate terminal project root {}: {error}",
-                project_root.display()
+                "terminal project storage holds what cowshed cannot discard: {}",
+                survey
+                    .kept
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
-            "check controller storage permissions and retry",
-        )
-    })? {
-        let path = entry
-            .map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot read terminal project root {}: {error}",
-                        project_root.display()
-                    ),
-                    "check controller storage permissions and retry",
-                )
-            })?
-            .path();
-        if path != binding
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".lock"))
-        {
-            plan_terminal_storage_tree(&path, &mut plan)?;
-        }
+            "run cowshed doctor --json before removing the project binding",
+        ));
     }
-    remove_planned_terminal_storage(plan)
+    discard_terminal_storage(project_root, survey.plan, cleanup)
 }
 
 #[cfg(target_os = "macos")]
@@ -3542,7 +3435,7 @@ pub(crate) fn finish_restored_project_unbinding(
         }
     };
     // Failure-prone storage and mount cleanup happens while controller authority still exists.
-    clean_terminal_project_storage(&paths.project_root, path, cleanup)?;
+    clean_terminal_project_storage(&paths.project_root, cleanup)?;
     remove_project_mount_trees(paths)?;
     if bound {
         observe(UnbindCheckpoint::BeforeBindingRemoval)?;
@@ -28734,7 +28627,10 @@ mod terminal_project_cleanup_tests {
         UnbindCheckpoint, clean_terminal_project_storage, finish_restored_project_unbinding,
         require_terminal_storage,
     };
+    use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
     use crate::repository::{BoundIdentity, ProjectPaths, RepoId, RepositoryBinding};
+    use crate::storage::store_inventory::{Class, Disposal, StoreArtifact};
+    use std::path::PathBuf;
 
     fn root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -28754,7 +28650,7 @@ mod terminal_project_cleanup_tests {
         std::fs::write(&binding, b"binding").expect("binding");
         std::fs::write(root.join("policy.json"), b"preserve").expect("policy");
 
-        clean_terminal_project_storage(&root, &binding, None).expect("terminal cleanup");
+        clean_terminal_project_storage(&root, None).expect("terminal cleanup");
         assert!(binding.is_file());
         assert_eq!(
             std::fs::read(root.join("policy.json")).expect("policy"),
@@ -28767,18 +28663,24 @@ mod terminal_project_cleanup_tests {
     }
 
     #[test]
-    fn cleanup_preserves_and_rejects_an_unreclaimed_image() {
-        let root = root("blocked");
+    fn cleanup_refuses_and_keeps_what_cowshed_does_not_write() {
+        let root = root("foreign");
         let binding = root.join("repository.json");
-        let image = root.join("sessions/.trash/main-retired.dmg");
-        std::fs::create_dir_all(image.parent().expect("trash")).expect("trash");
-        std::fs::write(&image, b"image").expect("retained image");
+        let foreign = root.join("sessions/.trash/notes.txt");
+        std::fs::create_dir_all(foreign.parent().expect("trash")).expect("trash");
+        std::fs::write(&foreign, b"notes").expect("a file cowshed does not write");
+        std::fs::write(root.join("main.dmg.lock"), b"").expect("main lock");
         std::fs::write(&binding, b"binding").expect("binding");
 
-        let error = clean_terminal_project_storage(&root, &binding, None)
-            .expect_err("unreclaimed image must block binding cleanup");
+        let error = clean_terminal_project_storage(&root, None)
+            .expect_err("a file cowshed does not write must block binding cleanup");
         assert_eq!(error.code.as_str(), "integrity");
-        assert_eq!(std::fs::read(&image).expect("image preserved"), b"image");
+        assert!(error.message.contains("notes.txt"), "{}", error.message);
+        assert_eq!(std::fs::read(&foreign).expect("kept"), b"notes");
+        assert!(
+            root.join("main.dmg.lock").is_file(),
+            "a lock went before the refusal"
+        );
         assert!(binding.is_file());
         std::fs::remove_dir_all(root).expect("cleanup");
     }
@@ -28937,42 +28839,250 @@ mod terminal_project_cleanup_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Where each artifact's own writer puts one in `paths`'s project, through the writers' path
+    /// functions, and whether it is a directory.
+    fn written(artifact: StoreArtifact, paths: &ProjectPaths) -> (PathBuf, bool) {
+        let raven = WorkspaceName::new("raven").expect("name");
+        let incarnation = WorkspaceIncarnation::new(VOLUME).expect("incarnation");
+        let volume = crate::build_volume::BuildVolumeId::parse(VOLUME).expect("volume id");
+        let layout = crate::storage::StorageLayout::new(
+            &paths.store_root,
+            &RepoId::parse("example-org/example-app").expect("repo id"),
+        )
+        .expect("layout");
+        let session = layout.session_image(&raven).expect("session image");
+        let build = crate::build_volume::BuildVolumeLayout::new(paths).expect("build layout");
+        let trash = paths
+            .sessions
+            .join(crate::storage::recovery::TRASH_NAMESPACE);
+        let bundle = trash.join(format!(
+            "raven-{VOLUME}.{}",
+            crate::storage::recovery::ABANDON_BUNDLE_EXTENSION
+        ));
+        let retired =
+            crate::storage::apfs::retired_image_below(&paths.sessions, &raven, &incarnation);
+        let staged = paths
+            .project_root
+            .join(crate::storage::recovery::STAGING_NAMESPACE)
+            .join(crate::storage::store_inventory::readopt_build_stem(
+                &incarnation,
+            ))
+            .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
+        let file = |path: &std::path::Path| (path.to_owned(), false);
+        match artifact {
+            StoreArtifact::ProjectLock => file(layout.main_image().expect("main").lock()),
+            StoreArtifact::SessionImage => file(session.image()),
+            StoreArtifact::SessionGrants => file(session.sidecar()),
+            StoreArtifact::SessionCaKey => file(session.ca_private_key()),
+            StoreArtifact::ImageLock => file(session.lock()),
+            StoreArtifact::IntentLease => file(&paths.sessions.join(format!(
+                "raven{}",
+                crate::storage::recovery::INTENT_LEASE_SUFFIX
+            ))),
+            StoreArtifact::LandLease => file(&crate::runtime::land_lease::lease_path(
+                &paths.sessions,
+                "raven",
+            )),
+            StoreArtifact::AbandonBundle => file(&bundle),
+            StoreArtifact::AbandonBundlePatchIds => {
+                file(&crate::storage::recovery::abandon_bundle_sidecar(&bundle))
+            }
+            StoreArtifact::StagedBundle => file(&trash.join(format!(
+                ".raven-{VOLUME}.bundle.{VOLUME}{}",
+                crate::git::STAGED_BUNDLE_SUFFIX
+            ))),
+            StoreArtifact::BundleVerification => (
+                trash.join(format!(
+                    "{}-{VOLUME}",
+                    crate::git::BUNDLE_VERIFICATION_PREFIX
+                )),
+                true,
+            ),
+            StoreArtifact::RetiredImage => file(&retired),
+            StoreArtifact::RetiredGrants => file(&crate::metadata::sidecar_path(&retired)),
+            StoreArtifact::RetiredCaKey => file(&crate::storage::apfs::companion_path(&retired)),
+            StoreArtifact::ReleasedSessionImage => file(
+                &crate::storage::apfs::deleting_image_below(&paths.sessions, &raven, &incarnation),
+            ),
+            StoreArtifact::ExecTemp => (layout.exec_temp_dir(&raven).expect("temp dir"), true),
+            StoreArtifact::BuildVolumeImage => file(&build.image(&volume)),
+            StoreArtifact::BuildVolumeRecord => file(&build.record(&volume)),
+            StoreArtifact::BuildVolumeHold => file(&build.hold_path(&volume)),
+            StoreArtifact::ReleasedBuildVolume => file(&build.released(&volume)),
+            StoreArtifact::CompactionLock => file(
+                &build
+                    .compacting()
+                    .join(crate::build_volume::COMPACTION_LOCK),
+            ),
+            StoreArtifact::CompactionImage => file(
+                &build
+                    .compacting()
+                    .join(format!("{VOLUME}.{}", cowshed_apfs::image::IMAGE_EXTENSION)),
+            ),
+            StoreArtifact::EarlierBackgroundRecord => {
+                file(&paths.project_root.join("build/.collecting/log"))
+            }
+            StoreArtifact::StagedImage => file(&staged),
+            StoreArtifact::StagedGrants => file(&crate::metadata::sidecar_path(&staged)),
+            StoreArtifact::StagedCaKey => file(&crate::storage::apfs::companion_path(&staged)),
+            StoreArtifact::PublicationTemp => file(&paths.sessions.join(
+                cowshed_os::fsio::temp_name(std::ffi::OsStr::new("raven.dmg.grants.json"), VOLUME),
+            )),
+        }
+    }
+
+    /// Writes `artifact` where its writer does, with content in it; answers its path.
+    fn write_artifact(artifact: StoreArtifact, paths: &ProjectPaths) -> PathBuf {
+        let (path, directory) = written(artifact, paths);
+        let file = if directory {
+            path.join("content")
+        } else {
+            path.clone()
+        };
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("parent");
+        std::fs::write(&file, format!("{artifact:?}")).expect("artifact");
+        path
+    }
+
+    /// An adoption interrupted before its sidecar leaves only its intent: the journal, its lock,
+    /// main's image lock and main's intent lease (02_workspaces.md, adopt's crash table). With no
+    /// binding and no image, unadopt discards all of it through the binding-absent unbinding, and
+    /// no store directory remains.
     #[test]
-    fn anything_the_unbinding_could_not_delete_refuses_before_anything_is_removed() {
-        for (label, artifact) in [
-            ("bundle", "sessions/.trash/raven-0123.bundle"),
-            ("session", "sessions/raven.dmg.grants.json"),
-            ("staged", ".staging/raven-4567.dmg"),
-            ("temp", "tmp/raven/scratch"),
-        ] {
-            let (root, paths) = project(label);
-            let lock = paths.sessions.join("raven.dmg.lock");
-            let artifact = paths.project_root.join(artifact);
-            std::fs::create_dir_all(artifact.parent().expect("parent")).expect("parent");
-            std::fs::create_dir_all(&paths.sessions).expect("sessions");
-            std::fs::write(&lock, b"").expect("lock");
-            std::fs::write(&artifact, b"retained").expect("artifact");
+    fn an_intent_only_adoption_is_discarded_whole() {
+        let (root, paths) = project("intent-only");
+        let main = WorkspaceName::main();
+        drop(
+            crate::storage::recovery::IntentLease::try_claim(&paths.sessions, &main)
+                .expect("claim")
+                .expect("the lease is free"),
+        );
+        let layout = crate::storage::StorageLayout::new(
+            &paths.store_root,
+            &RepoId::parse("example-org/example-app").expect("repo id"),
+        )
+        .expect("layout");
+        std::fs::write(layout.main_image().expect("main").lock(), b"").expect("main's image lock");
+        std::fs::write(
+            paths.project_root.join(format!(
+                "{}.lock",
+                crate::storage::recovery::LIFECYCLE_INTENTS_FILE
+            )),
+            b"",
+        )
+        .expect("the journal's lock");
+        assert!(!paths.repository_binding.exists());
 
-            let error = require_terminal_storage(&paths.project_root)
-                .expect_err("a retained artifact must refuse the restore");
-            assert_eq!(error.code.as_str(), "conflict", "{label}");
-            assert!(
-                error
-                    .message
-                    .contains(artifact.file_name().expect("name").to_str().expect("utf-8")),
-                "{label}: {}",
-                error.message
-            );
-            assert!(lock.is_file(), "{label}: the check removed a lock");
+        require_terminal_storage(&paths.project_root)
+            .expect("an intent-only adoption holds no work");
+        finish_unbinding(&paths).expect("unadopt discards an intent-only adoption");
+        assert!(!paths.project_root.exists(), "store directory remains");
+        assert!(
+            !paths.project_root.parent().expect("owner").exists(),
+            "empty owner directory remains in the store"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+    /// The inventory names every artifact at the path its writer gives it.
+    #[test]
+    fn every_artifact_is_named_where_its_writer_puts_it() {
+        let (root, paths) = project("inventory-names");
+        for &artifact in StoreArtifact::ALL {
+            let (path, directory) = written(artifact, &paths);
+            let relative = path
+                .strip_prefix(&paths.project_root)
+                .expect("under the project");
             assert_eq!(
-                std::fs::read(&artifact).expect("artifact kept"),
-                b"retained"
+                StoreArtifact::of(relative, directory),
+                Some(artifact),
+                "{}",
+                relative.display()
             );
+        }
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
 
-            std::fs::remove_file(&artifact).expect("artifact removed by its owner");
-            require_terminal_storage(&paths.project_root)
-                .expect("locks and empty directories pass");
-            assert!(lock.is_file(), "{label}: the check removed a lock");
+    /// Whether main's restore (or, with `unbinding`, the unbinding) must refuse `artifact`, naming
+    /// it; otherwise both discard it.
+    fn refused(artifact: StoreArtifact, unbinding: bool) -> bool {
+        match artifact.class() {
+            Class::UserWork(_) => true,
+            Class::Derived(Disposal::VolumeRelease) => unbinding,
+            Class::Derived(Disposal::Remove | Disposal::Release) => false,
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+        /// For any set of artifacts, and with or without a file cowshed does not write: main's
+        /// restore and the unbinding refuse exactly when user work, a left build volume (the
+        /// unbinding only) or the foreign file is there, naming each, and touch nothing then.
+        /// Otherwise the unbinding leaves none of them, and every derived image went to the
+        /// store's `.deleting`, freed by nobody.
+        #[test]
+        fn the_unbinding_discards_derived_state_and_refuses_the_rest_by_name(
+            chosen in proptest::sample::subsequence(StoreArtifact::ALL.to_vec(), 0..=StoreArtifact::ALL.len()),
+            foreign in proptest::bool::ANY,
+        ) {
+            let (root, paths) = project("inventory-property");
+            let written = chosen
+                .iter()
+                .map(|&artifact| (artifact, write_artifact(artifact, &paths)))
+                .collect::<Vec<_>>();
+            let foreign = foreign.then(|| {
+                let path = paths.project_root.join("build/.compacting/notes.txt");
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+                std::fs::write(&path, b"notes").expect("foreign");
+                path
+            });
+            for unbinding in [false, true] {
+                let outcome = if unbinding {
+                    clean_terminal_project_storage(&paths.project_root, None)
+                } else {
+                    require_terminal_storage(&paths.project_root)
+                };
+                let named = written
+                    .iter()
+                    .filter(|(artifact, _)| refused(*artifact, unbinding))
+                    .map(|(_, path)| path)
+                    .chain(foreign.iter())
+                    .collect::<Vec<_>>();
+                if named.is_empty() {
+                    proptest::prop_assert!(outcome.is_ok(), "{:?}", outcome.err());
+                    continue;
+                }
+                let error = outcome.expect_err("what cowshed cannot discard refuses");
+                for path in named {
+                    proptest::prop_assert!(
+                        error.message.contains(&path.display().to_string()),
+                        "{} unnamed: {}",
+                        path.display(),
+                        error.message
+                    );
+                }
+                for (artifact, path) in &written {
+                    proptest::prop_assert!(path.exists(), "{artifact:?} went before the refusal");
+                }
+            }
+            if written.iter().any(|(artifact, _)| refused(*artifact, true)) || foreign.is_some() {
+                std::fs::remove_dir_all(root).expect("cleanup");
+                return Ok(());
+            }
+            for (artifact, path) in &written {
+                proptest::prop_assert!(!path.exists(), "{artifact:?} outlived the unbinding");
+            }
+            for tree in [".staging", "sessions", "tmp", "build"] {
+                proptest::prop_assert!(!paths.project_root.join(tree).exists(), "{tree} remains");
+            }
+            let released = written
+                .iter()
+                .filter(|(artifact, _)| artifact.class() == Class::Derived(Disposal::Release))
+                .count();
+            let moved = std::fs::read_dir(crate::storage::apfs::deleter::store_deleting(&paths.store_root))
+                .map_or(0, Iterator::count);
+            proptest::prop_assert_eq!(moved, released, "every derived image goes to the store's .deleting");
+            finish_unbinding(&paths).expect("the binding-absent unbinding finishes what is left");
+            proptest::prop_assert!(!paths.project_root.exists(), "the project directory remains");
             std::fs::remove_dir_all(root).expect("cleanup");
         }
     }
@@ -29045,7 +29155,7 @@ mod terminal_project_cleanup_tests {
             .expect("stale image lock record");
         require_terminal_storage(&paths.project_root)
             .expect("a recorded lease or image lock is a lock, not a retained artifact");
-        clean_terminal_project_storage(&paths.project_root, &paths.repository_binding, None)
+        clean_terminal_project_storage(&paths.project_root, None)
             .expect("the purge removes every lease and image lock as a lock");
         assert!(!stale.exists() && !main_lease.exists());
         assert!(!held_image.exists() && !stale_image.exists());
@@ -29068,7 +29178,7 @@ mod terminal_project_cleanup_tests {
 
     const VOLUME: &str = "0123456789abcdef0123456789abcdef";
 
-    /// A live session's image owns that session's temp dir: the refusal names the image.
+    /// A live session's image is user work and is named; its temp dir is derived and is not.
     #[test]
     fn a_live_sessions_image_is_named_before_its_temp_dir() {
         let (root, paths) = project("live-session");
@@ -29123,20 +29233,19 @@ mod terminal_project_cleanup_tests {
             .expect("orphan hold");
         std::fs::write(&binding, b"binding").expect("binding");
 
-        clean_terminal_project_storage(&root, &binding, None).expect("terminal cleanup");
+        clean_terminal_project_storage(&root, None).expect("terminal cleanup");
         assert!(!build.exists(), "build/ outlives the unbinding");
         assert!(binding.is_file());
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// Released images waiting for their deletion in the project's deleting directories never
-    /// refuse main's restore: the unbinding moves them into the store's own `.deleting` before it
-    /// deletes their trees, frees none of them, and leaves no tree behind. A stray among them
-    /// still refuses, named, with the released images already moved and everything else kept.
+    /// refuse main's restore: the unbinding moves them into the store's own `.deleting`, frees
+    /// none of them, and leaves no tree behind. A stray among them refuses, named, before
+    /// anything moves.
     #[test]
     fn the_unbinding_moves_its_released_images_out_and_refuses_a_stray_among_them() {
         let (root, paths) = project("released-images");
-        let binding = paths.project_root.join("repository.json");
         let released = [
             paths
                 .project_root
@@ -29155,17 +29264,20 @@ mod terminal_project_cleanup_tests {
 
         let stray = paths.project_root.join("sessions/.deleting/notes.txt");
         std::fs::write(&stray, b"not an image").expect("stray");
-        std::fs::write(&binding, b"binding").expect("binding");
-        let error = clean_terminal_project_storage(&paths.project_root, &binding, None)
+        let error = clean_terminal_project_storage(&paths.project_root, None)
             .expect_err("a stray in a deleting directory refuses the unbinding");
         assert!(error.message.contains("notes.txt"), "{}", error.message);
         for image in &released {
             assert!(
-                !image.exists(),
-                "{} moved out before the plan",
+                image.is_file(),
+                "{} moved before the refusal",
                 image.display()
             );
         }
+        assert_eq!(std::fs::read(&stray).expect("stray kept"), b"not an image");
+
+        std::fs::remove_file(&stray).expect("drop the stray");
+        clean_terminal_project_storage(&paths.project_root, None).expect("terminal cleanup");
         let store_deleting = crate::storage::apfs::deleter::store_deleting(&paths.store_root);
         let moved: Vec<_> = std::fs::read_dir(&store_deleting)
             .expect("the store's .deleting")
@@ -29176,11 +29288,6 @@ mod terminal_project_cleanup_tests {
             vec![vec![7_u8; 64 * 1024]; released.len()],
             "the unbinding frees none of them"
         );
-        assert_eq!(std::fs::read(&stray).expect("stray kept"), b"not an image");
-
-        std::fs::remove_file(&stray).expect("drop the stray");
-        clean_terminal_project_storage(&paths.project_root, &binding, None)
-            .expect("terminal cleanup");
         assert!(!paths.project_root.join("build").exists());
         assert!(!paths.project_root.join("sessions").exists());
         std::fs::remove_dir_all(root).expect("cleanup");
@@ -29199,7 +29306,7 @@ mod terminal_project_cleanup_tests {
         std::fs::write(&lock, b"").expect("lock");
         std::fs::write(&binding, b"binding").expect("binding");
 
-        let error = clean_terminal_project_storage(&root, &binding, None)
+        let error = clean_terminal_project_storage(&root, None)
             .expect_err("a build volume left in build/ must block the unbinding");
         assert_eq!(error.code.as_str(), "integrity");
         assert!(error.message.contains(VOLUME), "{}", error.message);

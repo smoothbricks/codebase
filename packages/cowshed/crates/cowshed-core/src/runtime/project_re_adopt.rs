@@ -419,14 +419,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     owner_record: read_build_record(&image)?,
                     replacement_image: project
                         .join(STAGING_NAMESPACE)
-                        .join(format!("readopt-{}-build", replacement.as_str()))
+                        .join(crate::storage::store_inventory::readopt_build_stem(
+                            &replacement,
+                        ))
                         .with_extension(IMAGE_EXTENSION),
-                    replacement_mount: staging
-                        .join(format!("readopt-{}-build", replacement.as_str())),
+                    replacement_mount: staging.join(
+                        crate::storage::store_inventory::readopt_build_stem(&replacement),
+                    ),
                     image: ReAdoptImage {
                         retained: retained_image(&retained, &format!("build-{}", id.as_str())),
                         original: image,
-                        source_mount: staging.join(format!("readopt-{}-build", old.as_str())),
+                        source_mount: staging
+                            .join(crate::storage::store_inventory::readopt_build_stem(&old)),
                         capacity_bytes,
                     },
                 })

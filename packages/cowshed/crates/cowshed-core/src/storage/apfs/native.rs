@@ -662,7 +662,7 @@ fn is_staged_image(path: &Path) -> bool {
 
 /// The workspace a staging stem (`<name>-<incarnation>`, or the legacy `recover-` prefixed form)
 /// belongs to. `None` for a name staging never produces, which the sweeps leave alone.
-fn staged_stem_workspace(stem: &str) -> Option<WorkspaceName> {
+pub(crate) fn staged_stem_workspace(stem: &str) -> Option<WorkspaceName> {
     let stem = stem.strip_prefix("recover-").unwrap_or(stem);
     let (workspace, incarnation) = stem.rsplit_once('-')?;
     WorkspaceIncarnation::new(incarnation).ok()?;

@@ -53,7 +53,10 @@ pub(crate) const RECORD_SUFFIX: &str = ".json";
 /// run, and that a release takes exclusively: `<id>.dmg.hold` ([`BuildVolumeHold`]).
 pub(crate) const HOLD_SUFFIX: &str = ".hold";
 /// Where a seed compaction works ([`BuildVolumeLayout::compacting`]).
-const COMPACTING_DIRECTORY: &str = ".compacting";
+pub(crate) const COMPACTING_DIRECTORY: &str = ".compacting";
+/// The seed compaction's one-at-a-time lock in [`COMPACTING_DIRECTORY`].
+#[cfg(target_os = "macos")]
+pub(crate) const COMPACTION_LOCK: &str = "lock";
 /// Where the background collection a land starts logs ([`BuildVolumeLayout::collecting`]).
 const COLLECTING_DIRECTORY: &str = ".collecting";
 /// The volume's own statement of the build-state paths it holds, at its root. It travels with

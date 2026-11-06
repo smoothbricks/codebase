@@ -58,7 +58,6 @@ pub(crate) enum Admission {
 }
 
 /// In the compaction directory: the one-at-a-time lock, last failure and child log.
-const LOCK: &str = "lock";
 const FAILED: &str = "failed";
 const LOG: &str = "log";
 
@@ -397,7 +396,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         // The descriptor is close-on-exec from its `open` and held in a `Fenced`, so no child of
         // this process holds the lease past `exec`, and the process itself starts with every
         // inherited descriptor sealed ([`start_background_verb`]).
-        let path = directory.join(LOCK);
+        let path = directory.join(crate::build_volume::COMPACTION_LOCK);
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
