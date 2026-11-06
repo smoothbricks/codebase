@@ -2240,6 +2240,10 @@ controller's answer does not decode as a host's. Every operation calls the funct
 what that function computes; only rendering is the verb's. Guidance goes to `cowshed host`'s stderr; stdout is never
 written.
 
+Kernel holder censuses run on the blocking pool, not on the host connection's async executor. A slow lock, tree or
+descriptor scan must leave the connection able to heartbeat and answer independent calls; its silence bound is not
+extended to accommodate a blocking scan ([05 Deadlines](./05_gateway.md#deadlines)).
+
 TypeScript reaches it through `openHost(): Promise<Host>`: the addon makes a socketpair, starts the package launcher
 (`bin/cowshed host`, 06_cli.md "Launcher") with one end as its standard input and the caller's stdout and stderr, and
 connects on the other. `Host.close()` ends the connection and resolves once the process has exited; every call after it

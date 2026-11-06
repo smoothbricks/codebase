@@ -163,13 +163,34 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
             respond::<operations::HostGatewayStop>(&EmptyResult {})
         }
         Op::HostLockHolders(request) => {
-            respond::<operations::HostLockHolders>(&crate::lock::holders(&request.path)?)
+            let observation =
+                tokio::task::spawn_blocking(move || crate::lock::holders(&request.path))
+                    .await
+                    .map_err(|error| {
+                        CowshedError::internal(format!(
+                            "the lock-holder census task failed: {error}"
+                        ))
+                    })??;
+            respond::<operations::HostLockHolders>(&observation)
         }
         Op::HostTreeHolders(request) => {
-            respond::<operations::HostTreeHolders>(&crate::tree_holders::holders(&request.path)?)
+            let holders =
+                tokio::task::spawn_blocking(move || crate::tree_holders::holders(&request.path))
+                    .await
+                    .map_err(|error| {
+                        CowshedError::internal(format!(
+                            "the tree-holder census task failed: {error}"
+                        ))
+                    })??;
+            respond::<operations::HostTreeHolders>(&holders)
         }
         Op::HostFdHolders(request) => {
-            respond::<operations::HostFdHolders>(&crate::fd_holders::holders(&request)?)
+            let holders = tokio::task::spawn_blocking(move || crate::fd_holders::holders(&request))
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("the descriptor census task failed: {error}"))
+                })??;
+            respond::<operations::HostFdHolders>(&holders)
         }
         Op::HostRetireDescendants(request) => respond::<operations::HostRetireDescendants>(
             &crate::subtree::retire_handle(
