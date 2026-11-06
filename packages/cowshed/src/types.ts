@@ -234,7 +234,7 @@ export interface Coordinator {
   /** Rebuilds one keyless workspace's CA identity at its preserved incarnation. */
   rekey(workspace: string): Promise<Api.RekeyResult>;
   remove(workspace: string, options?: Api.RemoveOptions): Promise<Api.RemoveReport>;
-  /** Removes the adopted project end to end: every session, its images and main's adoption. */
+  /** Unadopts the project: every session, its images, then main, putting the pre-adoption checkout back. */
   removeProject(options?: Api.RemoveProjectOptions): Promise<Api.RemoveProjectReport>;
   gc(options?: Api.GcOptions): Promise<Api.GcReport>;
   doctor(): Promise<Api.DoctorReport>;

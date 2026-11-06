@@ -1,6 +1,6 @@
 use crate::args::{
     AdoptArgs, CacheCommand, Cli, Command, ExecArgs, GrantTarget, MoveDestination,
-    ProjectDiscovery, RevokeArgs, RevokeSelection, StdinSource as CliStdinSource,
+    ProjectDiscovery, RevokeArgs, RevokeSelection, StdinSource as CliStdinSource, UnadoptArgs,
 };
 use crate::forget;
 use crate::gateway_service;
@@ -237,6 +237,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Grant(_)
         | Command::Revoke(_)
         | Command::Remove(_)
+        | Command::Unadopt(_)
         // A retirement fences opens and drains supervisors, and only a daemon of a build that
         // knows the record enforces that fence (06_cli.md, "Project retirement").
         | Command::Forget(_)
@@ -311,6 +312,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Grant(_)
         | Command::Revoke(_)
         | Command::Remove(_)
+        | Command::Unadopt(_)
         | Command::Forget(_)
         | Command::Attach(_)
         | Command::Detach(_)
@@ -398,6 +400,8 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         Command::Remove(args) => WorkspaceName::new(&args.workspace)
             .map(RecoveryScope::Removal)
             .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?,
+        // Main's retirement is the one unadopt finishes, so its own record is left for it.
+        Command::Unadopt(_) => RecoveryScope::Removal(WorkspaceName::main()),
         Command::Gc(_) => RecoveryScope::Store,
         Command::Doctor(args) if !args.repair => RecoveryScope::Inspect,
         Command::Defrag(_) => RecoveryScope::Inspect,
@@ -1541,6 +1545,57 @@ where
     ))
 }
 
+/// An authorized abandonment still says out loud what it destroyed and where the only remaining
+/// copy went. The refusal it replaced would have said the same thing; passing the flag buys the
+/// deletion, not silence.
+fn report_abandoned<W, E>(
+    output: &mut Output<W, E>,
+    workspace: &str,
+    abandoned: &AbandonedWork,
+) -> io::Result<()>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    output.guidance(&format!(
+        "abandoned {} commit{} at {}{} that {} ({}) did not contain",
+        abandoned.unlanded_commits,
+        if abandoned.unlanded_commits == 1 {
+            ""
+        } else {
+            "s"
+        },
+        abandoned.head,
+        match abandoned.branches.len() {
+            0 => String::new(),
+            1 => String::from(" and 1 other branch"),
+            count => format!(" and {count} other branches"),
+        },
+        abandoned.target_branch,
+        match abandoned.target_head.as_ref() {
+            Some(head) => format!("at {head}"),
+            None => "no such branch".to_owned(),
+        }
+    ))?;
+    for branch in &abandoned.branches {
+        output.guidance(&format!(
+            "abandoned branch {} at {}",
+            branch.branch, branch.tip
+        ))?;
+    }
+    if let Some(commit) = abandoned.uncommitted.as_ref() {
+        output.guidance(&format!(
+            "committed the uncommitted work as {commit} on top of {}",
+            abandoned.head
+        ))?;
+    }
+    output.guidance(&format!("bundled to {}", abandoned.bundle.display()))?;
+    if let Some(warning) = predating_warning(workspace, abandoned) {
+        output.warning(&warning)?;
+    }
+    Ok(())
+}
+
 async fn report_recovered_adoption<S, W, E>(
     service: &mut S,
     root: &Path,
@@ -1825,12 +1880,9 @@ where
             Ok(success())
         }
         Command::Revoke(args) => revoke(service, output, json, args).await,
-        Command::Remove(args) if args.purge => {
+        Command::Unadopt(UnadoptArgs { abandon, force }) => {
             let report = service
-                .remove_project(RemoveProjectOptions {
-                    force: args.force,
-                    abandon: args.abandon,
-                })
+                .remove_project(RemoveProjectOptions { force, abandon })
                 .await?;
             service.reconcile_gateway().await?;
             if json {
@@ -1840,12 +1892,9 @@ where
                 output
                     .guidance(&format!("removed {}", removed.workspace))
                     .map_err(output_error)?;
-                if let Some(warning) =
-                    removed.report.abandoned.as_ref().and_then(|abandoned| {
-                        predating_warning(removed.workspace.as_str(), abandoned)
-                    })
-                {
-                    output.warning(&warning).map_err(output_error)?;
+                if let Some(abandoned) = removed.report.abandoned.as_ref() {
+                    report_abandoned(output, removed.workspace.as_str(), abandoned)
+                        .map_err(output_error)?;
                 }
             }
             for bundle in &report.deleted_bundles {
@@ -1872,7 +1921,6 @@ where
                     &args.workspace,
                     RemoveOptions {
                         force: args.force,
-                        restore: args.restore,
                         abandon: args.abandon,
                     },
                 )
@@ -1881,54 +1929,8 @@ where
             if json {
                 output.success(report.clone()).map_err(output_error)?;
             }
-            // An authorized abandonment still says out loud what it destroyed and where the only
-            // remaining copy went. The refusal it replaced would have said the same thing; passing
-            // the flag buys the deletion, not silence.
             if let Some(abandoned) = report.abandoned.as_ref() {
-                output
-                    .guidance(&format!(
-                        "abandoned {} commit{} at {}{} that {} ({}) did not contain",
-                        abandoned.unlanded_commits,
-                        if abandoned.unlanded_commits == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        abandoned.head,
-                        match abandoned.branches.len() {
-                            0 => String::new(),
-                            1 => String::from(" and 1 other branch"),
-                            count => format!(" and {count} other branches"),
-                        },
-                        abandoned.target_branch,
-                        match abandoned.target_head.as_ref() {
-                            Some(head) => format!("at {head}"),
-                            None => "no such branch".to_owned(),
-                        }
-                    ))
-                    .map_err(output_error)?;
-                for branch in &abandoned.branches {
-                    output
-                        .guidance(&format!(
-                            "abandoned branch {} at {}",
-                            branch.branch, branch.tip
-                        ))
-                        .map_err(output_error)?;
-                }
-                if let Some(commit) = abandoned.uncommitted.as_ref() {
-                    output
-                        .guidance(&format!(
-                            "committed the uncommitted work as {commit} on top of {}",
-                            abandoned.head
-                        ))
-                        .map_err(output_error)?;
-                }
-                output
-                    .guidance(&format!("bundled to {}", abandoned.bundle.display()))
-                    .map_err(output_error)?;
-                if let Some(warning) = predating_warning(args.workspace.as_str(), abandoned) {
-                    output.warning(&warning).map_err(output_error)?;
-                }
+                report_abandoned(output, &args.workspace, abandoned).map_err(output_error)?;
             }
             output.hint("cowshed gc").map_err(output_error)?;
             Ok(success())
@@ -7756,9 +7758,7 @@ mod tests {
         let invalid = runtime_recovery_scope(&Command::Remove(crate::args::RemoveArgs {
             workspace: "not/a/name".into(),
             force: false,
-            restore: false,
             abandon: false,
-            purge: false,
         }))
         .expect_err("a removal's scope is its name");
         assert_eq!(invalid.code, ErrorCode::Usage);

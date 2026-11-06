@@ -683,12 +683,12 @@ pub enum LifecycleIntent {
         destination: WorkspaceName,
         /// True only for the clone/registration/retire rename transaction. Older fork tags
         /// omit it and retain their raw-clone recovery behavior.
-        #[serde(default, skip_serializing_if = "not_rename")]
+        #[serde(default, skip_serializing_if = "is_false")]
         rename: bool,
     },
     Retire {
         workspace: WorkspaceName,
-        options: RemoveOptions,
+        options: RetireOptions,
         /// What the retirement measures the workspace's work against when it is not main's
         /// `main`: the branch a `land` just moved, in the workspace it moved (02_workspaces.md,
         /// "Lanes"). Absent is main's `main`, what every `rm` measures against and what every
@@ -702,8 +702,60 @@ pub enum LifecycleIntent {
     },
 }
 
-fn not_rename(rename: &bool) -> bool {
-    !*rename
+/// What a journaled retirement was authorized to do, the request its replay repeats. `restore`
+/// marks main's retirement by `cowshed unadopt`: that unfinished record is what lets the same
+/// command finish an interrupted unbinding (02_workspaces.md, "Checkout layouts"). The fields are
+/// the record's on-disk schema, so a store journaled before `unadopt` existed replays unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetireOptions {
+    pub force: bool,
+    pub restore: bool,
+    pub abandon: bool,
+    /// A session retired by `cowshed unadopt` before main: its abandon bundle goes into the
+    /// retained checkout's Git directory, because the project's trash goes with the project, and
+    /// the ten-minute age floor does not apply, because the whole project was named. Absent is an
+    /// ordinary removal, what every earlier record meant.
+    #[serde(skip_serializing_if = "is_false")]
+    pub unadopting: bool,
+}
+
+impl RetireOptions {
+    /// A session `cowshed unadopt` retires: rm's containment gate, `force` waiving only its own
+    /// running jobs, `abandon` bundling its work into the retained checkout.
+    pub const fn unadopting_session(force: bool, abandon: bool) -> Self {
+        Self {
+            force,
+            restore: false,
+            abandon,
+            unadopting: true,
+        }
+    }
+
+    /// Main's retirement by `cowshed unadopt`, last: it puts the pre-adoption checkout back.
+    pub const fn unadopting_main(abandon: bool) -> Self {
+        Self {
+            force: false,
+            restore: true,
+            abandon,
+            unadopting: false,
+        }
+    }
+}
+
+impl From<RemoveOptions> for RetireOptions {
+    fn from(RemoveOptions { force, abandon }: RemoveOptions) -> Self {
+        Self {
+            force,
+            restore: false,
+            abandon,
+            unadopting: false,
+        }
+    }
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The branch a land's retire measured its workspace against, in the repository of the

@@ -155,6 +155,9 @@ pub const PARITY: &[Row] = &[
     row("adopt", "repo-id", field(&[("coordinator.adopt", "options.repoId")], &[argument("Coordinator.adopt", 0, "repoId")])),
     row("adopt", "quarantine", field(&[("coordinator.adopt", "options.quarantine")], &[argument("Coordinator.adopt", 0, "quarantine")])),
     row("adopt", "re-adopt", field(&[("coordinator.adopt", "options.reAdopt")], &[argument("Coordinator.adopt", 0, "reAdopt")])),
+    row("unadopt", "", field(&[("coordinator.removeProject", "")], &[member("Coordinator.removeProject")])),
+    row("unadopt", "abandon", field(&[("coordinator.removeProject", "options.abandon")], &[argument("Coordinator.removeProject", 0, "abandon")])),
+    row("unadopt", "force", field(&[("coordinator.removeProject", "options.force")], &[argument("Coordinator.removeProject", 0, "force")])),
 
     row("setup", "", Counterpart::CliOnly { reason: SETUP_DIALOG }),
     row("setup", "uninstall", Counterpart::CliOnly { reason: SETUP_DIALOG }),
@@ -230,12 +233,10 @@ pub const PARITY: &[Row] = &[
     row("revoke", "loopback-any", field(&[("coordinator.revoke", "delta.loopbackAny")], &[argument("Coordinator.revoke", 1, "loopbackAny")])),
     row("revoke", "all", Counterpart::Composed { recipe: "read the grants and revoke every granted item at their revision (expectedRevision), as the CLI does", facade: &[member("WorkspaceRef.grants"), argument("Coordinator.revoke", 1, "expectedRevision"), member("Coordinator.projectGrants"), argument("Coordinator.revokeProject", 0, "expectedRevision")] }),
 
-    row("rm", "", field(&[("coordinator.destroy", ""), ("coordinator.removeProject", "")], &[member("Coordinator.remove"), member("Coordinator.removeProject")])),
+    row("rm", "", field(&[("coordinator.destroy", "")], &[member("Coordinator.remove")])),
     row("rm", "workspace", field(&[("coordinator.destroy", "workspace")], &[argument("Coordinator.remove", 0, "")])),
-    row("rm", "force", field(&[("coordinator.destroy", "options.force"), ("coordinator.removeProject", "options.force")], &[argument("Coordinator.remove", 1, "force"), argument("Coordinator.removeProject", 0, "force")])),
-    row("rm", "restore", field(&[("coordinator.destroy", "options.restore")], &[argument("Coordinator.remove", 1, "restore")])),
-    row("rm", "abandon", field(&[("coordinator.destroy", "options.abandon"), ("coordinator.removeProject", "options.abandon")], &[argument("Coordinator.remove", 1, "abandon"), argument("Coordinator.removeProject", 0, "abandon")])),
-    row("rm", "purge", field(&[("coordinator.removeProject", "")], &[member("Coordinator.removeProject")])),
+    row("rm", "force", field(&[("coordinator.destroy", "options.force")], &[argument("Coordinator.remove", 1, "force")])),
+    row("rm", "abandon", field(&[("coordinator.destroy", "options.abandon")], &[argument("Coordinator.remove", 1, "abandon")])),
 
     row("forget", "", field(&[("host.forgetAbandoned", "")], &[member("Host.forgetAbandoned")])),
     row("forget", "repo", field(&[("host.forgetAbandoned", "repoId")], &[argument("Host.forgetAbandoned", 0, "")])),

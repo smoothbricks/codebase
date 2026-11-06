@@ -4799,7 +4799,7 @@ mod tests {
             |journal| {
                 journal.begin(LifecycleIntent::Retire {
                     workspace: WorkspaceName::main(),
-                    options: crate::api::dto::RemoveOptions {
+                    options: crate::storage::recovery::RetireOptions {
                         restore: true,
                         ..Default::default()
                     },
@@ -4922,7 +4922,7 @@ mod tests {
                 journal.clear(&WorkspaceName::main());
                 journal.begin(LifecycleIntent::Retire {
                     workspace: workspace.clone(),
-                    options: crate::api::dto::RemoveOptions {
+                    options: crate::storage::recovery::RetireOptions {
                         restore,
                         ..Default::default()
                     },
@@ -4946,7 +4946,7 @@ mod tests {
         LifecycleIntentJournal::update(&crate::census::this_test(), &path, |journal| {
             journal.begin(LifecycleIntent::Retire {
                 workspace: WorkspaceName::main(),
-                options: crate::api::dto::RemoveOptions {
+                options: crate::storage::recovery::RetireOptions {
                     restore: true,
                     ..Default::default()
                 },

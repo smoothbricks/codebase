@@ -307,26 +307,34 @@ cowshed never auto-deletes it.
 | After the swap, before the mount   | `Active` main, stub at the checkout, original at `.pre-cowshed`  | The swap is recognized as done; main mounts at the checkout.                                                                                                   |
 | After the mount, before completion | `Active` main mounted at the checkout + pending intent           | Finishing validates the mounted marker, records the append-safe commitment, and completes the intent.                                                          |
 
-Adopting is reversible, and reverses the same way: `cowshed rm main --restore` detaches, swaps the retained
-`<root>.pre-cowshed` tree back against whatever publication left at the checkout path — the emptied mountpoint directory
-— and removes the displaced artifact. The checkout path is never absent during the restore either.
+Adopting is reversible, and `cowshed unadopt` reverses it for the whole project. It first retires every session
+workspace, listed or never published, under the gate `rm` applies: a session whose changes main holds, or the ref
+`cowshed push` wrote keeps, retires with no flag, and one holding work main lacks refuses the unadopt, named. Then it
+detaches main, swaps the retained `<root>.pre-cowshed` tree back against whatever publication left at the checkout path
+— the emptied mountpoint directory — and removes the displaced artifact. The checkout path is never absent while it runs
+either.
 
-The restore refuses (exit 4) when main's head is contained by neither the retained checkout's head nor a remote ref:
-commits made in main after adoption would be lost with its image. `--restore --abandon` authorizes exactly that loss and
-keeps it recoverable: before anything moves, main's history beyond the retained head (all of it when that head is not an
+Unadopt refuses (exit 4) when main's head is contained by neither the retained checkout's head nor a remote ref: commits
+made in main after adoption would be lost with its image. `unadopt --abandon` authorizes exactly that loss and keeps it
+recoverable: before anything moves, main's history beyond the retained head (all of it when that head is not an
 ancestor) is written to `abandoned-main-<tip>.bundle` in a `cowshed/` directory of the retained checkout's Git directory
 (`<root>.pre-cowshed/.git/cowshed/` for an ordinary checkout, which the swap carries to `<root>/.git/cowshed/`),
 verified, and reported as abandoned work against the retained checkout's branch, with nothing to preserve as refs
-(`AbandonedWork.preserved` is `nothingToPreserve`). `--abandon` on main without `--restore` is a usage error.
+(`AbandonedWork.preserved` is `nothingToPreserve`). The same flag abandons each session's work main lacks as
+`rm --abandon` does, except that its bundle, `<ws>-<tip>.bundle`, goes into that same `cowshed/` directory, because the
+project's trash goes with the project; and it deletes the abandon bundles earlier `rm --abandon` runs left in
+`sessions/.trash`. `--force` stops each session's own running jobs instead of waiting for them and waives nothing else;
+a session's age refuses nothing, since the whole project was named, and main's retirement takes no force.
+`rm main --abandon` is a usage error that names `unadopt --abandon`.
 
-Main's image is the repository that holds every `refs/cowshed/*` ref cowshed wrote: the branches `push` preserves. The
-restore retires that image, so before the swap it fetches each of those refs, unforced, into the retained checkout under
+Main's image is the repository that holds every `refs/cowshed/*` ref cowshed wrote: the branches `push` preserves.
+Unadopt retires that image, so before the swap it fetches each of those refs, unforced, into the retained checkout under
 the same name, reads each back, and refuses (naming the refs) when one is missing or holds another tip; a `push` staging
 ref is transient and stays. The retained checkout is the repository the user keeps, so the refs outlive the project
-there, and a later removal of that checkout is what would lose them; the restore says so on stderr.
+there, and a later removal of that checkout is what would lose them; unadopt says so on stderr.
 
 Unbinding is last. Removing main first records the checkout path in the project store (`checkout-root.json`), because
-main's images — the only other record naming it — are retired and then reclaimed. A restore interrupted after retiring
+main's images — the only other record naming it — are retired and then reclaimed. An unadopt interrupted after retiring
 main is finished by the same command from the checkout: the project root lookup matches that record when no main image
 exists, which is what reaches a checkout with no remote. The finishing run reports no abandoned work; the bundle the
 interrupted run wrote stays where it was reported. Unbinding first releases every build volume the project still has:
@@ -353,7 +361,7 @@ unbound, the identity's project lease `.retirements/<owner>/<repo>.lease` goes t
 leaves empty, but only under the lease itself: the unbinding's own shared hold must upgrade to exclusive without
 waiting, and no `<repo>.json` retirement record may stand beside it. Another holder (the gateway, a command still open
 on the project) or a record keeps it, said on stderr, and the unbinding keeps its shared hold. Because every holder
-rechecks the lease's inode after locking (`forget`, below), removing it cannot split them. The restore checks terminal
+rechecks the lease's inode after locking (`forget`, below), removing it cannot split them. Unadopt checks terminal
 storage before it retires main, by the same inventory, so its refusal leaves main in place: it refuses user work and
 anything cowshed does not write, every one named, and lets cowshed's derived state and the build volumes the unbinding
 releases stand. Binding removal becomes completion only after its parent sync; a retry finishes controller cleanup
@@ -361,9 +369,9 @@ before removing the lease, without recreating project directories. A fresh contr
 unbinding from the exact canonical checkout-root record and a typed, unfinished `Mutating Retire(main, restore=true)` in
 the source journal, even for a checkout with no remote. This is read-only recovery admission, never active inventory or
 registration. Live bindings retain precedence; ambiguous matching continuation records refuse rather than choosing one.
-That unfinished record is the restore's own: no startup replay or other verb completes it while the project is bound,
-and a restore is never answered from a completed record, so a retry after any failed unbinding (a stray file, a release
-that cannot move) runs the unbinding again rather than reporting success while the binding stands. A released image the
+That unfinished record is unadopt's own: no startup replay or other verb completes it while the project is bound, and an
+unadopt is never answered from a completed record, so a retry after any failed unbinding (a stray file, a release that
+cannot move) runs the unbinding again rather than reporting success while the binding stands. A released image the
 unbinding lists but finds already unlinked by the gateway's cleanup is released, not an error. The lifecycle journal is
 released after the other controller records, so failures in their removal retain the continuation. A death after
 releasing the journal but before deleting the checkout record can leave only that unbound bookkeeping record; it holds
@@ -416,7 +424,7 @@ The reported archive is the preservation artifact. `gc` does not discover that r
 silently delete its evidence. The one thing freed there is a released image already waiting in the project's deleting
 directories (`build/.deleting` and `sessions/.deleting`): it is no evidence, and the gateway's cleanup frees it where
 the rename left it, its startup listing finding it there (05_gateway.md, "Deleting released images"). Normal
-`rm main --restore` and its verified Git-containment rules remain unchanged.
+`cowshed unadopt` and its verified Git-containment rules remain unchanged.
 
 The native qualification runs ten complete attach/mount/busy-refusal/holder-close/forget cycles. Every cycle records
 `ioclasscount` before and after and proves that the owned image is no longer registered while its archive remains. The
@@ -1458,7 +1466,7 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    changes something) or a merge that authors nothing, and a tip carrying nothing beyond main is held by ancestry; a
    bundle that advertises no tip is kept. `gc --abandoned` releases every bundle (01_storage.md, "Retention"). The
    report names it (`AbandonedWork.bundle`), and `AbandonedWork.preserved` says what else keeps the tips: absent
-   (`bundleOnly`) for every session abandonment; `nothingToPreserve` for main's own `--restore --abandon` (below), where
+   (`bundleOnly`) for every session abandonment; `nothingToPreserve` for `unadopt --abandon` ("Checkout layouts"), where
    main is what is being restored and its bundle is the copy; or `preserved` with each ref, in a record an earlier build
    wrote when abandonments also wrote refs into main's repository, which no build writes or reads now. A measurement's
    files (`unlandedPaths`) are `named`, or `predatesPaths` for a record from a build that counted commits by patch
@@ -1586,18 +1594,16 @@ no clone with only its slot binding to release. A retirement refused there, say 
 journaled with that refusal. Kept journaled with no refusal of its own, such a fork held its clone, and every build
 volume it registered, deferred behind it on every pass.
 
-`cowshed rm main --restore` is the adoption rollback described above and maps to `RemoveOptions.restore`; plain
-`cowshed rm main` requires `--force` and a clean `git status` (exit 4 otherwise).
-
-`cowshed rm main --restore --purge [--force] [--abandon]` (`Coordinator::remove_project`) removes the whole project in
-one call: every session workspace, including clones a create never published, under the given `--force`/`--abandon`;
-each removal has already committed its release when collection begins; collects; with `--abandon` deletes the abandon
-bundles in `sessions/.trash`, the only copy of the commits they hold, which `--abandon` authorizes losing
-(01_storage.md); and restores main, whose final unbinding moves the project's released images into the store's
-`.deleting` and nudges the gateway ("Checkout layouts"). Each step is idempotent, so a refusal leaves the rest to the
-same command. A collection that still finds the store changed under it (another process) is refused as retryable —
-`Conflict` with `Retry::GcPlanStale` — and the same command finishes the removal; callers never sleep and retry `gc`
-themselves.
+`cowshed unadopt [--abandon] [--force]` (`Coordinator::remove_project`) is the adoption rollback described in "Checkout
+layouts"; `rm` has no rollback mode, and plain `cowshed rm main` requires `--force` and a clean `git status` (exit 4
+otherwise). It removes the whole project in one call: every session workspace, including clones a create never
+published, under the given `--force`/`--abandon`; each removal has already committed its release when collection begins;
+collects; with `--abandon` deletes the abandon bundles in `sessions/.trash`, the only copy of the commits they hold,
+which `--abandon` authorizes losing (01_storage.md); and retires main, whose final unbinding moves the project's
+released images into the store's `.deleting` and nudges the gateway ("Checkout layouts"). Each step is idempotent, so a
+refusal leaves the rest to the same command. A collection that still finds the store changed under it (another process)
+is refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the same command finishes the removal; callers
+never sleep and retry `gc` themselves.
 
 ## `cowshed attach` / `cowshed detach`
 

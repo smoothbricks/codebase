@@ -1337,15 +1337,15 @@ seed the lane base already had and builds the folded delta incrementally, as an 
   of it.
 - Each target keeps only its latest seed; a superseded seed is released when replaced (by a land's seal or a fork's seed
   refresh, committed to `build/.deleting` like every release, above), and a target's seed is released when the target
-  retires. Detached seeds need no attach or label rename to be released. Main retires last, in `rm main --restore` (and
-  `--restore --purge`): its unbinding collects once main's image is retired, so main's linked volume and seed are
-  released with every volume an earlier collection left, and a volume that stays refuses the unbinding while the project
-  is still bound (02_workspaces.md, "Checkout layouts"). The unbinding is the project's last act and its store tree goes
-  with it: it discards `build/` with the rest of terminal storage by the store inventory, moving each image there (a
-  released volume in `build/.deleting`, a compaction's working image) into `<store>/.deleting/<fresh id>.dmg` with a
-  nudge to the gateway, and removing everything else; it frees nothing itself, and a cut the gateway is making moves
-  with its entry, which the cleanup holds open. Anything cowshed does not write refuses, named, before one entry is
-  touched. It then removes the project's `.build/<owner>/<repo>` mount tree.
+  retires. Detached seeds need no attach or label rename to be released. Main retires last, in `cowshed unadopt`: its
+  unbinding collects once main's image is retired, so main's linked volume and seed are released with every volume an
+  earlier collection left, and a volume that stays refuses the unbinding while the project is still bound
+  (02_workspaces.md, "Checkout layouts"). The unbinding is the project's last act and its store tree goes with it: it
+  discards `build/` with the rest of terminal storage by the store inventory, moving each image there (a released volume
+  in `build/.deleting`, a compaction's working image) into `<store>/.deleting/<fresh id>.dmg` with a nudge to the
+  gateway, and removing everything else; it frees nothing itself, and a cut the gateway is making moves with its entry,
+  which the cleanup holds open. Anything cowshed does not write refuses, named, before one entry is touched. It then
+  removes the project's `.build/<owner>/<repo>` mount tree.
 - GC also enumerates sidecars whose images are already gone: every seed's, and every other record collection would
   release with its image: one recorded superseded, registered and interrupted, or naming a checkout that no longer links
   it. An image that does not exist cannot be waiting for anything, so deferring its record would defer it on every pass

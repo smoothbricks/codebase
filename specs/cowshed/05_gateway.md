@@ -2270,7 +2270,7 @@ substrate, only renames: its release moves the payload into `<project>/sessions/
 runs in-process; `DirectoryExecutionHost::finish_build_releases` can finish build-volume trees, leaving one a process
 still holds (16_build_volumes.md, "Garbage collection").
 
-A project's final unbinding (`rm main --restore`, 02_workspaces.md, "Checkout layouts") frees nothing either. Its store
+A project's final unbinding (`cowshed unadopt`, 02_workspaces.md, "Checkout layouts") frees nothing either. Its store
 tree goes with it, so it moves each image its terminal storage holds, released images from `build/.deleting` and
 `sessions/.deleting` among them, into `<store>/.deleting/<fresh id>.dmg` and nudges like any release, once the whole of
 that storage is judged by the store inventory (02_workspaces.md, "Checkout layouts"). A cut the gateway is making moves

@@ -1008,11 +1008,10 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
     assert_eq!(
         serde_json::to_value(RemoveOptions {
             force: false,
-            restore: true,
-            abandon: false,
+            abandon: true,
         })
         .unwrap(),
-        json!({"force":false,"restore":true,"abandon":false})
+        json!({"force":false,"abandon":true})
     );
     // An ordinary removal reports an empty object: `abandoned` appears only when commits died.
     assert_eq!(

@@ -21,8 +21,8 @@ use crate::api::dto::{
     ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor,
     JobListeningPorts, JobTail, JobTailLimits, LandOptions, LandReport, MirrorInfo,
     ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport,
-    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, RemovedWorkspace,
-    SealedJob, StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, RemovedWorkspace, SealedJob,
+    StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 #[cfg(target_os = "macos")]
 use crate::api::dto::{BranchLandings, LandingCommits, UnlandedPaths};
@@ -51,6 +51,7 @@ use crate::runtime::process_stream::JobProcessStream;
 #[cfg(target_os = "macos")]
 use crate::runtime::supervisor::{NxDaemonRetirement, RetireWhen};
 use crate::runtime::supervisor_socket::AdmissionSource;
+use crate::storage::recovery::RetireOptions;
 #[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::RunAsync as _;
 #[cfg(target_os = "macos")]
@@ -273,7 +274,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
     async fn remove(
         &mut self,
         workspace: WorkspaceName,
-        options: RemoveOptions,
+        options: RetireOptions,
     ) -> Result<RemoveReport>;
     /// Its answer may arrive after the route ends: a plain sweep's held-bundle measurement runs
     /// beside the router actor, which serves the next call meanwhile.
@@ -1552,7 +1553,10 @@ impl ProjectActor {
             }
             Op::CoordinatorDestroy(params) => {
                 self.require_repo(&params.repo_id)?;
-                let report = self.host.remove(params.workspace, params.options).await?;
+                let report = self
+                    .host
+                    .remove(params.workspace, params.options.into())
+                    .await?;
                 respond::<operations::CoordinatorDestroy>(&report)
             }
             Op::CoordinatorGc(params) => {
@@ -2364,12 +2368,14 @@ impl ProjectActor {
     }
 }
 
-/// Remove an adopted project end to end: retire every session workspace, listed or never
-/// published, finishing each physical release or recovery preservation; collect; delete the abandon bundles the
-/// removals left (only under `abandon`, which is what authorized them); then restore main, which
-/// unbinds the project and, with main retired, releases the build volumes main's link and seed
-/// kept from that collection. Every step is idempotent, so a refusal at any step leaves the rest
-/// for the same call to finish — and a stale collection says so as [`crate::error::Retry`].
+/// Unadopt an adopted project (`cowshed unadopt`): retire every session workspace, listed or never
+/// published, under rm's containment gate, finishing each physical release or recovery
+/// preservation, an abandoned session's bundle kept in the retained checkout; collect; delete the
+/// trash's abandon bundles (only under `abandon`, which is what authorized them); then retire main,
+/// which puts the pre-adoption checkout back, unbinds the project and, with main retired, releases
+/// the build volumes main's link and seed kept from that collection. Every step is idempotent, so
+/// a refusal at any step leaves the rest for the same call to finish — and a stale collection says
+/// so as [`crate::error::Retry`].
 async fn remove_project(
     host: &mut dyn ProjectRuntimeHost,
     options: RemoveProjectOptions,
@@ -2391,11 +2397,7 @@ async fn remove_project(
             .into_iter()
             .filter(|workspace| !workspace.is_main()),
     );
-    let session_removal = RemoveOptions {
-        force: options.force,
-        restore: false,
-        abandon: options.abandon,
-    };
+    let session_removal = RetireOptions::unadopting_session(options.force, options.abandon);
     let mut removed = Vec::with_capacity(sessions.len());
     for workspace in sessions {
         let report = host.remove(workspace.clone(), session_removal).await?;
@@ -2410,11 +2412,7 @@ async fn remove_project(
     let restored = host
         .remove(
             WorkspaceName::main(),
-            RemoveOptions {
-                force: false,
-                restore: true,
-                abandon: options.abandon,
-            },
+            RetireOptions::unadopting_main(options.abandon),
         )
         .await?;
     Ok(RemoveProjectReport {
@@ -3618,7 +3616,7 @@ fn plan_empty_directories_on(path: &Path, device: u64, plan: &mut Vec<PathBuf>) 
                 "the project stays bound: its mount tree still holds {}",
                 path.display()
             ),
-            "move that entry aside, then retry cowshed rm main --restore",
+            "move that entry aside, then retry cowshed unadopt",
         ));
     }
     for entry in std::fs::read_dir(path).map_err(inspect)? {
@@ -4851,12 +4849,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 )
                                 .await?;
                             } else if options.restore {
-                                // Only the restore finishes its unbinding, and this unfinished
-                                // record is what lets it (02_workspaces.md, `rm main --restore`):
-                                // completing it here would answer the restore's retry with
-                                // success while the binding stands.
+                                // Only unadopt finishes its unbinding, and this unfinished record
+                                // is what lets it (02_workspaces.md, "Checkout layouts"):
+                                // completing it here would answer unadopt's retry with success
+                                // while the binding stands.
                                 cowshed_os::eprintln!(
-                                    "cowshed: {workspace} was retired by a restore that has not unbound the project yet; cowshed rm main --restore finishes it"
+                                    "cowshed: {workspace} was retired by an unadopt that has not unbound the project yet; cowshed unadopt finishes it"
                                 );
                             } else {
                                 self.complete_lifecycle_intent(
@@ -7540,7 +7538,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn require_removal_safe(
         &self,
         workspace: &WorkspaceName,
-        options: RemoveOptions,
+        options: RetireOptions,
         fence: &NativeRemovalGitFence,
         containment: &NativeContainment,
         young: Option<&YoungWorkspace>,
@@ -7548,11 +7546,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         if workspace.is_main() {
             // Main's removal has no landed gate: main *is* the branch a session has to reach, and
             // its own preservation proof is the retained checkout or a remote ref, which the
-            // `--restore` path checks. What remains here is transient state — and unlike a session,
+            // `unadopt` path checks. What remains here is transient state — and unlike a session,
             // main's is not overridable, because there is no fork of it to fall back on.
             let forced = removal_state_gate(
                 workspace,
-                RemoveOptions {
+                RetireOptions {
                     abandon: false,
                     ..options
                 },
@@ -7937,8 +7935,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         .await
     }
 
-    /// Write and verify the commits that are about to lose their only workspace ref: the bundle in
-    /// the trash is their only copy (02_workspaces.md, `rm` step 1).
+    /// Write and verify the commits that are about to lose their only workspace ref: the bundle is
+    /// their only copy (02_workspaces.md, `rm` step 1), in the trash or, for a session `unadopt`
+    /// retires, in the retained checkout's Git directory (`unadopting`).
     ///
     /// The live main tip is both the report's baseline and a positive revision in the bundle.
     /// Carrying both histories makes the bundle self-contained even after main was rewritten, and
@@ -7953,6 +7952,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         fence: &NativeRemovalGitFence,
         landed: NativeLandedState,
         containment: &NativeContainment,
+        unadopting: bool,
     ) -> Result<AbandonedWork> {
         let mount = self.workspace_mount_path(workspace)?;
         let target_head = landed.commits.target_head().cloned();
@@ -7967,28 +7967,39 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
             None => git,
         };
-        let trash = self
-            .layout
-            .project()
-            .sessions
-            .join(crate::storage::recovery::TRASH_NAMESPACE);
-        let bundle = trash.join(format!("{}-{}.bundle", workspace.as_str(), fence.head));
-        let directory = trash.clone();
-        crate::storage::lifecycle::dispatch_blocking(move || {
-            std::fs::create_dir_all(&directory).map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot create the retirement trash directory {}: {error}",
-                        directory.display()
-                    ),
-                    "repair the cowshed store and retry",
-                )
-            })
-        })
-        .await
-        .map_err(|error| {
-            CowshedError::internal(format!("trash directory task failed: {error}"))
-        })??;
+        let name = format!("{}-{}.bundle", workspace.as_str(), fence.head);
+        let (bundle, reported) = match unadopting {
+            false => {
+                let trash = self
+                    .layout
+                    .project()
+                    .sessions
+                    .join(crate::storage::recovery::TRASH_NAMESPACE);
+                let directory = trash.clone();
+                crate::storage::lifecycle::dispatch_blocking(move || {
+                    std::fs::create_dir_all(&directory).map_err(|error| {
+                        CowshedError::environment_missing(
+                            format!(
+                                "cannot create the retirement trash directory {}: {error}",
+                                directory.display()
+                            ),
+                            "repair the cowshed store and retry",
+                        )
+                    })
+                })
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("trash directory task failed: {error}"))
+                })??;
+                let bundle = trash.join(name);
+                (bundle.clone(), bundle)
+            }
+            true => {
+                let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
+                let (staged, reported) = self.retained_bundle_directory(&pre_cowshed).await?;
+                (staged.join(&name), reported.join(name))
+            }
+        };
         // `HEAD` and branch refs, not the fence oid, are load-bearing: a raw oid does not
         // advertise a fetchable ref in a bundle. The fence already proved HEAD is exactly
         // `fence.head`, and bundle creation verifies each exact tip and the commit range by
@@ -8052,7 +8063,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             unlanded_commits,
             branches,
             preserved: AbandonedPreservation::BundleOnly,
-            bundle,
+            bundle: reported,
             uncommitted,
         })
     }
@@ -8256,7 +8267,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn remove_contained_in(
         &mut self,
         workspace: WorkspaceName,
-        options: RemoveOptions,
+        options: RetireOptions,
         containment: &NativeContainment,
         nx_check: CheckoutNxCheck,
         young: YoungPolicy,
@@ -8474,7 +8485,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         )?;
         self.retire_contained_in(
             workspace.clone(),
-            RemoveOptions::default(),
+            RetireOptions::default(),
             containment,
             CheckoutNxCheck::CloseRecorded,
             YoungPolicy::Authorized,
@@ -8490,7 +8501,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn retire_contained_in(
         &mut self,
         workspace: WorkspaceName,
-        options: RemoveOptions,
+        options: RetireOptions,
         containment: &NativeContainment,
         nx_check: CheckoutNxCheck,
         young: YoungPolicy,
@@ -8498,27 +8509,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     ) -> Result<RemoveReport> {
         use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
 
-        if options.restore && options.force {
-            return Err(CowshedError::usage(
-                "--force and --restore select conflicting main removal modes",
-                "choose exactly one main removal mode",
-            ));
-        }
-        if options.restore && !workspace.is_main() {
-            return Err(CowshedError::usage(
-                "--restore is only valid for the adopted main workspace",
-                "remove a session without --restore",
-            ));
-        }
         // `--abandon` authorizes destroying commits nothing else holds. On a session that is
         // commits the project's main branch does not contain; main *is* that branch, so on main
-        // the flag authorizes only what a restore would otherwise refuse to lose, and without
-        // `--restore` it would let a script carry one spelling for both and lose main to a typo.
+        // the flag authorizes only what unadopt would otherwise refuse to lose, and on `rm` it
+        // would let a script carry one spelling for both and lose main to a typo.
         if options.abandon && workspace.is_main() && !options.restore {
             return Err(CowshedError::usage(
-                "--abandon on main needs --restore: it keeps main's unpreserved commits in a \
+                "--abandon on main belongs to unadopt: it keeps main's unpreserved commits in a \
                  bundle inside the restored checkout",
-                "cowshed rm main --restore --abandon",
+                "cowshed unadopt --abandon",
             ));
         }
         if workspace.is_main() && !options.restore && !options.force {
@@ -8864,8 +8863,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                  remote ref"
                         ),
                         "push main to its remote so its commits survive, or keep them only \
-                             as a bundle in the restored checkout: cowshed rm main --restore \
-                             --abandon",
+                             as a bundle in the restored checkout: cowshed unadopt --abandon",
                     )),
                     Err(error) => Err(error),
                 };
@@ -8992,8 +8990,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // preservation artifact that has not proved its own recoverability authorizes nothing.
             let abandoned = match abandoning {
                 Some(landed) => Some(
-                    self.bundle_abandoned_work(&workspace, &final_fence, landed, containment)
-                        .await?,
+                    self.bundle_abandoned_work(
+                        &workspace,
+                        &final_fence,
+                        landed,
+                        containment,
+                        options.unadopting,
+                    )
+                    .await?,
                 ),
                 None => None,
             };
@@ -9114,34 +9118,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         })
     }
 
-    /// Keeps main's unpreserved commits where the restore puts them: a bundle in the retained
-    /// checkout's Git directory, which the restore makes the project checkout's own. The bundle
-    /// carries the retained head as well, so it fetches into an empty repository, and it is
-    /// verified that way before anything is restored. Git names that directory: a linked worktree
-    /// keeps it outside the tree, where the swap leaves it, rather than under `.git`.
-    async fn bundle_abandoned_main(
+    /// Where unadopt keeps abandoned work: the `cowshed/` directory of the retained checkout's Git
+    /// directory, created here, and that directory as the report names it, where the swap carries
+    /// it to the checkout path. Git names the Git directory: a linked worktree keeps it outside
+    /// the tree, where the swap leaves it, rather than under `.git`.
+    async fn retained_bundle_directory(
         &self,
-        workspace: &NativeWorkspace,
         pre_cowshed_checkout: &Path,
-        head: GitOid,
-        retained_head: Option<GitOid>,
-    ) -> Result<AbandonedWork> {
+    ) -> Result<(PathBuf, PathBuf)> {
         let store_root = &std::sync::Arc::clone(self.git.store_root());
-        let main_git = crate::git::GitRepository::from_root(
-            self.git.store_root(),
-            current_snapshot_mount(self, workspace)?,
-        );
-        let base = match retained_head {
-            Some(retained)
-                if main_git
-                    .commit_is_ancestor(retained.as_str(), head.as_str())
-                    .await? =>
-            {
-                Some(retained)
-            }
-            _ => None,
-        };
-        let name = format!("abandoned-main-{head}.bundle");
         let git_dir = invoke_git(
             store_root,
             pre_cowshed_checkout,
@@ -9158,7 +9143,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             PathBuf::from(std::ffi::OsString::from_vec(bytes))
         };
         let staged_directory = git_dir.join("cowshed");
-        // The report names where the bundle is once the restore has swapped the trees.
         let retained_root = tokio::fs::canonicalize(pre_cowshed_checkout)
             .await
             .map_err(|error| {
@@ -9174,17 +9158,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             Ok(inside) => self.descriptor.git_root.join(inside),
             Err(_) => staged_directory.clone(),
         };
-        let target_branch =
-            crate::git::GitRepository::from_root(self.git.store_root(), pre_cowshed_checkout)
-                .current_branch()
-                .await?
-                .unwrap_or_else(|| "HEAD".to_owned());
         let directory = staged_directory.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
             std::fs::create_dir_all(&directory).map_err(|error| {
                 CowshedError::environment_missing(
                     format!(
-                        "cannot create the abandoned-main directory {}: {error}",
+                        "cannot create the retained checkout's bundle directory {}: {error}",
                         directory.display()
                     ),
                     "make the retained checkout's Git directory writable and retry",
@@ -9193,8 +9172,44 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         })
         .await
         .map_err(|error| {
-            CowshedError::internal(format!("abandoned-main directory task failed: {error}"))
+            CowshedError::internal(format!("retained bundle directory task failed: {error}"))
         })??;
+        Ok((staged_directory, final_directory))
+    }
+    /// Keeps main's unpreserved commits where the restore puts them: a bundle in the retained
+    /// checkout's Git directory, which the restore makes the project checkout's own. The bundle
+    /// carries the retained head as well, so it fetches into an empty repository, and it is
+    /// verified that way before anything is restored. Git names that directory: a linked worktree
+    /// keeps it outside the tree, where the swap leaves it, rather than under `.git`.
+    async fn bundle_abandoned_main(
+        &self,
+        workspace: &NativeWorkspace,
+        pre_cowshed_checkout: &Path,
+        head: GitOid,
+        retained_head: Option<GitOid>,
+    ) -> Result<AbandonedWork> {
+        let main_git = crate::git::GitRepository::from_root(
+            self.git.store_root(),
+            current_snapshot_mount(self, workspace)?,
+        );
+        let base = match retained_head {
+            Some(retained)
+                if main_git
+                    .commit_is_ancestor(retained.as_str(), head.as_str())
+                    .await? =>
+            {
+                Some(retained)
+            }
+            _ => None,
+        };
+        let name = format!("abandoned-main-{head}.bundle");
+        let (staged_directory, final_directory) =
+            self.retained_bundle_directory(pre_cowshed_checkout).await?;
+        let target_branch =
+            crate::git::GitRepository::from_root(self.git.store_root(), pre_cowshed_checkout)
+                .current_branch()
+                .await?
+                .unwrap_or_else(|| "HEAD".to_owned());
         // `HEAD`, not the fence oid: a raw oid advertises no fetchable ref in a bundle, and the
         // fence already proved main's HEAD is exactly `head`.
         let unlanded_commits = main_git
@@ -10774,9 +10789,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         origin: crate::storage::recovery::LifecycleIntent,
         source: &WorkspaceName,
     ) -> Result<()> {
-        let options = RemoveOptions {
+        let options = RetireOptions {
             force: true,
-            ..RemoveOptions::default()
+            ..RetireOptions::default()
         };
         let pending = self
             .pending_metadata()
@@ -10859,9 +10874,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 .map_err(native_storage_error)
         } else {
             let origin = abandoned_clone_origin(&metadata);
-            let options = RemoveOptions {
+            let options = RetireOptions {
                 force: true,
-                ..RemoveOptions::default()
+                ..RetireOptions::default()
             };
             self.retire_pending_workspace(&workspace, options, origin, metadata)
                 .await
@@ -10887,7 +10902,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn retire_pending_workspace(
         &mut self,
         workspace: &WorkspaceName,
-        options: RemoveOptions,
+        options: RetireOptions,
         origin: crate::storage::recovery::LifecycleIntent,
         metadata: crate::metadata::DetachedWorkspaceMetadata,
     ) -> Result<RemoveReport> {
@@ -10998,8 +11013,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         this.mark_lifecycle_intent_mutating(workspace).await?;
                         let abandoned = match abandoning {
                             Some(landed) => Some(
-                                this.bundle_abandoned_work(workspace, &last, landed, containment)
-                                    .await?,
+                                this.bundle_abandoned_work(
+                                    workspace,
+                                    &last,
+                                    landed,
+                                    containment,
+                                    options.unadopting,
+                                )
+                                .await?,
                             ),
                             None => None,
                         };
@@ -15579,7 +15600,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     async fn remove(
         &mut self,
         workspace: WorkspaceName,
-        options: RemoveOptions,
+        options: RetireOptions,
     ) -> Result<RemoveReport> {
         // A land of this workspace in flight holds the lease, and this removal is refused naming
         // it; held for the removal, so a land started meanwhile is refused the same way.
@@ -15594,7 +15615,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             options,
             &containment,
             CheckoutNxCheck::CloseRecorded,
-            YoungPolicy::Refuse,
+            // Unadopt names the whole project, so its sessions' age is no reason to refuse.
+            if options.unadopting {
+                YoungPolicy::Authorized
+            } else {
+                YoungPolicy::Refuse
+            },
         )
         .await
     }
@@ -16626,7 +16652,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             match self
                 .retire_contained_in(
                     workspace.clone(),
-                    RemoveOptions::default(),
+                    RetireOptions::default(),
                     &containment,
                     plan.retirement(),
                     // The owner's own land retires the unit it just landed, however young.
@@ -19286,14 +19312,14 @@ mod removal_refusal_tests {
             ),
             removal_state_gate(
                 &workspace(),
-                RemoveOptions::default(),
+                RetireOptions::default(),
                 &fence(&["notes.txt"], None),
                 None,
             )
             .expect_err("dirty is refused"),
             removal_state_gate(
                 &workspace(),
-                RemoveOptions::default(),
+                RetireOptions::default(),
                 &fence(&[], Some("MERGE_HEAD")),
                 None,
             )
@@ -19920,10 +19946,10 @@ mod removal_refusal_tests {
             created_at: "2026-07-14T00:00:00Z".to_owned(),
             age: Some(std::time::Duration::from_secs(180)),
         };
-        let options = |force, abandon| RemoveOptions {
+        let options = |force, abandon| RetireOptions {
             force,
             abandon,
-            ..RemoveOptions::default()
+            ..RetireOptions::default()
         };
         let dirty = ["src/lib.rs", "notes.txt"];
         let refused_dirt = "workspace raven has uncommitted work: src/lib.rs, notes.txt";
@@ -20154,7 +20180,7 @@ mod removal_refusal_tests {
     fn a_head_the_push_ref_keeps_retires_with_no_flag_and_dirt_still_refuses() {
         let verdict = |landed: NativeLandedState, dirty: bool| match removal_state_gate(
             &workspace(),
-            RemoveOptions::default(),
+            RetireOptions::default(),
             &fence(if dirty { &["notes.txt"] } else { &[] }, None),
             None,
         ) {
@@ -24177,7 +24203,7 @@ struct NativeRemovalAuthority {
 #[cfg(target_os = "macos")]
 fn removal_state_gate(
     workspace: &WorkspaceName,
-    options: RemoveOptions,
+    options: RetireOptions,
     fence: &NativeRemovalGitFence,
     young: Option<&YoungWorkspace>,
 ) -> Result<Option<Vec<crate::storage::deletion_log::Overridden>>> {
@@ -24685,13 +24711,13 @@ enum RetirementPurpose<'a> {
     Rename { destination: &'a WorkspaceName },
 }
 
-/// Removing main without `--restore` throws the project's warm image away for good, so the gate
-/// points at the mode that recovers the pre-adoption checkout instead.
+/// Removing main other than by `cowshed unadopt` throws the project's warm image away for good,
+/// so the gate points at the verb that recovers the pre-adoption checkout instead.
 #[cfg(target_os = "macos")]
 fn main_removal_mode_refusal() -> CowshedError {
     CowshedError::conflict(
-        "removing main without --restore destroys this project's warm main image",
-        "recover the pre-adoption checkout instead: cowshed rm main --restore",
+        "removing main without unadopt destroys this project's warm main image",
+        "recover the pre-adoption checkout instead: cowshed unadopt",
     )
 }
 

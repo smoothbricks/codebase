@@ -832,7 +832,7 @@ impl ProjectRuntimeHost for FakeHost {
     async fn remove(
         &mut self,
         workspace: WorkspaceName,
-        options: RemoveOptions,
+        options: cowshed_core::storage::recovery::RetireOptions,
     ) -> Result<RemoveReport> {
         if options.force && options.restore {
             return Err(CowshedError::usage(
@@ -5950,7 +5950,7 @@ async fn session_removal_refuses_dirty_work_until_abandoned() {
         json!({
             "repoId": repo,
             "workspace": "unsafe",
-            "options": RemoveOptions { force: true, restore: false, abandon: false }
+            "options": RemoveOptions { force: true, abandon: false }
         }),
     )
     .await
@@ -5965,7 +5965,7 @@ async fn session_removal_refuses_dirty_work_until_abandoned() {
         json!({
             "repoId": repo,
             "workspace": "unsafe",
-            "options": RemoveOptions { force: false, restore: false, abandon: true }
+            "options": RemoveOptions { force: false, abandon: true }
         }),
     )
     .await
@@ -6001,7 +6001,6 @@ async fn unlanded_session_removal_survives_force_and_only_abandon_destroys_it() 
         RemoveOptions::default(),
         RemoveOptions {
             force: true,
-            restore: false,
             abandon: false,
         },
     ] {
@@ -6035,7 +6034,7 @@ async fn unlanded_session_removal_survives_force_and_only_abandon_destroys_it() 
         json!({
             "repoId": repo,
             "workspace": "unsafe",
-            "options": RemoveOptions { force: false, restore: false, abandon: true }
+            "options": RemoveOptions { force: false, abandon: true }
         }),
     )
     .await
@@ -6118,7 +6117,7 @@ async fn plain_main_removal_requires_force_and_still_requires_clean_git() {
         json!({
             "repoId": repo,
             "workspace": "main",
-            "options": RemoveOptions { force: true, restore: false, abandon: false }
+            "options": RemoveOptions { force: true, abandon: false }
         }),
     )
     .await
@@ -6139,7 +6138,7 @@ async fn plain_main_removal_requires_force_and_still_requires_clean_git() {
         json!({
             "repoId": repo,
             "workspace": "main",
-            "options": RemoveOptions { force: true, restore: false, abandon: false }
+            "options": RemoveOptions { force: true, abandon: false }
         }),
     )
     .await
@@ -6159,15 +6158,16 @@ async fn main_restore_detaches_swaps_exact_checkout_and_then_retires() {
     route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.destroy",
+        "coordinator.removeProject",
         json!({
             "repoId": repo,
-            "workspace": "main",
-            "options": RemoveOptions { force: false, restore: true, abandon: false }
+            "options": RemoveProjectOptions::default()
         }),
     )
     .await
     .expect("adoption rollback");
+    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(events.recv().await, Some(Event::Gc));
     let main = WorkspaceName::new("main").expect("main");
     assert_eq!(events.recv().await, Some(Event::GitSafety(main.clone())));
     assert_eq!(events.recv().await, Some(Event::Stop(main.clone())));
@@ -6195,7 +6195,7 @@ async fn main_restore_detaches_swaps_exact_checkout_and_then_retires() {
 }
 
 #[tokio::test]
-async fn main_restore_missing_tree_collision_and_force_ambiguity_mutate_nothing() {
+async fn main_restore_missing_tree_and_collision_mutate_nothing() {
     for refusal in ["missing", "collision"] {
         let root = test_root();
         let removal = FakeRemoval {
@@ -6210,16 +6210,17 @@ async fn main_restore_missing_tree_collision_and_force_ambiguity_mutate_nothing(
         let error = route(
             &router,
             coordinator(repo.clone()),
-            "coordinator.destroy",
+            "coordinator.removeProject",
             json!({
                 "repoId": repo,
-                "workspace": "main",
-                "options": RemoveOptions { force: false, restore: true, abandon: false }
+                "options": RemoveProjectOptions::default()
             }),
         )
         .await
         .expect_err("unsafe restore fact");
         assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+        assert_eq!(events.recv().await, Some(Event::Gc));
         assert_eq!(
             events.recv().await,
             Some(Event::GitSafety(WorkspaceName::new("main").expect("main")))
@@ -6231,6 +6232,7 @@ async fn main_restore_missing_tree_collision_and_force_ambiguity_mutate_nothing(
     let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     while events.try_recv().is_ok() {}
+    // Main's adoption rollback is unadopt's alone: the removal request has no field for it.
     let error = route(
         &router,
         coordinator(repo.clone()),
@@ -6238,11 +6240,11 @@ async fn main_restore_missing_tree_collision_and_force_ambiguity_mutate_nothing(
         json!({
             "repoId": repo,
             "workspace": "main",
-            "options": RemoveOptions { force: true, restore: true, abandon: false }
+            "options": { "force": false, "restore": true, "abandon": false }
         }),
     )
     .await
-    .expect_err("ambiguous authority");
+    .expect_err("rm carries no restore");
     assert_eq!(error.code, ErrorCode::Usage);
     assert!(events.try_recv().is_err());
 }
@@ -6260,16 +6262,12 @@ async fn main_restore_retries_after_each_detach_and_swap_crash_boundary() {
             start_with_removal(&root, false, Vec::new(), removal).await;
         adopt(&router, &repo).await;
         while events.try_recv().is_ok() {}
-        let options = RemoveOptions {
-            force: false,
-            restore: true,
-            abandon: false,
-        };
+        let options = RemoveProjectOptions::default();
         let error = route(
             &router,
             coordinator(repo.clone()),
-            "coordinator.destroy",
-            json!({ "repoId": repo, "workspace": "main", "options": options }),
+            "coordinator.removeProject",
+            json!({ "repoId": repo, "options": options }),
         )
         .await
         .expect_err("injected crash");
@@ -6279,8 +6277,8 @@ async fn main_restore_retries_after_each_detach_and_swap_crash_boundary() {
         route(
             &router,
             coordinator(repo.clone()),
-            "coordinator.destroy",
-            json!({ "repoId": repo, "workspace": "main", "options": options }),
+            "coordinator.removeProject",
+            json!({ "repoId": repo, "options": options }),
         )
         .await
         .expect("retry completes rollback");

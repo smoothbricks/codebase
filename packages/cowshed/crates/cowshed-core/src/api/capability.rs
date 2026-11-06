@@ -2636,9 +2636,10 @@ impl Coordinator {
         invoke::<operations::CoordinatorGc>(&*self.runtime, &request).await
     }
 
-    /// Remove the adopted project end to end: every session workspace, the collection of their
-    /// images, the abandon bundles (under `abandon`), and main's restore, which unbinds it. A
-    /// refusal leaves the rest for the next call; a store that changed under the collection is
+    /// Unadopt the project (`cowshed unadopt`): retire every session workspace under rm's
+    /// containment gate, the collection of their images, the trash's abandon bundles (under
+    /// `abandon`), and main's unadoption, which puts the pre-adoption checkout back and unbinds it.
+    /// A refusal leaves the rest for the next call; a store that changed under the collection is
     /// `Conflict` with [`crate::error::Retry::GcPlanStale`], resolved by calling again.
     pub async fn remove_project(
         &self,
@@ -4841,7 +4842,7 @@ mod tests {
                 json!({
                     "repoId": "acme/widget",
                     "workspace": "crow",
-                    "options": { "force": true, "restore": false, "abandon": false },
+                    "options": { "force": true, "abandon": false },
                 })
             );
             write_rpc_success(

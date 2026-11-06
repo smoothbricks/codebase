@@ -632,9 +632,10 @@ impl Coordinator {
     pub async fn assign_slot(&self, ws: &str, slot: u32) -> Result<(), CowshedError>;
     pub async fn destroy(&self, ws: &str, opts: RemoveOptions) -> Result<(), CowshedError>;
     pub async fn gc(&self, opts: GcOptions) -> Result<GcReport, CowshedError>;
-    // Remove the adopted project end to end (`cowshed rm main --restore --purge`, 02_workspaces.md): every session
-    // workspace, listed or never published, under opts' force/abandon; wait for their reclamation; gc; under abandon
-    // delete the trash's abandon bundles; restore main. A stale gc plan is `Conflict` with `Retry::GcPlanStale`
+    // Unadopt the project (`cowshed unadopt`, 02_workspaces.md, "Checkout layouts"): every session workspace, listed
+    // or never published, under opts' force/abandon, an abandoned session bundled into the retained checkout; wait
+    // for their reclamation; gc; under abandon delete the trash's abandon bundles; retire main, which puts the
+    // pre-adoption checkout back and unbinds the project. A stale gc plan is `Conflict` with `Retry::GcPlanStale`
     // (`retry_source()`, wire `"retry": {"reason": "gcPlanStale"}`): call again, nothing done is repeated.
     pub async fn remove_project(&self, opts: RemoveProjectOptions) -> Result<RemoveProjectReport, CowshedError>;
     pub async fn repo_mirror(&self, ws: &str, url: &Url) -> Result<MirrorInfo, CowshedError>;
@@ -814,8 +815,8 @@ NAPI, and MCP — no adapter redefines a field, and contract goldens (08_testing
 `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`, `ProtectedOutput`, `BinaryData`,
 `OutputSummary`, `OutputPublication`, `PublicationPolicy`, `ControllerCommitment` and its event structs, `PushReport`,
 `LandReport`, `RevisionTarget`, `GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/ `RepoRule`/`SimVerb`, `GatewayStatus`,
-`AuditEvent`, and every `*Options` type (`AdoptOptions`, `ForkOptions`, `AttachOptions`, `RemoveOptions`, `GcOptions`,
-`RebaseOptions`, `LandOptions`, `PushOptions`).
+`AuditEvent`, and every `*Options` type (`AdoptOptions`, `ForkOptions`, `AttachOptions`, `RemoveOptions`,
+`RemoveProjectOptions`, `GcOptions`, `RebaseOptions`, `LandOptions`, `PushOptions`).
 
 `JobArtifactRecord` is a canonical internal storage/Arrow contract, not CLI/N-API/MCP JSON envelopes. Adapters expose
 only their bounded constituent result types and payload-free controller commitments; they never reveal protected paths
@@ -1493,8 +1494,8 @@ supervisor that ran the job retires.
   the object is a breaking wire change, and a client of an older build cannot decode it. A consumer that keys on the
   listed workspaces counts an unproven one as present: it is the project's, and only its mount is in doubt.
 - `AdoptOptions.repoId` is optional only because a trusted remote binding can supply it; local-only adoption requires
-  the explicit value. `RemoveOptions.restore` selects the reversible `main` adoption rollback; it is not an alias for
-  forced retirement.
+  the explicit value. `coordinator.removeProject { repoId, options: RemoveProjectOptions }` is the reversible adoption
+  rollback (`cowshed unadopt`); `RemoveOptions` has no rollback mode, so forced retirement is never an alias for it.
 - `DoctorReport = { healthy, findings }`; `Finding = { code, severity, message, hint, path? }`, and severity is
   `"info" | "warning" | "error"`. `GcCandidate = { identity: Sha256Digest, path, bytes, reason }`, where reason is the
   closed
@@ -1594,15 +1595,15 @@ supervisor that ran the job retires.
   stderr for the human who reopened cowshed; the two coexist deliberately.
   `ForkOptions = { ref?, clean, browse, slot?, register, gitWorktree }`;
   `AttachOptions = { browse, observedPath?, aggregate }`, `aggregate` marking one attach of `attach` with no name or
-  `--all`, which makes no room (02_workspaces.md, "Making room for an attach"); `RemoveOptions = { force }`;
-  `GcOptions = { dryRun, abandoned }`; `RebaseOptions`, `LandOptions`, and `PushOptions` use the expectation fields
-  shown above. All booleans are explicit in JSON; absence never silently means authority was granted. Both GC options
-  default to false on input; only `abandoned: true` authorizes reclaiming abandon bundles.
-  `coordinator.fork { repoId, workspace, source?, options: ForkOptions }` defaults an absent source to main. A ref with
-  `clean: false` is a usage refusal; the CLI sets clean for `--ref`. Every fork uses the same mint, carries source edits
-  and untracked files by default, and gets its own `cowshed/<ws>` branch. `coordinator.create`, `CreateOptions`, and
-  `cowshed.create` are not API names; calling `coordinator.create` returns a Usage error. The TypeScript entry point is
-  `cowshed.fork(workspace, { source, ... })`.
+  `--all`, which makes no room (02_workspaces.md, "Making room for an attach"); `RemoveOptions = { force, abandon }`;
+  `RemoveProjectOptions = { force, abandon }`; `GcOptions = { dryRun, abandoned }`; `RebaseOptions`, `LandOptions`, and
+  `PushOptions` use the expectation fields shown above. All booleans are explicit in JSON; absence never silently means
+  authority was granted. Both GC options default to false on input; only `abandoned: true` authorizes reclaiming abandon
+  bundles. `coordinator.fork { repoId, workspace, source?, options: ForkOptions }` defaults an absent source to main. A
+  ref with `clean: false` is a usage refusal; the CLI sets clean for `--ref`. Every fork uses the same mint, carries
+  source edits and untracked files by default, and gets its own `cowshed/<ws>` branch. `coordinator.create`,
+  `CreateOptions`, and `cowshed.create` are not API names; calling `coordinator.create` returns a Usage error. The
+  TypeScript entry point is `cowshed.fork(workspace, { source, ... })`.
 - `GrantSet`, `GrantDelta`, `PortBlock`, `EgressRule`, `RepoRule`, and `SimVerb` reuse the metadata definitions.
   `GrantSet.portBlock` is present on macOS and omitted on Linux; `GrantSet.retainedPortBlocks` is present only after a
   macOS relocation; `GrantSet.loopbackAny` is present only while granted; `GrantDelta.servicePorts`,

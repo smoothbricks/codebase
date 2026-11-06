@@ -51,7 +51,7 @@
   "coordinator.destroy": {
     "repoId": "acme/widget",
     "workspace": "feature",
-    "options": { "force": false, "restore": false, "abandon": false }
+    "options": { "force": false, "abandon": false }
   },
   "coordinator.gc": { "repoId": "acme/widget", "options": { "dryRun": false, "abandoned": false } },
   "coordinator.removeProject": { "repoId": "acme/widget", "options": { "force": false, "abandon": false } },

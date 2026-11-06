@@ -358,12 +358,12 @@ cowshed attach agent-auth --project ~/src/api
 checkout, use the explicit reversible path:
 
 ```sh
-cowshed rm main --restore --project ~/src/api
+cowshed unadopt --project ~/src/api
 ```
 
-The command refuses dirty or conflicting state unless the documented force path is deliberately chosen. Successful
-rollback removes only that repository's binding and controller storage; other adopted repositories and their `main`
-images are unaffected.
+The command refuses while main holds commits neither the retained checkout nor a remote ref keeps, unless `--abandon`
+bundles them into the restored checkout first. Successful rollback removes only that repository's binding and controller
+storage; other adopted repositories and their `main` images are unaffected.
 
 ## Command map
 
@@ -380,6 +380,7 @@ images are unaffected.
 | Detach / attach                                 | `cowshed detach <workspace>`, `cowshed attach <workspace>`                              |
 | Preserve Git work                               | `cowshed push <workspace>`, `cowshed rebase <workspace>`, `cowshed land <workspace>`    |
 | Remove a workspace                              | `cowshed rm <workspace>`                                                                |
+| Undo adoption                                   | `cowshed unadopt` (every workspace, then main)                                          |
 | Preview / run reclamation                       | `cowshed gc --dry-run`, `cowshed gc`                                                    |
 | Clear a workspace's and the project's Nx caches | `cowshed cache clear [<ws>]` (not `nx reset`, which only removes the links)             |
 | Make `fork` fast on a churned main              | `cowshed defrag main` (idle checkout; when a fork warns its source clone took over 4 s) |

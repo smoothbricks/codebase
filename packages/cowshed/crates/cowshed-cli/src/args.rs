@@ -42,6 +42,7 @@ pub static COMMAND_GROUPS: &[CommandGroup] = &[
         commands: &[
             &SETUP,
             &ADOPT,
+            &UNADOPT,
             &DOCTOR,
             &GATEWAY,
             &CREDENTIAL,
@@ -91,6 +92,8 @@ pub struct Cli {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     Adopt(AdoptArgs),
+    /// The reverse of `Adopt`, for the whole project: every session, then main.
+    Unadopt(UnadoptArgs),
     /// Host storage setup, repair, and teardown. Its subject is the host, so it takes no
     /// project and no workspace — neither is something a stranded machine can name.
     Setup(SetupArgs),
@@ -176,6 +179,7 @@ impl Command {
             Self::Mount(_) => ProjectDiscovery::NotUsed,
             Self::Forget(_) => ProjectDiscovery::NotUsed,
             Self::Adopt(_)
+            | Self::Unadopt(_)
             | Self::Fork(_)
             | Self::Move(_)
             | Self::Path(_)
@@ -386,6 +390,16 @@ pub struct AdoptArgs {
     pub re_adopt: bool,
 }
 
+/// `unadopt` — reverse `adopt` for the whole project. It takes no workspace: it retires every
+/// workspace, main last, which its name says. `Coordinator::remove_project`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UnadoptArgs {
+    /// What `rm --abandon` authorizes, for every session and for main's unpreserved commits; each
+    /// bundle goes into the retained checkout's Git directory.
+    pub abandon: bool,
+    /// Stop each session's own running jobs instead of waiting for them.
+    pub force: bool,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForkArgs {
     pub source: Option<String>,
@@ -540,11 +554,7 @@ pub enum RevokeSelection {
 pub struct RemoveArgs {
     pub workspace: String,
     pub force: bool,
-    pub restore: bool,
     pub abandon: bool,
-    /// With `main --restore`: remove the whole project first (every session, its images, and
-    /// under `abandon` its abandon bundles) — `Coordinator::remove_project`.
-    pub purge: bool,
 }
 
 /// `forget <owner/repo> --abandon` — the one project to retire.
@@ -914,6 +924,7 @@ pub fn cli_command() -> ClapCommand {
             flag("quarantine"),
             flag("re-adopt"),
         ]))
+        .subcommand(leaf("unadopt").args([flag("abandon"), flag("force")]))
         .subcommand(leaf("setup").args([
             flag("uninstall"),
             flag("force"),
@@ -1002,12 +1013,11 @@ pub fn cli_command() -> ClapCommand {
                 .arg(flag("loopback-any"))
                 .arg(flag("all")),
         )
-        .subcommand(leaf("rm").arg(positional("workspace", 0..=1)).args([
-            flag("force"),
-            flag("restore"),
-            flag("abandon"),
-            flag("purge"),
-        ]))
+        .subcommand(
+            leaf("rm")
+                .arg(positional("workspace", 0..=1))
+                .args([flag("force"), flag("abandon")]),
+        )
         .subcommand(
             leaf("forget")
                 .arg(positional("repo", 0..=1))
@@ -1265,6 +1275,7 @@ fn cli_from_matches(matches: ArgMatches, environment: Environment<'_>) -> Result
     let global = merge_globals(&matches, leaf);
     let command = match name {
         "adopt" => parse_adopt(leaf)?,
+        "unadopt" => parse_unadopt(leaf)?,
         "setup" => parse_setup(leaf, &global)?,
         "fork" => parse_fork(leaf)?,
         "mv" => parse_move(leaf)?,
@@ -2560,6 +2571,35 @@ const ADOPT: CommandSpec = CommandSpec {
     ],
 };
 
+const UNADOPT: CommandSpec = CommandSpec {
+    name: "unadopt",
+    missing: "unadopt requires an argument",
+    args: "",
+    trailing: "",
+    summary: "undo adoption for the whole project",
+    about: &[
+        "Reverses `adopt` for the whole project: retires every session workspace, listed or never published, under the containment gate `rm` applies, collects their images, then detaches main, swaps the retained `<root>.pre-cowshed` tree back against the emptied mountpoint directory at the checkout path, removes the displaced artifact and unbinds the project. The checkout path is never absent while it runs. Run it from the checkout, or name the project with `--project`.",
+        "A session whose changes main holds, by content or patch identity, or kept by the ref `cowshed push` wrote, retires with no flag, however young; one holding work main lacks refuses, named, unless --abandon is given. Main's image is the repository that holds every refs/cowshed ref `cowshed push` wrote. Before the swap each is fetched, unforced, into the retained checkout and read back, so the pushed branches outlive the project there; a ref missing there or holding another tip refuses, naming it.",
+        "Refused (exit 4) while main's head is held neither by the retained checkout's head nor by a remote ref, unless --abandon is given. Each step is idempotent: a refusal or an interruption is finished by running the same command again from the checkout, and a run that finishes an interrupted one reports no abandoned work. A store another process changed under the collection is refused as retryable (`retry.reason` is `gcPlanStale` in --json); run the same command again.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--abandon",
+            meaning: "authorizes losing work nothing else preserves: each session's unlanded commits and uncommitted work, as `rm --abandon` bundles them, and main's history beyond the retained head, all bundled into .git/cowshed/ of the restored checkout first (<ws>-<tip>.bundle, abandoned-main-<tip>.bundle) and verified. It also deletes the abandon bundles earlier `rm --abandon` runs left in sessions/.trash, each deletion journaled as `remove-abandoned-bundle`",
+        },
+        Opt {
+            spelling: "--force",
+            meaning: "stop each session workspace's own running jobs instead of waiting for them; it waives nothing else, and main's own retirement takes no force",
+        },
+    ],
+};
+
+fn parse_unadopt(matches: &ArgMatches) -> Result<Command, UsageError> {
+    Ok(Command::Unadopt(UnadoptArgs {
+        abandon: flagged(matches, "abandon"),
+        force: flagged(matches, "force"),
+    }))
+}
 const SETUP: CommandSpec = CommandSpec {
     name: "setup",
     missing: "setup requires an argument",
@@ -3378,16 +3418,8 @@ const REMOVE: CommandSpec = CommandSpec {
             meaning: "stop the workspace's own running jobs instead of waiting for them, and waive the ten-minute floor on a workspace's age; the deletion log records the age it waived and which process asked. It waives no uncommitted work, no in-progress Git operation, no containment gate and no process cowshed does not run holding the mount",
         },
         Opt {
-            spelling: "--restore",
-            meaning: "main only: put the pre-adoption checkout back and unbind the project, the reverse of adopt. Refused while main's head is preserved neither by the retained checkout nor by a remote ref, unless --abandon is given",
-        },
-        Opt {
             spelling: "--abandon",
-            meaning: "the sole authorization for destroying work main does not hold, and needed only for that: a workspace whose changes main holds, or whose head the ref `cowshed push` wrote keeps, passes without it. Before deleting, HEAD and every local branch that did not pass are bundled into a verified recovery bundle, sessions/.trash/<ws>-<tip>.bundle, which is the only copy of those commits: nothing is written into main's repository, and `gc --abandoned` is what eventually deletes the bundle. It is also the sole authorization for removing uncommitted work: tracked edits and untracked files no ignore rule covers go into the same bundle as one commit on top of HEAD, refs/cowshed/uncommitted, and an in-progress operation's work tree with them. No image is kept. The project's deletion log names the head, every branch tip and the bundle that keeps each. With --restore on main, it authorizes restoring past commits nothing else preserves: they are bundled into .git/cowshed/abandoned-main-<tip>.bundle of the restored checkout first",
-        },
-        Opt {
-            spelling: "--purge",
-            meaning: "main --restore only: remove the whole project in one call — every session workspace (listed or never published, under the --force and --abandon given), the collection of their images, and with --abandon the abandon bundles in sessions/.trash, each deleted and its deletion journaled as `remove-abandoned-bundle` — and then restore main, which first carries every refs/cowshed ref (pushed branches) into the retained checkout it puts back, where they outlive the project. A store another process changed under the collection is refused as retryable (`retry.reason` is `gcPlanStale` in --json); run the same command again",
+            meaning: "the sole authorization for destroying work main does not hold, and needed only for that: a workspace whose changes main holds, or whose head the ref `cowshed push` wrote keeps, passes without it. Before deleting, HEAD and every local branch that did not pass are bundled into a verified recovery bundle, sessions/.trash/<ws>-<tip>.bundle, which is the only copy of those commits: nothing is written into main's repository, and `gc --abandoned` is what eventually deletes the bundle. It is also the sole authorization for removing uncommitted work: tracked edits and untracked files no ignore rule covers go into the same bundle as one commit on top of HEAD, refs/cowshed/uncommitted, and an in-progress operation's work tree with them. No image is kept. The project's deletion log names the head, every branch tip and the bundle that keeps each. Refused on main: only `cowshed unadopt --abandon` gives up main's unpreserved commits",
         },
     ],
 };
@@ -3395,34 +3427,18 @@ const REMOVE: CommandSpec = CommandSpec {
 fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &REMOVE;
     let workspace = require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?;
-    let restore = flagged(matches, "restore");
     let abandon = flagged(matches, "abandon");
-    if restore && workspace != "main" {
+    if abandon && workspace == "main" {
         return Err(UsageError::new(
-            "--restore is only valid for the main workspace",
-            USAGE,
-        ));
-    }
-    if abandon && workspace == "main" && !restore {
-        return Err(UsageError::new(
-            "--abandon on main needs --restore: it keeps main's unpreserved commits in a bundle \
+            "--abandon on main belongs to unadopt: it keeps main's unpreserved commits in a bundle \
              inside the restored checkout",
-            USAGE,
-        ));
-    }
-    let purge = flagged(matches, "purge");
-    if purge && !restore {
-        return Err(UsageError::new(
-            "--purge removes the whole project and needs main --restore",
             USAGE,
         ));
     }
     Ok(Command::Remove(RemoveArgs {
         workspace,
         force: flagged(matches, "force"),
-        restore,
         abandon,
-        purge,
     }))
 }
 
@@ -5613,13 +5629,6 @@ mod tests {
         assert_eq!(args.ref_turn, Some(OsString::from("repo.ref")));
         assert_eq!(args.ref_lock, None);
         assert!(cli.global.json);
-
-        let Command::Remove(remove) = parse_args(["rm", "main", "--restore"]).unwrap().command
-        else {
-            panic!("expected remove")
-        };
-        assert!(remove.restore);
-        assert!(!remove.force);
     }
 
     /// `--force` and `--abandon` are separate flags carrying separate authorizations, and the
@@ -5629,7 +5638,7 @@ mod tests {
         let Command::Remove(plain) = parse_args(["rm", "raven"]).unwrap().command else {
             panic!("expected remove")
         };
-        assert!(!plain.force && !plain.restore && !plain.abandon);
+        assert!(!plain.force && !plain.abandon);
 
         let Command::Remove(forced) = parse_args(["rm", "raven", "--force"]).unwrap().command
         else {
@@ -5651,35 +5660,38 @@ mod tests {
         };
         assert!(both.force && both.abandon);
 
-        // No short spelling. On main, `--abandon` authorizes only what a restore would otherwise
-        // refuse to lose, so it is refused without `--restore`.
+        // No short spelling. On main, `--abandon` authorizes only what unadopt would otherwise
+        // refuse to lose, so rm refuses it and names the verb that takes it.
         assert!(parse_args(["rm", "raven", "-a"]).is_err());
         let error = parse_args(["rm", "main", "--abandon"]).expect_err("main has no landed gate");
-        assert!(error.message.contains("--restore"), "{}", error.message);
+        assert!(error.message.contains("unadopt"), "{}", error.message);
         // Usage text is where the flags are documented deliberately.
+        assert_eq!(error.hint, "cowshed rm <ws> [--force] [--abandon]");
+        for flag in ["--restore", "--purge"] {
+            assert!(parse_args(["rm", "main", flag]).is_err(), "rm main {flag}");
+        }
+    }
+
+    /// `unadopt` reverses `adopt` for the whole project, carries the two authorizations it is
+    /// given to its sessions, and names no workspace.
+    #[test]
+    fn unadopt_parses_abandon_and_force() {
+        let unadopt = |argv: &[&str]| match parse_args(argv.iter().copied()).map(|cli| cli.command)
+        {
+            Ok(Command::Unadopt(args)) => Ok(args),
+            Ok(other) => panic!("expected unadopt, got {other:?}"),
+            Err(error) => Err(error),
+        };
+        assert_eq!(unadopt(&["unadopt"]).unwrap(), UnadoptArgs::default());
         assert_eq!(
-            error.hint,
-            "cowshed rm <ws> [--force] [--restore] [--abandon] [--purge]"
+            unadopt(&["unadopt", "--abandon", "--force"]).unwrap(),
+            UnadoptArgs {
+                abandon: true,
+                force: true
+            }
         );
-        let Command::Remove(discard) = parse_args(["rm", "main", "--restore", "--abandon"])
-            .unwrap()
-            .command
-        else {
-            panic!("expected remove")
-        };
-        assert!(discard.restore && discard.abandon && !discard.force);
-        // `--purge` removes the whole project, so it rides only on main's restore and carries the
-        // session authorizations it is given, never more.
-        let Command::Remove(purge) =
-            parse_args(["rm", "main", "--restore", "--purge", "--force", "--abandon"])
-                .unwrap()
-                .command
-        else {
-            panic!("expected remove")
-        };
-        assert!(purge.purge && purge.restore && purge.force && purge.abandon);
-        assert!(parse_args(["rm", "main", "--purge"]).is_err());
-        assert!(parse_args(["rm", "raven", "--purge"]).is_err());
+        assert!(unadopt(&["unadopt", "--purge"]).is_err());
+        assert!(unadopt(&["unadopt", "main"]).is_err());
     }
 
     /// Which verbs may omit `<ws>` is a parser-level fact, and the split is deliberate: acting on

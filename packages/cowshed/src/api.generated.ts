@@ -2906,15 +2906,15 @@ export type RemovalRefusal = { readonly reason: 'young' } & {
  */
 export type RemoveOptions = {
   readonly force?: boolean;
-  readonly restore?: boolean;
   readonly abandon?: boolean;
 };
 
 /**
- * Authorization for removing a whole adopted project (`Coordinator::remove_project`). `force` and
- * `abandon` mean for every session workspace what they mean for one (`RemoveOptions`); `abandon`
- * also authorizes deleting the abandon bundles in the project's trash, which are then the only
- * copy of those commits, and bundling main's unpreserved commits into the restored checkout.
+ * Authorization for `cowshed unadopt` (`Coordinator::remove_project`), which removes the whole
+ * adopted project. `force` and `abandon` mean for every session workspace what they mean for one
+ * (`RemoveOptions`), except that an abandoned session's bundle goes into the retained checkout's
+ * Git directory; `abandon` also authorizes deleting the abandon bundles in the project's trash,
+ * which are then the only copy of those commits, and bundling main's unpreserved commits there.
  */
 export type RemoveProjectOptions = {
   readonly force?: boolean;

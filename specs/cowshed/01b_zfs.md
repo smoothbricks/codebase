@@ -52,8 +52,8 @@ inheritance and are never mounted themselves, so every workspace and build datas
 inside another dataset's mount. `canmount` is not inherited, so the datasets below them mount normally. Retirement does
 not rely on that inheritance: it unmounts a dataset, sets `canmount=off` on it locally and only then renames it under a
 `.trash` container (`mountpoint=none`). `canmount=off` holds whatever `mountpoint` the dataset carries, so main, whose
-`mountpoint` is set locally to its checkout path and survives a rename, cannot remount there; `rm main --restore`
-retires main this way, into `ws/.trash`, before it swaps the retained tree back (02_workspaces.md, "Checkout layouts").
+`mountpoint` is set locally to its checkout path and survives a rename, cannot remount there; `cowshed unadopt` retires
+main this way, into `ws/.trash`, before it swaps the retained tree back (02_workspaces.md, "Checkout layouts").
 Collection sets `canmount=off` on any dataset it finds under a `.trash` without it before it decides anything else about
 that dataset.
 

@@ -487,6 +487,39 @@ Two namespaces both present, or a malformed intent, are refused by name instead 
 `--repo-id` is an identity override, not a remote check. `origin` may already point at the renamed repository, may still
 use the old path, or may be absent; cowshed does not inspect or rewrite it.
 
+### `cowshed unadopt [--abandon] [--force]`
+
+The reverse of `adopt`, for the whole project. It retires every session workspace, listed or never published, under the
+containment gate `rm` applies, collects their images, then puts the pre-adoption checkout back and unbinds the project.
+Run it from the checkout, or name the project with `--project`; it takes no workspace. A session whose changes main
+holds, or the ref `cowshed push` wrote keeps, retires with no flag, however young; one holding work main lacks refuses
+the unadopt, named. `--force` stops each session's own running jobs instead of waiting for them, and waives nothing
+else. Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.
+
+Before the swap, every `refs/cowshed/*` ref `push` wrote into main is fetched into the retained checkout and read back,
+so the pushed branches outlive the project there; stderr says so. Unadopt refuses (exit 4) when main's head is in
+neither the retained checkout nor a remote ref, because unadopting would drop commits made in main after adoption.
+
+`cowshed unadopt --abandon` unadopts anyway. It bundles each session's work main lacks, as `rm --abandon` would, and
+main's history beyond the retained head into the restored checkout's Git directory — `.git/cowshed/<ws>-<tip>.bundle`
+and `.git/cowshed/abandoned-main-<tip>.bundle` for an ordinary checkout; the report names each path — and it deletes the
+abandon bundles earlier `rm --abandon` runs left in `sessions/.trash`. `cowshed rm main --abandon` is a usage error that
+names `unadopt --abandon`. Recover from the restored checkout:
+
+```sh
+git fetch .git/cowshed/abandoned-main-<tip>.bundle HEAD:refs/heads/recovered-main
+```
+
+Every step is idempotent: a refusal or an interruption is finished by running the same command again from the checkout.
+A checkout with no remote is still found then: removing main records the checkout's path in the project store first. The
+finishing run reports no abandoned work; a bundle the interrupted run reported stays where it said. A store another
+process changed under the collection is refused as retryable (`retry.reason` is `gcPlanStale` in `--json`); run the same
+command again.
+
+Nothing on stdout. With `--json`, the result names every session removal with its report, the collection, the deleted
+trash bundles and main's own report; an abandonment's `targetBranch` for main is the retained checkout's branch (`HEAD`
+when it is detached).
+
 ### `cowshed fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree]`
 
 Clones a live image from the selected repository and mints its own `cowshed/<ws>` branch, the only local branch the
@@ -599,7 +632,7 @@ compilation is mbx's, and a land check builds the same units an interactive comm
 
 `main` cannot take a slot — its mount is fixed by the project's checkout layout.
 
-### `cowshed rm <name> [--force] [--restore] [--abandon]`
+### `cowshed rm <name> [--force] [--abandon]`
 
 Marks the workspace deleted and answers immediately; detach and image deletion run in the background, and the `cowshed`
 process waits for them before it exits, so nothing is left for a later `gc`. Before answering, `rm` collects the build
@@ -690,26 +723,11 @@ Bundles stay until `cowshed gc --abandoned`, but they are never out of sight: a 
 trash keeps and their bytes, `cowshed doctor` reports them as an `abandon-bundles` finding, and `cowshed ls --all` names
 each project's after its table. `gc --abandoned` deletes them, and with them the only copy of their commits.
 
-`cowshed rm main --restore` is the reverse of `adopt`: it puts the pre-adoption checkout back and unbinds the project.
-Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.
-
-A restore refuses (exit 4) when main's head is in neither the retained checkout nor a remote ref, because restoring
-would drop commits made in main after adoption. `cowshed rm main --restore --abandon` restores anyway, and first bundles
-main's history beyond the retained head into the restored checkout's Git directory —
-`.git/cowshed/abandoned-main-<tip>.bundle` for an ordinary checkout; the report names the path. `--abandon` on main
-needs `--restore`. Recover from the restored checkout:
-
-```sh
-git fetch .git/cowshed/abandoned-main-<tip>.bundle HEAD:refs/heads/recovered-main
-```
-
-A restore interrupted after main was retired is finished by running the same command again from the checkout. A checkout
-with no remote is still found then: removing main records the checkout's path in the project store first. The finishing
-run reports no abandoned work; the bundle the interrupted run reported stays where it said.
+Plain `cowshed rm main` throws the warm main image away and needs `--force`; `cowshed unadopt` is the reverse of `adopt`
+that puts the pre-adoption checkout back.
 
 Nothing on stdout — `rm` has no answer to give. With `--json`, the result is `{}`, or
-`{"abandoned":{"head":…,"targetBranch":"main","targetHead":…,"unlandedCommits":9,"bundle":…}}` after an abandonment. For
-main, `targetBranch` is the retained checkout's branch (`HEAD` when it is detached).
+`{"abandoned":{"head":…,"targetBranch":"main","targetHead":…,"unlandedCommits":9,"bundle":…}}` after an abandonment.
 
 ### `cowshed forget <owner/repo> --abandon`
 
@@ -1587,9 +1605,9 @@ seeds a fork or land replaces, an orphan image `gc` collects, the staged image a
 into the project's `sessions/.deleting/` or `build/.deleting/`, and the command nudges the gateway and answers at once;
 the gateway frees the image a bounded cut at a time, one image at a time, and free space catches up while it does, not
 when the command returns. If the gateway is down or does not answer, the command says so on stderr and still answers:
-the image is released, and the gateway's next listing finds it. Removing the whole project with
-`cowshed rm main --restore` frees nothing itself either: it moves its released images into the store's `.deleting/` and
-nudges the gateway before it deletes the project's store directory.
+the image is released, and the gateway's next listing finds it. Removing the whole project with `cowshed unadopt` frees
+nothing itself either: it moves its released images into the store's `.deleting/` and nudges the gateway before it
+deletes the project's store directory.
 
 An image under `sessions/` without its grants sidecar is skipped by other commands with a named warning; `doctor`
 reports it, and `gc` can release it as an orphan after mount and lock checks. `gc` keeps going when an individual

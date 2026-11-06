@@ -10,7 +10,8 @@ use std::process::{Command, Stdio};
 use arrow_ipc::reader::StreamReader;
 use cowshed_core::api::ControllerCommitment;
 use cowshed_core::api::dto::{
-    AdoptOptions, AttachOptions, ForkOptions, LandMode, LandOptions, RemoveOptions, RevisionTarget,
+    AdoptOptions, AttachOptions, ForkOptions, LandMode, LandOptions, RemoveOptions,
+    RemoveProjectOptions, RevisionTarget,
 };
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
@@ -26,7 +27,7 @@ use cowshed_core::storage::job_artifact::{
 };
 use cowshed_core::storage::recovery::{
     IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion,
-    LifecycleIntentJournal, LifecycleIntentPhase, LifecycleIntentRecord,
+    LifecycleIntentJournal, LifecycleIntentPhase, LifecycleIntentRecord, RetireOptions,
 };
 use cowshed_core::{CowshedError, Result};
 use cowshed_os::fork_lock::Spawn as _;
@@ -83,9 +84,9 @@ async fn clean_landed_source_is_physically_deleted_before_reply_and_crash_replay
     LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Retire {
             workspace: name("landed"),
-            options: RemoveOptions {
+            options: RetireOptions {
                 force: true,
-                ..RemoveOptions::default()
+                ..RetireOptions::default()
             },
             containment: None,
             origin: None,
@@ -214,7 +215,7 @@ async fn a_named_rm_abandon_supersedes_its_targets_refused_unfinished_retire() {
             "coordinator.destroy",
             json!({
                 "repoId": fixture.repo, "workspace": "unit",
-                "options": RemoveOptions { abandon: true, force: true, ..RemoveOptions::default() },
+                "options": RemoveOptions { abandon: true, force: true },
             }),
         )
         .await
@@ -639,7 +640,7 @@ async fn ignored_and_hidden_content_is_released_and_visible_content_is_refused_u
             "coordinator.destroy",
             json!({
                 "repoId": fixture.repo, "workspace": "notes",
-                "options": RemoveOptions { force: true, abandon: true, ..RemoveOptions::default() },
+                "options": RemoveOptions { force: true, abandon: true },
             }),
         )
         .await
@@ -664,25 +665,24 @@ async fn ignored_and_hidden_content_is_released_and_visible_content_is_refused_u
     runtime.shutdown().await.expect("stop runtime");
 }
 
-/// A restore whose unbinding fails after main retired is finished by the same command again
-/// (02_workspaces.md, `rm main --restore`): the reopening that replays its journaled retirement
-/// leaves it unfinished for the restore, and the retry removes the binding rather than answering
+/// An unadopt whose unbinding fails after main retired is finished by the same command again
+/// (02_workspaces.md, "Checkout layouts"): the reopening that replays its journaled retirement
+/// leaves it unfinished for unadopt, and the retry removes the binding rather than answering
 /// with a recorded success while the binding stands.
 #[tokio::test]
-async fn a_restore_whose_unbinding_failed_is_finished_by_its_retry() {
-    let fixture = Fixture::new("restore-retry");
+async fn an_unadopt_whose_unbinding_failed_is_finished_by_its_retry() {
+    let fixture = Fixture::new("unadopt-retry");
     let runtime = fixture.adopt().await;
     let layout = fixture.layout();
     let stray = layout.project().mount_root.join("stray/notes.txt");
     fs::create_dir_all(stray.parent().unwrap()).unwrap();
     fs::write(&stray, b"left in the mount tree").unwrap();
-    let restore = json!({
+    let unadopt = json!({
         "repoId": fixture.repo,
-        "workspace": "main",
-        "options": RemoveOptions { restore: true, ..RemoveOptions::default() },
+        "options": RemoveProjectOptions::default(),
     });
     let error = fixture
-        .call(&runtime, "coordinator.destroy", restore.clone())
+        .call(&runtime, "coordinator.removeProject", unadopt.clone())
         .await
         .expect_err("a file in the mount tree fails the unbinding after main retired");
     assert!(error.message.contains("notes.txt"), "{}", error.message);
@@ -698,14 +698,65 @@ async fn a_restore_whose_unbinding_failed_is_finished_by_its_retry() {
         .await
         .expect("the retry reopens the still-bound project");
     fixture
-        .call(&retry, "coordinator.destroy", restore)
+        .call(&retry, "coordinator.removeProject", unadopt)
         .await
-        .expect("the retry finishes the restore");
+        .expect("the retry finishes the unadopt");
     assert!(
         !layout.project().repository_binding.exists(),
         "the retry answered while the binding stood"
     );
     retry.shutdown().await.expect("stop the retry runtime");
+}
+
+/// `unadopt --abandon` retires a session holding work main lacks into a verified bundle in the
+/// retained checkout's Git directory, beside main's, never into the project trash that goes with
+/// the project; without `--abandon` that session refuses the unadopt, named, and its youth refuses
+/// nothing, since unadopt names the whole project (02_workspaces.md,
+/// "Checkout layouts").
+#[tokio::test]
+async fn unadopt_abandon_keeps_a_sessions_work_in_the_retained_checkout() {
+    let fixture = Fixture::new("unadopt-abandon");
+    let runtime = fixture.adopt().await;
+    let minted = fixture
+        .mint(&runtime, "notes", ForkOptions::default())
+        .await
+        .expect("fork");
+    let mount = PathBuf::from(minted["info"]["mount"].as_str().unwrap());
+    fs::write(mount.join("private-notes"), b"only visible copy\n").unwrap();
+    let unadopt = |abandon| {
+        json!({
+            "repoId": fixture.repo,
+            "options": RemoveProjectOptions { force: false, abandon },
+        })
+    };
+    let refusal = fixture
+        .call(&runtime, "coordinator.removeProject", unadopt(false))
+        .await
+        .expect_err("a session holding work main lacks refuses the unadopt");
+    assert!(
+        refusal
+            .message
+            .ends_with("workspace notes has uncommitted work: private-notes"),
+        "{refusal:?}"
+    );
+    assert!(fixture.layout().project().repository_binding.exists());
+
+    let report = fixture
+        .call(&runtime, "coordinator.removeProject", unadopt(true))
+        .await
+        .expect("--abandon unadopts the whole project");
+    let abandoned = &report["removed"][0]["report"]["abandoned"];
+    assert_eq!(report["removed"][0]["workspace"], "notes", "{report}");
+    let bundle = PathBuf::from(abandoned["bundle"].as_str().expect("the session's bundle"));
+    assert!(bundle.is_file(), "{report}");
+    assert_eq!(
+        fs::canonicalize(bundle.parent().unwrap()).unwrap(),
+        fs::canonicalize(fixture.checkout.join(".git/cowshed")).unwrap(),
+        "the bundle is in the restored checkout's Git directory: {report}"
+    );
+    assert!(abandoned["uncommitted"].is_string(), "{report}");
+    assert!(!fixture.layout().project().repository_binding.exists());
+    runtime.shutdown().await.expect("stop runtime");
 }
 /// The directory store of the fixture whose scratch root is `scratch`: its `store` directory.
 fn fixture_storage(namespace: TestNamespace, scratch: &Path) -> ValidatedHostStorage {
@@ -2650,7 +2701,7 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
             "coordinator.destroy",
             json!({
                 "repoId": fixture.repo, "workspace": "finished",
-                "options": RemoveOptions { abandon: true, force: true, ..RemoveOptions::default() },
+                "options": RemoveOptions { abandon: true, force: true },
             }),
         )
         .await
@@ -2943,7 +2994,7 @@ async fn rm_refuses_a_young_or_dirty_workspace_and_abandon_bundles_its_dirt() {
             "coordinator.destroy",
             json!({
                 "repoId": fixture.repo, "workspace": "fresh",
-                "options": RemoveOptions { force: true, abandon: true, ..RemoveOptions::default() },
+                "options": RemoveOptions { force: true, abandon: true },
             }),
         )
         .await

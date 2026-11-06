@@ -6,12 +6,13 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{
-    AbandonedPreservation, AdoptOptions, LandingCommits, RemoveOptions, RemoveReport, UnlandedPaths,
+    AbandonedPreservation, AdoptOptions, LandingCommits, RemoveReport, UnlandedPaths,
 };
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
     IntentLease, IntentLeases, KeptAbandonBundles, LIFECYCLE_INTENTS_FILE, LifecycleIntent,
     LifecycleIntentCompletion, LifecycleIntentJournal, LifecycleIntentPhase, MintOptions,
+    RetireOptions,
 };
 use cowshed_os::fork_lock::Spawn as _;
 
@@ -227,9 +228,9 @@ fn intent(operation: &str) -> LifecycleIntent {
         },
         "remove" => LifecycleIntent::Retire {
             workspace: workspace("removed"),
-            options: RemoveOptions {
+            options: RetireOptions {
                 force: true,
-                ..RemoveOptions::default()
+                ..RetireOptions::default()
             },
             containment: None,
             origin: None,
@@ -237,7 +238,7 @@ fn intent(operation: &str) -> LifecycleIntent {
         other => panic!("unknown crash fixture operation {other}"),
     }
 }
-fn retire(name: &str, options: RemoveOptions) -> LifecycleIntent {
+fn retire(name: &str, options: RetireOptions) -> LifecycleIntent {
     LifecycleIntent::Retire {
         workspace: workspace(name),
         options,
@@ -359,7 +360,7 @@ fn crash_then_recover(operation: &str) {
 #[test]
 fn read_only_startup_discards_a_refused_retirement_before_listing() {
     let mut journal = LifecycleIntentJournal::default();
-    journal.begin(retire("dirty", RemoveOptions::default()));
+    journal.begin(retire("dirty", RetireOptions::default()));
 
     let discarded = journal.discard_prepared_retirement(&workspace("dirty"));
 
@@ -373,7 +374,7 @@ fn read_only_startup_discards_a_refused_retirement_before_listing() {
 #[test]
 fn refused_retirement_cannot_hide_a_later_force_authorization() {
     let mut journal = LifecycleIntentJournal::default();
-    journal.begin(retire("dirty", RemoveOptions::default()));
+    journal.begin(retire("dirty", RetireOptions::default()));
     assert!(
         journal.discard_prepared_retirement(&workspace("dirty")),
         "startup must discard the earlier unforced request before dispatch"
@@ -381,9 +382,9 @@ fn refused_retirement_cannot_hide_a_later_force_authorization() {
 
     journal.begin(retire(
         "dirty",
-        RemoveOptions {
+        RetireOptions {
             force: true,
-            ..RemoveOptions::default()
+            ..RetireOptions::default()
         },
     ));
     let record = journal.get(&workspace("dirty")).expect("forced request");
@@ -396,7 +397,7 @@ fn refused_retirement_cannot_hide_a_later_force_authorization() {
 #[test]
 fn refused_retirement_cannot_hide_a_later_abandon_authorization() {
     let mut journal = LifecycleIntentJournal::default();
-    journal.begin(retire("unlanded", RemoveOptions::default()));
+    journal.begin(retire("unlanded", RetireOptions::default()));
     assert!(
         journal.discard_prepared_retirement(&workspace("unlanded")),
         "startup must discard the earlier non-abandoning request before dispatch"
@@ -404,9 +405,9 @@ fn refused_retirement_cannot_hide_a_later_abandon_authorization() {
 
     journal.begin(retire(
         "unlanded",
-        RemoveOptions {
+        RetireOptions {
             abandon: true,
-            ..RemoveOptions::default()
+            ..RetireOptions::default()
         },
     ));
     let record = journal
@@ -421,7 +422,7 @@ fn refused_retirement_cannot_hide_a_later_abandon_authorization() {
 #[test]
 fn prepared_retirement_of_one_workspace_cannot_block_an_unrelated_command() {
     let mut journal = LifecycleIntentJournal::default();
-    journal.begin(retire("unrelated", RemoveOptions::default()));
+    journal.begin(retire("unrelated", RetireOptions::default()));
     journal.begin(LifecycleIntent::Create {
         workspace: workspace("requested"),
         options: MintOptions::default(),
@@ -437,7 +438,7 @@ fn prepared_retirement_of_one_workspace_cannot_block_an_unrelated_command() {
 fn mutating_retirement_remains_recoverable_after_a_crash() {
     let name = workspace("retiring");
     let mut journal = LifecycleIntentJournal::default();
-    journal.begin(retire("retiring", RemoveOptions::default()));
+    journal.begin(retire("retiring", RetireOptions::default()));
     journal
         .mark_mutating(&name)
         .expect("cross the retirement mutation fence");
@@ -453,7 +454,7 @@ fn mutating_retirement_remains_recoverable_after_a_crash() {
 fn a_refused_clone_puts_back_the_record_it_superseded() {
     let name = workspace("created");
     let mut journal = LifecycleIntentJournal::default();
-    journal.begin(retire("created", RemoveOptions::default()));
+    journal.begin(retire("created", RetireOptions::default()));
     journal
         .complete(
             &name,
@@ -556,7 +557,7 @@ fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_author
         journal.begin(clone.clone());
         journal.begin(LifecycleIntent::Retire {
             workspace: name.clone(),
-            options: RemoveOptions::default(),
+            options: RetireOptions::default(),
             containment: None,
             origin: Some(Box::new(clone.clone())),
         });
@@ -569,9 +570,9 @@ fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_author
         assert_eq!(reopened.get(&name).unwrap().operation, clone);
         reopened.begin(LifecycleIntent::Retire {
             workspace: name.clone(),
-            options: RemoveOptions {
+            options: RetireOptions {
                 abandon: true,
-                ..RemoveOptions::default()
+                ..RetireOptions::default()
             },
             containment: None,
             origin: Some(Box::new(clone.clone())),
@@ -623,7 +624,7 @@ fn a_killed_create_keeps_its_intent_when_another_process_updates_the_journal() {
     assert!(!status.success(), "the create child is killed mid-flight");
 
     LifecycleIntentJournal::update(&census(), &journal_path, |journal| {
-        journal.begin(retire("unrelated", RemoveOptions::default()));
+        journal.begin(retire("unrelated", RetireOptions::default()));
         Ok(())
     })
     .expect("record the other process's step");
@@ -652,9 +653,9 @@ fn lifecycle_lease_child() {
     LifecycleIntentJournal::update(&census(), &root.join(LIFECYCLE_INTENTS_FILE), |journal| {
         journal.begin(retire(
             "removed",
-            RemoveOptions {
+            RetireOptions {
                 abandon: true,
-                ..RemoveOptions::default()
+                ..RetireOptions::default()
             },
         ));
         journal.mark_mutating(&name)

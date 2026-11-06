@@ -3569,7 +3569,6 @@ pub struct CacheClearReport {
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveOptions {
     pub force: bool,
-    pub restore: bool,
     pub abandon: bool,
 }
 
@@ -3582,10 +3581,11 @@ pub struct GcOptions {
     pub abandoned: bool,
 }
 
-/// Authorization for removing a whole adopted project (`Coordinator::remove_project`). `force` and
-/// `abandon` mean for every session workspace what they mean for one (`RemoveOptions`); `abandon`
-/// also authorizes deleting the abandon bundles in the project's trash, which are then the only
-/// copy of those commits, and bundling main's unpreserved commits into the restored checkout.
+/// Authorization for `cowshed unadopt` (`Coordinator::remove_project`), which removes the whole
+/// adopted project. `force` and `abandon` mean for every session workspace what they mean for one
+/// (`RemoveOptions`), except that an abandoned session's bundle goes into the retained checkout's
+/// Git directory; `abandon` also authorizes deleting the abandon bundles in the project's trash,
+/// which are then the only copy of those commits, and bundling main's unpreserved commits there.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveProjectOptions {
@@ -4433,7 +4433,7 @@ pub enum AbandonedPreservation {
     /// `refs/cowshed/<ws>/abandoned/<head>/`. No build writes or reads those refs now; the record is
     /// read for what that removal did.
     Preserved { refs: Vec<PreservedRef> },
-    /// Main's own `--restore --abandon`: main's repository is what is being restored, so there is
+    /// Main's own `unadopt --abandon`: main's repository is what is being restored, so there is
     /// no main to keep refs in; the bundle in the restored checkout's Git directory holds them.
     NothingToPreserve,
     /// The bundle is the only copy (01_storage.md, "Retention"): every session abandonment.
