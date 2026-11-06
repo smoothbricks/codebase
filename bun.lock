@@ -124,7 +124,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.4.10-next.0",
+      "version": "0.5.0",
       "bin": {
         "cowshed": "./bin/cowshed",
       },
