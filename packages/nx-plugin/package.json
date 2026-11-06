@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/nx-plugin",
-  "version": "0.7.16",
+  "version": "0.7.17-next.0",
   "type": "module",
   "sideEffects": false,
   "main": "./loader.js",
