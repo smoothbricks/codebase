@@ -30,14 +30,27 @@ pub fn align_to_8(size: usize) -> usize {
     (size + 7) & !7usize
 }
 
-/// Exact size of the RecordBatch FlatBuffer metadata this encoder emits
-/// (`recordBatchMetadataSize`): 76-byte base + 16 bytes per buffer/node
-/// vector entry, 8-aligned.
-pub fn record_batch_metadata_size(field_count: u32, buffer_count: u32) -> usize {
-    let base_overhead = 76usize;
-    let buffers_vec_size = 4 + buffer_count as usize * 16;
-    let nodes_vec_size = 4 + field_count as usize * 16;
-    align_to_8(base_overhead + buffers_vec_size + nodes_vec_size)
+/// Exact size of the RecordBatch Message metadata, including standard per-batch
+/// KeyValue pairs. An empty slice keeps the original message layout unchanged.
+pub fn record_batch_metadata_size(
+    field_count: u32,
+    buffer_count: u32,
+    custom_metadata: &[(&str, &str)],
+) -> usize {
+    if custom_metadata.is_empty() {
+        return align_to_8(76 + 4 + buffer_count as usize * 16 + 4 + field_count as usize * 16);
+    }
+    let mut size =
+        104 + (buffer_count as usize + field_count as usize) * 16 + 4 + custom_metadata.len() * 4;
+    for (key, value) in custom_metadata {
+        // KeyValue vtable (8), table (12), and two length-prefixed, NUL-terminated strings.
+        size += 20 + align_to_4(5 + key.len()) + align_to_4(5 + value.len());
+    }
+    align_to_8(size)
+}
+
+fn align_to_4(size: usize) -> usize {
+    (size + 3) & !3usize
 }
 
 /// Retained-metadata limits (`MetadataLimits`).
@@ -307,13 +320,14 @@ pub fn encode_record_batch_dynamic(
     buffer_descs: &[BufferDesc],
     body: &[u8],
     body_length: usize,
+    custom_metadata: &[(&str, &str)],
 ) -> usize {
     let field_count = field_nodes.len() as u32;
     let buffer_count = buffer_descs.len() as u32;
 
     // Compute metadata size from the field and buffer vectors.
     let buffers_vec_size = 4 + buffer_count as usize * 16;
-    let metadata_size = record_batch_metadata_size(field_count, buffer_count);
+    let metadata_size = record_batch_metadata_size(field_count, buffer_count, custom_metadata);
 
     // 8 = continuation + metadata_size prefix.
     let total_size = 8 + metadata_size + body_length;
@@ -331,59 +345,56 @@ pub fn encode_record_batch_dynamic(
     // Clear metadata area, then build the FlatBuffer in place.
     output[metadata_start..metadata_start + metadata_size].fill(0);
 
-    // FlatBuffer layout (offsets relative to metadata_start):
-    //   0: root offset -> Message table at 20
-    //   8: Message vtable, 20: Message table
-    //  42: RecordBatch vtable, 52: RecordBatch table
-    //  76: buffers vector, 76+buffers_vec_size: nodes vector
-    put_u32(output, metadata_start, 20);
-
-    // Message vtable (at 8): [vtable_size][table_size][field offsets...]
-    let msg_vtable = metadata_start + 8;
-    put_u16(output, msg_vtable, 12); // vtable size
-    put_u16(output, msg_vtable + 2, 22); // table size
-    put_u16(output, msg_vtable + 4, 20); // version offset
-    put_u16(output, msg_vtable + 6, 19); // header_type offset
-    put_u16(output, msg_vtable + 8, 12); // header offset
-    put_u16(output, msg_vtable + 10, 4); // bodyLength offset
-
-    // Message table (at 20): soffset to vtable (20-12=8).
-    put_i32(output, metadata_start + 20, 12);
-    // bodyLength at 24 (i64).
-    put_i64(output, metadata_start + 24, body_length as i64);
-    // header offset at 32: RecordBatch table at 52, relative 52-32=20.
-    put_u32(output, metadata_start + 32, 20);
-    // version at 40 (u16) = 4 (IPC v4).
-    put_u16(output, metadata_start + 40, 4);
-    // header_type at 39 (u8) = 3 (RecordBatch).
-    output[metadata_start + 39] = 3;
-
-    // RecordBatch vtable (at 42).
-    let rb_vtable = metadata_start + 42;
-    put_u16(output, rb_vtable, 10); // vtable size
-    put_u16(output, rb_vtable + 2, 24); // table size
-    put_u16(output, rb_vtable + 4, 12); // length offset
-    put_u16(output, rb_vtable + 6, 8); // nodes offset
-    put_u16(output, rb_vtable + 8, 4); // buffers offset
-
-    // RecordBatch table (at 52): soffset to vtable (52-10=42).
-    put_i32(output, metadata_start + 52, 10);
-    // buffers vector offset at 56 (relative).
-    let buffers_vector_offset = 76usize;
-    put_u32(
-        output,
-        metadata_start + 56,
-        (buffers_vector_offset - 56) as u32,
-    );
-    // nodes vector offset at 60 (relative).
-    let nodes_vector_offset = buffers_vector_offset + buffers_vec_size;
-    put_u32(
-        output,
-        metadata_start + 60,
-        (nodes_vector_offset - 60) as u32,
-    );
-    // length (row_count) at 64 (i64).
-    put_i64(output, metadata_start + 64, row_count);
+    let (buffers_vector_offset, nodes_vector_offset) = if custom_metadata.is_empty() {
+        // Original Message and RecordBatch layout: no custom_metadata vtable entry.
+        put_u32(output, metadata_start, 20);
+        let msg_vtable = metadata_start + 8;
+        put_u16(output, msg_vtable, 12);
+        put_u16(output, msg_vtable + 2, 22);
+        put_u16(output, msg_vtable + 4, 20);
+        put_u16(output, msg_vtable + 6, 19);
+        put_u16(output, msg_vtable + 8, 12);
+        put_u16(output, msg_vtable + 10, 4);
+        put_i32(output, metadata_start + 20, 12);
+        put_i64(output, metadata_start + 24, body_length as i64);
+        put_u32(output, metadata_start + 32, 20);
+        put_u16(output, metadata_start + 40, 4);
+        output[metadata_start + 39] = 3;
+        let rb_vtable = metadata_start + 42;
+        put_u16(output, rb_vtable, 10);
+        put_u16(output, rb_vtable + 2, 24);
+        put_u16(output, rb_vtable + 4, 12);
+        put_u16(output, rb_vtable + 6, 8);
+        put_u16(output, rb_vtable + 8, 4);
+        put_i32(output, metadata_start + 52, 10);
+        put_u32(output, metadata_start + 56, 20);
+        put_u32(output, metadata_start + 60, (16 + buffers_vec_size) as u32);
+        put_i64(output, metadata_start + 64, row_count);
+        (76, 76 + buffers_vec_size)
+    } else {
+        // Message.fbs fields: version, header_type, header, bodyLength, custom_metadata.
+        // The larger vtable precedes Message at 24; RecordBatch follows at 64.
+        put_u32(output, metadata_start, 24);
+        let msg_vtable = metadata_start + 8;
+        for (index, value) in [14, 28, 26, 25, 16, 8, 20].into_iter().enumerate() {
+            put_u16(output, msg_vtable + index * 2, value);
+        }
+        put_i32(output, metadata_start + 24, 16);
+        put_i64(output, metadata_start + 32, body_length as i64);
+        put_u32(output, metadata_start + 40, 24);
+        output[metadata_start + 49] = 3;
+        put_u16(output, metadata_start + 50, 4);
+        let rb_vtable = metadata_start + 52;
+        for (index, value) in [10, 24, 16, 8, 4].into_iter().enumerate() {
+            put_u16(output, rb_vtable + index * 2, value);
+        }
+        put_i32(output, metadata_start + 64, 12);
+        put_u32(output, metadata_start + 68, 24);
+        let nodes = 100 + buffer_count as usize * 16;
+        put_u32(output, metadata_start + 72, (nodes - 72) as u32);
+        put_i64(output, metadata_start + 80, row_count);
+        (92, nodes)
+    };
 
     // Buffers vector.
     put_u32(output, metadata_start + buffers_vector_offset, buffer_count);
@@ -403,6 +414,33 @@ pub fn encode_record_batch_dynamic(
         at += 8;
         put_i64(output, at, node.null_count);
         at += 8;
+    }
+
+    if !custom_metadata.is_empty() {
+        let vector = metadata_start + nodes_vector_offset + 4 + field_nodes.len() * 16;
+        put_u32(
+            output,
+            metadata_start + 44,
+            (vector - metadata_start - 44) as u32,
+        );
+        put_u32(output, vector, custom_metadata.len() as u32);
+        let mut entry = vector + 4 + custom_metadata.len() * 4;
+        for (index, (key, value)) in custom_metadata.iter().enumerate() {
+            let table = entry + 8;
+            let slot = vector + 4 + index * 4;
+            put_u32(output, slot, (table - slot) as u32);
+            for (index, value) in [8, 12, 4, 8].into_iter().enumerate() {
+                put_u16(output, entry + index * 2, value);
+            }
+            put_i32(output, table, 8);
+            entry = table + 12;
+            for (slot, text) in [(table + 4, *key), (table + 8, *value)] {
+                put_u32(output, slot, (entry - slot) as u32);
+                put_u32(output, entry, text.len() as u32);
+                output[entry + 4..entry + 4 + text.len()].copy_from_slice(text.as_bytes());
+                entry += align_to_4(5 + text.len());
+            }
+        }
     }
 
     write_offset += metadata_size;
@@ -640,8 +678,16 @@ mod tests {
         let body = builder.body().to_vec();
 
         let mut output = [0u8; 1024];
-        let result =
-            encode_record_batch_dynamic(&mut output, 1, None, &nodes, &descs, &body, body_length);
+        let result = encode_record_batch_dynamic(
+            &mut output,
+            1,
+            None,
+            &nodes,
+            &descs,
+            &body,
+            body_length,
+            &[],
+        );
         assert_eq!(
             u32::from_le_bytes(output[0..4].try_into().unwrap()),
             0xFFFF_FFFF
@@ -653,7 +699,7 @@ mod tests {
     #[test]
     fn encode_4_field_in_place() {
         let mut output = [0u8; 2048];
-        let body_start = 8 + record_batch_metadata_size(4, 11);
+        let body_start = 8 + record_batch_metadata_size(4, 11, &[]);
         let mut metadata = MetadataStorage::for_counts(4, 11, MetadataLimits::default()).unwrap();
         let (body_length, nodes, descs) = {
             let mut builder = DynamicBodyBuilder::new(&mut output[body_start..], &mut metadata);
@@ -721,6 +767,7 @@ mod tests {
             &descs,
             &[],
             body_length,
+            &[],
         );
         assert_eq!(
             u32::from_le_bytes(output[0..4].try_into().unwrap()),
@@ -729,5 +776,37 @@ mod tests {
         let metadata_size = u32::from_le_bytes(output[4..8].try_into().unwrap());
         assert!(metadata_size > 100 && metadata_size < 400);
         assert_eq!(8 + metadata_size as usize + body_length, result);
+    }
+
+    #[test]
+    fn empty_message_metadata_keeps_the_original_exact_bytes() {
+        let nodes = [FieldNode {
+            length: 1,
+            null_count: 0,
+        }];
+        let buffers = [BufferDesc {
+            offset: 0,
+            length: 8,
+        }];
+        let mut output = [0xaa; 136];
+        let written = encode_record_batch_dynamic(
+            &mut output,
+            1,
+            None,
+            &nodes,
+            &buffers,
+            &42_i64.to_le_bytes(),
+            8,
+            &[],
+        );
+        let expected = [
+            255, 255, 255, 255, 120, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 12, 0, 22, 0, 20, 0, 19, 0,
+            12, 0, 4, 0, 12, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 3, 4, 0, 10, 0,
+            24, 0, 12, 0, 8, 0, 4, 0, 10, 0, 0, 0, 20, 0, 0, 0, 36, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(written, expected.len());
+        assert_eq!(output, expected);
     }
 }

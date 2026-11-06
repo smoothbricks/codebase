@@ -580,12 +580,13 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
         input: &[u8],
         format: InputFormat,
         output: &mut [u8],
+        batch_metadata: &[(&str, &str)],
     ) -> ResultCode {
         if output.len() < RESULT_HEADER_SIZE {
             return ResultCode::OutputTooSmall;
         }
         match self.parse(input, format) {
-            Ok(batch) => batch.encode(output),
+            Ok(batch) => batch.encode(output, batch_metadata),
             Err(error) => {
                 match error.diagnostic {
                     Some(diagnostic) if self.plane.options.diagnostics => {
@@ -679,13 +680,14 @@ impl ParsedBatch<'_> {
     /// Encode the columns into `[ResultHeader][Arrow IPC]`, writing a
     /// success header with zeroed bytes 16..32. `Err` means the encoded
     /// batch did not fit — nothing reached the caller.
-    pub fn encode(self, output: &mut [u8]) -> ResultCode {
+    pub fn encode(self, output: &mut [u8], batch_metadata: &[(&str, &str)]) -> ResultCode {
         let rows = self.columns.count;
         match write_arrow_ipc_from_dynamic_columns(
             self.columns,
             self.schema_config,
             &mut output[RESULT_HEADER_SIZE..],
             self.record_batch_metadata,
+            batch_metadata,
         ) {
             Ok(len) => {
                 let written = u32::try_from(len)
@@ -721,7 +723,12 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
     /// caller arms a semantic envelope on a compact handle, and a processor
     /// whose envelope holds value-object nodes refuses compact batches as
     /// `InvalidFormat` rather than writing value objects it never admitted.
-    pub fn compact(&mut self, batch: &[u8], output: &mut [u8]) -> ResultCode {
+    pub fn compact(
+        &mut self,
+        batch: &[u8],
+        output: &mut [u8],
+        batch_metadata: &[(&str, &str)],
+    ) -> ResultCode {
         if output.len() < RESULT_HEADER_SIZE {
             return ResultCode::OutputTooSmall;
         }
@@ -748,9 +755,11 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
             }
         };
 
-        let required_ipc = match required_arrow_ipc_len(&plane.schema_config, |index| {
-            view.column(index, &plane.schema_config)
-        }) {
+        let required_ipc = match required_arrow_ipc_len(
+            &plane.schema_config,
+            |index| view.column(index, &plane.schema_config),
+            batch_metadata,
+        ) {
             Ok(required) => required,
             Err(_) => {
                 let diagnostic = compact_encode_diagnostic();
@@ -788,6 +797,7 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
             &mut plane.record_batch_metadata,
             |index| view.column(index, &plane.schema_config),
             |index| view.null_count(index),
+            batch_metadata,
         );
         match result {
             Ok(written) => {
@@ -1180,6 +1190,30 @@ mod tests {
         DynamicSchemaConfig::from_physical_fields_with_names(fields, names).unwrap()
     }
 
+    fn assert_batch_metadata(output: &[u8], expected: &str) {
+        let (_, offset, length, _, _) = read_result_header(output);
+        let stream = &output[offset as usize..(offset + length) as usize];
+        let schema_length = u32::from_le_bytes(stream[4..8].try_into().unwrap()) as usize;
+        let schema = arrow_ipc::root_as_message(&stream[8..8 + schema_length]).unwrap();
+        assert!(
+            schema.custom_metadata().is_none(),
+            "schema is entry-independent"
+        );
+        let batch_start = 8 + schema_length;
+        let batch_length =
+            u32::from_le_bytes(stream[batch_start + 4..batch_start + 8].try_into().unwrap())
+                as usize;
+        let batch =
+            arrow_ipc::root_as_message(&stream[batch_start + 8..batch_start + 8 + batch_length])
+                .unwrap();
+        let metadata = batch
+            .custom_metadata()
+            .expect("per-batch metadata forwarded");
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata.get(0).key(), Some("source"));
+        assert_eq!(metadata.get(0).value(), Some(expected));
+    }
+
     #[test]
     fn compact_null_rows_ignore_parse_column_capacity_and_round_trip() {
         let schema =
@@ -1195,7 +1229,11 @@ mod tests {
         request[COMPACT_HEADER_SIZE] = ArrowType::Null as u8;
 
         let mut output = vec![0u8; 8192];
-        assert_eq!(processor.compact(&request, &mut output), ResultCode::Ok);
+        assert_eq!(
+            processor.compact(&request, &mut output, &[("source", "compact-α")]),
+            ResultCode::Ok
+        );
+        assert_batch_metadata(&output, "compact-α");
         let (code, arrow_offset, arrow_len, rows, duplicates) = read_result_header(&output);
         assert_eq!(
             (code, arrow_offset, rows, duplicates),
@@ -1223,7 +1261,12 @@ mod tests {
         let input = br#"[{"id":"test","type":"click","timestamp":1705315800000000}]"#;
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
-            ep.create_log_entry(input, InputFormat::Json, &mut output),
+            ep.create_log_entry(
+                input,
+                InputFormat::Json,
+                &mut output,
+                &[("source", "parsed-α")]
+            ),
             ResultCode::Ok
         );
         let (code, arrow_offset, arrow_len, processed, dupes) = read_result_header(&output);
@@ -1232,6 +1275,7 @@ mod tests {
         assert!(arrow_len > 0);
         assert_eq!(processed, 1);
         assert_eq!(dupes, 0);
+        assert_batch_metadata(&output, "parsed-α");
     }
 
     #[test]
@@ -1244,7 +1288,7 @@ mod tests {
             br#"[{"id":"a-1","type":"click","timestamp":100,"value":{"x":1}},{"id":"a-2","type":"view","timestamp":200}]"#;
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
-            ep.create_log_entry(input, InputFormat::Json, &mut output),
+            ep.create_log_entry(input, InputFormat::Json, &mut output, &[]),
             ResultCode::Ok
         );
         let (code, _, arrow_len, processed, dupes) = read_result_header(&output);
@@ -1274,7 +1318,7 @@ mod tests {
         .unwrap();
         let mut base_out = vec![0u8; 64 * 1024];
         assert_eq!(
-            base_ep.create_log_entry(input, InputFormat::Json, &mut base_out),
+            base_ep.create_log_entry(input, InputFormat::Json, &mut base_out, &[]),
             ResultCode::Ok
         );
 
@@ -1286,7 +1330,7 @@ mod tests {
         .unwrap();
         let mut dyn_out = vec![0u8; 64 * 1024];
         assert_eq!(
-            dyn_ep.create_log_entry(dyn_input, InputFormat::Json, &mut dyn_out),
+            dyn_ep.create_log_entry(dyn_input, InputFormat::Json, &mut dyn_out, &[]),
             ResultCode::Ok
         );
 
@@ -1306,7 +1350,7 @@ mod tests {
         let mut ep = EventProcessor::new(admission_options(), 10, schema).unwrap();
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
-            ep.create_log_entry(b"not json", InputFormat::Json, &mut output),
+            ep.create_log_entry(b"not json", InputFormat::Json, &mut output, &[]),
             ResultCode::ParseError
         );
         let (code, ..) = read_result_header(&output);
@@ -1316,7 +1360,7 @@ mod tests {
         assert_eq!(output[21], diagnostic_stage::JSON);
 
         assert_eq!(
-            ep.create_log_entry(b"[]", InputFormat::ArrowPassthrough, &mut output),
+            ep.create_log_entry(b"[]", InputFormat::ArrowPassthrough, &mut output, &[]),
             ResultCode::InvalidFormat
         );
     }
@@ -1389,12 +1433,12 @@ mod tests {
 
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
-            consumer_ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output),
+            consumer_ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output, &[]),
             ResultCode::ParseError,
             "admission options: no msgpack growth, overflow surfaces"
         );
         assert_eq!(
-            col_ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output),
+            col_ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output, &[]),
             ResultCode::Ok,
             "columine options: workspace grows and the batch succeeds"
         );
@@ -1433,11 +1477,11 @@ mod tests {
                 (msgpack.as_slice(), InputFormat::MsgpackStream),
             ] {
                 assert_eq!(
-                    lazy.create_log_entry(input, format, &mut actual),
+                    lazy.create_log_entry(input, format, &mut actual, &[]),
                     ResultCode::Ok
                 );
                 assert_eq!(
-                    presized.create_log_entry(input, format, &mut expected),
+                    presized.create_log_entry(input, format, &mut expected, &[]),
                     ResultCode::Ok
                 );
                 let (_, offset, length, rows, _) = read_result_header(&actual);
@@ -1473,7 +1517,7 @@ mod tests {
         }
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
-            ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output),
+            ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output, &[]),
             ResultCode::ParseError
         );
         assert_eq!(output[20], DIAGNOSTIC_ABI_VERSION);
@@ -1493,7 +1537,7 @@ mod tests {
         // Exactly the plane is legal.
         let exact = &input[..input.len() / 3 * 2];
         assert_eq!(
-            ep.create_log_entry(exact, InputFormat::MsgpackStream, &mut output),
+            ep.create_log_entry(exact, InputFormat::MsgpackStream, &mut output, &[]),
             ResultCode::Ok
         );
     }
@@ -1520,7 +1564,7 @@ mod tests {
         let input = br#"[{"id":"greeting:42","type":"hi","timestamp":1,"value":{"greeting":42}}]"#;
         let mut output = vec![0xa5; 4096];
         assert_eq!(
-            ep.create_log_entry(input, InputFormat::Json, &mut output),
+            ep.create_log_entry(input, InputFormat::Json, &mut output, &[]),
             ResultCode::ParseError
         );
         let diagnostic = ep.payload_validation_diagnostic().unwrap();
@@ -1603,7 +1647,8 @@ mod tests {
             ep.create_log_entry(
                 br#"[{"id":"a","type":"hi","timestamp":1,"value":{"greeting":42}}]"#,
                 InputFormat::Json,
-                &mut output
+                &mut output,
+                &[]
             ),
             ResultCode::ParseError,
             "the prepared envelope still judges"
@@ -1620,7 +1665,8 @@ mod tests {
             ep.create_log_entry(
                 br#"[{"id":"a","type":"hi","timestamp":1,"value":{"greeting":"ok"}}]"#,
                 InputFormat::Json,
-                &mut output
+                &mut output,
+                &[]
             ),
             ResultCode::Ok
         );
@@ -1634,7 +1680,7 @@ mod tests {
             (&br#"[{"id":"b","timestamp":2}]"#[..], None, "absent"),
         ] {
             assert_eq!(
-                ep.create_log_entry(input, InputFormat::Json, &mut output),
+                ep.create_log_entry(input, InputFormat::Json, &mut output, &[]),
                 ResultCode::ParseError
             );
             let diagnostic = ep.payload_validation_diagnostic().unwrap();
@@ -1660,7 +1706,8 @@ mod tests {
             ep.create_log_entry(
                 br#"[{"id":"a","type":"hi","timestamp":1,"value":{"greeting":"ok"}}]"#,
                 InputFormat::Json,
-                &mut output
+                &mut output,
+                &[]
             ),
             ResultCode::Ok
         );
@@ -1676,7 +1723,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                ep.create_log_entry(input, InputFormat::Json, &mut output),
+                ep.create_log_entry(input, InputFormat::Json, &mut output, &[]),
                 ResultCode::ParseError
             );
             let diagnostic = ep.payload_validation_diagnostic().unwrap();
@@ -1698,7 +1745,8 @@ mod tests {
             ep.create_log_entry(
                 br#"[{"id":"a","type":"order","timestamp":1,"value":{"qty":3,"dims":[1,2.5,3]}}]"#,
                 InputFormat::Json,
-                &mut output
+                &mut output,
+                &[]
             ),
             ResultCode::Ok
         );
@@ -1728,7 +1776,7 @@ mod tests {
         ] {
             let mut refused = vec![0xa5; 4096];
             assert_eq!(
-                ep.create_log_entry(input, InputFormat::Json, &mut refused),
+                ep.create_log_entry(input, InputFormat::Json, &mut refused, &[]),
                 ResultCode::ParseError
             );
             let diagnostic = ep.payload_validation_diagnostic().unwrap();
@@ -1773,7 +1821,8 @@ mod tests {
             ep.create_log_entry(
                 br#"[{"id":"a","type":"owned","timestamp":1,"value":{"owner":"d~g~t"}}]"#,
                 InputFormat::Json,
-                &mut output
+                &mut output,
+                &[]
             ),
             ResultCode::Ok
         );
@@ -1784,7 +1833,8 @@ mod tests {
             ep.create_log_entry(
                 br#"[{"id":"b","type":"owned","timestamp":2,"value":{"owner":"other"}}]"#,
                 InputFormat::Json,
-                &mut refused
+                &mut refused,
+                &[]
             ),
             ResultCode::ParseError
         );

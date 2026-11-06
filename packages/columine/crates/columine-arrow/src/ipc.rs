@@ -4,6 +4,9 @@
 //! schema bytes are copied once, each borrowed Arrow buffer is copied once
 //! into its final aligned body position, then the RecordBatch metadata and
 //! EOS marker are emitted around that body.
+//! Borrowed custom metadata is written once on the RecordBatch's Message as standard
+//! Arrow KeyValue entries, never on the Schema or a row. Empty metadata keeps the
+//! original IPC bytes; metadata adds no allocation or intermediate serialization.
 
 use crate::columns::DynamicColumns;
 use crate::record_batch::{
@@ -80,6 +83,7 @@ fn validate_column_shape(
 pub fn required_arrow_ipc_len<'a, F>(
     schema_config: &DynamicSchemaConfig,
     mut column_at: F,
+    custom_metadata: &[(&str, &str)],
 ) -> Result<usize, IpcError>
 where
     F: FnMut(usize) -> Result<DynamicColumn<'a>, IpcError>,
@@ -96,6 +100,7 @@ where
     let metadata_size = record_batch_metadata_size(
         field_count,
         compute_buffer_count(&schema_config.field_metadata),
+        custom_metadata,
     );
     schema_config
         .schema_message_size()
@@ -121,6 +126,7 @@ fn finish_stream(
     metadata: &MetadataStorage,
     body: BuiltBody,
     required: usize,
+    custom_metadata: &[(&str, &str)],
 ) -> Result<usize, IpcError> {
     let rb_written = encode_record_batch_dynamic(
         &mut output[write_offset..],
@@ -130,6 +136,7 @@ fn finish_stream(
         &metadata.buffer_descs[..body.desc_count],
         &[],
         body.length,
+        custom_metadata,
     );
     if rb_written == 0 {
         return Err(IpcError::BufferTooSmall { required });
@@ -159,12 +166,13 @@ pub fn write_arrow_ipc_from_borrowed_columns<'a, F, N>(
     metadata_storage: &mut MetadataStorage,
     mut column_at: F,
     mut null_count_at: N,
+    custom_metadata: &[(&str, &str)],
 ) -> Result<usize, IpcError>
 where
     F: FnMut(usize) -> Result<DynamicColumn<'a>, IpcError>,
     N: FnMut(usize) -> i64,
 {
-    let required = required_arrow_ipc_len(schema_config, &mut column_at)?;
+    let required = required_arrow_ipc_len(schema_config, &mut column_at, custom_metadata)?;
     let required_capacity = required.max(MIN_ARROW_OUTPUT_CAPACITY);
     if output.len() < required_capacity {
         return Err(IpcError::BufferTooSmall {
@@ -185,6 +193,7 @@ where
         .checked_add(record_batch_metadata_size(
             field_count,
             compute_buffer_count(&schema_config.field_metadata),
+            custom_metadata,
         ))
         .ok_or(IpcError::SizeOverflow)?;
     let body_start = write_offset
@@ -221,6 +230,7 @@ where
         metadata_storage,
         body,
         required_capacity,
+        custom_metadata,
     )
 }
 
@@ -266,6 +276,7 @@ pub fn write_arrow_ipc_from_dynamic_columns(
     schema_config: &DynamicSchemaConfig,
     output: &mut [u8],
     metadata_storage: &mut MetadataStorage,
+    custom_metadata: &[(&str, &str)],
 ) -> Result<usize, IpcError> {
     write_arrow_ipc_from_borrowed_columns(
         columns.count,
@@ -274,6 +285,7 @@ pub fn write_arrow_ipc_from_dynamic_columns(
         metadata_storage,
         |index| dynamic_column(columns, schema_config, index),
         |index| dynamic_null_count(columns, index),
+        custom_metadata,
     )
 }
 
@@ -332,8 +344,9 @@ mod tests {
 
         let mut metadata = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
         let mut out = vec![0u8; 8192];
-        let len = write_arrow_ipc_from_dynamic_columns(&columns, &config, &mut out, &mut metadata)
-            .unwrap();
+        let len =
+            write_arrow_ipc_from_dynamic_columns(&columns, &config, &mut out, &mut metadata, &[])
+                .unwrap();
         assert!(out[..len].ends_with(&EOS_MARKER));
 
         // Read it back through the official reader: the id/type/timestamp
@@ -410,7 +423,7 @@ mod tests {
         let mut meta = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
         let mut out = vec![0u8; 8192];
         let len =
-            write_arrow_ipc_from_dynamic_columns(&cols, &config, &mut out, &mut meta).unwrap();
+            write_arrow_ipc_from_dynamic_columns(&cols, &config, &mut out, &mut meta, &[]).unwrap();
 
         // Stream = schema bytes + RecordBatch message + EOS.
         let schema_len = config.schema_bytes.len();
@@ -427,7 +440,7 @@ mod tests {
             u32::from_le_bytes(out[schema_len + 4..schema_len + 8].try_into().unwrap());
         assert_eq!(
             metadata_size as usize,
-            crate::record_batch::record_batch_metadata_size(4, compute_buffer_count(&fields))
+            crate::record_batch::record_batch_metadata_size(4, compute_buffer_count(&fields), &[])
         );
     }
 
@@ -529,6 +542,7 @@ mod tests {
                 6 => 3,
                 _ => 0,
             },
+            &[],
         )
         .unwrap();
 
@@ -599,10 +613,96 @@ mod tests {
         let mut meta = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
         let mut out = vec![0u8; 1024]; // < 4096 hard floor
         assert_eq!(
-            write_arrow_ipc_from_dynamic_columns(&cols, &config, &mut out, &mut meta),
+            write_arrow_ipc_from_dynamic_columns(&cols, &config, &mut out, &mut meta, &[]),
             Err(IpcError::BufferTooSmall {
                 required: MIN_ARROW_OUTPUT_CAPACITY,
             })
         );
+    }
+
+    #[test]
+    fn standard_message_metadata_retains_full_rows_and_exact_sizes() {
+        let fields = base_fields();
+        let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
+        let mut columns = DynamicColumns::new(&fields, 2).unwrap();
+        for (id, timestamp, bytes) in [
+            ("α", i64::MIN, &[0, 255, 1][..]),
+            ("𐐀-two", i64::MAX, &[42, 0, 17, 128][..]),
+        ] {
+            assert!(columns.begin_row());
+            columns.append_variable(0, id.as_bytes()).unwrap();
+            columns.append_variable(1, b"event").unwrap();
+            columns.append_int(2, timestamp).unwrap();
+            columns.append_variable(3, bytes).unwrap();
+            columns.end_row();
+        }
+        let mut storage = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
+        let mut baseline = vec![0u8; 8192];
+        let baseline_len = write_arrow_ipc_from_dynamic_columns(
+            &columns,
+            &config,
+            &mut baseline,
+            &mut storage,
+            &[],
+        )
+        .unwrap();
+        let expected = StreamReader::try_new(Cursor::new(&baseline[..baseline_len]), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let pairs = [
+            ("batch.source", "domain~group~type~α"),
+            ("", ""),
+            ("κλειδί", "𐐀-value"),
+        ];
+        for count in 1..=pairs.len() {
+            let custom = &pairs[..count];
+            let required = required_arrow_ipc_len(
+                &config,
+                |index| dynamic_column(&columns, &config, index),
+                custom,
+            )
+            .unwrap();
+            let mut output = vec![0xa5; required.max(MIN_ARROW_OUTPUT_CAPACITY)];
+            let written = write_arrow_ipc_from_dynamic_columns(
+                &columns,
+                &config,
+                &mut output,
+                &mut storage,
+                custom,
+            )
+            .unwrap();
+            assert_eq!(written, required);
+            let schema_len = config.schema_message_size();
+            assert_eq!(&output[..schema_len], &baseline[..schema_len]);
+            let metadata_len =
+                u32::from_le_bytes(output[schema_len + 4..schema_len + 8].try_into().unwrap())
+                    as usize;
+            assert_eq!(metadata_len % 8, 0);
+            let message =
+                arrow_ipc::root_as_message(&output[schema_len + 8..schema_len + 8 + metadata_len])
+                    .unwrap();
+            let metadata = message
+                .custom_metadata()
+                .expect("Message metadata, not Schema metadata");
+            assert_eq!(metadata.len(), custom.len());
+            for (actual, (key, value)) in metadata.iter().zip(custom) {
+                assert_eq!(actual.key(), Some(*key));
+                assert_eq!(actual.value(), Some(*value));
+            }
+            assert_eq!(message.header_as_record_batch().unwrap().length(), 2);
+            let mut reader = StreamReader::try_new(Cursor::new(&output[..written]), None).unwrap();
+            assert_eq!(reader.next().unwrap().unwrap(), expected);
+            assert!(reader.next().is_none());
+            // Body bytes stay exact; only the standard RecordBatch Message metadata changes.
+            let baseline_metadata_len =
+                u32::from_le_bytes(baseline[schema_len + 4..schema_len + 8].try_into().unwrap())
+                    as usize;
+            assert_eq!(
+                &output[schema_len + 8 + metadata_len..written],
+                &baseline[schema_len + 8 + baseline_metadata_len..baseline_len],
+            );
+        }
     }
 }

@@ -271,7 +271,7 @@ pub unsafe extern "C" fn ep_create_log_entry(
     };
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
     let output = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_len as usize) };
-    instance.ep.create_log_entry(input, format, output) as u32
+    instance.ep.create_log_entry(input, format, output, &[]) as u32
 }
 
 /// Encode one CPB1 typed column batch into `[ResultHeader][Arrow IPC]`.
@@ -322,5 +322,5 @@ pub unsafe extern "C" fn ep_compact(
     } else {
         unsafe { std::slice::from_raw_parts(batch_ptr, batch_len as usize) }
     };
-    instance.ep.compact(batch, output) as u32
+    instance.ep.compact(batch, output, &[]) as u32
 }

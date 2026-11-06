@@ -110,7 +110,7 @@ fn time(handle: &mut EventProcessor, input: &[u8], format: InputFormat, iters: u
     let mut total = 0u128;
     for i in 0..iters + WARMUP {
         let start = Instant::now();
-        let code = handle.create_log_entry(input, format, &mut output);
+        let code = handle.create_log_entry(input, format, &mut output, &[]);
         let elapsed = start.elapsed().as_nanos();
         assert_eq!(code, ResultCode::Ok, "{format:?}");
         if i >= WARMUP {

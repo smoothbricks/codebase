@@ -47,7 +47,7 @@ fn round_trip(
         MetadataStorage::for_fields(fields, MetadataLimits::default()).expect("size metadata");
     let mut output = vec![0u8; 1 << 16];
     let written =
-        write_arrow_ipc_from_dynamic_columns(&columns, &config, &mut output, &mut metadata)
+        write_arrow_ipc_from_dynamic_columns(&columns, &config, &mut output, &mut metadata, &[])
             .expect("emit arrow ipc");
 
     let mut reader =
