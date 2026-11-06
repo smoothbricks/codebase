@@ -911,6 +911,45 @@ impl ProjectRuntime {
         .await
     }
 
+    /// `cowshed unadopt` of an adoption that recorded its intent and nothing else
+    /// (02_workspaces.md, "Checkout layouts"): no repository binding, no main image, and a
+    /// journal holding only main's unfinished adopt. Opening such a project would resume the
+    /// adoption, so this runs before any opening. Answers the identity whose store it removed, or
+    /// `None` when the checkout's identity is bound, claimed by an interrupted unadopt, or never
+    /// stored: the ordinary unadopt answers those. An unbound store in any other state refuses,
+    /// naming what it holds.
+    pub async fn discard_intent_only_adoption(
+        project_root: impl AsRef<Path>,
+    ) -> Result<Option<RepoId>> {
+        Self::discard_intent_only_adoption_in(project_root.as_ref(), None).await
+    }
+
+    /// [`Self::discard_intent_only_adoption`] in a caller-owned store.
+    pub async fn discard_intent_only_adoption_at(
+        project_root: impl AsRef<Path>,
+        storage: crate::storage::bootstrap::ValidatedHostStorage,
+    ) -> Result<Option<RepoId>> {
+        Self::discard_intent_only_adoption_in(project_root.as_ref(), Some(storage)).await
+    }
+
+    async fn discard_intent_only_adoption_in(
+        project_root: &Path,
+        storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
+    ) -> Result<Option<RepoId>> {
+        #[cfg(target_os = "macos")]
+        {
+            discard_intent_only_adoption(project_root, storage).await
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (project_root, storage);
+            Err(CowshedError::environment_missing(
+                "the native cowshed project runtime requires macOS APFS",
+                "run the controller on macOS or use an injected test host",
+            ))
+        }
+    }
+
     /// Opens for the identity-change verb alone. The verb rebinds the project rather than any
     /// session workspace, so it finishes only `main`'s unfinished lifecycle work.
     ///
@@ -2367,6 +2406,201 @@ impl ProjectActor {
         Ok(())
     }
 }
+/// The store of an adoption that recorded its intent and nothing else, removed
+/// ([`ProjectRuntime::discard_intent_only_adoption`]). The identity is the one adopt derives from
+/// the checkout's remotes. The adopt's intent lease must be free, since a held one is a live
+/// adopt, and it is held through the removal so none starts meanwhile. The removal is the
+/// unbinding's own, binding-absent path ([`finish_restored_project_unbinding`]).
+#[cfg(target_os = "macos")]
+async fn discard_intent_only_adoption(
+    project_root: &Path,
+    supplied: Option<crate::storage::bootstrap::ValidatedHostStorage>,
+) -> Result<Option<RepoId>> {
+    use crate::storage::recovery::{
+        IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal,
+    };
+
+    let served_store = match &supplied {
+        Some(storage) => std::sync::Arc::clone(storage.roots().shared_store()),
+        None => std::sync::Arc::clone(
+            crate::storage::bootstrap::CanonicalRoots::global().shared_store(),
+        ),
+    };
+    let git = crate::git::GitRepository::discover(&served_store, project_root).await?;
+    let git_root = git.root().to_path_buf();
+    let storage = host_storage(
+        &git_root,
+        crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
+        supplied,
+    )
+    .await?;
+    // A store that claims this checkout, by main's images or an interrupted unadopt's checkout
+    // record, is the ordinary unadopt's.
+    if crate::gateway_inventory::NativeGatewayInventory::new(storage.clone())
+        .repository_for_project_root(&git_root)
+        .await
+        .map_err(native_integrity_error)?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let candidate = binding_from_git(&git, None).await?;
+    let repo_id = candidate
+        .primary()
+        .map_err(native_integrity_error)?
+        .repo_id
+        .clone();
+    if project_owning_repo_id(storage.store(), &repo_id)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let layout = crate::storage::StorageLayout::new(storage.store(), &repo_id)
+        .map_err(native_integrity_error)?;
+    let paths = layout.project().clone();
+    let main = WorkspaceName::main();
+    let image = layout
+        .canonical_image(&main)
+        .map_err(native_integrity_error)?
+        .image()
+        .to_owned();
+    let lease = crate::project_retirement::acquire_project_reader(storage.store(), &repo_id)?;
+    let discarded = crate::storage::lifecycle::dispatch_blocking({
+        let repo_id = repo_id.clone();
+        move || -> Result<bool> {
+            if !paths.project_root.exists() {
+                return Ok(false);
+            }
+            let Some(adopting) = IntentLease::try_claim(&paths.sessions, &main)? else {
+                return Err(CowshedError::conflict(
+                    format!("an adoption of {repo_id} is running: it holds main's intent lease"),
+                    "let that cowshed adopt finish, then retry cowshed unadopt",
+                ));
+            };
+            let journal =
+                LifecycleIntentJournal::load(&paths.project_root.join(LIFECYCLE_INTENTS_FILE))?;
+            let records: Vec<_> = journal.records().collect();
+            let intent_only = matches!(
+                records.as_slice(),
+                [(workspace, record)] if workspace.is_main()
+                    && record.completion.is_none()
+                    && matches!(record.operation, LifecycleIntent::Adopt { .. })
+            );
+            if !intent_only || image.exists() {
+                let mut held: Vec<String> = records
+                    .iter()
+                    .map(|(workspace, record)| {
+                        format!(
+                            "{} {} of {workspace}",
+                            if record.completion.is_none() {
+                                "an unfinished"
+                            } else {
+                                "a finished"
+                            },
+                            record.operation.verb()
+                        )
+                    })
+                    .collect();
+                if image.exists() {
+                    held.push(format!("main's image {}", image.display()));
+                }
+                return Err(CowshedError::conflict(
+                    format!(
+                        "{repo_id} has no repository binding, but its store {} holds {}",
+                        paths.project_root.display(),
+                        if held.is_empty() {
+                            "no adopt intent".to_owned()
+                        } else {
+                            held.join(", ")
+                        }
+                    ),
+                    "cowshed unadopt discards only an unfinished adoption of main that left no \
+                     image; inspect that store",
+                ));
+            }
+            finish_restored_project_unbinding(&paths, &candidate, None, &mut |_| Ok(()))?;
+            drop(adopting);
+            Ok(true)
+        }
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("adoption discard task failed: {error}")))??;
+    if !discarded {
+        return Ok(None);
+    }
+    report_unbound_lease(&lease, storage.store(), &repo_id)?;
+    Ok(Some(repo_id))
+}
+
+/// The host storage an opening serves: the caller's own store, or this host's, bootstrapped for
+/// `mode` from the checkout at `git_root`.
+#[cfg(target_os = "macos")]
+async fn host_storage(
+    git_root: &Path,
+    mode: crate::storage::bootstrap::native::NativeBootstrapMode,
+    supplied: Option<crate::storage::bootstrap::ValidatedHostStorage>,
+) -> Result<crate::storage::bootstrap::ValidatedHostStorage> {
+    if let Some(storage) = supplied {
+        return Ok(storage);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            CowshedError::environment_missing(
+                "HOME is missing or is not absolute",
+                "launch the controller with a canonical HOME",
+            )
+        })?;
+    let bootstrap = cowshed_os::timing::spanned(
+        "open",
+        "bootstrap",
+        crate::storage::bootstrap::native::bootstrap_system_storage(git_root, &home, mode),
+    )
+    .await
+    .map_err(native_environment_error)?;
+    if !matches!(
+        bootstrap.substrate(),
+        crate::storage::bootstrap::SelectedSubstrate::Apfs { .. }
+    ) {
+        return Err(CowshedError::environment_missing(
+            "the macOS runtime requires the APFS image substrate",
+            "remove the unsupported substrate override and retry",
+        ));
+    }
+    Ok(crate::storage::bootstrap::ValidatedHostStorage::new(
+        home.clone(),
+        crate::capabilities::host_program_directories(&home),
+        bootstrap.roots().clone(),
+    ))
+}
+
+/// The last of an unbinding (02_workspaces.md): the identity's
+/// `.retirements/<owner>/<repo>.lease` goes too, unless another process shares it or a
+/// retirement record stands beside it; either is said on stderr, never skipped silently.
+#[cfg(target_os = "macos")]
+fn report_unbound_lease(
+    lease: &crate::project_retirement::ProjectReadLease,
+    store: &Path,
+    repo_id: &RepoId,
+) -> Result<()> {
+    use crate::project_retirement::UnboundLease;
+    match lease.remove_unbound(store)? {
+        UnboundLease::Removed => {}
+        UnboundLease::Held { lease } => cowshed_os::eprintln!(
+            "cowshed: project lease {} stays: another cowshed process (the gateway, or a \
+             command still open on {repo_id}) holds it, and removing a held lease would let a \
+             later `cowshed forget` fence past that process",
+            lease.display()
+        ),
+        UnboundLease::Recorded { lease } => cowshed_os::eprintln!(
+            "cowshed: project lease {} stays beside the retirement record it fences",
+            lease.display()
+        ),
+    }
+    Ok(())
+}
 
 /// Unadopt an adopted project (`cowshed unadopt`): retire every session workspace, listed or never
 /// published, under rm's containment gate, finishing each physical release or recovery
@@ -3738,45 +3972,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         } else {
             SupervisorHome::Daemon
         };
-        let storage = match supplied_storage {
-            Some(storage) => storage,
-            None => {
-                let home = std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .filter(|path| path.is_absolute())
-                    .ok_or_else(|| {
-                        CowshedError::environment_missing(
-                            "HOME is missing or is not absolute",
-                            "launch the controller with a canonical HOME",
-                        )
-                    })?;
-                let bootstrap = spanned(
-                    "open",
-                    "bootstrap",
-                    crate::storage::bootstrap::native::bootstrap_system_storage(
-                        &git_root,
-                        &home,
-                        bootstrap_mode,
-                    ),
-                )
-                .await
-                .map_err(native_environment_error)?;
-                if !matches!(
-                    bootstrap.substrate(),
-                    crate::storage::bootstrap::SelectedSubstrate::Apfs { .. }
-                ) {
-                    return Err(CowshedError::environment_missing(
-                        "the macOS runtime requires the APFS image substrate",
-                        "remove the unsupported substrate override and retry",
-                    ));
-                }
-                crate::storage::bootstrap::ValidatedHostStorage::new(
-                    home.clone(),
-                    crate::capabilities::host_program_directories(&home),
-                    bootstrap.roots().clone(),
-                )
-            }
-        };
+        let storage = host_storage(&git_root, bootstrap_mode, supplied_storage).await?;
         let gateway_control = gateway_factory(&storage)?;
         let gateway_inventory = crate::gateway_sessions::NativeSessionInventory::with_backend(
             storage.clone(),
@@ -9329,30 +9525,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         self.remove_unbound_lease()
     }
 
-    /// The last of an unbinding (02_workspaces.md): the identity's
-    /// `.retirements/<owner>/<repo>.lease` goes too, unless another process shares it or a
-    /// retirement record stands beside it; either is said on stderr, never skipped silently. A
-    /// project already unbound by an earlier run gets here as well, so its retry removes it.
+    /// The last of an unbinding ([`report_unbound_lease`]). A project already unbound by an
+    /// earlier run gets here as well, so its retry removes the lease.
     fn remove_unbound_lease(&self) -> Result<()> {
-        use crate::project_retirement::UnboundLease;
-        match self
-            .retirement_lease
-            .remove_unbound(self.descriptor.storage.store())?
-        {
-            UnboundLease::Removed => {}
-            UnboundLease::Held { lease } => cowshed_os::eprintln!(
-                "cowshed: project lease {} stays: another cowshed process (the gateway, or a \
-             command still open on {}) holds it, and removing a held lease would let a later \
-             `cowshed forget` fence past that process",
-                lease.display(),
-                self.descriptor.repo_id
-            ),
-            UnboundLease::Recorded { lease } => cowshed_os::eprintln!(
-                "cowshed: project lease {} stays beside the retirement record it fences",
-                lease.display()
-            ),
-        }
-        Ok(())
+        report_unbound_lease(
+            &self.retirement_lease,
+            self.descriptor.storage.store(),
+            &self.descriptor.repo_id,
+        )
     }
 
     /// Main's images are the record of where the checkout is, and removing main takes them away.

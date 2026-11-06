@@ -494,7 +494,9 @@ containment gate `rm` applies, collects their images, then puts the pre-adoption
 Run it from the checkout, or name the project with `--project`; it takes no workspace. A session whose changes main
 holds, or the ref `cowshed push` wrote keeps, retires with no flag, however young; one holding work main lacks refuses
 the unadopt, named. `--force` stops each session's own running jobs instead of waiting for them, and waives nothing
-else. Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.
+else. Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`. An adoption that recorded
+its intent and nothing else, interrupted before it wrote anything else, is discarded the same way: unadopt removes its
+store directory without opening it, and refuses while an adopt still runs.
 
 Before the swap, every `refs/cowshed/*` ref `push` wrote into main is fetched into the retained checkout and read back,
 so the pushed branches outlive the project there; stderr says so. Unadopt refuses (exit 4) when main's head is in

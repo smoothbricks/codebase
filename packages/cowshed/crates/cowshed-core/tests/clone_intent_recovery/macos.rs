@@ -758,6 +758,79 @@ async fn unadopt_abandon_keeps_a_sessions_work_in_the_retained_checkout() {
     assert!(!fixture.layout().project().repository_binding.exists());
     runtime.shutdown().await.expect("stop runtime");
 }
+
+/// `cowshed unadopt` of an adoption that recorded its intent and nothing else: no binding, no
+/// main image, only main's unfinished adopt in the journal and the locks beside it. Opening it
+/// would resume the adoption, so the discard runs before any opening; a live adopt, which holds
+/// main's intent lease, refuses it, and once discarded no store directory is left
+/// (02_workspaces.md, "Checkout layouts", "Before the sidecar").
+#[tokio::test]
+async fn unadopt_discards_an_adoption_that_recorded_only_its_intent() {
+    let fixture = Fixture::new("unadopt-intent-only");
+    git(
+        &fixture.checkout,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/fixture/intents.git",
+        ],
+    );
+    let project = fixture.layout().project().clone();
+    fs::create_dir_all(&project.sessions).unwrap();
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Adopt {
+            options: AdoptOptions {
+                path: Some(fixture.checkout.clone()),
+                repo_id: Some(fixture.repo.clone()),
+                capacity: None,
+                quarantine: false,
+                re_adopt: false,
+            },
+        });
+        Ok(())
+    })
+    .expect("journal an adopt that recorded only its intent");
+    for lock in [
+        project.project_root.join("main.dmg.lock"),
+        project.sessions.join("main.intent.lock"),
+    ] {
+        fs::write(&lock, b"").unwrap();
+    }
+    let discard = || {
+        ProjectRuntime::discard_intent_only_adoption_at(&fixture.checkout, fixture.storage.clone())
+    };
+
+    let adopting = IntentLease::try_claim(&project.sessions, &name("main"))
+        .unwrap()
+        .expect("the adopt's lease");
+    let refusal = discard()
+        .await
+        .expect_err("a live adopt holds main's intent lease");
+    assert!(refusal.message.contains("is running"), "{refusal:?}");
+    assert!(
+        fixture.journal_path().exists(),
+        "a refusal discards nothing"
+    );
+    drop(adopting);
+
+    assert_eq!(
+        discard()
+            .await
+            .expect("the intent-only adoption is discarded"),
+        Some(fixture.repo.clone())
+    );
+    assert!(
+        !project.project_root.exists(),
+        "no store directory is left: {}",
+        project.project_root.display()
+    );
+    assert_eq!(
+        discard().await.expect("nothing is left to discard"),
+        None,
+        "with no store, the ordinary unadopt answers"
+    );
+}
 /// The directory store of the fixture whose scratch root is `scratch`: its `store` directory.
 fn fixture_storage(namespace: TestNamespace, scratch: &Path) -> ValidatedHostStorage {
     ValidatedHostStorage::new(

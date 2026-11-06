@@ -298,7 +298,7 @@ cowshed never auto-deletes it.
 
 | Kill window                        | Durable state                                                    | Recovery action and guard                                                                                                                                      |
 | ---------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Before the sidecar                 | Intent only                                                      | Re-run adopt normally.                                                                                                                                         |
+| Before the sidecar                 | Intent only                                                      | Re-run adopt normally, or `unadopt` to discard the intent.                                                                                                     |
 | After the sidecar, before payload  | `PendingFence` sidecar                                           | Startup recovery removes the sidecar-only record.                                                                                                              |
 | After the clone, before its attach | `PendingFence` + formatted, unattached canonical image           | The payload is a clone of the store's blank template, empty and formatted: the ordinary verified attach mounts it and the copy starts; same incarnation.       |
 | After attach, before staging mount | `PendingFence` + verified, unmounted attachment                  | The unmounted attachment is settled and the ordinary verified attach repeats before mounting; same incarnation.                                                |
@@ -312,7 +312,11 @@ workspace, listed or never published, under the gate `rm` applies: a session who
 `cowshed push` wrote keeps, retires with no flag, and one holding work main lacks refuses the unadopt, named. Then it
 detaches main, swaps the retained `<root>.pre-cowshed` tree back against whatever publication left at the checkout path
 — the emptied mountpoint directory — and removes the displaced artifact. The checkout path is never absent while it runs
-either.
+either. An adoption that recorded its intent and nothing else (no binding, no main image, a journal holding only main's
+unfinished adopt) has nothing to unbind and is never opened, since opening resumes it: `unadopt` finds its store by the
+identity adopt derives from the checkout's remotes and, while no adopt holds main's intent lease, removes it through the
+unbinding's own terminal-storage path, leaving no store directory; any other store without a binding refuses, naming
+what it holds.
 
 Unadopt refuses (exit 4) when main's head is contained by neither the retained checkout's head nor a remote ref: commits
 made in main after adoption would be lost with its image. `unadopt --abandon` authorizes exactly that loss and keeps it

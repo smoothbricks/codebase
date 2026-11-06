@@ -5486,6 +5486,22 @@ where
         }
     };
     let root = &resolved.root;
+    // An adoption that recorded only its intent has nothing to unbind, and opening it would
+    // resume it; unadopt discards it before any opening (02_workspaces.md, "Checkout layouts").
+    if matches!(&cli.command, Command::Unadopt(_))
+        && let Some(repo) = ProjectRuntime::discard_intent_only_adoption(root).await?
+    {
+        if cli.global.json {
+            output.success(EmptyResult {}).map_err(output_error)?;
+        }
+        output
+            .guidance(&format!(
+                "discarded the unfinished adoption of {repo}: it had recorded its intent and \
+                 nothing else"
+            ))
+            .map_err(output_error)?;
+        return Ok(success());
+    }
     let mode = runtime_open_mode(&cli.command);
     let requested_repo_id = runtime_open_repo_id(&cli.command)?;
     if mode == RuntimeOpenMode::Provision {
