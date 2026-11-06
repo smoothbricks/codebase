@@ -2,26 +2,22 @@
 //! or attach/mount work over ten seconds advises a detached compactor. Only the compactor
 //! counts the refreshed immutable clone immediately before copying. The copy holds nothing
 //! a fork or land waits on, catches up to newer seeds, and holds while a land runs.
-//! A failure holds later advice by the same cowshed build until a compaction succeeds.
 use std::fs::{self, File, OpenOptions};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
-
-use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use super::{
     BuildVolumes, Owner, RuntimeStorageHost, StoreSpace, SupersededSeeds, TargetLock,
     claim_superseded, io, seeds_of, storage,
 };
+use crate::Result;
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeRecord, BuildVolumeRole, Registrant, Registration,
 };
 use crate::runtime::project::SEED_COMPACTION_VERB;
-use crate::runtime::supervisor_socket::BuildId;
 use crate::storage::apfs::native::{CompactedSeed, CompactionSource, SeedCatchUp, SeedCompaction};
-use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Fenced;
 
 /// A seed holding this many extents is compacted. Measured 2026-10-25 on this host: a fork's
@@ -55,44 +51,6 @@ pub(crate) enum Admission {
     Wait,
     /// Stop, because of this: whether to wait cannot be decided, and not knowing is no permission.
     Stop(String),
-}
-
-/// In the compaction directory: the one-at-a-time lock, last failure and child log.
-const FAILED: &str = "failed";
-const LOG: &str = "log";
-
-/// The last compaction that failed: the build that ran it and its error. Foreground advice writes it when it
-/// cannot decide or start a compaction, the compaction process when it ends in an error, and a
-/// success removes it.
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Failure {
-    build: BuildId,
-    error: String,
-}
-
-/// A failed compaction foreground advice holds back for: its error, and when it failed.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct Held {
-    pub error: String,
-    pub at: SystemTime,
-}
-
-/// Whether a land of `build` holds back for `recorded`, written at `at`: only when `build` is the
-/// one that failed. Another build carries whatever fix the failed one lacked, so its land starts
-/// a compaction again.
-pub(crate) fn held(recorded: Failure, at: SystemTime, build: &BuildId) -> Option<Held> {
-    (recorded.build == *build).then_some(Held {
-        error: recorded.error,
-        at,
-    })
-}
-
-/// Whole seconds from `at` to now; a time after now (the clock moved back) is 0.
-pub(crate) fn seconds_since(at: SystemTime) -> u64 {
-    SystemTime::now()
-        .duration_since(at)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Why a compaction's copy waits for lands, from the queues the gateway answered
@@ -139,32 +97,23 @@ pub(crate) fn lands_hold(
 
 /// Start `program <verb> <project_root>`, a background cowshed verb of the project (the seed
 /// compaction, the collection a land starts), in a session of its own, so the land's terminal and
-/// process group end nothing of it, with its stdout discarded and its stderr appended to the log
-/// in `directory`, which is created first: the project's first run finds none. It inherits no
-/// descriptor but its stdio: a held lock the land's command inherited (02_workspaces.md "Held
-/// locks") would otherwise stay held for the whole run. Returns the process and its log.
+/// process group end nothing of it, with null stdio: what it says is its span (13_telemetry.md,
+/// "Background verb spans"), and it creates no file or directory to start. It inherits no
+/// descriptor: a held lock the land's command inherited (02_workspaces.md "Held locks") would
+/// otherwise stay held for the whole run.
 pub(crate) fn start_background_verb(
     program: &Path,
     verb: &str,
     project_root: &Path,
-    directory: &Path,
-) -> Result<(Child, PathBuf)> {
+) -> Result<Child> {
     use std::os::unix::process::CommandExt;
-    fs::create_dir_all(directory)
-        .map_err(|error| io(&format!("create the {verb} directory"), directory, &error))?;
-    let log = directory.join(LOG);
-    let output = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .map_err(|error| io(&format!("open the {verb} log"), &log, &error))?;
     let mut command = Command::new(program);
     command
         .arg(verb)
         .arg(project_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(output);
+        .stderr(Stdio::null());
     crate::exec::prepare_child_descriptors(&mut command).map_err(|failure| {
         io(
             &format!("seal the {verb} process's descriptors"),
@@ -183,7 +132,7 @@ pub(crate) fn start_background_verb(
     }
     let process = cowshed_os::fork_lock::Spawn::spawn_locked(&mut command)
         .map_err(|error| io(&format!("start {verb}"), program, &error))?;
-    Ok((process, log))
+    Ok(process)
 }
 /// Whether necessary work on main's seed advises a background compaction. The receipt
 /// covers one capture or the actual attach plus mount, never queueing, fsck or metadata.
@@ -196,23 +145,6 @@ pub(crate) fn advised(main: bool, operation_elapsed: Option<Duration>) -> bool {
 #[must_use = "the compaction turn is let go when this is dropped"]
 pub(crate) struct CompactionTurn {
     _lock: Fenced<File>,
-    directory: PathBuf,
-}
-
-impl CompactionTurn {
-    /// A successful publication removes the earlier failure; success is not a timing guard.
-    pub fn succeeded(&self) -> Result<()> {
-        let failed = self.directory.join(FAILED);
-        match fs::remove_file(&failed) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io(
-                "remove the failed seed compaction's record",
-                &failed,
-                &error,
-            )),
-        }
-    }
 }
 
 /// The copy's and a catch-up's `keep_going`: from the first chunk on, every
@@ -303,7 +235,8 @@ pub(crate) enum Published {
 
 impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// Foreground advice uses only the operation receipt. No extent provider is reachable here.
-    /// Start failures are values and retain the same-build hold rather than failing a fork or land.
+    /// Deciding or starting is a value, `Failed` with its error, never a failed fork or land;
+    /// nothing is recorded, and the compaction lock alone keeps two from running at once.
     pub fn advise_compaction(
         &self,
         target: &Owner,
@@ -327,21 +260,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             return LandSeedCompaction::NotAdvised;
         }
         let start = || -> Result<LandSeedCompaction> {
-            if let Some(held) = self.compaction_held()? {
-                return Ok(LandSeedCompaction::Held {
-                    error: held.error,
-                    seconds_ago: seconds_since(held.at),
-                });
-            }
             let executable = std::env::current_exe().map_err(|error| {
                 io("find this cowshed executable", Path::new("cowshed"), &error)
             })?;
-            let (mut child, log) = start_background_verb(
-                &executable,
-                SEED_COMPACTION_VERB,
-                project_root,
-                &self.layout.compacting(),
-            )?;
+            let mut child = start_background_verb(&executable, SEED_COMPACTION_VERB, project_root)?;
             let pid = child.id();
             // WHY unbounded: a detached reaper, with no waiter, collects the child when it ends.
             #[allow(clippy::disallowed_methods)]
@@ -353,34 +275,18 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     }
                 });
             if let Err(error) = reaper {
-                let mut failure = io("reap the seed compaction", &executable, &error);
-                if let Err(recording) = self.record_compaction_failure(&failure.message) {
-                    failure.message = format!(
-                        "{}; recording that failure failed too: {}",
-                        failure.message, recording.message
-                    );
-                }
                 cowshed_os::eprintln!(
-                    "cowshed: seed compaction process {pid} started, logging to {}, but its reaper could not be created: {}",
-                    log.display(),
-                    failure.message
+                    "cowshed: seed compaction process {pid} started, but its reaper could not be created: {}",
+                    io("reap the seed compaction", &executable, &error).message
                 );
             }
-            Ok(LandSeedCompaction::Started { pid, log })
+            Ok(LandSeedCompaction::Started { pid })
         };
         match start() {
             Ok(report) => report,
-            Err(mut error) => {
-                if let Err(recording) = self.record_compaction_failure(&error.message) {
-                    error.message = format!(
-                        "{}; recording that failure failed too: {}",
-                        error.message, recording.message
-                    );
-                }
-                LandSeedCompaction::Failed {
-                    error: error.message,
-                }
-            }
+            Err(error) => LandSeedCompaction::Failed {
+                error: error.message,
+            },
         }
     }
 
@@ -405,68 +311,12 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             .map_err(|error| io("open the seed compaction lock", &path, &error))?;
         let file = Fenced::new(file);
         match file.try_lock() {
-            Ok(()) => Ok(Some(CompactionTurn {
-                _lock: file,
-                directory,
-            })),
+            Ok(()) => Ok(Some(CompactionTurn { _lock: file })),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(error)) => {
                 Err(io("take the seed compaction lock", &path, &error))
             }
         }
-    }
-
-    /// The failure a land of this build holds back for ([`held`]), or `None`.
-    pub fn compaction_held(&self) -> Result<Option<Held>> {
-        let path = self.layout.compacting().join(FAILED);
-        let file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(io(
-                    "open the failed seed compaction's record",
-                    &path,
-                    &error,
-                ));
-            }
-        };
-        let at = file
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .map_err(|error| io("read the failed seed compaction's time", &path, &error))?;
-        let recorded: Failure = serde_json::from_reader(file).map_err(|error| {
-            CowshedError::integrity(
-                format!(
-                    "the failed seed compaction's record at {} is unreadable: {error}",
-                    path.display()
-                ),
-                "cowshed doctor --json",
-            )
-        })?;
-        Ok(held(recorded, at, BuildId::current()?))
-    }
-
-    /// Record that a compaction by this build failed with `error`: no land of this build starts
-    /// another until one succeeds. Written aside and renamed into place, so a reader sees a whole
-    /// record or none.
-    pub fn record_compaction_failure(&self, error: &str) -> Result<()> {
-        let directory = self.layout.compacting();
-        fs::create_dir_all(&directory)
-            .map_err(|error| io("create the seed compaction directory", &directory, &error))?;
-        let record = serde_json::to_vec(&Failure {
-            build: BuildId::current()?.clone(),
-            error: error.to_owned(),
-        })
-        .map_err(|error| {
-            CowshedError::internal(format!(
-                "cannot encode the failed seed compaction's record: {error}"
-            ))
-        })?;
-        let path = directory.join(FAILED);
-        let staged = directory.join(format!("{FAILED}.{}", uuid::Uuid::new_v4().simple()));
-        fs::write(&staged, record)
-            .and_then(|()| fs::rename(&staged, &path))
-            .map_err(|error| io("record the failed seed compaction", &path, &error))
     }
 
     /// Hand what a compaction left in `build/.compacting` to the gateway's cleanup, under the
@@ -640,10 +490,6 @@ mod tests {
         );
     }
 
-    fn now() -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
-    }
-
     #[test]
     fn only_necessary_main_seed_work_strictly_over_ten_seconds_advises() {
         for main in [false, true] {
@@ -665,24 +511,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_land_holds_back_only_for_its_own_builds_failure() {
-        let failure = |build: &str| Failure {
-            build: BuildId::named(build),
-            error: "the copy failed".to_owned(),
-        };
-        assert_eq!(
-            held(failure("a"), now(), &BuildId::named("a")),
-            Some(Held {
-                error: "the copy failed".to_owned(),
-                at: now(),
-            })
-        );
-        assert_eq!(held(failure("a"), now(), &BuildId::named("b")), None);
-    }
-
-    /// The first compaction of a project starts with no compaction directory, and the process
-    /// holds none of the land's descriptors: a land run under `cowshed land-turn` holds its
+    /// A background verb starts creating no file or directory, and the process holds none of the
+    /// land's descriptors: a land run under `cowshed land-turn` holds its
     /// repository's turn through an inheritable descriptor, and a process that kept it would
     /// hold the turn for its whole copy. The oracle is the child's own descriptor table, not
     /// the ticket's lock: under libtest this process's inheritable descriptors also leak into
@@ -728,11 +558,12 @@ mod tests {
             path
         };
         let (ready, go) = (fifo("ready"), fifo("go"));
-        let compacting = directory.join("build/.compacting");
-        let (mut process, log) =
-            start_background_verb(&program, SEED_COMPACTION_VERB, &directory, &compacting)
-                .expect("started");
-        assert_eq!(log, compacting.join(LOG));
+        let mut process =
+            start_background_verb(&program, SEED_COMPACTION_VERB, &directory).expect("started");
+        assert!(
+            !directory.join("build").exists(),
+            "the background verb created a directory to start"
+        );
         let mut said = String::new();
         File::open(&ready)
             .expect("the process's ready FIFO")

@@ -702,10 +702,10 @@ source-bound image-lease admission completed before that work is timed. The atta
 attach and mount command work inside their granted disk leases; it excludes lease waits, fsck, metadata,
 destination-seed capture and the rest of build-ready. A fork of a non-main source never advises main's compaction from
 its own slow work. No timer, rolling window, advice cache, Arrow query or foreground extent walk decides it. A
-successful compaction leaves no recent-success guard or success marker: an adopted lineage cannot inherit another
-lineage's old suppression. The same-build failure hold remains (Failures). The compactor alone verifies the existing
-**500,000-extent** bound on its current immutable source immediately before copying. A seed replaced during the copy is
-caught up to (Catch-up); a later qualifying foreground operation can advise another run if one stopped.
+compaction, failed or successful, leaves no guard, marker or record: an adopted lineage cannot inherit another lineage's
+old suppression, and no trace is read for a decision (13_telemetry.md, "Storage"). The compactor alone verifies the
+existing **500,000-extent** bound on its current immutable source immediately before copying. A seed replaced during the
+copy is caught up to (Catch-up); a later qualifying foreground operation can advise another run if one stopped.
 
 - **Why 500,000.** A fork's first write costs 0.1 to 0.2 ms per extent of its seed's map, and every fork pays it twice
   (its volume, then its own seed's capture), so 500,000 extents cost a fork about 140 s. A compaction writes the whole
@@ -714,21 +714,16 @@ caught up to (Catch-up); a later qualifying foreground operation can advise anot
   forks, and a seed growing about 110,000 extents a day is due again after a few days. Compacting at every land would
   rewrite the seed every time and hold main's image lock for minutes.
 - **Off the foreground path.** Advice starts `cowshed __compact-seed <project-root>` in a session of its own, holding no
-  descriptor of the fork or land but its stdio, its stderr appended to `build/.compacting/log` (the foreground creates
-  `build/.compacting` first). The foreground answers without waiting for the child or counting any extents for advice.
-  The operation receipt already proves a seed was captured or prepared: advice enumerates no build records and makes no
-  seed-existence probe. Only the child's refreshed source determines whether a seed still exists and reaches the bound.
+  descriptor of the fork or land, with null stdio: its account is its span (13_telemetry.md, "Background verb spans"),
+  and the foreground creates no file or directory for it. The foreground answers without waiting for the child or
+  counting any extents for advice. The operation receipt already proves a seed was captured or prepared: advice
+  enumerates no build records and makes no seed-existence probe. Only the child's refreshed source determines whether a
+  seed still exists and reaches the bound.
 - **The land reports it.** The frozen seed carries `notMain`, `notAdvised` (no usable qualifying live operation),
-  `started` (the actual process and log, never an unobserved extent count), `held` (the same-build failure and its age),
-  or `failed` (deciding or starting failed, and why). None fails the land. A start whose reaper cannot be created still
-  reports started; the reaper failure is recorded as the compaction failure.
-- **Failures.** A foreground decision or start that fails, and a compaction ending in an error, write
-  `build/.compacting/failed`: the cowshed build that failed (its `BuildId`, 11_shell.md "Draining a supervisor of
-  another build") and the error, written aside and renamed into place. Advice by that same build starts nothing and
-  reports `held`, so an unchanged cause is not met at every fork or land. Another build can start as usual, since a new
-  build is how a fix ships. `cowshed __compact-seed <project-root>` run by hand does not read the record, and any
-  success removes it. A compaction that cannot tell whether a gate or a land runs, gives up catching up, or finds
-  another one running has not failed.
+  `started` (the actual process, never an unobserved extent count), or `failed` (deciding or starting failed, and why),
+  which records nothing: the next qualifying fork or land advises again, and the compaction lock keeps two from running
+  at once. None fails the land. A start whose reaper cannot be created still reports started, and the land says the
+  reaper failure on stderr.
 - **One at a time.** The process takes the project's compaction lock (`build/.compacting/lock`) without waiting and
   exits if another process holds it. It refreshes main's seed exactly as a fork of main does (Fork step 2), under main's
   image lock, without recursively advising another compaction. The copy then holds what main's live volume holds, so the
@@ -757,7 +752,7 @@ caught up to (Catch-up); a later qualifying foreground operation can advise anot
   punches of at most 8 MiB alike, ask the gateway whether a land holds or waits for any repository's turn
   (05_gateway.md, "Land turns"); a land that starts the compaction still holds its own turn. A gate-class job outside a
   land does not hold it: a class is a nice, not a lock (05_gateway.md, "Classes"). While a land runs, the writer holds
-  where it is, says once in its log what it waits for, and checks again every **15 s**; it says how long it waited when
+  where it is, says once on its span what it waits for, and checks again every **15 s**; it says how long it waited when
   it goes on. If the gateway's answer cannot be read, it stops, and the copy is removed. The seed is left as it was. A
   gateway that is not running holds no land turn: the turns are its own state.
 - **Publication.** Under main's image lock again, main's seed is refreshed once more exactly as a fork of main refreshes
@@ -766,7 +761,7 @@ caught up to (Catch-up); a later qualifying foreground operation can advise anot
   before its image exists, renamed into place, and given that seed's freshness mark (its bytes are that seed's, so they
   are no newer). It is proven forkable and published, as a captured seed is. Every older seed is then claimed under the
   lock and committed to `build/.deleting` once the compaction lets the lock go, as a fork's seed refresh retires the
-  seeds it replaces (Garbage collection). A successful publication removes its prior failure record.
+  seeds it replaces (Garbage collection).
 - **Catch-up.** When a land, a fork's reseed or the publication's own refresh replaced the seed the copy holds, the new
   latest seed is cloned aside under the same lock, and the lock is let go. With no lock held, the copy is made to hold
   the new seed's bytes: wherever the new seed's data sits on the same device blocks as the old seed's clone at the same
@@ -776,7 +771,7 @@ caught up to (Catch-up); a later qualifying foreground operation can advise anot
   copy's runs (measured 2026-10-26 on the store volume: sixteen 1 MiB overwrites of a contiguous 64 MiB file left its 8
   runs, the same writes into a clone of it made 87). The old clone is then handed to the gateway's cleanup (Leftovers),
   and publication is tried again under the lock, refresh first. Each catch-up writes only what main's seed changed since
-  the last, so it takes the time of one land's delta, not of the whole seed; each says on stderr the seeds, the bytes
+  the last, so it takes the time of one land's delta, not of the whole seed; each says on its span the seeds, the bytes
   written and punched, and the time taken. After **8** catch-ups the seed is replaced faster than the copy follows it,
   and the compaction stops. A copy already under way finishes the seed it started rather than switching to the new one:
   it reads one immutable clone in one pass and takes no lock, a switch would still need the catch-up for the part
@@ -803,32 +798,34 @@ caught up to (Catch-up); a later qualifying foreground operation can advise anot
   it stay compact; without the move, the next fork's reseed would replace the compacted seed with a capture of main's
   fragmented volume as soon as main is written. Forks made after the compacted seed is published start compact either
   way, and their lands carry the compact lineage into main.
-- **Leftovers.** `build/.compacting`, and `build/.collecting` with the background collection's log, are read by no
-  enumeration of images, records or `build/.deleting`. Every `.dmg` in it, the clones and the copy, is handed to the
-  gateway's cleanup by the compaction itself before it answers, and an interrupted compaction's by the next one once it
-  holds the compaction lock and before it takes main's image lock: one rename into `build/.deleting` under a fresh id,
-  made durable, and a nudge (05_gateway.md, "Deleting released images"). The compaction cuts nothing: the gateway's
-  cleanup is the only cutter on the store's container. Measured 2026-10-26, a compaction that freed its old seed's clone
-  itself beside the cleanup took 67.98 s for its first cut and 1 to 14 s for later ones, the cleanup's cuts beside it 14
-  and 17 s, and unrelated opens on the host waited up to 49 s.
-- The process reports one line on stderr: running elsewhere, below the bound with the child's actual count, no seed,
+- **Leftovers.** `build/.compacting` holds the compaction lock (`lock`) and its working images, the staged clones
+  `<seed>.dmg` and the copy `copy.dmg`. No enumeration of images, records or `build/.deleting` reads it, and the
+  project's unbinding discards it with the rest of `build/` (02_workspaces.md, "Checkout layouts"). Every `.dmg` in it,
+  the clones and the copy, is handed to the gateway's cleanup by the compaction itself before it answers, and an
+  interrupted compaction's by the next one once it holds the compaction lock and before it takes main's image lock: one
+  rename into `build/.deleting` under a fresh id, made durable, and a nudge (05_gateway.md, "Deleting released images").
+  The compaction cuts nothing: the gateway's cleanup is the only cutter on the store's container. Measured 2026-10-26, a
+  compaction that freed its old seed's clone itself beside the cleanup took 67.98 s for its first cut and 1 to 14 s for
+  later ones, the cleanup's cuts beside it 14 and 17 s, and unrelated opens on the host waited up to 49 s.
+- The process's span ends with its report: running elsewhere, below the bound with the child's actual count, no seed,
   stopped and why, or compacted with both extent counts, the bytes written, the time taken, each catch-up, and whether
-  main's volume moved or why it was kept.
+  main's volume moved or why it was kept. A compaction that cannot tell whether a gate or a land runs, gives up catching
+  up, or finds another one running has not failed and ends `span-ok`; one ending in an error ends `span-err` with it.
 - **Enforced by**: pure injected-duration advice tables below, at and strictly above ten seconds, main and non-main,
   absent observations, and actual attach-plus-mount composition; an injected-clock adapter witness excludes admission
   queueing from command work; the production count seam counts once, makes no copy below 500,000 and reuses its count at
-  the bound; the failure hold admits only another build. A test in which the first start, with no `build/.compacting`,
-  starts a process that holds none of the land's descriptors; a held copy asks again until it may go on; a copy that a
-  stop interrupts removes its copy and leaves the source unchanged; a real-APFS test of the catch-up writing nothing for
-  a plain clone of the copied seed and, for a clone with a range rewritten, data written into a hole and a range
-  punched, exactly its unshared data, admitting the last write and every punch, after which the copy holds the new
-  seed's bytes and holes; a real-APFS test in which a fragmented seed is cloned, copied and published as main's latest
-  seed, with at least ten times fewer extents, the same data and holes, and the copied seed's freshness mark, while the
-  old seed is committed to `build/.deleting`, and in which a seed a land publishes between the copy and its publication,
-  or during the copy, is caught up to, writing only what the land changed, and published with that seed's bytes and
-  mark; and a real-APFS test in which main moves onto a clone of its seed only once its volume holds no write after the
-  seed's mark, and a write made while the replacement is cloned refuses the move, is kept, and leaves no replacement
-  behind.
+  the bound. A test in which a start creates no file or directory and starts a process that holds none of the land's
+  descriptors; a background verb that fails seals a `span-err` row carrying its error; a held copy asks again until it
+  may go on; a copy that a stop interrupts removes its copy and leaves the source unchanged; a real-APFS test of the
+  catch-up writing nothing for a plain clone of the copied seed and, for a clone with a range rewritten, data written
+  into a hole and a range punched, exactly its unshared data, admitting the last write and every punch, after which the
+  copy holds the new seed's bytes and holes; a real-APFS test in which a fragmented seed is cloned, copied and published
+  as main's latest seed, with at least ten times fewer extents, the same data and holes, and the copied seed's freshness
+  mark, while the old seed is committed to `build/.deleting`, and in which a seed a land publishes between the copy and
+  its publication, or during the copy, is caught up to, writing only what the land changed, and published with that
+  seed's bytes and mark; and a real-APFS test in which main moves onto a clone of its seed only once its volume holds no
+  write after the seed's mark, and a write made while the replacement is cloned refuses the move, is kept, and leaves no
+  replacement behind.
 
 ### Source and build state arrive together
 
@@ -1069,17 +1066,17 @@ unit's export.
       `build <target>`; its previous volume becomes superseded under the target at its incarnation, as the seeds its
       freeze replaced are, and the land answers without releasing either. Once main has moved, adopted and retired, the
       land starts `cowshed __collect-build-volumes <project-root>`, the store's installed cowshed, in a session of its
-      own with its stderr appended to `build/.collecting/log`, and that collection releases them with whatever else no
-      checkout links, unless a running job's hold still owns the previous volume: it stays the target's and that job's
-      end releases it. This applies with `--no-retire` too. No release's unmount, detach or commit rename holds the
-      land's answer (measured: the unmount of a 403 GB previous volume took 26.5 s inside the land, and the land's
-      in-process client fell `SILENT` while it ran). Each release the collection makes or defers is a line of its log,
-      and its last line says what it reclaimed. A store with no installed cowshed has no program for it: the land
-      collects before it answers and says so. A collection that does not start is said on stderr, and the next land,
-      `rm` or `gc` collects what it would have. It needs no image lock: a fork or reseed that takes the lock after the
-      rename reads the adopted volume, and none that held it before the land took it still runs, and no fork reads a
-      superseded seed. Nothing frees a byte on the land's path: the gateway's cleanup frees the committed images (GC
-      below).
+      own with null stdio, and that collection releases them with whatever else no checkout links, unless a running
+      job's hold still owns the previous volume: it stays the target's and that job's end releases it. This applies with
+      `--no-retire` too. No release's unmount, detach or commit rename holds the land's answer (measured: the unmount of
+      a 403 GB previous volume took 26.5 s inside the land, and the land's in-process client fell `SILENT` while it
+      ran). The collection's account is its span (13_telemetry.md, "Background verb spans"): each volume it defers is an
+      `info` row with the reason, and its end says what it examined and reclaimed, or its error. A store with no
+      installed cowshed has no program for it: the land collects before it answers and says so. A collection that does
+      not start is said on stderr, and the next land, `rm` or `gc` collects what it would have. It needs no image lock:
+      a fork or reseed that takes the lock after the rename reads the adopted volume, and none that held it before the
+      land took it still runs, and no fork reads a superseded seed. Nothing frees a byte on the land's path: the
+      gateway's cleanup frees the committed images (GC below).
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
    and builds the landed delta incrementally the next time anything builds there; forks start from the new seed until

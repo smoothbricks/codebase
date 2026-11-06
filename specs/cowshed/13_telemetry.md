@@ -19,8 +19,8 @@ vocabulary (`Deadline`, `LatencyClass`, `RetryClass`, `BlockedReason`; specs/lma
 "Rust"). It does not take lmao's telemetry runtime, so cowshed works without lmao's tracing. One `cowshed-core` module
 writes lmao's Arrow trace schema — the system-column prefix, the entry-type dictionary and sealed-segment publication —
 byte-for-byte aligned with `lmao-arrow`'s, because that crate cannot be imported without `lmao-core`'s span buffers. The
-gateway's request spans, the supervisor's job spans, the native image observations and the CLI's wait spans all use that
-module; none keeps a copy. Nothing in cowshed queries traces with `lmao-query`.
+gateway's request spans, the supervisor's job spans, the native image observations, the CLI's wait spans and the
+background verbs' run spans all use that module; none keeps a copy. Nothing in cowshed queries traces with `lmao-query`.
 
 **Job span segments.** The workspace supervisor writes each job's span with the trace context the controller minted or
 adopted for it (`JobInfo.trace`): a `span-start` row at admission, the `job.unattributed` row below when its terminal
@@ -89,6 +89,8 @@ it. This is what upgrades a first-party tool's traffic from tier-2 to tier-1 att
   back to which task created this workspace from which state of main.
 - **Wait spans.** A wait on another cowshed process that expires (05_gateway.md, "Deadlines") is a `cowshed.wait` span,
   so `lmao-q errors` lists the expiry with its cause (below, "Wait spans").
+- **Background verb spans.** Each run of a background verb a land or fork starts is one span (below, "Background verb
+  spans"), so its account and its failure are rows, not a log file.
 - **Grant-mutation spans.** Each `grant`/`revoke` (04_sandbox.md) records the trace that caused it, so
   `revision × trace` answers "**why** does this workspace hold this grant" — the task, not just the timestamp.
 - **The escalation loop as one trace.** The exit-6 negotiation (12_mcp.md) — denial span (with the EPERM evidence,
@@ -227,6 +229,22 @@ publication. Its unprivileged 2-second sample runs before a foreground relay dro
 boundary reuses the local receipt rather than sampling or sealing twice. Capture failure is stated in the original error
 and wait_stack_error, never as a successful empty report. Diagnostic work does not move the span's start or expiry
 timestamps, change the original failure, or signal the supervisor.
+
+## Background verb spans
+
+`cowshed __collect-build-volumes` (16_build_volumes.md, Land 6.5) and `cowshed __compact-seed` (16_build_volumes.md,
+"Seed compaction") run in a session of their own with null stdio and write no file of their own: each run is one span,
+sealed when the run ends as its own segment `verb-<uuid>.arrow` under `<store>/telemetry/<yyyy-mm-dd>/`, the UTC date
+the run began, through the same `trace_segment` owner as the wait spans. The span is span 1 of a fresh lmao thread, in
+the trace the verb adopted from `TRACEPARENT` (a land's background verb inherits the land's), with the adopted span id
+in `w3c_parent_span_id`; with none it is the root of a fresh trace. Its `span-start` row, named
+`cowshed.collect-build-volumes` or `cowshed.compact-seed`, is stamped when the run began; an `info` row stamped when it
+was said follows for each thing the run says as it goes (the compaction's waits on a land and its catch-ups, each volume
+the collection defers with the reason); the last row is `span-ok` with the run's summary (what the collection examined
+and reclaimed, the compaction's report) or `span-err` with its error and hint. Every row carries `verb_project` (`Utf8`,
+the project root, null when the arguments named none), `process_id` (`u32`) and `w3c_parent_span_id` (`u64`). A run that
+dies before it ends seals nothing. A seal that fails is said on stderr and never changes the verb's exit code; nothing
+reads these spans for a decision ("Storage").
 
 ## Process-tree spans
 

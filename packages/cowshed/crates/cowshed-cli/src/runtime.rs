@@ -3744,15 +3744,11 @@ fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> V
             match compaction {
                 LandSeedCompaction::NotMain
                 | LandSeedCompaction::NotAdvised => {}
-                LandSeedCompaction::Started { pid, log } => lines.push(format!(
-                    "build volume: necessary main-seed work exceeded ten seconds; process {pid} checks and compacts the current seed in the background, logging to {}",
-                    log.display()
-                )),
-                LandSeedCompaction::Held { error, seconds_ago } => lines.push(format!(
-                    "build volume: main's seed is not compacted, because a compaction by this cowshed build failed {seconds_ago} s ago: {error}; no fork or land of this build starts one until `cowshed __compact-seed <project-root>` succeeds"
+                LandSeedCompaction::Started { pid } => lines.push(format!(
+                    "build volume: necessary main-seed work exceeded ten seconds; process {pid} checks and compacts the current seed in the background"
                 )),
                 LandSeedCompaction::Failed { error } => lines.push(format!(
-                    "build volume: main's seed compaction was not started: {error}; no fork or land of this build starts one until `cowshed __compact-seed <project-root>` succeeds"
+                    "build volume: main's seed compaction was not started: {error}; the next fork or land whose main-seed work exceeds ten seconds starts one"
                 )),
             }
         }

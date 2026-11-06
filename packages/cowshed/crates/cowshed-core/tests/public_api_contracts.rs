@@ -1193,18 +1193,15 @@ fn seed_compaction_reports_only_observed_foreground_facts() {
         json!({"kind": "notAdvised"})
     );
     assert_eq!(
-        serde_json::to_value(LandSeedCompaction::Started {
-            pid: 42,
-            log: "/fixture/compaction.log".into(),
-        })
-        .unwrap(),
-        json!({"kind": "started", "pid": 42, "log": "/fixture/compaction.log"})
+        serde_json::to_value(LandSeedCompaction::Started { pid: 42 }).unwrap(),
+        json!({"kind": "started", "pid": 42})
     );
     for obsolete in [
         json!({"kind": "recent", "secondsAgo": 1}),
         json!({"kind": "below", "extents": 499999}),
         json!({"kind": "noSeed"}),
-        json!({"kind": "started", "pid": 42, "log": "/fixture/compaction.log", "extents": 500000}),
+        json!({"kind": "started", "pid": 42, "log": "/fixture/compaction.log"}),
+        json!({"kind": "held", "error": "the copy failed", "secondsAgo": 1}),
     ] {
         assert!(
             serde_json::from_value::<LandSeedCompaction>(obsolete.clone()).is_err(),
@@ -1249,7 +1246,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
             seed: cowshed_core::api::dto::LandSeed::Frozen {
                 compaction: cowshed_core::api::dto::LandSeedCompaction::Failed {
-                    error: "cannot open the seed compaction log at /Users/fixture/.cache/cowshed/build/.compacting/log: Permission denied (os error 13)".to_owned(),
+                    error: "cannot start __compact-seed at /opt/cowshed/bin/cowshed: Permission denied (os error 13)".to_owned(),
                 },
             },
             adoption: cowshed_core::api::dto::Adoption::Skipped {
@@ -1268,7 +1265,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
     assert_eq!(land["targetWasCheckedOut"], true);
     assert_eq!(
         land["buildVolume"],
-        json!({"seed":{"kind":"frozen","compaction":{"kind":"failed","error":"cannot open the seed compaction log at /Users/fixture/.cache/cowshed/build/.compacting/log: Permission denied (os error 13)"}},
+        json!({"seed":{"kind":"frozen","compaction":{"kind":"failed","error":"cannot start __compact-seed at /opt/cowshed/bin/cowshed: Permission denied (os error 13)"}},
             "adoption":{"kind":"skipped","reason":{"kind":"targetHeld",
             "database":"/m/.nx/workspace-data/A-v3.db","holders":[{"pid":42,"command":"node nx run-many"}]}}})
     );

@@ -1483,7 +1483,6 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         if matches!(
             advice,
             crate::api::dto::LandSeedCompaction::Started { .. }
-                | crate::api::dto::LandSeedCompaction::Held { .. }
                 | crate::api::dto::LandSeedCompaction::Failed { .. }
         ) {
             cowshed_os::eprintln!("cowshed: main seed compaction: {advice:?}");
@@ -2286,16 +2285,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
-    /// Start `program __collect-build-volumes <project_root>` in a session of its own, its stderr
-    /// appended to `build/.collecting/log` (16_build_volumes.md, Land 6.5), and a detached
-    /// reaper for it: the land that starts it answers without waiting. Answers the process's pid
-    /// and its log.
-    pub fn start_collection(&self, program: &Path, project_root: &Path) -> Result<(u32, PathBuf)> {
-        let (mut child, log) = compaction::start_background_verb(
+    /// Start `program __collect-build-volumes <project_root>` in a session of its own with null
+    /// stdio, its run its span (16_build_volumes.md, Land 6.5; 13_telemetry.md, "Background verb
+    /// spans"), and a detached reaper for it: the land that starts it answers without waiting.
+    /// Answers the process's pid.
+    pub fn start_collection(&self, program: &Path, project_root: &Path) -> Result<u32> {
+        let mut child = compaction::start_background_verb(
             program,
             crate::runtime::project::BUILD_VOLUME_COLLECTION_VERB,
             project_root,
-            &self.layout.collecting(),
         )?;
         let pid = child.id();
         // WHY unbounded: a detached reaper, with no waiter, collects the child when it ends.
@@ -2311,11 +2309,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             });
         if let Err(error) = reaper {
             cowshed_os::eprintln!(
-                "cowshed: build-volume collection process {pid} started, logging to {}, but its reaper could not be created: {error}",
-                log.display()
+                "cowshed: build-volume collection process {pid} started, but its reaper could not be created: {error}"
             );
         }
-        Ok((pid, log))
+        Ok(pid)
     }
 
     /// Next-open recovery of interrupted creations (16_build_volumes.md, "Garbage collection"):

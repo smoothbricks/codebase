@@ -3921,20 +3921,14 @@ pub enum LandSeed {
 pub enum LandSeedCompaction {
     /// The target is not main; only main's seed is compacted.
     NotMain,
-    /// A compaction by this cowshed build failed `secondsAgo` seconds ago with `error`, so none
-    /// was started: no fork or land of this build starts one until a compaction succeeds.
-    Held {
-        error: String,
-        #[serde(rename = "secondsAgo")]
-        seconds_ago: u64,
-    },
     /// No necessary main-seed capture or attach/mount operation exceeded ten seconds.
     NotAdvised,
-    /// Process `pid` checks the current seed and compacts it in the background when due,
-    /// its stderr appended to `log`. No foreground extent count is made.
-    Started { pid: u32, log: PathBuf },
-    /// Deciding or starting the compaction failed with `error`. The failure is recorded, so the
-    /// next lands of this build hold back for it.
+    /// Process `pid` checks the current seed and compacts it in the background when due; its
+    /// run is its span (13_telemetry.md, "Background verb spans"). No foreground extent count is
+    /// made.
+    Started { pid: u32 },
+    /// Deciding or starting the compaction failed with `error`. Nothing is recorded: the next
+    /// qualifying fork or land advises again.
     Failed { error: String },
 }
 /// What one seed compaction did (16_build_volumes.md, "Seed compaction"): the result of the

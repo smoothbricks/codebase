@@ -57,8 +57,6 @@ pub(crate) const COMPACTING_DIRECTORY: &str = ".compacting";
 /// The seed compaction's one-at-a-time lock in [`COMPACTING_DIRECTORY`].
 #[cfg(target_os = "macos")]
 pub(crate) const COMPACTION_LOCK: &str = "lock";
-/// Where the background collection a land starts logs ([`BuildVolumeLayout::collecting`]).
-const COLLECTING_DIRECTORY: &str = ".collecting";
 /// The volume's own statement of the build-state paths it holds, at its root. It travels with
 /// every clone, so a fork knows what its source linked without rediscovering it.
 pub const STATE_FILE: &str = "cowshed-build-state.json";
@@ -1165,13 +1163,6 @@ impl BuildVolumeLayout {
     /// copy. No enumeration of images, records or the release journal reads it.
     pub fn compacting(&self) -> PathBuf {
         self.images.join(COMPACTING_DIRECTORY)
-    }
-
-    /// Where the background build-volume collection a land starts logs (16_build_volumes.md,
-    /// Land 6.5), `build/.collecting`. No enumeration of images, records or the release journal
-    /// reads it.
-    pub fn collecting(&self) -> PathBuf {
-        self.images.join(COLLECTING_DIRECTORY)
     }
 
     /// Release `id`'s detached image inside the operation that retires or replaces it, and say

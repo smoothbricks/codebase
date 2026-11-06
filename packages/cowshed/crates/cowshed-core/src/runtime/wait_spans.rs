@@ -207,14 +207,47 @@ pub enum WaitSpanError {
     #[error(transparent)]
     Segment(#[from] TraceSegmentError),
 }
+/// The trace a span this process writes is in: the one its caller exported in `TRACEPARENT`,
+/// hanging from the caller's span, or a fresh one (13_telemetry.md, "Wait spans").
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdoptedTrace {
+    pub(crate) trace_id: TraceId,
+    /// The adopted context's span, which the span hangs from; `None` in a minted trace.
+    pub(crate) parent: Option<SpanId>,
+}
+
+impl AdoptedTrace {
+    /// The trace `traceparent` names: a W3C `traceparent`, as a traced caller exports it in
+    /// `TRACEPARENT`. With none, or one that does not parse, a fresh trace, as a W3C participant
+    /// restarts one.
+    pub fn of(traceparent: Option<&str>) -> Self {
+        match traceparent.and_then(TraceContext::from_traceparent) {
+            Some(adopted) => Self {
+                trace_id: adopted.trace_id,
+                parent: Some(adopted.span_id),
+            },
+            None => Self {
+                trace_id: TraceContext::mint().trace_id,
+                parent: None,
+            },
+        }
+    }
+
+    /// The `w3c_parent_span_id` column: the adopted span id, null in a minted trace.
+    pub(crate) fn parent_column(&self) -> Option<u64> {
+        self.parent.as_ref().map(|parent| {
+            u64::from_str_radix(parent.as_str(), 16)
+                .expect("a SpanId is exactly 16 lowercase hex digits")
+        })
+    }
+}
+
 /// Where a boundary with no span of its own seals the waits that expired under it, and the trace
 /// those spans are in.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WaitSpans {
     root: PathBuf,
-    trace_id: TraceId,
-    /// The adopted context's span, which a wait span hangs from; `None` in a minted trace.
-    parent: Option<SpanId>,
+    trace: AdoptedTrace,
 }
 
 /// The OS sampler a recording takes a silent peer's stacks with: the peer's pid in, the report's
@@ -297,18 +330,12 @@ impl WaitRecording {
 }
 
 impl WaitSpans {
-    /// Seal under the telemetry `root`, in the trace `traceparent` names: a W3C `traceparent`, as
-    /// a traced caller exports it in `TRACEPARENT`. With none, or one that does not parse, each
-    /// wait span is the root of a fresh trace, as a W3C participant restarts one.
+    /// Seal under the telemetry `root`, in the trace `traceparent` names ([`AdoptedTrace::of`]):
+    /// with none, each wait span is the root of a fresh trace.
     pub fn adopting(root: PathBuf, traceparent: Option<&str>) -> Self {
-        let (trace_id, parent) = match traceparent.and_then(TraceContext::from_traceparent) {
-            Some(adopted) => (adopted.trace_id, Some(adopted.span_id)),
-            None => (TraceContext::mint().trace_id, None),
-        };
         Self {
             root,
-            trace_id,
-            parent,
+            trace: AdoptedTrace::of(traceparent),
         }
     }
 
@@ -398,7 +425,7 @@ impl WaitSpans {
             system.push(SystemRow {
                 timestamp_ns: i64::try_from(at.as_nanos())
                     .map_err(|_| WaitSpanError::BeyondNanoseconds)?,
-                trace_id: self.trace_id.as_str(),
+                trace_id: self.trace.trace_id.as_str(),
                 span,
                 parent: None,
                 entry_type,
@@ -417,10 +444,7 @@ impl WaitSpans {
             wait_stack_sample: None,
             wait_stack_error: None,
             process_id: std::process::id(),
-            w3c_parent_span_id: self.parent.as_ref().map(|parent| {
-                u64::from_str_radix(parent.as_str(), 16)
-                    .expect("a SpanId is exactly 16 lowercase hex digits")
-            }),
+            w3c_parent_span_id: self.trace.parent_column(),
         };
         let end = WaitColumns {
             wait_code: Some(failure.code),
@@ -630,11 +654,11 @@ mod tests {
             Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
         );
         assert_eq!(
-            adopted.trace_id.as_str(),
+            adopted.trace.trace_id.as_str(),
             "4bf92f3577b34da6a3ce929d0e0e4736"
         );
         assert_eq!(
-            adopted.parent.as_ref().map(SpanId::as_str),
+            adopted.trace.parent.as_ref().map(SpanId::as_str),
             Some("00f067aa0ba902b7")
         );
         for refused in [
@@ -648,8 +672,8 @@ mod tests {
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-00",
         ] {
             let minted = WaitSpans::adopting(root.clone(), Some(refused));
-            assert_eq!(minted.parent, None, "{refused:?}");
-            assert_ne!(minted.trace_id, adopted.trace_id, "{refused:?}");
+            assert_eq!(minted.trace.parent, None, "{refused:?}");
+            assert_ne!(minted.trace.trace_id, adopted.trace.trace_id, "{refused:?}");
         }
     }
 }

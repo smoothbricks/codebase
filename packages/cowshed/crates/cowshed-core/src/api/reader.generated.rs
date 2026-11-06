@@ -569,18 +569,15 @@ static LAND_SEED_COMPACTION: Reader = Reader::Internal {
     tag: "kind",
     arms: &[
         ("notMain", &LAND_SEED_COMPACTION__NOT_MAIN),
-        ("held", &LAND_SEED_COMPACTION__HELD),
         ("notAdvised", &LAND_SEED_COMPACTION__NOT_ADVISED),
         ("started", &LAND_SEED_COMPACTION__STARTED),
         ("failed", &LAND_SEED_COMPACTION__FAILED),
     ],
 };
 static LAND_SEED_COMPACTION__FAILED: Reader = Reader::Record(&[("error", &LEAF)]);
-static LAND_SEED_COMPACTION__HELD: Reader =
-    Reader::Record(&[("error", &LEAF), ("secondsAgo", &LEAF)]);
 static LAND_SEED_COMPACTION__NOT_ADVISED: Reader = Reader::Record(&[]);
 static LAND_SEED_COMPACTION__NOT_MAIN: Reader = Reader::Record(&[]);
-static LAND_SEED_COMPACTION__STARTED: Reader = Reader::Record(&[("pid", &LEAF), ("log", &LEAF)]);
+static LAND_SEED_COMPACTION__STARTED: Reader = Reader::Record(&[("pid", &LEAF)]);
 static LAND_SEED__FROZEN: Reader = Reader::Record(&[("compaction", &LAND_SEED_COMPACTION)]);
 static LAND_SEED__SEAL_BUSY: Reader = Reader::Record(&[("reason", &LEAF)]);
 static LAND_SEED__UNCHANGED: Reader = Reader::Record(&[]);

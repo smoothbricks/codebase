@@ -5474,8 +5474,8 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
 /// A land answers once main has moved, adopted and retired (16_build_volumes.md, Land 6.5): its
 /// target's previous volume is still recorded superseded under main when the land answers, and the
 /// collection that releases it runs as `cowshed __collect-build-volumes`, the store's installed
-/// cowshed, logging to `build/.collecting/log`. No release's unmount or detach holds the answer,
-/// however long it takes.
+/// cowshed, with null stdio, its account its span: starting it leaves nothing under `build/` but
+/// volumes. No release's unmount or detach holds the answer, however long it takes.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_a_land_answers_before_its_previous_volume_is_released() {
     let rust = RustToolchain::of_this_test();
@@ -5506,9 +5506,26 @@ async fn directory_a_land_answers_before_its_previous_volume_is_released() {
         ),
         "main's previous volume stays recorded as main's for the collection"
     );
+    let images = layout
+        .image(&previous)
+        .parent()
+        .expect("an image directory")
+        .to_path_buf();
+    let strays: Vec<_> = fs::read_dir(&images)
+        .expect("read build/")
+        .map(|entry| entry.expect("a build/ entry").file_name())
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            !(name == ".deleting"
+                || name.ends_with(".dmg")
+                || name.ends_with(".dmg.json")
+                || name.ends_with(".dmg.hold")
+                || name.ends_with(".dmg.written"))
+        })
+        .collect();
     assert!(
-        layout.collecting().join("log").is_file(),
-        "the land started its background collection, logging to build/.collecting/log"
+        strays.is_empty(),
+        "the land's background collection left files under build/ besides volumes: {strays:?}"
     );
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;

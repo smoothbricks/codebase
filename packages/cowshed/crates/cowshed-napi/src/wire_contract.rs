@@ -963,10 +963,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     let land_held = cowshed_core::api::dto::LandedReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
             seed: cowshed_core::api::dto::LandSeed::Frozen {
-                compaction: cowshed_core::api::dto::LandSeedCompaction::Started {
-                    pid: 4243,
-                    log: PathBuf::from("/Users/fixture/.cache/cowshed/build/.compacting/log"),
-                },
+                compaction: cowshed_core::api::dto::LandSeedCompaction::Started { pid: 4243 },
             },
             adoption: cowshed_core::api::dto::Adoption::Skipped {
                 reason: cowshed_core::api::dto::AdoptionSkip::TargetHeld {
@@ -993,9 +990,8 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     let land_opening = cowshed_core::api::dto::LandedReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
             seed: cowshed_core::api::dto::LandSeed::Frozen {
-                compaction: cowshed_core::api::dto::LandSeedCompaction::Held {
+                compaction: cowshed_core::api::dto::LandSeedCompaction::Failed {
                     error: "build volume storage failed: the copy could not be written".to_owned(),
-                    seconds_ago: 3600,
                 },
             },
             adoption: cowshed_core::api::dto::Adoption::Skipped {

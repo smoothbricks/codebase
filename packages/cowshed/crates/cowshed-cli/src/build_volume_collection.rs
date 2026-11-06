@@ -2,40 +2,69 @@
 //! a process of its own (16_build_volumes.md, Land 6.5).
 //!
 //! Not a user verb and not in the command map: a land starts it once main has moved, adopted and
-//! retired, in a session of its own, with stderr appended to `build/.collecting/log`, so the
-//! land answers without waiting for any release's unmount or detach. Each release it makes, or
-//! defers, is a line of that log; it ends with what it reclaimed. Run by hand it collects what
-//! no checkout links, as the next land would.
+//! retired, in a session of its own with null stdio, so the land answers without waiting for any
+//! release's unmount or detach. Its account is its span (13_telemetry.md, "Background verb
+//! spans"): an `info` row for each volume it defers, with the reason, and a `span-ok` row saying
+//! what it examined and reclaimed, or a `span-err` row with its error. Run by hand it collects
+//! what no checkout links, as the next land would.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cowshed_core::api::dto::GcReport;
-use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
+use cowshed_core::runtime::ProjectRuntime;
+use cowshed_core::runtime::verb_spans::{COLLECTION_SPAN, VerbNotes, VerbSpan};
 use cowshed_core::{CowshedError, Result};
 
 /// Collect the build volumes of the project `arguments` name; the process's exit code.
 pub async fn run(arguments: &[OsString]) -> i32 {
-    match collect(arguments).await {
-        Ok(report) => {
-            cowshed_os::eprintln!(
-                "cowshed: build-volume collection: examined {}, reclaimed {} ({} bytes), {} stay",
-                report.examined,
-                report.reclaimed,
-                report.released_bytes,
-                report.deferred.len()
-            );
-            0
-        }
-        Err(error) => {
-            cowshed_os::eprintln!("cowshed: build-volume collection failed: {}", error.message);
-            cowshed_os::eprintln!("hint: {}", error.hint);
-            i32::from(error.code.exit_code())
-        }
-    }
+    let project = match arguments {
+        [project] => Some(Path::new(project)),
+        _ => None,
+    };
+    traced(arguments, VerbSpan::host(COLLECTION_SPAN, project)).await
 }
 
-async fn collect(arguments: &[OsString]) -> Result<GcReport> {
+/// The collection under `span`, sealed once it ends. A seal that fails is said on stderr and
+/// never changes the exit code (13_telemetry.md, "Background verb spans").
+async fn traced(arguments: &[OsString], span: VerbSpan) -> i32 {
+    let notes = span.notes();
+    let (code, outcome) = match collect(arguments, notes.clone()).await {
+        Ok(report) => {
+            for deferred in &report.deferred {
+                notes.say(format!(
+                    "build volume {} stays: {}",
+                    deferred.path.display(),
+                    deferred.diagnostic
+                ));
+            }
+            (
+                0,
+                Ok(format!(
+                    "examined {}, reclaimed {} ({} bytes), {} stay",
+                    report.examined,
+                    report.reclaimed,
+                    report.released_bytes,
+                    report.deferred.len()
+                )),
+            )
+        }
+        Err(error) => (
+            i32::from(error.code.exit_code()),
+            Err(format!("{}; hint: {}", error.message, error.hint)),
+        ),
+    };
+    let root = span.root().to_path_buf();
+    if let Err(error) = span.end(outcome.as_deref().map_err(String::as_str)) {
+        cowshed_os::eprintln!(
+            "cowshed: the build-volume collection's span could not be sealed under {}: {error}",
+            root.display()
+        );
+    }
+    code
+}
+
+async fn collect(arguments: &[OsString], notes: VerbNotes) -> Result<GcReport> {
     let [project] = arguments else {
         return Err(CowshedError::usage(
             format!(
@@ -45,14 +74,76 @@ async fn collect(arguments: &[OsString]) -> Result<GcReport> {
             "run `cowshed __collect-build-volumes <project-root>`; a land starts it on its own",
         ));
     };
-    let runtime = ProjectRuntime::open_existing(
+    let runtime = ProjectRuntime::open_existing_for_background_verb(
         PathBuf::from(project),
-        RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
         crate::gateway_service::runtime_control,
+        notes,
     )
     .await?;
     let collected = runtime.collect_build_volumes().await;
     let shutdown = runtime.shutdown().await;
     let report = collected?;
     shutdown.map(|()| report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::ArrayAccessor as _;
+    use arrow_array::cast::AsArray as _;
+    use arrow_array::types::{UInt8Type, UInt32Type};
+
+    /// A collection that fails leaves its span: one segment whose `span-err` row carries the
+    /// error, here the usage error of a run that names no project.
+    #[tokio::test]
+    async fn a_failed_collection_seals_an_err_span_carrying_its_error() {
+        let root =
+            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "csverb");
+        let code = traced(
+            &[],
+            VerbSpan::begin(root.to_path_buf(), None, COLLECTION_SPAN, None),
+        )
+        .await;
+        assert_ne!(code, 0);
+        let segments: Vec<_> = std::fs::read_dir(&*root)
+            .expect("telemetry root")
+            .flat_map(|partition| {
+                std::fs::read_dir(partition.expect("partition").path()).expect("partition")
+            })
+            .map(|entry| entry.expect("segment").path())
+            .collect();
+        assert_eq!(segments.len(), 1, "{segments:?}");
+        let mut reader = arrow_ipc::reader::StreamReader::try_new(
+            std::fs::File::open(&segments[0]).expect("open segment"),
+            None,
+        )
+        .expect("an Arrow stream");
+        let batch = reader.next().expect("one batch").expect("a readable batch");
+        let column = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let entry = column("entry_type").as_dictionary::<UInt8Type>();
+        let entry = entry
+            .downcast_dict::<arrow_array::StringArray>()
+            .expect("names");
+        let message = column("message").as_dictionary::<UInt32Type>();
+        let message = message
+            .downcast_dict::<arrow_array::StringArray>()
+            .expect("messages");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(
+            (entry.value(0), message.value(0)),
+            ("span-start", COLLECTION_SPAN)
+        );
+        assert_eq!(entry.value(1), "span-err");
+        assert!(
+            message
+                .value(1)
+                .starts_with("__collect-build-volumes takes a project root; hint: "),
+            "{}",
+            message.value(1)
+        );
+    }
 }

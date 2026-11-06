@@ -2011,14 +2011,9 @@ export type LandSeed =
  */
 export type LandSeedCompaction =
   | { readonly kind: 'notMain' }
-  | ({ readonly kind: 'held' } & {
-      readonly error: string;
-      readonly secondsAgo: number & tags.Type<'uint64'>;
-    })
   | { readonly kind: 'notAdvised' }
   | ({ readonly kind: 'started' } & {
       readonly pid: number & tags.Type<'uint32'>;
-      readonly log: string;
     })
   | ({ readonly kind: 'failed' } & {
       readonly error: string;

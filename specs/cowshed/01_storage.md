@@ -95,6 +95,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
       <id>.dmg.json                  # its sidecar: built-at tree, linking checkout, checked-out tree when placed, seed flag, created
       <id>.dmg.hold                  # flock each job on the volume holds shared; a release claims it exclusive, then deletes it
       .deleting/<id>.dmg             # a committed release, waiting for the gateway's cleanup
+      .compacting/                   # the seed compaction's flock `lock` and its working images: <seed>.dmg clones, copy.dmg
     tmp/
       <workspace>/                   # its TMPDIR, 0700: writable by its own sandbox only; reclaimed with its retired image,
                                      #   read-only directories its tools sealed made owner-writable first (`go clean -modcache`)

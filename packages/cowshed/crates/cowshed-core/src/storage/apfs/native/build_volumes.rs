@@ -29,7 +29,7 @@ use crate::storage::lifecycle::ExtentCount;
 
 /// The compaction's contiguous copy, until it is published or released. Each seed it copies or
 /// catches up to is cloned beside it as `<seed>.dmg` ([`CompactionSource`]).
-const COMPACTION_COPY: &str = "copy.dmg";
+pub(crate) const COMPACTION_COPY: &str = "copy.dmg";
 
 /// A seed cloned aside for its compaction (16_build_volumes.md, "Seed compaction"), as
 /// `build/.compacting/<seed>.dmg`. The clone shares the seed's blocks and is never written, so a

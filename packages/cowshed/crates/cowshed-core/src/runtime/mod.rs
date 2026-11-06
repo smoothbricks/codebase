@@ -53,6 +53,7 @@ pub(crate) mod storage_host;
 pub mod supervisor;
 pub mod supervisor_manager;
 pub mod supervisor_socket;
+pub mod verb_spans;
 pub mod volume_usage;
 pub mod wait_spans;
 

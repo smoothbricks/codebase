@@ -134,7 +134,6 @@ type ReaderName =
   | 'LAND_SEED'
   | 'LAND_SEED_COMPACTION'
   | 'LAND_SEED_COMPACTION__FAILED'
-  | 'LAND_SEED_COMPACTION__HELD'
   | 'LAND_SEED_COMPACTION__NOT_ADVISED'
   | 'LAND_SEED_COMPACTION__NOT_MAIN'
   | 'LAND_SEED_COMPACTION__STARTED'
@@ -1217,29 +1216,15 @@ const READERS: Readers<ReaderName> = {
     tag: 'kind',
     arms: [
       ['notMain', 'LAND_SEED_COMPACTION__NOT_MAIN'],
-      ['held', 'LAND_SEED_COMPACTION__HELD'],
       ['notAdvised', 'LAND_SEED_COMPACTION__NOT_ADVISED'],
       ['started', 'LAND_SEED_COMPACTION__STARTED'],
       ['failed', 'LAND_SEED_COMPACTION__FAILED'],
     ],
   },
   LAND_SEED_COMPACTION__FAILED: { kind: 'record', fields: [['error', 'LEAF']] },
-  LAND_SEED_COMPACTION__HELD: {
-    kind: 'record',
-    fields: [
-      ['error', 'LEAF'],
-      ['secondsAgo', 'LEAF'],
-    ],
-  },
   LAND_SEED_COMPACTION__NOT_ADVISED: { kind: 'record', fields: [] },
   LAND_SEED_COMPACTION__NOT_MAIN: { kind: 'record', fields: [] },
-  LAND_SEED_COMPACTION__STARTED: {
-    kind: 'record',
-    fields: [
-      ['pid', 'LEAF'],
-      ['log', 'LEAF'],
-    ],
-  },
+  LAND_SEED_COMPACTION__STARTED: { kind: 'record', fields: [['pid', 'LEAF']] },
   LAND_SEED__FROZEN: { kind: 'record', fields: [['compaction', 'LAND_SEED_COMPACTION']] },
   LAND_SEED__SEAL_BUSY: { kind: 'record', fields: [['reason', 'LEAF']] },
   LAND_SEED__UNCHANGED: { kind: 'record', fields: [] },

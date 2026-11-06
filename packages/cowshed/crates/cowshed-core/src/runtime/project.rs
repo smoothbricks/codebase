@@ -858,6 +858,9 @@ fn rename_selected_by_source(
 struct RuntimeServices {
     continuity: crate::storage::audit::ContinuityAudit,
     gateway_factory: crate::gateway_sessions::GatewayControlFactory,
+    /// Where a background verb's run says what it does: its span's `info` rows
+    /// (13_telemetry.md, "Background verb spans"). Any other verb's runtime says it on stderr.
+    notes: super::verb_spans::VerbNotes,
 }
 
 impl ProjectRuntime {
@@ -876,6 +879,7 @@ impl ProjectRuntime {
             RuntimeServices {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
+                notes: super::verb_spans::VerbNotes::default(),
             },
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
@@ -903,6 +907,7 @@ impl ProjectRuntime {
             RuntimeServices {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
+                notes: super::verb_spans::VerbNotes::default(),
             },
             BindingRemoteValidation::Strict,
             scope,
@@ -950,6 +955,31 @@ impl ProjectRuntime {
         }
     }
 
+    /// Opens the production runtime for a background verb a land or fork starts
+    /// (`__collect-build-volumes`, `__compact-seed`), as [`Self::open_existing`] opens it for a
+    /// verb naming no workspace, with what the run says going to `notes`, its span's `info`
+    /// rows (13_telemetry.md, "Background verb spans").
+    pub async fn open_existing_for_background_verb(
+        project_root: impl AsRef<Path>,
+        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
+        notes: super::verb_spans::VerbNotes,
+    ) -> Result<Self> {
+        Self::open_native(
+            project_root.as_ref(),
+            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
+            None,
+            RuntimeServices {
+                continuity: continuity_from_environment()?,
+                gateway_factory,
+                notes,
+            },
+            BindingRemoteValidation::Strict,
+            RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+            None,
+        )
+        .await
+    }
+
     /// Opens for the identity-change verb alone. The verb rebinds the project rather than any
     /// session workspace, so it finishes only `main`'s unfinished lifecycle work.
     ///
@@ -967,6 +997,7 @@ impl ProjectRuntime {
             RuntimeServices {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
+                notes: super::verb_spans::VerbNotes::default(),
             },
             BindingRemoteValidation::ForIdentityChange,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
@@ -992,6 +1023,7 @@ impl ProjectRuntime {
             RuntimeServices {
                 continuity,
                 gateway_factory,
+                notes: super::verb_spans::VerbNotes::default(),
             },
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
@@ -1015,6 +1047,7 @@ impl ProjectRuntime {
             RuntimeServices {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
+                notes: super::verb_spans::VerbNotes::default(),
             },
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
@@ -1037,6 +1070,7 @@ impl ProjectRuntime {
             RuntimeServices {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
+                notes: super::verb_spans::VerbNotes::default(),
             },
             BindingRemoteValidation::Strict,
             scope,
@@ -1101,6 +1135,7 @@ impl ProjectRuntime {
                 RuntimeServices {
                     continuity: continuity_from_environment()?,
                     gateway_factory,
+                    notes: super::verb_spans::VerbNotes::default(),
                 },
                 BindingRemoteValidation::Strict,
                 scope,
@@ -1164,6 +1199,7 @@ impl ProjectRuntime {
                 requested_repo_id,
                 services.continuity,
                 services.gateway_factory,
+                services.notes,
                 validation,
                 recovery_scope,
                 storage,
@@ -2884,6 +2920,8 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     retirement_lease: crate::project_retirement::ProjectReadLease,
     /// The plain `gc`'s held-bundle sweeper, started by the first sweep with bundles to measure.
     held_bundles: Option<super::held_bundles::HeldBundles>,
+    /// Where a background verb's run says what it does ([`RuntimeServices::notes`]).
+    notes: super::verb_spans::VerbNotes,
 }
 
 /// Who runs a workspace's supervisor.
@@ -3936,6 +3974,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let RuntimeServices {
             continuity,
             gateway_factory,
+            notes,
         } = services;
 
         // The store this controller serves: a fixture's supplied one, or the host store that
@@ -4385,6 +4424,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             recovery_scope,
             retirement_lease,
             held_bundles: None,
+            notes,
         })
     }
     /// Apply `change` to the journal on disk under its lock and adopt the result, which also
@@ -5661,8 +5701,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// The collection a land owes once it has moved, adopted and retired (16_build_volumes.md,
     /// Land 6.5): the target's previous volume, the seeds its freeze replaced and whatever else no
     /// checkout links. It runs as `cowshed __collect-build-volumes`, the store's installed cowshed,
-    /// in a session of its own logging to `build/.collecting/log`, so no release's unmount or
-    /// detach holds the land's answer. A store with no installed cowshed has no program for it,
+    /// in a session of its own with null stdio, its run its span (13_telemetry.md, "Background
+    /// verb spans"), so no release's unmount or detach holds the land's answer. A store with no
+    /// installed cowshed has no program for it,
     /// and the land collects before it answers, saying so.
     async fn collect_after_land(&self) -> Result<()> {
         let program = crate::host_dirs::installed_binary_directory(&self.home).join("cowshed");
@@ -5677,10 +5718,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .build_volumes()?
             .start_collection(&program, &self.descriptor.git_root)
         {
-            Ok((pid, log)) => cowshed_os::eprintln!(
-                "cowshed: build-volume collection runs as process {pid}, logging to {}",
-                log.display()
-            ),
+            Ok(pid) => {
+                cowshed_os::eprintln!("cowshed: build-volume collection runs as process {pid}");
+            }
             Err(failed) => cowshed_os::eprintln!(
                 "cowshed: build-volume collection was not started: {}; the next land, `rm` or `gc` collects what it would have",
                 failed.message
@@ -6370,13 +6410,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// at most [`SEED_COMPACTION_CATCH_UPS`] times. The copy of the first seed is finished rather
     /// than switched to the newer one: it reads one immutable clone in one pass and takes no lock,
     /// a switch would still need the catch-up over the part already copied, and finishing writes
-    /// at most the newer seed's changes to the remaining part twice. A publication records the
-    /// success and moves main's live volume onto the compacted seed ([`Self::move_main_onto`]).
+    /// at most the newer seed's changes to the remaining part twice. A publication moves main's
+    /// live volume onto the compacted seed ([`Self::move_main_onto`]). It runs under `_turn`, this
+    /// project's one compaction at a time.
     async fn compact_due_seed(
         &self,
         volumes: &super::build_volumes::BuildVolumes<H>,
         owner: super::build_volumes::Owner,
-        turn: &super::build_volumes::CompactionTurn,
+        _turn: &super::build_volumes::CompactionTurn,
         started: std::time::Instant,
     ) -> Result<crate::api::dto::SeedCompactionReport> {
         use super::build_volumes::{Published, SEED_COMPACTION_CATCH_UPS};
@@ -6447,7 +6488,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     superseded,
                 } => {
                     volumes.retire_superseded(superseded).await;
-                    turn.succeeded()?;
                     let lineage = self.move_main_onto(volumes, &replacement).await?;
                     return Ok(SeedCompactionReport::Compacted {
                         seed: seed.to_string(),
@@ -6488,9 +6528,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     punched,
                 } => {
                     let elapsed_ms = u64::try_from(round.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    cowshed_os::eprintln!(
-                        "cowshed: seed compaction: caught up from seed {from} to {to}: {written} bytes written and {punched} punched in {elapsed_ms} ms"
-                    );
+                    self.notes.say(format!(
+                        "seed compaction: caught up from seed {from} to {to}: {written} bytes written and {punched} punched in {elapsed_ms} ms"
+                    ));
                     caught_up.push(SeedCatchUp {
                         from,
                         to,
@@ -6605,8 +6645,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 
     /// A compaction's copy or catch-up, `work`, whose every check asks this controller, on its own
     /// task, whether to go on: an answer, not a timer, so the work is asked exactly as often as it
-    /// checks. While a land runs, the controller says why once in the compaction's
-    /// log, holds [`SEED_COMPACTION_WAIT`] and answers `Wait`; the work asks again.
+    /// checks. While a land runs, the controller says why once on the compaction's span, holds
+    /// [`SEED_COMPACTION_WAIT`] and answers `Wait`; the work asks again.
     async fn between_gates<T, Work>(
         &self,
         work: impl FnOnce(Box<dyn FnMut() -> super::build_volumes::Admission + Send>) -> Work,
@@ -6635,10 +6675,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     let admission = match self.why_compaction_waits().await {
                         Ok(None) => {
                             if let Some((since, _)) = waiting.take() {
-                                cowshed_os::eprintln!(
-                                    "cowshed: seed compaction: copying again after waiting {} s",
+                                self.notes.say(format!(
+                                    "seed compaction: copying again after waiting {} s",
                                     since.elapsed().as_secs()
-                                );
+                                ));
                             }
                             Admission::Copy
                         }
@@ -6646,7 +6686,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             let since = match waiting.take() {
                                 Some((since, said)) if said == why => since,
                                 held => {
-                                    cowshed_os::eprintln!("cowshed: seed compaction: waiting: {why}");
+                                    self.notes.say(format!("seed compaction: waiting: {why}"));
                                     held.map_or_else(std::time::Instant::now, |(since, _)| since)
                                 }
                             };
@@ -16985,23 +17025,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         })
     }
 
-    /// A compaction that ends in an error records it, so no land of this build starts another
-    /// until one succeeds (16_build_volumes.md, "Seed compaction"); the error is still the answer.
+    /// `coordinator.compactSeed` (16_build_volumes.md, "Seed compaction"): its error is the
+    /// answer, which the verb's span carries; nothing is recorded for a later advice to read.
     async fn compact_seed(&mut self) -> Result<crate::api::dto::SeedCompactionReport> {
-        let compacted = self.compact_main_seed().await;
-        let Err(mut error) = compacted else {
-            return compacted;
-        };
-        if let Err(recording) = self
-            .build_volumes()
-            .and_then(|volumes| volumes.record_compaction_failure(&error.message))
-        {
-            error.message = format!(
-                "{}; recording that failure failed too: {}",
-                error.message, recording.message
-            );
-        }
-        Err(error)
+        self.compact_main_seed().await
     }
 
     async fn refresh_build_state(
