@@ -75,6 +75,179 @@ fn create_processor(capacity: u32) -> u32 {
     }
 }
 
+fn assert_create_log_entry_capacity_retry(input: &[u8], format: u8, expected_value: &[u8]) {
+    let _serial = serial();
+    let handle = create_processor(1);
+    assert_ne!(handle, 0, "processor creation failed");
+    // SAFETY: the handle stays live, and input and each output borrow are valid
+    // for the synchronous call and do not overlap.
+    let process = |output: &mut [u8]| unsafe {
+        ep_create_log_entry(
+            handle,
+            input.as_ptr(),
+            input.len() as u32,
+            format,
+            output.as_mut_ptr(),
+            output.len() as u32,
+        )
+    };
+
+    let mut first_output = vec![0xa5; 64 * 1024];
+    let first_status = process(&mut first_output);
+    let (first_header, arrow_offset, required_capacity, rows, duplicates) =
+        read_result_header(&first_output);
+    assert_eq!(
+        first_status,
+        ResultCode::OutputTooSmall as u32,
+        "format {format}"
+    );
+    assert_eq!(
+        (first_header, arrow_offset, rows, duplicates),
+        (4, 32, 0, 0),
+        "format {format}"
+    );
+    assert!(
+        required_capacity > 64 * 1024,
+        "large IPC required, format {format}"
+    );
+    assert_eq!(&first_output[20..32], &[0; 12]);
+    assert!(
+        first_output[32..].iter().all(|byte| *byte == 0xa5),
+        "capacity refusal modified the IPC destination, format {format}"
+    );
+
+    // The writer's answer is the IPC capacity, not the total output capacity.
+    let mut retry_output = vec![0; 32 + required_capacity as usize];
+    let retry_status = process(&mut retry_output);
+    let mut baseline = vec![0; 256 * 1024];
+    let baseline_status = process(&mut baseline);
+    ep_destroy(handle);
+
+    assert_eq!(retry_status, ResultCode::Ok as u32, "format {format}");
+    assert_eq!(
+        read_result_header(&retry_output),
+        (retry_status, 32, required_capacity, 1, 0),
+        "one exact retry, format {format}"
+    );
+    assert_eq!(&retry_output[20..32], &[0; 12]);
+    assert_eq!(baseline_status, ResultCode::Ok as u32, "format {format}");
+    assert_eq!(
+        read_result_header(&baseline),
+        (baseline_status, 32, required_capacity, 1, 0),
+        "generous-buffer baseline, format {format}"
+    );
+    let ipc = &retry_output[32..];
+    assert_eq!(
+        ipc,
+        &baseline[32..32 + required_capacity as usize],
+        "retry must preserve the complete baseline IPC, format {format}"
+    );
+    assert!(ipc.ends_with(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]));
+    let mut reader = StreamReader::try_new(Cursor::new(ipc), None).unwrap();
+    let record = reader.next().unwrap().unwrap();
+    assert!(
+        reader.next().is_none(),
+        "one complete batch, format {format}"
+    );
+    assert_eq!(record.num_rows(), 1);
+    assert_eq!(record.num_columns(), 4);
+    assert_eq!(
+        record
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "e1"
+    );
+    assert_eq!(
+        record
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "large"
+    );
+    assert_eq!(
+        record
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        0
+    );
+    let values = record
+        .column(3)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert!(!values.is_null(0));
+    assert_eq!(
+        values.value(0),
+        expected_value,
+        "full value, format {format}"
+    );
+}
+
+#[test]
+fn create_log_entry_json_capacity_header_supports_one_exact_retry() {
+    let value = format!("\"{}\"", "x".repeat(65_537));
+    let input = format!(r#"[{{"id":"e1","type":"large","timestamp":0,"value":{value}}}]"#);
+    assert_create_log_entry_capacity_retry(input.as_bytes(), 0, value.as_bytes());
+}
+
+#[test]
+fn create_log_entry_msgpack_capacity_header_supports_one_exact_retry() {
+    let text = |output: &mut Vec<u8>, value: &str| {
+        output.push(0xdb);
+        output.extend_from_slice(&u32::try_from(value.len()).unwrap().to_be_bytes());
+        output.extend_from_slice(value.as_bytes());
+    };
+    let mut value = Vec::new();
+    text(&mut value, &"x".repeat(65_537));
+    let mut input = vec![0x91, 0x84];
+    text(&mut input, "id");
+    text(&mut input, "e1");
+    text(&mut input, "type");
+    text(&mut input, "large");
+    text(&mut input, "timestamp");
+    input.push(0);
+    text(&mut input, "value");
+    input.extend_from_slice(&value);
+    assert_create_log_entry_capacity_retry(&input, 1, &value);
+}
+
+#[test]
+fn create_log_entry_short_output_refuses_without_writes() {
+    let _serial = serial();
+    let handle = create_processor(1);
+    assert_ne!(handle, 0, "processor creation failed");
+    let input = br#"[{"id":"e1","type":"large","timestamp":0,"value":1}]"#;
+    for length in 0..32 {
+        let mut output = [0xa5; 32];
+        // SAFETY: both buffers are live and disjoint, and length is within output.
+        let status = unsafe {
+            ep_create_log_entry(
+                handle,
+                input.as_ptr(),
+                input.len() as u32,
+                0,
+                output.as_mut_ptr(),
+                length,
+            )
+        };
+        assert_eq!(status, ResultCode::OutputTooSmall as u32, "length {length}");
+        assert_eq!(status, 4, "existing ABI status, length {length}");
+        assert_eq!(
+            output, [0xa5; 32],
+            "short output was modified, length {length}"
+        );
+    }
+    ep_destroy(handle);
+}
+
 #[test]
 fn version_is_stable() {
     let _serial = serial();

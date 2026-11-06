@@ -678,9 +678,20 @@ impl ParsedBatch<'_> {
     }
 
     /// Encode the columns into `[ResultHeader][Arrow IPC]`, writing a
-    /// success header with zeroed bytes 16..32. `Err` means the encoded
-    /// batch did not fit — nothing reached the caller.
+    /// success header with zeroed bytes 16..32.
+    ///
+    /// On `OutputTooSmall`, a complete result header reports offset 32 and
+    /// the IPC writer's required capacity in `arrow_ipc_len`, with zero rows.
+    /// That capacity includes `MIN_ARROW_OUTPUT_CAPACITY`; it need not equal
+    /// the stream length reported after a successful retry. Retry the same
+    /// input with `RESULT_HEADER_SIZE + arrow_ipc_len` output bytes.
+    /// No IPC bytes are written on this refusal. If even the header does not
+    /// fit, the method returns `OutputTooSmall` without changing the buffer.
+    /// Invalid columns and unrepresentable sizes remain `EncodeError`.
     pub fn encode(self, output: &mut [u8], batch_metadata: &[(&str, &str)]) -> ResultCode {
+        if output.len() < RESULT_HEADER_SIZE {
+            return ResultCode::OutputTooSmall;
+        }
         let rows = self.columns.count;
         match write_arrow_ipc_from_dynamic_columns(
             self.columns,
@@ -700,6 +711,22 @@ impl ParsedBatch<'_> {
                     rows,
                 );
                 ResultCode::Ok
+            }
+            Err(IpcError::BufferTooSmall { required })
+                if output.len() - RESULT_HEADER_SIZE < required =>
+            {
+                let Ok(required) = u32::try_from(required) else {
+                    write_result_header(output, ResultCode::EncodeError as u32, 0, 0, 0);
+                    return ResultCode::EncodeError;
+                };
+                write_result_header(
+                    output,
+                    ResultCode::OutputTooSmall as u32,
+                    RESULT_HEADER_SIZE as u32,
+                    required,
+                    0,
+                );
+                ResultCode::OutputTooSmall
             }
             Err(
                 IpcError::BufferTooSmall { .. } | IpcError::InvalidColumn | IpcError::SizeOverflow,
