@@ -9,6 +9,8 @@ import { linuxMemory } from './host-memory.linux.js';
 export interface HostMemory {
   /** The memory the run's pool charges its leaves' peaks against. */
   readRunMemory(): Promise<RunMemoryReading>;
+  /** One process's resident set for an exit diagnostic; unavailable is never a zero RSS sample. */
+  residentUsage(pid: number): ResidentUsageReading;
   /**
    * A leaf's peak in bytes, from the `maxRSS` that Bun's `Subprocess.resourceUsage()` on `bunVersion` reports for
    * it: the exited leaf's `ru_maxrss`.
@@ -39,6 +41,11 @@ export interface LiveUsage {
 
 export type LiveUsageReading =
   | { readonly ok: true; readonly usage: LiveUsage }
+  | { readonly ok: false; readonly reason: string };
+
+/** A process's resident bytes and source, or why no sample could be read. */
+export type ResidentUsageReading =
+  | { readonly ok: true; readonly bytes: number; readonly source: string }
   | { readonly ok: false; readonly reason: string };
 
 /** The run's memory in bytes, and where it was read: the file or sysctl that holds it. */

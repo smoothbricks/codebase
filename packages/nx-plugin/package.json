@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/nx-plugin",
-  "version": "0.7.16-next.0",
+  "version": "0.7.16",
   "type": "module",
   "sideEffects": false,
   "main": "./loader.js",
@@ -34,6 +34,11 @@
       "types": "./dist/bounded-test-policy.d.ts",
       "import": "./dist/bounded-test-policy.js",
       "default": "./dist/bounded-test-policy.js"
+    },
+    "./bounded-exec-diagnostics": {
+      "types": "./dist/executors/bounded-exec/child-exit-diagnostics.d.ts",
+      "import": "./dist/executors/bounded-exec/child-exit-diagnostics.js",
+      "default": "./dist/executors/bounded-exec/child-exit-diagnostics.js"
     },
     "./test-results": {
       "types": "./dist/executors/bounded-exec/test-results.d.ts",

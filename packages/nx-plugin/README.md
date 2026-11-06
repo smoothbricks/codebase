@@ -2494,6 +2494,15 @@ and says so. A host CI scope's first run of a task it holds no record of is the 
 release workflow's CI's) and takes, at each run, the record of every task the scope lacks
 (`specs/cowshed/05_gateway.md`, "Without mbx, every Nx run budgets itself").
 
+A child-runtime owner can diagnose a death without guessing from its WebSocket close. `bounded-exec` passes the
+memory-bearing grant's immutable charge/bound and its installed observer module URL through
+`BOUNDED_EXEC_MEMORY_DIAGNOSTICS` / `BOUNDED_EXEC_DIAGNOSTICS_MODULE`. `observeChildMemory(pid, context)` returns a
+stop-and-snapshot function called at the child's exit: the last readable, timestamped RSS and the existing bound's live
+anon/shmem reading at exit. An unavailable reading carries its reason. Nested sub-pools retain the memory-bearing
+ancestor's facts; these fields never change admission, runner sizing or retry policy. The runtime owner adds the actual
+exit code/signal and prints its structured diagnostic before its existing crash handling. See 05_gateway's “A dead child
+keeps its diagnosis”; a SIGKILL without kernel evidence is not an OOM verdict.
+
 The pool runs on a worker thread of its own (`cpu-pool-thread.ts`). The process that serves the run, the Nx daemon when
 installed plugins load in it or the Nx CLI without one, hashes tasks and builds the project graph in synchronous calls
 on its main thread; a pool on that thread wrote no heartbeat behind a 14.2 s `hashPlans`, and every runner queued on it

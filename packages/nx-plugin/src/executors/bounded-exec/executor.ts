@@ -15,6 +15,7 @@ import {
 } from '../../process-group.js';
 import { AdmissionObservation, type QueueHost } from './admission-queue.js';
 import { type BoundEvent, type BoundKind, type Bounds, earliestBound, stepBounds, UNARMED } from './bounds.js';
+import { DIAGNOSTIC_CONTEXT_ENV, DIAGNOSTIC_MODULE_ENV, grantMemoryEnvironment } from './child-exit-diagnostics.js';
 import { type CpuPool, createCpuPool } from './cpu-pool.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
@@ -94,7 +95,14 @@ const POOL_ENV = [CPU_TOKENS_ENV, CPU_POOL_ENV];
  * itself inherits, a parent make's or its cowshed job's, still reaches an ungranted command by Cargo's own rule; a
  * granted one's sub-pool names its own fifo over it.
  */
-const BUDGET_ENV = [...POOL_ENV, 'CARGO_MAKEFLAGS', 'MAKEFLAGS', 'MFLAGS'];
+const BUDGET_ENV = [
+  ...POOL_ENV,
+  'CARGO_MAKEFLAGS',
+  'MAKEFLAGS',
+  'MFLAGS',
+  DIAGNOSTIC_CONTEXT_ENV,
+  DIAGNOSTIC_MODULE_ENV,
+];
 
 export interface BoundedExecContext {
   root: string;
@@ -730,6 +738,7 @@ async function runCommand(
     ...sized.env,
     ...native.env,
     ...(pool?.environment ?? {}),
+    ...(await grantMemoryEnvironment(grant?.charged ?? null, process.env)),
     ...(leaf?.kind === 'cargo' ? { MBX_GRANT_FD: String(MBX_GRANT_FD) } : {}),
   };
   // A fixture rides as segment 0 of the lifecycle. Without the channel (Windows) it is plain shell text ahead

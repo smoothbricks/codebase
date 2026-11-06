@@ -2696,6 +2696,35 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).not.toContain('977');
   });
 
+  it('passes memory-bearing grant facts to the command instead of target-provided diagnostic values', async () => {
+    const workspace = await createWorkspace();
+    const result = await withPool(
+      2,
+      (pool) =>
+        runBoundedExec(
+          {
+            command:
+              'node -e "console.log(process.env.BOUNDED_EXEC_MEMORY_DIAGNOSTICS); console.log(process.env.BOUNDED_EXEC_DIAGNOSTICS_MODULE)"',
+            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+            env: {
+              BOUNDED_EXEC_MEMORY_DIAGNOSTICS: 'forged-context',
+              BOUNDED_EXEC_DIAGNOSTICS_MODULE: 'forged-module',
+            },
+          },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+          inheritedFrom(pool),
+        ),
+      1024 ** 3,
+    );
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toContain('"chargedBytes":0');
+    expect(result.terminalOutput).toContain('child-exit-diagnostics.ts');
+    expect(result.terminalOutput).not.toContain('forged-context');
+    expect(result.terminalOutput).not.toContain('forged-module');
+  });
+
   it('refuses the run when its parent pool answers with a refusal', async () => {
     const socketDirectory = await ownedSocketDirectory('cpu-refuse-', 'p.sock');
     workspaces.push(socketDirectory);

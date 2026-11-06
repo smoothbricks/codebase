@@ -136,6 +136,7 @@ export const darwinMemory: HostMemory = {
   readRunMemory,
   peakBytes: (maxRss) => maxRss,
   treeResidentBytes,
+  residentUsage: () => ({ ok: false, reason: 'Node has no macOS per-process RSS reader' }),
   // macOS has no cgroup, and its anonymous and shared pages are not read from a file the pool may open.
   liveUsage: () => ({ ok: false, reason: 'macOS keeps no anonymous and shared memory of a run to read' }),
 };

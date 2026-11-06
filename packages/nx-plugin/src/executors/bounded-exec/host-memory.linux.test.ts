@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
 import type { LiveUsageReading, RunMemoryReading } from './host-memory.js';
-import { type FileRead, linuxLiveUsage, linuxMemory, linuxRunMemory } from './host-memory.linux.js';
+import { type FileRead, linuxLiveUsage, linuxMemory, linuxResidentUsage, linuxRunMemory } from './host-memory.linux.js';
 
 const GiB = 1024 ** 3;
 const MEMINFO = `MemTotal:       ${64 * 1024 * 1024} kB\nMemFree:         1024 kB\n`;
@@ -196,4 +196,21 @@ it("reads what the run's bound holds that the kernel cannot take back: the cgrou
   for (const check of cases) {
     expect(linuxLiveUsage(sync(check.files), check.bound), check.name).toEqual(check.reading);
   }
+});
+
+it('keeps a child RSS sample distinct from an unreadable or exited process', () => {
+  const source = '/proc/42/status';
+  expect(linuxResidentUsage(() => ({ ok: true, text: 'VmRSS:   1234 kB\n' }), 42)).toEqual({
+    ok: true,
+    bytes: 1234 * 1024,
+    source,
+  });
+  expect(linuxResidentUsage(() => absent, 42)).toEqual({
+    ok: false,
+    reason: `${source}: ENOENT: no such file or directory`,
+  });
+  expect(linuxResidentUsage(() => ({ ok: true, text: 'State: Z (zombie)\n' }), 42)).toEqual({
+    ok: false,
+    reason: `${source} names no VmRSS in kB`,
+  });
 });

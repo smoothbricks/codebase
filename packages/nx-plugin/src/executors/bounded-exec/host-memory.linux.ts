@@ -2,7 +2,14 @@ import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { posix } from 'node:path';
 import { childPids } from '../../process-children.linux.js';
-import type { HostMemory, LiveUsageReading, RunMemory, RunMemoryError, RunMemoryReading } from './host-memory.js';
+import type {
+  HostMemory,
+  LiveUsageReading,
+  ResidentUsageReading,
+  RunMemory,
+  RunMemoryError,
+  RunMemoryReading,
+} from './host-memory.js';
 
 /**
  * Linux's memory mechanisms. The run's memory is the least of the host's `MemTotal` and every finite `memory.max` of
@@ -175,13 +182,29 @@ async function residentBytes(pid: number): Promise<number> {
     if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ESRCH')) return 0;
     throw error;
   }
-  const kib = /^VmRSS:\s+(\d+) kB$/m.exec(status)?.[1];
+  const kib = residentKib(status);
   return kib === undefined ? 0 : Number(kib) * 1024;
+}
+
+function residentKib(status: string): string | undefined {
+  return /^VmRSS:\s+(\d+) kB$/m.exec(status)?.[1];
+}
+
+/** The same VmRSS field the peak waiter reads, without turning an unreadable or exited PID into zero. */
+export function linuxResidentUsage(read: (path: string) => FileRead, pid: number): ResidentUsageReading {
+  const source = `/proc/${pid}/status`;
+  const status = read(source);
+  if (!status.ok) return { ok: false, reason: `${source}: ${status.code}: ${status.message}` };
+  const kib = residentKib(status.text);
+  return kib === undefined
+    ? { ok: false, reason: `${source} names no VmRSS in kB` }
+    : { ok: true, bytes: Number(kib) * 1024, source };
 }
 
 export const linuxMemory: HostMemory = {
   readRunMemory: () => linuxRunMemory(readText),
   peakBytes,
   treeResidentBytes,
+  residentUsage: (pid) => linuxResidentUsage(readTextSync, pid),
   liveUsage: (bound) => linuxLiveUsage(readTextSync, bound),
 };

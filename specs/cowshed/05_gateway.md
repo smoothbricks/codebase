@@ -1820,6 +1820,17 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   none, say so (`live anon+shmem unread (<reason>)`). What the other holders were charged, what lies outside the leaves
   and what a suite holds beyond its record are therefore measured, not inferred.
 
+  **A dead child keeps its diagnosis.** A memory-bearing grant publishes its immutable charge and the run's typed
+  memory-bound reading as `BOUNDED_EXEC_MEMORY_DIAGNOSTICS`, with the installed observer's module URL in
+  `BOUNDED_EXEC_DIAGNOSTICS_MODULE`. These are diagnostic facts, never configuration or an admission authority; a target
+  cannot override them, and a descendant whose sub-pool charges no memory retains the ancestor's facts. A runtime owner
+  observes its child's exit code and signal and writes them with the PID, the last readable RSS sample and its time, the
+  grant's charge and bound, and that bound's live anonymous/shared memory at exit. The existing platform readers own
+  those measurements; unsupported, malformed and unreadable observations retain their reason, never zero. Linux RSS is
+  `/proc/<pid>/status`'s `VmRSS`, sampled every 250 ms while the child lives; exit ends the sampler and retains the last
+  readable sample. Node has no macOS per-process RSS reader. This is a leaf's charge, not a new reading of every sibling
+  holder. A signal alone does not prove an OOM kill: the kernel's diagnosis does.
+
   **A leaf the kernel killed for memory runs once more, alone.** Records cannot make admission safe alone: a leaf with
   no record is charged nothing, a suite that has grown holds more than its record, and what lies outside the leaves is
   charged to no one (`pool-sim.property.test.ts` judges each over runs shaped like the downstream test step). The
