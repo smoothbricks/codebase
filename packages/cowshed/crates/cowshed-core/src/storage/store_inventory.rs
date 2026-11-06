@@ -347,3 +347,36 @@ fn staging_file(name: &str) -> Option<StoreArtifact> {
         is_staged_image(name).then_some(StoreArtifact::StagedImage)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn work_and_its_orphan_patch_ids_have_distinct_classes(
+            workspace in "work-[a-z]{1,16}",
+            tip in "[a-f0-9]{40}",
+        ) {
+            let image = format!("sessions/{workspace}.dmg");
+            let bundle = format!("sessions/.trash/{workspace}-{tip}.bundle");
+            let patch_ids = format!("{bundle}.patch-ids");
+            for path in [&image, &bundle] {
+                let artifact = StoreArtifact::of(Path::new(path), false).expect("user work");
+                prop_assert!(matches!(artifact.class(), Class::UserWork(_)));
+            }
+            let artifact = StoreArtifact::of(Path::new(&patch_ids), false).expect("derived sidecar");
+            prop_assert_eq!(artifact, StoreArtifact::AbandonBundlePatchIds);
+            prop_assert_eq!(artifact.class(), Class::Derived(Disposal::Remove));
+        }
+
+        #[test]
+        fn unknown_files_are_not_inventory_in_any_terminal_namespace(name in "[a-z]{1,24}") {
+            for namespace in ["", "sessions", "sessions/.trash", "sessions/.deleting", "build", "build/.compacting", "build/.collecting", "build/.deleting", ".staging", "tmp"] {
+                let path = Path::new(namespace).join(format!("user-{name}.txt"));
+                prop_assert_eq!(StoreArtifact::of(&path, false), None, "{}", path.display());
+            }
+        }
+    }
+}
