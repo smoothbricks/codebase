@@ -5485,7 +5485,7 @@ where
     // An adoption that recorded only its intent has nothing to unbind, and opening it would
     // resume it; unadopt discards it before any opening (02_workspaces.md, "Checkout layouts").
     if matches!(&cli.command, Command::Unadopt(_))
-        && let Some(repo) = ProjectRuntime::discard_intent_only_adoption(root).await?
+        && let Some(repo) = ProjectRuntime::discard_intent_only_adoption(root, None).await?
     {
         if cli.global.json {
             output.success(EmptyResult {}).map_err(output_error)?;

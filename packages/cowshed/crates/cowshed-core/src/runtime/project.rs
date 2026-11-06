@@ -923,21 +923,9 @@ impl ProjectRuntime {
     /// `None` when the checkout's identity is bound, claimed by an interrupted unadopt, or never
     /// stored: the ordinary unadopt answers those. An unbound store in any other state refuses,
     /// naming what it holds.
+    /// With no supplied storage, validates the canonical host store; otherwise uses the
+    /// caller's already-validated store and leaves its teardown to the caller.
     pub async fn discard_intent_only_adoption(
-        project_root: impl AsRef<Path>,
-    ) -> Result<Option<RepoId>> {
-        Self::discard_intent_only_adoption_in(project_root.as_ref(), None).await
-    }
-
-    /// [`Self::discard_intent_only_adoption`] in a caller-owned store.
-    pub async fn discard_intent_only_adoption_at(
-        project_root: impl AsRef<Path>,
-        storage: crate::storage::bootstrap::ValidatedHostStorage,
-    ) -> Result<Option<RepoId>> {
-        Self::discard_intent_only_adoption_in(project_root.as_ref(), Some(storage)).await
-    }
-
-    async fn discard_intent_only_adoption_in(
         project_root: &Path,
         storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
     ) -> Result<Option<RepoId>> {

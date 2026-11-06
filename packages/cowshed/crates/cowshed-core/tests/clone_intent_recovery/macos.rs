@@ -798,7 +798,10 @@ async fn unadopt_discards_an_adoption_that_recorded_only_its_intent() {
         fs::write(&lock, b"").unwrap();
     }
     let discard = || {
-        ProjectRuntime::discard_intent_only_adoption_at(&fixture.checkout, fixture.storage.clone())
+        ProjectRuntime::discard_intent_only_adoption(
+            &fixture.checkout,
+            Some(fixture.storage.clone()),
+        )
     };
 
     let adopting = IntentLease::try_claim(&project.sessions, &name("main"))
