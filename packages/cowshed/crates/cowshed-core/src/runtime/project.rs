@@ -61,13 +61,6 @@ const ROUTER_CAPACITY: usize = 64;
 const STARTUP_LIFECYCLE_ATTEMPTS: usize = 8;
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
 
-/// The branch a workspace's commits are expected to reach.
-///
-/// One constant for two questions that must never disagree: where `land` merges by default, and
-/// which branch `rm` requires to contain a workspace's head before destroying its object store.
-/// If they diverged, `land` would satisfy a check `rm` does not make.
-pub const DEFAULT_LANDING_BRANCH: &str = "main";
-
 /// The hidden verb a land starts to compact its target's seed, `cowshed __compact-seed
 /// <project-root>` ([`ProjectRuntimeHost::compact_seed`]; 16_build_volumes.md, "Seed
 /// compaction"). It is the CLI's on every platform: only a host with build volumes compacts.
@@ -3888,9 +3881,10 @@ fn plan_empty_directories_on(path: &Path, device: u64, plan: &mut Vec<PathBuf>) 
 #[cfg(target_os = "macos")]
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// What a plain `gc`'s held-bundle sweep measures (02_workspaces.md, `rm` step 1), read in the
-    /// actor: the abandon bundles in the trash and main's tip. The measurement runs beside the
-    /// actor ([`super::held_bundles`]). `None` when the trash keeps no bundle, main has no landing
-    /// branch, or main is detached, whose repository is what has to hold their commits.
+    /// actor: the abandon bundles in the trash and the tip of main's checked-out branch. The
+    /// measurement runs beside the actor ([`super::held_bundles`]). `None` when the trash keeps no
+    /// bundle, main's image is detached or main has a detached HEAD: main's branch is what has to
+    /// hold their commits.
     async fn held_bundle_sweep(&mut self) -> Result<Option<super::held_bundles::Sweep>> {
         let trash = self
             .layout
@@ -3919,12 +3913,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         let store_root = std::sync::Arc::clone(self.git.store_root());
         let main_root = self.workspace_mount_path(&main_name())?;
-        let Some(tip) = git_optional_ref_oid(
-            &store_root,
-            &main_root,
-            &format!("refs/heads/{DEFAULT_LANDING_BRANCH}"),
-        )
-        .await?
+        let Some(branch) = crate::git::GitRepository::from_root(&store_root, &main_root)
+            .current_branch()
+            .await?
+        else {
+            cowshed_os::eprintln!(
+                "cowshed: gc measured no abandon bundle: main has a detached HEAD, and its \
+                 checked-out branch is what has to hold their commits"
+            );
+            return Ok(None);
+        };
+        let Some(tip) =
+            git_optional_ref_oid(&store_root, &main_root, &format!("refs/heads/{branch}")).await?
         else {
             return Ok(None);
         };
@@ -5043,7 +5043,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             // Authorized before it was journaled Mutating: the replay finishes it, and
                             // a workspace's youth no longer decides anything. It measures what its
                             // request measured: a land's retire, the branch the unit landed on.
-                            let containment = self.recorded_containment(containment.as_ref())?;
+                            let containment = self.recorded_containment(containment.as_ref()).await?;
                             self.remove_contained_in(
                                 workspace,
                                 options,
@@ -5063,7 +5063,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             {
                                 // Authorized before it was journaled Mutating: the replay finishes it, and
                                 // a workspace's youth no longer decides anything.
-                                let containment = self.recorded_containment(containment.as_ref())?;
+                                let containment = self.recorded_containment(containment.as_ref()).await?;
                                 self.remove_contained_in(
                                     workspace,
                                     options,
@@ -7926,23 +7926,28 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         self.retire_workspace(current).await
     }
 
-    /// Main as the branch a session's work has to reach: what `rm` measures against.
-    fn main_containment(&self) -> Result<NativeContainment> {
+    /// Main as the branch a session's work has to reach: what `rm` measures against. It is the
+    /// branch main's checkout has checked out, read as every land target's is (02_workspaces.md,
+    /// "Lanes"); a main with a detached HEAD has no branch to hold anything, and the removal is
+    /// refused naming it.
+    async fn main_containment(&self) -> Result<NativeContainment> {
+        let mount = self.workspace_mount_path(&main_name())?;
+        let branch = target_checked_out_branch(self.git.store_root(), &mount, &main_name()).await?;
         Ok(NativeContainment {
             target: main_name(),
-            mount: self.workspace_mount_path(&main_name())?,
-            branch: DEFAULT_LANDING_BRANCH.to_owned(),
+            mount,
+            branch,
         })
     }
 
     /// What a journaled retirement measures against: the branch its request recorded, in that
-    /// workspace's repository, or main's `main` when it recorded none.
-    fn recorded_containment(
+    /// workspace's repository, or main's checked-out branch when it recorded none.
+    async fn recorded_containment(
         &self,
         recorded: Option<&crate::storage::recovery::RetireContainment>,
     ) -> Result<NativeContainment> {
         let Some(recorded) = recorded else {
-            return self.main_containment();
+            return self.main_containment().await;
         };
         Ok(NativeContainment {
             target: recorded.workspace.clone(),
@@ -8844,7 +8849,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let intent = crate::storage::recovery::LifecycleIntent::Retire {
             workspace: workspace.clone(),
             options,
-            containment: containment.recorded(),
+            containment: Some(containment.recorded()),
             origin: None,
         };
         let unfinished = self
@@ -11171,7 +11176,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .is_some_and(|record| record.operation == retire_intent && record.completion.is_none());
         let substrate = self.substrate.clone();
         // An unpublished clone never landed anywhere: main is what has to hold its work.
-        let containment = self.main_containment()?;
+        let containment = self.main_containment().await?;
         // Its supervisor stops before the clone's image lock is taken, as a published
         // workspace's rm stops one (02_workspaces.md, `rm`): the stop waits for the clone's jobs,
         // and nothing waits for them under the lock. The stopped supervisor's socket stays bound
@@ -11806,7 +11811,7 @@ struct NativeLandedAuthority {
 }
 
 /// The branch a removal measures a session against, in the repository that holds it: main's
-/// `main` for `rm`; for `land`'s retire, the branch the unit just landed on.
+/// checked-out branch for `rm`; for `land`'s retire, the branch the unit just landed on.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeContainment {
@@ -11819,15 +11824,14 @@ struct NativeContainment {
 
 #[cfg(target_os = "macos")]
 impl NativeContainment {
-    /// What a retire intent journals of this containment for its replay: nothing for main's
-    /// `main`, which an absent record means.
-    fn recorded(&self) -> Option<crate::storage::recovery::RetireContainment> {
-        (!self.target.is_main() || self.branch != DEFAULT_LANDING_BRANCH).then(|| {
-            crate::storage::recovery::RetireContainment {
-                workspace: self.target.clone(),
-                branch: self.branch.clone(),
-            }
-        })
+    /// What a retire intent journals of this containment for its replay: the workspace and the
+    /// branch it measured, main's included, so a replay measures that branch even after main's
+    /// checkout has moved to another one.
+    fn recorded(&self) -> crate::storage::recovery::RetireContainment {
+        crate::storage::recovery::RetireContainment {
+            workspace: self.target.clone(),
+            branch: self.branch.clone(),
+        }
     }
 }
 /// What a unit lands into or rebases onto: main, or a lane base.
@@ -11843,12 +11847,9 @@ struct NativeLandingInto {
 
 #[cfg(target_os = "macos")]
 impl NativeLandingInto {
-    /// The branch a land moves when the caller names none: `main` for main, and whatever branch
-    /// a lane base has checked out.
+    /// The branch a land moves when the caller names none: the one the target's checkout has
+    /// checked out, main's as every lane base's (02_workspaces.md, "Lanes").
     async fn checked_out_branch(&self, store_root: &std::sync::Arc<Path>) -> Result<String> {
-        if self.name.is_main() {
-            return Ok(DEFAULT_LANDING_BRANCH.to_owned());
-        }
         target_checked_out_branch(store_root, &self.root, &self.name).await
     }
 
@@ -12315,6 +12316,47 @@ mod rebase_recovery_tests {
                 LandingCommits::Measured { unlanded: 1, .. }
             ),
             "{refused:?}"
+        );
+    }
+
+    /// Main's branch is the one its checkout has checked out, read as a lane base's is
+    /// (02_workspaces.md, "Lanes"): a main on `master` is what `land` moves and `rm` measures
+    /// against, and a main with a detached HEAD has no branch, so both refuse naming it.
+    #[tokio::test]
+    async fn a_main_on_master_is_the_branch_land_moves_and_rm_measures() {
+        let lane = Lane::new("master");
+        let store_root = lane.store.shared();
+        run_git(&lane.main, &["branch", "-m", "main", "master"]);
+        let into = NativeLandingInto {
+            name: main_name(),
+            root: lane.main.clone(),
+            mount: lane.main.clone(),
+        };
+
+        let branch = into
+            .checked_out_branch(store_root)
+            .await
+            .expect("main has master checked out");
+        assert_eq!(branch, "master");
+        assert_eq!(
+            contained_in(store_root, &lane.main, &branch, &lane.lane, &lane.main).await,
+            RemovalLandedDecision::Landed,
+            "a clone of main's master is contained in master"
+        );
+
+        run_git(&lane.main, &["checkout", "--detach"]);
+        let error = into
+            .checked_out_branch(store_root)
+            .await
+            .expect_err("a detached main has no branch to land on or to measure against");
+        assert!(
+            error.message.contains("workspace main has a detached HEAD"),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            error.fence_source(),
+            Some(&FenceRefusal::TargetNotCheckedOut { checked_out: None })
         );
     }
     /// A unit on `cowshed/unit` carrying a second local branch `kept` with work found nowhere else,
@@ -15817,7 +15859,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             workspace.as_str(),
             super::land_lease::Holding::Remove,
         )?;
-        let containment = self.main_containment()?;
+        let containment = self.main_containment().await?;
         self.remove_contained_in(
             workspace,
             options,
@@ -16501,17 +16543,21 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             fetch_target_branch(store_root, &root, &into.root, &into.name).await?
         } else if is_git_worktree(&current.metadata) {
             // A git-worktree workspace reads main's branches straight out of the shared ref
-            // namespace, so there is nothing to refresh and no remote to refresh it from.
-            options
-                .onto
-                .as_ref()
-                .map_or_else(|| DEFAULT_LANDING_BRANCH.to_owned(), revision_target)
+            // namespace, so there is nothing to refresh and no remote to refresh it from; the
+            // default destination is the branch main's checkout has checked out.
+            match options.onto.as_ref() {
+                Some(onto) => revision_target(onto),
+                None => {
+                    let main_mount = self.workspace_mount_path(&main_name())?;
+                    target_checked_out_branch(store_root, &main_mount, &main_name()).await?
+                }
+            }
         } else {
-            // The default destination follows the remote's name, which is `main` — and
-            // `cowshed-main` in a workspace where something else already held that name. The
-            // refresh runs for an explicit `onto` too, since that is how main's commits reach the
-            // workspace: rebasing onto `main/main` resolves a ref only a fetch creates, and a stale
-            // one silently replays onto yesterday's base.
+            // The default destination is main's checked-out branch under the remote's name, which
+            // is `main` — and `cowshed-main` in a workspace where something else already held
+            // that name. The refresh runs for an explicit `onto` too, since that is how main's
+            // commits reach the workspace: rebasing onto `main/<branch>` resolves a ref only a
+            // fetch creates, and a stale one silently replays onto yesterday's base.
             let main_mount = self.workspace_mount_path(&main_name())?;
             let main_remote = crate::git::GitRepository::from_root(self.git.store_root(), &root)
                 .configure_main_remote(&main_mount)
@@ -16524,10 +16570,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 ["fetch", "--no-tags", remote],
             )
             .await?;
-            options.onto.as_ref().map_or_else(
-                || format!("{remote}/{DEFAULT_LANDING_BRANCH}"),
-                revision_target,
-            )
+            match options.onto.as_ref() {
+                Some(onto) => revision_target(onto),
+                None => {
+                    let branch =
+                        target_checked_out_branch(store_root, &main_mount, &main_name()).await?;
+                    format!("{remote}/{branch}")
+                }
+            }
         };
         let onto_head = git_revision_oid(store_root, &root, &onto).await?;
         require_onto_head(options.expected_onto_head.as_ref(), &onto, &onto_head)?;
@@ -19415,7 +19465,7 @@ mod removal_refusal_tests {
 
     fn state(commits: LandingCommits) -> NativeLandedState {
         NativeLandedState {
-            branch: DEFAULT_LANDING_BRANCH.to_owned(),
+            branch: String::from("main"),
             commits,
             branches: BranchLandings::Measured {
                 unlanded: Vec::new(),
@@ -19436,7 +19486,7 @@ mod removal_refusal_tests {
     /// `unlanded` commits changing one file main lacks the change of, or none when zero.
     fn measured(unlanded: u64, landed: u64) -> NativeLandedState {
         state(LandingCommits::Measured {
-            target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
+            target_branch: String::from("main"),
             target_head: oid('1'),
             unlanded,
             landed,
@@ -19770,7 +19820,7 @@ mod removal_refusal_tests {
         ];
         let with_paths = |paths: Vec<crate::api::dto::UnlandedPath>| {
             state(LandingCommits::Measured {
-                target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
+                target_branch: String::from("main"),
                 target_head: oid('1'),
                 unlanded: 2,
                 landed: 0,
@@ -19893,7 +19943,7 @@ mod removal_refusal_tests {
                 branch: String::from("side"),
                 tip: oid('5'),
                 commits: LandingCommits::Measured {
-                    target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
+                    target_branch: String::from("main"),
                     target_head: oid('1'),
                     unlanded: 2,
                     landed: 0,
@@ -20073,7 +20123,7 @@ mod removal_refusal_tests {
             branch: String::from("side"),
             tip: oid('5'),
             commits: LandingCommits::Measured {
-                target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
+                target_branch: String::from("main"),
                 target_head: oid('1'),
                 unlanded: 2,
                 landed: 0,
@@ -20436,7 +20486,7 @@ mod removal_refusal_tests {
         let work = crate::api::dto::AbandonedWork {
             uncommitted: None,
             head: oid('6'),
-            target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
+            target_branch: String::from("main"),
             target_head: Some(oid('1')),
             unlanded_commits: 2,
             branches: vec![crate::api::dto::BranchLanding {
@@ -20901,7 +20951,8 @@ async fn require_target_checked_out(
     ))
 }
 
-/// The branch a lane base has checked out: what its units land on and rebase onto.
+/// The branch a land target has checked out, main's or a lane base's: what units land on and
+/// rebase onto, and what `rm` measures against when the target is main.
 #[cfg(target_os = "macos")]
 async fn target_checked_out_branch(
     store_root: &std::sync::Arc<Path>,
@@ -20914,7 +20965,10 @@ async fn target_checked_out_branch(
         .ok_or_else(|| {
             CowshedError::fence_refusal(
                 crate::error::FenceRefusal::TargetNotCheckedOut { checked_out: None },
-                format!("workspace {target} has a detached HEAD, so it has no branch to land on"),
+                format!(
+                    "workspace {target} has a detached HEAD, so it has no branch to land on or to \
+                     hold a workspace's commits"
+                ),
                 format!("check out a branch in workspace {target}, then retry"),
             )
         })

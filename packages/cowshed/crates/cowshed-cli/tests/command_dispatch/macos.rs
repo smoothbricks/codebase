@@ -3975,6 +3975,54 @@ async fn directory_a_land_while_an_rm_holds_the_lease_is_refused_substrate_lifec
         .expect("stop the real directory project");
 }
 
+/// A main whose checkout has `master` checked out lands into and measures against `master`
+/// (02_workspaces.md, "Lanes" and `rm` step 1): the USDT project, whose shed `rm` refused as
+/// "has no main branch". A land moves master and a plain `rm` then retires its shed; with main's
+/// HEAD detached there is no branch to hold a shed, so `rm` refuses naming it and retires the shed
+/// once main has master checked out again.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_main_on_master_lands_and_removes_against_master_substrate_lifecycle() {
+    let mut fixture = Fixture::directory();
+    let main = fixture.checkout.clone();
+    git(&main, &["branch", "-m", "main", "master"]);
+    let mut service = serve_project(&mut fixture, &[]).await;
+
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let topic_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
+    succeed(&mut service, ["--json", "land", "topic", "--no-retire"]).await;
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "master"]),
+        topic_head,
+        "the land moved master, the branch main has checked out"
+    );
+    // Seconds old, so past the age floor only by force, which waives no containment.
+    succeed(&mut service, ["rm", "topic", "--force"]).await;
+    until_gone(&topic).await;
+
+    let held = new_workspace(&mut service, "held").await;
+    git(&main, &["checkout", "-q", "--detach"]);
+    let (refused, _, stderr) = run(&mut service, ["rm", "held", "--force"]).await;
+    let refusal = refused.expect_err("a main with a detached HEAD has no branch to hold the shed");
+    assert!(
+        refusal
+            .message
+            .contains("workspace main has a detached HEAD"),
+        "{refusal}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(held.exists(), "the refused rm left the workspace in place");
+    git(&main, &["checkout", "-q", "master"]);
+    succeed(&mut service, ["rm", "held", "--force"]).await;
+    until_gone(&held).await;
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
 /// A preflight refuses an untracked leaf main's checkout does not hold with the land's own
 /// refusal, code, words and fence data alike, and moves nothing.
 #[tokio::test(flavor = "multi_thread")]

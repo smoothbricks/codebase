@@ -21,7 +21,6 @@
 
 use crate::build_record::{BuildRecord, lost_commits_refusal, unproven_refusal};
 use cowshed_core::git::GitRepository;
-use cowshed_core::runtime::project::DEFAULT_LANDING_BRANCH;
 use cowshed_core::{CowshedError, Result};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -204,7 +203,8 @@ pub struct Mains {
 /// Whether the build at `source`, recording `candidate`, may replace the installed build
 /// recording `installed`, judged in the adopted mains of `mains`.
 ///
-/// The main whose `main` branch holds the candidate's commit is the one that judges it. No such
+/// The main whose checked-out branch holds the candidate's commit is the one that judges it: the
+/// branch `land` merges into and `rm` measures against (02_workspaces.md, "Lanes"). No such
 /// main is a refusal: a commit only a shed holds may be rebased away when it lands, so what it
 /// contains is not yet a question with a lasting answer. In that main, every commit the installed
 /// build carries must be held by the candidate; one that is not is named in the refusal. A
@@ -216,12 +216,29 @@ pub async fn judge(
     installed: &BuildRecord,
     mains: &Mains,
 ) -> Result<()> {
-    let main_ref = format!("refs/heads/{DEFAULT_LANDING_BRANCH}");
     let mut searched = Vec::with_capacity(mains.roots.len());
     for main in &mains.roots {
         let repository = GitRepository::from_root(&mains.store, main);
+        let branch = match repository.current_branch().await {
+            Ok(Some(branch)) => branch,
+            Ok(None) => {
+                searched.push(format!(
+                    "{} has a detached HEAD, so no branch of it holds anything",
+                    main.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                searched.push(format!(
+                    "{}'s checked-out branch could not be read: {}",
+                    main.display(),
+                    error.message
+                ));
+                continue;
+            }
+        };
         match repository
-            .commit_is_ancestor(&candidate.commit, &main_ref)
+            .commit_is_ancestor(&candidate.commit, &format!("refs/heads/{branch}"))
             .await
         {
             Ok(true) => {
@@ -234,7 +251,7 @@ pub async fn judge(
                             candidate,
                             installed,
                             &format!(
-                                "{} holds the build's commit on {DEFAULT_LANDING_BRANCH} but \
+                                "{} holds the build's commit on {branch} but \
                                  cannot compare it with the installed one: {}",
                                 main.display(),
                                 error.message
@@ -246,10 +263,7 @@ pub async fn judge(
                     false => Err(lost_commits_refusal(source, candidate, installed, &lost)),
                 };
             }
-            Ok(false) => searched.push(format!(
-                "{}'s {DEFAULT_LANDING_BRANCH} does not hold it",
-                main.display()
-            )),
+            Ok(false) => searched.push(format!("{}'s {branch} does not hold it", main.display())),
             Err(error) => searched.push(format!(
                 "{} could not be read: {}",
                 main.display(),
@@ -260,9 +274,9 @@ pub async fn judge(
     let reason = match searched.is_empty() {
         true => String::from("no project is adopted on this host to judge it against"),
         false => format!(
-            "its commit is on no adopted project's {DEFAULT_LANDING_BRANCH} ({}); a build's \
-             contents are judged once its commit is on {DEFAULT_LANDING_BRANCH}, so land it and \
-             install the build of {DEFAULT_LANDING_BRANCH}",
+            "its commit is on no adopted project's checked-out branch ({}); a build's contents \
+             are judged once its commit is on its main's branch, so land it and install the \
+             build of that branch",
             searched.join("; ")
         ),
     };
@@ -309,7 +323,7 @@ pub(crate) mod tests {
                 root,
                 store: Arc::from(store),
             };
-            main.git(["init", "-q", "-b", DEFAULT_LANDING_BRANCH, "."]);
+            main.git(["init", "-q", "-b", "main", "."]);
             main.commit("base.txt", "base\n", "base", 1_000);
             main
         }
@@ -411,7 +425,7 @@ pub(crate) mod tests {
             "fix(cowshed): judge strays by the project ignore rules",
             2_000,
         );
-        main.git(["checkout", "-q", DEFAULT_LANDING_BRANCH]);
+        main.git(["checkout", "-q", "main"]);
         let sibling = main.commit(
             "release.txt",
             "next prerelease\n",
@@ -450,6 +464,20 @@ pub(crate) mod tests {
         cowshed_os::eprintln!("refusal: {}\nhint: {}", refusal.message, refusal.hint);
     }
 
+    /// An adopted main on `master` judges as one on `main` does: the branch main's checkout has
+    /// checked out is the one that has to hold the build (02_workspaces.md, "Lanes").
+    #[tokio::test]
+    async fn a_main_on_master_judges_a_build_its_checked_out_branch_holds() {
+        let main = Main::new("master");
+        main.git(["branch", "-q", "-m", "main", "master"]);
+        let installed = main.commit("gc.rs", "first\n", "fix(cowshed): first", 2_000);
+        let candidate = main.commit("gc.rs", "second\n", "fix(cowshed): second", 3_000);
+
+        judged(&main, &candidate, &installed)
+            .await
+            .expect("master holds the candidate and everything the installed build carries");
+    }
+
     /// A build of main that descends from the installed commit holds everything it carries.
     #[tokio::test]
     async fn a_descendant_on_main_is_admitted() {
@@ -469,7 +497,7 @@ pub(crate) mod tests {
         let main = Main::new("rebased");
         main.git(["checkout", "-q", "-b", "shed"]);
         let installed = main.commit("gc.rs", "fixed\n", "fix(cowshed): the gc fix", 2_000);
-        main.git(["checkout", "-q", DEFAULT_LANDING_BRANCH]);
+        main.git(["checkout", "-q", "main"]);
         main.commit(
             "other.rs",
             "other\n",
@@ -497,7 +525,7 @@ pub(crate) mod tests {
         main.git(["checkout", "-q", "-b", "shed"]);
         main.commit("a.rs", "a\n", "fix(cowshed): first half", 2_000);
         let installed = main.commit("b.rs", "b\n", "fix(cowshed): second half", 2_100);
-        main.git(["checkout", "-q", DEFAULT_LANDING_BRANCH]);
+        main.git(["checkout", "-q", "main"]);
         main.git(["merge", "-q", "--squash", "shed"]);
         git_at(
             &main.root,
@@ -525,12 +553,15 @@ pub(crate) mod tests {
         let installed = main.head(1_000);
         main.git(["checkout", "-q", "-b", "shed"]);
         let shed = main.commit("gc.rs", "fixed\n", "fix(cowshed): unlanded", 2_000);
-        main.git(["checkout", "-q", DEFAULT_LANDING_BRANCH]);
+        main.git(["checkout", "-q", "main"]);
         let refusal = judged(&main, &shed, &installed)
             .await
             .expect_err("a shed-only commit is refused");
         assert!(
-            refusal.message.contains("is on no adopted project's main"),
+            refusal
+                .message
+                .contains("is on no adopted project's checked-out branch")
+                && refusal.message.contains("'s main does not hold it"),
             "{}",
             refusal.message
         );

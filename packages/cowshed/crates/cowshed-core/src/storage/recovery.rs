@@ -689,10 +689,11 @@ pub enum LifecycleIntent {
     Retire {
         workspace: WorkspaceName,
         options: RetireOptions,
-        /// What the retirement measures the workspace's work against when it is not main's
-        /// `main`: the branch a `land` just moved, in the workspace it moved (02_workspaces.md,
-        /// "Lanes"). Absent is main's `main`, what every `rm` measures against and what every
-        /// record written before this field meant, so a replay measures what its request did.
+        /// What the retirement measures the workspace's work against: the branch it measured, in
+        /// the workspace that holds it — main's checked-out branch for `rm`, the branch a `land`
+        /// just moved for its retire (02_workspaces.md, "Lanes"). Absent is main's checked-out
+        /// branch, read at replay: what an unpublished clone's retirement and every record written
+        /// before this field mean, so a replay measures what its request did.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         containment: Option<RetireContainment>,
         /// Original create/fork intent when retiring an unpublished clone. Its source is
@@ -758,9 +759,10 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// The branch a land's retire measured its workspace against, in the repository of the
-/// workspace it landed into: a lane base, or main under `--target`. Recorded by name, not by
-/// mount: the mount is derived again when the record replays.
+/// The branch a retirement measured its workspace against, in the repository that holds it: main's
+/// checked-out branch for `rm`, or for a land's retire the branch it moved in the workspace it
+/// landed into, a lane base or main. Recorded by name, not by mount: the mount is derived again
+/// when the record replays.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetireContainment {

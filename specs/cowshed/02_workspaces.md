@@ -987,13 +987,13 @@ baked in.
 
 ### `cowshed rebase <ws> [--onto <branch-or-ref> | --into <lane>] | --continue | --abort`
 
-Brings a workspace's branch up to the selected host revision. The default is `main`; `--onto` accepts a validated local
-branch or fully qualified ref in the main workspace repository. An object ID may be used as an immutable replay base,
-but `land` still requires a named branch as its fast-forward target. `--into <lane>` selects what the workspace lands
-into instead — the branch the lane base `<lane>` has checked out, fetched from the lane base's mount into the workspace
-as `refs/cowshed/targets/<lane>/<branch>` (see "Lanes" below); any workspace can be that lane base, so this is how a
-shed's work moves onto a batch's branch. `--onto` and `--into` are two destinations for one rebase and are refused
-together (exit 2).
+Brings a workspace's branch up to the selected host revision. The default is the branch main's checkout has checked out;
+`--onto` accepts a validated local branch or fully qualified ref in the main workspace repository. An object ID may be
+used as an immutable replay base, but `land` still requires a named branch as its fast-forward target. `--into <lane>`
+selects what the workspace lands into instead — the branch the lane base `<lane>` has checked out, fetched from the lane
+base's mount into the workspace as `refs/cowshed/targets/<lane>/<branch>` (see "Lanes" below); any workspace can be that
+lane base, so this is how a shed's work moves onto a batch's branch. `--onto` and `--into` are two destinations for one
+rebase and are refused together (exit 2).
 
 - Default mode: fetch the selected host revision inside the workspace, then replay the branch onto that exact object ID
   with `git rebase <object ID>`. The whole step runs **inside the workspace sandbox** — the fetch from the main
@@ -1026,9 +1026,9 @@ together (exit 2).
 
 The full born-from-host-return-to-host close-out, as one primitive. It lands into main, or with `--into <lane>` into
 that lane base (see "Lanes" below); "the target" below is whichever one it is. The target branch defaults to the branch
-the target's checkout has checked out (`main` for main); a detached checkout with no `--target` is refused with exit 4
-before anything runs. How the branch moves depends only on checkout state, read again under the repository lock just
-before the update, because the check can run for minutes while the checkout is switched (step 3).
+the target's checkout has checked out, main's as a lane base's; a detached checkout with no `--target` is refused with
+exit 4 before anything runs. How the branch moves depends only on checkout state, read again under the repository lock
+just before the update, because the check can run for minutes while the checkout is switched (step 3).
 
 A gated land does not rebase. It lands the head the caller validated and named (`--expected-source-head`), and an
 implicit rebase would land a head nobody named whenever main had moved. A workspace whose base main has moved past fails
@@ -1402,7 +1402,9 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
 ## `cowshed rm <ws>` — perceived-instant deletion
 
 1. Refuse (exit 4) unless every local branch (HEAD included) is landed in live main: the image takes every branch with
-   it. Landed is judged in three questions, cheapest first. A tip main contains (an ancestor of main, or main itself) is
+   it. Main here is the branch main's checkout has checked out, the branch `land` defaults to; a main with a detached
+   HEAD has no branch to hold anything, and the removal is refused naming it, as `land` refuses a detached target.
+   Landed is judged in three questions, cheapest first. A tip main contains (an ancestor of main, or main itself) is
    landed, cheaply and exactly. Otherwise a tip whose merge into main changes nothing is landed:
    `git merge-tree --write-tree <main> <tip>` merges cleanly to main's own tree, one process for the whole branch, and
    it follows a file the branch renamed, where the per-file proof below sees a new path that main has since edited. No
@@ -1491,14 +1493,14 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
 
    The refusal reports whether the published branch already holds HEAD's commits; it never authorizes a removal. Only
    once the gate has refused HEAD does it measure HEAD, with the same landing module `ls` reads, against the primary
-   bound remote's tracking ref of main's branch in main's own repository (`refs/remotes/<remote>/main`, as main last
-   fetched it; nothing is fetched). When that ref holds every commit HEAD carries, HEAD's finding gains "`<remote>/main`
-   (published, `<tip>`) holds all of them" ("holds it" for one commit), then how local main stands against it: "local
-   main has diverged from it (`<a>` ahead, `<b>` behind)", or "local main is `<b>` behind it" when local main has no
-   commits of its own, the normal gap after a release. It ends with "reconcile main, do not abandon". It speaks for HEAD
-   alone: the other branches the refusal names follow it as the gate measured them, and a refusal for other branches
-   alone measures nothing published. Otherwise, including when the ref cannot be read, the refusal says only what the
-   gate measured. The hint is the same either way.
+   bound remote's tracking ref of main's branch in main's own repository (`refs/remotes/<remote>/<branch>`, as main last
+   fetched it; nothing is fetched). When that ref holds every commit HEAD carries, HEAD's finding gains
+   "`<remote>/<branch>` (published, `<tip>`) holds all of them" ("holds it" for one commit), then how local main stands
+   against it: "local main has diverged from it (`<a>` ahead, `<b>` behind)", or "local main is `<b>` behind it" when
+   local main has no commits of its own, the normal gap after a release. It ends with "reconcile main, do not abandon".
+   It speaks for HEAD alone: the other branches the refusal names follow it as the gate measured them, and a refusal for
+   other branches alone measures nothing published. Otherwise, including when the ref cannot be read, the refusal says
+   only what the gate measured. The hint is the same either way.
 
 2. Stop the supervisor. Ordinary removal quiesces, letting running jobs finish before retirement. `--force` retires
    directly: TERM → grace → KILL across the workspace's descendant process trees (11_shell.md), without waiting for a
@@ -1565,15 +1567,16 @@ startup observes the workspace absent and records completion without retiring it
 crossed the safety fence is discarded, not a deferred deletion; an authorized mutating request reruns the safety fences
 and retirement. Cancellation cannot discard the journal while the blocking release commit finishes.
 
-The request also records what the retirement measures against: nothing for main's `main`, which every `rm` measures
-against and every record from before the field means, and for a `land`'s retire the workspace and branch the unit landed
-on ("Lanes"). A replay measures what its request measured, so a lane unit whose land delivered but whose retire was cut
-off is retired against its lane base, never refused against main. A named `rm` first replays its target's own unfinished
-retirement; one that replay cannot finish — a refusal, an unreadable target — is reported on stderr and superseded: the
-`rm` journals its own options and containment (main, as any standalone `rm`) before its first mutation and reruns every
-fence under them, so a journaled request's refusal never stands between the caller and an explicit removal, and
-`--abandon` authorizes destroying what main lacks. A removal re-issued after a session's retirement finished, by a
-replay or an earlier call, answers with that retirement's report, whichever options either carried.
+The request also records what the retirement measures against: the workspace and branch it measured, main's checked-out
+branch for `rm` and for a `land`'s retire the workspace and branch the unit landed on ("Lanes"). A record from before
+the field names none, and its replay measures main's checked-out branch. A replay measures what its request measured, so
+a lane unit whose land delivered but whose retire was cut off is retired against its lane base, never refused against
+main. A named `rm` first replays its target's own unfinished retirement; one that replay cannot finish — a refusal, an
+unreadable target — is reported on stderr and superseded: the `rm` journals its own options and containment (main, as
+any standalone `rm`) before its first mutation and reruns every fence under them, so a journaled request's refusal never
+stands between the caller and an explicit removal, and `--abandon` authorizes destroying what main lacks. A removal
+re-issued after a session's retirement finished, by a replay or an earlier call, answers with that retirement's report,
+whichever options either carried.
 
 A named `rm` can retire an unfinished fork without activating it. Its supervisor, if one runs, is stopped first, before
 the clone's image lock is taken, as an active workspace's `rm` stops one: the stop waits for the clone's jobs, and

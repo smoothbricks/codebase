@@ -1662,3 +1662,47 @@ async fn the_landed_listing_keeps_a_shed_whose_head_the_push_ref_keeps() {
         "the listing still counts what main lacks"
     );
 }
+
+/// `ls` measures against the branch main's checkout has checked out, as `rm` does
+/// (02_workspaces.md, `rm` step 1): a main on `master`, with no `main` branch at all, holds a shed
+/// cloned from it. Hardcoding `main` answered "the repository … has no main branch" here.
+#[tokio::test]
+async fn a_listing_measures_against_the_branch_main_has_checked_out() {
+    let fixture = Fixture::new("listing-master");
+    git(fixture.parent(), ["branch", "-q", "-m", TARGET, "master"]);
+    let shed = fixture.clone_workspace("shed");
+    let mut rows = vec![
+        listing_row("main", WorkspaceRole::Main, fixture.parent()),
+        listing_row("shed", WorkspaceRole::Workspace, shed),
+    ];
+
+    annotate_listing(fixture.store(), &mut rows).await;
+
+    let landing = rows[1].landing.as_ref().expect("the shed was measured");
+    assert_eq!(counts(landing), (0, 0, 0));
+    assert!(
+        matches!(
+            &landing.commits,
+            LandingCommits::Measured { target_branch, .. } if target_branch == "master"
+        ),
+        "{landing:?}"
+    );
+}
+
+/// A main with a detached HEAD has no branch to hold anything: the listing says so rather than
+/// measuring against a branch the gate would not read.
+#[tokio::test]
+async fn a_listing_against_a_main_with_a_detached_head_is_indeterminate() {
+    let fixture = Fixture::new("listing-detached");
+    let shed = fixture.clone_workspace("shed");
+    git(fixture.parent(), ["checkout", "-q", "--detach"]);
+    let mut rows = vec![
+        listing_row("main", WorkspaceRole::Main, fixture.parent()),
+        listing_row("shed", WorkspaceRole::Workspace, shed),
+    ];
+
+    annotate_listing(fixture.store(), &mut rows).await;
+
+    let landing = rows[1].landing.as_ref().expect("the shed was answered");
+    assert!(reason(landing).contains("detached HEAD"), "{landing:?}");
+}

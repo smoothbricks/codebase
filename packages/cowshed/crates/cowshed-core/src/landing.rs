@@ -757,10 +757,28 @@ async fn counted(
     })
 }
 
-/// The branch `ls` measures against, which is the same constant `land` merges into and `rm` gates
-/// on. Sharing it is the point: a listing that reported against a different branch than the gate
-/// enforces would be a listing that lies about what `rm` will do.
-const LISTING_TARGET_BRANCH: &str = crate::runtime::project::DEFAULT_LANDING_BRANCH;
+/// The target `ls` measures against: the branch main's checkout has checked out, read as `rm`
+/// reads it. Reading it the same way is the point: a listing that reported against a different
+/// branch than the gate enforces would be a listing that lies about what `rm` will do.
+async fn main_branch_target(
+    store_root: &std::sync::Arc<Path>,
+    main: &Path,
+) -> std::result::Result<LandingTarget, String> {
+    let branch = GitRepository::from_root(store_root, main)
+        .current_branch()
+        .await
+        .map_err(|error| {
+            format!(
+                "main's checked-out branch could not be read at {}: {}",
+                main.display(),
+                error.message
+            )
+        })?
+        .ok_or_else(|| {
+            String::from("main has a detached HEAD, so it has no branch to compare against")
+        })?;
+    resolve_target(store_root, main, &branch).await
+}
 
 /// Measure every session workspace of one project's listing against the project's own main.
 ///
@@ -794,8 +812,7 @@ pub async fn annotate_listing<T: AsMut<WorkspaceInfo>>(
         }
         return;
     };
-    let target =
-        std::sync::Arc::new(resolve_target(store_root, &main, LISTING_TARGET_BRANCH).await);
+    let target = std::sync::Arc::new(main_branch_target(store_root, &main).await);
     let main: std::sync::Arc<Path> = std::sync::Arc::from(main);
     let mut tasks = tokio::task::JoinSet::new();
     for (index, row) in rows.iter_mut().enumerate() {
