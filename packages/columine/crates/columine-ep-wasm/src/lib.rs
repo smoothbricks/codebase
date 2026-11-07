@@ -16,7 +16,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use columine_arrow::schema::DynamicSchemaConfig;
+use columine_arrow::schema::{DynamicSchemaConfig, MAX_SCHEMA_FIELDS};
 use columine_event_processor::{
     CompactValidationError, CreateFailure, EventProcessor, InputFormat, ParseOptions,
     RESULT_HEADER_SIZE, ResultCode, ResultDiagnostic, write_compact_result_header,
@@ -128,9 +128,14 @@ unsafe fn wire_schema(
     field_count: u32,
     field_names: Option<(*const u8, u32)>,
 ) -> Result<DynamicSchemaConfig, CreateFailure> {
-    let field_meta_len = (field_count as usize)
-        .checked_mul(4)
-        .ok_or(CreateFailure::BadRequest)?;
+    // A count past the capacity is refused before a slice is formed over the
+    // caller's pointer: no table that long was lent, and on wasm32 the byte
+    // length `count * 4` would wrap. Native and wasm refuse it alike.
+    let field_count = field_count as usize;
+    if field_count > MAX_SCHEMA_FIELDS {
+        return Err(CreateFailure::SchemaTooManyFields);
+    }
+    let field_meta_len = field_count * 4;
     if schema_ptr.is_null() || (field_meta_len != 0 && field_meta_ptr.is_null()) {
         return Err(CreateFailure::BadRequest);
     }

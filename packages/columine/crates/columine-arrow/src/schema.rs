@@ -15,8 +15,17 @@ use arrow_schema::{
 
 use crate::columns::{MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES};
 
-/// Maximum supported fields in one flattened schema.
-pub const MAX_SCHEMA_FIELDS: usize = 256;
+/// Maximum physical Arrow fields in one flattened schema.
+///
+/// This is the processor's column capacity, not a row, event or decision
+/// bound. Everything sized by it derives from it: `MetadataLimits::default()`
+/// (`MAX_SCHEMA_FIELDS` field nodes, `MAX_SCHEMA_FIELDS * 3` buffers) and the
+/// compact validator's `MAX_SCHEMA_FIELDS * 3` range table, 24 KiB of stack
+/// on a 64-bit target and 12 KiB on wasm32. `MAX_FIELDS` in
+/// `parse-backend.ts` mirrors it, pinned by `tests/parse_backend_abi.rs`. A
+/// schema this wide is still refused when its Schema message passes
+/// [`MAX_SCHEMA_MESSAGE_BYTES`].
+pub const MAX_SCHEMA_FIELDS: usize = 512;
 
 /// Largest declared byte width of a `FixedSizeBinary` field.
 ///

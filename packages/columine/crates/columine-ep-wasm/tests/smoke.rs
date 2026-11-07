@@ -9,7 +9,9 @@ use arrow_array::{Array, BinaryArray, Int64Array, StringArray};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
-use columine_arrow::schema::{ArrowType, MAX_SCHEMA_MESSAGE_BYTES, SignalSchemaField};
+use columine_arrow::schema::{
+    ArrowType, MAX_SCHEMA_FIELDS, MAX_SCHEMA_MESSAGE_BYTES, SignalSchemaField,
+};
 use columine_ep_wasm::{
     MAX_EVENT_CAPACITY, ep_compact, ep_create_log_entry, ep_create_with_schema,
     ep_create_with_schema_and_names, ep_destroy, ep_version,
@@ -1002,6 +1004,123 @@ fn creation_failures_name_their_cause() {
     );
 }
 
+/// The physical field capacity holds end to end through the extern ABI. A
+/// named schema of exactly `MAX_SCHEMA_FIELDS` nullable utf8 fields creates a
+/// handle, and one compact row through it reads back every column, the last
+/// field index included. Each column carries validity, offsets and data, so
+/// compact validation fills its whole range table. One field more is refused
+/// as `SchemaTooManyFields` whichever input carries it, and so is a metadata
+/// count no table could hold.
+#[test]
+fn widest_schema_round_trips_and_one_more_field_is_refused() {
+    let _serial = serial();
+    let schema_of = |count: usize| {
+        ipc_schema_bytes(
+            (0..count)
+                .map(|index| Field::new(format!("f{index}"), DataType::Utf8, true))
+                .collect(),
+        )
+    };
+    let widest = schema_of(MAX_SCHEMA_FIELDS);
+    let over = schema_of(MAX_SCHEMA_FIELDS + 1);
+    let fields = vec![SignalSchemaField::new(ArrowType::Utf8, true); MAX_SCHEMA_FIELDS + 1];
+    let over_names: Vec<u8> = (0..=MAX_SCHEMA_FIELDS)
+        .flat_map(|index| format!("f{index}\0").into_bytes())
+        .collect();
+    let widest_names = &over_names[..over_names.len() - format!("f{MAX_SCHEMA_FIELDS}\0").len()];
+    let create = |schema: &[u8], count: u32, names: &[u8]| unsafe {
+        ep_create_with_schema_and_names(
+            1,
+            schema.as_ptr(),
+            schema.len() as u32,
+            fields.as_ptr().cast(),
+            count,
+            names.as_ptr(),
+            names.len() as u32,
+        )
+    };
+    let widest_count = MAX_SCHEMA_FIELDS as u32;
+    let too_many = CreateFailure::SchemaTooManyFields as u32;
+    assert_eq!(create(&widest, widest_count + 1, &over_names), too_many);
+    assert_eq!(create(&over, widest_count, widest_names), too_many);
+    assert_eq!(create(&over, widest_count + 1, &over_names), too_many);
+    assert_eq!(create(&widest, u32::MAX, widest_names), too_many);
+    assert_eq!(
+        create(&widest, widest_count, &over_names),
+        CreateFailure::SchemaFieldNames as u32
+    );
+
+    let handle = create(&widest, widest_count, widest_names);
+    assert!(
+        (1..=255).contains(&handle),
+        "the widest schema must create: {handle:#x}"
+    );
+
+    let table_end = 16 + MAX_SCHEMA_FIELDS * COMPACT_DESCRIPTOR_SIZE;
+    let mut batch = vec![0; table_end + MAX_SCHEMA_FIELDS * 24];
+    write_u32(&mut batch, 0, COMPACT_BATCH_MAGIC);
+    write_u16(&mut batch, 4, COMPACT_ABI_VERSION);
+    write_u16(&mut batch, 6, COMPACT_DESCRIPTOR_SIZE as u16);
+    write_u32(&mut batch, 8, 1);
+    write_u32(&mut batch, 12, widest_count);
+    for index in 0..MAX_SCHEMA_FIELDS {
+        let value = format!("v{index}");
+        let at = table_end + index * 24;
+        let base = at as u32;
+        descriptor(
+            &mut batch,
+            index,
+            ArrowType::Utf8,
+            1,
+            (base, 1),
+            (base + 8, 8),
+            (base + 16, value.len() as u32),
+        );
+        batch[at] = 1;
+        write_u32(&mut batch, at + 12, value.len() as u32);
+        batch[at + 16..at + 16 + value.len()].copy_from_slice(value.as_bytes());
+    }
+
+    let mut probe = [0u8; 32];
+    let probe_status = unsafe {
+        ep_compact(
+            handle,
+            batch.as_ptr(),
+            batch.len() as u32,
+            probe.as_mut_ptr(),
+            probe.len() as u32,
+        )
+    };
+    assert_eq!(probe_status, ResultCode::EncodeError as u32);
+    let (_, _, required_arrow_len, _, _) = read_result_header(&probe);
+    let mut output = vec![0u8; 32 + usize::max(4096, required_arrow_len as usize)];
+    let status = unsafe {
+        ep_compact(
+            handle,
+            batch.as_ptr(),
+            batch.len() as u32,
+            output.as_mut_ptr(),
+            output.len() as u32,
+        )
+    };
+    assert_eq!(status, ResultCode::Ok as u32);
+    let (_, arrow_offset, arrow_len, rows, _) = read_result_header(&output);
+    assert_eq!(rows, 1);
+    let ipc = &output[arrow_offset as usize..(arrow_offset + arrow_len) as usize];
+    let mut reader = StreamReader::try_new(Cursor::new(ipc), None).unwrap();
+    let record = reader.next().unwrap().unwrap();
+    assert_eq!(record.num_columns(), MAX_SCHEMA_FIELDS);
+    for index in 0..MAX_SCHEMA_FIELDS {
+        assert_eq!(record.schema().field(index).name(), &format!("f{index}"));
+        let column = record
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(column.value(0), format!("v{index}"), "field {index}");
+    }
+    ep_destroy(handle);
+}
 #[test]
 fn destroyed_handle_is_reused_and_invalid_or_double_destroy_is_harmless() {
     let _serial = serial();

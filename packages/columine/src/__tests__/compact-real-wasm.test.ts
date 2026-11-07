@@ -18,6 +18,9 @@ import type { CompactBatch, CompactColumn, EncodedArrowSchema } from '../pipelin
 const ROW_COUNT = 300;
 const FIELD_NAMES = ['all_null', 'i32_value', 'f64_value', 'i64_value', 'bool_value', 'binary_value', 'utf8_value'];
 const NULL_ROWS: readonly number[] = [0, 7, 8, 9, 257];
+// The shipped artifact's physical field capacity. The fleet's widest
+// coordinator schema needs 313 physical fields.
+const WIDEST_FIELD_COUNT = 512;
 
 function schemaMessage(): EncodedArrowSchema {
   const table = tableFromArrays(
@@ -42,6 +45,13 @@ function schemaMessage(): EncodedArrowSchema {
       },
     },
   );
+  return {
+    schemaBytes: schemaBytesOf(table),
+    fieldMetadata: new Uint8Array([0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 0, 0, 6, 1, 0, 0, 5, 1, 0, 0, 3, 1, 0, 0, 4, 1, 0, 0]),
+  };
+}
+
+function schemaBytesOf(table: ReturnType<typeof tableFromArrays>): Uint8Array {
   const stream = tableToIPC(table, { format: 'stream' });
   if (stream === null) {
     throw new Error('Flechette did not return in-memory Arrow IPC bytes');
@@ -51,10 +61,21 @@ function schemaMessage(): EncodedArrowSchema {
     throw new Error('Flechette schema message is not continuation-prefixed');
   }
   const messageLength = 8 + view.getUint32(4, true);
-  return {
-    schemaBytes: stream.slice(0, messageLength),
-    fieldMetadata: new Uint8Array([0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 0, 0, 6, 1, 0, 0, 5, 1, 0, 0, 3, 1, 0, 0, 4, 1, 0, 0]),
-  };
+  return stream.slice(0, messageLength);
+}
+
+/** `fieldCount` nullable utf8 fields named `f0`, `f1`, …. */
+function wideSchema(fieldCount: number): EncodedArrowSchema {
+  const names = Array.from({ length: fieldCount }, (_, index) => `f${index}`);
+  const table = tableFromArrays(Object.fromEntries(names.map((name) => [name, ['']])), {
+    types: Object.fromEntries(names.map((name) => [name, utf8()])),
+  });
+  const fieldMetadata = new Uint8Array(fieldCount * 4);
+  for (let index = 0; index < fieldCount; index += 1) {
+    fieldMetadata[index * 4] = 4;
+    fieldMetadata[index * 4 + 1] = 1;
+  }
+  return { schemaBytes: schemaBytesOf(table), fieldMetadata };
 }
 
 function getAt<T>(values: readonly T[], index: number, label: string): T {
@@ -289,5 +310,37 @@ describe('Compact real event_processor.wasm', () => {
     } finally {
       mismatchBackend.dispose();
     }
+  });
+
+  // The physical field capacity through the shipped artifact. Every column is
+  // a nullable utf8 with validity, offsets and data, so native compact
+  // validation fills its whole range table, and the last field index reads
+  // back its own value. One field more is refused before native code runs.
+  it('encodes the widest admitted schema and refuses one field more', () => {
+    const encoder = new TextEncoder();
+    const validity = bitmapSubview(2, false);
+    setBit(validity, 0, true);
+    const columns = Array.from(
+      { length: WIDEST_FIELD_COUNT },
+      (_, index): CompactColumn => ({
+        kind: 'utf8',
+        ...variableColumn([encoder.encode(`v${index}`), null]),
+        validity,
+      }),
+    );
+    const table = tableFromIPC(backend.encode({ rowCount: 2, schema: wideSchema(WIDEST_FIELD_COUNT), columns }));
+    expect(table.numRows).toBe(2);
+    expect(table.numCols).toBe(WIDEST_FIELD_COUNT);
+    for (let index = 0; index < WIDEST_FIELD_COUNT; index += 1) {
+      expect(table.names[index]).toBe(`f${index}`);
+      expect(table.getChildAt(index).at(0)).toBe(`v${index}`);
+      expect(table.getChildAt(index).at(1)).toBeNull();
+    }
+    expect(table.getChild('f511').at(0)).toBe('v511');
+
+    const overColumns = [...columns, getAt(columns, 0, 'column')];
+    expect(() =>
+      backend.encode({ rowCount: 2, schema: wideSchema(WIDEST_FIELD_COUNT + 1), columns: overColumns }),
+    ).toThrow(new RangeError(`fieldMetadata contains more than ${WIDEST_FIELD_COUNT} fields`));
   });
 });

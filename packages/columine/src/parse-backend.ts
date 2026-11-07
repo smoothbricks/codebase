@@ -111,7 +111,8 @@ const MAX_EVENTS_PER_BATCH = 65_536;
  */
 const EP_EVENT_CAPACITY = 256;
 
-const MAX_FIELDS = 256;
+/** Physical Arrow field capacity: the native `MAX_SCHEMA_FIELDS`, pinned by `parse_backend_abi.rs`. */
+const MAX_FIELDS = 512;
 const MAX_VARIABLE_DATA_BYTES = 16 * 1024 * 1024;
 const MAX_SCHEMA_MESSAGE_BYTES = 256 * 1024;
 const MIN_COMPACT_ARROW_CAPACITY = 4 * 1024;

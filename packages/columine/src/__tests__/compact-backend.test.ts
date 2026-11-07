@@ -445,17 +445,18 @@ describe('Compact validation', () => {
   });
 
   it('rejects field and packed-batch bounds before calling native code', () => {
-    const tooManyFields = new Uint8Array(257 * 4);
-    for (let index = 0; index < 257; index += 1) {
+    const overCapacity = 513;
+    const tooManyFields = new Uint8Array(overCapacity * 4);
+    for (let index = 0; index < overCapacity; index += 1) {
       tooManyFields[index * 4 + 1] = 1;
     }
-    const tooManyColumns = Array.from({ length: 257 }, (): CompactColumn => ({ kind: 'null' }));
+    const tooManyColumns = Array.from({ length: overCapacity }, (): CompactColumn => ({ kind: 'null' }));
     const fieldMock = createCompactMock();
     expect(() =>
       createParseCompactWasmBackend(fieldMock.exports).encode(
         batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: tooManyFields }, tooManyColumns),
       ),
-    ).toThrow(/more than 256 fields/);
+    ).toThrow(/more than 512 fields/);
     expect(fieldMock.compactCalls).toHaveLength(0);
 
     const data = new Uint8Array(16 * 1024 * 1024);
