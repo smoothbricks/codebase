@@ -28,7 +28,10 @@ and then `reset_field_idx:u8`, the same trailing position `0x82` gives its compa
 it `Opcode::BatchStructMapUpsertFirstSinceReset` and the TypeScript registry
 `Opcode.BATCH_STRUCT_MAP_UPSERT_FIRST_SINCE_RESET`; the frozen ABI fixture lists the byte and its dispatch membership.
 It executes at top level and as a `FOR_EACH` or `FLAT_MAP` body instruction, and every program walk (body length, column
-uses, capacity effects, value-object input links) reads the trailing ordinal.
+uses, capacity effects, value-object input links) reads the trailing ordinal. Companion pairing reads it as a write of
+its destination, as it reads every unary struct-map upsert ([upsert-last-if](06-struct-map-upsert-last-if.md) §2): a
+program that writes a guarded upsert's destination with it and does not clear the companion row under the same key
+column in the very next instruction is `InvalidProgram` before any write.
 
 The reset ordinal names a `BOOL` field the instruction itself maps from a scalar column. Every unary struct-map upsert
 maps each field at most once, because a pick lane binds one column and the row writer must store that same column. A
