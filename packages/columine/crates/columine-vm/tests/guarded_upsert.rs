@@ -338,9 +338,18 @@ fn a_row_deleted_while_unresolved_stays_deleted_when_its_guarded_write_lands() {
 }
 
 /// A program in the seeded shape whose extra body is caller-chosen, for
-/// admission cases the paired program cannot express.
+/// admission cases the paired program cannot express. The destination
+/// carries a third, BOOL field the guarded write leaves unmapped, so a
+/// first-since-reset write has a reset lane.
 fn variant_program(extra_type: u32, extra_body: &[u8]) -> Vec<u8> {
-    let mut init = slot_def(0, &[StructFieldType::UInt32, StructFieldType::Int64]);
+    let mut init = slot_def(
+        0,
+        &[
+            StructFieldType::UInt32,
+            StructFieldType::Int64,
+            StructFieldType::Bool,
+        ],
+    );
     init.extend(slot_def(
         1,
         &[StructFieldType::String, StructFieldType::Int64],
@@ -472,4 +481,86 @@ fn a_self_companion_guarded_write_refuses_the_whole_program() {
         ),
         INVALID
     );
+}
+
+/// A first-since-reset write of the destination (0x8b): value <- col 2,
+/// since <- col 3, reset <- col 4 into the BOOL field 2, reset ordinal 2.
+fn first_since_reset_write() -> Vec<u8> {
+    vec![
+        Opcode::BatchStructMapUpsertFirstSinceReset as u8,
+        0,
+        1,
+        3,
+        2,
+        0,
+        3,
+        1,
+        4,
+        2,
+        0,
+        2,
+    ]
+}
+
+#[test]
+fn an_unpaired_destination_first_since_reset_write_refuses_the_whole_program() {
+    // A first-since-reset write rewrites the destination row like any other
+    // upsert; with no companion clear after it, the claim it leaves behind
+    // is stranded, so admission refuses before the seed batch folds.
+    let program = variant_program(CHALLENGE, &first_since_reset_write());
+    let mut state = init(&program);
+    let mut vm = Vm::default();
+    assert_eq!(
+        run(
+            &mut vm,
+            &mut state,
+            &program,
+            &[SEED],
+            &[7],
+            &[700],
+            &[41],
+            &[0]
+        ),
+        INVALID
+    );
+    assert_eq!(row(&state, 1, 7), None);
+}
+
+#[test]
+fn a_paired_destination_first_since_reset_write_is_admitted_and_clears_the_claim() {
+    let mut paired = first_since_reset_write();
+    paired.extend([Opcode::BatchStructMapRemove as u8, 1, 1]);
+    let program = variant_program(CHALLENGE, &paired);
+    let mut state = init(&program);
+    let mut vm = Vm::default();
+    assert_eq!(
+        run(
+            &mut vm,
+            &mut state,
+            &program,
+            &[SEED],
+            &[7],
+            &[700],
+            &[41],
+            &[0]
+        ),
+        OK
+    );
+    assert_eq!(row(&state, 1, 7), Some((700, 41)));
+    // The paired write lands and consumes the companion claim it supersedes.
+    assert_eq!(
+        run(
+            &mut vm,
+            &mut state,
+            &program,
+            &[CHALLENGE],
+            &[7],
+            &[5],
+            &[6],
+            &[1]
+        ),
+        OK
+    );
+    assert_eq!(row(&state, 0, 7), Some((5, 6)));
+    assert_eq!(row(&state, 1, 7), None);
 }

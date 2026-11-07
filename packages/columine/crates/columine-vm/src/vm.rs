@@ -3382,6 +3382,7 @@ fn guard_inst(code: &[u8], pc: usize, op: Opcode) -> Option<GuardInst> {
     let at = pc.checked_add(1)?;
     Some(match op {
         Opcode::BatchStructMapUpsertLast
+        | Opcode::BatchStructMapUpsertFirstSinceReset
         | Opcode::BatchStructMapUpsertFirst
         | Opcode::BatchStructMapUpsertMax
         | Opcode::BatchStructMapUpsertLastIf => {
