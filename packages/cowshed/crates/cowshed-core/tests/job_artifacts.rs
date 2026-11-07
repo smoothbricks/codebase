@@ -1472,7 +1472,7 @@ fn verified_open_rejects_a_symlinked_workspace_root() {
 }
 
 #[test]
-fn streaming_recovery_enforces_retained_budget_before_payload_allocation() {
+fn full_record_recovery_refuses_past_its_retained_budget_naming_the_records() {
     let root = TempRoot::new("recovery-budget");
     let mut store = store(root.path(), ArtifactConfig::default());
     let _token = begin(&mut store, 1, OutputTargets::default());
@@ -1481,9 +1481,10 @@ fn streaming_recovery_enforces_retained_budget_before_payload_allocation() {
     assert!(matches!(
         error,
         ArtifactError::RecoveryBudgetExceeded {
+            path,
             limit_bytes: 1,
             required_bytes
-        } if required_bytes > 1
+        } if required_bytes > 1 && path == records
     ));
 }
 

@@ -739,23 +739,27 @@ only from the generation the store fully verified at seal or open: device, inode
 nanosecond modification and change times. The digest pass observes the same opened descriptor before and after hashing
 and accepts evidence only when both generations and the commitment agree. Each bounded positioned read checks that
 generation before and after reading; a changed generation is `Integrity`, never altered bytes. Generation evidence is
-process-local and published beside the immutable terminal record in the validated snapshot, not persisted or accompanied
-by a payload cache. Paging B bytes reads O(B) payload bytes after the required seal/open digest pass, without reading or
+process-local and kept in the store's index entry for the immutable terminal record, not persisted or accompanied by a
+payload cache. Paging B bytes reads O(B) payload bytes after the required seal/open digest pass, without reading or
 hashing preceding prefixes.
 
-The artifact sink's `sealed(jobId)` returns `Result<Option<SealedJobReader>>`: one owned projection sharing the
-canonical validated terminal entry and workspace root for both streams. `Ok(None)` means the current protected-store
-authority proves no terminal record for that id. Logs and tails use that projection directly, without a discarded
-terminal DTO, payload copy or inline revalidation. Only an explicit terminal-facts request materializes the unchanged
-wire `SealedJob` DTO. A supervisor-held unsealed job answers that fact before any store refresh; a held sealed terminal
-still answers its record. A readable current-incarnation admission row likewise proves that its job has no terminal row,
-rather than making that known job an unread-history unknown.
+The artifact sink's `sealed(jobId)` returns `Result<Option<SealedJobReader>>`: one owned projection of the validated
+terminal entry and the workspace root for both streams. The store keeps each terminal entry as its index entry (the
+frame's offset and `batch_sha256` and each spilled stream's verified generation; 11_shell.md, "Exec records, stream
+storage, and tiered authority"), never its payload: a projection reads that one frame back, and the frame must still
+carry the indexed digest. `Ok(None)` means the current protected-store authority proves no terminal record for that id.
+Logs and tails use that projection directly, without a discarded terminal DTO, payload copy or inline revalidation. Only
+an explicit terminal-facts request materializes the unchanged wire `SealedJob` DTO. A supervisor-held unsealed job
+answers that fact before any store refresh; a held sealed terminal still answers its record. A readable
+current-incarnation admission row likewise proves that its job has no terminal row, rather than making that known job an
+unread-history unknown.
 
-A cache miss refreshes under the existing records lock through the same authoritative snapshot that append uses.
-Unchanged validated inode/length within the retained budget reads no record payload and re-hashes no sealed stream.
-Changed records validate repository/lineage and row invariants; only newly learned terminal spill files are hashed. Read
-and recovery failures retain their causes and never become `None`. Snapshot publication advances readable-job presence,
-immutable terminal rows, key authority, record identity together.
+A lookup refreshes under the existing records lock through the same authoritative index that append uses. Unchanged
+validated inode/length re-indexes nothing and re-hashes no sealed stream. Changed records are indexed again in one
+streaming pass that validates repository/lineage and row invariants; a terminal entry already indexed keeps its digest
+and generations, and only newly learned terminal spill files are hashed. Read and recovery failures retain their causes
+and never become `None`. Index publication advances readable-job presence, immutable terminal entries, key authority and
+record identity together.
 
 Any unread layout can hold numeric job ids at or below its valid retained `records.job-floor`. A missing id above that
 floor is proven not to come from the unread store and reaches the ordinary missing-job error. With unread history but no

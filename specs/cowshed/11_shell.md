@@ -1244,6 +1244,17 @@ stay in the schema at their indices, and writers write them null. The `checkpoin
 recovery passes over a frame of that kind (it names no job). Recovery frames retain `batch_sha256`; only an incomplete
 trailing frame may be discarded/reported.
 
+Opening a store reads its records in one streaming pass that holds one frame at a time, and keeps an index of them,
+never a record's payload: each terminal job of the incarnation as its frame's offset and `batch_sha256` plus the
+generation of each spilled stream the open's digest pass verified, each readable job id, each keyed admission with the
+request a repeat must match, and the frame place of each job with no terminal record yet, whose admission record sealing
+it `supervisorLost` reads back. A record is read back from its frame when asked for, and that frame must still carry the
+digest the index proved. The index is held within the retained recovery budget (64 MiB), which bounds working memory,
+not the size of the records. Each entry is charged an upper bound of what it holds resident: its share of the B-tree
+node it lives in (a whole root node per tree) and every allocation it owns, each rounded up as the allocator's size
+classes round it. An append that would carry the index past the budget is refused before its frame is written, and an
+open over a larger index refuses the same way, each naming the records file. Neither drops a record.
+
 The workspace-file stdin source opens after allocation with a read-only no-follow component walk rooted at the workspace
 mount and must resolve to a regular file beneath it. EOF closes child stdin exactly once. Cancellation records
 incomplete delivery without implicitly killing the job. `JobInfo.stdin` and job/trace metadata carry stdin kind, bytes

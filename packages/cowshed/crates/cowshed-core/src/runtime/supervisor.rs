@@ -10772,7 +10772,9 @@ fn missing_artifact_token(job_id: JobId) -> CowshedError {
 
 /// A store refusal as the caller reports it: records a newer cowshed wrote are a version
 /// conflict this build must not touch, and a key another writer bound first is the caller's to
-/// look up; a records lock held past its bound is a wait on the process the census names; anything else is damage to the store.
+/// look up; a records index past its working-memory budget is a bound the history outgrew, its
+/// records intact; a records lock held past its bound is a wait on the process the census names;
+/// anything else is damage to the store.
 pub(super) fn map_artifact_error(error: ArtifactError) -> CowshedError {
     match error {
         ArtifactError::NewerLayout { .. } => CowshedError::conflict(
@@ -10782,6 +10784,11 @@ pub(super) fn map_artifact_error(error: ArtifactError) -> CowshedError {
         ArtifactError::AdmissionKeyTaken { admitted, .. } => CowshedError::conflict(
             error.to_string(),
             format!("reach job {} with jobByKey", admitted.get()),
+        ),
+        ArtifactError::RecoveryBudgetExceeded { .. } => CowshedError::conflict(
+            error.to_string(),
+            "the records are intact; this workspace's job history outgrew the index one store keeps \
+             (11_shell.md, \"Exec records, stream storage, and tiered authority\")",
         ),
         ArtifactError::HistoryUnprovable { set_aside } => {
             CowshedError::admission_refusal(AdmissionRefusal::Unprovable { set_aside })

@@ -51,7 +51,7 @@ use cowshed_core::storage::host_config::{
     RETIRED_LAYOUT_HINT, RetiredLayoutRecord, retired_layout_paths,
 };
 use cowshed_core::storage::job_artifact::{
-    ArtifactConfig, ArtifactError, records_lock_held, repair_workspace_record_sequences,
+    ArtifactError, records_lock_held, repair_workspace_record_sequences,
 };
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Substrate};
 use cowshed_core::storage::recovery::KeptAbandonBundles;
@@ -5296,25 +5296,24 @@ async fn repair_project_artifacts(project_root: &Path) -> Result<Vec<Finding>> {
                 "cowshed ls --all --json",
             )
         })?;
-    let retained_budget = ArtifactConfig::default().retained_recovery_budget_bytes;
     for workspace in project
         .workspaces
         .into_iter()
         .filter(|workspace| workspace.state == WorkspaceState::Attached)
     {
         let (mount, census) = (workspace.mount.clone(), CanonicalRoots::global().census());
-        tokio::task::spawn_blocking(move || {
-            repair_workspace_record_sequences(&census, &mount, retained_budget)
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("artifact repair task failed: {error}")))?
-        .map_err(|error| match error {
-            ArtifactError::LockExpired(expired) => records_lock_held(&expired),
-            error => CowshedError::integrity(
-                error.to_string(),
-                "the log was not replaced; create a fresh store if record ordering failed",
-            ),
-        })?;
+        tokio::task::spawn_blocking(move || repair_workspace_record_sequences(&census, &mount))
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("artifact repair task failed: {error}"))
+            })?
+            .map_err(|error| match error {
+                ArtifactError::LockExpired(expired) => records_lock_held(&expired),
+                error => CowshedError::integrity(
+                    error.to_string(),
+                    "the log was not replaced; create a fresh store if record ordering failed",
+                ),
+            })?;
     }
     Ok(Vec::new())
 }

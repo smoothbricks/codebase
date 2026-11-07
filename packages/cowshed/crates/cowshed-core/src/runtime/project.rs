@@ -10206,7 +10206,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             &self.descriptor.storage.census(),
             &mount,
             current.derived.workspace.incarnation(),
-            crate::storage::job_artifact::ArtifactConfig::default().retained_recovery_budget_bytes,
         )?;
         // Directory stores own no kernel volume; their job samples explicitly remain
         // unconfigured rather than reporting the containing filesystem's usage.
@@ -23938,7 +23937,6 @@ fn workspace_lineage(
     census: &crate::census::CensusScope,
     mount: &Path,
     current: &WorkspaceIncarnation,
-    retained_recovery_budget_bytes: usize,
 ) -> Result<std::collections::BTreeSet<WorkspaceIncarnation>> {
     let marker_path = mount.join(crate::storage::WORKSPACE_MARKER_PATH);
     let mut marker = crate::metadata::WorkspaceMarker::read_from(&marker_path)
@@ -23953,18 +23951,14 @@ fn workspace_lineage(
         ));
     }
     if marker.lineage.is_none() {
-        let recorded = crate::storage::job_artifact::recorded_historical_incarnations(
-            census,
-            mount,
-            current,
-            retained_recovery_budget_bytes,
-        )
-        .map_err(|error| match error {
-            crate::storage::job_artifact::ArtifactError::LockExpired(expired) => {
-                crate::storage::job_artifact::records_lock_held(&expired)
-            }
-            error => CowshedError::integrity(error.to_string(), "cowshed doctor --json"),
-        })?;
+        let recorded =
+            crate::storage::job_artifact::recorded_historical_incarnations(census, mount, current)
+                .map_err(|error| match error {
+                    crate::storage::job_artifact::ArtifactError::LockExpired(expired) => {
+                        crate::storage::job_artifact::records_lock_held(&expired)
+                    }
+                    error => CowshedError::integrity(error.to_string(), "cowshed doctor --json"),
+                })?;
         marker.lineage = Some(recorded.into_iter().collect());
         marker
             .validate()

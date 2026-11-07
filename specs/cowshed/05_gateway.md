@@ -1014,17 +1014,20 @@ the handshake bound.
     the backend left running.
 - **A short lock is a request.** A lock taken for one short critical section is waited for within its class's bound. The
   job records lock (11_shell.md, "Job control") is held for an open's recovery of the records and its scan of the job
-  directories that stay, a refresh, one record-sequence allocation and its append. An open refuses records past the
-  retained recovery budget (64 MiB) and its scan reads one directory entry per job that stays, so each hold is short and
-  its wait is control class. A free lock is taken without blocking. A held one is waited for on a helper thread that
-  blocks in `flock(2)` and hands the locked descriptor back, so nothing polls. At the bound the wait fails `TIMEOUT`,
-  naming the lock path and its holders as the held-lock census reads them then (02_workspaces.md, "Held locks"); every
-  caller (the supervisor, doctor's repair, a workspace's lineage read) answers it as a wait on another process, never as
-  damage to the store. The holder is never signalled, and a lock the helper takes after its waiter left is released at
-  once. A checkout's activation-record fence (one read and write) and the lifecycle intent journal's lock (one read and
-  write) are waited for within the control bound the same way. The image lease is held for one disk-image command's run,
-  so its wait is class `ffi` bounded by that command's own deadline, 120 s (`DISK_CHILD_DEADLINE`), and it names the pid
-  its holder recorded. The shell is `cowshed-os::flock::exclusive`.
+  directories that stay, a refresh, one record-sequence allocation and its append. An open reads the records in one
+  streaming pass that holds one frame and an index within the retained recovery budget (64 MiB; 11_shell.md, "Exec
+  records, stream storage, and tiered authority"), runs the digest pass of every spilled stream it has not verified yet
+  (all of them at the first open), and its scan reads one directory entry per job that stays: a hold grows with the
+  records and the spilled bytes it verifies, and its wait is control class. A free lock is taken without blocking. A
+  held one is waited for on a helper thread that blocks in `flock(2)` and hands the locked descriptor back, so nothing
+  polls. At the bound the wait fails `TIMEOUT`, naming the lock path and its holders as the held-lock census reads them
+  then (02_workspaces.md, "Held locks"); every caller (the supervisor, doctor's repair, a workspace's lineage read)
+  answers it as a wait on another process, never as damage to the store. The holder is never signalled, and a lock the
+  helper takes after its waiter left is released at once. A checkout's activation-record fence (one read and write) and
+  the lifecycle intent journal's lock (one read and write) are waited for within the control bound the same way. The
+  image lease is held for one disk-image command's run, so its wait is class `ffi` bounded by that command's own
+  deadline, 120 s (`DISK_CHILD_DEADLINE`), and it names the pid its holder recorded. The shell is
+  `cowshed-os::flock::exclusive`.
 - **A lock held across its holder's work is queued, not silent.** A waiter behind a holder that keeps the lock for as
   long as its work (an image's lifecycle lock, a project's retirement lock, a build volume's exclusive claim, the
   install slot, the ref lock) has no ceiling: a bound would fail a waiter that is only queued. It keeps its place in the

@@ -280,9 +280,12 @@ pub enum ArtifactError {
     #[error("failed to secure redirect descriptor for {path}: {message}")]
     RedirectDescriptor { path: PathBuf, message: String },
     #[error(
-        "artifact recovery retention budget {limit_bytes} bytes exceeded by {required_bytes} bytes"
+        "job records {}: recovery would retain {required_bytes} bytes of working state, past its \
+         {limit_bytes}-byte budget",
+        path.display()
     )]
     RecoveryBudgetExceeded {
+        path: PathBuf,
         limit_bytes: usize,
         required_bytes: usize,
     },
@@ -602,7 +605,7 @@ struct Admitted {
 }
 
 /// Readable admission keys of the store's incarnation; unread history is store authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct AdmissionIndex {
     keys: BTreeMap<AdmissionKey, Admitted>,
 }
@@ -630,51 +633,33 @@ pub enum AdmissionLookup<'a> {
 }
 
 impl AdmissionIndex {
-    /// The keyed admissions of this incarnation among the validated readable records.
-    fn recover(
-        recovery: &RecoveryReport,
-        incarnation: &WorkspaceIncarnation,
-    ) -> Result<Self, ArtifactError> {
-        let mut keys = BTreeMap::<AdmissionKey, Admitted>::new();
-        for frame in &recovery.frames {
-            let record = &frame.record;
-            let Some(admission) = &record.admission else {
-                continue;
-            };
-            if &record.workspace_incarnation != incarnation {
-                continue;
+    /// Whether `record` binds `admission`'s key for the first time: `false` when the key already
+    /// names this job with the same request, `Integrity` when it names another job or request.
+    fn binds_new_key(
+        &self,
+        record: &JobArtifactRecord,
+        admission: &JobAdmission,
+    ) -> Result<bool, ArtifactError> {
+        match self.keys.get(&admission.key) {
+            Some(known)
+                if known.job_id == record.job_id
+                    && known.command == record.command
+                    && &known.admission == admission
+                    && known.scheduling == record.scheduling =>
+            {
+                Ok(false)
             }
-            match keys.get(&admission.key) {
-                Some(known)
-                    if known.job_id == record.job_id
-                        && known.command == record.command
-                        && &known.admission == admission
-                        && known.scheduling == record.scheduling => {}
-                Some(known) => {
-                    return Err(integrity(
-                        0,
-                        &format!(
-                            "admission key {:?} is recorded for job {} and for job {}",
-                            admission.key.as_str(),
-                            known.job_id.get(),
-                            record.job_id.get()
-                        ),
-                    ));
-                }
-                None => {
-                    keys.insert(
-                        admission.key.clone(),
-                        Admitted {
-                            job_id: record.job_id,
-                            command: record.command.clone(),
-                            admission: admission.clone(),
-                            scheduling: record.scheduling,
-                        },
-                    );
-                }
-            }
+            Some(known) => Err(integrity(
+                0,
+                &format!(
+                    "admission key {:?} is recorded for job {} and for job {}",
+                    admission.key.as_str(),
+                    known.job_id.get(),
+                    record.job_id.get()
+                ),
+            )),
+            None => Ok(true),
         }
-        Ok(Self { keys })
     }
 
     fn lookup<'a>(
@@ -1002,6 +987,64 @@ pub struct RecoveryReport {
     pub set_aside: Option<SetAsideStore>,
 }
 
+/// What opening a store did to its records: the incomplete tail it cut, the first job id it
+/// allocates, and the store it set aside, when it set one aside.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreRecovery {
+    pub truncated_bytes: u64,
+    pub next_job_id: JobId,
+    pub set_aside: Option<SetAsideStore>,
+}
+
+/// A terminal job of this incarnation as a store indexes it: where its frame starts, the frame's
+/// digest, and the generation of each spilled stream its digest pass verified. The record is
+/// read back from its frame when asked for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommittedJob {
+    offset: u64,
+    batch_sha256: Sha256Digest,
+    stdout: Option<FileGeneration>,
+    stderr: Option<FileGeneration>,
+}
+
+/// Where a job's admission frame starts, and the frame's digest.
+type FramePlace = (u64, Sha256Digest);
+
+/// What a store keeps of its records, built by one streaming pass and extended by each append:
+/// never a record's payload, only the facts its decisions read (11_shell.md, "Exec records,
+/// stream storage, and tiered authority"). A terminal job is its frame's place; a job admitted
+/// and not ended is its admission frame's place, which sealing it lost reads back; a keyed
+/// admission keeps the request a repeat must match. `retained_bytes` bounds what all of it holds
+/// resident from above, and never passes [`ArtifactConfig::retained_recovery_budget_bytes`].
+#[derive(Debug)]
+struct RecordIndex {
+    committed: BTreeMap<JobId, CommittedJob>,
+    readable: BTreeSet<JobId>,
+    admissions: AdmissionIndex,
+    unterminated: BTreeMap<JobId, FramePlace>,
+    retained_bytes: usize,
+}
+
+/// Whose records an index admits, and where its files are.
+struct IndexScope<'a> {
+    workspace_root: &'a Path,
+    records: &'a Path,
+    owned_repo_ids: &'a OwnedRepoIds,
+    incarnation: &'a WorkspaceIncarnation,
+    config: &'a ArtifactConfig,
+}
+
+/// One frame's change to an index, decided before anything changes: an append stages its record
+/// before writing its frame and commits the entry once the frame is written.
+struct IndexEntry {
+    record: JobArtifactRecord,
+    batch_sha256: Sha256Digest,
+    /// The spill generations of a terminal record; `None` for an admission.
+    files: Option<(Option<FileGeneration>, Option<FileGeneration>)>,
+    new_key: bool,
+    retained_bytes: usize,
+}
+
 pub struct ArtifactStore {
     workspace_root: Arc<PathBuf>,
     /// The holder census of the store this workspace belongs to, which names who holds the
@@ -1014,12 +1057,10 @@ pub struct ArtifactStore {
     budget: BufferBudget,
     next_job_id: u64,
     live_jobs: BTreeMap<JobId, LiveJobState>,
-    committed_jobs: BTreeMap<JobId, Arc<ValidatedJob>>,
-    readable_jobs: BTreeSet<JobId>,
-    admissions: AdmissionIndex,
+    index: RecordIndex,
     unread_history: Vec<UnreadHistory>,
     retained_job_floor: Option<u64>,
-    recovery: RecoveryReport,
+    recovery: StoreRecovery,
     /// The records file as this store last recovered or appended to it. An append that finds it
     /// unchanged — same inode, same length — knows every frame already, so it skips re-reading
     /// and re-hashing the whole log; any other writer's append, a torn tail it left, or a
@@ -1114,21 +1155,12 @@ impl SealedStream {
         })
     }
 
-    fn recovered(
-        workspace_root: &Path,
-        info: StreamInfo,
-        before: Option<&Self>,
-    ) -> Result<Self, ArtifactError> {
-        Self::from_info(info, |path, bytes, sha256| match before {
-            Some(before) => match &before.storage {
-                SealedStorage::File { generation, .. } => Ok(generation.clone()),
-                SealedStorage::Inline(_) => Err(integrity(
-                    0,
-                    "a validated terminal record changed its immutable facts",
-                )),
-            },
-            None => verify_file_content(workspace_root, path, bytes, sha256),
-        })
+    /// The generation of the spilled file this stream is sealed in; none for an inline stream.
+    fn generation(&self) -> Option<FileGeneration> {
+        match &self.storage {
+            SealedStorage::File { generation, .. } => Some(generation.clone()),
+            SealedStorage::Inline(_) => None,
+        }
     }
 
     fn into_info(self) -> StreamInfo {
@@ -1438,47 +1470,37 @@ impl ArtifactStore {
         let workspace_root: Arc<PathBuf> = Arc::new(workspace_root.into());
         let records_path = records_path(&workspace_root);
         let lock = RecordsLock::acquire(&census, &records_path, CONTROL)?;
-        let mut recovery =
-            recover_records_with_budget_under_lock(&lock, config.retained_recovery_budget_bytes)?;
-        validate_recovered_authority(&owned_repo_ids, &workspace_incarnation, &config, &recovery)?;
-        let RecoveredFiles {
-            new_jobs: committed_jobs,
-            ..
-        } = validate_recovered_files(&workspace_root, &workspace_incarnation, &recovery)?;
+        let (index, end) = index_records(
+            &lock,
+            &IndexScope {
+                workspace_root: &workspace_root,
+                records: &records_path,
+                owned_repo_ids: &owned_repo_ids,
+                incarnation: &workspace_incarnation,
+                config: &config,
+            },
+            None,
+        )?;
         let directory_max = scan_job_directories(&workspace_root)?;
-        let record_max = recovery
-            .frames
-            .iter()
-            .map(|frame| frame.record.job_id.get())
-            .max()
-            .unwrap_or(0);
         let retained_job_floor = read_counter(&job_floor_path(&lock)?, &JOB_FLOOR)?;
         let maximum = directory_max
-            .max(record_max)
+            .max(end.highest_job_id)
             .max(retained_job_floor.unwrap_or(0));
         let next_job_id = maximum
             .checked_add(1)
             .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
-        recovery.next_job_id = JobId::new(next_job_id)?;
-        ensure_record_sequence_counter(&lock, &recovery)?;
+        ensure_record_sequence_counter(&lock, end.highest_sequence, end.truncated_bytes)?;
         let job_root = lock
             .records
             .parent()
             .ok_or_else(|| integrity(0, "records path has no job parent"))?
             .to_path_buf();
-        if let Some(set_aside) = &recovery.set_aside
+        if let Some(set_aside) = &end.set_aside
             && set_aside.layout >= FIRST_KEYED_LAYOUT
         {
             record_set_aside_incarnation(set_aside, &workspace_incarnation)?;
         }
-        let admissions = AdmissionIndex::recover(&recovery, &workspace_incarnation)?;
         let unread_history = history_set_aside(&job_root, &workspace_incarnation)?;
-        let readable_jobs = recovery
-            .frames
-            .iter()
-            .filter(|frame| frame.record.workspace_incarnation == workspace_incarnation)
-            .map(|frame| frame.record.job_id)
-            .collect();
         let records_seen = RecordsIdentity::of(&records_path)?;
         drop(lock);
         let token_namespace = Sha256Digest::compute(workspace_root.as_os_str().as_encoded_bytes());
@@ -1494,19 +1516,22 @@ impl ArtifactStore {
             },
             next_job_id,
             live_jobs: BTreeMap::new(),
-            committed_jobs,
-            readable_jobs,
-            admissions,
+            index,
             unread_history,
             retained_job_floor,
-            recovery,
+            recovery: StoreRecovery {
+                truncated_bytes: end.truncated_bytes,
+                next_job_id: JobId::new(next_job_id)?,
+                set_aside: end.set_aside,
+            },
             config,
             records_seen,
         })
     }
 
-    /// What opening this store recovered, including its adjusted allocation floor and set-aside.
-    pub fn recovery(&self) -> &RecoveryReport {
+    /// What opening this store did to its records: the tail it cut, its first job id and the
+    /// store it set aside.
+    pub fn recovery(&self) -> &StoreRecovery {
         &self.recovery
     }
 
@@ -1514,21 +1539,30 @@ impl ArtifactStore {
         JobId::new(self.next_job_id).map_err(ArtifactError::from)
     }
 
-    /// A readable terminal record, or authoritative absence. Unread history is a refusal, never
-    /// evidence that a numeric job was not admitted.
-    pub fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJobReader>, ArtifactError> {
-        if !self.committed_jobs.contains_key(&job_id) {
-            let path = records_path(&self.workspace_root);
-            let lock = RecordsLock::acquire(&self.census, &path, CONTROL)?;
-            self.refresh_under_lock(&lock)?;
+    /// Whose records this store's index admits.
+    fn scope<'a>(&'a self, records: &'a Path) -> IndexScope<'a> {
+        IndexScope {
+            workspace_root: &self.workspace_root,
+            records,
+            owned_repo_ids: &self.owned_repo_ids,
+            incarnation: &self.workspace_incarnation,
+            config: &self.config,
         }
-        if let Some(record) = self.committed_jobs.get(&job_id) {
+    }
+
+    /// A readable terminal record, read back from its frame, or authoritative absence. Unread
+    /// history is a refusal, never evidence that a numeric job was not admitted.
+    pub fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJobReader>, ArtifactError> {
+        let path = records_path(&self.workspace_root);
+        let lock = RecordsLock::acquire(&self.census, &path, CONTROL)?;
+        self.refresh_under_lock(&lock)?;
+        if let Some(job) = self.index.committed.get(&job_id) {
             return Ok(Some(SealedJobReader {
                 workspace_root: Arc::clone(&self.workspace_root),
-                record: Arc::clone(record),
+                record: Arc::new(read_committed(&lock, job_id, job)?),
             }));
         }
-        if self.readable_jobs.contains(&job_id) {
+        if self.index.readable.contains(&job_id) {
             return Ok(None);
         }
         if let Some(store) = self.unread_history.first()
@@ -1543,8 +1577,9 @@ impl ArtifactStore {
         Ok(None)
     }
 
-    /// One validated generation for reads and appends. Advancing record identity
-    /// always advances its readable rows, terminal rows and key authority together.
+    /// One validated generation for reads and appends. A records file this store has not seen
+    /// is indexed again in one streaming pass: each terminal job it indexed before must keep its
+    /// frame's digest, and keeps the spill generations its digest pass verified.
     fn refresh_under_lock(&mut self, lock: &RecordsLock<'_>) -> Result<(), ArtifactError> {
         let seen = RecordsIdentity::of(lock.records)?;
         if self.records_seen.is_some() && seen.is_none() {
@@ -1553,76 +1588,34 @@ impl ArtifactStore {
                 "previously readable protected job records disappeared",
             ));
         }
-        let unchanged = seen == self.records_seen
-            && seen.is_none_or(|seen| {
-                usize::try_from(seen.len)
-                    .is_ok_and(|len| len <= self.config.retained_recovery_budget_bytes)
-            });
         let job_root = lock
             .records
             .parent()
             .ok_or_else(|| integrity(0, "records path has no job parent"))?;
-        if unchanged {
-            // Refresh metadata authority without reading or hashing unchanged captured payloads.
-            let unread_history = history_set_aside(job_root, &self.workspace_incarnation)?;
-            let retained_job_floor = read_counter(&job_floor_path(lock)?, &JOB_FLOOR)?;
-            self.unread_history = unread_history;
-            self.retained_job_floor = retained_job_floor;
-            return Ok(());
-        }
-        let recovery = recover_records_with_budget_under_lock(
-            lock,
-            self.config.retained_recovery_budget_bytes,
-        )?;
-        validate_recovered_authority(
-            &self.owned_repo_ids,
-            &self.workspace_incarnation,
-            &self.config,
-            &recovery,
-        )?;
-        let admissions = AdmissionIndex::recover(&recovery, &self.workspace_incarnation);
-        let set_aside = recovery.set_aside.clone();
-        let readable_jobs = recovery
-            .frames
-            .iter()
-            .filter(|frame| frame.record.workspace_incarnation == self.workspace_incarnation)
-            .map(|frame| frame.record.job_id)
-            .collect();
-        let RecoveredFiles {
-            terminal_jobs,
-            mut new_jobs,
-        } = validate_recovered_files_since(
-            &self.workspace_root,
-            &self.workspace_incarnation,
-            recovery
-                .frames
-                .into_iter()
-                .map(|frame| std::borrow::Cow::Owned(frame.record)),
-            Some(&self.committed_jobs),
-        )?;
-        if let Some(set_aside) = &set_aside
-            && set_aside.layout >= FIRST_KEYED_LAYOUT
-        {
-            record_set_aside_incarnation(set_aside, &self.workspace_incarnation)?;
-        }
-        let admissions = admissions?;
-        let unread_history = history_set_aside(job_root, &self.workspace_incarnation)?;
-        let retained_job_floor = read_counter(&job_floor_path(lock)?, &JOB_FLOOR)?;
-        for job_id in self.committed_jobs.keys() {
-            if !terminal_jobs.contains(job_id) {
+        if seen != self.records_seen {
+            let (index, end) =
+                index_records(lock, &self.scope(lock.records), Some(&self.index.committed))?;
+            if let Some(set_aside) = &end.set_aside
+                && set_aside.layout >= FIRST_KEYED_LAYOUT
+            {
+                record_set_aside_incarnation(set_aside, &self.workspace_incarnation)?;
+            }
+            if self
+                .index
+                .committed
+                .keys()
+                .any(|job_id| !index.committed.contains_key(job_id))
+            {
                 return Err(integrity(
                     0,
                     "a validated terminal job disappeared from protected records",
                 ));
             }
+            self.index = index;
+            self.records_seen = RecordsIdentity::of(lock.records)?;
         }
-        let records_seen = RecordsIdentity::of(lock.records)?;
-        self.committed_jobs.append(&mut new_jobs);
-        self.readable_jobs = readable_jobs;
-        self.admissions = admissions;
-        self.unread_history = unread_history;
-        self.retained_job_floor = retained_job_floor;
-        self.records_seen = records_seen;
+        self.unread_history = history_set_aside(job_root, &self.workspace_incarnation)?;
+        self.retained_job_floor = read_counter(&job_floor_path(lock)?, &JOB_FLOOR)?;
         Ok(())
     }
 
@@ -1648,7 +1641,7 @@ impl ArtifactStore {
                 message: "job id is behind the next expected artifact id",
             });
         }
-        if self.live_jobs.contains_key(&job_id) || self.committed_jobs.contains_key(&job_id) {
+        if self.live_jobs.contains_key(&job_id) || self.index.committed.contains_key(&job_id) {
             return Err(ArtifactError::TokenConflict {
                 job_id,
                 message: "job id already has artifact state",
@@ -1707,7 +1700,7 @@ impl ArtifactStore {
 
     /// What this incarnation's admissions say of `key`.
     pub fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_> {
-        self.admissions.lookup(key, &self.unread_history)
+        self.index.admissions.lookup(key, &self.unread_history)
     }
 
     /// Seal every job this incarnation admitted and never sealed: the jobs a supervisor ran when
@@ -1723,21 +1716,22 @@ impl ArtifactStore {
     pub fn seal_unterminated(
         &mut self,
     ) -> Result<Vec<(JobArtifactRecord, Sha256Digest)>, ArtifactError> {
-        let admitted: BTreeMap<JobId, JobArtifactRecord> = self
-            .recovery
-            .frames
-            .iter()
-            .filter(|frame| {
-                let record = &frame.record;
-                record.workspace_incarnation == self.workspace_incarnation
-                    && !record.state.is_terminal()
-                    && !self.committed_jobs.contains_key(&record.job_id)
-                    && !self.live_jobs.contains_key(&record.job_id)
-            })
-            .map(|frame| (frame.record.job_id, frame.record.clone()))
-            .collect();
+        let admitted = {
+            let path = records_path(&self.workspace_root);
+            let lock = RecordsLock::acquire(&self.census, &path, CONTROL)?;
+            self.index
+                .unterminated
+                .iter()
+                .filter(|(job_id, _)| {
+                    !self.index.committed.contains_key(job_id)
+                        && !self.live_jobs.contains_key(job_id)
+                })
+                .map(|(job_id, place)| read_admission(&lock, *job_id, place))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let mut sealed = Vec::with_capacity(admitted.len());
-        for (job_id, admission) in admitted {
+        for admission in admitted {
+            let job_id = admission.job_id;
             let stdout = orphan_stream(
                 &self.workspace_root,
                 job_id,
@@ -1764,14 +1758,15 @@ impl ArtifactStore {
         &mut self,
         pending: AppendJob,
     ) -> Result<(JobArtifactRecord, Sha256Digest), ArtifactError> {
-        let (mut record, mut terminal) = match pending {
+        let (mut record, files) = match pending {
             AppendJob::Admission(record) => (record, None),
             AppendJob::Terminal(record) => {
-                let wire = record.clone().try_map_streams(
+                let files = (record.stdout.generation(), record.stderr.generation());
+                let wire = record.try_map_streams(
                     |stream| Ok(stream.into_info()),
                     |stream| Ok(stream.into_info()),
                 )?;
-                (wire, Some(record))
+                (wire, Some(files))
             }
         };
         let path = records_path(&self.workspace_root);
@@ -1779,7 +1774,7 @@ impl ArtifactStore {
         self.refresh_under_lock(&lock)?;
         let duplicate_terminal = record.state.is_terminal()
             && record.workspace_incarnation == self.workspace_incarnation
-            && self.committed_jobs.contains_key(&record.job_id);
+            && self.index.committed.contains_key(&record.job_id);
         if duplicate_terminal {
             return Err(integrity(
                 0,
@@ -1789,13 +1784,14 @@ impl ArtifactStore {
         // The key binds under the lock that orders every record: no other job can take it
         // between this check and the append.
         if let Some(admission) = &record.admission {
-            self.admissions
+            self.index
+                .admissions
                 .check(record.job_id, admission, &self.unread_history)?;
         }
         let sequence = allocate_record_sequence(&lock)?;
         record.sequence = sequence;
         record.validate()?;
-        if record.state.is_terminal() != terminal.is_some() {
+        if record.state.is_terminal() != files.is_some() {
             return Err(integrity(
                 0,
                 "terminal artifact publication requires typed sealed storage",
@@ -1804,17 +1800,17 @@ impl ArtifactStore {
         let batch = job_record_to_batch(&record)?;
         let payload = encode_batch(&batch)?;
         let digest = Sha256Digest::compute(&payload);
-        append_framed_batch_under_lock(&lock, &payload, digest, JOB_RECORD_DURABILITY, None)?;
-        if record.workspace_incarnation == self.workspace_incarnation {
-            self.readable_jobs.insert(record.job_id);
-        }
-        if let Some(admission) = &record.admission {
-            self.admissions.admit(&record, admission);
-        }
-        if let Some(mut terminal) = terminal.take() {
-            terminal.sequence = sequence;
-            self.committed_jobs
-                .insert(record.job_id, Arc::new(terminal));
+        // The index decides before the frame is written: a record its working-memory budget
+        // cannot hold is refused with nothing appended.
+        let staged = self
+            .index
+            .stage(&self.scope(&path), record.clone(), digest, |_| {
+                files.ok_or_else(|| integrity(0, "an admission record names no spill files"))
+            })?;
+        let offset =
+            append_framed_batch_under_lock(&lock, &payload, digest, JOB_RECORD_DURABILITY, None)?;
+        if let Some(entry) = staged {
+            self.index.commit(entry, offset);
         }
         self.records_seen = RecordsIdentity::of(&path)?;
         Ok((record, digest))
@@ -2283,14 +2279,19 @@ impl ArtifactStore {
         stream: StreamKind,
         publication: &OutputPublication,
     ) -> Result<(), ArtifactError> {
-        let record =
-            self.committed_jobs
-                .get(&job_id)
-                .ok_or_else(|| ArtifactError::Publication {
-                    path: publication.path.as_path().to_owned(),
-                    stage: PublicationStage::ValidateDestination,
-                    message: "job has no durable terminal artifact record".into(),
-                })?;
+        let path = records_path(&self.workspace_root);
+        let lock = RecordsLock::acquire(&self.census, &path, CONTROL)?;
+        let job = self
+            .index
+            .committed
+            .get(&job_id)
+            .ok_or_else(|| ArtifactError::Publication {
+                path: publication.path.as_path().to_owned(),
+                stage: PublicationStage::ValidateDestination,
+                message: "job has no durable terminal artifact record".into(),
+            })?;
+        let record = read_committed(&lock, job_id, job)?;
+        drop(lock);
         let info = match stream {
             StreamKind::Stdout => &record.stdout,
             StreamKind::Stderr => &record.stderr,
@@ -2755,107 +2756,401 @@ fn open_artifact_no_follow(
     }
 }
 
-fn validate_recovered_authority(
-    owned_repo_ids: &OwnedRepoIds,
-    current_incarnation: &WorkspaceIncarnation,
-    config: &ArtifactConfig,
-    recovery: &RecoveryReport,
-) -> Result<(), ArtifactError> {
-    for frame in &recovery.frames {
-        if !owned_repo_ids.accepts(frame.record.repo_id()) {
+/// The generation of `info`'s spilled file, verified by its full digest pass; none for an inline
+/// stream.
+fn stream_generation(
+    workspace_root: &Path,
+    info: &StreamInfo,
+) -> Result<Option<FileGeneration>, ArtifactError> {
+    match info.storage.artifact() {
+        Some(ProtectedOutput::File { path }) => {
+            verify_file_content(workspace_root, path, info.bytes, info.sha256).map(Some)
+        }
+        Some(ProtectedOutput::Inline { .. }) => Ok(None),
+        None => Err(integrity(0, "a recorded stream names no artifact")),
+    }
+}
+
+/// What an allocation of `bytes` can occupy: the allocator rounds a request up to its size
+/// class, by at most 15 bytes for a tiny request, 511 for a small one (1009 bytes and more) and
+/// a page for a large one, each within half the request plus 16 bytes.
+const fn allocation_bytes(bytes: usize) -> usize {
+    if bytes == 0 {
+        0
+    } else {
+        bytes.saturating_add(bytes / 2).saturating_add(16)
+    }
+}
+
+/// What one entry of `T` (its key and value together) can cost resident in std's B-tree
+/// (B = 6): a node allocates 11 entries, a parent link, two counts and, inside the tree, 12
+/// child links, `11 T + 112` bytes; every node but the root holds at least 5 entries. One node's
+/// allocation spread over 5 entries stays within this.
+const fn tree_entry_bytes<T>() -> usize {
+    4 * std::mem::size_of::<T>() + 40
+}
+
+/// A B-tree's root node, which may hold a single entry: one node's whole allocation.
+const fn tree_root_bytes<T>() -> usize {
+    17 * std::mem::size_of::<T>() + 184
+}
+
+/// The text of `value` as one allocation.
+fn text_bytes(value: &str) -> usize {
+    allocation_bytes(value.len())
+}
+
+/// `count` values of `T` in one vector, each holding `heap` beyond itself.
+fn vector_bytes<T>(count: usize, heap: usize) -> usize {
+    allocation_bytes(count.saturating_mul(std::mem::size_of::<T>())).saturating_add(heap)
+}
+
+/// The heap a keyed admission's index entry holds beyond the entry: its key twice (the map's and
+/// the admission's own), the paths, names and environment of its request, and its command. Each
+/// is a clone, allocated at its length.
+fn admitted_heap_bytes(command: &ExecCommand, admission: &JobAdmission) -> usize {
+    let path = |path: &WorkspacePath| text_bytes(path.as_str());
+    let env = if admission.env.is_empty() {
+        0
+    } else {
+        admission.env.iter().fold(
+            tree_root_bytes::<(String, String)>(),
+            |sum, (name, value)| {
+                sum.saturating_add(tree_entry_bytes::<(String, String)>())
+                    .saturating_add(text_bytes(name))
+                    .saturating_add(text_bytes(value))
+            },
+        )
+    };
+    let stdin = match &admission.stdin {
+        AdmittedStdin::WorkspaceFile(file) => path(file),
+        AdmittedStdin::Empty | AdmittedStdin::Inline { .. } | AdmittedStdin::Stream => 0,
+    };
+    let session = match &admission.session {
+        AdmittedSession::Named(name) => text_bytes(name),
+        AdmittedSession::None | AdmittedSession::Unnamed(_) => 0,
+    };
+    let copies = [&admission.stdout_copy, &admission.stderr_copy]
+        .into_iter()
+        .flatten()
+        .map(|copy| path(&copy.path))
+        .fold(0_usize, usize::saturating_add);
+    let command = match command {
+        ExecCommand::Argv(argv) => vector_bytes::<CommandArg>(
+            argv.len(),
+            argv.iter()
+                .map(|arg| allocation_bytes(arg.as_os_str().len()))
+                .fold(0_usize, usize::saturating_add),
+        ),
+        ExecCommand::Script(script) => {
+            let parts = vector_bytes::<String>(
+                script.parts().len(),
+                script
+                    .parts()
+                    .iter()
+                    .map(|part| text_bytes(part))
+                    .fold(0_usize, usize::saturating_add),
+            );
+            let values = vector_bytes::<crate::api::dto::ScriptValue>(
+                script.values().len(),
+                script
+                    .values()
+                    .iter()
+                    .map(|value| match value {
+                        crate::api::dto::ScriptValue::Word(word) => text_bytes(word),
+                        crate::api::dto::ScriptValue::Words(words) => vector_bytes::<String>(
+                            words.len(),
+                            words
+                                .iter()
+                                .map(|word| text_bytes(word))
+                                .fold(0_usize, usize::saturating_add),
+                        ),
+                    })
+                    .fold(0_usize, usize::saturating_add),
+            );
+            parts.saturating_add(values)
+        }
+    };
+    text_bytes(admission.key.as_str())
+        .saturating_mul(2)
+        .saturating_add(admission.cwd.as_ref().map_or(0, path))
+        .saturating_add(env)
+        .saturating_add(stdin)
+        .saturating_add(session)
+        .saturating_add(copies)
+        .saturating_add(command)
+}
+
+impl RecordIndex {
+    /// An empty index, already charged the root node each of its trees allocates.
+    fn new() -> Self {
+        Self {
+            committed: BTreeMap::new(),
+            readable: BTreeSet::new(),
+            admissions: AdmissionIndex::default(),
+            unterminated: BTreeMap::new(),
+            retained_bytes: tree_root_bytes::<(JobId, CommittedJob)>()
+                .saturating_add(tree_root_bytes::<JobId>())
+                .saturating_add(tree_root_bytes::<(AdmissionKey, Admitted)>())
+                .saturating_add(tree_root_bytes::<(JobId, FramePlace)>()),
+        }
+    }
+
+    /// Check `record`'s authority and decide what indexing it changes, changing nothing. A
+    /// record of an ancestor incarnation is history this incarnation never reads, so it adds no
+    /// entry. `files` names a terminal record's spill generations. A change that would carry
+    /// what the index holds past the retained recovery budget is refused, naming the records.
+    fn stage(
+        &self,
+        scope: &IndexScope<'_>,
+        record: JobArtifactRecord,
+        batch_sha256: Sha256Digest,
+        files: impl FnOnce(
+            &JobArtifactRecord,
+        )
+            -> Result<(Option<FileGeneration>, Option<FileGeneration>), ArtifactError>,
+    ) -> Result<Option<IndexEntry>, ArtifactError> {
+        if !scope.owned_repo_ids.accepts(record.repo_id()) {
             return Err(integrity(
                 0,
                 &format!(
-                    "record repo identity {} is not owned by attached project {owned_repo_ids}",
-                    frame.record.repo_id(),
+                    "record repo identity {} is not owned by attached project {}",
+                    record.repo_id(),
+                    scope.owned_repo_ids,
                 ),
             ));
         }
-        if frame.record.origin_incarnation() != current_incarnation
-            && !config
+        if record.origin_incarnation() != scope.incarnation {
+            if scope
+                .config
                 .historical_incarnations
-                .contains(frame.record.origin_incarnation())
-        {
+                .contains(record.origin_incarnation())
+            {
+                return Ok(None);
+            }
             return Err(integrity(
                 0,
                 &format!(
                     "record incarnation {} is neither current nor in the workspace's lineage",
-                    frame.record.origin_incarnation(),
+                    record.origin_incarnation(),
                 ),
             ));
         }
+        let unended = tree_entry_bytes::<(JobId, FramePlace)>();
+        let refund = if self.unterminated.contains_key(&record.job_id) {
+            unended
+        } else {
+            0
+        };
+        let readable = if self.readable.contains(&record.job_id) {
+            0
+        } else {
+            tree_entry_bytes::<JobId>()
+        };
+        let new_key = match &record.admission {
+            Some(admission) => self.admissions.binds_new_key(&record, admission)?,
+            None => false,
+        };
+        let key = match &record.admission {
+            Some(admission) if new_key => tree_entry_bytes::<(AdmissionKey, Admitted)>()
+                .saturating_add(admitted_heap_bytes(&record.command, admission)),
+            _ => 0,
+        };
+        let (files, kept) = if record.state.is_terminal() {
+            (
+                Some(files(&record)?),
+                tree_entry_bytes::<(JobId, CommittedJob)>(),
+            )
+        } else {
+            (None, unended)
+        };
+        let required = self
+            .retained_bytes
+            .checked_sub(refund)
+            .expect("an unended job's charge is part of what its index holds")
+            .saturating_add(readable)
+            .saturating_add(key)
+            .saturating_add(kept);
+        let limit = scope.config.retained_recovery_budget_bytes;
+        if required > limit {
+            return Err(ArtifactError::RecoveryBudgetExceeded {
+                path: scope.records.to_path_buf(),
+                limit_bytes: limit,
+                required_bytes: required,
+            });
+        }
+        Ok(Some(IndexEntry {
+            record,
+            batch_sha256,
+            files,
+            new_key,
+            retained_bytes: required,
+        }))
     }
-    Ok(())
-}
 
-struct RecoveredFiles {
-    terminal_jobs: BTreeSet<JobId>,
-    new_jobs: BTreeMap<JobId, Arc<ValidatedJob>>,
-}
-
-fn validate_recovered_files(
-    workspace_root: &Path,
-    current_incarnation: &WorkspaceIncarnation,
-    recovery: &RecoveryReport,
-) -> Result<RecoveredFiles, ArtifactError> {
-    validate_recovered_files_since(
-        workspace_root,
-        current_incarnation,
-        recovery
-            .frames
-            .iter()
-            .map(|frame| std::borrow::Cow::Borrowed(&frame.record)),
-        None,
-    )
-}
-
-fn validate_recovered_files_since<'a>(
-    workspace_root: &Path,
-    current_incarnation: &WorkspaceIncarnation,
-    records: impl IntoIterator<Item = std::borrow::Cow<'a, JobArtifactRecord>>,
-    known: Option<&BTreeMap<JobId, Arc<ValidatedJob>>>,
-) -> Result<RecoveredFiles, ArtifactError> {
-    let mut terminal_jobs = BTreeSet::new();
-    let mut new_jobs = BTreeMap::new();
-    for record in records {
-        if &record.workspace_incarnation != current_incarnation || !record.state.is_terminal() {
-            continue;
-        }
+    /// Apply a staged entry whose frame starts at `offset`.
+    fn commit(&mut self, entry: IndexEntry, offset: u64) {
+        let IndexEntry {
+            record,
+            batch_sha256,
+            files,
+            new_key,
+            retained_bytes,
+        } = entry;
         let job_id = record.job_id;
-        if !terminal_jobs.insert(job_id) {
-            return Err(integrity(
-                0,
-                "duplicate terminal artifact record for current job id",
-            ));
+        self.readable.insert(job_id);
+        if new_key && let Some(admission) = &record.admission {
+            self.admissions.admit(&record, admission);
         }
-        // Opening clones only newly learned terminals out of its retained recovery report.
-        // A changed refresh owns its recovered rows and moves them through this same path.
-        let before = known.and_then(|known| known.get(&job_id));
-        let validated = record.into_owned().try_map_streams(
-            |info| {
-                SealedStream::recovered(workspace_root, info, before.map(|record| &record.stdout))
-            },
-            |info| {
-                SealedStream::recovered(workspace_root, info, before.map(|record| &record.stderr))
-            },
-        )?;
-        match before {
-            Some(before) if before.as_ref() == &validated => {}
-            Some(_) => {
-                return Err(integrity(
-                    0,
-                    "a validated terminal record changed its immutable facts",
-                ));
+        match files {
+            Some((stdout, stderr)) => {
+                self.unterminated.remove(&job_id);
+                self.committed.insert(
+                    job_id,
+                    CommittedJob {
+                        offset,
+                        batch_sha256,
+                        stdout,
+                        stderr,
+                    },
+                );
             }
             None => {
-                new_jobs.insert(job_id, Arc::new(validated));
+                self.unterminated.insert(job_id, (offset, batch_sha256));
             }
         }
+        self.retained_bytes = retained_bytes;
     }
-    Ok(RecoveredFiles {
-        terminal_jobs,
-        new_jobs,
-    })
+}
+
+/// Index the records `lock` guards in one streaming pass. A terminal job `known` already holds
+/// must keep its frame's digest and keeps the spill generations verified then; every other
+/// spilled stream is verified by its full digest pass. A store set aside indexes as empty.
+fn index_records(
+    lock: &RecordsLock<'_>,
+    scope: &IndexScope<'_>,
+    known: Option<&BTreeMap<JobId, CommittedJob>>,
+) -> Result<(RecordIndex, ReadEnd), ArtifactError> {
+    let mut index = RecordIndex::new();
+    let end = read_records_under_lock(lock, &mut |frame| {
+        let batch_sha256 = frame.batch_sha256;
+        let staged = index.stage(scope, frame.record, batch_sha256, |record| {
+            match known.and_then(|known| known.get(&record.job_id)) {
+                Some(before) if before.batch_sha256 == batch_sha256 => {
+                    Ok((before.stdout.clone(), before.stderr.clone()))
+                }
+                Some(_) => Err(integrity(
+                    0,
+                    "a validated terminal record changed its immutable facts",
+                )),
+                None => Ok((
+                    stream_generation(scope.workspace_root, &record.stdout)?,
+                    stream_generation(scope.workspace_root, &record.stderr)?,
+                )),
+            }
+        })?;
+        if let Some(entry) = staged {
+            index.commit(entry, frame.offset);
+        }
+        Ok(())
+    })?;
+    if end.set_aside.is_some() {
+        index = RecordIndex::new();
+    }
+    Ok((index, end))
+}
+
+/// The record of `job_id` read back from its frame at `offset` in the records `lock` guards,
+/// which must still carry the digest its index proved.
+fn read_indexed(
+    lock: &RecordsLock<'_>,
+    job_id: JobId,
+    offset: u64,
+    batch_sha256: Sha256Digest,
+) -> Result<JobArtifactRecord, ArtifactError> {
+    let path = lock.records;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).map_err(|error| io_error(path, error))?;
+    let len = file
+        .metadata()
+        .map_err(|error| io_error(path, error))?
+        .len();
+    let start = usize::try_from(offset)
+        .map_err(|_| integrity(0, "records offset does not fit this platform"))?;
+    let remaining = len
+        .checked_sub(offset)
+        .and_then(|remaining| usize::try_from(remaining).ok())
+        .ok_or_else(|| integrity(start, "an indexed frame lies past the records' end"))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| io_error(path, error))?;
+    let Some((batch, digest, _)) = read_frame(&mut file, path, start, remaining)? else {
+        return Err(integrity(start, "an indexed frame is incomplete"));
+    };
+    if digest != batch_sha256 {
+        return Err(integrity(
+            start,
+            "an indexed frame no longer carries its digest",
+        ));
+    }
+    let record =
+        batch_to_protected_record(&batch).map_err(|error| integrity(start, &error.to_string()))?;
+    record
+        .validate()
+        .map_err(|error| integrity(start, &error.to_string()))?;
+    if record.job_id != job_id {
+        return Err(integrity(start, "an indexed frame holds another job"));
+    }
+    Ok(record)
+}
+
+/// The admission record of the unended job `job_id`, read back from its indexed frame.
+fn read_admission(
+    lock: &RecordsLock<'_>,
+    job_id: JobId,
+    (offset, batch_sha256): &FramePlace,
+) -> Result<JobArtifactRecord, ArtifactError> {
+    let record = read_indexed(lock, job_id, *offset, *batch_sha256)?;
+    if record.state.is_terminal() {
+        return Err(integrity(0, "an unended job's indexed frame is terminal"));
+    }
+    Ok(record)
+}
+
+/// The terminal record of `job_id`, read back from its indexed frame; each spilled stream keeps
+/// the generation its digest pass verified.
+fn read_committed(
+    lock: &RecordsLock<'_>,
+    job_id: JobId,
+    job: &CommittedJob,
+) -> Result<ValidatedJob, ArtifactError> {
+    let record = read_indexed(lock, job_id, job.offset, job.batch_sha256)?;
+    if !record.state.is_terminal() {
+        return Err(integrity(
+            0,
+            "a terminal job's indexed frame is not terminal",
+        ));
+    }
+    let spilled = |generation: &Option<FileGeneration>| {
+        let generation = generation.clone();
+        move |_: &WorkspacePath, _: u64, _: Sha256Digest| {
+            generation.ok_or_else(|| {
+                integrity(
+                    0,
+                    "an inline stream of an indexed frame names a protected file",
+                )
+            })
+        }
+    };
+    record.try_map_streams(
+        |info| SealedStream::from_info(info, spilled(&job.stdout)),
+        |info| SealedStream::from_info(info, spilled(&job.stderr)),
+    )
 }
 
 #[cfg(unix)]
@@ -2969,15 +3264,6 @@ fn job_floor_path(lock: &RecordsLock<'_>) -> Result<PathBuf, ArtifactError> {
     Ok(job_root.join(JOB_FLOOR_FILE))
 }
 
-fn highest_record_sequence(recovery: &RecoveryReport) -> u64 {
-    recovery
-        .frames
-        .iter()
-        .map(|frame| frame.record.sequence)
-        .max()
-        .unwrap_or(0)
-}
-
 fn read_record_sequence_counter(lock: &RecordsLock<'_>) -> Result<Option<u64>, ArtifactError> {
     read_counter(&record_sequence_path(lock)?, &RECORD_SEQUENCE)
 }
@@ -3049,9 +3335,9 @@ fn publish_counter(
 
 fn ensure_record_sequence_counter(
     lock: &RecordsLock<'_>,
-    recovery: &RecoveryReport,
+    observed: u64,
+    truncated_bytes: u64,
 ) -> Result<(), ArtifactError> {
-    let observed = highest_record_sequence(recovery);
     match read_record_sequence_counter(lock)? {
         // A counter behind the log is the mixed-binary case: the store was
         // migrated while empty, then appended to by a build that still derived
@@ -3068,7 +3354,7 @@ fn ensure_record_sequence_counter(
             publish_record_sequence_counter(lock, observed, Durability::PowerLoss)
         }
         Some(_) => Ok(()),
-        None if recovery.truncated_bytes != 0 => Err(integrity(
+        None if truncated_bytes != 0 => Err(integrity(
             0,
             "cannot initialize record sequence counter after an incomplete tail; create a fresh store",
         )),
@@ -3111,20 +3397,20 @@ pub fn recorded_historical_incarnations(
     census: &crate::census::CensusScope,
     workspace_root: &Path,
     current: &WorkspaceIncarnation,
-    retained_recovery_budget_bytes: usize,
 ) -> Result<BTreeSet<WorkspaceIncarnation>, ArtifactError> {
-    let recovery = recover_records_with_budget(
-        census,
-        &records_path(workspace_root),
-        retained_recovery_budget_bytes,
-    )?;
-    Ok(recovery
-        .frames
-        .iter()
-        .map(|frame| frame.record.origin_incarnation())
-        .filter(|origin| *origin != current)
-        .cloned()
-        .collect())
+    let path = records_path(workspace_root);
+    let lock = RecordsLock::acquire(census, &path, CONTROL)?;
+    let mut origins = BTreeSet::new();
+    let end = read_records_under_lock(&lock, &mut |frame| {
+        if frame.record.origin_incarnation() != current {
+            origins.insert(frame.record.workspace_incarnation);
+        }
+        Ok(())
+    })?;
+    if end.set_aside.is_some() {
+        origins.clear();
+    }
+    Ok(origins)
 }
 fn verify_records_layout(path: &Path) -> Result<(), ArtifactError> {
     let job_root = path
@@ -3297,15 +3583,17 @@ fn append_framed_batch_impl(
         JOB_RECORD_DURABILITY,
         fail_after_bytes,
     )
+    .map(|_| ())
 }
 
+/// Append one frame to the records `lock` guards; returns the offset it starts at.
 fn append_framed_batch_under_lock(
     lock: &RecordsLock<'_>,
     payload: &[u8],
     digest: Sha256Digest,
     durability: Durability,
     mut fail_after_bytes: Option<usize>,
-) -> Result<(), ArtifactError> {
+) -> Result<u64, ArtifactError> {
     let path = lock.records;
     let payload_len = u64::try_from(payload.len())
         .map_err(|_| ArtifactError::Arrow("record batch is too large".into()))?;
@@ -3379,7 +3667,11 @@ fn append_framed_batch_under_lock(
             error,
         ));
     }
-    Ok(())
+    Ok(if !existing || original_len == 0 {
+        RECORD_MAGIC.len() as u64
+    } else {
+        original_len
+    })
 }
 
 fn write_append_bytes(
@@ -3437,27 +3729,95 @@ pub fn recover_records_with_budget(
     recover_records_with_budget_under_lock(&lock, retained_budget_bytes)
 }
 
+/// Every frame of the records `lock` guards, kept: the diagnostic read of a whole log, held
+/// within `retained_budget_bytes`. A store opens through [`index_records`] instead, which keeps
+/// no record's output.
 fn recover_records_with_budget_under_lock(
     lock: &RecordsLock<'_>,
     retained_budget_bytes: usize,
 ) -> Result<RecoveryReport, ArtifactError> {
-    let path = lock.records;
     if retained_budget_bytes == 0 {
         return Err(ArtifactError::InvalidConfig(
             "retained recovery budget must be positive",
         ));
     }
+    let mut frames = Vec::new();
+    let mut retained = 0_usize;
+    let end = read_records_under_lock(lock, &mut |frame| {
+        let required = retained.saturating_add(frame.len);
+        if required > retained_budget_bytes {
+            return Err(ArtifactError::RecoveryBudgetExceeded {
+                path: lock.records.to_path_buf(),
+                limit_bytes: retained_budget_bytes,
+                required_bytes: required,
+            });
+        }
+        frames
+            .try_reserve(1)
+            .map_err(|_| ArtifactError::BufferAllocation)?;
+        frames.push(RecoveredFrame {
+            record: frame.record,
+            batch_sha256: frame.batch_sha256,
+        });
+        retained = required;
+        Ok(())
+    })?;
+    if end.set_aside.is_some() {
+        frames.clear();
+    }
+    let next = end
+        .highest_job_id
+        .checked_add(1)
+        .ok_or_else(|| integrity(0, "job id allocation exhausted"))?;
+    Ok(RecoveryReport {
+        frames,
+        truncated_bytes: end.truncated_bytes,
+        next_job_id: JobId::new(next)?,
+        set_aside: end.set_aside,
+    })
+}
+
+/// One complete current-layout job frame of a records log, as a streaming pass hands it over.
+struct ReadFrame {
+    offset: u64,
+    len: usize,
+    batch_sha256: Sha256Digest,
+    record: JobArtifactRecord,
+}
+
+/// How a streaming pass over a store's records ended.
+struct ReadEnd {
+    /// The incomplete tail the pass cut from a store that stays.
+    truncated_bytes: u64,
+    /// The highest job id any frame named, a store set aside included.
+    highest_job_id: u64,
+    /// The highest record sequence of the store that stays: zero when it was set aside.
+    highest_sequence: u64,
+    set_aside: Option<SetAsideStore>,
+}
+
+/// Read the records `lock` guards in one pass, handing each complete, valid job frame to `visit`
+/// in order and keeping none: the pass holds one frame at a time, whatever the log's size. It
+/// checks what spans frames (sequences only rise; one terminal record per job of an
+/// incarnation), cuts an incomplete tail a crash left, passes over a retired manifest, and sets
+/// aside a store holding a record in an earlier layout (11_shell.md, "Job control"): every frame
+/// from that record on adds only its job id to the store's floor. When it sets the store aside,
+/// what `visit` was handed before belongs to the store set aside.
+fn read_records_under_lock(
+    lock: &RecordsLock<'_>,
+    visit: &mut dyn FnMut(ReadFrame) -> Result<(), ArtifactError>,
+) -> Result<ReadEnd, ArtifactError> {
+    let path = lock.records;
+    let empty = |truncated_bytes| ReadEnd {
+        truncated_bytes,
+        highest_job_id: 0,
+        highest_sequence: 0,
+        set_aside: None,
+    };
     verify_records_layout(path)?;
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(RecoveryReport {
-                frames: Vec::new(),
-                truncated_bytes: 0,
-                next_job_id: JobId::new(1).expect("one is a valid job id"),
-                set_aside: None,
-            });
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(empty(0)),
         Err(error) => return Err(io_error(path, error)),
     };
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -3488,12 +3848,7 @@ fn recover_records_with_budget_under_lock(
             JOB_RECORD_DURABILITY
                 .sync_file(&file)
                 .map_err(|error| io_error(path, error))?;
-            return Ok(RecoveryReport {
-                frames: Vec::new(),
-                truncated_bytes: original_len,
-                next_job_id: JobId::new(1).expect("one is a valid job id"),
-                set_aside: None,
-            });
+            return Ok(empty(original_len));
         }
         return Err(integrity(0, "invalid records file magic"));
     }
@@ -3505,13 +3860,13 @@ fn recover_records_with_budget_under_lock(
     }
 
     let mut offset = RECORD_MAGIC.len();
-    let mut retained = 0_usize;
-    let mut records = Vec::new();
-    let mut previous_job: Option<JobArtifactRecord> = None;
-    let mut terminal_jobs = BTreeSet::new();
-    // Once a record in an earlier layout is met: that layout, and the highest job id the store
-    // handed out, read from each frame's leading `job_id` column and nothing else.
-    let mut aside: Option<(u64, u64)> = None;
+    let mut previous_sequence: Option<u64> = None;
+    let mut terminal_jobs = BTreeMap::<WorkspaceIncarnation, BTreeSet<JobId>>::new();
+    let mut highest_job_id = 0_u64;
+    let mut highest_sequence = 0_u64;
+    // Once a record in an earlier layout is met: that layout. From then on each frame's leading
+    // `job_id` column is read and nothing else.
+    let mut aside: Option<u64> = None;
     while (offset as u64) < original_len {
         let frame_start = offset;
         let remaining = usize::try_from(original_len - offset as u64).map_err(|_| {
@@ -3520,60 +3875,18 @@ fn recover_records_with_budget_under_lock(
                 "remaining records length does not fit platform",
             )
         })?;
-        let present = remaining.min(FRAME_HEADER_BYTES);
-        let mut header = [0_u8; FRAME_HEADER_BYTES];
-        file.read_exact(&mut header[..present])
-            .map_err(|error| io_error(path, error))?;
-        let (payload_len, frame_len) = match frame_extent(&header[..present], remaining)
-            .map_err(|message| integrity(frame_start, message))?
-        {
-            FrameExtent::Incomplete => {
-                // A store being set aside moves as it is; only a store that stays is cut.
-                if aside.is_none() {
-                    truncate_incomplete(&mut file, path, frame_start)?;
-                }
-                break;
+        let Some((batch, batch_sha256, frame_len)) =
+            read_frame(&mut file, path, frame_start, remaining)?
+        else {
+            // A store being set aside moves as it is; only a store that stays is cut.
+            if aside.is_none() {
+                truncate_incomplete(&mut file, path, frame_start)?;
             }
-            FrameExtent::Complete {
-                payload_len,
-                frame_len,
-            } => (payload_len, frame_len),
+            break;
         };
-        let required =
-            retained
-                .checked_add(frame_len)
-                .ok_or(ArtifactError::RecoveryBudgetExceeded {
-                    limit_bytes: retained_budget_bytes,
-                    required_bytes: usize::MAX,
-                })?;
-        if required > retained_budget_bytes {
-            return Err(ArtifactError::RecoveryBudgetExceeded {
-                limit_bytes: retained_budget_bytes,
-                required_bytes: required,
-            });
-        }
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(payload_len)
-            .map_err(|_| ArtifactError::BufferAllocation)?;
-        payload.resize(payload_len, 0);
-        file.read_exact(&mut payload)
-            .map_err(|error| io_error(path, error))?;
-        let mut digest_bytes = [0_u8; 32];
-        file.read_exact(&mut digest_bytes)
-            .map_err(|error| io_error(path, error))?;
-        let mut trailer = [0_u8; BATCH_TRAILER.len()];
-        file.read_exact(&mut trailer)
-            .map_err(|error| io_error(path, error))?;
-        if &trailer != BATCH_TRAILER {
-            return Err(integrity(frame_start, "invalid complete batch trailer"));
-        }
-        let expected_digest = Sha256Digest::from_bytes(digest_bytes);
-        if Sha256Digest::compute(&payload) != expected_digest {
-            return Err(integrity(frame_start, "complete batch digest mismatch"));
-        }
-        let batch = decode_single_batch(&payload)
-            .map_err(|error| integrity(frame_start, &format!("invalid Arrow IPC: {error}")))?;
+        let next_offset = offset
+            .checked_add(frame_len)
+            .ok_or_else(|| integrity(frame_start, "records offset overflow"))?;
         if let Some(layout) = newer_layout(&batch) {
             return Err(ArtifactError::NewerLayout {
                 offset: frame_start as u64,
@@ -3582,53 +3895,32 @@ fn recover_records_with_budget_under_lock(
                 newest_columns: protected_record_schema().fields().len(),
             });
         }
-        if let Some((_, floor)) = aside.as_mut() {
-            if earlier_layout(&batch).is_none() {
-                let intact_current = if is_current_layout(&batch) && batch.num_rows() == 1 {
-                    let version = uint64(&batch, 1)
-                        .map_err(|error| integrity(frame_start, &error.to_string()))?;
-                    version.is_valid(0) && version.value(0) == RECORD_SCHEMA_VERSION
-                } else {
-                    false
-                };
-                if !intact_current {
-                    return Err(integrity(
-                        frame_start,
-                        "a frame after an earlier layout has no intact supported allocation header",
-                    ));
-                }
+        if aside.is_some() && earlier_layout(&batch).is_none() {
+            let intact_current = if is_current_layout(&batch) && batch.num_rows() == 1 {
+                let version = uint64(&batch, 1)
+                    .map_err(|error| integrity(frame_start, &error.to_string()))?;
+                version.is_valid(0) && version.value(0) == RECORD_SCHEMA_VERSION
+            } else {
+                false
+            };
+            if !intact_current {
+                return Err(integrity(
+                    frame_start,
+                    "a frame after an earlier layout has no intact supported allocation header",
+                ));
             }
-            *floor = (*floor).max(
+        }
+        if aside.is_some() || earlier_layout(&batch).is_some() {
+            aside = aside.or_else(|| earlier_layout(&batch));
+            highest_job_id = highest_job_id.max(
                 leading_job_id(&batch)
                     .map_err(|error| integrity(frame_start, &error.to_string()))?,
             );
-            retained = required;
-            offset = offset
-                .checked_add(frame_len)
-                .ok_or_else(|| integrity(frame_start, "records offset overflow"))?;
-            continue;
-        }
-        if let Some(layout) = earlier_layout(&batch) {
-            let floor = records
-                .iter()
-                .map(|frame: &RecoveredFrame| frame.record.job_id.get())
-                .fold(
-                    leading_job_id(&batch)
-                        .map_err(|error| integrity(frame_start, &error.to_string()))?,
-                    u64::max,
-                );
-            aside = Some((layout, floor));
-            retained = required;
-            offset = offset
-                .checked_add(frame_len)
-                .ok_or_else(|| integrity(frame_start, "records offset overflow"))?;
+            offset = next_offset;
             continue;
         }
         if is_retired_manifest(&batch) {
-            retained = required;
-            offset = offset
-                .checked_add(frame_len)
-                .ok_or_else(|| integrity(frame_start, "records offset overflow"))?;
+            offset = next_offset;
             continue;
         }
         let record = batch_to_protected_record(&batch)
@@ -3636,62 +3928,100 @@ fn recover_records_with_budget_under_lock(
         record
             .validate()
             .map_err(|error| integrity(frame_start, &error.to_string()))?;
-        if let Some(previous) = previous_job.as_ref()
-            && record.sequence <= previous.sequence
+        if let Some(previous) = previous_sequence
+            && record.sequence <= previous
         {
             return Err(ArtifactError::SequenceOrdering {
                 offset: frame_start as u64,
-                previous: previous.sequence,
+                previous,
                 current: record.sequence,
             });
         }
-        previous_job = Some(record.clone());
+        previous_sequence = Some(record.sequence);
         if record.state.is_terminal()
-            && !terminal_jobs.insert((record.workspace_incarnation.clone(), record.job_id))
+            && !terminal_jobs
+                .entry(record.workspace_incarnation.clone())
+                .or_default()
+                .insert(record.job_id)
         {
             return Err(integrity(
                 frame_start,
                 "duplicate terminal artifact record for job id",
             ));
         }
-        records
-            .try_reserve(1)
-            .map_err(|_| ArtifactError::BufferAllocation)?;
-        records.push(RecoveredFrame {
+        highest_job_id = highest_job_id.max(record.job_id.get());
+        highest_sequence = highest_sequence.max(record.sequence);
+        visit(ReadFrame {
+            offset: frame_start as u64,
+            len: frame_len,
+            batch_sha256,
             record,
-            batch_sha256: expected_digest,
-        });
-        retained = required;
-        offset = offset
-            .checked_add(frame_len)
-            .ok_or_else(|| integrity(frame_start, "records offset overflow"))?;
+        })?;
+        offset = next_offset;
     }
 
-    if let Some((layout, floor)) = aside {
+    if let Some(layout) = aside {
         drop(file);
-        let next = floor
-            .checked_add(1)
-            .ok_or_else(|| integrity(0, "job id allocation exhausted"))?;
-        return Ok(RecoveryReport {
-            frames: Vec::new(),
+        return Ok(ReadEnd {
             truncated_bytes: 0,
-            next_job_id: JobId::new(next)?,
-            set_aside: Some(set_aside_records(lock, layout, floor)?),
+            highest_job_id,
+            highest_sequence: 0,
+            set_aside: Some(set_aside_records(lock, layout, highest_job_id)?),
         });
     }
-    let next = records
-        .iter()
-        .map(|frame| frame.record.job_id.get())
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| integrity(0, "job id allocation exhausted"))?;
-    Ok(RecoveryReport {
-        frames: records,
+    Ok(ReadEnd {
         truncated_bytes: original_len.saturating_sub(offset as u64),
-        next_job_id: JobId::new(next)?,
+        highest_job_id,
+        highest_sequence,
         set_aside: None,
     })
+}
+
+/// The complete frame starting at `frame_start` of a log `remaining` bytes from its end, read
+/// from `file` positioned there: its decoded batch, its digest and its length, its trailer and
+/// digest checked. `None` when the bytes left hold only part of a frame.
+fn read_frame(
+    file: &mut File,
+    path: &Path,
+    frame_start: usize,
+    remaining: usize,
+) -> Result<Option<(RecordBatch, Sha256Digest, usize)>, ArtifactError> {
+    let present = remaining.min(FRAME_HEADER_BYTES);
+    let mut header = [0_u8; FRAME_HEADER_BYTES];
+    file.read_exact(&mut header[..present])
+        .map_err(|error| io_error(path, error))?;
+    let (payload_len, frame_len) = match frame_extent(&header[..present], remaining)
+        .map_err(|message| integrity(frame_start, message))?
+    {
+        FrameExtent::Incomplete => return Ok(None),
+        FrameExtent::Complete {
+            payload_len,
+            frame_len,
+        } => (payload_len, frame_len),
+    };
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(payload_len)
+        .map_err(|_| ArtifactError::BufferAllocation)?;
+    payload.resize(payload_len, 0);
+    file.read_exact(&mut payload)
+        .map_err(|error| io_error(path, error))?;
+    let mut digest_bytes = [0_u8; 32];
+    file.read_exact(&mut digest_bytes)
+        .map_err(|error| io_error(path, error))?;
+    let mut trailer = [0_u8; BATCH_TRAILER.len()];
+    file.read_exact(&mut trailer)
+        .map_err(|error| io_error(path, error))?;
+    if &trailer != BATCH_TRAILER {
+        return Err(integrity(frame_start, "invalid complete batch trailer"));
+    }
+    let digest = Sha256Digest::from_bytes(digest_bytes);
+    if Sha256Digest::compute(&payload) != digest {
+        return Err(integrity(frame_start, "complete batch digest mismatch"));
+    }
+    let batch = decode_single_batch(&payload)
+        .map_err(|error| integrity(frame_start, &format!("invalid Arrow IPC: {error}")))?;
+    Ok(Some((batch, digest, frame_len)))
 }
 
 /// The allocation identity in an intact frame's common header.
@@ -5976,14 +6306,13 @@ fn require_job_columns(batch: &RecordBatch, row: usize) -> Result<(), ArtifactEr
 pub fn repair_workspace_record_sequences(
     census: &crate::census::CensusScope,
     workspace_root: &Path,
-    retained_budget_bytes: usize,
 ) -> Result<(), ArtifactError> {
     let path = records_path(workspace_root);
     let lock = RecordsLock::acquire(census, &path, CONTROL)?;
     // Each frame's digest authenticates its exact serialized bytes. Rewriting sequences changes that
     // identity, while recomputing the in-file digest would let the rewrite attest to itself.
     // Holding the append lock makes the diagnosis stable; preserving identity requires refusal.
-    match recover_records_with_budget_under_lock(&lock, retained_budget_bytes) {
+    match read_records_under_lock(&lock, &mut |_| Ok(())) {
         Ok(_) => Ok(()),
         Err(ArtifactError::SequenceOrdering {
             offset,
@@ -6161,9 +6490,9 @@ mod tests {
             .sealed(id)
             .unwrap()
             .expect("second terminal projection");
-        assert!(
-            Arc::ptr_eq(&first.record, &second.record),
-            "projection shares the payload-owning record"
+        assert_eq!(
+            first, second,
+            "every projection reads back the same validated entry"
         );
         assert!(
             Arc::ptr_eq(&first.workspace_root, &second.workspace_root),
@@ -6344,9 +6673,9 @@ mod tests {
             .sealed(first_id)
             .unwrap()
             .expect("retained terminal projection");
-        assert!(
-            Arc::ptr_eq(&retained.record, &unchanged.record),
-            "refresh keeps the original canonical entry and evidence"
+        assert_eq!(
+            retained.record, unchanged.record,
+            "refresh keeps the original terminal entry and its generation evidence"
         );
         assert_eq!(
             counts.get(),
@@ -6684,10 +7013,7 @@ mod tests {
                 path: set_aside.clone(),
             })
         );
-        assert!(
-            store.recovery().frames.is_empty(),
-            "nothing earlier is read"
-        );
+        assert!(store.index.readable.is_empty(), "nothing earlier is read");
         assert_eq!(store.next_job_id().unwrap().get(), 6);
         assert_eq!(fs::read(set_aside.join(RECORDS_FILE)).unwrap(), old_records);
         assert!(set_aside.join(RECORD_SEQUENCE_FILE).exists());
@@ -8463,7 +8789,7 @@ mod tests {
             })
         );
         assert!(
-            store.recovery().frames.is_empty(),
+            store.index.readable.is_empty(),
             "nothing of layout 12 is decoded"
         );
         assert!(matches!(
@@ -8498,7 +8824,7 @@ mod tests {
                 path: set_aside.clone(),
             })
         );
-        assert!(store.recovery().frames.is_empty());
+        assert!(store.index.readable.is_empty());
         assert!(matches!(
             store.sealed(JobId::new(5).unwrap()),
             Err(ArtifactError::HistoryUnprovable { set_aside: ref path }) if path == &set_aside
@@ -8622,7 +8948,7 @@ mod tests {
                 path: set_aside.clone(),
             })
         );
-        assert!(store.recovery().frames.is_empty());
+        assert!(store.index.readable.is_empty());
         assert_eq!(fs::read(set_aside.join(RECORDS_FILE)).unwrap(), old_records);
         assert_eq!(
             store.admitted(&admission.key),
@@ -8923,7 +9249,10 @@ mod tests {
         drop(store);
 
         let reopened = store_at(&root, ArtifactConfig::default());
-        for frame in &reopened.recovery().frames {
+        for frame in &recover_records(&crate::census::this_test(), &records_path(&root))
+            .unwrap()
+            .frames
+        {
             let record = &frame.record;
             assert_eq!(
                 record.admission.as_ref().unwrap().env_sha256,
@@ -8947,6 +9276,227 @@ mod tests {
             reopened.admitted(&AdmissionKey::new("op-2").unwrap()),
             AdmissionLookup::Absent
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Many completed jobs whose records run far past the retained budget: an open streams them
+    /// and keeps only its index, reads each job's output back from its frame, keeps every key
+    /// bound to its job and allocates above every id. The full-history reader, which keeps every
+    /// frame, refuses the same records, naming them.
+    #[test]
+    fn a_store_opens_records_far_past_its_budget_and_reads_every_job_back() {
+        const BUDGET: usize = 256 * 1024;
+        let root = temp_root("streaming-open");
+        let config = ArtifactConfig {
+            inline_cap_bytes: 16 * 1024,
+            retained_recovery_budget_bytes: BUDGET,
+            ..ArtifactConfig::default()
+        };
+        let mut store = store_at(&root, config.clone());
+        let mut written = Vec::new();
+        for index in 0..64_u8 {
+            let job_id = store.next_job_id().unwrap();
+            let admission =
+                (index % 4 == 0).then(|| keyed(&format!("op-{index}"), AdmittedStdin::Empty));
+            let token = store
+                .begin_job(
+                    job_id,
+                    1,
+                    &argv_true(),
+                    admission.clone(),
+                    JobScheduling::default(),
+                    OutputTargets::default(),
+                )
+                .unwrap();
+            // Every eighth job spills its stdout past the inline cap; the rest stay inline.
+            let stdout = vec![index; if index % 8 == 0 { 20 * 1024 } else { 12 * 1024 }];
+            store.append(&token, StreamKind::Stdout, &stdout).unwrap();
+            store.finish(token, JobState::Exited).unwrap();
+            written.push((job_id, admission, stdout));
+        }
+        let records = records_path(&root);
+        let records_len = fs::metadata(&records).unwrap().len();
+        assert!(
+            records_len > 2 * BUDGET as u64,
+            "the records ({records_len} bytes) run far past the budget"
+        );
+        let retained = store.index.retained_bytes;
+        drop(store);
+
+        let mut reopened = store_at(&root, config);
+        assert_eq!(
+            reopened.index.retained_bytes, retained,
+            "an open charges what the appends charged"
+        );
+        assert!(retained <= BUDGET);
+        assert_eq!(
+            reopened.next_job_id().unwrap().get(),
+            written.len() as u64 + 1
+        );
+        for (job_id, admission, stdout) in &written {
+            let reader = reopened.sealed(*job_id).unwrap().expect("sealed terminal");
+            assert_eq!(
+                reader
+                    .read_range(StreamKind::Stdout, 0..stdout.len() as u64)
+                    .unwrap(),
+                *stdout
+            );
+            if let Some(admission) = admission {
+                assert!(matches!(
+                    reopened.admitted(&admission.key),
+                    AdmissionLookup::Admitted { job_id: admitted, .. } if admitted == *job_id
+                ));
+            }
+        }
+        assert_eq!(
+            reopened.admitted(&AdmissionKey::new("op-fresh").unwrap()),
+            AdmissionLookup::Absent
+        );
+        assert!(matches!(
+            recover_records_with_budget(&crate::census::this_test(), &records, BUDGET),
+            Err(ArtifactError::RecoveryBudgetExceeded { path, limit_bytes: BUDGET, .. })
+                if path == records
+        ));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A job admitted and never ended survives a reopen as its admission alone: its key still
+    /// answers it, the next supervisor seals it lost exactly once, and no id goes back.
+    #[test]
+    fn an_unended_admission_is_indexed_across_reopen_and_sealed_lost_once() {
+        let root = temp_root("streaming-unended");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let ended = store.next_job_id().unwrap();
+        let token = store
+            .begin_job(
+                ended,
+                1,
+                &argv_true(),
+                Some(keyed("op-ended", AdmittedStdin::Empty)),
+                JobScheduling::default(),
+                OutputTargets::default(),
+            )
+            .unwrap();
+        store.finish(token, JobState::Exited).unwrap();
+        let lost = store.next_job_id().unwrap();
+        let _running = store
+            .begin_job(
+                lost,
+                1,
+                &argv_true(),
+                Some(keyed("op-lost", AdmittedStdin::Empty)),
+                JobScheduling::default(),
+                OutputTargets::default(),
+            )
+            .unwrap();
+        // The supervisor ends without seeing the job end.
+        drop(store);
+
+        let mut reopened = store_at(&root, ArtifactConfig::default());
+        assert!(matches!(
+            reopened.admitted(&AdmissionKey::new("op-lost").unwrap()),
+            AdmissionLookup::Admitted { job_id, .. } if job_id == lost
+        ));
+        assert!(
+            reopened.sealed(lost).unwrap().is_none(),
+            "an admitted job that never ended has no terminal record"
+        );
+        let sealed = reopened.seal_unterminated().unwrap();
+        assert_eq!(
+            sealed
+                .iter()
+                .map(|(record, _)| (record.job_id, record.state, record.failure))
+                .collect::<Vec<_>>(),
+            vec![(
+                lost,
+                JobState::Failed,
+                Some(crate::api::dto::JobFailure::SupervisorLost)
+            )]
+        );
+        assert!(
+            reopened.seal_unterminated().unwrap().is_empty(),
+            "a job is sealed lost once"
+        );
+        assert!(reopened.next_job_id().unwrap() > lost);
+        drop(reopened);
+
+        let mut again = store_at(&root, ArtifactConfig::default());
+        assert!(again.index.unterminated.is_empty());
+        assert_eq!(
+            again
+                .sealed(lost)
+                .unwrap()
+                .expect("sealed lost")
+                .record()
+                .failure,
+            Some(crate::api::dto::JobFailure::SupervisorLost)
+        );
+        assert!(matches!(
+            again.admitted(&AdmissionKey::new("op-ended").unwrap()),
+            AdmissionLookup::Admitted { job_id, .. } if job_id == ended
+        ));
+        assert!(again.seal_unterminated().unwrap().is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The index's working memory is bounded both ways: an admission that would carry it past
+    /// the budget is refused, naming the records, with nothing written and no id taken, and a
+    /// reopen of what was written fits the same budget and refuses the same admission.
+    #[test]
+    fn an_admission_past_the_index_budget_is_refused_before_its_frame_is_written() {
+        const BUDGET: usize = 64 * 1024;
+        let root = temp_root("streaming-guard");
+        let config = ArtifactConfig {
+            retained_recovery_budget_bytes: BUDGET,
+            ..ArtifactConfig::default()
+        };
+        let records = records_path(&root);
+        let mut store = store_at(&root, config.clone());
+        let mut written = 0_u64;
+        let admit = |store: &mut ArtifactStore, job_id: JobId| {
+            store.begin_job(
+                job_id,
+                1,
+                &argv_true(),
+                Some(keyed(&format!("op-{}", job_id.get()), AdmittedStdin::Empty)),
+                JobScheduling::default(),
+                OutputTargets::default(),
+            )
+        };
+        let (refused, error) = loop {
+            let job_id = store.next_job_id().unwrap();
+            assert!(job_id.get() <= 10_000, "every keyed job grows the index");
+            match admit(&mut store, job_id) {
+                Ok(token) => {
+                    store.finish(token, JobState::Exited).unwrap();
+                    written = fs::metadata(&records).unwrap().len();
+                }
+                Err(error) => break (job_id, error),
+            }
+        };
+        assert!(refused.get() > 1, "the budget holds some jobs");
+        assert!(matches!(
+            error,
+            ArtifactError::RecoveryBudgetExceeded { ref path, limit_bytes: BUDGET, required_bytes }
+                if *path == records && required_bytes > BUDGET
+        ));
+        assert_eq!(fs::metadata(&records).unwrap().len(), written);
+        assert_eq!(
+            store.next_job_id().unwrap(),
+            refused,
+            "a refused admission takes no id"
+        );
+        let retained = store.index.retained_bytes;
+        drop(store);
+
+        let mut reopened = store_at(&root, config);
+        assert_eq!(reopened.index.retained_bytes, retained);
+        assert_eq!(reopened.next_job_id().unwrap(), refused);
+        assert!(matches!(
+            admit(&mut reopened, refused),
+            Err(ArtifactError::RecoveryBudgetExceeded { .. })
+        ));
+        assert_eq!(fs::metadata(&records).unwrap().len(), written);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -8980,7 +9530,7 @@ mod tests {
             })
         );
         assert!(
-            store.recovery().frames.is_empty(),
+            store.index.readable.is_empty(),
             "nothing of the earlier layout is decoded"
         );
         assert!(matches!(
@@ -9075,14 +9625,18 @@ mod tests {
         // reported as absence. Each is a valid encoded row appended after the reader's snapshot at
         // the sequence after the file's highest, then removed by restoring the exact bytes.
         let intact_records = fs::read(records_path(&root)).unwrap();
-        let sequence = highest_record_sequence(
-            &recover_records_with_budget(
-                &crate::census::this_test(),
-                &records_path(&root),
-                ArtifactConfig::default().retained_recovery_budget_bytes,
-            )
-            .unwrap(),
-        ) + 1;
+        let sequence = recover_records_with_budget(
+            &crate::census::this_test(),
+            &records_path(&root),
+            ArtifactConfig::default().retained_recovery_budget_bytes,
+        )
+        .unwrap()
+        .frames
+        .iter()
+        .map(|frame| frame.record.sequence)
+        .max()
+        .unwrap_or(0)
+            + 1;
         let foreign = JobArtifactRecord {
             repo_id: RepoId::parse("acme/elsewhere").unwrap(),
             sequence,
@@ -9541,21 +10095,12 @@ mod tests {
             store.finish(token, JobState::Exited).unwrap();
             lineage.insert(origin.clone());
         }
-        let recorded = recorded_historical_incarnations(
-            &crate::census::this_test(),
-            &root,
-            &incarnation(),
-            ArtifactConfig::default().retained_recovery_budget_bytes,
-        )
-        .unwrap();
+        let recorded =
+            recorded_historical_incarnations(&crate::census::this_test(), &root, &incarnation())
+                .unwrap();
         assert_eq!(recorded, BTreeSet::from([ancestor.clone(), older]));
-        let own = recorded_historical_incarnations(
-            &crate::census::this_test(),
-            &root,
-            &ancestor,
-            ArtifactConfig::default().retained_recovery_budget_bytes,
-        )
-        .unwrap();
+        let own = recorded_historical_incarnations(&crate::census::this_test(), &root, &ancestor)
+            .unwrap();
         assert!(
             !own.contains(&ancestor),
             "the current incarnation is never its own ancestor"
@@ -9566,7 +10111,6 @@ mod tests {
                 &crate::census::this_test(),
                 &empty_root,
                 &incarnation(),
-                ArtifactConfig::default().retained_recovery_budget_bytes,
             )
             .unwrap()
             .is_empty(),
@@ -10190,12 +10734,7 @@ mod tests {
         file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
             .unwrap();
         file.sync_data().unwrap();
-        repair_workspace_record_sequences(
-            &crate::census::this_test(),
-            &root,
-            ArtifactConfig::default().retained_recovery_budget_bytes,
-        )
-        .unwrap();
+        repair_workspace_record_sequences(&crate::census::this_test(), &root).unwrap();
 
         let after_repair = store
             .append_record(AppendJob::Terminal(
@@ -10243,12 +10782,8 @@ mod tests {
         assert!(refusal.contains("concurrent or stale-recovery append"));
         assert!(refusal.contains("cowshed doctor --repair"));
 
-        let repair = repair_workspace_record_sequences(
-            &crate::census::this_test(),
-            &root,
-            ArtifactConfig::default().retained_recovery_budget_bytes,
-        )
-        .unwrap_err();
+        let repair =
+            repair_workspace_record_sequences(&crate::census::this_test(), &root).unwrap_err();
         assert!(matches!(
             repair,
             ArtifactError::SequenceRepairRefused {
@@ -10287,7 +10822,6 @@ mod tests {
         assert!(matches!(
             repair_workspace_record_sequences(&crate::census::this_test(),
                 &root,
-                ArtifactConfig::default().retained_recovery_budget_bytes,
             ),
             Err(ArtifactError::Integrity { message, .. })
                 if message.contains("digest mismatch")
