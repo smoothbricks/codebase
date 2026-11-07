@@ -2530,8 +2530,8 @@ impl Coordinator {
         invoke::<operations::CoordinatorRevokeProject>(&*self.runtime, &request).await
     }
 
-    /// Rebase `workspace` onto what it lands into: `into`'s checked-out branch, or main's `main`
-    /// when `into` is `None`. `into` and `options.onto` are exclusive. The report carries the new
+    /// Rebase `workspace` onto what it lands into: `into`'s checked-out branch, or main's
+    /// checked-out branch when `into` is `None`. `into` and `options.onto` are exclusive. The report carries the new
     /// head and what the workspace's build volume took of its target's Nx cache.
     pub async fn rebase(
         &self,
