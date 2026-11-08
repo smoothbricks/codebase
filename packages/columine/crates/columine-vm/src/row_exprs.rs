@@ -88,7 +88,7 @@ use columine_types::types::{
 };
 
 use crate::bytes;
-use crate::column_uses::{ColumnUse, ReduceReads};
+use crate::column_uses::{ReduceRead, ReduceReads};
 use crate::key_index::{InternBytes, KeyCx, KeyIndex, NoStrings};
 use crate::logical_export::Interner;
 use crate::struct_map::{StructMap2Slot, StructMapSlot, StructRows};
@@ -488,13 +488,6 @@ impl RowColumns {
         (index != NOT_LIVE).then_some(index as usize)
     }
 
-    /// The lane of the wide entry whose cells column `col` holds after the
-    /// splice: the last entry targeting a column is the one spliced.
-    fn wide_lane(&self, col: u32) -> Option<CmpType> {
-        let entry = self.targets.iter().rposition(|&target| target == col)?;
-        Some(self.lanes[entry]).filter(|&lane| lane != CmpType::U32)
-    }
-
     /// Replace every target column in `cols` with the cells the last bind
     /// computed — the splice [`bind_row_columns`] performs, repeated for a
     /// host that rebuilds its column set from the same batch (a resumed
@@ -716,34 +709,76 @@ impl Range {
 ///
 /// - A live column holds zero placeholder cells, which a per-element `*_IF`
 ///   predicate or a stored-row sweep resolves through the handle. The
-///   table's type column and every plain read ([`ColumnUse::Read`]) would
-///   take the zeros as cells.
-/// - A wide column holds 8-byte cells of its lane. An operand of another
-///   lane would take half a cell, or the other number type, as data, and
-///   the table's type column is u32. The handle answers u32 predicate cells,
-///   so a wide live column has no reader at all.
+///   table's type column and every plain read
+///   ([`ColumnUse::Read`](crate::column_uses::ColumnUse::Read)) would take the
+///   zeros as cells. Which entries bind live is the embedder's
+///   answer for this batch, so this bind checks its own live entries.
+/// - A wide column holds 8-byte cells of its lane. The table's targets and
+///   lanes are the program's, so [`refuses_wide_reads`] judged them once,
+///   when the reads were derived.
 fn refuse_unreadable_columns(reads: &ReduceReads, out: &RowColumns) -> Result<(), ErrorCode> {
-    let has_wide = out.lanes.iter().any(|&lane| lane != CmpType::U32);
-    if out.live.is_empty() && !has_wide {
-        return Ok(());
-    }
-    if out.live_entry(out.type_col).is_some() || (has_wide && out.wide_lane(out.type_col).is_some())
-    {
+    if reads.refuses_wide() {
         return Err(ErrorCode::InvalidProgram);
     }
-    let unreadable = reads.reads().iter().any(|read| {
-        let plain_read_of_live =
-            read.usage == ColumnUse::Read && out.live_entry(read.column).is_some();
-        let off_lane = has_wide
-            && out
-                .wide_lane(read.column)
-                .is_some_and(|wide| read.lane != Some(wide));
-        plain_read_of_live || off_lane
-    });
-    if unreadable {
+    if out.live.is_empty() {
+        return Ok(());
+    }
+    let plain_read_of_live = out
+        .targets
+        .iter()
+        .any(|&column| reads.reads_plainly(column) && out.live_entry(column).is_some());
+    if plain_read_of_live || out.live_entry(out.type_col).is_some() {
         return Err(ErrorCode::InvalidProgram);
     }
     Ok(())
+}
+
+/// Whether `program`'s row-expression table holds a wide column `reads`
+/// cannot read as its cells: a wide entry (f64 or i64) makes a column hold
+/// 8-byte cells of its lane, and the last entry targeting a column is the one
+/// spliced. An operand of another lane would take half a cell, or the other
+/// number type, as data; the table's type column is read as u32; the handle
+/// answers u32 predicate cells, so a wide live column has no reader at all.
+///
+/// The table's targets and lanes are program bytes, so this is the program's
+/// verdict, judged once beside its reads. A program whose table does not
+/// parse whole never reaches the judgement: every bind refuses its table
+/// first. It answers `false`. Memory that cannot hold the table's targets
+/// is `OutOfMemory`.
+pub(crate) fn refuses_wide_reads(program: &[u8], reads: &[ReduceRead]) -> Result<bool, ErrorCode> {
+    let Ok(Some((table, _))) = row_table(program) else {
+        return Ok(false);
+    };
+    let count = usize::from(bytes::read_u16(table, 4));
+    let laned = bytes::read_u32(table, 0) == LANED_ROW_EXPRESSIONS_MAGIC;
+    let mut header = Operands::at(table, TABLE_FIXED_BYTES);
+    let Some(type_col) = header.index() else {
+        return Ok(false);
+    };
+    let mut entries: Vec<(u32, CmpType)> = Vec::new();
+    room(&mut entries, count)?;
+    let mut pos = header.pos();
+    for _ in 0..count {
+        let Ok(entry) = parse_entry(table, &mut pos, laned) else {
+            return Ok(false);
+        };
+        entries.push((entry.target_col, entry.lane));
+    }
+    if pos != table.len() || entries.iter().all(|&(_, lane)| lane == CmpType::U32) {
+        return Ok(false);
+    }
+    let wide_lane = |column: u32| {
+        entries
+            .iter()
+            .rev()
+            .find(|&&(target, _)| target == column)
+            .map(|&(_, lane)| lane)
+            .filter(|&lane| lane != CmpType::U32)
+    };
+    Ok(wide_lane(type_col).is_some()
+        || reads
+            .iter()
+            .any(|read| wide_lane(read.column).is_some_and(|wide| read.lane != Some(wide))))
 }
 
 /// Back `additional` more elements of `buf`, refusing with `OutOfMemory`.

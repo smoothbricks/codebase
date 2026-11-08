@@ -76,10 +76,12 @@ operand would read half a cell, and an f64 operand an i64's bits. A CSR pair's c
 field are never read as a wide column, and neither is the table's type column. The walk reads only the program's bytes
 (a TTL slot's timestamp column is the one its init definition names, which every state laid out for the program
 records), so its answer, `ReduceReads`, is derived once per program and handed to every bind; no bind walks the reduce
-section. The check runs over those reads once per bind, only when the table has a wide entry or a live one, in the same
-pass that refuses plain reads of live columns. A u32 entry is read exactly as before. A bind determines wide-entry
-presence once from its bound lanes. With no wide entry, it performs no per-operand wide-lane lookup; the same pass still
-refuses every plain read of a live column.
+section. The table's targets and lanes are program bytes too, so the wide check is the program's: it is judged once,
+beside the reads, against the last entry targeting each column (the one spliced), and a bind refuses on that verdict
+before splicing. A program whose table does not parse never reaches it, since every bind refuses that table first. Which
+entries bind live is the embedder's answer per batch, so each bind checks only its own live entries: a live entry's
+column refuses when some operand reads it plainly, and the type column refuses when it is live. A u32 entry is read
+exactly as before.
 
 ## 5. Live entries
 

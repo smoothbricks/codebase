@@ -174,16 +174,30 @@ pub struct ReduceRead {
     pub lane: Option<CmpType>,
 }
 
-/// Every cell read of a program's reduce section, in walk order. The walk
-/// reads only the program's bytes: a TTL slot's timestamp column is the one
-/// its init definition names, which is the column every state laid out for
-/// the program records. So the reads are derived once per program, and each
-/// bind checks its live and wide columns against them
-/// ([`crate::row_exprs::bind_row_columns`]) rather than walking the
-/// bytecode again. A CSR pair is its offsets read, then its values read, at
-/// u32: they hold offsets and element bytes, never a cell of a lane.
+/// Every cell read of a program's reduce section, in walk order, with what a
+/// bind judges against them. The walk reads only the program's bytes: a TTL
+/// slot's timestamp column is the one its init definition names, which is
+/// the column every state laid out for the program records. So the reads are
+/// derived once per program, together with the two answers a bind needs from
+/// them ([`crate::row_exprs::bind_row_columns`]): the columns some operand
+/// reads plainly, which a live entry's zero cells cannot answer, and whether
+/// the program's own row-expression table holds a wide column its reduce
+/// section reads at another lane — the table's targets and lanes are program
+/// bytes, so that verdict is the program's. Which entries bind live is the
+/// embedder's answer per batch, so only that check is left to each bind. A
+/// CSR pair is its offsets read, then its values read, at u32: they hold
+/// offsets and element bytes, never a cell of a lane.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReduceReads(Vec<ReduceRead>);
+pub struct ReduceReads {
+    reads: Vec<ReduceRead>,
+    /// The columns some operand reads plainly ([`ColumnUse::Read`]), sorted
+    /// and unique.
+    plain: Vec<u32>,
+    /// Whether the program's row-expression table holds a wide column its
+    /// reduce section cannot read as its cells
+    /// ([`crate::row_exprs::refuses_wide_reads`]).
+    off_lane: bool,
+}
 
 impl ReduceReads {
     /// The reads of `program`'s reduce section.
@@ -231,13 +245,40 @@ impl ReduceReads {
         if out_of_memory {
             return Err(ErrorCode::OutOfMemory);
         }
-        Ok(Self(reads))
+        let mut plain = Vec::new();
+        let plain_reads = reads.iter().filter(|read| read.usage == ColumnUse::Read);
+        plain
+            .try_reserve_exact(plain_reads.clone().count())
+            .map_err(|_| ErrorCode::OutOfMemory)?;
+        plain.extend(plain_reads.map(|read| read.column));
+        plain.sort_unstable();
+        plain.dedup();
+        let off_lane = crate::row_exprs::refuses_wide_reads(program, &reads)?;
+        Ok(Self {
+            reads,
+            plain,
+            off_lane,
+        })
     }
 
     /// Each read, in walk order.
     #[must_use]
     pub fn reads(&self) -> &[ReduceRead] {
-        &self.0
+        &self.reads
+    }
+
+    /// Whether some operand reads `column` plainly: as the bytes the batch
+    /// carries, which a live entry's zero cells cannot answer.
+    #[must_use]
+    pub fn reads_plainly(&self, column: u32) -> bool {
+        self.plain.binary_search(&column).is_ok()
+    }
+
+    /// Whether the program's row-expression table holds a wide column its
+    /// reduce section cannot read as its cells.
+    #[must_use]
+    pub fn refuses_wide(&self) -> bool {
+        self.off_lane
     }
 }
 

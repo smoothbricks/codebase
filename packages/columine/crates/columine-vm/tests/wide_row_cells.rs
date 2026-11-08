@@ -9,7 +9,7 @@ mod common;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{AggType, CmpType, ErrorCode, StructFieldType};
 use columine_vm::aggregates::{agg_value_f64, agg_value_i64};
-use columine_vm::column_uses::ReduceReads;
+use columine_vm::column_uses::{ColumnUse, ReduceRead, ReduceReads};
 use columine_vm::key_index::NoStrings;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
@@ -588,6 +588,222 @@ proptest! {
     }
 }
 
+/// Binds an entry up front.
+const BOUND: u8 = 0;
+/// Binds an entry live.
+const LIVE: u8 = 1;
+/// Binds an entry live when the batch holds an odd number of rows: which
+/// entries bind live is the embedder's answer per batch.
+const LIVE_IF_ODD: u8 = 2;
+
+/// The embedder of the verdict property: an entry's expression `[mode, _]`
+/// names how it binds, and every cell is 1 in the entry's own lane.
+struct Modes;
+
+impl RowExpression for Modes {
+    fn admit(
+        &mut self,
+        expr: &[u8],
+        _: CmpType,
+        batch: &BatchView<'_>,
+    ) -> Result<Binding, ErrorCode> {
+        Ok(match expr[0] {
+            BOUND => Binding::Bound,
+            LIVE => Binding::Live,
+            _ if batch.batch_len % 2 == 1 => Binding::Live,
+            _ => Binding::Bound,
+        })
+    }
+
+    fn eval(
+        &mut self,
+        _: &[u8],
+        lane: CmpType,
+        _: &BatchView<'_>,
+        _: u32,
+        _: &mut dyn columine_vm::logical_export::Interner,
+    ) -> Result<RowCell, ErrorCode> {
+        Ok(match lane {
+            CmpType::U32 => RowCell::U32(1),
+            CmpType::F64 => RowCell::F64(1.0),
+            CmpType::I64 => RowCell::I64(1),
+        })
+    }
+}
+
+/// The judgement a bind made over every read before the verdict was derived
+/// once per program: `entries` are the table's targets and lanes in order,
+/// `live` the columns an entry bound live in this batch.
+fn walked_refusal(reads: &[ReduceRead], entries: &[(u8, CmpType)], live: &[u8]) -> bool {
+    let has_wide = entries.iter().any(|&(_, lane)| lane != CmpType::U32);
+    if live.is_empty() && !has_wide {
+        return false;
+    }
+    let wide_lane = |column: u32| {
+        entries
+            .iter()
+            .rev()
+            .find(|&&(target, _)| u32::from(target) == column)
+            .map(|&(_, lane)| lane)
+            .filter(|&lane| lane != CmpType::U32)
+    };
+    let is_live = |column: u32| live.iter().any(|&target| u32::from(target) == column);
+    let type_col = u32::from(TYPE_COL);
+    if is_live(type_col) || (has_wide && wide_lane(type_col).is_some()) {
+        return true;
+    }
+    reads.iter().any(|read| {
+        (read.usage == ColumnUse::Read && is_live(read.column))
+            || (has_wide && wide_lane(read.column).is_some_and(|wide| read.lane != Some(wide)))
+    })
+}
+
+/// A generated program: slot 0 sums an f64 column, slot 1 an i64 column,
+/// slot 2 is a hash map, slot 3 counts rows; `top` are top-level
+/// `(op, column)` reads (0 f64 sum, 1 i64 sum, 2 count-if predicate) and
+/// `body` an optional `FOR_EACH` map upsert of `(key, value, predicate)`.
+fn generated(
+    top: &[(u8, u8)],
+    body: Option<(u8, u8, u8)>,
+    entries: &[(u8, CmpType, u8)],
+) -> Vec<u8> {
+    let init = [
+        0x10,
+        0,
+        2,
+        AggType::Sum as u8,
+        0,
+        0x10,
+        1,
+        2,
+        AggType::SumI64 as u8,
+        0,
+        0x10,
+        2,
+        0x00,
+        8,
+        0,
+        0x10,
+        3,
+        2,
+        AggType::Count as u8,
+        0,
+        0,
+    ];
+    let mut reduce = Vec::new();
+    for &(op, column) in top {
+        reduce.extend(match op {
+            0 => [0x40, 0, column],
+            1 => [0x49, 1, column],
+            _ => [0x45, 3, column],
+        });
+    }
+    match body {
+        Some((key, value, pred)) => reduce.extend(for_each(&[0x2a, 2, key, value, pred])),
+        None => reduce.push(0),
+    }
+    let entries: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|&(target, lane, mode)| laned(target, lane, [mode, 0]))
+        .collect();
+    program(
+        4,
+        &init,
+        &reduce,
+        &table(LANED_ROW_EXPRESSIONS_MAGIC, &entries),
+    )
+}
+
+fn lane_of(index: u8) -> CmpType {
+    CmpType::from_u8(index).expect("a generated lane")
+}
+
+/// The verdict derived once per program, with each bind checking only its own
+/// live entries, refuses exactly the binds the per-bind judgement over every
+/// read refused, with the same code, over generated programs (wide, live and
+/// batch-dependent live entries, the type column among the targets) and
+/// generated batches. The counts printed show both answers were exercised.
+#[test]
+fn the_once_derived_verdict_refuses_exactly_what_the_per_bind_walk_refused() {
+    use proptest::test_runner::{TestCaseError, TestRunner};
+    use std::cell::Cell;
+    let cases = (
+        prop::collection::vec((0u8..3, 0u8..5), 0..4),
+        prop::option::of((0u8..5, 0u8..5, 0u8..5)),
+        prop::collection::vec((0u8..5, 0u8..3, 0u8..3), 0..5),
+        1u32..6,
+    );
+    let (refused, accepted, live_refused) = (Cell::new(0u32), Cell::new(0u32), Cell::new(0u32));
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(4096));
+    let verdict = runner.run(&cases, |(top, body, entries, len)| {
+        let entries: Vec<(u8, CmpType, u8)> = entries
+            .into_iter()
+            .map(|(target, lane, mode)| (target, lane_of(lane), mode))
+            .collect();
+        let prog = generated(&top, body, &entries);
+        let reads = ReduceReads::of(&prog).expect("the reduce reads derive");
+        let state = init(&prog);
+        let types = vec![ORDER_TYPE; len as usize];
+        let host: Vec<u32> = (1..=len).collect();
+        let mut cols: Vec<&[u8]> = vec![u32s_as_bytes(&types)];
+        cols.extend((1..NUM_COLS).map(|_| u32s_as_bytes(&host)));
+        let live: Vec<u8> = entries
+            .iter()
+            .filter(|&&(_, _, mode)| mode == LIVE || (mode == LIVE_IF_ODD && len % 2 == 1))
+            .map(|&(target, _, _)| target)
+            .collect();
+        let twice_live = live
+            .iter()
+            .enumerate()
+            .any(|(i, target)| live[..i].contains(target));
+        let lanes: Vec<(u8, CmpType)> = entries
+            .iter()
+            .map(|&(target, lane, _)| (target, lane))
+            .collect();
+        let walked = twice_live || walked_refusal(reads.reads(), &lanes, &live);
+        let mut out = RowColumns::new();
+        let mut eval = Modes;
+        let bound = bind_row_columns(
+            &prog,
+            &reads,
+            &state,
+            &mut cols,
+            len,
+            &mut eval,
+            &mut NoStrings,
+            &mut out,
+        )
+        .err();
+        if bound != walked.then_some(ErrorCode::InvalidProgram) {
+            return Err(TestCaseError::fail(format!(
+                "bind {bound:?}, walked {walked}: reads {:?}, entries {entries:?}, live {live:?}",
+                reads.reads()
+            )));
+        }
+        if walked {
+            refused.set(refused.get() + 1);
+            if !reads.refuses_wide() {
+                live_refused.set(live_refused.get() + 1);
+            }
+        } else {
+            accepted.set(accepted.get() + 1);
+        }
+        Ok(())
+    });
+    println!(
+        "verdict property: {} refused ({} by live entries, the rest by the wide verdict), {} accepted",
+        refused.get(),
+        live_refused.get(),
+        accepted.get()
+    );
+    if let Err(failure) = verdict {
+        panic!("{failure}");
+    }
+    assert!(
+        accepted.get() > 0 && live_refused.get() > 0 && refused.get() > live_refused.get(),
+        "every judgement is exercised"
+    );
+}
 #[test]
 fn a_warmed_wide_bind_allocates_nothing() {
     let prog = sums(

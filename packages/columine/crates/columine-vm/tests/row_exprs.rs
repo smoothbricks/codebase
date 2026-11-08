@@ -668,6 +668,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
     prog.extend(reduce);
     prog.extend_from_slice(&trailer);
     let state = init(&prog);
+    let reads = ReduceReads::of(&prog).expect("the reduce reads derive");
     let types = [ORDER_TYPE, ORDER_TYPE];
     let vals = [50u32, 150];
     let mut cols: Vec<&[u8]> = vec![u32s_as_bytes(&types), &[], u32s_as_bytes(&vals), &[], &[]];
@@ -683,7 +684,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         without_memory(|| {
             bind_row_columns(
                 &prog,
-                &ReduceReads::of(&prog).expect("the reduce reads derive"),
+                &reads,
                 &state,
                 &mut cols,
                 2,
@@ -698,7 +699,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
     assert!(cols[3].is_empty() && cols[4].is_empty());
     bind_row_columns(
         &prog,
-        &ReduceReads::of(&prog).expect("the reduce reads derive"),
+        &reads,
         &state,
         &mut cols,
         2,
@@ -716,7 +717,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         without_memory(|| {
             bind_row_columns(
                 &prog,
-                &ReduceReads::of(&prog).expect("the reduce reads derive"),
+                &reads,
                 &state,
                 &mut again,
                 2,
@@ -743,7 +744,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         without_memory(|| {
             bind_row_columns(
                 &prog,
-                &ReduceReads::of(&prog).expect("the reduce reads derive"),
+                &reads,
                 &state,
                 &mut longer,
                 64,
