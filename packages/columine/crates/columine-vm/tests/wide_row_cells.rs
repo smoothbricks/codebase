@@ -16,9 +16,10 @@ use columine_vm::row_exprs::{
     RowExpression, StoredRow, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
-use columine_vm::vm::{Vm, col_i64_exact, col_u32_exact, i64s_as_bytes, u32s_as_bytes};
+use columine_vm::vm::{CheckedMap, Vm, col_i64_exact, col_u32_exact, i64s_as_bytes, u32s_as_bytes};
 
 use common::memory::with_allocations;
+use proptest::prelude::*;
 
 const OK: u32 = ErrorCode::Ok as u32;
 
@@ -43,6 +44,8 @@ const PAST_F64: u8 = 1;
 const NEXT: u8 = 2;
 /// `n` as a u32.
 const COPY: u8 = 3;
+/// Copy the u32 input through a live predicate rather than at bind.
+const LIVE_COPY: u8 = 4;
 
 /// The embedder of these tests. Each expression answers its own lane,
 /// whatever lane the entry names, so a table naming another lane shows the
@@ -64,7 +67,7 @@ impl RowExpression for Wide {
             return Err(ErrorCode::InvalidProgram);
         }
         let covered = match op {
-            HALF_MORE | PAST_F64 | COPY => {
+            HALF_MORE | PAST_F64 | COPY | LIVE_COPY => {
                 col_u32_exact(batch.column(col), batch.batch_len).is_some()
             }
             NEXT if batch.derived_lane(col) == Some(CmpType::I64) => {
@@ -73,7 +76,11 @@ impl RowExpression for Wide {
             _ => return Err(ErrorCode::InvalidProgram),
         };
         if covered {
-            Ok(Binding::Bound)
+            Ok(if op == LIVE_COPY {
+                Binding::Live
+            } else {
+                Binding::Bound
+            })
         } else {
             Err(ErrorCode::ColumnUnderrun)
         }
@@ -93,7 +100,7 @@ impl RowExpression for Wide {
         Ok(match expr[0] {
             HALF_MORE => RowCell::F64(1.5 * f64::from(n())),
             PAST_F64 => RowCell::I64(TWO_53 + i64::from(n())),
-            COPY => RowCell::U32(n()),
+            COPY | LIVE_COPY => RowCell::U32(n()),
             _ => RowCell::I64(
                 col_i64_exact(column, batch.batch_len).expect("admit proved coverage")[row] + 1,
             ),
@@ -515,6 +522,65 @@ fn a_wide_type_column_or_an_unknown_lane_is_refused() {
         )),
         ErrorCode::InvalidProgram
     );
+}
+
+proptest! {
+    /// Readability is judged from the final splice's lane, while a live column is never a plain value.
+    #[test]
+    fn mixed_live_and_duplicate_columns_keep_their_final_lane_and_refusals(
+        ns in prop::collection::vec(0u32..100, 1..7),
+    ) {
+        let mut rows = RowColumns::new();
+        let types = vec![ORDER_TYPE; ns.len()];
+        let keys: Vec<u32> = (1..=u32::try_from(ns.len()).expect("small batch")).collect();
+        let placeholder = vec![0xAAu32; ns.len()];
+        for (wide_last, plain_live) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut entries = vec![
+                laned(DERIVED_2, CmpType::U32, [COPY, N_COL]),
+                laned(DERIVED_2, CmpType::I64, [PAST_F64, N_COL]),
+            ];
+            if !wide_last {
+                entries.push(laned(DERIVED_2, CmpType::U32, [COPY, N_COL]));
+            }
+            entries.push(laned(DERIVED, CmpType::U32, [LIVE_COPY, N_COL]));
+            let value_col = if plain_live { DERIVED } else { DERIVED_2 };
+            let prog = program(
+                1,
+                &[0x10, 0, 0x00, 8, 0, 0],
+                &for_each(&[0x2a, 0, KEY_COL, value_col, DERIVED]),
+                &table(LANED_ROW_EXPRESSIONS_MAGIC, &entries),
+            );
+            let mut state = init(&prog);
+            let mut cols: Vec<&[u8]> = vec![
+                u32s_as_bytes(&types), u32s_as_bytes(&keys), u32s_as_bytes(&ns),
+                u32s_as_bytes(&placeholder), u32s_as_bytes(&placeholder),
+            ];
+            let mut eval = Wide;
+            let bound = bind_row_columns(
+                &prog, &state, &mut cols, u32::try_from(ns.len()).expect("small batch"),
+                &mut eval, &mut NoStrings, &mut rows,
+            );
+            match bound {
+                Err(error) => {
+                    prop_assert!(wide_last || plain_live);
+                    prop_assert_eq!(error, ErrorCode::InvalidProgram);
+                    for col in [DERIVED, DERIVED_2] {
+                        prop_assert_eq!(cols[usize::from(col)], u32s_as_bytes(&placeholder));
+                    }
+                }
+                Ok(mut live) => {
+                    prop_assert!(!wide_last && !plain_live);
+                    prop_assert_eq!(Vm::default().execute_batch_live(
+                        &mut state, &prog, &cols, u32::try_from(ns.len()).expect("small batch"), &mut live,
+                    ), OK);
+                    let map = CheckedMap::bind(&state, 0).expect("valid map slot");
+                    for (&key, &n) in keys.iter().zip(&ns) {
+                        prop_assert_eq!(map.get(key), (n != 0).then_some(n));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

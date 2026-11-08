@@ -726,7 +726,12 @@ fn refuse_unreadable_columns(
     state: &[u8],
     out: &RowColumns,
 ) -> Result<(), ErrorCode> {
-    if out.live_entry(out.type_col).is_some() || out.wide_lane(out.type_col).is_some() {
+    let has_wide = out.lanes.iter().any(|&lane| lane != CmpType::U32);
+    if out.live.is_empty() && !has_wide {
+        return Ok(());
+    }
+    if out.live_entry(out.type_col).is_some() || (has_wide && out.wide_lane(out.type_col).is_some())
+    {
         return Err(ErrorCode::InvalidProgram);
     }
     let init = ProgramHeader::sections(program)
@@ -735,9 +740,10 @@ fn refuse_unreadable_columns(
     let mut unreadable = false;
     reduce_column_reads(program, state, &mut |col, usage, lane| {
         let plain_read_of_live = usage == ColumnUse::Read && out.live_entry(col).is_some();
-        let off_lane = out
-            .wide_lane(col)
-            .is_some_and(|wide| lane.resolve(init) != Some(wide));
+        let off_lane = has_wide
+            && out
+                .wide_lane(col)
+                .is_some_and(|wide| lane.resolve(init) != Some(wide));
         unreadable |= plain_read_of_live || off_lane;
     })?;
     if unreadable {
@@ -916,9 +922,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     if pos != table.len() {
         return Err(ErrorCode::InvalidProgram);
     }
-    if !out.live.is_empty() || out.lanes.iter().any(|&lane| lane != CmpType::U32) {
-        refuse_unreadable_columns(program, state, out)?;
-    }
+    refuse_unreadable_columns(program, state, out)?;
 
     out.bound = true;
     let bound: &'a RowColumns = out;
