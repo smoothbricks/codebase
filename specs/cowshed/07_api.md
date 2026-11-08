@@ -634,8 +634,9 @@ impl Coordinator {
     pub async fn gc(&self, opts: GcOptions) -> Result<GcReport, CowshedError>;
     // Unadopt the project (`cowshed unadopt`, 02_workspaces.md, "Checkout layouts"): every session workspace, listed
     // or never published, under opts' force/abandon, an abandoned session bundled into the retained checkout; wait
-    // for their reclamation; gc; under abandon delete the trash's abandon bundles; retire main, which puts the
-    // pre-adoption checkout back and unbinds the project. A stale gc plan is `Conflict` with `Retry::GcPlanStale`
+    // for their reclamation; collect the project's own storage, never what other projects share; under abandon
+    // delete the trash's abandon bundles; retire main, which puts the pre-adoption checkout back and unbinds the
+    // project. A stale gc plan is `Conflict` with `Retry::GcPlanStale`
     // (`retry_source()`, wire `"retry": {"reason": "gcPlanStale"}`): call again, nothing done is repeated.
     pub async fn remove_project(&self, opts: RemoveProjectOptions) -> Result<RemoveProjectReport, CowshedError>;
     pub async fn repo_mirror(&self, ws: &str, url: &Url) -> Result<MirrorInfo, CowshedError>;

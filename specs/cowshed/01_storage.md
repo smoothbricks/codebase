@@ -406,9 +406,11 @@ release) and provably dead scratch, never idle workspaces:
 ### Shared temporary scratch
 
 The daemon sweeps at startup and every **60 seconds**, independently of the deletion of released images (05_gateway.md,
-"Deleting released images"). `gc` runs the same sweep before answering, including a read-only preview for `--dry-run`.
-Each pass examines at most **256 directory entries**, not 256 successful deletions; a retained directory cannot make the
-pass unbounded. The daemon keeps its directory cursors between passes, so live entries at the front do not starve dead
+"Deleting released images"). `gc` runs the same sweep before answering, including a read-only preview for `--dry-run`; a
+project's removal (`unadopt`, 02_workspaces.md) collects only that project's own storage, so it runs neither this sweep
+nor the store's sandbox profile collection (04_sandbox.md, "Exec pipeline"), which serve every project. Each pass
+examines at most **256 directory entries**, not 256 successful deletions; a retained directory cannot make the pass
+unbounded. The daemon keeps its directory cursors between passes, so live entries at the front do not starve dead
 entries behind them. Each root gets a turn, and a complete scan restarts on the next pass. Sixty seconds amortizes idle
 polling; 256 bounds filesystem and process probes even when the shared temp root contains thousands of other tools'
 entries. Background archive deletion has its own 256-entry budget and never synchronously walks an entire output tree.

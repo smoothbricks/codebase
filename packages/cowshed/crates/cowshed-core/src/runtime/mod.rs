@@ -59,9 +59,9 @@ pub mod wait_spans;
 
 pub use nx_daemon::{NxKeeperHold, NxKeeperState};
 pub use project::{
-    BUILD_VOLUME_COLLECTION_VERB, ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime,
-    ProjectRuntimeHost, ProjectSnapshots, RecoveryScope, RuntimeLogChunk, SEED_COMPACTION_VERB,
-    WorkspaceSnapshot,
+    BUILD_VOLUME_COLLECTION_VERB, ClonePurpose, GcReach, JobAnswer, ProjectDescriptor,
+    ProjectRuntime, ProjectRuntimeHost, ProjectSnapshots, RecoveryScope, RuntimeLogChunk,
+    SEED_COMPACTION_VERB, WorkspaceSnapshot,
 };
 pub use supervisor::{
     CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, LogChunk, SessionSnapshot,

@@ -1980,6 +1980,118 @@ async fn directory_detach_and_rm_refuse_a_host_process_holding_the_mount() {
     fixture.stop_gateway().await;
 }
 
+/// A project's removal collects its own project and nothing every project shares (01_storage.md,
+/// "Shared temporary scratch"). \`cowshed unadopt\`, dispatched against the production storage host,
+/// retires the project's session and unbinds it, while a temp root another live process leases
+/// stays exactly as it was and no shared-temp sweep runs: none prints the summary every sweep
+/// prints, which the explicit \`gc --dry-run\` before it does print. The sweep reports on the
+/// process's stderr, not dispatch's writer, so a child test process runs the scenario and this one
+/// reads it, owning the leased root across it.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_unadopt_collects_only_its_project_and_runs_no_shared_temp_sweep() {
+    use std::os::unix::fs::MetadataExt as _;
+    const CHILD: &str = "COWSHED_TEST_UNADOPT_SHARED_TEMP_CHILD";
+    const SWEEP: &str = "cowshed: scratch examined";
+    if std::env::var_os(CHILD).is_none() {
+        let leased = cowshed_os::scratch::create_named(Path::new("/tmp"), "cs-unadopt-leased")
+            .expect("a temp root this process leases");
+        fs::write(
+            leased.join("evidence"),
+            b"leased by the parent test process\n",
+        )
+        .expect("the leased root's evidence");
+        let witness = |root: &Path| {
+            let metadata = fs::symlink_metadata(root).expect("the leased root");
+            let entries = fs::read_dir(root)
+                .expect("list the leased root")
+                .map(|entry| entry.expect("a leased entry").file_name())
+                .collect::<Vec<_>>();
+            (
+                metadata.ino(),
+                metadata.mtime_nsec(),
+                entries,
+                fs::read(root.join("evidence")).expect("the leased evidence"),
+            )
+        };
+        let before = witness(&leased);
+        let output = tokio::process::Command::new(
+            std::env::current_exe().expect("test executable"),
+        )
+        .args([
+            "--exact",
+            "macos::directory_unadopt_collects_only_its_project_and_runs_no_shared_temp_sweep",
+            "--nocapture",
+            "--quiet",
+        ])
+        .env(CHILD, "1")
+        .output_bounded()
+        .await
+        .expect("run the unadopt scenario in a child test process");
+        let after = witness(&leased);
+        fs::remove_dir_all(&leased).expect("remove the leased root");
+        let stdout = String::from_utf8(output.stdout).expect("child test stdout");
+        let stderr = String::from_utf8(output.stderr).expect("child test stderr");
+        assert!(
+            output.status.success(),
+            "child scenario failed\n{stdout}\n{stderr}"
+        );
+        assert_eq!(before, after, "the unadopt left the leased root as it was");
+        let segment = |verb: &str| {
+            let start = format!("dispatch fixture cowshed: {verb} start");
+            let done = format!("dispatch fixture cowshed: {verb} done");
+            let (_, rest) = stderr
+                .split_once(&start)
+                .unwrap_or_else(|| panic!("the child dispatched {verb}: {stderr}"));
+            rest.split_once(&done)
+                .unwrap_or_else(|| panic!("the child finished {verb}: {stderr}"))
+                .0
+                .to_owned()
+        };
+        assert!(
+            segment("Gc").contains(SWEEP),
+            "an explicit gc previews the shared-temp sweep: {stderr}"
+        );
+        let unadopt = segment("Unadopt");
+        assert!(
+            !unadopt.contains(SWEEP),
+            "the unadopt swept shared temp: {unadopt}"
+        );
+        return;
+    }
+    let mut fixture = Fixture::directory();
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the project");
+    new_workspace(&mut service, "landed").await;
+    succeed(&mut service, ["gc", "--dry-run"]).await;
+    let (stdout, stderr) = succeed(&mut service, ["--json", "unadopt"]).await;
+    let report: serde_json::Value = serde_json::from_slice(&stdout).expect("unadopt --json");
+    let report = &report["result"];
+    assert_eq!(
+        report["removed"][0]["workspace"], "landed",
+        "{report}\n{stderr}"
+    );
+    assert_eq!(report["collected"]["dryRun"], false, "{report}");
+    assert!(
+        !fixture.storage.store().join(".trash/scratch").exists(),
+        "the unadopt archived no shared-temp scratch into the store"
+    );
+    let layout = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("project layout");
+    assert!(
+        !layout.project().repository_binding.exists(),
+        "the unadopt unbound the project"
+    );
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
 /// Removing a detached workspace's gateway session unbinds its block's base until its next attach,
 /// and every fixture store and test gateway on the host shares the fixture partition: the store
 /// claims the block's first service port before the removal, so no claimant that binds it before

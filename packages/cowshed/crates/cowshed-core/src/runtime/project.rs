@@ -139,6 +139,19 @@ pub enum ClonePurpose {
     Rename,
 }
 
+/// How far a collection reaches beyond the project's own storage (01_storage.md, "Retention").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GcReach {
+    /// The project's own storage alone: a project's removal (`unadopt`), which never walks or
+    /// reaps what other projects share.
+    Project,
+    /// An explicit `gc` (and `doctor --repair`, which runs it): also the maintenance every project
+    /// shares, the shared-temp scratch sweep (01_storage.md, "Shared temporary scratch") once the
+    /// binding is validated, and after a real sweep the store's sandbox profile files no live
+    /// supervisor launches from (04_sandbox.md, "Exec pipeline" step 4).
+    Shared,
+}
+
 /// Actor-owned platform seam. Implementations must reread authoritative repository, storage,
 /// metadata, mount, gateway, and supervisor facts inside every effectful method before mutation.
 ///
@@ -269,9 +282,10 @@ pub trait ProjectRuntimeHost: Send + 'static {
         workspace: WorkspaceName,
         options: RetireOptions,
     ) -> Result<RemoveReport>;
+    /// Collect this project's storage, and under [`GcReach::Shared`] what every project shares.
     /// Its answer may arrive after the route ends: a plain sweep's held-bundle measurement runs
     /// beside the router actor, which serves the next call meanwhile.
-    async fn gc(&mut self, options: GcOptions) -> Result<JobAnswer<GcReport>>;
+    async fn gc(&mut self, options: GcOptions, reach: GcReach) -> Result<JobAnswer<GcReport>>;
     /// The session workspaces a listing does not show: clones whose create or fork never
     /// published them. `remove` retires them like any other.
     async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>>;
@@ -1617,7 +1631,7 @@ impl ProjectActor {
             }
             Op::CoordinatorGc(params) => {
                 self.require_repo(&params.repo_id)?;
-                let collected = self.host.gc(params.options).await?;
+                let collected = self.host.gc(params.options, GcReach::Shared).await?;
                 return Ok(Routed::Later(Box::pin(async move {
                     respond::<operations::CoordinatorGc>(&collected.await?)
                 })));
@@ -2621,10 +2635,11 @@ fn report_unbound_lease(
 
 /// Unadopt an adopted project (`cowshed unadopt`): retire every session workspace, listed or never
 /// published, under rm's containment gate, finishing each physical release or recovery
-/// preservation, an abandoned session's bundle kept in the retained checkout; collect; delete the
-/// trash's abandon bundles (only under `abandon`, which is what authorized them); then retire main,
-/// which puts the pre-adoption checkout back, unbinds the project and, with main retired, releases
-/// the build volumes main's link and seed kept from that collection. Every step is idempotent, so
+/// preservation, an abandoned session's bundle kept in the retained checkout; collect the project's
+/// own storage, never what other projects share; delete the trash's abandon bundles (only under
+/// `abandon`, which is what authorized them); then retire main, which puts the pre-adoption
+/// checkout back, unbinds the project and, with main retired, releases the build volumes main's
+/// link and seed kept from that collection. Every step is idempotent, so
 /// a refusal at any step leaves the rest for the same call to finish — and a stale collection says
 /// so as [`crate::error::Retry`].
 async fn remove_project(
@@ -2654,7 +2669,10 @@ async fn remove_project(
         let report = host.remove(workspace.clone(), session_removal).await?;
         removed.push(RemovedWorkspace { workspace, report });
     }
-    let collected = host.gc(GcOptions::default()).await?.await?;
+    let collected = host
+        .gc(GcOptions::default(), GcReach::Project)
+        .await?
+        .await?;
     let deleted_bundles = if options.abandon {
         host.delete_abandon_bundles().await?
     } else {
@@ -15874,20 +15892,25 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         .await
     }
 
-    async fn gc(&mut self, options: GcOptions) -> Result<JobAnswer<GcReport>> {
+    async fn gc(&mut self, options: GcOptions, reach: GcReach) -> Result<JobAnswer<GcReport>> {
         use crate::storage::lifecycle::{StorageGcOptions, StorageGcReason, Substrate};
 
         self.validate_binding().await?;
-        let scratch_store = self.layout.project().store_root.clone();
-        let dry_run = options.dry_run;
-        tokio::task::spawn_blocking(move || match cowshed_os::scratch::Reaper::host() {
-            Ok(mut reaper) => reaper.sweep(&scratch_store, dry_run).print(),
-            Err(error) => {
-                cowshed_os::eprintln!("cowshed: kept scratch: cannot start reaper: {error}")
-            }
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("scratch reaper task failed: {error}")))?;
+        let store_root = self.layout.project().store_root.clone();
+        if reach == GcReach::Shared {
+            let scratch_store = store_root.clone();
+            let dry_run = options.dry_run;
+            tokio::task::spawn_blocking(move || match cowshed_os::scratch::Reaper::host() {
+                Ok(mut reaper) => reaper.sweep(&scratch_store, dry_run).print(),
+                Err(error) => {
+                    cowshed_os::eprintln!("cowshed: kept scratch: cannot start reaper: {error}")
+                }
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("scratch reaper task failed: {error}"))
+            })?;
+        }
         self.retire_abandoned_pending_workspaces(options.dry_run)
             .await?;
         // `--abandoned` deletes every bundle below; a plain sweep drops those main holds, measured
@@ -16051,16 +16074,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // Profile files no live supervisor of the store can still launch from (04_sandbox.md,
         // "Exec pipeline" step 4). A failure leaves them for the next gc and is said, never
         // turned into a failed collection of everything else.
-        let store_root = self.layout.project().store_root.clone();
-        match crate::exec::collect_profiles(&store_root) {
-            Ok(0) => {}
-            Ok(removed) => cowshed_os::eprintln!(
-                "cowshed: gc removed {removed} sandbox profile file(s) no live supervisor launches from"
-            ),
-            Err(error) => cowshed_os::eprintln!(
-                "cowshed: gc left the sandbox profile files in {}: {error}",
-                crate::exec::profile_directory(&store_root).display()
-            ),
+        if reach == GcReach::Shared {
+            match crate::exec::collect_profiles(&store_root) {
+                Ok(0) => {}
+                Ok(removed) => cowshed_os::eprintln!(
+                    "cowshed: gc removed {removed} sandbox profile file(s) no live supervisor launches from"
+                ),
+                Err(error) => cowshed_os::eprintln!(
+                    "cowshed: gc left the sandbox profile files in {}: {error}",
+                    crate::exec::profile_directory(&store_root).display()
+                ),
+            }
         }
         let report = GcReport {
             examined: u64::try_from(report.examined)

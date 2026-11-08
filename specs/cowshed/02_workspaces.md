@@ -1606,12 +1606,13 @@ volume it registered, deferred behind it on every pass.
 layouts"; `rm` has no rollback mode, and plain `cowshed rm main` requires `--force` and a clean `git status` (exit 4
 otherwise). It removes the whole project in one call: every session workspace, including clones a create never
 published, under the given `--force`/`--abandon`; each removal has already committed its release when collection begins;
-collects; with `--abandon` deletes the abandon bundles in `sessions/.trash`, the only copy of the commits they hold,
-which `--abandon` authorizes losing (01_storage.md); and retires main, whose final unbinding moves the project's
-released images into the store's `.deleting` and nudges the gateway ("Checkout layouts"). Each step is idempotent, so a
-refusal leaves the rest to the same command. A collection that still finds the store changed under it (another process)
-is refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the same command finishes the removal; callers
-never sleep and retry `gc` themselves.
+collects the project's own storage, never what other projects share (01_storage.md, "Shared temporary scratch"); with
+`--abandon` deletes the abandon bundles in `sessions/.trash`, the only copy of the commits they hold, which `--abandon`
+authorizes losing (01_storage.md); and retires main, whose final unbinding moves the project's released images into the
+store's `.deleting` and nudges the gateway ("Checkout layouts"). Each step is idempotent, so a refusal leaves the rest
+to the same command. A collection that still finds the store changed under it (another process) is refused as retryable
+— `Conflict` with `Retry::GcPlanStale` — and the same command finishes the removal; callers never sleep and retry `gc`
+themselves.
 
 ## `cowshed attach` / `cowshed detach`
 

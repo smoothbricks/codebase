@@ -41,7 +41,7 @@ use cowshed_core::runtime::supervisor::{
 };
 use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::runtime::{
-    ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost,
+    ClonePurpose, GcReach, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost,
     ProjectSnapshots, RuntimeLogChunk, WorkspaceSnapshot,
 };
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
@@ -96,7 +96,7 @@ enum Event {
     Detach(WorkspaceName),
     AtomicCheckoutRestore(PathBuf),
     RemoveBinding,
-    Gc,
+    Gc(GcOptions, GcReach),
     Exec {
         workspace: WorkspaceName,
         mount: PathBuf,
@@ -976,8 +976,8 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(RemoveReport { abandoned })
     }
 
-    async fn gc(&mut self, options: GcOptions) -> Result<JobAnswer<GcReport>> {
-        self.events.send(Event::Gc).ok();
+    async fn gc(&mut self, options: GcOptions, reach: GcReach) -> Result<JobAnswer<GcReport>> {
+        self.events.send(Event::Gc(options.clone(), reach)).ok();
         if std::mem::take(&mut self.removal.gc_stale_once) {
             return Err(CowshedError::retryable(
                 Retry::GcPlanStale,
@@ -6167,7 +6167,10 @@ async fn main_restore_detaches_swaps_exact_checkout_and_then_retires() {
     .await
     .expect("adoption rollback");
     assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
-    assert_eq!(events.recv().await, Some(Event::Gc));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::Gc(GcOptions::default(), GcReach::Project))
+    );
     let main = WorkspaceName::new("main").expect("main");
     assert_eq!(events.recv().await, Some(Event::GitSafety(main.clone())));
     assert_eq!(events.recv().await, Some(Event::Stop(main.clone())));
@@ -6220,7 +6223,10 @@ async fn main_restore_missing_tree_and_collision_mutate_nothing() {
         .expect_err("unsafe restore fact");
         assert_eq!(error.code, ErrorCode::Conflict);
         assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
-        assert_eq!(events.recv().await, Some(Event::Gc));
+        assert_eq!(
+            events.recv().await,
+            Some(Event::Gc(GcOptions::default(), GcReach::Project))
+        );
         assert_eq!(
             events.recv().await,
             Some(Event::GitSafety(WorkspaceName::new("main").expect("main")))
@@ -6566,7 +6572,7 @@ async fn removing_a_project_finishes_each_release_before_collecting_then_restore
                 retired.push(name);
             }
             Event::Reclaim(name) => reclaimed.push(name),
-            Event::Gc => break,
+            Event::Gc(..) => break,
             _ => {}
         }
     }
@@ -6660,6 +6666,147 @@ async fn a_stale_collection_is_a_retryable_refusal_and_the_retry_finishes_the_re
     );
 }
 
+/// A project's removal reaches only its own project. Under every authorization and over every kind
+/// of session, it never asks for the maintenance other projects share: it collects once, with the
+/// plain options (never \`--abandoned\`), after every session's release and before main's restore
+/// and unbinding, and a session holding work the call does not authorize abandoning refuses before
+/// any collection, restore or unbinding. An explicit \`gc\`, dry or real, keeps that shared
+/// maintenance.
+#[tokio::test]
+async fn a_project_removal_collects_only_its_own_project_and_an_explicit_gc_keeps_shared_maintenance()
+ {
+    let main = WorkspaceName::new("main").expect("main");
+    for force in [false, true] {
+        for abandon in [false, true] {
+            for sessions in 0_u8..8 {
+                let (landed, unlanded, unpublished) =
+                    (sessions & 1 != 0, sessions & 2 != 0, sessions & 4 != 0);
+                let case = format!(
+                    "force={force} abandon={abandon} landed={landed} unlanded={unlanded} \
+                     unpublished={unpublished}"
+                );
+                let root = test_root();
+                let (events, mut receiver) = mpsc::unbounded_channel();
+                let mut host = FakeHost::new(&root, events, false, Vec::new());
+                if unlanded {
+                    host.removal
+                        .unlanded
+                        .insert(WorkspaceName::new("unsafe").expect("name"));
+                }
+                if unpublished {
+                    host.removal
+                        .unpublished
+                        .insert(WorkspaceName::new("stray").expect("name"));
+                }
+                let runtime = ProjectRuntime::start(host).await.expect("runtime");
+                let router = runtime.router();
+                let repo = runtime.descriptor().repo_id.clone();
+                adopt(&router, &repo).await;
+                for (name, wanted) in [("landed", landed), ("unsafe", unlanded)] {
+                    if wanted {
+                        route(
+                            &router,
+                            coordinator(repo.clone()),
+                            "coordinator.fork",
+                            json!({ "repoId": repo, "workspace": name, "options": ForkOptions::default() }),
+                        )
+                        .await
+                        .expect("create");
+                    }
+                }
+                while receiver.try_recv().is_ok() {}
+
+                let result =
+                    remove_project(&router, &repo, RemoveProjectOptions { force, abandon }).await;
+                let seen = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+                let collections = seen
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| matches!(event, Event::Gc(..)))
+                    .map(|(at, _)| at)
+                    .collect::<Vec<_>>();
+                let restore = seen
+                    .iter()
+                    .position(|event| matches!(event, Event::AtomicCheckoutRestore(_)));
+                let unbound = seen
+                    .iter()
+                    .position(|event| matches!(event, Event::RemoveBinding));
+                if unlanded && !abandon {
+                    let error = result.expect_err(&case);
+                    assert_eq!(error.code, ErrorCode::Conflict, "{case}");
+                    assert!(collections.is_empty(), "{case}: {seen:?}");
+                    assert_eq!((restore, unbound), (None, None), "{case}: {seen:?}");
+                    assert!(
+                        !seen.contains(&Event::Retire(main.clone())),
+                        "{case}: {seen:?}"
+                    );
+                    continue;
+                }
+                let report = result.expect(&case);
+                let [collected] = collections[..] else {
+                    panic!("{case}: one collection, saw {seen:?}");
+                };
+                assert_eq!(
+                    seen[collected],
+                    Event::Gc(GcOptions::default(), GcReach::Project),
+                    "{case}"
+                );
+                for (at, event) in seen.iter().enumerate() {
+                    if let Event::Retire(name) | Event::Reclaim(name) = event
+                        && *name != main
+                    {
+                        assert!(
+                            at < collected,
+                            "{case}: {event:?} after collection: {seen:?}"
+                        );
+                    }
+                }
+                let (Some(restore), Some(unbound)) = (restore, unbound) else {
+                    panic!("{case}: main restored and unbound, saw {seen:?}");
+                };
+                assert!(collected < restore && restore < unbound, "{case}: {seen:?}");
+                assert_eq!(
+                    report.removed.len(),
+                    usize::from(landed) + usize::from(unlanded) + usize::from(unpublished),
+                    "{case}"
+                );
+                assert_eq!(
+                    report.deleted_bundles.len(),
+                    usize::from(unlanded && abandon),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    let root = test_root();
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    while events.try_recv().is_ok() {}
+    for dry_run in [true, false] {
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.gc",
+            json!({ "repoId": repo, "options": { "dryRun": dry_run, "abandoned": false } }),
+        )
+        .await
+        .expect("explicit gc");
+        let collections = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| matches!(event, Event::Gc(..)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            collections,
+            [Event::Gc(
+                GcOptions {
+                    dry_run,
+                    abandoned: false
+                },
+                GcReach::Shared
+            )]
+        );
+    }
+}
 /// This test process's census, as a fixture store's census reaches it, over a store that holds no
 /// lease.
 fn census() -> cowshed_core::census::CensusScope {
