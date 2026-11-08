@@ -2500,6 +2500,67 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
     gateway.drain().await.expect("drain gateway");
 }
 
+/// A removal leaves its revision as a tombstone, and every fork, restore and re-adoption is a
+/// new identity, so a gateway whose tombstones counted against `max_sessions` refused every
+/// install once that many identities had come and gone. Churning more identities than
+/// `max_sessions` still installs, and every tombstone, the oldest included, still fences its
+/// removed revision, as the installed session fences a replay of its own.
+#[tokio::test]
+async fn removed_identities_never_exhaust_session_capacity() {
+    let (mut config, _cache) = test_config();
+    config.limits = GatewayLimits {
+        max_sessions: 2,
+        workspace_active: 1,
+        workspace_queued: 1,
+        global_active: 1,
+        global_queued: 1,
+        origin_active: 1,
+        leaf_cache_workspace: 2,
+        leaf_cache_global: 2,
+    };
+    let gateway = gateway(
+        config,
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let handle = gateway.handle();
+    let incarnation = |workspace_id: &str, endpoint| {
+        session(
+            workspace_id,
+            "owner/repo-churn",
+            block_endpoint(endpoint),
+            5,
+            1,
+            WorkspacePolicy::default(),
+        )
+        .0
+    };
+    let mut endpoint = free_endpoint();
+    for workspace_id in ["churn.i1", "churn.i2", "churn.i3"] {
+        endpoint = install_in_free_block(&handle, incarnation(workspace_id, endpoint)).await;
+        handle
+            .remove(workspace_id, 1)
+            .await
+            .expect("remove the incarnation's session");
+    }
+    let endpoint = install_in_free_block(&handle, incarnation("churn.i4", endpoint)).await;
+    for workspace_id in ["churn.i1", "churn.i2", "churn.i3", "churn.i4"] {
+        assert!(matches!(
+            handle.install(incarnation(workspace_id, endpoint)).await,
+            Err(GatewayError::StaleRevision)
+        ));
+    }
+    let status = handle.status().await.expect("gateway status");
+    assert_eq!(status.sessions.len(), 1);
+    assert_eq!(status.sessions[0].workspace_id, "churn.i4");
+    gateway.drain().await.expect("drain gateway");
+}
+
 /// Same actor, socket, client and optimized binary; alternate arms to share host load.
 /// Session IDs have the 101-byte shape of stable_workspace_id. One query is one
 /// resident admission; setup, installs and shutdown are outside the measured intervals.

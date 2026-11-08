@@ -812,9 +812,12 @@ connection-capacity refusal, connection-task failure and shutdown; an admission 
 
 Workspace sessions are installed and removed over the control plane, and the gateway's session table is a cache of host
 inventory, never an authority. Each session carries its workspace's effective grant revision, which every grant change
-and every attach advances. An install must exceed every revision that workspace identity has held — a removal leaves its
-revision behind as a tombstone — and a removal must name the installed revision; either refusal is `revision-fence`, and
-a removal of a session that is already gone is `not-installed`.
+and every attach advances. An install must exceed the revision of its identity's installed session or tombstone — a
+removal leaves its revision behind as a tombstone — and a removal must name the installed revision; either refusal is
+`revision-fence`, and a removal of a session that is already gone is `not-installed`. Only installed sessions count
+against `max_sessions`; tombstones count against no limit and live until the gateway process ends, as every fork,
+restore and re-adoption names a new identity whose removal buries one more. A tombstone fences a reconcile still in
+flight from before its removal, which a restart also ends, since that reconcile's install then fails.
 
 A workspace whose mount is unproven (01a_apfs.md, "Ownership, identity, and the volume label") is held by the inventory
 that found it: reconciliation installs no session for it and removes none of its sessions, at any incarnation. A held

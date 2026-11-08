@@ -1107,7 +1107,11 @@ struct Actor {
     sessions: HashMap<String, SessionState>,
     nx_backends: HashMap<String, NxBackendState>,
     nx_queue: VecDeque<NxPending>,
-    revisions: HashMap<String, u64>,
+    /// The revision each removed identity last held (05_gateway.md, "Control plane"): an install
+    /// of a buried identity must exceed it, as an install of an installed one must exceed its
+    /// session's. An identity is installed or buried, never both. Tombstones count against no
+    /// limit and die with the process.
+    tombstones: HashMap<String, u64>,
     permits: HashMap<u64, PermitState>,
     origins: HashMap<(String, String), usize>,
     queue: VecDeque<Pending>,
@@ -1154,6 +1158,7 @@ impl Actor {
         } = brokers;
         Self {
             leaf_cache: LeafCache::new(config.limits, config.timeouts),
+            tombstones: HashMap::new(),
             commands,
             completions,
             completion_receiver,
@@ -1170,7 +1175,6 @@ impl Actor {
             sessions: HashMap::new(),
             nx_backends: HashMap::new(),
             nx_queue: VecDeque::new(),
-            revisions: HashMap::new(),
             permits: HashMap::new(),
             origins: HashMap::new(),
             queue: VecDeque::new(),
@@ -1303,25 +1307,41 @@ impl Actor {
         }
     }
 
+    /// An install that fails after taking down its identity's installed session buries that
+    /// session's revision, so the identity stays fenced at it.
     async fn install(&mut self, session: WorkspaceSession) -> Result<(), GatewayError> {
+        let workspace_id = session.workspace_id.clone();
+        let held = self
+            .sessions
+            .get(&workspace_id)
+            .map(|current| current.revision);
+        let installed = self.install_session(session).await;
+        if let Some(revision) =
+            held.filter(|_| installed.is_err() && !self.sessions.contains_key(&workspace_id))
+        {
+            self.tombstones.insert(workspace_id, revision);
+        }
+        installed
+    }
+
+    async fn install_session(&mut self, session: WorkspaceSession) -> Result<(), GatewayError> {
         if self.draining {
             return Err(GatewayError::Draining);
         }
         session.validate()?;
         self.config.validate_session_endpoint(&session)?;
         let signer = CaSigner::parse(&session.ca)?;
-        if (!self.sessions.contains_key(&session.workspace_id)
-            && self.sessions.len() >= self.config.limits.max_sessions)
-            || (!self.revisions.contains_key(&session.workspace_id)
-                && self.revisions.len() >= self.config.limits.max_sessions)
+        if !self.sessions.contains_key(&session.workspace_id)
+            && self.sessions.len() >= self.config.limits.max_sessions
         {
             return Err(GatewayError::SessionCapacity);
         }
-        if self
-            .revisions
+        let fence = self
+            .sessions
             .get(&session.workspace_id)
-            .is_some_and(|revision| session.revision <= *revision)
-        {
+            .map(|current| current.revision)
+            .or_else(|| self.tombstones.get(&session.workspace_id).copied());
+        if fence.is_some_and(|revision| session.revision <= revision) {
             return Err(GatewayError::StaleRevision);
         }
         if self.sessions.iter().any(|(workspace_id, current)| {
@@ -1421,7 +1441,7 @@ impl Actor {
                 handoff,
             },
         );
-        self.revisions.insert(workspace_id, revision);
+        self.tombstones.remove(&workspace_id);
         Ok(())
     }
 
@@ -1444,6 +1464,8 @@ impl Actor {
             .sessions
             .remove(workspace_id)
             .expect("session was checked");
+        self.tombstones
+            .insert(workspace_id.to_owned(), session.revision);
         let repo_id = session.repo_id.clone();
         session.stop().await;
         self.repo_mirror
