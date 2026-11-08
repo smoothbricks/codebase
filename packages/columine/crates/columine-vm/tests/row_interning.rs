@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{CmpType, ErrorCode};
+use columine_vm::column_uses::ReduceReads;
 use columine_vm::key_index::NoStrings;
 use columine_vm::logical_export::{InternLookup, Interner};
 use columine_vm::meta::SlotMetaView;
@@ -199,6 +200,7 @@ fn bind(
     let mut rows = RowColumns::new();
     bind_row_columns(
         prog,
+        &ReduceReads::of(prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         len,
@@ -223,8 +225,17 @@ fn fold(prog: &[u8], state: &mut [u8], strings: &mut Table, heads: &[u32], tails
     let len = u32::try_from(heads.len()).expect("batch fits u32");
     let mut rows = RowColumns::new();
     let mut eval = Join::default();
-    let mut live =
-        bind_row_columns(prog, state, &mut cols, len, &mut eval, strings, &mut rows).expect("bind");
+    let mut live = bind_row_columns(
+        prog,
+        &ReduceReads::of(prog).expect("the reduce reads derive"),
+        state,
+        &mut cols,
+        len,
+        &mut eval,
+        strings,
+        &mut rows,
+    )
+    .expect("bind");
     assert_eq!(
         Vm::default().execute_batch_live(state, prog, &cols, len, &mut live),
         OK
@@ -289,6 +300,7 @@ fn an_interner_refusal_refuses_the_bind_and_splices_nothing() {
     let mut rows = RowColumns::new();
     let refused = bind_row_columns(
         &prog,
+        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         1,

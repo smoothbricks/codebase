@@ -300,11 +300,12 @@ fn scatter_no_consumer_preserves_middle_ordinals_and_undo() {
                     }
                 }
                 assert_eq!(2, columine_types::types::state_num_slots(&state));
-                let mut columns = Vec::new();
-                columine_vm::column_uses::reduce_column_uses(&prog, &state, &mut |col, _| {
-                    columns.push(col)
-                })
-                .expect("sparse routes admit their real columns");
+                let columns: Vec<u32> = columine_vm::column_uses::ReduceReads::of(&prog)
+                    .expect("sparse routes admit their real columns")
+                    .reads()
+                    .iter()
+                    .map(|read| read.column)
+                    .collect();
                 assert!(
                     !columns.contains(&u32::MAX),
                     "ignored value is not a column read"
@@ -372,12 +373,12 @@ fn scatter_no_consumer_keeps_consumed_shared_value_column() {
         Opcode::BatchStructMapScatterGuarded,
     ] {
         let prog = sparse_scatter_program(opcode, 1, 5);
-        let state = init(&prog);
-        let mut columns = Vec::new();
-        columine_vm::column_uses::reduce_column_uses(&prog, &state, &mut |col, _| {
-            columns.push(col)
-        })
-        .expect("shared value column remains admitted");
+        let columns: Vec<u32> = columine_vm::column_uses::ReduceReads::of(&prog)
+            .expect("shared value column remains admitted")
+            .reads()
+            .iter()
+            .map(|read| read.column)
+            .collect();
         assert_eq!(
             2,
             columns.iter().filter(|&&col| col == 5).count(),
@@ -520,6 +521,43 @@ fn seed_probe_row(
 // =============================================================================
 // TTL through the live reducer path ()
 // =============================================================================
+
+/// A program's reduce reads are derived from its bytes alone: the TTL
+/// timestamp column `BATCH_MAP_UPSERT_LAST` reads is the one every state laid
+/// out for the program records, at the lane its deadline is kept in, for a
+/// float and an integer deadline alike.
+#[test]
+fn reduce_reads_name_the_ttl_timestamp_column_the_state_records() {
+    use columine_types::types::SlotTypeFlags;
+    use columine_vm::column_uses::{ColumnUse, ReduceRead, ReduceReads};
+    for (timestamp_col, flags) in [(2u8, 0x10u8), (3, 0x10 | SlotTypeFlags::INTEGER_DEADLINE)] {
+        let init_section = slot_def_ttl(0, flags, 4, 0, 10.0, 0.0, timestamp_col);
+        let reduce = [Opcode::BatchMapUpsertLast as u8, 0, 0, 1];
+        let mut prog = program(1, 4, &init_section, &reduce);
+        prog.extend(TEMPORAL_MAGIC.to_le_bytes());
+        prog.extend(8u32.to_le_bytes());
+        prog.extend(3u32.to_le_bytes());
+        prog.extend(0u32.to_le_bytes());
+        let state = init(&prog);
+        let meta = SlotMetaView::read(&state, 0);
+        assert!(meta.has_ttl(), "slot 0 is a TTL map");
+        let recorded = ReduceRead {
+            column: meta.timestamp_col(&state),
+            usage: ColumnUse::Read,
+            lane: Some(if meta.type_flags.integer_deadline() {
+                CmpType::I64
+            } else {
+                CmpType::F64
+            }),
+        };
+        let reads = ReduceReads::of(&prog).expect("the reduce reads derive");
+        assert!(
+            reads.reads().contains(&recorded),
+            "flags {flags:#x}: {recorded:?} is among {:?}",
+            reads.reads()
+        );
+    }
+}
 
 #[test]
 fn ttl_hashmap_insert_and_evict_through_live_reducer_path() {

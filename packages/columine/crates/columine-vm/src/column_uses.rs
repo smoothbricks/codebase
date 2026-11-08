@@ -1,6 +1,6 @@
 //! The column operands of a reduce section, with how each is read.
 //!
-//! [`reduce_column_uses`] walks a program's reduce section — top-level ops,
+//! [`ReduceReads::of`] walks a program's reduce section — top-level ops,
 //! `FOR_EACH` bodies and the `FLAT_MAP` bodies nested in them — and reports
 //! every operand that names a batch column together with its
 //! [`ColumnUse`]. The one distinction that matters to a caller is whether a
@@ -13,9 +13,11 @@
 //! zero placeholder cells, so such a read would silently see zeros;
 //! `row_exprs` refuses the bind instead.
 //!
+//! A program's reads are a function of its bytes: [`ReduceReads`] is that
+//! walk's answer, derived once per program and checked against every bind.
 //! [`reduce_column_roles`] is the same walk for load-time admission. It
 //! reports each operand as a `ColumnOperand`: an ordinary cell, or a
-//! value-object CSR pair. The public walk reports a CSR pair as its two reads.
+//! value-object CSR pair. [`ReduceReads`] holds a CSR pair as its two reads.
 //!
 //! Each cell operand also names its [`OperandLane`]: the cell the dispatch
 //! reads its column at, a u32 or an 8-byte f64 or i64. An instruction fixes
@@ -41,7 +43,6 @@ use columine_types::types::{
     SlotTypeFlags, StructFieldType,
 };
 
-use crate::meta::SlotMetaView;
 use crate::vm::{
     ScalarOperands, StructMapPick, body_op_len, decode_struct_map_guarded_upsert_operands,
     decode_struct_map_upsert_operands, decode_struct_map2_tuple_operands,
@@ -163,122 +164,119 @@ fn field_lane(kind: u8) -> Option<CmpType> {
     }
 }
 
-/// Visit every column operand of `program`'s reduce section. `state` is the
-/// initialised state the program runs against: a `BatchMapUpsertLast` on a
-/// TTL slot reads the slot's timestamp column, which only the state names.
-/// A CSR pair is visited as its offsets read, then its values read.
-/// A reduce section the VM would refuse is `InvalidProgram` here too.
-pub fn reduce_column_uses(
-    program: &[u8],
-    state: &[u8],
-    visit: &mut dyn FnMut(u32, ColumnUse),
-) -> Result<(), ErrorCode> {
-    reduce_column_reads(program, state, &mut |column, usage, _| visit(column, usage))
+/// One cell read of a reduce section: its column, how it is read, and the
+/// lane its cells are read at, `None` where the slot's definition declares
+/// no scalar cell there (an array or value-object field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReduceRead {
+    pub column: u32,
+    pub usage: ColumnUse,
+    pub lane: Option<CmpType>,
 }
 
-/// [`reduce_column_uses`] with the lane each operand reads its column at. A
-/// CSR pair's columns are visited as u32 reads: they hold offsets and
-/// element bytes, never a cell of a lane.
-pub(crate) fn reduce_column_reads(
-    program: &[u8],
-    state: &[u8],
-    visit: &mut dyn FnMut(u32, ColumnUse, OperandLane),
-) -> Result<(), ErrorCode> {
-    let sections = ProgramHeader::sections(program).ok_or(ErrorCode::InvalidProgram)?;
-    walk(
-        sections.reduce_code,
-        TimestampSource::State(state),
-        false,
-        NO_PARENT_TS_COL,
-        &mut |operand| match operand {
+/// Every cell read of a program's reduce section, in walk order. The walk
+/// reads only the program's bytes: a TTL slot's timestamp column is the one
+/// its init definition names, which is the column every state laid out for
+/// the program records. So the reads are derived once per program, and each
+/// bind checks its live and wide columns against them
+/// ([`crate::row_exprs::bind_row_columns`]) rather than walking the
+/// bytecode again. A CSR pair is its offsets read, then its values read, at
+/// u32: they hold offsets and element bytes, never a cell of a lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReduceReads(Vec<ReduceRead>);
+
+impl ReduceReads {
+    /// The reads of `program`'s reduce section.
+    ///
+    /// # Errors
+    /// `InvalidProgram` for a reduce section the VM would refuse, or a slot
+    /// its init section does not define; `OutOfMemory` when memory cannot
+    /// back the reads.
+    pub fn of(program: &[u8]) -> Result<Self, ErrorCode> {
+        let sections = ProgramHeader::sections(program).ok_or(ErrorCode::InvalidProgram)?;
+        let init = sections.init_code;
+        let mut reads = Vec::new();
+        let mut out_of_memory = false;
+        let mut keep = |read: ReduceRead| {
+            if reads.try_reserve(1).is_ok() {
+                reads.push(read);
+            } else {
+                out_of_memory = true;
+            }
+        };
+        reduce_column_roles(init, sections.reduce_code, &mut |operand| match operand {
             ColumnOperand::Cell {
                 column,
                 usage,
                 lane,
-            } => visit(column, usage, lane),
+            } => keep(ReduceRead {
+                column,
+                usage,
+                lane: lane.resolve(init),
+            }),
             ColumnOperand::Csr {
                 offsets_col,
                 values_col,
                 ..
             } => {
-                visit(offsets_col, ColumnUse::Read, U32);
-                visit(values_col, ColumnUse::Read, U32);
+                for column in [offsets_col, values_col] {
+                    keep(ReduceRead {
+                        column,
+                        usage: ColumnUse::Read,
+                        lane: Some(CmpType::U32),
+                    });
+                }
             }
-        },
-    )
+        })?;
+        if out_of_memory {
+            return Err(ErrorCode::OutOfMemory);
+        }
+        Ok(Self(reads))
+    }
+
+    /// Each read, in walk order.
+    #[must_use]
+    pub fn reads(&self) -> &[ReduceRead] {
+        &self.0
+    }
 }
 
 /// Visit every column operand of the reduce section `code` by role. `init` is
 /// the init section the program is compiled from: a `BatchMapUpsertLast` on a
-/// TTL slot reads the timestamp column its definition names, and `init` is
-/// the only place that column is named before a state exists. A reduce
-/// section the walk refuses, or a slot `init` does not define, is
-/// `InvalidProgram`.
+/// TTL slot reads the timestamp column its definition names. A reduce section
+/// the walk refuses, or a slot `init` does not define, is `InvalidProgram`.
 pub(crate) fn reduce_column_roles(
     init: &[u8],
     code: &[u8],
     visit: &mut dyn FnMut(ColumnOperand),
 ) -> Result<(), ErrorCode> {
-    walk(
-        code,
-        TimestampSource::Init(init),
-        false,
-        NO_PARENT_TS_COL,
-        visit,
-    )
+    walk(code, init, false, NO_PARENT_TS_COL, visit)
 }
 
-/// Where a TTL slot's timestamp column is named: the state the program runs
-/// column: the state the program runs against, or the init section it is
-/// compiled from.
-#[derive(Clone, Copy)]
-enum TimestampSource<'a> {
-    State(&'a [u8]),
-    Init(&'a [u8]),
+/// The timestamp column of `slot` when its definition in `init` gives it a
+/// TTL, at the lane its deadline is kept in.
+fn ttl_timestamp(init: &[u8], slot: u32) -> Result<Option<(u32, OperandLane)>, ErrorCode> {
+    let record = slot_record(init, slot)?;
+    Ok(record.timestamp_col.map(|col| {
+        (
+            col,
+            if record.flags.integer_deadline() {
+                I64
+            } else {
+                F64
+            },
+        )
+    }))
 }
 
-impl TimestampSource<'_> {
-    /// The timestamp column of `slot` when the slot has a TTL.
-    fn timestamp_col(self, slot: u32) -> Result<Option<(u32, OperandLane)>, ErrorCode> {
-        match self {
-            Self::State(state) => {
-                let meta = SlotMetaView::read(state, slot);
-                Ok(meta.has_ttl().then(|| {
-                    (
-                        meta.timestamp_col(state),
-                        if meta.type_flags.integer_deadline() {
-                            I64
-                        } else {
-                            F64
-                        },
-                    )
-                }))
-            }
-            Self::Init(init) => {
-                let record = slot_record(init, slot)?;
-                Ok(record.timestamp_col.map(|col| {
-                    (
-                        col,
-                        if record.flags.integer_deadline() {
-                            I64
-                        } else {
-                            F64
-                        },
-                    )
-                }))
-            }
-        }
-    }
-}
-
-/// What one instruction sequence's operands are read under: where a TTL
-/// slot's timestamp column is named, how a `*_IF` predicate is read, and the
+/// What one instruction sequence's operands are read under: the init section
+/// that names a TTL slot's timestamp column, how a `*_IF` predicate is read, and the
 /// parent timestamp column of an enclosing `FLAT_MAP` (`NO_PARENT_TS_COL`
 /// outside one), which its body's timestamp operands read instead of their
 /// own.
 #[derive(Clone, Copy)]
 struct Context<'a> {
-    source: TimestampSource<'a>,
+    init: &'a [u8],
     predicate: ColumnUse,
     parent_ts: u32,
 }
@@ -288,13 +286,13 @@ struct Context<'a> {
 /// a `FOR_EACH`/`FLAT_MAP` body.
 fn walk(
     code: &[u8],
-    source: TimestampSource<'_>,
+    init: &[u8],
     element: bool,
     parent_ts: u32,
     visit: &mut dyn FnMut(ColumnOperand),
 ) -> Result<(), ErrorCode> {
     let context = Context {
-        source,
+        init,
         predicate: if element {
             ColumnUse::ElementPredicate
         } else {
@@ -329,7 +327,7 @@ fn walk_op(
     visit: &mut dyn FnMut(ColumnOperand),
 ) -> Option<Result<(), ErrorCode>> {
     let Context {
-        source,
+        init,
         predicate,
         parent_ts,
     } = context;
@@ -355,7 +353,7 @@ fn walk_op(
     };
     // A TTL slot's timestamp column, named by the slot, not the instruction.
     let ttl = |slot: u32, visit: &mut dyn FnMut(ColumnOperand)| -> Result<(), ErrorCode> {
-        if let Some((column, lane)) = source.timestamp_col(slot)? {
+        if let Some((column, lane)) = ttl_timestamp(init, slot)? {
             cell(visit, column, ColumnUse::Read, lane);
         }
         Ok(())
@@ -655,7 +653,7 @@ fn walk_op(
             reads(ops, 1, visit)?;
             let parent_ts = ops.index()?;
             let body_len = usize::from(ops.u16()?);
-            return Some(walk(ops.bytes(body_len)?, source, true, parent_ts, visit));
+            return Some(walk(ops.bytes(body_len)?, init, true, parent_ts, visit));
         }
         Opcode::ForEach => {
             // col, match_count, ids u32 × match_count, body_len u16, body.
@@ -663,13 +661,7 @@ fn walk_op(
             let match_count = usize::try_from(ops.index()?).ok()?;
             ops.bytes(match_count * 4)?;
             let body_len = usize::from(ops.u16()?);
-            return Some(walk(
-                ops.bytes(body_len)?,
-                source,
-                true,
-                NO_PARENT_TS_COL,
-                visit,
-            ));
+            return Some(walk(ops.bytes(body_len)?, init, true, NO_PARENT_TS_COL, visit));
         }
         _ => return Some(Err(ErrorCode::InvalidProgram)),
     }

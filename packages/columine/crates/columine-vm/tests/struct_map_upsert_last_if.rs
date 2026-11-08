@@ -29,6 +29,7 @@ use columine_types::operand::encode_index;
 use columine_types::types::{
     CmpType, ErrorCode, NO_PARENT_TS_COL, Opcode, SlotMetaOffset, SlotType, StructFieldType,
 };
+use columine_vm::column_uses::ReduceReads;
 use columine_vm::key_index::NoStrings;
 use columine_vm::meta::slot_meta_base;
 use columine_vm::row_exprs::{
@@ -424,8 +425,17 @@ fn execute(
     let batch = Batch::of(rows);
     let mut cols = batch.cols();
     let len = batch.len();
-    let mut live = bind_row_columns(program, state, &mut cols, len, eval, &mut NoStrings, store)
-        .expect("bind the lease predicate");
+    let mut live = bind_row_columns(
+        program,
+        &ReduceReads::of(program).expect("the reduce reads derive"),
+        state,
+        &mut cols,
+        len,
+        eval,
+        &mut NoStrings,
+        store,
+    )
+    .expect("bind the lease predicate");
     vm.execute_batch_delta_live(state, program, &cols, len, &mut live)
 }
 
@@ -948,6 +958,7 @@ fn growth_refuses_before_any_write_and_the_retry_folds_the_model() {
 #[test]
 fn a_warmed_batch_binds_evaluates_and_writes_without_allocating() {
     let program = lease_program(16);
+    let reads = ReduceReads::of(&program).expect("the reduce reads derive");
     let mut vm = Vm::default();
     let mut state = init(&program);
     let mut eval = LeaseWinner::default();
@@ -975,6 +986,7 @@ fn a_warmed_batch_binds_evaluates_and_writes_without_allocating() {
     let status = with_allocations(0, || {
         let mut live = bind_row_columns(
             &program,
+            &reads,
             &state,
             &mut cols,
             len,
@@ -1100,6 +1112,7 @@ fn top_level_upsert_last_if_is_refused() {
     assert_eq!(
         bind_row_columns(
             &live,
+            &ReduceReads::of(&live).expect("the reduce reads derive"),
             &state,
             &mut cols,
             1,

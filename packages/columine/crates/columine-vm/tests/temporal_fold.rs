@@ -206,6 +206,7 @@ proptest! {
 #[test]
 fn idle_expiry_does_not_evaluate_stored_rows_or_record_any_mutation() {
     use columine_types::types::CmpType;
+    use columine_vm::column_uses::ReduceReads;
     use columine_vm::row_exprs::{
         BatchView, Binding, RowCell, RowColumns, RowExpression, bind_row_columns,
     };
@@ -274,6 +275,7 @@ fn idle_expiry_does_not_evaluate_stored_rows_or_record_any_mutation() {
     ];
     let mut live = bind_row_columns(
         &p,
+        &ReduceReads::of(&p).expect("the reduce reads derive"),
         &state,
         &mut cols,
         999,

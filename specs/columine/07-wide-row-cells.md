@@ -73,10 +73,13 @@ walk names the parent timestamp column at each of them.
 
 The bind refuses with `InvalidProgram` a program that reads a wide column through an operand of any other lane: a u32
 operand would read half a cell, and an f64 operand an i64's bits. A CSR pair's columns and an array or value-object
-field are never read as a wide column, and neither is the table's type column. The check walks the reduce section once
-per bind, only when the table has a wide entry, in the same pass that refuses plain reads of live columns. A u32 entry
-is read exactly as before. A bind determines wide-entry presence once from its bound lanes. With no wide entry, it
-performs no per-operand wide-lane lookup; the same walk still refuses every plain read of a live column.
+field are never read as a wide column, and neither is the table's type column. The walk reads only the program's bytes
+(a TTL slot's timestamp column is the one its init definition names, which every state laid out for the program
+records), so its answer, `ReduceReads`, is derived once per program and handed to every bind; no bind walks the reduce
+section. The check runs over those reads once per bind, only when the table has a wide entry or a live one, in the same
+pass that refuses plain reads of live columns. A u32 entry is read exactly as before. A bind determines wide-entry
+presence once from its bound lanes. With no wide entry, it performs no per-operand wide-lane lookup; the same pass still
+refuses every plain read of a live column.
 
 ## 5. Live entries
 

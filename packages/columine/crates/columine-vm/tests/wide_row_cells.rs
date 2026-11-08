@@ -9,6 +9,7 @@ mod common;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{AggType, CmpType, ErrorCode, StructFieldType};
 use columine_vm::aggregates::{agg_value_f64, agg_value_i64};
+use columine_vm::column_uses::ReduceReads;
 use columine_vm::key_index::NoStrings;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
@@ -237,6 +238,7 @@ fn fold(prog: &[u8], state: &mut [u8], keys: &[u32], ns: &[u32]) {
     let mut eval = Wide;
     let mut live = bind_row_columns(
         prog,
+        &ReduceReads::of(prog).expect("the reduce reads derive"),
         state,
         &mut cols,
         len,
@@ -348,6 +350,7 @@ fn a_later_entry_reads_an_earlier_wide_column_at_its_lane() {
     let mut eval = Wide;
     let mut live = bind_row_columns(
         &prog,
+        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         2,
@@ -394,6 +397,7 @@ fn an_rxp1_table_binds_the_u32_cells_an_rxp2_u32_entry_binds() {
         let mut rows = RowColumns::new();
         bind_row_columns(
             &prog,
+            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             3,
@@ -422,6 +426,7 @@ fn refusal(prog: &[u8]) -> ErrorCode {
     let mut rows = RowColumns::new();
     let code = bind_row_columns(
         prog,
+        &ReduceReads::of(prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         1,
@@ -557,7 +562,7 @@ proptest! {
             ];
             let mut eval = Wide;
             let bound = bind_row_columns(
-                &prog, &state, &mut cols, u32::try_from(ns.len()).expect("small batch"),
+                &prog, &ReduceReads::of(&prog).expect("the reduce reads derive"), &state, &mut cols, u32::try_from(ns.len()).expect("small batch"),
                 &mut eval, &mut NoStrings, &mut rows,
             );
             match bound {
@@ -597,6 +602,7 @@ fn a_warmed_wide_bind_allocates_nothing() {
         ),
     );
     let state = init(&prog);
+    let reads = ReduceReads::of(&prog).expect("the reduce reads derive");
     let (types, keys, ns) = ([ORDER_TYPE; 3], [1u32, 2, 3], [1u32, 2, 3]);
     let host = || -> Vec<&[u8]> {
         vec![
@@ -611,6 +617,7 @@ fn a_warmed_wide_bind_allocates_nothing() {
     let mut cold = host();
     bind_row_columns(
         &prog,
+        &reads,
         &state,
         &mut cold,
         3,
@@ -623,6 +630,7 @@ fn a_warmed_wide_bind_allocates_nothing() {
     let bound = with_allocations(0, || {
         bind_row_columns(
             &prog,
+            &reads,
             &state,
             &mut warm,
             3,

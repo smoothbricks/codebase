@@ -88,7 +88,7 @@ use columine_types::types::{
 };
 
 use crate::bytes;
-use crate::column_uses::{ColumnUse, reduce_column_reads};
+use crate::column_uses::{ColumnUse, ReduceReads};
 use crate::key_index::{InternBytes, KeyCx, KeyIndex, NoStrings};
 use crate::logical_export::Interner;
 use crate::struct_map::{StructMap2Slot, StructMapSlot, StructRows};
@@ -711,7 +711,8 @@ impl Range {
 }
 
 /// Refuse, before any column is spliced, a program whose reduce section
-/// reads a derived column its cells cannot answer:
+/// reads a derived column its cells cannot answer, judged over `reads`, the
+/// program's reduce reads ([`ReduceReads`]):
 ///
 /// - A live column holds zero placeholder cells, which a per-element `*_IF`
 ///   predicate or a stored-row sweep resolves through the handle. The
@@ -721,11 +722,7 @@ impl Range {
 ///   lane would take half a cell, or the other number type, as data, and
 ///   the table's type column is u32. The handle answers u32 predicate cells,
 ///   so a wide live column has no reader at all.
-fn refuse_unreadable_columns(
-    program: &[u8],
-    state: &[u8],
-    out: &RowColumns,
-) -> Result<(), ErrorCode> {
+fn refuse_unreadable_columns(reads: &ReduceReads, out: &RowColumns) -> Result<(), ErrorCode> {
     let has_wide = out.lanes.iter().any(|&lane| lane != CmpType::U32);
     if out.live.is_empty() && !has_wide {
         return Ok(());
@@ -734,18 +731,15 @@ fn refuse_unreadable_columns(
     {
         return Err(ErrorCode::InvalidProgram);
     }
-    let init = ProgramHeader::sections(program)
-        .ok_or(ErrorCode::InvalidProgram)?
-        .init_code;
-    let mut unreadable = false;
-    reduce_column_reads(program, state, &mut |col, usage, lane| {
-        let plain_read_of_live = usage == ColumnUse::Read && out.live_entry(col).is_some();
+    let unreadable = reads.reads().iter().any(|read| {
+        let plain_read_of_live =
+            read.usage == ColumnUse::Read && out.live_entry(read.column).is_some();
         let off_lane = has_wide
             && out
-                .wide_lane(col)
-                .is_some_and(|wide| lane.resolve(init) != Some(wide));
-        unreadable |= plain_read_of_live || off_lane;
-    })?;
+                .wide_lane(read.column)
+                .is_some_and(|wide| read.lane != Some(wide));
+        plain_read_of_live || off_lane
+    });
     if unreadable {
         return Err(ErrorCode::InvalidProgram);
     }
@@ -795,9 +789,14 @@ fn store(words: &mut [u64], lane: CmpType, row: usize, cell: RowCell) -> Result<
 /// `strings` is the caller's interner: every bound entry's evaluation may
 /// read an id's text and intern the strings it builds, and the bind is the
 /// table's only writer (specs/columine/09-row-interning.md). A refusal of the
-/// table refuses the bind with its code, before any splice.
+/// table refuses the bind with its code, before any splice. `reads` are
+/// `program`'s reduce reads ([`ReduceReads::of`]), derived once per program:
+/// the bind judges its live and wide columns against them and never walks
+/// the reduce section itself.
+#[allow(clippy::too_many_arguments)]
 pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     program: &'a [u8],
+    reads: &ReduceReads,
     state: &[u8],
     cols: &mut [&'a [u8]],
     batch_len: u32,
@@ -922,7 +921,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     if pos != table.len() {
         return Err(ErrorCode::InvalidProgram);
     }
-    refuse_unreadable_columns(program, state, out)?;
+    refuse_unreadable_columns(reads, out)?;
 
     out.bound = true;
     let bound: &'a RowColumns = out;

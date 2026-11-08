@@ -16,6 +16,7 @@ use columine_types::vo::{
     certify_counts, prepare_each,
 };
 
+use crate::column_uses::ReduceReads;
 use crate::counts_fold::CountsFoldOp;
 use crate::element_body::{InvalidSource, SourceOp, visit_source_ops};
 use crate::key_index::{HashIndex, InternBytes, KeyIndex, NoStrings};
@@ -88,6 +89,9 @@ pub struct AdmittedProgram<A: VoProgramAdmission, I: KeyIndex = HashIndex> {
     /// Whether the bytecode carries a row-expression table, which only
     /// [`Self::execute_bound`] binds.
     binds_rows: bool,
+    /// The reduce section's reads, derived once at admission: what every bind
+    /// of this program checks its live and wide columns against.
+    reads: ReduceReads,
     magic: u32,
     /// The image size of this program under family `I`.
     state_size: u32,
@@ -156,6 +160,12 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
                 )
             })?
             .is_some();
+        let reads = ReduceReads::of(&bytecode).map_err(|code| match code {
+            ErrorCode::OutOfMemory => ProgramAdmissionError::OutOfMemory,
+            _ => ProgramAdmissionError::InvalidProgram(
+                state_init::ProgramInvalidCause::MalformedProgram,
+            ),
+        })?;
         for (index, link) in metadata.fields.iter().enumerate() {
             if metadata.fields[..index]
                 .iter()
@@ -256,6 +266,7 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
             admission,
             inputs,
             binds_rows,
+            reads,
             magic,
             state_size,
             family: PhantomData,
@@ -334,9 +345,17 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
         rows: &'a mut RowColumns,
         execute: impl FnOnce(&[u8], &mut [u8], &[&[u8]], &mut LiveColumns<'_, '_>, &S) -> u32,
     ) -> Result<u32, InputAdmissionError> {
-        let mut live =
-            bind_row_columns(&self.bytecode, state, cols, batch_len, eval, strings, rows)
-                .map_err(InputAdmissionError::Rows)?;
+        let mut live = bind_row_columns(
+            &self.bytecode,
+            &self.reads,
+            state,
+            cols,
+            batch_len,
+            eval,
+            strings,
+            rows,
+        )
+        .map_err(InputAdmissionError::Rows)?;
         let strings: &S = strings;
         self.inputs.admit_and_execute(
             &self.metadata,
@@ -705,12 +724,15 @@ mod tests {
             counts: vec![],
         };
         let inputs = InputPlan::compile(&init, &reduce, &metadata).expect("plan compiles");
+        let reads =
+            crate::column_uses::ReduceReads::of(&bytecode).expect("the reduce reads derive");
         AdmittedProgram {
             bytecode,
             metadata,
             admission: UnavailableVoAdmission,
             inputs,
             binds_rows: true,
+            reads,
             magic: PROGRAM_MAGIC,
             state_size: 0,
             family: core::marker::PhantomData,

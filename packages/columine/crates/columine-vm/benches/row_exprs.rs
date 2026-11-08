@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{CmpType, ErrorCode};
+use columine_vm::column_uses::ReduceReads;
 use columine_vm::key_index::NoStrings;
 use columine_vm::row_exprs::{
     BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression, bind_row_columns,
@@ -199,6 +200,7 @@ fn main() {
             .collect();
         entries.push(entry(LIVE_COL, &[1, KEY_COL, VAL_COL]));
         let prog = program(8192, &table(&entries));
+        let reads = ReduceReads::of(&prog).expect("the reduce reads derive");
         let n = cell.rows;
         let types = vec![ORDER_TYPE; n];
         // 64 keys, values ascending so most rows land (the upsert's cost is
@@ -225,6 +227,7 @@ fn main() {
             let t0 = Instant::now();
             let mut live = bind_row_columns(
                 &prog,
+                &reads,
                 &state,
                 &mut cols,
                 n as u32,

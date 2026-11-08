@@ -4,6 +4,7 @@
 
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{CmpType, ErrorCode};
+use columine_vm::column_uses::ReduceReads;
 use columine_vm::key_index::NoStrings;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
@@ -231,6 +232,7 @@ fn derived_predicate_gates_the_upsert_and_unmatched_rows_stay_zero() {
     };
     bind_row_columns(
         &prog,
+        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         4,
@@ -267,6 +269,7 @@ fn a_program_without_a_table_binds_nothing() {
     };
     bind_row_columns(
         &prog,
+        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         2,
@@ -298,6 +301,7 @@ fn an_empty_batch_binds_nothing_even_without_column_pointers() {
     };
     bind_row_columns(
         &prog,
+        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         0,
@@ -323,6 +327,7 @@ fn bind_err<'a>(
     };
     bind_row_columns(
         prog,
+        &ReduceReads::of(prog).expect("the reduce reads derive"),
         &state,
         cols,
         batch_len,
@@ -483,6 +488,7 @@ fn an_extension_table_after_the_row_table_leaves_the_bind_unchanged() {
         };
         bind_row_columns(
             &prog,
+            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             3,
@@ -525,6 +531,7 @@ fn a_tail_of_extension_tables_alone_binds_nothing() {
     };
     bind_row_columns(
         &prog,
+        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         2,
@@ -625,6 +632,7 @@ fn a_later_entry_reads_an_earlier_entry_s_derived_column() {
     };
     bind_row_columns(
         &prog,
+        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         2,
@@ -675,6 +683,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         without_memory(|| {
             bind_row_columns(
                 &prog,
+                &ReduceReads::of(&prog).expect("the reduce reads derive"),
                 &state,
                 &mut cols,
                 2,
@@ -689,6 +698,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
     assert!(cols[3].is_empty() && cols[4].is_empty());
     bind_row_columns(
         &prog,
+        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         2,
@@ -706,6 +716,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         without_memory(|| {
             bind_row_columns(
                 &prog,
+                &ReduceReads::of(&prog).expect("the reduce reads derive"),
                 &state,
                 &mut again,
                 2,
@@ -732,6 +743,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         without_memory(|| {
             bind_row_columns(
                 &prog,
+                &ReduceReads::of(&prog).expect("the reduce reads derive"),
                 &state,
                 &mut longer,
                 64,
@@ -805,6 +817,7 @@ fn run_live(prog: &[u8], state: &mut [u8], keys: &[u32], vals: &[u32]) -> Vec<Op
     {
         let mut live = bind_row_columns(
             prog,
+            &ReduceReads::of(prog).expect("the reduce reads derive"),
             state,
             &mut cols,
             keys.len() as u32,
@@ -879,6 +892,7 @@ fn a_live_entry_gates_on_the_type_column_and_re_binds_per_batch() {
     {
         let mut live = bind_row_columns(
             &prog,
+            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             2,
@@ -905,6 +919,7 @@ fn a_live_entry_gates_on_the_type_column_and_re_binds_per_batch() {
     let mut plain_cols: Vec<&[u8]> = vec![&[], &[], &[], &[]];
     let live = bind_row_columns(
         &plain,
+        &ReduceReads::of(&plain).expect("the reduce reads derive"),
         &state,
         &mut plain_cols,
         1,
@@ -945,6 +960,7 @@ fn splice_repeats_the_bound_columns_over_a_rebuilt_column_set() {
     let bound: Vec<Vec<u8>> = {
         let live = bind_row_columns(
             &prog,
+            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             2,
@@ -1014,6 +1030,7 @@ fn live_bind_refusal(body: &[u8]) -> Option<ErrorCode> {
     let mut eval = Competes { evaluated: 0 };
     let outcome = bind_row_columns(
         &prog,
+        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         1,
@@ -1225,6 +1242,7 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
         ];
         bind_row_columns(
             &live_on_3,
+            &ReduceReads::of(&live_on_3).expect("the reduce reads derive"),
             &state,
             &mut cols,
             1,
@@ -1286,6 +1304,7 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
     ];
     let mut live = bind_row_columns(
         &live_on_4,
+        &ReduceReads::of(&live_on_4).expect("the reduce reads derive"),
         &state,
         &mut cols,
         1,
@@ -1426,6 +1445,7 @@ fn a_bound_derived_guard_column_plans_and_orders_the_scatter() {
     {
         let mut live = bind_row_columns(
             &prog,
+            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             2,
@@ -1479,6 +1499,7 @@ fn a_live_derived_guard_column_is_refused_before_any_element_runs() {
     assert_eq!(
         bind_row_columns(
             &prog,
+            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             1,
@@ -1568,6 +1589,7 @@ fn a_live_element_predicate_binds_beside_a_guarded_scatter() {
     {
         let mut live = bind_row_columns(
             &prog,
+            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             2,
