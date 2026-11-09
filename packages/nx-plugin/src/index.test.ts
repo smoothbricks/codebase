@@ -2692,9 +2692,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // The aggregate build names its outputs, never the test build's.
       expect(wasm.build?.dependsOn).toEqual(['^build', 'cargo-wasm']);
 
-      // The crate whose project also builds the debug cdylib keeps that edge:
-      // its tests load the artifact `napi-debug` writes into `target/debug`.
-      expect(native['cargo-test-native-napi']?.dependsOn).toEqual([rootFetch, rootBuild, 'napi-debug']);
+      // A crate whose project also builds the debug cdylib takes no napi-debug edge: no test binary loads that addon
+      // (only a target that sets NAPI_DEBUG_ADDON=1 does, through the package's loader).
+      expect(native['cargo-test-native-napi']?.dependsOn).toEqual([rootFetch, rootBuild]);
       // The addon build consumes only its dependencies' outputs; it is not
       // ordered behind the test compile.
       expect(native['napi-debug']?.dependsOn).toEqual(['^build']);
@@ -3578,11 +3578,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         },
       });
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
-      // cargo-fetch survives the napi-debug edge: the per-crate runner is itself
-      // a frozen cargo command, so its precondition is its own edge. It reads
-      // the workspace test build and still waits for the debug cdylib its own
-      // project builds, because its tests load that artifact from `target/`.
-      expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build', 'napi-debug']);
+      // The per-crate runner is a frozen cargo command, so cargo-fetch is its own precondition beside the workspace test
+      // build. It waits for no napi-debug: its tests load no debug addon.
+      expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-build']);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
         /^cargo --frozen nextest run --binaries-metadata \.cache\/nextest\/binaries-metadata\.json --cargo-metadata \.cache\/nextest\/cargo-metadata\.json --target-dir-remap "\$\(\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/\.\.\/nextest-extract\/dist\/bin\/[a-z0-9-]+\/smoo-nx-nextest-binaries target-dir\)" --workspace-remap \. -E 'package\(cowshed-napi\)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );

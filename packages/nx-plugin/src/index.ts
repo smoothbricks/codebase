@@ -2246,38 +2246,6 @@ async function createProjectTargets(
     ];
   }
 
-  const napiDebug = targets['napi-debug'];
-  if (napiDebug && cargoWorkspace) {
-    // A crate whose project also builds the debug cdylib runs its tests after
-    // that build: the tests dlopen what `napi-debug` writes into `target/debug`,
-    // and a test binary run in place loads it from this tree.
-    const runners = [
-      ...cargoPackagePlans.flatMap((plan) => plan.pieces.map((piece) => piece.targetName)),
-      // The root owns the serial groups' runners, so they take its build as its pieces do.
-      ...(ownsCargoWorkspaceTargets
-        ? cargoWorkspace.serialGroups.map((group) => cargoTestGroupTargetName(group.group))
-        : []),
-    ];
-    for (const name of runners) {
-      const target = targets[name];
-      if (target && !hasCargoTargetDependency(target.dependsOn ?? [], 'napi-debug')) {
-        target.dependsOn = [...(target.dependsOn ?? []), 'napi-debug'];
-      }
-    }
-  } else if (napiDebug) {
-    const cargoTest = targets[CARGO_TEST_TARGET];
-    if (
-      cargoTest?.options &&
-      typeof cargoTest.options.command === 'string' &&
-      cargoTest.options.command.startsWith('cargo ')
-    ) {
-      const dependsOn = cargoTest.dependsOn ?? [];
-      if (!dependsOn.includes('napi-debug')) {
-        cargoTest.dependsOn = [...dependsOn, 'napi-debug'];
-      }
-    }
-  }
-
   // The inferring host's own platform binaries join the aggregate `build`;
   // publish still owns foreign platforms.
   const hostPlatformBinaries = hostPlatformTargetNames(
@@ -3622,22 +3590,4 @@ function cargoTestGroupTarget(
       parallelism: 1,
     },
   };
-}
-
-function hasCargoTargetDependency(
-  dependencies: readonly CargoTargetDependency[],
-  expected: CargoTargetDependency,
-): boolean {
-  if (typeof expected === 'string') {
-    return dependencies.includes(expected);
-  }
-  return dependencies.some(
-    (dependency) =>
-      typeof dependency !== 'string' &&
-      dependency.target === expected.target &&
-      Array.isArray(dependency.projects) &&
-      Array.isArray(expected.projects) &&
-      dependency.projects.length === expected.projects.length &&
-      dependency.projects.every((project, index) => project === expected.projects?.[index]),
-  );
 }

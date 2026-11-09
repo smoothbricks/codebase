@@ -1339,10 +1339,11 @@ Concrete targets come from concrete files:
   so one cache entry serves every checkout of the same commit; nextest re-points
   `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the remapped binaries at runtime, but a test that reads them
   through the compile-time `env!` macro keeps the producing tree's path. Per-crate runners accept an empty nextest
-  selection because a valid workspace member may have no tests and a hash partition may legitimately be empty. A crate
-  in the project that builds the debug cdylib runs after `napi-debug`, because its tests load that addon from
-  `target/debug`. A crate declaring `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable
-  `cargo-wasm` output target in its owning project.
+  selection because a valid workspace member may have no tests and a hash partition may legitimately be empty. No Rust
+  test runner waits on `napi-debug`: a test binary loads no debug addon, and a test that runs the package's JavaScript
+  loads the host addon `napi-native` writes, which the runner names itself; only a target that sets `NAPI_DEBUG_ADDON=1`
+  reads `napi-debug`'s (below). A crate declaring `[package.metadata.smoothbricks.wasm-bindgen]` also receives the
+  cacheable `cargo-wasm` output target in its owning project.
 - The plugin's own `nextest.toml` is passed as
   `--tool-config-file "smoo:$PWD/<to workspace root>/node_modules/@smoothbricks/nx-plugin/nextest.toml"`, so it is a
   layer BENEATH the repository's `<cargo-workspace>/.config/nextest.toml` rather than a replacement for it: a repository
