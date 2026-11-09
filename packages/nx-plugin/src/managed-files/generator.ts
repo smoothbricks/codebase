@@ -1,10 +1,12 @@
+import { createHash } from 'node:crypto';
 import { createProjectGraphAsync, getProjects, joinPathFragments, readJson, type Tree } from 'nx/src/devkit-exports.js';
-import { renderTypecheckTestFiles } from '../typecheck-test-policy.js';
+import { renderTypecheckTestFiles, treeSourceListing } from '../typecheck-test-policy.js';
 import type { PackageJson } from '../workspace-manifest.js';
 import { deriveManagedFileContext, type WorkspaceProjects } from './context.js';
 import { type ManagedFileContext, renderManagedFiles } from './files.js';
 import { formatManagedContent } from './managed-format.js';
 import { inspectManagedPaths } from './paths.js';
+import { renderedOnChange } from './render-memo.js';
 import { assertNoManagedConflicts, type FileResult, type ManagedPathInfo, stageManagedFiles } from './tree.js';
 
 /**
@@ -33,16 +35,29 @@ export async function generateManagedFiles(
   );
 }
 
-/** Shared rendering boundary; stage only after every consumer formatter has succeeded. */
+/**
+ * Shared rendering boundary; stage only after every consumer formatter has succeeded. The render is a function of the
+ * context, the workspace's source listing and what it reads through the Tree, so it runs again only when one of those
+ * changed (`renderedOnChange`); staging always compares against the Tree as it is.
+ */
 export async function generateManagedFilesForContext(
   tree: Tree,
   context: ManagedFileContext,
   pathInfo?: ReadonlyMap<string, ManagedPathInfo>,
 ): Promise<FileResult[]> {
-  const files = [...renderManagedFiles(context), ...renderTypecheckTestFiles(tree)];
-  for (const file of files) {
-    if (file.content !== null) file.content = await formatManagedContent(tree.root, file.target, file.content);
-  }
+  const listing = treeSourceListing(tree);
+  const key = createHash('sha256')
+    .update(JSON.stringify(context))
+    .update('\0')
+    .update(listing.join('\0'))
+    .digest('hex');
+  const files = await renderedOnChange(tree, key, async (reading) => {
+    const rendered = [...renderManagedFiles(context), ...renderTypecheckTestFiles(reading, listing)];
+    for (const file of rendered) {
+      if (file.content !== null) file.content = await formatManagedContent(reading.root, file.target, file.content);
+    }
+    return rendered;
+  });
   const paths =
     pathInfo ??
     inspectManagedPaths(

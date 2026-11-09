@@ -1,21 +1,23 @@
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, posix, relative } from 'node:path';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { getProjects, parseJson, readJson, readProjectConfiguration } from 'nx/src/devkit-exports.js';
+import { globWithWorkspaceContextSync } from 'nx/src/utils/workspace-context.js';
 import typia from 'typia';
 import { editJsonText } from './managed-files/json-edit.js';
 import { formatJsonWithBiome, jsonFileText } from './managed-files/managed-format.js';
 import type { ManagedFile } from './managed-files/tree.js';
 import {
   includeGlobsFor,
-  listTypeScriptSources,
-  type ProjectTree,
+  SOURCE_LISTING_GLOBS,
   type TestProgram,
   type TestProgramFault,
   testProgramFault,
+  typeScriptSourcesByProject,
 } from './test-program.js';
 import { isRecord } from './type-guards.js';
 import type { NxPolicyIssue } from './workspace-config-policy.js';
+import { freshIndexedFiles } from './workspace-index.js';
 import { workspacePackagePatterns } from './workspace-manifest.js';
 
 export type TestRunner = 'bun' | 'vitest';
@@ -261,8 +263,13 @@ export function removeTsconfigTestReference(projectTsconfig: Record<string, unkn
  */
 export function checkTypecheckTestPolicyTree(tree: Tree): NxPolicyIssue[] {
   const issues: NxPolicyIssue[] = [];
+  const projects = getProjects(tree);
+  const sources = typeScriptSourcesByProject(
+    treeSourceListing(tree),
+    [...projects.values()].map((project) => project.root),
+  );
 
-  for (const [projectName, config] of getProjects(tree)) {
+  for (const [projectName, config] of projects) {
     const pkgPath = `${config.root}/package.json`;
     if (!tree.exists(pkgPath)) continue;
     if (config.root === '.' || config.root === '') continue;
@@ -289,7 +296,7 @@ export function checkTypecheckTestPolicyTree(tree: Tree): NxPolicyIssue[] {
     // Check tsconfig.test.json contents
     const tsconfigTest = readJson<Record<string, unknown>>(tree, tsconfigTestPath);
     issues.push(...checkTypecheckTestConfig(tsconfigTest, config.root));
-    const fault = testProgramFault(treeProgram(tree, config.root), tsconfigTest);
+    const fault = testProgramFault(treeProgram(tree, config.root, sources), tsconfigTest);
     if (fault !== null) {
       issues.push({ path: tsconfigTestPath, message: testProgramFaultMessage(config.root, testRunners, fault) });
     }
@@ -308,12 +315,18 @@ export function checkTypecheckTestPolicyTree(tree: Tree): NxPolicyIssue[] {
 /**
  * Render test typechecking policy from the caller's Tree. The managed generator
  * owns staging, permission checks, and flushing together with its other files.
+ * `listing` is {@link treeSourceListing} of the same Tree: the caller holds it, as the render's memo is keyed on it.
  */
-export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
+export function renderTypecheckTestFiles(tree: Tree, listing: readonly string[]): ManagedFile[] {
   const files: ManagedFile[] = [];
   const workspacePackages = collectWorkspacePackagesTree(tree);
+  const projects = getProjects(tree);
+  const sources = typeScriptSourcesByProject(
+    listing,
+    [...projects.values()].map((project) => project.root),
+  );
 
-  for (const [projectName, config] of getProjects(tree)) {
+  for (const [projectName, config] of projects) {
     const pkgPath = `${config.root}/package.json`;
     if (!tree.exists(pkgPath)) continue;
     if (config.root === '.' || config.root === '') continue;
@@ -341,7 +354,7 @@ export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
     // Collect reference paths
     const referencePaths = collectReferencePathsTree(tree, config.root, pkg, workspacePackages);
 
-    const program = treeProgram(tree, config.root);
+    const program = treeProgram(tree, config.root, sources);
     applyTypecheckTestDefaults(tsconfigTest, {
       testRunners,
       testExtends,
@@ -397,28 +410,34 @@ function renderTsconfig(tree: Tree, target: string, after: Record<string, unknow
   return { target, content: edited === current ? current : formatJsonWithBiome(path, edited) };
 }
 
-function treeProgram(tree: Tree, projectRoot: string): TestProgram {
+/**
+ * The files a Tree's source listing reads, workspace-relative and sorted: Nx's workspace file index for the Tree's
+ * root, with the Tree's pending edits over it, as devkit's own `getProjects` lists project files. The index applies
+ * .gitignore and .nxignore, so the listing is what the commit holds, the same in every checkout, and never build
+ * output one disk happens to carry; it is read from memory, so no directory is listed and no file probed. A path a
+ * pending edit writes is listed whatever its name: the listing passes over what is neither a source nor a manifest.
+ */
+export function treeSourceListing(tree: Tree): string[] {
+  const files = new Set(globWithWorkspaceContextSync(tree.root, SOURCE_LISTING_GLOBS));
+  for (const change of tree.listChanges()) {
+    if (change.type === 'DELETE') files.delete(change.path);
+    else files.add(change.path);
+  }
+  return [...files].sort();
+}
+
+function treeProgram(tree: Tree, projectRoot: string, sources: ReadonlyMap<string, readonly string[]>): TestProgram {
   return {
     projectRoot,
-    files: listTypeScriptSources(tree, projectRoot),
+    files: sources.get(projectRoot) ?? [],
     readConfig: (path) => (tree.exists(path) ? readJson<Record<string, unknown>>(tree, path) : null),
   };
 }
 
-function diskProgram(root: string, projectRoot: string): TestProgram {
-  const disk: ProjectTree = {
-    children: (directory) => readdirSync(join(root, directory)),
-    isFile: (path) => {
-      try {
-        return statSync(join(root, path)).isFile();
-      } catch {
-        return false;
-      }
-    },
-  };
+function diskProgram(root: string, projectRoot: string, sources: ReadonlyMap<string, readonly string[]>): TestProgram {
   return {
     projectRoot,
-    files: listTypeScriptSources(disk, projectRoot),
+    files: sources.get(projectRoot) ?? [],
     readConfig: (path) => readJsonObject(join(root, path)),
   };
 }
@@ -450,7 +469,13 @@ function testProgramFaultMessage(
 export function checkTypecheckTestPolicy(root: string): NxPolicyIssue[] {
   const issues: NxPolicyIssue[] = [];
   const workspaceNames = getWorkspacePackageNames(root);
-  for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
+  const packageJsonPaths = listWorkspacePackageJsonPaths(root);
+  // Files as they are on disk now, through the same ignore rules as the Tree listing.
+  const sources = typeScriptSourcesByProject(
+    freshIndexedFiles(root, SOURCE_LISTING_GLOBS),
+    packageJsonPaths.map((path) => relative(root, dirname(path))),
+  );
+  for (const packageJsonPath of packageJsonPaths) {
     const pkg = readJsonObject(packageJsonPath);
     if (!pkg) {
       continue;
@@ -483,7 +508,7 @@ export function checkTypecheckTestPolicy(root: string): NxPolicyIssue[] {
     if (tsconfig) {
       const absoluteIssues = checkTypecheckTestConfig(tsconfig, join(root, packagePath));
       issues.push(...absoluteIssues);
-      const program = diskProgram(root, packagePath);
+      const program = diskProgram(root, packagePath, sources);
       const fault = testProgramFault(program, tsconfig);
       if (fault !== null) {
         issues.push({ path: tsconfigTestPath, message: testProgramFaultMessage(packagePath, testRunners, fault) });

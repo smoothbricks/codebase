@@ -19,6 +19,7 @@ import {
   detectPackageTestRunners,
   removeTsconfigTestReference,
   renderTypecheckTestFiles,
+  treeSourceListing,
 } from './typecheck-test-policy.js';
 
 // ---------------------------------------------------------------------------
@@ -31,14 +32,14 @@ async function writeJsonFs(path: string, value: unknown): Promise<void> {
 }
 
 function applyTypecheckTestPolicyTree(tree: Tree): boolean {
-  const results = stageManagedFiles(tree, renderTypecheckTestFiles(tree));
+  const results = stageManagedFiles(tree, renderTypecheckTestFiles(tree, treeSourceListing(tree)));
   assertNoManagedConflicts(results);
   return results.some((result) => result.action === 'created' || result.action === 'updated');
 }
 
 function applyTypecheckTestPolicy(root: string): boolean {
   const tree = new FsTree(root, false);
-  const files = renderTypecheckTestFiles(tree);
+  const files = renderTypecheckTestFiles(tree, treeSourceListing(tree));
   const results = stageManagedFiles(
     tree,
     files,
@@ -1266,7 +1267,7 @@ describe('a test program that selects none of its tests', () => {
       await packageWithoutTests(root);
       const tree = new FsTree(root, false);
 
-      const results = stageManagedFiles(tree, renderTypecheckTestFiles(tree));
+      const results = stageManagedFiles(tree, renderTypecheckTestFiles(tree, treeSourceListing(tree)));
       const skipped = results.find((result) => result.target === 'packages/app/tsconfig.test.json');
 
       expect(skipped?.action).toBe('skipped');
@@ -1414,7 +1415,7 @@ describe('a test program that selects none of its tests', () => {
       });
 
       const tree = new FsTree(root, false);
-      const results = stageManagedFiles(tree, renderTypecheckTestFiles(tree));
+      const results = stageManagedFiles(tree, renderTypecheckTestFiles(tree, treeSourceListing(tree)));
 
       expect(results.find((result) => result.target === 'packages/app/tsconfig.json')?.action).toBe('updated');
       expect(results.find((result) => result.target === 'packages/app/tsconfig.test.json')?.action).toBe('skipped');

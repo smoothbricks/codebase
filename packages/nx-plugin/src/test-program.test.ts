@@ -1,11 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import {
-  includeGlobsFor,
-  listTypeScriptSources,
-  type ProjectTree,
-  type TestProgram,
-  testProgramFault,
-} from './test-program.js';
+import { includeGlobsFor, type TestProgram, testProgramFault, typeScriptSourcesByProject } from './test-program.js';
 
 type Configs = Record<string, Record<string, unknown>>;
 
@@ -223,22 +217,8 @@ describe('where a test program looks for tests', () => {
   });
 });
 
-/** An in-memory project listing: what `listTypeScriptSources` walks, built from the file paths it should contain. */
-function listing(files: string[]): ProjectTree {
-  const paths = new Set(files);
-  const children = new Map<string, Set<string>>();
-  for (const file of files) {
-    const parts = file.split('/');
-    for (let depth = 1; depth <= parts.length; depth++) {
-      const parent = parts.slice(0, depth - 1).join('/');
-      children.set(parent, (children.get(parent) ?? new Set()).add(parts[depth - 1] ?? ''));
-    }
-  }
-  return { children: (directory) => [...(children.get(directory) ?? [])], isFile: (path) => paths.has(path) };
-}
-
 describe('which sources belong to a project', () => {
-  const sources = (files: string[]) => listTypeScriptSources(listing(files), 'packages/app');
+  const sources = (files: string[]) => typeScriptSourcesByProject(files, ['packages/app']).get('packages/app') ?? [];
 
   it('lists the TypeScript the project holds, project-relative and sorted', () => {
     expect(
@@ -299,5 +279,39 @@ describe('which sources belong to a project', () => {
     expect(
       sources(['packages/app/package.json', 'packages/app/tsconfig.json', 'packages/app/scripts/a.test.ts']),
     ).toEqual(['scripts/a.test.ts']);
+  });
+
+  it('never lists what lies beneath a build-output or dot directory', () => {
+    expect(
+      sources([
+        'packages/app/src/a.ts',
+        'packages/app/dist/a.d.ts',
+        'packages/app/dist-test/a.test.ts',
+        'packages/app/target/x.ts',
+        'packages/app/src/.cache/y.ts',
+        'packages/app/node_modules/z/index.d.ts',
+      ]),
+    ).toEqual(['src/a.ts']);
+  });
+
+  it('answers every project from one listing, each with its own files and a nested one with its own', () => {
+    const byProject = typeScriptSourcesByProject(
+      [
+        'tooling/run.test.ts',
+        'packages/app/src/a.test.ts',
+        'packages/app/vendored/package.json',
+        'packages/app/vendored/x.test.ts',
+        'packages/lib/project.json',
+        'packages/lib/src/b.ts',
+      ],
+      ['tooling', 'packages/app', 'packages/app/vendored', 'packages/lib', 'packages/empty'],
+    );
+    expect([...byProject]).toEqual([
+      ['tooling', ['run.test.ts']],
+      ['packages/app', ['src/a.test.ts']],
+      ['packages/app/vendored', ['x.test.ts']],
+      ['packages/lib', ['src/b.ts']],
+      ['packages/empty', []],
+    ]);
   });
 });

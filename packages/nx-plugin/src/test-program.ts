@@ -1,5 +1,4 @@
 import { posix } from 'node:path';
-import type { Tree } from 'nx/src/devkit-exports.js';
 import { isNonSourceDirectory } from './source-directories.js';
 
 /**
@@ -19,9 +18,6 @@ export interface TestProgram {
   /** A tsconfig by workspace-relative path; null when the file is absent. */
   readonly readConfig: (path: string) => Record<string, unknown> | null;
 }
-
-/** A directory listing the walker can use: an Nx `Tree`, or the disk behind a small adapter. */
-export type ProjectTree = Pick<Tree, 'children' | 'isFile'>;
 
 /** Why a test program typechecks none of what it exists to typecheck. */
 export type TestProgramFault =
@@ -49,51 +45,50 @@ const PACKAGE_CONVENTION_ROOT = 'src';
 const TESTS_DIRECTORY = '__tests__';
 
 /**
- * The TypeScript sources of a project, project-relative and sorted.
+ * The files {@link typeScriptSourcesByProject} lists from: the TypeScript sources, and the manifests that make a
+ * directory a project of its own.
+ */
+export const SOURCE_LISTING_GLOBS = ['**/*.{ts,tsx,mts,cts}', '**/{package,project}.json'];
+
+/**
+ * The TypeScript sources of each of `projectRoots`, project-relative and sorted, from one listing of the workspace's
+ * files (workspace-relative; a file that is neither a source nor a manifest is passed over). One pass over the listing
+ * answers every project: no directory is listed and no file is probed.
  *
  * A directory below the project that is a project of its own (its own manifest or Nx project file) is not part of
  * this one: its files are its own tests, found by its own policy pass, and folding them in would count them twice.
  * A directory that merely carries a tsconfig is not that: in a monorepo of Bun programs such a file routes the
  * directory's files to the parent's program (a `tests/tsconfig.json` extending `../tsconfig.test.json`), and
- * nothing typechecks the directory but that program.
+ * nothing typechecks the directory but that program. Nothing beneath a build-output or dot directory is a source
+ * ({@link isNonSourceDirectory}).
  */
-export function listTypeScriptSources(tree: ProjectTree, projectRoot: string): string[] {
-  const files: string[] = [];
-  const walk = (directory: string): void => {
-    for (const name of childrenOf(tree, directory)) {
-      const path = posix.join(directory, name);
-      if (tree.isFile(path)) {
-        if (TYPESCRIPT_SOURCE.test(name)) files.push(posix.relative(projectRoot, path));
-      } else if (!isNonSourceDirectory(name) && !isNestedProject(tree, path)) {
-        walk(path);
-      }
-    }
-  };
-  walk(projectRoot);
-  return files.sort();
+export function typeScriptSourcesByProject(
+  files: Iterable<string>,
+  projectRoots: Iterable<string>,
+): ReadonlyMap<string, readonly string[]> {
+  const sources = new Map<string, string[]>();
+  for (const root of projectRoots) sources.set(root === '' ? '.' : root, []);
+  const owners = new Set(sources.keys());
+  const listed: string[] = [];
+  for (const file of files) {
+    const name = posix.basename(file);
+    if (PROJECT_FILE.test(name)) owners.add(posix.dirname(file));
+    if (TYPESCRIPT_SOURCE.test(name)) listed.push(file);
+  }
+  for (const file of listed) {
+    const owner = ownerOf(file, owners);
+    if (owner === null) continue;
+    sources.get(owner)?.push(owner === '.' ? file : file.slice(owner.length + 1));
+  }
+  for (const list of sources.values()) list.sort();
+  return sources;
 }
 
-/** A directory with its own manifest or Nx project file is a project, and its files are that project's. */
-function isNestedProject(tree: ProjectTree, directory: string): boolean {
-  return childrenOf(tree, directory).some(
-    (name) => PROJECT_FILE.test(name) && tree.isFile(posix.join(directory, name)),
-  );
-}
-
-/** A dangling link (a collected build out-link) is neither a file nor a directory; anything else is a real fault. */
-function childrenOf(tree: ProjectTree, directory: string): string[] {
-  try {
-    return tree.children(directory);
-  } catch (error) {
-    // ELOOP is a link cycle: there is nothing beneath it to list.
-    if (
-      error instanceof Error &&
-      'code' in error &&
-      (error.code === 'ENOENT' || error.code === 'ENOTDIR' || error.code === 'ELOOP')
-    ) {
-      return [];
-    }
-    throw error;
+/** The nearest directory holding a file that is a project, or null when a build-output or dot directory comes first. */
+function ownerOf(file: string, owners: ReadonlySet<string>): string | null {
+  for (let directory = posix.dirname(file); ; directory = posix.dirname(directory)) {
+    if (owners.has(directory)) return directory;
+    if (directory === '.' || isNonSourceDirectory(posix.basename(directory))) return null;
   }
 }
 

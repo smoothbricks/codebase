@@ -9,7 +9,7 @@ import { applyWorkspaceBoundedTestTargetPolicy } from '../bounded-test-policy.js
 import { managedAssetsRoot } from '../managed-assets.js';
 import { applyPackageTargetPolicy } from '../package-target-policy.js';
 import { applyReleaseConfigPolicy } from '../release-config-policy.js';
-import { renderTypecheckTestFiles } from '../typecheck-test-policy.js';
+import { renderTypecheckTestFiles, treeSourceListing } from '../typecheck-test-policy.js';
 import { applyWorkspaceConfigPolicy } from '../workspace-config-policy.js';
 import { biomeHookArguments, formatJsonWithBiome, jsonFileText, writeJsonFile } from './managed-format.js';
 import { inspectManagedPaths } from './paths.js';
@@ -249,7 +249,7 @@ describe('tsconfig.test.json the managed generator writes', () => {
       await writeFile(join(root, 'packages/app/src/app.test.ts'), 'export {};\n');
 
       const tree = new FsTree(root, false);
-      const files = renderTypecheckTestFiles(tree);
+      const files = renderTypecheckTestFiles(tree, treeSourceListing(tree));
       assertNoManagedConflicts(
         stageManagedFiles(
           tree,

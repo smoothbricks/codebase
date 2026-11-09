@@ -1,6 +1,6 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Tests assert literal credential and GitHub expressions. */
-import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { afterEach, describe, expect, it, spyOn } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readJson, type Tree, updateJson } from 'nx/src/devkit-exports.js';
@@ -10,6 +10,7 @@ import type { PackageJson } from '../workspace-manifest.js';
 import type { WorkspaceProjects } from './context.js';
 import { generateManagedFiles } from './generator.js';
 import { INLINE_LOCAL_BEGIN, INLINE_LOCAL_END, LOCAL_SECTION_MARKER } from './managed-content.js';
+import * as managedFormat from './managed-format.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
 import { assertNoManagedConflicts } from './tree.js';
 
@@ -239,5 +240,55 @@ describe('managed-files generator', () => {
     expect(second.listChanges()).toEqual([]);
     expect(results.every((result) => result.action === 'unchanged' || result.action === 'skipped')).toBe(true);
     expect(readFileSync(join(root, 'tooling/devenv'), 'utf8')).toBe(first.read('tooling/devenv', 'utf8') ?? '');
+  });
+
+  /** The workspace with a Bun-tested library holding one test, so the typecheck policy renders its program. */
+  function testedWorkspace(): Tree {
+    const tree = workspace();
+    updateJson<PackageJson>(tree, 'packages/library/package.json', (pkg) => ({
+      ...pkg,
+      scripts: { test: 'bun test' },
+    }));
+    tree.write('packages/library/src/answer.test.ts', 'export {};\n');
+    return tree;
+  }
+
+  it("finds a project's tests in Nx's file index, listing no directory", async () => {
+    const tree = testedWorkspace();
+    const children = spyOn(tree, 'children');
+    await generate(tree);
+    expect(children).not.toHaveBeenCalled();
+    expect(tree.read('packages/library/tsconfig.test.json', 'utf8')).toContain('src/**/*.test.ts');
+  });
+
+  it('renders again only when one of its inputs changed', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'smoo-generator-memo-'));
+    temporaryRoots.push(root);
+    flushChanges(root, testedWorkspace().listChanges());
+    const format = spyOn(managedFormat, 'formatManagedContent');
+    try {
+      const pass = async (): Promise<number> => {
+        const tree = new FsTree(root, false);
+        const before = format.mock.calls.length;
+        await generate(tree);
+        flushChanges(root, tree.listChanges());
+        return format.mock.calls.length - before;
+      };
+      // The first pass writes the files the second reads as they now are: both render.
+      expect(await pass()).toBeGreaterThan(0);
+      expect(await pass()).toBeGreaterThan(0);
+      // Nothing it reads changed: no render, and still nothing to stage.
+      expect(await pass()).toBe(0);
+      const unchanged = new FsTree(root, false);
+      await generate(unchanged);
+      expect(unchanged.listChanges()).toEqual([]);
+      // An input it read changed on disk: it renders again, and restores what the policy owns.
+      const program = join(root, 'packages/library/tsconfig.test.json');
+      writeFileSync(program, readFileSync(program, 'utf8').replace('"noEmit": true', '"noEmit": false'));
+      expect(await pass()).toBeGreaterThan(0);
+      expect(readFileSync(program, 'utf8')).toContain('"noEmit": true');
+    } finally {
+      format.mockRestore();
+    }
   });
 });

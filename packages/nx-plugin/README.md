@@ -2956,6 +2956,20 @@ The plugin owns the packaged templates, pure rendering and content-preservation 
 files through Nx `Tree` and uses Nx's resolved project graph for inferred targets. The CLI only supplies the filesystem
 and process boundary. There is no separate serialized change plan.
 
+A project's TypeScript sources, which decide its `tsconfig.test.json` include, come from Nx's workspace file index for
+the Tree's root (.gitignore and .nxignore applied) with the Tree's pending edits over it, as devkit's `getProjects`
+lists project files: one pass over that listing answers every project, so a render lists no directory and probes no
+file, and a gitignored build output never shapes a committed config. The render (policy, JSON edits, formatter runs) is
+a function of the derived context, that listing and what it reads through the Tree, and the generator keeps the last
+one: a later run whose context and listing are equal, and whose every read gives the same bytes, stages that render
+again rather than rendering. A Tree with pending edits is always rendered. Prettier and Biome read their own
+configuration from disk, so it is not part of that check; Prettier already holds it for the life of the process.
+
+The daemon runs a global sync generator on every graph computation and reports what it would change, but only `nx sync`
+writes it: a task run applies task sync generators alone. A managed file edited in a consuming repository is therefore
+drift every computation reports and nothing converges until `nx sync` reverts it. Change the packaged template instead,
+here.
+
 The idempotence witness compares the second pass's managed-target roster with the populated first pass before checking
 unchanged actions, an empty staged diff and retained bytes. An empty result is not evidence that generation inspected
 the managed files.
