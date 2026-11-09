@@ -2959,7 +2959,7 @@ index 1914a3eca8b47318a3aede3990836f5e757501ce..efc124fa0f23869852af305b5e77961a
          return this.inspector.inspectInputs(plansReference);
      }
 diff --git a/dist/src/hasher/native-task-hasher-impl.js b/dist/src/hasher/native-task-hasher-impl.js
-index 5812bc2b6c931a98193985115a15d3050e2d1020..92095397db52325e9de4278d7295882523d58e72 100644
+index 5812bc2b6c931a98193985115a15d3050e2d1020..ec4f0a1b2428936062ce2beb146ac92f27fc7054 100644
 --- a/dist/src/hasher/native-task-hasher-impl.js
 +++ b/dist/src/hasher/native-task-hasher-impl.js
 @@ -50,12 +50,13 @@ class NativeTaskHasherImpl {
@@ -2968,13 +2968,13 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..92095397db52325e9de4278d72958825
                  taskGraphFingerprint(taskGraph, ultracacheConfigurations)) {
 -            Object.assign(hashes, this.hasher.hashPlansFor(this.upfrontPlans.plans, unplanned, envs, resolvedCwd, shouldCollectInputs));
 +            const { plans } = this.upfrontPlans;
-+            Object.assign(hashes, nameHashFailure(unplanned, this.planner, taskGraph, () => this.hasher.hashPlansFor(plans, unplanned, envs, resolvedCwd, shouldCollectInputs)));
++            Object.assign(hashes, keyOwnTargetConfiguration(nameHashFailure(unplanned, this.planner, taskGraph, () => this.hasher.hashPlansFor(plans, unplanned, envs, resolvedCwd, shouldCollectInputs)), taskGraph, this.projectGraph));
              unplanned = unplanned.filter((id) => !(id in hashes));
          }
          if (unplanned.length > 0) {
              const plans = this.plan(unplanned, taskGraph, ultracacheConfigurations);
 -            Object.assign(hashes, this.hasher.hashPlans(plans, envs, resolvedCwd, shouldCollectInputs));
-+            Object.assign(hashes, nameHashFailure(unplanned, this.planner, taskGraph, () => this.hasher.hashPlans(plans, envs, resolvedCwd, shouldCollectInputs)));
++            Object.assign(hashes, keyOwnTargetConfiguration(nameHashFailure(unplanned, this.planner, taskGraph, () => this.hasher.hashPlans(plans, envs, resolvedCwd, shouldCollectInputs)), taskGraph, this.projectGraph));
          }
          return tasks.map((t) => hashes[t.id]);
      }
@@ -2993,14 +2993,89 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..92095397db52325e9de4278d72958825
          };
          const shouldCollectInputs = collectInputs ?? (0, task_io_service_1.getTaskIOService)().hasTaskInputSubscribers();
 -        return this.hasher.hashPlansUpfront(plans, perTaskEnvs, cwd ?? process.cwd(), shouldCollectInputs);
-+        return nameHashFailure(taskIds, this.planner, taskGraph, () => this.hasher.hashPlansUpfront(plans, perTaskEnvs, cwd ?? process.cwd(), shouldCollectInputs));
++        return keyOwnTargetConfiguration(nameHashFailure(taskIds, this.planner, taskGraph, () => this.hasher.hashPlansUpfront(plans, perTaskEnvs, cwd ?? process.cwd(), shouldCollectInputs)), taskGraph, this.projectGraph);
      }
  }
  exports.NativeTaskHasherImpl = NativeTaskHasherImpl;
-@@ -104,3 +106,60 @@ function taskGraphFingerprint(taskGraph, ultracacheConfigurations) {
+@@ -104,3 +106,135 @@ function taskGraphFingerprint(taskGraph, ultracacheConfigurations) {
      }
      return (0, native_1.hashArray)(parts);
  }
++const PROJECT_CONFIGURATION = ':ProjectConfiguration';
++/**
++ * The native `ProjectConfiguration` node (`hash_project_config.rs`) hashes the
++ * executor, outputs, options, configurations and parallelism of every target
++ * of a project, so an edit to one target re-keyed every task of that project
++ * and every task whose `^` inputs reach it. A task's key holds the
++ * configuration it runs: the node of the task's own project hashes the
++ * project's root, tags and named inputs and the task's own target; the node of
++ * a project its `^` inputs reach hashes that project's root, tags and named
++ * inputs, through which those inputs resolve. The task's value folds its
++ * details again, their values in key order, as the native hasher does.
++ * Upstream: https://github.com/nrwl/nx/issues/37802 and the pull request that
++ * fixes it; drop this once the installed Nx keys a task's own target only.
++ */
++function keyOwnTargetConfiguration(hashes, taskGraph, projectGraph) {
++    const configurations = new Map();
++    const configuration = (project, target) => {
++        const id = JSON.stringify([project, target]);
++        let hashed = configurations.get(id);
++        if (hashed === undefined) {
++            hashed = projectConfigurationHash(projectGraph, project, target);
++            configurations.set(id, hashed);
++        }
++        return hashed;
++    };
++    for (const [taskId, hashed] of Object.entries(hashes)) {
++        const task = taskGraph.tasks[taskId];
++        if (task === undefined) {
++            throw new Error(`Hashed task ${taskId} is not in the task graph it was hashed for`);
++        }
++        const keys = Object.keys(hashed.details).sort();
++        const details = {};
++        for (const key of keys) {
++            if (!key.endsWith(PROJECT_CONFIGURATION)) {
++                details[key] = hashed.details[key];
++                continue;
++            }
++            const project = key.slice(0, -PROJECT_CONFIGURATION.length);
++            details[key] = configuration(project, project === task.target.project ? task.target.target : null);
++        }
++        hashes[taskId] = {
++            ...hashed,
++            value: (0, native_1.hashArray)(keys.map((key) => details[key])),
++            details,
++        };
++    }
++    return hashes;
++}
++/** A project's root, tags and named inputs, and `target`'s executor, outputs, options, configurations and parallelism. */
++function projectConfigurationHash(projectGraph, project, target) {
++    const node = projectGraph.nodes[project];
++    if (node === undefined) {
++        throw new Error(`Could not find project '${project}'`);
++    }
++    const { root, tags, namedInputs, targets } = node.data;
++    let own = null;
++    if (target !== null) {
++        const configured = targets?.[target];
++        if (configured === undefined) {
++            throw new Error(`Project '${project}' has no target '${target}' to hash`);
++        }
++        own = [
++            target,
++            configured.executor ?? null,
++            configured.outputs ?? [],
++            configured.options ?? {},
++            configured.configurations ?? {},
++            configured.parallelism ?? null,
++        ];
++    }
++    const inputs = Object.keys(namedInputs ?? {})
++        .sort()
++        .map((name) => [name, namedInputs[name]]);
++    return (0, native_1.hashArray)([JSON.stringify([root, tags ?? [], inputs, own])]);
++}
 +/** A refusal names this many task ids and counts the rest, as cowshed's refusals do. */
 +const NAMED_TASKS = 10;
 +function namedTasks(ids) {

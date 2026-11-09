@@ -461,11 +461,13 @@ this repository once loaded it through one, and the land gate refused the graph)
 lock-scope node of the crates the target builds (`cargoClosure` carries it; a target that names neither gets the node of
 the directory it runs in). An entry naming only `cargo-lock:` nodes does not count as naming npm packages.
 
-No input declaration removes a project's own configuration from a task's key. Nx 24.0.3 adds `ProjectConfiguration` to
-every task (`hash_planner.rs` `gather_self_inputs`), and `hash_project_config.rs` hashes the executor, outputs, options,
-configurations and parallelism of every target in the project, plus its tags and named inputs (not `inputs`,
-`dependsOn`, `cache` or `//`). An edit to one target's command therefore re-keys every target of that project, including
-each inferred `cargo-test-*` runner. Only the project a target lives in decides that sensitivity.
+No input declaration removes a task's own target from its key. Nx 24.0.3 adds a `ProjectConfiguration` node to every
+task for its own project and for each project its `^` inputs reach (`hash_planner.rs` `gather_self_inputs`). The
+project-configuration hunk of `nx@24.0.3.patch` (`patches/README.md`) hashes that node for the task's own project from
+the project's root, tags and named inputs and the task's own target: its executor, outputs, options, configurations and
+parallelism (not `inputs`, `dependsOn`, `cache` or `//`). For a project the task's `^` inputs reach, the node hashes
+that project's root, tags and named inputs. An edit to one target's command re-keys that target's tasks. Its sibling
+targets, each inferred `cargo-test-*` runner among them, keep their keys unless they read the edited file.
 
 Workspace policy defaults non-production tasks to `["{projectRoot}/**/*", "!{projectRoot}/**/*.md"]`, without a forced
 CI workflow input. It migrates the old CI-only `sharedGlobals` reference out of `default` and never re-injects that

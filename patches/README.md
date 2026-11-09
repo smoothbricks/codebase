@@ -192,6 +192,43 @@ planner whose `getPlans` throws, and a native value that is not an `Error`. It a
 Nx, with and without the daemon, requiring the error to name the task and its runtime input. Drop the hunk, and keep the
 tests, once the installed Nx's hasher names the input it failed on.
 
+## A task keys its own target's configuration
+
+Nx 24.0.3's planner adds a `<project>:ProjectConfiguration` node to every task's key. It does so for the task's own
+project and for each project its `^` inputs reach (`hash_planner.rs` `gather_self_inputs`). `hash_project_config.rs`
+hashes the executor, outputs, options, configurations and parallelism of every target of that project, with its root,
+tags and named inputs. So an edit to one target re-keyed every task of the project and every task whose `^` inputs reach
+it. In a consumer workspace, changing only one maintenance target's command re-keyed a 437 s build of the same project
+and a generator beside it. Neither task reads that command, and both rebuilt byte-identical outputs.
+`specs/cowshed/03_caches.md` ("What a land re-runs") keys a cached task on the inputs it declares.
+
+`NativeTaskHasherImpl` (`hasher/native-task-hasher-impl.js`) replaces each such node after every native hash call
+(`hashPlans`, `hashPlansUpfront` and `hashPlansFor`):
+
+- **The task's own project** hashes its root, tags and named inputs and the task's own target's executor, outputs,
+  options, configurations and parallelism.
+- **A project its `^` inputs reach** hashes its root, tags and named inputs, through which those inputs resolve.
+
+Every other node keeps its native value. The task's value is `hashArray` of its details in key order, so every key
+changed once when the hunk landed. The hunk runs wherever hashing runs, in the daemon or in the client.
+
+No executor the workspaces run reads another target's configuration at run time, so no task's key names a sibling
+target:
+
+- `bounded-exec`, `all-verdicts`, `typescript-emit`, `scriptc-native`, `cargo-zigbuild`, `shard-timings` and
+  `wrangler-deploy` read their own options and their project's root.
+- `nx:run-commands` reads its own target's `continuous` and `ultracache`, and `nx:run-script` reads its project's root.
+- `nx:noop` and `@nx/js:verdaccio` read neither.
+
+A test that reads its own package's targets keys that `package.json` as a file.
+
+`packages/nx-plugin/src/nx-project-config-hash.test.ts` drives the installed class over native stand-ins, faked at their
+published methods. A sibling target's edit and a reached project's target keep the key. The task's own command,
+executor, outputs, configurations and parallelism, and its project's named inputs and tags, each re-key it, and all
+three native calls key alike. Upstream: [nrwl/nx#37802](https://github.com/nrwl/nx/issues/37802) and
+[nrwl/nx#37803](https://github.com/nrwl/nx/pull/37803), which plans the task's own target into the instruction. Drop the
+hunk, and keep the test, once the installed Nx keys a task's own target only.
+
 ## Cross-client task output ownership
 
 Clients of one checkout share a target's output tree and cache entry. Each target with declared outputs holds one
