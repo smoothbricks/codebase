@@ -37,8 +37,7 @@ use columine_vm::row_exprs::{
     RowPlan, StoredBinding, StoredRow, bind_row_columns,
 };
 use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, calculate_grown_state_size, calculate_state_size,
-    init_state,
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_grown_state_size, calculate_state_size, init_state,
 };
 use columine_vm::vm::{Vm, col_i64_exact, col_u32_exact, i64s_as_bytes, u32s_as_bytes};
 use common::memory::with_allocations;

@@ -10,9 +10,8 @@ use columine_types::types::{
 };
 use columine_vm::bytes;
 use columine_vm::state_init::{
-    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, ProgramInvalidCause,
-    SizingRefusal, calculate_grown_state_size, calculate_state_size, grow_state, init_state,
-    struct_field_offset,
+    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
+    calculate_grown_state_size, calculate_state_size, grow_state, init_state, struct_field_offset,
 };
 use columine_vm::temporal::TEMPORAL_MAGIC;
 use columine_vm::vm::{

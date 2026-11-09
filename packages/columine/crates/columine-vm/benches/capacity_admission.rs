@@ -19,8 +19,7 @@ use std::time::Instant;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{ErrorCode, Opcode, SlotType};
 use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, calculate_grown_state_size, calculate_state_size,
-    init_state,
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_grown_state_size, calculate_state_size, init_state,
 };
 use columine_vm::vm::{Vm, u32s_as_bytes};
 
