@@ -361,8 +361,12 @@ every time. A Git listing reads the checkout's own `.git/index` and that configu
 worktree's listing, or a Git this process's `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` or `GIT_COMMON_DIR` redirects,
 is listed every time. mbx resolves `settings get` from its environment, which the reading clears to `HOME`, and its
 global settings file, so the executable and that file are its inputs. A developer-link capture names its own inputs as
-it reads: every directory it lists, every tracked package's directory, the build link, and every directory a link's
-resolution passes through. The decisions are pure functions of identities and the time they were read, and a model of
+it reads: every directory it lists, every tracked package's directory, the build link, every directory a link's
+resolution passes through beneath the checkout, and outside it each path the resolution reaches and the directory
+holding each link it follows: a directory that is no link moves its own identity when it is replaced, so another
+checkout's mount point made or removed beside a build volume is no input (measured 2026-11-10: each one made every
+supervisor of the project capture its package trees again, 31-38k stat, lstat and getattrlist calls per admission on the
+a 40-package checkout). The decisions are pure functions of identities and the time they were read, and a model of
 coarse filesystem clocks (a Linux tick, an HFS+ second, stamps behind the clock by up to a tick, writes in place and by
 rename, creations and removals, a file created and removed inside one reading, between asks and during a reading that
 sees the checkout before or after it, readings longer than the settling time, and identities taken after the reading)

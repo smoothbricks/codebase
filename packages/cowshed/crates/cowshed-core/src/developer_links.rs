@@ -668,9 +668,11 @@ impl Reads {
     }
 
     /// What decides where `path` resolves: beneath `root`, every directory above each path the
-    /// resolution passes through; elsewhere, each such path and the directory holding it. A
-    /// replaced link changes the directory that holds it, and a resolution that comes to name
-    /// another directory changes the identity at its end.
+    /// resolution passes through; elsewhere, each such path and the directory holding each link it
+    /// follows. A replaced link changes the directory that holds it, and a resolution that comes to
+    /// name another directory changes the identity at its end. A directory that is no link is its
+    /// own input: replacing it moves its identity, so the entries beside it (another checkout's
+    /// mount point beside a build volume) are not inputs.
     fn resolution(&mut self, root: &Path, path: &Path) {
         if self.0.is_none() {
             return;
@@ -681,12 +683,16 @@ impl Reads {
                 self.within(root, &pending);
             } else {
                 self.path(&pending);
-                if let Some(parent) = pending.parent() {
-                    self.path(parent);
-                }
             }
             match first_link(root, &pending) {
-                Some(next) => pending = next,
+                Some((link, next)) => {
+                    if !link.starts_with(root)
+                        && let Some(holder) = link.parent()
+                    {
+                        self.path(holder);
+                    }
+                    pending = next;
+                }
                 None => return,
             }
         }
@@ -720,10 +726,10 @@ impl Reads {
 /// cycle.
 const MAX_RESOLUTION_LINKS: usize = 40;
 
-/// `path` with its first link replaced by that link's text, or `None` when no component is a
-/// link, or one cannot be read (the capture's own resolution reports it). Beneath `root` only the
-/// components below it are examined.
-fn first_link(root: &Path, path: &Path) -> Option<PathBuf> {
+/// The first link of `path` and `path` with that link replaced by its text, or `None` when no
+/// component is a link, or one cannot be read (the capture's own resolution reports it). Beneath
+/// `root` only the components below it are examined.
+fn first_link(root: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> {
     let (mut prefix, rest) = match path.strip_prefix(root) {
         Ok(rest) => (root.to_path_buf(), rest),
         Err(_) => (PathBuf::new(), path),
@@ -739,7 +745,7 @@ fn first_link(root: &Path, path: &Path) -> Option<PathBuf> {
             if !rest.as_os_str().is_empty() {
                 next.push(rest);
             }
-            return Some(next);
+            return Some((prefix, next));
         }
     }
     None
@@ -3165,5 +3171,78 @@ mod tests {
         let next = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
         assert!(!Arc::ptr_eq(&first, &next));
         assert_eq!(next.links.len(), 3);
+    }
+
+    /// `settled_checkout` linked to its build volume `volumes/own`, the directory every other
+    /// checkout of the project mounts its own volume in, all of it settled.
+    fn settled_linked_checkout(scratch: &Path) -> (PathBuf, PathBuf) {
+        let (root, _) = settled_checkout(scratch);
+        let volumes = scratch.join("volumes");
+        fs::create_dir_all(volumes.join("own")).unwrap();
+        fs::create_dir_all(root.join(".cowshed")).unwrap();
+        symlink(
+            volumes.join("own"),
+            root.join(crate::build_volume::BUILD_LINK),
+        )
+        .unwrap();
+        for settled in [
+            root.clone(),
+            root.join(".cowshed"),
+            volumes.join("own"),
+            volumes.clone(),
+        ] {
+            crate::input_memo::settle(&settled);
+        }
+        (root, volumes)
+    }
+
+    /// Another checkout's mount point made or removed beside this one's build volume is not
+    /// something the capture read: the kept snapshot stands. Each sibling fork or removal used to
+    /// make every supervisor of the project capture its package trees again, about 31-38k
+    /// stat/lstat/getattrlist calls per admission on a 40-package checkout (measured 2026-11-10).
+    #[test]
+    fn a_sibling_mount_point_keeps_the_kept_snapshot() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-sibling-volume");
+        let (root, volumes) = settled_linked_checkout(&scratch);
+        let first = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        let again = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "the kept snapshot");
+        let sibling = volumes.join("sibling");
+        fs::create_dir(&sibling).unwrap();
+        let mounted = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &mounted),
+            "a sibling's new mount point is no input"
+        );
+        fs::remove_dir(&sibling).unwrap();
+        let unmounted = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &unmounted),
+            "a sibling's removed mount point is no input"
+        );
+    }
+
+    /// A link outside the checkout that a developer link resolves through, replaced by one that
+    /// names the same directory in other words, moves only the directory holding it: that
+    /// directory is an input, so the next admission captures again.
+    #[test]
+    fn a_replaced_link_outside_the_checkout_captures_again() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-outside-link");
+        let (root, original) = settled_checkout(&scratch);
+        let alias = scratch.join("alias");
+        symlink(&original, &alias).unwrap();
+        let dev = root.join("node_modules/@scope/dev");
+        fs::remove_file(&dev).unwrap();
+        symlink(&alias, &dev).unwrap();
+        for settled in [scratch.to_path_buf(), root.join("node_modules/@scope")] {
+            crate::input_memo::settle(&settled);
+        }
+        let first = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        let again = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "the kept snapshot");
+        fs::remove_file(&alias).unwrap();
+        symlink("original", &alias).unwrap();
+        let next = DeveloperLinks::capture_kept(&root, fixture_stores(&root)).unwrap();
+        assert!(!Arc::ptr_eq(&first, &next), "the replaced link is an input");
     }
 }
