@@ -131,8 +131,7 @@ four Deferred Work items that the 01q spec removed (WasmTracer, string pooling, 
 - Rule: a build a test needs is its own cached Nx target and the test target `dependsOn` it; the test only loads cached
   bytes. A cold compile inside a test reads as a hung test and a compile error as a test red.
 - Code: `packages/lmao-ttsc/src/__tests__/bun-adapter.integration.test.ts` `beforeAll` runs `Bun.build` through the
-  `@ttsc/unplugin` adapter, and `trace-mode-cache.integration.test.ts` spawns `trace-mode-probe.ts`, which compiles
-  through the transform API. ttsc builds the linked plugin host from `plugin/driver` on first use ("building linked
+  `@ttsc/unplugin` adapter. ttsc builds the linked plugin host from `plugin/driver` on first use ("building linked
   plugin host … a cold Go cache can take several minutes"). `packages/lmao-ttsc/package.json` `test` depends only on
   `...` and `go-test`, which builds Go test binaries, not the ttsc plugin host.
 - Work: add a `ttsc-plugin` target to lmao-ttsc whose command prepares the linked plugin host into `TTSC_CACHE_DIR`

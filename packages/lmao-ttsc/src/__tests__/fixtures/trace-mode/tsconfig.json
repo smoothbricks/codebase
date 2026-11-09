@@ -1,6 +1,0 @@
-{
-  "//": "A one-file project, so each trace-mode compile of trace-mode-cache.integration.test.ts snapshots this directory alone.",
-  "extends": "../../../../tsconfig.test.json",
-  "include": [],
-  "files": ["entry.ts", "second.ts"]
-}
