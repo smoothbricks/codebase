@@ -1717,11 +1717,11 @@ async fn a_background_start_waits_for_the_reported_drop_and_a_gate_does_not() {
 
 /// The program `TestMbx` installs as the host's `mbx`, answering the verbs a supervisor runs. It
 /// starts with no `PATH`, so it runs shell builtins alone. A `reserve` appends what it does to
-/// `$HOME/mbx.log` and says it on `$HOME/events`, naming its own pid when it starts; it takes the
-/// pool's answer from `$HOME/answers`, a count of cores to grant or `refuse`, and once granted
-/// runs its command with the count in `MBX_RESERVE_CPUS`, as `mbx reserve` does (05_gateway.md,
-/// "Held jobs"). Every refusal it makes is named on its stderr, never a silent exit
-/// (08_testing.md, "Fixtures").
+/// `$HOME/mbx.log` and says it on `$HOME/events`, naming the class it reserves for (`--name`) and
+/// its own pid when it starts; it takes the pool's answer from `$HOME/answers`, a count of cores
+/// to grant or `refuse`, and once granted runs its command with the count in `MBX_RESERVE_CPUS`,
+/// as `mbx reserve` does (05_gateway.md, "Held jobs"). Every refusal it makes is named on its
+/// stderr, never a silent exit (08_testing.md, "Fixtures").
 const TEST_MBX: &str = r#"#!/bin/sh
 say() {
   printf '%s\n' "$*" >> "$HOME/mbx.log"
@@ -1739,10 +1739,12 @@ reserve) shift ;;
   exit 64
   ;;
 esac
+name=
 cpus=
 priority=
 while :; do
   case "$1" in
+  --name) name=$2; shift 2 ;;
   --cpus) cpus=$2; shift 2 ;;
   --priority) priority=$2; shift 2 ;;
   --) shift; break ;;
@@ -1752,7 +1754,7 @@ while :; do
     ;;
   esac
 done
-say "reserve cpus=$cpus priority=$priority scheduler=$MBX_SCHEDULER pid=$$"
+say "reserve name=$name cpus=$cpus priority=$priority scheduler=$MBX_SCHEDULER pid=$$"
 read -r answer < "$HOME/answers" || {
   printf 'mbx test double: no answer arrived on %s/answers\n' "$HOME" >&2
   exit 70
@@ -1921,10 +1923,11 @@ impl TestMbx {
         self.record(said, expected);
     }
 
-    /// Waits for the program's `reserve` of `cpus` cores at the background priority, unless `job`
-    /// ends first, and answers the pid it names: the `mbx` the supervisor started for the hold.
+    /// Waits for the program's `reserve` of `cpus` cores at the background priority for a held
+    /// exec of [`HELD_NAME`], unless `job` ends first, and answers the pid it names: the `mbx` the
+    /// supervisor started for the hold.
     async fn hear_reserve(&mut self, h: &Harness, job: JobId, cpus: usize) -> i32 {
-        let prefix = format!("reserve cpus={cpus} priority=low scheduler=1 pid=");
+        let prefix = format!("reserve name={HELD_NAME} cpus={cpus} priority=low scheduler=1 pid=");
         let said = self
             .next_unless_ended(h, job, &format!("{prefix}<pid>"))
             .await;
@@ -1975,6 +1978,10 @@ async fn queued_without_spawn(h: &mut Harness, jobs: &[JobId]) {
         "nothing spawns before its grant"
     );
 }
+
+/// The class a held exec of these tests names in mbx's pool, `cowshed:<repo>:<command class>`
+/// (05_gateway.md "Held jobs"): the fixture's repository and its request's `printf payload`.
+const HELD_NAME: &str = "cowshed:acme/widget:printf payload";
 
 /// An exec that declares a hold of `want` cores in a project with mbx: a held job (05_gateway.md
 /// "Held jobs", "Declaration"). A `want` alone declares none.

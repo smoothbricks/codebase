@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 59074993b7afa3f1a9b3501fe0efae29bc4cf45e4164fcf9e5b723a75e585d2a # shrinks to ops = [Request { checkout: 0, class: Gate, cpus: 1, held: false, predicted: None }, Request { checkout: 0, class: Gate, cpus: 1, held: false, predicted: None }, Request { checkout: 0, class: Gate, cpus: 1, held: false, predicted: None }, Request { checkout: 0, class: Gate, cpus: 1, held: true, predicted: None }, Request { checkout: 0, class: Background, cpus: 7, held: true, predicted: Some(242.0) }, Spawn(0), Request { checkout: 1, class: Background, cpus: 1, held: true, predicted: Some(1.0) }, Request { checkout: 0, class: Gate, cpus: 1, held: false, predicted: None }, Request { checkout: 0, class: Gate, cpus: 1, held: false, predicted: None }]

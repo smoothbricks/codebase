@@ -6565,8 +6565,9 @@ impl SupervisorActor {
 
     /// Start `job_id`'s hold of `cpus` at `priority` in the pool its own work enters
     /// (05_gateway.md "Held jobs"): the installed mbx under the job's sandbox home, with the
-    /// canonical mbx environment of the sandbox it was admitted under. A hold that cannot start is
-    /// refused at once.
+    /// canonical mbx environment of the sandbox it was admitted under, named by the job's
+    /// repository and command ([`super::host_hold::reservation_name`]). A hold that cannot start
+    /// is refused at once.
     fn reserve_hold(
         &mut self,
         job_id: JobId,
@@ -6581,7 +6582,8 @@ impl SupervisorActor {
             &sandbox.home,
             &sandbox.capabilities.contribution.env,
         );
-        match pool.reserve(job_id, cpus, priority, self.events.clone()) {
+        let name = super::host_hold::reservation_name(&pending.authority.repo_id, &pending.command);
+        match pool.reserve(job_id, &name, cpus, priority, self.events.clone()) {
             Ok(hold) => {
                 self.holds.insert(job_id, hold);
             }

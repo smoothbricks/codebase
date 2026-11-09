@@ -16,10 +16,12 @@
 //!   the reservation leaves over.
 //! - [`Rule::Moldable`] grants a request as many of its cpus as are free: greedy, on any free cpu
 //!   at once; otherwise once half of them are free, and on any free cpu once it has aged. Its
-//!   aging orders requests within their class only, so a higher class always goes first. No
-//!   request ever waits for the whole host.
+//!   aging orders requests within their class or priority only, so a higher one always goes
+//!   first. No request ever waits for the whole host.
 
 use std::cmp::Ordering;
+
+use serde::Deserialize;
 
 use crate::model::{Class, Secs};
 
@@ -28,6 +30,17 @@ use crate::model::{Class, Secs};
 pub(crate) enum Priority {
     Normal,
     Low,
+}
+
+/// What asked: mbx's observation kinds.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Kind {
+    Compile,
+    Link,
+    Reservation,
+    TestBinary,
+    NextestTest,
 }
 
 /// What a grant holds: cpus and memory bytes.
@@ -75,8 +88,11 @@ pub(crate) struct Request {
     pub(crate) since: Secs,
     /// Its estimated bottom level: the longest chain of work that waits on it.
     pub(crate) rank: Secs,
-    /// How long its holder is expected to hold the whole charge.
-    pub(crate) estimate: Secs,
+    /// How long mbx predicts its holder holds the whole charge: its name's history, or none for a
+    /// name mbx has not seen, which [`predictions`] orders by its kind's default.
+    pub(crate) predicted: Option<Secs>,
+    /// What asked, whose history gives an unseen request its default.
+    pub(crate) kind: Kind,
     pub(crate) charge: Charge,
 }
 
@@ -141,6 +157,10 @@ pub(crate) enum Order {
     Class,
     /// Class, then the highest bottom level, then arrival.
     ClassCriticalPath,
+    /// mbx's `admission_pass`: priority (`normal` first), then, among requests that have not aged,
+    /// the shortest prediction, then ticket. A request mbx has not seen takes its kind's default
+    /// ([`predictions`]). An aged request goes before every fresh one of its priority, oldest first.
+    ShortestPredicted,
 }
 
 /// The requests of `queue` that start now and what each holds, given the live grants and the
@@ -182,15 +202,50 @@ fn total(live: &[Lease]) -> Charge {
 
 /// The queue in priority order, each with whether it has aged.
 fn ordered(order: Order, aging: Option<Secs>, queue: &[Request], now: Secs) -> Vec<(bool, usize)> {
+    // Only the shortest-predicted order reads the predictions.
+    let predicted = match order {
+        Order::ShortestPredicted => predictions(queue),
+        Order::Fifo | Order::Class | Order::ClassCriticalPath => Vec::new(),
+    };
     let mut ordered: Vec<(bool, usize)> = queue
         .iter()
         .enumerate()
         .map(|(i, r)| (aged(aging, r, now), i))
         .collect();
-    ordered.sort_by(|&(a_aged, a), &(b_aged, b)| {
-        precedes(order, (a_aged, &queue[a]), (b_aged, &queue[b]))
-    });
+    ordered.sort_by(|&a, &b| precedes(order, queue, &predicted, a, b));
     ordered
+}
+
+/// What [`Order::ShortestPredicted`] orders each request of `queue` by: its prediction, or, for a
+/// request mbx has not seen, its kind's default. The default is the median of the predictions
+/// the queue's requests of that kind carry, the upper middle of an even count, as the pool's
+/// knowledge of that kind; with none, the request goes after every predicted one.
+pub(crate) fn predictions(queue: &[Request]) -> Vec<Secs> {
+    let mut defaults: Vec<(Kind, Secs)> = Vec::new();
+    queue
+        .iter()
+        .map(|request| {
+            request.predicted.unwrap_or_else(|| {
+                if let Some(&(_, default)) =
+                    defaults.iter().find(|&&(kind, _)| kind == request.kind)
+                {
+                    return default;
+                }
+                let mut known: Vec<Secs> = queue
+                    .iter()
+                    .filter(|other| other.kind == request.kind)
+                    .filter_map(|other| other.predicted)
+                    .collect();
+                known.sort_by(Secs::total_cmp);
+                let default = known
+                    .get(known.len() / 2)
+                    .copied()
+                    .unwrap_or(Secs::INFINITY);
+                defaults.push((request.kind, default));
+                default
+            })
+        })
+        .collect()
 }
 
 fn listed(list: List, queue: &[Request], live: &[Lease], cap: Charge, now: Secs) -> Vec<usize> {
@@ -254,7 +309,7 @@ fn easy_backfill(
             continue;
         }
         if let Some(shadow) = &mut reservation {
-            let ends_first = now + request.estimate <= shadow.at;
+            let ends_first = now + request.predicted.unwrap_or(Secs::INFINITY) <= shadow.at;
             let beside = request.charge.cpus <= shadow.extra.cpus
                 && request.charge.memory <= shadow.extra.memory;
             if !ends_first && !beside {
@@ -271,7 +326,7 @@ fn easy_backfill(
         used = used.plus(request.charge);
         leases.push(Lease {
             charge: request.charge,
-            ends: now + request.estimate,
+            ends: now + request.predicted.unwrap_or(Secs::INFINITY),
         });
     }
     grants
@@ -287,9 +342,11 @@ fn molded(
     let mut used = total(live);
     let mut grants = Vec::new();
     let mut order = ordered(moldable.order, Some(moldable.aging), queue, now);
-    // A stable sort by class keeps the aged-first order within each class.
-    if moldable.order != Order::Fifo {
-        order.sort_by(|&(_, a), &(_, b)| queue[a].class.cmp(&queue[b].class));
+    // A stable sort by class or priority keeps the aged-first order within each.
+    match moldable.order {
+        Order::Fifo => {}
+        Order::ShortestPredicted => order.sort_by_key(|&(_, i)| queue[i].priority),
+        Order::Class | Order::ClassCriticalPath => order.sort_by_key(|&(_, i)| queue[i].class),
     }
     for (is_aged, i) in order {
         let request = &queue[i];
@@ -331,29 +388,43 @@ fn molded(
     grants
 }
 
+/// Whether request `a` of `queue` goes before `b`, each with whether it has aged: aged first,
+/// oldest first, then the order, then ticket. `predicted` is [`predictions`] of the queue when
+/// the order is [`Order::ShortestPredicted`], and read by no other order.
 fn precedes(
     order: Order,
-    (a_aged, a): (bool, &Request),
-    (b_aged, b): (bool, &Request),
+    queue: &[Request],
+    predicted: &[Secs],
+    (a_aged, a): (bool, usize),
+    (b_aged, b): (bool, usize),
 ) -> Ordering {
+    let (first, second) = (&queue[a], &queue[b]);
     b_aged
         .cmp(&a_aged)
         .then_with(|| {
             if a_aged && b_aged {
-                a.since.total_cmp(&b.since)
+                first.since.total_cmp(&second.since)
             } else {
                 Ordering::Equal
             }
         })
         .then_with(|| match order {
             Order::Fifo => Ordering::Equal,
-            Order::Class => a.class.cmp(&b.class),
-            Order::ClassCriticalPath => a
+            Order::Class => first.class.cmp(&second.class),
+            Order::ClassCriticalPath => first
                 .class
-                .cmp(&b.class)
-                .then_with(|| b.rank.total_cmp(&a.rank)),
+                .cmp(&second.class)
+                .then_with(|| second.rank.total_cmp(&first.rank)),
+            // Both aged or both fresh here: aged ones go by arrival alone, as mbx orders them.
+            Order::ShortestPredicted => first.priority.cmp(&second.priority).then_with(|| {
+                if a_aged {
+                    Ordering::Equal
+                } else {
+                    predicted[a].total_cmp(&predicted[b])
+                }
+            }),
         })
-        .then_with(|| a.ticket.cmp(&b.ticket))
+        .then_with(|| first.ticket.cmp(&second.ticket))
 }
 
 /// mbx quantizes memory to 16 MiB in its passing rule.
@@ -566,7 +637,8 @@ mod tests {
             priority: Priority::Low,
             since: 0.0,
             rank: 0.0,
-            estimate: 5.0,
+            kind: Kind::Reservation,
+            predicted: Some(5.0),
             charge: Charge { cpus, memory: 0 },
         }
     }
@@ -698,7 +770,7 @@ mod tests {
             ends: 100.0,
         });
         let mut long = request(3, 1);
-        long.estimate = 50.0;
+        long.predicted = Some(50.0);
         let queue = [request(1, 17), request(2, 1), long];
         let easy = |aging| {
             Rule::Easy(Easy {

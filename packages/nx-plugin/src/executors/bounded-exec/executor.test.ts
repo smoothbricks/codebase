@@ -22,6 +22,7 @@ import {
   type BoundedExecResult,
   createProcessTreeKiller,
   type ProcessTreeKiller,
+  recordContext,
   resolveCowshedExecutable,
   runBoundedExec,
   type TempVolume,
@@ -2014,7 +2015,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         Array.from({ length: leaves }, () =>
           runBoundedExec(
             { command: 'stryker run --concurrency=6', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
-            workspace.context,
+            { ...workspace.context, leafClass: 'nx:@acme/widgets:app:test' },
             createProcessTreeKiller(),
             null,
           ),
@@ -2031,8 +2032,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       }
       expect(await readdir(workspace.root)).not.toContain('mbx-invoked');
       expect(endpoint.connections()).toBe(1);
-      expect(endpoint.reserves.map(({ cpus, priority }) => ({ cpus, priority }))).toEqual(
-        Array.from({ length: leaves }, () => ({ cpus: 6, priority: 'low' })),
+      // Each leaf names its Nx task's class, which keys mbx's run-time prediction of it.
+      expect(endpoint.reserves.map(({ cpus, priority, name }) => ({ cpus, priority, name }))).toEqual(
+        Array.from({ length: leaves }, () => ({ cpus: 6, priority: 'low', name: 'nx:@acme/widgets:app:test' })),
       );
       await endpoint.released(leaves);
       const byId = (left: number, right: number) => left - right;
@@ -2046,6 +2048,22 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
   });
 
+  it("names a task's reserved leaves by its workspace's package name and its Nx task id", async () => {
+    const workspace = await createWorkspace();
+    await workspace.write('package.json', JSON.stringify({ name: '@acme/widgets', private: true }));
+    const task = (configurationName?: string) =>
+      recordContext({
+        root: workspace.root,
+        projectName: 'app',
+        targetName: 'test',
+        ...(configurationName === undefined ? {} : { configurationName }),
+        taskGraph: { tasks: { 'app:test': {}, 'app:test:ci': {} } },
+      }).leafClass;
+    expect(task()).toBe('nx:@acme/widgets:app:test');
+    expect(task('ci')).toBe('nx:@acme/widgets:app:test:ci');
+    // Outside an Nx task a leaf names no class, and reserves as an unnamed request.
+    expect(recordContext({ root: workspace.root }).leafClass).toBeUndefined();
+  });
   it.each([
     [
       'its run published why its endpoint did not start',

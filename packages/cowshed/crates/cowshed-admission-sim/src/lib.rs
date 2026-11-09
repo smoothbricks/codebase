@@ -12,6 +12,8 @@
 #![cfg(test)]
 
 mod admit;
+mod bend_admission;
+mod bend_driver;
 mod engine;
 mod fixture;
 mod held;

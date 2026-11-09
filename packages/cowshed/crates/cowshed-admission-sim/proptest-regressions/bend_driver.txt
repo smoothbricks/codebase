@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c427db24ec28636544621bf899df52459dd8b23ea8effd7007514e9364576c69 # shrinks to cap = 3, acts = [Arrive { gate: false, want: 1, pred: 1 }, Arrive { gate: false, want: 1, pred: 1 }, Arrive { gate: false, want: 1, pred: 1 }, Finish(0), Arrive { gate: false, want: 1, pred: 391 }, Arrive { gate: false, want: 1, pred: 1 }, Arrive { gate: false, want: 1, pred: 1 }, Arrive { gate: false, want: 1, pred: 1 }, Tick(11), Tick(19), Decide]

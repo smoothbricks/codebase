@@ -15,7 +15,7 @@ use cowshed_core::api::dto::JobId;
 use cowshed_core::runtime::job_admission::{Admission, Effect, Event, Reading};
 use cowshed_gateway_types::host_status::{DarwinPressureLevel, MemoryPressure};
 
-use crate::admit::{Charge, Grant, Lease, Priority, Request, Rule, admit};
+use crate::admit::{Charge, Grant, Kind, Lease, Priority, Request, Rule, admit};
 use crate::model::{Class, JobIx, Runner, Secs, TaskIx, Workload, list_span};
 use crate::policy::{CpuLedger, Leaf, MemoryCharge, Policy, Threads};
 use crate::random::Rng;
@@ -621,9 +621,17 @@ impl<'a> Sim<'a> {
 
     fn ask(&mut self, owner: Owner, t: TaskIx, threads: u32, charge: Charge) {
         let class = self.class(t);
-        let estimate = match owner {
-            Owner::Leaf(t) => self.estimate(t, threads),
-            Owner::Process(id) => self.units[&id].work,
+        // The kind is what mbx would record each ask as: a leaf's reservation, or the process.
+        let (kind, predicted) = match owner {
+            Owner::Leaf(t) => (Kind::Reservation, self.estimate(t, threads)),
+            Owner::Process(id) => (
+                match self.w.tasks[t.0].runner {
+                    Runner::Cargo => Kind::Compile,
+                    Runner::Nextest => Kind::NextestTest,
+                    Runner::Workers | Runner::Process | Runner::Restore => Kind::TestBinary,
+                },
+                self.units[&id].work,
+            ),
         };
         self.tickets += 1;
         self.queue.push(Pending {
@@ -639,7 +647,8 @@ impl<'a> Sim<'a> {
                 },
                 since: self.now,
                 rank: self.w.bottom(t),
-                estimate,
+                predicted: Some(predicted),
+                kind,
                 charge,
             },
             fit_since: None,

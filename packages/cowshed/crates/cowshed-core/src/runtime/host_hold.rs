@@ -20,9 +20,10 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 use tokio::sync::{mpsc, oneshot};
 
 use super::job_admission::PoolPriority;
-use super::supervisor::ProcessEvent;
+use super::supervisor::{ProcessEvent, SpawnCommand};
 use crate::api::dto::JobId;
 use crate::capabilities::EnvAction;
+use crate::repository::RepoId;
 use crate::storage::job_artifact::StreamKind;
 
 /// The held command: it prints the count mbx granted it (`MBX_RESERVE_CPUS`, at most `--cpus`,
@@ -87,13 +88,14 @@ impl Pool {
         command
     }
 
-    /// Start `job`'s hold of at most `cpus` at `priority`: `mbx reserve` in a process group of
-    /// its own, its held command's stdin a pipe whose write end the returned hold alone keeps and
-    /// its stdout the grant. The count granted, or why none was, reaches the supervisor on
-    /// `events`.
+    /// Start `job`'s hold of at most `cpus` at `priority` under the class `name`
+    /// ([`reservation_name`]): `mbx reserve` in a process group of its own, its held command's
+    /// stdin a pipe whose write end the returned hold alone keeps and its stdout the grant. The
+    /// count granted, or why none was, reaches the supervisor on `events`.
     pub fn reserve(
         &self,
         job: JobId,
+        name: &str,
         cpus: NonZeroUsize,
         priority: PoolPriority,
         events: mpsc::Sender<ProcessEvent>,
@@ -105,6 +107,8 @@ impl Pool {
         command
             .args([
                 "reserve",
+                "--name",
+                name,
                 "--cpus",
                 &cpus.to_string(),
                 "--priority",
@@ -146,6 +150,43 @@ impl Pool {
             _release: release,
         })
     }
+}
+
+/// The class a held job names in mbx's pool (`mbx reserve --name`), by which mbx keys its
+/// run-time predictions and its observation and decision rows: `cowshed:<repo>:<command class>`,
+/// so every checkout of a repository shares one history per command.
+pub fn reservation_name(repo: &RepoId, command: &SpawnCommand) -> String {
+    format!("cowshed:{}:{}", repo.as_str(), command_class(command))
+}
+
+/// A command's class: its program's basename, then the words after it that name subcommands, at
+/// most two, ending at the first that names none: one that starts with `-` or holds whitespace or
+/// `/`, an option, a path or shell text. So `bun nx run-many -t test` is `bun nx run-many`,
+/// `cargo nextest run -p x` is `cargo nextest run` and `sh -c 'script'` is `sh`. A script is
+/// shell text the exec host's shell runs, as `sh -c` runs its argument, so its class is `sh`.
+fn command_class(command: &SpawnCommand) -> String {
+    let argv = match command {
+        SpawnCommand::Argv(argv) => argv,
+        SpawnCommand::Script(_) => return "sh".to_owned(),
+    };
+    let mut words = argv.iter();
+    let program = words.next().map(|program| {
+        Path::new(program)
+            .file_name()
+            .unwrap_or(program.as_os_str())
+            .to_string_lossy()
+    });
+    let subcommands = words
+        .map(|word| word.to_string_lossy())
+        .take_while(|word| {
+            !word.starts_with('-') && !word.contains(|c: char| c.is_whitespace() || c == '/')
+        })
+        .take(2);
+    program
+        .into_iter()
+        .chain(subcommands)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// What one hold's watch owns.
@@ -509,5 +550,44 @@ mod tests {
                 "{line:?}"
             );
         }
+    }
+
+    /// A held job's class is its program's basename and the subcommand words after it, at most
+    /// two, up to the first option, path or shell text; a script's is `sh`'s. Its name in the
+    /// pool leads with cowshed and the job's repository.
+    #[test]
+    fn a_hold_is_named_by_its_repository_and_command_class() {
+        let argv = |words: &[&str]| SpawnCommand::Argv(words.iter().map(OsString::from).collect());
+        let cases: &[(&[&str], &str)] = &[
+            (&["bun", "nx", "run-many", "-t", "test"], "bun nx run-many"),
+            (
+                &["cargo", "nextest", "run", "-p", "cowshed-core"],
+                "cargo nextest run",
+            ),
+            (&["sh", "-c", "cargo build && cargo test"], "sh"),
+            (&["sh", "-c", "true"], "sh"),
+            (&["bun", "nx", "run", "cowshed-core:test"], "bun nx run"),
+            (
+                &["/opt/homebrew/bin/cargo", "build", "--release"],
+                "cargo build",
+            ),
+            (&["cargo", "-q", "build"], "cargo"),
+            (&["./scripts/check.sh", "src/lib.rs"], "check.sh"),
+            (&["make", "all\tquick", "install"], "make"),
+            (&["git"], "git"),
+        ];
+        for &(words, class) in cases {
+            assert_eq!(command_class(&argv(words)), class, "{words:?}");
+        }
+        let script = SpawnCommand::Script(crate::script::RenderedScript {
+            text: "cargo nextest run -p cowshed-core".to_owned(),
+            bindings: Vec::new(),
+        });
+        assert_eq!(command_class(&script), "sh");
+        let repo = RepoId::parse("acme/widget").expect("a repository id");
+        assert_eq!(
+            reservation_name(&repo, &argv(&["cargo", "nextest", "run", "-p", "x"])),
+            "cowshed:acme/widget:cargo nextest run"
+        );
     }
 }

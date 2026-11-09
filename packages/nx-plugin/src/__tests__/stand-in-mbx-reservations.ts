@@ -7,7 +7,7 @@ import { ownedSocketDirectory } from '../testing.js';
 
 /** A line a client writes to `mbx reservations` (mbx's docs/scheduling.md, "Serve reservations to many commands"). */
 type HeardLine =
-  | { type: 'reserve'; id: number; cpus: number; priority: 'normal' | 'low' }
+  | { type: 'reserve'; id: number; cpus: number; priority: 'normal' | 'low'; name?: string }
   | { type: 'release'; id: number };
 
 const parseLine = typia.json.createAssertParse<HeardLine>();
@@ -17,6 +17,8 @@ export interface HeardReserve {
   readonly id: number;
   readonly cpus: number;
   readonly priority: 'normal' | 'low';
+  /** The class the reserve names, which keys mbx's run-time predictions; null for a reserve that names none. */
+  readonly name: string | null;
   readonly connection: number;
 }
 
@@ -70,7 +72,7 @@ export async function standInReservations(
           for (const wait of waiting.filter((wait) => releases.length >= wait.count)) wait.heard();
           continue;
         }
-        const heard = { id: line.id, cpus: line.cpus, priority: line.priority, connection };
+        const heard = { id: line.id, cpus: line.cpus, priority: line.priority, name: line.name ?? null, connection };
         reserves.push(heard);
         const said = answer(heard);
         if (said === null) continue;

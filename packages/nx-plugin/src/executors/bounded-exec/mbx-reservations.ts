@@ -191,7 +191,7 @@ type Uint = number & tags.Type<'uint32'>;
 
 /** The lines a client writes (mbx's `docs/scheduling.md`, "Serve reservations to many commands"). */
 type ReservationRequest =
-  | { type: 'reserve'; id: Uint; cpus: Uint & tags.Minimum<1>; priority: 'normal' | 'low' }
+  | { type: 'reserve'; id: Uint; cpus: Uint & tags.Minimum<1>; priority: 'normal' | 'low'; name?: string }
   | { type: 'release'; id: Uint };
 
 /** The lines the endpoint answers; an added field is mbx's to add. */
@@ -232,7 +232,7 @@ class Connection {
     this.#socket.on('close', () => this.#close(`mbx reservation endpoint ${this.endpoint} closed the connection`));
   }
 
-  reserve(cpus: number, priority: 'normal' | 'low'): Reservation {
+  reserve(cpus: number, priority: 'normal' | 'low', name: string | undefined): Reservation {
     if (this.#closed !== null) {
       return { granted: Promise.resolve({ ok: false, error: this.#closed }), release() {} };
     }
@@ -241,7 +241,7 @@ class Connection {
     const granted = new Promise<Granted>((resolve) => (answer = resolve));
     this.#entries.set(id, { kind: 'waiting', answer });
     this.#socket.ref();
-    this.#socket.write(`${stringifyRequest({ type: 'reserve', id, cpus, priority })}\n`);
+    this.#socket.write(`${stringifyRequest({ type: 'reserve', id, cpus, priority, name })}\n`);
     let released = false;
     return {
       granted,
@@ -315,9 +315,11 @@ const connections = new Map<string, Connection>();
 
 /**
  * Ask the endpoint at `socket` for at most `cpus` cores at `priority`, over this process's one connection to it,
- * opened by its first request and kept while another one may come.
+ * opened by its first request and kept while another one may come. `name` is the leaf's class (`leafClass` in
+ * executor.ts), by which mbx keys its run-time predictions and its observation and decision rows; a request that
+ * names none is mbx's unnamed reservation.
  */
-export function reserveCores(socket: string, cpus: number, priority: 'normal' | 'low'): Reservation {
+export function reserveCores(socket: string, cpus: number, priority: 'normal' | 'low', name?: string): Reservation {
   let connection = connections.get(socket);
   if (connection === undefined) {
     const opened: Connection = new Connection(socket, () => {
@@ -326,5 +328,5 @@ export function reserveCores(socket: string, cpus: number, priority: 'normal' | 
     connections.set(socket, opened);
     connection = opened;
   }
-  return connection.reserve(cpus, priority);
+  return connection.reserve(cpus, priority, name);
 }

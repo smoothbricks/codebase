@@ -83,14 +83,14 @@ pub(crate) const AGING: Secs = 30.0;
 /// process and a lease handoff.
 pub(crate) const MBX_GRANT: Secs = 0.02;
 
-/// The pool rule this simulation recommends for mbx: priority order (a gate's work first), first
-/// come first served within a priority with the aging bound, and a moldable grant of whatever is
-/// free up to the request, so a wide request never waits for the whole pool and no request waits
-/// while a cpu it could use is free.
-/// moldable grant of whatever is free up to the request, so a wide request never waits for the
-/// whole pool and no request waits while a cpu it could use is free.
+/// The pool rule this simulation recommends for mbx, mbx's `admission_pass`: priority order (a
+/// gate's work first), then within a priority the shortest predicted request first, with the
+/// aging bound: a request that has waited it goes before every fresher one of its priority,
+/// oldest first, and holds them while it cannot start. A moldable grant of whatever is free up to
+/// the request, so a wide request never waits for the whole pool and no request waits while a
+/// cpu it could use is free.
 pub(crate) const POOL_RULE: Rule = Rule::Moldable(Moldable {
-    order: Order::Class,
+    order: Order::ShortestPredicted,
     aging: AGING,
     greedy: true,
 });

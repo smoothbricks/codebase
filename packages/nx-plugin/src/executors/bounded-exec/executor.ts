@@ -1,5 +1,5 @@
 import { type ChildProcess, type IOType, spawn } from 'node:child_process';
-import { accessSync, constants } from 'node:fs';
+import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { availableParallelism, constants as osConstants, userInfo } from 'node:os';
 import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path';
@@ -110,6 +110,12 @@ export interface BoundedExecContext {
   root: string;
   /** The Nx task this run executes as, and the directory its verdict and report go to. */
   record?: { task: BoundedExecTask; directory: string };
+  /**
+   * The class this task's reserved leaves name on their run's mbx endpoint, by which mbx keys its run-time predictions
+   * of them: `nx:<workspace>:<task id>`, the workspace named by its root package.json. Absent outside an Nx task, or in
+   * a workspace whose package.json names none: its leaves then reserve unnamed.
+   */
+  leafClass?: string;
   /** Owns child stdout when present; otherwise it is retained and forwarded normally. */
   stdout?: (chunk: string) => void;
 }
@@ -264,7 +270,8 @@ export function runBoundedExecWith(
 
 /**
  * Nx gives an executor the task's project, target and configuration, not its id; the id is the
- * key of the task graph entry they name. Outside a task graph the run records nothing.
+ * key of the task graph entry they name. Outside a task graph the run records nothing and its
+ * reserved leaves name no class.
  */
 export function recordContext(context: NxTaskContext): BoundedExecContext {
   const { root, projectName, targetName, configurationName, taskGraph } = context;
@@ -276,13 +283,25 @@ export function recordContext(context: NxTaskContext): BoundedExecContext {
   if (task === undefined) {
     return { root };
   }
+  const workspace = workspaceName(root);
   return {
     root,
     record: {
       task: { id, hash: task.hash ?? null },
       directory: taskDirectory(workspaceDataDirectoryForWorkspace(root), id),
     },
+    ...(workspace === undefined ? {} : { leafClass: `nx:${workspace}:${id}` }),
   };
+}
+
+/** The workspace's name: its root package.json's `name`, which every checkout of the repository shares. */
+function workspaceName(root: string): string | undefined {
+  const path = join(root, 'package.json');
+  if (!existsSync(path)) return undefined;
+  const manifest: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  return typeof manifest === 'object' && manifest !== null && 'name' in manifest && typeof manifest.name === 'string'
+    ? manifest.name
+    : undefined;
 }
 
 /**
@@ -1338,7 +1357,7 @@ async function runCommand(
         }
         queue.waiting();
         tell(`cowshed: mbx reserve wait start cpus=${cpus} priority=${reservedLeaf.priority}\n`);
-        const held = reserveCores(endpoint, cpus, reservedLeaf.priority);
+        const held = reserveCores(endpoint, cpus, reservedLeaf.priority, context.leafClass);
         reservation = held;
         void held.granted.then((granted) => {
           if (!granted.ok) {

@@ -1,7 +1,9 @@
 //! Held jobs against mbx's pool as it admits (05_gateway.md "Held jobs", "Admission"): several
 //! checkouts' real `job_admission` state machines reserve from one pool that grants by
 //! [`POOL_RULE`], the rule the pinned mbx implements. A grant is moldable: a hold may start on
-//! fewer cores than it asked for, and its job then runs on what it holds.
+//! fewer cores than it asked for, and its job then runs on what it holds. Within a priority the
+//! pool grants the shortest predicted hold first, and a hold that has waited the aging bound
+//! before every fresher one, oldest first.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -11,9 +13,9 @@ use cowshed_core::api::dto::{ExecClass, JobId};
 use cowshed_core::runtime::job_admission::{Admission, Effect, Event, Ledger, Phase, PoolPriority};
 use proptest::prelude::*;
 
-use crate::admit::{self, Charge, Lease, Priority, Request};
+use crate::admit::{self, Charge, Kind, Lease, Priority, Request};
 use crate::model::{Class, Secs};
-use crate::policy::POOL_RULE;
+use crate::policy::{AGING, POOL_RULE};
 
 const CHECKOUTS: usize = 4;
 const CORES: u32 = 8;
@@ -35,6 +37,8 @@ fn id(value: u64) -> JobId {
 struct Job {
     class: ExecClass,
     hold: Option<NonZeroUsize>,
+    /// What mbx predicts its hold lasts: none for a job it has not seen.
+    predicted: Option<Secs>,
 }
 
 /// mbx's pool: the holds waiting in ticket order, and what each granted one holds.
@@ -46,8 +50,15 @@ struct Pool {
 }
 
 impl Pool {
-    /// A hold enters at its job's pool priority: mbx knows nothing of a job but its priority.
-    fn enter(&mut self, holder: Holder, cpus: NonZeroUsize, priority: PoolPriority, now: Secs) {
+    /// A hold enters at its job's pool priority and prediction: mbx knows nothing else of a job.
+    fn enter(
+        &mut self,
+        holder: Holder,
+        cpus: NonZeroUsize,
+        priority: PoolPriority,
+        predicted: Option<Secs>,
+        now: Secs,
+    ) {
         self.tickets += 1;
         let (class, priority) = match priority {
             PoolPriority::Normal => (Class::Gate, Priority::Normal),
@@ -62,7 +73,8 @@ impl Pool {
                 priority,
                 since: now,
                 rank: 0.0,
-                estimate: 0.0,
+                kind: Kind::Reservation,
+                predicted,
                 charge: Charge { cpus, memory: 0 },
             },
         ));
@@ -106,6 +118,8 @@ enum Op {
         class: ExecClass,
         cpus: u32,
         held: bool,
+        /// What mbx predicts the job's hold lasts.
+        predicted: Option<Secs>,
     },
     /// One pass of the pool rule.
     Grant,
@@ -159,7 +173,8 @@ impl World {
                         Some(cpus),
                         "{holder:?} reserved what it did not declare"
                     );
-                    self.pool.enter(holder, cpus, priority, self.now);
+                    let predicted = self.jobs[&holder].predicted;
+                    self.pool.enter(holder, cpus, priority, predicted, self.now);
                 }
                 Effect::Release { job } => {
                     let holder = (checkout, job);
@@ -208,6 +223,7 @@ impl World {
                 class,
                 cpus,
                 held,
+                predicted,
             } => {
                 self.minted += 1;
                 let job = id(self.minted);
@@ -215,12 +231,23 @@ impl World {
                     NonZeroUsize::new(usize::try_from(cpus).expect("a count fits usize"))
                         .expect("a positive count")
                 });
-                self.jobs.insert((checkout, job), Job { class, hold });
+                self.jobs.insert(
+                    (checkout, job),
+                    Job {
+                        class,
+                        hold,
+                        predicted,
+                    },
+                );
                 let ledger = Ledger::Mbx { hold };
                 self.step(checkout, Event::Requested { job, class, ledger });
             }
             Op::Grant => {
+                let seen = self.pool.queue.clone();
+                let requests: Vec<Request> = seen.iter().map(|&(_, request)| request).collect();
+                let predicted = admit::predictions(&requests);
                 let started = self.pool.admit(self.now);
+                self.check_order(&seen, &predicted, &started);
                 let low_started = started.iter().any(|&(holder, _)| {
                     self.jobs
                         .get(&holder)
@@ -268,6 +295,46 @@ impl World {
             }
         }
         self.check();
+    }
+
+    /// One pass's order within each priority, against the queue it saw and the predictions it
+    /// ordered by: no fresh hold is granted while a fresh hold of its priority predicted shorter,
+    /// or as short and asked before it, still waits; and once a hold has waited the aging bound,
+    /// nothing that asked after it in its priority is granted while it waits.
+    fn check_order(
+        &self,
+        seen: &[(Holder, Request)],
+        predicted: &[Secs],
+        started: &[(Holder, Charge)],
+    ) {
+        let aged = |request: &Request| admit::aged(Some(AGING), request, self.now);
+        let granted = |holder: Holder| started.iter().any(|&(started, _)| started == holder);
+        for (g, &(holder, request)) in seen.iter().enumerate() {
+            if !granted(holder) {
+                continue;
+            }
+            for (w, &(waiter, waits)) in seen.iter().enumerate() {
+                if granted(waiter) || waits.priority != request.priority {
+                    continue;
+                }
+                if aged(&waits) {
+                    assert!(
+                        waits.ticket > request.ticket,
+                        "{holder:?} was granted while {waiter:?}, aged and asked before it, waited"
+                    );
+                } else if !aged(&request) {
+                    assert!(
+                        predicted[w]
+                            .total_cmp(&predicted[g])
+                            .then(waits.ticket.cmp(&request.ticket))
+                            .is_gt(),
+                        "{holder:?}, predicted {} s, was granted while {waiter:?}, predicted {} s, waited",
+                        predicted[g],
+                        predicted[w]
+                    );
+                }
+            }
+        }
     }
 
     /// What holds between happenings: the grants fit the pool; each admitted held job holds a
@@ -385,6 +452,7 @@ impl World {
             class: ExecClass::Background,
             cpus: CORES,
             held: true,
+            predicted: None,
         });
         self.apply(Op::Grant);
         let holder = (0, id(self.minted));
@@ -406,9 +474,20 @@ fn class() -> impl Strategy<Value = ExecClass> {
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        4 => (0..CHECKOUTS, class(), 1..=CORES, prop::bool::weighted(0.8)).prop_map(
-            |(checkout, class, cpus, held)| Op::Request { checkout, class, cpus, held }
-        ),
+        4 => (
+            0..CHECKOUTS,
+            class(),
+            1..=CORES,
+            prop::bool::weighted(0.8),
+            prop::option::weighted(0.8, 1..=600_u32),
+        )
+            .prop_map(|(checkout, class, cpus, held, predicted)| Op::Request {
+                checkout,
+                class,
+                cpus,
+                held,
+                predicted: predicted.map(f64::from),
+            }),
         4 => Just(Op::Grant),
         1 => any::<usize>().prop_map(Op::Refuse),
         2 => any::<usize>().prop_map(Op::Spawn),
@@ -422,8 +501,9 @@ proptest! {
 
     /// Random requests, pool passes, refusals, spawns, cancels and ends from four checkouts keep
     /// every grant within the pool and within what its job asked for; start no background hold
-    /// while a gate's hold waits; grant every hold once the holds ahead of it end; and leave
-    /// every grant released and the whole pool grantable again.
+    /// while a gate's hold waits; within a priority, grant fresh holds shortest predicted first
+    /// and nothing younger while an aged hold waits; grant every hold once the holds ahead of it
+    /// end; and leave every grant released and the whole pool grantable again.
     #[test]
     fn held_jobs_across_checkouts_keep_the_pool_contract(ops in prop::collection::vec(op(), 1..96)) {
         let mut world = World::new();
@@ -433,4 +513,37 @@ proptest! {
         world.drain();
         world.reuse();
     }
+}
+
+/// One core is free and two `low` holds wait, the older predicted 300 s and the younger 5 s: the
+/// younger goes first. Once the older has waited the aging bound, it goes before a fresh 5 s hold.
+#[test]
+fn a_shorter_younger_hold_goes_first_until_the_older_one_ages() {
+    let one = NonZeroUsize::MIN;
+    let low = PoolPriority::Low;
+    let (filler, older, younger, fresh) = ((0, id(1)), (1, id(2)), (2, id(3)), (3, id(4)));
+    let mut pool = Pool::default();
+    let seven = NonZeroUsize::new(7).expect("a positive count");
+    pool.enter(filler, seven, low, Some(1000.0), 0.0);
+    pool.admit(0.0);
+    pool.enter(older, one, low, Some(300.0), 1.0);
+    pool.enter(younger, one, low, Some(5.0), 2.0);
+    let started = |pool: &mut Pool, now: Secs| -> Vec<Holder> {
+        pool.admit(now)
+            .into_iter()
+            .map(|(holder, _)| holder)
+            .collect()
+    };
+    assert_eq!(
+        started(&mut pool, 2.0),
+        [younger],
+        "the shorter hold waited"
+    );
+    pool.leave(younger);
+    pool.enter(fresh, one, low, Some(5.0), 1.0 + AGING);
+    assert_eq!(
+        started(&mut pool, 1.0 + AGING),
+        [older],
+        "the aged hold was passed"
+    );
 }

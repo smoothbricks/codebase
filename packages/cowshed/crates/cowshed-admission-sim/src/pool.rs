@@ -6,7 +6,7 @@
 
 use serde::Deserialize;
 
-use crate::admit::{Charge, Grant, Lease, Priority, Request, Rule, admit};
+use crate::admit::{Charge, Grant, Kind, Lease, Priority, Request, Rule, admit};
 use crate::model::{Class, Secs};
 use crate::policy::AGING;
 
@@ -37,17 +37,6 @@ struct RequestFacts {
     cpus: u32,
     memory_bytes: u64,
     kind: Kind,
-}
-
-/// What asked: mbx's observation kinds.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum Kind {
-    Compile,
-    Link,
-    Reservation,
-    TestBinary,
-    NextestTest,
 }
 
 /// One recorded admission.
@@ -107,16 +96,16 @@ pub(crate) enum Estimate {
     Exact,
     /// Its recorded hold times a factor.
     Times(f64),
-    /// Nothing: every hold might never end.
+    /// Nothing: no hold has a prediction, and any might never end.
     Unknown,
 }
 
 impl Estimate {
-    fn of(self, hold: Secs) -> Secs {
+    fn of(self, hold: Secs) -> Option<Secs> {
         match self {
-            Self::Exact => hold,
-            Self::Times(factor) => hold * factor,
-            Self::Unknown => Secs::INFINITY,
+            Self::Exact => Some(hold),
+            Self::Times(factor) => Some(hold * factor),
+            Self::Unknown => None,
         }
     }
 }
@@ -278,7 +267,8 @@ pub(crate) fn replay(trace: &Trace, rule: Rule, estimate: Estimate) -> Replayed 
                         priority: r.priority,
                         since: r.at,
                         rank: 0.0,
-                        estimate: estimate.of(r.hold),
+                        kind: r.kind,
+                        predicted: estimate.of(r.hold),
                         charge: r.charge,
                     }
                 })
@@ -345,7 +335,9 @@ pub(crate) fn replay(trace: &Trace, rule: Rule, estimate: Estimate) -> Replayed 
                 let hold = request.hold * stretch;
                 live.push(Live {
                     charge,
-                    estimated_end: now + estimate.of(request.hold) * stretch,
+                    estimated_end: estimate
+                        .of(request.hold)
+                        .map_or(Secs::INFINITY, |hold| now + hold * stretch),
                     end: now + hold,
                 });
             }
