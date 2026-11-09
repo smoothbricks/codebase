@@ -571,6 +571,9 @@ pub(crate) struct NxDaemonKeeper {
     /// Whether a lifecycle verb's census of the mount stopped the keeper's starts
     /// ([`Self::stop_starts`]): none starts until the shed's next use ([`Self::used`]).
     stopped: bool,
+    /// Whether the idle bound ended the start in flight ([`Self::end_idle_start`]): its end is
+    /// no failed start and has no successor.
+    idle_ended: bool,
     /// The length of the next pause ([`FIRST_PAUSE`], doubling to [`PAUSE_CAP`]).
     next_pause: Duration,
     /// Stops of the idle shed's live daemon in a row that failed ([`STOP_ATTEMPTS`]); a probe
@@ -616,6 +619,7 @@ impl NxDaemonKeeper {
                     starting_served: false,
                     hold: None,
                     stopped: false,
+                    idle_ended: false,
                     next_pause: FIRST_PAUSE,
                     failed_stops: 0,
                 })
@@ -727,6 +731,10 @@ impl NxDaemonKeeper {
         if self.stopped {
             return;
         }
+        // The idle bound ended it ([`Self::end_idle_start`]): no failed start, and no successor.
+        if std::mem::take(&mut self.idle_ended) {
+            return;
+        }
         let what = |ending: &str| {
             format!(
                 "Nx daemon start job {} for {} {ending}, and the daemon is {daemon}",
@@ -781,6 +789,20 @@ impl NxDaemonKeeper {
         self.probes.reset_immediately();
     }
 
+    /// The shed went its idle bound while the start job ran and no daemon is live: its shell is
+    /// still activating, for no developer job (11_shell.md, "Activation belongs to the job that
+    /// waited on it"). The start to end as a census ends one, its end counted as no failure
+    /// (04_sandbox.md, the kept daemon); `None` once it is being ended or none runs.
+    pub(crate) fn end_idle_start(&mut self) -> Option<JobId> {
+        let start = self.starting.filter(|_| !self.idle_ended)?;
+        self.idle_ended = true;
+        cowshed_os::eprintln!(
+            "cowshed: Nx daemon start job {} left no daemon live by the shed's idle bound; ending it",
+            start.get()
+        );
+        Some(start)
+    }
+
     /// A job of the ledger other than the keeper's own start ended: the shed's idle interval
     /// starts now, not at the last probe that saw the job run, up to [`PROBE_INTERVAL`] earlier.
     pub(crate) fn job_ended(&mut self) {
@@ -830,11 +852,16 @@ impl NxDaemonKeeper {
         daemon: Probe,
     ) -> Verdict {
         let live = daemon == Probe::Live;
+        let seen = match (live, self.starting.is_some()) {
+            (false, _) => DaemonSeen::Absent,
+            (true, true) => DaemonSeen::Kept,
+            (true, false) => DaemonSeen::Other,
+        };
         let idleness = self.clock.probe(
             Instant::now(),
             self.idle,
             working.is_some(),
-            live,
+            seen,
             self.stopped,
         );
         let kept_by = working.filter(|_| live);
@@ -933,6 +960,18 @@ enum Idleness {
     Suspended,
 }
 
+/// What one probe found of the daemon, as the [`IdleClock`] weighs it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonSeen {
+    /// No daemon is live.
+    Absent,
+    /// A daemon is live while the keeper's own start job runs: the keeper brought it up, so its
+    /// coming up is no use of the shed.
+    Kept,
+    /// A daemon is live that no start of the keeper's runs for: someone else asked for it.
+    Other,
+}
+
 impl IdleClock {
     /// The shed was used at `now`.
     fn use_at(&mut self, now: Instant) {
@@ -940,20 +979,22 @@ impl IdleClock {
     }
 
     /// One probe at `now`, whose ledger holds use when `working` and which found the daemon
-    /// `live`, against the bound `idle`. A daemon that has just come up was asked for by someone:
-    /// it gets a whole bound, however idle the shed looks.
+    /// `seen`, against the bound `idle`. A daemon someone else brought up was asked for: it gets
+    /// a whole bound, however idle the shed looks. One the keeper's own start brought up -- a
+    /// successor of a daemon that stopped -- is no use: the bound runs on from the last real use.
     fn probe(
         &mut self,
         now: Instant,
         idle: NxDaemonIdle,
         working: bool,
-        live: bool,
+        seen: DaemonSeen,
         suspended: bool,
     ) -> Idleness {
         if suspended {
             return Idleness::Suspended;
         }
-        if working || (live && !self.daemon_was_live) {
+        let live = seen != DaemonSeen::Absent;
+        if working || (seen == DaemonSeen::Other && !self.daemon_was_live) {
             self.use_at(now);
         }
         self.daemon_was_live = live;
@@ -1134,8 +1175,13 @@ mod tests {
     enum ClockEvent {
         /// The supervisor admitted a job, opened a session, or a job ended.
         Used,
-        /// A probe whose ledger holds use when `working`, finding the daemon `live`.
-        Probe { working: bool, live: bool },
+        /// A probe whose ledger holds use when `working`, finding the daemon `live`, brought up
+        /// by the keeper's own running start when `own`.
+        Probe {
+            working: bool,
+            live: bool,
+            own: bool,
+        },
     }
 
     /// Events with the time since the one before each.
@@ -1145,8 +1191,8 @@ mod tests {
                 (0_u64..600).prop_map(Duration::from_secs),
                 prop_oneof![
                     Just(ClockEvent::Used),
-                    (any::<bool>(), any::<bool>())
-                        .prop_map(|(working, live)| ClockEvent::Probe { working, live }),
+                    (any::<bool>(), any::<bool>(), any::<bool>())
+                        .prop_map(|(working, live, own)| ClockEvent::Probe { working, live, own }),
                 ],
             ),
             1..40,
@@ -1156,7 +1202,7 @@ mod tests {
     proptest! {
         /// The idle clock stops a live daemon exactly once the shed has gone its whole bound
         /// without use -- a developer job in the ledger at a probe, a job admitted or ended, a
-        /// session opened, or a daemon newly up -- and settles a shed whose daemon is gone. A probe
+        /// session opened, or a daemon someone else newly brought up -- and settles a shed whose daemon is gone. A probe
         /// whose ledger holds use never stops one, and a longer bound never stops one sooner.
         #[test]
         fn the_idle_clock_stops_a_live_daemon_only_after_its_whole_bound_without_use(
@@ -1180,23 +1226,28 @@ mod tests {
                         longer_clock.use_at(now);
                         last_use = Some(now);
                     }
-                    ClockEvent::Probe { working, live } => {
-                        if working || (live && !was_live) {
+                    ClockEvent::Probe { working, live, own } => {
+                        if working || (live && !own && !was_live) {
                             last_use = Some(now);
                         }
                         was_live = live;
+                        let seen = match (live, own) {
+                            (false, _) => DaemonSeen::Absent,
+                            (true, true) => DaemonSeen::Kept,
+                            (true, false) => DaemonSeen::Other,
+                        };
                         let unused = last_use.is_none_or(|used| now - used >= idle.get());
                         let expected = match (unused, live) {
                             (false, _) => Idleness::InUse,
                             (true, true) => Idleness::Stop,
                             (true, false) => Idleness::Settled,
                         };
-                        let decided = clock.probe(now, idle, working, live, false);
+                        let decided = clock.probe(now, idle, working, seen, false);
                         prop_assert_eq!(decided, expected);
                         if working {
                             prop_assert_eq!(decided, Idleness::InUse);
                         }
-                        let under_longer = longer_clock.probe(now, longer, working, live, false);
+                        let under_longer = longer_clock.probe(now, longer, working, seen, false);
                         if decided == Idleness::InUse {
                             prop_assert_eq!(under_longer, Idleness::InUse);
                         }
@@ -1263,7 +1314,11 @@ mod tests {
                         epoch + Duration::from_secs(completed_at),
                         NxDaemonIdle::DEFAULT,
                         working,
-                        live,
+                        if live {
+                            DaemonSeen::Other
+                        } else {
+                            DaemonSeen::Absent
+                        },
                         suspended,
                     ),
                     if suspended {

@@ -8519,8 +8519,22 @@ impl SupervisorActor {
                 daemon,
             );
         }
-        if keeper.judge(&project_root, working, daemon).await != Verdict::Keep {
-            return true;
+        match keeper.judge(&project_root, working, daemon).await {
+            Verdict::Keep => {}
+            Verdict::Release if running && daemon != Probe::Live => {
+                if let Some(job_id) = keeper.end_idle_start()
+                    && let Err(error) = self.begin_kill(job_id, KillReason::Retire)
+                {
+                    cowshed_os::eprintln!(
+                        "cowshed: cannot end the idle Nx daemon start job {} of {}: {}",
+                        job_id.get(),
+                        project_root.display(),
+                        error.message
+                    );
+                }
+                return true;
+            }
+            Verdict::Release | Verdict::Hold => return true,
         }
         if daemon == Probe::Live || running {
             return true;

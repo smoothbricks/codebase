@@ -8600,7 +8600,8 @@ async fn a_foreground_nx_keeper_does_not_count_as_user_work_and_quiescence_drain
 
 /// A named session held open without a job, and the foreground maintenance job, are not continuous
 /// developer use: reopening the same handle, a keyed repeat of an admitted exec and reading actor
-/// state do not revive an expired interval; only a new named session's opening does.
+/// state do not revive an expired interval; only a new named session's opening does. The maintenance
+/// start, still in flight with no daemon live once the interval expired, is ended by the keeper.
 #[tokio::test(start_paused = true)]
 async fn idle_named_handles_and_maintenance_do_not_keep_the_nx_daemon_resident() {
     let (config, _root) = nx_project("idle-handles");
@@ -8643,7 +8644,22 @@ async fn idle_named_handles_and_maintenance_do_not_keep_the_nx_daemon_resident()
         job,
         "a keyed replay is not a real admission"
     );
-    complete(&maintenance, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let ended = loop {
+        if let ProcessObservation::Signal(job, signal) = h.process.recv().await.unwrap() {
+            break (job, signal);
+        }
+    };
+    assert_eq!(ended, (maintenance.request.job_id, ProcessSignal::Term));
+    complete(
+        &maintenance,
+        b"",
+        b"",
+        ExitStatus::Signaled {
+            signal: 15,
+            core_dumped: false,
+        },
+    )
+    .await;
     h.handle.wait(maintenance.request.job_id).await.unwrap();
     assert!(
         tokio::time::timeout(NX_PROBES, h.spawned.recv())
@@ -8665,12 +8681,15 @@ async fn idle_named_handles_and_maintenance_do_not_keep_the_nx_daemon_resident()
     // successor nothing ends would hold the retirement forever.
     let handle = h.handle.clone();
     let retiring = tokio::spawn(async move { handle.retire(NxDaemonRetirement::Recorded).await });
+    // The ended maintenance start's grace may escalate meanwhile: only the restart's signal counts.
     let stopped = loop {
-        if let ProcessObservation::Signal(job, signal) = h.process.recv().await.unwrap() {
-            break (job, signal);
+        if let ProcessObservation::Signal(job, signal) = h.process.recv().await.unwrap()
+            && job == restart.request.job_id
+        {
+            break signal;
         }
     };
-    assert_eq!(stopped, (restart.request.job_id, ProcessSignal::Term));
+    assert_eq!(stopped, ProcessSignal::Term);
     complete(
         &restart,
         b"",
@@ -8682,6 +8701,97 @@ async fn idle_named_handles_and_maintenance_do_not_keep_the_nx_daemon_resident()
     )
     .await;
     retiring.await.unwrap().unwrap();
+}
+
+/// A keeper start still in flight when the shed has gone its idle bound -- its shell still
+/// activating, so no daemon is live -- serves no developer job, and its activation belongs to no
+/// requester (11_shell.md, "Activation belongs to the job that waited on it"). The keeper ends it
+/// as a census ends one, and that end is no failed start: no successor follows and no pause starts
+/// until the shed is used again (04_sandbox.md, the kept daemon). Measured 2026-11-10 in a shed
+/// whose developer job's holder timed out: the keeper's start, queued behind that job's cold
+/// activation, took the evaluation over and ran `devenv direnv-export` for nobody.
+#[tokio::test(start_paused = true)]
+async fn an_idle_shed_ends_the_keeper_start_that_left_no_daemon() {
+    let (config, _root) = nx_project("idle-start");
+    let mut h = real_store_harness(config);
+    let session = open_named(&h.handle, "build").await;
+    let start = h
+        .spawned
+        .recv()
+        .await
+        .expect("session opening starts the keeper");
+    h.handle.close_session(session).await.unwrap();
+    pass_idle(&h, NX_IDLE + NX_PROBES).await;
+    let ended = tokio::time::timeout(NX_PROBES, async {
+        loop {
+            if let ProcessObservation::Signal(job, signal) = h.process.recv().await.unwrap() {
+                break (job, signal);
+            }
+        }
+    })
+    .await
+    .expect("the idle shed's keeper ends the start that left no daemon");
+    assert_eq!(ended, (start.request.job_id, ProcessSignal::Term));
+    complete(
+        &start,
+        b"",
+        b"",
+        ExitStatus::Signaled {
+            signal: 15,
+            core_dumped: false,
+        },
+    )
+    .await;
+    h.handle.wait(start.request.job_id).await.unwrap();
+    pass_idle(&h, NX_PROBES).await;
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "an ended idle start is no failed start: no successor follows"
+    );
+    let state = h.handle.nx_daemon_keeper().await.unwrap().unwrap();
+    assert!(
+        state.starting.is_none() && state.held.is_none(),
+        "no start is awaited and no pause runs: {:?} {:?}",
+        state.starting,
+        state.held
+    );
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+}
+
+/// A daemon the keeper starts is no use of the shed: only one someone else started is
+/// (04_sandbox.md, the kept daemon). A kept daemon that dies while the shed's bound runs -- Nx's
+/// own idle stop, or an agent's SIGTERM -- gets its successor, and that successor coming up does
+/// not restart the bound: the bound runs from the shed's last real use, then the keeper stops the
+/// successor and starts none. Measured 2026-11-10: idle sheds' daemons, stopped by hand, were back
+/// within 15 s and each came-up successor bought itself another bound.
+#[tokio::test(start_paused = true)]
+async fn the_keepers_own_successor_coming_up_is_no_use_of_the_shed() {
+    let (mut h, daemon, project, _root) = shed_with_live_nx_daemon("successor").await;
+    let died_after = Duration::from_secs(120);
+    pass_idle(&h, died_after).await;
+    drop(daemon);
+    let successor = tokio::time::timeout(NX_PROBES, h.spawned.recv())
+        .await
+        .expect("a kept daemon that died while the bound runs gets its successor")
+        .unwrap();
+    let mut daemon = LiveDaemon::start(&project);
+    assert!(
+        running_after_probe(&h, &mut daemon).await,
+        "the successor's daemon is observed live"
+    );
+    complete(&successor, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(successor.request.job_id).await.unwrap();
+    pass_idle(&h, NX_IDLE - died_after + NX_PROBES).await;
+    assert!(
+        !running_after_probe(&h, &mut daemon).await,
+        "the shed's bound runs from its last real use, not from its keeper's successor coming up"
+    );
+    pass_idle(&h, NX_PROBES).await;
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "an idle shed whose daemon stopped starts none"
+    );
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// How long a shed must go unused before its keeper stops the daemon it keeps.
