@@ -413,6 +413,26 @@ Known limitation: dead-run reclaim of the shared Nx fixture root enumerates live
 cowshed workspace denies that spawn, so reclaim cannot run there. A focused hook proof may use the host's direnv only to
 reclaim; that is neither a subject grant nor a cutover claim.
 
+### Fixture templates
+
+A fixture repository that every test of a suite would otherwise build is built once per test run and cloned by each test
+(`cowshed-os/src/test_template.rs`): the CLI's committed checkouts and their installed Nx, cowshed-core's git-module
+`repository()`, the project runtime's `Lane` (main and its lane base) and the landing suite's `Fixture` parent. The
+first test of the run to ask writes the template aside, under the template's lock that every reader also takes, and
+renames it in whole, so a writer killed halfway leaves no template. Every other test clones it, by one `clonefile` on
+Darwin and by a file-by-file copy elsewhere, and starts no git. A template holds no path of the scratch it is cloned
+under: the lane base's `origin` is the relative `../main`, its own fixture's main. The templates live in the run's
+template directory (below, "Host-controller authority"), which the lane setup's template sweep takes after the run;
+Linux has no such sweep, and the directory goes with the CI job's workspace.
+
+The fork lock counts each thread's spawns by program under `test-hooks` (`cowshed_os::fork_lock::spawn_count`). Each
+templated fixture has one regression that builds it twice on one thread and requires the second build to start no git
+process: the count is the fence, never wall time.
+
+Scratch-root keepers stay one per root. A keeper reclaims its real-image root the moment its test dies (below,
+"Integration tests"), and nextest runs each test in a process of its own, so no process lives as long as a test binary
+for one keeper to serve.
+
 ## Host-controller authority
 
 Run `nx run cowshed:host-controller-test` from the owned checkout in an unsandboxed host-controller shell. This single

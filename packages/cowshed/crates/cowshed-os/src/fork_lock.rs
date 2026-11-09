@@ -105,6 +105,8 @@ impl Spawn for std::process::Command {
     )]
     fn spawn_locked(&mut self) -> io::Result<Self::Child> {
         let _spawning = spawning();
+        #[cfg(any(test, feature = "test-hooks"))]
+        spawn_count::record(self.get_program());
         self.spawn()
     }
 }
@@ -118,6 +120,8 @@ impl Spawn for tokio::process::Command {
     )]
     fn spawn_locked(&mut self) -> io::Result<Self::Child> {
         let _spawning = spawning();
+        #[cfg(any(test, feature = "test-hooks"))]
+        spawn_count::record(self.as_std().get_program());
         self.spawn()
     }
 }
@@ -226,6 +230,44 @@ pub fn held_exclusive() -> bool {
         FORK_LOCK.try_read(),
         Err(std::sync::TryLockError::WouldBlock)
     )
+}
+
+/// The children this thread has spawned through [`Spawn`], by the program each command names.
+///
+/// Every spawn of a cowshed process goes through [`Spawn`] (each crate's `clippy.toml` refuses
+/// the unlocked ones), so a count here is every process a test's own thread started. A test reads
+/// [`spawned`] before and after the fixture it fences and asserts the difference: a fixture that
+/// starts more processes fails by the count, never by wall time. The count is the thread's own, so
+/// tests running beside it on other threads of one process move none of it.
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod spawn_count {
+    use std::cell::RefCell;
+    use std::ffi::{OsStr, OsString};
+
+    thread_local! {
+        static SPAWNED: RefCell<Vec<(OsString, usize)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(program: &OsStr) {
+        SPAWNED.with_borrow_mut(|spawned| {
+            match spawned.iter_mut().find(|(named, _)| named == program) {
+                Some((_, count)) => *count += 1,
+                None => spawned.push((program.to_owned(), 1)),
+            }
+        });
+    }
+
+    /// How many children this thread has spawned whose command names `program`, as the command
+    /// spelled it (`Command::new("git")` counts under `"git"`).
+    pub fn spawned(program: impl AsRef<OsStr>) -> usize {
+        let program = program.as_ref();
+        SPAWNED.with_borrow(|spawned| {
+            spawned
+                .iter()
+                .find(|(named, _)| named == program)
+                .map_or(0, |(_, count)| *count)
+        })
+    }
 }
 
 impl<T> Deref for Fenced<T> {

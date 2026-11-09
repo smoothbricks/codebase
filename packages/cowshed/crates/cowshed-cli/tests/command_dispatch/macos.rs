@@ -36,6 +36,7 @@ use cowshed_os::test_backstop::{
     AsyncCommandBackstop as _, ChildBackstop as _, CommandBackstop as _, FileBackstop as _,
     UnixStreamBackstop as _,
 };
+use cowshed_os::test_template;
 use std::ffi::OsString;
 use std::fs;
 use std::io::PipeReader;
@@ -138,7 +139,8 @@ impl Fixture {
                 &blank_template_path(&store, blank_image::CAPACITY),
             );
         }
-        clone_tree(&checkout_template(project), &checkout);
+        test_template::clone_tree(&checkout_template(project), &checkout)
+            .expect("clone the checkout template");
         // The fixture's workspaces run the host's own tools (bash, Bun, Nx's node), resolved
         // where production resolves them: the real host's program directories, named
         // explicitly (08_testing.md, "Fixtures").
@@ -338,152 +340,16 @@ impl Project<'_> {
     }
 }
 
-/// This run's committed checkout holding `project`, written by whichever test asks first.
-///
-/// A fixture checkout is a handful of git, Cargo and file writes that every test repeated; on
-/// the loaded gate each git process took 0.8 s against 75 ms alone. The tree holds no path of
-/// the scratch root it is cloned under, so one per run serves every test. Like the blank image
-/// template, it lives in the run's template directory ([`checkout_template_directory`]) and is
-/// written aside and moved in whole, so a writer killed halfway leaves no template.
+/// This run's committed checkout holding `project`, written by whichever test asks first: a
+/// template in the run's template directory, cloned by every other test of the run
+/// ([`test_template`]).
 fn checkout_template(project: Project<'_>) -> PathBuf {
-    materialized_template(
-        &checkout_template_directory(),
+    test_template::materialized(
+        &test_template::directory().expect("the run's template directory"),
         &format!("checkout-{}", project.key()),
         |aside| project.write(aside),
     )
-}
-
-/// This run's template directory, named for the run's process ([`run_process`]): every test
-/// process of the run writes and clones its templates there, and the lane setup's template sweep
-/// takes it by that pid, so only once the run has ended.
-fn checkout_template_directory() -> PathBuf {
-    let directory = PathBuf::from(format!(
-        "/private/tmp/{}{}-templates",
-        scratch_directory::cleanup::ROOT_PREFIX,
-        run_process()
-    ));
-    fs::create_dir_all(&directory)
-        .unwrap_or_else(|error| panic!("template directory {}: {error}", directory.display()));
-    directory
-}
-
-/// The process whose life is this test run: every test process of the run descends from it, and it
-/// outlives them all. nextest names the run (`NEXTEST_RUN_ID`) and starts each test in a process
-/// group of its own, led by whatever wraps the test (its target runner, `mbx-test-runner`, or a run
-/// wrapper), which waits for it: the run's process is the nearest ancestor outside the test's
-/// group, never the test's parent. Outside nextest a run is this one process.
-fn run_process() -> libc::pid_t {
-    // SAFETY: `getpid` has no preconditions and cannot fail.
-    let this = unsafe { libc::getpid() };
-    if std::env::var_os("NEXTEST_RUN_ID").is_none() {
-        return this;
-    }
-    // SAFETY: `getpgrp` and `getppid` have no preconditions and cannot fail.
-    let (group, mut ancestor) = unsafe { (libc::getpgrp(), libc::getppid()) };
-    loop {
-        let info = scratch_namespace::bsd_info(ancestor).unwrap_or_else(|error| {
-            panic!("the run's process: ancestor {ancestor} of test process {this}: {error}")
-        });
-        if libc::pid_t::try_from(info.pbi_pgid).ok() != Some(group) {
-            return ancestor;
-        }
-        ancestor = libc::pid_t::try_from(info.pbi_ppid)
-            .unwrap_or_else(|error| panic!("the run's process: parent of {ancestor}: {error}"));
-    }
-}
-
-/// Every test process of one run clones from one template directory, whatever wraps each test.
-/// nextest starts each test in a process group of its own, led by its target runner
-/// (`mbx-test-runner`) or run wrapper, which waits for the test: a test's parent is its own
-/// wrapper, never the run. Two test processes of one run, each under a wrapper of its own, name
-/// the same directory, named for this process, which plays the run and outlives both; the lane
-/// setup's template sweep takes a directory by the pid its name records, so only after the run.
-#[test]
-fn checkout_templates_are_one_directory_per_run_whatever_wraps_each_test() {
-    use std::os::unix::process::CommandExt as _;
-
-    const PROBE: &str = "COWSHED_TEST_CHECKOUT_TEMPLATE_PROBE";
-    const MARK: &str = "template-directory=";
-    if std::env::var_os(PROBE).is_some() {
-        println!("{MARK}{}", checkout_template_directory().display());
-        return;
-    }
-    let probe = || {
-        // The shell leads the probe's process group and waits for it rather than exec it, as
-        // nextest's target runner does for each test, so it is the probe's parent.
-        let output = Command::new("/bin/sh")
-            .args(["-c", "\"$0\" --exact \"$1\" --nocapture --quiet; exit $?"])
-            .arg(std::env::current_exe().expect("test executable"))
-            .arg("macos::checkout_templates_are_one_directory_per_run_whatever_wraps_each_test")
-            .env(PROBE, "1")
-            .env("NEXTEST_RUN_ID", "one-run-two-wrapped-tests")
-            .process_group(0)
-            .output_bounded()
-            .expect("run a wrapped template probe");
-        let stdout = String::from_utf8(output.stdout).expect("probe stdout");
-        assert!(
-            output.status.success(),
-            "the probe failed\n{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(MARK))
-            .map(PathBuf::from)
-            .expect("the probe names its template directory")
-    };
-    let (first, second) = (probe(), probe());
-    assert_eq!(
-        first, second,
-        "two test processes of one run share one template directory"
-    );
-    assert_eq!(
-        first,
-        PathBuf::from(format!(
-            "/private/tmp/{}{}-templates",
-            scratch_directory::cleanup::ROOT_PREFIX,
-            std::process::id()
-        )),
-        "the directory is named for the run's process, which outlives every test of the run"
-    );
-}
-
-/// Publish one immutable tree for this runner, under the same lock used by its readers.
-fn materialized_template(directory: &Path, key: &str, write: impl FnOnce(&Path)) -> PathBuf {
-    let template = directory.join(key);
-    let lock = directory.join(format!("{key}.lock"));
-    let _writing = cowshed_os::test_backstop::lock_exclusive(&lock)
-        .unwrap_or_else(|error| panic!("template lock {}: {error}", lock.display()));
-    if !template.exists() {
-        let aside = directory.join(format!("{key}.{}", std::process::id()));
-        write(&aside);
-        fs::rename(&aside, &template).unwrap_or_else(|error| {
-            panic!("publish fixture template {}: {error}", template.display())
-        });
-    }
-    template
-}
-
-/// `source`'s whole tree cloned to `destination`, which must not exist: one `clonefile`, no copy.
-fn clone_tree(source: &Path, destination: &Path) {
-    use std::os::unix::ffi::OsStrExt;
-    unsafe extern "C" {
-        fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32)
-        -> libc::c_int;
-    }
-    let path = |path: &Path| std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
-    let (from, to) = (path(source), path(destination));
-    // SAFETY: both arguments are NUL-terminated strings that outlive the call, which reads them
-    // and touches no other memory.
-    let cloned = unsafe { clonefile(from.as_ptr(), to.as_ptr(), 0) };
-    assert_eq!(
-        cloned,
-        0,
-        "clone {} to {}: {}",
-        source.display(),
-        destination.display(),
-        std::io::Error::last_os_error()
-    );
+    .expect("the checkout template")
 }
 
 impl Drop for Fixture {
@@ -2534,7 +2400,7 @@ fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
     fs::create_dir_all(checkout.join("packages")).unwrap();
     let nx = checkout.join("packages/nx");
     let installed = fixture_nx(&fixture.checkout);
-    clone_tree(&installed, &nx);
+    test_template::clone_tree(&installed, &nx).expect("clone the installed Nx");
     let modules = nx.join("node_modules");
     clone_nx_store_entries(&installed, &modules.join(".bun"));
     // Nx's bindings are the links Bun left beside it in its store entry. A relative one names a
@@ -2751,7 +2617,7 @@ fn nx_install_closure(nx: &Path) -> std::collections::BTreeMap<String, PathBuf> 
 /// installed Nx, with byte-identical product files.
 fn clone_repository_nx_install(checkout: &Path, nx: &Path) {
     clone_nx_namespace(
-        &checkout_template_directory(),
+        &test_template::directory().expect("the run's template directory"),
         &checkout.join("node_modules"),
         |installed| write_repository_nx_install(installed, nx),
     );
@@ -2759,8 +2625,9 @@ fn clone_repository_nx_install(checkout: &Path, nx: &Path) {
 
 /// Every checkout shape clones one published install; only its first writer crosses volumes.
 fn clone_nx_namespace(templates: &Path, destination: &Path, write: impl FnOnce(&Path)) {
-    let installed = materialized_template(templates, "nx-install", write);
-    clone_tree(&installed, destination);
+    let installed = test_template::materialized(templates, "nx-install", write)
+        .expect("the installed Nx template");
+    test_template::clone_tree(&installed, destination).expect("clone the installed Nx template");
 }
 
 #[test]
@@ -2780,7 +2647,7 @@ fn directory_nx_install_is_materialized_once_across_checkout_templates() {
             1,
             "a second checkout template must not reread or recopy the installed namespace"
         );
-        clone_tree(&source, destination);
+        test_template::clone_tree(&source, destination).expect("clone the installed namespace");
     };
     let first = scratch.path().join("nx-declared");
     clone_nx_namespace(&templates, &first, write);
@@ -7634,13 +7501,14 @@ async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips
     // A real foreign stock daemon owns a standalone root that retirement must not remove.
     // Its produced record nominates it in the landing checkout; it grants no ledger ownership.
     let foreign = fixture._scratch.path().join("foreign-daemon-checkout");
-    clone_tree(
+    test_template::clone_tree(
         &checkout_template(Project::Build {
             nx: Some((&nx, &node)),
             rust: None,
         }),
         &foreign,
-    );
+    )
+    .expect("clone the checkout template");
     let state = fixture._scratch.path().join("foreign-daemon-state");
     let data = state.join("workspace-data");
     let socket = cowshed_core::sandbox::workspace_runtime_link(&foreign).join("nx");

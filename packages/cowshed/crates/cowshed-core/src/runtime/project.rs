@@ -12170,7 +12170,8 @@ mod rebase_recovery_tests {
     }
 
     /// A lane: main, a lane base cloned from it on `cowshed/<lane>`, and unit clones of the lane
-    /// base on `cowshed/<unit>`, each its own repository exactly as cowshed's clones are.
+    /// base on `cowshed/<unit>`, each its own repository exactly as cowshed's clones are. Main and
+    /// the lane base are cloned from this run's template ([`Lane::write_template`]).
     struct Lane {
         base: crate::temp_root::TempRoot,
         main: PathBuf,
@@ -12185,18 +12186,38 @@ mod rebase_recovery_tests {
                 &crate::temp_parent::canonical_parent(),
                 &format!("cowshed-lane-{label}"),
             );
-            let main = base.join("main");
-            std::fs::create_dir_all(&main).expect("create main");
-            run_git(&main, &["init", "--initial-branch=main"]);
-            Self::identify(&main);
-            commit_file(&main, "base\n", "base");
-            let lane = Self::clone_of(&base, &main, "lane");
+            let template = cowshed_os::test_template::materialized(
+                &cowshed_os::test_template::directory().expect("the run's template directory"),
+                "project-lane",
+                Self::write_template,
+            )
+            .expect("the lane template");
+            let (main, lane) = (base.join("main"), base.join("lane"));
+            for (from, to) in [
+                (template.join("main"), &main),
+                (template.join("lane"), &lane),
+            ] {
+                cowshed_os::test_template::clone_tree(&from, to).expect("clone the lane template");
+            }
             Self {
                 base,
                 main,
                 lane,
                 store: crate::temp_root::FixtureStore::new(),
             }
+        }
+
+        /// [`Lane::new`]'s template under `root`: `main` with one commit and the lane base `lane`
+        /// cloned from it. The lane base's `origin` is spelled `../main`, so each clone of the
+        /// template names its own fixture's main, never the template's.
+        fn write_template(root: &Path) {
+            let main = root.join("main");
+            std::fs::create_dir_all(&main).expect("create main");
+            run_git(&main, &["init", "--initial-branch=main"]);
+            Self::identify(&main);
+            commit_file(&main, "base\n", "base");
+            let lane = Self::clone_of(root, &main, "lane");
+            run_git(&lane, &["remote", "set-url", "origin", "../main"]);
         }
 
         fn identify(root: &Path) {
@@ -12225,6 +12246,20 @@ mod rebase_recovery_tests {
         fn name(name: &str) -> WorkspaceName {
             WorkspaceName::new(name).expect("workspace name")
         }
+    }
+
+    /// A lane fixture starts no git once this run has built one: the second costs no process,
+    /// counted at the fork lock every spawn goes through, never timed.
+    #[test]
+    fn a_lane_fixture_starts_no_git_once_the_run_has_built_one() {
+        let _first = Lane::new("spawns-first");
+        let before = cowshed_os::fork_lock::spawn_count::spawned("git");
+        let _second = Lane::new("spawns-second");
+        assert_eq!(
+            cowshed_os::fork_lock::spawn_count::spawned("git") - before,
+            0,
+            "git processes the second lane fixture started"
+        );
     }
 
     fn unit_commit(root: &Path, file: &str, message: &str) {

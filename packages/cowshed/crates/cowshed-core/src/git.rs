@@ -7242,6 +7242,8 @@ mod tests {
         assert_eq!(repository.tracked_paths().await.unwrap(), expected);
     }
 
+    /// A committed repository on `main`, cloned from this run's template ([`write_repository`]):
+    /// the run's first fixture writes it, and every fixture after it starts no git.
     fn repository() -> Repository {
         let scratch = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::canonical_parent(),
@@ -7251,8 +7253,21 @@ mod tests {
             root: scratch.join("repository"),
             _scratch: scratch,
         };
-        fs::create_dir_all(&fixture.root).expect("create test repository");
-        let root = &fixture.root;
+        let template = cowshed_os::test_template::materialized(
+            &cowshed_os::test_template::directory().expect("the run's template directory"),
+            "git-repository",
+            write_repository,
+        )
+        .expect("the repository template");
+        cowshed_os::test_template::clone_tree(&template, &fixture.root)
+            .expect("clone the repository template");
+        fixture
+    }
+
+    /// [`repository`]'s template: one commit of `README` on `main`, with automatic gc and
+    /// maintenance off.
+    fn write_repository(root: &Path) {
+        fs::create_dir_all(root).expect("create test repository");
         let status = Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .arg(root)
@@ -7298,7 +7313,20 @@ mod tests {
             .status_bounded()
             .expect("run git commit");
         assert!(status.success());
-        fixture
+    }
+
+    /// A repository fixture starts no git once this run has built one: the second costs no process,
+    /// counted at the fork lock every spawn goes through, never timed.
+    #[test]
+    fn a_repository_fixture_starts_no_git_once_the_run_has_built_one() {
+        let _first = repository();
+        let before = cowshed_os::fork_lock::spawn_count::spawned("git");
+        let _second = repository();
+        assert_eq!(
+            cowshed_os::fork_lock::spawn_count::spawned("git") - before,
+            0,
+            "git processes the second repository fixture started"
+        );
     }
 
     /// What `git status --porcelain=v2 --branch` reports for `root`: the checked-out branch, HEAD's

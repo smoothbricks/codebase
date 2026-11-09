@@ -15,4 +15,5 @@ pub mod scratch;
 pub mod stderr;
 pub mod stdio;
 pub mod test_backstop;
+pub mod test_template;
 pub mod timing;

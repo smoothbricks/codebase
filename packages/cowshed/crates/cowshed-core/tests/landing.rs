@@ -38,7 +38,8 @@ const TARGET: &str = "main";
 /// A parent repository plus clones of it, deleted with the test. Under `/tmp`, not TMPDIR: the
 /// measurement runs controller git sandboxed, and the sandbox never grants a workspace's TMPDIR,
 /// which is inside the protected store. The second field is the fixture's own store, where that
-/// sandboxed controller Git writes its profiles.
+/// sandboxed controller Git writes its profiles. The parent is cloned from this run's template
+/// ([`write_parent_template`]).
 struct Fixture(TempRoot, FixtureStore);
 
 impl Fixture {
@@ -50,13 +51,14 @@ impl Fixture {
             ),
             FixtureStore::new(),
         );
-        git(
-            fixture.parent_unchecked(),
-            ["init", "-q", "-b", TARGET, "."],
-        );
-        fixture.write_parent("base.txt", "base\n");
-        git(fixture.parent_unchecked(), ["add", "-A"]);
-        commit(fixture.parent_unchecked(), "base");
+        let template = cowshed_os::test_template::materialized(
+            &cowshed_os::test_template::directory().expect("the run's template directory"),
+            "landing-parent",
+            write_parent_template,
+        )
+        .expect("the parent template");
+        cowshed_os::test_template::clone_tree(&template, &fixture.parent())
+            .expect("clone the parent template");
         fixture
     }
 
@@ -64,16 +66,8 @@ impl Fixture {
         self.1.shared()
     }
 
-    /// The parent directory before it is known to be a repository, for `init` and for the case that
-    /// deliberately leaves it as something other than a repository.
-    fn parent_unchecked(&self) -> PathBuf {
-        let path = self.0.join("parent");
-        fs::create_dir_all(&path).expect("parent directory");
-        path
-    }
-
     fn parent(&self) -> PathBuf {
-        self.parent_unchecked()
+        self.0.join("parent")
     }
 
     fn write_parent(&self, name: &str, contents: &str) {
@@ -107,6 +101,29 @@ impl Fixture {
     fn parent_commit(&self, file: &str, contents: &str, message: &str) {
         self.land_content_separately(file, contents, message);
     }
+}
+
+/// [`Fixture::new`]'s parent template at `parent`: `base.txt` committed on the target branch.
+fn write_parent_template(parent: &Path) {
+    fs::create_dir_all(parent).expect("parent directory");
+    git(parent, ["init", "-q", "-b", TARGET, "."]);
+    fs::write(parent.join("base.txt"), "base\n").expect("write parent file");
+    git(parent, ["add", "-A"]);
+    commit(parent, "base");
+}
+
+/// A fixture starts no git once this run has built one: the second costs no process, counted at
+/// the fork lock every spawn goes through, never timed.
+#[test]
+fn a_fixture_starts_no_git_once_the_run_has_built_one() {
+    let _first = Fixture::new("spawns-first");
+    let before = cowshed_os::fork_lock::spawn_count::spawned("git");
+    let _second = Fixture::new("spawns-second");
+    assert_eq!(
+        cowshed_os::fork_lock::spawn_count::spawned("git") - before,
+        0,
+        "git processes the second fixture started"
+    );
 }
 
 fn git<I, S>(root: impl AsRef<Path>, args: I) -> String

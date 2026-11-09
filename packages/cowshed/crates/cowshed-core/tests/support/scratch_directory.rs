@@ -12,7 +12,8 @@ use super::scratch_namespace::processes;
 
 #[path = "../../../cowshed-apfs/tests/support/scratch_directory_cleanup.rs"]
 pub(crate) mod cleanup;
-use cleanup::{ROOT_PREFIX, reclaim};
+use cleanup::reclaim;
+use cowshed_os::test_template::ROOT_PREFIX;
 
 /// The file in each root that names the test which made it. The name stays out of the path: the
 /// store's Unix sockets (`run/<32 hex>.sock`, the CPU pools' `run/cpu/<22>/<22>`) must fit

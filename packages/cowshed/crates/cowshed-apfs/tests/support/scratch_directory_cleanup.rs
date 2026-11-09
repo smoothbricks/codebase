@@ -5,7 +5,7 @@ use super::super::scratch_namespace::{processes, tree};
 use std::ffi::OsStr;
 use std::path::Path;
 
-pub(crate) const ROOT_PREFIX: &str = "cowshed-dtest-";
+use cowshed_os::test_template::ROOT_PREFIX;
 /// The pid a short directory's name records, `cowshed-dtest-<pid>-…` (a directory fixture's root,
 /// or a run's template directory), once no process holds it: the lane setup's template and
 /// short-directory sweep takes such a directory. A live pid keeps it, a reused one included.
