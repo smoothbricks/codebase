@@ -14,6 +14,11 @@
  * Recorded declarations follow their current target after a successful install.
  * A plain `bun install` still relinks an undeclared link: only a wrapper around
  * bun itself could intercept that. A declared one (below) comes back on its own.
+ * A consumer's Nx key never hashes an undeclared link as the installed version:
+ * a key that omits a linked package's live files is sound only while every
+ * link is a tracked `smoo.developerLinks` declaration, whose edit recomputes
+ * the graph, so a consumer's Nx plugin refuses an undeclared link by name,
+ * applying the definition below through `developerLinksIn`.
  *
  * A developer link is a symlink directly inside a node_modules tree bun
  * installs (the root's or a workspace member's, scoped names included) whose
@@ -146,14 +151,14 @@ import {
   snapshotBinding,
 } from './linked-snapshots.ts';
 
-interface DeveloperLink {
+export interface DeveloperLink {
   /** Where the link is, relative to the project root. */
   readonly path: string;
   /** The link's own text, restored byte for byte. */
   readonly target: string;
 }
 
-interface DeveloperLinks {
+export interface DeveloperLinks {
   /** Links kept across an install: every link whose target is not known to be gone, unreadable ones included. */
   readonly live: readonly DeveloperLink[];
   /** Links whose target no longer exists. */
@@ -378,10 +383,19 @@ function describeDeveloperLinks(root: string, { live, unreadable }: Omit<Develop
 }
 
 function findDeveloperLinks(root: string): DeveloperLinks {
+  return developerLinksIn(root, nodeModulesTrees(root));
+}
+
+/**
+ * The developer links directly inside `trees` (node_modules directories relative to `root`), classified as
+ * `findDeveloperLinks` classifies them. The caller names the trees, so a process that is not Bun (an Nx plugin
+ * worker under Node, which takes them from its project graph) applies the same definition without reading bun.lock.
+ */
+export function developerLinksIn(root: string, trees: readonly string[]): DeveloperLinks {
   const live: DeveloperLink[] = [];
   const dangling: DeveloperLink[] = [];
   const unreadable: (DeveloperLink & { readonly code: string })[] = [];
-  for (const tree of nodeModulesTrees(root)) {
+  for (const tree of trees) {
     for (const entry of packageLinks(root, tree)) {
       const link: DeveloperLink = { path: entry, target: readlinkSync(path.join(root, entry)) };
       const target = resolvedTarget(root, link);

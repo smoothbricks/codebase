@@ -3,7 +3,10 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import fc from 'fast-check';
-import { hasStaleDeveloperLinks } from '../../../nx-plugin/managed/raw/tooling/direnv/developer-links.ts';
+import {
+  developerLinksIn,
+  hasStaleDeveloperLinks,
+} from '../../../nx-plugin/managed/raw/tooling/direnv/developer-links.ts';
 
 // CI's cache once restored the install stamp without the links it vouched for, and the stamp alone said the install
 // was current. A stamp cannot see whether a link still resolves, so install currency also reads the links
@@ -52,6 +55,27 @@ describe('a stamped install is stale exactly while its developer links say so', 
             planted.some(({ target }) => target === 'outside-missing') ||
               planted.some(({ name, target }) => target === 'outside' && relink.includes(name)),
           );
+        } finally {
+          rmSync(base, { recursive: true, force: true });
+        }
+      }),
+    );
+  });
+
+  it('developerLinksIn finds, in the trees its caller names, exactly the links out of the checkout', () => {
+    fc.assert(
+      fc.property(links, fc.subarray(['', 'packages/member']), (planted, trees) => {
+        const base = plant(planted);
+        try {
+          const named = trees.map((tree) => join(tree, 'node_modules'));
+          const { live, dangling } = developerLinksIn(join(base, 'root'), named);
+          const expected = (target: Target) =>
+            planted
+              .filter((link) => link.target === target && trees.includes(link.tree))
+              .map(({ tree, name }) => join(tree, 'node_modules', name))
+              .sort();
+          expect(live.map(({ path }) => path).sort()).toEqual(expected('outside'));
+          expect(dangling.map(({ path }) => path).sort()).toEqual(expected('outside-missing'));
         } finally {
           rmSync(base, { recursive: true, force: true });
         }
