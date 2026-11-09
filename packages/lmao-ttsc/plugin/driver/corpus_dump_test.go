@@ -136,7 +136,7 @@ func transformCorpusEntry(t *testing.T, body string) string {
 		t.Fatal("corpus input source was not loaded")
 	}
 
-	transform, err := lmaoPluginTransform(program, compilerOptions{cwd: root, tsconfig: configPath})
+	transform, err := lmaoPluginTransform(program, compilerOptions{cwd: root, tsconfig: configPath, trace: traceEntriesKept})
 	if err != nil {
 		t.Fatalf("corpus transform construction failed: %v", err)
 	}

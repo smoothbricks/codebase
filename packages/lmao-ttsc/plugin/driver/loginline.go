@@ -46,6 +46,7 @@ import (
 )
 
 var spanLoggerTypeNames = []string{"SpanLogger", "GeneratedSpanLogger", "FluentLogEntry"}
+var fluentLogEntryTypeNames = []string{"FluentLogEntry"}
 
 // Entry-type dictionary values, pinned to
 // packages/lmao/src/lib/schema/systemSchema.ts (ENTRY_TYPE_*). The fixture
@@ -75,14 +76,24 @@ type logInline struct {
 }
 
 func isSpanLoggerType(chk *shimchecker.Checker, t *shimchecker.Type) bool {
+	return isTypeNamedAmong(chk, t, spanLoggerTypeNames)
+}
+
+// isFluentLogEntryType reports the type a log call returns: the receiver of a
+// second entry chained onto a first, as in log.info('a').trace('b').
+func isFluentLogEntryType(chk *shimchecker.Checker, t *shimchecker.Type) bool {
+	return isTypeNamedAmong(chk, t, fluentLogEntryTypeNames)
+}
+
+func isTypeNamedAmong(chk *shimchecker.Checker, t *shimchecker.Type, names []string) bool {
 	name := chk.TypeToString(t)
-	for _, w := range spanLoggerTypeNames {
+	for _, w := range names {
 		if name == w || strings.HasPrefix(name, w+"<") {
 			return true
 		}
 	}
 	if sym := shimchecker.Type_getTypeNameSymbol(t); sym != nil {
-		for _, w := range spanLoggerTypeNames {
+		for _, w := range names {
 			if sym.Name == w {
 				return true
 			}

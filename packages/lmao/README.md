@@ -274,6 +274,13 @@ SQLite sidecars and persistent publication gate, so a workspace manager can hold
 `.cowshed.toml` `[build] state = ["packages/*/.cache/lmao"]`). Traces flush to a SQLite sink you can query with the
 `TraceQuery` API or the `sqlite3` CLI. See the docs for the full harness setup, the SQLite schema, and query recipes.
 
+The trace level is free in production. A `ctx.log.trace('<what> no-op').reason(...)` statement inside an existing span
+is compiled away whole, arguments included, by `@smoothbricks/lmao-ttsc` in every compile whose `NODE_ENV` is not
+`test`, and kept in test compiles: `bun test` and Vitest set `NODE_ENV=test`, so trace-claim tests see the entries and
+can count them (`facts.byNamespace('log')`), for example the expected no-ops of an idempotent operation. A trace call
+used as a value rather than a statement of its own is a compile error in every mode. See
+[spec 01o §6.3](../../specs/lmao/01o_typescript_transformer.md#smoo/lmao!n/transformer-trace-elision).
+
 ## Package exports
 
 | Import                                                          | Provides                                                                                                                                                                                                             |

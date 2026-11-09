@@ -135,9 +135,24 @@ func fieldValueMatches(chk *shimchecker.Checker, value *shimast.Node, expected s
 	}
 }
 
-// collectLogVocabulary validates and registers one direct logger call while the
-// checker still sees the untouched source tree.
+// logTemplate is the vocabulary record of one literal log call.
+type logTemplate struct {
+	text   string
+	fields []vocabularyField
+}
+
+// collectLogVocabulary validates and registers one direct logger call.
 func (t *fileTransformer) collectLogVocabulary(call *shimast.CallExpression) {
+	if template, ok := t.logTemplateOf(call); ok {
+		t.vocabulary.addRecord(vocabularyLogTemplate, template.text, template.fields, call, t.file.FileName())
+	}
+}
+
+// logTemplateOf validates one direct logger call while the checker still sees
+// the untouched source tree, and returns the record it registers. A call that
+// breaks the level/template policy reports its diagnostic; a call that is not a
+// proved LMAO log call returns nothing silently.
+func (t *fileTransformer) logTemplateOf(call *shimast.CallExpression) (template logTemplate, ok bool) {
 	if t.checker == nil || t.vocabulary == nil || call.Expression.Kind != shimast.KindPropertyAccessExpression {
 		return
 	}
@@ -195,8 +210,7 @@ func (t *fileTransformer) collectLogVocabulary(call *shimast.CallExpression) {
 			t.addLogDiagnostic("LMAO_PLACEHOLDER_MISMATCH", call, "every placeholder requires a matching structured field")
 			return
 		}
-		t.vocabulary.addRecord(vocabularyLogTemplate, cooked, nil, call, t.file.FileName())
-		return
+		return logTemplate{text: cooked}, true
 	}
 	if args[1].Kind != shimast.KindObjectLiteralExpression {
 		t.addLogDiagnostic("LMAO_FIELDS_NOT_OBJECT_LITERAL", call, "structured fields must be a plain object literal")
@@ -248,5 +262,5 @@ func (t *fileTransformer) collectLogVocabulary(call *shimast.CallExpression) {
 		t.addLogDiagnostic("LMAO_PLACEHOLDER_MISMATCH", call, "placeholder and field keys must match exactly")
 		return
 	}
-	t.vocabulary.addRecord(vocabularyLogTemplate, cooked, fields, call, t.file.FileName())
+	return logTemplate{text: cooked, fields: fields}, true
 }

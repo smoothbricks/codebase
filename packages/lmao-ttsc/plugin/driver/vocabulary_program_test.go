@@ -76,7 +76,7 @@ func compileWholeProgramFixture(t *testing.T, sources []wholeProgramSource) whol
 		t.Fatal(err)
 	}
 	defer program.Close()
-	options := compilerOptions{cwd: root, tsconfig: configPath}
+	options := compilerOptions{cwd: root, tsconfig: configPath, trace: traceEntriesKept}
 	compilation, err := collectProgramCompilation(program, options)
 	if err != nil {
 		t.Fatalf("whole-program collection failed: %v", err)

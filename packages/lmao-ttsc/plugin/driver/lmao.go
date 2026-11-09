@@ -19,6 +19,8 @@
 //	§5     defineModule() metadata injection (git_sha, package_name, package_file)
 //	§6     .line(N) injection on log/ok/err chains, literal messages encoded as
 //	       vocabulary IDs
+//	§6.3   trace-level statements compiled away in production (NODE_ENV other
+//	       than "test"), kept in test compiles
 //	§7     task('name', fn) line injection
 //
 // Column-name contract (spec 01e): emitted hot-path writes always use
@@ -69,7 +71,7 @@ func (plugin) ApplyProgram(prog *driver.Program, ctx driver.PluginContext) error
 	if err := validateEntryConfig(ctx.Entry.Config); err != nil {
 		return err
 	}
-	transform, err := lmaoPluginTransform(prog, compilerOptions{cwd: ctx.Cwd, tsconfig: ctx.Tsconfig})
+	transform, err := lmaoPluginTransform(prog, compilerOptions{cwd: ctx.Cwd, tsconfig: ctx.Tsconfig, trace: traceEntriesFor(os.Getenv("NODE_ENV"))})
 	if err != nil {
 		return err
 	}
@@ -102,7 +104,10 @@ func validateEntryConfig(config map[string]any) error {
 	return nil
 }
 
-type compilerOptions struct{ cwd, tsconfig string }
+type compilerOptions struct {
+	cwd, tsconfig string
+	trace         traceEntries
+}
 
 type collectedFile struct {
 	transformer         *fileTransformer
@@ -119,14 +124,42 @@ type programCompilation struct {
 func collectProgramCompilation(prog *driver.Program, options compilerOptions) (*programCompilation, error) {
 	collector := newProgramVocabularyCollector()
 	compilation := &programCompilation{files: map[*shimast.SourceFile]*collectedFile{}}
+	type pendingFile struct {
+		transformer *fileTransformer
+		traces      []traceStatement
+	}
+	var pending []pendingFile
 	for _, sf := range prog.SourceFiles() {
 		if sf == nil || sf.IsDeclarationFile {
 			continue
 		}
 		t := &fileTransformer{file: sf, cwd: options.cwd, checker: prog.Checker, processed: map[*shimast.CallExpression]bool{}, opSpans: map[*shimast.CallExpression]bool{}, fnSpans: map[*shimast.CallExpression]bool{}, blockedReceivers: map[*shimast.Node]bool{}, physicalLogCalls: map[*shimast.CallExpression]callMessagePhysicalLayout{}, currentLogLocalIDs: map[*shimast.CallExpression]uint16{}, vocabulary: collector}
-		t.collectOptimizations(sf.AsNode(), false)
-		t.destructures = t.collectDestructuredRewrites(sf.AsNode())
-		compilation.files[sf] = &collectedFile{transformer: t}
+		pending = append(pending, pendingFile{transformer: t, traces: t.collectTraceStatements(sf.AsNode())})
+	}
+	// Trace elision (spec 01o §6.3) runs after its detection on the untouched
+	// tree and before every other collect pass, so an elided entry registers no
+	// vocabulary, counts toward no capacity and takes no inline, as if the source
+	// never held it. It is the one mutation ahead of those passes; they query the
+	// checker only on nodes it leaves in place.
+	switch options.trace {
+	case traceEntriesElided:
+		for _, file := range pending {
+			for _, trace := range file.traces {
+				// The level/template policy holds in every mode: a production
+				// compile rejects what the test compile rejects.
+				file.transformer.logTemplateOf(trace.call)
+				elideTraceStatement(trace.statement)
+			}
+		}
+	case traceEntriesKept:
+	default:
+		panic(fmt.Sprintf("compile has no trace mode (%d)", options.trace))
+	}
+	for _, file := range pending {
+		t := file.transformer
+		t.collectOptimizations(t.file.AsNode(), false)
+		t.destructures = t.collectDestructuredRewrites(t.file.AsNode())
+		compilation.files[t.file] = &collectedFile{transformer: t}
 	}
 	if err := collector.diagnosticError(); err != nil {
 		return nil, err

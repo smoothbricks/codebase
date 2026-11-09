@@ -16,7 +16,7 @@ import { makeBuildOutputRoot } from './build-output-root.js';
 const projectPath = fileURLToPath(new URL('../../tsconfig.test.json', import.meta.url));
 const packageUrl = new URL('../../package.json', import.meta.url);
 const PARITY = ['structured-log-parity', 'specialized-message-parity', 'enum-metadata-parity'] as const;
-type Fixture = (typeof PARITY)[number] | 'typed-op';
+type Fixture = (typeof PARITY)[number] | 'typed-op' | 'trace-entry';
 
 interface Built {
   readonly path: string;
@@ -75,7 +75,7 @@ let pluginOff: ReadonlyMap<Fixture, Built> = new Map();
 beforeAll(async () => {
   outputRoot = await makeBuildOutputRoot('bun-adapter');
   [pluginOn, pluginOff] = await Promise.all([
-    buildFixtures(true, [...PARITY, 'typed-op'], join(outputRoot, 'on')),
+    buildFixtures(true, [...PARITY, 'typed-op', 'trace-entry'], join(outputRoot, 'on')),
     buildFixtures(false, PARITY, join(outputRoot, 'off')),
   ]);
 });
@@ -247,6 +247,19 @@ test('plugin OFF and ON preserve exact enum value/null bytes while ON reuses pla
   expect(onBuild.source).toContain('.enumLookup.byField["operation"].encode(');
   expect(onBuild.source).not.toContain('case "READ":');
   expect(onBuild.source).not.toContain('case "WRITE":');
+});
+
+interface TraceEntryResult {
+  logFacts: string[];
+}
+
+test('a test-mode compile keeps trace entries for trace-claim queries', async () => {
+  // bun test sets NODE_ENV=test, and the plugin keeps trace statements only for that value: a production compile
+  // would leave no trace row behind for these facts to count.
+  expect(process.env.NODE_ENV).toBe('test');
+  const result = await executeFixture<TraceEntryResult>(output(pluginOn, 'trace-entry'), process.cwd());
+
+  expect(result.logFacts).toEqual(['log:trace: cache warm no-op', 'log:trace: cache warm no-op']);
 });
 
 describe('package export contract', () => {

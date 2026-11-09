@@ -91,7 +91,8 @@ so both lanes emit the same bytes.
 
 The tsconfig plugin entry accepts no plugin-specific keys. `validateEntryConfig` rejects any key beyond ttsc's
 `transform`/`enabled` transport keys with `LMAO1010`, naming the lowest-sorting offender so the diagnostic does not
-depend on Go's randomized map iteration (`packages/lmao-ttsc/plugin/driver/lmao.go:91-105`).
+depend on Go's randomized map iteration (`packages/lmao-ttsc/plugin/driver/lmao.go:91-105`). The one compile-time switch
+the transform reads, trace-level elision (§6.3), comes from the compile's `NODE_ENV`, not from the entry.
 
 ## Design Philosophy <a id="smoo/lmao!n/transformer-philosophy"></a>
 
@@ -605,6 +606,7 @@ Policy violations are diagnostics, not silent raw-message bailouts:
 | `LMAO_PLACEHOLDER_MISMATCH`       | missing, extra, duplicate, malformed, or unresolved placeholder/field        |
 | `LMAO_LOGGER_PROOF_REQUIRED`      | strict optimized build cannot prove an apparent LMAO logger call             |
 | `LMAO_VOCABULARY_ABI_UNAVAILABLE` | emitted chunk cannot use callback ABI version 1                              |
+| `LMAO_TRACE_NOT_STATEMENT`        | a trace call is not a whole statement of its own (§6.3)                      |
 
 An unrelated or genuinely unproved logger call is left byte-shape unchanged; the transformer must not guess. A typed
 LMAO call violating the level/template contract must not silently fall back, because that would make vocabulary coverage
@@ -638,6 +640,36 @@ must show few or no allocations and reuse the startup `PhysicalLayoutPlan`, dens
 must not regress a reported percentile by more than 3%. Startup and span setup are explicit costs and must not regress
 by more than 3% unless the commit message names and justifies the trade. A change that fails a gate does not land, and
 no zero-overhead claim is made without a passing run.
+
+#### 6.3 Trace level compiles away in production <a id="smoo/lmao!n/transformer-trace-elision"></a>
+
+The trace level is the zero-production-cost diagnostic level. Spans and every other level are production: they run the
+same in every build. A trace entry is a statement of its own: a `trace(...)` call on a checker-proved LMAO logger (§6.2
+recognition), optionally followed by the entry's own fluent setters, standing as an expression statement in any
+statement position:
+
+```typescript
+ctx.log.trace('cache warm no-op').reason('already warm');
+if (stale) ctx.log.trace('refresh skipped');
+```
+
+The compile's `NODE_ENV` selects the mode. With `NODE_ENV=test`, which `bun test` and Vitest set before any transform
+runs, trace statements are kept and lower like any other level (§6, §6.2), so trace-claim tests over
+`@smoothbricks/lmao/testing` count them. Any other value, unset included, is a production compile: the transformer
+removes each trace statement whole, the call, its setters and every argument expression, so none of them is evaluated,
+no vocabulary record is registered for its template, and no Op capacity or runtime hint counts its row. A statement list
+loses the statement; a single-statement slot (an `if` branch, a loop body, a label) takes an empty statement, so the
+surrounding code, a condition included, still runs. A trace entry's arguments therefore carry no effect the program
+relies on.
+
+There is no runtime switch and no plugin-entry key: ttsc hands its compiler the host process's environment, so a test
+runner gets the kept mode without per-project setup. A build cache over transformed output keys on `NODE_ENV`.
+
+A trace call anywhere else is `LMAO_TRACE_NOT_STATEMENT` in both modes: an initializer, argument, operand, return value
+or concise arrow body; a trace chained onto another entry (`log.info('a').trace('b')`) or followed by another log-level
+call or by a call that is not the entry's own; and `.trace` read without a call. A production compile cannot remove a
+value something consumes, and keeping it would ship trace cost the test compile never flagged. The §6.2 level/template
+policy holds for trace statements in both modes, so a production compile rejects what the test compile rejects.
 
 ## V8 Optimization Impact <a id="smoo/lmao!n/transformer-v8-impact"></a>
 

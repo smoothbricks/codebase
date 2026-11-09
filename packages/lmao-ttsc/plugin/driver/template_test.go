@@ -95,7 +95,14 @@ type templateFixtureResult struct {
 	source    string
 }
 
+// runTemplateFixture compiles a fixture the way a test runner does: trace
+// statements kept.
 func runTemplateFixture(t *testing.T, body string) templateFixtureResult {
+	t.Helper()
+	return runTemplateFixtureWithTrace(t, body, traceEntriesKept)
+}
+
+func runTemplateFixtureWithTrace(t *testing.T, body string, trace traceEntries) templateFixtureResult {
 	t.Helper()
 	// tsgo printer/program emit is not concurrency-safe across parallel tests.
 	tsgoTestMu.Lock()
@@ -136,7 +143,7 @@ func runTemplateFixture(t *testing.T, body string) templateFixtureResult {
 		t.Fatal("template fixture input source was not loaded")
 	}
 
-	options := compilerOptions{cwd: root, tsconfig: configPath}
+	options := compilerOptions{cwd: root, tsconfig: configPath, trace: trace}
 	compilation, err := collectProgramCompilation(program, options)
 	if err != nil {
 		return templateFixtureResult{err: err, inputPath: inputPath, source: source}
