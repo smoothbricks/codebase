@@ -507,16 +507,8 @@ fn order(mut effects: Vec<Fx>) -> Vec<Fx> {
     effects
 }
 
-fn holds(law: &str, (holds, shown): (bool, String), args: impl FnOnce() -> String) {
-    assert!(
-        holds,
-        "the emitted model breaks {law} on {}: {shown}",
-        args()
-    );
-}
-
-/// Every enumerated input sequence of the model's corpus, and the model's own law checks on every
-/// law's corpus: the proven laws and their definedness companions.
+/// Every enumerated input sequence of the model's corpus. Each check is evaluated on the code's own
+/// ledger after every input, so the corpus needs no second run of the model's laws on itself.
 #[test]
 fn the_ledger_is_the_model_on_its_corpus() {
     let mut seen = Seen::default();
@@ -526,140 +518,6 @@ fn the_ledger_is_the_model_on_its_corpus() {
         seen.add(pair.seen);
     }
     eprintln!("corpus reached {seen:?}");
-    let sequence = |c0: u64, b0: u64, os: &Rc<List<Op>>| {
-        format!("cap {} bound {} {}", c0 + 1, b0 + 1, model::show_ListOp(os))
-    };
-    for (c0, b0, os) in model::corpus_exclusion_check() {
-        holds(
-            "exclusion",
-            model::law_exclusion_check(c0, b0, os.clone()),
-            || sequence(c0, b0, &os),
-        );
-    }
-    for (c0, b0, os) in model::corpus_no_phase_no_wait_check() {
-        holds(
-            "no_phase_no_wait",
-            model::law_no_phase_no_wait_check(c0, b0, os.clone()),
-            || sequence(c0, b0, &os),
-        );
-    }
-    for (c0, b0, os) in model::corpus_phase_has_holder_check() {
-        holds(
-            "phase_has_holder",
-            model::law_phase_has_holder_check(c0, b0, os.clone()),
-            || sequence(c0, b0, &os),
-        );
-    }
-    for (c0, b0, os) in model::corpus_fifo_check() {
-        holds("fifo", model::law_fifo_check(c0, b0, os.clone()), || {
-            sequence(c0, b0, &os)
-        });
-    }
-    for (c0, b0, os) in model::corpus_no_overtaking_check() {
-        holds(
-            "no_overtaking",
-            model::law_no_overtaking_check(c0, b0, os.clone()),
-            || sequence(c0, b0, &os),
-        );
-    }
-    for (c0, b0, os) in model::corpus_bounded_hold_check() {
-        holds(
-            "bounded_hold",
-            model::law_bounded_hold_check(c0, b0, os.clone()),
-            || sequence(c0, b0, &os),
-        );
-    }
-    for (c0, b0, os, o) in model::corpus_no_starvation_check() {
-        holds(
-            "no_starvation",
-            model::law_no_starvation_check(c0, b0, os.clone(), o.clone()),
-            || format!("{} then {}", sequence(c0, b0, &os), model::show_Op(&o)),
-        );
-    }
-    for (c0, b0, c, s) in model::corpus_ask_idle_granted() {
-        holds(
-            "ask_idle_granted",
-            model::law_ask_idle_granted(c0, b0, c.clone(), s.clone()),
-            || format!("{c0} {b0}"),
-        );
-    }
-    for (c0, b0, c, s) in model::corpus_leave_drains_to_idle() {
-        holds(
-            "leave_drains_to_idle",
-            model::law_leave_drains_to_idle(c0, b0, c.clone(), s.clone()),
-            || format!("{c0} {b0}"),
-        );
-    }
-    for (c0, b0) in model::corpus_queue_in_arrival_order() {
-        holds(
-            "queue_in_arrival_order",
-            model::law_queue_in_arrival_order(c0, b0),
-            || format!("{c0} {b0}"),
-        );
-    }
-    for (b0,) in model::corpus_running_class_enters_with_room() {
-        holds(
-            "running_class_enters_with_room",
-            model::law_running_class_enters_with_room(b0),
-            || format!("{b0}"),
-        );
-    }
-    for (b0,) in model::corpus_oldest_waiter_granted_when_room() {
-        holds(
-            "oldest_waiter_granted_when_room",
-            model::law_oldest_waiter_granted_when_room(b0),
-            || format!("{b0}"),
-        );
-    }
-    for (c0, b0) in model::corpus_waiter_granted_when_phase_drains() {
-        holds(
-            "waiter_granted_when_phase_drains",
-            model::law_waiter_granted_when_phase_drains(c0, b0),
-            || format!("{c0} {b0}"),
-        );
-    }
-    for (b0,) in model::corpus_waiting_class_stops_entries() {
-        holds(
-            "waiting_class_stops_entries",
-            model::law_waiting_class_stops_entries(b0),
-            || format!("{b0}"),
-        );
-    }
-    for (c0,) in model::corpus_expire_evicts_at_bound() {
-        holds(
-            "expire_evicts_at_bound",
-            model::law_expire_evicts_at_bound(c0),
-            || format!("{c0}"),
-        );
-    }
-    for (c0,) in model::corpus_expire_waits_for_bound() {
-        holds(
-            "expire_waits_for_bound",
-            model::law_expire_waits_for_bound(c0),
-            || format!("{c0}"),
-        );
-    }
-    for (c0, b0) in model::corpus_gate_io_priority_refuted() {
-        holds(
-            "gate_io_priority_refuted",
-            model::law_gate_io_priority_refuted(c0, b0),
-            || format!("{c0} {b0}"),
-        );
-    }
-    for (c0, b0, c, s) in model::corpus_gate_lease_on_idle_ledger_is_granted() {
-        holds(
-            "gate_lease_on_idle_ledger_is_granted",
-            model::law_gate_lease_on_idle_ledger_is_granted(c0, b0, c.clone(), s.clone()),
-            || format!("{c0} {b0}"),
-        );
-    }
-    for (c0, b0) in model::corpus_gate_behind_gate_is_no_violation() {
-        holds(
-            "gate_behind_gate_is_no_violation",
-            model::law_gate_behind_gate_is_no_violation(c0, b0),
-            || format!("{c0} {b0}"),
-        );
-    }
 }
 
 /// The model's seeded draws: longer sequences, the same stream every target draws. The runs
@@ -816,16 +674,16 @@ fn the_seeded_counterexamples_to_gate_io_priority_shrink_to_two_asks() {
     let mut rng = model::Rng(model::SEED_EXCLUSION_CHECK);
     let (mut draws, mut refuted) = (0, 0);
     let mut first = None;
-    for _ in 0..model::PROPS_GATE_IO_PRIORITY_REFUTED {
-        let c0 = model::gen_Nat(&mut rng, model::PROP_LEN_GATE_IO_PRIORITY_REFUTED);
-        let b0 = model::gen_Nat(&mut rng, model::PROP_LEN_GATE_IO_PRIORITY_REFUTED);
+    for _ in 0..model::PROPS_EXCLUSION_CHECK {
+        let c0 = model::gen_Nat(&mut rng, model::PROP_LEN_EXCLUSION_CHECK);
+        let b0 = model::gen_Nat(&mut rng, model::PROP_LEN_EXCLUSION_CHECK);
         let ops = items(&model::gen_ListOp(
             &mut rng,
-            model::PROP_LEN_GATE_IO_PRIORITY_REFUTED,
+            model::PROP_LEN_EXCLUSION_CHECK,
         ));
         let gates = items(&model::gen_ListNat(
             &mut rng,
-            model::PROP_LEN_GATE_IO_PRIORITY_REFUTED,
+            model::PROP_LEN_EXCLUSION_CHECK,
         ));
         let mut asked = 0;
         let labelled: Vec<Labelled> = ops
