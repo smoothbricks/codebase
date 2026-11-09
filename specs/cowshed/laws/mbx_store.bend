@@ -10,22 +10,24 @@
 #
 # Three switches say what the store does, and each deployed store is one setting of them:
 #   touch   a use writes the access time collection ranks by (agent.rs:518 `record_use`).
-#           Off is the pin, 8add551: the volume is noatime, so eviction reads the creation time.
+#           Off is a build without `record_use` (upstream 8add551): the volume is noatime, so eviction
+#           reads the creation time. cowshed's pin, 8cd8f6b (packages/cowshed/nix/mbx/flake.nix), has it.
 #   lease   a producer's blobs are protected from the sweep from their store to their publish: the
 #           sweep's unlink of a held blob answers `Removal::Blocked`, which `evict_objects` already
 #           skips without crossing into rooted blobs (lib.rs:3149-3158).
 #   atomic  a sweep drops the results that name an evicted blob before it unlinks the blob, so no
 #           reader finds a result whose blob is gone.
-# The pin is (off, off, off), fork HEAD 8cd8f6b is (on, off, off), and the protocol this model
-# proves is (on, on, on).
+# cowshed's pin, fork 8cd8f6b, is (on, off, off); a build without record_use is (off, off, off); the
+# protocol this model proves is (on, on, on).
 #
 # Latency is counted by two fields of the state: `redo`, the publishes a sweep made the store
 # refuse (each is a compile that runs twice), and `dang`, the lookups that found a result naming a
 # blob that was gone (each is a miss and a compile).
 #
 # Check: bun bend2/main.ts mbx_store.bend --verdict
-# The laws the deployed settings do not satisfy are open claims in mbx_store_open.bend; each is
-# refuted here by a trace (`t_lru`, `t_swept`, `t_inflight`, `t_window`) the checker evaluates.
+# The laws the pinned store does not satisfy are open claims in mbx_store_open.bend; each is
+# refuted here by a trace (`t_swept`, `t_inflight`, `t_window`) the checker evaluates. `t_lru`
+# refutes lru for a build without record_use, the regression record_use guards against.
 # Bound to the code by the mbx fork's mbx-cache-store src/store_laws.rs, which runs the emitted
 # model (src/store_laws/model.rs) and `evict_objects` on the same inputs.
 import Base
@@ -609,7 +611,7 @@ def inflight_b(s: St) -> Bool:
     case St{n, +bs, rs, fl, d, w}:
       all_in(fl, ids(bs))
 
-# the pinned mbx (8add551): nothing writes a use, the volume is noatime
+# a build without record_use (upstream 8add551): nothing writes a use, the volume is noatime
 def pin() -> Pol:
   Pol{False{}, False{}, False{}}
 
@@ -1767,8 +1769,8 @@ def t_lru() -> +List<Op>:
 law lru_head_evicts:
   {ev_after(head(), 1n, run(t_lru(), head(), empty())) == [2n] : +List<Nat>}
 
-# touch off, the pin: the sweep ranks by creation, so blob 1 goes though blob 2 is the older use.
-# This is the counterexample to lru for the pin.
+# touch off, a build without record_use: the sweep ranks by creation, so blob 1 goes though blob 2
+# is the older use. This is the counterexample to lru without record_use.
 law lru_pin_evicts:
   {ev_after(pin(), 1n, run(t_lru(), pin(), empty())) == [1n] : +List<Nat>}
 
@@ -1794,7 +1796,7 @@ def t_swept() -> +List<Op>:
 def t_inflight() -> +List<Op>:
   [StoreBlob{1n, 1n}, SweepObjects{0n}, Publish{10n, [1n]}]
 
-# HEAD and the pin: the sweep evicts the blob the producer holds, so the publish is refused and the
+# The pin (8cd8f6b) and HEAD: the sweep evicts the blob the producer holds, so the publish is refused and the
 # compile runs again (local.rs:386, rustc.rs:990, session.rs:1882). This is the counterexample to
 # in_flight_kept.
 law in_flight_lost_today:
@@ -1829,7 +1831,7 @@ def publish_lands_here():
 def t_window() -> +List<Op>:
   [StoreBlob{1n, 1n}, Publish{10n, [1n]}, SweepObjects{0n}, Use{10n}]
 
-# HEAD and the pin: step 1 of the sweep took the blob and step 2 has not yet dropped the result, so
+# The pin (8cd8f6b) and HEAD: step 1 of the sweep took the blob and step 2 has not yet dropped the result, so
 # the reader finds a result that names a blob that is gone: the miss `cached action is missing
 # blob`, and a compile. This is the counterexample to no_dangling.
 law window_today:

@@ -7,21 +7,15 @@
 import Base
 import ./mbx_store.bend as S
 
-# The pin (8add551) writes no use and the volume is noatime, so eviction ranks by creation.
-# Refuted by S.lru_pin_refuted on the trace S.t_lru.
-law lru_pin:
-  for +b: Nat
-  for +os: +List<S.Op>
-  {S.lru_after(S.pin(), b, S.run(os, S.pin(), S.empty())) == True{} : Bool}
 
-# Neither the pin nor HEAD holds a producer's blob against the sweep.
+# Neither the pin (8cd8f6b) nor a build without record_use holds a producer's blob against the sweep.
 # Refuted by S.in_flight_lost_today on the trace S.t_swept.
 law in_flight_kept_today:
   for +tch: Bool
   for +os: +List<S.Op>
   {S.inflight_b(S.run(os, S.Pol{tch, False{}, False{}}, S.empty())) == True{} : Bool}
 
-# Neither the pin nor HEAD drops a result before it takes the blob the result names.
+# Neither the pin (8cd8f6b) nor a build without record_use drops a result before it takes its blob.
 # Refuted by S.window_today on the trace S.t_window.
 law no_dangling_today:
   for +tch: Bool
