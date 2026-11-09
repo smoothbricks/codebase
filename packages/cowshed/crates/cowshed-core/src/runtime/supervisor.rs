@@ -652,6 +652,9 @@ pub struct CpuPlacement {
     /// A held job (05_gateway.md "Held jobs"): its tree runs under the hold its supervisor took,
     /// so its own mbx work takes no permits of its own.
     pub held: bool,
+    /// When the job was admitted, in milliseconds since 1970: interactive work names it to mbx,
+    /// whose pool decays the job's later asks as it ages ([`super::placement::INTERACTIVE_DECAY`]).
+    pub started_ms: u64,
     #[cfg(target_os = "macos")]
     pub nice: i32,
 }
@@ -661,10 +664,11 @@ impl CpuPlacement {
     /// a jobserver or a count its job was not served. Test threads take no jobserver token, so they
     /// are sized to the count where the caller named none (05_gateway.md "Cargo reads its holder's
     /// jobserver"). In a project with the mbx capability (`mbx`), the job's priority in mbx's one
-    /// pool follows its class, land gates `normal` and every other class `low`, and its count is
-    /// each Cargo build's ceiling, `CARGO_BUILD_JOBS`, not a reservation around it (05_gateway.md,
-    /// "Classes", "Parallelism inside a job"). Cargo keeps the job's fifo: it bounds that build
-    /// tree's own fan-out, never host capacity, which only mbx's pool admits.
+    /// pool follows its class ([`super::job_admission::PoolPriority`]), interactive work names its
+    /// start, from which mbx decays its asks, and its count is each Cargo build's ceiling,
+    /// `CARGO_BUILD_JOBS`, not a reservation around it (05_gateway.md, "Classes", "Parallelism
+    /// inside a job"). Cargo keeps the job's fifo: it bounds that build tree's own fan-out, never
+    /// host capacity, which only mbx's pool admits.
     pub(super) fn environment(
         &self,
         caller: &BTreeMap<String, String>,
@@ -700,6 +704,12 @@ impl CpuPlacement {
                 priority.clone(),
             ));
             environment.push((OsString::from("MBX_SCHEDULER_PRIORITY"), priority));
+            if super::placement::decays(self.class) {
+                environment.push((
+                    OsString::from("MBX_SCHEDULER_JOB_STARTED_MS"),
+                    OsString::from(self.started_ms.to_string()),
+                ));
+            }
             environment.push((OsString::from("CARGO_BUILD_JOBS"), tokens.clone()));
             if self.held {
                 // What `mbx reserve` gives its own command: nested mbx work runs under the hold,
@@ -730,14 +740,21 @@ fn nx_parallel(caller: &BTreeMap<String, String>, tokens: usize) -> usize {
 mod cpu_placement_tests {
     use super::*;
 
-    /// With mbx, the job's class sets its priority in the one pool (land gates `normal`, every
-    /// other class `low`) and `g` is its Cargo ceiling, never another reservation; without mbx
-    /// none of that environment appears (05_gateway.md, "Classes", "Parallelism inside a job").
+    /// With mbx, the job's class sets its priority in the one pool (a gate `normal`, interactive
+    /// work `interactive`, every other class `low`) and `g` is its Cargo ceiling, never another
+    /// reservation; without mbx none of that environment appears (05_gateway.md, "Classes",
+    /// "Parallelism inside a job").
     #[test]
     fn an_mbx_job_names_its_pool_priority_and_cargo_ceiling_and_a_plain_job_neither() {
         for (class, mbx, held, priority) in [
             (ExecClass::Gate, true, false, Some("normal")),
-            (ExecClass::Interactive, true, false, Some("low")),
+            (ExecClass::Interactive, true, false, Some("interactive")),
+            (
+                ExecClass::InteractiveResident,
+                true,
+                false,
+                Some("interactive"),
+            ),
             (ExecClass::Background, true, false, Some("low")),
             (ExecClass::Resident, true, false, Some("low")),
             (ExecClass::Background, true, true, Some("low")),
@@ -748,6 +765,7 @@ mod cpu_placement_tests {
                 tokens: std::num::NonZeroUsize::new(4).expect("four"),
                 class,
                 held,
+                started_ms: 1_700_000_000_000,
                 #[cfg(target_os = "macos")]
                 nice: 10,
             };
@@ -764,6 +782,12 @@ mod cpu_placement_tests {
                 read("MBX_SCHEDULER_PRIORITY").as_deref(),
                 priority,
                 "{class:?}"
+            );
+
+            assert_eq!(
+                read("MBX_SCHEDULER_JOB_STARTED_MS").as_deref(),
+                (mbx && class == ExecClass::Interactive).then_some("1700000000000"),
+                "only interactive work names its start to mbx, from which its asks decay: {class:?}"
             );
             assert_eq!(
                 read("CARGO_BUILD_JOBS").as_deref(),
@@ -800,6 +824,7 @@ mod cpu_placement_tests {
             tokens: std::num::NonZeroUsize::new(4).expect("four"),
             class: ExecClass::Background,
             held: false,
+            started_ms: 0,
             #[cfg(target_os = "macos")]
             nice: 10,
         };
@@ -837,11 +862,11 @@ mod cpu_placement_tests {
         }
     }
 
-    /// A gate's priority in mbx's pool survives a shell activation inside its command. The
+    /// A job's priority in mbx's pool survives a shell activation inside its command. The
     /// workspace's `.cowshed/env` exports the canonical `low` a host shell runs at, and a gate's
-    /// `normal` comes back over it, as its Nx fan-out does (05_gateway.md, "Classes", "Parallelism
-    /// inside a job"). On 2026-10-31 every reservation of a downstream land gate entered the pool
-    /// at `low`.
+    /// `normal` or interactive work's `interactive` comes back over it, as its Nx fan-out does
+    /// (05_gateway.md, "Classes", "Parallelism inside a job"). On 2026-10-31 every reservation of a
+    /// downstream land's gate entered the pool at `low`.
     #[test]
     fn a_gates_pool_priority_survives_its_commands_shell_activation() {
         use cowshed_os::test_backstop::CommandBackstop as _;
@@ -864,12 +889,17 @@ mod cpu_placement_tests {
             None,
         )
         .expect("the workspace environment");
-        for (class, priority) in [(ExecClass::Gate, "normal"), (ExecClass::Background, "low")] {
+        for (class, priority) in [
+            (ExecClass::Gate, "normal"),
+            (ExecClass::Interactive, "interactive"),
+            (ExecClass::Background, "low"),
+        ] {
             let placement = CpuPlacement {
                 fifo: PathBuf::from("/pool/j"),
                 tokens: std::num::NonZeroUsize::new(4).expect("four"),
                 class,
                 held: false,
+                started_ms: 0,
                 #[cfg(target_os = "macos")]
                 nice: 10,
             };
@@ -965,6 +995,13 @@ pub enum ProcessEvent {
     Escalate {
         job_id: JobId,
     },
+    /// Interactive work reached a step of its decay ([`super::placement::INTERACTIVE_DECAY`]):
+    /// `after` its start it runs on at `to`'s nice.
+    Decay {
+        job_id: JobId,
+        after: std::time::Duration,
+        to: ExecClass,
+    },
     /// A cold exec host spawned to activate for a job: the job's first process, which it owns
     /// until its command starts.
     Activating {
@@ -1032,6 +1069,7 @@ impl ProcessEvent {
             Self::HoldGranted { .. } => "hold-granted",
             Self::HoldRefused { .. } => "hold-refused",
             Self::HoldLost { .. } => "hold-lost",
+            Self::Decay { .. } => "decay",
         }
     }
 }
@@ -7992,13 +8030,12 @@ impl SupervisorActor {
         // A held job (05_gateway.md "Held jobs") declares its hold in an mbx project. A nested exec,
         // one that names its requester's jobserver, is never held: its tokens are its requester's,
         // and a held requester's hold covers it. A resident is never held: it idles between
-        // requests, and a hold would keep its cores while it does. A gate is never held: it is
-        // admitted leaf by leaf at its class's priority on the host's cores ("Gates and lands");
-        // held, it would run on the cores one hold was granted.
-        let resident = matches!(
-            scheduling.class(),
-            ExecClass::Resident | ExecClass::InteractiveResident | ExecClass::Gate
-        );
+        // requests, and a hold would keep its cores while it does. A gate and interactive work are
+        // never held: each is admitted leaf by leaf at its class's priority ("Gates and lands");
+        // held, it would run on the cores one hold was granted, and one focused test would wait
+        // behind a hold.
+        let unheld =
+            scheduling.class().is_resident() || scheduling.class().is_admitted_leaf_by_leaf();
         let ledger = if self
             .policy
             .child(mode)
@@ -8008,7 +8045,7 @@ impl SupervisorActor {
             .contains(&crate::capabilities::CapabilityId::Mbx)
         {
             super::job_admission::Ledger::Mbx {
-                hold: (declared && parent_jobserver.is_none() && !resident)
+                hold: (declared && parent_jobserver.is_none() && !unheld)
                     .then(|| scheduling.want()),
             }
         } else {
@@ -8167,6 +8204,13 @@ impl SupervisorActor {
             tokens: jobserver.tokens(),
             class: job.info.class,
             held,
+            started_ms: u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("the host clock reads after 1970")
+                    .as_millis(),
+            )
+            .expect("milliseconds since 1970 fit u64"),
             #[cfg(target_os = "macos")]
             nice: super::placement::macos::nice_from(
                 super::placement::macos::own_nice(),
@@ -8229,6 +8273,23 @@ impl SupervisorActor {
             Instant::now(),
             super::job_admission::Event::Spawned { job: job_id },
         ));
+        if super::placement::decays(job.info.class) {
+            // The actor hears each step of the decay as its own event, never a poll.
+            let events = self.events.clone();
+            let started = tokio::time::Instant::now();
+            tokio::spawn(async move {
+                for (after, to) in super::placement::INTERACTIVE_DECAY {
+                    tokio::time::sleep_until(started + after).await;
+                    if events
+                        .send(ProcessEvent::Decay { job_id, after, to })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
         #[cfg(target_os = "macos")]
         {
             job.monitor = process.observations().cloned();
@@ -9162,6 +9223,7 @@ impl SupervisorActor {
                     let _ = process.signal_process_tree(ProcessSignal::Kill);
                 }
             }
+            ProcessEvent::Decay { job_id, after, to } => self.decay(job_id, after, to).await,
             ProcessEvent::SignalFailed { job_id, error } => {
                 let Some(job) = self.jobs.get_mut(&job_id) else {
                     return;
@@ -9178,6 +9240,48 @@ impl SupervisorActor {
                 }
             }
         }
+    }
+
+    /// Interactive work at a step of its decay ([`super::placement::INTERACTIVE_DECAY`]) runs on
+    /// at `to`'s nice, said once on its stderr. A job that ended before the step, or whose
+    /// command has not started, takes nothing.
+    async fn decay(&mut self, job_id: JobId, after: std::time::Duration, to: ExecClass) {
+        let Some(job) = self.jobs.get(&job_id) else {
+            return;
+        };
+        if job.terminal() || job.process.is_none() {
+            return;
+        }
+        // The job's handle holds its leader unreaped while it lives (`RunningProcess`), so the
+        // leader's pid names the job's group alone.
+        let Some(leader) = job.birth.as_ref().and_then(Birth::leader) else {
+            return;
+        };
+        let (to_name, seconds) = (to.as_str(), after.as_secs());
+        #[cfg(target_os = "macos")]
+        let note = {
+            let nice = super::placement::macos::nice_from(super::placement::macos::own_nice(), to);
+            match super::placement::macos::place_group_nice(leader.pgid(), nice) {
+                Ok(_) => {
+                    format!("cowshed: interactive job decayed to {to_name} after {seconds}s\n")
+                }
+                Err(error) => format!(
+                    "cowshed: interactive job did not decay to {to_name} after {seconds}s: {error}\n"
+                ),
+            }
+        };
+        // WHY: a Linux job's class is its class cgroup, and cgroup v2 cannot move a job cgroup
+        // across class cgroups without migrating its pids, which would break the job cgroup's
+        // accounting. Only mbx's pool decays the job's asks; its kernel weight stays interactive's.
+        #[cfg(target_os = "linux")]
+        let note = {
+            let _ = leader;
+            format!(
+                "cowshed: interactive job decayed to {to_name} after {seconds}s in mbx's pool; its kernel weight stays interactive's, since a job cgroup cannot leave its class cgroup\n"
+            )
+        };
+        self.process_output(job_id, StreamKind::Stderr, Bytes::from(note))
+            .await;
     }
 
     async fn process_output(&mut self, job_id: JobId, stream: StreamKind, bytes: Bytes) {
@@ -11655,6 +11759,7 @@ mod workspace_toolchain_tests {
                 tokens: std::num::NonZeroUsize::MIN,
                 class: ExecClass::Background,
                 held: false,
+                started_ms: 0,
                 #[cfg(target_os = "macos")]
                 nice: 0,
             },
@@ -13575,6 +13680,7 @@ mod sandbox_environment_tests {
                 tokens: std::num::NonZeroUsize::MIN,
                 class: ExecClass::Background,
                 held: false,
+                started_ms: 0,
                 #[cfg(target_os = "macos")]
                 nice: 0,
             },

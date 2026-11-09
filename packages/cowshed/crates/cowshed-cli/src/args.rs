@@ -2912,7 +2912,7 @@ const EXEC: CommandSpec = CommandSpec {
     about: &[
         "Runs one argv — never a shell string — inside the workspace's sandbox, with the cwd at the workspace root. Child stdout and stderr pass through as opaque bytes and the child's exit code passes through untouched; only a denial cowshed has authoritative evidence for is reported as one.",
         "Waits for the command however long it runs and exits with its status. With `--timeout`, a command still running then keeps running under the workspace supervisor and exec exits 103 naming its job; `--background` prints the job id and returns at once. No CLI verb reattaches to a job: the cowshed API does. `--session` keeps a named session's cwd and variables across calls.",
-        "Every job starts at its class's nice (on Linux, its job cgroup's weight), and the kernel schedules it beside everything else on the host. A job that names no `--want` starts at once. An ordinary command is `background` and runs at nice +10. `--class interactive` names a command someone is waiting on: it runs at its supervisor's own nice, ahead of a gate at +5 and background at +10 whenever cores are contended, and a workspace may ask for it. `--class gate` admits the command as the operator's gate, at nice +5. Only this trusted route may ask for a gate; a workspace's own capability is refused. Every job has its own jobserver with as many slots as the host has cores, which its make, Cargo and test runners share, and a `cowshed exec` it starts in its own workspace shares it too; `--want <n>` gives the job fewer. In a project with mbx, `--want <n>` also declares the job heavy: it stays queued, saying so on stderr, until mbx's pool grants it as many of those cores as are free, at least one, and holds them for its life; a resident and an exec started inside a held job are never held. A background job waits, queued, while the host reports memory pressure, and starts once it eases; on macOS, while pressure is critical, the youngest background or resident job is ended and fails with `memory`. A foreground job lives as long as this exec does: if exec ends first, however it ends, the job is killed, so a gate whose lander is gone never holds up the next land and a caller's timeout leaves no orphan; `--timeout` lets it run on, and `--background` never holds it. `--host` runs the command once at the host boundary, outside the workspace sandbox, at the class it names.",
+        "Every job starts at its class's nice (on Linux, its job cgroup's weight), and the kernel schedules it beside everything else on the host. A job that names no `--want` starts at once. An ordinary command is `background` and runs at nice +10. `--class interactive` names a command someone is waiting on: it runs at its supervisor's own nice, ahead of a gate at +5 and background at +10 whenever cores are contended, and a workspace may ask for it. It is never held and takes no `--want`: its builds and tests enter mbx's pool leaf by leaf at the interactive priority, and it decays to the gate's nice after 30 s and to background's after 120 s. `--class gate` admits the command as the operator's gate, at nice +5. Only this trusted route may ask for a gate; a workspace's own capability is refused. Every job has its own jobserver with as many slots as the host has cores, which its make, Cargo and test runners share, and a `cowshed exec` it starts in its own workspace shares it too; `--want <n>` gives the job fewer. In a project with mbx, `--want <n>` also declares the job heavy: it stays queued, saying so on stderr, until mbx's pool grants it as many of those cores as are free, at least one, and holds them for its life; a resident and an exec started inside a held job are never held. A background job waits, queued, while the host reports memory pressure, and starts once it eases; on macOS, while pressure is critical, the youngest background or resident job is ended and fails with `memory`. A foreground job lives as long as this exec does: if exec ends first, however it ends, the job is killed, so a gate whose lander is gone never holds up the next land and a caller's timeout leaves no orphan; `--timeout` lets it run on, and `--background` never holds it. `--host` runs the command once at the host boundary, outside the workspace sandbox, at the class it names.",
         "`--class resident` admits a process that stays up to serve requests and is idle between them — a daemon, a worker — at nice +10; an idle resident costs the host nothing, and is never held in mbx's pool. `--class interactive-resident` is the same resident at nice 0, for a worker whose requests someone waits on, and differs in nothing else.",
     ],
     options: &[
@@ -3036,13 +3036,16 @@ fn parse_exec(matches: &ArgMatches, environment: Environment<'_>) -> Result<Comm
             }
         },
     };
-    // A gate runs on its class's parallelism, admitted leaf by leaf at its priority on the host's
-    // cores ("Gates and lands"): an agent shell's COWSHED_EXEC_WANT never sizes it, and a line
-    // that names a want for one is refused by name rather than run on fewer cores.
-    let want = if class == ExecClass::Gate {
+    // A gate and interactive work are admitted leaf by leaf at their class's priority, never held
+    // ("Gates and lands"): an agent shell's COWSHED_EXEC_WANT never sizes one, and a line that
+    // names a want for one is refused by name rather than run on fewer cores.
+    let want = if class.is_admitted_leaf_by_leaf() {
         if matches.contains_id("want") {
             return Err(UsageError::new(
-                "--want is not valid with --class gate: a gate runs on the host's cores at its class's priority",
+                format!(
+                    "--want is not valid with --class {}: it runs on the host's cores at its class's priority",
+                    class.as_str()
+                ),
                 USAGE,
             ));
         }
@@ -4934,11 +4937,9 @@ mod tests {
         assert_eq!(gate.class, ExecClass::Gate);
         assert_eq!(gate.scope, ExecScope::Workspace);
 
-        let host = exec(&[
-            "exec", "raven", "--class", "gate", "--host", "--want", "18", "--", "gate",
-        ]);
+        let host = exec(&["exec", "raven", "--class", "gate", "--host", "--", "gate"]);
         assert_eq!(host.scope, ExecScope::HostGate);
-        assert_eq!(host.want.map(NonZeroUsize::get), Some(18));
+        assert_eq!(host.want, None, "a gate takes no want");
 
         let host_background = exec(&["exec", "raven", "--host", "--want", "4", "--", "test"]);
         assert_eq!(
@@ -5100,29 +5101,36 @@ mod tests {
     }
 
     #[test]
-    fn a_gate_takes_no_want_from_the_environment_and_refuses_one_on_its_line() {
-        let gate = ["exec", "raven", "--class", "gate", "--", "gate"];
-        let parsed = parse_args_in(gate, |_| Some(OsString::from("4"))).expect("a gate parses");
-        let Command::Exec(exec) = parsed.command else {
-            panic!("exec parses as exec");
-        };
-        assert_eq!(exec.class, ExecClass::Gate);
-        assert_eq!(exec.want, None, "COWSHED_EXEC_WANT never sizes a gate");
-        let error = parse_args_in(
-            [
-                "exec", "raven", "--class", "gate", "--want", "4", "--", "gate",
-            ],
-            |_| None,
-        )
-        .expect_err("a gate's --want is refused");
-        assert!(
-            error
-                .message
-                .contains("--want is not valid with --class gate"),
-            "{}",
-            error.message
-        );
-        assert_eq!(error.exit_code(), 2);
+    fn a_gate_and_interactive_work_take_no_want_from_the_environment_and_refuse_one_on_their_line()
+    {
+        for (spelled, class) in [
+            ("gate", ExecClass::Gate),
+            ("interactive", ExecClass::Interactive),
+        ] {
+            let line = ["exec", "raven", "--class", spelled, "--", "x"];
+            let parsed =
+                parse_args_in(line, |_| Some(OsString::from("4"))).expect("the class parses");
+            let Command::Exec(exec) = parsed.command else {
+                panic!("exec parses as exec");
+            };
+            assert_eq!(exec.class, class);
+            assert_eq!(exec.want, None, "COWSHED_EXEC_WANT never sizes {spelled}");
+            let error = parse_args_in(
+                [
+                    "exec", "raven", "--class", spelled, "--want", "4", "--", "x",
+                ],
+                |_| None,
+            )
+            .expect_err("its --want is refused");
+            assert!(
+                error
+                    .message
+                    .contains(&format!("--want is not valid with --class {spelled}")),
+                "{}",
+                error.message
+            );
+            assert_eq!(error.exit_code(), 2);
+        }
     }
 
     #[test]

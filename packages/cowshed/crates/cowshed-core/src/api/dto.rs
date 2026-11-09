@@ -38,6 +38,7 @@ pub enum ExecClass {
     Background,
     /// Work a person or model is waiting on, declared by the requester that awaits its result: it
     /// runs at the supervisor's own nice and never waits on memory pressure. A worker may ask for it.
+    /// It is never held, and it decays: to the gate's nice at 30 s, to background's at 120 s.
     Interactive,
     /// A land's gate job, a train's proof and the jobs a land's steps start: nice +5, never
     /// CPU-limited, and never made to wait or ended for memory. Only the trusted coordinator route admits it.
@@ -57,6 +58,25 @@ impl ExecClass {
     /// is idle between them (05_gateway.md "Classes").
     pub const fn is_resident(self) -> bool {
         matches!(self, Self::Resident | Self::InteractiveResident)
+    }
+
+    /// Whether this class is admitted leaf by leaf at its priority in mbx's pool, never as a held
+    /// job: a gate's tree, on the host's cores ("Gates and lands"), and work someone waits on, so
+    /// one focused test never waits behind a hold. Held, either would run on the cores one grant
+    /// gave it.
+    pub const fn is_admitted_leaf_by_leaf(self) -> bool {
+        matches!(self, Self::Interactive | Self::Gate)
+    }
+
+    /// The class as `--class` and the job record spell it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::Interactive => "interactive",
+            Self::Gate => "gate",
+            Self::Resident => "resident",
+            Self::InteractiveResident => "interactive-resident",
+        }
     }
 }
 

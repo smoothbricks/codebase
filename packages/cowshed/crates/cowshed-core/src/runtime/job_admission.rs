@@ -50,10 +50,12 @@ pub enum Ledger {
     Jobservers,
 }
 
-/// A job's priority in mbx's pool: a land gate's `normal`, every other class's `low`
-/// (05_gateway.md "Classes"). Each is a lane of a checkout's held jobs.
+/// A job's priority in mbx's pool (05_gateway.md "Classes"): interactive work's and an interactive
+/// resident's `interactive`, which mbx ranks above the gate's and decays as the job ages; a gate's
+/// `normal`; every other class's `low`. Each is a lane of a checkout's held jobs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PoolPriority {
+    Interactive,
     Normal,
     Low,
 }
@@ -61,17 +63,16 @@ pub enum PoolPriority {
 impl PoolPriority {
     pub const fn of(class: ExecClass) -> Self {
         match class {
+            ExecClass::Interactive | ExecClass::InteractiveResident => Self::Interactive,
             ExecClass::Gate => Self::Normal,
-            ExecClass::Background
-            | ExecClass::Interactive
-            | ExecClass::Resident
-            | ExecClass::InteractiveResident => Self::Low,
+            ExecClass::Background | ExecClass::Resident => Self::Low,
         }
     }
 
     /// mbx's own word for it, as `mbx reserve --priority` and `MBX_SCHEDULER_PRIORITY` take it.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Interactive => "interactive",
             Self::Normal => "normal",
             Self::Low => "low",
         }
@@ -79,8 +80,9 @@ impl PoolPriority {
 
     const fn lane(self) -> usize {
         match self {
-            Self::Normal => 0,
-            Self::Low => 1,
+            Self::Interactive => 0,
+            Self::Normal => 1,
+            Self::Low => 2,
         }
     }
 }
@@ -216,7 +218,7 @@ pub struct Admission {
     pressure: Option<Reading>,
     jobs: BTreeMap<JobId, Entry>,
     /// Indexed by [`PoolPriority::lane`].
-    lanes: [Lane; 2],
+    lanes: [Lane; 3],
 }
 
 impl Admission {
@@ -890,8 +892,8 @@ mod tests {
     }
 
     /// One hold per lane waits in the pool: a checkout's later held jobs wait in request order and
-    /// enter one by one as the one ahead is granted or withdrawn, while its gate has a lane of its
-    /// own and enters at once at `normal`.
+    /// enter one by one as the one ahead is granted or withdrawn, while its interactive work and
+    /// its gate each have a lane of their own and enter at once, at `interactive` and `normal`.
     #[test]
     fn a_checkout_waits_in_the_pool_once_per_lane_in_request_order() {
         let mut admission = Admission::default();
@@ -919,8 +921,14 @@ mod tests {
             cpus: n(cpus),
             priority,
         };
-        assert_eq!(answered[1], [started(2, 3, PoolPriority::Low, 1)]);
-        assert_eq!(answered[2], [started(3, 1, PoolPriority::Low, 2)]);
+        assert_eq!(
+            answered[1],
+            [
+                started(2, 3, PoolPriority::Interactive, 0),
+                reserve(2, 3, PoolPriority::Interactive)
+            ]
+        );
+        assert_eq!(answered[2], [started(3, 1, PoolPriority::Low, 1)]);
         assert_eq!(
             answered[3],
             [
@@ -937,16 +945,10 @@ mod tests {
                     ok: true
                 },
                 Effect::Admit { job: id(1) },
-                reserve(2, 3, PoolPriority::Low),
+                reserve(3, 1, PoolPriority::Low),
             ]
         );
-        assert_eq!(
-            answered[5],
-            [
-                Effect::Release { job: id(2) },
-                reserve(3, 1, PoolPriority::Low)
-            ]
-        );
+        assert_eq!(answered[5], [Effect::Release { job: id(2) },]);
         assert_eq!(
             admission.phase(id(3)),
             Some(Phase::Holding {

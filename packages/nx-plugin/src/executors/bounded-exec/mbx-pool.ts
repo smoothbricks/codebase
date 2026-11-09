@@ -12,13 +12,21 @@ import {
 import { shellQuote } from './verdict.js';
 
 /**
+ * mbx's pool priorities, as `MBX_SCHEDULER_PRIORITY` and a reservation name them: interactive work's `interactive`,
+ * which mbx ranks first and decays as its job ages, a gate's `normal`, every other job's `low` (cowshed's
+ * `PoolPriority`).
+ */
+export const MBX_PRIORITIES = ['interactive', 'normal', 'low'] as const;
+export type MbxPriority = (typeof MBX_PRIORITIES)[number];
+
+/**
  * mbx's machine-wide pool as a leaf runner meets it (specs/cowshed/05_gateway.md, "Host scheduling", "Parallelism inside
  * a job"). With the mbx capability the canonical environment names the one pool (`MBX_SCHEDULER=1` beside the shared
  * `MBX_CACHE_DIR`) and the job's priority in it; that pool is the host's CPU and memory ledger, so no Nx run or leaf
  * serves a pool of its own beside it.
  */
 export interface MbxPool {
-  readonly priority: 'normal' | 'low';
+  readonly priority: MbxPriority;
 }
 
 /**
@@ -33,7 +41,8 @@ export function mbxPool(environment: Readonly<NodeJS.ProcessEnv>): MbxPool | nul
   if (environment.MBX_SCHEDULER !== '1' || !environment.MBX_CACHE_DIR || environment.MBX_SCHED_DISABLE === '1') {
     return null;
   }
-  return { priority: environment.MBX_SCHEDULER_PRIORITY === 'normal' ? 'normal' : 'low' };
+  const named = MBX_PRIORITIES.find((priority) => priority === environment.MBX_SCHEDULER_PRIORITY);
+  return { priority: named ?? 'low' };
 }
 
 /**
@@ -52,7 +61,7 @@ export type MbxLeaf =
   | { readonly kind: 'cargo' }
   | {
       readonly kind: 'reserve';
-      readonly priority: 'normal' | 'low';
+      readonly priority: MbxPriority;
       readonly demand: ReservedDemand;
     };
 

@@ -75,6 +75,39 @@ pub fn place_nice(pid: u32, nice: i32) -> Result<i32, PriorityFailure> {
     }
 }
 
+/// Set every process of the group `pgid` leads to `nice` -- interactive work decaying
+/// ([`super::INTERACTIVE_DECAY`]) -- and read back the group's nice, its highest-priority
+/// member's. Only lowering: a member a command already placed below `nice` is refused, never
+/// raised. The caller holds the leader unreaped, so `pgid` names the job's group alone.
+pub fn place_group_nice(pgid: i32, nice: i32) -> io::Result<i32> {
+    let who = libc::id_t::try_from(pgid).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("process group {pgid} is not a group id"),
+        )
+    })?;
+    // SAFETY: plain system calls naming a group whose leader the caller holds unreaped.
+    if unsafe { libc::setpriority(libc::PRIO_PGRP, who, nice) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    crate::runtime::shell_host::clear_errno();
+    // SAFETY: as above.
+    let observed = unsafe { libc::getpriority(libc::PRIO_PGRP, who) };
+    if observed == -1
+        && let Some(errno) = io::Error::last_os_error().raw_os_error()
+        && errno != 0
+    {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    if observed == nice {
+        Ok(observed)
+    } else {
+        Err(io::Error::other(format!(
+            "process group {pgid} reads nice {observed} once set to {nice}"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

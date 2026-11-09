@@ -61,6 +61,7 @@ impl Pool {
     ) {
         self.tickets += 1;
         let (class, priority) = match priority {
+            PoolPriority::Interactive => (Class::Interactive, Priority::Normal),
             PoolPriority::Normal => (Class::Gate, Priority::Normal),
             PoolPriority::Low => (Class::Background, Priority::Low),
         };
@@ -348,12 +349,17 @@ impl World {
             self.pool.used()
         );
         let mut lanes = BTreeSet::new();
-        for (holder, request) in &self.pool.queue {
+        for (holder, _) in &self.pool.queue {
+            let priority = PoolPriority::of(
+                self.jobs
+                    .get(holder)
+                    .expect("a hold waiting in the pool has a live job")
+                    .class,
+            );
             assert!(
-                lanes.insert((holder.0, request.priority)),
-                "checkout {} waits in the pool twice at {:?}",
-                holder.0,
-                request.priority
+                lanes.insert((holder.0, priority.as_str())),
+                "checkout {} waits in the pool twice at {priority:?}",
+                holder.0
             );
         }
         for (&holder, job) in &self.jobs {

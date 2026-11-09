@@ -11,6 +11,7 @@
 //!   a class shares one weight against the other classes, however many threads its jobs run.
 
 use crate::api::dto::ExecClass;
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
@@ -26,4 +27,23 @@ pub const fn class_nice(class: ExecClass) -> i32 {
         ExecClass::Gate => 5,
         ExecClass::Background | ExecClass::Resident => 10,
     }
+}
+
+/// How long interactive work keeps its own nice: a person or model waits on its first seconds;
+/// past them it runs at the gate's nice (05_gateway.md "Classes").
+pub const INTERACTIVE_TO_GATE: Duration = Duration::from_secs(30);
+/// When interactive work runs at background's nice: work this long is no edit's quick feedback.
+pub const INTERACTIVE_TO_BACKGROUND: Duration = Duration::from_secs(120);
+/// Interactive work's decay, in order: how long after its start each step comes, and the class
+/// whose nice the job's group runs at from then. mbx decays the job's asks in its pool from the
+/// start the job names (`MBX_SCHEDULER_JOB_STARTED_MS`).
+pub const INTERACTIVE_DECAY: [(Duration, ExecClass); 2] = [
+    (INTERACTIVE_TO_GATE, ExecClass::Gate),
+    (INTERACTIVE_TO_BACKGROUND, ExecClass::Background),
+];
+
+/// Whether a job of `class` decays: interactive work alone. An interactive resident serves many
+/// short requests over a long life, and its age says nothing of any one request's.
+pub const fn decays(class: ExecClass) -> bool {
+    matches!(class, ExecClass::Interactive)
 }

@@ -24,6 +24,13 @@ describe("mbx's one pool at the leaf", () => {
     expect(mbxPool({ MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx', MBX_SCHEDULER_PRIORITY: 'normal' })).toEqual({
       priority: 'normal',
     });
+
+    expect(mbxPool({ MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx', MBX_SCHEDULER_PRIORITY: 'interactive' })).toEqual({
+      priority: 'interactive',
+    });
+    expect(mbxPool({ MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx', MBX_SCHEDULER_PRIORITY: 'urgent' })).toEqual({
+      priority: 'low',
+    });
   });
 
   it('names no pool inside a reservation: nested work shares the grant it runs under', () => {

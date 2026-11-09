@@ -8,7 +8,7 @@ import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src
 import typia, { type tags } from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CONTROL_MS } from './lease-wait.js';
-import { mbxPool } from './mbx-pool.js';
+import { type MbxPriority, mbxPool } from './mbx-pool.js';
 
 /**
  * mbx's reservation endpoint of one Nx run (specs/cowshed/05_gateway.md, "Parallelism inside a job"). A reserved leaf
@@ -191,7 +191,7 @@ type Uint = number & tags.Type<'uint32'>;
 
 /** The lines a client writes (mbx's `docs/scheduling.md`, "Serve reservations to many commands"). */
 type ReservationRequest =
-  | { type: 'reserve'; id: Uint; cpus: Uint & tags.Minimum<1>; priority: 'normal' | 'low' }
+  | { type: 'reserve'; id: Uint; cpus: Uint & tags.Minimum<1>; priority: MbxPriority }
   | { type: 'release'; id: Uint };
 
 /** The lines the endpoint answers; an added field is mbx's to add. */
@@ -232,7 +232,7 @@ class Connection {
     this.#socket.on('close', () => this.#close(`mbx reservation endpoint ${this.endpoint} closed the connection`));
   }
 
-  reserve(cpus: number, priority: 'normal' | 'low'): Reservation {
+  reserve(cpus: number, priority: MbxPriority): Reservation {
     if (this.#closed !== null) {
       return { granted: Promise.resolve({ ok: false, error: this.#closed }), release() {} };
     }
@@ -317,7 +317,7 @@ const connections = new Map<string, Connection>();
  * Ask the endpoint at `socket` for at most `cpus` cores at `priority`, over this process's one connection to it,
  * opened by its first request and kept while another one may come.
  */
-export function reserveCores(socket: string, cpus: number, priority: 'normal' | 'low'): Reservation {
+export function reserveCores(socket: string, cpus: number, priority: MbxPriority): Reservation {
   let connection = connections.get(socket);
   if (connection === undefined) {
     const opened: Connection = new Connection(socket, () => {

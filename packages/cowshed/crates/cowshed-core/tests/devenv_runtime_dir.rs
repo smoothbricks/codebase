@@ -1135,6 +1135,7 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
             tokens: std::num::NonZeroUsize::MIN,
             class: cowshed_core::api::dto::ExecClass::Background,
             held: false,
+            started_ms: 0,
             #[cfg(target_os = "macos")]
             nice: 0,
         },

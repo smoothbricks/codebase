@@ -4744,9 +4744,7 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
     ]);
     let scheduling = record.scheduling;
     columns.extend([
-        Arc::new(StringArray::from(vec![Some(class_name(
-            scheduling.class(),
-        ))])) as ArrayRef,
+        Arc::new(StringArray::from(vec![Some(scheduling.class().as_str())])) as ArrayRef,
         Arc::new(UInt64Array::from(vec![Some(token_column(
             scheduling.want(),
         )?)])),
@@ -4918,16 +4916,6 @@ fn decode_tokens(value: u64, what: &str) -> Result<NonZeroUsize, ArtifactError> 
         .ok_or_else(|| {
             ArtifactError::Arrow(format!("{what} {value} is not a positive token count"))
         })
-}
-
-fn class_name(class: ExecClass) -> &'static str {
-    match class {
-        ExecClass::Background => "background",
-        ExecClass::Interactive => "interactive",
-        ExecClass::Gate => "gate",
-        ExecClass::Resident => "resident",
-        ExecClass::InteractiveResident => "interactive-resident",
-    }
 }
 
 fn scope_name(scope: ExecScope) -> &'static str {

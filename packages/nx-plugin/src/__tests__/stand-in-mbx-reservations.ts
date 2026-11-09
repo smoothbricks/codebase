@@ -3,15 +3,14 @@ import { rm } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
 import typia from 'typia';
+import type { MbxPriority } from '../executors/bounded-exec/mbx-pool.js';
 import { ownedSocketDirectory } from '../testing.js';
 
 /**
  * A line a client writes to `mbx reservations` (mbx's docs/scheduling.md, "Serve reservations to many commands"):
  * exactly these fields, as the host's installed mbx accepts them.
  */
-type HeardLine =
-  | { type: 'reserve'; id: number; cpus: number; priority: 'normal' | 'low' }
-  | { type: 'release'; id: number };
+type HeardLine = { type: 'reserve'; id: number; cpus: number; priority: MbxPriority } | { type: 'release'; id: number };
 
 const validLine = typia.createValidateEquals<HeardLine>();
 
@@ -37,7 +36,7 @@ function heardLine(raw: string): HeardLine | { readonly refused: string } {
 export interface HeardReserve {
   readonly id: number;
   readonly cpus: number;
-  readonly priority: 'normal' | 'low';
+  readonly priority: MbxPriority;
   readonly connection: number;
 }
 

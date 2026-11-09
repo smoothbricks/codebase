@@ -2259,6 +2259,27 @@ async fn an_exec_that_is_not_a_held_job_starts_at_once_and_reserves_nothing() {
     let landing = spawned_at_once(&mut h, gate).await;
     assert!(!landing.request.cpu.held, "a gate runs under no hold");
 
+    // Work someone waits on is admitted leaf by leaf like a gate: it is never held, whatever it
+    // declares, so one focused test never waits behind a hold in the pool.
+    let awaited = h
+        .handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                class: ExecClass::Interactive,
+                ..held(4)
+            },
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let focused = spawned_at_once(&mut h, awaited).await;
+    assert!(
+        !focused.request.cpu.held,
+        "interactive work runs under no hold"
+    );
+
     // A nested exec is covered by its requester's hold: it reads its requester's jobserver, runs
     // under that hold, and takes no place in the pool of its own.
     let requester = InheritedJobserver {
@@ -2328,7 +2349,9 @@ async fn an_exec_that_is_not_a_held_job_starts_at_once_and_reserves_nothing() {
     assert_eq!(held_job.request.job_id, waiting);
     assert_eq!(held_job.request.cpu.tokens.get(), 1);
     assert!(held_job.request.cpu.held);
-    for spawned in [&brief, &idle, &landing, &covered, &sized, &held_job] {
+    for spawned in [
+        &brief, &idle, &landing, &focused, &covered, &sized, &held_job,
+    ] {
         finish(&h, spawned).await;
     }
     mbx.hear("released 1").await;
@@ -7171,6 +7194,102 @@ async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_re
         Some(terminal),
         "the sealed sample keeps the peak"
     );
+}
+
+/// Interactive work decays (05_gateway.md "Classes"): past 30 s its whole group runs at the gate's
+/// nice, past 120 s at background's, and its stderr says each step once.
+#[cfg(target_os = "macos")]
+#[tokio::test(start_paused = true)]
+async fn interactive_work_decays_to_the_gate_s_nice_then_background_s() {
+    use cowshed_core::runtime::placement::{INTERACTIVE_TO_BACKGROUND, INTERACTIVE_TO_GATE, macos};
+    let (supervisor_config, _root) =
+        isolated_config(&temp_parent::scratch_parent(), "interactive-decay");
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                class: ExecClass::Interactive,
+                ..request(StdinSource::Empty)
+            },
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let leader = lone_group();
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            process: owned(&leader, Instant::now()),
+            nice: Some(0),
+        },
+        0,
+    )
+    .await;
+    let pgid = leader.id();
+    let group_nice = || {
+        // SAFETY: a plain read of the priority of a group whose leader this test holds unreaped.
+        unsafe { libc::getpriority(libc::PRIO_PGRP, pgid) }
+    };
+    // The actor hears the decay's steps and the test's bytes on one channel, in order: a byte
+    // served after a step's deadline was handled after that step.
+    let served = |offset: u64| {
+        let (handle, events) = (handle.clone(), job.events.clone());
+        async move {
+            events
+                .send(ProcessEvent::Output {
+                    job_id,
+                    stream: StreamKind::Stdout,
+                    bytes: Bytes::from_static(b"."),
+                })
+                .await
+                .unwrap();
+            let chunk = handle
+                .log_read(job_id, StreamKind::Stdout, offset, true)
+                .await
+                .unwrap();
+            assert_eq!(chunk.bytes.as_ref(), b".");
+        }
+    };
+    let own = macos::own_nice();
+    assert_eq!(group_nice(), own, "interactive work starts at its own nice");
+
+    tokio::time::sleep(INTERACTIVE_TO_GATE + Duration::from_millis(1)).await;
+    served(1).await;
+    assert_eq!(
+        group_nice(),
+        macos::nice_from(own, ExecClass::Gate),
+        "past 30 s the group runs at the gate's nice"
+    );
+
+    tokio::time::sleep(INTERACTIVE_TO_BACKGROUND - INTERACTIVE_TO_GATE).await;
+    served(2).await;
+    assert_eq!(
+        group_nice(),
+        macos::nice_from(own, ExecClass::Background),
+        "past 120 s the group runs at background's nice"
+    );
+
+    end_group(&leader);
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(handle.wait(job_id).await.unwrap().state, JobState::Exited);
+    reap(leader);
+    let stderr = stderr_of(&handle, job_id).await;
+    for line in [
+        "cowshed: interactive job decayed to gate after 30s\n",
+        "cowshed: interactive job decayed to background after 120s\n",
+    ] {
+        assert_eq!(
+            stderr.matches(line).count(),
+            1,
+            "{line:?} once in {stderr:?}"
+        );
+    }
 }
 
 #[tokio::test]
