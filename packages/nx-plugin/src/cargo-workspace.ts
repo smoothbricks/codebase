@@ -249,6 +249,33 @@ export function createCargoInputsCache(): CargoInputsCache {
   return { manifests: new Map(), nestedCrateDirs: new Map(), compiledInFiles: new Map(), results: new Map() };
 }
 
+/** A producer output a Cargo target hashes: the files one producer edge writes under one closure file set. */
+export interface CargoProducerOutputInput {
+  readonly dependentTasksOutputFiles: string;
+  readonly transitive: false;
+}
+
+/**
+ * The outputs of a Cargo target's producers its compile can read: one `dependentTasksOutputFiles` per file set of its
+ * closure (`cargoPackageTestInputs`, or the generic fallback rooted at `projectRoot`). A producer that writes a
+ * generated crate source, a compiled-in file or a manifest keys the target; one that writes anywhere else, such as a
+ * TypeScript package's `dist`, does not. Nx matches the glob against each output file's workspace-relative path (the
+ * same `matchGlobPaths` its `--check` uses), so the `{workspaceRoot}/` anchor is dropped. An exclusion or a named input
+ * has no output form, and a producer writes into no build directory the exclusions name.
+ */
+export function cargoProducerOutputInputs(
+  inputs: readonly (string | object)[],
+  projectRoot: string,
+): CargoProducerOutputInput[] {
+  const globs = inputs.flatMap((input) => {
+    if (typeof input !== 'string') return [];
+    if (input.startsWith('{workspaceRoot}/')) return [input.slice('{workspaceRoot}/'.length)];
+    if (input.startsWith('{projectRoot}/')) return [posix.join(projectRoot, input.slice('{projectRoot}/'.length))];
+    return [];
+  });
+  return [...new Set(globs)].map((glob) => ({ dependentTasksOutputFiles: glob, transitive: false }));
+}
+
 export function cargoPackageTestInputs(options: CargoPackageTestInputsOptions): Promise<string[]> {
   const cache = options.cache ?? createCargoInputsCache();
   const key = `${options.absoluteProjectRoot}\0${options.memberDir}`;

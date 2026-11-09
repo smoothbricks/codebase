@@ -14,7 +14,7 @@ import type {
   ProjectGraphProjectNode,
   TargetConfiguration,
 } from 'nx/src/devkit-exports.js';
-import { WorkspaceContext } from 'nx/src/native/index.js';
+import { matchGlobPaths, WorkspaceContext } from 'nx/src/native/index.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-configuration/target-defaults.js';
 import { resolveNxTokensInOptions } from 'nx/src/project-graph/utils/project-configuration/target-merging.js';
@@ -1992,15 +1992,28 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-test': 'test',
         test: 'test',
       });
-      // The test build and the lints hash every crate's sources
-      // AND the outputs of the targets they depend on: generated crate inputs
-      // are gitignored, so a repository that had to restate `inputs` to add
-      // them replaced the crate union with the root's `default` and shipped a
-      // stale test build to every per-crate test.
+      // The test build and the lints hash every crate's sources AND the outputs of the targets they depend on that a
+      // compile can read: generated crate inputs are gitignored, so a repository that had to restate `inputs` to add
+      // them replaced the crate union with the root's `default` and shipped a stale test build to every per-crate
+      // test. A producer's output outside every closure file set (a TypeScript package's dist) keys none of them.
+      // Nx's own matcher for `dependentTasksOutputFiles` (`matchGlobPaths`, the one `--check` uses) decides.
+      const producerOutputs = [
+        ['packages/ferris/crates/ferris-core/src/generated.rs', true],
+        ['packages/ferris/crates/ferris-wasm/fixtures/corpus.json', true],
+        ['packages/ferris/Cargo.toml', true],
+        ['packages/ferris/dist/ts/index.js', false],
+        ['packages/web/dist/generated.ts', false],
+      ] as const;
       for (const name of ['cargo-test-build', 'cargo-lint', CARGO_CROSS_LINT_TARGET]) {
         const inputs = targets[name]?.inputs ?? [];
-        expect(inputs).toContainEqual({ dependentTasksOutputFiles: '**/*', transitive: false });
         expect(inputs).toContain('{workspaceRoot}/packages/ferris/crates/ferris-core/**/*');
+        expect(inputs).not.toContainEqual({ dependentTasksOutputFiles: '**/*', transitive: false });
+        const globs = inputs.flatMap((input) =>
+          typeof input === 'object' && 'dependentTasksOutputFiles' in input ? [input.dependentTasksOutputFiles] : [],
+        );
+        for (const [path, keyed] of producerOutputs) {
+          expect(matchGlobPaths(globs, [path])[0], `${name} ${path}`).toBe(keyed);
+        }
       }
       // The test build is the one test compile; no uncached `--no-run` warm-up compiles the same units again.
       expect(targets['cargo-test-compile']).toBeUndefined();

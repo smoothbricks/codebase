@@ -1303,10 +1303,16 @@ Concrete targets come from concrete files:
   that key in the target directory it built. Nx cache restoration must never replace Cargo's `target` link. Its inputs,
   like every cargo-derived fileset, are anchored at `{workspaceRoot}`: Nx resolves a `{projectRoot}` glob against only
   the files its project owns, and a nested package owns the crates under it, so a root workspace's test build spelled
-  that way hashes none of its members and replays stale binaries against edited crates. Each member crate gets a cached
-  `cargo-test-<package>` run (30s slow-test warning, no per-test kill) whose inputs include the crates Cargo builds for
-  that crate's tests (from Cargo's locked resolve: its dependencies and its own dev-dependencies, never the
-  dev-dependencies of the crates below it), and whose command runs
+  that way hashes none of its members and replays stale binaries against edited crates. The test build, `cargo-lint`,
+  the cross check and archives, mutation and bench also hash the outputs of the producers a repository adds to their
+  `dependsOn` that a compile can read: one `{dependentTasksOutputFiles: "<fileset>", transitive: false}` per positive
+  file set of that union, its `{workspaceRoot}/` anchor dropped because Nx matches the glob against each output's
+  workspace-relative path. A generated crate source, a compiled-in file or a manifest a producer writes keys them; a
+  producer's output anywhere else, such as a TypeScript package's `dist`, keys none of them. The test build also keys
+  the local nextest helper it runs (`**/dist/bin/<platform>/smoo-nx-nextest-binaries`) where the workspace builds it.
+  Each member crate gets a cached `cargo-test-<package>` run (30s slow-test warning, no per-test kill) whose inputs
+  include the crates Cargo builds for that crate's tests (from Cargo's locked resolve: its dependencies and its own
+  dev-dependencies, never the dev-dependencies of the crates below it), and whose command runs
   `cargo --frozen nextest run --binaries-metadata … --cargo-metadata … --target-dir-remap … --workspace-remap . -E 'package(<crate>)'`
   in place, against the binaries the build left in Cargo's target directory. Runners therefore execute rather than
   build: they compile nothing in cargo's build tree, copy nothing, and fan out instead of chaining. A test archive

@@ -49,6 +49,7 @@ import {
   type CargoCrossTestTarget,
   type CargoInputsCache,
   cargoPackageTestInputs,
+  cargoProducerOutputInputs,
   cargoTestGroupTargetName,
   cargoTestPackageTargetName,
   createCargoInputsCache,
@@ -859,18 +860,29 @@ function createCargoWasmTarget(
  * create its parent, so the build consumes what the `mkdir` produced. Outside
  * Nx there is no task hash, and a build no task names is refused here rather
  * than by every runner.
+ *
+ * `inputs` is the workspace's Cargo union. The build runs the nextest helper it
+ * depends on (`record`), so a workspace that builds that helper keys its bytes.
  */
 function createCargoTestBuildTarget(
   projectRoot: string,
   toolConfig: string,
   nativeTools: NativeTools | null,
+  inputs: NonNullable<TargetConfiguration['inputs']>,
 ): TargetConfiguration {
-  const helper = nativeToolCommand(nativeTools, projectRoot, 'nextest-extract', 'smoo-nx-nextest-binaries');
+  const helperBin = 'smoo-nx-nextest-binaries';
+  const helper = nativeToolCommand(nativeTools, projectRoot, 'nextest-extract', helperBin);
+  const helperProducer = nativeToolDependsOn(nativeTools, 'nextest-extract');
   return {
     executor: 'nx:run-commands',
     metadata: CARGO_PRODUCER_METADATA,
     cache: true,
-    inputs: CARGO_INPUTS,
+    inputs: [
+      ...inputs,
+      ...(helperProducer.length > 0 && nativeTools !== null
+        ? [{ dependentTasksOutputFiles: `**/dist/bin/${nativeTools.platform}/${helperBin}`, transitive: false }]
+        : []),
+    ],
     outputs: [
       `{projectRoot}/${NEXTEST_BINARIES_METADATA}`,
       `{projectRoot}/${NEXTEST_CARGO_METADATA}`,
@@ -1909,26 +1921,30 @@ async function createProjectTargets(
         ).flat(),
       ),
     ];
-    // Generated crate sources (wire codecs, vocabularies, fixtures) are
-    // gitignored and invisible to nx's file hasher; they reach these targets
-    // as the outputs of the targets a repository adds to `dependsOn`. Hashing
-    // those outputs here means a repository never has to restate `inputs` to
-    // add them - and a restated `inputs` REPLACES this union with the root
-    // project's `default`, which owns no crate file, so the test build then
-    // cache-hits against edited crates while every per-crate test reruns on
-    // the stale binary. That verdict is wrong, not merely slow.
+    // Generated crate sources (wire codecs, vocabularies, fixtures) and
+    // compiled-in files are often gitignored and invisible to nx's file
+    // hasher; they reach these targets as the outputs of the targets a
+    // repository adds to `dependsOn`. Hashing those outputs here means a
+    // repository never has to restate `inputs` to add them - and a restated
+    // `inputs` REPLACES this union with the root project's `default`, which
+    // owns no crate file, so the test build then cache-hits against edited
+    // crates while every per-crate test reruns on the stale binary. Only the
+    // outputs under the union's own file sets are hashed
+    // (`cargoProducerOutputInputs`): a compile reads nothing else, and a
+    // producer's TypeScript output outside every crate keys no Rust build.
+    const closureInputs = workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS;
     const workspaceCargoInputs: TargetConfiguration['inputs'] = [
-      ...(workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS),
-      { dependentTasksOutputFiles: '**/*', transitive: false },
+      ...closureInputs,
+      ...cargoProducerOutputInputs(closureInputs, cargoWorkspaceRoot),
     ];
+    // The build's `cargo nextest list` loads the repository's nextest config and
+    // refuses an invalid one, so that file keys the build as well as every run.
     targets[CARGO_TEST_BUILD_TARGET] = createCargoTestBuildTarget(
       cargoWorkspaceRoot,
       nextestToolConfigArg(cargoWorkspaceRoot),
       nativeTools,
+      [...workspaceCargoInputs, `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`],
     );
-    // The build's `cargo nextest list` loads the repository's nextest config and
-    // refuses an invalid one, so that file keys the build as well as every run.
-    targets[CARGO_TEST_BUILD_TARGET].inputs = [...workspaceCargoInputs, `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`];
     // One archive per declared foreign triple, from the same inputs and the
     // same repository nextest config, whose `archive.include` decides what an
     // archive CONTAINS: it is the workspace's test binaries for another
