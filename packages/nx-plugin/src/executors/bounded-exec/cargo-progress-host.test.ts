@@ -240,7 +240,9 @@ fn main() {
       expect(output).toContain('{"reason":"build-finished","success":true}\n');
       expect(released, 'the production watchdog must terminate teardown, not fixture cleanup').toBe(false);
       expect(result.success).toBe(false);
-      expect(result.terminalOutput).toContain(`no test finished for ${BOUNDED_TEST_IDLE_TIMEOUT_MS}ms`);
+      expect(result.terminalOutput).toContain(
+        `no test finished or reported progress for ${BOUNDED_TEST_IDLE_TIMEOUT_MS}ms`,
+      );
       expect(kills).toContain('SIGTERM');
       const record: unknown = JSON.parse(await readFile(join(root, 'record', VERDICT_FILE), 'utf8'));
       expect(record).toHaveProperty('verdict.outcome', 'wedged');

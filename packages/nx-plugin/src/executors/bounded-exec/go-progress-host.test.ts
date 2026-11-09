@@ -151,7 +151,9 @@ describe('Go test progress host proofs', () => {
       );
       expect(advanced).toBe(true);
       expect(result.success).toBe(false);
-      expect(result.terminalOutput).toContain(`no test finished for ${BOUNDED_TEST_IDLE_TIMEOUT_MS}ms`);
+      expect(result.terminalOutput).toContain(
+        `no test finished or reported progress for ${BOUNDED_TEST_IDLE_TIMEOUT_MS}ms`,
+      );
       expect(result.terminalOutput).toContain('still running: example TestHang');
     } finally {
       jest.useRealTimers();

@@ -6,7 +6,8 @@ import { BUN_TEST, GO_TEST, GO_TEST_RUNNER, NEXTEST_RUN } from './verdict.js';
 
 /**
  * What a run's output says about its forward motion: whether a test finished, and which tests the runner said
- * are running and has not said finished. `idleTimeoutMs` re-arms only on a finished test.
+ * are running and has not said finished. In the output, `idleTimeoutMs` re-arms only on a finished test; a running test
+ * reports its own progress on the run's progress channel instead (progress-channel.ts).
  *
  * Output alone is not progress. nextest repeats a `SLOW` line for every test still running at each slow-timeout
  * period, and a hung test may print a heartbeat, so a bound on silence never fires on either. A finished test is

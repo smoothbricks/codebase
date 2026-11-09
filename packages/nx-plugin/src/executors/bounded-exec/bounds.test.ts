@@ -66,6 +66,38 @@ describe('bounded-exec bounds', () => {
       { kind: 'idle', at: 160 },
     ],
     [
+      'progress a running test reports restarts the progress bound as a finished test does',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: false, fixtureFirst: false },
+        { kind: 'reported', at: 60, testing: true },
+        progress(90, true, true),
+      ],
+      { kind: 'idle', at: 160 },
+    ],
+    [
+      'reported progress outside the testing lifecycle arms nothing: the fixture ceiling stands',
+      { idleMs: 100, fixtureMs: 200 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: true, queued: false, fixtureFirst: false },
+        progress(10, true, false),
+        { kind: 'reported', at: 50, testing: false },
+      ],
+      { kind: 'fixture', at: 200 },
+    ],
+    [
+      'progress reported while a scheduled leaf holds no grant restores its whole budget for the next grant',
+      { idleMs: 100 },
+      [
+        { kind: 'spawn', at: 0, testing: true, fixture: false, queued: true, fixtureFirst: false },
+        { kind: 'granted', at: 10, testing: true, fixture: false },
+        { kind: 'released', at: 60 },
+        { kind: 'reported', at: 70, testing: true },
+        { kind: 'granted', at: 80, testing: true, fixture: false },
+      ],
+      { kind: 'idle', at: 180 },
+    ],
+    [
       'the total ceiling wins when it comes first, and on a tie',
       { idleMs: 100, totalMs: 100 },
       [{ kind: 'spawn', at: 0, testing: true, fixture: false, queued: false, fixtureFirst: false }],

@@ -16,6 +16,7 @@ import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processGroupHasMembers } from '../../process-group.js';
 import { ownedSocketDirectory, processesOf } from '../../testing.js';
 import { type CpuPool, createCpuPool } from './cpu-pool.js';
+import { CPU_RISING_CLASS } from './cpu-rise.js';
 import {
   type BoundedExecContext,
   type BoundedExecResult,
@@ -32,6 +33,7 @@ import { RESERVATIONS_ENV, RESERVATIONS_UNSERVED_ENV } from './mbx-reservations.
 import { createNoSpaceWatch } from './no-space.js';
 import { cowshedSubtreeOwner, type SubtreeOwner } from './owned-subtree.js';
 import { CPU_POOL_ENV, type InheritedCpuPool, readInheritedCpuPool } from './pool-environment.js';
+import { PROGRESS_SOCKET_ENV } from './progress-channel.js';
 import {
   createHostCommands,
   describeRamTempError,
@@ -228,7 +230,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.terminalOutput).toContain('Command made no progress: no test finished for 100ms');
+    expect(result.terminalOutput).toContain(
+      'Command made no progress: no test finished or reported progress for 100ms',
+    );
     expect(result.terminalOutput).toContain('idleTimeoutMs=100');
     expect(result.terminalOutput).toContain('the runner named no test still running');
     // The bound that fired is named, so a hang is never reported as a slow run.
@@ -401,7 +405,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     expect(result.success).toBe(false);
     expect(result.terminalOutput).toContain('SLOW [>');
-    expect(result.terminalOutput).toContain('Command made no progress: no test finished for 400ms (idleTimeoutMs=400)');
+    expect(result.terminalOutput).toContain(
+      'Command made no progress: no test finished or reported progress for 400ms (idleTimeoutMs=400)',
+    );
     expect(result.terminalOutput).toContain('still running: fake tests::hangs (cwd=');
     expect(result.terminalOutput).not.toContain('fake tests::quick (cwd=');
   });
@@ -488,7 +494,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.success).toBe(false);
     // The rising process is evidence for the verdict; it moved no bound.
     expect(result.terminalOutput).toContain(
-      `no test finished for ${2 * HANG_CAPTURE_MS}ms (idleTimeoutMs=${2 * HANG_CAPTURE_MS})`,
+      `no test finished or reported progress for ${2 * HANG_CAPTURE_MS}ms (idleTimeoutMs=${2 * HANG_CAPTURE_MS})`,
     );
     expect((await readRecord(record.directory))?.verdict).toEqual({
       outcome: 'wedged',
@@ -587,7 +593,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       );
       const output = result.terminalOutput;
       expect(result.success).toBe(false);
-      expect(output).toContain(`Command made no progress: no test finished for ${HANG_CAPTURE_MS + 5_000}ms`);
+      expect(output).toContain(
+        `Command made no progress: no test finished or reported progress for ${HANG_CAPTURE_MS + 5_000}ms`,
+      );
       // The capture began after the command said it was opening the FIFO, and completed before the expiry.
       expect(readyWhenAsked, output).toBe(true);
       expect(output).toContain('Hang snapshot outcome=');
@@ -728,7 +736,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     expect(result.success).toBe(false);
     expect(result.terminalOutput).toContain('still waiting...');
-    expect(result.terminalOutput).toContain('Command made no progress: no test finished for 300ms');
+    expect(result.terminalOutput).toContain(
+      'Command made no progress: no test finished or reported progress for 300ms',
+    );
   });
 
   it('lets a run that keeps finishing tests outlive its progress bound', async () => {
@@ -764,6 +774,110 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain('(10/10) fake tests::t10');
     expect(result.terminalOutput).not.toContain('made no progress');
     expect(movedMs).toBeGreaterThan(400);
+  });
+
+  it('lets a long test that reports progress on its channel outlive its progress bound, though it finishes nothing', async () => {
+    const workspace = await createWorkspace();
+    // One long test run alone, as an agent harness's: it finishes nothing for ten 300ms steps of a 400ms progress bound,
+    // and reports each movement its own no-progress check sees on the run's progress channel. The executor closes a
+    // connection only after reading its record, and the test says 'beat' only after that close, so the clock moves only
+    // after the record was read. A real 50ms pause between beats keeps each one its own output chunk, so each moves the
+    // clock: without a channel the bound expires on the second.
+    await workspace.write(
+      'reporting.js',
+      [
+        "const { connect } = require('node:net');",
+        `const channel = process.env.${PROGRESS_SOCKET_ENV};`,
+        'const report = () =>',
+        '  new Promise((done, failed) => {',
+        '    if (channel === undefined) return done();',
+        "    const socket = connect(channel, () => socket.end('moved\\n'));",
+        "    socket.on('error', failed);",
+        "    socket.on('close', done);",
+        '    socket.resume();',
+        '  });',
+        '(async () => {',
+        '  for (let beat = 1; beat <= 10; beat++) {',
+        '    await report();',
+        "    console.log('beat ' + beat);",
+        '    await new Promise((paced) => setTimeout(paced, 50));',
+        '  }',
+        "  console.error('        PASS [   3.000s] (1/1) fake tests::long');",
+        '})();',
+        '',
+      ].join('\n'),
+    );
+
+    const { result, movedMs } = await onProgressClock(
+      (chunk) => /^beat \d+$/m.test(chunk),
+      300,
+      () =>
+        runBoundedExec(
+          { command: 'node reporting.js', idleTimeoutMs: 400 },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+        ),
+    );
+
+    expect(result.terminalOutput).not.toContain('made no progress');
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toContain('beat 10');
+    expect(movedMs).toBeGreaterThan(400);
+  });
+
+  it('fails a run whose test writes something other than a progress record on its channel, and reads it as no progress', async () => {
+    const workspace = await createWorkspace();
+    // The reporter is broken: it writes a line that is not the record, then waits forever. Only the refusal ends it.
+    await workspace.write(
+      'broken-reporter.js',
+      [
+        "const { connect } = require('node:net');",
+        `const socket = connect(process.env.${PROGRESS_SOCKET_ENV}, () => socket.write('progress: 50%\\n'));`,
+        "socket.on('error', () => {});",
+        'setInterval(() => {}, 1000);',
+        '',
+      ].join('\n'),
+    );
+
+    const result = await runBoundedExec(
+      { command: 'node broken-reporter.js', idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain(
+      'bounded-exec: progress channel: a progress record is the line moved, not "progress: 50%"',
+    );
+    expect(result.terminalOutput).not.toContain('made no progress');
+  });
+  it('ends a test that only gains CPU and reports no progress at its bound, and names it a build inside the test', async () => {
+    if (process.platform === 'win32') return;
+    const workspace = await createWorkspace();
+    const record = { task: { id: 'app:test', hash: null }, directory: join(workspace.root, 'compile') };
+    // A compile inside a test: its tree gains CPU and reports nothing. Real timers: the capture's two censuses fall
+    // inside its window before the bound, and the bound expires on its own schedule; CPU never restarts it.
+    await workspace.write('compile.js', "console.log('compiling');\nfor (;;) {}\n");
+
+    const result = await runBoundedExec(
+      { command: 'node compile.js', idleTimeoutMs: HANG_CAPTURE_MS + 5_000, killAfterMs: 0 },
+      { ...workspace.context, record },
+      createProcessTreeKiller(),
+      null,
+    );
+
+    const output = result.terminalOutput;
+    expect(result.success).toBe(false);
+    expect(output).toContain('Command made no progress');
+    expect(output).toContain(CPU_RISING_CLASS);
+    const verdict = (await readRecord(record.directory))?.verdict;
+    if (verdict?.outcome !== 'wedged') throw new Error(`the run is not wedged: ${JSON.stringify(verdict)}`);
+    expect(
+      verdict.cpuRising.some((rise) => rise.command.includes('compile.js')),
+      output,
+    ).toBe(true);
   });
 
   it("counts bun's dots on stderr as finished tests", async () => {

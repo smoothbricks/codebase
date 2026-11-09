@@ -1297,14 +1297,14 @@ unchanged.
    with why, and said. Each outcome is one more `lands.log` line, and each command's output is kept in
    `lands/<head>.*.log` beside it, as it comes. The push (`git push --progress`) and each after command have a silence
    bound of 180 s, not a total, over their output and the CPU of what they run. That "output and CPU" bound is these
-   commands' own: it is not bounded-exec's idle bound, which counts finished tests alone and which CPU never restarts
-   (08_testing.md, "Integration tests (real substrate)"), and not the bound a land step watchdog puts on a step of the
-   land it watches, which belongs to the repository that runs that land. On Linux each runs in a cgroup leaf of its own
-   inside the job's cgroup, retired once it ends, and on Darwin in a process group of its own. One that shows neither
-   for 180 s is sent `SIGTERM` and its outcome is `SILENT` (05_gateway.md "Deadlines"). The land never waits for the
-   job: a remote is never needed to land, and a slow push or install holds up neither this land nor the next.
-   `--no-push` records `unpushed` and pushes nothing; the after commands still run. The report is the primitive's
-   `landed` report.
+   commands' own: it is not bounded-exec's idle bound, which counts finished tests and the progress records running
+   tests report, and which CPU never restarts (08_testing.md, "Integration tests (real substrate)"), and not the bound a
+   land step watchdog puts on a step of the land it watches, which belongs to the repository that runs that land. On
+   Linux each runs in a cgroup leaf of its own inside the job's cgroup, retired once it ends, and on Darwin in a process
+   group of its own. One that shows neither for 180 s is sent `SIGTERM` and its outcome is `SILENT` (05_gateway.md
+   "Deadlines"). The land never waits for the job: a remote is never needed to land, and a slow push or install holds up
+   neither this land nor the next. `--no-push` records `unpushed` and pushes nothing; the after commands still run. The
+   report is the primitive's `landed` report.
 
 **The declared commands' environment.** Every command a declared land or a doc commit runs (gate, edit, check, commit,
 push, after) runs with nothing of the caller's shell. The environment is cleared; `HOME`, `USER`, `LOGNAME`, `TERM`,

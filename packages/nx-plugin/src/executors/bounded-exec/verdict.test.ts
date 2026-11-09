@@ -291,7 +291,7 @@ describe('bounded-exec verdicts', () => {
     expect(
       describeVerdict({ outcome: 'wedged', idleMs: 180_000, elapsedMs: 200_000, tests: [], lockWaits, cpuRising: [] }),
     ).toBe(
-      'wedged: no test finished for 180000ms after 200000ms; the runner named no test still running; ' +
+      'wedged: no test finished or reported progress for 180000ms after 200000ms; the runner named no test still running; ' +
         'waiting on a lock: /Users/dev/.cargo/.package-cache held open by pid 51234 (cargo)',
     );
   });
@@ -316,7 +316,7 @@ describe('bounded-exec verdicts', () => {
       cpuRising,
     });
     expect(describeVerdict(verdict)).toBe(
-      'wedged: no test finished for 180000ms after 180900ms; the runner named no test still running; ' +
+      'wedged: no test finished or reported progress for 180000ms after 180900ms; the runner named no test still running; ' +
         "a process in the test's tree was using CPU: likely a build inside the test: " +
         'pid 4242 (rustc --crate-name hang_fixture) gained 7.0 s of CPU',
     );

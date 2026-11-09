@@ -7,7 +7,9 @@
  *   ceiling starts at spawn. Later zero-hold intervals pause only the idle budget.
  * - Any explicitly queued task process pauses idle, including alongside held grants; ceilings keep running.
  * - The fixture ceiling ends with its segment. The idle clock also stops outside the testing lifecycle.
- * - Finished tests reset the idle budget whether their release byte arrived before or after their output.
+ * - Finished tests reset the idle budget whether their release byte arrived before or after their output, and so does
+ *   progress a running test reports on the run's progress channel (progress-channel.ts). The run's CPU is no event:
+ *   it never resets the budget.
  */
 
 /** The limits a run was given, in milliseconds; an absent one never expires. */
@@ -63,6 +65,11 @@ export type BoundEvent =
       readonly wasTesting: boolean;
       readonly finished: boolean;
     }
+  /**
+   * A running test reported progress on the run's progress channel: it restarts the idle bound as a finished test
+   * does, and moves no phase, so `testing` is the answer before and after it.
+   */
+  | { readonly kind: 'reported'; readonly at: number; readonly testing: boolean }
   /** The fixture's segment ended: its ceiling no longer applies. */
   | { readonly kind: 'fixture-done' };
 
@@ -151,10 +158,12 @@ export function stepBounds(bounds: Bounds, limits: BoundLimits, event: BoundEven
         idleRemaining: bounds.idle === null ? bounds.idleRemaining : Math.max(0, bounds.idle - event.at),
       };
     }
-    case 'progress': {
-      if (bounds.queued) return event.finished ? { ...bounds, idleRemaining: limits.idleMs ?? null } : bounds;
+    case 'progress':
+    case 'reported': {
+      const moved = event.kind === 'reported' || event.finished;
+      if (bounds.queued) return moved ? { ...bounds, idleRemaining: limits.idleMs ?? null } : bounds;
       if (!event.testing) return { ...bounds, idle: null, idleRemaining: limits.idleMs ?? null };
-      const restart = event.finished || !event.wasTesting;
+      const restart = moved || (event.kind === 'progress' && !event.wasTesting);
       if (!restart || limits.idleMs === undefined) return bounds;
       return {
         ...bounds,

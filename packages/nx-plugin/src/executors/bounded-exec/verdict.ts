@@ -19,14 +19,14 @@ import { TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
  *   outlived `timeoutMs` (`total`), its fixture segment outlived `fixtureTimeoutMs`
  *   (`fixture`), or every failing test in the runner's report failed on
  *   its runner's per-test timeout (`test`). A loaded host produces exactly these.
- * - `wedged`: `idleTimeoutMs` fired: no test finished for that long during a chargeable test interval. This proves
- *   the suite's completion bound was exceeded, not that every process stopped: an expensive active fixture can
- *   exceed it too. The verdict names tests reported running but never finished and tests the report says were
- *   aborted; diagnostics distinguish a stalled wait from a progressing but oversized lifecycle.
- *   When the snapshot named a lock wait, `lockWaits` names the file the run holds on a numbered descriptor and the
- *   processes outside the run that also hold it open: open-handle evidence, not a kernel lock owner. When it named a
- *   process whose CPU time rose, `cpuRising` names it: a build inside the test, which is a defect and not a hang. CPU
- *   never restarts the bound, which counts finished tests only.
+ * - `wedged`: `idleTimeoutMs` fired: no test finished and no running test reported progress for that long during a
+ *   chargeable test interval. This proves the suite's completion bound was exceeded, not that every process stopped:
+ *   an expensive active fixture can exceed it too. The verdict names tests reported running but never finished and
+ *   tests the report says were aborted; diagnostics distinguish a stalled wait from a progressing but oversized
+ *   lifecycle. When the snapshot named a lock wait, `lockWaits` names the file the run holds on a numbered descriptor
+ *   and the processes outside the run that also hold it open: open-handle evidence, not a kernel lock owner. When it
+ *   named a process whose CPU time rose, `cpuRising` names it: a build inside the test, which is a defect and not a
+ *   hang. CPU never restarts the bound, which counts finished tests and the progress running tests report.
  * - `no-space`: the run failed and its output said a write found no space (ENOSPC). Whatever its tests then reported,
  *   they failed on the disk, not on their own: the verdict names the line that said so and, when the task held one,
  *   its RAM temp volume as it stood when that line arrived.
@@ -748,7 +748,7 @@ export function describeVerdict(verdict: BoundedExecVerdict): string {
         verdict.tests.length > 0
           ? `still running: ${verdict.tests.join(', ')}`
           : 'the runner named no test still running';
-      return `wedged: no test finished for ${verdict.idleMs}ms after ${verdict.elapsedMs}ms; ${running}${[...locks, ...cpu].join('')}`;
+      return `wedged: no test finished or reported progress for ${verdict.idleMs}ms after ${verdict.elapsedMs}ms; ${running}${[...locks, ...cpu].join('')}`;
     }
     case 'no-space':
       return `${describeNoSpace(verdict)}${verdict.tests.length > 0 ? `; the tests that then failed: ${verdict.tests.join(', ')}` : ''}`;

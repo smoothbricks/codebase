@@ -2085,16 +2085,24 @@ line or dot, or a Vitest default-reporter file/test result. Timed Vitest `✓` a
 duration for skipped files. Reporter headers, failure stack locations and final summary counts do not count. Output that
 finishes no test is not progress: the nextest `SLOW` warning, repeated every slow-timeout period for a test still
 running, and a hung test heartbeat both keep printing. A suite that keeps finishing tests therefore runs as long as it
-needs, however slow the host, and a test that never returns ends the run 180 s after the last test that finished. bun
-prints nothing per passing test when it believes an agent runs it, so the executor asks a lone `bun test` for `--dots`,
-one dot per finished test. Without a recognised execution lifecycle, the clock starts at command spawn; a command that
-reports no tests makes progress only by exiting. nextest's slow-timeout and the serial groups' code-time classes only
-warn; no per-test bound kills a test or fails one that passed. Bun has a per-test deadline of its own, 5000 ms unless
-the command sets one, and it reads no bunfig for it, so every bun leg deletes it with `bun test --timeout=0`
-(`BUN_TEST_TIMEOUT_FLAG`; `0` means no deadline, measured on the pinned Bun 1.4.2). A test waits for the event it is
-waiting for, however long a loaded host makes the work take; one that never returns still ends the run through
-`idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that report no tests; a target names at least one of
-the two.
+needs, however slow the host, and a test that never returns ends the run 180 s after the last test that finished.
+
+A running test may also report its own progress. Each run with an idle bound is served a progress channel, a Unix socket
+in a fresh 0700 directory named in the command's environment as `BOUNDED_EXEC_PROGRESS_SOCKET` (`progress-channel.ts`).
+Each line a client writes there is one record and must be `moved`; the record restarts the bound exactly as a finished
+test does, and anything else fails the run as a broken reporter. The executor ends its side of a connection when the
+client ends its own, after reading every record on it, so a client that waits for that end knows its records counted. An
+agent harness that enforces its own no-progress bound over what its run does reports each movement that check sees, so a
+long test that keeps moving is not ended for being the last one running. The run's CPU is never a record: a compile
+inside a test reports nothing and still ends at the bound, where the snapshot names it. bun prints nothing per passing
+test when it believes an agent runs it, so the executor asks a lone `bun test` for `--dots`, one dot per finished test.
+Without a recognised execution lifecycle, the clock starts at command spawn; a command that reports no tests makes
+progress only by exiting. nextest's slow-timeout and the serial groups' code-time classes only warn; no per-test bound
+kills a test or fails one that passed. Bun has a per-test deadline of its own, 5000 ms unless the command sets one, and
+it reads no bunfig for it, so every bun leg deletes it with `bun test --timeout=0` (`BUN_TEST_TIMEOUT_FLAG`; `0` means
+no deadline, measured on the pinned Bun 1.4.2). A test waits for the event it is waiting for, however long a loaded host
+makes the work take; one that never returns still ends the run through `idleTimeoutMs`. `timeoutMs`, an absolute
+ceiling, is for commands that report no tests; a target names at least one of the two.
 
 With mbx admission, a supported Cargo/nextest test leaf inherits a private grant pipe: mbx writes `g` on every admission
 and `r` on permit drop (`MBX_GRANT_FD=5`). The executor counts overlapping holds: while no hold exists it pauses the
@@ -2628,16 +2636,17 @@ task id and the hash it ran at:
   `process aborted with signal 15 (SIGTERM)` (SIGKILL once the force-kill follows); they are the bound's casualties and
   do not make the run `failed`. A test that dies of any other signal, or that is aborted with no bound to explain it,
   does.
-- `wedged`: `idleTimeoutMs` fired: no test finished during that much active test time. This proves the completion
-  interval was exceeded, not that every process stopped: an oversized fixture can exceed it too. Its `tests` name those
-  the runner reported running (nextest's `SLOW`, libtest's `has been running for over`) and never finished, and those
-  the JUnit report says it aborted when the bound stopped it. Its `lockWaits` lists only regular files the run holds on
-  numbered descriptors that processes outside the run also hold open, naming those holders' pids and commands. This is
-  open-handle evidence, not kernel lock-owner proof. The open-file census runs only on macOS, so on every other platform
-  `lockWaits` is always empty. An incomplete or raced capture records none. Its `cpuRising` lists each process of the
-  run's tree whose CPU time rose by at least two counted seconds between the snapshot's two process censuses, with its
-  pid, command and gain: a build inside the test, which is a defect and not a hang. It is empty when no process rose or
-  the closing census did not complete, and a record written before it carries none.
+- `wedged`: `idleTimeoutMs` fired: no test finished and no running test reported progress during that much active test
+  time. This proves the completion interval was exceeded, not that every process stopped: an oversized fixture can
+  exceed it too. Its `tests` name those the runner reported running (nextest's `SLOW`, libtest's
+  `has been running for over`) and never finished, and those the JUnit report says it aborted when the bound stopped it.
+  Its `lockWaits` lists only regular files the run holds on numbered descriptors that processes outside the run also
+  hold open, naming those holders' pids and commands. This is open-handle evidence, not kernel lock-owner proof. The
+  open-file census runs only on macOS, so on every other platform `lockWaits` is always empty. An incomplete or raced
+  capture records none. Its `cpuRising` lists each process of the run's tree whose CPU time rose by at least two counted
+  seconds between the snapshot's two process censuses, with its pid, command and gain: a build inside the test, which is
+  a defect and not a hang. It is empty when no process rose or the closing census did not complete, and a record written
+  before it carries none.
 - `no-space`: the command failed after its output said a write found no space (`ENOSPC` or `No space left on device`).
   Its tests failed on the disk, not on their own, whatever bound or hang followed: it records that line and, when the
   task held a RAM lease, the lease, the volume and its free bytes when the line arrived, or why none were read: the

@@ -4,7 +4,8 @@ import type { tags } from 'typia';
  * The CPU a run's tree used while its idle bound counted down. A test that runs a compiler is a build inside the test,
  * which is a defect and not a test (specs/cowshed/08_testing.md, "Integration tests (real substrate)"): the pre-signal
  * snapshot names the processes whose CPU time rose between its two process censuses, so the expiry fails as that and
- * not as an anonymous hang. CPU never restarts the idle bound, which counts only finished tests; this says what ran.
+ * not as an anonymous hang. CPU never restarts the idle bound, which counts only finished tests and the progress a
+ * running test reports (progress-channel.ts); this says what ran.
  */
 
 /** What a rising process makes of the expiry, said in the same words by the snapshot and by the verdict. */

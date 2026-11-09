@@ -48,6 +48,7 @@ import { askParentPool, describeGrant } from './parent-grant.js';
 import { type LastPeak, readLastPeak } from './peak-charge.js';
 import { CPU_POOL_ENV, type InheritedCpuPool, readInheritedCpuPool } from './pool-environment.js';
 import { createRunProgress, withProgressReport, withTestResultReport } from './progress.js';
+import { PROGRESS_SOCKET_ENV, type ProgressChannel, serveProgressChannel } from './progress-channel.js';
 import {
   createHostCommands,
   describeCoverageGap,
@@ -613,6 +614,17 @@ async function runCommand(
   let pool: CpuPool | null = null;
   let reservation: Reservation | null = null;
   const releaseReservation = (): void => reservation?.release();
+  // The run's progress channel (progress-channel.ts), served when the run has an idle bound for its records to restart,
+  // and closed once its command is gone. A channel that leaves its socket behind says so; the run's verdict stands.
+  let progressChannel: ProgressChannel | null = null;
+  let progressClosed: Promise<void> | null = null;
+  const closeProgress = (): Promise<void> => {
+    progressClosed ??= (async () => {
+      const left = (await progressChannel?.close()) ?? null;
+      if (left !== null) appendStderr(`bounded-exec: ${left}\n`);
+    })();
+    return progressClosed;
+  };
   let cpuReleased: Promise<void> | null = null;
   const releaseCpu = (): Promise<void> => {
     cpuReleased ??= (async () => {
@@ -701,6 +713,7 @@ async function runCommand(
   const refuse = async (message: string): Promise<BoundedExecResult> => {
     appendStderr(message);
     await releaseCpu();
+    await closeProgress();
     // The command never started, so its lease holds nothing of its own to keep.
     await releaseLease(false);
     await recordRun(1, null, Date.now() - asked, false, null, [], [], null);
@@ -729,6 +742,29 @@ async function runCommand(
     }
     pool = created.pool;
   }
+  // A running test reports its own progress on the run's progress channel, and each record restarts the idle bound as a
+  // finished test does; a record that is not one fails the run as a broken reporter. A run with no idle bound has
+  // nothing for a record to restart and is served none. Only the command learns the socket, from its environment, so
+  // these handlers run after it is spawned and its bounds are wired below.
+  if (idleTimeoutMs !== undefined) {
+    const served = await serveProgressChannel({
+      moved: () => {
+        if (fixtureDone) stepTo({ kind: 'reported', at: Date.now(), testing: isTesting() });
+      },
+      invalid: (detail) => {
+        if (lifecycleFailure !== null || state.expiry !== null || state.settled) return;
+        lifecycleFailure = `progress channel: ${detail}`;
+        appendStderr(`bounded-exec: ${lifecycleFailure}\n`);
+        termination = terminate();
+      },
+    });
+    if (!served.ok) {
+      return refuse(
+        `bounded-exec: the run's progress channel could not be served (${served.error}); refusing to run the command\n`,
+      );
+    }
+    progressChannel = served.channel;
+  }
   const native = directory === null ? { command: sized.command, env: {} } : withTestResultReport(sized.command);
   const command =
     directory === null
@@ -746,6 +782,7 @@ async function runCommand(
     ...(pool?.environment ?? {}),
     ...(await grantMemoryEnvironment(grant?.charged ?? null, process.env)),
     ...(leaf?.kind === 'cargo' ? { MBX_GRANT_FD: String(MBX_GRANT_FD) } : {}),
+    ...(progressChannel === null ? {} : { [PROGRESS_SOCKET_ENV]: progressChannel.socket }),
   };
   // A fixture rides as segment 0 of the lifecycle. Without the channel (Windows) it is plain shell text ahead
   // of the command: the progress bound runs during it and its own ceiling does not. Under mbx a leaf that names its
@@ -851,7 +888,8 @@ async function runCommand(
     });
   }
 
-  // Progress is a finished test, not output: a runner's SLOW warnings and a hung test's heartbeat keep printing.
+  // Progress in the output is a finished test, never output itself: a runner's SLOW warnings and a hung test's heartbeat
+  // keep printing. A running test reports its own progress on the progress channel instead.
   const progress = createRunProgress(
     command,
     resultWriter === null
@@ -1088,6 +1126,7 @@ async function runCommand(
         queue.stop();
         return killChildTree();
       })
+      .finally(closeProgress)
       .finally(releaseCpu)
       .finally(() => releaseLease(true))
       .finally(releaseReservation)
@@ -1152,7 +1191,7 @@ async function runCommand(
     const elapsedMs = Date.now() - startedAt;
     appendStderr(
       bound.kind === 'idle'
-        ? `\nCommand made no progress: no test finished for ${bound.limitMs}ms (idleTimeoutMs=${bound.limitMs}) after ${elapsedMs}ms of runtime; ${
+        ? `\nCommand made no progress: no test finished or reported progress for ${bound.limitMs}ms (idleTimeoutMs=${bound.limitMs}) after ${elapsedMs}ms of runtime; ${
             bound.tests.length > 0
               ? `still running: ${bound.tests.join(', ')}`
               : 'the runner named no test still running'
@@ -1373,8 +1412,9 @@ async function runCommand(
   clearTimeout(boundTimer);
   cancelCapture();
   removeSignalHandlers();
-  // The runner is gone. Its sub-pool closes first, so no descendant still draws on tokens the grant returns;
-  // then the grant goes back to its parent or the host.
+  // The runner is gone, and with it every test that could report on the run's progress channel. Its sub-pool closes
+  // first, so no descendant still draws on tokens the grant returns; then the grant goes back to its parent or the host.
+  await closeProgress();
   await releaseCpu();
 
   const code = exitCode ?? signalToExitCode(exitSignal);
