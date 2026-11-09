@@ -1,7 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { join } from 'node:path';
 import typia from 'typia';
+import type { DependencyManifest } from './dependency-manifests.js';
 
 /**
  * What a package whose ttsc plugin lowers a dialect declares in its manifest, as `smoo.typecheck`: every project that
@@ -33,21 +31,14 @@ export interface TypecheckRoute {
 }
 
 /**
- * The typecheck route of the project whose manifest is `packageJsonPath`, over its direct dependencies (the ones ttsc
- * discovers plugins on: `dependencies` and `devDependencies`). Each dependency's manifest is the one Node resolution
- * reaches from the project, as ttsc reads it; a dependency that is not installed declares nothing. A manifest that
+ * The typecheck route of a project over its direct dependencies' manifests (dependency-manifests.ts). A manifest that
  * declares `smoo.typecheck` in another shape refuses the inference by its path and the field it got wrong.
  */
-export function typecheckRoute(packageJsonPath: string, dependencies: readonly string[]): TypecheckRoute {
+export function typecheckRoute(manifests: readonly DependencyManifest[]): TypecheckRoute {
   const declaredBy: string[] = [];
   const dependsOn: string[] = [];
-  const lookup = createRequire(packageJsonPath);
-  for (const name of new Set(dependencies)) {
-    const manifest = (lookup.resolve.paths(name) ?? [])
-      .map((root) => join(root, ...name.split('/'), 'package.json'))
-      .find((candidate) => existsSync(candidate));
-    if (manifest === undefined) continue;
-    const checked = validateManifest(JSON.parse(readFileSync(manifest, 'utf-8')));
+  for (const { name, path: manifest, json } of manifests) {
+    const checked = validateManifest(json);
     if (!checked.success) {
       throw new Error(
         `${manifest}: smoo.typecheck must be { compiler: 'ttsc', dependsOn: ['<project>:<target>', ...] }: ${checked.errors

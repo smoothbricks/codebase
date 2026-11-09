@@ -32,6 +32,11 @@
       "transform": "@smoothbricks/lmao-ttsc/ttsc-plugin"
     }
   },
+  "smoo": {
+    "compileEnv": [
+      "NODE_ENV"
+    ]
+  },
   "files": [
     "dist",
     "plugin.cjs",

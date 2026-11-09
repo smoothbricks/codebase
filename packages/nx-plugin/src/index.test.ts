@@ -417,6 +417,53 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('hashes the environment a direct dependency declares its plugin lowers by into the transformed emit only', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","dependencies":{"lowering":"1.0.0"},"devDependencies":{"also-lowering":"1.0.0"}}\n',
+      );
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+      await workspace.write(
+        'packages/example/node_modules/lowering/package.json',
+        '{"name":"lowering","smoo":{"compileEnv":["NODE_ENV"]}}\n',
+      );
+      await workspace.write(
+        'packages/example/node_modules/also-lowering/package.json',
+        '{"name":"also-lowering","smoo":{"compileEnv":["NODE_ENV","LOWERING_MODE"]}}\n',
+      );
+
+      const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
+
+      const environment = targets['tsc-js']?.inputs?.filter((input) => typeof input === 'object' && 'env' in input);
+      expect(environment).toEqual([{ env: 'NODE_ENV' }, { env: 'LOWERING_MODE' }]);
+      expect(targets.typecheck?.inputs).not.toContainEqual({ env: 'NODE_ENV' });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('refuses a dependency whose compile-environment declaration has another shape, by its manifest', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/example/package.json',
+        '{"name":"example","dependencies":{"lowering":"1.0.0"}}\n',
+      );
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+      await workspace.write(
+        'packages/example/node_modules/lowering/package.json',
+        '{"name":"lowering","smoo":{"compileEnv":"NODE_ENV"}}\n',
+      );
+
+      await expect(inferProjectTargets(workspace, 'packages/example/package.json')).rejects.toThrow(
+        /node_modules\/lowering\/package\.json: smoo\.compileEnv must be/,
+      );
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   it('makes executable only the bins its own emit writes', async () => {
     const workspace = await createWorkspace();
     try {

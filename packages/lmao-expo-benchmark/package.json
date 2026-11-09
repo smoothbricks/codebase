@@ -162,6 +162,9 @@
               "bun-lock:packages/lmao-expo-benchmark"
             ]
           },
+          {
+            "env": "NODE_ENV"
+          },
           "{workspaceRoot}/patches/**/*",
           "!{workspaceRoot}/patches/**/*.md"
         ],
@@ -234,6 +237,9 @@
             "externalDependencies": [
               "bun-lock:packages/lmao-expo-benchmark"
             ]
+          },
+          {
+            "env": "NODE_ENV"
           },
           "{workspaceRoot}/patches/**/*",
           "!{workspaceRoot}/patches/**/*.md"

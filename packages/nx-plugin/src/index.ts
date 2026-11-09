@@ -63,6 +63,7 @@ import {
   type SerialTestGroup,
   serialTestGroups,
 } from './cargo-workspace.js';
+import { compileEnvironment } from './compile-environment.js';
 import {
   CARGO_CROSS_LINT_COMMAND,
   CARGO_CROSS_LINT_TARGET,
@@ -75,6 +76,7 @@ import {
   cargoFrozen,
   runsFrozenCargo,
 } from './cross-check-policy.js';
+import { type DependencyManifest, directDependencyManifests } from './dependency-manifests.js';
 import { eslintConfigClosure } from './eslint-config-closure.js';
 import type { EslintFileSet } from './eslint-file-set.js';
 import { ESLINT_SOURCES_GLOB, eslintSources } from './eslint-sources.js';
@@ -160,11 +162,8 @@ interface TypecheckTargets {
  * which bun.lock and the patches in its check inputs already key, and it waits for the targets the declaring package
  * names to prepare the plugin binaries ttsc loads. Every other project runs the pinned native compiler.
  */
-function typecheckTargets(packageJsonPath: string, packageJson: PackageJson): TypecheckTargets {
-  const route = typecheckRoute(packageJsonPath, [
-    ...Object.keys(packageJson.dependencies ?? {}),
-    ...Object.keys(packageJson.devDependencies ?? {}),
-  ]);
+function typecheckTargets(manifests: readonly DependencyManifest[]): TypecheckTargets {
+  const route = typecheckRoute(manifests);
   return route.declaredBy.length === 0
     ? { command: typecheckCommand, inputs: [TYPECHECK_COMPILER_INPUT], dependsOn: [] }
     : { command: (args) => `ttsc ${args}`, inputs: [], dependsOn: route.dependsOn };
@@ -1625,7 +1624,14 @@ async function createProjectTargets(
   const projectRoot = dirname(packageJsonPath);
   const absoluteProjectRoot = join(workspaceRoot, projectRoot);
   const packageJson = await readPackageJson(join(workspaceRoot, packageJsonPath));
-  const typecheck = typecheckTargets(join(workspaceRoot, packageJsonPath), packageJson);
+  const dependencyManifests = directDependencyManifests(join(workspaceRoot, packageJsonPath), [
+    ...Object.keys(packageJson.dependencies ?? {}),
+    ...Object.keys(packageJson.devDependencies ?? {}),
+  ]);
+  const typecheck = typecheckTargets(dependencyManifests);
+  // The environment a direct dependency's ttsc plugin lowers by (compile-environment.ts): the emitted JavaScript is a
+  // function of it, so every target whose output is the transformed compile hashes it. A check never is.
+  const compileEnvInputs = compileEnvironment(dependencyManifests).map((name) => ({ env: name }));
   const projectName = packageJson.nx?.name ?? packageJson.name;
   if (typeof projectName !== 'string' || projectName.length === 0) {
     throw new Error(`${packageJsonPath} must declare a non-empty package or nx project name`);
@@ -1726,7 +1732,7 @@ async function createProjectTargets(
     targets['tsc-js'] = {
       executor: '@smoothbricks/nx-plugin:typescript-emit',
       cache: true,
-      inputs: ['production', '^production', ...toolchainInputs, '{projectRoot}/tsconfig.lib.json'],
+      inputs: ['production', '^production', ...toolchainInputs, ...compileEnvInputs, '{projectRoot}/tsconfig.lib.json'],
       outputs: inferTypescriptOutputs(libOutDir),
       dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
@@ -1754,7 +1760,10 @@ async function createProjectTargets(
     };
     Object.assign(
       targets,
-      scriptcPlatformTargets(packageJson, packageJsonPath, projectRoot, libTsconfigPath, toolchainInputs),
+      scriptcPlatformTargets(packageJson, packageJsonPath, projectRoot, libTsconfigPath, [
+        ...toolchainInputs,
+        ...compileEnvInputs,
+      ]),
     );
   }
 

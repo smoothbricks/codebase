@@ -1279,6 +1279,12 @@ Concrete targets come from concrete files:
   and never compiles one, and the inference guesses no workspace target. A declaration of another shape refuses the
   inference by its manifest path. Its compiler is the installed ttsc, which `bun.lock` and the patches in the check
   inputs already key. A project that depends only on typia stays on the pinned compiler.
+- A direct dependency whose ttsc plugin lowers by environment variables declares them in its manifest,
+  `"smoo": { "compileEnv": ["NODE_ENV"] }` (`@smoothbricks/lmao-ttsc` does: it compiles trace statements away unless
+  `NODE_ENV` is `test`). The transformed JavaScript is then a function of those variables, so `tsc-js` and every scriptc
+  target hash each as an `{ "env": … }` input; `typecheck` does not, as no check reads them. A declaration of another
+  shape refuses the inference by its manifest path. Targets a project declares itself, and test targets, list the input
+  in their own `inputs`.
 - `typecheck-tests` is inferred from `tsconfig.test.json` and runs the same compiler on
   `-p tsconfig.test.json --noEmit`. It first rebuilds the current package's `tsc-js` output (or its non-TypeScript
   `build`) so self-imports resolve from its own outputs. Transform calls in test files are checked when the test runner
