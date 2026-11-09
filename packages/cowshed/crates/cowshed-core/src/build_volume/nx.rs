@@ -1722,23 +1722,30 @@ pub(crate) fn spelled_by(check: &str, command: &str) -> Option<Vec<String>> {
 
 /// What `nx show target inputs <task> --json` prints (pinned Nx 24.0.3,
 /// `command-line/show/show-target/inputs.js` `renderInputs`): the task's project and target and
-/// the raw hash inputs of its plan, by category.
+/// the raw hash inputs of its plan, by category. Its `printJson` (show-target/utils.js) leaves out
+/// every empty list, so a category the task has nothing in is absent, not `[]`: a task with no
+/// runtime input prints no `runtime`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TaskInputsWire {
     project: String,
     target: String,
+    #[serde(default)]
     external: Vec<String>,
+    #[serde(default)]
     runtime: Vec<String>,
+    #[serde(default)]
     environment: Vec<String>,
+    #[serde(default)]
     files: Vec<String>,
+    #[serde(default)]
     dep_outputs: Vec<String>,
 }
 
 /// The hash inputs of `task` (`project:target` or `project:target:configuration`) by Nx's own
 /// category names, from what `nx show target inputs <task> --json` printed. Anything but that
 /// exact shape, for that task, is an error naming what was read: a custom hasher's warning
-/// object, a missing or unknown category, another task.
+/// object, an unknown category, another task. A category Nx left out as empty is empty.
 pub fn task_inputs(
     task: &str,
     stdout: &[u8],
@@ -2015,6 +2022,26 @@ mod tests {
             "a run of fewer arguments than the check spells is another command"
         );
         assert_eq!(targets("cargo test", "nx run-many -t build"), None);
+    }
+
+    #[test]
+    fn task_inputs_read_a_category_stock_nx_omits_as_empty() {
+        // Nx 24.0.3's `nx show target inputs a:test --json` for a task whose only inputs are its
+        // project's files: printJson drops the empty external, runtime, environment and depOutputs.
+        let printed = br#"{
+  "project": "a",
+  "target": "test",
+  "files": [
+    "a/project.json",
+    "a/src.txt"
+  ]
+}"#;
+        let inputs = task_inputs("a:test", printed).unwrap();
+        assert_eq!(inputs["files"], ["a/project.json", "a/src.txt"]);
+        for category in ["external", "runtime", "environment", "depOutputs"] {
+            assert_eq!(inputs[category], Vec::<String>::new(), "{category}");
+        }
+        assert_eq!(inputs.len(), 5);
     }
 
     #[test]
