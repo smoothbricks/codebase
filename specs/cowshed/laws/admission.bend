@@ -1,17 +1,19 @@
-# mbx's pool admission (specs/cowshed/05_gateway.md "Admission", "Held jobs" Order,
+
+# mbx's pool admission (specs/cowshed/05_gateway.md "Classes", "Admission", "Held jobs" Order,
 # "Gates and lands"), as a model whose laws are the policy's contract.
 #
-# Two lanes, gate first. A lane is two lists: `old`, the requests that have waited
-# their aging bound, in arrival order (an entry's id is its arrival ticket), and `new`,
-# the rest. A decision walks the gate
-# lane's old then new, then the low lane's old then new, and hands each request what
-# it still needs from what is free: a request is granted min(want, free) once, and a
-# grant is never taken back nor grown. `Tick` ages every request in `new` and moves
-# those that reached the bound into `old` by ticket.
+# One lane per band, in priority order: interactive, the gate's (`normal`), background (`low`).
+# An interactive job decays by its elapsed time when it asks: its ask enters the interactive
+# lane before `b1()`, the gate's until `b2()`, background's after. A lane is two lists:
+# `old`, the requests that have waited their aging bound, in arrival order (an entry's id is its
+# arrival ticket), and `new`, the rest. A decision walks the lanes in order, each lane's old then
+# its new, and hands each request what it still needs from what is free: a
+# request is granted min(want, free) once, and a grant is never taken back nor grown. `Tick`
+# ages every request in `new` and moves those that reached the bound into `old` by ticket.
 #
-# Today: `new` is in arrival order, so the whole lane is. Spt (shortest predicted
-# first): `new` is ordered by each request's predicted run time, measured from its
-# class's history, so the shortest request goes first unless an older one has aged.
+# Today: `new` is in arrival order, so the whole lane is. Spt: `new` is ordered by the
+# predicted run time measured from the request's class history, so a lane's shortest request
+# goes first unless an older one has aged.
 import Base
 
 type Pol is Data:
@@ -25,11 +27,36 @@ type E is Data:
 type Lane is Data:
   Lane{old: +List<E>, new: +List<E>}
 
+# The pool: its free permits, its aging bound, and its lanes in priority order. A decision
+# walks them first to last; `empty` makes three: interactive, the gate's (`normal`), background
+# (`low`).
 type St is Data:
-  St{free: Nat, bound: Nat, gate: Lane, low: Lane}
+  St{free: Nat, bound: Nat, lanes: +List<Lane>}
 
+# What a walk or a finish over the lanes leaves: the free permits, and the lanes.
+type LS is Data:
+  LS{free: Nat, lanes: +List<Lane>}
+
+def lsf(w: LS) -> Nat:
+  match w:
+    case LS{f, ls}:
+      f
+
+def lsl(w: LS) -> +List<Lane>:
+  match w:
+    case LS{f, ls}:
+      ls
+
+# The band a request asks for: a land's gate, interactive work (a check or one test an agent
+# waits on), or background.
+type Band is Data:
+  Gate{}
+  Interactive{}
+  Background{}
+
+# `elapsed`: how long the request's job has run when it asks (seconds).
 type Op is Data:
-  Arrive{gate: Bool, id: Nat, want: Nat, pred: Nat}
+  Arrive{band: Band, id: Nat, want: Nat, pred: Nat, elapsed: Nat}
   Decide{}
   Tick{}
   Finish{id: Nat}
@@ -169,10 +196,18 @@ def lwalk(l: Lane, +free: Nat) -> LW:
     case Lane{+o, +n}:
       LW{wf(walk(n, wf(walk(o, free)))), Lane{wl(walk(o, free)), wl(walk(n, wf(walk(o, free))))}}
 
+# A decision walks each lane in order with what the lanes before it left free.
+def walks(ls: +List<Lane>, +f: Nat) -> LS:
+  match ls:
+    case Nil{}:
+      LS{f, []}
+    case Con{+l, +t}:
+      LS{lsf(walks(t, lf(lwalk(l, f)))), Con{ll(lwalk(l, f)), lsl(walks(t, lf(lwalk(l, f))))}}
+
 def decide(s: St) -> St:
   match s:
-    case St{+f, +b, +g, +l}:
-      St{lf(lwalk(l, lf(lwalk(g, f)))), b, ll(lwalk(g, f)), ll(lwalk(l, lf(lwalk(g, f))))}
+    case St{+f, +b, +ls}:
+      St{lsf(walks(ls, f)), b, lsl(walks(ls, f))}
 
 # --- arrivals: Today appends, Spt inserts by prediction ----------------------------
 
@@ -243,12 +278,20 @@ def arrive.lane(+p: Pol, +y: E, l: Lane) -> Lane:
     case Lane{o, n}:
       Lane{o, enter(p, n, y)}
 
-def arrive(+p: Pol, +gate: Bool, +y: E, s: St) -> St:
-  match gate s:
-    case True{} St{f, b, g, l}:
-      St{f, b, arrive.lane(p, y, g), l}
-    case False{} St{f, b, g, l}:
-      St{f, b, g, arrive.lane(p, y, l)}
+# A request enters lane `i`; there is no lane past the last, and `empty` has one per band.
+def arrive.at(+p: Pol, i: Nat, +y: E, ls: +List<Lane>) -> +List<Lane>:
+  match i ls:
+    case 0n Con{+l, +t}:
+      Con{arrive.lane(p, y, l), t}
+    case 1n+j Con{+l, +t}:
+      Con{l, arrive.at(p, j, y, t)}
+    case i0 Nil{}:
+      []
+
+def arrive(+p: Pol, +i: Nat, +y: E, s: St) -> St:
+  match s:
+    case St{f, b, ls}:
+      St{f, b, arrive.at(p, i, y, ls)}
 
 # --- a tick: every request in `new` ages; those at the bound move to `old` ----------
 
@@ -291,10 +334,17 @@ def tick.lane(+b: Nat, l: Lane) -> Lane:
     case Lane{+o, +n}:
       Lane{insall(sm(split(n, b)), o), ss(split(n, b))}
 
+def ticks(+b: Nat, ls: +List<Lane>) -> +List<Lane>:
+  match ls:
+    case Nil{}:
+      []
+    case Con{+l, +t}:
+      Con{tick.lane(b, l), ticks(b, t)}
+
 def tick(s: St) -> St:
   match s:
-    case St{+f, +b, +g, +l}:
-      St{f, b, tick.lane(b, g), tick.lane(b, l)}
+    case St{+f, +b, +ls}:
+      St{f, b, ticks(b, ls)}
 
 # --- an end gives its entry's permits back -----------------------------------------
 
@@ -317,15 +367,55 @@ def lfin(l: Lane, +x: Nat) -> LW:
     case Lane{+o, +n}:
       LW{add(wf(fin(o, x)), wf(fin(n, x))), Lane{wl(fin(o, x)), wl(fin(n, x))}}
 
+def fins(ls: +List<Lane>, +x: Nat) -> LS:
+  match ls:
+    case Nil{}:
+      LS{0n, []}
+    case Con{+l, +t}:
+      LS{add(lf(lfin(l, x)), lsf(fins(t, x))), Con{ll(lfin(l, x)), lsl(fins(t, x))}}
+
 def finish(+x: Nat, s: St) -> St:
   match s:
-    case St{+f, +b, +g, +l}:
-      St{add(f, add(lf(lfin(g, x)), lf(lfin(l, x)))), b, ll(lfin(g, x)), ll(lfin(l, x))}
+    case St{+f, +b, +ls}:
+      St{add(f, lsf(fins(ls, x))), b, lsl(fins(ls, x))}
+
+# An interactive job decays (05 "Classes"): its asks are interactive while the job has run less
+# than `b1()`, gate-band work until `b2()`, and background work from then on. One unit is one
+# second.
+def b1() -> Nat:
+  30n
+
+def b2() -> Nat:
+  120n
+
+# The band an interactive job's ask takes at `elapsed`: 0 interactive, 1 the gate's, 2 background.
+def iband.go(late1: Bool, late2: Bool) -> Nat:
+  match late1 late2:
+    case False{} l2:
+      0n
+    case True{} False{}:
+      1n
+    case True{} True{}:
+      2n
+
+def iband(+elapsed: Nat) -> Nat:
+  iband.go(le(b1(), elapsed), le(b2(), elapsed))
+
+# The lane a request enters: the gate's band is lane 1, background lane 2, and an interactive
+# job's ask the lane of its band at its elapsed time.
+def lane(band: Band, +elapsed: Nat) -> Nat:
+  match band:
+    case Gate{}:
+      1n
+    case Interactive{}:
+      iband(elapsed)
+    case Background{}:
+      2n
 
 def step(+p: Pol, o: Op, +s: St) -> St:
   match o:
-    case Arrive{gate, id, want, pred}:
-      arrive(p, gate, E{id, 1n+want, 0n, pred, 0n}, s)
+    case Arrive{+band, id, want, +pred, +elapsed}:
+      arrive(p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n}, s)
     case Decide{}:
       decide(s)
     case Tick{}:
@@ -341,7 +431,7 @@ def run(+p: Pol, os: +List<Op>, s: St) -> St:
       run(p, t, step(p, o, s))
 
 def empty(cap: Nat, bound: Nat) -> St:
-  St{cap, bound, Lane{[], []}, Lane{[], []}}
+  St{cap, bound, [Lane{[], []}, Lane{[], []}, Lane{[], []}]}
 
 # === laws ==========================================================================
 
@@ -452,10 +542,17 @@ def suml(l: Lane) -> Nat:
     case Lane{o, n}:
       add(sumk(o), sumk(n))
 
+def sumls(ls: +List<Lane>) -> Nat:
+  match ls:
+    case Nil{}:
+      0n
+    case Con{+l, +t}:
+      add(suml(l), sumls(t))
+
 def total(s: St) -> Nat:
   match s:
-    case St{f, b, g, l}:
-      add(f, add(suml(g), suml(l)))
+    case St{f, b, ls}:
+      add(f, sumls(ls))
 
 def cons_sum(+h: E, +w: W) -> {add(wf(W.cons(h, w)), sumk(wl(W.cons(h, w)))) == add(ek(h), add(wf(w), sumk(wl(w)))) : Nat}:
   match w:
@@ -511,11 +608,18 @@ def lwalk_sum(+l: Lane, +f: Nat) -> {add(lf(lwalk(l, f)), suml(ll(lwalk(l, f))))
       chain2(wf(walk(n, wf(walk(o, f)))), sumk(wl(walk(o, f))), sumk(wl(walk(n, wf(walk(o, f))))),
         wf(walk(o, f)), f, sumk(o), sumk(n), walk_sum(o, f), walk_sum(n, wf(walk(o, f))))
 
+def walks_sum(+ls: +List<Lane>, +f: Nat) -> {add(lsf(walks(ls, f)), sumls(lsl(walks(ls, f)))) == add(f, sumls(ls)) : Nat}:
+  match ls:
+    case Nil{}:
+      {==}
+    case Con{+l, +t}:
+      chain2(lsf(walks(t, lf(lwalk(l, f)))), suml(ll(lwalk(l, f))), sumls(lsl(walks(t, lf(lwalk(l, f))))),
+        lf(lwalk(l, f)), f, suml(l), sumls(t), lwalk_sum(l, f), walks_sum(t, lf(lwalk(l, f))))
+
 def decide_total(+s: St) -> {total(decide(s)) == total(s) : Nat}:
   match s:
-    case St{f, b, g, l}:
-      chain2(lf(lwalk(l, lf(lwalk(g, f)))), suml(ll(lwalk(g, f))), suml(ll(lwalk(l, lf(lwalk(g, f))))),
-        lf(lwalk(g, f)), f, suml(g), suml(l), lwalk_sum(g, f), lwalk_sum(l, lf(lwalk(g, f))))
+    case St{f, b, ls}:
+      walks_sum(ls, f)
 
 # --- an arrival holds nothing ----------------------------------------------------------
 
@@ -558,13 +662,21 @@ def arrive_lane_sum(+p: Pol, +id: Nat, +want: Nat, +pred: Nat, +l: Lane) -> {sum
       %Equal.sym(Nat, sumk(enter(p, n, E{id, want, 0n, pred, 0n})), sumk(n), enter_sum(p, n, id, want, pred)) : {add(sumk(o), _) == add(sumk(o), sumk(n)) : Nat}
       {==}
 
-def arrive_total(+p: Pol, +gate: Bool, +id: Nat, +want: Nat, +pred: Nat, +s: St) -> {total(arrive(p, gate, E{id, want, 0n, pred, 0n}, s)) == total(s) : Nat}:
-  match gate s:
-    case True{} St{f, b, g, l}:
-      %Equal.sym(Nat, suml(arrive.lane(p, E{id, want, 0n, pred, 0n}, g)), suml(g), arrive_lane_sum(p, id, want, pred, g)) : {add(f, add(_, suml(l))) == add(f, add(suml(g), suml(l))) : Nat}
+def arrive_at_sum(+p: Pol, +i: Nat, +id: Nat, +want: Nat, +pred: Nat, +ls: +List<Lane>) -> {sumls(arrive.at(p, i, E{id, want, 0n, pred, 0n}, ls)) == sumls(ls) : Nat}:
+  match i ls:
+    case 0n Con{+l, +t}:
+      %Equal.sym(Nat, suml(arrive.lane(p, E{id, want, 0n, pred, 0n}, l)), suml(l), arrive_lane_sum(p, id, want, pred, l)) : {add(_, sumls(t)) == add(suml(l), sumls(t)) : Nat}
       {==}
-    case False{} St{f, b, g, l}:
-      %Equal.sym(Nat, suml(arrive.lane(p, E{id, want, 0n, pred, 0n}, l)), suml(l), arrive_lane_sum(p, id, want, pred, l)) : {add(f, add(suml(g), _)) == add(f, add(suml(g), suml(l))) : Nat}
+    case 1n+j Con{+l, +t}:
+      %Equal.sym(Nat, sumls(arrive.at(p, j, E{id, want, 0n, pred, 0n}, t)), sumls(t), arrive_at_sum(p, j, id, want, pred, t)) : {add(suml(l), _) == add(suml(l), sumls(t)) : Nat}
+      {==}
+    case i0 Nil{}:
+      {==}
+
+def arrive_total(+p: Pol, +i: Nat, +id: Nat, +want: Nat, +pred: Nat, +s: St) -> {total(arrive(p, i, E{id, want, 0n, pred, 0n}, s)) == total(s) : Nat}:
+  match s:
+    case St{f, b, ls}:
+      %Equal.sym(Nat, sumls(arrive.at(p, i, E{id, want, 0n, pred, 0n}, ls)), sumls(ls), arrive_at_sum(p, i, id, want, pred, ls)) : {add(f, _) == add(f, sumls(ls)) : Nat}
       {==}
 
 # --- a tick moves requests between a lane's lists, and no permit ----------------------
@@ -639,11 +751,19 @@ def tick_lane_sum(+b: Nat, +l: Lane) -> {suml(tick.lane(b, l)) == suml(l) : Nat}
         add_assoc(sumk(o), sumk(sm(split(n, b))), sumk(ss(split(n, b)))),
         Equal.cong(Nat, Nat, x => add(sumk(o), x), add(sumk(sm(split(n, b))), sumk(ss(split(n, b)))), sumk(n), split_sum(n, b)))))
 
+def ticks_sum(+b: Nat, +ls: +List<Lane>) -> {sumls(ticks(b, ls)) == sumls(ls) : Nat}:
+  match ls:
+    case Nil{}:
+      {==}
+    case Con{+l, +t}:
+      %Equal.sym(Nat, suml(tick.lane(b, l)), suml(l), tick_lane_sum(b, l)) : {add(_, sumls(ticks(b, t))) == add(suml(l), sumls(t)) : Nat}
+      %Equal.sym(Nat, sumls(ticks(b, t)), sumls(t), ticks_sum(b, t)) : {add(suml(l), _) == add(suml(l), sumls(t)) : Nat}
+      {==}
+
 def tick_total(+s: St) -> {total(tick(s)) == total(s) : Nat}:
   match s:
-    case St{f, b, g, l}:
-      %Equal.sym(Nat, suml(tick.lane(b, g)), suml(g), tick_lane_sum(b, g)) : {add(f, add(_, suml(tick.lane(b, l)))) == add(f, add(suml(g), suml(l))) : Nat}
-      %Equal.sym(Nat, suml(tick.lane(b, l)), suml(l), tick_lane_sum(b, l)) : {add(f, add(suml(g), _)) == add(f, add(suml(g), suml(l))) : Nat}
+    case St{f, b, ls}:
+      %Equal.sym(Nat, sumls(ticks(b, ls)), sumls(ls), ticks_sum(b, ls)) : {add(f, _) == add(f, sumls(ls)) : Nat}
       {==}
 
 # --- an end gives back what its entry held ----------------------------------------------
@@ -672,17 +792,20 @@ def lfin_sum(+l: Lane, +x: Nat) -> {add(lf(lfin(l, x)), suml(ll(lfin(l, x)))) ==
     case Lane{o, n}:
       sum2(wf(fin(o, x)), sumk(wl(fin(o, x))), sumk(o), wf(fin(n, x)), sumk(wl(fin(n, x))), sumk(n), fin_sum(o, x), fin_sum(n, x))
 
+def fins_sum(+ls: +List<Lane>, +x: Nat) -> {add(lsf(fins(ls, x)), sumls(lsl(fins(ls, x)))) == sumls(ls) : Nat}:
+  match ls:
+    case Nil{}:
+      {==}
+    case Con{+l, +t}:
+      sum2(lf(lfin(l, x)), suml(ll(lfin(l, x))), suml(l), lsf(fins(t, x)), sumls(lsl(fins(t, x))), sumls(t), lfin_sum(l, x), fins_sum(t, x))
+
 def finish_total(+x: Nat, +s: St) -> {total(finish(x, s)) == total(s) : Nat}:
   match s:
-    case St{f, b, g, l}:
-      Equal.trans(Nat, add(add(f, add(lf(lfin(g, x)), lf(lfin(l, x)))), add(suml(ll(lfin(g, x))), suml(ll(lfin(l, x))))),
-        add(f, add(add(lf(lfin(g, x)), lf(lfin(l, x))), add(suml(ll(lfin(g, x))), suml(ll(lfin(l, x)))))),
-        add(f, add(suml(g), suml(l))),
-        add_assoc(f, add(lf(lfin(g, x)), lf(lfin(l, x))), add(suml(ll(lfin(g, x))), suml(ll(lfin(l, x))))),
-        Equal.cong(Nat, Nat, y => add(f, y),
-          add(add(lf(lfin(g, x)), lf(lfin(l, x))), add(suml(ll(lfin(g, x))), suml(ll(lfin(l, x))))),
-          add(suml(g), suml(l)),
-          sum2(lf(lfin(g, x)), suml(ll(lfin(g, x))), suml(g), lf(lfin(l, x)), suml(ll(lfin(l, x))), suml(l), lfin_sum(g, x), lfin_sum(l, x))))
+    case St{f, b, ls}:
+      Equal.trans(Nat, add(add(f, lsf(fins(ls, x))), sumls(lsl(fins(ls, x)))),
+        add(f, add(lsf(fins(ls, x)), sumls(lsl(fins(ls, x))))), add(f, sumls(ls)),
+        add_assoc(f, lsf(fins(ls, x)), sumls(lsl(fins(ls, x)))),
+        Equal.cong(Nat, Nat, y => add(f, y), add(lsf(fins(ls, x)), sumls(lsl(fins(ls, x)))), sumls(ls), fins_sum(ls, x)))
 
 # LAW (conservation): no step creates or destroys a permit, so from an empty pool of
 # `cap` permits, free plus every entry's grant stays `cap`: the grants never exceed it.
@@ -694,8 +817,8 @@ law conserved:
 
 def conserved(p, o, s):
   match o:
-    case Arrive{gate, id, want, pred}:
-      arrive_total(p, gate, id, 1n+want, pred, s)
+    case Arrive{band, id, want, pred, elapsed}:
+      arrive_total(p, lane(band, elapsed), id, 1n+want, pred, s)
     case Decide{}:
       decide_total(s)
     case Tick{}:
@@ -884,62 +1007,137 @@ def ldry_tail(+l: Lane, +r: Nat, z: IsZero(r)) -> IsZero(lf(lwalk(l, r))):
 
 def sfree(s: St) -> Nat:
   match s:
-    case St{f, b, g, l}:
+    case St{f, b, ls}:
       f
 
-def sgate(s: St) -> Lane:
+def slanes(s: St) -> +List<Lane>:
   match s:
-    case St{f, b, g, l}:
-      g
+    case St{f, b, ls}:
+      ls
 
-def slow(s: St) -> Lane:
-  match s:
-    case St{f, b, g, l}:
+# Lane `i` of `ls`, or an empty lane past the last.
+def nth(i: Nat, ls: +List<Lane>) -> Lane:
+  match i ls:
+    case 0n Con{+l, +t}:
       l
+    case 1n+j Con{+l, +t}:
+      nth(j, t)
+    case i0 Nil{}:
+      Lane{[], []}
 
-# --- LAW (gate first): low work gains a permit only once gate work needs none --------------
+# `R` holds of every lane.
+def AllL(R: Lane -> Data, ls: +List<Lane>) -> Data:
+  match ls:
+    case Nil{}:
+      Unit
+    case Con{+l, +t}:
+      Sigma<&2, &2, R(l), u => AllL(R, t)>
 
-law gate_first:
+# `R` holds of every lane before a step and the same lane after it.
+def All2(R: Lane -> Lane -> Data, ls: +List<Lane>, ms: +List<Lane>) -> Data:
+  match ls ms:
+    case Nil{} Nil{}:
+      Unit
+    case Con{l, t} Con{m, u}:
+      Sigma<&2, &2, R(l, m), v => All2(R, t, u)>
+    case Nil{} Con{m, u}:
+      Empty
+    case Con{l, t} Nil{}:
+      Empty
+
+# Lane by lane: each lane after a decision needs nothing, or every lane after it is as it was.
+def Before(ls: +List<Lane>, ms: +List<Lane>) -> Data:
+  match ls ms:
+    case Nil{} Nil{}:
+      Unit
+    case Con{l, t} Con{m, u}:
+      Sigma<&2, &2, Either<&2, &2, AllFilledL(m), {u == t : +List<Lane>}>, v => Before(t, u)>
+    case Nil{} Con{m, u}:
+      Empty
+    case Con{l, t} Nil{}:
+      Empty
+
+def walks_zero_l(+ls: +List<Lane>) -> {ls == lsl(walks(ls, 0n)) : +List<Lane>}:
+  match ls:
+    case Nil{}:
+      {==}
+    case Con{+l, +t}:
+      %lwalk_zero_f(l) : {Con{l, t} == Con{ll(lwalk(l, 0n)), lsl(walks(t, _))} : +List<Lane>}
+      %lwalk_zero_l(l) : {Con{l, t} == Con{_, lsl(walks(t, 0n))} : +List<Lane>}
+      %walks_zero_l(t) : {Con{l, t} == Con{l, _} : +List<Lane>}
+      {==}
+
+def walks_zero_f(+ls: +List<Lane>) -> {0n == lsf(walks(ls, 0n)) : Nat}:
+  match ls:
+    case Nil{}:
+      {==}
+    case Con{+l, +t}:
+      %lwalk_zero_f(l) : {0n == lsf(walks(t, _)) : Nat}
+      walks_zero_f(t)
+
+def lszero_tail(+ls: +List<Lane>, +r: Nat, z: IsZero(r)) -> {lsl(walks(ls, r)) == ls : +List<Lane>}:
+  match r:
+    case 0n:
+      Equal.sym(+List<Lane>, ls, lsl(walks(ls, 0n)), walks_zero_l(ls))
+    case 1n+q:
+      match z:
+
+def lsdry_tail(+ls: +List<Lane>, +r: Nat, z: IsZero(r)) -> IsZero(lsf(walks(ls, r))):
+  match r:
+    case 0n:
+      %walks_zero_f(ls) : IsZero(_)
+      Unit{}
+    case 1n+q:
+      match z:
+
+# --- LAW (lanes in order): a lane gains a permit only once every lane before it needs none ---
+
+law lanes_in_order:
   for +p: Pol
   for +s: St
-  Either<&2, &2, AllFilledL(sgate(step(p, Decide{}, s))), {slow(step(p, Decide{}, s)) == slow(s) : Lane}>
+  Before(slanes(s), slanes(step(p, Decide{}, s)))
 
-def gate_first.go(+g: Lane, +l: Lane, +f: Nat,
-  fd: Either<&2, &2, AllFilledL(ll(lwalk(g, f))), IsZero(lf(lwalk(g, f)))>)
-  -> Either<&2, &2, AllFilledL(ll(lwalk(g, f))), {ll(lwalk(l, lf(lwalk(g, f)))) == l : Lane}>:
+def lanes_in_order.go(+l: Lane, +t: +List<Lane>, +f: Nat,
+  fd: Either<&2, &2, AllFilledL(ll(lwalk(l, f))), IsZero(lf(lwalk(l, f)))>)
+  -> Either<&2, &2, AllFilledL(ll(lwalk(l, f))), {lsl(walks(t, lf(lwalk(l, f)))) == t : +List<Lane>}>:
   match fd:
     case Inl{a}:
       Inl{a}
     case Inr{z}:
-      Inr{lzero_tail(l, lf(lwalk(g, f)), z)}
+      Inr{lszero_tail(t, lf(lwalk(l, f)), z)}
 
-def gate_first(p, s):
+def lanes_before(+ls: +List<Lane>, +f: Nat) -> Before(ls, lsl(walks(ls, f))):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (lanes_in_order.go(l, t, f, lwalk_fd(l, f)), lanes_before(t, lf(lwalk(l, f))))
+
+def lanes_in_order(p, s):
   match s:
-    case St{f, b, g, l}:
-      gate_first.go(g, l, f, lwalk_fd(g, f))
+    case St{f, b, ls}:
+      lanes_before(ls, f)
 
 # --- LAW (work conserving): no permit stays free while any request needs one -------------
-# Landing gets priority, never exclusivity: low work is admitted whenever gate work is filled.
+# Landing gets priority, never exclusivity: a later lane is admitted whenever earlier ones fill.
 
 law work_conserving:
   for +p: Pol
   for +s: St
-  Either<&2, &2, Sigma<&2, &2, AllFilledL(sgate(step(p, Decide{}, s))), u => AllFilledL(slow(step(p, Decide{}, s)))>, IsZero(sfree(step(p, Decide{}, s)))>
+  Either<&2, &2, AllL(l => AllFilledL(l), slanes(step(p, Decide{}, s))), IsZero(sfree(step(p, Decide{}, s)))>
 
-def work_conserving.go(+g: Lane, +l: Lane, +f: Nat,
-  fd: Either<&2, &2, AllFilledL(ll(lwalk(g, f))), IsZero(lf(lwalk(g, f)))>)
-  -> Either<&2, &2, Sigma<&2, &2, AllFilledL(ll(lwalk(g, f))), u => AllFilledL(ll(lwalk(l, lf(lwalk(g, f)))))>, IsZero(lf(lwalk(l, lf(lwalk(g, f)))))>:
-  match fd:
-    case Inl{a}:
-      fd_combine(AllFilledL(ll(lwalk(g, f))), AllFilledL(ll(lwalk(l, lf(lwalk(g, f))))), IsZero(lf(lwalk(l, lf(lwalk(g, f))))), Empty,
-        Inl{a}, lwalk_fd(l, lf(lwalk(g, f))), e => Empty.absurd(IsZero(lf(lwalk(l, lf(lwalk(g, f))))), e))
-    case Inr{z}:
-      Inr{ldry_tail(l, lf(lwalk(g, f)), z)}
+def walks_fd(+ls: +List<Lane>, +f: Nat) -> Either<&2, &2, AllL(l => AllFilledL(l), lsl(walks(ls, f))), IsZero(lsf(walks(ls, f)))>:
+  match ls:
+    case Nil{}:
+      Inl{Unit{}}
+    case Con{+l, +t}:
+      fd_combine(AllFilledL(ll(lwalk(l, f))), AllL(m => AllFilledL(m), lsl(walks(t, lf(lwalk(l, f))))), IsZero(lsf(walks(t, lf(lwalk(l, f))))), IsZero(lf(lwalk(l, f))),
+        lwalk_fd(l, f), walks_fd(t, lf(lwalk(l, f))), z => lsdry_tail(t, lf(lwalk(l, f)), z))
 
 def work_conserving(p, s):
   match s:
-    case St{f, b, g, l}:
-      work_conserving.go(g, l, f, lwalk_fd(g, f))
+    case St{f, b, ls}:
+      walks_fd(ls, f)
 
 # --- LAW (first in order, first filled) ----------------------------------------------------
 # In each list a request is filled, or nothing after it changed; in each lane, `new` changes
@@ -1010,12 +1208,19 @@ def lwalk_order(+l: Lane, +f: Nat) -> OrderL(l, ll(lwalk(l, f))):
 law first_in_order_filled:
   for +p: Pol
   for +s: St
-  Sigma<&2, &2, OrderL(sgate(s), sgate(step(p, Decide{}, s))), u => OrderL(slow(s), slow(step(p, Decide{}, s)))>
+  All2(l => m => OrderL(l, m), slanes(s), slanes(step(p, Decide{}, s)))
+
+def walks_order(+ls: +List<Lane>, +f: Nat) -> All2(l => m => OrderL(l, m), ls, lsl(walks(ls, f))):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (lwalk_order(l, f), walks_order(t, lf(lwalk(l, f))))
 
 def first_in_order_filled(p, s):
   match s:
-    case St{f, b, g, l}:
-      (lwalk_order(g, f), lwalk_order(l, lf(lwalk(g, f))))
+    case St{f, b, ls}:
+      walks_order(ls, f)
 
 # --- LAW (no preemption): nothing but a request's own end takes a permit back ---------------
 
@@ -1072,12 +1277,19 @@ def lwalk_kept(+l: Lane, +f: Nat) -> KeptL(l, ll(lwalk(l, f))):
 law decide_never_preempts:
   for +p: Pol
   for +s: St
-  Sigma<&2, &2, KeptL(sgate(s), sgate(step(p, Decide{}, s))), u => KeptL(slow(s), slow(step(p, Decide{}, s)))>
+  All2(l => m => KeptL(l, m), slanes(s), slanes(step(p, Decide{}, s)))
+
+def walks_kept(+ls: +List<Lane>, +f: Nat) -> All2(l => m => KeptL(l, m), ls, lsl(walks(ls, f))):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (lwalk_kept(l, f), walks_kept(t, lf(lwalk(l, f))))
 
 def decide_never_preempts(p, s):
   match s:
-    case St{f, b, g, l}:
-      (lwalk_kept(g, f), lwalk_kept(l, lf(lwalk(g, f))))
+    case St{f, b, ls}:
+      walks_kept(ls, f)
 
 # Every entry of xs is in ys, unchanged and in its order.
 def Sub(xs: +List<E>, ys: +List<E>) -> Data:
@@ -1138,21 +1350,36 @@ def subl_arrive(+p: Pol, +y: E, +l: Lane) -> SubL(l, arrive.lane(p, y, l)):
     case Lane{o, n}:
       (sub_refl(o), sub_enter(p, n, y))
 
+def subls_refl(+ls: +List<Lane>) -> All2(l => m => SubL(l, m), ls, ls):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (subl_refl(l), subls_refl(t))
+
+def subls_arrive(+p: Pol, +i: Nat, +y: E, +ls: +List<Lane>) -> All2(l => m => SubL(l, m), ls, arrive.at(p, i, y, ls)):
+  match i ls:
+    case 0n Con{+l, +t}:
+      (subl_arrive(p, y, l), subls_refl(t))
+    case 1n+j Con{+l, +t}:
+      (subl_refl(l), subls_arrive(p, j, y, t))
+    case i0 Nil{}:
+      Unit{}
+
 law arrival_never_preempts:
   for +p: Pol
-  for +gate: Bool
+  for +band: Band
   for +id: Nat
   for +want: Nat
   for +pred: Nat
+  for +elapsed: Nat
   for +s: St
-  Sigma<&2, &2, SubL(sgate(s), sgate(step(p, Arrive{gate, id, want, pred}, s))), u => SubL(slow(s), slow(step(p, Arrive{gate, id, want, pred}, s)))>
+  All2(l => m => SubL(l, m), slanes(s), slanes(step(p, Arrive{band, id, want, pred, elapsed}, s)))
 
-def arrival_never_preempts(p, gate, id, want, pred, s):
-  match gate s:
-    case True{} St{f, b, g, l}:
-      (subl_arrive(p, E{id, 1n+want, 0n, pred, 0n}, g), subl_refl(l))
-    case False{} St{f, b, g, l}:
-      (subl_refl(g), subl_arrive(p, E{id, 1n+want, 0n, pred, 0n}, l))
+def arrival_never_preempts(p, band, id, want, pred, elapsed, s):
+  match s:
+    case St{f, b, ls}:
+      subls_arrive(p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n}, ls)
 
 # An end removes its own entry; every other entry stays as it was.
 def sub_cons_r(+xs: +List<E>, +e: E) -> Sub(xs, e <> xs):
@@ -1188,12 +1415,19 @@ law finish_takes_only_its_own:
   for +p: Pol
   for +x: Nat
   for +s: St
-  Sigma<&2, &2, SubL(sgate(step(p, Finish{x}, s)), sgate(s)), u => SubL(slow(step(p, Finish{x}, s)), slow(s))>
+  All2(l => m => SubL(l, m), slanes(step(p, Finish{x}, s)), slanes(s))
+
+def subls_fin(+ls: +List<Lane>, +x: Nat) -> All2(l => m => SubL(l, m), lsl(fins(ls, x)), ls):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (subl_fin(l, x), subls_fin(t, x))
 
 def finish_takes_only_its_own(p, x, s):
   match s:
-    case St{f, b, g, l}:
-      (subl_fin(g, x), subl_fin(l, x))
+    case St{f, b, ls}:
+      subls_fin(ls, x)
 
 # --- LAW (a tick takes no permit): it regroups `new`, each entry keeping its id and grant -----
 
@@ -1310,20 +1544,26 @@ def tick_lane_law(+b: Nat, +l: Lane) -> TickL(b, l):
 
 def sbound(s: St) -> Nat:
   match s:
-    case St{f, b, g, l}:
+    case St{f, b, ls}:
       b
 
 law tick_regroups:
   for +p: Pol
   for +s: St
-  Sigma<&2, &2, {sgate(step(p, Tick{}, s)) == tick.lane(sbound(s), sgate(s)) : Lane}, u =>
-  Sigma<&2, &2, {slow(step(p, Tick{}, s)) == tick.lane(sbound(s), slow(s)) : Lane}, v =>
-  Sigma<&2, &2, TickL(sbound(s), sgate(s)), w => TickL(sbound(s), slow(s))>>>
+  Sigma<&2, &2, {slanes(step(p, Tick{}, s)) == ticks(sbound(s), slanes(s)) : +List<Lane>}, u =>
+  AllL(l => TickL(sbound(s), l), slanes(s))>
+
+def ticks_law(+b: Nat, +ls: +List<Lane>) -> AllL(l => TickL(b, l), ls):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (tick_lane_law(b, l), ticks_law(b, t))
 
 def tick_regroups(p, s):
   match s:
-    case St{f, b, g, l}:
-      ({==}, ({==}, (tick_lane_law(b, g), tick_lane_law(b, l))))
+    case St{f, b, ls}:
+      ({==}, ticks_law(b, ls))
 
 # --- LAW (bounded wait): a request leaves `new` once it has waited its bound ---------------
 # After a tick every request still in `new` has waited fewer than `bound` ticks, and every one
@@ -1365,7 +1605,7 @@ def split_age(+n: +List<E>, +b: Nat) -> Sigma<&2, &2, Aged(b, sm(split(n, b))), 
 law tick_bounds_wait:
   for +p: Pol
   for +s: St
-  Sigma<&2, &2, Young(sbound(s), lnew(sgate(step(p, Tick{}, s)))), u => Young(sbound(s), lnew(slow(step(p, Tick{}, s))))>
+  AllL(l => Young(sbound(s), lnew(l)), slanes(step(p, Tick{}, s)))
 
 def snd_young.go(+b: Nat, +n: +List<E>, ih: Sigma<&2, &2, Aged(b, sm(split(n, b))), u => Young(b, ss(split(n, b)))>) -> Young(b, ss(split(n, b))):
   (ihm, ihs) = ih
@@ -1379,10 +1619,17 @@ def tick_lane_young(+b: Nat, +l: Lane) -> Young(b, lnew(tick.lane(b, l))):
     case Lane{o, n}:
       snd_young(b, n)
 
+def ticks_young(+b: Nat, +ls: +List<Lane>) -> AllL(l => Young(b, lnew(l)), ticks(b, ls)):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (tick_lane_young(b, l), ticks_young(b, t))
+
 def tick_bounds_wait(p, s):
   match s:
-    case St{f, b, g, l}:
-      (tick_lane_young(b, g), tick_lane_young(b, l))
+    case St{f, b, ls}:
+      ticks_young(b, ls)
 
 # --- LAW (shortest predicted first): under Spt every lane's `new` stays sorted -----------
 # by prediction, so a decision, which walks `new` in its order, serves the request predicted
@@ -1580,7 +1827,7 @@ def SortedL(l: Lane) -> Data:
   Sorted(lnew(l))
 
 def Ordered(s: St) -> Data:
-  Sigma<&2, &2, SortedL(sgate(s)), u => SortedL(slow(s))>
+  AllL(l => SortedL(l), slanes(s))
 
 def sorted_lane.arrive(+y: E, +l: Lane, +s: SortedL(l)) -> SortedL(arrive.lane(Spt{}, y, l)):
   match l:
@@ -1608,23 +1855,51 @@ law spt_keeps_new_sorted:
   for +i: Ordered(s)
   Ordered(step(Spt{}, o, s))
 
+def sorted_arrive(+i: Nat, +y: E, +ls: +List<Lane>, +h: AllL(l => SortedL(l), ls)) -> AllL(l => SortedL(l), arrive.at(Spt{}, i, y, ls)):
+  match i ls:
+    case 0n Con{+l, +t}:
+      (sl, st) = h
+      (sorted_lane.arrive(y, l, sl), st)
+    case 1n+j Con{+l, +t}:
+      (sl, st) = h
+      (sl, sorted_arrive(j, y, t, st))
+    case i0 Nil{}:
+      Unit{}
+
+def sorted_walks(+ls: +List<Lane>, +f: Nat, +h: AllL(l => SortedL(l), ls)) -> AllL(l => SortedL(l), lsl(walks(ls, f))):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (sl, st) = h
+      (sorted_lane.walk(l, f, sl), sorted_walks(t, lf(lwalk(l, f)), st))
+
+def sorted_ticks(+b: Nat, +ls: +List<Lane>, +h: AllL(l => SortedL(l), ls)) -> AllL(l => SortedL(l), ticks(b, ls)):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (sl, st) = h
+      (sorted_lane.tick(b, l, sl), sorted_ticks(b, t, st))
+
+def sorted_fins(+ls: +List<Lane>, +x: Nat, +h: AllL(l => SortedL(l), ls)) -> AllL(l => SortedL(l), lsl(fins(ls, x))):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (sl, st) = h
+      (sorted_lane.fin(l, x, sl), sorted_fins(t, x, st))
+
 def spt_keeps_new_sorted(o, s, i):
   match o s:
-    case Arrive{True{}, id, want, pred} St{f, b, g, l}:
-      (sg, sl) = i
-      (sorted_lane.arrive(E{id, 1n+want, 0n, pred, 0n}, g, sg), sl)
-    case Arrive{False{}, id, want, pred} St{f, b, g, l}:
-      (sg, sl) = i
-      (sg, sorted_lane.arrive(E{id, 1n+want, 0n, pred, 0n}, l, sl))
-    case Decide{} St{f, b, g, l}:
-      (sg, sl) = i
-      (sorted_lane.walk(g, f, sg), sorted_lane.walk(l, lf(lwalk(g, f)), sl))
-    case Tick{} St{f, b, g, l}:
-      (sg, sl) = i
-      (sorted_lane.tick(b, g, sg), sorted_lane.tick(b, l, sl))
-    case Finish{x} St{f, b, g, l}:
-      (sg, sl) = i
-      (sorted_lane.fin(g, x, sg), sorted_lane.fin(l, x, sl))
+    case Arrive{band, id, want, pred, elapsed} St{f, b, ls}:
+      sorted_arrive(lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n}, ls, i)
+    case Decide{} St{f, b, ls}:
+      sorted_walks(ls, f, i)
+    case Tick{} St{f, b, ls}:
+      sorted_ticks(b, ls, i)
+    case Finish{x} St{f, b, ls}:
+      sorted_fins(ls, x, i)
 
 # --- `old` by arrival ticket -------------------------------------------------------
 
@@ -1753,7 +2028,7 @@ def OldOrderedL(l: Lane) -> Data:
   SortedI(lold(l))
 
 def OldOrdered(s: St) -> Data:
-  Sigma<&2, &2, OldOrderedL(sgate(s)), u => OldOrderedL(slow(s))>
+  AllL(l => OldOrderedL(l), slanes(s))
 
 def old_lane.walk(+l: Lane, +f: Nat, +s: OldOrderedL(l)) -> OldOrderedL(ll(lwalk(l, f))):
   match l:
@@ -1784,23 +2059,51 @@ law old_stays_in_arrival_order:
   for +i: OldOrdered(s)
   OldOrdered(step(p, o, s))
 
+def old_arrive(+p: Pol, +i: Nat, +y: E, +ls: +List<Lane>, +h: AllL(l => OldOrderedL(l), ls)) -> AllL(l => OldOrderedL(l), arrive.at(p, i, y, ls)):
+  match i ls:
+    case 0n Con{+l, +t}:
+      (sl, st) = h
+      (old_lane.arrive(p, y, l, sl), st)
+    case 1n+j Con{+l, +t}:
+      (sl, st) = h
+      (sl, old_arrive(p, j, y, t, st))
+    case i0 Nil{}:
+      Unit{}
+
+def old_walks(+ls: +List<Lane>, +f: Nat, +h: AllL(l => OldOrderedL(l), ls)) -> AllL(l => OldOrderedL(l), lsl(walks(ls, f))):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (sl, st) = h
+      (old_lane.walk(l, f, sl), old_walks(t, lf(lwalk(l, f)), st))
+
+def old_ticks(+b: Nat, +ls: +List<Lane>, +h: AllL(l => OldOrderedL(l), ls)) -> AllL(l => OldOrderedL(l), ticks(b, ls)):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (sl, st) = h
+      (old_lane.tick(b, l, sl), old_ticks(b, t, st))
+
+def old_fins(+ls: +List<Lane>, +x: Nat, +h: AllL(l => OldOrderedL(l), ls)) -> AllL(l => OldOrderedL(l), lsl(fins(ls, x))):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (sl, st) = h
+      (old_lane.fin(l, x, sl), old_fins(t, x, st))
+
 def old_stays_in_arrival_order(p, o, s, i):
   match o s:
-    case Arrive{True{}, id, want, pred} St{f, b, g, l}:
-      (sg, sl) = i
-      (old_lane.arrive(p, E{id, 1n+want, 0n, pred, 0n}, g, sg), sl)
-    case Arrive{False{}, id, want, pred} St{f, b, g, l}:
-      (sg, sl) = i
-      (sg, old_lane.arrive(p, E{id, 1n+want, 0n, pred, 0n}, l, sl))
-    case Decide{} St{f, b, g, l}:
-      (sg, sl) = i
-      (old_lane.walk(g, f, sg), old_lane.walk(l, lf(lwalk(g, f)), sl))
-    case Tick{} St{f, b, g, l}:
-      (sg, sl) = i
-      (old_lane.tick(b, g, sg), old_lane.tick(b, l, sl))
-    case Finish{x} St{f, b, g, l}:
-      (sg, sl) = i
-      (old_lane.fin(g, x, sg), old_lane.fin(l, x, sl))
+    case Arrive{band, id, want, pred, elapsed} St{f, b, ls}:
+      old_arrive(p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n}, ls, i)
+    case Decide{} St{f, b, ls}:
+      old_walks(ls, f, i)
+    case Tick{} St{f, b, ls}:
+      old_ticks(b, ls, i)
+    case Finish{x} St{f, b, ls}:
+      old_fins(ls, x, i)
 
 # --- the difference, computed --------------------------------------------------------------
 # One permit free; a request predicted at 9 asked first, one predicted at 1 after it. Today
@@ -1808,18 +2111,97 @@ def old_stays_in_arrival_order(p, o, s, i):
 # into `old`, and Spt then grants it ahead of a newer, shorter request.
 law spt_serves_shortest_then_the_aged:
   Sigma<&2, &2,
-    {slow(run(Today{}, [Arrive{False{}, 1n, 0n, 9n}, Arrive{False{}, 2n, 0n, 1n}, Decide{}], empty(1n, 2n))) == Lane{[], [E{1n, 1n, 1n, 9n, 0n}, E{2n, 1n, 0n, 1n, 0n}]} : Lane},
+    {nth(2n, slanes(run(Today{}, [Arrive{Background{}, 1n, 0n, 9n, 0n}, Arrive{Background{}, 2n, 0n, 1n, 0n}, Decide{}], empty(1n, 2n)))) == Lane{[], [E{1n, 1n, 1n, 9n, 0n}, E{2n, 1n, 0n, 1n, 0n}]} : Lane},
     u => Sigma<&2, &2,
-    {slow(run(Spt{}, [Arrive{False{}, 1n, 0n, 9n}, Arrive{False{}, 2n, 0n, 1n}, Decide{}], empty(1n, 2n))) == Lane{[], [E{2n, 1n, 1n, 1n, 0n}, E{1n, 1n, 0n, 9n, 0n}]} : Lane},
+    {nth(2n, slanes(run(Spt{}, [Arrive{Background{}, 1n, 0n, 9n, 0n}, Arrive{Background{}, 2n, 0n, 1n, 0n}, Decide{}], empty(1n, 2n)))) == Lane{[], [E{2n, 1n, 1n, 1n, 0n}, E{1n, 1n, 0n, 9n, 0n}]} : Lane},
     v =>
-    {slow(run(Spt{}, [Arrive{False{}, 1n, 0n, 9n}, Tick{}, Tick{}, Arrive{False{}, 2n, 0n, 1n}, Decide{}], empty(1n, 2n))) == Lane{[E{1n, 1n, 1n, 9n, 2n}], [E{2n, 1n, 0n, 1n, 0n}]} : Lane}>>
+    {nth(2n, slanes(run(Spt{}, [Arrive{Background{}, 1n, 0n, 9n, 0n}, Tick{}, Tick{}, Arrive{Background{}, 2n, 0n, 1n, 0n}, Decide{}], empty(1n, 2n)))) == Lane{[E{1n, 1n, 1n, 9n, 2n}], [E{2n, 1n, 0n, 1n, 0n}]} : Lane}>>
 
 def spt_serves_shortest_then_the_aged():
   ({==}, ({==}, {==}))
 
 # Two requests aging on one tick enter `old` by ticket, whatever their predictions.
 law same_tick_ages_by_ticket:
-  {lold(slow(run(Spt{}, [Arrive{False{}, 1n, 0n, 9n}, Arrive{False{}, 2n, 0n, 1n}, Tick{}], empty(0n, 1n)))) == [E{1n, 1n, 0n, 9n, 1n}, E{2n, 1n, 0n, 1n, 1n}] : +List<E>}
+  {lold(nth(2n, slanes(run(Spt{}, [Arrive{Background{}, 1n, 0n, 9n, 0n}, Arrive{Background{}, 2n, 0n, 1n, 0n}, Tick{}], empty(0n, 1n))))) == [E{1n, 1n, 0n, 9n, 1n}, E{2n, 1n, 0n, 1n, 1n}] : +List<E>}
 
 def same_tick_ages_by_ticket():
+  {==}
+
+
+# --- LAW (interactive decays and never rises) ---------------------------------------------------
+
+def le_trans_b(+a: Nat, +b: Nat, +c: Nat, ab: IsTrue(le(a, b)), bc: IsTrue(le(b, c))) -> IsTrue(le(a, c)):
+  match a b c:
+    case 0n b0 c0:
+      Unit{}
+    case 1n+a1 0n c0:
+      match ab:
+    case 1n+a1 1n+b1 0n:
+      match bc:
+    case 1n+a1 1n+b1 1n+c1:
+      le_trans_b(a1, b1, c1, ab, bc)
+
+# The band an ask takes is monotone in its job's elapsed time: from late facts (`x` implies `y`
+# for each bound) the later ask's band is no higher than the earlier one's.
+def absurd_nat(-A: Data, e: Empty) -> A:
+  match e:
+
+def iband_mono(+x1: Bool, +x2: Bool, +y1: Bool, +y2: Bool, i1: IsTrue(x1) -> IsTrue(y1), i2: IsTrue(x2) -> IsTrue(y2))
+  -> IsTrue(le(iband.go(x1, x2), iband.go(y1, y2))):
+  match x1 x2 y1 y2:
+    case False{} x20 y10 y20:
+      Unit{}
+    case True{} False{} False{} y20:
+      absurd_nat(IsTrue(le(1n, iband.go(False{}, y20))), i1(Unit{}))
+    case True{} False{} True{} False{}:
+      Unit{}
+    case True{} False{} True{} True{}:
+      Unit{}
+    case True{} True{} False{} y20:
+      absurd_nat(IsTrue(le(2n, iband.go(False{}, y20))), i1(Unit{}))
+    case True{} True{} True{} False{}:
+      absurd_nat(IsTrue(le(2n, 1n)), i2(Unit{}))
+    case True{} True{} True{} True{}:
+      Unit{}
+
+# LAW (decay never rises): an interactive job's later ask is never in a higher band than an
+# earlier one: interactive, then the gate's band at 30 s, then background at 120 s.
+law decay_never_rises:
+  for +e1: Nat
+  for +e2: Nat
+  for +ee: IsTrue(le(e1, e2))
+  IsTrue(le(iband(e1), iband(e2)))
+
+def decay_never_rises(e1, e2, ee):
+  iband_mono(le(b1(), e1), le(b2(), e1), le(b1(), e2), le(b2(), e2),
+    h => le_trans_b(b1(), e1, e2, h, ee),
+    h => le_trans_b(b2(), e1, e2, h, ee))
+
+# An interactive ask before 30 s is ordered before every gate-band request of the lane; one that
+# has decayed past 30 s is ordered among them; past 120 s it is background work.
+law interactive_decays_through_the_bands:
+  Sigma<&2, &2, {iband(0n) == 0n : Nat}, u => Sigma<&2, &2, {iband(30n) == 1n : Nat}, v => {iband(120n) == 2n : Nat}>>
+
+def interactive_decays_through_the_bands():
+  ({==}, ({==}, {==}))
+
+# A gate leaf predicted 1 s and a fresh interactive leaf predicted 5 s both wait, one permit
+# free: the interactive leaf goes first. Asked at 40 s, it waits in the gate's lane behind the
+# shorter gate leaf; at 130 s it is background work.
+law interactive_before_the_gate_until_it_decays:
+  Sigma<&2, &2,
+    {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 1n, 0n}, Arrive{Interactive{}, 2n, 0n, 5n, 0n}, Decide{}], empty(1n, 30n))) == [Lane{[], [E{2n, 1n, 1n, 5n, 0n}]}, Lane{[], [E{1n, 1n, 0n, 1n, 0n}]}, Lane{[], []}] : +List<Lane>},
+    u => Sigma<&2, &2,
+    {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 1n, 0n}, Arrive{Interactive{}, 2n, 0n, 5n, 40n}, Decide{}], empty(1n, 30n))) == [Lane{[], []}, Lane{[], [E{1n, 1n, 1n, 1n, 0n}, E{2n, 1n, 0n, 5n, 0n}]}, Lane{[], []}] : +List<Lane>},
+    v => {slanes(run(Spt{}, [Arrive{Interactive{}, 3n, 0n, 5n, 130n}], empty(1n, 30n))) == [Lane{[], []}, Lane{[], []}, Lane{[], [E{3n, 1n, 0n, 5n, 0n}]}] : +List<Lane>}>>
+
+def interactive_before_the_gate_until_it_decays():
+  ({==}, ({==}, {==}))
+
+# Aging stays within a band: a gate request that has aged into `old` still waits behind a
+# fresh interactive one (the case a shared top lane got wrong).
+law aged_gate_stays_behind_fresh_interactive:
+  {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 9n, 0n}, Tick{}, Tick{}, Arrive{Interactive{}, 2n, 0n, 1n, 0n}, Decide{}], empty(1n, 2n))) == [Lane{[], [E{2n, 1n, 1n, 1n, 0n}]}, Lane{[E{1n, 1n, 0n, 9n, 2n}], []}, Lane{[], []}] : +List<Lane>}
+
+def aged_gate_stays_behind_fresh_interactive():
   {==}

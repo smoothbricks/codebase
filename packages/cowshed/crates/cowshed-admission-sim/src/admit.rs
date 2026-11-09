@@ -25,11 +25,58 @@ use serde::Deserialize;
 
 use crate::model::{Class, Secs};
 
-/// mbx's two priorities (05_gateway.md "Classes": a land's gate `normal`, everything else `low`).
+/// mbx's three priority bands, the first admitted first (05_gateway.md "Classes"): interactive
+/// work's `interactive`, a land's gate `normal`, everything else `low`.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum Priority {
+    Interactive,
     Normal,
     Low,
+}
+
+/// When an interactive job's asks decay (05_gateway.md "Classes"; the model's `b1()` and `b2()`,
+/// mbx's `INTERACTIVE_FOR_MS` and `NORMAL_UNTIL_MS`): one pair, swept as a whole.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Decay {
+    /// How long a job's asks stay `interactive`.
+    pub(crate) interactive_for: Secs,
+    /// Until when they are `normal`, before they are `low`.
+    pub(crate) normal_until: Secs,
+}
+
+pub(crate) const DECAY: Decay = Decay {
+    interactive_for: 30.0,
+    normal_until: 120.0,
+};
+
+/// The band a request declares. An interactive one names its job's start, since its band decays
+/// as its job ages.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Declared {
+    Interactive { job_started: Secs },
+    Normal,
+    Low,
+}
+
+impl Declared {
+    /// The band an ask at `asked` is admitted in, decided once as it enters the queue and never
+    /// re-ranked: mbx's `decayed`.
+    pub(crate) fn band(self, asked: Secs) -> Priority {
+        match self {
+            Self::Interactive { job_started } => {
+                let elapsed = asked - job_started;
+                if elapsed < DECAY.interactive_for {
+                    Priority::Interactive
+                } else if elapsed < DECAY.normal_until {
+                    Priority::Normal
+                } else {
+                    Priority::Low
+                }
+            }
+            Self::Normal => Priority::Normal,
+            Self::Low => Priority::Low,
+        }
+    }
 }
 
 /// What asked: mbx's observation kinds.
@@ -157,7 +204,7 @@ pub(crate) enum Order {
     Class,
     /// Class, then the highest bottom level, then arrival.
     ClassCriticalPath,
-    /// mbx's `admission_pass`: priority (`normal` first), then, among requests that have not aged,
+    /// mbx's `admission_pass`: band (`interactive`, then `normal`, then `low`), then, among requests that have not aged,
     /// the shortest prediction, then ticket. A request mbx has not seen takes its kind's default
     /// ([`predictions`]). An aged request goes before every fresh one of its priority, oldest first.
     ShortestPredicted,

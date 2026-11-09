@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 use sha2::{Digest, Sha256};
+use std::rc::Rc;
 
-use crate::admit::{self, Charge, Kind, Lease, Priority, Request};
-use crate::bend_admission::{self as bend, E, Lane, List, Op, Pol, St};
+use crate::admit::{self, Charge, DECAY, Declared, Kind, Lease, Priority, Request};
+use crate::bend_admission::{self as bend, Band, E, Lane, List, Op, Pol, St};
 use crate::model::{Class, Secs};
 use crate::policy::{AGING, POOL_RULE};
 
@@ -58,8 +59,14 @@ fn the_kernel_is_emitted_from_the_model_in_the_tree() {
 /// One step of a trace.
 #[derive(Clone, Copy, Debug)]
 enum Act {
-    /// A request of the gate's lane or the low one, for `want` cores, predicted `pred` s.
-    Arrive { gate: bool, want: u32, pred: u32 },
+    /// A request of `band`, for `want` cores, predicted `pred` s, from a job that has run
+    /// `elapsed` s: the age an interactive request's band decays by.
+    Arrive {
+        band: Declares,
+        want: u32,
+        pred: u32,
+        elapsed: u32,
+    },
     /// One pool decision.
     Decide,
     /// This many ticks of one second each.
@@ -69,10 +76,44 @@ enum Act {
     Finish(u64),
 }
 
+/// The band a request declares, as the model's `Band` names it.
+#[derive(Clone, Copy, Debug)]
+enum Declares {
+    Gate,
+    Interactive,
+    Background,
+}
+
+impl Declares {
+    fn model(self) -> Band {
+        match self {
+            Self::Gate => Band::Gate,
+            Self::Interactive => Band::Interactive,
+            Self::Background => Band::Background,
+        }
+    }
+
+    /// The sim's declaration of an ask at `asked` from a job that has run `elapsed`.
+    fn sim(self, asked: Secs, elapsed: u32) -> Declared {
+        match self {
+            Self::Gate => Declared::Normal,
+            Self::Interactive => Declared::Interactive {
+                job_started: asked - Secs::from(elapsed),
+            },
+            Self::Background => Declared::Low,
+        }
+    }
+}
+
 fn act() -> impl Strategy<Value = Act> {
+    let band = prop_oneof![
+        Just(Declares::Gate),
+        Just(Declares::Interactive),
+        Just(Declares::Background),
+    ];
     prop_oneof![
-        4 => (any::<bool>(), 1..=4_u32, 1..=600_u32)
-            .prop_map(|(gate, want, pred)| Act::Arrive { gate, want, pred }),
+        4 => (band, 1..=4_u32, 1..=600_u32, 0..=200_u32)
+            .prop_map(|(band, want, pred, elapsed)| Act::Arrive { band, want, pred, elapsed }),
         3 => Just(Act::Decide),
         2 => (1..=BOUND).prop_map(Act::Tick),
         2 => any::<u64>().prop_map(Act::Finish),
@@ -88,16 +129,16 @@ struct Pool {
 }
 
 impl Pool {
-    fn arrive(&mut self, id: u64, gate: bool, want: u32, pred: u32) {
-        let (class, priority) = if gate {
-            (Class::Gate, Priority::Normal)
-        } else {
-            (Class::Background, Priority::Low)
+    fn arrive(&mut self, id: u64, declared: Declared, want: u32, pred: u32) {
+        let class = match declared {
+            Declared::Interactive { .. } => Class::Interactive,
+            Declared::Normal => Class::Gate,
+            Declared::Low => Class::Background,
         };
         let request = Request {
             ticket: id,
             class,
-            priority,
+            priority: declared.band(self.now),
             since: self.now,
             rank: 0.0,
             predicted: Some(Secs::from(pred)),
@@ -145,9 +186,10 @@ impl Pool {
 
 /// Every request the model's state holds a grant for, with its cores.
 fn granted(state: &St) -> BTreeMap<u64, u64> {
-    let St::St(_, _, gate, low) = state;
+    let St::St(_, _, lanes) = state;
     let mut granted = BTreeMap::new();
-    for Lane::Lane(old, new) in [gate, low] {
+    let mut lane: &List<Lane> = lanes;
+    while let List::Con(Lane::Lane(old, new), rest) = lane {
         for list in [old, new] {
             let mut at: &List<E> = list;
             while let List::Con(E::E(id, _, k, _, _), rest) = at {
@@ -157,29 +199,64 @@ fn granted(state: &St) -> BTreeMap<u64, u64> {
                 at = rest;
             }
         }
+        lane = rest;
     }
     granted
 }
 
-fn empty_lane() -> Lane {
-    Lane::Lane(List::Nil.into(), List::Nil.into())
+/// The model's `empty(cap, bound)`: a pool of `cap` permits and one empty lane per band.
+fn empty(cap: u32) -> St {
+    let lanes = (0..3).fold(Rc::new(List::Nil), |rest, _| {
+        Rc::new(List::Con(
+            Lane::Lane(List::Nil.into(), List::Nil.into()),
+            rest,
+        ))
+    });
+    St::St(u64::from(cap), u64::from(BOUND), lanes)
+}
+
+/// The model's lane index of a sim band, in the order of its `lane(band, elapsed)`.
+fn lane(band: Priority) -> u64 {
+    match band {
+        Priority::Interactive => 0,
+        Priority::Normal => 1,
+        Priority::Low => 2,
+    }
 }
 
 /// Runs `acts` on a pool of `cap` cores through the model's `step(Spt, …)` and the sim's pool
 /// rule, and holds that every decision grants the same requests the same cores in both.
 fn drive(cap: u32, acts: &[Act]) -> Result<(), TestCaseError> {
     prop_assert_eq!(AGING, Secs::from(BOUND));
-    let mut model = St::St(u64::from(cap), u64::from(BOUND), empty_lane(), empty_lane());
+    let mut model = empty(cap);
     let mut pool = Pool::default();
     let mut arrived = 0_u64;
     for (at, &act) in acts.iter().enumerate() {
         match act {
-            Act::Arrive { gate, want, pred } => {
+            Act::Arrive {
+                band,
+                want,
+                pred,
+                elapsed,
+            } => {
                 arrived += 1;
                 // The model's `Arrive` asks for one more than its `want`, so none asks for none.
-                let op = Op::Arrive(gate, arrived, u64::from(want - 1), u64::from(pred));
+                let op = Op::Arrive(
+                    band.model(),
+                    arrived,
+                    u64::from(want - 1),
+                    u64::from(pred),
+                    u64::from(elapsed),
+                );
+                let declared = band.sim(pool.now, elapsed);
+                prop_assert_eq!(
+                    lane(declared.band(pool.now)),
+                    bend::lane(band.model(), u64::from(elapsed)),
+                    "act {} entered another lane",
+                    at
+                );
                 model = bend::step(Pol::Spt, op, model);
-                pool.arrive(arrived, gate, want, pred);
+                pool.arrive(arrived, declared, want, pred);
             }
             Act::Decide => {
                 let before = granted(&model);
@@ -224,7 +301,7 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// Seeded random traces of arrivals to either lane, decisions, ticks and ends, on pools of
+    /// Seeded random traces of arrivals to the three bands, decisions, ticks and ends, on pools of
     /// 1 to 18 cores: after every decision the model's kernel and the sim's pool rule have granted
     /// the same requests the same cores. A mismatch prints the shrunk trace.
     #[test]
@@ -233,5 +310,18 @@ proptest! {
         acts in prop::collection::vec(act(), 0..=40),
     ) {
         drive(cap, &acts)?;
+    }
+}
+
+/// The sim's decay bounds are the model's `b1()` and `b2()`, and an interactive ask takes the
+/// model's band (`iband`) at every age from 0 to 200 s.
+#[test]
+fn an_interactive_ask_decays_at_the_models_bounds() {
+    let secs = |n: u64| Secs::from(u32::try_from(n).expect("a bound fits u32"));
+    assert_eq!(secs(bend::b1()), DECAY.interactive_for);
+    assert_eq!(secs(bend::b2()), DECAY.normal_until);
+    for elapsed in 0..=200_u32 {
+        let sim = (Declared::Interactive { job_started: 0.0 }).band(Secs::from(elapsed));
+        assert_eq!(lane(sim), bend::iband(u64::from(elapsed)), "at {elapsed} s");
     }
 }

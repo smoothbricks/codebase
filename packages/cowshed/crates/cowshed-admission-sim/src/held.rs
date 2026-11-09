@@ -1,9 +1,10 @@
 //! Held jobs against mbx's pool as it admits (05_gateway.md "Held jobs", "Admission"): several
 //! checkouts' real `job_admission` state machines reserve from one pool that grants by
 //! [`POOL_RULE`], the rule the pinned mbx implements. A grant is moldable: a hold may start on
-//! fewer cores than it asked for, and its job then runs on what it holds. Within a priority the
-//! pool grants the shortest predicted hold first, and a hold that has waited the aging bound
-//! before every fresher one, oldest first.
+//! fewer cores than it asked for, and its job then runs on what it holds. The pool admits its three
+//! bands in turn, interactive, the gate's, then background, an interactive hold's band decaying by
+//! its job's age when it asks. Within a band it grants the shortest predicted hold first, and a
+//! hold that has waited the aging bound before every fresher one, oldest first.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -13,7 +14,7 @@ use cowshed_core::api::dto::{ExecClass, JobId};
 use cowshed_core::runtime::job_admission::{Admission, Effect, Event, Ledger, Phase, PoolPriority};
 use proptest::prelude::*;
 
-use crate::admit::{self, Charge, Kind, Lease, Priority, Request};
+use crate::admit::{self, Charge, Declared, Kind, Lease, Priority, Request};
 use crate::model::{Class, Secs};
 use crate::policy::{AGING, POOL_RULE};
 
@@ -39,6 +40,10 @@ struct Job {
     hold: Option<NonZeroUsize>,
     /// What mbx predicts its hold lasts: none for a job it has not seen.
     predicted: Option<Secs>,
+    /// When the job was requested: the start an interactive hold's band decays from.
+    requested: Secs,
+    /// The band its hold asked in, once it asked.
+    asked: Option<Priority>,
 }
 
 /// mbx's pool: the holds waiting in ticket order, and what each granted one holds.
@@ -50,21 +55,22 @@ struct Pool {
 }
 
 impl Pool {
-    /// A hold enters at its job's pool priority and prediction: mbx knows nothing else of a job.
+    /// A hold enters at the band it declares and its prediction: mbx knows nothing else of a job.
     fn enter(
         &mut self,
         holder: Holder,
         cpus: NonZeroUsize,
-        priority: PoolPriority,
+        declared: Declared,
         predicted: Option<Secs>,
         now: Secs,
     ) {
         self.tickets += 1;
-        let (class, priority) = match priority {
-            PoolPriority::Interactive => (Class::Interactive, Priority::Normal),
-            PoolPriority::Normal => (Class::Gate, Priority::Normal),
-            PoolPriority::Low => (Class::Background, Priority::Low),
+        let class = match declared {
+            Declared::Interactive { .. } => Class::Interactive,
+            Declared::Normal => Class::Gate,
+            Declared::Low => Class::Background,
         };
+        let priority = declared.band(now);
         let cpus = u32::try_from(cpus.get()).expect("a hold's cores fit u32");
         self.queue.push((
             holder,
@@ -174,8 +180,20 @@ impl World {
                         Some(cpus),
                         "{holder:?} reserved what it did not declare"
                     );
-                    let predicted = self.jobs[&holder].predicted;
-                    self.pool.enter(holder, cpus, priority, predicted, self.now);
+                    let job = self.jobs[&holder];
+                    let declared = match priority {
+                        PoolPriority::Interactive => Declared::Interactive {
+                            job_started: job.requested,
+                        },
+                        PoolPriority::Normal => Declared::Normal,
+                        PoolPriority::Low => Declared::Low,
+                    };
+                    self.pool
+                        .enter(holder, cpus, declared, job.predicted, self.now);
+                    let band = declared.band(self.now);
+                    if let Some(job) = self.jobs.get_mut(&holder) {
+                        job.asked = Some(band);
+                    }
                 }
                 Effect::Release { job } => {
                     let holder = (checkout, job);
@@ -238,6 +256,9 @@ impl World {
                         class,
                         hold,
                         predicted,
+                        // `step` stamps the request a second after the last happening.
+                        requested: self.now + 1.0,
+                        asked: None,
                     },
                 );
                 let ledger = Ledger::Mbx { hold };
@@ -249,20 +270,6 @@ impl World {
                 let predicted = admit::predictions(&requests);
                 let started = self.pool.admit(self.now);
                 self.check_order(&seen, &predicted, &started);
-                let low_started = started.iter().any(|&(holder, _)| {
-                    self.jobs
-                        .get(&holder)
-                        .is_some_and(|job| PoolPriority::of(job.class) == PoolPriority::Low)
-                });
-                let normal_waits = self
-                    .pool
-                    .queue
-                    .iter()
-                    .any(|(_, request)| request.priority == Priority::Normal);
-                assert!(
-                    !(low_started && normal_waits),
-                    "a background hold started while a gate's hold waited"
-                );
                 for ((checkout, job), _) in started {
                     self.step(checkout, Event::Granted { job });
                 }
@@ -298,10 +305,11 @@ impl World {
         self.check();
     }
 
-    /// One pass's order within each priority, against the queue it saw and the predictions it
-    /// ordered by: no fresh hold is granted while a fresh hold of its priority predicted shorter,
-    /// or as short and asked before it, still waits; and once a hold has waited the aging bound,
-    /// nothing that asked after it in its priority is granted while it waits.
+    /// One pass's order, against the queue it saw and the predictions it ordered by: no hold is
+    /// granted while a hold of a higher band waits; within a band, no fresh hold is granted while
+    /// a fresh hold predicted shorter, or as short and asked before it, still waits; and once a
+    /// hold has waited the aging bound, nothing that asked after it in its band is granted while
+    /// it waits.
     fn check_order(
         &self,
         seen: &[(Holder, Request)],
@@ -315,7 +323,16 @@ impl World {
                 continue;
             }
             for (w, &(waiter, waits)) in seen.iter().enumerate() {
-                if granted(waiter) || waits.priority != request.priority {
+                if granted(waiter) {
+                    continue;
+                }
+                assert!(
+                    waits.priority >= request.priority,
+                    "{holder:?}, a {:?} hold, was granted while {waiter:?}, a {:?} hold, waited",
+                    request.priority,
+                    waits.priority
+                );
+                if waits.priority != request.priority {
                     continue;
                 }
                 if aged(&waits) {
@@ -361,6 +378,21 @@ impl World {
                 "checkout {} waits in the pool twice at {priority:?}",
                 holder.0
             );
+        }
+        // decay_never_rises: an ask the job made now would be in its hold's band or a lower one.
+        for (&holder, job) in &self.jobs {
+            if let (Some(asked), PoolPriority::Interactive) =
+                (job.asked, PoolPriority::of(job.class))
+            {
+                let now = Declared::Interactive {
+                    job_started: job.requested,
+                }
+                .band(self.now);
+                assert!(
+                    now >= asked,
+                    "decay_never_rises: {holder:?} asked in {asked:?} and would ask in {now:?} now"
+                );
+            }
         }
         for (&holder, job) in &self.jobs {
             let phase = self.phase(holder).expect("a live job is in its admission");
@@ -506,10 +538,11 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
 
     /// Random requests, pool passes, refusals, spawns, cancels and ends from four checkouts keep
-    /// every grant within the pool and within what its job asked for; start no background hold
-    /// while a gate's hold waits; within a priority, grant fresh holds shortest predicted first
-    /// and nothing younger while an aged hold waits; grant every hold once the holds ahead of it
-    /// end; and leave every grant released and the whole pool grantable again.
+    /// every grant within the pool and within what its job asked for; grant no hold while a hold
+    /// of a higher band waits; within a band, grant fresh holds shortest predicted first and
+    /// nothing younger while an aged hold waits; never raise an interactive job's band as it ages
+    /// (decay_never_rises); grant every hold once the holds ahead of it end; and leave every grant
+    /// released and the whole pool grantable again.
     #[test]
     fn held_jobs_across_checkouts_keep_the_pool_contract(ops in prop::collection::vec(op(), 1..96)) {
         let mut world = World::new();
@@ -526,7 +559,7 @@ proptest! {
 #[test]
 fn a_shorter_younger_hold_goes_first_until_the_older_one_ages() {
     let one = NonZeroUsize::MIN;
-    let low = PoolPriority::Low;
+    let low = Declared::Low;
     let (filler, older, younger, fresh) = ((0, id(1)), (1, id(2)), (2, id(3)), (3, id(4)));
     let mut pool = Pool::default();
     let seven = NonZeroUsize::new(7).expect("a positive count");
@@ -551,5 +584,41 @@ fn a_shorter_younger_hold_goes_first_until_the_older_one_ages() {
         started(&mut pool, 1.0 + AGING),
         [older],
         "the aged hold was passed"
+    );
+}
+
+/// One core is free and a gate's hold predicted 5 s waits. An interactive hold predicted 100 s,
+/// whose job started just now, goes before it; one whose job started 40 s before its ask has
+/// decayed to the gate's band and goes behind it (05_gateway.md "Classes").
+#[test]
+fn an_interactive_hold_goes_before_a_shorter_gate_hold_until_it_decays() {
+    let one = NonZeroUsize::MIN;
+    let (filler, gate, fresh, late) = ((0, id(1)), (1, id(2)), (2, id(3)), (3, id(4)));
+    let mut pool = Pool::default();
+    let seven = NonZeroUsize::new(7).expect("a positive count");
+    pool.enter(filler, seven, Declared::Low, Some(1000.0), 0.0);
+    pool.admit(0.0);
+    pool.enter(gate, one, Declared::Normal, Some(5.0), 1.0);
+    let interactive = |asked: Secs, ran: Secs| Declared::Interactive {
+        job_started: asked - ran,
+    };
+    pool.enter(fresh, one, interactive(2.0, 0.0), Some(100.0), 2.0);
+    let started = |pool: &mut Pool| -> Vec<Holder> {
+        pool.admit(2.0)
+            .into_iter()
+            .map(|(holder, _)| holder)
+            .collect()
+    };
+    assert_eq!(
+        started(&mut pool),
+        [fresh],
+        "the interactive hold waited behind the gate's"
+    );
+    pool.leave(fresh);
+    pool.enter(late, one, interactive(2.0, 40.0), Some(100.0), 2.0);
+    assert_eq!(
+        started(&mut pool),
+        [gate],
+        "the decayed hold passed the gate's"
     );
 }

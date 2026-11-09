@@ -1496,14 +1496,31 @@ A requester names its job's class in the exec request: `ExecClass`, one of `inte
 value (07_api.md, "CLI and API exec parity"), so an embedding executor declares a class exactly as the CLI does. Only
 the trusted coordinator/operator route may ask `gate`; a worker that asks it is refused with typed class-not-permitted
 before any job or spawn effect. Ordinary commands default to `background`. A class is fixed at the job's birth; no live
-transition moves a running job between classes. The table owns kernel placement and the non-mbx pressure policy. With
-mbx selected, all classes use its admission and pressure policy ("Memory pressure"); the land gate has
-`MBX_SCHEDULER_PRIORITY=normal`, and every other class has `low`, including interactive and resident work. The same
-mapping supplies `mbx reserve --priority` and the priority of a leaf's request to its Nx run's reservation endpoint. The
-supervisor exports the job's value again as `COWSHED_MBX_SCHEDULER_PRIORITY`, which `.cowshed/env` restores after its
-own canonical `low`, so a shell activation inside a gate's command (a `direnv exec` in its script, say) keeps `normal`;
-on 2026-10-31 every reservation of a downstream land gate entered the pool at `low`. Kernel nice and cgroup placement do
-not create another pool.
+transition moves a running job between classes (an interactive job's decay, below, changes the pool band its asks take
+and its nice, never its class, its cgroup or its record's class). The table owns kernel placement and the non-mbx
+pressure policy. With mbx selected, all classes use its admission and pressure policy ("Memory pressure"). mbx's pool
+has three bands, `interactive` before `normal` before `low`, each ordered shortest predicted first with aging ("Held
+jobs", Order). The land gate has `MBX_SCHEDULER_PRIORITY=normal`; background and resident work has `low`; interactive
+work has `interactive` and decays by how long its job has run when it asks: its asks are `interactive` for its job's
+first 30 s, then `normal`, the gate's band, until 120 s, then `low`. So a check, lint or test an agent waits on after an
+edit runs ahead of the gate's waiting leaves, and a run that turns out long stops crowding interactive work and then
+gates. The decay is stateless: the supervisor exports an interactive job's start as `MBX_SCHEDULER_JOB_STARTED_MS`
+(every other job exports it empty, so a job started inside an interactive one never inherits its clock), mbx computes
+each ask's band from it when the ask enters the queue and names a decayed band in its decision record, and nothing
+already granted is re-ranked, since nothing is preempted. The kernel follows at the same bounds: the supervisor re-nices
+the job's process group to the gate's nice at 30 s and to background's at 120 s. A step writes nothing to the job's
+output: it is one `info` row of the job's span (`job.decayed.gate`, `job.decayed.background`; 13_telemetry.md, "Job span
+segments"), a transition recorded for its own reason, and mbx's decision row names each decayed ask (on Linux, where a
+job's cgroup cannot move between class cgroups, the nice step is skipped, its row still recorded, and the pool band
+alone decays). An interactive-resident serves many short requests and does not decay. Interactive work is never held:
+like a gate, its leaves are admitted one by one (`cowshed exec --class interactive` reads no `COWSHED_EXEC_WANT` and
+refuses `--want`). The owner's rulings, 2026-11-10: "a coding agent must be able to execute 1 test under interactive,
+above background", with the decay through the gate's band to background. The same mapping supplies
+`mbx reserve --priority` and the priority of a leaf's request to its Nx run's reservation endpoint. The supervisor
+exports the job's value again as `COWSHED_MBX_SCHEDULER_PRIORITY`, which `.cowshed/env` restores after its own canonical
+`low`, so a shell activation inside a gate's command (a `direnv exec` in its script, say) keeps `normal`; on 2026-10-31
+every reservation of a downstream land gate entered the pool at `low`. Kernel nice and cgroup placement do not create
+another pool.
 
 | Class                  | What runs in it                                                                                                       | Nice | Linux cgroup                                                                 | Without mbx: waits on memory pressure | Without mbx: ended at macOS Critical |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------ |
@@ -1677,15 +1694,18 @@ end, and a released pool grants a later hold of the whole pool whole; and
 pressure feed.
 
 **The pool's laws.** mbx's pool decision is stated as a model, [laws/admission.bend](laws/admission.bend), which bend2
-checks and its Lean-proven kernel checks again (`bend specs/cowshed/laws/admission.bend --verdict`). A lane is two
-lists: `old`, the requests that have waited their aging bound, in arrival order, and `new`, the rest; a decision walks
-the gate lane's `old` then `new`, then the low lane's. Its laws are the policy's contract, under today's arrival order
-and under shortest predicted first (`Spt`) alike unless named:
+checks and its Lean-proven kernel checks again (`bend specs/cowshed/laws/admission.bend --verdict`). The pool is a list
+of lanes in priority order, one per band: interactive, the gate's (`normal`), background (`low`). An ask enters its
+band's lane; an interactive job's ask enters the lane of its decayed band at its elapsed time (`lane`, `iband`). A lane
+is two lists: `old`, the requests that have waited their aging bound, in arrival order, and `new`, the rest, so a
+request ages within its band and an aged request never passes a fresh one of a higher band. A decision walks the lanes
+in order, each lane's `old` then its `new`. Its laws are the policy's contract, for any number of lanes, under today's
+arrival order and under shortest predicted first (`Spt`) alike unless named:
 
 - `conserved`, `never_overcommits`: no step makes or loses a permit, so the grants never exceed the pool.
-- `gate_first`: after a decision the gate lane needs nothing, or the low lane is as it was.
-- `work_conserving`: after a decision both lanes need nothing, or no permit is free: low work is admitted whenever gate
-  work is filled, so landing gets priority and never exclusivity.
+- `lanes_in_order`: after a decision each lane needs nothing, or every lane after it is as it was.
+- `work_conserving`: after a decision every lane needs nothing, or no permit is free: a later lane is admitted whenever
+  the lanes before it are filled, so landing gets priority and never exclusivity.
 - `first_in_order_filled`: in each list a request is filled, or nothing after it changed, and a lane's `new` changes
   only once its `old` is filled.
 - `decide_never_preempts`, `arrival_never_preempts`, `finish_takes_only_its_own`, `tick_regroups`: no step takes a
@@ -1698,6 +1718,11 @@ and under shortest predicted first (`Spt`) alike unless named:
   request predicted shortest first among those that have not aged.
 - `spt_serves_shortest_then_the_aged`: computed cases where today serves the first asker, Spt the shortest, and Spt the
   aged request ahead of a newer, shorter one.
+- `decay_never_rises`: an interactive job's later ask is never in a higher band than an earlier one;
+  `interactive_decays_through_the_bands` computes the bands at 0, 30 and 120 s, and
+  `interactive_before_the_gate_until_it_decays` a fresh interactive leaf admitted ahead of a shorter gate leaf, behind
+  it once decayed, and in the low lane past 120 s; `aged_gate_stays_behind_fresh_interactive` a gate request aged into
+  its lane's `old` still waiting behind a fresh interactive one.
 
 Together they bound every wait: a request is ordered by its prediction for at most the aging bound, then joins `old` by
 its arrival among the requests that aged before it, and every permit an end frees goes to the first request of the
@@ -1766,22 +1791,22 @@ host's load.
   compiles still restore from and store to the shared store, but they leave mbx's in-flight registry, so an identical
   compilation another checkout runs at the same moment is compiled twice.
 - **Order: shortest predicted first.** mbx's pool rule orders the holds as it orders every request ("Admission", "Long
-  holders"): normal priority before low ("Classes": a gate's hold `normal`, every other `low`); within a priority, a
-  request that has waited 30 s goes first, oldest first, and holds back the requests behind it while it cannot start;
-  every other request goes in order of its predicted run time, shortest first, then by ticket. The prediction is the
-  median of its class's last recorded run times (a compile's crate and mode, a test's binary and name, a held job's
-  class); a class with none takes its kind's median. It starts a waiting hold on whatever cores are free, at least one,
-  rather than holding it until all `g` are. The owner's ruling, 2026-11-09: "make the scheduling as optimal as you can
-  prove it", keeping work moving and the first asker unpunished. Measured on the gate window of 2026-11-09 17:55-18:49
-  (the recorded observations replayed through the admission model): against arrival order, shortest predicted first cut
-  the gate's span 30 to 86% and low work's mean completion 35 to 62%, and finished the oldest quarter of low requests 18
-  to 41% sooner, in 22 of 24 configurations; growing a grant toward its want made low work 3 to 6 times slower, and
-  lower niceness for low work changed no gate span, since the gate's threads already win their cores. Each supervisor
-  keeps its own held jobs in request order, one lane per pool priority, and lets one hold per lane wait in the pool at a
-  time; the next enters when that one is granted, refused or withdrawn. A checkout that submits twenty jobs holds one
-  place in the queue, so checkouts take turns, and a gate never waits behind its own checkout's background job. An
-  admitted hold is never preempted, and its count never grows: a job granted fewer cores than it asked runs on those to
-  its end.
+  holders"): interactive before normal before low ("Classes": a gate's hold `normal`, every other `low`, interactive
+  work never held); within a band, a request that has waited 30 s goes first, oldest first, and holds back the requests
+  behind it while it cannot start; every other request goes in order of its predicted run time, shortest first, then by
+  ticket. The prediction is the median of its class's last recorded run times (a compile's crate and mode, a test's
+  binary and name, a held job's class); a class with none takes its kind's median. It starts a waiting hold on whatever
+  cores are free, at least one, rather than holding it until all `g` are. The owner's ruling, 2026-11-09: "make the
+  scheduling as optimal as you can prove it", keeping work moving and the first asker unpunished. Measured on the gate
+  window of 2026-11-09 17:55-18:49 (the recorded observations replayed through the admission model): against arrival
+  order, shortest predicted first cut the gate's span 30 to 86% and low work's mean completion 35 to 62%, and finished
+  the oldest quarter of low requests 18 to 41% sooner, in 22 of 24 configurations; growing a grant toward its want made
+  low work 3 to 6 times slower, and lower niceness for low work changed no gate span, since the gate's threads already
+  win their cores. Each supervisor keeps its own held jobs in request order, one lane per pool priority, and lets one
+  hold per lane wait in the pool at a time; the next enters when that one is granted, refused or withdrawn. A checkout
+  that submits twenty jobs holds one place in the queue, so checkouts take turns, and a gate never waits behind its own
+  checkout's background job. An admitted hold is never preempted, and its count never grows: a job granted fewer cores
+  than it asked runs on those to its end.
 
 - **The fence is admission.** A gate's priority in the pool replaces the fence. A gate, the land gate and a train's
   proof alike, is never held ("Declaration"): its leaves are admitted at `normal` ("A land is a gate job") and pass
@@ -2112,10 +2137,10 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
 - **Landing gets priority, never exclusivity.** No fork, attach, rebase, removal, release cleanup or other job waits for
   a gate to finish, and no agent holds work back, reads the host's load or keeps a quiet window for one. With mbx,
   low-priority work, unheld leaves and held jobs alike, continues through the same pool while normal-priority gate work
-  waits or runs: every permit that frees goes to waiting gate work first, and to low work whenever gate work needs none
-  ("Held jobs", Order; the laws `gate_first` and `work_conserving`). The admission policy belongs to mbx and never
-  preempts an admitted reservation or hold. Without mbx, the existing class placement applies. A gate has no quiet
-  window and creates no additional hold.
+  waits or runs: every permit that frees goes to waiting interactive work first, then to waiting gate work, and to low
+  work whenever both need none ("Held jobs", Order; the laws `lanes_in_order` and `work_conserving`). The admission
+  policy belongs to mbx and never preempts an admitted reservation or hold. Without mbx, the existing class placement
+  applies. A gate has no quiet window and creates no additional hold.
 - **A job lives with its requester.** A foreground job's only consumer is the process that asked for it, so when that
   process is gone the job stops. A gate job's verdict moves main only through the `cowshed land` its lander runs next,
   so a gate whose lander is gone authorizes nothing and only loads the host. Measured 2026-10-18: a land of another
@@ -2208,13 +2233,14 @@ ready unit acquires a lease. Strong models propose task boundaries and interface
 
 - **The order.** Aged waiters first: a unit that has waited the configured age bound outranks fresh priority and runs
   among the aged in the order they waited, so a stream of fresh urgent work can never starve a queued unit. Then the
-  class order — gate-class work first, interactive and background work behind it, the same on any host — then the
-  coordinator's `urgent` override, the unit's leverage (the distinct units transitively depending on it), the
-  cache-domain deadline (known deadlines first, soonest first; an unknown deadline sorts behind known ones and is never
-  invented), and finally the stable unit id. The schedule is recomputed at every event and at the oldest waiter's age
-  bound; the same facts always produce the same order. Within one unchanged-graph operation, selection, ready order and
-  queue status share one leverage observation; an actual post-selection abandonment before the queue reply is the sole
-  invalidation, and the reply then takes one fresh leverage pass over the abandoned graph.
+  class order — gate-class work first, interactive and background work behind it, the same on any host; this orders work
+  units for their leases, while each unit's leaves enter mbx's pool by its bands ("Classes"), where interactive asks
+  precede the gate's — then the coordinator's `urgent` override, the unit's leverage (the distinct units transitively
+  depending on it), the cache-domain deadline (known deadlines first, soonest first; an unknown deadline sorts behind
+  known ones and is never invented), and finally the stable unit id. The schedule is recomputed at every event and at
+  the oldest waiter's age bound; the same facts always produce the same order. Within one unchanged-graph operation,
+  selection, ready order and queue status share one leverage observation; an actual post-selection abandonment before
+  the queue reply is the sole invalidation, and the reply then takes one fresh leverage pass over the abandoned graph.
 - **Ownership.** A unit keeps exactly one live attempt: its admission connection is the attempt, held like a disk lease.
   A second admission of a live unit is refused. A connection that closes without a terminal outcome abandons its
   attempt, and a delayed holder of a settled attempt can never advance a newer one.
