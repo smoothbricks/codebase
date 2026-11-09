@@ -29,11 +29,11 @@ pub const fn class_nice(class: ExecClass) -> i32 {
     }
 }
 
-/// How long interactive work keeps its own nice: a person or model waits on its first seconds;
-/// past them it runs at the gate's nice (05_gateway.md "Classes").
-pub const INTERACTIVE_TO_GATE: Duration = Duration::from_secs(30);
+/// How long interactive work keeps its own nice: a person or model waits on a check this short;
+/// past it the job runs at the gate's nice (05_gateway.md "Classes").
+pub const INTERACTIVE_TO_GATE: Duration = Duration::from_secs(120);
 /// When interactive work runs at background's nice: work this long is no edit's quick feedback.
-pub const INTERACTIVE_TO_BACKGROUND: Duration = Duration::from_secs(120);
+pub const INTERACTIVE_TO_BACKGROUND: Duration = Duration::from_secs(240);
 /// A step of interactive work's decay (05_gateway.md "Classes"): when after the job's start it
 /// comes, and the class whose nice the job's group runs at from then. mbx decays the job's asks in
 /// its pool from the start the job names (`MBX_SCHEDULER_JOB_STARTED_MS`).

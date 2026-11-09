@@ -7252,10 +7252,9 @@ async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_re
         "the sealed sample keeps the peak"
     );
 }
-/// Interactive work decays (05_gateway.md "Classes"): past 30 s its whole group runs at the gate's
-/// nice, past 120 s at background's. The job's stderr is its command's alone: an agent reads it as
+/// Interactive work decays (05_gateway.md "Classes"): past 120 s its whole group runs at the gate's
+/// nice, past 240 s at background's. The job's stderr is its command's alone: an agent reads it as
 /// the command's output, so the decay writes nothing there.
-/// nice, past 120 s at background's, and its stderr says each step once.
 #[cfg(target_os = "macos")]
 #[tokio::test(start_paused = true)]
 async fn interactive_work_decays_to_the_gate_s_nice_then_background_s() {
@@ -7322,7 +7321,7 @@ async fn interactive_work_decays_to_the_gate_s_nice_then_background_s() {
     assert_eq!(
         group_nice(),
         macos::nice_from(own, ExecClass::Gate),
-        "past 30 s the group runs at the gate's nice"
+        "past 120 s the group runs at the gate's nice"
     );
 
     tokio::time::sleep(INTERACTIVE_TO_BACKGROUND - INTERACTIVE_TO_GATE).await;
@@ -7330,7 +7329,7 @@ async fn interactive_work_decays_to_the_gate_s_nice_then_background_s() {
     assert_eq!(
         group_nice(),
         macos::nice_from(own, ExecClass::Background),
-        "past 120 s the group runs at background's nice"
+        "past 240 s the group runs at background's nice"
     );
 
     end_group(&leader);

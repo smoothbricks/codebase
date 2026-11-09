@@ -38,7 +38,7 @@ pub enum ExecClass {
     Background,
     /// Work a person or model is waiting on, declared by the requester that awaits its result: it
     /// runs at the supervisor's own nice and never waits on memory pressure. A worker may ask for it.
-    /// It is never held, and it decays: to the gate's nice at 30 s, to background's at 120 s.
+    /// It is never held, and it decays: to the gate's nice at 120 s, to background's at 240 s.
     Interactive,
     /// A land's gate job, a train's proof and the jobs a land's steps start: nice +5, never
     /// CPU-limited, and never made to wait or ended for memory. Only the trusted coordinator route admits it.
