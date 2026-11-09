@@ -233,6 +233,9 @@ pub fn refusal(busy: &[Busy]) -> Option<CowshedError> {
 }
 
 #[cfg(test)]
+mod laws;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use cowshed_gateway_types::{GATEWAY_DRAIN_WITHIN, GATEWAY_EXIT_TIMEOUT};
