@@ -588,7 +588,7 @@ fn a_shorter_younger_hold_goes_first_until_the_older_one_ages() {
 }
 
 /// One core is free and a gate's hold predicted 5 s waits. An interactive hold predicted 100 s,
-/// whose job started just now, goes before it; one whose job started 40 s before its ask has
+/// whose job started just now, goes before it; one whose job started 130 s before its ask has
 /// decayed to the gate's band and goes behind it (05_gateway.md "Classes").
 #[test]
 fn an_interactive_hold_goes_before_a_shorter_gate_hold_until_it_decays() {
@@ -615,7 +615,7 @@ fn an_interactive_hold_goes_before_a_shorter_gate_hold_until_it_decays() {
         "the interactive hold waited behind the gate's"
     );
     pool.leave(fresh);
-    pool.enter(late, one, interactive(2.0, 40.0), Some(100.0), 2.0);
+    pool.enter(late, one, interactive(2.0, 130.0), Some(100.0), 2.0);
     assert_eq!(
         started(&mut pool),
         [gate],

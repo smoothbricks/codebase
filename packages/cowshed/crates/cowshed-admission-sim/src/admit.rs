@@ -45,8 +45,8 @@ pub(crate) struct Decay {
 }
 
 pub(crate) const DECAY: Decay = Decay {
-    interactive_for: 30.0,
-    normal_until: 120.0,
+    interactive_for: 120.0,
+    normal_until: 240.0,
 };
 
 /// The band a request declares. An interactive one names its job's start, since its band decays

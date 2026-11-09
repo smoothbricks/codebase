@@ -383,10 +383,10 @@ def finish(+x: Nat, s: St) -> St:
 # than `b1()`, gate-band work until `b2()`, and background work from then on. One unit is one
 # second.
 def b1() -> Nat:
-  30n
+  120n
 
 def b2() -> Nat:
-  120n
+  240n
 
 # The band an interactive job's ask takes at `elapsed`: 0 interactive, 1 the gate's, 2 background.
 def iband.go(late1: Bool, late2: Bool) -> Nat:
@@ -2165,7 +2165,7 @@ def iband_mono(+x1: Bool, +x2: Bool, +y1: Bool, +y2: Bool, i1: IsTrue(x1) -> IsT
       Unit{}
 
 # LAW (decay never rises): an interactive job's later ask is never in a higher band than an
-# earlier one: interactive, then the gate's band at 30 s, then background at 120 s.
+# earlier one: interactive, then the gate's band at 120 s, then background at 240 s.
 law decay_never_rises:
   for +e1: Nat
   for +e2: Nat
@@ -2177,23 +2177,23 @@ def decay_never_rises(e1, e2, ee):
     h => le_trans_b(b1(), e1, e2, h, ee),
     h => le_trans_b(b2(), e1, e2, h, ee))
 
-# An interactive ask before 30 s is ordered before every gate-band request of the lane; one that
-# has decayed past 30 s is ordered among them; past 120 s it is background work.
+# An interactive ask before 120 s is ordered before every gate-band request; one that has
+# decayed past 120 s is ordered among them; past 240 s it is background work.
 law interactive_decays_through_the_bands:
-  Sigma<&2, &2, {iband(0n) == 0n : Nat}, u => Sigma<&2, &2, {iband(30n) == 1n : Nat}, v => {iband(120n) == 2n : Nat}>>
+  Sigma<&2, &2, {iband(0n) == 0n : Nat}, u => Sigma<&2, &2, {iband(120n) == 1n : Nat}, v => {iband(240n) == 2n : Nat}>>
 
 def interactive_decays_through_the_bands():
   ({==}, ({==}, {==}))
 
 # A gate leaf predicted 1 s and a fresh interactive leaf predicted 5 s both wait, one permit
-# free: the interactive leaf goes first. Asked at 40 s, it waits in the gate's lane behind the
-# shorter gate leaf; at 130 s it is background work.
+# free: the interactive leaf goes first. Asked at 130 s, it waits in the gate's lane behind the
+# shorter gate leaf; at 250 s it is background work.
 law interactive_before_the_gate_until_it_decays:
   Sigma<&2, &2,
     {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 1n, 0n}, Arrive{Interactive{}, 2n, 0n, 5n, 0n}, Decide{}], empty(1n, 30n))) == [Lane{[], [E{2n, 1n, 1n, 5n, 0n}]}, Lane{[], [E{1n, 1n, 0n, 1n, 0n}]}, Lane{[], []}] : +List<Lane>},
     u => Sigma<&2, &2,
-    {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 1n, 0n}, Arrive{Interactive{}, 2n, 0n, 5n, 40n}, Decide{}], empty(1n, 30n))) == [Lane{[], []}, Lane{[], [E{1n, 1n, 1n, 1n, 0n}, E{2n, 1n, 0n, 5n, 0n}]}, Lane{[], []}] : +List<Lane>},
-    v => {slanes(run(Spt{}, [Arrive{Interactive{}, 3n, 0n, 5n, 130n}], empty(1n, 30n))) == [Lane{[], []}, Lane{[], []}, Lane{[], [E{3n, 1n, 0n, 5n, 0n}]}] : +List<Lane>}>>
+    {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 1n, 0n}, Arrive{Interactive{}, 2n, 0n, 5n, 130n}, Decide{}], empty(1n, 30n))) == [Lane{[], []}, Lane{[], [E{1n, 1n, 1n, 1n, 0n}, E{2n, 1n, 0n, 5n, 0n}]}, Lane{[], []}] : +List<Lane>},
+    v => {slanes(run(Spt{}, [Arrive{Interactive{}, 3n, 0n, 5n, 250n}], empty(1n, 30n))) == [Lane{[], []}, Lane{[], []}, Lane{[], [E{3n, 1n, 0n, 5n, 0n}]}] : +List<Lane>}>>
 
 def interactive_before_the_gate_until_it_decays():
   ({==}, ({==}, {==}))

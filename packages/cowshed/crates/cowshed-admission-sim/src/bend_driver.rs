@@ -112,7 +112,7 @@ fn act() -> impl Strategy<Value = Act> {
         Just(Declares::Background),
     ];
     prop_oneof![
-        4 => (band, 1..=4_u32, 1..=600_u32, 0..=200_u32)
+        4 => (band, 1..=4_u32, 1..=600_u32, 0..=300_u32)
             .prop_map(|(band, want, pred, elapsed)| Act::Arrive { band, want, pred, elapsed }),
         3 => Just(Act::Decide),
         2 => (1..=BOUND).prop_map(Act::Tick),
@@ -314,13 +314,13 @@ proptest! {
 }
 
 /// The sim's decay bounds are the model's `b1()` and `b2()`, and an interactive ask takes the
-/// model's band (`iband`) at every age from 0 to 200 s.
+/// model's band (`iband`) at every age from 0 to 300 s.
 #[test]
 fn an_interactive_ask_decays_at_the_models_bounds() {
     let secs = |n: u64| Secs::from(u32::try_from(n).expect("a bound fits u32"));
     assert_eq!(secs(bend::b1()), DECAY.interactive_for);
     assert_eq!(secs(bend::b2()), DECAY.normal_until);
-    for elapsed in 0..=200_u32 {
+    for elapsed in 0..=300_u32 {
         let sim = (Declared::Interactive { job_started: 0.0 }).band(Secs::from(elapsed));
         assert_eq!(lane(sim), bend::iband(u64::from(elapsed)), "at {elapsed} s");
     }
