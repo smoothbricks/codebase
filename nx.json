@@ -76,18 +76,33 @@
       "dependsOn": [
         "...",
         { "projects": ["cowshed"], "target": "apfs-test-root" },
-        { "projects": ["cowshed"], "target": "capability-probe" }
+        { "projects": ["cowshed"], "target": "capability-probe" },
+        { "projects": ["cowshed"], "target": "tsc-js" },
+        { "projects": ["cowshed"], "target": "napi-native" }
       ],
       "inputs": [
         "...",
         { "dependentTasksOutputFiles": "**/capability-probe/diagnostics.json", "transitive": false },
-        { "externalDependencies": ["nx@24.0.3", "nx@23.2.1"] },
+        { "dependentTasksOutputFiles": "**/*.node", "transitive": true },
+        { "dependentTasksOutputFiles": "**/dist/ts/**/*", "transitive": false },
+        { "externalDependencies": ["nx@24.0.3", "nx@23.2.1", "bun-lock:packages/cowshed"] },
         "{workspaceRoot}/patches/nx@*.patch"
       ]
     },
     "cargo-test-cowshed-cli-*": {
-      "dependsOn": ["...", { "projects": ["cowshed"], "target": "apfs-test-root" }],
-      "inputs": ["...", { "externalDependencies": ["nx@24.0.3"] }, "{workspaceRoot}/patches/nx@*.patch"]
+      "dependsOn": [
+        "...",
+        { "projects": ["cowshed"], "target": "apfs-test-root" },
+        { "projects": ["cowshed"], "target": "tsc-js" },
+        { "projects": ["cowshed"], "target": "napi-native" }
+      ],
+      "inputs": [
+        "...",
+        { "dependentTasksOutputFiles": "**/*.node", "transitive": true },
+        { "dependentTasksOutputFiles": "**/dist/ts/**/*", "transitive": false },
+        { "externalDependencies": ["nx@24.0.3", "bun-lock:packages/cowshed"] },
+        "{workspaceRoot}/patches/nx@*.patch"
+      ]
     },
     "cargo-test-cowshed-gateway": {
       "dependsOn": ["...", { "projects": ["cowshed"], "target": "apfs-test-root" }],
