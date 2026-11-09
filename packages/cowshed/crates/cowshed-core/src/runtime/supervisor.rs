@@ -704,12 +704,16 @@ impl CpuPlacement {
                 priority.clone(),
             ));
             environment.push((OsString::from("MBX_SCHEDULER_PRIORITY"), priority));
-            if super::placement::decays(self.class) {
-                environment.push((
-                    OsString::from("MBX_SCHEDULER_JOB_STARTED_MS"),
-                    OsString::from(self.started_ms.to_string()),
-                ));
-            }
+            // Only interactive work decays from its start; every other job names an empty one, which
+            // mbx reads as none, so a job never inherits the start of the interactive job that ran it.
+            environment.push((
+                OsString::from("MBX_SCHEDULER_JOB_STARTED_MS"),
+                if super::placement::decays(self.class) {
+                    OsString::from(self.started_ms.to_string())
+                } else {
+                    OsString::new()
+                },
+            ));
             environment.push((OsString::from("CARGO_BUILD_JOBS"), tokens.clone()));
             if self.held {
                 // What `mbx reserve` gives its own command: nested mbx work runs under the hold,
@@ -786,8 +790,13 @@ mod cpu_placement_tests {
 
             assert_eq!(
                 read("MBX_SCHEDULER_JOB_STARTED_MS").as_deref(),
-                (mbx && class == ExecClass::Interactive).then_some("1700000000000"),
-                "only interactive work names its start to mbx, from which its asks decay: {class:?}"
+                mbx.then_some(if class == ExecClass::Interactive {
+                    "1700000000000"
+                } else {
+                    ""
+                }),
+                "only interactive work names its start to mbx, from which its asks decay; every other \
+                 job names none over its caller's: {class:?}"
             );
             assert_eq!(
                 read("CARGO_BUILD_JOBS").as_deref(),
