@@ -18,7 +18,8 @@ use columine_types::types::{CmpType, ErrorCode};
 use columine_vm::column_uses::ReduceReads;
 use columine_vm::key_index::NoStrings;
 use columine_vm::row_exprs::{
-    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression, bind_row_columns,
+    BatchView, Binding, EntryReads, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression,
+    RowPlan, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::vm::{CheckedMap, Vm, col_u32_exact, u32s_as_bytes};
@@ -109,7 +110,7 @@ impl RowExpression for Exprs {
         &mut self,
         expr: &[u8],
         _: CmpType,
-        _batch: &BatchView<'_>,
+        _: &mut EntryReads<'_>,
     ) -> Result<Binding, ErrorCode> {
         match expr[0] {
             0 => Ok(Binding::Bound),
@@ -209,6 +210,7 @@ fn main() {
         let vals: Vec<u32> = (0..n).map(|i| i as u32 + 1).collect();
         let mut rows = RowColumns::new();
         let mut eval = Exprs;
+        let plan = RowPlan::of(&prog, &reads, &mut eval).expect("the table plans");
         let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
         let iters = if n >= 4096 { 200 } else { 2000 };
         let mut run = |timed: bool| -> (u128, usize, usize) {
@@ -227,7 +229,7 @@ fn main() {
             let t0 = Instant::now();
             let mut live = bind_row_columns(
                 &prog,
-                &reads,
+                &plan,
                 &state,
                 &mut cols,
                 n as u32,

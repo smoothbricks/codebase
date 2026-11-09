@@ -20,9 +20,10 @@ spliced. `NoStrings` is the interner of a state with no string table: it names n
 
 ## 3. Bind and reduce
 
-`bind_row_columns(program, state, cols, batch_len, eval, strings, rows)` takes the interner as `&mut dyn Interner` and
-hands it to `RowExpression::eval(expr, lane, batch, row, strings)` for every bound entry, in table order and row order.
-An entry that makes strings answers each id as its u32 cell; a wide lane holds no id. The bind is the only writer:
+`bind_row_columns(program, plan, state, cols, batch_len, eval, strings, rows)` runs the program's `RowPlan`
+([wide row cells](07-wide-row-cells.md) §3), takes the interner as `&mut dyn Interner` and hands it to
+`RowExpression::eval(expr, lane, batch, row, strings)` for every bound entry, in table order and row order. An entry
+that makes strings answers each id as its u32 cell; a wide lane holds no id. The bind is the only writer:
 `AdmittedProgram::execute_bound` takes the interner as `&mut S` for the bind, then hands the reduce section `&S`, so the
 key lanes the reduce section resolves can never see the table change under them.
 

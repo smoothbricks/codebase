@@ -34,19 +34,24 @@ so every program written before stays byte-identical and binds as before.
 
 ## 3. Evaluation and storage
 
-`RowExpression::admit(expr, lane, batch)` and `RowExpression::eval(expr, lane, batch, row, strings)`
-([row interning](09-row-interning.md)) receive the entry's lane. An evaluator refuses at admission, with
-`InvalidProgram`, an expression that cannot answer the lane, such as a predicate in a wide lane. It answers each row
-with a `RowCell` (`U32`, `F64` or `I64`). The bind stores a cell only in its entry's lane. A cell of another lane, or a
-value the lane cannot hold, refuses the bind with `InvalidCellValue` before any column is spliced.
+`RowExpression::admit(expr, lane, reads)` and `RowExpression::eval(expr, lane, batch, row, strings)`
+([row interning](09-row-interning.md)) receive the entry's lane. Admission is the program's, not a batch's:
+`RowPlan::of(program, reduce_reads, eval)` parses the table and admits each entry once, and every
+`bind_row_columns(program, plan, …)` of that program runs the plan, so no bind parses the table or admits an entry again
+(a host that binds the same program for every committed row pays the admission per row without it). An evaluator refuses
+at admission, with `InvalidProgram`, an expression that cannot answer the lane, such as a predicate in a wide lane, and
+names to `reads` each column the expression reads and the lane it reads it at. It answers each row with a `RowCell`
+(`U32`, `F64` or `I64`). The bind stores a cell only in its entry's lane. A cell of another lane, or a value the lane
+cannot hold, refuses the bind with `InvalidCellValue` before any column is spliced.
 
 `RowColumns` keeps each entry's cells in 8-byte words, two u32 cells or one wide cell to a word, so a wide column is
 aligned for its typed view. The splice hands an entry's column to the reduce section as `batch_len` cells of the lane's
 stride in little-endian bytes. A u32 column is byte-identical to the column an RXP1 entry binds, and a wide column has 8
 bytes per row. A row outside the entry's match set keeps the zero cell (`0`, `+0.0`, `0`). A later entry reads an
-earlier entry's column through `BatchView::column` at that column's stride. `BatchView::derived_lane(col)` names the
-lane an earlier entry bound there, or `None` for a host column, so an evaluator refuses a read at another lane at
-admission. After warm-up a bind allocates nothing: an entry's words grow to the longest batch once and are reused.
+earlier entry's column through `BatchView::column` at that column's stride. The plan refuses with `InvalidProgram` a
+read of an earlier entry's column at another lane than that entry's; every other column a plan reads is the host's, and
+a bind refuses one that does not hold `batch_len` cells of the lane it is read at with `ColumnUnderrun`, checking each
+once. After warm-up a bind allocates nothing: an entry's words grow to the longest batch once and are reused.
 
 ## 4. Readers
 
@@ -76,12 +81,11 @@ operand would read half a cell, and an f64 operand an i64's bits. A CSR pair's c
 field are never read as a wide column, and neither is the table's type column. The walk reads only the program's bytes
 (a TTL slot's timestamp column is the one its init definition names, which every state laid out for the program
 records), so its answer, `ReduceReads`, is derived once per program and handed to every bind; no bind walks the reduce
-section. The table's targets and lanes are program bytes too, so the wide check is the program's: it is judged once,
-beside the reads, against the last entry targeting each column (the one spliced), and a bind refuses on that verdict
-before splicing. A program whose table does not parse never reaches it, since every bind refuses that table first. Which
-entries bind live is the embedder's answer per batch, so each bind checks only its own live entries: a live entry's
-column refuses when some operand reads it plainly, and the type column refuses when it is live. A u32 entry is read
-exactly as before.
+section. The table's targets and lanes are program bytes too, and which entries bind live is the evaluator's answer at
+admission, so every refusal of a derived column's reader is the program's: the plan judges it once, beside the reads,
+against the last entry targeting each column (the one spliced), and no bind is reached. A live entry's column refuses
+when some operand reads it plainly, the type column refuses when it is live, and a table that does not parse refuses the
+plan. A u32 entry is read exactly as before.
 
 ## 5. Live entries
 
@@ -97,7 +101,7 @@ the zero placeholder like any live column.
   `BATCH_AGG_SUM_I64`, whose sums are exact folded as one batch and as one batch per row;
 - the same entries filling a FLOAT64 and an INT64 struct-map field, which store `1.5 × n` and `2^53 + n` exactly under
   both cuts;
-- a later i64 entry reading an earlier i64 column through `BatchView::column` and `BatchView::derived_lane`;
+- a later i64 entry reading an earlier i64 column through `BatchView::column`, the plan holding its lane;
 - an RXP1 table binding the u32 cells an RXP2 u32 entry binds;
 - refusals of a cell of another lane than its entry, an f64 column read by the i64 sum, a field of another kind, a u32
   predicate reading a wide column, a wide type column and an unknown lane byte, each leaving every column as the host

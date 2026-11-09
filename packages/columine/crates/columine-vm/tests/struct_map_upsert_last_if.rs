@@ -33,8 +33,8 @@ use columine_vm::column_uses::ReduceReads;
 use columine_vm::key_index::NoStrings;
 use columine_vm::meta::slot_meta_base;
 use columine_vm::row_exprs::{
-    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression, StoredBinding,
-    StoredRow, bind_row_columns,
+    BatchView, Binding, EntryReads, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression,
+    RowPlan, StoredBinding, StoredRow, bind_row_columns,
 };
 use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_grown_state_size, calculate_state_size, init_state,
@@ -317,17 +317,15 @@ impl RowExpression for LeaseWinner {
         &mut self,
         expr: &[u8],
         _: CmpType,
-        batch: &BatchView<'_>,
+        reads: &mut EntryReads<'_>,
     ) -> Result<Binding, ErrorCode> {
-        if expr != [LEASE_WINNER] || !matches!(batch.stored(), StoredBinding::Unbound) {
+        if expr != [LEASE_WINNER] {
             return Err(ErrorCode::InvalidProgram);
         }
         for col in [ACTION_COL, HOLDER_COL] {
-            col_u32_exact(batch.column(u32::from(col)), batch.batch_len)
-                .ok_or(ErrorCode::ColumnUnderrun)?;
+            reads.read(u32::from(col), CmpType::U32)?;
         }
-        col_i64_exact(batch.column(u32::from(AT_COL)), batch.batch_len)
-            .ok_or(ErrorCode::ColumnUnderrun)?;
+        reads.read(u32::from(AT_COL), CmpType::I64)?;
         Ok(Binding::Live)
     }
 
@@ -427,7 +425,12 @@ fn execute(
     let len = batch.len();
     let mut live = bind_row_columns(
         program,
-        &ReduceReads::of(program).expect("the reduce reads derive"),
+        &RowPlan::of(
+            program,
+            &ReduceReads::of(program).expect("the reduce reads derive"),
+            eval,
+        )
+        .expect("the table plans"),
         state,
         &mut cols,
         len,
@@ -983,10 +986,11 @@ fn a_warmed_batch_binds_evaluates_and_writes_without_allocating() {
     let batch = Batch::of(&rows);
     let mut cols = batch.cols();
     let len = batch.len();
+    let plan = RowPlan::of(&program, &reads, &mut eval).expect("the table plans");
     let status = with_allocations(0, || {
         let mut live = bind_row_columns(
             &program,
-            &reads,
+            &plan,
             &state,
             &mut cols,
             len,
@@ -1104,21 +1108,13 @@ fn top_level_upsert_last_if_is_refused() {
     );
     assert_eq!(state, before);
 
+    // The live column read at top level is the program's refusal: its plan refuses it.
     let live = program(INPUTS, 8, &reduce, &lease_table());
-    let state = init(&live);
-    let mut cols = batch.cols();
-    let mut eval = LeaseWinner::default();
-    let mut store = RowColumns::new();
     assert_eq!(
-        bind_row_columns(
+        RowPlan::of(
             &live,
             &ReduceReads::of(&live).expect("the reduce reads derive"),
-            &state,
-            &mut cols,
-            1,
-            &mut eval,
-            &mut NoStrings,
-            &mut store
+            &mut LeaseWinner::default(),
         )
         .err()
         .map(|e| e as u32),

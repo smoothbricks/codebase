@@ -208,13 +208,19 @@ fn idle_expiry_does_not_evaluate_stored_rows_or_record_any_mutation() {
     use columine_types::types::CmpType;
     use columine_vm::column_uses::ReduceReads;
     use columine_vm::row_exprs::{
-        BatchView, Binding, RowCell, RowColumns, RowExpression, bind_row_columns,
+        BatchView, Binding, EntryReads, RowCell, RowColumns, RowExpression, RowPlan,
+        bind_row_columns,
     };
     struct Guard {
         calls: usize,
     }
     impl RowExpression for Guard {
-        fn admit(&mut self, _: &[u8], _: CmpType, _: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+        fn admit(
+            &mut self,
+            _: &[u8],
+            _: CmpType,
+            _: &mut EntryReads<'_>,
+        ) -> Result<Binding, ErrorCode> {
             Ok(Binding::Live)
         }
         fn eval(
@@ -275,7 +281,12 @@ fn idle_expiry_does_not_evaluate_stored_rows_or_record_any_mutation() {
     ];
     let mut live = bind_row_columns(
         &p,
-        &ReduceReads::of(&p).expect("the reduce reads derive"),
+        &RowPlan::of(
+            &p,
+            &ReduceReads::of(&p).expect("the reduce reads derive"),
+            &mut eval,
+        )
+        .expect("the table plans"),
         &state,
         &mut cols,
         999,

@@ -75,8 +75,18 @@
 //! A live column read by anything else — an aggregate, an
 //! aggregate's `*_IF` predicate, a key, value, timestamp or element operand,
 //! the `FOR_EACH` type column, the table's own type column — would see the
-//! zero placeholder; the bind refuses such a program with `InvalidProgram`
+//! zero placeholder; the plan refuses such a program with `InvalidProgram`
 //! (see [`column_uses`]) so the zeros can never be mistaken for an answer.
+//!
+//! ## The plan
+//!
+//! Everything about the table but its cells is the program's: the entries,
+//! their targets, lanes and match sets, how each binds, the columns each
+//! reads and at which lane, and the refusals those facts imply. [`RowPlan::of`]
+//! parses the table and admits each entry through the evaluator once, beside
+//! the program's [`ReduceReads`]; every [`bind_row_columns`] of the program
+//! runs that plan. A bind checks only what its batch decides: that the host
+//! columns the plan reads cover its rows, and each matched row's cell.
 //!
 //! [`admit`]: RowExpression::admit
 //! [`column_uses`]: crate::column_uses
@@ -92,7 +102,7 @@ use crate::column_uses::{ReduceRead, ReduceReads};
 use crate::key_index::{InternBytes, KeyCx, KeyIndex, NoStrings};
 use crate::logical_export::Interner;
 use crate::struct_map::{StructMap2Slot, StructMapSlot, StructRows};
-use crate::vm::{col_at, col_u32, col_u32_exact, u64s_as_bytes};
+use crate::vm::{col_at, col_f64_exact, col_i64_exact, col_u32, col_u32_exact, u64s_as_bytes};
 
 pub use columine_types::types::{LANED_ROW_EXPRESSIONS_MAGIC, ROW_EXPRESSIONS_MAGIC};
 
@@ -264,13 +274,6 @@ impl<'a> BatchView<'a> {
         }
     }
 
-    /// The lane of column `col` when an earlier entry derived it; `None` for
-    /// a host column, whose lane only the program's readers name.
-    pub fn derived_lane(&self, col: u32) -> Option<CmpType> {
-        let i = self.derived_targets.iter().position(|&t| t == col)?;
-        Some(self.derived_lanes[i])
-    }
-
     /// The stored row in scope, when there is one: absent during ordinary
     /// row evaluation and admission, and when an upsert-last-if's key holds
     /// no row. The view cannot outlive this batch borrow.
@@ -295,11 +298,6 @@ impl<'a> BatchView<'a> {
         self.stored = StoredBinding::Row(row);
         self
     }
-
-    /// Number of columns the host passed.
-    pub fn num_cols(&self) -> usize {
-        self.cols.len()
-    }
 }
 
 /// How an admitted entry binds: computed before the reduce section, or at
@@ -321,23 +319,49 @@ pub enum RowCell {
     I64(i64),
 }
 
+/// A column an entry's expression reads, at the lane it reads the cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnRead {
+    pub column: u32,
+    pub lane: CmpType,
+}
+
+/// Where an evaluator names, while it admits an expression, every column the
+/// expression reads ([`RowExpression::admit`]).
+pub struct EntryReads<'p> {
+    reads: &'p mut Vec<ColumnRead>,
+}
+
+impl EntryReads<'_> {
+    /// The expression reads `column`'s cells at `lane`. Memory that cannot
+    /// hold the read is `OutOfMemory`.
+    pub fn read(&mut self, column: u32, lane: CmpType) -> Result<(), ErrorCode> {
+        room(self.reads, 1)?;
+        self.reads.push(ColumnRead { column, lane });
+        Ok(())
+    }
+}
+
 /// The embedder's expression evaluator. Its answer for an expression is a
 /// function of the expression bytes, the batch's columns and the state at
 /// the row: a resume over retained cells evaluates its deferred entries
 /// with whatever evaluator it is handed, so every evaluator one embedder
 /// passes for a program implements one expression language.
 pub trait RowExpression {
-    /// Validate one entry's expression against the batch before any row is
-    /// evaluated, and answer how it binds: every column it reads must cover
-    /// `batch_len`, so per-row evaluation is infallible on that axis. `lane`
-    /// is the cell the entry's column holds. A malformed expression, or one
-    /// that cannot answer `lane`, is `InvalidProgram`; a short column is
-    /// `ColumnUnderrun`.
+    /// Admit one entry's expression, once per program ([`RowPlan::of`]), and
+    /// answer how it binds. No batch is in scope: the answer is the
+    /// program's. Name to `reads` every column the expression reads, at the
+    /// lane it reads it. The plan refuses a read of an earlier entry's
+    /// column at another lane than that entry's, and every bind refuses a
+    /// host column that does not cover its rows, so per-row evaluation is
+    /// infallible on that axis. `lane` is the cell the entry's column holds.
+    /// A malformed expression, or one that cannot answer `lane`, is
+    /// `InvalidProgram`.
     fn admit(
         &mut self,
         expr: &[u8],
         lane: CmpType,
-        batch: &BatchView<'_>,
+        reads: &mut EntryReads<'_>,
     ) -> Result<Binding, ErrorCode>;
 
     /// Evaluate the expression for one row and answer the cell to store, in
@@ -609,19 +633,161 @@ fn matches(match_ids: &[u8], type_id: u32) -> bool {
 struct Entry<'a> {
     target_col: u32,
     lane: CmpType,
-    /// Raw `u32le × match_count` bytes; decoded per comparison so the entry
-    /// borrows the program instead of collecting the ids.
-    match_ids: &'a [u8],
     expr: &'a [u8],
-    /// Where `match_ids` and `expr` sit within the table, for a live entry
-    /// to record and read back without re-parsing.
+    /// Where the raw `u32le × match_count` ids and `expr` sit within the
+    /// table, for the plan to record and a bind to read back without
+    /// re-parsing.
     match_ids_at: Range,
     expr_at: Range,
 }
 
-impl Entry<'_> {
-    fn matches(&self, type_id: u32) -> bool {
-        matches(self.match_ids, type_id)
+/// A program's row-expression table, parsed and admitted once and run by
+/// every bind of that program ([`bind_row_columns`]). A program without a
+/// table plans nothing and binds nothing.
+#[derive(Debug)]
+pub struct RowPlan {
+    table: Option<TablePlan>,
+}
+
+#[derive(Debug)]
+struct TablePlan {
+    /// The table the plan was made from and where it sat in its program: a
+    /// bind of a program whose table differs is refused.
+    bytes: Box<[u8]>,
+    start: usize,
+    type_col: u32,
+    entries: Box<[PlannedEntry]>,
+    /// The host columns the entries read, at the lane each is read: sorted
+    /// and unique, so a bind checks each once.
+    host_reads: Box<[ColumnRead]>,
+    /// The highest column the table names: a batch with no column there is
+    /// refused.
+    last_col: u32,
+    /// Whether any entry binds live.
+    any_live: bool,
+}
+
+/// One admitted entry: its program ranges, its lane and how it binds.
+#[derive(Debug, Clone, Copy)]
+struct PlannedEntry {
+    target_col: u32,
+    lane: CmpType,
+    match_ids: Range,
+    expr: Range,
+    binding: Binding,
+}
+
+impl RowPlan {
+    /// Parse `program`'s row-expression table and admit each entry through
+    /// `eval`, once. `reads` are the program's reduce reads
+    /// ([`ReduceReads::of`]): the plan refuses with `InvalidProgram` a
+    /// program whose reduce section reads a derived column its cells cannot
+    /// answer, judged against them:
+    ///
+    /// - A live column holds zero placeholder cells, which a per-element
+    ///   `*_IF` predicate or a stored-row sweep resolves through the handle.
+    ///   The table's type column and every plain read
+    ///   ([`ColumnUse::Read`](crate::column_uses::ColumnUse::Read)) would take
+    ///   the zeros as cells.
+    /// - A wide column holds 8-byte cells of its lane, which
+    ///   [`refuses_wide_reads`] judged when the reads were derived.
+    ///
+    /// A table that does not parse, an expression its evaluator refuses, a
+    /// read of an earlier entry's column at another lane than that entry's
+    /// and two live entries on one column are refused with the code the
+    /// check answers. Memory that cannot hold the plan is `OutOfMemory`.
+    pub fn of<E: RowExpression>(
+        program: &[u8],
+        reads: &ReduceReads,
+        eval: &mut E,
+    ) -> Result<Self, ErrorCode> {
+        let Some((table, start)) = row_table(program)? else {
+            return Ok(Self { table: None });
+        };
+        let count = usize::from(bytes::read_u16(table, 4));
+        let laned = bytes::read_u32(table, 0) == LANED_ROW_EXPRESSIONS_MAGIC;
+        let mut header = Operands::at(table, TABLE_FIXED_BYTES);
+        let type_col = header.index().ok_or(ErrorCode::InvalidProgram)?;
+        let mut entries: Vec<PlannedEntry> = Vec::new();
+        room(&mut entries, count)?;
+        let mut host_reads: Vec<ColumnRead> = Vec::new();
+        let mut expr_reads: Vec<ColumnRead> = Vec::new();
+        let mut last_col = type_col;
+        let mut pos = header.pos();
+        for _ in 0..count {
+            let entry = parse_entry(table, &mut pos, laned)?;
+            expr_reads.clear();
+            let binding = eval.admit(
+                entry.expr,
+                entry.lane,
+                &mut EntryReads {
+                    reads: &mut expr_reads,
+                },
+            )?;
+            for read in &expr_reads {
+                // An earlier entry's column holds that entry's cells, in its lane.
+                match entries.iter().rev().find(|e| e.target_col == read.column) {
+                    Some(earlier) if earlier.lane != read.lane => {
+                        return Err(ErrorCode::InvalidProgram);
+                    }
+                    Some(_) => {}
+                    None => {
+                        room(&mut host_reads, 1)?;
+                        host_reads.push(*read);
+                    }
+                }
+                last_col = last_col.max(read.column);
+            }
+            // Two live entries on one column: the read could only answer one.
+            if binding == Binding::Live
+                && entries
+                    .iter()
+                    .any(|e| e.binding == Binding::Live && e.target_col == entry.target_col)
+            {
+                return Err(ErrorCode::InvalidProgram);
+            }
+            last_col = last_col.max(entry.target_col);
+            entries.push(PlannedEntry {
+                target_col: entry.target_col,
+                lane: entry.lane,
+                match_ids: entry.match_ids_at.shifted(start),
+                expr: entry.expr_at.shifted(start),
+                binding,
+            });
+        }
+        if pos != table.len() {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        let live = |column: u32| {
+            entries
+                .iter()
+                .any(|e| e.binding == Binding::Live && e.target_col == column)
+        };
+        if reads.refuses_wide()
+            || live(type_col)
+            || entries
+                .iter()
+                .any(|e| e.binding == Binding::Live && reads.reads_plainly(e.target_col))
+        {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        host_reads.sort_unstable_by_key(|read| (read.column, read.lane as u8));
+        host_reads.dedup();
+        let mut bytes = Vec::new();
+        room(&mut bytes, table.len())?;
+        bytes.extend_from_slice(table);
+        let any_live = entries.iter().any(|e| e.binding == Binding::Live);
+        Ok(Self {
+            table: Some(TablePlan {
+                bytes: bytes.into_boxed_slice(),
+                start,
+                type_col,
+                entries: entries.into_boxed_slice(),
+                host_reads: host_reads.into_boxed_slice(),
+                last_col,
+                any_live,
+            }),
+        })
     }
 }
 
@@ -665,7 +831,7 @@ fn parse_entry<'a>(table: &'a [u8], pos: &mut usize, laned: bool) -> Result<Entr
         return Err(ErrorCode::InvalidProgram);
     }
     let ids_start = operands.pos();
-    let match_ids = operands
+    operands
         .bytes(
             match_count
                 .checked_mul(4)
@@ -680,7 +846,6 @@ fn parse_entry<'a>(table: &'a [u8], pos: &mut usize, laned: bool) -> Result<Entr
     Ok(Entry {
         target_col,
         lane,
-        match_ids,
         expr,
         match_ids_at: Range {
             start: ids_start,
@@ -701,36 +866,6 @@ impl Range {
             end: self.end + offset,
         }
     }
-}
-
-/// Refuse, before any column is spliced, a program whose reduce section
-/// reads a derived column its cells cannot answer, judged over `reads`, the
-/// program's reduce reads ([`ReduceReads`]):
-///
-/// - A live column holds zero placeholder cells, which a per-element `*_IF`
-///   predicate or a stored-row sweep resolves through the handle. The
-///   table's type column and every plain read
-///   ([`ColumnUse::Read`](crate::column_uses::ColumnUse::Read)) would take the
-///   zeros as cells. Which entries bind live is the embedder's
-///   answer for this batch, so this bind checks its own live entries.
-/// - A wide column holds 8-byte cells of its lane. The table's targets and
-///   lanes are the program's, so [`refuses_wide_reads`] judged them once,
-///   when the reads were derived.
-fn refuse_unreadable_columns(reads: &ReduceReads, out: &RowColumns) -> Result<(), ErrorCode> {
-    if reads.refuses_wide() {
-        return Err(ErrorCode::InvalidProgram);
-    }
-    if out.live.is_empty() {
-        return Ok(());
-    }
-    let plain_read_of_live = out
-        .targets
-        .iter()
-        .any(|&column| reads.reads_plainly(column) && out.live_entry(column).is_some());
-    if plain_read_of_live || out.live_entry(out.type_col).is_some() {
-        return Err(ErrorCode::InvalidProgram);
-    }
-    Ok(())
 }
 
 /// Whether `program`'s row-expression table holds a wide column `reads`
@@ -808,30 +943,44 @@ fn store(words: &mut [u64], lane: CmpType, row: usize, cell: RowCell) -> Result<
     Ok(())
 }
 
-/// Evaluate `program`'s row-expression table over the batch and replace each
-/// target column in `cols` with its derived cells. Entries bind in table
-/// order; a later entry reads an earlier one's column through
-/// [`BatchView::column`]. `out` holds the cells for as long as `cols` names
-/// them. The answer is the batch's live columns — the entries deferred to
-/// the reduce section — which the reduce section runs with; it is empty
-/// when every entry bound up front.
+/// Whether `column` holds `batch_len` cells of `lane`.
+fn covers(column: &[u8], lane: CmpType, batch_len: u32) -> bool {
+    match lane {
+        CmpType::U32 => col_u32_exact(column, batch_len).is_some(),
+        CmpType::F64 => col_f64_exact(column, batch_len).is_some(),
+        CmpType::I64 => col_i64_exact(column, batch_len).is_some(),
+    }
+}
+
+/// Evaluate `program`'s row-expression table over the batch, as `plan`
+/// ([`RowPlan::of`] over `program`) admitted it, and replace each target
+/// column in `cols` with its derived cells. Entries bind in table order; a
+/// later entry reads an earlier one's column through [`BatchView::column`].
+/// `out` holds the cells for as long as `cols` names them. The answer is the
+/// batch's live columns — the entries deferred to the reduce section — which
+/// the reduce section runs with; it is empty when every entry bound up
+/// front.
 ///
-/// Errors leave `cols` untouched: the table is validated and every cell
-/// computed before the first splice. `out` grows to the widest and longest
-/// batch it has bound and keeps that storage; memory that cannot back it
-/// refuses with `OutOfMemory`.
+/// The bind neither parses the table nor admits an entry: it refuses a plan
+/// of another table with `InvalidProgram`, a batch without a column the plan
+/// names with `InvalidProgram`, and a host column the plan reads that does
+/// not cover `batch_len` cells of its lane, the type column included, with
+/// `ColumnUnderrun`. Then it evaluates each bound entry at each row its
+/// match set selects.
+///
+/// Errors leave `cols` untouched: every cell is computed before the first
+/// splice. `out` grows to the widest and longest batch it has bound and
+/// keeps that storage; memory that cannot back it refuses with
+/// `OutOfMemory`.
 ///
 /// `strings` is the caller's interner: every bound entry's evaluation may
 /// read an id's text and intern the strings it builds, and the bind is the
 /// table's only writer (specs/columine/09-row-interning.md). A refusal of the
-/// table refuses the bind with its code, before any splice. `reads` are
-/// `program`'s reduce reads ([`ReduceReads::of`]), derived once per program:
-/// the bind judges its live and wide columns against them and never walks
-/// the reduce section itself.
+/// table refuses the bind with its code, before any splice.
 #[allow(clippy::too_many_arguments)]
 pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     program: &'a [u8],
-    reads: &ReduceReads,
+    plan: &RowPlan,
     state: &[u8],
     cols: &mut [&'a [u8]],
     batch_len: u32,
@@ -846,13 +995,17 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     out.clear_live();
     out.bound = false;
     out.table.clear();
-    let Some((table, table_start)) = row_table(program)? else {
-        out.bound = true;
-        return Ok(LiveColumns {
-            rows: out,
-            program,
-            eval,
-        });
+    let tp = match (row_table(program)?, &plan.table) {
+        (None, None) => {
+            out.bound = true;
+            return Ok(LiveColumns {
+                rows: out,
+                program,
+                eval,
+            });
+        }
+        (Some((table, start)), Some(tp)) if start == tp.start && *table == *tp.bytes => tp,
+        _ => return Err(ErrorCode::InvalidProgram),
     };
     // An empty batch carries no rows to derive and may carry no column
     // pointers at all; the reduce section reads nothing from it either.
@@ -864,42 +1017,59 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
             eval,
         });
     }
-    let count = usize::from(bytes::read_u16(table, 4));
-    let laned = bytes::read_u32(table, 0) == LANED_ROW_EXPRESSIONS_MAGIC;
-    let mut header = Operands::at(table, TABLE_FIXED_BYTES);
-    let type_col = header.index().ok_or(ErrorCode::InvalidProgram)?;
-    if type_col as usize >= cols.len() {
+    if tp.last_col as usize >= cols.len() {
         return Err(ErrorCode::InvalidProgram);
     }
-    room(&mut out.table, table.len())?;
-    out.table.extend_from_slice(table);
-    out.table_start = table_start;
+    let view: &[&[u8]] = cols;
+    let type_cells = col_u32_exact(col_at(view, tp.type_col as usize), batch_len)
+        .ok_or(ErrorCode::ColumnUnderrun)?;
+    if !tp
+        .host_reads
+        .iter()
+        .all(|read| covers(col_at(view, read.column as usize), read.lane, batch_len))
+    {
+        return Err(ErrorCode::ColumnUnderrun);
+    }
+    let count = tp.entries.len();
+    room(&mut out.table, tp.bytes.len())?;
+    out.table.extend_from_slice(&tp.bytes);
+    out.table_start = tp.start;
     let have = out.cells.len();
     room(&mut out.cells, count.saturating_sub(have))?;
     out.cells.resize_with(count, Vec::new);
-    let have = out.targets.len();
-    room(&mut out.targets, count.saturating_sub(have))?;
-    out.targets.resize(count, 0);
-    let have = out.lanes.len();
-    room(&mut out.lanes, count.saturating_sub(have))?;
-    out.lanes.resize(count, CmpType::U32);
-    out.type_col = type_col;
+    room(&mut out.targets, count)?;
+    room(&mut out.lanes, count)?;
+    out.type_col = tp.type_col;
     out.batch_len = batch_len;
+    if tp.any_live {
+        room(&mut out.live_index, view.len())?;
+        out.live_index.resize(view.len(), NOT_LIVE);
+    }
 
-    let view: &[&[u8]] = cols;
-    let type_cells = col_u32_exact(col_at(view, type_col as usize), batch_len)
-        .ok_or(ErrorCode::ColumnUnderrun)?;
-    let mut pos = header.pos();
-    for i in 0..count {
-        let entry = parse_entry(table, &mut pos, laned)?;
-        if entry.target_col as usize >= view.len() {
-            return Err(ErrorCode::InvalidProgram);
-        }
-        out.targets[i] = entry.target_col;
-        out.lanes[i] = entry.lane;
+    for (i, entry) in tp.entries.iter().enumerate() {
+        out.targets.push(entry.target_col);
+        out.lanes.push(entry.lane);
         // The entries before `i` are final; this entry reads them and writes
         // only its own cells.
         let (done, rest) = out.cells.split_at_mut(i);
+        let cells = &mut rest[0];
+        cells.clear();
+        let words = (batch_len as usize * entry.lane.stride()).div_ceil(8);
+        room(cells, words)?;
+        cells.resize(words, 0);
+        if entry.binding == Binding::Live {
+            // The zero cells stand in for the column the reduce section
+            // reads live; they also keep the column covering the batch.
+            let index = u32::try_from(out.live.len()).map_err(|_| ErrorCode::InvalidProgram)?;
+            room(&mut out.live, 1)?;
+            out.live_index[entry.target_col as usize] = index;
+            out.live.push(LiveEntry {
+                match_ids: entry.match_ids,
+                expr: entry.expr,
+                lane: entry.lane,
+            });
+            continue;
+        }
         let batch = BatchView {
             state,
             batch_len,
@@ -909,37 +1079,12 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
             derived: done,
             stored: StoredBinding::Unbound,
         };
-        let binding = eval.admit(entry.expr, entry.lane, &batch)?;
-        let cells = &mut rest[0];
-        cells.clear();
-        let words = (batch_len as usize * entry.lane.stride()).div_ceil(8);
-        room(cells, words)?;
-        cells.resize(words, 0);
-        if binding == Binding::Live {
-            // The zero cells stand in for the column the reduce section
-            // reads live; they also keep the column covering the batch.
-            let index = u32::try_from(out.live.len()).map_err(|_| ErrorCode::InvalidProgram)?;
-            if out.live_entry(entry.target_col).is_some() {
-                // Two live entries on one column: the read could only answer
-                // one of them.
-                return Err(ErrorCode::InvalidProgram);
-            }
-            if out.live_index.len() < view.len() {
-                let have = out.live_index.len();
-                room(&mut out.live_index, view.len() - have)?;
-                out.live_index.resize(view.len(), NOT_LIVE);
-            }
-            room(&mut out.live, 1)?;
-            out.live_index[entry.target_col as usize] = index;
-            out.live.push(LiveEntry {
-                match_ids: entry.match_ids_at.shifted(table_start),
-                expr: entry.expr_at.shifted(table_start),
-                lane: entry.lane,
-            });
-            continue;
-        }
+        // The plan cut these ranges from a table equal to this program's, at
+        // the same position, so the indexing is exact.
+        let match_ids = &program[entry.match_ids.start..entry.match_ids.end];
+        let expr = &program[entry.expr.start..entry.expr.end];
         for (row, &type_id) in type_cells.iter().enumerate() {
-            if !entry.matches(type_id) {
+            if !matches(match_ids, type_id) {
                 continue;
             }
             // `row < batch_len`, which is a u32.
@@ -949,14 +1094,10 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
                 cells,
                 entry.lane,
                 row,
-                eval.eval(entry.expr, entry.lane, &batch, at, strings)?,
+                eval.eval(expr, entry.lane, &batch, at, strings)?,
             )?;
         }
     }
-    if pos != table.len() {
-        return Err(ErrorCode::InvalidProgram);
-    }
-    refuse_unreadable_columns(reads, out)?;
 
     out.bound = true;
     let bound: &'a RowColumns = out;

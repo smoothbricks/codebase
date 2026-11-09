@@ -6,9 +6,11 @@ use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{CmpType, ErrorCode};
 use columine_vm::column_uses::ReduceReads;
 use columine_vm::key_index::NoStrings;
+use columine_vm::logical_export::Interner;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
-    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression, bind_row_columns,
+    BatchView, Binding, EntryReads, LiveColumns, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns,
+    RowExpression, RowPlan, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::struct_map::StructMapSlot;
@@ -152,7 +154,8 @@ fn init(prog: &[u8]) -> Vec<u8> {
 }
 
 /// Expression `[col, threshold u32le]`: 1 when the row's `col` cell exceeds
-/// `threshold`, else 0. `admit` refuses a column that cannot cover the batch.
+/// `threshold`, else 0. `admit` names `col`, so a bind refuses a batch whose
+/// column cannot cover its rows.
 struct Threshold {
     admitted: usize,
     evaluated: usize,
@@ -163,18 +166,14 @@ impl RowExpression for Threshold {
         &mut self,
         expr: &[u8],
         _: CmpType,
-        batch: &BatchView<'_>,
+        reads: &mut EntryReads<'_>,
     ) -> Result<Binding, ErrorCode> {
         self.admitted += 1;
         if expr.len() != 5 {
             return Err(ErrorCode::InvalidProgram);
         }
-        if usize::from(expr[0]) >= batch.num_cols() {
-            return Err(ErrorCode::InvalidProgram);
-        }
-        col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
-            .map(|_| Binding::Bound)
-            .ok_or(ErrorCode::ColumnUnderrun)
+        reads.read(u32::from(expr[0]), CmpType::U32)?;
+        Ok(Binding::Bound)
     }
 
     fn eval(
@@ -187,7 +186,7 @@ impl RowExpression for Threshold {
     ) -> Result<RowCell, ErrorCode> {
         self.evaluated += 1;
         let cells = col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
-            .expect("admit proved coverage");
+            .expect("the bind proved coverage");
         let threshold = u32::from_le_bytes([expr[1], expr[2], expr[3], expr[4]]);
         Ok(RowCell::U32(u32::from(cells[row as usize] > threshold)))
     }
@@ -197,6 +196,22 @@ fn threshold_expr(col: u8, threshold: u32) -> Vec<u8> {
     let mut e = vec![col];
     e.extend(threshold.to_le_bytes());
     e
+}
+
+/// Plan `prog`'s table with `eval`, as an embedder does once per program,
+/// and bind the plan over `cols`.
+fn bind<'a, 'e, E: RowExpression>(
+    prog: &'a [u8],
+    state: &[u8],
+    cols: &mut [&'a [u8]],
+    batch_len: u32,
+    eval: &'e mut E,
+    strings: &mut dyn Interner,
+    rows: &'a mut RowColumns,
+) -> Result<LiveColumns<'a, 'e>, ErrorCode> {
+    let reads = ReduceReads::of(prog)?;
+    let plan = RowPlan::of(prog, &reads, eval)?;
+    bind_row_columns(prog, &plan, state, cols, batch_len, eval, strings, rows)
 }
 
 fn map_value(state: &[u8], key: u32) -> Option<u32> {
@@ -230,9 +245,8 @@ fn derived_predicate_gates_the_upsert_and_unmatched_rows_stay_zero() {
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(
+    bind(
         &prog,
-        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         4,
@@ -274,6 +288,7 @@ fn a_program_admits_each_entry_once_however_many_batches_bind() {
         admitted: 0,
         evaluated: 0,
     };
+    let plan = RowPlan::of(&prog, &reads, &mut eval).expect("the table plans");
     let mut rows = RowColumns::new();
     for value in [50u32, 150, 999] {
         let types = [ORDER_TYPE];
@@ -287,7 +302,7 @@ fn a_program_admits_each_entry_once_however_many_batches_bind() {
         ];
         bind_row_columns(
             &prog,
-            &reads,
+            &plan,
             &state,
             &mut cols,
             1,
@@ -316,9 +331,8 @@ fn a_program_without_a_table_binds_nothing() {
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(
+    bind(
         &prog,
-        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         2,
@@ -348,9 +362,8 @@ fn an_empty_batch_binds_nothing_even_without_column_pointers() {
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(
+    bind(
         &prog,
-        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         0,
@@ -360,7 +373,11 @@ fn an_empty_batch_binds_nothing_even_without_column_pointers() {
     )
     .expect("bind");
     assert!(cols.is_empty());
-    assert_eq!(eval.admitted, 0);
+    assert_eq!(
+        eval.admitted, 1,
+        "the plan admits the entry; the empty bind evaluates nothing"
+    );
+    assert_eq!(eval.evaluated, 0);
 }
 
 fn bind_err<'a>(
@@ -374,9 +391,8 @@ fn bind_err<'a>(
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(
+    bind(
         prog,
-        &ReduceReads::of(prog).expect("the reduce reads derive"),
         &state,
         cols,
         batch_len,
@@ -535,9 +551,8 @@ fn an_extension_table_after_the_row_table_leaves_the_bind_unchanged() {
             admitted: 0,
             evaluated: 0,
         };
-        bind_row_columns(
+        bind(
             &prog,
-            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             3,
@@ -578,9 +593,8 @@ fn a_tail_of_extension_tables_alone_binds_nothing() {
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(
+    bind(
         &prog,
-        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         2,
@@ -679,9 +693,8 @@ fn a_later_entry_reads_an_earlier_entry_s_derived_column() {
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(
+    bind(
         &prog,
-        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         2,
@@ -717,7 +730,6 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
     prog.extend(reduce);
     prog.extend_from_slice(&trailer);
     let state = init(&prog);
-    let reads = ReduceReads::of(&prog).expect("the reduce reads derive");
     let types = [ORDER_TYPE, ORDER_TYPE];
     let vals = [50u32, 150];
     let mut cols: Vec<&[u8]> = vec![u32s_as_bytes(&types), &[], u32s_as_bytes(&vals), &[], &[]];
@@ -726,6 +738,13 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         admitted: 0,
         evaluated: 0,
     };
+    // The plan is made once, with memory; only the binds run without it.
+    let plan = RowPlan::of(
+        &prog,
+        &ReduceReads::of(&prog).expect("the reduce reads derive"),
+        &mut eval,
+    )
+    .expect("the table plans");
     // Storage that memory cannot back refuses the bind by name, with the
     // columns untouched.
     let mut cold = RowColumns::new();
@@ -733,7 +752,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         without_memory(|| {
             bind_row_columns(
                 &prog,
-                &reads,
+                &plan,
                 &state,
                 &mut cols,
                 2,
@@ -748,7 +767,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
     assert!(cols[3].is_empty() && cols[4].is_empty());
     bind_row_columns(
         &prog,
-        &reads,
+        &plan,
         &state,
         &mut cols,
         2,
@@ -766,7 +785,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         without_memory(|| {
             bind_row_columns(
                 &prog,
-                &reads,
+                &plan,
                 &state,
                 &mut again,
                 2,
@@ -793,7 +812,7 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         without_memory(|| {
             bind_row_columns(
                 &prog,
-                &reads,
+                &plan,
                 &state,
                 &mut longer,
                 64,
@@ -820,11 +839,13 @@ impl RowExpression for Competes {
         &mut self,
         expr: &[u8],
         _: CmpType,
-        batch: &BatchView<'_>,
+        reads: &mut EntryReads<'_>,
     ) -> Result<Binding, ErrorCode> {
-        if expr.len() != 2 || expr.iter().any(|&c| usize::from(c) >= batch.num_cols()) {
+        let &[key, value] = expr else {
             return Err(ErrorCode::InvalidProgram);
-        }
+        };
+        reads.read(u32::from(key), CmpType::U32)?;
+        reads.read(u32::from(value), CmpType::U32)?;
         Ok(Binding::Live)
     }
 
@@ -865,9 +886,8 @@ fn run_live(prog: &[u8], state: &mut [u8], keys: &[u32], vals: &[u32]) -> Vec<Op
     // The handle borrows the evaluator; the block hands it back for the
     // count below.
     {
-        let mut live = bind_row_columns(
+        let mut live = bind(
             prog,
-            &ReduceReads::of(prog).expect("the reduce reads derive"),
             state,
             &mut cols,
             keys.len() as u32,
@@ -940,9 +960,8 @@ fn a_live_entry_gates_on_the_type_column_and_re_binds_per_batch() {
     let mut eval = Competes { evaluated: 0 };
     let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
     {
-        let mut live = bind_row_columns(
+        let mut live = bind(
             &prog,
-            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             2,
@@ -967,9 +986,8 @@ fn a_live_entry_gates_on_the_type_column_and_re_binds_per_batch() {
     // entry forward.
     let plain = program(&[]);
     let mut plain_cols: Vec<&[u8]> = vec![&[], &[], &[], &[]];
-    let live = bind_row_columns(
+    let live = bind(
         &plain,
-        &ReduceReads::of(&plain).expect("the reduce reads derive"),
         &state,
         &mut plain_cols,
         1,
@@ -1008,9 +1026,8 @@ fn splice_repeats_the_bound_columns_over_a_rebuilt_column_set() {
         evaluated: 0,
     };
     let bound: Vec<Vec<u8>> = {
-        let live = bind_row_columns(
+        let live = bind(
             &prog,
-            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             2,
@@ -1078,9 +1095,8 @@ fn live_bind_refusal(body: &[u8]) -> Option<ErrorCode> {
     ];
     let mut rows = RowColumns::new();
     let mut eval = Competes { evaluated: 0 };
-    let outcome = bind_row_columns(
+    let outcome = bind(
         &prog,
-        &ReduceReads::of(&prog).expect("the reduce reads derive"),
         &state,
         &mut cols,
         1,
@@ -1290,9 +1306,8 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
             u32s_as_bytes(&vals),
             &[],
         ];
-        bind_row_columns(
+        bind(
             &live_on_3,
-            &ReduceReads::of(&live_on_3).expect("the reduce reads derive"),
             &state,
             &mut cols,
             1,
@@ -1314,12 +1329,12 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
             &mut self,
             expr: &[u8],
             _: CmpType,
-            batch: &BatchView<'_>,
+            reads: &mut EntryReads<'_>,
         ) -> Result<Binding, ErrorCode> {
             if expr.len() == 5 {
-                self.threshold.admit(expr, CmpType::U32, batch)
+                self.threshold.admit(expr, CmpType::U32, reads)
             } else {
-                self.competes.admit(expr, CmpType::U32, batch)
+                self.competes.admit(expr, CmpType::U32, reads)
             }
         }
         fn eval(
@@ -1352,9 +1367,8 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
         &[],
         &[],
     ];
-    let mut live = bind_row_columns(
+    let mut live = bind(
         &live_on_4,
-        &ReduceReads::of(&live_on_4).expect("the reduce reads derive"),
         &state,
         &mut cols,
         1,
@@ -1431,14 +1445,13 @@ impl RowExpression for Copy {
         &mut self,
         expr: &[u8],
         _: CmpType,
-        batch: &BatchView<'_>,
+        reads: &mut EntryReads<'_>,
     ) -> Result<Binding, ErrorCode> {
-        if expr.len() != 1 || usize::from(expr[0]) >= batch.num_cols() {
+        let &[col] = expr else {
             return Err(ErrorCode::InvalidProgram);
-        }
-        col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
-            .map(|_| self.binding)
-            .ok_or(ErrorCode::ColumnUnderrun)
+        };
+        reads.read(u32::from(col), CmpType::U32)?;
+        Ok(self.binding)
     }
 
     fn eval(
@@ -1493,9 +1506,8 @@ fn a_bound_derived_guard_column_plans_and_orders_the_scatter() {
     };
     let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
     {
-        let mut live = bind_row_columns(
+        let mut live = bind(
             &prog,
-            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             2,
@@ -1547,9 +1559,8 @@ fn a_live_derived_guard_column_is_refused_before_any_element_runs() {
         binding: Binding::Live,
     };
     assert_eq!(
-        bind_row_columns(
+        bind(
             &prog,
-            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             1,
@@ -1637,9 +1648,8 @@ fn a_live_element_predicate_binds_beside_a_guarded_scatter() {
     };
     let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
     {
-        let mut live = bind_row_columns(
+        let mut live = bind(
             &prog,
-            &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
             &mut cols,
             2,

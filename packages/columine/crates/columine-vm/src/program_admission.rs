@@ -22,7 +22,9 @@ use crate::element_body::{InvalidSource, SourceOp, visit_source_ops};
 use crate::key_index::{HashIndex, InternBytes, KeyIndex, NoStrings};
 use crate::logical_export::Interner;
 use crate::program_inputs::InputPlan;
-use crate::row_exprs::{LiveColumns, RowColumns, RowExpression, bind_row_columns, row_table};
+use crate::row_exprs::{
+    LiveColumns, RowColumns, RowExpression, RowPlan, bind_row_columns, row_table,
+};
 use crate::state_init;
 use crate::vm::Vm;
 use core::marker::PhantomData;
@@ -320,12 +322,21 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
         )
     }
 
+    /// This program's row-expression table, parsed and admitted once through
+    /// `eval` against the reduce reads admission derived ([`RowPlan::of`]):
+    /// the plan every [`Self::execute_bound`] of this program runs. The
+    /// embedder makes it once, beside the program, with the evaluator of its
+    /// expression language.
+    pub fn plan_rows<E: RowExpression>(&self, eval: &mut E) -> Result<RowPlan, ErrorCode> {
+        RowPlan::of(&self.bytecode, &self.reads, eval)
+    }
     /// Bind the row-expression table over `cols`, admit the selected VO frames
     /// against that bound column set, then run `execute` on it with the
     /// batch's live columns. A scope filter, FLAT_MAP offsets or VO column
     /// may be a derived column, so admission must read the same cells the
     /// reduce section will: a host placeholder for a derived column is never
-    /// what admission sees. Binding reads `state` and writes only `rows` and
+    /// what admission sees. Binding runs `plan`, this program's
+    /// [`Self::plan_rows`], reads `state` and writes only `rows` and
     /// `cols`; every refusal happens before `execute` runs. A program without
     /// a table binds nothing and its live columns are empty.
     ///
@@ -340,6 +351,7 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
         cols: &mut [&'a [u8]],
         batch_len: u32,
         scratch: &mut ProgramScratch,
+        plan: &RowPlan,
         eval: &mut E,
         strings: &mut S,
         rows: &'a mut RowColumns,
@@ -347,7 +359,7 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
     ) -> Result<u32, InputAdmissionError> {
         let mut live = bind_row_columns(
             &self.bytecode,
-            &self.reads,
+            plan,
             state,
             cols,
             batch_len,
@@ -607,7 +619,8 @@ mod tests {
     use crate::key_index::NoStrings;
     use crate::program_inputs::InputPlan;
     use crate::row_exprs::{
-        BatchView, Binding, LiveColumns, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression,
+        BatchView, Binding, EntryReads, LiveColumns, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns,
+        RowExpression,
     };
 
     /// The derived column the FOR_EACH reads its type from.
@@ -629,7 +642,7 @@ mod tests {
             &mut self,
             expr: &[u8],
             _: CmpType,
-            _: &BatchView<'_>,
+            _: &mut EntryReads<'_>,
         ) -> Result<Binding, ErrorCode> {
             match expr {
                 [_] | [_, 1] => Ok(Binding::Bound),
@@ -782,6 +795,7 @@ mod tests {
             &mut cols,
             1,
             &mut scratch,
+            &program.plan_rows(&mut Constant).expect("the table plans"),
             &mut Constant,
             &mut NoStrings,
             &mut rows,
@@ -810,6 +824,7 @@ mod tests {
             &mut cols,
             1,
             &mut scratch,
+            &program.plan_rows(&mut Constant).expect("the table plans"),
             &mut Constant,
             &mut NoStrings,
             &mut rows,
@@ -838,21 +853,10 @@ mod tests {
             Err(InputAdmissionError::UnboundRows)
         );
 
-        let refused = admitted(&[]);
-        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
-        let mut rows = RowColumns::new();
         assert_eq!(
-            refused.execute_bound(
-                &mut [],
-                &mut cols,
-                1,
-                &mut scratch,
-                &mut Constant,
-                &mut NoStrings,
-                &mut rows,
-                |_, _, _, _, _| unreachable!("never run"),
-            ),
-            Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram))
+            admitted(&[]).plan_rows(&mut Constant).err(),
+            Some(ErrorCode::InvalidProgram),
+            "the evaluator refuses the empty expression when the table is planned"
         );
     }
 
@@ -881,6 +885,7 @@ mod tests {
             &mut cols,
             1,
             &mut scratch,
+            &program.plan_rows(&mut Constant).expect("the table plans"),
             &mut Constant,
             &mut NoStrings,
             &mut rows,
@@ -911,6 +916,7 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
+                &program.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -947,6 +953,7 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
+                &program.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -1013,6 +1020,7 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
+                &program.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -1036,20 +1044,21 @@ mod tests {
             "bound over another batch length"
         );
 
-        let failed = admitted(&[]);
-        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
+        // A bind that fails leaves no cells to resume: here its type column is short.
+        let mut cols: [&[u8]; 6] = [&[], &offsets, b"ab", &key, &[], &[]];
         assert_eq!(
-            failed.execute_bound(
+            program.execute_bound(
                 &mut [],
                 &mut cols,
                 1,
                 &mut scratch,
+                &program.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
                 |_, _, _, _, _| unreachable!("bind refused"),
             ),
-            Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram))
+            Err(InputAdmissionError::Rows(ErrorCode::ColumnUnderrun))
         );
         let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         assert_eq!(
@@ -1077,6 +1086,7 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
+                &live.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -1116,6 +1126,9 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
+                &bound_split
+                    .plan_rows(&mut Constant)
+                    .expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -1155,6 +1168,7 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
+                &live.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,

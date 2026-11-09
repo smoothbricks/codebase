@@ -11,10 +11,12 @@ use columine_types::types::{AggType, CmpType, ErrorCode, StructFieldType};
 use columine_vm::aggregates::{agg_value_f64, agg_value_i64};
 use columine_vm::column_uses::{ColumnUse, ReduceRead, ReduceReads};
 use columine_vm::key_index::NoStrings;
+use columine_vm::logical_export::Interner;
 use columine_vm::meta::SlotMetaView;
+use columine_vm::row_exprs::BatchView;
 use columine_vm::row_exprs::{
-    BatchView, Binding, LANED_ROW_EXPRESSIONS_MAGIC, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns,
-    RowExpression, StoredRow, bind_row_columns,
+    Binding, EntryReads, LANED_ROW_EXPRESSIONS_MAGIC, LiveColumns, ROW_EXPRESSIONS_MAGIC, RowCell,
+    RowColumns, RowExpression, RowPlan, StoredRow, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::vm::{CheckedMap, Vm, col_i64_exact, col_u32_exact, i64s_as_bytes, u32s_as_bytes};
@@ -58,33 +60,22 @@ impl RowExpression for Wide {
         &mut self,
         expr: &[u8],
         _: CmpType,
-        batch: &BatchView<'_>,
+        reads: &mut EntryReads<'_>,
     ) -> Result<Binding, ErrorCode> {
         let &[op, col] = expr else {
             return Err(ErrorCode::InvalidProgram);
         };
         let col = u32::from(col);
-        if col as usize >= batch.num_cols() {
-            return Err(ErrorCode::InvalidProgram);
-        }
-        let covered = match op {
-            HALF_MORE | PAST_F64 | COPY | LIVE_COPY => {
-                col_u32_exact(batch.column(col), batch.batch_len).is_some()
-            }
-            NEXT if batch.derived_lane(col) == Some(CmpType::I64) => {
-                col_i64_exact(batch.column(col), batch.batch_len).is_some()
-            }
+        match op {
+            HALF_MORE | PAST_F64 | COPY | LIVE_COPY => reads.read(col, CmpType::U32)?,
+            NEXT => reads.read(col, CmpType::I64)?,
             _ => return Err(ErrorCode::InvalidProgram),
-        };
-        if covered {
-            Ok(if op == LIVE_COPY {
-                Binding::Live
-            } else {
-                Binding::Bound
-            })
-        } else {
-            Err(ErrorCode::ColumnUnderrun)
         }
+        Ok(if op == LIVE_COPY {
+            Binding::Live
+        } else {
+            Binding::Bound
+        })
     }
 
     fn eval(
@@ -110,6 +101,22 @@ impl RowExpression for Wide {
 }
 
 /// One RXP2 entry over the order rows: target column, lane, expression.
+/// Plan `prog`'s table with `eval` against `reads` and bind the plan: the
+/// plan's refusal or the bind's, as an embedder meets either.
+#[allow(clippy::too_many_arguments)]
+fn plan_and_bind<'a, 'e, E: RowExpression>(
+    prog: &'a [u8],
+    reads: &ReduceReads,
+    state: &[u8],
+    cols: &mut [&'a [u8]],
+    batch_len: u32,
+    eval: &'e mut E,
+    strings: &mut dyn Interner,
+    rows: &'a mut RowColumns,
+) -> Result<LiveColumns<'a, 'e>, ErrorCode> {
+    let plan = RowPlan::of(prog, reads, eval)?;
+    bind_row_columns(prog, &plan, state, cols, batch_len, eval, strings, rows)
+}
 fn laned(target: u8, lane: CmpType, expr: [u8; 2]) -> Vec<u8> {
     let mut out = vec![target, lane as u8, 1];
     out.extend(ORDER_TYPE.to_le_bytes());
@@ -238,7 +245,12 @@ fn fold(prog: &[u8], state: &mut [u8], keys: &[u32], ns: &[u32]) {
     let mut eval = Wide;
     let mut live = bind_row_columns(
         prog,
-        &ReduceReads::of(prog).expect("the reduce reads derive"),
+        &RowPlan::of(
+            prog,
+            &ReduceReads::of(prog).expect("the reduce reads derive"),
+            &mut eval,
+        )
+        .expect("the table plans"),
         state,
         &mut cols,
         len,
@@ -350,7 +362,12 @@ fn a_later_entry_reads_an_earlier_wide_column_at_its_lane() {
     let mut eval = Wide;
     let mut live = bind_row_columns(
         &prog,
-        &ReduceReads::of(&prog).expect("the reduce reads derive"),
+        &RowPlan::of(
+            &prog,
+            &ReduceReads::of(&prog).expect("the reduce reads derive"),
+            &mut eval,
+        )
+        .expect("the table plans"),
         &state,
         &mut cols,
         2,
@@ -395,7 +412,7 @@ fn an_rxp1_table_binds_the_u32_cells_an_rxp2_u32_entry_binds() {
             &[],
         ];
         let mut rows = RowColumns::new();
-        bind_row_columns(
+        plan_and_bind(
             &prog,
             &ReduceReads::of(&prog).expect("the reduce reads derive"),
             &state,
@@ -424,7 +441,7 @@ fn refusal(prog: &[u8]) -> ErrorCode {
         u32s_as_bytes(&placeholder),
     ];
     let mut rows = RowColumns::new();
-    let code = bind_row_columns(
+    let code = plan_and_bind(
         prog,
         &ReduceReads::of(prog).expect("the reduce reads derive"),
         &state,
@@ -561,7 +578,7 @@ proptest! {
                 u32s_as_bytes(&placeholder), u32s_as_bytes(&placeholder),
             ];
             let mut eval = Wide;
-            let bound = bind_row_columns(
+            let bound = plan_and_bind(
                 &prog, &ReduceReads::of(&prog).expect("the reduce reads derive"), &state, &mut cols, u32::try_from(ns.len()).expect("small batch"),
                 &mut eval, &mut NoStrings, &mut rows,
             );
@@ -592,9 +609,6 @@ proptest! {
 const BOUND: u8 = 0;
 /// Binds an entry live.
 const LIVE: u8 = 1;
-/// Binds an entry live when the batch holds an odd number of rows: which
-/// entries bind live is the embedder's answer per batch.
-const LIVE_IF_ODD: u8 = 2;
 
 /// The embedder of the verdict property: an entry's expression `[mode, _]`
 /// names how it binds, and every cell is 1 in the entry's own lane.
@@ -605,13 +619,12 @@ impl RowExpression for Modes {
         &mut self,
         expr: &[u8],
         _: CmpType,
-        batch: &BatchView<'_>,
+        _: &mut EntryReads<'_>,
     ) -> Result<Binding, ErrorCode> {
         Ok(match expr[0] {
             BOUND => Binding::Bound,
             LIVE => Binding::Live,
-            _ if batch.batch_len % 2 == 1 => Binding::Live,
-            _ => Binding::Bound,
+            _ => return Err(ErrorCode::InvalidProgram),
         })
     }
 
@@ -718,11 +731,11 @@ fn lane_of(index: u8) -> CmpType {
     CmpType::from_u8(index).expect("a generated lane")
 }
 
-/// The verdict derived once per program, with each bind checking only its own
-/// live entries, refuses exactly the binds the per-bind judgement over every
-/// read refused, with the same code, over generated programs (wide, live and
-/// batch-dependent live entries, the type column among the targets) and
-/// generated batches. The counts printed show both answers were exercised.
+/// The verdict a plan derives once per program refuses exactly the programs
+/// the per-bind judgement over every read refused, with the same code, over
+/// generated programs (wide and live entries, the type column among the
+/// targets) and generated batches. The counts printed show both answers
+/// were exercised.
 #[test]
 fn the_once_derived_verdict_refuses_exactly_what_the_per_bind_walk_refused() {
     use proptest::test_runner::{TestCaseError, TestRunner};
@@ -730,7 +743,7 @@ fn the_once_derived_verdict_refuses_exactly_what_the_per_bind_walk_refused() {
     let cases = (
         prop::collection::vec((0u8..3, 0u8..5), 0..4),
         prop::option::of((0u8..5, 0u8..5, 0u8..5)),
-        prop::collection::vec((0u8..5, 0u8..3, 0u8..3), 0..5),
+        prop::collection::vec((0u8..5, 0u8..3, 0u8..2), 0..5),
         1u32..6,
     );
     let (refused, accepted, live_refused) = (Cell::new(0u32), Cell::new(0u32), Cell::new(0u32));
@@ -749,7 +762,7 @@ fn the_once_derived_verdict_refuses_exactly_what_the_per_bind_walk_refused() {
         cols.extend((1..NUM_COLS).map(|_| u32s_as_bytes(&host)));
         let live: Vec<u8> = entries
             .iter()
-            .filter(|&&(_, _, mode)| mode == LIVE || (mode == LIVE_IF_ODD && len % 2 == 1))
+            .filter(|&&(_, _, mode)| mode == LIVE)
             .map(|&(target, _, _)| target)
             .collect();
         let twice_live = live
@@ -763,7 +776,7 @@ fn the_once_derived_verdict_refuses_exactly_what_the_per_bind_walk_refused() {
         let walked = twice_live || walked_refusal(reads.reads(), &lanes, &live);
         let mut out = RowColumns::new();
         let mut eval = Modes;
-        let bound = bind_row_columns(
+        let bound = plan_and_bind(
             &prog,
             &reads,
             &state,
@@ -830,10 +843,11 @@ fn a_warmed_wide_bind_allocates_nothing() {
         ]
     };
     let mut rows = RowColumns::new();
+    let plan = RowPlan::of(&prog, &reads, &mut Wide).expect("the table plans");
     let mut cold = host();
     bind_row_columns(
         &prog,
-        &reads,
+        &plan,
         &state,
         &mut cold,
         3,
@@ -846,7 +860,7 @@ fn a_warmed_wide_bind_allocates_nothing() {
     let bound = with_allocations(0, || {
         bind_row_columns(
             &prog,
-            &reads,
+            &plan,
             &state,
             &mut warm,
             3,

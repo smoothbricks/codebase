@@ -13,7 +13,8 @@ use columine_vm::key_index::NoStrings;
 use columine_vm::logical_export::{InternLookup, Interner};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
-    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression, bind_row_columns,
+    BatchView, Binding, EntryReads, ROW_EXPRESSIONS_MAGIC, RowCell, RowColumns, RowExpression,
+    RowPlan, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::vm::{Vm, col_u32_exact, u32s_as_bytes};
@@ -83,7 +84,7 @@ impl RowExpression for Join {
         &mut self,
         expr: &[u8],
         lane: CmpType,
-        batch: &BatchView<'_>,
+        reads: &mut EntryReads<'_>,
     ) -> Result<Binding, ErrorCode> {
         let &[head, tail] = expr else {
             return Err(ErrorCode::InvalidProgram);
@@ -92,9 +93,7 @@ impl RowExpression for Join {
             return Err(ErrorCode::InvalidProgram);
         }
         for col in [head, tail] {
-            if col_u32_exact(batch.column(u32::from(col)), batch.batch_len).is_none() {
-                return Err(ErrorCode::ColumnUnderrun);
-            }
+            reads.read(u32::from(col), CmpType::U32)?;
         }
         Ok(Binding::Bound)
     }
@@ -200,7 +199,12 @@ fn bind(
     let mut rows = RowColumns::new();
     bind_row_columns(
         prog,
-        &ReduceReads::of(prog).expect("the reduce reads derive"),
+        &RowPlan::of(
+            prog,
+            &ReduceReads::of(prog).expect("the reduce reads derive"),
+            &mut Join::default(),
+        )
+        .expect("the table plans"),
         &state,
         &mut cols,
         len,
@@ -227,7 +231,12 @@ fn fold(prog: &[u8], state: &mut [u8], strings: &mut Table, heads: &[u32], tails
     let mut eval = Join::default();
     let mut live = bind_row_columns(
         prog,
-        &ReduceReads::of(prog).expect("the reduce reads derive"),
+        &RowPlan::of(
+            prog,
+            &ReduceReads::of(prog).expect("the reduce reads derive"),
+            &mut eval,
+        )
+        .expect("the table plans"),
         state,
         &mut cols,
         len,
@@ -300,7 +309,12 @@ fn an_interner_refusal_refuses_the_bind_and_splices_nothing() {
     let mut rows = RowColumns::new();
     let refused = bind_row_columns(
         &prog,
-        &ReduceReads::of(&prog).expect("the reduce reads derive"),
+        &RowPlan::of(
+            &prog,
+            &ReduceReads::of(&prog).expect("the reduce reads derive"),
+            &mut Join::default(),
+        )
+        .expect("the table plans"),
         &state,
         &mut cols,
         1,
