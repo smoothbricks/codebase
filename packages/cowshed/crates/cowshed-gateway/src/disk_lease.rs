@@ -488,6 +488,9 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
 }
 
 #[cfg(test)]
+mod laws;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use DiskClass::{Namespace, Storage};
