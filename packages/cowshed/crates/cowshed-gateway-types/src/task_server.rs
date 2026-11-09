@@ -24,15 +24,16 @@ pub const TASK_QUEUE_OP: &str = "task-queue";
 
 /// What a work unit runs as. Interactive is work a person or model is waiting on; gate is the
 /// land's gate job and the work it relays, the land turn's holder included; background is every
-/// other unit. Gate-class work is selected first; interactive and background work follow it. A
-/// background unit is not selected while the host is under memory pressure (05_gateway.md "Host
-/// scheduling", "Memory pressure").
+/// other unit, and the class a request that omits its own is admitted as (05_gateway.md
+/// "Classes": ordinary commands default to background). Gate-class work is selected first;
+/// interactive and background work follow it. A background unit is not selected while the host is
+/// under memory pressure (05_gateway.md "Host scheduling", "Memory pressure").
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskClass {
-    #[default]
     Gate,
     Interactive,
+    #[default]
     Background,
 }
 
@@ -146,7 +147,7 @@ pub struct TaskAdmitRequest<'a> {
     pub priority: u32,
     #[serde(skip_serializing_if = "is_false")]
     pub urgent: bool,
-    #[serde(skip_serializing_if = "is_gate")]
+    #[serde(skip_serializing_if = "is_background")]
     pub class: TaskClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline: Option<u64>,
@@ -157,7 +158,8 @@ pub struct TaskAdmitRequest<'a> {
 }
 
 impl<'a> TaskAdmitRequest<'a> {
-    /// A gate-class unit with no leases, priority or observations.
+    /// A background unit, the class an omitted one is admitted as, with no leases, priority or
+    /// observations; a gate unit names its class.
     pub fn new(unit: &'a str, owner: &'a str, command: &'a str) -> Self {
         Self {
             op: TASK_ADMIT_OP,
@@ -320,6 +322,6 @@ fn is_false(urgent: &bool) -> bool {
     !*urgent
 }
 
-fn is_gate(class: &TaskClass) -> bool {
-    *class == TaskClass::Gate
+fn is_background(class: &TaskClass) -> bool {
+    *class == TaskClass::Background
 }

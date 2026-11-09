@@ -5,10 +5,8 @@
 //! after every input compares the two queues, the ready orders, the holders, the units a pass
 //! grants, and evaluates the laws' checks on the code's own state. No gateway stderr log holds a
 //! `cowshed: timing task-server select` line and no in-repo caller sends a `task-admit`, so there
-//! is no recorded fixture to replay.
-//!
-//! The two laws the code refutes are `task_server_open.bend`'s. Each is a test named for its
-//! defect that asserts what the code does today, so the repair flips it.
+//! is no recorded fixture to replay. Plain cases follow the drivers: a land is ordered behind the
+//! aged waiter it queues behind, and a request that omits its class is background.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -16,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cowshed_gateway_types::host_status::{DarwinPressureLevel, MemoryPressure};
-use cowshed_gateway_types::{LeaseClass, TaskClass, TaskOutcome};
+use cowshed_gateway_types::{LeaseClass, TaskAdmitRequest, TaskClass, TaskOutcome};
 
 use super::{Effect, Ledger, LeverageObservation, State, TaskFacts, TaskServerLimits};
 
@@ -393,6 +391,10 @@ impl Pair {
             ("aged_first", model::aged_first_b(state.clone())),
             ("gate_first", model::gate_first_b(state.clone())),
             ("no_starve", model::no_starve_b(state.clone())),
+            (
+                "lands_behind_older_aged",
+                model::lands_behind_b(state.clone()),
+            ),
             ("grants_when_free", model::grants_b(state.clone())),
         ] {
             if !holds {
@@ -429,7 +431,7 @@ impl Pair {
         Ok(pair)
     }
 
-    /// Whether the code's ready order keeps every land behind the aged units older than it.
+    /// Whether Ledger's ready order keeps every land behind the aged units admitted before it.
     fn lands_behind_older_aged(&self) -> bool {
         model::lands_behind_b(self.code_state())
     }
@@ -438,7 +440,7 @@ impl Pair {
 type Seeded = (u64, u64, u64);
 
 /// Each proven law's seed, draw count and draw length: the same streams every target draws.
-const SEEDED: [Seeded; 5] = [
+const SEEDED: [Seeded; 6] = [
     (
         model::SEED_LEASE_EXCLUSION,
         model::PROPS_LEASE_EXCLUSION,
@@ -460,6 +462,11 @@ const SEEDED: [Seeded; 5] = [
         model::PROP_LEN_NO_STARVE,
     ),
     (
+        model::SEED_LANDS_BEHIND_OLDER_AGED,
+        model::PROPS_LANDS_BEHIND_OLDER_AGED,
+        model::PROP_LEN_LANDS_BEHIND_OLDER_AGED,
+    ),
+    (
         model::SEED_GRANTS_WHEN_FREE,
         model::PROPS_GRANTS_WHEN_FREE,
         model::PROP_LEN_GRANTS_WHEN_FREE,
@@ -476,6 +483,10 @@ fn model_laws_hold(ops: &Rc<List<Op>>, bound: u64) -> Result<(), String> {
         ("aged_first", model::law_aged_first(ops.clone(), bound)),
         ("gate_first", model::law_gate_first(ops.clone(), bound)),
         ("no_starve", model::law_no_starve(ops.clone(), bound)),
+        (
+            "lands_behind_older_aged",
+            model::law_lands_behind_older_aged(ops.clone(), bound),
+        ),
         (
             "grants_when_free",
             model::law_grants_when_free(ops.clone(), bound),
@@ -545,11 +556,10 @@ const IMAGE: Ls = Ls::Ls(false, true, false);
 const LAND: Ls = Ls::Ls(false, false, true);
 const IMAGE_LAND: Ls = Ls::Ls(false, true, true);
 
-/// D2 (05_gateway.md 2060-2061, 2063): a land that has waited no time is ordered ahead of a unit
-/// that has waited the age bound, though the spec has the land queue behind older aged waiters.
-/// Pins today's order: when the repair puts the aged unit first, this test fails.
+/// Lands queue behind older aged waiters (05_gateway.md "The task server schedules work units"): a
+/// land that has waited no time is ordered behind a unit that has waited the age bound.
 #[test]
-fn defect_d2_a_fresh_land_is_ordered_ahead_of_the_aged_waiter_it_queues_behind() {
+fn lands_behind_older_aged_a_fresh_land_follows_the_aged_waiter_in_the_ready_order() {
     let ops = list(vec![
         admit(0, Cls::CBack, NO_LEASE),
         Op::OTick(1),
@@ -558,19 +568,16 @@ fn defect_d2_a_fresh_land_is_ordered_ahead_of_the_aged_waiter_it_queues_behind()
     let pair = Pair::run(1, &ops).unwrap();
     assert_eq!(
         pair.code_ready(),
-        [1, 0],
-        "the land (1, waited 0) is ahead of the aged unit (0, waited 1 against a bound of 1); the spec orders [0, 1]"
+        [0, 1],
+        "the aged unit (0, waited 1 against a bound of 1) is ahead of the land (1, waited 0)"
     );
-    assert!(
-        !pair.lands_behind_older_aged(),
-        "lands_behind_older_aged fails on Ledger's state"
-    );
+    assert!(pair.lands_behind_older_aged());
 }
 
-/// D2: among the aged, a land goes ahead of an aged unit that waited longer; the spec has the
-/// aged run in the order they waited. Pins today's order.
+/// Among the aged a land waits behind an aged unit that waited longer: the aged run in the order
+/// they waited.
 #[test]
-fn defect_d2_an_aged_land_is_ordered_ahead_of_the_aged_waiter_that_waited_longer() {
+fn lands_behind_older_aged_an_aged_land_follows_the_aged_waiter_that_waited_longer() {
     let ops = list(vec![
         admit(0, Cls::CGate, NO_LEASE),
         Op::OTick(1),
@@ -580,16 +587,16 @@ fn defect_d2_an_aged_land_is_ordered_ahead_of_the_aged_waiter_that_waited_longer
     let pair = Pair::run(1, &ops).unwrap();
     assert_eq!(
         pair.code_ready(),
-        [1, 0],
-        "both have waited the bound; the land (1) waited 1 and the unit (0) waited 2; the spec orders [0, 1]"
+        [0, 1],
+        "both have waited the bound; the unit (0) waited 2 and the land (1) waited 1"
     );
-    assert!(!pair.lands_behind_older_aged());
+    assert!(pair.lands_behind_older_aged());
 }
 
-/// D2's effect on selection, which the order alone hides: when a land and an aged unit want the
-/// same lease class, the land takes it and the aged unit keeps waiting. Pins today's grant.
+/// The order's effect on selection: when a land and an aged unit want the same lease class, the
+/// aged unit takes it and the land waits its turn.
 #[test]
-fn defect_d2_a_fresh_land_takes_the_lease_an_aged_waiter_was_waiting_for() {
+fn lands_behind_older_aged_a_fresh_land_leaves_the_lease_to_the_aged_waiter() {
     let ops = list(vec![
         admit(0, Cls::CBack, IMAGE),
         Op::OTick(1),
@@ -599,55 +606,10 @@ fn defect_d2_a_fresh_land_takes_the_lease_an_aged_waiter_was_waiting_for() {
     let pair = Pair::run(1, &ops).unwrap();
     assert_eq!(
         pair.code_selected(),
-        [1],
-        "the land (1) holds the image window; the spec grants it to the aged unit (0)"
+        [0],
+        "the aged unit (0) holds the image window; the land (1) waits for it"
     );
-    assert_eq!(pair.code_holders(LeaseClass::Image), [1]);
-}
-
-/// D2: the emitted driver's counterexample to `lands_behind_older_aged`, the first draw of the
-/// corpus or of the seeded stream, shrunk by dropping inputs while the law stays refuted, and
-/// `Ledger` reproduces it.
-#[test]
-fn defect_d2_the_emitted_driver_finds_a_counterexample_and_ledger_reproduces_it() {
-    let refuted =
-        |ops: &[Op], bound: u64| !model::law_lands_behind_older_aged(list(ops.to_vec()), bound).0;
-    let (drawn, bound) = model::corpus_lands_behind_older_aged()
-        .into_iter()
-        .find(|(ops, bound)| refuted(&items(ops), *bound))
-        .or_else(|| {
-            let mut rng = model::Rng(model::SEED_LANDS_BEHIND_OLDER_AGED);
-            (0..model::PROPS_LANDS_BEHIND_OLDER_AGED)
-                .map(|_| {
-                    let ops = model::gen_ListOp(&mut rng, model::PROP_LEN_LANDS_BEHIND_OLDER_AGED);
-                    let bound = model::gen_Nat(&mut rng, model::PROP_LEN_LANDS_BEHIND_OLDER_AGED);
-                    (ops, bound)
-                })
-                .find(|(ops, bound)| refuted(&items(ops), *bound))
-        })
-        .expect("the driver finds a schedule that puts a land ahead of an older aged unit");
-    let mut ops = items(&drawn);
-    while let Some(fewer) = (0..ops.len())
-        .map(|at| {
-            let mut fewer = ops.clone();
-            fewer.remove(at);
-            fewer
-        })
-        .find(|fewer| refuted(fewer, bound))
-    {
-        ops = fewer;
-    }
-    println!(
-        "lands_behind_older_aged counterexample: ops = {}, age bound = {bound} (the first draw has {} inputs)",
-        model::show_ListOp(&list(ops.clone())),
-        items(&drawn).len()
-    );
-    let pair = Pair::run(bound, &list(ops)).unwrap();
-    assert!(
-        !pair.lands_behind_older_aged(),
-        "Ledger orders the counterexample as the model does, a land ahead of an older aged unit: {:?}",
-        pair.code_ready()
-    );
+    assert_eq!(pair.code_holders(LeaseClass::Image), [0]);
 }
 
 /// The wire line a `task-admit` request is, with the class the model says it names, if any.
@@ -669,8 +631,8 @@ fn admitted_as(wire: &Wire) -> Cls {
     )
 }
 
-/// `TaskAdmitIn` is the model's `wire_class` with the default the code has, `CGate`, on the model's
-/// corpus and draws: a named class is kept, an omitted one takes the default.
+/// `TaskAdmitIn` is the model's `wire_class` on the model's corpus and draws: a named class is
+/// kept, an omitted one is background.
 #[test]
 fn the_wire_class_is_the_model_on_its_corpus_and_draws() {
     let mut wires: Vec<Wire> = model::corpus_omitted_class_is_background()
@@ -685,34 +647,47 @@ fn the_wire_class_is_the_model_on_its_corpus_and_draws() {
     for wire in wires {
         assert_eq!(
             model::show_Cls(&admitted_as(&wire)),
-            model::show_Cls(&model::wire_class(Cls::CGate, wire.clone())),
+            model::show_Cls(&model::wire_class(wire.clone())),
             "TaskAdmitIn admits {} as the model says",
             model::show_Wire(&wire)
         );
     }
 }
 
-/// D1 (05_gateway.md 1416): an omitted class is admitted as gate, where the spec says ordinary
-/// commands default to background. `TaskClass::default()` is Gate, and so is the default
-/// `TaskAdmitRequest::new` gives. Pins today's class: when the repair makes the default Background,
-/// this test fails.
+/// An omitted class is background (05_gateway.md "Classes": ordinary commands default to
+/// background): a `task-admit` line without a class is admitted as background, the line
+/// `TaskAdmitRequest::new` writes leaves the class off, and a request that names a class, gate
+/// included, writes it and is admitted as it.
 #[test]
-fn defect_d1_an_omitted_class_is_admitted_as_gate_where_the_spec_says_background() {
+fn omitted_class_is_background_a_task_admit_without_a_class_is_admitted_as_background() {
     let omitted = Wire::WOmit;
     assert_eq!(
         crate::control::admitted_class(wire_line(&omitted).as_bytes()),
-        Some(TaskClass::Gate),
-        "a task-admit line without a class is admitted as gate"
-    );
-    let (holds, value) = model::law_omitted_class_is_background(omitted.clone());
-    assert!(
-        !holds && value == "CGate",
-        "the emitted driver's counterexample is {}: the code's class is {value}, the spec's is {}",
-        model::show_Wire(&omitted),
-        model::show_Cls(&model::spec_class(omitted.clone()))
+        Some(TaskClass::Background),
+        "a task-admit line without a class is admitted as background"
     );
     assert!(
-        model::law_repaired_default_is_background(omitted).0,
-        "the repaired default is the spec's"
+        model::law_omitted_class_is_background(omitted).0,
+        "the model's class for an omitted one is the spec's"
     );
+    let mut request = TaskAdmitRequest::new("u", "o", "c");
+    let line = serde_json::to_string(&request).expect("a request encodes");
+    assert!(!line.contains("class"), "{line}");
+    assert_eq!(
+        crate::control::admitted_class(line.as_bytes()),
+        Some(TaskClass::Background)
+    );
+    for class in [
+        TaskClass::Gate,
+        TaskClass::Interactive,
+        TaskClass::Background,
+    ] {
+        request.class = class;
+        let line = serde_json::to_string(&request).expect("a request encodes");
+        assert_eq!(
+            crate::control::admitted_class(line.as_bytes()),
+            Some(class),
+            "{line}"
+        );
+    }
 }

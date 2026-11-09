@@ -2119,10 +2119,10 @@ ready unit acquires a lease. Strong models propose task boundaries and interface
   `cowshed-new` (one `cowshed new` on the host at a time), `image` (a workspace-image mutation window), and
   `land-publication` (the checked land-authority transition). `land-publication` is a publication fence — it serializes
   publication only: gate coordinator groups run concurrently in one class. Lands queue for the fence in one order — the
-  first claimant in admission order, behind older aged waiters — so an urgent land waits its turn and never overtakes an
-  older claimant. These classes bound the windows the operator keeps by hand today; the disk-lifecycle lease above still
-  spaces every disk command; leaf resource admission follows "Host scheduling". A lease-blocked unit holds up nothing
-  beside it.
+  first claimant in admission order, behind the aged waiters admitted before them — so an urgent land waits its turn and
+  never overtakes an older claimant. These classes bound the windows the operator keeps by hand today; the
+  disk-lifecycle lease above still spaces every disk command; leaf resource admission follows "Host scheduling". A
+  lease-blocked unit holds up nothing beside it.
 - **Caps and bands.** A unit may declare its own parallelism ceiling — the caps its run kind applies to itself
   (`nx parallel`, `CARGO_BUILD_JOBS`, `--test-threads`) — and the grant reports that ceiling as declared; leaf controls
   derive from it, never from a static profile. The grant also names the run's band, its class's nice in "Classes":
@@ -2156,6 +2156,36 @@ stream of fresher urgent arrivals, the serial classes with the urgent land behin
 per unit, the caps reported as declared, and gate work ordered first — plus `tests/task_server.rs` over a real control
 socket: units admitted and advanced by their terminal facts alone, with the caps and the queue view read off the wire.
 Gate-band units are granted concurrently; a work-unit class never creates exclusive root-gate admission.
+
+**Task-server laws.** `Ledger`, the pure core of the task server, is the Bend model `laws/task_server.bend`, and its
+laws are this section's contract, proven for every sequence of admissions, clock ticks, selection passes and terminal
+facts (`--verdict`), with one place per lease class and the age bound the sequence names:
+
+- **Lease exclusion** (`lease_exclusion`): no lease class has more than one holder. A pass takes a unit only when every
+  class it declares has a free place, and a unit held back holds up nothing beside it.
+- **Aged first** (`aged_first`): the unit a pass takes next, when it is fresh, leaves no aged unit with its places free.
+- **Class order among the fresh** (`gate_first`): the unit a pass takes next, when it is neither aged nor a land, is
+  gate-class whenever a non-aged gate-class unit has its places free; interactive and background work take a place only
+  behind it. A fresh land goes ahead of the class order: lands queue in admission order whatever their class.
+- **No starvation** (`no_starve`): in every pass, each grant made while an aged unit has its places free goes to an aged
+  unit, never to a fresh one. A stream of fresh work, urgent or not, cannot hold back a unit that has waited the age
+  bound.
+- **Lands queue behind older aged waiters** (`lands_behind_older_aged`): taking the ready order's units one after
+  another, a land is taken only when no aged unit admitted before it is left. The aged run in the order they waited, a
+  land among them, and where a land and an aged waiter want the same place the waiter takes it.
+- **An omitted class is background** (`omitted_class_is_background`, `named_class_is_kept`): a `task-admit` that omits
+  `class` is admitted as background and one that names a class keeps it. `TaskAdmitRequest` leaves the default off the
+  wire and writes every other class, gate included.
+- **Definedness** (`grants_when_free`, `done_frees`): a pass grants a unit whose places are free, and a unit that is
+  done holds no place.
+
+The gateway's `task_server::laws` runs the model, emitted to Rust, and `Ledger` on the same inputs: the model's
+enumerated corpus and its seeded draws. After every input it compares the two queues, the ready orders, the running
+units, the holders and each pass's grants, and checks the laws on `Ledger`'s own state; the class default is read
+through the control socket's own parse of a `task-admit` line. A change to `order_cmp`, `select` or the class default
+that breaks a law fails there; changing a law is changing this paragraph. The model leaves out what the order does not
+read: dependencies (leverage is a number each unit carries; the driver gives a unit that many dependents), memory
+pressure (it changes who is selectable, never who comes first) and `priority`, which the order does not read.
 
 ## Credentials
 

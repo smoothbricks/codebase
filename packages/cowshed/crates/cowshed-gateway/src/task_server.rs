@@ -502,8 +502,8 @@ impl Ledger {
     }
 
     /// The schedule's total order. Aged waiters run before fresh priority in the order they
-    /// waited — the starvation bound — then the class, the urgent override, leverage, the
-    /// cache-domain deadline, and the stable unit id.
+    /// waited — the starvation bound, lands among them — then the lands, the class, the urgent
+    /// override, leverage, the cache-domain deadline, and the stable unit id.
     fn order_cmp(
         &self,
         a: &Unit,
@@ -513,23 +513,9 @@ impl Ledger {
     ) -> Ordering {
         let aged =
             |unit: &Unit| now.saturating_duration_since(unit.admitted) >= self.limits.age_bound;
-        // Lands are their own queue: the publication fence goes to the first claimant in
-        // admission order — the land lock's one order — behind older aged waiters, and the land
-        // class ranks as the foreground class beside bulk work. The urgent override orders bulk
-        // and never overtakes an older claimant.
-        let land = |unit: &Unit| unit.facts.leases.contains(&LeaseClass::LandPublication);
-        match (land(a), land(b)) {
-            (true, false) => return Ordering::Less,
-            (false, true) => return Ordering::Greater,
-            (true, true) => {
-                return match (aged(a), aged(b)) {
-                    (true, false) => Ordering::Less,
-                    (false, true) => Ordering::Greater,
-                    _ => a.entry.cmp(&b.entry),
-                };
-            }
-            (false, false) => {}
-        }
+        // An aged unit goes before any fresh one, a land or not: a land queues behind the aged
+        // waiters older than it, and the aged run in the order they waited, then in the order
+        // they were admitted.
         match (aged(a), aged(b)) {
             (true, false) => return Ordering::Less,
             (false, true) => return Ordering::Greater,
@@ -537,8 +523,19 @@ impl Ledger {
                 return a
                     .admitted
                     .cmp(&b.admitted)
-                    .then_with(|| a.facts.unit.cmp(&b.facts.unit));
+                    .then_with(|| a.entry.cmp(&b.entry));
             }
+            (false, false) => {}
+        }
+        // Fresh lands are their own queue: the publication fence goes to the first claimant in
+        // admission order — the land lock's one order — and the land class ranks as the
+        // foreground class beside bulk work. The urgent override orders bulk and never overtakes
+        // an older claimant.
+        let land = |unit: &Unit| unit.facts.leases.contains(&LeaseClass::LandPublication);
+        match (land(a), land(b)) {
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            (true, true) => return a.entry.cmp(&b.entry),
             (false, false) => {}
         }
         let leverage_of = |unit: &Unit| leverage.get(&unit.facts.unit).copied().unwrap_or(0);

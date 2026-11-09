@@ -17,7 +17,9 @@ use cowshed_gateway::{
     CredentialProvider, CredentialQuery, CredentialRecord, Gateway, GatewayConfig,
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
-use cowshed_gateway_types::{TaskAdmitRequest, TaskOutcome, TaskRunCaps, TaskTerminalRequest};
+use cowshed_gateway_types::{
+    LeaseClass, TaskAdmitRequest, TaskClass, TaskOutcome, TaskRunCaps, TaskTerminalRequest,
+};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
@@ -88,10 +90,24 @@ async fn gateway() -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
     (gateway, root, socket)
 }
 
+/// A gate-class request: a gate unit never waits for the host's memory pressure, so the units
+/// these tests run are selected whatever the host is doing.
 fn admit(unit: &str, deps: &[&str], caps: Option<TaskRunCaps>) -> String {
     let mut request = TaskAdmitRequest::new(unit, "workspace-1", "nx run gate");
+    request.class = TaskClass::Gate;
     request.deps = deps.to_vec();
     request.caps = caps;
+    let mut line = serde_json::to_string(&request).expect("encode");
+    line.push('\n');
+    line
+}
+
+/// A request for the image window of `class`, which `TaskAdmitRequest` leaves off the wire when it
+/// is the default.
+fn admit_image(unit: &str, class: TaskClass) -> String {
+    let mut request = TaskAdmitRequest::new(unit, "workspace-1", "nx run gate");
+    request.class = class;
+    request.leases = vec![LeaseClass::Image];
     let mut line = serde_json::to_string(&request).expect("encode");
     line.push('\n');
     line
@@ -235,16 +251,41 @@ async fn one_unit_keeps_one_live_attempt_over_the_wire() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gate_band_units_are_granted_concurrently() {
     let (gateway, _root, socket) = gateway().await;
-    // Both requests retain TaskAdmitRequest's Gate class. Their grants coexist: a task band is
-    // not an exclusive gate root.
+    // Both requests name the gate class. Their grants coexist: a task band is not an exclusive
+    // gate root.
     let mut first = Asker::ask(&socket, admit("first", &[], None)).await;
     let mut second = Asker::ask(&socket, admit("second", &[], None)).await;
     for runner in [&mut first, &mut second] {
-        runner.granted().await;
+        assert_eq!(runner.granted().await["band"], "normal");
     }
     let queue = one_shot(&socket, "{\"op\":\"task-queue\"}\n").await;
     assert_eq!(queue["taskQueue"]["running"].as_array().unwrap().len(), 2);
     drop(first);
     drop(second);
+    gateway.drain().await.expect("drain");
+}
+
+/// A request that omits its class is background (05_gateway.md "Classes"): the wire line leaves
+/// the default off, the queue names the waiting unit's class and band, and a request that names
+/// gate sends its class and is granted the gate band.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_that_omits_its_class_is_background_and_a_gate_request_names_its_own() {
+    let (gateway, _root, socket) = gateway().await;
+    let held = admit_image("holder", TaskClass::Gate);
+    assert!(held.contains(r#""class":"gate""#), "{held}");
+    let waiting = admit_image("waiter", TaskClass::Background);
+    assert!(!waiting.contains("class"), "{waiting}");
+    let mut holder = Asker::ask(&socket, held).await;
+    assert_eq!(holder.granted().await["band"], "normal");
+    // The waiter wants the window the holder has, so the queue shows it whatever the host's memory
+    // pressure is.
+    let waiter = Asker::ask(&socket, waiting).await;
+    let queue = one_shot(&socket, "{\"op\":\"task-queue\"}\n").await;
+    let ready = &queue["taskQueue"]["ready"][0];
+    assert_eq!(ready["unit"], "waiter", "{queue}");
+    assert_eq!(ready["class"], "background", "{queue}");
+    assert_eq!(ready["band"], "background", "{queue}");
+    drop(holder);
+    drop(waiter);
     gateway.drain().await.expect("drain");
 }

@@ -11,12 +11,13 @@
 # code counts the live units that depend on it; the driver gives a unit that many dependents).
 # Memory pressure holds a background unit back, which changes who is selectable, never who comes
 # first, and the model has no dependencies, so every unit it holds is ready. The coordinator's
-# `priority` is not read by `order_cmp` and is not modelled.
+# `priority` is not read by `order_cmp` and is not modelled. The clock only moves forward, so an
+# aged unit was admitted no later than now: the model's `u_aged` says so, and the code's cannot
+# differ on a state the actor reaches.
 #
 # Check: bun bend2/main.ts task_server.bend --verdict
 # Bound to the code by cowshed-gateway src/task_server/laws.rs, which runs the emitted model
-# (src/task_server/laws/model.rs) and `Ledger` on the same inputs. The laws the code refutes are in
-# task_server_open.bend.
+# (src/task_server/laws/model.rs) and `Ledger` on the same inputs.
 import Base
 
 # the unit's class: Gate ranks first, Interactive and Background share the rank behind it
@@ -202,10 +203,17 @@ def mem(+x: Nat, xs: +List<Nat>) -> Bool:
 
 # --- the unit's facts -------------------------------------------------------
 
-def u_aged(+now: Nat, +bound: Nat, u: U) -> Bool:
+def adm_of(u: U) -> Nat:
   match u:
     case U{i, c, ur, lv, d, l, a, e}:
-      le_b(bound, monus(a, now))
+      a
+
+# a unit is aged once it has waited the age bound; the clock only moves forward, so an aged unit
+# was admitted no later than now
+def u_aged(+now: Nat, +bound: Nat, u: U) -> Bool:
+  match u:
+    case U{i, c, ur, lv, d, l, +a, e}:
+      and(le_b(a, now), le_b(bound, monus(a, now)))
 
 def u_land(u: U) -> Bool:
   match u:
@@ -221,23 +229,31 @@ def u_gate(u: U) -> Bool:
     case U{i, CBack{}, ur, lv, d, l, a, e}:
       False{}
 
-# tier 0: aged land, 1: fresh land, 2: aged non-land,
-# 3: fresh non-land Gate, 4: fresh non-land Interactive or Background
-def tier.of(aged: Bool, land: Bool, gate: Bool) -> Nat:
-  match aged land gate:
-    case True{} True{} g:
-      0n
-    case False{} True{} g:
-      1n
-    case True{} False{} g:
-      2n
-    case False{} False{} True{}:
-      3n
-    case False{} False{} False{}:
-      4n
+def plus(k: Nat, +n: Nat) -> Nat:
+  match k:
+    case 0n:
+      n
+    case 1n+p:
+      1n+plus(p, n)
 
-def tier(+now: Nat, +bound: Nat, +u: U) -> Nat:
-  tier.of(u_aged(now, bound, u), u_land(u), u_gate(u))
+# The order's first key: the lesser rank goes first. An aged unit's rank is the time it was
+# admitted, so the aged run in the order they waited, all before the fresh, who were admitted
+# after now less the age bound. A fresh land's rank is one past now, a fresh Gate unit's two, any
+# other fresh unit's three: lands, then Gate work, then the rest. Units of one rank are told
+# apart by the keys below.
+def rank.of(aged: Bool, land: Bool, gate: Bool, +a: Nat, +now: Nat) -> Nat:
+  match aged land gate:
+    case True{} l g:
+      a
+    case False{} True{} g:
+      plus(1n, now)
+    case False{} False{} True{}:
+      plus(2n, now)
+    case False{} False{} False{}:
+      plus(3n, now)
+
+def rank(+now: Nat, +bound: Nat, +u: U) -> Nat:
+  rank.of(u_aged(now, bound, u), u_land(u), u_gate(u), adm_of(u), now)
 
 # --- the total order (cowshed-gateway task_server.rs `order_cmp`) ---------------
 
@@ -299,11 +315,11 @@ def fresh_key(a: U, b: U) -> Ord:
     case U{ia, ca, ua, la, da, sa, aa, ea} U{ib, cb, ub, lb, db, sb, ab, eb}:
       then(cmp_urgent(ua, ub), then(cmp(lb, la), then(cmp_dl(da, db), cmp(ia, ib))))
 
-# the aged wait in the order they waited
+# the aged run in the order they waited, then in the order they were admitted
 def aged_key(a: U, b: U) -> Ord:
   match a b:
     case U{ia, ca, ua, la, da, sa, aa, ea} U{ib, cb, ub, lb, db, sb, ab, eb}:
-      then(cmp(aa, ab), cmp(ia, ib))
+      then(cmp(aa, ab), cmp(ea, eb))
 
 # lands queue in admission order
 def land_key(a: U, b: U) -> Ord:
@@ -313,14 +329,14 @@ def land_key(a: U, b: U) -> Ord:
 
 def lt_in(aged: Bool, land: Bool, a: U, b: U) -> Bool:
   match aged land:
-    case g True{}:
-      is_lt(land_key(a, b))
-    case True{} False{}:
+    case True{} l:
       is_lt(aged_key(a, b))
+    case False{} True{}:
+      is_lt(land_key(a, b))
     case False{} False{}:
       is_lt(fresh_key(a, b))
 
-# (tier, then the tier's own key): tier, a coarse order, decides before the key does
+# (rank, then the rank's own key): the rank, a coarse order, decides before the key does
 def lt_tt(p: Nat, q: Nat, tie: Bool) -> Bool:
   match p q:
     case 0n 0n:
@@ -333,7 +349,7 @@ def lt_tt(p: Nat, q: Nat, tie: Bool) -> Bool:
       lt_tt(p1, q1, tie)
 
 def lt(+now: Nat, +bound: Nat, +a: U, +b: U) -> Bool:
-  lt_tt(tier(now, bound, a), tier(now, bound, b), lt_in(u_aged(now, bound, a), u_land(a), a, b))
+  lt_tt(rank(now, bound, a), rank(now, bound, b), lt_in(u_aged(now, bound, a), u_land(a), a, b))
 
 # --- places: one per lease class ------------------------------------------------
 
@@ -598,9 +614,9 @@ def lt_tt_case(+p: Nat, +q: Nat, +tie: Bool) -> LtCase(lt_tt(p, q, tie), p, q):
     case 1n+p1 1n+q1:
       lt_tt_case.s(lt_tt(p1, q1, tie), p1, q1, lt_tt_case(p1, q1, tie))
 
-# --- the first selectable unit has the least tier of all the selectable --------------------
+# --- the first selectable unit has the least rank of all the selectable --------------------
 
-# every unit of the queue that fits has a tier of at least k
+# every unit of the queue that fits has a rank of at least k
 def LowerC(b: Bool, +k: Nat, +n: Nat, R: Data) -> Data:
   match b:
     case True{}:
@@ -613,7 +629,7 @@ def Lower(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, +k: Nat) -> Data:
     case Nil{}:
       Unit
     case Con{+x, t}:
-      LowerC(fits(x, h), k, tier(now, bound, x), Lower(t, h, now, bound, k))
+      LowerC(fits(x, h), k, rank(now, bound, x), Lower(t, h, now, bound, k))
 
 # no unit of the queue fits
 def NoFreeC(b: Bool, R: Data) -> Data:
@@ -635,7 +651,7 @@ def PickOk(p: Pick, +q: +List<U>, +h: Hold, +now: Nat, +bound: Nat) -> Data:
     case PNone{}:
       NoFree(q, h)
     case PSome{+c}:
-      Sigma<&2, &2, IsT(fits(c, h)), u => Lower(q, h, now, bound, tier(now, bound, c))>
+      Sigma<&2, &2, IsT(fits(c, h)), u => Lower(q, h, now, bound, rank(now, bound, c))>
 
 def nofree_lower.c(b: Bool, +k: Nat, +n: Nat, -R1: Data, -R2: Data, nf: NoFreeC(b, R1), ih: R1 -> R2) -> LowerC(b, k, n, R2):
   match b:
@@ -649,7 +665,7 @@ def nofree_lower(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, +k: Nat, nf: No
     case Nil{}:
       Unit{}
     case Con{+x, t}:
-      nofree_lower.c(fits(x, h), k, tier(now, bound, x), NoFree(t, h), Lower(t, h, now, bound, k), nf, w => nofree_lower(t, h, now, bound, k, w))
+      nofree_lower.c(fits(x, h), k, rank(now, bound, x), NoFree(t, h), Lower(t, h, now, bound, k), nf, w => nofree_lower(t, h, now, bound, k, w))
 
 def lower_weaken.c(b: Bool, +k1: Nat, +k2: Nat, +n: Nat, -R1: Data, -R2: Data, le: LE(k1, k2), lw: LowerC(b, k2, n, R2), ih: R2 -> R1) -> LowerC(b, k1, n, R1):
   match b:
@@ -664,26 +680,26 @@ def lower_weaken(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, +k1: Nat, +k2: 
     case Nil{}:
       Unit{}
     case Con{+x, t}:
-      lower_weaken.c(fits(x, h), k1, k2, tier(now, bound, x), Lower(t, h, now, bound, k1), Lower(t, h, now, bound, k2), le, lw, w => lower_weaken(t, h, now, bound, k1, k2, le, w))
+      lower_weaken.c(fits(x, h), k1, k2, rank(now, bound, x), Lower(t, h, now, bound, k1), Lower(t, h, now, bound, k2), le, lw, w => lower_weaken(t, h, now, bound, k1, k2, le, w))
 
-def pick_ok.lt(b: Bool, +x: U, +y: U, +t: +List<U>, +h: Hold, +now: Nat, +bound: Nat, lc: LtCase(b, tier(now, bound, x), tier(now, bound, y)), fx: {fits(x, h) == True{} : Bool}, ih: PickOk(PSome{y}, t, h, now, bound)) -> PickOk(pick.lt(x, y, b), Con{x, t}, h, now, bound):
+def pick_ok.lt(b: Bool, +x: U, +y: U, +t: +List<U>, +h: Hold, +now: Nat, +bound: Nat, lc: LtCase(b, rank(now, bound, x), rank(now, bound, y)), fx: {fits(x, h) == True{} : Bool}, ih: PickOk(PSome{y}, t, h, now, bound)) -> PickOk(pick.lt(x, y, b), Con{x, t}, h, now, bound):
   match b:
     case True{}:
       (ihf, lw) = ih
-      %Equal.sym(Bool, fits(x, h), True{}, fx) : Sigma<&2, &2, IsT(_), u => LowerC(_, tier(now, bound, x), tier(now, bound, x), Lower(t, h, now, bound, tier(now, bound, x)))>
-      (Unit{}, (le_refl(tier(now, bound, x)), lower_weaken(t, h, now, bound, tier(now, bound, x), tier(now, bound, y), lc, lw)))
+      %Equal.sym(Bool, fits(x, h), True{}, fx) : Sigma<&2, &2, IsT(_), u => LowerC(_, rank(now, bound, x), rank(now, bound, x), Lower(t, h, now, bound, rank(now, bound, x)))>
+      (Unit{}, (le_refl(rank(now, bound, x)), lower_weaken(t, h, now, bound, rank(now, bound, x), rank(now, bound, y), lc, lw)))
     case False{}:
       (ihf, lw) = ih
-      %Equal.sym(Bool, fits(x, h), True{}, fx) : Sigma<&2, &2, IsT(fits(y, h)), u => LowerC(_, tier(now, bound, y), tier(now, bound, x), Lower(t, h, now, bound, tier(now, bound, y)))>
+      %Equal.sym(Bool, fits(x, h), True{}, fx) : Sigma<&2, &2, IsT(fits(y, h)), u => LowerC(_, rank(now, bound, y), rank(now, bound, x), Lower(t, h, now, bound, rank(now, bound, y)))>
       (ihf, (lc, lw))
 
 def pick_ok.y(+x: U, +r: Pick, +t: +List<U>, +h: Hold, +now: Nat, +bound: Nat, fx: {fits(x, h) == True{} : Bool}, ih: PickOk(r, t, h, now, bound)) -> PickOk(pick.y(now, bound, x, r), Con{x, t}, h, now, bound):
   match r:
     case PNone{}:
-      %Equal.sym(Bool, fits(x, h), True{}, fx) : Sigma<&2, &2, IsT(_), u => LowerC(_, tier(now, bound, x), tier(now, bound, x), Lower(t, h, now, bound, tier(now, bound, x)))>
-      (Unit{}, (le_refl(tier(now, bound, x)), nofree_lower(t, h, now, bound, tier(now, bound, x), ih)))
+      %Equal.sym(Bool, fits(x, h), True{}, fx) : Sigma<&2, &2, IsT(_), u => LowerC(_, rank(now, bound, x), rank(now, bound, x), Lower(t, h, now, bound, rank(now, bound, x)))>
+      (Unit{}, (le_refl(rank(now, bound, x)), nofree_lower(t, h, now, bound, rank(now, bound, x), ih)))
     case PSome{+y}:
-      pick_ok.lt(lt(now, bound, x, y), x, y, t, h, now, bound, lt_tt_case(tier(now, bound, x), tier(now, bound, y), lt_in(u_aged(now, bound, x), u_land(x), x, y)), fx, ih)
+      pick_ok.lt(lt(now, bound, x, y), x, y, t, h, now, bound, lt_tt_case(rank(now, bound, x), rank(now, bound, y), lt_in(u_aged(now, bound, x), u_land(x), x, y)), fx, ih)
 
 def pick_ok.x(b: Bool, +x: U, +r: Pick, +t: +List<U>, +h: Hold, +now: Nat, +bound: Nat, fx: {fits(x, h) == b : Bool}, ih: PickOk(r, t, h, now, bound)) -> PickOk(pick.x(now, bound, x, b, r), Con{x, t}, h, now, bound):
   match b:
@@ -695,7 +711,7 @@ def pick_ok.x(b: Bool, +x: U, +r: Pick, +t: +List<U>, +h: Hold, +now: Nat, +boun
           %Equal.sym(Bool, fits(x, h), False{}, fx) : NoFreeC(_, NoFree(t, h))
           ih
         case PSome{c}:
-          %Equal.sym(Bool, fits(x, h), False{}, fx) : Sigma<&2, &2, IsT(fits(c, h)), u => LowerC(_, tier(now, bound, c), tier(now, bound, x), Lower(t, h, now, bound, tier(now, bound, c)))>
+          %Equal.sym(Bool, fits(x, h), False{}, fx) : Sigma<&2, &2, IsT(fits(c, h)), u => LowerC(_, rank(now, bound, c), rank(now, bound, x), Lower(t, h, now, bound, rank(now, bound, c)))>
           ih
 
 def pick_ok(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat) -> PickOk(pick(q, h, now, bound), q, h, now, bound):
@@ -710,30 +726,25 @@ def pick_ok(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat) -> PickOk(pick(q, h,
 type Sel is Data:
   SAged{}
   SFreshGate{}
-  SAgedPlain{}
 
-# a unit's age, land and class decide its tier and its set
+# the set a unit is in: the aged, or the fresh Gate units
 def in_sel.b(k: Sel, ag: Bool, ld: Bool, gt: Bool) -> Bool:
   match k:
     case SAged{}:
       ag
     case SFreshGate{}:
       and(not(ag), gt)
-    case SAgedPlain{}:
-      and(ag, not(ld))
 
 def in_sel(k: Sel, +now: Nat, +bound: Nat, +u: U) -> Bool:
   in_sel.b(k, u_aged(now, bound, u), u_land(u), u_gate(u))
 
-# the greatest tier a unit of the set can have
-def top(k: Sel) -> Nat:
+# the greatest rank a unit of the set can have
+def top(k: Sel, +now: Nat) -> Nat:
   match k:
     case SAged{}:
-      2n
+      now
     case SFreshGate{}:
-      3n
-    case SAgedPlain{}:
-      2n
+      plus(2n, now)
 
 # some unit of the set fits its places
 def free_in(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, +k: Sel) -> Bool:
@@ -742,29 +753,6 @@ def free_in(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, +k: Sel) -> Bool:
       False{}
     case Con{+x, t}:
       or(and(in_sel(k, now, bound, x), fits(x, h)), free_in(t, h, now, bound, k))
-
-def sel_top(k: Sel, ag: Bool, ld: Bool, gt: Bool, m: IsT(in_sel.b(k, ag, ld, gt))) -> LE(tier.of(ag, ld, gt), top(k)):
-  match k ag ld gt:
-    case SAged{} True{} True{} g:
-      Unit{}
-    case SAged{} True{} False{} g:
-      Unit{}
-    case SAged{} False{} l g:
-      match m:
-    case SFreshGate{} False{} True{} True{}:
-      Unit{}
-    case SFreshGate{} False{} False{} True{}:
-      Unit{}
-    case SFreshGate{} False{} l False{}:
-      match m:
-    case SFreshGate{} True{} l g:
-      match m:
-    case SAgedPlain{} True{} False{} g:
-      Unit{}
-    case SAgedPlain{} True{} True{} g:
-      match m:
-    case SAgedPlain{} False{} l g:
-      match m:
 
 def IsF(b: Bool) -> Data:
   match b:
@@ -784,14 +772,102 @@ def lt_irrefl(+p: Nat, h: LE(1n+p, p)) -> Empty:
     case 1n+p1:
       lt_irrefl(p1, h)
 
-# the tier bound turns "no unit of the queue has a tier below n" into "no unit of the set fits"
-def lnf.c(b: Bool, s: Bool, +r: Bool, +tp: Nat, +n: Nat, +m: Nat, -R: Data, gt: LE(1n+tp, n), lw: LowerC(b, n, m, R), sb: IsT(s) -> LE(m, tp), ih: R -> {r == False{} : Bool}) -> {or(and(s, b), r) == False{} : Bool}:
+def and_true(+a: Bool, +b: Bool, pa: {a == True{} : Bool}, pb: {b == True{} : Bool}) -> {and(a, b) == True{} : Bool}:
+  match a:
+    case True{}:
+      pb
+    case False{}:
+      absurd({and(False{}, b) == True{} : Bool}, false_not_true(pa))
+
+def and_fst(a: Bool, b: Bool, m: IsT(and(a, b))) -> IsT(a):
+  match a:
+    case True{}:
+      Unit{}
+    case False{}:
+      match m:
+
+def and_snd(a: Bool, b: Bool, m: IsT(and(a, b))) -> IsT(b):
+  match a:
+    case True{}:
+      m
+    case False{}:
+      match m:
+
+# --- what the rank says ------------------------------------------------------------------------
+
+def le_succ(+n: Nat) -> LE(n, 1n+n):
+  match n:
+    case 0n:
+      Unit{}
+    case 1n+p:
+      le_succ(p)
+
+def le_succ2(+n: Nat) -> LE(n, plus(2n, n)):
+  le_trans(n, 1n+n, plus(2n, n), le_succ(n), le_succ(1n+n))
+
+def le_b_le(+a: Nat, +b: Nat, m: IsT(le_b(a, b))) -> LE(a, b):
+  match a b:
+    case 0n b0:
+      Unit{}
+    case 1n+a1 0n:
+      match m:
+    case 1n+a1 1n+b1:
+      le_b_le(a1, b1, m)
+
+def lt_b_le(+a: Nat, +b: Nat, m: IsT(lt_b(a, b))) -> LE(1n+a, b):
+  match a b:
+    case 0n 0n:
+      match m:
+    case 0n 1n+b1:
+      Unit{}
+    case 1n+a1 0n:
+      match m:
+    case 1n+a1 1n+b1:
+      lt_b_le(a1, b1, m)
+
+# an aged unit was admitted no later than now
+def aged_adm(+now: Nat, +bound: Nat, +u: U, m: IsT(u_aged(now, bound, u))) -> LE(adm_of(u), now):
+  match u:
+    case U{i, c, ur, lv, d, l, +a, e}:
+      le_b_le(a, now, and_fst(le_b(a, now), le_b(bound, monus(a, now)), m))
+
+# a fresh unit ranks past now
+def fresh_gt(ld: Bool, gt: Bool, +a: Nat, +now: Nat) -> LE(1n+now, rank.of(False{}, ld, gt, a, now)):
+  match ld gt:
+    case True{} g:
+      le_refl(now)
+    case False{} True{}:
+      le_succ(now)
+    case False{} False{}:
+      le_succ2(now)
+
+def sel_top.of(k: Sel, ag: Bool, ld: Bool, gt: Bool, +a: Nat, +now: Nat, m: IsT(in_sel.b(k, ag, ld, gt)), ha: IsT(ag) -> LE(a, now)) -> LE(rank.of(ag, ld, gt, a, now), top(k, now)):
+  match k ag ld gt:
+    case SAged{} True{} l g:
+      ha(Unit{})
+    case SAged{} False{} l g:
+      match m:
+    case SFreshGate{} False{} True{} True{}:
+      le_succ(now)
+    case SFreshGate{} False{} False{} True{}:
+      le_refl(plus(2n, now))
+    case SFreshGate{} False{} l False{}:
+      match m:
+    case SFreshGate{} True{} l g:
+      match m:
+
+# every unit of a set ranks no higher than the set's top
+def sel_top(+k: Sel, +now: Nat, +bound: Nat, +u: U, m: IsT(in_sel(k, now, bound, u))) -> LE(rank(now, bound, u), top(k, now)):
+  sel_top.of(k, u_aged(now, bound, u), u_land(u), u_gate(u), adm_of(u), now, m, h => aged_adm(now, bound, u, h))
+
+# a pick of rank above the top of a set leaves none of the set with its places free
+def lnf.c(b: Bool, s: Bool, +r: Bool, +n: Nat, +m: Nat, -R: Data, lw: LowerC(b, n, m, R), sb: IsT(s) -> LE(1n+m, n), ih: R -> {r == False{} : Bool}) -> {or(and(s, b), r) == False{} : Bool}:
   match b:
     case True{}:
       match s:
         case True{}:
           (lw0, lw1) = lw
-          absurd({or(and(True{}, True{}), r) == False{} : Bool}, lt_irrefl(tp, le_trans(1n+tp, n, tp, gt, le_trans(n, m, tp, lw0, sb(Unit{})))))
+          absurd({or(and(True{}, True{}), r) == False{} : Bool}, lt_irrefl(m, le_trans(1n+m, n, m, sb(Unit{}), lw0)))
         case False{}:
           (lw0, lw1) = lw
           ih(lw1)
@@ -802,12 +878,12 @@ def lnf.c(b: Bool, s: Bool, +r: Bool, +tp: Nat, +n: Nat, +m: Nat, -R: Data, gt: 
         case False{}:
           ih(lw)
 
-def lower_no_free(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, +k: Sel, +n: Nat, +gt: LE(1n+top(k), n), lw: Lower(q, h, now, bound, n)) -> {free_in(q, h, now, bound, k) == False{} : Bool}:
+def lower_no_free(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, +k: Sel, +n: Nat, +gt: LE(1n+top(k, now), n), lw: Lower(q, h, now, bound, n)) -> {free_in(q, h, now, bound, k) == False{} : Bool}:
   match q:
     case Nil{}:
       {==}
     case Con{+x, +t}:
-      lnf.c(fits(x, h), in_sel(k, now, bound, x), free_in(t, h, now, bound, k), top(k), n, tier(now, bound, x), Lower(t, h, now, bound, n), gt, lw, m => sel_top(k, u_aged(now, bound, x), u_land(x), u_gate(x), m), w => lower_no_free(t, h, now, bound, k, n, gt, w))
+      lnf.c(fits(x, h), in_sel(k, now, bound, x), free_in(t, h, now, bound, k), n, rank(now, bound, x), Lower(t, h, now, bound, n), lw, m => le_trans(1n+rank(now, bound, x), 1n+top(k, now), n, sel_top(k, now, bound, x, m), gt), w => lower_no_free(t, h, now, bound, k, n, gt, w))
 
 def nffi.c(b: Bool, s: Bool, +r: Bool, -R: Data, nf: NoFreeC(b, R), ih: R -> {r == False{} : Bool}) -> {or(and(s, b), r) == False{} : Bool}:
   match b:
@@ -820,6 +896,7 @@ def nffi.c(b: Bool, s: Bool, +r: Bool, -R: Data, nf: NoFreeC(b, R), ih: R -> {r 
         case False{}:
           ih(nf)
 
+# no unit fits at all: none of any set does
 def nofree_free_in(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, +k: Sel, nf: NoFree(q, h)) -> {free_in(q, h, now, bound, k) == False{} : Bool}:
   match q:
     case Nil{}:
@@ -827,59 +904,66 @@ def nofree_free_in(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, +k: Sel, nf: 
     case Con{+x, +t}:
       nffi.c(fits(x, h), in_sel(k, now, bound, x), free_in(t, h, now, bound, k), NoFree(t, h), nf, w => nofree_free_in(t, h, now, bound, k, w))
 
-def fit.c(b: Bool, s: Bool, +r: Bool, +tp: Nat, +n: Nat, +m: Nat, -R: Data, lw: LowerC(b, n, m, R), sb: IsT(s) -> LE(m, tp), ih: R -> ({r == True{} : Bool} -> LE(n, tp)), fi: {or(and(s, b), r) == True{} : Bool}) -> LE(n, tp):
-  match b:
-    case True{}:
-      match s:
-        case True{}:
-          (lw0, lw1) = lw
-          le_trans(n, m, tp, lw0, sb(Unit{}))
-        case False{}:
-          (lw0, lw1) = lw
-          ih(lw1)(fi)
-    case False{}:
-      match s:
-        case True{}:
-          ih(lw)(fi)
-        case False{}:
-          ih(lw)(fi)
+# --- aged units: no unit of the queue with its places free was admitted before the pick --------------
 
-def free_in_top(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, +k: Sel, +n: Nat, lw: Lower(q, h, now, bound, n), fi: {free_in(q, h, now, bound, k) == True{} : Bool}) -> LE(n, top(k)):
+# some unit of the queue waited the age bound, was admitted before `c`, and has its places free
+def older_fit(+q: +List<U>, +c: U, +h: Hold, +now: Nat, +bound: Nat) -> Bool:
   match q:
     case Nil{}:
-      absurd(LE(n, top(k)), false_not_true(fi))
+      False{}
+    case Con{+x, t}:
+      or(and(and(u_aged(now, bound, x), lt_b(adm_of(x), adm_of(c))), fits(x, h)), older_fit(t, c, h, now, bound))
+
+# an aged unit ranks below a unit admitted after it, aged or fresh
+def older_below.of(ag: Bool, +ld: Bool, +gt: Bool, +ac: Nat, +ax: Nat, +now: Nat, hx: LE(ax, now), lx: LE(1n+ax, ac)) -> LE(1n+ax, rank.of(ag, ld, gt, ac, now)):
+  match ag:
+    case True{}:
+      lx
+    case False{}:
+      le_trans(1n+ax, 1n+now, rank.of(False{}, ld, gt, ac, now), hx, fresh_gt(ld, gt, ac, now))
+
+def older_below.x(agx: Bool, ldx: Bool, gtx: Bool, ag: Bool, +ld: Bool, +gt: Bool, +ac: Nat, +ax: Nat, +now: Nat, hx: LE(ax, now), lx: LE(1n+ax, ac), mx: IsT(agx)) -> LE(1n+rank.of(agx, ldx, gtx, ax, now), rank.of(ag, ld, gt, ac, now)):
+  match agx:
+    case True{}:
+      older_below.of(ag, ld, gt, ac, ax, now, hx, lx)
+    case False{}:
+      match mx:
+
+def older_below(+now: Nat, +bound: Nat, +c: U, +x: U, +m: IsT(and(u_aged(now, bound, x), lt_b(adm_of(x), adm_of(c))))) -> LE(1n+rank(now, bound, x), rank(now, bound, c)):
+  older_below.x(u_aged(now, bound, x), u_land(x), u_gate(x), u_aged(now, bound, c), u_land(c), u_gate(c), adm_of(c), adm_of(x), now, aged_adm(now, bound, x, and_fst(u_aged(now, bound, x), lt_b(adm_of(x), adm_of(c)), m)), lt_b_le(adm_of(x), adm_of(c), and_snd(u_aged(now, bound, x), lt_b(adm_of(x), adm_of(c)), m)), and_fst(u_aged(now, bound, x), lt_b(adm_of(x), adm_of(c)), m))
+
+# the pick has no aged unit admitted before it with its places free
+def lower_no_older(+q: +List<U>, +c: U, +h: Hold, +now: Nat, +bound: Nat, lw: Lower(q, h, now, bound, rank(now, bound, c))) -> {older_fit(q, c, h, now, bound) == False{} : Bool}:
+  match q:
+    case Nil{}:
+      {==}
     case Con{+x, +t}:
-      fit.c(fits(x, h), in_sel(k, now, bound, x), free_in(t, h, now, bound, k), top(k), n, tier(now, bound, x), Lower(t, h, now, bound, n), lw, m => sel_top(k, u_aged(now, bound, x), u_land(x), u_gate(x), m), w => (v => free_in_top(t, h, now, bound, k, n, w, v)), fi)
+      lnf.c(fits(x, h), and(u_aged(now, bound, x), lt_b(adm_of(x), adm_of(c))), older_fit(t, c, h, now, bound), rank(now, bound, c), rank(now, bound, x), Lower(t, h, now, bound, rank(now, bound, c)), lw, m => older_below(now, bound, c, x, m), w => lower_no_older(t, c, h, now, bound, w))
 
 # --- the laws as checks a driver evaluates on the code's own state ---------------------------
 
-# aged first: a fresh non-land pick means no aged unit fits its places
-def af.f(ag: Bool, ld: Bool, fr: Bool) -> Bool:
-  or(or(ag, ld), not(fr))
+# aged first: the pick, when it is fresh, leaves no aged unit with its places free
+def af.f(ag: Bool, fr: Bool) -> Bool:
+  or(ag, not(fr))
 
 def af.p(p: Pick, +q: +List<U>, +h: Hold, +now: Nat, +bound: Nat) -> Bool:
   match p:
     case PNone{}:
       True{}
     case PSome{+f}:
-      af.f(u_aged(now, bound, f), u_land(f), free_in(q, h, now, bound, SAged{}))
+      af.f(u_aged(now, bound, f), free_in(q, h, now, bound, SAged{}))
 
 def aged_first_b(s: St) -> Bool:
   match s:
     case St{+q, sel, +hold, +now, +bound, next, last}:
       af.p(pick(q, hold, now, bound), q, hold, now, bound)
 
-def af.ok(ag: Bool, ld: Bool, gt: Bool, +fr: Bool, nf: LE(3n, tier.of(ag, ld, gt)) -> {fr == False{} : Bool}) -> {af.f(ag, ld, fr) == True{} : Bool}:
-  match ag ld gt:
-    case True{} l g:
+def af.ok(ag: Bool, ld: Bool, gt: Bool, +a: Nat, +now: Nat, +fr: Bool, nf: LE(1n+now, rank.of(ag, ld, gt, a, now)) -> {fr == False{} : Bool}) -> {af.f(ag, fr) == True{} : Bool}:
+  match ag:
+    case True{}:
       {==}
-    case False{} True{} g:
-      {==}
-    case False{} False{} True{}:
-      %Equal.sym(Bool, fr, False{}, nf(le_refl(3n))) : {af.f(False{}, False{}, _) == True{} : Bool}
-      {==}
-    case False{} False{} False{}:
-      %Equal.sym(Bool, fr, False{}, nf(Unit{})) : {af.f(False{}, False{}, _) == True{} : Bool}
+    case False{}:
+      %Equal.sym(Bool, fr, False{}, nf(fresh_gt(ld, gt, a, now))) : {af.f(False{}, _) == True{} : Bool}
       {==}
 
 def af_ok(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, p: Pick, po: PickOk(p, q, h, now, bound)) -> {af.p(p, q, h, now, bound) == True{} : Bool}:
@@ -888,9 +972,10 @@ def af_ok(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, p: Pick, po: PickOk(p,
       {==}
     case PSome{+f}:
       (pf, lw) = po
-      af.ok(u_aged(now, bound, f), u_land(f), u_gate(f), free_in(q, h, now, bound, SAged{}), w => lower_no_free(q, h, now, bound, SAged{}, tier(now, bound, f), w, lw))
+      af.ok(u_aged(now, bound, f), u_land(f), u_gate(f), adm_of(f), now, free_in(q, h, now, bound, SAged{}), w => lower_no_free(q, h, now, bound, SAged{}, rank(now, bound, f), w, lw))
 
-# gate priority among the non-aged: a fresh non-land non-Gate pick means no non-aged Gate unit fits
+# gate first: the pick, when it is neither aged nor a land, is a Gate unit or leaves no fresh
+# Gate unit with its places free
 def gf.f(ag: Bool, ld: Bool, gt: Bool, fr: Bool) -> Bool:
   or(or(ag, ld), or(gt, not(fr)))
 
@@ -906,7 +991,7 @@ def gate_first_b(s: St) -> Bool:
     case St{+q, sel, +hold, +now, +bound, next, last}:
       gf.p(pick(q, hold, now, bound), q, hold, now, bound)
 
-def gf.ok(ag: Bool, ld: Bool, gt: Bool, +fr: Bool, nf: LE(4n, tier.of(ag, ld, gt)) -> {fr == False{} : Bool}) -> {gf.f(ag, ld, gt, fr) == True{} : Bool}:
+def gf.ok(ag: Bool, ld: Bool, gt: Bool, +a: Nat, +now: Nat, +fr: Bool, nf: LE(1n+plus(2n, now), rank.of(ag, ld, gt, a, now)) -> {fr == False{} : Bool}) -> {gf.f(ag, ld, gt, fr) == True{} : Bool}:
   match ag ld gt:
     case True{} l g:
       {==}
@@ -915,7 +1000,7 @@ def gf.ok(ag: Bool, ld: Bool, gt: Bool, +fr: Bool, nf: LE(4n, tier.of(ag, ld, gt
     case False{} False{} True{}:
       {==}
     case False{} False{} False{}:
-      %Equal.sym(Bool, fr, False{}, nf(le_refl(4n))) : {gf.f(False{}, False{}, False{}, _) == True{} : Bool}
+      %Equal.sym(Bool, fr, False{}, nf(le_refl(now))) : {gf.f(False{}, False{}, False{}, _) == True{} : Bool}
       {==}
 
 def gf_ok(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, p: Pick, po: PickOk(p, q, h, now, bound)) -> {gf.p(p, q, h, now, bound) == True{} : Bool}:
@@ -924,47 +1009,7 @@ def gf_ok(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, p: Pick, po: PickOk(p,
       {==}
     case PSome{+f}:
       (pf, lw) = po
-      gf.ok(u_aged(now, bound, f), u_land(f), u_gate(f), free_in(q, h, now, bound, SFreshGate{}), w => lower_no_free(q, h, now, bound, SFreshGate{}, tier(now, bound, f), w, lw))
-
-# no starvation: a selectable aged non-land unit means a grant, and it goes to an aged unit or a land
-def ns.f(fr: Bool, ag: Bool, ld: Bool) -> Bool:
-  or(not(fr), or(ag, ld))
-
-def ns.p(p: Pick, fr: Bool, +now: Nat, +bound: Nat) -> Bool:
-  match p:
-    case PNone{}:
-      not(fr)
-    case PSome{+f}:
-      ns.f(fr, u_aged(now, bound, f), u_land(f))
-
-def next_fair_b(s: St) -> Bool:
-  match s:
-    case St{+q, sel, +hold, +now, +bound, next, last}:
-      ns.p(pick(q, hold, now, bound), free_in(q, hold, now, bound, SAgedPlain{}), now, bound)
-
-def ns.ok(+fr: Bool, ag: Bool, ld: Bool, gt: Bool, bd: {fr == True{} : Bool} -> LE(tier.of(ag, ld, gt), 2n)) -> {ns.f(fr, ag, ld) == True{} : Bool}:
-  match fr:
-    case False{}:
-      {==}
-    case True{}:
-      match ag ld gt:
-        case True{} l g:
-          {==}
-        case False{} True{} g:
-          {==}
-        case False{} False{} True{}:
-          absurd({ns.f(True{}, False{}, False{}) == True{} : Bool}, bd({==}))
-        case False{} False{} False{}:
-          absurd({ns.f(True{}, False{}, False{}) == True{} : Bool}, bd({==}))
-
-def ns_ok(+q: +List<U>, +h: Hold, +now: Nat, +bound: Nat, p: Pick, po: PickOk(p, q, h, now, bound)) -> {ns.p(p, free_in(q, h, now, bound, SAgedPlain{}), now, bound) == True{} : Bool}:
-  match p:
-    case PNone{}:
-      %Equal.sym(Bool, free_in(q, h, now, bound, SAgedPlain{}), False{}, nofree_free_in(q, h, now, bound, SAgedPlain{}, po)) : {not(_) == True{} : Bool}
-      {==}
-    case PSome{+f}:
-      (pf, lw) = po
-      ns.ok(free_in(q, h, now, bound, SAgedPlain{}), u_aged(now, bound, f), u_land(f), u_gate(f), v => free_in_top(q, h, now, bound, SAgedPlain{}, tier(now, bound, f), lw, v))
+      gf.ok(u_aged(now, bound, f), u_land(f), u_gate(f), adm_of(f), now, free_in(q, h, now, bound, SFreshGate{}), w => lower_no_free(q, h, now, bound, SFreshGate{}, rank(now, bound, f), w, lw))
 
 def aged_first_at(+s: St) -> {aged_first_b(s) == True{} : Bool}:
   match s:
@@ -975,6 +1020,56 @@ def gate_first_at(+s: St) -> {gate_first_b(s) == True{} : Bool}:
   match s:
     case St{+q, sel, +hold, +now, +bound, next, last}:
       gf_ok(q, hold, now, bound, pick(q, hold, now, bound), pick_ok(q, hold, now, bound))
+
+# lands behind older aged waiters: the ready order takes the first unit of the queue, drops it, and
+# takes the first of the rest; at every take a land is taken only when no aged unit admitted
+# before it is left (05_gateway.md: lands queue behind older aged waiters)
+def lb.step(+q: +List<U>, +c: U, +now: Nat, +bound: Nat) -> Bool:
+  not(and(u_land(c), older_fit(q, c, nothing(), now, bound)))
+
+def lb.ord(fuel: Nat, +q: +List<U>, +now: Nat, +bound: Nat, p: Pick) -> Bool:
+  match fuel:
+    case 0n:
+      True{}
+    case 1n+f:
+      match p:
+        case PNone{}:
+          True{}
+        case PSome{+u}:
+          and(lb.step(q, u, now, bound), lb.ord(f, drop_id(id_of(u), q), now, bound, pick(drop_id(id_of(u), q), nothing(), now, bound)))
+
+def lands_behind_b(+s: St) -> Bool:
+  match s:
+    case St{+q, sel, hold, +now, +bound, next, last}:
+      lb.ord(len(q), q, now, bound, pick(q, nothing(), now, bound))
+
+def not_and_false(+a: Bool) -> {not(and(a, False{})) == True{} : Bool}:
+  match a:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+def lb_step_ok(+q: +List<U>, +c: U, +now: Nat, +bound: Nat, lw: Lower(q, nothing(), now, bound, rank(now, bound, c))) -> {lb.step(q, c, now, bound) == True{} : Bool}:
+  %Equal.sym(Bool, older_fit(q, c, nothing(), now, bound), False{}, lower_no_older(q, c, nothing(), now, bound, lw)) : {not(and(u_land(c), _)) == True{} : Bool}
+  not_and_false(u_land(c))
+
+def lb_ok(+fuel: Nat, +q: +List<U>, +now: Nat, +bound: Nat, p: Pick, po: PickOk(p, q, nothing(), now, bound)) -> {lb.ord(fuel, q, now, bound, p) == True{} : Bool}:
+  match fuel:
+    case 0n:
+      {==}
+    case 1n+f:
+      match p:
+        case PNone{}:
+          {==}
+        case PSome{+u}:
+          (pf, lw) = po
+          and_true(lb.step(q, u, now, bound), lb.ord(f, drop_id(id_of(u), q), now, bound, pick(drop_id(id_of(u), q), nothing(), now, bound)), lb_step_ok(q, u, now, bound, lw), lb_ok(f, drop_id(id_of(u), q), now, bound, pick(drop_id(id_of(u), q), nothing(), now, bound), pick_ok(drop_id(id_of(u), q), nothing(), now, bound)))
+
+def lands_behind_at(+s: St) -> {lands_behind_b(s) == True{} : Bool}:
+  match s:
+    case St{+q, sel, hold, +now, +bound, next, last}:
+      lb_ok(len(q), q, now, bound, pick(q, nothing(), now, bound), pick_ok(q, nothing(), now, bound))
 
 # --- lease exclusion: at most one holder per lease class ----------------------------------------
 
@@ -1025,20 +1120,6 @@ def short_remove(+x: Nat, h: +List<Nat>, sh: Short(h)) -> Short(remove(x, h)):
           short_remove.if(y, same(x, y))
         case Con{a, b}:
           match sh:
-
-def and_fst(a: Bool, b: Bool, m: IsT(and(a, b))) -> IsT(a):
-  match a:
-    case True{}:
-      Unit{}
-    case False{}:
-      match m:
-
-def and_snd(a: Bool, b: Bool, m: IsT(and(a, b))) -> IsT(b):
-  match a:
-    case True{}:
-      m
-    case False{}:
-      match m:
 
 def short_grant(flag: Bool, +x: Nat, h: +List<Nat>, sh: Short(h), fr: IsT(free1(flag, h))) -> Short(grant1(flag, x, h)):
   match flag:
@@ -1164,7 +1245,6 @@ def holds_refl(s: St, i: Inv(s)) -> {holds_ok_b(s) == True{} : Bool}:
       %Equal.sym(Bool, short_b(hi), True{}, short_refl(hi, s2)) : {and(_, short_b(hl)) == True{} : Bool}
       %Equal.sym(Bool, short_b(hl), True{}, short_refl(hl, s3)) : {_ == True{} : Bool}
       {==}
-
 # --- the pass is a sequence of picks: no starvation ---------------------------------------------
 
 def now_of(s: St) -> Nat:
@@ -1180,7 +1260,7 @@ def bound_of(s: St) -> Nat:
 def sf.step(+s: St, +u: U) -> Bool:
   match s:
     case St{+q, sel, +hold, +now, +bound, next, last}:
-      ns.f(free_in(q, hold, now, bound, SAgedPlain{}), u_aged(now, bound, u), u_land(u))
+      af.f(u_aged(now, bound, u), free_in(q, hold, now, bound, SAged{}))
 
 # a pass takes its picks one after another from the state the last one left, `select`'s own
 # recursion; the check holds at every one of them
@@ -1198,18 +1278,11 @@ def sf.sel(fuel: Nat, +s: St, p: Pick) -> Bool:
 def no_starve_b(+s: St) -> Bool:
   sf.sel(len_st(s), s, pick_st(s))
 
-def and_true(+a: Bool, +b: Bool, pa: {a == True{} : Bool}, pb: {b == True{} : Bool}) -> {and(a, b) == True{} : Bool}:
-  match a:
-    case True{}:
-      pb
-    case False{}:
-      absurd({and(False{}, b) == True{} : Bool}, false_not_true(pa))
-
 def step_ok(+s: St, +u: U, po: PickOkSt(PSome{u}, s)) -> {sf.step(s, u) == True{} : Bool}:
   match s:
     case St{+q, sel, +hold, +now, +bound, next, last}:
       (pf, lw) = po
-      ns.ok(free_in(q, hold, now, bound, SAgedPlain{}), u_aged(now, bound, u), u_land(u), u_gate(u), v => free_in_top(q, hold, now, bound, SAgedPlain{}, tier(now, bound, u), lw, v))
+      af.ok(u_aged(now, bound, u), u_land(u), u_gate(u), adm_of(u), now, free_in(q, hold, now, bound, SAged{}), w => lower_no_free(q, hold, now, bound, SAged{}, rank(now, bound, u), w, lw))
 
 def sf_ok(+fuel: Nat, +s: St, p: Pick, po: PickOkSt(p, s)) -> {sf.sel(fuel, s, p) == True{} : Bool}:
   match fuel:
@@ -1380,12 +1453,12 @@ type Wire is Data:
   WOmit{}
   WClass{cls: Cls}
 
-# the class a request is admitted with: an omitted class takes `dflt`, which the code
-# makes TaskClass::default(); a class the request names is kept
-def wire_class(dflt: Cls, w: Wire) -> Cls:
+# the class a request is admitted with: a class it names is kept, an omitted one is background,
+# TaskClass::default()
+def wire_class(w: Wire) -> Cls:
   match w:
     case WOmit{}:
-      dflt
+      CBack{}
     case WClass{c}:
       c
 
@@ -1397,39 +1470,6 @@ def spec_class(w: Wire) -> Cls:
     case WClass{c}:
       c
 
-# --- the order as the spec states it for lands (05_gateway.md "The task server schedules work units") ---
-
-# the units in the order the schedule would grant them with every place free
-def ready_units(+s: St) -> +List<U>:
-  match s:
-    case St{+q, sel, hold, +now, +bound, next, last}:
-      order(len(q), q, now, bound, pick(q, nothing(), now, bound))
-
-def adm_of(u: U) -> Nat:
-  match u:
-    case U{i, c, ur, lv, d, l, a, e}:
-      a
-
-# some unit of `ys` waited the age bound and was admitted before `x`
-def older_aged(+x: U, +now: Nat, +bound: Nat, ys: +List<U>) -> Bool:
-  match ys:
-    case Nil{}:
-      False{}
-    case Con{+y, t}:
-      or(and(u_aged(now, bound, y), lt_b(adm_of(y), adm_of(x))), older_aged(x, now, bound, t))
-
-# no land is ordered ahead of an aged unit older than it (05:2060-2061, 2063: lands queue behind
-# older aged waiters; the aged wait in the order they waited)
-def lands_behind.go(+ys: +List<U>, +now: Nat, +bound: Nat) -> Bool:
-  match ys:
-    case Nil{}:
-      True{}
-    case Con{+x, +t}:
-      and(not(and(u_land(x), older_aged(x, now, bound, t))), lands_behind.go(t, now, bound))
-
-def lands_behind_b(+s: St) -> Bool:
-  lands_behind.go(ready_units(s), now_of(s), bound_of(s))
-
 # --- the laws -------------------------------------------------------------------------------------------
 
 # (a) One place per lease class: after any inputs no lease class has more than one holder.
@@ -1438,27 +1478,35 @@ law lease_exclusion:
   for +b: Nat
   {holds_ok_b(run(os, empty(b))) == True{} : Bool}
 
-# (b) Aged first: the unit the next selection takes, when it is fresh and no land, leaves no aged
-# unit with its places free. (A fresh land goes first: 05:2060-2061 says it queues behind older aged
-# waiters, and order_cmp ranks it ahead of them, the open law lands_behind_older_aged.)
+# (b) Aged first: the unit the next selection takes, when it is fresh, leaves no aged unit with
+# its places free.
 law aged_first:
   for +os: +List<Op>
   for +b: Nat
   {aged_first_b(run(os, empty(b))) == True{} : Bool}
 
-# (c) Class order among the fresh: the unit the next selection takes, when it is no aged unit and
-# no land, is a Gate unit whenever a non-aged Gate unit has its places free.
+# (c) Class order among the fresh: the unit the next selection takes, when it is neither aged nor
+# a land, is a Gate unit whenever a non-aged Gate unit has its places free. A fresh land goes
+# ahead of the class order: lands queue in admission order whatever their class.
 law gate_first:
   for +os: +List<Op>
   for +b: Nat
   {gate_first_b(run(os, empty(b))) == True{} : Bool}
 
-# (d) No starvation: in every pass, each grant made while an aged non-land unit has its places free
-# goes to an aged unit or a land, never to a fresh unit.
+# (d) No starvation: in every pass, each grant made while an aged unit has its places free goes
+# to an aged unit, never to a fresh one.
 law no_starve:
   for +os: +List<Op>
   for +b: Nat
   {no_starve_b(run(os, empty(b))) == True{} : Bool}
+
+# Lands queue behind older aged waiters (05_gateway.md "The task server schedules work units"):
+# taking the ready order's units one after another, a land is taken only when no aged unit
+# admitted before it is left. The aged run in the order they waited, a land among them.
+law lands_behind_older_aged:
+  for +os: +List<Op>
+  for +b: Nat
+  {lands_behind_b(run(os, empty(b))) == True{} : Bool}
 
 # Definedness: a pass grants a unit whose places are free, so (a)-(d) are not vacuous...
 law grants_when_free:
@@ -1473,16 +1521,15 @@ law done_frees:
   for +i: Nat
   {held(i, hold_of(done(i, run(os, empty(b))))) == False{} : Bool}
 
-# A class the request names is kept; the spec's default is background (the code's is the open law
-# omitted_class_is_background in task_server_open.bend).
-law named_class_is_kept:
-  for d: Cls
-  for +c: Cls
-  {wire_class(d, WClass{c}) == c : Cls}
-
-law repaired_default_is_background:
+# A request that omits its class is admitted as background (05_gateway.md "Classes"), and one
+# that names a class keeps it.
+law omitted_class_is_background:
   for +w: Wire
-  {wire_class(CBack{}, w) == spec_class(w) : Cls}
+  {wire_class(w) == spec_class(w) : Cls}
+
+law named_class_is_kept:
+  for +c: Cls
+  {wire_class(WClass{c}) == c : Cls}
 
 def lease_exclusion(os, b):
   holds_refl(run(os, empty(b)), inv_run(os, empty(b), inv_empty(b)))
@@ -1496,6 +1543,9 @@ def gate_first(os, b):
 def no_starve(os, b):
   no_starve_ok(run(os, empty(b)))
 
+def lands_behind_older_aged(os, b):
+  lands_behind_at(run(os, empty(b)))
+
 def grants_when_free(os, b):
   grants_ok(run(os, empty(b)))
 
@@ -1508,12 +1558,12 @@ def done_frees(os, b, i):
   %Equal.sym(Hold, hold_of(done(i, run(os, empty(b)))), release(i, hold_of(run(os, empty(b)))), done_hold(i, run(os, empty(b)))) : {held(i, _) == False{} : Bool}
   done_frees_at(i, hold_of(run(os, empty(b))))
 
-def named_class_is_kept(d, c):
-  {==}
-
-def repaired_default_is_background(w):
+def omitted_class_is_background(w):
   match w:
     case WOmit{}:
       {==}
     case WClass{c}:
       {==}
+
+def named_class_is_kept(c):
+  {==}
