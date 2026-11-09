@@ -5,20 +5,39 @@ import { join } from 'node:path';
 import typia from 'typia';
 import { ownedSocketDirectory } from '../testing.js';
 
-/** A line a client writes to `mbx reservations` (mbx's docs/scheduling.md, "Serve reservations to many commands"). */
+/**
+ * A line a client writes to `mbx reservations` (mbx's docs/scheduling.md, "Serve reservations to many commands"):
+ * exactly these fields, as the host's installed mbx accepts them.
+ */
 type HeardLine =
-  | { type: 'reserve'; id: number; cpus: number; priority: 'normal' | 'low'; name?: string }
+  | { type: 'reserve'; id: number; cpus: number; priority: 'normal' | 'low' }
   | { type: 'release'; id: number };
 
-const parseLine = typia.json.createAssertParse<HeardLine>();
+const validLine = typia.createValidateEquals<HeardLine>();
+
+/** `raw` as a line mbx accepts, or why mbx refuses it: an unknown field is refused as mbx's serde refuses it. */
+function heardLine(raw: string): HeardLine | { readonly refused: string } {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    return { refused: `not a reservation request: ${String(error)}` };
+  }
+  const valid = validLine(value);
+  return valid.success
+    ? valid.data
+    : {
+        refused: `not a reservation request: ${valid.errors
+          .map((error) => `${error.path} must be ${error.expected}`)
+          .join('; ')}`,
+      };
+}
 
 /** One `reserve` line the stand-in heard, and the connection it came on, counted from one. */
 export interface HeardReserve {
   readonly id: number;
   readonly cpus: number;
   readonly priority: 'normal' | 'low';
-  /** The class the reserve names, which keys mbx's run-time predictions; null for a reserve that names none. */
-  readonly name: string | null;
   readonly connection: number;
 }
 
@@ -65,14 +84,19 @@ export async function standInReservations(
     client.on('data', (text: string) => {
       unread += text;
       for (let end = unread.indexOf('\n'); end !== -1; end = unread.indexOf('\n')) {
-        const line = parseLine(unread.slice(0, end));
+        const line = heardLine(unread.slice(0, end));
         unread = unread.slice(end + 1);
+        if ('refused' in line) {
+          // mbx answers a line it does not accept with an error and ends the connection.
+          client.end(`${JSON.stringify({ type: 'error', error: line.refused })}\n`);
+          return;
+        }
         if (line.type === 'release') {
           releases.push(line.id);
           for (const wait of waiting.filter((wait) => releases.length >= wait.count)) wait.heard();
           continue;
         }
-        const heard = { id: line.id, cpus: line.cpus, priority: line.priority, name: line.name ?? null, connection };
+        const heard = { id: line.id, cpus: line.cpus, priority: line.priority, connection };
         reserves.push(heard);
         const said = answer(heard);
         if (said === null) continue;

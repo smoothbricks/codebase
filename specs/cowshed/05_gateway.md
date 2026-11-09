@@ -1769,19 +1769,19 @@ host's load.
   holders"): normal priority before low ("Classes": a gate's hold `normal`, every other `low`); within a priority, a
   request that has waited 30 s goes first, oldest first, and holds back the requests behind it while it cannot start;
   every other request goes in order of its predicted run time, shortest first, then by ticket. The prediction is the
-  median of its class's last recorded run times (a compile's crate and mode, a test's binary and name, a hold's or Nx
-  leaf's class); a class with none takes its kind's median. It starts a waiting hold on whatever cores are free, at
-  least one, rather than holding it until all `g` are. The owner's ruling, 2026-11-09: "make the scheduling as optimal
-  as you can prove it", keeping work moving and the first asker unpunished. Measured on the gate window of 2026-11-09
-  17:55-18:49 (the recorded observations replayed through the admission model): against arrival order, shortest
-  predicted first cut the gate's span 30 to 86% and low work's mean completion 35 to 62%, and finished the oldest
-  quarter of low requests 18 to 41% sooner, in 22 of 24 configurations; growing a grant toward its want made low work 3
-  to 6 times slower, and lower niceness for low work changed no gate span, since the gate's threads already win their
-  cores. Each supervisor keeps its own held jobs in request order, one lane per pool priority, and lets one hold per
-  lane wait in the pool at a time; the next enters when that one is granted, refused or withdrawn. A checkout that
-  submits twenty jobs holds one place in the queue, so checkouts take turns, and a gate never waits behind its own
-  checkout's background job. An admitted hold is never preempted, and its count never grows: a job granted fewer cores
-  than it asked runs on those to its end.
+  median of its class's last recorded run times (a compile's crate and mode, a test's binary and name, a held job's
+  class); a class with none takes its kind's median. It starts a waiting hold on whatever cores are free, at least one,
+  rather than holding it until all `g` are. The owner's ruling, 2026-11-09: "make the scheduling as optimal as you can
+  prove it", keeping work moving and the first asker unpunished. Measured on the gate window of 2026-11-09 17:55-18:49
+  (the recorded observations replayed through the admission model): against arrival order, shortest predicted first cut
+  the gate's span 30 to 86% and low work's mean completion 35 to 62%, and finished the oldest quarter of low requests 18
+  to 41% sooner, in 22 of 24 configurations; growing a grant toward its want made low work 3 to 6 times slower, and
+  lower niceness for low work changed no gate span, since the gate's threads already win their cores. Each supervisor
+  keeps its own held jobs in request order, one lane per pool priority, and lets one hold per lane wait in the pool at a
+  time; the next enters when that one is granted, refused or withdrawn. A checkout that submits twenty jobs holds one
+  place in the queue, so checkouts take turns, and a gate never waits behind its own checkout's background job. An
+  admitted hold is never preempted, and its count never grows: a job granted fewer cores than it asked runs on those to
+  its end.
 
 - **The fence is admission.** A gate's priority in the pool replaces the fence. A gate, the land gate and a train's
   proof alike, is never held ("Declaration"): its leaves are admitted at `normal` ("A land is a gate job") and pass
@@ -1833,13 +1833,13 @@ its PATH name, the canonical mbx environment's, which leads with the installed m
 owned directory of the job's socket namespace, waits up to the control-plane bound for its `listening` line, and
 publishes the socket in `MBX_RESERVATIONS_SOCKET`, which every task inherits. Its `postTasksExecution` closes the
 endpoint's standard input, which ends it with every grant it still serves. Each task's `bounded-exec` opens one
-connection to it per process and asks on it for each reserved leaf,
-`{"type":"reserve","id":n,"cpus":c,"priority":p,"name":"nx:<workspace>:<task>"}`, the class mbx predicts its run time by
-("Held jobs", Order), `<workspace>` being the root `package.json` name and `<task>` Nx's task id; the answer is the
-cores granted, and the leaf's end releases them (`{"type":"release","id":n}`) once its subtree is retired (11_shell.md,
-"Job admission and class placement"). A connection that closes, its executor dead, releases everything it held and
-withdraws what still waits. The leaf's shell asks its executor on descriptor 5, one line naming its count (`c`, at most
-`g`, the units below), says `cowshed: mbx reserve wait start cpus=<c> priority=<p>`, reads back the cores granted,
+connection to it per process and asks on it for each reserved leaf, `{"type":"reserve","id":n,"cpus":c,"priority":p}`;
+the answer is the cores granted, and the leaf's end releases them (`{"type":"release","id":n}`) once its subtree is
+retired (11_shell.md, "Job admission and class placement"). A request carries only the fields the host's installed mbx
+accepts, since the endpoint is the host's mbx ("Pool selection and revision"): a field a newer mbx adds enters the
+plugin's requests once that mbx is the host's. A connection that closes, its executor dead, releases everything it held
+and withdraws what still waits. The leaf's shell asks its executor on descriptor 5, one line naming its count (`c`, at
+most `g`, the units below), says `cowshed: mbx reserve wait start cpus=<c> priority=<p>`, reads back the cores granted,
 closes the descriptor, and runs its command in the same shell with `MBX_RESERVE_CPUS` set to that count,
 `MBX_SCHED_DISABLE=1` and an empty `MBX_SCHED_DIR`, what `mbx reserve` gives its own command, so no process starts for
 the reservation. A refusal ends the descriptor unanswered and fails the leaf, naming mbx's error. A run whose endpoint

@@ -13,10 +13,10 @@ import {
 } from './mbx-reservations.js';
 
 describe("a leaf's reservation on its run's mbx endpoint", () => {
-  it('asks for many reservations over one connection, each granted its cores under the class it names or none, and releases each once', async () => {
+  it('asks for many reservations over one connection, each granted its cores, and releases each once', async () => {
     const endpoint = await standInReservations((heard) => Math.min(heard.cpus, 4));
     try {
-      const wide = reserveCores(endpoint.socket, 6, 'low', 'nx:@acme/widgets:app:test');
+      const wide = reserveCores(endpoint.socket, 6, 'low');
       const narrow = reserveCores(endpoint.socket, 2, 'normal');
       expect(await wide.granted).toMatchObject({ ok: true, cpus: 4 });
       expect(await narrow.granted).toMatchObject({ ok: true, cpus: 2 });
@@ -26,9 +26,9 @@ describe("a leaf's reservation on its run's mbx endpoint", () => {
       await endpoint.released(2);
 
       expect(endpoint.connections()).toBe(1);
-      expect(endpoint.reserves.map(({ cpus, priority, name }) => ({ cpus, priority, name }))).toEqual([
-        { cpus: 6, priority: 'low', name: 'nx:@acme/widgets:app:test' },
-        { cpus: 2, priority: 'normal', name: null },
+      expect(endpoint.reserves.map(({ cpus, priority }) => ({ cpus, priority }))).toEqual([
+        { cpus: 6, priority: 'low' },
+        { cpus: 2, priority: 'normal' },
       ]);
       expect(endpoint.releases).toEqual(endpoint.reserves.map(({ id }) => id));
     } finally {
