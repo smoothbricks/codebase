@@ -256,6 +256,55 @@ fn derived_predicate_gates_the_upsert_and_unmatched_rows_stay_zero() {
     assert_eq!(map_value(&state, 4), Some(101));
 }
 
+/// A program's expressions are parsed and admitted once, when its plan is made, and never again per batch: the
+/// host that binds the same program for every committed row pays a per-bind admission per row.
+#[test]
+fn a_program_admits_each_entry_once_however_many_batches_bind() {
+    let prog = program(&table(
+        TYPE_COL,
+        &[entry(
+            PRED_COL,
+            &[ORDER_TYPE],
+            &threshold_expr(VAL_COL, 100),
+        )],
+    ));
+    let state = init(&prog);
+    let reads = ReduceReads::of(&prog).expect("the reduce reads derive");
+    let mut eval = Threshold {
+        admitted: 0,
+        evaluated: 0,
+    };
+    let mut rows = RowColumns::new();
+    for value in [50u32, 150, 999] {
+        let types = [ORDER_TYPE];
+        let keys = [1u32];
+        let vals = [value];
+        let mut cols: Vec<&[u8]> = vec![
+            u32s_as_bytes(&types),
+            u32s_as_bytes(&keys),
+            u32s_as_bytes(&vals),
+            &[],
+        ];
+        bind_row_columns(
+            &prog,
+            &reads,
+            &state,
+            &mut cols,
+            1,
+            &mut eval,
+            &mut NoStrings,
+            &mut rows,
+        )
+        .expect("bind");
+        assert_eq!(cols[3], u32s_as_bytes(&[u32::from(value > 100)]));
+    }
+    assert_eq!(eval.evaluated, 3, "each batch's row is evaluated");
+    assert_eq!(
+        eval.admitted, 1,
+        "the table's one entry is admitted once for the program, not once per bind"
+    );
+}
+
 #[test]
 fn a_program_without_a_table_binds_nothing() {
     let prog = program(&[]);
