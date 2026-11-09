@@ -241,6 +241,7 @@ runs:
         done
         if mkdir -p "$stable" && sudo mount --bind "$GITHUB_WORKSPACE" "$stable"; then
           echo "DEVENV_WORKDIR=$stable" >> "$GITHUB_ENV"
+          echo "CI_DEVENV_WORKSPACE_MOUNT=$stable" >> "$GITHUB_ENV"
           echo "devenv state: $root (workspace bind-mounted at $stable)"
         else
           echo "DEVENV_WORKDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
@@ -277,6 +278,7 @@ runs:
         target="$DEVENV_WORKDIR/target"
         if mkdir -p "$root" "$target" && sudo mount --bind "$root" "$target"; then
           echo "CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true" >> "$GITHUB_ENV"
+          echo "CI_CARGO_TARGET_MOUNT=$target" >> "$GITHUB_ENV"
           echo "cargo target: $root (bound at $target)"
         else
           echo "::warning::cargo target bind refused; this job builds $target from cold"
