@@ -400,7 +400,7 @@ hoist onto that API package so Nx does not load `@typescript/native` (TS7) via t
 ([oven-sh/bun#33834](https://github.com/oven-sh/bun/issues/33834)). Both dependencies and the environment binding are
 required: TypeScript 7 under the unscoped name breaks Nx API calls such as `readConfigFile`.
 
-For `ttsc@0.34.1`, smoo temporarily distributes `patches/ttsc@0.34.1.patch` and registers it in the root
+For `ttsc@0.36.3`, smoo temporarily distributes `patches/ttsc@0.36.3.patch` and registers it in the root
 `patchedDependencies` before `smoo monorepo update` runs Bun installation; it removes every other `ttsc@` registration.
 The patch repairs import-extension handling during the compiler's internal forced-emission diagnostic pass; user
 `--noEmit` still writes no output. It also makes a source-plugin build lock waiter inspect the holder before it reports

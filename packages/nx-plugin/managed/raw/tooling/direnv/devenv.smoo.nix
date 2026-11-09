@@ -348,7 +348,7 @@ in {
   # comment that rots.
   #
   # It needs its own input because the fleet's nixpkgs does not carry that patch:
-  # devenv-nixpkgs rolling has no Go 1.27, while ttsc 0.34.1 vendors go1.27.3.
+  # devenv-nixpkgs rolling has no Go 1.27, while ttsc 0.36.3 vendors go1.27.3.
   # Same idiom, and same reason, for any single-package pin — one leaf package
   # from a nixpkgs that has it, lock-pinned, prebuilt, rather than a fleet-wide
   # bump that would move rustc, bun and node too. Not every pairing is

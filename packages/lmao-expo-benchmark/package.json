@@ -24,9 +24,9 @@
   },
   "devDependencies": {
     "@smoothbricks/lmao-ttsc": "workspace:*",
-    "@ttsc/metro": "0.34.1",
+    "@ttsc/metro": "0.36.3",
     "@types/react": "^19.2.14",
-    "ttsc": "0.34.1",
+    "ttsc": "0.36.3",
     "typescript": "^6.0.3"
   },
   "nx": {

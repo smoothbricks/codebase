@@ -72,9 +72,9 @@ export interface ManagedFileContext {
 
 /** Temporary upstream compiler repairs distributed to smoo-managed Bun workspaces. */
 export const managedTtscPatch = {
-  version: '0.34.1',
-  key: 'ttsc@0.34.1',
-  path: 'patches/ttsc@0.34.1.patch',
+  version: '0.36.3',
+  key: 'ttsc@0.36.3',
+  path: 'patches/ttsc@0.36.3.patch',
 } as const;
 
 /** Maintained Nx 24.0.3 repairs, applied as an ordinary Bun patchedDependency over the registry release. */

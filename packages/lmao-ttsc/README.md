@@ -26,11 +26,11 @@ See [spec 01o §6.3](../../specs/lmao/01o_typescript_transformer.md#smoo/lmao!n/
 
 ## Caveats
 
-- **Transform caches must key on `NODE_ENV`.** `@ttsc/unplugin` 0.34.1 keys its transform caches without the
+- **Transform caches must key on `NODE_ENV`.** `@ttsc/unplugin` 0.36.3 keys its transform caches without the
   environment, so one process that compiles a project under `NODE_ENV=test` and then under another value can be handed
   the first compile's output for modules it has not delivered yet, trace statements kept or removed wrongly. This
   repository applies
-  [`patches/@ttsc%2Funplugin@0.34.1.patch`](https://github.com/smoothbricks/codebase/blob/main/patches/%40ttsc%252Funplugin%400.34.1.patch)
+  [`patches/@ttsc%2Funplugin@0.36.3.patch`](https://github.com/smoothbricks/codebase/blob/main/patches/%40ttsc%252Funplugin%400.36.3.patch)
   through `patchedDependencies`; a consumer outside it should apply the same patch until ttsc keys its caches on the
   environment a plugin reads, or keep one `NODE_ENV` per process.
 - **Build caches must key on `NODE_ENV`.** An Nx or other task cache over output this plugin transformed must include

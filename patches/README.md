@@ -51,10 +51,13 @@ Retire each when typia or scriptc removes its cause; bump both with typia.
 
 ## Transform caches keyed on the compile's NODE_ENV
 
-`@ttsc%2Funplugin@0.34.1.patch` adds the `NODE_ENV` the compile runs under to the two keys a transform is reused under:
+`@ttsc%2Funplugin@0.36.3.patch` adds the `NODE_ENV` of the compile's captured environment to
+`compilerEnvironmentIdentity`, which 0.36.3 already feeds into both keys a transform is reused under:
 `createTransformCacheKey`, one process's cache, and `sharedCompileIdentity`, the cross-process compile store of pooled
-hosts. `@smoothbricks/lmao-ttsc` lowers by that value (spec `specs/lmao/01o_typescript_transformer.md` §6.3): a test
-compile keeps trace statements and a production compile removes them. Neither ttsc nor `@ttsc/unplugin` lets a plugin
+hosts. Upstream it names only `TTSC_TSGO_ARGS` and `TTSC_TSGO_ARGS_CWD`. The environment it reads is the snapshot
+`resolveCompilerEnvironment` takes and the compiler is spawned with, so the key is the value the plugin sees.
+`@smoothbricks/lmao-ttsc` lowers by that value (spec `specs/lmao/01o_typescript_transformer.md` §6.3): a test compile
+keeps trace statements and a production compile removes them. Neither ttsc nor `@ttsc/unplugin` 0.36.3 lets a plugin
 declare an environment input, so without the patch a cache that compiled a project under `NODE_ENV=test` delivered its
 other modules, trace kept, to a production compile of the same state, and the reverse.
 `packages/lmao-ttsc/src/__tests__/trace-mode-cache.integration.test.ts` fails without it. Retire the patch when ttsc

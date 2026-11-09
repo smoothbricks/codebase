@@ -664,7 +664,7 @@ relies on.
 
 There is no runtime switch and no plugin-entry key: ttsc hands its compiler the host process's environment, so a test
 runner gets the kept mode without per-project setup. Every cache over transformed output keys on `NODE_ENV`: the
-`@ttsc/unplugin` transform caches, in-process and shared, through `patches/@ttsc%2Funplugin@0.34.1.patch` until ttsc
+`@ttsc/unplugin` transform caches, in-process and shared, through `patches/@ttsc%2Funplugin@0.36.3.patch` until ttsc
 lets a plugin declare its environment inputs; and task caches, through the package's
 `"smoo": { "compileEnv": ["NODE_ENV"] }` declaration that `@smoothbricks/nx-plugin` turns into `{ "env": "NODE_ENV" }`
 inputs on the targets it infers.

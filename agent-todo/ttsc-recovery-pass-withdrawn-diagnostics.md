@@ -22,5 +22,5 @@ failing build's report names one diagnostic that is not a defect, beside the def
 The recovery pass should drop what a `DiagnosticPlugin` would withdraw. Either run the pass through the host with its
 linked plugins and an analysis-only option, or have the host report its withdrawn diagnostics (file, code, span) in its
 failure output so the filter removes them alongside the ones it already printed. Both are changes to the managed ttsc
-patch (`packages/nx-plugin/managed/raw/patches/ttsc@0.34.1.patch` and `patches/ttsc@0.34.1.patch`, byte-identical), and
+patch (`packages/nx-plugin/managed/raw/patches/ttsc@0.36.3.patch` and `patches/ttsc@0.36.3.patch`, byte-identical), and
 the next nx-plugin publish carries them; upstream samchon/ttsc has neither the seam nor the pass change.
