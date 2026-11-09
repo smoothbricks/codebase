@@ -2172,6 +2172,58 @@ fn batch() -> impl Strategy<Value = ModelBatch> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
+    /// Rewriting the same `keys` rows with `payload`-byte frames for `rounds`
+    /// batches, growing for the room each refusal names:
+    /// - the row capacity never moves: no new key passes the admission bound,
+    ///   however much the arena churns;
+    /// - every growth leaves exactly the live payload in the arena
+    ///   (`keys * payload` bytes);
+    /// - the arena stays within `max(initial, 4 * live)` bytes. Each batch
+    ///   rewrites the whole live payload, so the arena doubles only when its
+    ///   live payload passes half of it (compaction cannot free `live` bytes);
+    ///   it was below `2 * live` before it doubled.
+    /// Under a growth that doubles rows and arena together, the rows double on
+    /// the first overflow and the arena keeps doubling as the churn refills it.
+    #[test]
+    fn rewrites_of_the_same_rows_bound_the_arena_by_live_payload_and_never_grow_rows(
+        keys in 1u32..=6,
+        payload in 1usize..=200,
+        rounds in 1u8..=120,
+    ) {
+        let prog = vo_program();
+        let mut state = init(&prog);
+        let rows = row_capacity(&state);
+        let initial_arena = arena_capacity(&state);
+        let live = keys * len_u32(payload);
+        let mut vm = Vm::default();
+        for round in 0..rounds {
+            let frame = vec![round; payload];
+            let batch = Rows::of((1..=keys).map(|key| (key, frame.as_slice())));
+            loop {
+                match run(&mut vm, &mut state, &prog, &batch) {
+                    ErrorCode::Ok => break,
+                    ErrorCode::NeedsGrowth => {
+                        let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
+                        state = grown(&mut vm, &state, room);
+                        if round > 0 {
+                            prop_assert_eq!(GrowthRoom::Arena, room, "only the arena ran out");
+                            prop_assert_eq!(live, arena_used(&state), "growth keeps exactly the live payload");
+                        }
+                    }
+                    other => panic!("round {round}: {other:?}"),
+                }
+            }
+            prop_assert_eq!(rows, row_capacity(&state), "the rows never grow");
+            prop_assert!(
+                arena_capacity(&state) <= initial_arena.max(4 * live),
+                "arena {} past max({initial_arena}, 4 * {live})",
+                arena_capacity(&state)
+            );
+        }
+        for key in 1..=keys {
+            prop_assert_eq!(Ok(Some(&vec![rounds - 1; payload][..])), vo(&state, key));
+        }
+    }
     /// Arbitrary opaque frames against a same-byte model: every batch reads
     /// back exactly, appends exactly its frames to the arena, and round-trips
     /// through undo and exported undo/redo; a growth request leaves the image
