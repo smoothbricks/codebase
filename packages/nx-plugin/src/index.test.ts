@@ -1739,6 +1739,159 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.cleanup();
     }
   });
+
+  //#region smoo/nx-plugin!n/executor-build-edge
+  it("orders each plugin executor target after the workspace plugin's own build, except the executors that build it", async () => {
+    const workspace = await createWorkspace();
+    const bounded: TargetConfiguration = {
+      executor: '@smoothbricks/nx-plugin:bounded-exec',
+      cache: true,
+      options: { command: 'true', idleTimeoutMs: 1000 },
+    };
+    const emit: TargetConfiguration = {
+      executor: '@smoothbricks/nx-plugin:typescript-emit',
+      cache: true,
+      options: { tsConfig: 'tsconfig.lib.json', cwd: '.' },
+    };
+    // The executor is a file the plugin's own build writes: a checkout whose dist predates it has none to load.
+    const zigbuild: TargetConfiguration = {
+      executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
+      cache: true,
+      options: {
+        target: 'x86_64-unknown-linux-musl',
+        manifestPath: '{projectRoot}/Cargo.toml',
+        output: '{projectRoot}/.cache/bin/tool',
+      },
+    };
+    const pluginTargets: Record<string, TargetConfiguration> = {
+      'own-check': bounded,
+      emit,
+      build: { executor: 'nx:noop', dependsOn: ['emit'] },
+    };
+    const toolTargets: Record<string, TargetConfiguration> = {
+      'cli-x64-linux': zigbuild,
+      emit,
+      report: { executor: '@smoothbricks/nx-plugin:shard-timings', options: {} },
+    };
+    const projects = [
+      { file: 'package.json', name: 'workspace', targets: {}, manifest: { name: 'workspace' } },
+      {
+        file: 'tools/nx-plugin/package.json',
+        name: 'graph-plugin',
+        targets: pluginTargets,
+        manifest: { name: '@smoothbricks/nx-plugin', nx: { name: 'graph-plugin', targets: pluginTargets } },
+      },
+      {
+        file: 'tools/tool/package.json',
+        name: 'tool',
+        targets: toolTargets,
+        manifest: { name: '@fixture/tool', nx: { name: 'tool', targets: toolTargets } },
+      },
+      {
+        file: 'services/worker/package.json',
+        name: 'worker',
+        targets: { check: bounded },
+        manifest: { name: '@fixture/worker', nx: { name: 'worker', targets: { check: bounded } } },
+      },
+    ];
+    try {
+      const root = workspace.context.workspaceRoot;
+      for (const project of projects) await workspace.write(project.file, JSON.stringify(project.manifest));
+      await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(join(root, 'tools/nx-plugin'), join(root, 'node_modules/@smoothbricks/nx-plugin'), 'dir');
+      resetWorkspaceContext();
+      const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
+      const files = projects.map((project) => project.file);
+      const results = await inferFixture(infer, files, undefined, workspace.context);
+      const nodes: Record<string, ProjectGraphProjectNode> = {};
+      for (const project of projects) {
+        const inferred =
+          results.find(([file]) => file === project.file)?.[1].projects?.[dirname(project.file)]?.targets ?? {};
+        const declared: Record<string, TargetConfiguration> = project.targets;
+        const targets = Object.fromEntries(
+          [...new Set([...Object.keys(inferred), ...Object.keys(declared)])].map((name) => [
+            name,
+            mergeTargetConfigurations(declared[name] ?? {}, inferred[name] ?? {}),
+          ]),
+        );
+        nodes[project.name] = { name: project.name, type: 'lib', data: { root: dirname(project.file), targets } };
+      }
+      const graph: ProjectGraph = {
+        nodes,
+        dependencies: Object.fromEntries(projects.map((project) => [project.name, []])),
+      };
+      const edge = { projects: ['graph-plugin'], target: 'build' };
+      const targetOf = (project: string, name: string) => nodes[project]?.data.targets?.[name];
+      for (const [project, name] of [
+        ['tool', 'cli-x64-linux'],
+        ['tool', 'report'],
+        ['worker', 'check'],
+      ] as const) {
+        expect(targetOf(project, name)?.dependsOn, `${project}:${name}`).toContainEqual(edge);
+        expect(
+          targetOf(project, name)?.dependsOn?.filter(
+            (dependency) => JSON.stringify(dependency) === JSON.stringify(edge),
+          ),
+        ).toHaveLength(1);
+      }
+      // The executors that build the plugin cannot wait for its build, and the plugin's own targets are its own.
+      for (const [project, name] of [
+        ['tool', 'emit'],
+        ['graph-plugin', 'emit'],
+        ['graph-plugin', 'own-check'],
+      ] as const) {
+        expect(targetOf(project, name)?.dependsOn ?? [], `${project}:${name}`).not.toContainEqual(edge);
+      }
+      const zig = createTaskGraph(graph, {}, ['tool'], ['cli-x64-linux'], undefined, {});
+      expect(findCycles(zig)).toBeNull();
+      expect(Object.keys(zig.tasks)).toContain('graph-plugin:build');
+      const build = createTaskGraph(graph, {}, ['graph-plugin'], ['build'], undefined, {});
+      expect(findCycles(build)).toBeNull();
+      expect(Object.keys(build.tasks)).not.toContain('tool:cli-x64-linux');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('adds no plugin build edge where the plugin is an installed package, not a project', async () => {
+    const workspace = await createWorkspace();
+    try {
+      const root = workspace.context.workspaceRoot;
+      await workspace.write(
+        'app/package.json',
+        JSON.stringify({
+          name: 'app',
+          nx: {
+            targets: {
+              'cli-x64-linux': {
+                executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
+                options: { target: 'x86_64-unknown-linux-musl', manifestPath: 'Cargo.toml', output: 'out' },
+              },
+            },
+          },
+        }),
+      );
+      await workspace.write(
+        'node_modules/.fixture/@smoothbricks/nx-plugin/package.json',
+        '{"name":"@smoothbricks/nx-plugin"}\n',
+      );
+      await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(
+        join(root, 'node_modules/.fixture/@smoothbricks/nx-plugin'),
+        join(root, 'node_modules/@smoothbricks/nx-plugin'),
+        'dir',
+      );
+      resetWorkspaceContext();
+      const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
+      const results = await inferFixture(infer, ['app/package.json'], undefined, workspace.context);
+      expect(
+        results.find(([file]) => file === 'app/package.json')?.[1].projects?.app?.targets?.['cli-x64-linux'],
+      ).toBeUndefined();
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+  //#endregion smoo/nx-plugin!n/executor-build-edge
   //#region smoo!n/rust-output-target-inference
   it('infers generic cargo workspace targets without any rust output targets', async () => {
     const workspace = await createWorkspace();

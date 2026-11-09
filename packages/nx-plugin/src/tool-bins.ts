@@ -41,6 +41,11 @@ export interface NativeTools {
   readonly target: string;
   /** Each tool package that is a project of this workspace, to its project name. */
   readonly projects: ReadonlyMap<NativeToolPackage, string>;
+  /**
+   * The Nx project of the plugin itself, when this workspace owns it: the executors it ships are files its own
+   * build writes. An installed plugin ships them built, so a consumer has none.
+   */
+  readonly plugin: string | undefined;
 }
 
 /**
@@ -54,6 +59,7 @@ export async function resolveNativeTools(
   target: string,
 ): Promise<NativeTools> {
   const projects = new Map<NativeToolPackage, string>();
+  let pluginProject: string | undefined;
   const plugin = await realpath(join(workspaceRoot, PLUGIN_LINK)).catch((error: unknown) => {
     // A workspace whose install has not linked the plugin yet has no tool package of its own either.
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
@@ -61,16 +67,21 @@ export async function resolveNativeTools(
   });
   if (plugin !== null) {
     const root = await realpath(workspaceRoot);
-    for (const tool of NATIVE_TOOL_PACKAGES) {
-      const manifest = relative(root, join(dirname(plugin), tool, 'package.json')).replaceAll('\\', '/');
-      if (!projectManifests.includes(manifest)) continue;
+    const owned = async (directory: string, package_: string): Promise<string | undefined> => {
+      const manifest = relative(root, join(directory, 'package.json')).replaceAll('\\', '/');
+      if (!projectManifests.includes(manifest)) return undefined;
       const parsed: unknown = JSON.parse(await readFile(join(root, manifest), 'utf8'));
       const name = projectName(parsed);
-      if (name === undefined) throw new Error(`${manifest}: a tool package names its Nx project in name or nx.name`);
-      projects.set(tool, name);
+      if (name === undefined) throw new Error(`${manifest}: ${package_} names its Nx project in name or nx.name`);
+      return name;
+    };
+    pluginProject = await owned(plugin, 'the plugin package');
+    for (const tool of NATIVE_TOOL_PACKAGES) {
+      const name = await owned(join(dirname(plugin), tool), 'a tool package');
+      if (name !== undefined) projects.set(tool, name);
     }
   }
-  return { platform, target, projects };
+  return { platform, target, projects, plugin: pluginProject };
 }
 
 function projectName(manifest: unknown): string | undefined {
@@ -109,4 +120,22 @@ export function nativeToolDependsOn(
   return project === undefined || tools === null
     ? []
     : [{ projects: [project], target: target ?? (tool === 'cowshed' ? 'napi-native' : tools.target) }];
+}
+
+/** The plugin executors its own build runs: they load from a dist an earlier build left, so none can wait for it. */
+const BOOTSTRAP_EXECUTORS: ReadonlySet<string> = new Set([
+  '@smoothbricks/nx-plugin:typescript-emit',
+  '@smoothbricks/nx-plugin:scriptc-native',
+]);
+
+/**
+ * The task that leaves the plugin's executors built, for a target whose `executor` is one of them, only when this
+ * workspace owns the plugin's package (an installed plugin ships its executors built). The executor is a file the
+ * plugin's own build writes, so a target that starts before that build ends loads the dist a previous build left, which
+ * lacks an executor the plugin gained since, or none at all.
+ */
+export function pluginBuildDependsOn(tools: NativeTools | null, executor: unknown): TargetDependency[] {
+  if (tools?.plugin === undefined || typeof executor !== 'string') return [];
+  if (!executor.startsWith('@smoothbricks/nx-plugin:') || BOOTSTRAP_EXECUTORS.has(executor)) return [];
+  return [{ projects: [tools.plugin], target: 'build' }];
 }

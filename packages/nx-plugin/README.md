@@ -1476,8 +1476,19 @@ inputs do not leak across the normal Nx override. The canonical dependency-free 
 judges already assembled shipping artifacts and verifies the addon is present, without compiling at runtime or disabling
 the observer (specs/cowshed/06_cli.md, `release-check`).
 
-N-API binaries are not prerequisites of TypeScript declaration emission, so compiler targets do not pull them in by
-default. Aggregate `build` remains the package-completeness boundary and includes every published local output family.
+<a id="smoo/nx-plugin!n/executor-build-edge"></a>A self-hosted workspace that owns this plugin's package also orders
+**every target that runs one of the plugin's executors**, in every project but the plugin, after the plugin's own
+`build`. An executor is a file that build writes (`dist/executors/<name>/executor.js`), so a task that starts before it
+ends loads the dist a previous build left, which lacks an executor the plugin gained since: a checkout restored from a
+cache that predated `cargo-zigbuild` failed `Could not resolve "./dist/executors/cargo-zigbuild/executor.js"` on
+`cli-x64-linux` while `nx-plugin:build` was still restoring it. The edge is one rule, inferred for declared and inferred
+targets alike (`{ "projects": ["<the plugin's project>"], "target": "build" }`), never written per executor or per
+target. Three things take none: the executors the plugin's own build runs (`typescript-emit` and `scriptc-native`, which
+load from the dist an earlier build left, so waiting for that build would be a cycle), the plugin's own targets (its
+graph orders them), and the canonical dependency-free `release-check`. An installed plugin ships its executors built, so
+a consumer takes no edge. Declarations that replace `dependsOn` keep it with Nx's `"..."` token. N-API binaries are not
+prerequisites of TypeScript declaration emission, so compiler targets do not pull them in by default. Aggregate `build`
+remains the package-completeness boundary and includes every published local output family.
 
 Do not use colon-style Nx target names such as `build:wasm` or `lint:fix`. Nx CLI syntax already uses colons for
 `project:target:configuration`, so colon target names are hard to read, easy to confuse with configurations, and awkward

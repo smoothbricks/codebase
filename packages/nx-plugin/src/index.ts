@@ -106,7 +106,13 @@ import {
   timingsSuiteInputs,
 } from './test-timings.js';
 import { assertUpstreamBasePrecondition } from './test-walk-policy.js';
-import { type NativeTools, nativeToolCommand, nativeToolDependsOn, resolveNativeTools } from './tool-bins.js';
+import {
+  type NativeTools,
+  nativeToolCommand,
+  nativeToolDependsOn,
+  pluginBuildDependsOn,
+  resolveNativeTools,
+} from './tool-bins.js';
 import { typecheckRoute } from './typecheck-route.js';
 import {
   isBuildOutputTargetName,
@@ -2481,6 +2487,35 @@ async function createProjectTargets(
         ...inputs,
         { dependentTasksOutputFiles: '**/*.node', transitive: true },
         { dependentTasksOutputFiles: '**/dist/lineage/**/*.js', transitive: true },
+      ];
+    }
+  }
+
+  // A plugin executor is a file the workspace plugin's own build writes, so a target that starts before that build
+  // ends loads the dist a previous build left: one without the executors the plugin gained since (a Linux CLI
+  // target failed "Could not resolve ./dist/executors/cargo-zigbuild/executor.js" in a checkout restored from a
+  // cache that predated it). Every such target of every project but the plugin takes the one edge, so no executor
+  // needs its own: the executors that build the plugin (the bootstrap ones) take none, the plugin's own targets
+  // are ordered by its own graph, and release-check stays dependency-free (specs/cowshed/06_cli.md,
+  // `release-check`). Declarations that replace `dependsOn` keep it with Nx's "..." token.
+  if (packageJson.name !== '@smoothbricks/nx-plugin') {
+    for (const name of new Set([...Object.keys(targets), ...Object.keys(declaredTargets)])) {
+      if (name === 'release-check') continue;
+      const declared = declaredTargets[name];
+      const executor =
+        isRecord(declared) && declared.executor !== undefined ? declared.executor : targets[name]?.executor;
+      const edge = pluginBuildDependsOn(nativeTools, executor);
+      if (edge.length === 0) continue;
+      // Nx discards an incompatible executor's inferred configuration; only the edge belongs below it.
+      if (targets[name]?.executor !== undefined && targets[name]?.executor !== executor) {
+        targets[name] = {};
+      }
+      targets[name] ??= {};
+      const target = targets[name];
+      const present = new Set((target.dependsOn ?? []).map((dependency) => JSON.stringify(dependency)));
+      target.dependsOn = [
+        ...(target.dependsOn ?? []),
+        ...edge.filter((dependency) => !present.has(JSON.stringify(dependency))),
       ];
     }
   }
