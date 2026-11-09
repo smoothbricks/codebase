@@ -469,6 +469,29 @@ parallelism (not `inputs`, `dependsOn`, `cache` or `//`). For a project the task
 that project's root, tags and named inputs. An edit to one target's command re-keys that target's tasks. Its sibling
 targets, each inferred `cargo-test-*` runner among them, keep their keys unless they read the edited file.
 
+That keying is sound only while no executor reads another target's configuration at run time. An executor that does must
+have that target named in the project-configuration hunk, which then hashes it beside the reading task's own target, for
+that executor's tasks only and never for a whole project. The hunk names no target today, because no executor below
+reads one. Every new executor, this plugin's or one a consumer adopts, gets a row here before it runs.
+
+| Executor                                   | Reads at run time                                                    | Verdict  | Evidence                                                                                             |
+| ------------------------------------------ | -------------------------------------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| `@smoothbricks/nx-plugin:bounded-exec`     | its options, the workspace root, its own task's id and hash          | own only | `src/executors/bounded-exec/executor.ts:266-271`, `:337`                                             |
+| `@smoothbricks/nx-plugin:all-verdicts`     | its options and the workspace root                                   | own only | `src/executors/all-verdicts/executor.ts:157-166`                                                     |
+| `@smoothbricks/nx-plugin:typescript-emit`  | its options and the tsconfig they name                               | own only | `src/executors/typescript-emit/executor.ts:66-68`                                                    |
+| `@smoothbricks/nx-plugin:scriptc-native`   | its options and the workspace root                                   | own only | `src/executors/scriptc-native/executor.ts:101`                                                       |
+| `@smoothbricks/nx-plugin:cargo-zigbuild`   | its options and the workspace root                                   | own only | `src/executors/cargo-zigbuild/executor.ts:226-227`                                                   |
+| `@smoothbricks/nx-plugin:shard-timings`    | its options, its project's name and the workspace root               | own only | `src/executors/shard-timings/executor.ts:19-23`                                                      |
+| `@smoothbricks/nx-plugin:wrangler-deploy`  | its project's root; its hasher reads its own target's `stage` option | own only | `src/executors/wrangler-deploy/executor.ts:25-39`, `src/executors/wrangler-deploy/hasher.ts:102-103` |
+| `nx:run-commands`                          | its options and its own target's `ultracache` and `continuous`       | own only | `nx/dist/src/executors/run-commands/run-commands.impl.js:78`                                         |
+| `nx:run-script`                            | its options and its project's root                                   | own only | `nx/dist/src/executors/run-script/run-script.impl.js:14`                                             |
+| `nx:noop`                                  | nothing                                                              | none     | `nx/dist/src/executors/noop/noop.impl.js`                                                            |
+| `@nx/js:verdaccio`                         | its options and the workspace root                                   | own only | `@nx/js/dist/src/executors/verdaccio/verdaccio.impl.js:30`, `:55`                                    |
+| A consumer's local plugins (`createNodes`) | nothing at run time: they shape targets while the graph is built     | n/a      | a derived target's options are part of its own configuration, so its own key carries them            |
+
+A test or script that reads its own package's targets (`package.json` `nx.targets`) keys that `package.json` as a file
+input; a check that reads the whole graph keys `{workspaceRoot}/**/*` or a runtime key of the graph it reads.
+
 Workspace policy defaults non-production tasks to `["{projectRoot}/**/*", "!{projectRoot}/**/*.md"]`, without a forced
 CI workflow input. It migrates the old CI-only `sharedGlobals` reference out of `default` and never re-injects that
 definition. Custom non-CI named globals and explicit workflow-target inputs remain repository-owned and unchanged;
