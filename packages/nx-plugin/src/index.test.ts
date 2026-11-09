@@ -369,6 +369,86 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('keys each package its TypeScript tools load by the scope declaring it, and no root tooling a member never loads', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'package.json',
+        JSON.stringify({
+          name: 'root',
+          private: true,
+          devDependencies: {
+            '@nx/expo': '24.0.3',
+            '@types/bun': '1.4.4',
+            '@typescript/native': 'npm:typescript@^7.0.2',
+            tslib: '^2.8.1',
+            ttsc: '0.34.1',
+            typescript: '^6.0.3',
+          },
+        }),
+      );
+      await workspace.write(
+        'packages/example/package.json',
+        JSON.stringify({ name: 'example', devDependencies: { typescript: '^6.0.3', typia: '14.0.6' } }),
+      );
+      await workspace.write(
+        'packages/example/tsconfig.lib.json',
+        JSON.stringify({
+          compilerOptions: { plugins: [{ transform: 'typia/lib/transform' }, { transform: 'unlinked' }] },
+        }),
+      );
+      await workspace.write('packages/example/tsconfig.test.json', '{}\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
+      const own = 'bun-lock:packages/example';
+      // The member's own typescript and typia are its node's; a transform no manifest declares loads nothing.
+      expect(externalDependencies(targets['tsc-js'])).toEqual([
+        [own, '@types/bun', '@typescript/native', 'tslib', 'ttsc'],
+      ]);
+      for (const name of ['typecheck', 'typecheck-tests', 'lint']) {
+        expect(externalDependencies(targets[name])).toEqual([[own, '@types/bun', 'tslib']]);
+      }
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('keys lint on the ESLint the root installs and each package its configs load, by the scope declaring it', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'package.json',
+        JSON.stringify({
+          name: 'root',
+          private: true,
+          devDependencies: { '@nx/expo': '24.0.3', eslint: '^9.39.1', 'eslint-plugin-review': '1.0.0' },
+        }),
+      );
+      await workspace.write(
+        'node_modules/eslint-plugin-review/package.json',
+        '{"name":"eslint-plugin-review","main":"index.cjs"}\n',
+      );
+      await workspace.write('node_modules/eslint-plugin-review/index.cjs', 'module.exports = {};\n');
+      await workspace.write(
+        'eslint.config.mjs',
+        "import review from 'eslint-plugin-review';\nexport default [review];\n",
+      );
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/src/index.ts', 'export const value = 1;\n');
+
+      const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
+      expect(lint?.options?.commands).toEqual(['eslint {eslintSources}']);
+      expect(externalDependencies(lint)).toContainEqual([
+        'bun-lock:packages/example',
+        'eslint',
+        'eslint-plugin-review',
+      ]);
+      expect(externalDependencies(lint).flat()).not.toContain('@nx/expo');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('typechecks through ttsc a project whose direct dependency declares a dialect, after the targets it names', async () => {
     const workspace = await createWorkspace();
     try {
@@ -834,6 +914,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // No crate manifest in this project, so no crate digest is declared at
       // all — nothing is hashed that nothing reads.
       expect(project?.namedInputs).toEqual({
+        // Every package.json project names its own lock scope for workspace-wide inputs.
+        bunLockScope: [{ externalDependencies: ['bun-lock:packages/example'] }],
         versionlessProduction: [
           'production',
           '!{projectRoot}/package.json',
@@ -5110,6 +5192,12 @@ async function loaderLoads(workspace: WorkspaceFixture, config: string): Promise
 }
 
 /** The `tooling/` files `lint` keys by name. */
+/** Each `externalDependencies` input of a target, in order. */
+function externalDependencies(target: TargetConfiguration | undefined): string[][] {
+  return (target?.inputs ?? []).flatMap((input) =>
+    typeof input === 'object' && 'externalDependencies' in input ? [[...input.externalDependencies]] : [],
+  );
+}
 function keyedTooling(lint: TargetConfiguration | undefined): string[] {
   return (lint?.inputs ?? [])
     .flatMap((input) =>

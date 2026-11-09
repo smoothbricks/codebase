@@ -167,5 +167,11 @@
     "@smoothbricks/nx-plugin": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "typia": "15.2.1"
+  },
+  "devDependencies": {
+    "@typescript-eslint/parser": "^8.70.0",
+    "eslint": "^10.11.0",
+    "scriptc": "0.4.4",
+    "typescript-eslint": "^8.70.0"
   }
 }

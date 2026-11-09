@@ -3,7 +3,22 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BUN_ROOT_LOCK_NODE, bunLockNodeName } from './bun-lock-scope.js';
+import type { ProjectGraph } from 'nx/src/devkit-exports.js';
+
+import {
+  BUN_ROOT_LOCK_NODE,
+  bunLoadInput,
+  bunLoadScope,
+  bunLockNodeName,
+  bunLockRuntimeNodeName,
+  bunScopeInput,
+  type ManifestDeclarations,
+  manifestsAbove,
+  specifierPackage,
+  typescriptLoads,
+  UndeclaredImportError,
+  undeclaredImports,
+} from './bun-lock-scope.js';
 import { type CargoClosureSource, cargoLockNode } from './cargo-closure-input.js';
 import { type CargoResolve, cargoSourceIndex, type LocalCargoPackage } from './cargo-source-hash.js';
 
@@ -156,6 +171,7 @@ const EDGES = `
 const { bunLockDependencies } = await import(Bun.argv[1]);
 const node = (name, packageName, version) => ({ type: 'npm', name, data: { packageName, version } });
 const lock = (root) => ({ type: 'bun', name: 'bun-lock:' + root, data: { packageName: 'bun-lock:' + root, version: '0.0.0' } });
+const runtime = (root) => ({ type: 'bun', name: 'bun-lock-runtime:' + root, data: { packageName: 'bun-lock-runtime:' + root, version: '0.0.0' } });
 const project = (root, packageName) => ({ root, metadata: { js: { packageName } } });
 const edges = bunLockDependencies({
   workspaceRoot: process.cwd(),
@@ -167,6 +183,9 @@ const edges = bunLockDependencies({
     'bun-lock:.': lock('.'),
     'bun-lock:packages/a': lock('packages/a'),
     'bun-lock:packages/b': lock('packages/b'),
+    'bun-lock-runtime:.': runtime('.'),
+    'bun-lock-runtime:packages/a': runtime('packages/a'),
+    'bun-lock-runtime:packages/b': runtime('packages/b'),
   },
   fileMap: { projectFileMap: {}, nonProjectFiles: [] },
   filesToProcess: { projectFileMap: {}, nonProjectFiles: [] },
@@ -174,7 +193,7 @@ const edges = bunLockDependencies({
 process.stdout.write(JSON.stringify(edges.map(({ source, target }) => [source, target])));
 `;
 
-it("links a bun lock-scope node to its manifest's packages and members, and every member's to the root's", async () => {
+it("links a manifest's lock-scope node to its packages and members' runtime nodes, the root's too, and no member's to the root's", async () => {
   const root = await workspace('smoo-bun-lock-');
   const write = async (path: string, value: unknown) => {
     await mkdir(join(root, path, '..'), { recursive: true });
@@ -188,7 +207,11 @@ it("links a bun lock-scope node to its manifest's packages and members, and ever
     devDependencies: { 'left-pad': '1.0.0', a: 'workspace:*' },
   });
   await write('node_modules/left-pad/package.json', { name: 'left-pad', version: '1.0.0' });
-  await write('packages/a/package.json', { name: 'a', dependencies: { x: '2.0.0', b: 'workspace:*' } });
+  await write('packages/a/package.json', {
+    name: 'a',
+    dependencies: { x: '2.0.0', b: 'workspace:*' },
+    devDependencies: { 'left-pad': '1.0.0' },
+  });
   await write('packages/a/node_modules/x/package.json', { name: 'x', version: '2.0.0' });
   await write('packages/b/package.json', { name: 'b' });
 
@@ -204,11 +227,129 @@ it("links a bun lock-scope node to its manifest's packages and members, and ever
   ]);
   expect(status, stderr).toBe(0);
   expect(JSON.parse(stdout)).toEqual([
-    // The root manifest's member `a` is no edge: every member reaches the root's node.
+    // A member reaches only what its own manifest declares, a dependent only a member's runtime closure; the root's
+    // node reaches the members the root declares.
+    [BUN_ROOT_LOCK_NODE, bunLockRuntimeNodeName('packages/a')],
     [BUN_ROOT_LOCK_NODE, 'npm:left-pad'],
-    [bunLockNodeName('packages/a'), BUN_ROOT_LOCK_NODE],
-    [bunLockNodeName('packages/a'), bunLockNodeName('packages/b')],
+    [bunLockNodeName('packages/a'), bunLockRuntimeNodeName('packages/b')],
+    [bunLockNodeName('packages/a'), 'npm:left-pad'],
     [bunLockNodeName('packages/a'), 'npm:x'],
-    [bunLockNodeName('packages/b'), BUN_ROOT_LOCK_NODE],
+    // The runtime node leaves out a's devDependencies.
+    [bunLockRuntimeNodeName('packages/a'), bunLockRuntimeNodeName('packages/b')],
+    [bunLockRuntimeNodeName('packages/a'), 'npm:x'],
   ]);
+});
+
+const declarations = (root: string, ...declared: string[]): ManifestDeclarations => ({
+  root,
+  declared: new Set(declared),
+});
+const member = declarations('packages/a', 'typescript', '@types/a');
+const root = declarations('.', 'typescript', 'ttsc', '@types/bun', 'tslib', '@nx/expo');
+
+it.each([
+  ['a member declaration, by its node', [member, root], 'typescript', bunLockNodeName('packages/a')],
+  ['a root-only declaration, by the package itself', [member, root], 'ttsc', 'ttsc'],
+  ['a declaration of the root seen from the root', [root], 'typescript', 'typescript'],
+  ['no declaration on the way', [member, root], 'left-pad', null],
+] as const)('keys a package a process loads by name by %s', (_case, manifests, name, scope) => {
+  expect(bunLoadScope(manifests, name)).toBe(scope);
+});
+
+it('keys the loads of a directory each once, sorted, and nothing no manifest declares', () => {
+  expect(bunLoadInput([member, root], ['ttsc', 'typescript', 'left-pad', 'ttsc'])).toEqual({
+    externalDependencies: [bunLockNodeName('packages/a'), 'ttsc'],
+  });
+});
+
+it('names the @types and tslib a TypeScript compile finds by ancestry, never the root tooling', () => {
+  expect(typescriptLoads([member, root])).toEqual(['@types/a', '@types/bun', 'tslib']);
+});
+
+it("puts a target's own lock-scope node first and every other scope once", () => {
+  expect(bunScopeInput('packages/a', ['ttsc', bunLockNodeName('packages/a')], ['@types/bun', 'ttsc'])).toEqual({
+    externalDependencies: [bunLockNodeName('packages/a'), '@types/bun', 'ttsc'],
+  });
+});
+
+it.each([
+  ['typia/lib/transform', 'typia'],
+  ['@scope/tool/ttsc-plugin', '@scope/tool'],
+  ['expo', 'expo'],
+])('names the package of specifier %s', (specifier, name) => {
+  expect(specifierPackage(specifier)).toBe(name);
+});
+
+it('reads the manifests at and above a directory, nearest first, skipping directories without one', async () => {
+  const at = await workspace('smoo-manifests-above-');
+  await mkdir(join(at, 'packages/a/src'), { recursive: true });
+  await writeFile(join(at, 'package.json'), '{"devDependencies":{"ttsc":"1.0.0"}}\n');
+  await writeFile(join(at, 'packages/a/package.json'), '{"dependencies":{"x":"1.0.0"},"peerDependencies":{"y":"*"}}\n');
+  expect(manifestsAbove(at, 'packages/a/src')).toEqual([
+    declarations('packages/a', 'y', 'x'),
+    declarations('.', 'ttsc'),
+  ]);
+});
+
+const npm = (name: string) => ({
+  type: 'npm' as const,
+  name: `npm:${name}`,
+  data: { packageName: name, version: '1.0.0' },
+});
+const scopeNode = (projectRoot: string) => ({
+  type: 'bun' as const,
+  name: bunLockNodeName(projectRoot),
+  data: { packageName: bunLockNodeName(projectRoot), version: '0.0.0' },
+});
+const graph: ProjectGraph = {
+  nodes: {
+    root: { name: 'root', type: 'lib', data: { root: '.' } },
+    a: { name: 'a', type: 'lib', data: { root: 'packages/a' } },
+    b: { name: 'b', type: 'lib', data: { root: 'packages/b' } },
+  },
+  externalNodes: {
+    'npm:x': npm('x'),
+    'npm:y': npm('y'),
+    'npm:mitata': npm('mitata'),
+    'npm:nx': npm('nx'),
+    'npm:@types/bun': npm('@types/bun'),
+    [BUN_ROOT_LOCK_NODE]: scopeNode('.'),
+    [bunLockNodeName('packages/a')]: scopeNode('packages/a'),
+    [bunLockNodeName('packages/b')]: scopeNode('packages/b'),
+  },
+  dependencies: {
+    root: [{ source: 'root', target: 'npm:nx', type: 'static' }],
+    a: [
+      { source: 'a', target: 'npm:x', type: 'static' },
+      // Reached through x: a package the member's own closure holds keys it.
+      { source: 'a', target: 'npm:y', type: 'dynamic' },
+      { source: 'a', target: 'npm:mitata', type: 'static' },
+      { source: 'a', target: 'npm:nx', type: 'implicit' },
+      // TypeScript loads @types by ancestry, which every TypeScript target keys (typescriptLoads).
+      { source: 'a', target: 'npm:@types/bun', type: 'static' },
+      { source: 'a', target: 'b', type: 'static' },
+    ],
+    b: [{ source: 'b', target: 'npm:nx', type: 'dynamic' }],
+    'npm:x': [{ source: 'npm:x', target: 'npm:y', type: 'static' }],
+    [BUN_ROOT_LOCK_NODE]: [
+      { source: BUN_ROOT_LOCK_NODE, target: 'npm:mitata', type: 'static' },
+      { source: BUN_ROOT_LOCK_NODE, target: 'npm:nx', type: 'static' },
+    ],
+    [bunLockNodeName('packages/a')]: [
+      { source: bunLockNodeName('packages/a'), target: 'npm:x', type: 'static' },
+      { source: bunLockNodeName('packages/a'), target: bunLockNodeName('packages/b'), type: 'static' },
+    ],
+  },
+};
+
+it("refuses a member's source import of a package only the root declares, naming project and package", () => {
+  expect(undeclaredImports(graph)).toEqual([
+    { project: 'a', root: 'packages/a', packageName: 'mitata' },
+    // b's node reaches nothing of its own: a dependent's closure does not declare b's imports for it.
+    { project: 'b', root: 'packages/b', packageName: 'nx' },
+  ]);
+  expect(() => {
+    const findings = undeclaredImports(graph);
+    if (findings.length > 0) throw new UndeclaredImportError(findings);
+  }).toThrow('  a (packages/a): mitata\n  b (packages/b): nx');
 });

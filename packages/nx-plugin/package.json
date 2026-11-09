@@ -711,6 +711,7 @@
   "devDependencies": {
     "@smoothbricks/lmao": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "fast-check": "^4.4.0"
   }
 }

@@ -26,7 +26,21 @@ import { parse as parseToml } from 'smol-toml';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { refuseOverlappingOutputs } from './build-state-output-policy.js';
 import { builtOutputLockfileDependencies, builtOutputLockfileNodes } from './built-output-packages.js';
-import { bunLockDependencies, bunLockInput, bunLockNode } from './bun-lock-scope.js';
+import {
+  BUN_LOCK_SCOPE_NAMED_INPUT,
+  bunLoadInput,
+  bunLoadScopes,
+  bunLockDependencies,
+  bunLockInput,
+  bunLockNode,
+  bunLockRuntimeNode,
+  bunScopeInput,
+  manifestsAbove,
+  type PackageLoad,
+  refuseUndeclaredImports,
+  specifierPackage,
+  typescriptLoads,
+} from './bun-lock-scope.js';
 import {
   CARGO_CLOSURE_INPUT,
   CARGO_LOCK_NODE_PREFIX,
@@ -240,13 +254,46 @@ const NODE_MODULES_SEGMENT = /(?:^|\/)node_modules(?:\/|$)/;
  * which is the silence above. The ancestors this cannot name as a fileset are
  * the two kinds Nx has no fileset for; see {@link configChainInput}.
  */
-function typescriptConfigChainInputs(configPaths: readonly string[], workspaceRoot: string): string[] {
-  const inputs = new Set([WORKSPACE_TSCONFIG_BASE_INPUT]);
+function typescriptConfigChainInputs(configPaths: readonly string[], workspaceRoot: string): TypescriptConfigChain {
+  const chain: TypescriptConfigChainParts = {
+    inputs: new Set([WORKSPACE_TSCONFIG_BASE_INPUT]),
+    extendsLoads: [],
+    transformLoads: [],
+  };
   const walked = new Set<string>();
   for (const configPath of configPaths) {
-    addTypescriptConfigAncestors(configPath, workspaceRoot, inputs, walked);
+    addTypescriptConfigAncestors(configPath, workspaceRoot, chain, walked);
   }
-  return [...inputs];
+  return { inputs: [...chain.inputs], extendsLoads: chain.extendsLoads, transformLoads: chain.transformLoads };
+}
+
+/** What a project's TypeScript configs make its tasks read: the config files, and the packages they load by name. */
+interface TypescriptConfigChain {
+  /** Every workspace config of the chains, as an input. */
+  readonly inputs: string[];
+  /** Each installed config the chains extend, by the package holding it and the directory of the config naming it. */
+  readonly extendsLoads: readonly PackageLoad[];
+  /** Each transform plugin a workspace config of the chains names (`compilerOptions.plugins[].transform`), which ttsc loads. */
+  readonly transformLoads: readonly PackageLoad[];
+}
+
+interface TypescriptConfigChainParts {
+  readonly inputs: Set<string>;
+  readonly extendsLoads: PackageLoad[];
+  readonly transformLoads: PackageLoad[];
+}
+
+/** The bare transform plugin specifiers one config names (`compilerOptions.plugins[].transform`). */
+function typescriptTransforms(configPath: string): string[] {
+  const config: unknown = readJsonFile(configPath, { expectComments: true });
+  if (!isRecord(config) || !isRecord(config.compilerOptions) || !Array.isArray(config.compilerOptions.plugins)) {
+    return [];
+  }
+  return config.compilerOptions.plugins.flatMap((plugin: unknown) =>
+    isRecord(plugin) && typeof plugin.transform === 'string' && /^[@\w]/u.test(plugin.transform)
+      ? [plugin.transform]
+      : [],
+  );
 }
 
 /**
@@ -254,24 +301,32 @@ function typescriptConfigChainInputs(configPaths: readonly string[], workspaceRo
  * `extends` cycle.
  *
  * The walk stops at an ancestor Nx cannot hash, because everything reachable
- * from an installed config is installed too: the lockfile pins that whole
- * subtree, and parsing it could only invent failures for a dependency's own
- * chain.
+ * from an installed config is installed too: the package holding it is
+ * recorded as a load of the extending config's directory, and the lock scope
+ * that declares it there keys that whole subtree. Parsing it could only
+ * invent failures for a dependency's own chain.
  */
 function addTypescriptConfigAncestors(
   configPath: string,
   workspaceRoot: string,
-  inputs: Set<string>,
+  chain: TypescriptConfigChainParts,
   walked: Set<string>,
 ): void {
   if (walked.has(configPath)) return;
   walked.add(configPath);
+  const directory = relative(workspaceRoot, dirname(configPath)).replaceAll('\\', '/') || '.';
+  for (const transform of typescriptTransforms(configPath)) {
+    chain.transformLoads.push({ directory, name: specifierPackage(transform) });
+  }
   for (const specifier of typescriptConfigExtends(configPath)) {
     const ancestor = resolveTypescriptConfigExtends(specifier, configPath);
     const input = configChainInput(ancestor, configPath, workspaceRoot);
-    if (input === null) continue;
-    inputs.add(input);
-    addTypescriptConfigAncestors(ancestor.path, workspaceRoot, inputs, walked);
+    if (input === null) {
+      if (ancestor.installed) chain.extendsLoads.push({ directory, name: specifierPackage(specifier) });
+      continue;
+    }
+    chain.inputs.add(input);
+    addTypescriptConfigAncestors(ancestor.path, workspaceRoot, chain, walked);
   }
 }
 
@@ -435,6 +490,8 @@ interface EslintWorkspace {
   readonly sources: ReadonlySet<string>;
   /** The workspace modules the root configs load, transitively, workspace-relative and sorted; the configs excluded. */
   readonly configImports: readonly string[];
+  /** The lock scopes of the installed packages those modules load by name, each where its module loads it; sorted. */
+  readonly configScopes: readonly string[];
 }
 
 /**
@@ -454,15 +511,18 @@ interface EslintWorkspace {
  * The configs key every lint target with exactly the workspace files they
  * load (eslint-config-closure.ts): a glob over the directory holding a
  * config's rule modules keyed every file beside them, and one test fixture
- * there re-keyed 44 lint targets in one land.
+ * there re-keyed 44 lint targets in one land. The packages they load by name
+ * key it by the lock scope declaring each where it loads (bun-lock-scope.ts).
  */
 async function eslintWorkspace(workspaceRoot: string): Promise<EslintWorkspace | null> {
   const configs = ESLINT_CONFIG_FILES.filter((name) => existsSync(join(workspaceRoot, name)));
   if (configs.length === 0) return null;
   const indexed = new Set(await globIndexedFiles(workspaceRoot, [ESLINT_SOURCES_GLOB, '**/*.json']));
+  const closure = eslintConfigClosure(workspaceRoot, configs, indexed);
   return {
     sources: new Set([...indexed].filter((path) => !path.endsWith('.json'))),
-    configImports: eslintConfigClosure(workspaceRoot, configs, indexed),
+    configImports: closure.files,
+    configScopes: bunLoadScopes(workspaceRoot, closure.packageLoads),
   };
 }
 
@@ -1339,6 +1399,7 @@ export const createDependencies: CreateDependencies = (options, context) => [
 export const createMetadata: CreateMetadata = (graph, _options, context) => {
   refuseOverlappingOutputs(graph, context.workspaceRoot);
   refuseBuildTestDependencies(graph, context.workspaceRoot);
+  refuseUndeclaredImports(graph);
   return {};
 };
 
@@ -1705,20 +1766,40 @@ async function createProjectTargets(
     [...(hasLibTsconfig ? [libTsconfigPath] : []), ...(hasTestTsconfig ? [testTsconfigPath] : [])],
     workspaceRoot,
   );
+  // The packages a TypeScript task loads by name beyond its sources' imports, each keyed by the lock scope that
+  // declares it where it loads (bun-lock-scope.ts): the project's own node keys its own declarations, and a root
+  // declaration is named by itself, so no task is keyed on root tooling it never loads. A check reads the @types and
+  // tslib TypeScript finds by ancestry and the installed configs its chain extends. The emit also runs ttsc from the
+  // root's node_modules/.bin, and ttsc loads the TypeScript API from the project and each transform plugin its
+  // configs name.
+  const manifests = manifestsAbove(workspaceRoot, projectRoot);
+  const rootManifests = manifests.filter((manifest) => manifest.root === '.');
+  const checkScopes = [
+    ...bunLoadInput(manifests, typescriptLoads(manifests)).externalDependencies,
+    ...bunLoadScopes(workspaceRoot, typescriptConfigChain.extendsLoads),
+  ];
+  const checkScopeInput = bunScopeInput(projectRoot, checkScopes);
+  const emitScopeInput = bunScopeInput(
+    projectRoot,
+    checkScopes,
+    bunLoadInput(manifests, ['typescript']).externalDependencies,
+    bunLoadInput(rootManifests, ['ttsc', '@typescript/native']).externalDependencies,
+    bunLoadScopes(workspaceRoot, typescriptConfigChain.transformLoads),
+  );
   const toolchainInputs = [
     ...RELEASE_REWRITTEN_WORKSPACE_INPUTS,
-    bunLockInput(projectRoot),
+    emitScopeInput,
     ...TYPESCRIPT_PATCH_INPUTS,
-    ...typescriptConfigChain,
+    ...typescriptConfigChain.inputs,
   ];
   const checkInputs =
     versionless === null
       ? toolchainInputs
       : [
           ...TYPESCRIPT_PATCH_INPUTS,
-          ...typescriptConfigChain,
+          ...typescriptConfigChain.inputs,
           ...VERSIONLESS_TOOLCHAIN_MANIFEST_INPUTS,
-          bunLockInput(projectRoot),
+          checkScopeInput,
         ];
   const selfProduction = versionless === null ? 'production' : VERSIONLESS_PRODUCTION_INPUT;
   const selfDefault = versionless === null ? 'default' : VERSIONLESS_DEFAULT_INPUT;
@@ -2412,6 +2493,15 @@ async function createProjectTargets(
     inputs: lintProgramInputs,
     eslintFileSet,
   } = projectLintCommands(projectRoot, workspaceRoot, eslint);
+  // The lint tools run from the root's node_modules/.bin, and ESLint loads the packages its configs name.
+  const runsEslint = eslintFileSet !== null;
+  const lintScopes = [
+    ...bunLoadInput(rootManifests, [
+      ...(runsEslint ? ['eslint'] : []),
+      ...(lintCommands.some((command) => command.startsWith('biome ')) ? ['@biomejs/biome'] : []),
+    ]).externalDependencies,
+    ...(runsEslint ? (eslint?.configScopes ?? []) : []),
+  ];
   // Every lint tool reaches its own verdict in one run: run-commands would end the
   // other tools once one fails, and their findings would surface a run later.
   if (validationTargets.length > 0 || lintCommands.length > 0) {
@@ -2431,6 +2521,7 @@ async function createProjectTargets(
           `{projectRoot}/${name}`,
         ]),
         ...(eslint?.configImports ?? []).map((path) => `{workspaceRoot}/${path}`),
+        ...(lintScopes.length > 0 ? [bunScopeInput(projectRoot, lintScopes)] : []),
       ],
       ...(lintCommands.length > 0
         ? {
@@ -2560,6 +2651,7 @@ async function createProjectTargets(
   // its configuration hash, so defining it everywhere would invalidate every
   // task in the repository to serve projects that can never reference it.
   const namedInputs: Record<string, NonNullable<TargetConfiguration['inputs']>> = {
+    [BUN_LOCK_SCOPE_NAMED_INPUT]: [bunLockInput(projectRoot)],
     ...(versionless === null
       ? {}
       : {
@@ -2646,7 +2738,8 @@ async function lockScopeNodes(
     }
   }
   const own = bunLockNode(projectRoot);
-  const nodes: Record<string, ProjectGraphExternalNode> = { [own.name]: own };
+  const runtime = bunLockRuntimeNode(projectRoot);
+  const nodes: Record<string, ProjectGraphExternalNode> = { [own.name]: own, [runtime.name]: runtime };
   for (const node of await Promise.all(
     [...directories].map((directory) => cargoLockNode(directory, cargoSourcesUnder(directory, cargoWorkspaces))),
   )) {

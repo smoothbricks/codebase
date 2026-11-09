@@ -51,7 +51,8 @@
   },
   "devDependencies": {
     "@smoothbricks/lmao": "workspace:*",
-    "@smoothbricks/validation": "workspace:*"
+    "@smoothbricks/validation": "workspace:*",
+    "mitata": "^1.0.34"
   },
   "nx": {
     "sourceRoot": "packages/lmao-ttsc/src",

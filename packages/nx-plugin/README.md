@@ -883,12 +883,30 @@ change re-keys the tasks that can load what changed and no other.
 
 - `bun-lock:<projectRoot>`, one per `package.json` project (`bun-lock:.` for the root manifest). Its edges, added by the
   plugin's `createDependencies`, go to the npm nodes the manifest's dependencies resolve to (resolved exactly as Nx
-  resolves a project's own package edges); a member's also go to the node of each workspace member it depends on and to
-  `bun-lock:.`, since a member's `node_modules` lookup ends in the root's. The root's node has no member edges: every
-  member reaches it, and a member loads another only through its own declaration. Nx's lockfile parser links every npm
-  node to the packages it depends on and hashes each by the integrity bun.lock records, so the node keys a target on the
-  closure its manifest reaches. Every inferred TypeScript target (`tsc-js`, `typecheck`, `typecheck-tests`, `lint`)
-  names its project's node.
+  resolves a project's own package edges) and to the runtime node (`bun-lock-runtime:<projectRoot>`) of each workspace
+  member it depends on: the closure of that member's `dependencies`, `optionalDependencies` and `peerDependencies`,
+  which a dependent loads through it, so a member's devDependencies key only its own targets. Nx's lockfile parser links
+  every npm node to the packages it depends on and hashes each by the integrity bun.lock records, so the node keys a
+  target on the closure its manifest reaches. A member's node has no edge to the root's. Bun's isolated linker links
+  into a directory's `node_modules` exactly what its manifest declares, but Node's lookup from a member goes on into the
+  root's, so a member can load anything the root declares. Two rules make the member's own closure the whole of what its
+  targets load:
+  - `createMetadata` refuses the graph when a member's sources import a package its node does not reach (Nx's own
+    `static` and `dynamic` edges to npm nodes), naming the member and the package. Declaring the package in the member's
+    `package.json` puts it in the member's closure.
+  - A tool a target runs keys each package it loads by name by the scope that declares it where it loads: the nearest
+    manifest at or above the loading directory that declares the package. A member's declaration is keyed by its node,
+    the root's by the package itself, since the root's node would key all of the root's tooling. Every inferred
+    TypeScript target (`tsc-js`, `typecheck`, `typecheck-tests`, `lint`) names its project's node, the `@types` packages
+    the manifests above it declare and `tslib` (TypeScript loads both by ancestry), and the packages holding the
+    installed configs its `tsconfig` chain extends. `tsc-js` adds `typescript` (ttsc loads the project's compiler API),
+    `ttsc` and `@typescript/native` (run from the root's `node_modules/.bin`), and each transform plugin its configs
+    name. `lint` adds `eslint` and `@biomejs/biome` when it runs them, and every package the ESLint configs load by
+    name.
+
+  An edit to a package only the root's tooling reaches, such as a dependency of an Nx generator, re-keys the root's
+  targets and no member's.
+
 - `cargo-lock:<directory>`, for the crates under a directory: its hash digests, per Cargo workspace, every package of
   the locked resolve closure of those crates (a locked package by Cargo package id and source, a path package by name,
   each with what its dependencies resolved to). `cargoClosure` names its project's node; each `cargo-test-*` runner
@@ -901,10 +919,18 @@ A hand-written target names the same nodes in its `externalDependencies`:
 ```
 
 A `cargo-lock:` node exists when an input of a `package.json` project names it (inferred or declared), computed from the
-Cargo resolves the plugin already holds. `externalDependencies` takes no `{projectRoot}` token, so a workspace-wide
-named input or target default can name only `bun-lock:.`; with a `^` input the project's own npm edges come from Nx. A
-target that names no `externalDependencies` at all is still keyed on every package in every lockfile
-(`AllExternalDependencies`), the Cargo nodes included.
+Cargo resolves the plugin already holds. A target that names no `externalDependencies` at all is still keyed on every
+package in every lockfile (`AllExternalDependencies`), the Cargo nodes included.
+
+Every `package.json` project defines the named input `bunLockScope` as its own node
+(`[{ "externalDependencies": ["bun-lock:<projectRoot>"] }]`). `externalDependencies` takes no `{projectRoot}` token, so
+a workspace-wide named input or target default names `bunLockScope` to key each project's targets on its own closure; Nx
+resolves a named input from the project first and `nx.json` second. A workspace defines it in `nx.json` as `bun-lock:.`
+for the projects no `package.json` stands for, whose lookup ends in the root's `node_modules`:
+
+```json
+{ "namedInputs": { "bunLockScope": [{ "externalDependencies": ["bun-lock:."] }] } }
+```
 
 The root project owns the lockfiles, so its `default` fileset holds them. Its versionless check inputs exclude
 `bun.lock`, `bun.lockb` and `Cargo.lock`; the nodes key what they decide.

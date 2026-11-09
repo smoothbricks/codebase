@@ -346,6 +346,7 @@
   },
   "devDependencies": {
     "fast-check": "^4.4.0",
+    "mitata": "^1.0.34",
     "vitest": "^4.1.11"
   },
   "peerDependencies": {

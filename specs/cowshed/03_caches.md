@@ -700,10 +700,11 @@ change).
   output (`dependentTasksOutputFiles`, `nx.json` `targetDefaults`), and the test reads a file (08_testing.md).
 - **Lint keys the files the ESLint config loads, not their directory.** Each lint target keys the workspace ESLint
   configs and every workspace file they load, read and resolved by the loader ESLint uses (jiti for a TypeScript config,
-  Node otherwise); `bun.lock` and the root manifest key installed packages, and a load the walk cannot key fails graph
-  construction (nx-plugin README, lint inputs). A directory glob keys every file beside those modules: under
-  `{workspaceRoot}/tooling/checks/**/*`, one fixture file (`tooling/checks/darwin-native-archive.fixtures.ts`) that no
-  config loads re-keyed 44 lint targets of a downstream workspace, 464 task-seconds, in land icm-land-10.
+  Node otherwise); an installed package they load is keyed by the lock scope that declares it where it loads, never by
+  the root's whole manifest, and a load the walk cannot key fails graph construction (nx-plugin README, lint inputs and
+  lockfile scope). A directory glob keys every file beside those modules: under `{workspaceRoot}/tooling/checks/**/*`,
+  one fixture file (`tooling/checks/darwin-native-archive.fixtures.ts`) that no config loads re-keyed 44 lint targets of
+  a downstream workspace, 464 task-seconds, in land icm-land-10.
 
 Cargo's own reuse is not where the time goes: a TypeScript-only land compiled no Rust unit, and a cowshed-core change
 compiled exactly the seven cowshed crates downstream of it. For an mbx-capable project that reuse does not travel in the

@@ -16,8 +16,10 @@
  *     `createRequire(module).resolve` and each `import` with
  *     `import.meta.resolve(specifier, module)`.
  *
- * A builtin, or a package installed outside the workspace's own files, adds
- * nothing: `bun.lock` and the root manifest key what is installed. A package
+ * A builtin adds nothing. A package installed outside the workspace's own
+ * files is reported by name with the directory whose module loads it: the
+ * lint target keys it by the lock scope that declares it there
+ * (bun-lock-scope.ts, `bunLoadScope`). A package
  * that resolves into the workspace's own files (a workspace member linked into
  * `node_modules`) is keyed and walked like a relative module. Every loaded
  * file keys the package.json files that decide how it loads: the nearest one
@@ -36,6 +38,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import type * as Jiti from 'jiti';
 import ts from 'typescript';
 import typia from 'typia';
+import { type PackageLoad, specifierPackage } from './bun-lock-scope.js';
 
 type LoadKind = 'require' | 'import';
 /** One load a module performs: CommonJS `require` and ESM `import` resolve under different conditions. */
@@ -72,16 +75,18 @@ console.log(JSON.stringify(loads.map(({ kind, specifier, from }) => {
 
 /**
  * The workspace-relative files `configs` load, transitively, the configs
- * excluded, sorted. `indexed` is Nx's workspace file index (at least its
- * JavaScript, TypeScript, JSON and package.json files); a file outside it refuses.
+ * excluded, sorted, and the installed packages those modules load by name.
+ * `indexed` is Nx's workspace file index (at least its JavaScript,
+ * TypeScript, JSON and package.json files); a file outside it refuses.
  */
 export function eslintConfigClosure(
   workspaceRoot: string,
   configs: readonly string[],
   indexed: ReadonlySet<string>,
-): string[] {
+): { readonly files: string[]; readonly packageLoads: PackageLoad[] } {
   const root = realpathSync(workspaceRoot);
   const keyed = new Set<string>();
+  const packageLoads = new Map<string, PackageLoad>();
   const jiti = configs.some((config) => TYPESCRIPT_CONFIG.test(config)) ? workspaceJiti(workspaceRoot) : null;
   for (const config of configs) {
     const loader = TYPESCRIPT_CONFIG.test(config) ? jiti : null;
@@ -103,6 +108,11 @@ export function eslintConfigClosure(
         const workspacePath = relative(root, real).split(sep).join('/');
         const installed = workspacePath.split('/').includes('node_modules');
         if (workspacePath.startsWith('../') || isAbsolute(workspacePath) || installed) {
+          if (load.bare) {
+            const directory = relative(root, dirname(load.from)).split(sep).join('/') || '.';
+            const name = specifierPackage(load.specifier);
+            packageLoads.set(`${directory}\0${name}`, { directory, name });
+          }
           if (load.bare || installed) return;
           throw new Error(
             `${load.importer} imports '${load.specifier}', which resolves outside the workspace to ${real}`,
@@ -121,7 +131,18 @@ export function eslintConfigClosure(
       });
     }
   }
-  return [...keyed].sort();
+  return {
+    files: [...keyed].sort(),
+    packageLoads: [...packageLoads.values()].sort((left, right) =>
+      left.directory === right.directory
+        ? left.name < right.name
+          ? -1
+          : 1
+        : left.directory < right.directory
+          ? -1
+          : 1,
+    ),
+  };
 }
 
 /** The loads `module` performs that resolve to a file; refuses a computed load or an unresolvable specifier kind. */
