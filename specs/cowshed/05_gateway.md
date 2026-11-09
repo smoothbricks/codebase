@@ -1569,6 +1569,16 @@ process's disk I/O along with its CPU, and a throttled thread sleeps while it ho
   80; a `utility` clamp made a cold SQLite open take 34.5 to 54.5 s against 2.4 to 2.7 s.
 - 2026-10-16: the landing gate took 40 minutes under `taskpolicy -b` with `--parallel=2` against 4m44s at default
   priority (08_testing.md, "The landing gate is never CPU-limited").
+- 2026-11-09: a gate-shaped pass (10,000 8 KiB files written, 100 `F_FULLFSYNC`, three `lstat` passes, cold reads,
+  unlinks) in one shed, beside six writers in another shed (64 MiB uncached writes with an `F_FULLFSYNC` each, and 4 KiB
+  create, `lstat` and unlink churn), four interleaved rounds per arm. Under `IOPOL_THROTTLE` the writers in their shed's
+  image kept 102 MB/s, against 85 MB/s at default, because a shed's disk I/O reaches the disk as its image's
+  backing-store I/O. The gate took 1.53 times its time alone, against 1.69 times. On the host's own volume, throttle
+  held the writers to 37 MB/s against 139 MB/s, and the gate still took 1.26 times against 1.31 times. What it lost was
+  its barriers: its `F_FULLFSYNC`s took 1.8 s alone and 3.9 to 4.7 s beside the writers at every tier, because each one
+  flushes the whole device. [laws/io_tier.bend](laws/io_tier.bend) states the mechanism: a throttled request that holds
+  a lock a gate waits on moves only on its low turns (`throttled_holder_stalls_the_gate`), so the gate's wait grows from
+  the holder's own services to (bound + 1) times them (`throttle_stretches_a_lock_wait`).
 
 ### Memory pressure
 
