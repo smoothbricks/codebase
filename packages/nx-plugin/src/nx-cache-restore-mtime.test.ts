@@ -1,4 +1,5 @@
 import { expect, it } from 'bun:test';
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,25 +25,46 @@ import { bindListener } from './testing.js';
  * a new file with a fresh mtime, so both cases pass there with or without the
  * hunk. Run them on macOS before dropping the hunk.
  *
+ * A local hit writes only what differs from its cached copy. The native
+ * restore removed each output and copied it whole, so an output that already
+ * held the entry's bytes got a new inode and, stamped, a new mtime, and every
+ * consumer judging freshness by either redid its work. The patched restore
+ * keeps a file with its cached bytes, size and mode as it is. A hit also
+ * removes an output its entry lacks: the native restore copied only what the
+ * entry held and left an output a run on other inputs wrote in place. The
+ * local case holds both; the remote case, whose native call restores the
+ * outputs it holds whole, holds the removal.
+ *
  * Drop the hunk, and keep this test, once the Nx version in use restores
- * outputs newer than the files they replace.
+ * outputs newer than the files they replace, keeps an output whose bytes did
+ * not change and removes an output its entry lacks.
  */
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(packageRoot));
 const nxEntry = join(repoRoot, 'node_modules', '.bin', 'nx');
 
+/** The outputs that differ between A and B. */
 const OUTPUTS = ['app/result.txt', 'app/dist/nested/copy.txt'] as const;
+/** An output with the same bytes from A and from B. */
+const UNCHANGED = 'app/dist/nested/same.txt';
+/** Outputs only B writes: a file output and a file in the directory output. */
+const B_ONLY = ['app/extra.txt', 'app/dist/only-b.txt'] as const;
 
 interface Run {
   readonly log: string;
   readonly outputs: readonly { readonly output: string; readonly text: string; readonly mtimeNs: bigint }[];
+  /** The unchanged output's file: its inode and times. */
+  readonly unchanged: { readonly ino: bigint; readonly mtimeNs: bigint; readonly ctimeNs: bigint };
+  /** The B-only outputs that exist. */
+  readonly bOnly: readonly string[];
 }
 
 /**
  * A fixture workspace with one cached `app:build` that copies its input into a
- * file output and a directory output. `run(text)` writes the input, builds
- * under `env`, and reports the outputs' contents and mtimes.
+ * file output and a directory output, writes one constant file into the
+ * directory, and writes the B-only outputs from input B alone. `run(text)`
+ * writes the input, builds under `env`, and reports the outputs.
  */
 async function restoreFixture(workspace: string, env: Record<string, string>) {
   await mkdir(join(workspace, 'app'), { recursive: true });
@@ -60,11 +82,13 @@ async function restoreFixture(workspace: string, env: Record<string, string>) {
           executor: 'nx:run-commands',
           cache: true,
           inputs: ['{projectRoot}/source.txt'],
-          // A file output and a directory output: the restore walks into the directory.
-          outputs: ['{projectRoot}/result.txt', '{projectRoot}/dist/'],
+          // A file output and a directory output: the restore walks into the directory. extra.txt is an output only
+          // a run on B writes.
+          outputs: ['{projectRoot}/result.txt', '{projectRoot}/dist/', '{projectRoot}/extra.txt'],
           options: {
             cwd: 'app',
-            command: 'cp source.txt result.txt && mkdir -p dist/nested && cp source.txt dist/nested/copy.txt',
+            command:
+              'cp source.txt result.txt && rm -rf dist extra.txt && mkdir -p dist/nested && cp source.txt dist/nested/copy.txt && printf same > dist/nested/same.txt && if [ "$(cat source.txt)" = B ]; then cp source.txt extra.txt && cp source.txt dist/only-b.txt; fi',
           },
         },
       },
@@ -94,7 +118,9 @@ async function restoreFixture(workspace: string, env: Record<string, string>) {
         mtimeNs: (await stat(join(workspace, output), { bigint: true })).mtimeNs,
       })),
     );
-    return { log, outputs };
+    const { ino, mtimeNs, ctimeNs } = await stat(join(workspace, UNCHANGED), { bigint: true });
+    const bOnly = B_ONLY.filter((output) => existsSync(join(workspace, output)));
+    return { log, outputs, unchanged: { ino, mtimeNs, ctimeNs }, bOnly };
   };
 }
 
@@ -105,6 +131,7 @@ function expectBuilt(run: Run, text: string): void {
   expect(run.outputs.map((output) => output.text)).toEqual(OUTPUTS.map(() => text));
 }
 
+/** A restore of A over B: each output that differs is written newer, and no B-only output stays. */
 function expectRestoredNewer(restored: Run, replaced: Run, text: string): void {
   restored.outputs.forEach(({ output, text: restoredText, mtimeNs }, index) => {
     expect(restoredText, output).toBe(text);
@@ -114,9 +141,11 @@ function expectRestoredNewer(restored: Run, replaced: Run, text: string): void {
       `${output}: restored mtime ${mtimeNs} is not newer than the replaced output's ${replacedNs}`,
     ).toBe(true);
   });
+  expect(replaced.bOnly, 'B wrote its B-only outputs').toEqual([...B_ONLY]);
+  expect(restored.bOnly, "outputs A's cache entry lacks are removed").toEqual([]);
 }
 
-it('restores a locally cached output newer than the output it replaces', async () => {
+it('restores a local hit: changed outputs newer, unchanged ones kept, outputs its entry lacks removed', async () => {
   await withNxFixture('nx-restore-mtime-', async ({ workspace, socketDirectory }) => {
     const run = await restoreFixture(workspace, fixtureNxEnv(workspace, socketDirectory));
 
@@ -125,6 +154,9 @@ it('restores a locally cached output newer than the output it replaces', async (
     expectBuilt(fromB, 'B');
     const restored = await run('A');
     expect(restored.log).toContain('[local cache]');
+    expect(restored.unchanged, 'an output a restore leaves byte-identical keeps its file, inode and times').toEqual(
+      fromB.unchanged,
+    );
     expectRestoredNewer(restored, fromB, 'A');
   });
 });

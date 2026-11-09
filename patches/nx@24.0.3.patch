@@ -4354,20 +4354,8 @@ index 3ab406eee377e39ebd9229a1d07b7b11c94413b2..1f14ec608e0386ce0918db7ca14f29a6
              if (e.daemonPermissionError) {
                  // Deliberately not disabled: unlike the inotify limit above, a socket
                  // owned by someone else stops being there when it is removed or the
-diff --git a/dist/src/tasks-runner/cache.d.ts b/dist/src/tasks-runner/cache.d.ts
-index 7af1ca6cae5c72a9fa601a0360b5da71a37ff731..560e5bedcda4102272febe15c09f19172ab1943e 100644
---- a/dist/src/tasks-runner/cache.d.ts
-+++ b/dist/src/tasks-runner/cache.d.ts
-@@ -60,6 +60,7 @@ export declare class DbCache {
-         size: number;
-     }[]): void;
-     copyFilesFromCache(_: string, cachedResult: CachedResult, outputs: string[]): Promise<import("../native").OutputFile[]>;
-+    private stampRestored;
-     removeOldCacheRecords(): void;
-     temporaryOutputPath(task: Task): string;
-     private getRemoteCache;
 diff --git a/dist/src/tasks-runner/cache.js b/dist/src/tasks-runner/cache.js
-index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..7106ae0df08d36128af9467bf92951aef41903cb 100644
+index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..dcf01c48e2ff13e8c61e91c4c1a5eea1e68c98f7 100644
 --- a/dist/src/tasks-runner/cache.js
 +++ b/dist/src/tasks-runner/cache.js
 @@ -28,6 +28,7 @@ const workspace_root_1 = require("../utils/workspace-root");
@@ -4378,44 +4366,35 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..7106ae0df08d36128af9467bf92951ae
  // This function is called once during tasks runner initialization. It checks if the db cache is enabled and logs a warning if it is not.
  function dbCacheEnabled() {
      // ...but if on wasm and the the db cache isnt supported we shouldn't warn
-@@ -175,7 +176,11 @@ class DbCache {
+@@ -175,7 +176,17 @@ class DbCache {
          return this.cache.getCacheSize();
      }
      applyRemoteCacheResults(hash, res, outputs) {
 -        return this.cache.applyRemoteCacheResults(hash, res, outputs);
 +        this.cache.applyRemoteCacheResults(hash, res, outputs);
-+        // The native call restores the outputs itself, under this same condition.
++        // The native call restores the outputs itself, under this same condition:
++        // it removes each output the artifact holds and copies it whole. It also
++        // records the entry's size as the bytes it copies, so it cannot be handed
++        // only the outputs that differ (restoreChangedOutputs) without
++        // undercounting the entry against maxCacheSize.
 +        if (outputs?.length > 0 && res.code === 0) {
-+            this.stampRestored(res.outputsPath, outputs);
++            const relativeOutputs = workspaceRelativeOutputs(outputs);
++            removeAbsentOutputs(workspace_root_1.workspaceRoot, res.outputsPath, relativeOutputs);
++            stampRestoredOutputs(workspace_root_1.workspaceRoot, res.outputsPath, (0, native_1.expandOutputs)(res.outputsPath, relativeOutputs));
 +        }
      }
      async put(task, terminalOutput, outputs, code) {
          return tryAndRetry(async () => {
-@@ -198,7 +203,22 @@ class DbCache {
+@@ -198,7 +209,7 @@ class DbCache {
          this.cache.recordTerminalOutputs(records);
      }
      copyFilesFromCache(_, cachedResult, outputs) {
 -        return tryAndRetry(async () => this.cache.copyFilesFromCache(cachedResult, outputs));
-+        return tryAndRetry(async () => {
-+            const files = this.cache.copyFilesFromCache(cachedResult, outputs);
-+            this.stampRestored(cachedResult.outputsPath, outputs);
-+            // These stamps go to the daemon in place of a walk of the outputs,
-+            // so they carry the time the restore gave the files.
-+            return files && restampOutputFiles(workspace_root_1.workspaceRoot, files);
-+        });
-+    }
-+    /**
-+     * Stamps what the native restore wrote from the cache entry at
-+     * `outputsPath`. The native restore makes an absolute in-workspace output
-+     * relative before expanding it in the entry, so this does too.
-+     */
-+    stampRestored(outputsPath, outputs) {
-+        const relativeOutputs = outputs.map((output) => (0, path_1.isAbsolute)(output) ? (0, path_1.relative)(workspace_root_1.workspaceRoot, output) : output);
-+        stampRestoredOutputs(workspace_root_1.workspaceRoot, outputsPath, (0, native_1.expandOutputs)(outputsPath, relativeOutputs));
++        return tryAndRetry(async () => restoreChangedOutputs(this.cache, workspace_root_1.workspaceRoot, cachedResult, workspaceRelativeOutputs(outputs)));
      }
      removeOldCacheRecords() {
          return this.cache.removeOldCacheRecords();
-@@ -293,7 +313,8 @@ class DbCache {
+@@ -293,7 +304,8 @@ class DbCache {
              if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
                  process.emitWarning("Setting the NODE_TLS_REJECT_UNAUTHORIZED environment variable to '0' makes TLS connections and HTTPS requests insecure by disabling certificate verification.");
              }
@@ -4425,7 +4404,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..7106ae0df08d36128af9467bf92951ae
          }
          return null;
      }
-@@ -452,6 +473,7 @@ class Cache {
+@@ -452,6 +464,7 @@ class Cache {
                      await this.copy(cached, src);
                  }
              }));
@@ -4433,7 +4412,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..7106ae0df08d36128af9467bf92951ae
          });
      }
      temporaryOutputPath(task) {
-@@ -557,6 +579,46 @@ class Cache {
+@@ -557,6 +570,195 @@ class Cache {
      }
  }
  exports.Cache = Cache;
@@ -4445,7 +4424,9 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..7106ae0df08d36128af9467bf92951ae
 + * judges freshness by mtime (a Cargo build script's `rerun-if-changed`, make,
 + * a file watcher) then kept what it built from the newer bytes. Running the
 + * task would have written the output now, so the restore stamps it now. Links
-+ * keep their own times: `utimes` would stamp what they point at.
++ * keep their own times: `utimes` would stamp what they point at. A local hit
++ * passes only the outputs it wrote (restoreChangedOutputs): a file it kept
++ * keeps its time.
 + */
 +function stampRestoredOutputs(workspaceRoot, outputsPath, expandedOutputs) {
 +    const now = new Date();
@@ -4476,6 +4457,153 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..7106ae0df08d36128af9467bf92951ae
 +        const stats = (0, node_fs_1.lstatSync)((0, path_1.resolve)(workspaceRoot, file.path), { bigint: true });
 +        return stats.isFile() ? { ...file, stamp: `${stats.mtimeNs}:${stats.size}` } : file;
 +    });
++}
++/**
++ * Outputs as the native restore expands them: it makes an absolute
++ * in-workspace output relative first, so these helpers do too.
++ */
++function workspaceRelativeOutputs(outputs) {
++    return outputs.map((output) => (0, path_1.isAbsolute)(output) ? (0, path_1.relative)(workspace_root_1.workspaceRoot, output) : output);
++}
++/**
++ * Removes each output the workspace holds that the cache entry at
++ * `outputsPath` does not. The native restore copies only the outputs an entry
++ * holds and leaves every other one in place, so a hit kept an output its run
++ * never wrote: what a run on other inputs left, which the restored task's
++ * consumers then read as its output.
++ */
++function removeAbsentOutputs(workspaceRoot, outputsPath, outputs) {
++    const cached = new Set((0, native_1.expandOutputs)(outputsPath, outputs));
++    for (const output of (0, native_1.expandOutputs)(workspaceRoot, outputs)) {
++        if (!cached.has(output)) {
++            (0, node_fs_1.rmSync)((0, path_1.join)(workspaceRoot, output), { recursive: true, force: true });
++        }
++    }
++}
++/**
++ * Restores a local hit from the cache entry at `cachedResult.outputsPath`,
++ * writing only what differs from the workspace. The native restore removes
++ * each output and copies it whole, so a hit on outputs that already held the
++ * entry's bytes (a run on an input those bytes do not depend on, an output
++ * edited and put back, a checkout without the outputs-stamp record) gave every
++ * file a new inode and, stamped, a new mtime: each consumer that judges
++ * freshness by mtime or file identity (a Cargo build script's
++ * `rerun-if-changed`, a watcher, a producer receipt over its tool) redid its
++ * work for bytes that had not changed. Here an output file with the size, mode
++ * and bytes of its cached copy, and a link to the same target, stay as they
++ * are. Everything else the entry holds goes through the native copy and is
++ * stamped as written. What the workspace holds inside a cached directory and
++ * the entry lacks is removed, as the native removal of the whole directory
++ * did, and so is each output the entry does not hold (removeAbsentOutputs).
++ *
++ * Answers the stamps of every file the outputs now hold, which go to the
++ * daemon in place of a walk, or null when an output is a pattern or a
++ * negation, as the native copy does.
++ */
++function restoreChangedOutputs(cache, workspaceRoot, cachedResult, outputs) {
++    const outputsPath = cachedResult.outputsPath;
++    removeAbsentOutputs(workspaceRoot, outputsPath, outputs);
++    const changed = [];
++    const kept = [];
++    for (const output of (0, native_1.expandOutputs)(outputsPath, outputs)) {
++        collectChangedOutputs(outputsPath, workspaceRoot, output, changed, kept);
++    }
++    let written = [];
++    if (changed.length > 0) {
++        // Each changed path is a literal output of its own: the native copy
++        // removes it and copies it whole from the entry, confined to the
++        // workspace as for any restore.
++        written = cache.copyFilesFromCache(cachedResult, changed);
++        stampRestoredOutputs(workspaceRoot, outputsPath, changed);
++    }
++    if (written === null || outputs.some((output) => /[!*?[\]{}()]/.test(output))) {
++        return null;
++    }
++    return [...kept, ...restampOutputFiles(workspaceRoot, written)];
++}
++/**
++ * Sorts `output` (workspace-relative, present in the cache entry) into what
++ * the restore must write from the entry (`changed`) and the file stamps it
++ * keeps (`kept`), removing what the workspace holds inside a cached directory
++ * that the entry does not.
++ */
++function collectChangedOutputs(outputsPath, workspaceRoot, output, changed, kept) {
++    const cachedPath = (0, path_1.join)(outputsPath, output);
++    const presentPath = (0, path_1.join)(workspaceRoot, output);
++    const cached = (0, node_fs_1.lstatSync)(cachedPath, { bigint: true });
++    const present = (0, node_fs_1.lstatSync)(presentPath, { bigint: true, throwIfNoEntry: false });
++    if (cached.isDirectory()) {
++        if (!present?.isDirectory()) {
++            changed.push(output);
++            return;
++        }
++        const names = (0, node_fs_1.readdirSync)(cachedPath);
++        const cachedNames = new Set(names);
++        for (const name of (0, node_fs_1.readdirSync)(presentPath)) {
++            if (!cachedNames.has(name)) {
++                (0, node_fs_1.rmSync)((0, path_1.join)(presentPath, name), { recursive: true, force: true });
++            }
++        }
++        for (const name of names) {
++            collectChangedOutputs(outputsPath, workspaceRoot, path_1.posix.join(output, name), changed, kept);
++        }
++    }
++    else if (cached.isSymbolicLink()) {
++        if (!present?.isSymbolicLink() || (0, node_fs_1.readlinkSync)(presentPath) !== (0, node_fs_1.readlinkSync)(cachedPath)) {
++            changed.push(output);
++            return;
++        }
++        // The native copy stamps a link by what it points at, and only a file.
++        const target = (0, node_fs_1.statSync)(presentPath, { bigint: true, throwIfNoEntry: false });
++        if (target?.isFile()) {
++            kept.push({ path: output, stamp: `${target.mtimeNs}:${target.size}` });
++        }
++    }
++    else if (cached.isFile() && present?.isFile() && sameFileBytes(cachedPath, cached, presentPath, present)) {
++        kept.push({ path: output, stamp: `${present.mtimeNs}:${present.size}` });
++    }
++    else {
++        changed.push(output);
++    }
++}
++/** The comparison's two read buffers, made on its first use: the restore is synchronous. */
++let compareBuffers;
++/** Whether two regular files have the same size, permission bits and bytes. */
++function sameFileBytes(cachedPath, cached, presentPath, present) {
++    if (cached.size !== present.size || (cached.mode & 0o7777n) !== (present.mode & 0o7777n)) {
++        return false;
++    }
++    compareBuffers ??= [Buffer.allocUnsafe(1 << 20), Buffer.allocUnsafe(1 << 20)];
++    const [cachedBytes, presentBytes] = compareBuffers;
++    const cachedFd = (0, node_fs_1.openSync)(cachedPath, 'r');
++    try {
++        const presentFd = (0, node_fs_1.openSync)(presentPath, 'r');
++        try {
++            for (;;) {
++                const read = (0, node_fs_1.readSync)(cachedFd, cachedBytes, 0, cachedBytes.length, null);
++                if (read === 0) {
++                    return true;
++                }
++                let filled = 0;
++                while (filled < read) {
++                    const more = (0, node_fs_1.readSync)(presentFd, presentBytes, filled, read - filled, null);
++                    if (more === 0) {
++                        return false;
++                    }
++                    filled += more;
++                }
++                if (cachedBytes.compare(presentBytes, 0, read, 0, read) !== 0) {
++                    return false;
++                }
++            }
++        }
++        finally {
++            (0, node_fs_1.closeSync)(presentFd);
++        }
++    }
++    finally {
++        (0, node_fs_1.closeSync)(cachedFd);
++    }
 +}
  function tryAndRetry(fn) {
      let attempts = 0;

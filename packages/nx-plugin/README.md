@@ -1905,6 +1905,16 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   which untars the artifact with its stored mtimes and restores it with the same copy. Restoring one directory output of
   10,000 1 KiB files took a median 3.4 s for the native remove and copy and 0.79 s more for the stamp, on a machine at
   load average 70–120. Not yet proposed upstream.
+- **A cache hit writes only the outputs that changed, and removes the outputs its entry lacks.** Nx's native restore
+  removed each output and copied it whole, so a hit on outputs that already held the entry's bytes (a run on an input
+  they do not depend on, an output edited and put back) gave every file a new inode and, with the stamp above, a new
+  mtime, and every consumer judging freshness by either redid its work. It also copied only the outputs the entry held,
+  so an output a run on other inputs wrote stayed beside the restored ones. The patched local restore
+  (`restoreChangedOutputs` in `tasks-runner/cache.js`) keeps each output file whose size, mode and bytes match its
+  cached copy and each link with the same target, removes what a cached directory lacks, hands the rest to the native
+  copy output by output, and stamps only those. Every hit, remote included, removes an output its entry lacks. A remote
+  hit still restores each output its artifact holds whole: the native call records the entry's size as the bytes it
+  copies. `nx-cache-restore-mtime.test.ts` holds both. Not yet proposed upstream.
 - **A workspace has one daemon, and a second one leaves it alone.** Every daemon overwrote `server-process.json` with
   its own pid, so two clients that each found no daemon started two, and the later one displaced the earlier. A client
   of the displaced daemon lost its socket mid-request (`EPIPE` on `RECORD_OUTPUTS_HASH_BATCH`) after the run had printed
