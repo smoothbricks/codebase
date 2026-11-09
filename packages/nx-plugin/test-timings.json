@@ -15,6 +15,7 @@
     "src/process-group.test.ts": 15352,
     "src/index.test.ts": 15133,
     "src/cargo-source-hash.test.ts": 12215,
+    "src/cache-key-laws.test.ts": 10728,
     "src/cargo-retention.test.ts": 10686,
     "src/cargo-closure-input.test.ts": 9328,
     "src/managed-files/repo-path.test.ts": 8962,
