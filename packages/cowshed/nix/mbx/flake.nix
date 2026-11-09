@@ -25,7 +25,10 @@
 # named by its class (`mbx reserve --name`, the endpoint's `name`) so its run time is predicted, and an
 # interactive priority above the gate's that decays to normal at 120 s and low at 240 s of its job's
 # age (MBX_SCHEDULER_JOB_STARTED_MS), each band its own lane, and a Nix shell's link variables refused
-# only when the driver's own ld is a wrapper, from smoothbricks/mr-boxington at the pinned revision.
+# only when the driver's own ld is a wrapper, the background collector's unlinks paced (1,000 a
+# second, flights 200), a size budget that never takes a present checkout's target, a compilation's
+# paths resolved once, and flights reclaimed after an hour unpublished or seven days unused, from
+# smoothbricks/mr-boxington at the pinned revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
 #
@@ -37,7 +40,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/b9681c887a0931fab593bc224bb2b4ac61669233";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/10de95683436668cec36bdfee0c314b83d648816";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
